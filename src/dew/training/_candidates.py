@@ -230,8 +230,9 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     if key is not None:
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
         # builds the reader's own).
-        held_until_release(_KEPT)
         with _KEEPING:
+            # Registered as it is published, under one lock, so no release clears the cache between them.
+            held_until_release(_KEPT)
             _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
                                                    spread=spread_axes())
             while len(_CANDIDATES) > KEPT_CANDIDATES:

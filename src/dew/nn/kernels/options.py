@@ -111,12 +111,16 @@ class Releasing(Protocol):
 
 _HOLDERS: weakref.WeakSet[Releasing] = weakref.WeakSet()
 """Every holder alive (`held_until_release`), whose executables and lowerings `release` drops."""
+_HOLDERS_LOCK = threading.Lock()
+"""Held as a holder is added and as `release` takes its snapshot of them: a set walked as another thread adds
+to it raises (row 8411's review)."""
 
 
 def held_until_release(holder: Releasing) -> None:
     """Register `holder` for `release`, held weakly: a program as it is made, a cache as it first keeps a
     lowering."""
-    _HOLDERS.add(holder)
+    with _HOLDERS_LOCK:
+        _HOLDERS.add(holder)
 
 type Taken = Mapping[str, Callable[[], jax.stages.Compiled]]
 """Executables compiled ahead or kept by another process (`dew.training.ahead`), each loaded on demand, by
@@ -531,8 +535,10 @@ def release() -> None:
     process, and a program keeps up to `OuterProgram.CACHED` of them for as long as it lives, past a cache
     JAX clears. A process that compiles on and on (a test suite) frees the mappings this way; each program
     compiles again at its next call."""
-    # A snapshot, each holder asked outside the set as it changes.
-    for holder in list(_HOLDERS):
+    # A snapshot taken under the lock, each holder asked outside it: none waits on the set with its own lock.
+    with _HOLDERS_LOCK:
+        holders = list(_HOLDERS)
+    for holder in holders:
         holder.released()
     unhold()
 

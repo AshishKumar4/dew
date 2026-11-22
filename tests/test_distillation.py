@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from arm_forms import dew_path
 from flax import linen as nn
 from flax.traverse_util import unflatten_dict
 from reference_error import as_given, assert_as_exact, widened
@@ -843,7 +844,6 @@ def test_a_tiled_full_kl_divides_by_a_wide_temperature_at_its_own_width():
                                jnp.ones((rows, positions), bool), jnp.asarray(temperature, jnp.float64),
                                tile=(3, vocab))[0]
 
-    @as_given
     def whole(student_table, teacher_table, student_states, teacher_states):
         student, teacher = (OutputTable(table, vocab_major=False) for table in (student_table, teacher_table))
         over = jnp.asarray(wide, jnp.float64)
@@ -855,7 +855,7 @@ def test_a_tiled_full_kl_divides_by_a_wide_temperature_at_its_own_width():
         at_wide, at_one = np.asarray(tiled(*inputs)), np.asarray(tiled(*inputs, temperature=1.0))
         assert at_wide.dtype == np.float64 and np.all(np.isfinite(at_wide)), at_wide
         assert not np.array_equal(at_wide, at_one), (at_wide, at_one)
-        assert_as_exact(as_given(tiled), whole, draw, "the tiled KL over a wide temperature",
+        assert_as_exact(tiled, dew_path(whole), draw, "the tiled KL over a wide temperature",
                         seeds=DISTILLATION_SEEDS["wide temperature"])
 
 
