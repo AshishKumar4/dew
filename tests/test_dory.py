@@ -13,7 +13,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from arm_arithmetic import float64_held
+import tier_wire
+from arm_arithmetic import drawn_on_the_host, float64_held
 from decision_support import decision_rows
 from float64_terms import float64_forward
 from interop_support import assert_reloads, assert_same_stored_tensors, token_draw
@@ -62,7 +63,12 @@ TOOL = load_tool('dory_reference')
 
 
 def load(**fields):
-    return Pretrained.load(TINY, dtype='float32', attention_impl='xla', **fields)
+    """The tiny Dory loaded; in a GPU tier part's prepare, on the host's CPU (`drawn_on_the_host`), its
+    default device a compile-only GPU that computes nothing (rows 11424-11619: every cell's load there left
+    it unprepared), its weights committed to no device, so its sites prepare."""
+    def loaded(_):
+        return Pretrained.load(TINY, dtype='float32', attention_impl='xla', **fields)
+    return drawn_on_the_host(loaded, None) if tier_wire.preparing() else loaded(None)
 
 
 def with_cache(model: CausalTransformer, mode: str) -> CausalTransformer:
