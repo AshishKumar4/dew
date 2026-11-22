@@ -2145,8 +2145,13 @@ class ForwardRegisters:
         if not family.budgets_registers:
             return None
         width = _width(self.width, family, self.dtype)
-        before = (0 if self.prologue is None
-                  else prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue))
+        if self.prologue is not None:
+            before = prologue_registers(family, tiles.block_q, width, self.dtype, *self.prologue)
+        elif (self.parts == 1 and jnp.dtype(self.dtype).itemsize == 2 and family.fixes_up
+              and not family.places_on_role and query_swizzle(family) is None):
+            before = resources.live_registers(family, [], [(tiles.block_q, width, self.dtype)])
+        else:
+            before = 0
         if peaks:
             return max(before, peaks_registers(family, tiles, self.dtype, params=self.params, width=width))
         value_width = value_columns(_width(self.value_width, family, self.dtype), columns or tiles.columns)

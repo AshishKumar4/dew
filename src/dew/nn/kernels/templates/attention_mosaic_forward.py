@@ -1195,9 +1195,9 @@ def _query_of(program: _Program, spec: algebra.Forward, q_view, q_smem, q_loaded
             swizzle = query_swizzle(family)
             if swizzle is not None:
                 across.scale_smem(q_smem, spec.prescale, swizzle=swizzle, interpret=interpret)
+                family.published()
             else:
-                q_smem[...] = by_power(family.tile_of(q_smem), spec.prescale)
-            family.published()
+                family.staged(by_power(family.tile_of(q_smem), spec.prescale), q_smem)
         return family.held(q_smem)
     family.loaded(tuple((view, q_smem.at[pl.ds(part * block_q, block_q)], barrier)
                         for part, (view, barrier) in enumerate(zip(q_view, q_loaded, strict=True))))

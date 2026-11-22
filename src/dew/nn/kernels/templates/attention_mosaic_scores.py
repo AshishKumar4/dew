@@ -361,7 +361,8 @@ def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool,
     k_pos = jax.ShapeDtypeStruct((1, tile[1]), jnp.int32)
     spec = algebra.Forward("causal", 64, ids=False, scale=1.0 / 8.0, natural=natural_form, headroom=scaled)
     if backward:
-        def backward_step(s, dp, peak, total, anchor, delta, q, k):
+        anchor_tile = jax.ShapeDtypeStruct(tile, jnp.bool_)
+        def backward_step(s, dp, peak, total, anchor, delta, q, k, at_anchor):
             seen = algebra.seen(spec, algebra.Coords(q, k), s)
             anchored = accurate or dropped
             forms = derived_cotangents(keys_first=False, dropped=dropped, masked=True,
@@ -371,18 +372,20 @@ def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool,
             if dropped:
                 tiles["keep"] = s
             if anchored:
-                tiles["at_anchor"] = seen
+                tiles["at_anchor"] = at_anchor
             exps, weights, ds = forms.mapped(tiles)
             return algebra.value_weights(exps, weights, jnp.bfloat16, dropped), ds.astype(jnp.bfloat16)
-        jaxpr = jax.make_jaxpr(backward_step)(s_in, s_in, row, row, row, row, q_pos, k_pos).jaxpr
+        jaxpr = jax.make_jaxpr(backward_step)(
+            s_in, s_in, row, row, row, row, q_pos, k_pos, anchor_tile).jaxpr
     else:
         def forward_step(s, m, l_val, q, k):
             mod = algebra.modify(spec, s, algebra.Coords(q, k), (), masked=True)
             new_m, alpha = algebra.peak(spec, m, mod)
-            w = algebra.weights(spec, mod, new_m)
+            w = algebra.raised_weights(spec, mod, new_m)
             if scaled:
                 exp = jnp.ones((tile[0],), jnp.int32)
-                held = algebra.Scaled(exp, exp, lambda shift: algebra.weights(spec, mod, new_m - shift))
+                held = algebra.Scaled(
+                    exp, exp, lambda shift: algebra.raised_weights(spec, mod, new_m - shift))
                 return (*algebra.at_scale(w, held), new_m, alpha)
             return w.astype(jnp.bfloat16), algebra.total(l_val, alpha, w), new_m
         jaxpr = jax.make_jaxpr(forward_step)(s_in, row, row, q_pos, k_pos).jaxpr

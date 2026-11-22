@@ -1949,19 +1949,35 @@ def test_sm90_overlapped_fused_backward_compiles_spill_free(width):
 @COMPILES_ON_CPU
 def test_sm90_overlapped_coop_backward_compiles_spill_free_for_d256():
     """Row 5272: sm90 overlapped shared-keys backward (`attention_dkv_shared`, qwen3.5-0.8b d256) compiles
-    spill-free with S/dP overlap and dead `chosen` excluded."""
+    spill-free with `_tile_scores` S/dP overlap and dead `chosen` excluded."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
+    from dew.nn.kernels.templates import (
+        attention_mosaic_coop as coop,
+        attention_mosaic_fused as fused,
+        attention_mosaic_program as program,
+    )
+
     with generation.assumed("sm90"):
+        target = generation.gpu_target()
         spans = template.spans(4096, 4096, 1, causal=True)
         q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
         k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
         shapes = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
+        op, args = attention_mosaic._backward_call(q, k, k, spans, None, q, shapes, scale=None,
+                                                   natural=attention_mosaic.NATURAL, accurate=False)
+        cfg = op.derived(op.bind(*args, interpret=False), target)
+        assert cfg is not None and cfg.shared_keys, cfg
+        family = program.bundle("sm90", jnp.bfloat16)
+        streamed = fused.streamed_statistics(family, cfg, 256, jnp.bfloat16, cfg.stages, reduced=0,
+                                             allocations_of=coop._coop_allocations, anchored=False)
+        assert "chosen" not in program.streamed_statistics_order(streamed, anchored=False)
         case = _fast_backward_compile_case("sm90-overlapped-coop-d256", q, k, spans, shapes)
         found = compile_mosaic_kernels([case], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
         assert any(kernel["kernel"] == "attention_dkv_shared"
                    for kernel in found[0].get("kernels", ())), found
+
 
 @COMPILES_ON_CPU
 def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_deterministic_ops):

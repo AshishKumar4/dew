@@ -148,8 +148,8 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         def between(s):
             if is_whole is not None:
                 def weights_for(*, is_masked: bool):
-                    exps, w, sl, _ = _score_weights(walk, coords, (), s, peak, prior, masked=is_masked)
-                    return exps, w, sl, None
+                    exps, w, sl, sn = _score_weights(walk, coords, (), s, peak, prior, masked=is_masked)
+                    return exps, w, sl, (jnp.ones(s.shape, jnp.bool_) if sn is None else sn)
                 return lax.cond(is_whole, functools.partial(weights_for, is_masked=False),
                                 functools.partial(weights_for, is_masked=True))
             assert masked is not None
@@ -175,9 +175,8 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         # Only the segmented TPU walk (`masked is not None`) passes `read` to skip unneeded coordinate tiles.
         if overlapped is not None:
             exponentials, overlapped_weights, slopes, seen = overlapped
-            if masked_step and seen is None:
-                seen = algebra.seen(walk.spec, coords, dp)
-            cotangents = _score_cotangents(coords, overlapped_weights, dp, anchor, delta, seen)
+            cotangents = _score_cotangents(coords, overlapped_weights, dp, anchor, delta,
+                                           seen if masked_step else None)
         else:
             scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen,
                              masked=masked_step)

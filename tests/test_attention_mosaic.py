@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import attention_terms
+from attention_oracle import attention_terms, traced_attention_terms
 from fla_gdn_support import KernelCase
 from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS
@@ -526,20 +526,17 @@ def _gradient_terms(spans: template.KeySpans | Callable[[], template.KeySpans],
     values, which `attention_terms` does not carry."""
     if "resumed" in score:
         return None
-    keep: np.ndarray | None = None
     # The parameters' terms over every draw, traced once and its static runs compiled (`float64_terms`).
     traced_terms = None if reference is None else functools.partial(float64_terms, reference)
 
     def terms(query, key, value, dout, *hooks):
-        nonlocal keep
-        if keep is None:
-            keep = template.dense(spans() if callable(spans) else spans)[:, None]
+        keep = template.dense(spans() if callable(spans) else spans)[:, None]
         params, initial = hooks if hooks else ((), None)
-        wide = tuple(jnp.asarray(np.asarray(param), np.float64) for param in params)
+        wide = tuple(jnp.asarray(param, jnp.float64) for param in params)
         # Each head's sink, the state's maximum at any row and query (`template.sinks`).
-        sinks = None if initial is None else np.asarray(initial.m)[0, :, 0]
+        sinks = None if initial is None else initial.m[0, :, 0]
         modded = None if hooked is None else (lambda raw: template.score_modded(raw, hooked(wide, None)))
-        found = attention_terms(query, key, value, dout, keep, sinks=sinks, score=modded)
+        found = traced_attention_terms(query, key, value, dout, keep, sinks=sinks, score=modded)
         if not params and initial is None:
             # No hook parameter takes a gradient (a softcap's hook has none): the operands' terms alone, the
             # draw's hooks `((), None)` as they are.
