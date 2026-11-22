@@ -165,7 +165,10 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return ["map", again(type(value), at=at),
                 [[again(key, at=at), again(each, at=f"{at}[{key!r}]")] for key, each in value.items()]]
     if isinstance(value, functools.partial):
-        return ["partial", again(value.func, at=at), again(value.args, at=at), again(value.keywords, at=at)]
+        # Its class among it, as a container's: a subclass's own `__call__` computes otherwise (train 1174:
+        # a doubling partial took a plain partial's held program).
+        return ["partial", again(type(value), at=at), again(value.func, at=at), again(value.args, at=at),
+                again(value.keywords, at=at)]
     if isinstance(value, types.MethodType):
         return ["method", again(value.__self__, at=at), value.__name__]
     if isinstance(value, types.FunctionType):
