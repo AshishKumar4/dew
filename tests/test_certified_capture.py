@@ -215,9 +215,10 @@ with (report.certifying(compile_only_gpus("sm90")[0]), assumed("sm90"), jax.set_
       mgpu_core.artificial_shared_memory_limit(gpu_target("sm90").shared_limit)):
     # Traced as its compile traces it, each launch certified aside and settled before it lowers: the
     # replays lowered.
-    with report.certifying_aside() as aside:
-        traced = step.trace(*shapes)
-    report.settled_aside(aside)
+    with report.settling():
+        with report.certifying_aside() as aside:
+            traced = step.trace(*shapes)
+        report.settled_aside(aside)
     replayed = dict(events)
     traced.lower()
 print(json.dumps({"replayed": replayed, "lowered": {kind: events[kind] - replayed[kind] for kind in events}}))
