@@ -261,27 +261,43 @@ def test_an_fp32_rated_scan_through_the_template_stays_finite_interpreted(forms)
                       'the decay bound')
 
 
-@pytest.mark.parametrize(('name', 'regime', 'forms'), [
-    pytest.param('scalar delta', 'aligned keys', None, id='scalar_delta-aligned_keys'),
-    pytest.param('vector delta', 'aligned keys', None, id='vector_delta-aligned_keys'),
-    pytest.param('scalar write', 'aligned keys', None, id='scalar_write-aligned_keys'),
-    pytest.param('rated', 'aligned keys', 'fast', id='rated-aligned_keys-fast'),
-    pytest.param('rated', 'aligned keys', 'accurate', id='rated-aligned_keys-accurate'),
-    pytest.param('gated', 'aligned keys', 'accurate', id='gated-aligned_keys-accurate',
-                 marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
-    pytest.param('scalar delta', 'decays near zero', None, id='scalar_delta-decays_near_zero',
-                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
-    pytest.param('vector delta', 'decays near zero', None, id='vector_delta-decays_near_zero',
-                 marks=pytest.mark.check1_shards(seeds=64, per_task=16)),
-    pytest.param('scalar write', 'decays near zero', None, id='scalar_write-decays_near_zero',
-                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
-    pytest.param('gated', 'decays near zero', 'accurate', id='gated-decays_near_zero-accurate',
-                 marks=pytest.mark.check1_shards(seeds=128, per_task=32)),
-    pytest.param('rated', 'decays near zero', 'fast', id='rated-decays_near_zero-fast',
-                 marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
-    pytest.param('rated', 'decays near zero', 'accurate', id='rated-decays_near_zero-accurate',
-                 marks=pytest.mark.check1_shards(seeds=256, per_task=64)),
-])
+CHECK1_SHARDS = {
+    "test_each_form_the_template_takes_stays_finite_and_on_par_interpreted[gated-aligned_keys-accurate]":
+        {"seeds": 128, "per_task": 32},
+    "test_each_form_the_template_takes_stays_finite_and_on_par_interpreted[scalar_delta-decays_near_zero]":
+        {"seeds": 64, "per_task": 32},
+    "test_each_form_the_template_takes_stays_finite_and_on_par_interpreted[vector_delta-decays_near_zero]":
+        {"seeds": 64, "per_task": 16},
+    "test_each_form_the_template_takes_stays_finite_and_on_par_interpreted[scalar_write-decays_near_zero]":
+        {"seeds": 64, "per_task": 32},
+    "test_each_form_the_template_takes_stays_finite_and_on_par_interpreted[gated-decays_near_zero-accurate]":
+        {"seeds": 128, "per_task": 32},
+    "test_each_form_the_template_takes_stays_finite_and_on_par_interpreted[rated-decays_near_zero-fast]":
+        {"seeds": 256, "per_task": 64},
+    "test_each_form_the_template_takes_stays_finite_and_on_par_interpreted[rated-decays_near_zero-accurate]":
+        {"seeds": 256, "per_task": 64},
+}
+"""The interpreted forwards whose check-1 seeds run as map tasks, by node id, a literal the CI plan reads as
+it reads a mark's (tools/armada/ci.py): their seeds and a task's share (`interpreted_cases`)."""
+
+
+def interpreted_cases() -> list:
+    """`CASES`' forwards under the regimes the CPU interprets (`INTERPRETED`), as the test's parameters, each
+    marked to run its seeds as map tasks where `CHECK1_SHARDS` names its node: a form or regime `SITES`,
+    `forms_of` or `INTERPRETED` adds reaches the CPU cell (row 9716)."""
+    test = "test_each_form_the_template_takes_stays_finite_and_on_par_interpreted"
+    cases = []
+    for name, regime, product, forms in CASES:
+        if product != 'forward' or regime not in INTERPRETED:
+            continue
+        ident = '-'.join(part.replace(' ', '_') for part in (name, regime, forms) if part is not None)
+        held = CHECK1_SHARDS.get(f"{test}[{ident}]")
+        cases.append(pytest.param(name, regime, forms, id=ident,
+                                  marks=[pytest.mark.check1_shards(**held)] if held else []))
+    return cases
+
+
+@pytest.mark.parametrize(('name', 'regime', 'forms'), interpreted_cases())
 def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, regime, forms):
     """Each form's 16-bit forward through the template, interpreted off a GPU under the regimes that grow its
     tiles most, held as its GPU flow cell is: finite, and its output and final memory on par from float64

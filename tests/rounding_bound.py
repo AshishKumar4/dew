@@ -44,7 +44,7 @@ from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
 from dew.nn import programs
-from dew.nn.precision import compensated_add, compensated_sum, correctly_rounded_divide_p
+from dew.nn.precision import compensated_add, compensated_sum, correctly_rounded_divide_p, summed_pairs
 
 COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
              primitives.reduce_scatter_p: "axis_name"}
@@ -60,6 +60,14 @@ FUNCTIONS = {getattr(jax.lax, f"{name}_p"): bound for name, bound in ULPS.items(
 """Each elementary function's error bound (`ULPS`, by the function's name in JAX and torch alike), by JAX's
 primitive of that name."""
 
+POWER = 1.31
+"""XLA CPU's float32 power's error bound (`lax.pow`, one `hlo.power`: its own implementation, which differs
+from libm's `powf` in the last bit on 4 percent of draws near one), in units of u times its true result: the
+largest over 2^27 drawn pairs where it errs most, results whose binary exponent is 100 to 126 from zero
+(its error grows with the base's logarithm times the exponent), 1.3069 near float32's least normal, rounded
+up at the second decimal; drawn, where `ULPS` reads every input, a pair of float32 operands being 2^64 of
+them (row 10157)."""
+
 SCATTERS = {jax.lax.scatter_p: jax.lax.scatter, jax.lax.scatter_add_p: jax.lax.scatter_add,
             jax.lax.scatter_mul_p: jax.lax.scatter_mul, jax.lax.scatter_min_p: jax.lax.scatter_min,
             jax.lax.scatter_max_p: jax.lax.scatter_max}
@@ -68,12 +76,17 @@ which a float64 evaluation of a float32 program builds again (`TapRule.primitive
 
 @functools.cache
 def compensating() -> frozenset:
-    """The combining computations of Dew's compensated sums, each a double-float pair's: `compensated_add`,
-    and the one `compensated_sum`'s reduction combines by, read from its own trace, so a renamed combine is
-    still known by its object."""
-    traced = jax.make_jaxpr(lambda x: compensated_sum(x, (0,)))(jax.ShapeDtypeStruct((2,), jnp.float32))
-    combines = {equation.params["computation"] for equation in programs.equations(traced.jaxpr)
-                if equation.primitive is jax.lax.reduce_p}
+    """The combining computations of Dew's compensated sums, each a double-float pair's, its first two
+    operands and results the pair, any third the plain sum carried beside it: `compensated_add`, and the
+    ones `compensated_sum`'s reduction (`summed_total`, the pair and its plain sum in one pass) and the pair
+    reduction alone (`summed_pairs`) combine by, read from their own traces, so a renamed combine is still
+    known by its object."""
+    shape = jax.ShapeDtypeStruct((2,), jnp.float32)
+    combines = set()
+    for summed in (lambda x: compensated_sum(x, (0,)), lambda x: summed_pairs((x, jnp.zeros_like(x)), (0,))):
+        traced = jax.make_jaxpr(summed)(shape)
+        combines |= {equation.params["computation"] for equation in programs.equations(traced.jaxpr)
+                     if equation.primitive is jax.lax.reduce_p}
     return frozenset({compensated_add, *combines})
 
 
@@ -143,7 +156,7 @@ class TapRule:
             if not jnp.issubdtype(dtype, jnp.floating):
                 tapped.append(value)
                 continue
-            weight = _weight(equation, params, operands, value)
+            weight = _weight(equation, params, operands, value, index)
             if weight is None:
                 tapped.append(value)
                 continue
@@ -306,7 +319,7 @@ def _wide(dtype):
     return jnp.float64 if dtype is not None and jnp.issubdtype(dtype, jnp.floating) else dtype
 
 
-def _weight(equation, params, operands, value):
+def _weight(equation, params, operands, value, index: int = 0):
     """The most one rounding at `equation` moves its float64 result `value` (module docstring), in units of
     its format's u; None where it rounds nothing. An operation with no rule is refused by name."""
     primitive, magnitude = equation.primitive, jnp.abs(value)
@@ -317,22 +330,31 @@ def _weight(equation, params, operands, value):
     if primitive in FUNCTIONS:
         return FUNCTIONS[primitive] * magnitude
     if primitive is jax.lax.integer_pow_p:
-        return max(abs(int(params["y"])) - 1, 1) * magnitude
+        # Its chain of multiplications (JAX's `_integer_pow`, by squaring): a product's relative errors add,
+        # so `|y| - 1` roundings to first order, and a negative power's reciprocal one more; `x**0` and
+        # `x**1` round nothing.
+        power = int(params["y"])
+        roundings = abs(power) - 1 + (power < 0) if power else 0
+        return roundings * magnitude if roundings else None
     if primitive is jax.lax.pow_p:
-        # A float's power (Adam's bias correction, `1 - b**count`): at an integer exponent rounding as an
-        # integer power's, `max(|e| - 1, 1)` times, else through `exp(e log x)`, by each function's ulps;
-        # `_dew_torch.rounding`'s rule for aten.pow, element by element.
-        exponent = jnp.broadcast_to(operands[1], jnp.shape(value))
-        whole = jnp.maximum(jnp.abs(exponent) - 1, 1)
-        return jnp.where(exponent == jnp.round(exponent), whole, ULPS["exp"] + ULPS["log"]) * magnitude
+        # A float's power (Adam's bias correction, `1 - b**count`): one `hlo.power`, XLA's library power
+        # (`POWER`), or, at an exponent XLA's simplifier folds to a constant of 2, 3 or -1 (a constant
+        # expression among them), its products, `x * x * x` the most, two roundings: the larger whatever the
+        # exponent, which the replay reads tapped, a folded constant moved off it (the review of 3580, F2).
+        return max(POWER, 2) * magnitude
     if primitive is jax.lax.reduce_p and params["computation"] in compensating():
         # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
         # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u; each of
-        # the pair's halves by it, as the high half's rounding moves the low half by as much.
+        # the pair's halves by it, as the high half's rounding moves the low half by as much. A plain sum
+        # carried beside the pair (`summed_total`'s third operand and result) rounds as any sum of its
+        # terms does, in whatever order the reduction adds them.
         terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
+        summed = operands[:len(equation.outvars)]
+        if index >= 2:
+            return max(terms - 1, 1) * jnp.sum(jnp.abs(summed[index]), params["dimensions"])
         u = _unit(primitive, params, equation.outvars[0].aval.dtype)
         gamma = (terms - 1) * u / (1 - (terms - 1) * u)
-        pair = operands[:len(operands) // 2]
+        pair = summed[:2]
         total = jnp.abs(sum(jnp.sum(operand, params["dimensions"]) for operand in pair))
         spread = sum(jnp.sum(jnp.abs(operand), params["dimensions"]) for operand in pair)
         return total + gamma * gamma / u * spread

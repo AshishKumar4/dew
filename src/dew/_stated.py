@@ -65,17 +65,24 @@ def _library_value(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     return _stateless(value, at, again)
 
 
+class _Bare:
+    """A Python class over `object` alone: the layout of an instance holding nothing past its `__dict__`
+    (`_stateless`)."""
+
+
 def _stateless(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """An instance holding nothing of its own, by its type alone (`again`: a library's by its name, one of
     the user's own code walked), which is all it computes by: a library's sentinel or descriptor (Flax's
     unspecified parent, its module classes' parent descriptor, which every Flax module class of the user's
     holds, so an arm reading one is stated). None for any other: a type of `__main__`, one whose instances
     hold no `__dict__` (a C type's or a slotted one's, a context variable's, holding state no attribute
-    shows), one defining its own attribute lookup (which reading it would run), a Flax module or a dataclass
-    with fields (whose state an empty `__dict__` would hide), and an instance whose `__dict__` holds
-    anything."""
+    shows) or more than a bare Python object's (`_Bare`: a Python subclass of a C type keeping its value
+    in the C base, a weak reference's referent among them, row 11772), one defining its own attribute lookup
+    (which reading it would run), a Flax module or a dataclass with fields (whose state an empty `__dict__`
+    would hide), and an instance whose `__dict__` holds anything."""
     kind = type(value)
-    if kind.__module__ == "__main__" or kind.__dictoffset__ == 0:
+    if (kind.__module__ == "__main__" or kind.__dictoffset__ == 0 or kind.__itemsize__
+            or kind.__basicsize__ != _Bare.__basicsize__):
         return None
     if any(name in vars(klass) for klass in kind.__mro__[:-1]
            for name in ("__getattr__", "__getattribute__", "__slots__")):

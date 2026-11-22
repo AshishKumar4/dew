@@ -263,9 +263,11 @@ class MxFp8:
 
 
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
-    """Block-scaled codes' values in `dtype`: each code times its `block` depths' scale, exact in float32
-    (an E2M1 code times an E4M3 scale: 6 bits)."""
-    return codes.astype(dtype) * jnp.repeat(scales.astype(dtype), block, axis=-1)
+    """Block-scaled codes' values in `dtype`: each code times its `block` depths' E4M3 scale, read by the one
+    decode of a block scale's (`bits.scales_decoded`, row 8675), exact in float32 (an E2M1 code times an E4M3
+    scale: 6 bits)."""
+    held = bits.scales_decoded(jax.lax.bitcast_convert_type(scales, jnp.uint8))
+    return codes.astype(dtype) * jnp.repeat(held.astype(dtype), block, axis=-1)
 
 
 @dataclasses.dataclass(frozen=True)

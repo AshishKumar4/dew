@@ -10,8 +10,9 @@ def float_arithmetic(lowered, *, paired: bool = False) -> list[str | None]:
     """The no-contract mark (`jax.extend.backend.no_contract_attribute`'s attribute, its value) of every float
     add, subtract and multiply of `lowered`'s StableHLO module (`dew.nn.kernels.lowered.read_operations`, a
     reduction's body among them), None where an operation carries none; with `paired`, those in a reduction
-    of pairs alone (a compensated sum's `(hi, lo)` accumulator, two operands and two inits), whose plain sum
-    beside it and its pair's final addition (`compensated_total`) no transform makes."""
+    of pairs alone (a compensated sum's `(hi, lo)` accumulator, or its `(hi, lo, plain)` carrying its plain
+    sum beside the pair, `precision.summed_total`'s: two or three operands and as many inits), whose pair's
+    final addition (`compensated_total`) no transform makes."""
     from jax.extend.backend import no_contract_attribute
     from jax.extend.mlir import ir
 
@@ -23,7 +24,7 @@ def float_arithmetic(lowered, *, paired: bool = False) -> list[str | None]:
         parent = operation.parent
         while parent is not None and parent.name != "stablehlo.reduce":
             parent = parent.parent
-        return parent is not None and len(parent.operands) == 4
+        return parent is not None and len(parent.operands) in (4, 6)
 
     def read(operation):
         arithmetic = operation.name in ("stablehlo.add", "stablehlo.subtract", "stablehlo.multiply")

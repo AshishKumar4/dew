@@ -59,6 +59,21 @@ def test_the_same_draw_weighs_alike_and_another_seed_draws_again():
     assert not np.array_equal(first, other)
 
 
+def test_a_power_rounds_as_torchs_kernel_computes_it_whatever_its_exponent():
+    """torch's power (aten.pow) is a library power at any exponent but a few its kernel computes as products
+    (row 10157: an integer exponent was weighed as an integer power's chain, a rounding more each unit of
+    it): at 4, whose powers here are powers of two (each relative scale computed alike to the bit), its scale
+    relative to its value is one number at exponents 7 and 50, a library power's one rounding of at most 2u,
+    and half of it at 2, the one product `x * x` its kernel computes."""
+    four = torch.full((1,), 4.0, dtype=torch.float64)
+
+    def relative(exponent):
+        value, scale = rounding_scale(lambda: torch.pow(four, exponent), UNIT)
+        return float(scale[0] / value[0])
+
+    assert relative(7) == relative(50) == 2 * relative(2)
+
+
 def test_an_operation_of_no_rule_is_refused():
     """An aten operation the scale has no rule for is refused, not passed as exact."""
     with pytest.raises(ValueError):
