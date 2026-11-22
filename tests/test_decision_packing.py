@@ -550,7 +550,8 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, arm: str, cou
         # The twin's parameters are the objective's own: the same tree, shapes and dtypes, traced where the
         # objective's kernels run, so a parameter the objective alone declares fails here, not drawn apart.
         def declared(drawing):
-            return jax.eval_shape(lambda key: nn.unbox(drawing.init(key)), jax.random.key(0))
+            # The key made in the trace: an eager one is an array on a device a compile-only run has not.
+            return jax.eval_shape(lambda: nn.unbox(drawing.init(jax.random.key(0))))
         assert declared(drawn_by) == declared(objective)
     initialized = jax.jit(lambda key: nn.unbox(initializer.init(key)))
     # A leaf whose float64 truth cancels, an algebraic zero's, is sized by the terms its sums add
