@@ -86,7 +86,7 @@ def test_a_kernel_counts_a_special_function_in_the_form_its_approx_math_lowers_i
         launch = plgpu.kernel(body, out_type=_ROW, num_threads=1, thread_name="wg",
                               scratch_types=[plgpu.SMEM((128,), jnp.float32)],
                               compiler_params=plgpu.CompilerParams(approx_math=approx))
-        traced = jax.make_jaxpr(launch)(jnp.zeros(128, jnp.float32)).jaxpr
+        traced = jax.make_jaxpr(launch)(_ROW).jaxpr
         (kernel,) = [equation for equation in programs.equations(traced)
                      if equation.primitive.name in ("mpmd_map", "pallas_call")]
         return emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
