@@ -414,9 +414,10 @@ def test_a_paged_decode_step_on_this_tpu_falls_back_where_jaxs_kernel_refuses(wi
     `kv_cache.TPU_PAGED_SUPPORTS` refuses jax's Pallas paged attention: on par with the compact cache's
     reference decode (check 1) through the layer's gathered fallback where refused, and through `tpu` where
     a newer TPU's MXU takes fp32-by-bf16."""
+    from test_kv_cache import assert_paged_decode_on_par
+
     from dew.nn.kernels import generation
     from dew.nn.models.transformer import CausalTransformer
-    from tests.test_kv_cache import assert_paged_decode_on_par
 
     def model(layout, dtype, implementation="auto"):
         return CausalTransformer(vocab_size=64, emb_features=width * 2, num_layers=1, num_heads=4,

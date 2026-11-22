@@ -99,19 +99,14 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         _one(consumers)
         return generation.shared_budget(generation.gpu_target()) // (VALUES * 4)
 
-    def value_scratch(self, blocks: dict, outputs: tuple, *, step: tuple = ()) -> tuple:
-        """VMEM scratch stand-ins for operand `blocks`, fp32 `outputs` accumulators, and a walk step's
-        live intermediate tiles `step` (each live value `VALUES` copies, as an accumulator): a v5e
-        refused 20.33 and 20.95 MiB at a 1024 x 512 x 2048 product and kernel gradient, 16.12 at a
-        256 x 512 x 4096 gradient, whose buffers alone counted 16.00, 16.00 and 13.0 (GEMM passes
-        `step=()`); attention passes its live score tiles (forward 6+6 score tiles, backward 10 beside
-        3 fp32 accumulators; v5e 22 MiB, row 10771)."""
+    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
+        """VMEM scratch stand-ins for operand `blocks` and fp32 `outputs` tiles (each live tile `VALUES`
+        copies): a v5e refused 20.33 and 20.95 MiB at a 1024 x 512 x 2048 product and kernel gradient,
+        16.12 at a 256 x 512 x 4096 gradient, whose buffers alone counted 16.00, 16.00 and 13.0."""
         operands = tuple(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in blocks.values())
         values = tuple(jax.ShapeDtypeStruct(shape, jnp.float32)
                        for shape, _ in outputs for _ in range(VALUES))
-        live = tuple(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in step for _ in range(VALUES))
-        return operands + values + live
-
+        return operands + values
     # A tile, a row and a column are values: the members the GPU's issuers lay out are plain reads.
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:
         return jnp.zeros(shape, jnp.float32)

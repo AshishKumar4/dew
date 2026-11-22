@@ -75,7 +75,7 @@ from dew.nn.precision import (
     weighted_total,
 )
 from dew.nn.progress import END, Progress, ReadsProgress
-from dew.nn.protocols import HiddenStates, ProjectsParameters, StagedStacks
+from dew.nn.protocols import HiddenStates, OutputTable, ProjectsParameters, StagedStacks
 from dew.nn.sharding import LogicalAxes, abstract, boxed_axes, rows_taken
 from dew.objectives.drawn import WHOLE, drawn_once
 
@@ -718,16 +718,15 @@ class Prediction:
     - `hidden`: the `[B, S, D]` states of the layers the caller asked for,
       in the order asked.
     - `final`: the `[B, S, D]` final states its head scored (or the logits of a model that gives them
-      from its tokens), and `head` the logits of any slice of them, through the head the loss read: a
-      caller that reads every column takes them a slice at a time (a distillation's tiled KL), none
-      where the objective states none.
+      from its tokens), which a caller reading every column scores through the head the loss read
+      (`Objective.output_table`) a slice at a time (a distillation's full KL), none where the objective
+      states none.
     """
     logits: jax.Array | None
     losses: jax.Array
     weights: jax.Array
     hidden: tuple[jax.Array, ...]
     final: jax.Array | None = None
-    head: Callable[[jax.Array], jax.Array] | None = struct.field(pytree_node=False, default=None)
 
 
 TEACHER = "teacher"
@@ -1859,10 +1858,16 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     @property
     def predicts_by_head(self) -> bool:
-        """Whether its prediction states the final states its logits are its head's of and that head
-        (`Prediction.final`, `Prediction.head`), so a caller reading every column reads them a slice at a
-        time; none for an objective whose scores go through more than its head."""
+        """Whether its prediction states the final states its logits are its head's of (`Prediction.final`),
+        so a caller reading every column reads them a slice at a time through its head
+        (`output_table`); none for an objective whose scores go through more than its head."""
         return False
+
+    def output_table(self, variables: Variables) -> OutputTable | None:
+        """The head its prediction's final states are scored through over `variables`, as one matrix
+        (`dew.nn.protocols.head_table`); None where it predicts by no head (`predicts_by_head`) or no matrix
+        alone is its head, whose whole logits a caller reading every column reads."""
+        return None
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None:
         """Return scoring artifacts for every row of the global batch that all processes evaluate.

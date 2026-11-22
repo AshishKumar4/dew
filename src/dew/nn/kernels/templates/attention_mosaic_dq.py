@@ -50,7 +50,9 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _query_tile_loaded,
     _relay_tiles,
     _relayed,
+    _score_cotangents,
     _score_params,
+    _score_weights,
     _scores,
 )
 
@@ -137,9 +139,30 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     shape = (tiles.block_q, tiles.block_k)
     k_slot = slots["keys"]
     k_first = (index if tile is None else tile(index)) * tiles.block_k
-    s, dp = family.product_pair(q, k_slot.transpose((1, 0)), do, slots["values"].transpose((1, 0)), shape)
-    slots.release("values")
-    params = params_of(s, k_first=k_first, slots=slots)
+    overlap = (family.products_overlap and not family.operands_in_registers and not walk.interpret
+               and not walk.accurate and not walk.dropped and not walk.kinds and walk.spec.score_mod is None)
+    overlapped: tuple | None = None
+    if overlap:
+        def between(s):
+            if masked is None:
+                coords = coords_of(k_first)
+                def weights_for(*, is_masked: bool):
+                    exps, w, sl, _ = _score_weights(walk, coords, (), s, peak, prior, masked=is_masked)
+                    return exps, w, sl
+                return lax.cond(whole(index), functools.partial(weights_for, is_masked=False),
+                                functools.partial(weights_for, is_masked=True))
+            coords = coords_of(k_first, read=walk.places_read(masked=masked))
+            exps, w, sl, _ = _score_weights(walk, coords, (), s, peak, prior, masked=masked)
+            return exps, w, sl
+
+        overlapped, dp = family.product_pair(
+            q, k_slot.transpose((1, 0)), do, slots["values"].transpose((1, 0)), shape, between=between)
+        slots.release("values")
+        s, params = dp, ()
+    else:
+        s, dp = family.product_pair(q, k_slot.transpose((1, 0)), do, slots["values"].transpose((1, 0)), shape)
+        slots.release("values")
+        params = params_of(s, k_first=k_first, slots=slots)
     residual, mass, grads, weighed, keyed_mass, keyed_shift = rows
     # dQ's and the keyed sums' places stay empty: their products go to the accumulators.
     sums = gradient.DqSums(empty, residual, mass, grads, weighed, empty, keyed_mass, keyed_shift)
@@ -152,15 +175,20 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         # Only the segmented TPU walk (`masked is not None`) passes `read` to skip unneeded coordinate tiles.
         coords = (coords_of(k_first) if masked is None
                   else coords_of(k_first, read=walk.places_read(masked=masked_step)))
-        scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen, masked=masked_step)
-        exponentials, _, cotangents, slopes, seen = scored
+        if overlapped is not None:
+            exponentials, overlapped_weights, slopes = overlapped
+            seen = algebra.seen(walk.spec, coords, dp) if masked_step else None
+            cotangents = _score_cotangents(coords, overlapped_weights, dp, anchor, delta, seen)
+        else:
+            scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen,
+                             masked=masked_step)
+            exponentials, _, cotangents, slopes, seen = scored
         terms, parts, keyed = gradient.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
                                                 prior, scale=walk.grad_scale, kinds=walk.kinds,
                                                 summed=walk.summed, accurate=walk.accurate, rows=True)
         row_sums = (terms.residual, terms.mass, terms.grads, terms.weighed, terms.keyed_mass,
                     terms.keyed_shift)
         return row_sums, parts, keyed
-
     # One walk, its tiles' masks chosen a tile at a time on register-budgeted GPUs (a walk of two loops into
     # one warpgroup accumulator, the first empty, faults on an H100 under jax 0.11.2); segmented on TPU mxu.
     if masked is None:
