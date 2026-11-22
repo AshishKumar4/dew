@@ -1198,17 +1198,12 @@ def _weak_types(traced: jax.stages.Traced) -> tuple[bool, ...]:
 
 
 def _outputs(out_info, weak_types: tuple[bool, ...]):
-    """The results' shapes a program's `out_info` states, each array's with its trace's weak type
-    (`_weak_types`), any other output (a token's) as stated: what a pass over shapes returns, so a later call
-    over them keys as one over its arrays does."""
-    infos, structure = jax.tree.flatten(out_info)
-    leaves = []
-    for info, weak in zip(infos, weak_types, strict=True):
-        if isinstance(info, jax.ShapeDtypeStruct):
-            shape = shapes_of(info)
-            info = jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=shape.sharding, weak_type=weak)
-        leaves.append(info)
-    return jax.tree.unflatten(structure, leaves)
+    """The results' shapes a program's `out_info` states, each with its trace's weak type (`_weak_types`):
+    what a pass over shapes returns, so a later call over them keys as one over its arrays does."""
+    shapes = shapes_of(out_info)
+    leaves = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=shape.sharding, weak_type=weak)
+              for shape, weak in zip(jax.tree.leaves(shapes), weak_types, strict=True)]
+    return jax.tree.unflatten(jax.tree.structure(shapes), leaves)
 
 
 def owned_program[**P, R](function: Callable[P, R], *, step: Mapping[str, Option] | None = None,

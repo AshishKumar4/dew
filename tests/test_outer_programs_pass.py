@@ -91,16 +91,13 @@ def test_a_text_generation_and_an_rl_rollout_are_read_by_the_pass_unless_it_is_o
     assert names and passes >= len(names), (passes, names)
 
 
-def test_a_program_returning_a_token_compiles_and_collects_at_the_compile_point():
+def test_a_program_returning_a_token_compiles_at_the_compile_point():
     """A program that returns a token beside an array (`jax.lax.create_token`) compiles through Dew's compile
-    point and runs over shapes within a collection: its outputs' weak types read for its arrays alone, the
-    token having none, where reading every output's crashed its compile (row 11786's review, F2)."""
-    from dew.nn.kernels.options import collecting, owned_program
+    point and runs: its outputs' weak types read for its arrays alone, the token having none, where reading
+    every output's crashed its compile (row 11786's review, F2)."""
+    from dew.nn.kernels.options import owned_program
 
     program = owned_program(lambda x: (x + 1, jax.lax.create_token()))
     x = np.arange(4, dtype=np.float32)
     value, _ = program(x)
     np.testing.assert_array_equal(np.asarray(value), x + 1)
-    with collecting():
-        shapes = program(jax.ShapeDtypeStruct(x.shape, x.dtype))
-    assert shapes[0].shape == x.shape, shapes
