@@ -50,9 +50,8 @@ from dew.training.distributed import (
     resumed_link_figures,
 )
 from dew.training.memory import (
-    available,
+    ceiling_headroom,
     climb_to,
-    device_memory,
     layer_gathers,
     local_devices,
     memory_record,
@@ -60,7 +59,6 @@ from dew.training.memory import (
     rung_record,
     step_fits,
     step_options,
-    unclaimed,
 )
 from dew.training.model_flops import batch_consumed, batch_tokens, model_batch
 from dew.training.narrow import holds_copies, narrowing
@@ -70,6 +68,7 @@ from dew.training.planning import (
     FitSearch,
     Planned,
     PlanRefused,
+    Probe,
     Rung,
     Trials,
     guided_compile,
@@ -1039,15 +1038,19 @@ class StepCompiler[L, E]:
                  and all(probe.fits or isinstance(probe.headroom, int) for probe in probes)
                  and all(rungs(split) == rungs() for split in refusal.candidates))
         room = freed()
-        # A growing pool's room read below its allocator's by the GPU's free bytes, which another process
-        # may give back while the state is placed (`memory.available`): no bound past placing it.
-        capped = any(available(memory, unclaimed(device, memory))
-                     < memory["bytes_limit"] - memory["bytes_in_use"]
-                     for device in local_devices(mesh) if (memory := device_memory(device)))
-        whole = whole and room is not None and not capped
-        beyond = [room is not None and not probe.fits and isinstance(probe.headroom, int)
-                  and -probe.headroom > room for probe in probes]
-        every = from_every_process([whole, beyond])
+        whole = whole and room is not None
+        devices = local_devices(mesh)
+
+        def beyond(probe: Probe) -> bool:
+            # Its miss read again at each allocator's ceiling, no GPU's free bytes capping a growing pool,
+            # which another process may give back by the time the state is placed (`ceiling_headroom`; row
+            # 11712's review: a miss read under that cap, the cap gone by this reading).
+            if room is None or probe.fits or probe.temp is None or probe.beside is None:
+                return False
+            margin = ceiling_headroom(devices, probe.beside, probe.temp)
+            return margin is not None and -margin > room
+
+        every = from_every_process([whole, [beyond(probe) for probe in probes]])
         if len({len(each[1]) for each in every}) != 1:
             return
         blocked = [any(column) for column in zip(*(each[1] for each in every), strict=True)]

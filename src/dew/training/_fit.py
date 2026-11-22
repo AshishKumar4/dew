@@ -61,7 +61,7 @@ from dew.data.dataset import (
 from dew.data.pipeline import Dataset
 from dew.data.plan import DataResume, PlanChanged
 from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position, split_fields
-from dew.distributed.placement import MeshSpec, Placement
+from dew.distributed.placement import MeshSpec, Placement, placed_shapes
 from dew.held_updates import waiting
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
 from dew.optim import OptimConfig
@@ -1346,11 +1346,7 @@ class Start:
         """Its state's variables as shapes at the shardings the start places them at (`shardings`): what a
         plan before the state is placed reads of their placement (`layer_gathers`, which sizes an FSDP
         step's gathers by the layers its parameter axes split)."""
-        def placed(leaf, sharding):
-            return (jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
-                    if isinstance(leaf, jax.ShapeDtypeStruct) else leaf)
-
-        return jax.tree.map(placed, self.abstract.variables, self.shardings.variables)
+        return placed_shapes(self.abstract.variables, self.shardings.variables)
 
     def unplaced(self, mesh: Mesh) -> int:
         """The most bytes any of this process's devices of `mesh` takes as the start places the state: the

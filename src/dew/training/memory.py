@@ -381,8 +381,17 @@ def admitted(devices: Sequence, resident: int, beside: int, temporaries: int, *,
     return _admitted(devices, memory, beside, temporaries, placed=placed)
 
 
+def ceiling_headroom(devices: Sequence, beside: int, temporaries: int) -> int | None:
+    """The headroom `admitted` reads of a step beside a state not placed yet, at each allocator's own
+    ceiling (`bytes_limit - bytes_in_use`), no GPU's free bytes capping a growing pool's (`unclaimed`, which
+    another process may give back between readings): the most room a later reading of the devices can give
+    the step while this process holds what it holds now."""
+    memory = [device_memory(device) for device in devices]
+    return _admitted(devices, memory, beside, temporaries, placed=False, ceiling=True)
+
+
 def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: int,
-              temporaries: int, *, placed: bool = True) -> int | None:
+              temporaries: int, *, placed: bool = True, ceiling: bool = False) -> int | None:
     """The headroom at a fixed reading of the allocators: the least, over `devices`, of two margins. XLA
     takes a step's temporaries in one allocation, after the bytes placed beside them (the outputs no
     donated argument holds, and what the loop keeps that the allocators do not hold yet: the batches, and
@@ -396,7 +405,7 @@ def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: in
         return None
     margins = []
     for device, held in zip(devices, memory, strict=True):
-        free = unclaimed(device, held)
+        free = None if ceiling else unclaimed(device, held)
         needed = temporaries * stranding(device, held)
         block = placeable_beside(held, free, beside) if placed else available(held, free)
         margins.append(min(block - needed, available(held, free) - beside - needed))
