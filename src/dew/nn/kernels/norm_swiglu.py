@@ -1000,6 +1000,8 @@ def _realize_output(operands: tuple, spec):
             for dim in spec.dims)
         return kernel_outputs.output(spec.dtype, *dims)
     return tuple(_realize_output(operands, part) for part in spec)
+
+
 def _typed(backward, parameters: int = 0):
     """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type and
     dtype: summed over each manual axis it varies over and its operand does not (a weight replicated in a
