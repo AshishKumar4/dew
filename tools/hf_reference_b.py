@@ -1000,7 +1000,7 @@ def write_llama4_blocks(directory: Path) -> None:
             arrays.update({f"self_attn.{tensor_name}": tensor.detach().numpy()
                            for tensor_name, tensor in attention.named_parameters()})
         assert attention.layer_idx == layer_index
-    np.savez(directory / "attention.npz", **arrays)
+    np.savez(directory / "attention.npz", allow_pickle=False, **arrays)
 
     moe = Llama4TextMoe(config).eval()
     scatter_weights(moe, seed=43)
@@ -1009,7 +1009,7 @@ def write_llama4_blocks(directory: Path) -> None:
     arrays = {"hidden": hidden.numpy(), "output": output.numpy()}
     arrays.update({f"feed_forward.{tensor_name}": tensor.detach().numpy()
                    for tensor_name, tensor in moe.named_parameters()})
-    np.savez(directory / "moe.npz", **arrays)
+    np.savez(directory / "moe.npz", allow_pickle=False, **arrays)
     print(f"{directory}: attention and moe blocks, {sorted(p.name for p in directory.iterdir())}")
 
 
