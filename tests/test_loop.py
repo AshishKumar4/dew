@@ -803,8 +803,10 @@ def _scored(model):
             states = tuple(exits.get("states", ()))
             ran = tuple(exits.get("ran", ())) or (True,) * len(states)
             kept = [jnp.where(each, state, 0) for each, state in zip(ran, states, strict=True)]
-            # The exits a smaller loop leaves, past its own, zero as a skipped pass's are.
-            kept += [jnp.zeros_like(kept[0])] * (COUNTED_CAP - 1 - len(kept)) if kept else []
+            # The exits a smaller loop leaves, past its own, zero as a skipped pass's are, where any exits.
+            if model.loop.exiting:
+                zero = jnp.zeros((*ids.shape, model.emb_features), logits.dtype)
+                kept += [zero] * (COUNTED_CAP - 1 - len(kept))
             exit_loss = sum((jnp.mean(jnp.square(state)) for state in kept), jnp.zeros((), logits.dtype))
             return jnp.sum(logits * cotangent.astype(logits.dtype)) + exit_loss, (logits, tuple(kept))
 
