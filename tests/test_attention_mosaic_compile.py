@@ -2018,7 +2018,7 @@ def test_decode_deepens_to_3_stages_without_losing_residency(gen):
         spans = template.spans(1, 4096, 8, causal=False)
         qd = jax.ShapeDtypeStruct((8, 1, 32, 128), jnp.bfloat16)
         kd = jax.ShapeDtypeStruct((8, 4096, 8, 128), jnp.bfloat16)
-        plan = attention_decode.plan(qd, kd, kd, spans, None, target=target)
+        plan = attention_decode.plan(qd, kd, kd, spans, None, scale=None, target=target)
         assert plan is not None and plan.config.stages >= 3, (gen, plan)
         dec_case = KernelCase(f"{gen}-dec-b8-d128-3stage",
                               lambda: (lambda q, k, v: attention_decode.attend(q, k, v, spans),
