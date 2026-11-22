@@ -590,19 +590,19 @@ def test_a_watched_merge_runs_its_depth_mixture_as_its_own_call(watch):
     np.testing.assert_array_equal(np.asarray(logits), np.asarray(model.apply(variables, ids)))
 
 
-@pytest.mark.parametrize(("site", "op"), [(r".*cross_pass_[^/]+$", "dot_general"),
-                                          (r".*cross_pass_[^/]+/depth", "einsum")], ids=["merge", "depth"])
-def test_a_merge_a_direct_qwix_rule_owns_takes_its_gradients_through_the_rule(site, op):
-    """A merge whose products a direct `qwix.quantize_model` rule owns, its controller's matmuls or its depth
-    mixture's einsums alone (a rule over the depth child's path), runs as Flax and Qwix see it in both modes
-    (row 11713's review): its gradients the ones of the same model run as a watched merge runs (captured,
-    `capture_intermediates`), and the rule's, not the unquantized model's."""
+@pytest.mark.parametrize("site", [r".*cross_pass_[^/]+/depth", r".*cross_pass.*"], ids=["depth", "merge"])
+def test_a_merge_a_direct_qwix_rule_owns_takes_its_gradients_through_the_rule(site):
+    """A merge whose depth mixture's einsums a direct `qwix.quantize_model` rule owns, by the depth child's
+    path or the merge's, runs as Flax and Qwix see it in both modes (row 11713's review: recomputed apart,
+    its reverse mode bypassed the rule): its gradients the ones of the same model run as a watched merge runs
+    (captured, `capture_intermediates`), and the rule's, not the unquantized model's. (A Qwix rule over the
+    merge's matmuls is Qwix's to refuse: its controller's kernels share a shape.)"""
     qwix = pytest.importorskip("qwix")
 
     model = decoder("attention", steps=2)
     ids = jnp.asarray(np.random.default_rng(11716).integers(0, VOCAB, (2, 12)), jnp.int32)
     quantized = qwix.quantize_model(model, qwix.QtProvider([qwix.QtRule(
-        module_path=site, weight_qtype=jnp.int8, act_qtype=jnp.int8, op_names=(op,))]))
+        module_path=site, weight_qtype=jnp.int8, act_qtype=jnp.int8, op_names=("einsum",))]))
     variables = gated(quantized.init(jax.random.key(0), ids), 11716)
 
     def gradients(applied, **watched):
