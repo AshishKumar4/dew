@@ -60,6 +60,14 @@ FUNCTIONS = {getattr(jax.lax, f"{name}_p"): bound for name, bound in ULPS.items(
 """Each elementary function's error bound (`ULPS`, by the function's name in JAX and torch alike), by JAX's
 primitive of that name."""
 
+POWER = 1.31
+"""XLA CPU's float32 power's error bound (`lax.pow`, one `hlo.power`: its own implementation, which differs
+from libm's `powf` in the last bit on 4 percent of draws near one), in units of u times its true result: the
+largest over 2^27 drawn pairs where it errs most, results whose binary exponent is 100 to 126 from zero
+(its error grows with the base's logarithm times the exponent), 1.3069 near float32's least normal, rounded
+up at the second decimal; drawn, where `ULPS` reads every input, a pair of float32 operands being 2^64 of
+them (row 10157)."""
+
 SCATTERS = {jax.lax.scatter_p: jax.lax.scatter, jax.lax.scatter_add_p: jax.lax.scatter_add,
             jax.lax.scatter_mul_p: jax.lax.scatter_mul, jax.lax.scatter_min_p: jax.lax.scatter_min,
             jax.lax.scatter_max_p: jax.lax.scatter_max}
@@ -322,14 +330,18 @@ def _weight(equation, params, operands, value, index: int = 0):
     if primitive in FUNCTIONS:
         return FUNCTIONS[primitive] * magnitude
     if primitive is jax.lax.integer_pow_p:
-        return max(abs(int(params["y"])) - 1, 1) * magnitude
+        # Its chain of multiplications (JAX's `_integer_pow`, by squaring): a product's relative errors add,
+        # so `|y| - 1` roundings to first order, and a negative power's reciprocal one more; `x**0` and
+        # `x**1` round nothing.
+        power = int(params["y"])
+        roundings = abs(power) - 1 + (power < 0) if power else 0
+        return roundings * magnitude if roundings else None
     if primitive is jax.lax.pow_p:
-        # A float's power (Adam's bias correction, `1 - b**count`): at an integer exponent rounding as an
-        # integer power's, `max(|e| - 1, 1)` times, else through `exp(e log x)`, by each function's ulps;
-        # `_dew_torch.rounding`'s rule for aten.pow, element by element.
-        exponent = jnp.broadcast_to(operands[1], jnp.shape(value))
-        whole = jnp.maximum(jnp.abs(exponent) - 1, 1)
-        return jnp.where(exponent == jnp.round(exponent), whole, ULPS["exp"] + ULPS["log"]) * magnitude
+        # A float's power (Adam's bias correction, `1 - b**count`): one `hlo.power`, XLA's library power
+        # (`POWER`), or, at an exponent XLA's simplifier folds to a constant of 2, 3 or -1 (a constant
+        # expression among them), its products, `x * x * x` the most, two roundings: the larger whatever the
+        # exponent, which the replay reads tapped, a folded constant moved off it (the review of 3580, F2).
+        return max(POWER, 2) * magnitude
     if primitive is jax.lax.reduce_p and params["computation"] in compensating():
         # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
         # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u; each of

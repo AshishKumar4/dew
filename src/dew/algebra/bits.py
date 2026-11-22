@@ -22,6 +22,7 @@ import numpy as np
 
 from dew.nn.fake_quant import E2M1_MAX, E4M3_MAX
 from dew.nn.float_bits import raised_exactly
+from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import NVFP4
 from dew.nn.precision import correctly_rounded_divide
 
@@ -319,6 +320,16 @@ class BitForm:
         """Its instructions on each unit."""
         return {unit: sum(step.op.issues for step in self.steps if step.unit is unit) for unit in Unit}
 
+    def work(self, words: float = 1) -> Work:
+        """What decoding `words` stored words costs, in the one vocabulary every price is told in
+        (`templates.cost.Work`, row 5386): each step's issues on its unit (`issues`), the ALU's as integer
+        operations (`Work.integer_operations`) and the FMA pipe's as integer multiply-adds (IMAD, beside the
+        fp32 lanes' FFMA at its own rate, `Work.integer_multiply_adds`); a step two output registers read
+        counted once, as ptxas computes it once in the kernel's whole PTX (`ptx`)."""
+        issues = self.issues
+        return Work(integer_operations=issues[Unit.ALU] * words,
+                    integer_multiply_adds=issues[Unit.FMA] * words)
+
     @property
     def live(self) -> int:
         """The most registers a word's decode holds at once: its stored word and each step's value, each
@@ -379,9 +390,17 @@ class BitForm:
 
     @property
     def price(self) -> tuple[int, int]:
-        """Its busiest unit's issues, then its instructions (`Unit`: one rate): a decoder's words are many
-        and independent, so its pipes' throughput prices it, not its chain's latency."""
-        return max(self.issues.values()), sum(step.op.issues for step in self.steps)
+        """A word's work's price (`work`, `priced`): a decoder's words are many and independent, so its
+        pipes' throughput prices it, not its chain's latency."""
+        return priced(self.work())
+
+
+def priced(work: Work) -> tuple[int, int]:
+    """A form's price from its work (`BitForm.work`): its busiest unit's issues, the ALU's integer operations
+    or the FMA pipe's multiply-adds, then all its instructions (`Unit`: one rate), the order the search walks
+    shapes in (`_priced`) and a form is chosen by."""
+    alu, fma = work.integer_operations, work.integer_multiply_adds
+    return int(max(alu, fma)), int(alu + fma)
 
 
 # LOP3's truth table of `c & (a ^ b)` and of `c & a`, over its operands' tables 0xF0, 0xCC and 0xAA (PTX ISA,
@@ -500,13 +519,14 @@ def _shifted(bits: Sequence[int], op: BitOp, amount: int) -> tuple[int, ...]:
 
 
 def _priced(shape: _Shape, registers: int, units: frozenset[Unit]) -> tuple[tuple[int, int], int]:
-    """A shape's price (`BitForm.price`) with one LOP3 a register, and its shifts on the ALU: a rotation there
-    (the ALU's alone), the rest split so the two pipes balance, or all of them where `units` holds no FMA."""
+    """A shape's price (`priced`, a form's of it) with one LOP3 a register, and its shifts on the ALU: a
+    rotation there (the ALU's alone), the rest split so the two pipes balance, or all of them where `units`
+    holds no FMA."""
     shifts = (shape.right is not None) + shape.lefts
     rotations = int(shape.right is BitOp.ROTR)
     on_alu = (shifts if Unit.FMA not in units
               else min(shifts, max(rotations, -(-(shifts - registers) // 2))))
-    return (max(registers + on_alu, shifts - on_alu), registers + shifts), on_alu
+    return priced(Work(integer_operations=registers + on_alu, integer_multiply_adds=shifts - on_alu)), on_alu
 
 
 def _configs(shape: _Shape, reach: int, width: int) -> Iterator[list[_Shift]]:
@@ -730,10 +750,13 @@ def scales_decoded(codes: jax.Array) -> jax.Array:
     """Block scales' E4M3 codes (uint8 or uint32, a code each) as float32, exactly, by the declared
     transform (`E4M3_SCALE_FORM`, `traced`: a kernel's portable path; its PTX, `BitForm.ptx`, where inline
     assembly runs) and the one restore rule (`float_bits.raised_exactly`, the register's owed 2^120 from its
-    bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing lane; the NaN code,
-    0x7F, which no block scale holds, reads as 480, as `decoded` reads it)."""
-    (pattern,) = E4M3_SCALE_FORM.traced(codes.astype(jnp.uint32))
-    return raised_exactly(jax.lax.bitcast_convert_type(pattern, jnp.float32), jnp.int32(120))
+    bits: a subnormal scale as its mantissa's integer times 2^-9, never through a flushing lane); E4M3's two
+    NaN codes, 0x7F and 0xFF, NaN, as a cast of them is, so a block of a NaN scale is NaN wherever it is
+    decoded, where the form's fields read them as 480 and -480 (the review of 3580, F1)."""
+    held = codes.astype(jnp.uint32)
+    (pattern,) = E4M3_SCALE_FORM.traced(held)
+    value = raised_exactly(jax.lax.bitcast_convert_type(pattern, jnp.float32), jnp.int32(120))
+    return jnp.where(held & 0x7F == 0x7F, jnp.float32(jnp.nan), value)
 
 
 NVFP4_OWED = 2.0 ** 8
@@ -966,13 +989,11 @@ def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     ratio = quotient(quotient(blocks, tensor), np.float32(E2M1_MAX))
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
 
-    def value(codes: jax.Array) -> jax.Array:
-        return jax.lax.bitcast_convert_type(codes.astype(jnp.uint8), jnp.float8_e4m3fn).astype(jnp.float32)
-
-    # The nearest rounded up where it fell below the ratio, never past the largest finite (448).
-    codes = jnp.where(value(nearest) < ratio, jnp.minimum(nearest + jnp.uint32(1), jnp.uint32(E4M3.largest)),
-                      nearest)
+    # The nearest rounded up where it fell below the ratio, never past the largest finite (448); each code's
+    # value the one decode of a block scale's (`scales_decoded`, row 8675).
+    codes = jnp.where(scales_decoded(nearest) < ratio,
+                      jnp.minimum(nearest + jnp.uint32(1), jnp.uint32(E4M3.largest)), nearest)
     scales = jax.lax.bitcast_convert_type(codes.astype(jnp.uint8), jnp.float8_e4m3fn)
-    each = jnp.repeat(value(codes), NVFP4.depth, axis=0)
+    each = jnp.repeat(scales_decoded(codes), NVFP4.depth, axis=0)
     scaled = jnp.where(each > 0, quotient(quotient(x, tensor), jnp.where(each > 0, each, 1)), 0)
     return encoded(jax.lax.bitcast_convert_type(scaled, jnp.uint32), E2M1), scales, tensor

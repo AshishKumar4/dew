@@ -153,7 +153,8 @@ def test_a_block_scales_declared_decode_is_the_formats_on_every_code():
     """The block scale's declared decode (`bits.E4M3_SCALE`, a fixed layout), its checked-in form proven
     (`bits.proven`) and no dearer than the search's, restored by its one rule (`bits.scales_decoded`), is
     the format's integer decode (`bits.decoded`) on every finite E4M3 code, bit for bit under a jit: subnormal
-    scales and both zeros among them (its linear form reads the NaN code 0x7F as 480)."""
+    scales and both zeros among them; and NaN at both NaN codes, 0x7F and 0xFF, which its linear form's
+    fields read as 480 and -480."""
     bits.proven(bits.E4M3_SCALE, bits.E4M3_SCALE_FORM)
     assert bits.E4M3_SCALE_FORM.price <= bits.synthesized(bits.E4M3_SCALE).price
     declared, integer = (np.asarray(x) for x in ahead_arm(jax.jit(lambda codes: (
@@ -161,7 +162,19 @@ def test_a_block_scales_declared_decode_is_the_formats_on_every_code():
         np.arange(256, dtype=np.uint32)))
     finite = (np.arange(256) & 0x7F) != 0x7F
     np.testing.assert_array_equal(declared[finite].view(np.uint32), integer[finite].view(np.uint32))
-    assert float(declared[0x7F]) == 480.0
+    np.testing.assert_array_equal(np.isnan(declared), ~finite)
+    # Every reader of a block scale reads it so (row 8675): an NVFP4 operand's block values
+    # (`formats.NvFp4Block.decoded`), each of whose blocks codes 1 under one scale, are ml_dtypes' FP8 values,
+    # which they were read as before, on every code: a block of a NaN scale NaN (the review of 3580, F1: read
+    # through the fields' 480 its values were finite).
+    from dew.nn.kernels.formats import NvFp4Block
+
+    scales = np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn)[None]
+    read = np.asarray(ahead_arm(jax.jit(lambda ones, scales: NvFp4Block(ones, scales, 1.0).decoded()),
+                                "a block's values")(np.ones((1, 256 * 16), ml_dtypes.float4_e2m1fn), scales))
+    read, cast = read[0, ::16], scales[0].astype(np.float32)
+    np.testing.assert_array_equal(read[finite].view(np.uint32), cast[finite].view(np.uint32))
+    np.testing.assert_array_equal(np.isnan(read), np.isnan(cast))
 
 
 @pytest.mark.parametrize(("dtype", "minifloat"), [(jnp.float8_e4m3fn, bits.E4M3),
@@ -379,6 +392,36 @@ def test_a_forms_ptx_compiles_for_the_gpu(generation, name):
 
     words = jax.ShapeDtypeStruct((1024,), jnp.uint32)
     lowered_for(_inline_decode(FORMS[name]()), (words,), generation).compile()
+
+
+def test_a_kernel_inlining_a_forms_decode_counts_the_forms_issues_on_each_pipe():
+    """A kernel that inlines the NVFP4 form's decode (`inline_forms.registers`, a body its emission count
+    cannot read) and writes every register of it counts the form's issues over its words, where the count
+    refused the body as unpriced (row 5386): the checked-in form's rotation and four masked XORs on the ALU
+    (`Work.integer_operations`), its three left shifts by a multiply on the FMA pipe
+    (`Work.integer_multiply_adds`), each word once; traced alone, nothing compiled or run."""
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    from dew.nn import programs
+    from dew.nn.kernels.templates import emission, inline_forms
+    from dew.nn.kernels.templates.cost import Stated
+
+    form, shape = bits.NVFP4_BFLOAT16_FORM, (64, 16)
+
+    def body(words_ref, *out_refs):
+        words = plgpu.layout_cast(words_ref[...], plgpu.Layout.WGMMA)
+        for out_ref, register in zip(out_refs, inline_forms.registers(form, words, plgpu.Layout.WGMMA),
+                                     strict=True):
+            out_ref[...] = register
+
+    launch = plgpu.kernel(body, out_type=(jax.ShapeDtypeStruct(shape, jnp.uint32),) * len(form.outputs),
+                          num_threads=1, thread_name="wg")
+    traced = jax.make_jaxpr(launch)(jnp.zeros(shape, jnp.uint32)).jaxpr
+    (kernel,) = [equation for equation in programs.equations(traced)
+                 if equation.primitive in programs.NATIVE_KERNELS]
+    counted = emission.launch_work(kernel, Stated(steps=0, bytes_accessed=0))
+    words = shape[0] * shape[1]
+    assert (counted.integer_operations, counted.integer_multiply_adds) == (5 * words, 3 * words)
 
 
 MINIFLOATS = {"e4m3": (bits.E4M3, ml_dtypes.float8_e4m3fn), "e5m2": (bits.E5M2, ml_dtypes.float8_e5m2),

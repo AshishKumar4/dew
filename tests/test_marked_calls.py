@@ -2,8 +2,11 @@
 (`dew.nn.derivatives.marked`), which every transform keeps a call of that kind, so the algebra pass reads a
 span's kind from the program it rewrites, its forward, tangent and cotangent alike."""
 
+import datetime
 import functools
+import io
 import typing
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -501,6 +504,56 @@ class _Held:
 
 _HELD = _Held()
 _HELD.value = 1
+
+
+class _Rate(float):
+    """A Python subclass of a C value type, its value held in the C base, its `__dict__` empty
+    (`test_values_a_c_base_holds_apart_never_share_a_statement`)."""
+
+
+class _Reference(weakref.ref):
+    """A Python subclass of a C reference, its referent held in the C base
+    (`test_values_a_c_base_holds_apart_never_share_a_statement`)."""
+
+
+class _Day(datetime.date):
+    """A Python subclass of a date (`test_values_a_c_base_holds_apart_never_share_a_statement`)."""
+
+
+class _Bytes(bytes):
+    """A Python subclass of a C value of variable size
+    (`test_values_a_c_base_holds_apart_never_share_a_statement`)."""
+
+
+class _When(datetime.datetime):
+    """A Python subclass of a time (`test_values_a_c_base_holds_apart_never_share_a_statement`)."""
+
+
+class _Failure(ValueError):
+    """A Python subclass of an exception (`test_values_a_c_base_holds_apart_never_share_a_statement`)."""
+
+
+class _Referent:
+    """An object a reference reads (`test_values_a_c_base_holds_apart_never_share_a_statement`)."""
+
+
+_REFERENTS = (_Referent(), _Referent())
+
+
+def test_values_a_c_base_holds_apart_never_share_a_statement():
+    """Instances of a C type, or of a Python subclass of one, keep their value in the C layout, which no
+    `__dict__` shows, so none is stated by its type (rows 11772 and 11777: a kept program or an exact resume
+    read a reference to one object as a reference to another, and a buffer of b"a" as one of b"b"): a
+    float's subclass is stated by its value, two of them apart, and a reference's, a date's, a time's, a
+    byte string's, an exception's and an in-memory stream's, which no form states, have no statement, on
+    every Python the suite runs (3.14 states a C layout's subclasses as 3.12 does)."""
+    from dew._stated import Unestablished, stated
+
+    assert stated(_Rate(0.1), "a rate") != stated(_Rate(0.2), "a rate")
+    for value in (_Reference(_REFERENTS[0]), _Day(2024, 1, 1), _When(2024, 1, 1), _Bytes(b"a"), _Failure("a"),
+                  io.BytesIO(b"a"), io.StringIO("a")):
+        with pytest.raises(Unestablished):
+            stated(value, "a value its C base holds")
 
 
 def test_a_module_held_instance_holding_a_value_has_no_statement():
