@@ -845,10 +845,12 @@ def test_a_prepares_compiles_on_dews_compile_threads_take_its_target(monkeypatch
     assert report.attempts([(lowered, None), (lowered, None)])
     with report.for_devices():
         begun = options.compiling(program, *shapes)
+        together = report.attempts([(lowered, None), (lowered, None)])
+    # Each program's refusal its own attempt's, raised where it is settled, in its caller's turn.
+    for attempt in (*together, begun.attempt.result()):
+        assert isinstance(attempt.error, report.Untuned)
         with pytest.raises(report.Untuned):
-            report.attempts([(lowered, None), (lowered, None)])
-    with pytest.raises(report.Untuned):
-        begun.attempt.result()
+            report.settled(lowered, None, lambda: lowered, attempt)
 
 
 @pytest.mark.parametrize("host, memory", [("a100-sxm4-40gb", 42_406_903_808), ("gh200", 101_468_602_368)])
