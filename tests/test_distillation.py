@@ -112,7 +112,9 @@ def teacher_forward():
     return jax.jit(lambda variables, ids: dew_outputs(teacher, variables, ids, layers))
 
 
-DISTILLATION_SEEDS = {"terms": 64, "gradient": 16, "wide temperature": 16}
+DISTILLATION_SEEDS = {"terms": 64, "gradient": 16, "wide temperature": 8}
+"""Each site's declared seeds; the wide temperature's `seeds_for`'s at the suite's host level, paired with
+its tiled arm."""
 
 TILE = (6, META["student"]["vocab_size"])
 """A tiled head whose full KL takes 3 of a row's positions a slice (`chunked.head_divergence`), which do not
