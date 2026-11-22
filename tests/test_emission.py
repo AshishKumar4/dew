@@ -623,6 +623,25 @@ def test_an_integer_operation_counts_on_the_integer_units_not_the_fp32_lanes():
         assert (role.fixed.integer_operations, role.fixed.operations) == (128, 0), role.fixed
 
 
+def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_fp32_lanes():
+    """A row's integer multiply counts one integer multiply-add an element (`Work.integer_multiply_adds`:
+    IMAD, the FMA pipe's, as a bit form's left shifts by a multiply are, `bits.BitForm.work`) and nothing of
+    the ALU's or the fp32 lanes'; a launch of them is priced at the target's IMAD rate
+    (`Architecture.integer_multiply_adds_per_clock`), its seconds the fp32 lanes' unit's, so an FFMA beside it
+    adds to them: on sm90, 64 a clock against 256 FLOPs of FFMA, where read as FFMA work they cost a quarter
+    (the review of 3580, F3)."""
+    row = jax.ShapeDtypeStruct((1, 128), jnp.int32)
+    role = _emitted(lambda x: x * 3, row).roles[0]
+    assert (role.fixed.integer_multiply_adds, role.fixed.integer_operations, role.fixed.operations) == (
+        128, 0, 0), role.fixed
+    target = generation.gpu_target("sm90")
+    rates = cost.rates(target, device=False)
+    assert rates.multiply_adds == 64 / 256 * rates.cuda
+    alone, _ = cost.units(Work(integer_multiply_adds=128), rates)
+    beside, _ = cost.units(Work(integer_multiply_adds=128, operations=256), rates)
+    assert beside[1] == alone[1] + 256 / rates.cuda
+
+
 @pytest.mark.parametrize("longest, span", [(None, 10 / 3), (4, 4)])
 def test_a_launchs_span_is_its_longest_programs_walk_where_its_programs_walk_unequal_shares(longest, span):
     """A launch of three programs walking ten steps among them: its span, the dependent steps on its critical

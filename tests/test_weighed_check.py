@@ -341,10 +341,10 @@ def test_a_compensated_sum_is_weighed_as_its_double_float_pair_rounds():
 
 def test_a_power_of_a_float_rounds_as_its_exponent_takes_it():
     """A float raised to a float power (`lax.pow`: Adam's bias correction, `1 - b**count`, row 8752 found its
-    step had no rule): at a constant exponent of 3, which XLA's simplifier writes as `x * x * x`, its value
-    rounds twice, as the integer power's chain (`lax.integer_pow`) does, so its scale is the integer
-    power's; at a half, through XLA's library power (`rounding_bound.POWER`), more than a square root's one
-    correctly rounded result."""
+    step had no rule) is weighed by the most any lowering of it rounds: at a constant exponent of 3, which
+    XLA's simplifier writes as `x * x * x`, twice, as the integer power's chain (`lax.integer_pow`) does, so
+    its scale is the integer power's; at a half, through XLA's library power (`rounding_bound.POWER`), as
+    much, more than a square root's one correctly rounded result."""
     x = jnp.asarray(np.linspace(0.5, 1.5, 64), jnp.float32)
     _, powered = rounding_scale(lambda x: jax.lax.pow(x, jnp.float32(3)), x)
     _, cubed = rounding_scale(lambda x: jax.lax.integer_pow(x, 3), x)
@@ -354,13 +354,15 @@ def test_a_power_of_a_float_rounds_as_its_exponent_takes_it():
     assert np.all(np.asarray(fractional) > np.asarray(rooted))
 
 
-def test_a_float_power_rounds_once_in_its_library_whatever_its_exponent():
-    """`lax.pow` lowers to one `hlo.power`, XLA's library power, at any exponent it is not given as a constant
-    (row 10157: an integer exponent was weighed as an integer power's chain, so Adam's `1 - b2**t` was
-    scaled a rounding more each step, 999 of them at t = 1000): at 4, whose powers here are powers of two
-    (each relative scale computed alike to the bit), its scale relative to its value is one number at
-    exponents 7, 50 and 2.5; and it covers what XLA's power errs by against float64 where that error is
-    largest, results near float32's least normal."""
+def test_a_float_power_is_weighed_alike_at_every_exponent_and_covers_what_xla_errs_by():
+    """`lax.pow` is weighed by the most any of its lowerings rounds, one `hlo.power` or the products XLA's
+    simplifier writes at a constant exponent (row 10157: an integer exponent was weighed as an integer
+    power's chain, so Adam's `1 - b2**t` was scaled a rounding more each step, 999 of them at t = 1000): at 4,
+    whose powers here are powers of two (each relative scale computed alike to the bit), its scale relative
+    to its value is one number at exponents 7, 50 and 2.5; and it covers what XLA's power errs by against
+    float64 where its library's error is largest, results near float32's least normal, and where its
+    exponent is a constant expression XLA folds to 3 and writes as `x * x * x`, whose replay reads the sum
+    moved off 3 by its own rounding's tap (the review of 3580, F2: 1.48u where 1.31u was charged)."""
     x = jnp.full((3,), 4.0, jnp.float32)
     value, scale = rounding_scale(jax.lax.pow, x, jnp.asarray([7.0, 50.0, 2.5], jnp.float32))
     relative = np.asarray(scale) / np.abs(np.asarray(value))
@@ -371,6 +373,32 @@ def test_a_float_power_rounds_once_in_its_library_whatever_its_exponent():
     value, scale = rounding_scale(jax.lax.pow, jnp.asarray(base), jnp.asarray(exponent))
     erred = np.abs(np.asarray(jax.jit(jax.lax.pow)(base, exponent), np.float64) - np.asarray(value))
     assert np.all(erred <= np.asarray(scale))
+
+    def cubed(x):
+        return jax.lax.pow(x, jax.lax.add(jnp.ones_like(x), jnp.full_like(x, 2)))
+
+    x = jnp.asarray(np.concatenate([[1 + 1440 * 2.0 ** -23], rng.uniform(0.5, 2, 255)]), jnp.float32)
+    value, scale = rounding_scale(cubed, x)
+    erred = np.abs(np.asarray(jax.jit(cubed)(x), np.float64) - np.asarray(value))
+    assert np.all(erred <= np.asarray(scale))
+
+
+def test_a_torch_power_is_weighed_with_its_exponent_narrowed_to_its_operands_format():
+    """torch's CPU power narrows a scalar exponent to its operand's format before it computes
+    (`_dew_torch.rounding._narrowed`, PowKernel.cpp): a bfloat16 4 to the 2 + 2^-7 takes its exponent as 2,
+    16 where the power is 16.17, 2.76 of bfloat16's u (the review of 3580, F6), and its scale covers that, as
+    a float32 one's covers its own narrowing, over drawn bases at exponents float32 does not hold."""
+    torch = pytest.importorskip("torch")
+    from _dew_torch.rounding import rounding_scale as torch_scale
+
+    for dtype, unit, exponent, bases in (
+            (torch.bfloat16, 2.0 ** -8, 2 + 2.0 ** -7, np.asarray([4.0])),
+            (torch.float32, 2.0 ** -24, 1 / 3, np.random.default_rng(3580).uniform(0.01, 100, 4096))):
+        narrow = torch.from_numpy(bases).to(dtype)
+        wide = narrow.to(torch.float64)
+        value, scale = torch_scale(lambda wide=wide, exponent=exponent: torch.pow(wide, exponent), unit)
+        erred = np.abs(torch.pow(narrow, exponent).to(torch.float64).numpy() - value)
+        assert np.all(erred <= scale)
 
 
 @pytest.mark.parametrize("power", [-1, -2, -3, 2, 5])
