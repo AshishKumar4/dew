@@ -138,9 +138,28 @@ def copied(source, destination) -> None:
     ns-noladder2, ns-abort1). A block whose elements no warpgroup's strided layout holds, a multiple of its
     threads (a ragged store's one row of an odd multiple of 64 columns, as every tile of gpt-oss's 2880-wide
     outputs: row 4474), is copied in a row's layout (`_row_layout`)."""
+    plgpu.store(destination, plgpu.load(source, layout=_copied_layout(source), optimized=False),
+                optimized=False)
+
+
+def _copied_layout(source) -> plgpu_core.SomeLayout | None:
+    """`copied`'s layout of `source`: the warpgroup's strided one where its threads divide the block's
+    elements (None, the layout inference's), else a row's (`_row_layout`)."""
     strided = math.prod(source.shape) % resources.THREADS == 0
-    layout = None if strided else _row_layout(source.shape, source.dtype)
-    plgpu.store(destination, plgpu.load(source, layout=layout, optimized=False), optimized=False)
+    return None if strided else _row_layout(source.shape, source.dtype)
+
+
+def narrowed(source, destination) -> None:
+    """`source` (in shared memory) to `destination` (in global memory) of a narrower dtype through registers,
+    in `coalesced`'s layout where `source` tiles it, else `copied`'s, each row block rounded to
+    `destination`'s dtype in turn: a wider tile stored in its output's dtype holding no narrow copy of the
+    whole tile beside it (the recurrence query/key sums' fp32 landing, `mainloop_backward._query_key_landing`,
+    whose whole tile rounded first took Nemotron-H 4B's query_key on an A100 past 255 registers, M-JS-207).
+    `copied` and `coalesced` refuse a dtype mismatch as the store does."""
+    layout = _copy_layout(source.shape, source.dtype)
+    layout = _copied_layout(source) if layout is None else layout
+    plgpu.store(destination, plgpu.load(source, layout=layout, optimized=False).astype(destination.dtype),
+                optimized=False)
 
 
 def _row_layout(shape: tuple[int, ...], dtype) -> plgpu_core.SomeLayout:
