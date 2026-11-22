@@ -63,6 +63,7 @@ __all__ = [
     "contracted",
     "declared_derivative",
     "declared_tangent",
+    "formed_together",
     "marked",
     "marked_call_p",
     "portable_formed",
@@ -621,3 +622,23 @@ def marked[Result](kind: Kind, function: Callable[..., Result]) -> Callable[...,
             for index in range(returned["structure"].num_leaves)])
     return call
 
+
+def _together_value[Input, Parameters](value: Input, parameters: Parameters) -> tuple[Input, Parameters]:
+    """`formed_together`'s value: its operands as they are."""
+    return value, parameters
+
+
+def _together_tangent(primals, tangents):
+    """`formed_together`'s tangent: its operands' tangents through the rule's dual (`with_tangents_formed`),
+    an operand no derivative reaches its symbolic zero as it came (`marked` returns it beside the span's
+    outputs; a non-floating leaf's zero is JAX's `float0`, which no instantiated zero of its dtype is)."""
+    return primals, with_tangents_formed(*tangents)
+
+
+formed_together = contracted("test_a_module_reading_its_parameters_formed_together_holds_every_order")(
+    declared_tangent(KernelGlue(), _together_value, _together_tangent, symbolic_zeros=True))
+"""`value` and `parameters` as they are, whose reverse mode returns `value`'s cotangent only with the
+`parameters`' cotangents formed (`with_tangents_formed`): identity forward, its reverse mode retaining no
+primal. What reads them computes in any way of its own; the layer below, reading `value`'s cotangent, waits
+on the parameters' (row 11713: a loop pass's bank cotangent summed over the layers above in one
+accumulator, `cross_pass.tie_bank`)."""
