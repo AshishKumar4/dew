@@ -32,6 +32,7 @@ from test_attention_template import (
     SEEDS,
     SOFTCAP,
     STARTS,
+    arguments,
     block_groups,
     case_keep,
     cross_documents,

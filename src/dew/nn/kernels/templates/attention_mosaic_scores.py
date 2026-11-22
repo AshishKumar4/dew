@@ -381,11 +381,10 @@ def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool,
         def forward_step(s, m, l_val, q, k):
             mod = algebra.modify(spec, s, algebra.Coords(q, k), (), masked=True)
             new_m, alpha = algebra.peak(spec, m, mod)
-            w = algebra.raised_weights(spec, mod, new_m)
+            w = algebra.weights(spec, mod, new_m)
             if scaled:
                 exp = jnp.ones((tile[0],), jnp.int32)
-                held = algebra.Scaled(
-                    exp, exp, lambda shift: algebra.raised_weights(spec, mod, new_m - shift))
+                held = algebra.Scaled(exp, exp, algebra.raised_weights(spec, mod, lambda: new_m))
                 return (*algebra.at_scale(w, held), new_m, alpha)
             return w.astype(jnp.bfloat16), algebra.total(l_val, alpha, w), new_m
         jaxpr = jax.make_jaxpr(forward_step)(s_in, row, row, q_pos, k_pos).jaxpr
