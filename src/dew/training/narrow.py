@@ -133,7 +133,16 @@ def narrowed_paths(loss, params: Variables, *rest) -> dict[tuple[str, ...], jnp.
 
 def _names(path) -> tuple:
     """A leaf's path as names: a mapping's keys, an attribute's names, a sequence's indices."""
-    return tuple(getattr(key, "key", getattr(key, "name", getattr(key, "idx", key))) for key in path)
+    def name(key):
+        if isinstance(key, jax.tree_util.DictKey | jax.tree_util.FlattenedIndexKey):
+            return key.key
+        if isinstance(key, jax.tree_util.GetAttrKey):
+            return key.name
+        if isinstance(key, jax.tree_util.SequenceKey):
+            return key.idx
+        return key
+
+    return tuple(map(name, path))
 
 
 class Reads(NamedTuple):
