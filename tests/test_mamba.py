@@ -284,12 +284,15 @@ sized by `seeds_for` on armada."""
 
 
 @pytest.mark.parametrize('chunk', [0, UNROLLED + 1])
-def test_a_layers_chunk_outside_its_straight_line_block_is_refused(chunk):
-    """A Mamba layer's chunk of no tokens, or past the tokens `ssm.affine_states` runs straight-line
-    (`ssm.UNROLLED`, row 8796), refused as the layer is built."""
+def test_a_chunk_outside_its_straight_line_block_is_refused(chunk):
+    """A chunk of no tokens, or past the tokens `ssm.affine_states` runs straight-line (`ssm.UNROLLED`, row
+    8796), refused by a Mamba layer as it is built and by its scan (`selective_scan`) called alone."""
     mixer = Mamba(emb_features=8, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=chunk)
     with pytest.raises(ValueError):
         mixer.init(jax.random.key(0), jnp.zeros((1, 4, 8)))
+    x = jnp.zeros((1, 2 * UNROLLED + 2, 4))
+    with pytest.raises(ValueError):
+        selective_scan(x, x, jnp.zeros((4, 2)), x[..., :2], x[..., :2], jnp.zeros((4,)), chunk_size=chunk)
 
 
 def test_the_layer_decodes_as_it_prefills():

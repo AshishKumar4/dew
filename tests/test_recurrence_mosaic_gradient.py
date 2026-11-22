@@ -475,33 +475,42 @@ def test_an_fp32_call_on_the_template_trains_as_the_portable_math_under_the_accu
     (`mainloop_backward.fast_backward_form`): Mamba-3's turned form (`TURNED`, row 7673), the gated delta
     rule's decay a head and Mamba2's rated scan (row 9700), each, where the template takes it, trains on the
     recurrence template's fast backward, output, final memory and every operand's gradient on par with the
-    portable math from float64 (check 1); one it takes none of (the gated delta rule's at its draws' widths,
-    no config whose launches the device holds) refused. The rated scan's packed rate gradient, a head's sum
-    over every token, was inconclusive at 40 seeds (its pooled ratio 1.33 in [0.73, 1.89]): 128."""
+    recurrence a token at a time from float64 (check 1, its oracle: no release rounds these forms), the turned
+    form's two ranks a token, which no decode step takes, with the portable math's, as its bf16 cell is
+    (test_recurrence_mosaic's turned call, row 7971); one it takes none of (the gated delta rule's at its
+    draws' widths, no config whose launches the device holds) refused, its forced training call as check 1
+    would run it. The rated scan's packed rate gradient, a head's
+    sum over every token, was inconclusive at 40 seeds (its pooled ratio 1.33 in [0.73, 1.89]): 128."""
     from map_judge import marked_seeds
-    from test_recurrence_chunk import assert_packed_on_par
+    from test_recurrence_chunk import assert_packed_on_par, marked, token_by_token
     from test_recurrence_mosaic import LENGTH, REFUSED, TURNED, hooked_draw, taken
     from test_recurrence_stability import SITES
 
     hooks = TURNED if form == "turned" else SITES[form]
+    documents = ((0, 24, 40), (10, 48))
+    starts = marked(documents, LENGTH) if packed else None
 
-    def on(route, operands, starts=None):
-        return chunk_on(route, hooks, dataclasses.replace(operands, starts=starts))
+    def on(operands, starts=None):
+        return chunk_on("mosaic_gpu", hooks, dataclasses.replace(operands, starts=starts))
+
+    def recurred(operands, starts=None):
+        if hooks.ranks > 1:
+            return chunk_on("xla", hooks, dataclasses.replace(operands, starts=starts))
+        return token_by_token(hooks, dataclasses.replace(operands, starts=starts))
 
     def drawn(seed):
         (operands,) = hooked_draw(hooks, packed=False, seed=seed)
         return operands, cotangents(operands, seed)
 
-    marked = request.node.get_closest_marker("check1_shards")
-    (sample, _) = drawn(0)
-    if not formed("accurate", taken)(sample, hooks):
+    rule = formed("accurate", on)
+    sample, cotangent = drawn(0)
+    if not formed("accurate", taken)(dataclasses.replace(sample, starts=starts), hooks):
         with pytest.raises(REFUSED):
-            formed("accurate", jax.eval_shape)(functools.partial(on, "mosaic_gpu"), sample)
+            jax.eval_shape(with_gradients(functools.partial(rule, starts=starts)), sample, cotangent)
         return
-    assert_packed_on_par(formed("accurate", functools.partial(on, "mosaic_gpu")),
-                         functools.partial(on, "xla"), drawn, f"{form} fp32 on the template",
-                         packed=packed, documents=((0, 24, 40), (10, 48)), length=LENGTH,
-                         seeds=marked_seeds(request) if marked else 8)
+    shards = request.node.get_closest_marker("check1_shards")
+    assert_packed_on_par(rule, recurred, drawn, f"{form} fp32 on the template", packed=packed,
+                         documents=documents, length=LENGTH, seeds=marked_seeds(request) if shards else 8)
 
 
 @COMPILES_ON_CPU

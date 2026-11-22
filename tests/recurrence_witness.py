@@ -1116,8 +1116,14 @@ def assert_inference_witnessed(lane: Lane, heads: int = 1) -> None:
     taking the write gate), at its own tiles (`Tiles.forward`): its states then output launches, no walk
     forming the output in one (rows 5668, 7877), every record inside its step's enclosure (`recorded`'s
     `inference`)."""
+    import tier_wire
+
     operands = draw(0, "mild", heads=heads)
-    for run in (recorded(*operands, inference=True), recorded(*operands, delta=False, inference=True)):
+    runs = (recorded(*operands, inference=True), recorded(*operands, delta=False, inference=True))
+    # Both runs recorded: a GPU tier's prepare gives each zeros, which judge nothing (row 7882).
+    if tier_wire.preparing():
+        return
+    for run in runs:
         for name, inside in witness(run, lane).items():
             assert np.all(inside), (name, float(np.mean(inside)))
 
