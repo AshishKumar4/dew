@@ -165,8 +165,7 @@ def _splits_scores(walk: _Backward) -> bool:
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                  coords: algebra.Coords | functools.partial[algebra.Coords], whole,
                  shape: tuple[int, int], *, masked: bool | None, whole_operands: bool = False,
-                 on_weights: Callable[[jax.Array], object] | None = None,
-                 after_weights: Callable[[], object] | None = None
+                 on_weights: Callable | None = None, after_weights: Callable | None = None
                  ) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
     (`_fused_step`'s, `_coop_step`'s): its `S` and `dP` products (issued through `product_pair`, overlapping
