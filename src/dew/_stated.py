@@ -200,7 +200,8 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
 
 def _wrapping(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """A callable wrapping one of the user's functions (`_wrapping_users`), its `__wrapped__` read as stored,
-    never through the object's own lookup, which a Flax module's runs its `setup` by; None for any other.
+    never through the object's own lookup, which a Flax module's runs its `setup` by (a `__wrapped__` its
+    class declares as a property is that descriptor, no function it wraps); None for any other.
     Refused for a Flax module bound to its variables (within its model's `init` or `apply`): its identity is
     its variables' as well as its fields' (train 1169: stating one ran its `setup`, and a second run found
     its submodules' names in use)."""
