@@ -189,12 +189,14 @@ def _port_holds_check_1(case):
             mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
 
     forms = [pinned(heads_pins(heads)) for heads in CASES[case]]
-    if case == "bf16":
-        # Every variant a tuning run may pick (`mamba_ssd._Launch.variants`: mamba_ssm's A100 picks), each
-        # launch at its i-th in turn, held to the gate as the derived configs are: every one pinned, the
-        # first among them, which sorts by its fields (`configs_by_kernel`), not as the heuristic's (an A100
-        # two-warp `ChunkState` pick sorted first at the seeded geometry, the default arm never taking it).
-        variants = configs_by_kernel(functools.partial(run, 0), inputs)
+    # Every variant a tuning run may pick (`mamba_ssd._Launch.variants`), each launch at its i-th in turn,
+    # held to the gate as the derived configs are, wherever a launch has more than its derived one (the bf16
+    # case's mamba_ssm A100 picks; offered the fp32 cases, they once passed no gate, row 10882): every one
+    # pinned, the first among them, which sorts by its fields (`configs_by_kernel`), not as the heuristic's
+    # (an A100 two-warp `ChunkState` pick sorted first at the seeded geometry, the default arm never taking
+    # it).
+    variants = configs_by_kernel(functools.partial(run, 0), inputs)
+    if any(len(found) > 1 for found in variants.values()):
         forms += [pinned({kernel: found[i] for kernel, found in variants.items() if len(found) > i})
                   for i in range(max(len(found) for found in variants.values()))]
     count = len(forms)
@@ -295,7 +297,12 @@ the same rounded projections, so their upstream rounding is shared)."""
 def test_a_mamba2_layer_on_the_port_matches_it_on_xla(dtype):
     """The layer on the port, packed documents and all, hands the scan its compute dtype: over drawn
     inputs and cotangents, its output and every parameter's and input's gradient on par with the XLA
-    scan's, both from the layer's float64 run (check 1)."""
+    scan's, both from the layer's float64 run (check 1). An fp32 layer's interpreted alone: natively the port
+    takes mamba_ssm's own fp32 products, one TF32 (`fla_gdn._dot`), where the XLA scan's are IEEE's, 1929
+    times its distance from float64 on an A100 at main and at every head since (row 11771, M-JS-200), a bar
+    the port does not claim; the GPU tier holds it to mamba_ssm's own instead ([SSD port])."""
+    if dtype == jnp.float32 and not INTERPRETED:
+        pytest.skip("an fp32 layer's port and XLA scan share IEEE products interpreted alone")
     layer = Mamba2(emb_features=64, num_heads=4, head_dim=16, state_size=16, n_groups=2, chunk_size=32,
                    dtype=dtype)
     params = layer.init(jax.random.key(5), jnp.zeros((2, 72, 64), dtype))

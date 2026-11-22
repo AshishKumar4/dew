@@ -74,6 +74,7 @@ from dew.training.memory import (
     remat_stated,
     rung_record,
     step_fits,
+    step_fits_admitted,
     temporaries_factor,
 )
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
@@ -375,6 +376,10 @@ class Probe:
     """The bytes the fit check placed beside the step's temporaries (`placed_beside`): its outputs that
     write over no donated argument and what the loop holds outside the step (copies, accumulators, a state
     not placed yet). None where none were read."""
+    admitted: tuple[int, int, int] | None = None
+    """The terms the fit check admitted by (`memory.admission`: resident, beside, temporaries), the
+    executable's whose fit it states (the sampled step's where it stands for the step, `FitSearch.measured`);
+    None where it read none."""
 
     @classmethod
     def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
@@ -428,8 +433,15 @@ class PlanRefused(RuntimeError):
     `allocators` what each local device's allocator stated as the search refused (`device_memory`): its
     limit, its bytes in use, its largest free block and its pool, which the closest's headroom read."""
 
-    def __init__(self, probes: Sequence[Probe], allocators: Sequence[Mapping[str, int]] = ()):
+    def __init__(self, probes: Sequence[Probe], allocators: Sequence[Mapping[str, int]] = (),
+                 candidates: Sequence[int] = (), variants: bool = True):
         self.probes, self.allocators = tuple(probes), tuple(allocators)
+        # The splits the search asked of each rung, and whether it chose a variant of its rungs from what
+        # its misses read (its Newton-Schulz stacks parted, its narrow copies dropped), which a search on
+        # more room may choose otherwise (`dew.training.compiler.StepCompiler.refuse_unplaced`).
+        self.candidates, self.variants = tuple(candidates), variants
+        # Whether the search began at a rung a record or a resumed checkpoint named (`StepCompiler._planned`).
+        self.recorded_start = False
         gib = 1024 ** 3
         read = [memory for memory in self.allocators if 'bytes_limit' in memory and 'bytes_in_use' in memory]
         said = ""
@@ -858,6 +870,8 @@ class FitSearch[LossT, EffectsT]:
     one 38.88 GiB block its pool could give of 70.88 GiB free, 22.41 GiB short, fits). A candidate holds
     none of them (`Candidate.held`), so one cached for a
     placed state serves an unplaced one."""
+    variants: bool = False
+    """Whether its search chose a variant of its rungs from what its misses read (`searched`)."""
     asked: list[Rung] = dataclasses.field(default_factory=list)
     """The rungs its search asked past the one it stood on first (`searched`), which a plan made offline
     asks none of again (`below`)."""
@@ -895,7 +909,8 @@ class FitSearch[LossT, EffectsT]:
         self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes}
         if split is None:
             allocators = [device_memory(device) for device in local_devices(self.mesh)]
-            raise PlanRefused(self.probes, allocators) from (self.refusals[-1] if self.refusals else None)
+            raise PlanRefused(self.probes, allocators, candidates, self.variants) from (
+                self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
 
     def above(self, candidates: Sequence[int], split: int) -> tuple[Probe, ...]:
@@ -929,12 +944,12 @@ class FitSearch[LossT, EffectsT]:
         return tuple(found)
 
     def fitting(self, executable: jax.stages.Compiled | None,
-                candidate: Candidate) -> tuple[bool, int | None]:
+                candidate: Candidate) -> tuple[bool, int | None, tuple[int, int, int] | None]:
         """`step_fits` of `executable`, `candidate`'s compiled step or its sampled twin, with the state's
-        `unplaced` bytes beside it where the devices hold none of it yet."""
-        unplaced = self.unplaced or 0
-        return step_fits(executable, self.mesh, self.held(candidate), candidate.built + unplaced,
-                         placed=self.unplaced is None)
+        `unplaced` bytes beside it where the devices hold none of it yet, and the terms it admitted by
+        (`admission`), None where its executable states no memory."""
+        return step_fits_admitted(executable, self.mesh, self.held(candidate),
+                                  candidate.built + (self.unplaced or 0), placed=self.unplaced is None)
 
     def held(self, candidate: Candidate) -> int:
         """The bytes the fit check holds beside `candidate`'s step: its own (`Candidate.held`), and the
@@ -942,9 +957,15 @@ class FitSearch[LossT, EffectsT]:
         return candidate.held + (self.unplaced or 0)
 
     def lowering(self, split: int) -> Candidate:
-        """The step at `split` at the objective's rung and the search's `narrow`, lowered."""
+        """The step at `split` at the objective's rung and the search's `narrow`, lowered, the launches its
+        trace reaches certified aside and the step lowered afresh while it launches a refused config
+        (`report.lowered_aside`)."""
+        from dew.nn.kernels.templates import report
+
         with spending() as spent:
-            lowered = self.lower(split, self.narrow, self.ns_group)
+            lowered = report.lowered_aside(lambda: self.lower(split, self.narrow, self.ns_group),
+                                           lambda: self.relowering(split),
+                                           lambda candidate: candidate.program)
         return dataclasses.replace(lowered, spent=spent)
 
     def relowering(self, split: int) -> Candidate:
@@ -1033,7 +1054,8 @@ class FitSearch[LossT, EffectsT]:
                 executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
                                                  first=firsts[0])
                 candidate = relowered.candidate(candidate)
-            fit, headroom = self.fitting(executable, candidate)
+            fit, headroom, admitted = self.fitting(executable, candidate)
+            judged = executable
             # Its lowering's own key, derived again only where a spill relowered it.
             key = looked if relowered is None or relowered.last is None else self.compiled_key(
                 candidate.lowered, options)
@@ -1071,11 +1093,14 @@ class FitSearch[LossT, EffectsT]:
                                     else SampledStep(lowered[-1], compiled))
                 # Admitted by the plan whichever compiled it, ahead or here (training.md: the sampled step is
                 # admitted by the same memory plan).
-                fit, headroom = self.fitting(None if self.sampled is None else self.sampled.executable,
-                                             candidate)
+                judged = None if self.sampled is None else self.sampled.executable
+                fit, headroom, admitted = self.fitting(judged, candidate)
         seconds = time.perf_counter() - began
-        probe = Probe.read(split, candidate, self.current(), fit, headroom, executable, self.held(candidate))
-        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, spent=spent)
+        # Its memory the executable's whose fit it states, the sampled step's where it stood for the step:
+        # one measurement its refusal, its diagnostics and its splits' forecast all read.
+        probe = Probe.read(split, candidate, self.current(), fit, headroom, judged, self.held(candidate))
+        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, spent=spent,
+                                    admitted=admitted)
         return options, candidate, executable, probe
 
     def fits_here(self, split: int) -> bool:
@@ -1205,6 +1230,8 @@ class FitSearch[LossT, EffectsT]:
                 self.said(named)
                 return split
             ns_group = 1 if self.freed(kept, self.rung()) else None
+            # The rungs past here chosen from what the misses read (`PlanRefused.variants`).
+            self.variants = True
             if ns_group is None:
                 _log.warning("the step's joined Newton-Schulz stacks free nothing it needs: it keeps them "
                              "joined and climbs on")
@@ -1226,6 +1253,7 @@ class FitSearch[LossT, EffectsT]:
                 self.said(named)
                 return split
             narrow = not self.freed(kept, self.rung())
+            self.variants = True
             if narrow:
                 # Dropped, the step fell no less short at the split both missed at: on a GPU the step casts
                 # its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them),

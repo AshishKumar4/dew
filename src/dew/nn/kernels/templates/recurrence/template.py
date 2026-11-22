@@ -28,7 +28,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew import _cache
 from dew.nn import derivatives
 from dew.nn.kernels import chunked_launch, generation
-from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources
+from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources, sass
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward
 from dew.nn.residuals import Residual
 
@@ -476,25 +476,6 @@ class Mosaic(base.Template[mainloop.Tiles]):
         family = bundle(self.launch_target())
         return resources.facts().thread_registers if family is None else family.registers(1)
 
-    def held(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, *, reverse: bool = False) -> bool:
-        """Whether every launch's consumer threads hold their registers at its own roles' budget
-        (`Family.registers` at `Launch.consumers`: a walk of `Tiles.walkers` roles holds less a role than a
-        launch of one) and a multiprocessor holds a program of it (`Launch.resident`): the forwards' at the
-        tiles each runs at (`_forwards`) when `not reverse`, or the launches reverse-mode certification
-        compiles (`launches(..., backward=True)`) when `reverse` (row 6740)."""
-        target = self.launch_target()
-        family = bundle(target, _dtype(ba))
-        if family is None:
-            return super().held(ba, config, reverse=reverse)
-        launches = (self.launches(ba, config, target, backward=True) if reverse
-                    else self._forwards(ba, config, target))
-        return self._launches_hold(launches, family)
-
-    def _launches_hold(self, launches: tuple[mainloop.Launch, ...], family: mosaic.Family) -> bool:
-        """Whether `launches`' consumer threads hold their registers and a multiprocessor a program of each
-        (`_launches_held`): the one rule `held` and `_product_holds` read."""
-        return _launches_held(launches, family)
-
     def _product_holds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
                        *, training: bool) -> bool:
         """Whether one product's forward holds at `tiles` (`legal`'s rules on its launches alone: a training
@@ -517,7 +498,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         assert family is not None
         launches = self.launches(ba, tiles, target, backward=False, training_forward=training)
         return (max(launch.shared for launch in launches) <= self.program_shared(tiles, target)
-                and self._launches_hold(launches, family))
+                and _launches_held(launches, family))
 
     def _refused(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
                  *, training: bool | None = None) -> bool:
@@ -777,7 +758,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         ladder compiled a hundred rungs from the top down, each spilling more, before the program fewer)."""
         roles = report.spilled_in(self, ba, joined) | (
             report.spilled_in(self, ba, joined.forward) if joined.forward else {})
-        if any(roles.get(kernel) != (report.CONSUMERS,) for kernel in spilled):
+        if any(roles.get(kernel) != (sass.CONSUMERS,) for kernel in spilled):
             return False
         family = bundle(target, _dtype(ba))
         assert family is not None

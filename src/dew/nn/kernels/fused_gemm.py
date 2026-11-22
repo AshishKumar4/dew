@@ -156,6 +156,8 @@ class Analysis:
     launch: generation.Route | None
     fused_seconds: float | None = None
     unfused_seconds: float | None = None
+    cheaper: bool = False
+    """Whether fused is the cheaper (`priced`): fewer seconds, and no more work no rule prices."""
     refused: str | None = None
     """Why a kernel the call names (`generation.chosen`) refuses the region, as `fused` would raise
     (`selection.KernelRefused`); None where nothing named refuses."""
@@ -182,7 +184,7 @@ def analysis(region, *inputs) -> Analysis:
 
     def last(choice):
         return next((route for route in reversed(found) if route.choice == choice), None)
-    seconds = priced(priced_calls[-1], generation.gpu_target()) if priced_calls else (None, None)
+    seconds = priced(priced_calls[-1], generation.gpu_target()) if priced_calls else (None, None, False)
     return Analysis(last(EPILOGUE.choice), last(PROLOGUE.choice), last('grouped_matmul'), *seconds,
                     resident=priced_calls[-1].resident if priced_calls else True)
 
@@ -239,7 +241,7 @@ _PRICED: contextvars.ContextVar[list | None] = contextvars.ContextVar('fused_gem
 """The regions `_product` traces while `analysis` collects them."""
 
 
-def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, float | None]:
+def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, float | None, bool]:
     """`region`'s seconds on `target`, fused and unfused, from one model (`templates.cost`): the launch's
     units overlapped at the whole device's rates (its products in their tensor mode, its operands, captured
     arrays and outputs in device memory), plus its fixed launch (`GpuTarget.launch_seconds`), with its
@@ -247,10 +249,14 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     depth values where it has a prologue (a norm's statistics); and unfused, XLA's program forming the
     operand whole and writing it, the plain launch writing the product at its result dtype, then XLA's
     fusion of the consumers reading it (`algebra.cost.fused`), each XLA program as the algebra prices it
-    (`algebra.program.priced`). None where the target states no tensor rate."""
+    (`algebra.program.priced`). Beside them, whether fused is the cheaper: fewer seconds, and no more work no
+    rule prices (`cost.Work.unpriced_operations`: a special function a launch compiles in a form no count
+    prices, an accurate sine, is no free work). Work at a rate the target leaves unread is the arms' alike
+    but for a form's own (an accurate exp's integer operations on a GPU whose integer rate is unread, a
+    B200's), which bars no fusion. None where the target states no tensor rate."""
     rates = cost.rates(target, device=True)
     if rates.tensor is None:
-        return None, None
+        return None, None, False
     product = algebra_cost.product_work(region.rows, region.depth, region.width, dtype=region.operands,
                                         precision=region.precision, on=target)
     operands = region.operand_bytes
@@ -270,22 +276,32 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     # The operand's base, the rows a prologue forms the operand from (its bytes the operand's).
     formed, base = region.formed, region.rows * region.depth * jnp.dtype(region.operands).itemsize
     prologue, forming, sides = cost.Work(), 0.0, 0.0
+    # Each arm's whole work, XLA's programs' with the launch's, whose amounts at no rate it compares.
+    fused_work = unfused_work = cost.Work()
     if formed is not None:
         prologue = counted(formed.stage, region.forms) + cost.Work(device_bytes=formed.side_bytes)
         # XLA's programs as the algebra prices them, beside the arrays they write: the operand formed whole,
         # or its sides alone.
-        forming = _written(algebra_program.priced(formed.whole, target), base, xla)
+        whole = algebra_program.priced(formed.whole, target)
+        forming, unfused_work = _written(whole, base, xla), whole.work
         if formed.sides is not None:
-            sides = _written(algebra_program.priced(formed.sides, target), formed.side_bytes, xla)
+            side = algebra_program.priced(formed.sides, target)
+            sides, fused_work = _written(side, formed.side_bytes, xla), side.work
     # Fused, the consumers' special functions in the forms the launch compiles; in XLA's fusion, one MUFU an
     # element.
-    fused_seconds = sides + launched(product + counted(region.consumers, region.forms) + prologue + cost.Work(
-        device_bytes=operands + region.captured_bytes + region.output_bytes))
-    unfused_seconds = forming + launched(product + cost.Work(device_bytes=operands + written))
+    launch_fused = product + counted(region.consumers, region.forms) + prologue + cost.Work(
+        device_bytes=operands + region.captured_bytes + region.output_bytes)
+    launch_unfused = product + cost.Work(device_bytes=operands + written)
+    fused_seconds = sides + launched(launch_fused)
+    unfused_seconds = forming + launched(launch_unfused)
+    fused_work, unfused_work = fused_work + launch_fused, unfused_work + launch_unfused
     if region.consumers is not None:
-        unfused_seconds += xla(counted(region.consumers) + cost.Work(
-            device_bytes=written + region.captured_bytes + region.output_bytes, kernels=1.0))
-    return fused_seconds, unfused_seconds
+        chain = counted(region.consumers) + cost.Work(
+            device_bytes=written + region.captured_bytes + region.output_bytes, kernels=1.0)
+        unfused_seconds += xla(chain)
+        unfused_work += chain
+    no_more = fused_work.unpriced_operations <= unfused_work.unpriced_operations
+    return fused_seconds, unfused_seconds, fused_seconds < unfused_seconds and no_more
 
 
 def _written(program: algebra_cost.Seconds, written: float, xla: algebra_cost.Fused) -> float:

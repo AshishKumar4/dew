@@ -113,6 +113,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tier_wire
 from arm_arithmetic import ahead_on_the_host
 from flax import linen as nn
 from interop_support import (
@@ -123,7 +124,7 @@ from interop_support import (
     transformers_model,
 )
 from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
-from reference_error import as_given, assert_as_exact, declared_seeds, recording
+from reference_error import ahead_arm, as_given, assert_as_exact, declared_seeds, recording
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
@@ -305,24 +306,41 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     directory = FIXTURES / fixture
     ids = np.load(directory / "input_ids.npy")
     with ahead_on_the_host():
-        # Loaded on the host in a GPU tier prepare, which computes nothing on its GPU (rows 7858, 7859).
-        loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
+        # Loaded on the host in a GPU tier prepare, which computes nothing on its GPU (rows 7858, 7859), its
+        # weights host arrays (`on_host`), the step's inputs (`ahead_arm`).
+        loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla", on_host=True)
     reference = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").eval()
     wide = float64_twin(reference)
     named = dict(reference.named_parameters())
     layouts = {layout.name: layout for layout in loaded.weight_layouts if layout.name in named}
 
-    def loss(params, ids):
-        return dew_next_token_loss(loaded, params, ids)
+    # One program of the logits and the gradients, compiled under the policy as a run under it compiles,
+    # through the arms' own path (`ahead_arm`): a GPU tier part's prepare holds it, its run launches it
+    # (row 11744: compiled here ahead, its executable was no arm's, so the prepare kept none). It reads the
+    # model alone, its variables an input, so one statement names it in the prepare and the run (`arm_role`:
+    # the load, whose source is a path, and its weights, placed on one device or another, are none).
+    model, variables = loaded.model, loaded.variables
 
-    with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
-        both = jax.jit(jax.value_and_grad(loss, has_aux=True)).trace(
-            loaded.variables["params"], jax.ShapeDtypeStruct(ids.shape, ids.dtype)).lower().compile()
+    def step(variables, ids):
+        return jax.value_and_grad(dew_next_token_loss, argnums=2, has_aux=True)(model, variables,
+                                                                               variables["params"], ids)
 
-    # Compiled once under the policy, as a run under it compiles: the gate runs it as given.
+    label = f"float32 {fixture} logits and gradients, its step"
+    stepped = ahead_arm(jax.jit(step), label)
+    if tier_wire.preparing():
+        from arm_store import armed
+        from store_wire import COMPILED
+
+        # A GPU tier part's prepare runs no arm of the site below (a host arm's, `as_given`'s): its program is
+        # held at a draw's shape here, which the store holds, and its run launches it.
+        with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
+            stepped(variables, np.asarray(ids, np.int32))
+        assert COMPILED.get().holds(armed(label))
+
     @as_given
     def ours(ids):
-        (_, logits), grads = both(loaded.variables["params"], jnp.asarray(ids, jnp.int32))
+        with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
+            (_, logits), grads = stepped(variables, np.asarray(ids, np.int32))
         return {"logits": np.asarray(logits, np.float64),
                 **{name: np.asarray(layout.export({"params": grads}), np.float64).reshape(named[name].shape)
                    for name, layout in layouts.items()}}

@@ -6,6 +6,7 @@ GEMM's (`gemm`), their recipes' projections a layer's (`projections`)."""
 
 import dataclasses
 import functools
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -121,6 +122,19 @@ class NvFp4:
         """The shape of the matrix it stands for: `[depth, width]`, a bank's `[groups, depth, width]`."""
         *groups, width, words = self.words.shape
         return (*groups, 8 * words, width)
+
+    @staticmethod
+    def leaf_axes(axes: Sequence[str | None]) -> dict[str, tuple[str | None, ...]]:
+        """The logical axes of each of its leaves, in their order, where the matrix it stands for is laid out
+        along `axes` (`[..., depth, width]`, any axes before them a bank's or a stack's): its words' and
+        block scales' `[..., width, depth / 8 or depth / 16]`, its tensor scales' the leading ones alone,
+        its form's bytes whole on every device. The one statement of how its layout follows the matrix's,
+        which placing a packed bank reads (row 11734). By each leaf's field name, in its fields' order (the
+        leaves', as `jax.tree_util.register_dataclass` flattens it)."""
+        *leading, depth, width = axes
+        named = {"words": (*leading, width, depth), "scales": (*leading, width, depth),
+                 "scale": tuple(leading), "form": (None,)}
+        return {field.name: named[field.name] for field in dataclasses.fields(NvFp4)}
 
     def layer(self, index: jax.Array) -> "NvFp4":
         """A stack of banks' bank at layer `index` (a traced index): its fields led by a layers axis before

@@ -1944,13 +1944,15 @@ class ScanCase:
     instruction family (`family`), the product (`product`) and whether it is forked (`forked`); its value
     heads and key groups on a launch's shard (`shard_heads`), its head and state widths as the call gives
     them (`logical`, unpadded) and its extent on that shard (`extent`); None where a caller reads no cell
-    (`scan_case`'s `shards`)."""
+    (`scan_case`'s `shards`); and whether its output is wide, at least fp32 (`wide`), or in the operands'
+    dtype."""
 
     varying: bool
     dtype: np.dtype
     widths: tuple[int, int, int]
     tpu: str | None
     logical: tuple[int, int]
+    wide: bool = True
     shard_heads: tuple[int, int] | None = None
     extent: Extent | None = None
     call: base.Call | None = None
@@ -1967,13 +1969,15 @@ class ScanCase:
         computes (`ScanCell`, row 8991)."""
         (heads, groups), (width, state) = self.shard_heads or (None, None), self.logical
         return self.family, ScanCell(self.dtype.name, self.product, (heads, width), (groups, state),
-                                     self.widths[2], self.extent)
+                                     self.widths[2], self.extent, self.wide)
 
 
 class ScanCell(NamedTuple):
     """A rated scan's cell a receipt declares (`ScanCase.cell`): its values' dtype, its product, its value
     heads and their width and its key groups and the state's width on a launch's shard, unpadded, its chunk,
-    and its extent: None where its case read no shard (`scan_case`'s `shards`), a cell none declares."""
+    its extent: None where its case read no shard (`scan_case`'s `shards`), a cell none declares; and
+    whether its output is wide (`ScanCase.wide`): an output in the operands' dtype writes and reads half the
+    bytes, which a receipt timing a wide one did not measure (row 11729)."""
 
     dtype: str
     product: str
@@ -1981,6 +1985,7 @@ class ScanCell(NamedTuple):
     keys: tuple[int | None, int]
     chunk: int
     extent: Extent | None
+    wide: bool
 
 
 SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
@@ -2019,14 +2024,15 @@ TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
 
 def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | None = None,
               product: str = 'forward', forked: bool = False, packed: bool = False, shards=None,
-              dtype: jnp.dtype | None = None) -> ScanCase:
+              dtype: jnp.dtype | None = None, wide: bool = True) -> ScanCase:
     """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
     `chunk_size` chunks, their widths as the port and the TPU's scan take them where `padded`
     (`_scan_widths`, `_rated_scan`); on a TPU, the platform its Pallas scan builds for
     (`ssd_kernel_platform`); the template's `call`, the `product`, and whether its rows pack documents
     (`packed`); and where `shards` gives `x` and `B` as each shard holds them (`template_bind`'s, as the port
     lays its launches too, `_ssd_ported`), its shard's heads, groups and extent, a declared cell's key; in
-    `dtype`, the operands' common one the scan launches in (`_rated_scan`'s), `x`'s where None."""
+    `dtype`, the operands' common one the scan launches in (`_rated_scan`'s), `x`'s where None; its output
+    `wide` or in that dtype."""
     dtype = jnp.dtype(x.dtype if dtype is None else dtype)
     widths = (x.shape[-1], B.shape[-1], chunk_size)
     if padded:
@@ -2038,7 +2044,7 @@ def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | 
                     tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(dtype))
                          if generation.backend() == 'tpu' else None),
                     logical=(x.shape[-1], B.shape[-1]), call=call, family=family, product=product,
-                    forked=forked, **held)
+                    forked=forked, wide=wide, **held)
 
 
 def fast_rounding(dtype) -> bool:
@@ -2102,7 +2108,7 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
         delta=False, wide=wide, rounded=fast_rounding(dtype) if rounded is None else rounded)
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product,
                      forked=forked is not None, packed=starts is not None or firsts is not None,
-                     shards=(shard_value, shard_key), dtype=dtype)
+                     shards=(shard_value, shard_key), dtype=dtype, wide=wide)
     return select(SCAN, case).kernel
 
 
@@ -2110,11 +2116,11 @@ SSD_PORT = Kernel[ScanCase]('pallas', SSD_SUPPORTS)
 """Dew's port of mamba_ssm's SSD kernels (`mamba_ssd.ssd_scan`)."""
 
 SCAN_CELLS: dict[tuple[str | None, ScanCell], tuple[Kernel[ScanCase], str]] = {
-    ('mma.sync', ScanCell('bfloat16', 'training', (96, 80), (8, 128), 256, TIMED)): (
+    ('mma.sync', ScanCell('bfloat16', 'training', (96, 80), (8, 128), 256, TIMED, wide=True)): (
         SSD_PORT, "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
                   "4.217 on Nemotron-H 4B's SSD, its 80-wide heads padded to the port's 128 "
                   "(ssd-train-a100-fdab2424c)"),
-    ('mma.sync', ScanCell('bfloat16', 'training', (64, 64), (8, 128), 128, TIMED)): (
+    ('mma.sync', ScanCell('bfloat16', 'training', (64, 64), (8, 128), 128, TIMED, wide=True)): (
         SSD_PORT, "on an A100 SXM4 40GB, the port's forward and gradient 1.584 ms against the template's "
                   "2.200 on Nemotron-H 30B's SSD (ssd-train-a100-fdab2424c)"),
 }

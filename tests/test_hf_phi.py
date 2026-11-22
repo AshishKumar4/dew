@@ -91,8 +91,8 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
     assert isinstance(loaded.model.rope_scaling, YarnScaling) and loaded.model.partial_rotary_factor == 0.5
 
     def dew(ids):
-        (_, logits), gradient = jax.value_and_grad(dew_next_token_loss, argnums=1, has_aux=True)(
-            loaded, loaded.variables['params'], ids)
+        (_, logits), gradient = jax.value_and_grad(dew_next_token_loss, argnums=2, has_aux=True)(
+            loaded.model, loaded.variables, loaded.variables['params'], ids)
         return logits, gradient
 
     stepped = jax.jit(dew)

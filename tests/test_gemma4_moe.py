@@ -90,3 +90,7 @@ def test_a_balance_loss_over_routers_that_record_their_choice_alone_is_refused()
     with fixed_routers() as found, pytest.raises(ValueError):
         balanced.loss(loaded.variables, {TEXT_KEY: ids}, step)
     assert not found.balanced
+    # The same run with no balance loss trains.
+    plain = LMObjective(loaded.model, 8, token_accuracy=False)
+    statistic, _ = plain.loss(loaded.variables, {TEXT_KEY: ids}, step)
+    assert np.isfinite(float(statistic.mean()[0]))

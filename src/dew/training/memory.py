@@ -341,10 +341,18 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     the allocator `strands_temporaries`, they need room twice. Where the state is not `placed` yet, `held`
     counting it, the devices' free bytes in all hold the step (`available`).
     """
+    return step_admitted(executable, devices, held, built, placed=placed)[0]
+
+
+def step_admitted(executable: jax.stages.Compiled, devices: Sequence, held: int = 0, built: int = 0, *,
+                  placed: bool = True) -> tuple[int | None, tuple[int, int, int] | None]:
+    """`step_headroom` of `executable` and the terms it admitted by (`admission`), each None where the
+    executable states no memory: one reading of its compiled memory for both."""
     stats = compiled_memory(executable)
     if stats is None:
-        return None
-    return admitted(devices, *admission(stats, held, built), placed=placed)
+        return None, None
+    terms = admission(stats, held, built)
+    return admitted(devices, *terms, placed=placed), terms
 
 
 def admission(stats: CompiledMemory, held: int = 0, built: int = 0) -> tuple[int, int, int]:
@@ -388,8 +396,18 @@ def admitted(devices: Sequence, resident: int, beside: int, temporaries: int, *,
     return _admitted(devices, memory, beside, temporaries, placed=placed)
 
 
+def ceiling_headroom(devices: Sequence, resident: int, beside: int, temporaries: int) -> int | None:
+    """The headroom `admitted` reads of a step of its admission's terms (`admission`: `resident`, `beside`,
+    `temporaries`) beside a state not placed yet, at each allocator's own ceiling (`bytes_limit -
+    bytes_in_use`), no GPU's free bytes capping a growing pool's (`unclaimed`, which another process may give
+    back between readings): the most room a later reading of the devices can give the step while this
+    process holds what it holds now."""
+    memory = [device_memory(device, resident) for device in devices]
+    return _admitted(devices, memory, beside, temporaries, placed=False, ceiling=True)
+
+
 def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: int,
-              temporaries: int, *, placed: bool = True) -> int | None:
+              temporaries: int, *, placed: bool = True, ceiling: bool = False) -> int | None:
     """The headroom at a fixed reading of the allocators: the least, over `devices`, of two margins. XLA
     takes a step's temporaries in one allocation, after the bytes placed beside them (the outputs no
     donated argument holds, and what the loop keeps that the allocators do not hold yet: the batches, and
@@ -403,7 +421,7 @@ def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: in
         return None
     margins = []
     for device, held in zip(devices, memory, strict=True):
-        free = unclaimed(device, held)
+        free = None if ceiling else unclaimed(device, held)
         needed = temporaries * stranding(device, held)
         block = placeable_beside(held, free, beside) if placed else available(held, free)
         margins.append(min(block - needed, available(held, free) - beside - needed))
@@ -732,10 +750,25 @@ def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
     the agreement. Where the state is not `placed` yet, the devices' free bytes in all hold the step
     (`available`).
     """
+    fit, headroom, _ = step_fits_admitted(executable, mesh, held, built, placed=placed)
+    return fit, headroom
+
+
+def step_fits_admitted(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0, built: int = 0,
+                       *, placed: bool = True) -> tuple[bool, int | None, tuple[int, int, int] | None]:
+    """`step_fits`, with the terms this process admitted the step by (`step_admitted`), read within the
+    one agreement, so a process whose read fails ends every process's check with its error."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
     if executable is None:
-        return fits_everywhere(lambda: -1)[0], None
-    return fits_everywhere(lambda: step_headroom(executable, local, held=held, built=built, placed=placed))
+        return fits_everywhere(lambda: -1)[0], None, None
+    terms: list[tuple[int, int, int] | None] = [None]
+
+    def read() -> int | None:
+        headroom, terms[0] = step_admitted(executable, local, held, built, placed=placed)
+        return headroom
+
+    fit, headroom = fits_everywhere(read)
+    return fit, headroom, terms[0]
 
 
 def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:

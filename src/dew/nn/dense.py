@@ -22,6 +22,7 @@ then sums, and offer no step to widen it.
 import functools
 import importlib.util
 import inspect
+import sys
 from collections.abc import Callable, Iterable
 
 import jax
@@ -57,6 +58,48 @@ def packed_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]):
     if module.has_variable(QUANTIZATION, name):
         return module.get_variable(QUANTIZATION, name)
     return make()
+
+
+def watched_or_owned(module: nn.Module) -> bool:
+    """Whether `module`'s calls must run as Flax and a wrapper see them, no rule of Dew's standing in for its
+    computation (`dew.nn.derivatives.portable_formed`, which differentiates a function of arrays apart from
+    the module's scope): a quantization scope of Dew's (`INTERCEPTED`) or a direct Qwix provider's
+    (`providing`: any of its ops, at any path its rules name, may be a rule's), a Flax method interceptor
+    installed (`intercepting`: a watch's), or its caller capturing its calls' outputs (`observed`)."""
+    return INTERCEPTED.value or providing() or intercepting() or observed(module)
+
+
+def providing() -> bool:
+    """Whether a direct Qwix provider's interception is on in this thread (`qwix.quantize_model`, its
+    interception manager, qwix/_src/interception.py, as `dew._cache.unintercepted` reads it): read by turning
+    it off and on again, no rule queried, so none counted as matched (`get_unused_rules`). False where Qwix is
+    not loaded."""
+    interception = sys.modules.get("qwix._src.interception")
+    if interception is None:
+        return False
+    interceptions = interception.interception_manager
+    providers = interceptions.disable_interception()
+    try:
+        return bool(providers)
+    finally:
+        interceptions.enable_interception(providers)
+
+
+def intercepting() -> bool:
+    """Whether a Flax method interceptor is installed (`nn.intercept_methods`, Flax's own stack): any of them
+    may intercept a module's own call, which a rule standing in for the call would bypass (a joined
+    projection's, base review 760be77fe F1: an interceptor zeroing `v_proj`'s output, the joined layer
+    returned it; a recomputed merge's)."""
+    from flax.linen import module as flax_module
+
+    return bool(flax_module._global_interceptor_stack)
+
+
+def observed(module: nn.Module) -> bool:
+    """Whether a caller reads `module`'s own calls' outputs as Flax captures every module's (its
+    `intermediates` collection open: `capture_intermediates`); a caller intercepting them is
+    `intercepting`'s (a watch's, node perturbation's)."""
+    return module.is_mutable_collection('intermediates')
 
 
 def intercepted() -> bool:
@@ -276,9 +319,8 @@ class Dense(_LinearEnvelope, nn.Dense):
             raise ValueError(f"{self.name}'s kernel is packed (a checkpoint's NVFP4 codes, served as they "
                              "are), and a quantization rule owns its product: load it without packed_weights")
         width = jnp.shape(inputs)[-1]
-        depth, features = 8 * jnp.shape(matrix.words)[-1], jnp.shape(matrix.words)[-2]
-        if (depth, features) != (width, self.features):
-            raise ValueError(f"{self.name}'s packed kernel is [{depth}, {features}], its layer "
+        if tuple(matrix.shape) != (width, self.features):
+            raise ValueError(f"{self.name}'s packed kernel is {list(matrix.shape)}, its layer "
                              f"[{width}, {self.features}]")
         bias = (self.param('bias', declared(self.bias_init, None if self.kernel_axes is None
                                             else self.kernel_axes[-1:]), (self.features,), self.param_dtype)
