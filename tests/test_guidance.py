@@ -163,20 +163,22 @@ def apg_holds_its_projection_at_its_ranges_edges():
     to float32 then scaled and added in float32, bit for bit, on every device: the lane of `2^-7` beside
     `2^120` `+2^-7`, where a CPU flushed its scaled 2^-128 and guided `-2^-7` and a GPU kept it (row 9710),
     and every lane of the second finite. Compiled as one program (`ahead_arm`), a GPU numerics cell too
-    (tests/test_gpu_numerics.py)."""
+    (tests/test_gpu_numerics.py), every edge's run before any is judged, so a GPU tier part's prepare,
+    whose arms give zeros, prepares each (the first edge's judgment ended it, the second unprepared)."""
     from reference_error import ahead_arm
 
-    for name, (conditional, unconditional, scale) in APG_EDGES.items():
-        conditional, unconditional = (np.asarray([value], np.float32)
-                                      for value in (conditional, unconditional))
-        found = np.asarray(ahead_arm(jax.jit(functools.partial(_apg_guided, scale=scale)), f"APG at {name}")(
-            conditional, unconditional))
+    edges = {name: (*(np.asarray([value], np.float32) for value in (conditional, unconditional)), scale)
+             for name, (conditional, unconditional, scale) in APG_EDGES.items()}
+    found = {name: np.asarray(ahead_arm(jax.jit(functools.partial(_apg_guided, scale=scale)),
+                                        f"APG at {name}")(conditional, unconditional))
+             for name, (conditional, unconditional, scale) in edges.items()}
+    for name, (conditional, unconditional, scale) in edges.items():
         direction = (conditional - unconditional).astype(np.float64)
         along = conditional.astype(np.float64)
         orthogonal = (direction - (direction @ along.T) / (along @ along.T) * along).astype(np.float32)
         expected = unconditional + np.float32(scale) * orthogonal
         assert np.all(np.isfinite(expected)), name
-        np.testing.assert_array_equal(found.view(np.uint32), expected.view(np.uint32), err_msg=name)
+        np.testing.assert_array_equal(found[name].view(np.uint32), expected.view(np.uint32), err_msg=name)
 
 
 def test_apg_holds_its_projection_at_its_ranges_edges():
