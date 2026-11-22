@@ -1577,7 +1577,7 @@ about it is an estimate.
   FP8 word's four codes into two bfloat16 pairs in their natural byte order take 13 steps a register (11
   issues on the ALU, two IMADs placing two fields in one multiply), from a seed of 15 or 16; the free layout's
   linear form takes 2 a register (the linear search, a shift and a masked XOR), so a consumer of FP8 weights
-  would store them in its free layout once (`BitForm.prepared`), as NVFP4's does, and no natural-order form is
+  would store them in its free layout once (`BitForm.encoded` where it packs them), as NVFP4's does, and no natural-order form is
   checked in. MX's E8M0 scale into fp32 bits, its endpoints 2^-127 and NaN, keeps its seed's 8 steps: no
   cheaper program within the windows (none found within the search's budgets: windows of at most three
   inputs, bounded rounds and solver timeouts; not a proof that none exists). Neither has a consumer yet (sm80's
@@ -1613,8 +1613,8 @@ Agreed with the GEMM template's owner (2026-11-03):
   order (code `i` at bits `4i`, a byte's low nibble the earlier element) into four bfloat16 pairs, each the
   code's value times 2^-126, and its form `NVFP4_BFLOAT16_FORM`, the search's at shifts of up to 6 places.
   The codec stores the codes in the form's layout once, where it packs them (`bits.packed` applies the
-  form's encoder to an e2m1 word; `BitForm.prepared` is that re-encoding of a naturally packed word, in
-  `jax.numpy`), so a consumer receives stored words and never encodes again; its portable path reads a word
+  form's encoder to an e2m1 word, `BitForm.encoded` a naturally packed word's), so a consumer receives
+  stored words and never encodes again; its portable path reads a word
   tile `[r, c]` back as `[r, 8c]` elements in depth order (`BitForm.values`). The scaled codec a GEMM takes
   is declared beside the form: `nvfp4_quantized(x)` gives a tile's stored words, its block scales (e4m3, one
   for each sixteen along the depth) and its tensor scale, and `nvfp4_decoded(words, scales)` the tile in

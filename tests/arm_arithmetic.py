@@ -63,6 +63,24 @@ def drawn_on_the_host[S, R](inputs_of: Callable[[S], R], seed: S, *, held: bool 
     return jax.device_get(made) if held else made
 
 
+def ahead_on_the_host():
+    """Where a GPU tier part's prepare runs a test (`tier_wire.preparing`), whose default device is a
+    compile-only GPU that computes nothing, the host's CPU as its default device and the host's own kernels
+    (no GPU `generation.assumed`); elsewhere the test's own: the context of what a cell computes before its
+    first check-1 site (a load, an export, a behavioral decode), so its prepare reaches its sites, where
+    `drawn_on_the_host` draws on the host wherever the test runs (rows 11424-11619)."""
+    import tier_wire
+
+    from dew.nn.kernels import generation
+
+    if not tier_wire.preparing():
+        return contextlib.nullcontext()
+    host = contextlib.ExitStack()
+    host.enter_context(jax.default_device(jax.devices("cpu")[0]))
+    host.enter_context(generation.assumed(None))
+    return host
+
+
 def widened(tree):
     """`tree` in float64, its complex leaves in complex128 and its integer leaves as they are: the inputs
     of a float64 truth. A leaf an accelerator holds is widened where it lies, so its truth runs on that

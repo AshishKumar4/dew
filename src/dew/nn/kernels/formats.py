@@ -29,8 +29,8 @@ this Dew's form, so a load refuses them (`NvFp4.checked`; algebra.md 7.4, row 61
 class NvFp4:
     """An NVFP4 matrix `[depth, width]` as the GEMM stores it (row 3621), K-major, each column's depths
     along its row (as a Dense kernel read transposed): its E2M1 codes eight a uint32 in the GEMM's staged
-    depth order (`words`, `[width, depth / 8]`: `staged_rows`, each word the
-    `bits.NVFP4_BFLOAT16_FORM.prepared` word of its eight codes), each sixteen consecutive depths' E4M3
+    depth order (`words`, `[width, depth / 8]`: `staged_rows`, each word the `bits.NVFP4_BFLOAT16_FORM` word
+    of its eight codes, `_staged_words`), each sixteen consecutive depths' E4M3
     scale (`scales`, `[width, depth / 16]`, in the depths' own order), and the tensor's fp32 scale
     (`scale`, a scalar): each value its code times its block's scale times the tensor's. Its depth is whole
     stages (`NVFP4_STAGE`): the mainloop's stage decode reads each column's words and scales as rows a TMA
