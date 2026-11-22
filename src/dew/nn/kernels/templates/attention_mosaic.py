@@ -1905,7 +1905,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dtype = ba.arguments["query"].dtype
         dq, dkv = self._launch_registers(ba, config)
         launches = ((config.dkv, dkv),) if config.fused else ((config, dq), (config.dkv, dkv))
-        models = [resources.register_model(bundle_of(tiles, dtype), tiles.consumers, registers)
+        models = [resources.register_model(bundle_of(tiles, dtype), tiles.consumers, registers, target=target)
                   for tiles, registers in launches]
         return (*((model.cap(1), model.moves) for model in models), self.resident(ba, config, target))
 

@@ -761,8 +761,9 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                 interpret=bodies.interpreted(interpret),
                                 kernel_name=report.named(
                                     name, model=(None if registers is None
-                                                 else resources.register_model(self, consumers, registers,
-                                                                               shared=shared))),
+                                                 else resources.register_model(
+                                                     self, consumers, registers, shared=shared,
+                                                     target=generation.gpu_target()))),
                                 cost_estimate=emission.built_with(cost))
         return mosaic.checked(emission.costed(built, cost), name or self.name, resident, model_flops,
                               out_type=out_type)
