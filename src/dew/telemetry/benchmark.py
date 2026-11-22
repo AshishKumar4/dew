@@ -277,12 +277,10 @@ def graphs() -> bool:
     """Whether this process's XLA:GPU may run programs as command buffers: unless its XLA_FLAGS leave it
     none, each occurrence of the flag taken in turn as XLA's parser takes it (a list of kinds replacing the
     one before it, a list of `+KIND`s and `-KIND`s amending it), XLA's defaults where no list is given."""
-    name = UNGRAPHED_FLAG.removesuffix("=")
+    from dew._devices import xla_flag_values
+
     kinds: set[str] | None = None
-    for token in os.environ.get("XLA_FLAGS", "").split():
-        named, _, value = token.partition("=")
-        if named != name:
-            continue
+    for value in xla_flag_values(UNGRAPHED_FLAG.removeprefix("--").removesuffix("=")):
         listed = [kind.strip().upper() for kind in value.split(",") if kind.strip()]
         if not (listed and all(kind[0] in "+-" for kind in listed)):
             kinds = set(listed)
