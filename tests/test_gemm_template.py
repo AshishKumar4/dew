@@ -2490,8 +2490,8 @@ def test_each_familys_deepest_ring_compiles_within_its_resources(generation_name
     target = generation.gpu_target(generation_name)
     with generation.assumed(generation_name):
         bound = launch.bind(*shapes, interpret=False, **options)
-        planned = resources.plan([launch.launch_of(bound, tiles)], pricing.family_of(tiles, jnp.bfloat16),
-                                 target, programs=1)
+        planned = resources.plan([launch.launch_of(bound, tiles, target)],
+                                 pricing.family_of(tiles, jnp.bfloat16), target, programs=1)
     assert planned is not None, f"no plan of {tiles} on {generation_name}"
     stages = planned[0].stages
     assert stages > 2, f"{generation_name}'s shared memory holds no ring deeper than two stages: {planned}"

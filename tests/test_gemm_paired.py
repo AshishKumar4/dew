@@ -391,32 +391,32 @@ def test_side_by_side_gradients_read_a_wide_cotangent_wide():
     np.testing.assert_array_equal(np.asarray(d_rows), np.full((64, 128), np.float16(70000.0 * 192 / 1024)))
 
 
-@pytest.mark.parametrize(("generation_name", "hidden", "widths", "rows", "dtype", "taken"), [
-    ("sm90", 4096, (4096, 1024, 1024), 12288, jnp.bfloat16, True),
-    ("sm90", 2560, (8192, 1024, 1024), 12288, jnp.bfloat16, True),
-    ("sm90", 2560, (8192, 1024, 1024), 2048, jnp.bfloat16, False),
-    ("sm90", 4096, (4096, 1024, 1024), 12288, jnp.float16, False),
-    ("sm80", 4096, (4096, 1024, 1024), 12288, jnp.bfloat16, False)],
+@pytest.mark.parametrize(("generation_name", "hidden", "widths", "rows", "dtype"), [
+    ("sm90", 4096, (4096, 1024, 1024), 12288, jnp.bfloat16),
+    ("sm90", 2560, (8192, 1024, 1024), 12288, jnp.bfloat16),
+    ("sm90", 2560, (8192, 1024, 1024), 2048, jnp.bfloat16),
+    ("sm90", 4096, (4096, 1024, 1024), 12288, jnp.float16),
+    ("sm80", 4096, (4096, 1024, 1024), 12288, jnp.bfloat16)],
     ids=["h100-8b-4x3072", "h100-4b-4x3072", "h100-4b-1x2048", "h100-8b-fp16", "a100-8b-4x3072"])
-def test_projections_side_by_side_take_one_launch_where_a_receipt_timed_it(generation_name, hidden, widths,
-                                                                             rows, dtype, taken):
-    """A layer's query, key and value over `dtype` rows, nothing named (`gemm.side_by_side`): on an assumed
-    H100 a launch takes them side by side at the joined geometry, rows and bf16 operands M-EM-73 timed the
-    chained input gradient faster than XLA's products (Llama-3.1-8B's and Qwen3.5-4B's at 4 x 3072 rows:
-    `Kind.together` keyed by its joined matrix, `TOGETHER`), not at the 4B's 1 x 2048, where it lost (base
-    review 156a4595a F4), nor fp16 operands, which no receipt timed (base review b68fc2382 F4); on an A100,
-    whose cp.async rings take no matrices side by side, none does, and the template named refuses them as
-    `gemm` would (`KernelRefused`, which a layer reads as its projections apart, `joined.BesideCase`)."""
+def test_projections_side_by_side_admit_legal_hopper_shapes_and_refuse_ampere(generation_name, hidden, widths,
+                                                                              rows, dtype):
+    """A layer's query, key and value over `dtype` rows (`gemm.side_by_side`): on an assumed H100 with the
+    template named explicitly, every valid Hopper geometry is admitted as `mosaic`; on an assumed A100,
+    whose cp.async rings take no matrices side by side, none is admitted and naming the template raises
+    `KernelRefused` (row 9769)."""
     from dew.nn.kernels.selection import KernelRefused
 
     matrices = tuple(jax.ShapeDtypeStruct((hidden, width), dtype) for width in widths)
     lhs = jax.ShapeDtypeStruct((rows, hidden), dtype)
     with generation.assumed(generation_name):
-        assert (gemm.side_by_side(lhs, matrices, dtype, None, whole=True) is not None) is taken
         if generation_name == "sm80":
+            assert gemm.side_by_side(lhs, matrices, dtype, None, whole=True) is None
             with generation.chosen(grouped_matmul="mosaic"), pytest.raises(KernelRefused):
                 gemm.side_by_side(lhs, matrices, dtype, None, whole=True)
-
+        else:
+            with generation.chosen(grouped_matmul="mosaic"):
+                route = gemm.side_by_side(lhs, matrices, dtype, None, whole=True)
+            assert route is not None and route.kernel == "mosaic", route
 
 def _overflow_witness(depth: int, rank: int) -> tuple[np.ndarray, ...]:
     """LoRA operands (`x [256, depth]`, `W [depth, 256]`, `A [depth, rank]`, `B [rank, 256]`) whose first
@@ -455,25 +455,31 @@ def test_an_adapted_products_running_sum_crosses_its_base_and_rank_as_one(depth,
     assert float(np.asarray(out, np.float32)[0, 0]) == 2.0 ** 127
 
 
-def test_an_unmeasured_side_by_side_forward_runs_each_product_in_its_own_cell():
-    """Two of Qwen3.5-4B's key-width matrices (2,560 by 1,024) side by side over 24,576 bf16 rows on an
-    assumed H100, nothing named: no receipt timed them in one launch, so each runs its own call (`APART`, the
-    op's preference), and each is the template's, the cell M-EM-36 timed its product in (`FOUR_B`), where
-    XLA's dot stood for both (base review a1ad2b4ca F3)."""
-    from dew.nn.kernels import grouped_matmul
+def test_side_by_side_forward_and_gradients_match_independent_projections():
+    """Matrices side by side through `gemm.gemm` with the template named explicitly on an assumed H100
+    (interpreted) match independent `gemm.gemm` projections in both forward values and input/matrix gradients
+    (rows 9665, 9768, 9769)."""
+    rng = np.random.default_rng(17)
+    rows = jnp.asarray(rng.integers(-2, 3, size=(128, 128)), jnp.bfloat16)
+    first = jnp.asarray(rng.integers(-2, 3, size=(128, 128)), jnp.bfloat16)
+    second = jnp.asarray(rng.integers(-2, 3, size=(128, 64)), jnp.bfloat16)
 
-    rows = jax.ShapeDtypeStruct((24576, 2560), jnp.bfloat16)
-    matrices = [jax.ShapeDtypeStruct((2560, 1024), jnp.bfloat16)] * 2
-    with generation.assumed("sm90"), generation.routes() as routes:
-        jax.eval_shape(lambda rows, *matrices: gemm.gemm(rows, matrices[0], beside=matrices[1:],
-                                                         out_dtype=jnp.bfloat16), rows, *matrices)
-    taken = [route for route in routes if route.choice == "grouped_matmul"]
-    mosaic = grouped_matmul.MosaicGmm.name
-    assert [route.kernel for route in taken] == [grouped_matmul.APART.name, mosaic, mosaic], taken
-    # A policy, not a receipt: the apart route is the op's preference, no measured win claimed (base review
-    # 3f38bf20d F3).
-    assert taken[0].preferred == grouped_matmul.APART.name and taken[0].refusal is None, taken[0]
+    def together(x, a, b):
+        outs = gemm.gemm(x, a, beside=(b,), out_dtype=jnp.float32, interpret_on_cpu=True)
+        return jnp.sum(outs[0]) + jnp.sum(outs[1]), outs
 
+    def apart(x, a, b):
+        o0 = gemm.gemm(x, a, out_dtype=jnp.float32, interpret_on_cpu=True)
+        o1 = gemm.gemm(x, b, out_dtype=jnp.float32, interpret_on_cpu=True)
+        return jnp.sum(o0) + jnp.sum(o1), (o0, o1)
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        (_, outs_t), grads_t = jax.value_and_grad(together, argnums=(0, 1, 2), has_aux=True)(
+            rows, first, second)
+        (_, outs_a), grads_a = jax.value_and_grad(apart, argnums=(0, 1, 2), has_aux=True)(
+            rows, first, second)
+    for got, exp in zip((*outs_t, *grads_t), (*outs_a, *grads_a), strict=True):
+        np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(exp, np.float32))
 
 def test_projections_side_by_side_whose_forward_a_pin_refuses_run_apart():
     """Projections of widths 256, 128 and 128 over 12,288 bf16 rows on an assumed H100, the template pinned

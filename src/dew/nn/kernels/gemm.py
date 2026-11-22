@@ -778,23 +778,31 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     blockwise FP8 product (1 x 128 activation tiles, 128 x 128 weight blocks; row 4518). Its forward alone:
     a recipe's gradients are their own FP8 products of requantized operands (row 2513). Its selector
     (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's."""
+    sizes_spec = jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32)
     launch = grouped_matmul.MosaicStepScaledGmm()
-    sizes = group_sizes.astype(jnp.int32)
-    call = functools.partial(launch, out_dtype='float32', trans_rhs=True, interpret=interpret_on_cpu,
-                             exact_sums=True)
     per = kernel.shape[1] // column_scales.shape[-1]
     # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
-    tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel, sizes), **call.keywords,
+    tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel), sizes_spec, out_dtype='float32',
+                                         trans_rhs=True, interpret=interpret_on_cpu, exact_sums=True,
                                          scales=_abstract(row_scales, column_scales)))
             if per == 1 or per % SCALE_DEPTH == 0 else None)
-    if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
-        assert tile is not None, "the selector names the template where it plans a tile"
-        summed = call(lhs, kernel, sizes, scales=(row_scales, column_scales))
-    else:
+
+    def portable(lhs, kernel, sizes, row_scales, column_scales):
         # Each product of two FP8 values is exact in bfloat16's range and in fp32.
         matrices = jnp.swapaxes(kernel, 1, 2).astype(jnp.bfloat16)
-        summed = xla_products.step_scaled(lhs.astype(jnp.bfloat16), matrices, group_sizes, row_scales,
-                                            column_scales, precision=jax.lax.Precision.DEFAULT)
+        return xla_products.step_scaled(lhs.astype(jnp.bfloat16), matrices, sizes, row_scales,
+                                        column_scales, precision=jax.lax.Precision.DEFAULT)
+
+    def mosaic(lhs, kernel, sizes, row_scales, column_scales, *, interpret):
+        return launch(lhs, kernel, sizes.astype(jnp.int32), out_dtype='float32', trans_rhs=True,
+                      interpret=interpret, exact_sums=True, scales=(row_scales, column_scales))
+
+    if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
+        assert tile is not None, "the selector names the template where it plans a tile"
+        summed = _dispatched(mosaic, portable, interpret_on_cpu, lhs, kernel, group_sizes, row_scales,
+                             column_scales)
+    else:
+        summed = portable(lhs, kernel, group_sizes, row_scales, column_scales)
     return summed.astype(out_dtype)
 
 
@@ -809,19 +817,29 @@ def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_bloc
     `group_blocks[g]` whole 128-row blocks, in order (a recipe pads each group's rows to them, DeepGEMM's
     contiguous layout), so no block straddles groups. Its selector (`BLOCKWISE_FP8`) runs the template's
     rows-contiguous kernel gradient where named (`mosaic_gpu.tgmm`'s `k_major`), else XLA's."""
-    sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicStepScaledTgmm()
-    # Bound as the call it is, its operands' rows first as a kernel gradient states them: the rows-contiguous
-    # operands' transposes, which XLA folds into the kernel's operands (`MosaicStepScaledTgmm`).
-    call = functools.partial(launch, lhs_t.T, rhs_t.T, sizes, out_dtype='float32', interpret=interpret_on_cpu,
-                             exact_sums=True, step_scales=(row_scales, column_scales))
-    tile = _planned(launch, launch.bind(*_abstract(*call.args), **{
-        **call.keywords, 'step_scales': _abstract(row_scales, column_scales)}))
+    # Bound as the call it is, its operands' rows first as a kernel gradient states them: abstract shapes
+    # alone during planning so transposes and scaled counts run only in the chosen branch.
+    lhs_spec = jax.ShapeDtypeStruct((lhs_t.shape[1], lhs_t.shape[0]), lhs_t.dtype)
+    rhs_spec = jax.ShapeDtypeStruct((rhs_t.shape[1], rhs_t.shape[0]), rhs_t.dtype)
+    sizes_spec = jax.ShapeDtypeStruct(group_blocks.shape, jnp.int32)
+    tile = _planned(launch, launch.bind(lhs_spec, rhs_spec, sizes_spec, out_dtype='float32',
+                                        interpret=interpret_on_cpu, exact_sums=True,
+                                        step_scales=_abstract(row_scales, column_scales)))
+
+    def portable(lhs_t, rhs_t, group_blocks, row_scales, column_scales):
+        return _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales)
+
+    def mosaic(lhs_t, rhs_t, group_blocks, row_scales, column_scales, *, interpret):
+        return launch(lhs_t.T, rhs_t.T, (group_blocks * SCALE_DEPTH).astype(jnp.int32), out_dtype='float32',
+                      interpret=interpret, exact_sums=True, step_scales=(row_scales, column_scales))
+
     if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
-        summed = call()
+        summed = _dispatched(mosaic, portable, interpret_on_cpu, lhs_t, rhs_t, group_blocks, row_scales,
+                             column_scales)
     else:
-        summed = _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales)
+        summed = portable(lhs_t, rhs_t, group_blocks, row_scales, column_scales)
     return summed.astype(out_dtype)
 
 
@@ -910,30 +928,45 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     thirty-second of the rows' bytes (row 4851)."""
     from dew.nn.kernels.templates import mosaic_sm100
 
-    sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicMxGmm()
     tables = (() if gather is None else (gather,))
     # Gathered rows' block scales are the same table's rows of the rows' scales, laid out for the products:
-    # planned from their tiles' shapes, laid out only where the template runs, so a call whose scales no tile
-    # holds (rows short of 128, a depth of fewer than four blocks) takes the decoded product.
-    rows_scales = lhs.scales if gather is None else lhs.scales[gather]
+    # planned from `mosaic_sm100.scale_tiles` alone so gathers and tiling run only in the chosen branch.
+    rows_count = lhs.scales.shape[0] if gather is None else gather.shape[0]
+    rows_scales_spec = jax.ShapeDtypeStruct((rows_count, *lhs.scales.shape[1:]), lhs.scales.dtype)
+    mat_scales_spec = jax.ShapeDtypeStruct(matrices.scales.shape, matrices.scales.dtype)
+    sizes_spec = jax.ShapeDtypeStruct(group_blocks.shape, jnp.int32)
+    tileable = all(mosaic_sm100.scales_tileable(each) for each in (rows_scales_spec, mat_scales_spec))
 
-    def tiled():
-        return mosaic_sm100.scales_tiled(rows_scales), mosaic_sm100.scales_tiled(matrices.scales)
+    def _tiled_spec(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+        *lead, rows_dim, cols_dim = spec.shape
+        return jax.ShapeDtypeStruct((*lead, *mosaic_sm100.scale_tiles(rows_dim, cols_dim)), spec.dtype)
 
-    call = functools.partial(launch, lhs.codes, matrices.codes, sizes, (), (), None, None, *tables,
-                             out_dtype='float32', trans_rhs=True, interpret=interpret)
-    tileable = all(mosaic_sm100.scales_tileable(each) for each in (rows_scales, matrices.scales))
-    tile = None if not tileable else _planned(launch, launch.bind(
-        *_abstract(*call.args[:3]), (), (), None, None, *_abstract(*tables),
-        **{**call.keywords, 'scales': jax.eval_shape(tiled)}))
-    if selection.select(op, ScaledCase(tile)).kernel != 'mosaic':
-        values = lhs.decoded() if gather is None else lhs.decoded()[gather]
-        return xla_products.xla_ragged_dot(values, jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
+    scales_spec = (None if not tileable else (_tiled_spec(rows_scales_spec), _tiled_spec(mat_scales_spec)))
+    tile = None if scales_spec is None else _planned(launch, launch.bind(
+        *_abstract(lhs.codes, matrices.codes), sizes_spec, (), (), None, None, *_abstract(*tables),
+        out_dtype='float32', trans_rhs=True, interpret=interpret, scales=scales_spec))
+    def portable(lhs_codes, lhs_scales, mat_codes, mat_scales, group_blocks, *gather_arg):
+        sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
+        lhs_val = dataclasses.replace(lhs, codes=lhs_codes, scales=lhs_scales).decoded()
+        mat_val = dataclasses.replace(matrices, codes=mat_codes, scales=mat_scales).decoded()
+        values = lhs_val if not gather_arg else lhs_val[gather_arg[0]]
+        return xla_products.xla_ragged_dot(values, jnp.swapaxes(mat_val, 1, 2), sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
+
+    def mosaic(lhs_codes, lhs_scales, mat_codes, mat_scales, group_blocks, *gather_arg, interpret):
+        sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
+        rows_sc = lhs_scales if not gather_arg else lhs_scales[gather_arg[0]]
+        scales = (mosaic_sm100.scales_tiled(rows_sc), mosaic_sm100.scales_tiled(mat_scales))
+        return launch(lhs_codes, mat_codes, sizes, (), (), None, None, *gather_arg,
+                      out_dtype='float32', trans_rhs=True, interpret=interpret, scales=scales)
+
+    operands = (lhs.codes, lhs.scales, matrices.codes, matrices.scales, group_blocks, *tables)
+    if selection.select(op, ScaledCase(tile)).kernel != 'mosaic':
+        return portable(*operands)
     assert tile is not None, "the selector names the template where it plans a tile"
-    return call(scales=tiled())
+    return _dispatched(mosaic, portable, interpret, *operands)
 
 
 NVFP4_BLOCK_OP = _block_scaled_op(generation.Choice.NVFP4_BLOCK, "an NVFP4 product")
@@ -1839,14 +1872,26 @@ def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:
     return jnp.arange(rows) < jnp.sum(group_sizes)
 
 
+def _committed_device(operands):
+    """The single committed device of concrete `operands`, or None if uncommitted, empty, or mixed."""
+    devices = {
+        device
+        for leaf in jax.tree.leaves(operands)
+        if isinstance(leaf, jax.Array) and leaf.committed
+        for device in leaf.devices()
+    }
+    return next(iter(devices)) if len(devices) == 1 else None
+
+
 def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
     """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
     (`xla_products._on_platform`). Evaluated eagerly, `platform_dependent` knows its platform and runs
     its branch alone, so a CPU's would skip the selection the kernel's branch makes (its routes, a named
     kernel's refusal): an eager call is first traced abstractly as a jit traces it, every branch
-    selecting, then runs its platform's branch eagerly, op by op as any eager call does: run under a jit
-    of its own (23c59c5fb), a quantized block's reload no longer computed its logits bit for bit
-    (test_wrapped_runs)."""
+    selecting, then runs its platform's branch eagerly on the operands' committed device where they carry
+    one (so `jax.lax.platform_dependent` resolves its lowering platform natively even under a mismatched
+    `jax.default_device`), op by op as any eager call does: run under a jit of its own (23c59c5fb), a
+    quantized block's reload no longer computed its logits bit for bit (test_wrapped_runs)."""
     branches, default = xla_products._on_platform(kernel, portable, interpret_on_cpu)
 
     def dispatched(*operands):
@@ -1856,4 +1901,7 @@ def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
 
     if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
         jax.eval_shape(dispatched, *operands)
+        if (device := _committed_device(operands)) is not None:
+            with jax.default_device(device):
+                return dispatched(*operands)
     return dispatched(*operands)

@@ -127,12 +127,17 @@ class Together(NamedTuple):
     evidence: str
 
 
-TOGETHER = (Together('wgmma', Made.INPUT_GRADIENT, 'bfloat16',
-                     Timed(frozenset(QKV_8B_4B), 4 * 3072, 4 * 3072), 'mosaic', M_EM_73),)
-"""The products in one launch receipts timed a kernel winning (`Together`): a call of them a cell of its own,
-keyed by its geometry (its `matrix`), which the declared cells run on the winner (`grouped_matmul.DECLARED`);
-outside them (the 4B's 1 x 2048, where the chain lost; fp16, untimed) each product its own call
-(`grouped_matmul._grouped_preferred`)."""
+QKV_4B_SHORT = (('chained', 2560, (1024, 1024, 8192)),)
+"""Qwen3.5-4B's query, key and value chained input gradient, where M-EM-73 measured the template behind XLA at
+1 x 2048 (0.263 vs 0.200 ms, 1.32x; rows 9665, 9768, 10151)."""
+
+TOGETHER = (
+    Together('wgmma', Made.INPUT_GRADIENT, 'bfloat16',
+             Timed(frozenset(QKV_4B_SHORT), 2048, 2048), 'apart', M_EM_73),
+)
+"""The products in one launch receipts timed losing to running apart (`Together`): declared to `'apart'`
+(`grouped_matmul.DECLARED`); every other products-in-one-launch call defaults to the template
+(kernel-templates.md §7; rows 9665, 9768)."""
 
 
 M_EM_36 = ("M-EM-36-gh200 (a GH200, base/kernels df82480cb5c, CUPTI medians of 5 rounds, cuBLASLt autotuned "
