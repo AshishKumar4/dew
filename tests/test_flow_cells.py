@@ -393,13 +393,17 @@ def test_a_parts_prepare_draws_an_nvfp4_tiles_values_on_the_host(tmp_path, monke
     import model_flows
     import test_algebra_bits
     import tier_wire
+    from arm_store import armed
     from generation_support import node_target
-    from truths_ahead import prepared
+    from truths_ahead import CompiledTruths, prepared
 
     monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
     with prepared(tmp_path / "store", stamp="a", target=node_target()):
         assert test_algebra_bits._quantized_values().shape == (256, 64)
+    # Each of its arms prepared in the store, as the run reads them (row 11747).
+    store = CompiledTruths(tmp_path / "store", prepare=False, stamp="a")
+    assert all(store.holds(armed(f"an NVFP4 tile's values, {step}")) for step in ("quantized", "decoded"))
 
 
 def test_a_parts_prepare_compiles_a_site_calling_the_host_at_its_run(tmp_path, monkeypatch):
