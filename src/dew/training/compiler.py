@@ -629,7 +629,8 @@ class DrawingStep:
     the microbatches the run dispatched (`drawn`), and a call no fit drew for, as `Trainer.compile`'s caller
     makes (`dew inspect`, a step called by hand), draws its own from where it stands, its first at its
     state's step's microbatches. A count none admitted yet is admitted as a call first draws it (`admit`),
-    on the loop, where every process draws it at once (rows 7959, 8067)."""
+    on the loop, where every process draws it at once, over the state the call steps (rows 7959, 8067), its
+    seconds the interval's compiling (`Interval.compiling`) where a fit drew it."""
 
     plans: dict[int, Planned]
     flops: dict[int, StepFlops | None]
@@ -643,21 +644,26 @@ class DrawingStep:
     pending: bool = False
     position: int | None = None
     """The global position of the next draw's first microbatch; None until a fit or the first call sets it."""
-    admit: Callable[[int], tuple[Planned, StepFlops | None]] | None = None
-    """A count's plan and FLOPs, admitted at the cap's plan (`StepCompiler.admitted_at`); none where every
-    count was admitted as the step was built (counts compiled ahead)."""
+    admit: Callable[[int, TrainState], tuple[Planned, StepFlops | None]] | None = None
+    """A count's plan and FLOPs, admitted at the cap's plan (`StepCompiler.admitted_at`) over the state the
+    call steps, which holds what its first step built (its window, its copies), so the fit check charges
+    none of them again; none where every count was admitted as the step was built (counts compiled
+    ahead)."""
     waited: Callable[[int], None] = lambda count: None
     """Waits for a count's compile off the loop where one is running (`LaterCounts`), before it is admitted
     on it."""
     begin: Callable[[DrawingStep, int], None] | None = None
     """Begins compiling, off the loop, the counts the draws from a global position will ask
-    (`dew.training.ahead.LaterCounts`), called once, at the first draw."""
+    (`dew.training.ahead.LaterCounts`), called once, at a fit's first draw (`drawn`): the fit waits for them
+    as it ends (`Trainer._later`), where a step called by hand would leave them running past its caller's
+    end, so it admits each count on its loop alone."""
 
-    def drawn(self, interval: Interval, step: int) -> StepFlops | None:
+    def drawn(self, interval: Interval, step: int, state: TrainState) -> StepFlops | None:
         """The counts of the next call's microbatches at the run's dispatched microbatches
         (`Interval.microbatches`, the interval's count past them): a run's first step, its fresh start's
         microbatch 0, a checkpoint's microbatches where it counted them, else (a checkpoint of a run that drew
-        none) its `step`'s, said; and the call's FLOPs, each microbatch's at its count's program's."""
+        none) its `step`'s, said; and the call's FLOPs, each microbatch's at its count's program's. A count
+        admitted over `state`, the state the call steps, adds its seconds to the interval's compiling."""
         if interval.microbatches is None:
             interval.microbatches = step * self.split
             if interval.last_saved is not None:
@@ -665,9 +671,14 @@ class DrawingStep:
                           "draw on from step %d's, microbatch %d", step, interval.microbatches)
         self.position = interval.microbatches
         interval.microbatches += self.split
+        if self.begin is not None:
+            begin, self.begin = self.begin, None
+            begin(self, self.position)
         self._draw()
         self.pending = True
-        self._admitted()
+        began = time.perf_counter()
+        self._admitted(state)
+        interval.compiling += time.perf_counter() - began
         total: StepFlops | None = None
         for count in self.counts:
             each = self.flops[count]
@@ -679,9 +690,6 @@ class DrawingStep:
     def _draw(self) -> None:
         """The next call's counts, drawn at `position`, which moves past them."""
         assert self.position is not None
-        if self.begin is not None:
-            begin, self.begin = self.begin, None
-            begin(self, self.position)
         self.counts = [self.sampled.count(self.key, self.position + part) for part in range(self.split)]
         self.position += self.split
 
@@ -693,12 +701,12 @@ class DrawingStep:
                               if (count := self.sampled.count(self.key, position + at)) < self.sampled.cap)
         return [*drawn, *(count for count in range(1, self.sampled.cap) if count not in drawn)]
 
-    def _admitted(self) -> None:
-        """Each count of the call in hand admitted (`admit`) where none was."""
+    def _admitted(self, state: TrainState) -> None:
+        """Each count of the call in hand admitted (`admit`) over `state` where none was."""
         for count in dict.fromkeys(self.counts):
             if count not in self.plans:
                 assert self.admit is not None, f"count {count} was admitted as the step was built"
-                self.plans[count], self.flops[count] = self.admit(count)
+                self.plans[count], self.flops[count] = self.admit(count, state)
 
     def __call__(self, state: TrainState, batch: Batch, /, sampled: bool = False):
         assert self.run is not None
@@ -707,7 +715,7 @@ class DrawingStep:
             if self.position is None:
                 self.position = int(state.step) * self.split
             self._draw()
-            self._admitted()
+            self._admitted(state)
         self.pending = False
         return self.run(state, batch, sampled)
 
@@ -1059,13 +1067,13 @@ class StepCompiler[L, E]:
         return self.sampled_step(holder, stepping, compiled, state, batch, key)
 
     @staticmethod
-    def drawn(held: tuple[CompiledStep, StepFlops | None], interval: Interval,
-              step: int) -> tuple[CompiledStep, StepFlops | None]:
+    def drawn(held: tuple[CompiledStep, StepFlops | None], interval: Interval, step: int,
+              state: TrainState) -> tuple[CompiledStep, StepFlops | None]:
         """A compiled step and its FLOPs (`held`), a drawing step's (`DrawingStep`) its next call's counts
-        drawn at the microbatches `interval` counted, its FLOPs theirs."""
+        drawn at the microbatches `interval` counted and admitted over `state`, its FLOPs theirs."""
         compiled, flops = held
         if isinstance(compiled, DrawingStep):
-            flops = compiled.drawn(interval, step)
+            flops = compiled.drawn(interval, step, state)
         return compiled, flops
 
     def sampled_step(self, holder: Holding[L, E], stepping: Callable[[], Stepping], cap: Compiled,
@@ -1097,16 +1105,17 @@ class StepCompiler[L, E]:
             from dew.training._candidates import _shapes
             from dew.training.ahead import LaterCounts
 
-            # The state's shapes as the step was built over it, which its counts are admitted over.
-            shapes = _shapes(state)
+            # The batch's shapes, not its arrays, which the step would hold on the devices as long as it.
+            shaped = _shapes(batch)
 
-            def admit(count: int) -> tuple[Planned, StepFlops | None]:
+            def admit(count: int, current: TrainState) -> tuple[Planned, StepFlops | None]:
                 step.waited(count)
-                [(_, each)] = self.admitted_counts(holder, stepping, planned, shapes, batch, (count,))
+                [(_, each)] = self.admitted_counts(holder, stepping, planned, _shapes(current), shaped,
+                                                   (count,))
                 return each.released(), self._flops(each)
 
             step.admit = admit
-            step.begin = LaterCounts.begun(holder, planned, shapes, batch)
+            step.begin = LaterCounts.begun(holder, planned, _shapes(state), shaped)
         step.run = self.runner(capped, planned, capped.settings.device_mesh,
                                parted=lambda: [plans[count] for count in step.counts])
         return step
@@ -1172,7 +1181,7 @@ class StepCompiler[L, E]:
         return flops and planned.split * flops
 
     def admitted_at(self, stepping: Stepping, state: TrainState, batch: Batch, cap: Planned, passes: int,
-                    ahead: AheadOfTime | None = None) -> Planned:
+                    ahead: AheadOfTime | None = None, provisional: bool = False) -> Planned:
         """The step of a sampled pass count's `passes` (`dew.training.phase_passes.SampledPasses`) at exactly
         the plan `cap` its cap's step runs: its split, its rung and the narrow copies the cap's step reads
         (`prepared_for`), so the window's microbatches pass one state between the counts' programs, part by
@@ -1183,39 +1192,23 @@ class StepCompiler[L, E]:
         recorded (`_plans`), so a resume admits each count as the run did. `ahead`, its step compiled ahead
         (`AheadOfTime.at_count`), runs in place of its compile where it is that program. Unreleased: its
         caller releases it (`Planned.released`) once it has read its lowering, a step compiled ahead its
-        program's digest."""
-        settings = stepping.settings
-        mesh = settings.device_mesh
-        links = self.links(mesh)
-        # The cap's rung over this count's modules: its remat, head and options, its passes this count's.
-        cap.at.put(self.objective)
-        self.phase_passes.restored(self.objective)
-        stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape, split=cap.split))
-        try:
-            with stepping.traced_on(mesh, links) as schedule, held_objects():
-                replicated, placement = NamedSharding(mesh, P()), batch_shardings(mesh, batch)
-                shaped = self.loss_shaped(stepping, schedule)
-
-                def lower(split: int, narrow: bool, ns_group: int | None) -> Candidate:
-                    grouped = dataclasses.replace(shaped, settings=dataclasses.replace(shaped.settings,
-                                                                                       ns_group=ns_group))
-                    return candidate_for(grouped, state, batch, schedule, placement, replicated, split,
-                                         narrow, copies=cap.candidate.copies)
-
-                gathered = layer_gathers(self.objective, state.variables, mesh.devices.size)
-                search = FitSearch(
-                    lower, lambda candidate: step_options(
-                        self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
-                    self.objective, mesh, cap.at.xla_defaults, cap.at.narrow, cap.at.ns_group,
-                    None if self._base_rung is None else self._base_rung[1], None, ahead=ahead)
-                if not search.fits_here(cap.split):
-                    short = search.probes[-1].headroom
-                    raise ValueError(f"the step of {passes} passes misses the devices at its cap's plan "
-                                     f"({search.rung()}, {cap.split} microbatches a step)"
-                                     + ("" if short is None else f" by {-short} bytes"))
-                planned = search.found(cap.split)
-        finally:
-            self._loss_shapes.clear()
+        program's digest. A `provisional` admission, off the loop, judges devices the loop's step holds
+        (`FitSearch.provisional`), keeping every executable it compiles for the loop's to judge again."""
+        mesh = stepping.settings.device_mesh
+        with self._lowering_at(stepping, state, batch, cap) as lower:
+            gathered = layer_gathers(self.objective, state.variables, mesh.devices.size)
+            search = FitSearch(
+                lower, lambda candidate: step_options(
+                    self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
+                self.objective, mesh, cap.at.xla_defaults, cap.at.narrow, cap.at.ns_group,
+                None if self._base_rung is None else self._base_rung[1], None, ahead=ahead,
+                provisional=provisional)
+            if not search.fits_here(cap.split):
+                short = search.probes[-1].headroom
+                raise ValueError(f"the step of {passes} passes misses the devices at its cap's plan "
+                                 f"({search.rung()}, {cap.split} microbatches a step)"
+                                 + ("" if short is None else f" by {-short} bytes"))
+            planned = search.found(cap.split)
         self._refuse_unlike(cap, planned.candidate, planned.executable.out_info, passes)
         return planned
 
@@ -1248,20 +1241,33 @@ class StepCompiler[L, E]:
             self.phase_passes.current = sampled.cap
 
     def _lowered_at(self, stepping: Stepping, state: TrainState, batch: Batch, cap: Planned) -> Candidate:
-        """The step the objective's count runs lowered at the cap's plan `cap`, as `admitted_at` lowers it."""
-        settings = stepping.settings
-        mesh = settings.device_mesh
+        """The step the objective's count runs lowered at the cap's plan `cap` (`_lowering_at`)."""
+        with self._lowering_at(stepping, state, batch, cap) as lower:
+            return lower(cap.split, cap.at.narrow, cap.at.ns_group)
+
+    @contextlib.contextmanager
+    def _lowering_at(self, stepping: Stepping, state: TrainState, batch: Batch,
+                     cap: Planned) -> Iterator[Callable[[int, bool, int | None], Candidate]]:
+        """The lowering of the step the objective's count runs at the cap's plan `cap`, at a split, narrow
+        copies and group (`FitSearch.lower`): the cap's rung over this count's modules (its remat, head and
+        options, its passes this count's), its split and the cap's narrow copies, traced on its mesh; the one
+        lowering `admitted_at` searches with and `lowered_counts` refuses by."""
+        mesh = stepping.settings.device_mesh
         cap.at.put(self.objective)
         self.phase_passes.restored(self.objective)
         stepping = dataclasses.replace(stepping, shape=dataclasses.replace(stepping.shape, split=cap.split))
         try:
             with stepping.traced_on(mesh, self.links(mesh)) as schedule, held_objects():
+                replicated, placement = NamedSharding(mesh, P()), batch_shardings(mesh, batch)
                 shaped = self.loss_shaped(stepping, schedule)
-                grouped = dataclasses.replace(shaped, settings=dataclasses.replace(
-                    shaped.settings, ns_group=cap.at.ns_group))
-                return candidate_for(grouped, state, batch, schedule, batch_shardings(mesh, batch),
-                                     NamedSharding(mesh, P()), cap.split, cap.at.narrow,
-                                     copies=cap.candidate.copies)
+
+                def lower(split: int, narrow: bool, ns_group: int | None) -> Candidate:
+                    grouped = dataclasses.replace(shaped, settings=dataclasses.replace(shaped.settings,
+                                                                                       ns_group=ns_group))
+                    return candidate_for(grouped, state, batch, schedule, placement, replicated, split,
+                                         narrow, copies=cap.candidate.copies)
+
+                yield lower
         finally:
             self._loss_shapes.clear()
 

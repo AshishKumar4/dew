@@ -1437,8 +1437,7 @@ class LaterPlans:
         finally:
             pool.shutdown(wait=False)
         _log.info("planning the steps of data phases %s off the loop", begun)
-        # A sampled run's counts compiling off the loop already (`LaterCounts`) are waited for alike.
-        return cls({**(trainer._later.futures if trainer._later is not None else {}), **futures})
+        return cls(futures)
 
     def waited(self, passes: int | None) -> None:
         """The plan of the phase whose step runs `passes` waited for, so the executables it compiled, which
@@ -1500,19 +1499,23 @@ class LaterCounts:
                 # (`PhasePasses.drawn_count`): the loop's own count stands at the cap meanwhile.
                 stepping = dataclasses.replace(stepping, settings=dataclasses.replace(
                     stepping.settings, sampled_passes=count))
-                compiler.admitted_at(stepping, shapes, batch, cap, count).released()
+                compiler.admitted_at(stepping, shapes, batch, cap, count, provisional=True).released()
 
         def begin(step, position: int) -> None:
+            # An earlier batch signature's counts still compiling off the loop: those not begun give way to
+            # this step's own, and one compiling is kept, waited for as the run ends.
+            running = {count: future for count, future in
+                       (trainer._later.futures if trainer._later is not None else {}).items()
+                       if not future.cancel() and not future.done()}
             order = [count for count in step.upcoming(position, UPCOMING_STEPS * step.split)
-                     if count not in step.plans]
+                     if count not in step.plans and count not in running]
             pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-later-counts")
             try:
                 futures = {count: pool.submit(contextvars.copy_context().run, compiled, count)
                            for count in order}
             finally:
                 pool.shutdown(wait=False)
-            held = trainer._later.futures if trainer._later is not None else {}
-            later = LaterPlans({**held, **futures})
+            later = LaterPlans({**running, **futures})
             trainer._later = later
             step.waited = later.waited
             _log.info("compiling the steps of pass counts %s off the loop, as the draws ask them", order)

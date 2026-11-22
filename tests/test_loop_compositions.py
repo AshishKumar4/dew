@@ -48,7 +48,7 @@ def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copi
         counts, fixed = [], {}
         for index in range(4):
             if isinstance(step, DrawingStep):
-                step.drawn(interval, index)
+                step.drawn(interval, index, state)
                 counts.extend(step.counts)
             oracle = drawn and implicit and copies and gated
             # The state before the step donates it, read where the fixed-count program steps it too.
@@ -99,7 +99,7 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
     def stepped(trainer) -> float:
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
-        step.drawn(Interval(0.0, None, microbatches=0), 0)
+        step.drawn(Interval(0.0, None, microbatches=0), 0, state)
         return float(step(state, batch)[1])
 
     with pytest.raises(ValueError):
