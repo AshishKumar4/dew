@@ -144,6 +144,19 @@ largest, `M`, its orthogonal `1.5 2^104 - M` formed over the scaled row (an unsc
 to -inf there, the review of 36155cc41)."""
 
 
+def _apg_guided(conditional, unconditional, scale):
+    """APG at eta 0 with no clipping guiding `conditional` against `unconditional` at `scale`, one step's
+    clean prediction: a module's function over values alone, which a statement holds, so a GPU tier part's
+    prepare compiles it (a closure over the guidance's process held an object no statement holds)."""
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+    denoise = process.denoiser(RawPrediction(), {}, {"prediction": conditional},
+                               {"prediction": unconditional})
+    walk = APG(scale, eta=0.0, norm_threshold=0.0).walk(denoise, 1)
+    x = jnp.zeros_like(conditional)
+    # At alpha=0 and sigma=1 DirectPredictionTransform's clean prediction is the raw one.
+    return walk.step(x, jnp.ones(1), 0, walk.init(x))[0][0]
+
+
 def apg_holds_its_projection_at_its_ranges_edges():
     """APG at eta 0 with no clipping over each of `APG_EDGES` (a conditional, an unconditional and a scale)
     guides as Diffusers' float64 projection of the float32 direction does, its orthogonal component rounded
@@ -153,20 +166,10 @@ def apg_holds_its_projection_at_its_ranges_edges():
     (tests/test_gpu_numerics.py)."""
     from reference_error import ahead_arm
 
-    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
-
-    def guided(conditional, unconditional, scale):
-        denoise = process.denoiser(RawPrediction(), {}, {"prediction": conditional},
-                                   {"prediction": unconditional})
-        walk = APG(scale, eta=0.0, norm_threshold=0.0).walk(denoise, 1)
-        x = jnp.zeros_like(conditional)
-        # At alpha=0 and sigma=1 DirectPredictionTransform's clean prediction is the raw one.
-        return walk.step(x, jnp.ones(1), 0, walk.init(x))[0][0]
-
     for name, (conditional, unconditional, scale) in APG_EDGES.items():
         conditional, unconditional = (np.asarray([value], np.float32)
                                       for value in (conditional, unconditional))
-        found = np.asarray(ahead_arm(jax.jit(functools.partial(guided, scale=scale)), f"APG at {name}")(
+        found = np.asarray(ahead_arm(jax.jit(functools.partial(_apg_guided, scale=scale)), f"APG at {name}")(
             conditional, unconditional))
         direction = (conditional - unconditional).astype(np.float64)
         along = conditional.astype(np.float64)
