@@ -1261,10 +1261,9 @@ def test_a_ragged_grouped_forward_at_its_derived_tile_is_its_groups_products(gpu
 
 
 def test_mosaic_completed_starts_unstarted_gathered_b200_producer():
-    """`_Mosaic.completed` completes an unstarted gathered B200 tile with `producers.started`, matching what
-    `derived` starts at so pinned and explicit configs lower the same producer share the planner priced
-    (row 7083)."""
-    from dew.nn.kernels.templates.gemm import producers, tiling
+    """Pinning an unstarted gathered B200 tile completes it to a legal producer share and lowers the same
+    producer allocation in `launch_of` (rows 7083, 11897)."""
+    from dew.nn.kernels.templates.gemm import tiling
 
     launch = grouped_matmul.MosaicGmm()
     ba = launch.bind(jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16),
@@ -1273,33 +1272,37 @@ def test_mosaic_completed_starts_unstarted_gathered_b200_producer():
                      jax.ShapeDtypeStruct((4096,), jnp.int32),
                      out_dtype="bfloat16", trans_rhs=False, interpret=False)
     unstarted = tiling.Tiles(128, 128, 64, 4, 1, warpgroups=1, family="tcgen05")
-    with generation.assumed("sm100"):
-        completed = launch.completed(ba, unstarted)
-        expected = producers.started(launch, ba, unstarted)
-    assert completed == expected and completed.producers.of(launch.KERNEL) is not None, completed
+    with generation.assumed("sm100"), tuning.pinned({grouped_matmul.MosaicGmm: unstarted}):
+        sm100 = generation.gpu_target()
+        pinned = launch.pinned(ba)
+        planned = launch.launch_of(ba, pinned, sm100)
+    assert pinned is not None and pinned.producers.of(launch.KERNEL) is not None
+    assert launch.legal(ba, pinned, sm100)
+    assert planned.producer == pinned.producers.of(launch.KERNEL)
 
 
 def test_mosaic_tgmm_split_pricing_preserves_final_output_dtype():
-    """`MosaicTgmm._split_tile` passes the original `out_dtype` (not the fp32 partials' dtype) into the split
-    planner so a bf16 kernel gradient prices its final store at 2 bytes (row 8296)."""
-    seen_stored: list[int] = []
-
-    class _ObservedTgmm(grouped_matmul.MosaicTgmm):
-        def _splits(self, ba, tile, target) -> int:
-            seen_stored.append(self._contraction(ba, tile, target)["stored"])
-            return super()._splits(ba, tile, target)
-
-    launch = _ObservedTgmm()
+    """`MosaicTgmm._split_plan` prices a bf16 kernel gradient's split walk with a 2-byte final store and an
+    fp32 one's with a 4-byte final store while keeping their fp32 partial-pass costs identical (rows 8296,
+    11888)."""
+    launch = grouped_matmul.MosaicTgmm()
     target = generation.gpu_target("sm90")
     ba_bf16 = launch.bind(jax.ShapeDtypeStruct((8192, 128), jnp.bfloat16),
                           jax.ShapeDtypeStruct((8192, 128), jnp.bfloat16),
                           jax.ShapeDtypeStruct((1,), jnp.int32),
                           out_dtype="bfloat16", interpret=False, dense=True)
+    ba_fp32 = launch.bind(jax.ShapeDtypeStruct((8192, 128), jnp.bfloat16),
+                          jax.ShapeDtypeStruct((8192, 128), jnp.bfloat16),
+                          jax.ShapeDtypeStruct((1,), jnp.int32),
+                          out_dtype="float32", interpret=False, dense=True)
     with generation.assumed("sm90"):
-        tile = launch._split_tile(ba_bf16, target)
-    assert tile is not None and tile.splits > 1 and launch.legal(ba_bf16, tile, target), tile
-    assert len(seen_stored) >= 2 and set(seen_stored) == {2}, seen_stored
-
+        tile_bf16, walk_bf16 = launch._split_plan(ba_bf16, target)
+        tile_fp32, walk_fp32 = launch._split_plan(ba_fp32, target)
+    assert tile_bf16 is not None and launch.legal(ba_bf16, tile_bf16, target)
+    assert tile_fp32 is not None and launch.legal(ba_fp32, tile_fp32, target)
+    assert walk_bf16 is not None and walk_fp32 is not None
+    assert walk_bf16.passes == walk_fp32.passes
+    assert walk_bf16.seconds(4) < walk_fp32.seconds(4)
 def test_mosaic_planning_uses_explicit_target_not_ambient_gpu():
     """Passing an explicit `target` to `MosaicGmm.derived`, `legal`, `takes`, `launch_of` and `staged_bytes`
     plans for that target, including its recorded refusals, rather than the ambient `generation.gpu_target()`
@@ -1328,3 +1331,85 @@ def test_mosaic_planning_uses_explicit_target_not_ambient_gpu():
             report.refuse([(sm86_identity, expected_tile, (launch.KERNEL,))])
             assert not launch.legal(ba, expected_tile, sm86)
             assert not launch.takes(ba, expected_tile, sm86)
+
+
+def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
+    """The GEMM register model prices epilogue hooks sequentially with output staging (sharing freed mainloop
+    scalar registers), keeps the tile-sized live set for distinct multi-output epilogues, and accounts for
+    `dew_tgmm`'s extra indexing scalars on wgmma (row 8723)."""
+    from dew.nn.kernels.templates.gemm import tiling
+
+    gmm = grouped_matmul.MosaicGmm()
+    tgmm = grouped_matmul.MosaicTgmm()
+    sm90 = generation.gpu_target("sm90")
+    x = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((1, 4096, 14336), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+    with generation.assumed("sm90"):
+        two_out_hooks = grouped_matmul.Hooks(
+            epilogue=lambda acc: (acc.astype(jnp.bfloat16), (acc + 1.0).astype(jnp.bfloat16)),
+            out_dtypes=("bfloat16", "bfloat16"))
+        ba_two = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False,
+                          hooks=two_out_hooks)
+        t256 = tiling.Tiles(64, 256, 64, 4, 56, warpgroups=1, family="wgmma")
+        # 128 acc + 32 scalar + max(0, max(32, 16) - 32) + 64 held = 224 (live beside output staging)
+        assert gmm.registers(ba_two, t256) == 224
+        ba_dw = tgmm.bind(x, jax.ShapeDtypeStruct((4096, 14336), jnp.bfloat16), sizes,
+                          out_dtype="float32", interpret=False, dense=False)
+        assert tgmm.registers(ba_dw, t256) == 168
+        assert gmm.legal(ba_two, t256, sm90)
+
+
+def test_gemm_fp32_bf16_part_count_uses_product_precision():
+    """`gemm._bf16_part_count` derives fp32's bf16 decomposition count via `error.product_precision` on both
+    GPU and TPU targets (row 5473)."""
+    for target_name in ("sm90", "v5e"):
+        with generation.assumed(target_name):
+            assert gemm._bf16_part_count(jnp.float32) == 3
+            assert gemm._bf16_part_count(jnp.bfloat16) == 1
+
+
+def test_tpu_v5e_gemm_derives_legal_vmem_bounded_tiles():
+    """On TPU v5e (`mxu`), `MosaicGmm` and `MosaicTgmm` derive legal tiles within v5e's 16 MiB scoped VMEM
+    across the M-FS-45 forward, input-gradient, and kernel-gradient geometries (row 10152)."""
+    v5e = generation.gpu_target("v5e")
+    gmm = grouped_matmul.MosaicGmm()
+    tgmm = grouped_matmul.MosaicTgmm()
+    sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+    with generation.assumed("v5e"):
+        for depth, width in ((4096, 4096), (4096, 28672), (5120, 7168)):
+            x = jax.ShapeDtypeStruct((8192, depth), jnp.bfloat16)
+            w = jax.ShapeDtypeStruct((1, depth, width), jnp.bfloat16)
+            dy = jax.ShapeDtypeStruct((8192, width), jnp.bfloat16)
+            ba_fwd = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+            tile_fwd = gmm.derived(ba_fwd, v5e)
+            assert tile_fwd is not None and gmm.legal(ba_fwd, tile_fwd, v5e)
+            assert gmm.staged_bytes(ba_fwd, tile_fwd, v5e) <= v5e.scoped_vmem
+            ba_dw = tgmm.bind(x, dy, sizes, out_dtype="float32", interpret=False, dense=True)
+            tile_dw = tgmm.derived(ba_dw, v5e)
+            assert tile_dw is not None and tgmm.legal(ba_dw, tile_dw, v5e)
+            assert tgmm.staged_bytes(ba_dw, tile_dw, v5e) <= v5e.scoped_vmem
+
+
+def test_ampere_multi_wave_dense_dx_runs_non_persistent_and_matches_xla():
+    """On Ampere (`mma.sync`, `walks_scoped=True`), multi-wave dense calls skip `_dense_tail` so `launched()`
+    runs non-persistent (avoiding persistent L2 drift on deep-K gate_up dX, row 5363; native multi-CTA
+    switch qualified via M-NG-2 on A100, while interpreted mode runs 1 program and verifies partial-row
+    numerical parity against XLA)."""
+    from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
+
+    with generation.assumed("sm80"):
+        tile = tiling.Tiles(64, 256, 32, 4, 16, warpgroups=1, family="mma.sync", programs=2)
+        family = pricing.family_of(tile, jnp.bfloat16)
+        tail = mosaic_gpu._dense_tail(tile, jnp.bfloat16, (8192, 4096, 28672), (2, 2), 216, balanced=True)
+        assert tail is None
+        assert mosaic_gpu.launched(family, 216, 2048, tail) == 2048
+        rng = np.random.default_rng(31)
+        for rows in (128, 100):
+            dy = jnp.asarray(rng.integers(-2, 3, size=(rows, 256)), jnp.bfloat16)
+            w = jnp.asarray(rng.integers(-2, 3, size=(128, 256)), jnp.bfloat16)
+            with generation.chosen(grouped_matmul="mosaic"):
+                got = gemm.gemm(dy, w, None, transpose_rhs=True, out_dtype=jnp.float32,
+                                interpret_on_cpu=True)
+            expected = jnp.dot(dy, w.T, preferred_element_type=jnp.float32)
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))

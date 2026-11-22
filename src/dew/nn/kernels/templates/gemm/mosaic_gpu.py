@@ -456,10 +456,16 @@ def _dense_tail(tiles: Tiles, dtype, extents: tuple, itemsizes: tuple, multiproc
     m, n, k = extents
     if not merges(tiles, dtype, dense=balanced):
         return None
-    columns = tile_columns(tiles, family_of(tiles, dtype))
-    return balanced_tail(tiles, (-(-m // tiles.block_m), -(-n // columns)), -(-k // tiles.block_k), itemsizes,
-                         generation.gpu_target(), multiprocessors)
-
+    family = family_of(tiles, dtype)
+    columns = tile_columns(tiles, family)
+    grid = (-(-m // tiles.block_m), -(-n // columns))
+    # On a scoped-pipeline family (`walks_scoped`, e.g. mma.sync), a balanced tail forces persistent mode
+    # (`launched`), whose CTAs drift across K over multiple waves and thrash L2 (row 5363; NS-P8-WALK2-a100:
+    # non-persistent ran 0.63x on Qwen3-32B gate_up dX). Keep tail balance for <=1 full wave only.
+    if family.walks_scoped and grid[0] * grid[1] >= 2 * multiprocessors:
+        return None
+    return balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, generation.gpu_target(),
+                         multiprocessors)
 
 def _of_no_depth(shape: tuple, group_sizes, accumulators: int, epilogue, epilogue_operands: tuple,
                  epilogue_axes: tuple, dtypes: tuple) -> tuple:
@@ -687,12 +693,11 @@ def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, 
     """Dew: whether a `gmm` walk of these facts reads a step's first fragments under the step before's last
     product (`_gmm_prefetch`, `Transport.prefetches_fragments`): a plain step's, one matrix of rows as staged
     (no prologue), unscaled and undecoded, no chained products, compiled, its rows and its matrix read
-    untransposed, its products summed by the tensor cores (no running sum of its own), as its walk decides
-    (`_gmm_stepped_at`)."""
+    untransposed (transposed-RHS prefetch requires accounting for the 32-deep granule overlap in
+    `operand_live_depth`), its products summed by the tensor cores (no running sum of its own), as its walk
+    decides (`_gmm_stepped_at`)."""
     return (family.prefetches_fragments and matrices == 1 and prologue is None and not scaled and not chained
             and not interpret and not any(transposed) and not summed)
-
-
 def _gmm_streamed(paired, scales, joined, bounded: "Chained | None" = None) -> tuple[dict, tuple, int]:
     """Dew: `_gmm_mainloop`'s matrices (its own, a paired one), each to the stream of the rows it multiplies
     (the rows', the joined rows' for a joined pair's paired matrix), the streams beyond the rows in its
@@ -1703,12 +1708,7 @@ def _rows_of(slots, matrices: dict, mine_rows, transpose_lhs: bool) -> dict:
 def _gmm_prefetch(family: mosaic.Family, matrices: dict, rows) -> Callable:
     """Dew: the walk's prefetch of a plain `_gmm_step`'s slots (`Transport.prefetches_fragments`;
     `_gmm_stepped_at` decides which are): its one product's first fragments (`Issuer.first_fragments`) of its
-    `rows`, read under the step before's last product, its rows and its matrix read untransposed: the
-    prefetch reads the left operand an instruction's granule at a time (`products_across`), which took a
-    transposed left's kernel gradient 7% slower on an A100 than its whole-swizzle-tile reads (FS-DENSE-AB1),
-    and an input gradient's transposed matrix, prefetched, ran Llama-3-8B's and Qwen3-32B's gate_up input
-    gradients 1.33x and 1.28x slower with an output other than the unprefetched walk's (M-FS-53-a100), where
-    every forward ran faster, its output the same (0.954x geomean)."""
+    `rows`, read under the step before's last product, its rows and its matrix read untransposed."""
     (name,) = matrices
 
     def prefetch(slots):
@@ -1717,7 +1717,6 @@ def _gmm_prefetch(family: mosaic.Family, matrices: dict, rows) -> Callable:
         return family.first_fragments(rows_of[name], oriented[name])
 
     return prefetch
-
 
 def _transformed(prologue, axes_of: tuple, mine: jax.Array, tiles_of: dict, halved: str, half) -> jax.Array:
     """Dew: `mine`, this warpgroup's half of a stage read into registers, transformed by the prologue on its

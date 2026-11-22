@@ -121,15 +121,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         side = _side(layouts, consumers, role, most_rows, columns, rows, target, dtype, steps,
                      padded=grouped and not dense)
         widths = _held_widths(layouts, consumers, columns, role, most_rows, side)
-        busy_at, fallback = None, None
-        for block_n, held_rows in widths:
-            tile, staged = held_tile(block_n, held_rows)
-            if tile is not None and staged and tile.block_m >= min(held_rows, side):
-                return tile, block_n == widths[0][0]
-            busy_at = busy_at or (tile if staged else None)
-            fallback = fallback or tile
-        return busy_at or fallback, False
-
+        return _best_width(widths, held_tile, side, budgets_registers=family.budgets_registers)
     # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
     # does a call no cooperative tile holds (a wide epilogue's outputs past a block), and a grouped call
     # whose groups average fewer rows than one role (a decode step's experts, a few routed rows each), whose
@@ -192,6 +184,7 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
     family = layouts[0]
     busy = 1 + family.loads_ahead + family.in_flight
     fallback = None
+    best: tuple[tuple[float, int, int], Tiles] | None = None
     for block_m in range(held_rows, 0, -role):
         for step in steps:
             def launches_of(layout, block_m=block_m, step=step):
@@ -207,10 +200,45 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
                 # A tile a compile of this process found spilling (`report.refused`) gives way to the next.
                 continue
             if tile.stages >= busy:
-                return tile, True
+                if family.budgets_registers:
+                    return tile, True
+                # VMEM-shared family (`mxu`): minimize 3D tile surface-to-volume ratio (M-FS-45, row 10152).
+                score = _vmem_score(tile)
+                if best is None or score < best[0]:
+                    best = (score, tile)
+                break
             fallback = fallback or tile
+    if best is not None:
+        return best[1], True
     return fallback, False
 
+
+def _vmem_score(tile: Tiles) -> tuple[float, int, int]:
+    """3D tile surface-to-volume ratio `(1/M + 1/N + 1/K)` for VMEM-shared families (M-FS-45, row 10152)."""
+    return (1.0 / tile.block_m + 1.0 / tile.block_n + 1.0 / tile.block_k,
+            -(tile.block_m * tile.block_n), -tile.block_k)
+
+
+def _best_width(widths: list[tuple[int, int]], held_tile: Callable, side: int, *,
+                budgets_registers: bool) -> tuple[Tiles | None, bool]:
+    """Pick the best width among `widths`: widest balanced for register-budgeted families, or lowest
+    `_vmem_score` for VMEM-shared families."""
+    busy_at, fallback = None, None
+    best_vmem: tuple[tuple[float, int, int], Tiles] | None = None
+    for block_n, held_rows in widths:
+        tile, staged = held_tile(block_n, held_rows)
+        if not budgets_registers and tile is not None and staged:
+            score = _vmem_score(tile)
+            if best_vmem is None or score < best_vmem[0]:
+                best_vmem = (score, tile)
+            continue
+        if tile is not None and staged and tile.block_m >= min(held_rows, side):
+            return tile, block_n == widths[0][0]
+        busy_at = busy_at or (tile if staged else None)
+        fallback = fallback or tile
+    if best_vmem is not None:
+        return best_vmem[1], True
+    return busy_at or fallback, False
 
 def _held_widths(layouts: tuple, consumers: int, columns: list[int], role: int, most_rows: int,
                  side: int) -> list[tuple[int, int]]:
