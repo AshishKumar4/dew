@@ -293,7 +293,7 @@ class ObservedScoring:
         counts = dict(asked)
         for row, output in zip(admitted.rows, outputs, strict=True):
             [laid] = row.questions
-            self.values[laid.name] = np.asarray(output)[0, :counts[laid.name]].copy()
+            self.values[laid.name] = np.asarray(output.logits)[0, :counts[laid.name]].copy()
         return self.task.answer(admitted, outputs)
 
 
