@@ -373,6 +373,15 @@ def walk_roles(family: mosaic.Family) -> int:
     return min(family.consumers, 2) if family.warpgroups(1) > 1 else 1
 
 
+def _spread(held: int, programs: int, target: generation.GpuTarget) -> int:
+    """The programs of a launch holding `held` a multiprocessor of `target` runs at once: no more than its
+    `programs` spread over the device's multiprocessors where it knows them, as a launch's blocks go to its
+    multiprocessors in turn (`Mosaic._running`'s states launch, `Mosaic._output_hides`' output)."""
+    if target.multiprocessors is None:
+        return held
+    return min(held, -(-programs // target.multiprocessors))
+
+
 @dataclasses.dataclass(frozen=True)
 class Mosaic(base.Template[mainloop.Tiles]):
     """The chunked rule on the recurrence template's mainloop (`mosaic_rule`), its config
@@ -1006,9 +1015,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         [output] = [launch for launch in self.launches(ba, tiles, target, backward=False,
                                                        training_forward=training)
                     if launch.name.split("__")[0].endswith("output")]
-        running = output.resident if target.multiprocessors is None else min(
-            output.resident, -(-output.programs // target.multiprocessors))
-        return running > 1 or output.stages > 1
+        return _spread(output.resident, output.programs, target) > 1 or output.stages > 1
 
     def _running(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget, *,
                  training: bool = False) -> int:
@@ -1020,10 +1027,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         deep (the 27B's 0.943 against 0.916), where the one deep ring narrowed the block to 16 at 0.752
         (1.193, gdn-pins-a100-3b0d2267d)."""
         held = self.states_held(ba, tiles, target, training=training)
-        if target.multiprocessors is None:
-            return held
-        programs = self._states(ba, tiles, target, training=training).programs
-        return min(held, -(-programs // target.multiprocessors))
+        return _spread(held, self._states(ba, tiles, target, training=training).programs, target)
 
     def neighbours(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> list[mainloop.Tiles]:
         """The tiles the opt-in tuner times beside the derived `config` (`variants`; the gate holds at each):
