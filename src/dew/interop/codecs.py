@@ -310,6 +310,12 @@ def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     return codes.reshape(*exponents.shape, GROUP // 2), exponents
 
 
+
+NvFp4Parts = tuple[tuple[np.ndarray | jax.ShapeDtypeStruct, ...], tuple[int, ...]]
+"""A weight's NVFP4 parts as `dew.nn.kernels.formats.NvFp4.of` takes them (its codes `[..., in, out]`, its
+block scales `[..., in / 16, out]` and its tensor scale, one a matrix) and the shape the weight decodes to,
+which a load's layout binds (`SourceQuantization.as_nvfp4`)."""
+
 @dataclass(frozen=True)
 class SourceQuantization:
     """One quantized storage format: which tensors of a checkpoint hold one
@@ -344,12 +350,13 @@ class SourceQuantization:
     decode_kept: Callable[[Mapping[str, Stored], str, str], Stored] | None = None
     """A weight decoded straight into the dtype `param_dtype` keeps it in, for a format that decodes
     faster so than in float32 and rounds alike; None decodes in float32 and casts."""
-    as_nvfp4: Callable[[Mapping[str, Stored], str], tuple[np.ndarray | jax.ShapeDtypeStruct, ...] | None] = (
-        lambda tensors, name: None)
-    """A dense weight's NVFP4 parts as `dew.nn.kernels.formats.NvFp4.of` packs them (its codes `[in, out]`,
-    its block scales `[in / 16, out]` and its tensor scale), read from its stored ones with no value
-    decoded, which a load serves packed (`Pretrained.load`'s `packed_weights`); None for a weight the
-    format stores otherwise or a load decodes (`dew.interop.quantized_loads.packed_banks`)."""
+    as_nvfp4: Callable[[Mapping[str, Stored], str], NvFp4Parts | str] = (
+        lambda tensors, name: "its codec reads it as no NVFP4")
+    """A weight's NVFP4 parts as `dew.nn.kernels.formats.NvFp4.of` packs them, read from its stored ones with
+    no value decoded, and the shape it decodes to (`NvFp4Parts`), which a load serves packed
+    (`Pretrained.load`'s `packed_weights`, `dew.interop.quantized_loads.packed_banks`, its one reader); else
+    why the weight stays dense, decoded as the format states it. The one statement of a format's packing
+    (row 11644)."""
 
     def tensor_names(self, tensors: Mapping[str, Stored]) -> tuple[str, ...]:
         """The names left once every quantized weight is decoded."""
@@ -469,6 +476,20 @@ def _paired(tensors: Mapping[str, Stored], suffixes: tuple[str, ...], weight: st
 MXFP4_SUFFIXES = ('_blocks', '_scales')
 """GPT OSS's `<stem>_blocks` and `<stem>_scales`."""
 
+def _mxfp4_as_nvfp4(tensors: Mapping[str, Stored], name: str) -> NvFp4Parts | str:
+    """An MXFP4 expert bank's NVFP4 parts (`mxfp4_as_nvfp4`, exactly its values) and the `[experts, in,
+    out]` it decodes to (`SourceQuantization.as_nvfp4`); dense where it holds no experts (a 2-D weight's
+    blocks) or its experts' group powers span past one tensor scale's reach (`mxfp4_tensor_powers`)."""
+    blocks, scales = (tensors[name + suffix] for suffix in MXFP4_SUFFIXES)
+    if len(blocks.shape) != 4:
+        return "it holds no experts"
+    experts, outputs, groups, _ = blocks.shape
+    powers = mxfp4_tensor_powers(blocks, scales)
+    if powers is None:
+        return "its experts' group powers span past one tensor scale's reach"
+    return mxfp4_as_nvfp4(blocks, scales, powers), (experts, groups * GROUP, outputs)
+
+
 MXFP4 = SourceQuantization(
     lambda tensors: _paired(tensors, MXFP4_SUFFIXES, ''),
     lambda name: tuple(name + suffix for suffix in MXFP4_SUFFIXES),
@@ -479,7 +500,8 @@ MXFP4 = SourceQuantization(
     # transformers holds it.
     decode_kept=lambda tensors, name, param_dtype: dequantize_mxfp4(
         tensors[name + MXFP4_SUFFIXES[0]], tensors[name + MXFP4_SUFFIXES[1]],
-        checkpoint_dtype(np.dtype(ml_dtypes.bfloat16), param_dtype)))
+        checkpoint_dtype(np.dtype(ml_dtypes.bfloat16), param_dtype)),
+    as_nvfp4=_mxfp4_as_nvfp4)
 """GPT OSS's MXFP4 (`quant_method: mxfp4`), [E, in, out] weights under their stems."""
 
 
@@ -1726,33 +1748,35 @@ def _modelopt_nvfp4_checked(name: str, packed: Stored, scale: Stored, overall: S
 
 
 def _modelopt_as_nvfp4(tensors: Mapping[str, Stored], name: str, *, method: str = 'NVFP4',
-                       layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS
-                       ) -> tuple[np.ndarray | jax.ShapeDtypeStruct, ...] | None:
+                       layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS) -> NvFp4Parts | str:
     """A ModelOpt W4A16_NVFP4 weight's NVFP4 parts (`SourceQuantization.as_nvfp4`), exactly the values its
     codes, E4M3 block scales and float32 global scale state (code 8 read as +0, as the author's reader reads
     it): its U8 pairs `[out, in / 2]` as E2M1 nibbles `[in, out]`, its scales `[out, in / 16]` as
-    `[in / 16, out]`, its global scale the tensor's; for a load that reads no values (`weights=False`), their
-    shapes and dtypes (`jax.ShapeDtypeStruct`), so it holds the tree a load of values holds. None for an FP8
-    or NVFP4 weight, whose stored input scale its product quantizes its input under
-    (`dew.interop.quantized_loads.input_quantization`), and for an expert's (`experts.<k>.` in its name,
-    `v_experts.<k>.` among them, a stack's member, which Dew packs as a bank whole or not at all; a shared
-    expert's stays packable)."""
-    if _modelopt_algo(name, method, layers) != 'W4A16_NVFP4' or re.search(r'experts\.\d+\.', name):
-        return None
+    `[in / 16, out]`, its global scale the tensor's, decoding to the stored `[out, in]`; for a load that
+    reads no values (`weights=False`), their shapes and dtypes (`jax.ShapeDtypeStruct`), so it holds the tree
+    a load of values holds. Dense for an FP8 or NVFP4 weight, whose stored input scale its product quantizes
+    its input under (`dew.interop.quantized_loads.input_quantization`), and for an expert's (`experts.<k>.`
+    in its name, `v_experts.<k>.` among them, a stack's member, which Dew packs as a bank whole or not at
+    all; a shared expert's stays packable)."""
+    algo = _modelopt_algo(name, method, layers)
+    if algo != 'W4A16_NVFP4':
+        return f"it is stored as {algo}, whose product quantizes its input"
+    if re.search(r'experts\.\d+\.', name):
+        return "it is one expert's of a stack"
     stored = (unread.held(tensors[part]) for part in (name, *_modelopt_layer_parts(name, 'W4A16_NVFP4')))
     packed = next(stored)
     scale, overall = _modelopt_nvfp4_checked(name, packed, *stored)
     if packed.ndim != 2 or overall.size != 1:
-        return None
+        return "it is no matrix of one tensor scale"
     outputs, inputs = packed.shape[0], packed.shape[1] * 2
     if not (unread.valued(packed) and unread.valued(scale) and unread.valued(overall)):
-        return (jax.ShapeDtypeStruct((inputs, outputs), np.uint8),
-                jax.ShapeDtypeStruct((inputs // 16, outputs), ml_dtypes.float8_e4m3fn),
-                jax.ShapeDtypeStruct((), np.float32))
+        return ((jax.ShapeDtypeStruct((inputs, outputs), np.uint8),
+                 jax.ShapeDtypeStruct((inputs // 16, outputs), ml_dtypes.float8_e4m3fn),
+                 jax.ShapeDtypeStruct((), np.float32)), (outputs, inputs))
     nibbles = np.stack([packed & 15, packed >> 4], axis=-1).reshape(packed.shape[0], -1)
     nibbles = np.where(nibbles == 8, np.uint8(0), nibbles).astype(np.uint8)
-    return (np.ascontiguousarray(nibbles.T), np.ascontiguousarray(scale.astype(ml_dtypes.float8_e4m3fn).T),
-            overall.reshape(()).astype(np.float32))
+    return ((np.ascontiguousarray(nibbles.T), np.ascontiguousarray(scale.astype(ml_dtypes.float8_e4m3fn).T),
+             overall.reshape(()).astype(np.float32)), (outputs, inputs))
 
 
 def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored] | None,

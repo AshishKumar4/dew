@@ -112,32 +112,27 @@ def packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, obje
                   ) -> tuple[dict[str, unread.Stored], dict[str, NvFp4]]:
     """`tensors` with each 4-bit weight a load serves packed (`Pretrained.load`'s `packed_weights`) taken
     out of the source's decoding, and those weights by their source names as NVFP4 banks
-    (`dew.nn.kernels.formats.NvFp4`, built on the host, exactly the values the source's codes state): an
-    MXFP4 source's expert banks (`codecs.mxfp4_as_nvfp4`), and a format's dense weights its codec reads as
-    NVFP4 (`SourceQuantization.as_nvfp4`: ModelOpt's W4A16_NVFP4 ones). In each one's place an unread leaf
+    (`dew.nn.kernels.formats.NvFp4`, built on the host, exactly the values the source's codes state), each
+    as its format reads it (`SourceQuantization.as_nvfp4`: an MXFP4 source's expert banks, ModelOpt's
+    W4A16_NVFP4 Linears). In each one's place an unread leaf
     of its decoded shape and dtype, which the decoder's translation binds as it binds a load without weights
     (`unread.Unread`), and `with_banks` replaces. A weight whose depth is no whole NVFP4 stages
-    (`formats.NVFP4_STAGE`), an MXFP4 bank whose experts' group powers span past one tensor scale's reach
-    (`mxfp4_tensor_powers` None) or that holds no experts (a 2-D weight's blocks), and a weight its codec
-    reads as no NVFP4 (an FP8 one, or one whose product quantizes its input), is decoded as the source states
-    it, and named in the load's log, once a load; a source of no quantized weights is refused."""
-    from dew.interop import codecs
-
+    (`formats.NVFP4_STAGE`), or that its format reads as no NVFP4 (its reason), is decoded as the source
+    states it, and named in the load's log with why, once a load; a source of no quantized weights is
+    refused."""
     quantization = source_quantization(config)
     if quantization is None:
         raise ValueError("packed_weights serves a quantized source's 4-bit weights as their codes; this "
                          "source states no quantization")
     tensors, banks = dict(tensors), {}
     for name in quantization.names(tensors):
-        if quantization is codecs.MXFP4:
-            packed = _mxfp4_bank(tensors, name)
-        else:
-            parts = quantization.as_nvfp4(tensors, name)
+        packed = quantization.as_nvfp4(tensors, name)
+        if not isinstance(packed, str):
+            parts, shape = packed
             # A load that reads no values holds the bank's shapes (`jax.eval_shape`), as it holds a weight's.
-            packing = (NvFp4.of if all(isinstance(part, np.ndarray) for part in parts or ())
+            packing = (NvFp4.of if all(isinstance(part, np.ndarray) for part in parts)
                        else lambda *parts: jax.eval_shape(NvFp4.of, *parts))
-            packed = ("its codec reads it as no NVFP4" if parts is None else
-                      _staged(parts[0].shape[0]) or (packing(*parts), tuple(reversed(parts[0].shape))))
+            packed = _staged(parts[0].shape[-2]) or (packing(*parts), shape)
         if isinstance(packed, str):
             _log.warning("packed_weights: %s stays dense: %s", name, packed)
             continue
@@ -162,23 +157,6 @@ def _staged(depth: int) -> str | None:
     from dew.nn.kernels.formats import NVFP4_STAGE
 
     return f"its depth {depth} is no whole {NVFP4_STAGE}-deep stages" if depth % NVFP4_STAGE else None
-
-
-def _mxfp4_bank(tensors: Mapping[str, unread.Stored], name: str) -> tuple[NvFp4, tuple[int, ...]] | str:
-    """An MXFP4 expert bank's NVFP4 bank and its decoded shape `[experts, in, out]`, or why it stays dense
-    (`packed_banks`)."""
-    from dew.interop import codecs
-
-    blocks, scales = (tensors[name + suffix] for suffix in codecs.MXFP4_SUFFIXES)
-    if len(blocks.shape) != 4:
-        return "it holds no experts"
-    experts, outputs, groups, _ = blocks.shape
-    if (reason := _staged(groups * codecs.GROUP)) is not None:
-        return reason
-    powers = codecs.mxfp4_tensor_powers(blocks, scales)
-    if powers is None:
-        return "its experts' group powers span past one tensor scale's reach"
-    return NvFp4.of(*codecs.mxfp4_as_nvfp4(blocks, scales, powers)), (experts, groups * codecs.GROUP, outputs)
 
 
 def with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: Mapping[str, NvFp4]
