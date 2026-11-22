@@ -474,7 +474,7 @@ def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_n
 
 
 FORWARD_GATE_BATCHES = _batched_gate(FORWARD_GATE, lambda c: (c[0], c[1], c[2], c[4]), lambda c: c[3],
-                                     max_items=3)
+                                     max_items=2)
 
 
 @COMPILES_ON_CPU
@@ -592,7 +592,7 @@ def test_a_short_training_calls_backward_compiles_spill_free_for_an_a100(tokens,
 
 
 BACKWARD_GATE_BATCHES = _batched_gate(BACKWARD_GATE, lambda c: (c[0], c[1], c[2]), lambda c: c[3],
-                                      max_items=2)
+                                      max_items=1)
 
 
 def _check_backward_batch(generation_name: str, width: int, accurate: bool,
@@ -1735,7 +1735,11 @@ def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pe
 
 
 @COMPILES_ON_CPU
-def test_sm90_d256_forward_fits_single_launch_without_spills():
+@pytest.mark.parametrize("gen", ["sm90", "sm80"])
+@pytest.mark.parametrize(("label", "residuals"),
+                         [("infer", template.Kept.NONE), ("train", template.Kept.OUTPUT)],
+                         ids=["infer", "train"])
+def test_sm90_d256_forward_fits_single_launch_without_spills(gen, label, residuals):
     """Row 5272: chunking wide (>128) register epilogues lets d256 bf16 causal forward (inference and
     training) derive and compile at `columns=None` (1 launch, 0 spills) on sm90 instead of spilling
     96-112 bytes in `algebra.finish` and falling back to 2-launch `columns=128`."""
@@ -1745,26 +1749,22 @@ def test_sm90_d256_forward_fits_single_launch_without_spills():
     spans = template.spans(4096, 4096, 1, causal=True)
     q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
     k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
-    for gen in ("sm90", "sm80"):
-        with generation.assumed(gen):
-            cases = []
-            for label, residuals in (("infer", template.Kept.NONE), ("train", template.Kept.OUTPUT)):
-                def _make(residuals=residuals):
-                    def forward(query, key, value):
-                        return attention_mosaic.forward(query, key, value, spans, None, residuals=residuals)
-                    return forward, (q, k, k)
-                cases.append(KernelCase(f"{gen}-d256-{label}", _make))
-            found = compile_mosaic_kernels(cases, gen)
-            assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-            for record in found:
-                assert any(kernel["kernel"] == "attention_forward"
-                           for kernel in record.get("kernels", ())), record
+    with generation.assumed(gen):
+        def forward(query, key, value):
+            return attention_mosaic.forward(query, key, value, spans, None, residuals=residuals)
+
+        found = compile_mosaic_kernels([KernelCase(f"{gen}-d256-{label}", lambda: (forward, (q, k, k)))],
+                                       gen)
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+        for record in found:
+            assert any(kernel["kernel"] == "attention_forward"
+                       for kernel in record.get("kernels", ())), record
 
 
 @COMPILES_ON_CPU
-def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
+@pytest.mark.parametrize("gen", ["sm80", "sm100"])
+def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100(gen):
     """Row 10682: fused dK/dV at width 64 derives and compiles spill-free on sm80 and sm100."""
-    from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     queries = 512
@@ -1773,54 +1773,44 @@ def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100():
     key = jax.ShapeDtypeStruct((1, queries, 2, 64), jnp.bfloat16)
     shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype),
                           _residuals(query.shape))
-
-    def backward(q, k, v, dout, residuals):
-        grads = attention_mosaic.backward(q, k, v, spans, None, dout, residuals=residuals, accurate=False)
-        return grads.query, grads.key, grads.value
-
-    for gen in ("sm80", "sm100"):
-        _, _, cfg = _gated_backward(gen, 64, accurate=False)
-        assert cfg is not None and cfg.fused, (gen, cfg)
-        if gen == "sm100":
-            assert cfg.stages >= 3, cfg
-        with generation.assumed(gen):
-            found = compile_mosaic_kernels([
-                KernelCase(f"{gen}-fused-d64", lambda: (backward, (query, key, key, query, shapes))),
-            ], gen)
-            assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    _, _, cfg = _gated_backward(gen, 64, accurate=False)
+    assert cfg is not None and cfg.fused, (gen, cfg)
+    if gen == "sm100":
+        assert cfg.stages >= 3, cfg
+    with generation.assumed(gen):
+        case = _fast_backward_compile_case(f"{gen}-fused-d64", query, key, spans, shapes)
+        found = compile_mosaic_kernels([case], gen)
+        assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
 @COMPILES_ON_CPU
-def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compiles_spill_free():
+@pytest.mark.parametrize(("label", "heads", "kv_heads", "width"),
+                         [("sm90-mha-d64", 16, 16, 64), ("sm90-qwen-d128", 32, 8, 128),
+                          ("sm90-qwen-d256", 8, 2, 256)],
+                         ids=["d64", "d128", "d256"])
+def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compiles_spill_free(
+        label, heads, kv_heads, width):
     """Row 5272: compute-bound multi-consumer sm90 forward deepens its TMA ring to `consumers + 1` stages
-    when SMEM holds it without reducing SM residency, and compiles spill-free at d64 and d128."""
+    when SMEM holds it without reducing SM residency, and compiles spill-free at d64, d128 and d256."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         spans = template.spans(4096, 4096, 1, causal=True)
-        cases = []
-        for label, heads, kv_heads, width in (("sm90-mha-d64", 16, 16, 64), ("sm90-qwen-d128", 32, 8, 128),
-                                              ("sm90-qwen-d256", 8, 2, 256)):
-            q = jax.ShapeDtypeStruct((2, 4096, heads, width), jnp.bfloat16)
-            k = jax.ShapeDtypeStruct((2, 4096, kv_heads, width), jnp.bfloat16)
-            op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
-                                                      natural=attention_mosaic.NATURAL)
-            ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
-            cfg = op.derived(ba, target)
-            assert cfg is not None and (cfg.stages >= 3 if width <= 128 or cfg.consumers == 1
-                                        else cfg.stages == 2), (label, cfg)
-            def _make(q=q, k=k):
-                def forward(query, key, value):
-                    return attention_mosaic.forward(query, key, value, spans, None,
-                                                    residuals=template.Kept.NONE)
-                return forward, (q, k, k)
+        q = jax.ShapeDtypeStruct((2, 4096, heads, width), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((2, 4096, kv_heads, width), jnp.bfloat16)
+        op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        cfg = op.derived(ba, target)
+        assert cfg is not None and cfg.stages >= 3, (label, cfg)
 
-            cases.append(KernelCase(label, _make))
-        found = compile_mosaic_kernels(cases, "sm90")
+        def forward(query, key, value):
+            return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.NONE)
+
+        found = compile_mosaic_kernels([KernelCase(label, lambda: (forward, (q, k, k)))], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-
 
 def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
     """Attention derives its fp32-exact bf16 part count (`bf16_part_count`) through
