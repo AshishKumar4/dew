@@ -617,8 +617,8 @@ def _route_forward(route, operands: tuple, form: str, *, inference: bool = False
     if trained and not inference:
         trained_forward = jax.jit(lambda *x: jax.vjp(route, *x)[0])
         (o, final), launches = launched(trained_forward, operands, f"training forward, {form}")
-        [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                   if isinstance(op, template.Mosaic)]
+        [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
+                            zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
     return o, final, tiles, trained, bound
 
 
