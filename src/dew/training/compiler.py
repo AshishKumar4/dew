@@ -1000,9 +1000,7 @@ class StepCompiler[L, E]:
             planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced)
         except PlanRefused as refused:
             _log.info(UNPLACED_REFUSED, refused)
-            # A step lowered for another target (`lower_for`) is judged on no devices of this host's.
-            self._unplaced = None
-            self._refused = None if stepping.settings.lower_for is not None else (signature, refused)
+            self._unplaced, self._refused = None, (signature, refused)
             return signature
         self._unplaced = Unplaced(signature, planned, compiled, keep)
         return signature
@@ -1013,27 +1011,26 @@ class StepCompiler[L, E]:
         gives each device at most the room the search read beside its bytes and what the held arrays the
         start copies let go (`freed`, `Start.freed`), and a placed plan is judged on no more than its
         devices' free bytes (their largest block), so a candidate the search saw miss by more than that misses
-        there. The search asked every rung's finest split before leaving it (`walked`), the least a split of
-        it needs, as finer microbatches need no more than coarser and narrow copies no less than none: where
-        each rung it asked was asked there, every miss measured and each beyond that room on some process
-        (a candidate's room is its tightest device's), no candidate fits placed (row 11712: a 4B step on two
-        H100s, short by 70 GiB of 72.71 free at each of four rungs, searched them all again once its state was
-        placed, 1.5 h). Else the placed devices are searched again (`compile`). Every process decides
+        there. Refused only where the search measured every candidate a search on the placed devices could
+        reach: each rung it asked at every split (`PlanRefused.candidates`), none passed over, its rungs'
+        variants chosen from no miss (`PlanRefused.variants`), every miss measured and each beyond that room
+        on some process (a candidate's room is its tightest device's; row 11712: a 4B step on two H100s at its
+        one split, short by 70 GiB of 72.71 free at each of four rungs, searched them all again once its state
+        was placed, 1.5 h). Else the placed devices are searched again (`compile`). Every process decides
         together; admission is the pool's, so where one process holds no refusal none does."""
         kept, self._refused = self._refused, None
         if kept is None or kept[0] != signature:
             return
-        probes = kept[1].probes
-        if not probes:
-            return
-        finest = max(probe.split for probe in probes)
+        refusal = kept[1]
+        probes = refusal.probes
 
         def rungs(split: int | None = None) -> set[str]:
             return {json.dumps(probe.rung, sort_keys=True) for probe in probes
                     if split is None or probe.split == split}
 
-        whole = (all(probe.fits or isinstance(probe.headroom, int) for probe in probes)
-                 and rungs() <= rungs(finest))
+        whole = (bool(probes) and bool(refusal.candidates) and not refusal.variants
+                 and all(probe.fits or isinstance(probe.headroom, int) for probe in probes)
+                 and all(rungs(split) == rungs() for split in refusal.candidates))
         room = freed()
         beyond = [not probe.fits and isinstance(probe.headroom, int) and -probe.headroom > room
                   for probe in probes]
@@ -1044,7 +1041,7 @@ class StepCompiler[L, E]:
         if all(each[0] for each in every) and all(blocked):
             _log.warning("the step fits no plan before its state is placed, each candidate short by more "
                          "than placing it frees (%d bytes): refused without searching again", room)
-            raise kept[1]
+            raise refusal
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
              trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:

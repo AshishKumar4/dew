@@ -1345,7 +1345,31 @@ class Start:
         devices = local_devices(mesh)
         inputs = jax.tree.leaves(self.initializer)
         kept = _device_bytes((inputs[given] for given in self._kept_through().values()), devices)
-        return max(self.held[device.id] - kept[device.id] for device in devices)
+        aliased = self._aliased(devices)
+        return max(self.held[device.id] - kept[device.id] - aliased[device.id] for device in devices)
+
+    def _aliased(self, devices) -> collections.Counter:
+        """The bytes each of `devices` holds, by its id, that the layout counts again for a held array the
+        start copies, at each path past the first where the state holds it placed alike: the start places
+        it there once (`placed_start`; row 11712's review: a host-backed frozen array at two paths was
+        charged twice)."""
+        from dew.state import apart
+
+        inputs = jax.tree.leaves(self.initializer)
+        where = jax.tree.leaves(apart(self.shardings)[1])
+        kept, seen = self._kept_through(), set()
+        extra: collections.Counter = collections.Counter()
+        for index, given in self.through.items():
+            if index in kept:
+                continue
+            sharding, leaf = where[index], inputs[given]
+            if (given, sharding) in seen and (sharding.memory_kind or "device") == "device":
+                shard = math.prod(sharding.shard_shape(tuple(leaf.shape))) * np.dtype(leaf.dtype).itemsize
+                for device in sharding.addressable_devices:
+                    if device in devices:
+                        extra[device.id] += shard
+            seen.add((given, sharding))
+        return extra
 
     def freed(self, mesh: Mesh) -> int:
         """The most bytes any of this process's devices of `mesh` can free as the start places the state: the

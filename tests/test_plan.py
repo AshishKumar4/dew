@@ -449,9 +449,35 @@ def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refus
         jax.effects_barrier()
         return raised.value, list(INITIALIZED), len(lowered)
 
+    # The held parameters lie on the device the run trains on, which the start copies and may let go.
+    assert {device for leaf in jax.tree.leaves(held) for device in leaf.devices()} == {jax.devices()[0]}
     for objective in (Watched, functools.partial(Watched, variables=held)):
         refusal, ran, count = refused(objective)
         assert ran == [] and count <= len(refusal.probes), (ran, count, refusal.probes)
+        # Each candidate it asked was measured short of the room.
+        assert all(isinstance(probe.headroom, int) and probe.headroom < 0 for probe in refusal.probes)
+
+
+def test_a_fit_of_no_steps_on_devices_holding_no_plan_returns_and_its_trainer_trains_given_room(monkeypatch):
+    """A fit of no steps on devices with room for no plan of its step returns its state, refused nothing
+    (a run with no work reads no step), and its trainer fit again on devices with room for its step trains
+    (row 11712's review: a refusal one fit kept was raised by the next)."""
+    from affine_run import Replaying
+
+    from dew.data.dataset import Loader
+
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    roomy = lm()
+    free(monkeypatch, LIMIT)
+    roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    assert roomy.validation is not None
+    room = max(roomy.validation.device_bytes.values()) + 1024
+    options.unhold()
+    trainer = lm()
+    free_until_placed(monkeypatch, room)
+    assert int(trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=0).step) == 0
+    free(monkeypatch, LIMIT)
+    assert int(trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1).step) == 1
 
 def needs(monkeypatch, trainer, run=None):
     """The bytes the step `trainer` compiles first needs beside what a device holds: the headroom that

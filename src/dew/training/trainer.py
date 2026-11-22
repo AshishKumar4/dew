@@ -1742,7 +1742,7 @@ class Trainer(Generic[Loss, Effects]):
         program compiles is its step's planning, which runs beside it, the overlap the start is begun for (a
         refusal of it, `PlanRefused` or `LayoutRefused`, a compile that fails, an interrupt); the process's
         exit then waits, saying so, for the start's compile to end (`options.compiling`)."""
-        if self._compiler.ahead is not None or self.host_master or pgle_runs():
+        if self._compiler.ahead is not None or self.host_master or pgle_runs() or self.lower_for is not None:
             return None
         key = shapes_of(fresh.key)
         begun = start_compiling(fresh.placing, fresh.initializer, key, fresh.abstract, fresh.shardings,

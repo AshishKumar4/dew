@@ -427,8 +427,13 @@ class PlanRefused(RuntimeError):
     `allocators` what each local device's allocator stated as the search refused (`device_memory`): its
     limit, its bytes in use, its largest free block and its pool, which the closest's headroom read."""
 
-    def __init__(self, probes: Sequence[Probe], allocators: Sequence[Mapping[str, int]] = ()):
+    def __init__(self, probes: Sequence[Probe], allocators: Sequence[Mapping[str, int]] = (),
+                 candidates: Sequence[int] = (), variants: bool = True):
         self.probes, self.allocators = tuple(probes), tuple(allocators)
+        # The splits the search asked of each rung, and whether it chose a variant of its rungs from what
+        # its misses read (its Newton-Schulz stacks parted, its narrow copies dropped), which a search on
+        # more room may choose otherwise (`dew.training.compiler.StepCompiler.refuse_unplaced`).
+        self.candidates, self.variants = tuple(candidates), variants
         gib = 1024 ** 3
         read = [memory for memory in self.allocators if 'bytes_limit' in memory and 'bytes_in_use' in memory]
         said = ""
@@ -857,6 +862,8 @@ class FitSearch[LossT, EffectsT]:
     one 38.88 GiB block its pool could give of 70.88 GiB free, 22.41 GiB short, fits). A candidate holds
     none of them (`Candidate.held`), so one cached for a
     placed state serves an unplaced one."""
+    variants: bool = False
+    """Whether its search chose a variant of its rungs from what its misses read (`searched`)."""
     asked: list[Rung] = dataclasses.field(default_factory=list)
     """The rungs its search asked past the one it stood on first (`searched`), which a plan made offline
     asks none of again (`below`)."""
@@ -896,7 +903,8 @@ class FitSearch[LossT, EffectsT]:
         self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes}
         if split is None:
             allocators = [device_memory(device) for device in local_devices(self.mesh)]
-            raise PlanRefused(self.probes, allocators) from (self.refusals[-1] if self.refusals else None)
+            raise PlanRefused(self.probes, allocators, candidates, self.variants) from (
+                self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
 
     def above(self, candidates: Sequence[int], split: int) -> tuple[Probe, ...]:
@@ -1195,6 +1203,9 @@ class FitSearch[LossT, EffectsT]:
             return walked(candidates, 0, self.fits_here, after)
 
         narrow, ns_group = self.narrow, self.ns_group
+        # Whether the rungs past here are chosen from what the misses read (`PlanRefused.variants`).
+        self.variants = ((ns_group is None and any(candidate.joins for candidate in self.lowered.values()))
+                         or (narrow and any(candidate.copies for candidate in self.lowered.values())))
         if ns_group is None and any(candidate.joins for candidate in self.lowered.values()):
             kept = self.rung()
             split = ask(dataclasses.replace(start, ns_group=1), "the step does not fit the devices with its "
