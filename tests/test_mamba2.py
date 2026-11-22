@@ -569,27 +569,28 @@ def test_a_decode_token_on_the_fused_step_is_the_layers_own(conv_bias):
 
 @pytest.mark.parametrize("kernel", ["fused", "xla"])
 def test_a_16_bit_layers_decode_token_is_in_its_compute_dtype(kernel):
-    """A bf16 Mamba-2's decode token on the fused step and on the unfused one: the scan's output, which its
-    gate reads (`Mamba2._gated`), in the layer's compute dtype on both, as its prefill's (`_ssd`), and the
-    recurrent state its cache keeps in the cache's fp32 (row 11726: the fused step left its output in fp32
-    where the unfused one rounded it to the compute dtype)."""
+    """A bf16 Mamba-2's decode token on the fused step and on the unfused one: the scan's output, named for
+    the remat policy (`Residual.SCAN`, `linear.held_scan`'s), in the layer's compute dtype on both, as its
+    prefill's (`_ssd`), and the recurrent state its cache keeps in the cache's fp32 (row 11726: the fused
+    step left its output in fp32 where the unfused one rounded it to the compute dtype), read off the token's
+    typed program."""
     import delta_decode_matrix
+    from jax.extend.core import primitives
 
+    from dew.nn import programs
     from dew.nn.kernels import generation
+    from dew.nn.residuals import Residual
 
     layer = delta_decode_matrix.initialized('mamba2', dtype=jnp.bfloat16)
     module = layer.make()
     variables, cache, tokens = layer.drawn(0, jnp.float32)
-    read = []
 
-    def gated(next_fn, args, kwargs, context):
-        if context.method_name == "_gated":
-            read.append(args[0].dtype)
-        return next_fn(*args, **kwargs)
+    def token(variables, cache, token):
+        return module.apply({**variables, "cache": cache}, token, MixerCall(decode=True), mutable=["cache"])
 
-    with (nn.intercept_methods(gated),
-          generation.chosen(delta_decode=kernel, **delta_decode_matrix.REFERENCES)):
-        _, after = module.apply({**variables, "cache": cache}, tokens[:, :1], MixerCall(decode=True),
-                                mutable=["cache"])
-    assert read == [jnp.dtype(jnp.bfloat16)]
+    with generation.chosen(delta_decode=kernel, **delta_decode_matrix.REFERENCES):
+        traced, (_, after) = jax.make_jaxpr(token, return_shape=True)(variables, cache, tokens[:, :1])
+    scanned = [equation.invars[0].aval.dtype for equation in programs.equations(traced.jaxpr)
+               if equation.primitive is primitives.name_p and equation.params["name"] == Residual.SCAN]
+    assert scanned == [jnp.dtype(jnp.bfloat16)]
     assert after["cache"][layer.state].dtype == jnp.float32
