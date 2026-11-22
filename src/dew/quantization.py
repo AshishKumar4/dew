@@ -598,18 +598,14 @@ def _product_rounded(values: jax.Array, scale: jax.Array, owed: int) -> jax.Arra
     product = whole_v * whole_f
     exponent = ((jnp.maximum(biased_v.astype(jnp.int32), 1) - 134)
                 + (jnp.maximum(biased_f.astype(jnp.int32), 1) - 150) + owed)
-    sign = (sign_v << np.uint32(16)) ^ sign_f
-    bits = jax.lax.bitcast_convert_type(rounded_float32(sign, product, exponent), jnp.uint32)
-    # A non-finite operand's product as IEEE's, classified on the operands' bits (a float32 multiply would
-    # flush a subnormal operand first, XLA's CPU, and make an infinity times it a NaN, row 11795): a NaN
-    # where either is one or an infinity meets a zero, else an infinity of the product's sign.
+    # A non-finite operand's product as IEEE's, classified on the operands' bits (row 11795): a NaN where
+    # either is one or an infinity meets a zero, else an infinity of the product's sign.
     infinite_v, infinite_f = (biased_v == 0xFF) & (fraction_v == 0), (biased_f == 0xFF) & (fraction_f == 0)
     zero_v, zero_f = (biased_v == 0) & (fraction_v == 0), (biased_f == 0) & (fraction_f == 0)
     nan = (((biased_v == 0xFF) & ~infinite_v) | ((biased_f == 0xFF) & ~infinite_f)
            | (infinite_v & zero_f) | (infinite_f & zero_v))
-    bits = jnp.where(nan, np.uint32(0x7FC00000),
-                     jnp.where(infinite_v | infinite_f, sign | np.uint32(0x7F800000), bits))
-    return jax.lax.bitcast_convert_type(bits, jnp.float32)
+    return rounded_float32((sign_v << np.uint32(16)) ^ sign_f, product, exponent,
+                           infinite=infinite_v | infinite_f, nan=nan)
 
 
 def decoded_banks(variables: Variables) -> Variables:

@@ -125,14 +125,17 @@ def raised_exactly(x: jax.Array, k: jax.Array) -> jax.Array:
     return jnp.where(kept, x.astype(jnp.float32), jax.lax.bitcast_convert_type(raised, jnp.float32))
 
 
-def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array) -> jax.Array:
+def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array, *,
+                    infinite: jax.Array | bool = False, nan: jax.Array | bool = False) -> jax.Array:
     """The float32 nearest `significand * 2^exponent` (`significand` uint32, any width under 2^32; `exponent`
     int32), signed by `sign` (uint32, the sign bit in place), rounded once to nearest even at the result's
     last place: 24 bits below its leading one, or the least subnormal's however far below the least normal,
     past the largest finite an infinity; a zero significand a zero of its sign. In integer arithmetic on the
     bits, so a process whose float32 arithmetic flushes a subnormal (XLA's CPU, row 4023) still returns it.
-    The one rounding of an exact value into float32 (`lowered_rounded`'s, `dew.quantization.packed_values`'s,
-    row 11807)."""
+    A value its caller's operands' bits make non-finite is its: an infinity of `sign` where `infinite`, a
+    NaN where `nan` (row 11795: classified on the bits, where a float32 multiply flushed a subnormal operand
+    first). The one rounding of an exact value into float32 (`lowered_rounded`'s,
+    `dew.quantization.packed_values`'s, row 11807)."""
     length = 32 - jax.lax.clz(significand).astype(jnp.int32)
     last = jnp.maximum(exponent + length - 24, -149)
     drop = last - exponent
@@ -152,21 +155,23 @@ def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array
     magnitude = jnp.where(biased >= 255, np.uint32(0x7F800000),
                           (jnp.clip(biased, 1, 254).astype(jnp.uint32) << np.uint32(23)) + kept
                           - np.uint32(1 << 23))
-    return jax.lax.bitcast_convert_type(sign | jnp.where(significand == 0, np.uint32(0), magnitude),
-                                        jnp.float32)
+    bits = sign | jnp.where(significand == 0, np.uint32(0), magnitude)
+    bits = jnp.where(nan, np.uint32(0x7FC00000), jnp.where(infinite, sign | np.uint32(0x7F800000), bits))
+    return jax.lax.bitcast_convert_type(bits, jnp.float32)
 
 
 def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:
     """`x` (fp32) times `2^-k` (`k` int32, at least 0, broadcast against `x`) rounded once to nearest even
     into fp32 however far below its least normal (`rounded_float32`): a process whose float32 multiply or
     conversion flushes a subnormal result (XLA's CPU, per primitive, row 4023) still returns it, as an IEEE
-    multiply by the power of two would. A finite `x` alone; an infinity or NaN returns as it is."""
+    multiply by the power of two would; an infinity returns as it is, a NaN as a NaN."""
     _, sign, biased, fraction = raw_fields(x.astype(jnp.float32))
     biased = biased.astype(jnp.int32)
     # A subnormal `x` holds its significand at the least normal's exponent, its leading bit none.
     significand = jnp.where(biased > 0, fraction | np.uint32(0x800000), fraction)
-    rounded = rounded_float32(sign, significand, jnp.maximum(biased, 1) - 150 - k)
-    return jnp.where(biased == 0xFF, x.astype(jnp.float32), rounded)
+    top = biased == 0xFF
+    return rounded_float32(sign, significand, jnp.maximum(biased, 1) - 150 - k,
+                           infinite=top & (fraction == 0), nan=top & (fraction != 0))
 
 
 WIDENED = frozenset(map(jnp.dtype, (jnp.float16, jnp.bfloat16, jnp.float32)))
