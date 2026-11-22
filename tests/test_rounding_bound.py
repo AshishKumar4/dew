@@ -98,9 +98,12 @@ def test_a_program_of_more_steps_than_a_span_is_scaled_as_compiled_whole(monkeyp
 
 def test_a_call_of_more_steps_than_a_span_is_walked_as_its_bodys_spans(monkeypatch):
     """A call whose body holds more steps than a compiled span (`float64_terms.SPAN_STEPS`; a jit-wrapped
-    reference, the gate's common arm, is one such step) is walked as its body's spans, its values and its
-    rounding scale each element's as the program compiled whole gives them (row 10950: counted as one step,
-    it was compiled whole however large its body; row 10971: its spans checked by their bounds alone)."""
+    reference, the gate's common arm, is one such step) is walked as its body's spans, no compiled span
+    holding more steps than a span may, its neighbours' and its body's counted (row 10950: counted as one
+    step, it was compiled whole with its neighbours; row 11004: the values alone cannot show it), and its
+    values and rounding scale those the program compiled whole gives."""
+    import float64_terms
+
     @jax.jit
     def body(x):
         for _ in range(10):
@@ -111,3 +114,7 @@ def test_a_call_of_more_steps_than_a_span_is_walked_as_its_bodys_spans(monkeypat
         return body(x + np.float32(1.0)) * np.float32(2.0)
 
     _held_whole_in_spans(monkeypatch, program)
+    rounding_scale(program, jnp.asarray([1.0, -2.0, 3.5], jnp.float32))
+    compiled = [sum(float64_terms._steps(equation) for equation in jaxpr.eqns[start:stop])
+                for jaxpr, start, stop, *_ in float64_terms.RUNS]
+    assert compiled and max(compiled) <= float64_terms.SPAN_STEPS

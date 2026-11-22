@@ -327,3 +327,50 @@ def test_a_marked_span_reads_the_state_its_function_reads_now(monkeypatch):
     second = jax.jit(lambda x: span(x) + 0.0)(x)
     np.testing.assert_array_equal(np.asarray(first), np.full(3, 3.0, np.float32))
     np.testing.assert_array_equal(np.asarray(second), np.full(3, 8.0, np.float32))
+
+
+def _span_traces(monkeypatch) -> list:
+    """The marked spans' traces JAX makes from here on (`derivatives.marked`'s `span`), each counted."""
+    traced = []
+    making = jax.make_jaxpr
+
+    def counted(fn, *args, **kwargs):
+        traced.append(getattr(fn, "__name__", None))
+        return making(fn, *args, **kwargs)
+
+    monkeypatch.setattr(jax, "make_jaxpr", counted)
+    return traced
+
+
+def test_an_error_free_transform_called_again_in_one_state_is_traced_once(monkeypatch):
+    """An error-free transform (`precision.two_sum`, one `bound_span` of `Protected`) called again in one
+    state is the program its first call traced: its span closes over stated values alone, never the call's
+    bound arguments, which no statement holds (row 11003: every bound span, the error-free transforms row
+    10762 names among them, was traced at each call)."""
+    from dew.nn.precision import two_sum
+
+    x, y = jnp.ones(3), jnp.full(3, 2.0)
+    traced = _span_traces(monkeypatch)
+    jax.jit(lambda x, y: two_sum(x, y)).trace(x, y)
+    jax.jit(lambda x, y: jax.tree.map(lambda z: z + 0.0, two_sum(x, y))).trace(x, y)
+    assert traced.count("span") == 1
+
+
+def test_a_held_span_reports_its_routes_wherever_it_is_taken():
+    """A marked span whose body takes a route (a kernel's choice) reports it in every trace that takes the
+    span, its program held or not: a held span reported nothing again, and a kernel report and the tuner
+    missed its route and launch (row 11002)."""
+    from dew.nn.kernels import generation
+
+    def routed(x):
+        generation.route("rms_norm", kernel="xla")
+        return x * 2.0
+
+    span = marked(Protected(), routed)
+    found = []
+    for program in (lambda x: span(x), lambda x: span(x) + 0.0):
+        with generation.routes() as routes:
+            jax.jit(program).trace(jnp.ones(3))
+        found.append([route.choice for route in routes])
+    assert found == [["rms_norm"], ["rms_norm"]]
+
