@@ -823,7 +823,11 @@ def test_a_launch_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu
     a host's own GPU of the generation certified it instead, a start compiling ahead on that host certified
     each launch traced outside its certifying block twice, apart (row 6791: the GH200's recurrent step
     certified 5 of its 28 programs twice), and a host of no GPU certified none of them."""
-    op = TwoKernels()
+    class Meshed(TwoKernels):
+        """`TwoKernels`, a launch of its own: certified here, whatever this process certified before (row
+        10853: run after the file's other tests, `TwoKernels` was certified already and this saw none)."""
+
+    op = Meshed()
     devices, lowered = _paired_step(op)
     before = {id(each) for each in report.certifications()}
     with generation.assumed("sm90"), jax.set_mesh(devices):

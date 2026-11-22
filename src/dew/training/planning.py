@@ -50,7 +50,7 @@ from dew.nn.kernels.options import (
     unhold,
 )
 from dew.nn.kernels.templates import report
-from dew.objectives.base import RECORD, Objective, Pooled
+from dew.objectives.base import RECORD, Objective, Pooled, head_fused_of, head_tile_of
 from dew.state import TrainState, apart, together
 from dew.telemetry.compiles import Ledger
 from dew.telemetry.instrumentation import compiled_memory
@@ -64,8 +64,6 @@ from dew.training.memory import (
     MemoryMiss,
     compile_limit,
     compiled_if_it_fits,
-    head_fused_of,
-    head_tile_of,
     local_devices,
     offloads,
     placeable,
