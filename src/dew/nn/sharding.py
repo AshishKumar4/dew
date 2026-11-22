@@ -745,6 +745,28 @@ def varying_like(x: jax.Array, *operands) -> jax.Array:
     return jax.lax.pcast(x, missing, to="varying") if missing else x
 
 
+def summed_axes(x: jax.Array, operand: jax.Array) -> tuple[str, ...]:
+    """The manual axes `x` varies over that `operand` does not: the axes a gradient of `operand` formed as
+    `x` sums its shards' partials over (`varying_as`)."""
+    return tuple(sorted(jax.typeof(x).mat.varying - jax.typeof(operand).mat.varying))
+
+
+def varying_as(cotangent, operand):
+    """`cotangent` typed as `operand` varies over a checked manual map's axes (`checked`): summed over each
+    axis it varies over that `operand` does not (`summed_axes`), and cast to varying over each `operand`
+    varies over that it does not (`varying_like`), as JAX's own transposes type an operand's cotangent. A
+    kernel's result varies over every axis an operand varies over (`launches._typed`, row 9808), so its
+    gradient of an operand every device holds the same of is each device's partial, which sums to the
+    operand's (row 10526), and a cotangent the backward formed from values the same on every device is cast
+    to an operand each device holds its own of. `cotangent` as it is outside a checked map, where typed as
+    `operand`, or where either is None. The one rule of it (row 10944)."""
+    if cotangent is None or operand is None:
+        return cotangent
+    if extra := summed_axes(cotangent, operand):
+        cotangent = jax.lax.psum(cotangent, extra)
+    return varying_like(cotangent, operand)
+
+
 def checked() -> bool:
     """Whether a value traced here is typed by the manual axes it varies over: inside a `shard_map` that
     checks them (`check_vma`)."""
