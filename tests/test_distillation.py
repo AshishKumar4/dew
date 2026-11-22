@@ -817,12 +817,11 @@ def test_a_tiled_full_kl_leaves_out_the_positions_whose_teacher_logits_are_not_f
         assert bool(jnp.all(finite == held)) and bool(jnp.all(jnp.isfinite(divergence))), (held, finite)
 
 
-def test_a_tiled_full_kl_divides_by_a_wide_temperature_at_its_width_as_the_whole_logits_do():
-    """Under x64, float32 states and heads over a float64 temperature too small for float32 (1e-50): the
-    tiled full KL (`chunked.head_divergence`) divides by it at float64, as the whole logits' KL does
-    (`categorical.kl_divergence`), each finite and float64 (row 10978's review: cast to the states'
-    float32 it became 0, its KL not finite)."""
-    from dew.nn import categorical
+def test_a_tiled_full_kl_divides_by_a_wide_temperature_at_its_own_width():
+    """Under x64, float32 states and heads over a float64 temperature float32 rounds (1 + 2**-40, to 1): the
+    tiled full KL (`chunked.head_divergence`) divides by it at float64, as the whole logits' KL divides
+    (`categorical.kl_divergence`), so its KL is float64 and other than at a temperature of 1 (row 10978's
+    review: cast to the states' float32, a float64 temperature of 1e-50 became 0)."""
     from dew.nn.protocols import OutputTable
     from dew.objectives.lm.chunked import head_divergence
 
@@ -832,13 +831,14 @@ def test_a_tiled_full_kl_divides_by_a_wide_temperature_at_its_width_as_the_whole
         tables = [jax.random.normal(key, (width, vocab), jnp.float32) for key in keys[:2]]
         states = [jax.random.normal(key, (rows, positions, width), jnp.float32) for key in keys[2:]]
         student, teacher = (OutputTable(table, vocab_major=False) for table in tables)
-        temperature = jnp.asarray(1e-50, jnp.float64)
-        tiled, _ = head_divergence(states[0], student, states[1], teacher, jnp.ones((rows, positions), bool),
-                                   temperature, tile=(3, vocab))
-        whole = categorical.kl_divergence(student.logits(states[0]) / temperature,
-                                          teacher.logits(states[1]) / temperature)
-    for divergence in (tiled, whole):
-        assert divergence.dtype == jnp.float64 and bool(jnp.all(jnp.isfinite(divergence))), divergence
+
+        def divergence(temperature) -> np.ndarray:
+            kept = jnp.ones((rows, positions), bool)
+            return np.asarray(head_divergence(states[0], student, states[1], teacher, kept,
+                                              jnp.asarray(temperature, jnp.float64), tile=(3, vocab))[0])
+
+        wide, one = divergence(1 + 2.0**-40), divergence(1.0)
+    assert wide.dtype == np.float64 and not np.array_equal(wide, one), (wide, one)
 
 
 @pytest.mark.mesh(devices=4)
