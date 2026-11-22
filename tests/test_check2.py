@@ -799,16 +799,19 @@ def test_a_move_of_keys_holds_their_data_and_a_word_off_breaks_it():
 
 
 def test_a_compensated_sum_holds_its_pairs_and_a_pair_a_step_off_breaks():
-    """A compensated sum's reduction (`dew.nn.precision.compensated_sum`'s, its combine
-    `compensated_add`) certifies: its `(hi, lo)` pairs hold the exact sum to fp32's precision squared, and a
-    pair whose `hi` is a step off, an error a plain sum's rounding could make, breaks there alone, as a
-    non-finite `hi` of a sum near the range's top that cannot overflow does."""
-    from dew.nn.precision import compensated_sum
+    """A compensated pair reduction (`dew.nn.precision.summed_pairs`', its combine `renormalized_add`)
+    certifies: its `(hi, lo)` pairs hold the exact sum to fp32's precision squared, and a pair whose `hi` is
+    a step off, an error a plain sum's rounding could make, breaks there alone, as a non-finite `hi` of a sum
+    near the range's top that cannot overflow does."""
+    from dew.nn.precision import compensated_sum, summed_pairs
+
+    def pairs(x):
+        return summed_pairs((x, jnp.zeros_like(x)), (1,))
 
     rng = np.random.default_rng(10)
     values = np.float32(rng.standard_normal((3, 64)) * 2.0 ** rng.integers(-8, 8, (3, 64)))
     assert ct.certified(lambda x: compensated_sum(x, (1,)), values)[1] == []
-    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [values], jax.lax.reduce_p)
+    params, given, results = _first_equation(pairs, [values], jax.lax.reduce_p)
     held = ct._pair_held(params, given, [np.asarray(result) for result in results], oc.FLOAT32)
     assert all(np.all(ok) for ok in held)
     high = _off_by_one_element(np.asarray(results[0]))
@@ -818,7 +821,7 @@ def test_a_compensated_sum_holds_its_pairs_and_a_pair_a_step_off_breaks():
     # them: a non-finite `hi` breaks each.
     largest = np.finfo(np.float32).max
     top = np.float32([[2.0 ** 127, 0], [largest, 0], [largest / 2, largest / 2]])
-    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [top], jax.lax.reduce_p)
+    params, given, results = _first_equation(pairs, [top], jax.lax.reduce_p)
     native = [np.asarray(result) for result in results]
     assert all(np.all(ok) for ok in ct._pair_held(params, given, native, oc.FLOAT32))
     for wrong in (np.nan, np.inf, -np.inf):
@@ -828,13 +831,31 @@ def test_a_compensated_sum_holds_its_pairs_and_a_pair_a_step_off_breaks():
     # Two largest values overflow in every order, a TwoSum of an infinite sum making both halves NaN: the
     # lane's NaN pair holds, an infinity of either sign breaks it.
     twice = np.float32([[largest, largest]])
-    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [twice], jax.lax.reduce_p)
+    params, given, results = _first_equation(pairs, [twice], jax.lax.reduce_p)
     native = [np.asarray(result) for result in results]
     assert np.isnan(native[0]).all()
     assert all(np.all(ok) for ok in ct._pair_held(params, given, native, oc.FLOAT32))
     for wrong in (np.inf, -np.inf):
         held = ct._pair_held(params, given, [np.float32([wrong]), native[1]], oc.FLOAT32)
         assert not held[0].any(), wrong
+
+
+def test_a_one_pass_compensated_sum_holds_its_plain_sum_and_one_a_term_short_breaks():
+    """A compensated sum's one-pass reduction (`dew.nn.precision.summed_total`'s, its combine
+    `_paired_and_plain`) certifies its pair and its plain sum, the total's inf or NaN fallback, as any sum
+    of its terms (in any order): a plain sum short its row's largest term, the fault the contract exists
+    for, breaks that row alone."""
+    from dew.nn.precision import compensated_sum
+
+    rng = np.random.default_rng(11)
+    values = np.float32(rng.standard_normal((3, 64)) * 2.0 ** rng.integers(-8, 8, (3, 64)))
+    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [values], jax.lax.reduce_p)
+    native = [np.asarray(result) for result in results]
+    assert all(np.all(ok) for ok in ct._pair_and_plain_held(params, given, native, oc.FLOAT32))
+    short = native[2].copy()
+    short[0] = np.float32(np.sum(np.delete(values[0], np.argmax(np.abs(values[0]))), dtype=np.float64))
+    plain = ct._pair_and_plain_held(params, given, [*native[:2], short], oc.FLOAT32)[2]
+    assert not plain[0] and plain[1:].all()
 
 
 def test_a_variadic_reduction_is_held_by_the_combine_it_was_given():
