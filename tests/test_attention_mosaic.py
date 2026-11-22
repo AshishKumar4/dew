@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import attention_terms, traced_attention_terms
+from attention_oracle import traced_attention_terms
 from fla_gdn_support import KernelCase
 from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS
