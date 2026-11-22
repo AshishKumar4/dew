@@ -135,8 +135,7 @@ def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array
     NaN where `nan` (row 11795: classified on the bits, where a float32 multiply flushed a subnormal operand
     first). The one rounding of an exact value into float32 (`lowered_rounded`'s,
     `dew.quantization.packed_values`'s, row 11807)."""
-    length = 32 - jax.lax.clz(significand).astype(jnp.int32)
-    last = jnp.maximum(exponent + length - 24, -149)
+    last = jnp.maximum(exponent + _bit_length(significand) - 24, -149)
     drop = last - exponent
     shift = jnp.clip(drop, 1, 31).astype(jnp.uint32)
     kept = jnp.where(drop <= 0, significand << jnp.clip(-drop, 0, 31).astype(jnp.uint32),
@@ -157,6 +156,17 @@ def rounded_float32(sign: jax.Array, significand: jax.Array, exponent: jax.Array
     bits = sign | jnp.where(significand == 0, np.uint32(0), magnitude)
     bits = jnp.where(nan, np.uint32(0x7FC00000), jnp.where(infinite, sign | np.uint32(0x7F800000), bits))
     return jax.lax.bitcast_convert_type(bits, jnp.float32)
+
+
+def _bit_length(x: jax.Array) -> jax.Array:
+    """The position of `x`'s leading one (uint32; 0 for a zero), int32, by halving searches of its bits: the
+    shifts and compares every kernel's lowering takes (a Triton kernel's has no count of leading zeros)."""
+    length = jnp.zeros(x.shape, jnp.int32)
+    for width in (16, 8, 4, 2, 1):
+        high = (x >> np.uint32(width)) != 0
+        x = jnp.where(high, x >> np.uint32(width), x)
+        length = length + jnp.where(high, width, 0).astype(jnp.int32)
+    return length + (x != 0).astype(jnp.int32)
 
 
 def lowered_rounded(x: jax.Array, k: jax.Array) -> jax.Array:

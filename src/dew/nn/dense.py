@@ -75,7 +75,8 @@ def providing() -> bool:
     it off and on again, no rule queried, so none counted as matched (`get_unused_rules`). False where Qwix is
     not loaded, or another thread is loading it (its module present, its manager not yet made: no provider
     can be on), row 11804."""
-    interceptions = getattr(sys.modules.get("qwix._src.interception"), "interception_manager", None)
+    interception = sys.modules.get("qwix._src.interception")
+    interceptions = None if interception is None else vars(interception).get("interception_manager")
     if interceptions is None:
         return False
     providers = interceptions.disable_interception()
