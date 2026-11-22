@@ -761,7 +761,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
             return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}",
                             records=False)
 
-        kept_o, kept_final, (a, (w, h, c, _)) = kept(*operands, starts=starts)
+        kept_o, kept_final, (a, (w, h, c, _, _)) = kept(*operands, starts=starts)
         for native, own in ((o, kept_o), (final, kept_final)):
             assert np.array_equal(np.asarray(native).view(np.uint8), np.asarray(own).view(np.uint8)), \
                 "the certify build is the production program"
@@ -1723,6 +1723,10 @@ def key_back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
                                records["dv"][n, head], records["d_scores"][n, head],
                                records["d_system"][n, head])
             enclosed_ = key_back_enclosures(step, run.scale, lane)
+            # The pairs launch finishes the queries' and keys' gradients, the memory launch's record added to
+            # its pairs' sum as it stores them (`key_backward._key_pairs_back`).
+            for name, memory in (("dq_pairs", "dq_memory"), ("dk_pairs", "dk_memory")):
+                enclosed_[name] = fp32(add(point(records[memory][n, head]), enclosed_[name]), lane)
             for name in KEY_BACK_RECORDS:
                 if name == "entering":
                     record = back.dh0[head] if n == 0 else back.dh[n - 1, head]
