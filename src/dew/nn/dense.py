@@ -79,8 +79,10 @@ def providing() -> bool:
         return False
     interceptions = interception.interception_manager
     providers = interceptions.disable_interception()
-    interceptions.enable_interception(providers)
-    return bool(providers)
+    try:
+        return bool(providers)
+    finally:
+        interceptions.enable_interception(providers)
 
 
 def intercepting() -> bool:
