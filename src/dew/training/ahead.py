@@ -1727,14 +1727,45 @@ def _arguments(executable: jax.stages.Compiled) -> int:
     return 0 if memory is None else memory.argument
 
 
+def _weights_among(placed: TrainState) -> Callable[[jax.stages.Compiled], int]:
+    """The bytes of the run's state among an evaluation program's arguments: its first argument's, where
+    that is the weights the run holds (`Objective._validation_report` passes the state's variables, or the
+    average it keeps, `evaluation_variables`), those of them the program reads (a leaf it drops holds no
+    sharding, `Compiled.input_shardings`); else none. Its batches and other arguments are none of the
+    state, so they count beside it, and its weights once (row 8710: an evaluation counted beside the whole
+    state counted them twice, and refused a GPU it fitted)."""
+    from dew.distributed.placement import placed_bytes
+
+    held = {_signature(tree) for tree in (placed.variables, placed.ema) if tree is not None}
+
+    def among(executable: jax.stages.Compiled) -> int:
+        (arguments, _), (shardings, _) = executable.in_avals, executable.input_shardings
+        if not arguments or _signature(arguments[0]) not in held:
+            return 0
+        read = [jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=sharding)
+                for aval, sharding in zip(jax.tree.leaves(arguments[0]),
+                                          jax.tree.leaves(shardings[0], is_leaf=lambda leaf: leaf is None),
+                                          strict=True)
+                if sharding is not None]
+        return placed_bytes(read, memory="device")
+
+    return among
+
+
+def _signature(tree) -> tuple:
+    """`tree`'s structure and each leaf's shape and dtype: what an argument and the state's weights share
+    where the one is the other."""
+    return jax.tree.structure(tree), tuple((tuple(leaf.shape), leaf.dtype)
+                                           for leaf in jax.tree.leaves(tree))
+
+
 def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
                                        plan: FitPlan | None, programs: Started) -> None:
     """The programs a run's steps run on their results and its state, and with its `fit`'s `plan` its
     evaluations' warming pass over its first state, compiled where the run's own code calls them over
     shapes (`collecting`), joining `programs` by digest (`_collected`): `started`'s last part. A window's
     allocation and a log's copies take the state alone; the programs over a step's results take none of it,
-    and an evaluation's, its weights among its batches, are counted beside the whole state, a need never
-    under what its run holds."""
+    and an evaluation's take the weights the run holds beside their batches (`_weights_among`)."""
     from dew.distributed.placement import placed_shapes
     from dew.state import apart, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest, streak_of
@@ -1763,6 +1794,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             added_tokens(counted.tokens, counted.tokens)
             with _collected(programs, _arguments):
                 copied(together(moving, frozen))
-        if plan is not None:
+    if plan is not None:
+        with _collected(programs, _weights_among(placed)):
             trainer._evaluator().warmed_ahead(plan, placed, start.shardings,
                                               trainer._compiler.links(trainer.device_mesh))
