@@ -2313,16 +2313,15 @@ def _reach(target: str, group: tuple) -> set:
     107 s a task (jsf-coversize)."""
     facts = generation.gpu_target(target)
     name, dtype, _, packed, variant = group
+    # Each launch with the arithmetic form its emitted part reads (`_form`: the delta rule, the rounding, the
+    # rate), not beside it: apart, a cover kept the form by another group and dropped the only one lowering
+    # a rated training launch (row 11728).
+    form = tuple(sorted(_form(name, dtype).items()))
     with generation.assumed(facts), report.refusals():
-        found = {(kind, launch) for _, bound, tiles, training in _cases(target, group)
+        found = {(kind, launch, form) for _, bound, tiles, training in _cases(target, group)
                  for kind, _, launch in _rungs_of(bound, tiles, training, facts)}
     kind = 'two roles' if variant == TWO_ROLES else 'derived' if variant is None else 'a neighbour'
-    # The arithmetic form a launch's emitted part reads (`_form`: the delta rule, the rounding), beside the
-    # operands' dtype: without it a cover could drop every write gate's group, whose unrounded launches emit
-    # branches of their own.
-    form = tuple(sorted(_form(name, dtype).items()))
-    return (found | {('dtype', jnp.dtype(dtype).name), ('packed', packed), ('tiles', kind), ('form', form)}
-            if found else found)
+    return found | {('dtype', jnp.dtype(dtype).name), ('packed', packed), ('tiles', kind)} if found else found
 
 
 def _rungs_of(bound, tiles, training: bool, facts) -> list:
