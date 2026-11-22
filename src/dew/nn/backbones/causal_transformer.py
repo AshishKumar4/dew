@@ -791,8 +791,11 @@ class CausalTransformer(LinearProducts):
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
         self.specs = specs
-        # What one scanned body shares: the layers' spec and how their variables are stored.
-        structures = StackView.layer_structures(self.variables, self.num_layers)
+        # What one scanned body shares: the layers' spec and how their variables are stored. A capture's
+        # outputs (`capture_intermediates`, whatever its filter keeps: a submodule a method returns among
+        # them) are no stored variable (row 11882).
+        stored = {name: tree for name, tree in self.variables.items() if name != _INTERMEDIATES}
+        structures = StackView.layer_structures(stored, self.num_layers)
         self.scan_keys = tuple(self.scanned_like(index, key)
                                for index, key in enumerate(zip(specs, structures, strict=True)))
         self.block = block

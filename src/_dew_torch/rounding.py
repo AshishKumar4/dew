@@ -188,18 +188,26 @@ def _move(name: str, func, args, kwargs, computed, unit: float):
     11844: a move past the derivative's reach, and `(-1)**257` taken as `(-1)**256`, a sign), added as
     distances, never divided by `unit`, which overflowed past float64's range where both powers are finite
     (the review of 3606, F1)."""
-    if name == "pow" and isinstance(args[1], (int, float)) and args[1] not in POWER_ATEN:
-        narrowed = _narrowed(args[1], unit)
-        if narrowed != args[1]:
-            power = args[0].pow(narrowed)
-            return 2 * unit * power.abs() + (power - computed).abs()
-    return unit * _weight(name, func, args, kwargs, computed, unit)
+    if name == "pow":
+        exponent = args[1]
+        # A tensor's exponent and one the kernel computes otherwise than by a library power (`POWER_ATEN`)
+        # held as given; any other narrowed to the operand's format first.
+        if not isinstance(exponent, (int, float)):
+            return 2 * unit * computed.abs()
+        if exponent in POWER_ATEN:
+            return POWER_ATEN[exponent] * unit * computed.abs()
+        narrowed = _narrowed(exponent, unit)
+        if narrowed == exponent:
+            return 2 * unit * computed.abs()
+        power = args[0].pow(narrowed)
+        return 2 * unit * power.abs() + (power - computed).abs()
+    return unit * _weight(name, func, args, kwargs, computed)
 
 
-def _weight(name: str, func, args, kwargs, computed, unit: float):
-    """The most one rounding of aten `func` moves its float64 `computed`, in units of `unit`, the u of the
-    format the program computes in (tests/rounding_bound.py's `_weight`); an operation of no rule refused,
-    naming it."""
+def _weight(name: str, func, args, kwargs, computed):
+    """The most one rounding of aten `func` moves its float64 `computed`, in units of the u of the format the
+    program computes in (tests/rounding_bound.py's `_weight`); a power's is its move's (`_move`); an operation
+    of no rule refused, naming it."""
     import torch
 
     magnitude = computed.abs()
@@ -209,12 +217,6 @@ def _weight(name: str, func, args, kwargs, computed, unit: float):
         return ULPS[ULPS_ATEN[name]] * magnitude
     if name in CIRCULAR:
         return 2 * magnitude
-    if name == "pow":
-        exponent = args[1]
-        if not isinstance(exponent, (int, float)):
-            return 2 * magnitude
-        # A scalar exponent the kernel narrows is weighed apart (`_move`).
-        return POWER_ATEN.get(exponent, 2) * magnitude
     if name in SUMS_ATEN:
         magnitudes = [arg.abs() if isinstance(arg, torch.Tensor) and arg.is_floating_point() else arg
                       for arg in args]

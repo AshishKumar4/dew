@@ -7,7 +7,8 @@ DPOConfig defaults it reads off the config class (the `sigmoid` loss,
 loss is TRL's code: the shift, `selective_log_softmax`, zeroing outside
 `completion_mask[:, 1:]`, the per-sequence sums, the `[chosen, rejected]`
 chunking, the reference forward and `mean(-logsigmoid(beta * delta))`. The
-trainer around it is a stand-in holding those settings, and the policy and
+trainer around it is a DPOTrainer whose initializer never ran, holding those
+settings alone, and the policy and
 reference models are stand-ins returning fixed logits, so the fixture pins
 the loss without a model. Autograd gives the gradient in the policy logits.
 The same call runs once in fp32, the values Dew is compared with, and once
@@ -25,7 +26,6 @@ import dataclasses
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import numpy as np
 
@@ -64,7 +64,7 @@ def trl_loss(arrays: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
     from trl.trainer.dpo_config import DPOConfig
     from trl.trainer.dpo_trainer import DPOTrainer
 
-    defaults: dict[str, Any] = {
+    defaults: dict[str, object] = {
         field.name: field.default if field.default is not dataclasses.MISSING
         else field.default_factory() if field.default_factory is not dataclasses.MISSING else None
         for field in dataclasses.fields(DPOConfig)}
@@ -83,20 +83,24 @@ def trl_loss(arrays: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
 
     identity = SimpleNamespace(device=torch.device("cpu"), gather=lambda x: x, gather_for_metrics=lambda x: x,
                                unwrap_model=lambda model: model)
-    trainer = SimpleNamespace(
+    loss_types = defaults["loss_type"]
+    if not isinstance(loss_types, list):
+        raise TypeError(f"DPOConfig's loss_type defaults to {loss_types!r}, no list of losses")
+    # A DPOTrainer whose initializer never ran, holding the fields its loss reads alone (no model, dataset or
+    # accelerator built whole), each written to the instance as its initializer writes them.
+    trainer = DPOTrainer.__new__(DPOTrainer)
+    vars(trainer).update(
         model=SimpleNamespace(training=True, is_gradient_checkpointing=False),
         ref_model=Fixed(reference),
         accelerator=identity, args=SimpleNamespace(gradient_checkpointing_kwargs=None),
         aux_loss_enabled=False, ld_alpha=defaults["ld_alpha"], precompute_ref_logps=False,
-        f_divergence_type=defaults["f_divergence_type"], loss_types=list(defaults["loss_type"]),
+        f_divergence_type=defaults["f_divergence_type"], loss_types=list(loss_types),
         loss_weights=[1.0], beta=BETA, use_weighting=defaults["use_weighting"],
         _metrics=defaultdict(lambda: defaultdict(list)), _total_train_tokens=0)
     inputs = {"input_ids": torch.tensor(arrays["input_ids"]),
               "attention_mask": torch.ones(arrays["input_ids"].shape, dtype=torch.long),
               "completion_mask": torch.tensor(arrays["completion_mask"], dtype=torch.long)}
-    # The trainer's loss over a stand-in holding the fields it reads, not a DPOTrainer built whole.
-    standing: Any = trainer
-    loss = DPOTrainer._compute_loss(standing, Fixed(policy), inputs, return_outputs=False)
+    loss = trainer._compute_loss(Fixed(policy), inputs, return_outputs=False)
     loss.backward()
     assert policy.grad is not None
     metrics = trainer._metrics["train"]

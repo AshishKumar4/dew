@@ -418,18 +418,15 @@ def earlier_fields(value: JSON) -> JSON:
     checkpoint's task record), with each component's fields its class lost since (`REMOVED_FIELDS`) left
     out: a component record names its class and holds its fields (`{"class": ..., "fields": ...}`),
     wherever it nests. Its callers hand it components alone, never a record of data a row holds, which may
-    look like one."""
-    if isinstance(value, list):
-        return [earlier_fields(part) for part in value]
-    if not isinstance(value, dict):
-        return value
-    held = {key: earlier_fields(part) for key, part in value.items()}
-    named = held.get("class")
-    removed = REMOVED_FIELDS.get(named) if isinstance(named, str) else None
-    fields = held.get("fields")
-    if removed and isinstance(fields, dict):
-        held["fields"] = {name: field for name, field in fields.items() if name not in removed}
-    return held
+    look like one. Walked as every class record is (`class_records`, row 11911)."""
+    def without_removed(name: str, fields: Mapping[str, JSON], root: bool) -> dict[str, JSON] | None:
+        removed = REMOVED_FIELDS.get(name, frozenset())
+        if removed.isdisjoint(fields):
+            return None
+        kept = {field: held for field, held in fields.items() if field not in removed}
+        return {"class": name, "fields": kept}
+
+    return class_records(value, without_removed)
 
 
 @overload
