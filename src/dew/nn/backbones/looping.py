@@ -480,6 +480,7 @@ class _Passes:
         entering_cache = None if shared is None else (shared.entering if shared.entering is not None
                                                      else model.variables.get('cache') or None)
 
+        @_arrays_captured
         def later(module, carry, step_inputs):
             # The block's input, its per-layer inputs and the entering cache close over the scan.
             theta, step = step_inputs
@@ -530,6 +531,7 @@ class _Passes:
         def branched(module, carry, step, passes):
             at_cut = False if backprop is None else step == passes - backprop
 
+            @_arrays_captured
             def run(module, carry):
                 return self.stepped(module, carry, theta, exit_stop=at_cut, enter_stop=at_cut,
                                     block=self.pass_block)
@@ -556,6 +558,38 @@ class _Passes:
 
         stepping = nn.remat(branched) if self.loop.remat else branched
         return stepping(module, carry, step, passes)
+
+
+def _arrays_captured(function):
+    """`function`, a scanned pass or a branch of one, keeping of what a capture (`capture_intermediates`)
+    sowed in it the arrays alone: a captured method that returns no array (a layer's resolved kind, a
+    helper handing it its submodules) is a value no scan stacks nor switch carries, kept by the passes a
+    loop traces one by one alone."""
+    def kept(variables):
+        captured = variables.get('intermediates')
+        if captured is None:
+            return variables
+        return {**variables, 'intermediates': _arrays_of(captured)}
+
+    def run(module, *operands):
+        if not module.is_mutable_collection('intermediates'):
+            return function(module, *operands)
+        return nn.map_variables(function, 'intermediates', trans_out_fn=kept, mutable=True)(module, *operands)
+
+    return run
+
+
+def _arrays_of(captured):
+    """A capture's collection with each captured value holding anything but arrays left out."""
+    if not isinstance(captured, Mapping):
+        return captured
+    kept = {}
+    for name, value in captured.items():
+        if isinstance(value, Mapping):
+            kept[name] = _arrays_of(value)
+        elif all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(value)):
+            kept[name] = value
+    return kept
 
 
 def _sown_switch(index, branches, module, *operands):

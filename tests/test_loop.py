@@ -801,8 +801,10 @@ def _scored(model):
             exits = sown.get("exits", {})
             states = tuple(exits.get("states", ()))
             ran = tuple(exits.get("ran", ())) or (True,) * len(states)
-            exit_loss = sum((jnp.where(each, jnp.mean(jnp.square(state.astype(jnp.float32))), 0.0)
-                             for each, state in zip(ran, states, strict=True)), jnp.zeros((), jnp.float32))
+            # In the exits' own width, at least float32's: a float64 truth's in float64.
+            wide = jnp.promote_types(states[0].dtype if states else logits.dtype, jnp.float32)
+            exit_loss = sum((jnp.where(each, jnp.mean(jnp.square(state.astype(wide))), 0)
+                             for each, state in zip(ran, states, strict=True)), jnp.zeros((), wide))
             return jnp.sum(logits * cotangent.astype(logits.dtype)) + exit_loss, (logits, exit_loss)
 
         (_, (logits, exit_loss)), gradients = jax.value_and_grad(loss, has_aux=True)(tree["params"])
@@ -859,10 +861,15 @@ def test_a_count_of_passes_given_per_call_sows_whether_each_router_ran(rng):
     sown = jax.jit(lambda tree, ids: looped.apply(tree, ids, mutable=[ROUTER_COLLECTION],
                                                   loop_passes=jnp.int32(2))[1][ROUTER_COLLECTION])(
         variables, ids)
-    routers = [node for path, node in leaves_by_path(sown).items() if path[-1] == ROUTER_RAN]
-    assert routers and all([bool(each) for each in ran] == [True, True, False] for ran in routers)
-    indices = [node for path, node in leaves_by_path(sown).items() if path[-1] == ROUTER_INDICES]
-    assert all(len(each) == 3 for each in indices)
+    # The looped layers' routers are called once a pass, three; the others once, and ran.
+    ran = {path: [bool(each) for each in node] for path, node in leaves_by_path(sown).items()
+           if path[-1] == ROUTER_RAN}
+    looped = {path: calls for path, calls in ran.items() if len(calls) == 3}
+    assert looped and all(calls == [True, True, False] for calls in looped.values()), ran
+    assert all(all(calls) for path, calls in ran.items() if path not in looped), ran
+    indices = {path[:-1]: len(node) for path, node in leaves_by_path(sown).items()
+               if path[-1] == ROUTER_INDICES}
+    assert all(indices[path[:-1]] == 3 for path in looped), indices
 
 
 def test_a_loop_whose_every_pass_exits_runs_under_a_capture_of_every_method():
