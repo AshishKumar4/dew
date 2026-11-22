@@ -31,7 +31,7 @@ from dew.batch import (
     leaves_by_path,
     merge,
     shifted_span,
-    sown_calls,
+    sown_nodes,
     token_layout,
 )
 from dew.nn.moe import (
@@ -39,6 +39,7 @@ from dew.nn.moe import (
     EXPERT_BIAS_COLLECTION,
     ROUTER_INDICES,
     ROUTER_LOG_Z,
+    ROUTER_RAN,
     ROUTER_SCORES,
     FixedRouters,
     RouterMoments,
@@ -176,8 +177,8 @@ class ExpertBalance:
         max_segments = laid.max_segments if isinstance(laid, Coordinates) else None
         sequence = []
         if self.seq_aux:
-            for scores, indices in routers:
-                valid = _router_queries(scores.shape[:2], queries, documents)
+            for scores, indices, ran in routers:
+                valid = _router_queries(scores.shape[:2], queries, documents, ran)
                 moments = sequence_router_moments(
                     scores, indices, valid, None if documents is None else documents[:, :scores.shape[1]],
                     max_segments=max_segments)
@@ -186,7 +187,8 @@ class ExpertBalance:
                 sequence.append(Ratio(Objective.row_mean(losses, batch).total,
                                       Objective.row_mean(supported, batch).total))
         global_routers = (() if self.seq_aux else
-                          tuple(router_moments(s, i, batch, queries, documents) for s, i in routers))
+                          tuple(router_moments(s, i, batch, queries, documents, ran)
+                                for s, i, ran in routers))
         statistics = RoutedStatistics(prediction, tuple(sequence), global_routers)
         combined, _ = self.reduce(statistics)
         prediction_loss, _ = prediction.mean()
@@ -305,12 +307,21 @@ def apply_routed(balance: ExpertBalance | None, variables: Variables, effects: V
 
 
 def _router_queries(shape: tuple[int, ...], queries: jax.Array | None,
-                    documents: jax.Array | None) -> jax.Array:
-    """The real queries of a router, a prediction depth's shifted inputs among them: each query whose span
-    to the input its depth shifts it to holds real inputs of one document (`shifted_span`)."""
-    if queries is None:
-        return jnp.ones(shape, bool)
-    return shifted_span(queries.shape, queries.shape[1] - shape[1], valid=queries, segments=documents)
+                    documents: jax.Array | None, ran: jax.Array | None = None) -> jax.Array:
+    """The real queries of a router's call, a prediction depth's shifted inputs among them: each query whose
+    span to the input its depth shifts it to holds real inputs of one document (`shifted_span`), none of a
+    call that did not run (`ran` False: a looped pass a count given per call skipped, `ROUTER_RAN`)."""
+    valid = (jnp.ones(shape, bool) if queries is None else
+             shifted_span(queries.shape, queries.shape[1] - shape[1], valid=queries, segments=documents))
+    return valid if ran is None else valid & ran
+
+
+def _calls_ran(routing: Variables, *markers: str) -> list[tuple[tuple[str, ...], tuple, jax.Array | None]]:
+    """Every router call that sowed `markers` (`sown_calls`), with whether it ran (`ROUTER_RAN`), None
+    where it sowed no such record."""
+    return [(path, call, ran) for path, node in sown_nodes(routing, *markers)
+            for call, ran in zip(zip(*(node[marker] for marker in markers), strict=True),
+                                 node.get(ROUTER_RAN) or (None,) * len(node[markers[0]]), strict=True)]
 
 
 def _selected_counts(indices: jax.Array, valid: jax.Array, experts: int) -> jax.Array:
@@ -334,10 +345,10 @@ def router_counts(moe: Variables, routing: Variables, queries: jax.Array | None 
     """
     biases = leaves_by_path(moe)
     counts: dict[tuple[str, ...], jax.Array] = {}
-    for path, (indices,) in sown_calls(routing, ROUTER_INDICES):
+    for path, (indices,), ran in _calls_ran(routing, ROUTER_INDICES):
         bias = (*path, EXPERT_BIAS)
         if bias in biases:
-            valid = _router_queries(indices.shape[:2], queries, documents)
+            valid = _router_queries(indices.shape[:2], queries, documents, ran)
             counted = jnp.sum(_selected_counts(indices, valid, biases[bias].shape[0]), axis=0)
             counts[bias] = counts[bias] + counted if bias in counts else counted
     return unflatten_dict(counts)
@@ -361,13 +372,13 @@ def router_z_terms(routing: Variables, weight: float, batch: Batch, queries: jax
     are `batch`'s rows' (`Objective.row_mean`).
     """
     terms = []
-    calls = sown_calls(routing, ROUTER_LOG_Z)
+    calls = _calls_ran(routing, ROUTER_LOG_Z)
     # A z-loss of a weight balances each router it reads (`dew.nn.moe.balancing`); one of none, none.
     if weight:
-        balancing(path for path, _ in calls)
+        balancing(path for path, _, _ in calls)
     # lm-engine: moe/module.py at 45b6b57b, before its 0.1 and router_aux_loss_coef.
-    for _, (log_z,) in calls:
-        valid = _router_queries(log_z.shape, queries, documents)
+    for _, (log_z,), ran in calls:
+        valid = _router_queries(log_z.shape, queries, documents, ran)
         dtype = at_least_fp32(log_z.dtype)
         total = Objective.row_mean(jnp.where(valid, jnp.square(log_z.astype(dtype)), 0), batch).total
         mass = Objective.row_mean(valid.astype(dtype), batch).total
@@ -376,15 +387,16 @@ def router_z_terms(routing: Variables, weight: float, batch: Batch, queries: jax
 
 
 def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch,
-                   queries: jax.Array | None = None, documents: jax.Array | None = None) -> RouterMoments:
-    """Return one router's routed-position statistics over `batch`'s rows (`Objective.row_mean`).
+                   queries: jax.Array | None = None, documents: jax.Array | None = None,
+                   ran: jax.Array | None = None) -> RouterMoments:
+    """Return one router call's routed-position statistics over `batch`'s rows (`Objective.row_mean`).
 
     `scores` is `[rows, positions, experts]` and `indices` the experts each
-    position chose, `[rows, positions, top_k]`.
+    position chose, `[rows, positions, top_k]`; a call that did not run (`ran` False) routes none.
     """
     experts = scores.shape[-1]
     dtype = at_least_fp32(scores.dtype)
-    valid = _router_queries(scores.shape[:2], queries, documents)
+    valid = _router_queries(scores.shape[:2], queries, documents, ran)
     # These counts enter a floating loss, unlike the exact integer bias effects.
     summed = Objective.row_mean(jnp.where(valid[..., None], scores.astype(dtype), 0), batch, axis=(0, 1))
     chosen = _selected_counts(indices, valid, experts)
@@ -393,9 +405,10 @@ def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch,
     return RouterMoments(summed.total, counts, positions, indices.shape[-1])
 
 
-def router_scores(routing: Variables) -> list[tuple[tuple, tuple[jax.Array, jax.Array]]]:
-    """Every router call that sowed its scores beside its choice, its path and its `(scores, indices)`, in
-    the tree's key order, a router's calls in the order they ran (`sown_calls`): the one selector of the
-    routers a loss over scores reads, a router recording its choice alone (a routing replay's record) none
-    of them (row 11808)."""
-    return sown_calls(routing, ROUTER_SCORES, ROUTER_INDICES)
+def router_scores(routing: Variables) -> list[tuple[tuple, tuple[jax.Array, jax.Array, jax.Array | None]]]:
+    """Every router call that sowed its scores beside its choice, its path and its `(scores, indices, ran)`,
+    `ran` whether the call ran (`ROUTER_RAN`, None where it sowed none), in the tree's key order, a
+    router's calls in the order they ran (`sown_calls`): the one selector of the routers a loss over scores
+    reads, a router recording its choice alone (a routing replay's record) none of them (row 11808)."""
+    return [(path, (scores, indices, ran)) for path, (scores, indices), ran
+            in _calls_ran(routing, ROUTER_SCORES, ROUTER_INDICES)]

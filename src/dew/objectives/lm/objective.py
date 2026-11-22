@@ -70,7 +70,7 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, processor_settings
 from dew.inputs import Field, InputSpec
-from dew.nn.backbones.looping import exit_objective
+from dew.nn.backbones.looping import exit_objective, never_exiting
 from dew.nn.continuum import feedforward_levels
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
@@ -513,7 +513,8 @@ class Scores(NamedTuple):
     logits: jax.Array | None = None
     inspected: dict | None = None
     moved: Mapping | None = None
-    exits: tuple[tuple[jax.Array, ...], tuple[jax.Array, ...], tuple[jax.Array, ...] | None] | None = None
+    exits: tuple[tuple[jax.Array, ...], tuple[jax.Array, ...], tuple[jax.Array, ...] | None,
+                 tuple[jax.Array, ...]] | None = None
 
 
 def _refuse_stacked(collections: Sequence[str], *, depths: bool, layers: Sequence[int], routes,
@@ -1083,7 +1084,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         and whether it was right); every pass's exit-gate logit; and, where the last pass's correctness is
         asked for, each pass's."""
         exited = self._looped().exit_passes(gathered)
-        states, logits = exited.states, exited.logits
+        states, logits, ran = exited.states, exited.logits, exited.ran
         if before is not None:
             states = tuple(_predicted(state, before) for state in states)
         losses, correct = last
@@ -1091,7 +1092,9 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         earlier = [self.head_terms(self.model, params, state, targets, predict=predict) for state in states]
         right = None if not predict else (
             *((predicted == targets).astype(losses.dtype) for _, predicted, _ in earlier), correct)
-        return (*(terms[0] for terms in earlier), losses), logits, right
+        # A pass the call's count left unrun exits at no chance (`never_exiting`; row 11951's design: one
+        # program at the loop's cap).
+        return (*(terms[0] for terms in earlier), losses), never_exiting(logits, ran), right, ran
 
     def _looped(self) -> Looped:
         """The model as the looped decoder the exit objective weighs (`Looped`)."""
@@ -1797,7 +1800,7 @@ class LMObjective(TokenScorer):
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
         elif passes is not None and self.exit_entropy is not None:
             # Ouro's exit objective in the cross entropy's place, over the same counted targets.
-            pass_losses, gates, _ = passes
+            pass_losses, gates, _, _ = passes
             term, expected, entropy = exit_objective(pass_losses, gates, self.exit_entropy, width)
             units = shares(term, weights)
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
@@ -1877,7 +1880,7 @@ class LMObjective(TokenScorer):
         scored = TokenScores(scores.losses, scores.weights, scores.correct)
         if self.pass_weights is None or scores.exits is None:
             return scored
-        terms, _, right = scores.exits
+        terms, _, right, _ = scores.exits
         assert right is not None, "a scoring predicts every pass"
         mass = jax.lax.stop_gradient(self.row_mean(scores.weights, batch).total) if losses else None
         return scored, PassReports(tuple(

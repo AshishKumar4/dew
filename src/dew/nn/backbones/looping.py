@@ -105,6 +105,25 @@ initialization, before it lowered β to 0.05 for the stages after (arXiv 2510.25
 training table)."""
 
 
+NEVER_EXITS = -1e4
+"""The exit-gate logit a pass a call's count left unrun exits by (`never_exiting`): its chance of exiting,
+`sigmoid` of it, rounds to zero in every float a gate computes in, and so does its share of every later
+pass's log survival, so its loss and entropy terms weigh nothing and stay finite."""
+
+
+def never_exiting(logits: Sequence[jax.Array], ran: Sequence[jax.Array]) -> tuple[jax.Array, ...]:
+    """Every pass's exit-gate `logits` (`Looped.exit_passes`), each earlier pass's at `NEVER_EXITS` where it
+    did not run (`ran`, a count of passes given per call, `run_loop`'s `passes`): its share the last
+    pass's, the pass the count stops at. A gate's last logit, the stack's own output's, is that pass's,
+    which always runs."""
+    if not ran or not logits:
+        return tuple(logits)
+    if len(logits) - len(ran) not in (0, 1):
+        raise ValueError(f"{len(logits)} exit-gate logits for {len(ran)} passes' exits")
+    return (*(jnp.where(valid, logit, jnp.asarray(NEVER_EXITS, logit.dtype))
+              for logit, valid in zip(logits[:len(ran)], ran, strict=True)), *logits[len(ran):])
+
+
 def exit_objective(pass_losses: Sequence[jax.Array], logits: Sequence[jax.Array], entropy_weight: float,
                    dtype: jnp.dtype) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Ouro's exit objective (arXiv 2510.25741) per token, in `dtype`, from each pass's loss `[B, S]` and
@@ -611,8 +630,12 @@ def _shaped_like(value, shape):
         return None
     if value is not None:
         return value
-    # Placed as the pass's own entry is: a statistic a batch-split forward sows split (its rows' maxima),
-    # which a replicated zero would differ from in type.
+    # Typed as the pass's own entry is, which a zero of its shape alone would differ from: varying over the
+    # manual axes it varies over (a batch-split forward's statistic under `shard_map`, its rows' maxima),
+    # placed as it is on a mesh whose types carry the split.
+    manual = shape.manual_axis_type
+    if manual is not None and manual.varying:
+        return jax.lax.pcast(jnp.zeros(shape.shape, shape.dtype), tuple(sorted(manual.varying)), to="varying")
     placed = shape.sharding if isinstance(shape.sharding, NamedSharding) else None
     return jnp.zeros(shape.shape, shape.dtype, out_sharding=placed)
 

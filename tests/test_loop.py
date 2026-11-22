@@ -789,65 +789,73 @@ each pass exits through, the cut a count's last passes leave."""
 
 
 def _scored(model):
-    """`model`'s train-mode logits, its exits' states over `COUNTED_CAP` less one passes (a skipped pass's,
-    and those past a smaller loop's, zero: `ExitPasses.ran`), and the gradient of the logits along
-    `cotangent` and of the exits' mean squares: with `count`, the count of passes given per call, a traced
-    argument."""
-    def run(tree, ids, cotangent, *count):
-        given = {"loop_passes": count[0]} if count else {}
+    """`model`'s train-mode logits, each earlier pass's exit (its state and its exit-gate logit, over
+    `COUNTED_CAP` less one passes: a skipped pass's and those past a smaller loop's zero, `ExitPasses.ran`),
+    the last pass's gate logit, and the gradient of the logits along `cotangent` beside the exits' states'
+    mean squares and gate logits' means: a call of a draw's arguments and its count of passes
+    (`loop_passes`), which a loop of a fixed count reads none of."""
+    def run(tree, ids, cotangent, count):
+        given = {"loop_passes": count} if model.loop.steps == COUNTED_CAP else {}
 
         def loss(params):
             logits, sown = model.apply({**tree, "params": params}, ids, train=True, mutable=["exits"],
                                        **given)
             exits = sown.get("exits", {})
-            states = tuple(exits.get("states", ()))
+            states, gates = tuple(exits.get("states", ())), tuple(exits.get("logits", ()))
             ran = tuple(exits.get("ran", ())) or (True,) * len(states)
-            kept = [jnp.where(each, state, 0) for each, state in zip(ran, states, strict=True)]
+            last = gates[len(states):]
+            earlier = gates[:len(states)] if gates else (None,) * len(states)
+            kept = [(jnp.where(each, state, 0), None if gate is None else jnp.where(each, gate, 0))
+                    for each, state, gate in zip(ran, states, earlier, strict=True)]
             # The exits a smaller loop leaves, past its own, zero as a skipped pass's are, where any exits.
             if model.loop.exiting:
                 zero = jnp.zeros((*ids.shape, model.emb_features), logits.dtype)
-                kept += [zero] * (COUNTED_CAP - 1 - len(kept))
-            exit_loss = sum((jnp.mean(jnp.square(state)) for state in kept), jnp.zeros((), logits.dtype))
-            return jnp.sum(logits * cotangent.astype(logits.dtype)) + exit_loss, (logits, tuple(kept))
+                gate = None if not gates else jnp.zeros((*ids.shape, 1), logits.dtype)
+                kept += [(zero, gate)] * (COUNTED_CAP - 1 - len(kept))
+            total = jnp.sum(logits * cotangent.astype(logits.dtype))
+            for state, gate in kept:
+                total = total + jnp.mean(jnp.square(state)) + (0 if gate is None else jnp.mean(gate))
+            total = total + sum((jnp.mean(gate) for gate in last), jnp.zeros((), logits.dtype))
+            return total, (logits, tuple(kept), last)
 
-        (_, (logits, exits)), gradients = jax.value_and_grad(loss, has_aux=True)(tree["params"])
-        return {"logits": logits, "exits": exits, "gradients": gradients}
+        (_, (logits, exits, last)), gradients = jax.value_and_grad(loss, has_aux=True)(tree["params"])
+        return {"logits": logits, "exits": exits, "last gate": last, "gradients": gradients}
     return run
 
 
 @functools.cache
 def _capped(name: str):
-    """The loop of `COUNTED_CAP` passes over `COUNTED[name]` and its one compiled program, every count a
-    call's argument (`_scored`)."""
+    """The loop of `COUNTED_CAP` passes over `COUNTED[name]` and the one function the gate compiles for
+    it, every count an argument of its one executable (`_scored`)."""
     capped = tiny(num_layers=4, loop=Loop(COUNTED_CAP, **COUNTED[name]), dtype="float32")
-    return capped, jax.jit(_scored(capped))
+    return capped, _scored(capped)
 
 
 @pytest.mark.parametrize("count", [1, 2, COUNTED_CAP])
 @pytest.mark.parametrize("name", sorted(COUNTED))
 def test_a_count_of_passes_given_per_call_runs_as_a_loop_of_that_many(name, count):
-    """A loop of `COUNTED_CAP` passes given a count per call (`loop_passes`) runs one compiled program for
-    every count (the count its argument, `_capped`) and computes what a loop of that many passes does: its
-    logits, the states of the exits it sows (`exits`, a skipped pass's zero by `ran`) and every gradient of
-    the logits and the exits' mean squares, on par from the loop of that many in float64 (check 1), its
-    passes past the count skipped and those before its cut passing no gradient back through their blocks,
-    their exits still training the coda, the norm and the gate; and it sows whether each later pass ran
-    (`ran`)."""
-    capped, program = _capped(name)
+    """A loop of `COUNTED_CAP` passes given a count per call (`loop_passes`, an argument of its one
+    executable, `_capped`) computes what a loop of that many passes does: its logits, the exits it sows
+    (their states and gate logits, a skipped pass's zero by `ran`), the last pass's gate logit, and every
+    gradient of the logits, the exits' states and their gate logits, on par from the loop of that many in
+    float64 (check 1), its passes past the count skipped and those before its cut passing no gradient back
+    through their blocks, their exits still training the coda, the norm and the gate; and it sows whether
+    each later pass ran (`ran`)."""
+    capped, counted = _capped(name)
     loop = capped.loop
     fixed = capped.clone(loop=dataclasses.replace(loop, steps=count, backprop_steps=(
         None if loop.backprop_steps is None else min(loop.backprop_steps, count))))
+    plain = with_logit_cotangent(drawn(capped, 16, 8), VOCAB, 0x7C0)
 
-    def counted(tree, ids, cotangent):
-        return program(tree, ids, cotangent, jnp.int32(count))
+    def draw(seed):
+        return (*plain(seed), jnp.int32(count))
 
-    draw = with_logit_cotangent(drawn(capped, 16, 8), VOCAB, 0x7C0)
-    assert_as_exact(counted, jax.jit(_scored(fixed)), draw,
+    assert_as_exact(counted, _scored(fixed), draw,
                     f"{count} of {COUNTED_CAP} passes given per call over {name}", seeds=COUNTED_SEEDS,
-                    truth_fn=jax.jit(_scored(fixed.clone(dtype=jnp.float64))))
+                    truth_fn=_scored(fixed.clone(dtype=jnp.float64)))
     if loop.exiting:
         _, sown = jax.jit(lambda tree, ids: capped.apply(tree, ids, mutable=["exits"],
-                                                         loop_passes=jnp.int32(count)))(*draw(0)[:2])
+                                                         loop_passes=jnp.int32(count)))(*plain(0)[:2])
         assert [bool(each) for each in sown["exits"]["ran"]] == [step < count for step in
                                                                  range(1, COUNTED_CAP)]
 
@@ -874,6 +882,43 @@ def test_a_count_of_passes_given_per_call_sows_whether_each_router_ran(rng):
     indices = {path[:-1]: len(node) for path, node in leaves_by_path(sown).items()
                if path[-1] == ROUTER_INDICES}
     assert all(indices[path[:-1]] == 3 for path in looped), indices
+
+
+def test_a_count_of_passes_given_per_call_counts_and_weighs_the_routers_as_a_loop_of_that_many(rng):
+    """A looped mixture given a count of two of its three passes per call routes, for every reader of its
+    routers' records, what a loop of two passes routes: each balancing bias's expert counts
+    (`router_counts`), each router call's z-loss (`router_z_terms`) and its routed-position moments
+    (`router_moments` over `router_scores`), a skipped call's left out by whether it ran (`ROUTER_RAN`),
+    where expert 0 took every slot of it; the counts exactly, the floats a sum of the same terms."""
+    from dew.nn.moe import ROUTER_COLLECTION
+    from dew.objectives.base import Batch
+    from dew.objectives.routing import router_counts, router_moments, router_scores, router_z_terms
+
+    mixture = Mixture(experts=4, top_k=2, bias=True)
+    capped = tiny(num_layers=4, mixture=mixture, loop=Loop(3, step_norm=False, layers=(1, 3)))
+    fixed = capped.clone(loop=Loop(2, step_norm=False, layers=(1, 3)))
+    ids = tokens(rng)
+    variables = nn.unbox(capped.init(rng, ids))
+    batch = Batch({"text": ids})
+
+    def read(model, **given):
+        _, sown = model.apply(variables, ids, mutable=[ROUTER_COLLECTION, "moe"], **given)
+        routing = sown[ROUTER_COLLECTION]
+        counts = leaves_by_path(router_counts(variables.get("moe", sown.get("moe", {})), routing))
+        terms = [term.total / term.mass for term in router_z_terms(routing, 1.0, batch)]
+        moments = [router_moments(scores, indices, batch, ran=ran).counts
+                   for _, (scores, indices, ran) in router_scores(routing)]
+        return counts, terms, moments
+
+    counts, terms, moments = jax.jit(lambda: read(capped, loop_passes=jnp.int32(2)))()
+    want_counts, want_terms, want_moments = jax.jit(lambda: read(fixed))()
+    assert counts.keys() == want_counts.keys() and counts
+    for path, count in counts.items():
+        np.testing.assert_array_equal(count, want_counts[path])
+    # The capped program's skipped calls weigh nothing: its terms are the fixed loop's, then zero mass.
+    ran_terms = [term for term in terms if bool(jnp.isfinite(term))]
+    np.testing.assert_allclose(np.asarray(ran_terms), np.asarray(want_terms), rtol=1e-6)
+    np.testing.assert_array_equal(np.asarray(sum(moments)), np.asarray(sum(want_moments)))
 
 
 def test_a_loop_whose_every_pass_exits_runs_under_a_capture_of_every_method():
@@ -941,4 +986,32 @@ def test_a_count_of_passes_given_per_call_sows_its_statistics_placed_as_its_rows
     maxima = sown['layers_1']['self_attn']['max_logits']
     assert len(maxima) == 3 and not bool(jnp.any(maxima[2]))
     assert all(bool(jnp.any(each != 0)) for each in maxima[:2])
+
+
+@pytest.mark.mesh
+def test_a_count_of_passes_given_per_call_sows_its_statistics_typed_as_its_rows_are_under_a_manual_axis(rng):
+    """A looped stack given a count of its passes per call inside `shard_map`, its rows split over a manual
+    data axis and the count replicated: a skipped pass's attention statistics are zeros varying over the
+    data axis as a pass's own are (`ShapeDtypeStruct.manual_axis_type`), so the pass and the skip agree in
+    type, the ran passes' maxima as they ran."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    looped = tiny(num_layers=4, qk_norm=False, loop=Loop(3, step_norm=False, layers=(1, 3)))
+    ids = tokens(rng, rows=4)
+    variables = nn.unbox(looped.init(rng, ids))
+
+    def maxima(tree, ids, count):
+        sown = looped.apply(tree, ids, mutable=[QK], loop_passes=count)[1][QK]
+        return tuple(sown['layers_1']['self_attn']['max_logits'])
+
+    with jax.set_mesh(mesh):
+        replicated = NamedSharding(mesh, PartitionSpec())
+        tree = jax.tree.map(lambda leaf: jax.device_put(leaf, replicated), variables)
+        placed = jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data")))
+        rows, whole = PartitionSpec("data"), PartitionSpec()
+        held = jax.jit(jax.shard_map(maxima, in_specs=(whole, rows, whole), out_specs=rows))(
+            tree, placed, jnp.int32(2))
+    assert len(held) == 3 and not bool(jnp.any(held[2]))
+    assert all(bool(jnp.any(each != 0)) for each in held[:2])
 
