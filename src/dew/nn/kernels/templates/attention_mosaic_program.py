@@ -2219,7 +2219,8 @@ STATISTICS_STREAM_ORDER: tuple[str, ...] = tuple(dict.fromkeys(("peak", "total",
 the fused backward launch streams the hottest rows before `anchor` and `chosen`."""
 
 @functools.cache
-def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool) -> int:
+def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool,
+                            accurate: bool = False) -> int:
     """Peak live 2D score-tile arrays in the traced attention algebra step (`jax.make_jaxpr`, row 10965)."""
     from dew.nn.kernels.templates import attention_backward_algebra as bwd_algebra
 
@@ -2231,7 +2232,13 @@ def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool)
     if backward:
         def backward_step(s, dp, peak, total, anchor, delta, q, k):
             seen = algebra.seen(spec, algebra.Coords(q, k), s)
-            exps, weights, ds = bwd_algebra.softmax_cotangents(s, dp, peak, total, anchor, delta, seen=seen)
+            forms = bwd_algebra.derived_cotangents(keys_first=False, dropped=False, masked=True,
+                                                   accurate=accurate, anchored=accurate)
+            tiles = {"logits": s, "products": dp, "peak": peak, "total": total, "anchor": anchor,
+                     "delta": delta, "seen": seen}
+            if accurate:
+                tiles["at_anchor"] = seen
+            exps, weights, ds = forms.mapped(tiles)
             return algebra.value_weights(exps, weights, jnp.bfloat16), ds.astype(jnp.bfloat16)
         jaxpr = jax.make_jaxpr(backward_step)(s_in, s_in, row, row, row, row, q_pos, k_pos).jaxpr
     else:
@@ -2256,12 +2263,14 @@ def _traced_step_tile_count(*, backward: bool, natural_form: bool, scaled: bool)
         peak = max(peak, len(live))
         live = {v for v in live if last_use.get(v, -1) > pos}
     return peak
-def step_live_tiles(block_q: int, block_k: int, *, backward: bool = False, natural_form: bool = False,
-                    scaled: bool = False) -> tuple:
-    """Live `(block_q, block_k)` fp32 score tiles in TPU VMEM derived from the traced step (row 10965)."""
-    count = _traced_step_tile_count(backward=backward, natural_form=natural_form, scaled=scaled)
-    return (((block_q, block_k), jnp.float32),) * count
 
+
+def step_live_tiles(block_q: int, block_k: int, *, backward: bool = False, natural_form: bool = False,
+                    scaled: bool = False, accurate: bool = False) -> tuple:
+    """Live `(block_q, block_k)` fp32 score tiles in TPU VMEM derived from the traced step (row 10965)."""
+    count = _traced_step_tile_count(backward=backward, natural_form=natural_form, scaled=scaled,
+                                    accurate=accurate)
+    return (((block_q, block_k), jnp.float32),) * count
 
 def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
                   products: list, held: list, vectors: int, *, accurate: bool, slopes: int) -> int:

@@ -1097,4 +1097,4 @@ def test_each_norm_and_swiglu_launch_states_its_outputs_dimensions():
     assert len(returning) >= 6, f"expected 6 norm/swiglu Triton launches, got {len(returning)}"
     for stated in returning:
         assert stated is not None, "a norm/swiglu launch returning arrays states no output_dims"
-        assert all(dims is not None for dims in stated), stated
+        assert all(dims is not None and dims[0] == [[0, 0]] for dims in stated), stated

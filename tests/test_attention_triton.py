@@ -283,13 +283,16 @@ def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
                                                       interpret=not ON_GPU)
         return (jnp.where(padding[..., None], out, 0.0),
                 jnp.where(padding, total.transpose(0, 2, 1), 0.0),
-                jnp.where(padding, sunk.transpose(0, 2, 1), 1.0))
+                jnp.where(padding, sunk.transpose(0, 2, 1), 1.0),
+                jnp.any(padding))
 
     def reference(query, key, value):
         del key, value
         return (np.zeros(query.shape, np.float64),
                 np.zeros((*query.shape[:2], 4), np.float64),
-                np.ones((*query.shape[:2], 4), np.float64))
+                np.ones((*query.shape[:2], 4), np.float64),
+                np.asarray(True))
+
     assert_as_exact(jax.jit(ours), as_given(reference), drawing(queries, keys, jnp.float32),
                     "padding query and sink", seeds=8)
 
@@ -518,6 +521,11 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
                                               dout, interpret=not ON_GPU)
         return grads.score_params[0], grads.query
 
+    def ours(query, key, value, dout, slopes):
+        wide_slope, wide_dq = run(query, key, value, dout, slopes, wide=True)
+        f32_slope, f32_dq = run(query, key, value, dout, slopes, wide=False)
+        return wide_slope, wide_dq, f32_slope, f32_dq
+
     def theirs(query, key, value, dout, slopes):
         spans = template.spans(queries, keys, ROWS, **arguments(case))
         def attend(q, sl):
@@ -525,19 +533,18 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
                                       template.Hooks(score_mod, (template.Param(sl, kinds[0]),)))
         _, pull = jax.vjp(attend, query, slopes)
         dq, dsl = pull(dout)
-        return dsl, dq
+        return dsl, dq, dsl, dq
+
+    def held(got, _):
+        wide_slope, wide_dq, f32_slope, f32_dq = got
+        assert wide_slope.dtype == jnp.float64
+        np.testing.assert_array_equal(np.asarray(wide_slope, np.float32), np.asarray(f32_slope))
+        np.testing.assert_array_equal(np.asarray(wide_dq), np.asarray(f32_dq))
 
     with jax.enable_x64(new_val=True):
-        wide_fn = jax.jit(functools.partial(run, wide=True))
-        f32_fn = jax.jit(functools.partial(run, wide=False))
-        assert_as_exact(wide_fn, jax.jit(theirs), draw, "wide alibi parameter", seeds=8)
-        import tier_wire
-        if not tier_wire.preparing():
-            sample = draw(0)
-            wide_out, f32_out = wide_fn(*sample), f32_fn(*sample)
-            assert wide_out[0].dtype == jnp.float64
-            np.testing.assert_array_equal(np.asarray(wide_out[0], np.float32), np.asarray(f32_out[0]))
-            np.testing.assert_array_equal(np.asarray(wide_out[1]), np.asarray(f32_out[1]))
+        assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, "wide alibi parameter", seeds=8, held=held)
+
+
 def bucketed(s, q_pos, k_pos, bucket):
     """A score hook of an int32 key parameter: a key's bucket, its low bit a bias."""
     del q_pos, k_pos

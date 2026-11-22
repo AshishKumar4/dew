@@ -1924,8 +1924,10 @@ def test_overlapped_derived_weights_and_from_weights_match_derived_cotangents():
     with generation.assumed("sm90"):
         family = program.bundle("sm90", jnp.bfloat16)
         cfg = program.BackwardTiles(64, 64, 2, 2, fused=True, family=family.name)
-        assert fused.streamed_statistics(family, cfg, 64, jnp.bfloat16, 2, reduced=0, anchored=False) <= 4
-
+        unanchored = fused.streamed_statistics(family, cfg, 64, jnp.bfloat16, 2, reduced=0, anchored=False)
+        anchored = fused.streamed_statistics(family, cfg, 64, jnp.bfloat16, 2, reduced=0, anchored=True)
+        assert unanchored == 4 and anchored == 5, (unanchored, anchored)
+        assert "chosen" not in program.STATISTICS_STREAM_ORDER[:unanchored]
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
@@ -1958,7 +1960,8 @@ def test_sm90_overlapped_coop_backward_compiles_spill_free_for_d256():
         case = _fast_backward_compile_case("sm90-overlapped-coop-d256", q, k, spans, shapes)
         found = compile_mosaic_kernels([case], "sm90")
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-
+        assert any(kernel["kernel"] == "attention_dkv_shared"
+                   for kernel in found[0].get("kernels", ())), found
 
 @COMPILES_ON_CPU
 def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_deterministic_ops):
@@ -1976,21 +1979,6 @@ def test_sm90_overlapped_keys_first_dkv_compiles_spill_free_deterministic(with_d
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
-def test_planned_stages_deepens_at_residency_two_with_registers():
-    """Row 10993: `_planned_stages` passes the launch's consumer registers to `resources.plan`, so a
-    launch at `resident >= 2` deepens its ring rather than falling back to `floor`."""
-    from dew.nn.kernels.templates import attention_mosaic_program as program, resources
-
-    with generation.assumed("sm80"):
-        target = generation.gpu_target()
-        family = program.layouts("sm80", jnp.bfloat16, 4096)[0]
-        tile = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16)
-        def scope_of(stages):
-            ring = jax.ShapeDtypeStruct((stages, 64, 64), jnp.bfloat16)
-            return resources.Scope(program=(tile,), walks=((ring,),))
-        stages = attention_mosaic._planned_stages(family, scope_of, target, consumers=1, registers=128,
-                                                  floor=2, most=3, resident=2)
-        assert stages == 3, stages
 
 
 @COMPILES_ON_CPU

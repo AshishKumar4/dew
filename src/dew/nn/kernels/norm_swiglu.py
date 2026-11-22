@@ -971,12 +971,20 @@ def _varying(operands: tuple) -> tuple:
     return tuple(None if operand is None else varying_like(operand, *present) for operand in operands)
 
 
+class _Sized(NamedTuple):
+    """An output axis derived from `operands[operand]`'s `axis` at static size `size` (`Dim.sized`)."""
+    operand: int
+    axis: int
+    size: int
+
+
 class _Out(NamedTuple):
     """Static output spec for `_launched` (`lowered_once`-hashable): `dims` are `(operand, axis)` pairs,
-    `(operand, axis, divisor)` triples, or constant `int`s, realized as `kernel_outputs.Output` against
-    the launched operands so `launches.pallas_call` declares `output_dims` (rows 10816, 10817)."""
+    `(operand, axis, divisor)` triples, `_Sized(operand, axis, size)`, or constant `int`s, realized as
+    `kernel_outputs.Output` against the launched operands so `launches.pallas_call` declares `output_dims`
+    (rows 10816, 10817, 11704)."""
     dtype: jnp.dtype
-    dims: tuple[int | tuple[int, int] | tuple[int, int, int], ...]
+    dims: tuple[int | _Sized | tuple[int, int] | tuple[int, int, int], ...]
 
 
 def _realize_output(operands: tuple, spec):
@@ -985,12 +993,13 @@ def _realize_output(operands: tuple, spec):
     if isinstance(spec, _Out):
         dims = tuple(
             dim if isinstance(dim, int)
+            else kernel_outputs.axis(operands[dim.operand], dim.axis).sized(dim.size)
+            if isinstance(dim, _Sized)
             else kernel_outputs.axis(operands[dim[0]], dim[1]) if len(dim) == 2
             else kernel_outputs.axis(operands[dim[0]], dim[1]) // dim[2]
             for dim in spec.dims)
         return kernel_outputs.output(spec.dtype, *dims)
     return tuple(_realize_output(operands, part) for part in spec)
-
 def _typed(backward, parameters: int = 0):
     """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type and
     dtype: summed over each manual axis it varies over and its operand does not (a weight replicated in a
@@ -1114,7 +1123,7 @@ class RmsBackward(tuning.KernelOp):
              weight_first: bool = False, epilogue=None, return_residuals: bool = False):
         rows = x.shape[0]
         groups = max(1, min(config.programs, pl.cdiv(rows, config.rows)))
-        partial = None if scale is None else _Out(jnp.dtype(jnp.float32), (groups, (0, 1)))
+        partial = None if scale is None else _Out(jnp.dtype(jnp.float32), (_Sized(0, 0, groups), (0, 1)))
         return _launched(
             x, scale, gate, mean_square, dy, ds, kernel=_rms_backward, name="rms_norm_backward",
             outputs=(_Out(x.dtype, ((0, 0), (0, 1))),
