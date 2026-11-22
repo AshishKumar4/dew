@@ -3,6 +3,7 @@ trained (`earlier_run`, the one place earlier record shapes are read), and the d
 gained since keeps for runs that predate it (`_earlier_default`)."""
 
 import dataclasses
+import sys
 from collections.abc import Mapping
 
 from dew import _records, registry
@@ -73,14 +74,14 @@ MARKERS = (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE)
 """Every key a run record holds beside its fields, each saying how it states a field (`RunConfig.record`)."""
 
 
-def earlier_retired(record: object, *, additive_unset: bool, root: bool = True) -> object:
+def earlier_retired(record: JSON, *, additive_unset: bool, root: bool = True) -> JSON:
     """A saved run's record with each run and trainer it holds, the root and every one a field holds as its
     class record, in today's shapes: a trainer's `export_model`, the field that wrote each persistent step's
     model beside it (row 11636), taken off, `dew export` the one export since; and a looped decoder's
     `loop_message_additive` true read as unset where the record could not leave it unset (no
     `ADDITIVE_UNSETTABLE`, `additive_unset` false; row 11742), every such record writing true for its
     default, a checkpoint's choice kept, its false a choice. A record written since states its own. Untyped
-    data passes as it is. Carried to 1.0 (ledger 1552)."""
+    data, and a class no module imported yet holds, pass as they are. Carried to 1.0 (ledger 1552)."""
     from dew.config import DecoderRunConfig, RunConfig
     from dew.config.trainer import TrainerConfig
 
@@ -88,31 +89,35 @@ def earlier_retired(record: object, *, additive_unset: bool, root: bool = True) 
         return [earlier_retired(value, additive_unset=additive_unset, root=False) for value in record]
     if not isinstance(record, Mapping):
         return record
-    walked = {key: earlier_retired(value, additive_unset=additive_unset, root=False)
-              for key, value in record.items()}
+    walked: dict[str, JSON] = {key: earlier_retired(value, additive_unset=additive_unset, root=False)
+                               for key, value in record.items()}
     named = registry.class_record(walked)
-    kind = _recorded_class(named[0]) if named is not None else (RunConfig if root else None)
-    fields = dict(named[1] if named is not None else walked.get("fields", {}))
-    if kind is None or not isinstance(fields, Mapping):
+    kind = _recorded_class(named[0]) if named is not None else None
+    if kind is None and not root:
         return walked
+    kind = RunConfig if kind is None else kind
+    fields: dict[str, JSON] = dict(named[1] if named is not None else {})
     if issubclass(kind, TrainerConfig):
         fields.pop("export_model", None)
-    if issubclass(kind, RunConfig) and isinstance(trainer := fields.get("trainer"), Mapping) and (
-            registry.class_record(trainer) is None):
+    # A trainer recorded flat, by its run's class, is read here; one recorded by its own class above.
+    trainer = fields.get("trainer")
+    if (issubclass(kind, RunConfig) and isinstance(trainer, Mapping)
+            and registry.class_record(trainer) is None):
         fields["trainer"] = {key: value for key, value in trainer.items() if key != "export_model"}
     if (issubclass(kind, DecoderRunConfig) and not additive_unset
             and fields.get("loop_message_additive") is True):
         fields["loop_message_additive"] = None
-    return {**walked, "fields": fields}
+    return {**walked, "fields": fields} if named is not None else walked
 
 
 def _recorded_class(name: str) -> type | None:
-    """The class a record names, a run's alias or an import path, where it resolves to one; None else."""
-    try:
-        member = registry.runs[name] if ":" not in name else registry.imported(name)
-    except (KeyError, ValueError, ImportError):
-        return None
-    return member if isinstance(member, type) else None
+    """The class a record names, a run's alias or an import path, where a module imported already holds it;
+    None else (a class a record imports is `registry.imported`'s, as it is built)."""
+    module, _, qualified = registry.runs.paths.get(name, name).partition(":")
+    found = sys.modules.get(module)
+    for part in qualified.split(".") if qualified else ():
+        found = getattr(found, part, None)
+    return found if isinstance(found, type) else None
 
 
 def earlier_packed_experts(record: Mapping[str, object]) -> Mapping[str, object]:
