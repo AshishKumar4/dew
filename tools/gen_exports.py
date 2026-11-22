@@ -16,8 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import lint_scopes as scopes
+from tools import lint_scopes as scopes
 
 REPO = Path(__file__).resolve().parents[1]
 

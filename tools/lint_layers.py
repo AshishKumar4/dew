@@ -12,7 +12,6 @@ reaches it. tools/check_gates runs it on every head:
 SOURCE is the directory that holds the `dew` package (`src`, the default).
 """
 
-import ast
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -116,12 +115,12 @@ def read(root: Path) -> Source:
     it)."""
     paths = {".".join(path.relative_to(root).with_suffix("").parts).removesuffix(".__init__"): path
              for path in sorted((root / "dew").rglob("*.py"))}
-    trees = {module: ast.parse(path.read_text()) for module, path in paths.items()}
-    parents = {module: scopes.package_of(module, path.name == "__init__.py")
-               for module, path in paths.items()}
-    named = {module: scopes.modules_imported(tree, parents[module]) for module, tree in trees.items()}
+    # One parse a file: the names a type checker reads (`Walk.parsed`) and those a run imports (`Walk.tree`).
     walk = scopes.walker().Walk({module: str(path) for module, path in paths.items()},
-                                     lambda module: paths[module].read_bytes())
+                                lambda module: paths[module].read_bytes())
+    named = {module: scopes.modules_imported(walk.parsed(module),
+                                             scopes.package_of(module, path.name == "__init__.py"))
+             for module, path in paths.items()}
     runs = {module: walk.imports(module)[0] for module in paths}
     return Source(paths, named, runs)
 

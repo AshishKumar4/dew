@@ -24,6 +24,7 @@ class Walk:
     def __init__(self, files: Mapping[str, str], read: Callable[[str], bytes],
                  selected: Mapping[str, str] | None = None):
         self.files, self.read, self.selected = files, read, dict(selected or {})
+        self._parsed: dict[str, ast.Module] = {}
         self._trees: dict[str, ast.Module] = {}
         self._tables: dict[str, dict[str, str] | None] = {}
         self._imports: dict[str, tuple[frozenset[str], tuple[str, ...]]] = {}
@@ -40,12 +41,20 @@ class Walk:
         prefixes = (".".join(parts[:end]) for end in range(1, len(parts) + 1))
         return {name for name in prefixes if name in self.files}
 
+    def parsed(self, module: str) -> ast.Module:
+        """`module`'s whole tree, its TYPE_CHECKING blocks among it, parsed once a walk: what a type checker
+        reads of it (tools/lint_layers.py's named imports), and what `tree` prunes."""
+        if module not in self._parsed:
+            self._parsed[module] = ast.parse(self.read(module), self.files[module])
+        return self._parsed[module]
+
     def tree(self, module: str) -> ast.Module:
-        """`module`'s tree, its top-level TYPE_CHECKING blocks pruned (`running`), parsed once a walk."""
+        """`module`'s tree as its run executes it: `parsed`, its top-level TYPE_CHECKING blocks pruned
+        (`running`)."""
         if module not in self._trees:
-            tree = ast.parse(self.read(module), self.files[module])
-            tree.body = list(running(tree, tree.body))
-            self._trees[module] = tree
+            whole = self.parsed(module)
+            pruned = list(running(whole, whole.body))
+            self._trees[module] = ast.Module(body=pruned, type_ignores=whole.type_ignores)
         return self._trees[module]
 
     def assigned(self, module: str, name: str) -> ast.expr | None:

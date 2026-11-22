@@ -133,3 +133,41 @@ def test_every_kernel_modules_code_is_keyed_by_its_closure_no_import_site_unrevi
     checkpoint parts' sites, unreviewed, through short_conv's linear layer)."""
     found = fresh(KERNELS, platforms="cpu")
     assert len(found) > 100 and {module: sites for module, sites in found.items() if sites} == {}
+
+
+KEPT = """
+import json, logging, os
+logged = []
+
+
+class Kept(logging.Handler):
+    def emit(self, record):
+        logged.append(record.getMessage())
+
+
+logging.getLogger("dew._code").addHandler(Kept())
+from dew._code import code_digest
+digest = code_digest("dew.communicators")
+kept = os.environ["JAX_COMPILATION_CACHE_DIR"] + "/dew-code"
+print(json.dumps({"digest": digest, "kept": sorted(os.listdir(kept)) if os.path.isdir(kept) else [],
+                  "logged": logged}))
+"""
+
+
+def test_a_closure_is_kept_beside_the_compilation_cache_and_a_read_only_one_keeps_none(tmp_path):
+    """A walked closure is kept beside the compilation cache the verdicts it keys live in (the directory
+    JAX_COMPILATION_CACHE_DIR names), and a later start's digest is the same; a cache directory that cannot be
+    written keeps none, logs the miss and gives the same digest (row 11743: a read-only home raised before a
+    prewarmed verdict could be read)."""
+    writable, readonly = tmp_path / "xla", tmp_path / "readonly"
+    readonly.mkdir()
+    readonly.chmod(0o555)
+    try:
+        first = fresh(KEPT, platforms="cpu", variables={"JAX_COMPILATION_CACHE_DIR": str(writable)})
+        again = fresh(KEPT, platforms="cpu", variables={"JAX_COMPILATION_CACHE_DIR": str(writable)})
+        refused = fresh(KEPT, platforms="cpu", variables={"JAX_COMPILATION_CACHE_DIR": str(readonly)})
+    finally:
+        readonly.chmod(0o755)
+    assert len(first["kept"]) == 1 and first["logged"] == [] and again == first
+    assert refused["digest"] == first["digest"] and refused["kept"] == []
+    assert len(refused["logged"]) == 1 and "not kept" in refused["logged"][0], refused
