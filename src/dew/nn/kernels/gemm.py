@@ -69,15 +69,7 @@ from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import scattered, tiling
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
-from dew.nn.kernels.templates.product import (
-    MXFP8 as MX_BLOCKS,
-    NVFP4 as NVFP4_BLOCKS,
-    SCALE_DEPTH,
-    bf16_part_count,
-    declared,
-    formed,
-    terms,
-)
+from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import (
     accumulated,
     asks_default_precision,
