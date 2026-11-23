@@ -163,3 +163,56 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
                 assert not rec.get("error"), rec
                 assert rec["kernels"], rec
                 assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
+    """Skinny decode products (`M=13`) for `Fp8Weights` (`e4m3`/`e5m2`) and `TernaryWeights` decode
+    directly into `wgmma` register operand A (`packed_rows=True`, zero SMEM staging), matching float64
+    truth bitwise and compiling spill-free on sm90 (row 5387)."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.templates.gemm import ternary, tiling
+
+    rng = np.random.default_rng(5387)
+    x = jnp.asarray(rng.integers(-3, 4, size=(13, 256)), jnp.bfloat16)
+    w_raw = jnp.asarray(rng.integers(-2, 3, size=(256, 128)), jnp.float32)
+    with generation.assumed("sm90"):
+        for fmt in ("e4m3", "e5m2"):
+            fp8_w = formats.Fp8Weights.of(w_raw, fmt=fmt, scale=0.5)
+            swapped_fp8 = tiling.Tiles(128, 64, 64, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
+            with tuning.pinned({grouped_matmul.MosaicFp8PackedGmm: swapped_fp8}):
+                got = gemm.fp8_weight_product(x, fp8_w, out_dtype=jnp.float32, interpret_on_cpu=True)
+            want = jax.lax.dot(x.astype(jnp.float32), fp8_w.decoded(jnp.float32),
+                               preferred_element_type=jnp.float32)
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        tern_w = formats.TernaryWeights.of(w_raw, scale=0.5)
+        swapped_t = tiling.Tiles(128, 64, 256, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
+        with tuning.pinned({ternary.MosaicTernaryPackedGmm: swapped_t}):
+            got_t = gemm.ternary_weight_product(x, tern_w, quantize_activations=False,
+                                                out_dtype=jnp.float32, interpret_on_cpu=True)
+        want_t = jax.lax.dot(x.astype(jnp.float32), tern_w.decoded(jnp.float32),
+                             preferred_element_type=jnp.float32)
+        np.testing.assert_array_equal(np.asarray(got_t), np.asarray(want_t))
+        if generation.compile_only_gpus("sm90"):
+            x_s = jax.ShapeDtypeStruct((13, 256), jnp.bfloat16)
+            fp8_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype),
+                                    formats.Fp8Weights.of(np.ones((256, 128), np.float32), fmt="e4m3"))
+            t_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype), tern_w)
+
+            def c_fp8(a, w):
+                with generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
+                        {grouped_matmul.MosaicFp8PackedGmm: swapped_fp8}):
+                    return gemm.fp8_weight_product(a, w, out_dtype=jnp.bfloat16)
+
+            def c_tern(a, w):
+                with generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
+                        {ternary.MosaicTernaryPackedGmm: swapped_t}):
+                    return gemm.ternary_weight_product(a, w, quantize_activations=False,
+                                                       out_dtype=jnp.bfloat16)
+
+            records = compile_mosaic_kernels(
+                [KernelCase("swapped_fp8_sm90", lambda: (c_fp8, (x_s, fp8_spec))),
+                 KernelCase("swapped_ternary_sm90", lambda: (c_tern, (x_s, t_spec)))], "sm90")
+            for rec in records:
+                assert not rec.get("error"), rec
+                assert rec["kernels"], rec
+                assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec

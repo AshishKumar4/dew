@@ -95,20 +95,46 @@ def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_l
 
 
 def fp8_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, transpose_lhs: bool,
-              depth: int, width: int) -> None:
-    """Refuse a packed FP8 or ternary weight call (`gmm`'s `packed_fp8`, rows 8548, 1464) its decode cannot
-    take: words `[groups, width, depth // codes_per_word]` uint32 read transposed in group-multiple steps and
-    64-column tiles with no prologue, pair, cluster, split, or swap."""
+              depth: int, width: int, lhs=None, family=None, dense: bool = False,
+              packed_rows: bool = False) -> None:
+    """Refuse a packed FP8 or ternary weight call (`gmm`'s `packed_fp8`, rows 8548, 1464, 5387) its decode
+    cannot take: staged as matrix (`rhs` `[G, width, depth // per]`) or swapped directly into `wgmma`
+    register operand A (`packed_rows=True`, `lhs` `[rows, depth // per]`, dense, 64 rows/consumer)."""
     if fmt != "ternary":
         fp8_minifloat(fmt)
     per_word = packed_codes_per_word(fmt)
     group = packed_group_depth(fmt)
+    if packed_rows:
+        if (not dense or lhs is None or lhs.dtype != jnp.uint32 or not transpose_rhs
+                or tiles.block_k % group or tiles.block_m // tiles.warpgroups != 64
+                or family is None or not rows_supported(family)
+                or prologue is not None or paired is not None or transpose_lhs
+                or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
+            raise ValueError(f"packed({fmt}) swapped rows require dense uint32 lhs, transpose_rhs, "
+                             f"{group}-deep steps, 64 rows/consumer on wgmma, not {tiles}")
+        return
     if (not transpose_rhs or rhs.dtype != jnp.uint32 or rhs.shape[1:] != (width, depth // per_word)
             or depth % group or tiles.block_k % group or tiles.block_n % 64
             or prologue is not None or paired is not None or transpose_lhs
             or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
         raise ValueError(f"a packed({fmt}) matrix {rhs.shape} is read transposed in {group}-deep "
                          f"steps and 64-col tiles with no prologue, pair, cluster or split, not {tiles}")
+
+def packed_depth(k: int, k2: int, n: int, rhs, tiles, *, packed_rows: bool, scales,
+                 packed_fp8: str | None, transpose_rhs: bool, prologue, paired,
+                 transpose_lhs: bool, lhs=None, family=None, dense: bool = False) -> tuple[int, int]:
+    """Resolve logical contraction depth `(k, k2)` for packed NVFP4/FP8/ternary calls and validate."""
+    per = packed_codes_per_word(packed_fp8) if packed_fp8 is not None else 8
+    k, k2 = ((per * k, k2) if packed_rows
+             else (k, 8 * k2 if scales is not None else (per if packed_fp8 is not None else 1) * k2))
+    if packed_fp8 is not None:
+        if scales is not None:
+            raise ValueError("packed_fp8 cannot combine with NVFP4 scales")
+        fp8_taken(rhs, packed_fp8, tiles, transpose_rhs=transpose_rhs, prologue=prologue,
+                  paired=paired, transpose_lhs=transpose_lhs, depth=k2, width=n,
+                  lhs=lhs, family=family, dense=dense, packed_rows=packed_rows)
+    return k, k2
+
 def rows_supported(family) -> bool:
     """Whether `family`'s products read an NVFP4 matrix decoded in registers (`rows_decoded`): its register
     family prefix is declared in `bits.NVFP4_BFLOAT16.fragments` (row 12038)."""
@@ -275,6 +301,14 @@ def stage_decoded_fp8(words, out, fmt: str, interpret: bool, *, layout=None) -> 
             out[:, pl.ds(fp8_staged_depth(group, 0, code), 16)] = lane
 
 
+def _ternary_lane(loaded: jax.Array, code: int) -> jax.Array:
+    code2 = (loaded >> jnp.uint32(2 * code)) & jnp.uint32(3)
+    nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
+    neg = (code2 >> jnp.uint32(1)) & nz
+    f32_bits = (neg << jnp.uint32(31)) | (nz * jnp.uint32(0x3F800000))
+    return jax.lax.bitcast_convert_type(f32_bits, jnp.float32).astype(jnp.bfloat16)
+
+
 def stage_decoded_ternary(words, out, interpret: bool, *, layout=None) -> None:
     """Decode a stage of 2-bit packed BitNet b1.58 ternary words (`[columns, 16]` uint32 per 256-depth group)
     into `out` (`[columns, depth]` bfloat16, exact `{-1, 0, +1}`, row 1464)."""
@@ -283,9 +317,27 @@ def stage_decoded_ternary(words, out, interpret: bool, *, layout=None) -> None:
         loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
                                                                     optimized=False)
         for code in range(16):
-            code2 = (loaded >> jnp.uint32(2 * code)) & jnp.uint32(3)
-            nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
-            neg = (code2 >> jnp.uint32(1)) & nz
-            f32_bits = (neg << jnp.uint32(31)) | (nz * jnp.uint32(0x3F800000))
-            lane = jax.lax.bitcast_convert_type(f32_bits, jnp.float32).astype(jnp.bfloat16)
-            out[:, pl.ds(ternary_staged_depth(group, 0, code), 16)] = lane
+            out[:, pl.ds(ternary_staged_depth(group, 0, code), 16)] = _ternary_lane(loaded, code)
+
+
+def rows_decoded_packed(words, fmt: str, interpret: bool, *, layout=None) -> jax.Array:
+    """Decode packed FP8 or BitNet b1.58 ternary rows (`[64, 16]` uint32 per group) directly into register
+    operand A (`[64, depth]` bfloat16 in `wgmma`'s fragment layout, zero SMEM staging, row 5387)."""
+    active = None if interpret else layout
+    slices: list[jax.Array] = []
+    if fmt == "ternary":
+        for group_words in words:
+            loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
+                                                                        optimized=False)
+            slices.extend(_ternary_lane(loaded, code) for code in range(16))
+        return jnp.concatenate(slices, axis=1)
+    minifloat = fp8_minifloat(fmt)
+    form, _ = bits.fp8_form(minifloat)
+    for group_words in words:
+        loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
+                                                                    optimized=False)
+        decoded = form.traced(loaded) if active is None else inline_forms.registers(form, loaded, active)
+        for register in decoded:
+            for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16)):
+                slices.append(bits.fp8_restored(half, minifloat, jnp.bfloat16))
+    return jnp.concatenate(slices, axis=1)

@@ -28,20 +28,26 @@ TERNARY_WEIGHT_ROW = "ledger 1464"
 
 @dataclasses.dataclass(frozen=True)
 class MosaicTernaryPackedGmm(grouped_matmul.MosaicFp8PackedGmm):
-    """`MosaicGmm` of 2-bit BitNet b1.58 ternary weights (`formats.TernaryWeights`, row 1464)."""
+    """`MosaicFp8PackedGmm` of 2-bit BitNet b1.58 ternary weights (`formats.TernaryWeights`, rows 1464,
+    5387), supporting both staged decode and direct in-register swapped decode at skinny rows."""
     STEPS: ClassVar[tuple[int, ...] | None] = (packed.TERNARY_STEP,)
 
     def _operand_bytes(self, ba, tile: tiling.Tiles) -> tuple[tuple[float, float], tuple]:
         tokens, kernel = ba.arguments["tokens"], ba.arguments["kernel"]
+        rows_b, stage = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(kernel.dtype).itemsize
+        if tile.swapped:
+            return (0.25, rows_b), ((0, 1), None)
         copies = 1 if packed.shared_decode(tile, interpret=False) else tile.warpgroups
-        return (jnp.dtype(tokens.dtype).itemsize, 0.25), (None, (jnp.dtype(kernel.dtype).itemsize, copies))
+        return (rows_b, 0.25), (None, (stage, copies))
 
     def _registers(self, ba, config: tiling.Tiles, *, merging: bool, target) -> int | None:
-        base = super(grouped_matmul.MosaicFp8PackedGmm, self)._registers(
-            ba, config, merging=merging, target=target)
-        return None if base is None else base + 2 * config.block_n * 16 // resources.THREADS + 4
-
-
+        base = grouped_matmul.MosaicGmm._registers(self, ba, config, merging=merging, target=target)
+        if base is None:
+            return None
+        share = config.block_m // config.warpgroups
+        decoded = (2 * share * 16 + share * config.block_k // 2 if ba.arguments["packed_rows"]
+                   else 2 * config.block_n * 16)
+        return base + decoded // resources.THREADS + 4
 class TernaryWeightCase(NamedTuple):
     """Facts deciding whether `ternary_weight_product` runs the inline-decoding Mosaic GEMM mainloop."""
     tile: tiling.Tiles | None
