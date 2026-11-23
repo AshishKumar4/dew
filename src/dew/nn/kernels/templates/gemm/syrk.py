@@ -724,22 +724,23 @@ MOSAIC_SYRK = MosaicSyrk()
 """The singleton Mosaic SYRK launch on the shared `Template`/`KernelOp` certification path."""
 
 
-MEASURED_GRAM_GENERATIONS = frozenset({"sm80", "sm90"})
-"""GPU generations with real symmetric Gram receipts (`M-NG-45-a100`, `M-NG-45b-gh200`)."""
-
-MEASURED_GRAM_SHAPES = frozenset({(2560, 2560), (2560, 4096), (4096, 4096), (4096, 14336)})
-"""Matrix `(d0, d1)` geometries measured faster than XLA with bitwise-equal digests in `M-NG-45`."""
+MEASURED_GRAM_CELLS: frozenset[tuple[str, tuple[int, int, int], bool, str, str]] = frozenset({
+    (gen, shape, transpose, "bfloat16", "bfloat16")
+    for gen in ("sm80", "sm90")
+    for shape in ((28, 2560, 2560), (28, 2560, 4096), (36, 4096, 4096), (36, 4096, 14336))
+    for transpose in (False, True)
+})
+"""Exact `(generation, shape, transpose, dtype, out_dtype)` stacked Gram cells proven 1.52-1.98x faster
+than XLA with bitwise-equal digests in `M-NG-45-a100` (sm80, 8/8) and `M-NG-45b-gh200` (sm90, 8/8;
+row 11941)."""
 
 
 def measured_gram(target: generation.GpuTarget, shape: tuple[int, int, int], dtype, *,
-                  transpose: bool) -> bool:
-    """Whether symmetric Gram `(shape, dtype, transpose)` is admitted on `target` by real GPU receipts:
-    strictly gated to BF16 stacked Muon cells proven 1.52-1.98x faster than XLA with bitwise-equal digests in
-    `M-NG-45-a100` (sm80, 10/10 equal) and `M-NG-45b-gh200` (sm90, 8/8 equal; row 11941)."""
-    del transpose
-    if generation.tpu(target) or target.generation not in MEASURED_GRAM_GENERATIONS:
+                  transpose: bool, out_dtype=None) -> bool:
+    """Whether symmetric Gram `(target, shape, transpose, dtype, out_dtype)` is admitted by real GPU
+    receipts (`MEASURED_GRAM_CELLS`, row 11941)."""
+    if generation.tpu(target):
         return False
-    if jnp.dtype(dtype) != jnp.bfloat16:
-        return False
-    batch, d0, d1 = shape
-    return batch >= 28 and (d0, d1) in MEASURED_GRAM_SHAPES
+    in_name = jnp.dtype(dtype).name
+    out_name = in_name if out_dtype is None else jnp.dtype(out_dtype).name
+    return (target.generation, tuple(shape), bool(transpose), in_name, out_name) in MEASURED_GRAM_CELLS
