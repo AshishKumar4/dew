@@ -79,23 +79,31 @@ def _placed_forward(tiles: attention_mosaic.Tiles, spans: template.KeySpans):
     return forward
 
 
-@pytest.mark.parametrize("moves", [False, True], ids=["kept", "moved"])
+MOVES = {"kept": None, "moved": None, "moved after kept": lambda role, step: step % 2 == 1,
+         "partners apart": lambda role, step: role == 0}
+"""Which steps of each consumer move its sums (`ring_protocol.programs`' `moves`): every step alike (the run's
+rare verdict, kept or moved), every second step, or one consumer's every step and its partner's none."""
+
+
+@pytest.mark.parametrize("moves", list(MOVES))
 @pytest.mark.parametrize("call", ["full", "causal"])
 @pytest.mark.parametrize("tiles", [ROWS_TILES, ROWS_PAIR_TILES], ids=["one", "two"])
 def test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving(tiles, call, moves):
     """The forward's launch on a B200's tcgen05 rows at one consumer and two, traced as a B200 builds it over
     256 queries and 256 keys, the full call's and the causal's (each consumer's own key walk): every
     interleaving of its consumers and its producer's and issuer's warps explored (`ring_protocol.explore`),
-    no deadlock and every barrier's phase whole and observed, every step's factor keeping its sums or moving
-    them (`moves`, a step whose maximum moves, the rare span). A step waits on the weighted values of the
-    step before only where its factor moves some row's sums (`placed.Tcgen05Placed.accumulating`), its
-    weights' turn freed by the product two steps back."""
+    no deadlock and every barrier's phase whole and observed, each consumer's step's factor keeping its sums
+    or moving them (`MOVES`: a step whose maximum moves, the rare span), every step alike, a move after a
+    kept step and a kept step after a move, and partners deciding apart, as each consumer decides at its own
+    step (row 8814). A step waits on the weighted values of the step before only where its factor moves some
+    row's sums (`placed.Tcgen05Placed.accumulating`), its weights' turn freed by the product two steps
+    back."""
     from ring_protocol import explore, programs
 
     query, key = jnp.ones((1, 256, 1, 128), jnp.bfloat16), jnp.ones((1, 256, 1, 128), jnp.bfloat16)
     spans = template.spans(256, 256, 1, **CALLS[call])
     threads, arrivals = programs(_placed_forward(tiles, spans), query, key,
-                                 threads=tiles.consumers + 1, rare=moves)
+                                 threads=tiles.consumers + 1, rare=moves == "moved", moves=MOVES[moves])
     assert explore(threads, arrivals) > 0
 
 

@@ -112,11 +112,14 @@ class PhasePasses[L, E]:
             if stated is not None:
                 raise ValueError("a run states its loop's pass counts once: one a phase of its data "
                                  "(phase_passes) or one drawn per microbatch (sampled_passes)")
+            # Its loop holding the cap, checked as a phase's count is: a model that loops not is refused
+            # first, as a phase's count refuses it.
+            capped = cls.of(objective, (sampled.cap,))
             if not objective.reads_pass_counts:
                 raise ValueError(f"{type(objective).__name__} runs its loop at the cap whatever count a "
                                  "microbatch draws, reading none (Objective.reads_pass_counts): "
-                                 "sampled_passes trains an objective that does, as LMObjective and "
-                                 "DecisionObjective do; phase_passes runs this one at a phase's count")
+                                 "sampled_passes trains an objective that does; phase_passes runs this one "
+                                 "at a phase's count")
             if uncounted := [type(entry.module).__name__ for entry in objective.program_key()
                              if _looped(entry.module)
                              and not _takes_counts(entry.module, objective.counted_forward(entry.module))]:
@@ -129,10 +132,10 @@ class PhasePasses[L, E]:
                 raise ValueError(f"{', '.join(unrunnable)} loops sharing one cache across its passes "
                                  "(`Loop.shared_cache`) or handing each token on at an exit threshold "
                                  "(`Loop.exit_threshold`), which the one program at its cap does not run "
-                                 "at a count given per call (`run_loop`): sampled_passes refuses it; "
-                                 "phase_passes runs it at a phase's count")
-            # Its loop holding the cap, checked as a phase's count is; no phase's count beside it.
-            return replace(cls.of(objective, (sampled.cap,)), counts=(), current=sampled.cap, sampled=sampled)
+                                 "at a count given per call (`run_loop`; row 12300): sampled_passes refuses "
+                                 "it; phase_passes runs it at a phase's count")
+            # No phase's count beside it.
+            return replace(capped, counts=(), current=sampled.cap, sampled=sampled)
         if stated is None:
             return cls(objective)
         counts = tuple(int(count) for count in stated)

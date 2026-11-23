@@ -19,7 +19,15 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
-from dew.batch import COORDINATES_FIELD, VALID_ROWS, Coordinates, Forks, Variables, coordinates
+from dew.batch import (
+    COORDINATES_FIELD,
+    VALID_ROWS,
+    Coordinates,
+    Forks,
+    Variables,
+    coordinates,
+    loop_passes_given,
+)
 from dew.data.preferences import (
     DOCUMENTS_KEY,
     HALVES_KEY,
@@ -227,6 +235,8 @@ class DPOObjective(TokenScorer):
             raise ValueError(
                 "the DPO reference reads step.ema, but the objective keeps no EMA; "
                 "a DPO run always freezes one")
+        # The pass count its microbatch drew, which the policy and its reference run alike.
+        passes = loop_passes_given(batch)
         batch = self.windows(batch)
         ids = jnp.asarray(batch[IDS_KEY])
         laid = window_coordinates(batch, self.finals, self.pairs)
@@ -236,8 +246,10 @@ class DPOObjective(TokenScorer):
         with watched_positions(real if step.watched is not None else None):
             policy = self.token_scores(variables, ids, coordinates=laid, qk_stats=step.qk_stats,
                                        predict=predict, progress=self.progress(step),
-                                       routing=self.balance is not None, watched=step.watched is not None)
-        reference = self.token_scores(step.ema, ids, coordinates=laid, progress=self.progress(step))
+                                       routing=self.balance is not None, watched=step.watched is not None,
+                                       loop_passes=passes)
+        reference = self.token_scores(step.ema, ids, coordinates=laid, progress=self.progress(step),
+                                      loop_passes=passes)
         policy_chosen, policy_rejected, weights = _halves(-policy.losses, batch, policy.weights, self.halved)
         ref_chosen, ref_rejected, _ = _halves(-reference.losses, batch, policy.weights, self.halved)
         ones = jnp.ones((*weights.shape, 1), policy_chosen.dtype)

@@ -28,8 +28,8 @@ class Horizon:
     before they are packed and before an objective makes several rows of one (a decision layout's row a
     question). Unnamed, the run is as long as its data, or a schedule's last stage ends it at its tokens
     (`budget_tokens`), as it bounds a run of any length beside it. A token-only run needs a constant
-    learning rate or a schedule with its own step horizon. `max_tokens` caps a run of any other length at
-    tokens counted as `tokens` counts them, the first of the two reached ending it."""
+    learning rate or a schedule with its own step horizon. `max_tokens` caps a run of steps, epochs or
+    examples at tokens counted as `tokens` counts them, the first of the two reached ending it."""
 
     steps: int | None = None
     epochs: int | None = None
@@ -42,6 +42,9 @@ class Horizon:
             raise ValueError(f"{' and '.join(self.named())} each name the run length; set one")
         if self.tokens is not None and self.max_tokens is not None:
             raise ValueError("a run of tokens is capped at them; max_tokens caps a run of another length")
+        if self.max_tokens is not None and not self.named():
+            raise ValueError("max_tokens caps a run of steps, epochs or examples, which it names none of: "
+                             "name one, or tokens for a run as long as its tokens")
         for name in (*self.named(), "max_tokens"):
             value = getattr(self, name)
             if value is not None and value < 0:

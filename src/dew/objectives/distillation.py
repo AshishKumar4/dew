@@ -248,12 +248,11 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
 
     @functools.cached_property
     def _projection_shapes(self) -> tuple[tuple[int, int], ...]:
-        """Each feature pair's projection, `[student, teacher]` widths, as `init` makes them (from an
-        abstract init): none where the pair's widths agree."""
+        """Each feature pair's projection, `[student, teacher]` widths, as `init` makes them (its one traced
+        draw, `drawn_shapes`): none where the pair's widths agree."""
         if not self.features:
             return ()
-        tree = jax.eval_shape(self.initializer, jax.random.key(0))
-        return tuple(leaf.shape for leaf in tree["params"].get(PROJECTIONS, {}).values())
+        return tuple(leaf.shape for leaf in self.drawn_shapes()["params"].get(PROJECTIONS, {}).values())
 
     def run_tokenizer(self) -> Tokenizer | None:
         """The student's tokenizer, whose record a saved distillation loads as."""
@@ -273,6 +272,16 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         teacher = (program._replace(trained=False) for program in self.teacher.program_key())
         return tuple(program._replace(head_fused=False)
                      for program in (*self.student.program_key(), *teacher))
+
+    @property
+    def reads_pass_counts(self) -> bool:
+        """Its loss runs the student and a looped teacher at a microbatch's count, as each model's own loss
+        does (`predict`), the two holding one count as a phase's passes hold them (`PhasePasses`)."""
+        return self.student.reads_pass_counts and self.teacher.reads_pass_counts
+
+    def counted_forward(self, module: nn.Module) -> str | None:
+        """The method the student's or the teacher's loss reads `module` by, which takes a call's count."""
+        return self.student.counted_forward(module) or self.teacher.counted_forward(module)
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         count = len(self.student.program_key())

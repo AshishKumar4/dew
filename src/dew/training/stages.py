@@ -768,8 +768,11 @@ class _Numbering:
     def inlined(self, equation, operands: list, leads: list) -> list[tuple] | None:
         """A loop's (`scan`) or a branch's (`cond`) results read through its programs over `operands`: a loop
         of at most `UNROLLED` steps unrolled, its carry through each step and each step's slice of what it
-        scans, which a stack is none of; a branch's each program's results, one where they agree, else the
-        branch's choice among them, row by row of a stack. None for a longer loop."""
+        scans; a branch's each program's results, one where they agree, else the branch's choice among
+        them, row by row of a stack. A loop that scans a stack along its rows' first axis (`lax.map` over
+        layers, `batch_size` rows a step where the rows lie over two axes) reads its next rows at each step
+        (`_step_rows`), its stacked results the rows again; a stack its rows do not divide among the steps is
+        none it reads. None for a longer loop."""
         from dew.training.staging import flattened
 
         def run(closed, values: list, held: list) -> list[tuple] | None:
@@ -786,24 +789,55 @@ class _Numbering:
         params = equation.params
         if equation.primitive is jax.lax.scan_p:
             consts, carries = _scan_counts(equation)
-            scanned = operands[consts + carries:]
-            if params["length"] > UNROLLED or any(isinstance(value, tuple) for value in scanned):
+            length = params["length"]
+            scanned, along = operands[consts + carries:], leads[consts + carries:]
+            # A stack scanned along its rows' first axis (`lax.map` over layers, `batch_size` rows a step
+            # where its rows lie over two axes): each step its next rows, a stack of the rest of its rows'
+            # axes or one row, the loop as long as that axis.
+            # A loop of no steps over a stack, or one whose steps act beside what they return (a callback's
+            # read of a whole stack), is none it reads row by row.
+            stacks = any(isinstance(value, tuple) for value in scanned)
+            if stacks and (length == 0 or equation.effects or scan_body(equation).effects):
+                return None
+            divided = all(not isinstance(value, tuple)
+                          or (len(value) == length if lead == 1 else len(value) % length == 0)
+                          for value, lead in zip(scanned, along, strict=True))
+            if length > UNROLLED or not divided:
                 return None
             carry = list(zip(operands[consts:consts + carries], leads[consts:consts + carries], strict=True))
-            steps: dict[int, list] = {}
-            order = range(params["length"] - 1, -1, -1) if params["reverse"] else range(params["length"])
+            steps: dict[int, list[tuple]] = {}
+            order = range(length - 1, -1, -1) if params["reverse"] else range(length)
             for step in order:
-                sliced = [self.number(("scanned", value, step)) for value in scanned]
-                values = [*operands[:consts], *(number for number, _ in carry), *sliced]
-                held = [*leads[:consts], *(lead for _, lead in carry), *([None] * len(sliced))]
+                sliced = [_step_rows(value, lead, step, length) if isinstance(value, tuple)
+                          else (self.number(("scanned", value, step)), None)
+                          for value, lead in zip(scanned, along, strict=True)]
+                values = [*operands[:consts], *(number for number, _ in carry),
+                          *(number for number, _ in sliced)]
+                held = [*leads[:consts], *(lead for _, lead in carry), *(lead for _, lead in sliced)]
                 out = run(scan_body(equation), values, held)
-                if out is None or any(isinstance(number, tuple) for number, _ in out[carries:]):
+                if out is None:
                     return None
-                carry, steps[step] = out[:carries], [number for number, _ in out[carries:]]
-            # A loop's stacked results, its steps' on a new leading axis, keyed by their shapes too.
-            stacked = [(self.number(("stacked steps", tuple(equation.outvars[carries + index].aval.shape),
-                                     tuple(steps[step][index] for step in sorted(steps)))), None)
-                       for index in range(len(equation.outvars) - carries)]
+                carry, steps[step] = out[:carries], out[carries:]
+            stacked = []
+            for index in range(len(equation.outvars) - carries):
+                each = [steps[step][index] for step in sorted(steps)]
+                if not any(isinstance(value, tuple) for value in scanned):
+                    if any(isinstance(number, tuple) for number, _ in each):
+                        # A stack a step makes of what it carries, on an axis of steps ahead of its rows'.
+                        return None
+                    # A loop's stacked results, its steps' on a new axis ahead, keyed by their shapes too.
+                    shape = tuple(equation.outvars[carries + index].aval.shape)
+                    named = self.number(("stacked steps", shape, tuple(number for number, _ in each)))
+                    stacked.append((named, None))
+                    continue
+                # Over a stack scanned along its rows, each step's rows again, on one more axis of rows.
+                leads_of = {lead for _, lead in each}
+                if len(leads_of) != 1:
+                    return None
+                lead = leads_of.pop()
+                stacked.append((tuple(row for number, _ in each
+                                      for row in (number if isinstance(number, tuple) else (number,))),
+                                1 if lead is None else lead + 1))
             return [*carry, *stacked]
         index, *given = operands
         if isinstance(index, tuple):
@@ -862,6 +896,14 @@ def _keeps_sign(equation, params: Mapping, operands: Sequence,
             jax.lax.reduce_sum_p, jax.lax.reduce_max_p, jax.lax.convert_element_type_p,
             jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.squeeze_p)
     return primitive in kept and all(operand in nonnegative for operand in operands)
+
+
+def _step_rows(rows: tuple, lead: int, step: int, length: int) -> tuple:
+    """The rows a loop of `length` steps scanning a stack of `rows` over its first `lead` axes reads at
+    `step`: its `step`th share of them, a stack over the rest of those axes, one row where they were one."""
+    share = len(rows) // length
+    taken = rows[step * share:(step + 1) * share]
+    return (taken[0], None) if lead == 1 else (taken, lead - 1)
 
 
 def _moved(equation, operands: list, leads: list) -> tuple | None:

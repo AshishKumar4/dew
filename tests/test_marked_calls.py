@@ -311,31 +311,49 @@ def test_a_marked_span_called_again_in_one_state_is_traced_once(monkeypatch):
     assert kinds_of(first.jaxpr) == kinds_of(second.jaxpr) == [Protected()]
 
 
-def test_a_marked_span_with_an_effect_is_traced_at_every_call_and_runs_it(monkeypatch):
+def test_a_marked_span_with_an_effect_is_traced_at_every_call_and_runs_it():
     """A marked span whose program has an effect (a host callback), which no call may take from another's
-    trace (`derivatives._holdable`), is traced at each call, as one no key holds (`_span_key` of None), in the
-    call's own collections, and runs its effect with each call's values: its held None never reads as a
-    program to take (Train 1205's review F1, its facts held by `generation.held_trace`)."""
-    traced, seen = [], []
-    making = jax.make_jaxpr
-
-    def counted(fn, *args, **kwargs):
-        traced.append(getattr(fn, "__name__", None))
-        return making(fn, *args, **kwargs)
+    trace (`derivatives._holdable`), held as none, is traced again at a second call of the same arguments'
+    types, in the same state, and runs its effect with each call's values (Train 1205's review F1, its facts
+    held by `generation.held_trace`)."""
+    seen = []
 
     def logged(x, y):
         jax.debug.callback(lambda total: seen.append(float(total)), x.sum())
         return x * y
 
     span = marked(Protected(), logged)
-    monkeypatch.setattr(jax, "make_jaxpr", counted)
-    first = jax.jit(lambda x, y: span(x, y))(jnp.ones(3), jnp.full(3, 2.0))
-    second = jax.jit(lambda x, y: span(x, y) + 0.0)(jnp.full(3, 3.0), jnp.full(3, 2.0))
+    x, y = jnp.ones(3), jnp.full(3, 2.0, jnp.float32)
+    # Both traced before either runs: what the span reads is alike at both.
+    first = jax.jit(lambda x, y: span(x, y)).trace(x, y).lower().compile()
+    second = jax.jit(lambda x, y: span(x, y) + 0.0).trace(x, y).lower().compile()
+    computed = [np.asarray(first(x, y)), np.asarray(second(3.0 * x, y))]
     jax.effects_barrier()
-    assert traced.count("span") == 2, traced
     assert seen == [3.0, 9.0]
-    np.testing.assert_array_equal(np.asarray(first), np.full(3, 2.0, np.float32))
-    np.testing.assert_array_equal(np.asarray(second), np.full(3, 6.0, np.float32))
+    np.testing.assert_array_equal(computed[0], np.full(3, 2.0, np.float32))
+    np.testing.assert_array_equal(computed[1], np.full(3, 6.0, np.float32))
+
+
+def test_a_marked_span_with_an_effect_reports_its_nested_routes_at_every_call():
+    """A marked span whose program has an effect, held as none, whose body calls a jitted function that takes
+    a route (a kernel's choice), reports the route at each of its calls in one trace, all of one argument
+    type: traced again as it is, in the trace's own collections, its nested function's trace was JAX's held
+    one from the call before, which reported nothing, and a kernel report missed its route (row 12094)."""
+    from dew.nn.kernels import generation
+
+    @jax.jit
+    def scaled(x):
+        generation.route("rms_norm", kernel="xla")
+        return x * 2.0
+
+    def logged(x):
+        jax.debug.callback(lambda total: None, x.sum())
+        return scaled(x)
+
+    span = marked(Protected(), logged)
+    with generation.routes() as routes:
+        jax.jit(lambda x: span(span(span(x)))).trace(jnp.ones(3))
+    assert [route.choice for route in routes] == ["rms_norm"] * 3
 
 
 SCALE = 2.0

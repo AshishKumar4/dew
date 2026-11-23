@@ -82,7 +82,10 @@ def test_a_steps_planner_certifies_its_launches_beside_the_trace_that_reaches_th
     launch's own compile, a `certified_` program, runs on a certification thread (`dew-certify`), none on a
     thread that traces. Certified within the planner's trace, a 4x1024 MoE step's 16 certifications compiled
     one after another (MC-6740-POOL), and an sm90 plan certified 64 of its 82 seconds in turn (FS-P5324-MAIN,
-    row 5324)."""
+    row 5324). Its start traced first alone, as a trainer's start traces it (`Trainer._started`, targeting
+    its mesh, no device named to certify on), then the plan: every launch certified on the one GPU the plan
+    certifies on, its mesh's first, where a start's launches traced outside the plan's certifying block were
+    certified again on another (rows 6791, 6824, 7212)."""
     script = """
 import json
 import threading
@@ -109,11 +112,21 @@ model = models.build("causal_transformer", vocab_size=VOCAB,
 trainer = Trainer(LMObjective(model, tokens), optax.adam(1e-3), key=jax.random.key(0),
                   mesh=MeshSpec().build(gpus("sm90")), layout=Layout(min_shard=TINY_SHARD))
 jax.monitoring.register_event_duration_secs_listener(heard)
+from dew.nn.kernels.generation import assumed
+from dew.nn.kernels.templates import report
+with assumed("sm90"):
+    trainer._started()
 started = bool(compile_ahead(trainer, token_rows(VOCAB, BATCH, tokens + 1)).starts)
-print(json.dumps({"started": started, "compiled_on": compiled_on}))
+certified = [[each.op, str(each.device)] for each in report.certifications()]
+print(json.dumps({"started": started, "compiled_on": compiled_on, "certified": certified,
+                  "first": str(trainer.device_mesh.devices.flat[0])}))
 """
     result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
                    variables={"CUDA_VISIBLE_DEVICES": ""})
     certifying = [thread for thread, name in result["compiled_on"] if "certified_" in name]
     assert result["started"], result
     assert certifying and all(thread.startswith("dew-certify") for thread in certifying), result
+    # Every launch certified on one device, the mesh's first compile-only GPU, the start's and the plan's
+    # alike, never the host's: a certification is one a launch and device, so none twice (rows 6791, 6824,
+    # 7212).
+    assert result["certified"] and {each[1] for each in result["certified"]} == {result["first"]}, result

@@ -1903,10 +1903,11 @@ def test_a_token_budget_reached_inside_a_split_step_keeps_the_window_its_later_p
                          ids=["cap-first", "steps-first"])
 def test_a_token_cap_beside_a_runs_steps_ends_it_at_the_first_reached(steps, capped, ends):
     """A run of `steps` steps capped at `capped` steps' targets (`Horizon.max_tokens`) ends at whichever
-    comes first; a cap beside a run of tokens, and two lengths, are refused before it trains."""
+    comes first; a cap beside a run of tokens, a cap of no length it caps, and two lengths, are refused
+    before it trains."""
     trainer = budget_lm_trainer()
     state = trainer.fit(lm_data(), steps=steps, max_tokens=capped * LM_ROWS * LM_CONTEXT)
     assert int(state.step) == ends
-    for refused in ({"tokens": 96, "max_tokens": 96}, {"steps": 2, "tokens": 96}):
+    for refused in ({"tokens": 96, "max_tokens": 96}, {"max_tokens": 96}, {"steps": 2, "tokens": 96}):
         with pytest.raises(ValueError):
             budget_lm_trainer().fit(lm_data(), **refused)

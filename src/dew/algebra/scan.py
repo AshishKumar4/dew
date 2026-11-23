@@ -1035,7 +1035,7 @@ def _scaled_contract(subscripts: str, scale: float | np.floating, scale_dtype: n
     from jax.custom_derivatives import SymbolicZero
 
     from dew.nn.kernels import generation
-    from dew.nn.sharding import varying_like
+    from dew.nn.sharding import varied_alike
 
     inputs, output = subscripts.split("->")
     axes = inputs.split(",")
@@ -1073,7 +1073,7 @@ def _scaled_contract(subscripts: str, scale: float | np.floating, scale_dtype: n
 
     def contraction(*operands):
         # The casts' transposes sum a varying cotangent back to each whole operand.
-        return rule(*(varying_like(operand, *operands) for operand in operands))
+        return rule(*varied_alike(operands))
 
     return contraction
 

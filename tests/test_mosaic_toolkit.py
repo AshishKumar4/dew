@@ -3,6 +3,7 @@ operand across persistent tiles of their own trip counts, one consumer or two sh
 interpreter is coverage, not proof (it treats wgmma_wait as a no-op); each kernel also lowers for an H100
 here, and runs on one in the GPU gate."""
 
+import contextlib
 import dataclasses
 import functools
 from collections.abc import Callable
@@ -25,8 +26,10 @@ from dew.nn.kernels.templates import (
     emission,
     handoffs,
     mosaic,
+    mosaic_sm80,
     outputs,
     product,
+    resources,
     rings,
     stacked,
     stores,
@@ -377,8 +380,6 @@ def test_a_schedules_roles_share_the_launch_pool_by_weight(weights, programs):
     """Each raised role's registers (`resources.role_registers`, a `Schedule`'s): none past the launch's pool
     or setmaxnreg's ceiling, a heavier role never below a lighter one, and the pool spent to within a step
     a role unless every role is at the ceiling (a capped role's share goes to the rest)."""
-    from dew.nn.kernels.templates import resources
-
     with generation.assumed("sm90"):
         held = resources.role_registers(weights, programs)
         pool = resources.entry_registers(len(weights), programs) * len(weights)
@@ -402,7 +403,7 @@ def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_c
     producer at them,
     its consumers sharing what remains of the launch's pool, and its register model states the same split:
     so the consumers' budget a derivation reads is the raise the kernel runs."""
-    from dew.nn.kernels.templates import handoffs, resources
+    from dew.nn.kernels.templates import handoffs
     from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
 
     with generation.assumed(generation_name):
@@ -427,8 +428,6 @@ def test_a_spilled_launchs_producer_steps_down_its_ladder_from_its_top(generatio
     share), then from the stated cap to its top, then a setmaxnreg step lower each time, past the stated cap,
     asked already; every other launch's left where it was; none at the ladder's foot, a step above the least,
     so the derivation steps its tiles down instead; a top past setmaxnreg's most bounded at it."""
-    from dew.nn.kernels.templates import resources
-
     with generation.assumed(generation_name):
         steps = resources.facts().raises()
         top = steps.lowest + 13 * steps.step
@@ -458,7 +457,6 @@ def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budg
     schedule runs at
     that split (`Family.roles`), which the planner, the walk's schedule and the gate's register model all
     read, so no decision holds a launch at the split it does not run."""
-    from dew.nn.kernels.templates import resources
     from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
 
     with generation.assumed(generation_name):
@@ -481,7 +479,7 @@ def test_a_launch_with_a_joined_correction_warpgroup_counts_its_registers_in_its
     program's launch pool shared four ways), its correction role's half of it, and its register model counts
     the correction's registers in what a program allocates, so a multiprocessor holds no more programs of it
     than its registers do (row 5368)."""
-    from dew.nn.kernels.templates import mosaic_sm100, resources
+    from dew.nn.kernels.templates import mosaic_sm100
 
     with generation.assumed("sm100"):
         family = mosaic_sm100.RINGS
@@ -526,7 +524,6 @@ def test_a_launchs_register_model_runs_the_programs_its_shared_memory_holds():
     """A launch's register model states the programs its plan runs: its registers' residency bounded by the
     programs its staged bytes hold on the target it derives for (row 5523: a B200's gathered input gradient
     staging 230,580 bytes was stated three programs, which its registers held, and ran one)."""
-    from dew.nn.kernels.templates import resources
     from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
 
     with generation.assumed("sm90"):
@@ -541,7 +538,6 @@ def test_a_register_models_caps_are_its_targets_wherever_they_are_asked():
     an A100 in effect, are those asked under the H100: its entry share and its consumers' raise beside its
     producer its own multiprocessor's (row 12028: they read the GPU in effect as they were asked, and an
     A100's takes no setmaxnreg)."""
-    from dew.nn.kernels.templates import resources
     from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
 
     model = resources.register_model(WGMMA, 2, 168, moves=True, target=generation.gpu_target("sm90"))
@@ -558,7 +554,6 @@ def test_a_register_model_decides_on_its_target_whatever_target_is_in_effect():
     multiprocessor has no setmaxnreg steps, decides as it does under the H100's own: its producer, file,
     residency and shared memory each its target's (row 11987's cross-generation checks raised reading the
     A100's setmaxnreg steps for an H100's producer)."""
-    from dew.nn.kernels.templates import resources
     from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
 
     h100 = generation.gpu_target("sm90")
@@ -574,7 +569,7 @@ def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
     (`report.Launch.kernels`), by its name less the launch's suffix, where the compile point reads the
     producer its schedule lowers to (`kernel_compile.producer_failures`); named outside any launch, it states
     nothing."""
-    from dew.nn.kernels.templates import attention, report, resources
+    from dew.nn.kernels.templates import attention, report
     from dew.nn.kernels.templates.attention_mosaic import MosaicForward, Tiles
     from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
 
@@ -653,7 +648,7 @@ def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     `plgpu.CtaBarrier`, a packed decode's consumers' meet); a tile scoped after its walks beside the program's
     on a family whose walks share a scope (warpgroup MMA), the larger of it and the walks on one that scopes
     each walk apart (mma.sync's emit_pipeline)."""
-    from dew.nn.kernels.templates import mosaic_sm80, mosaic_sm90, resources
+    from dew.nn.kernels.templates import mosaic_sm90
 
     program = (plgpu.SMEM((100,), jnp.float32), plgpu.Barrier(num_barriers=3),
                plgpu.CtaBarrier(num_arrivals=2))
@@ -672,8 +667,6 @@ def _fits(found, launches, family, target) -> bool:
     launch's floor and most, its shared bytes its scope's at those stages and within a program's share of
     the block at its residency, its programs within what the family's registers and the multiprocessor's
     resident threads hold at the launch's registers."""
-    from dew.nn.kernels.templates import resources
-
     block = generation.shared_budget(target)
     return all(launch.floor <= plan.stages <= launch.most
                and plan.shared == resources.shared_bytes(family, launch.scope(plan.stages))
@@ -688,8 +681,6 @@ def test_a_plan_fits_its_target_or_none_is_made():
     a stage and one of 40 KiB each plan within the block's shared memory, the registers and the resident
     threads (`_fits`); one whose floor of two stages no residency's share holds (200 KiB a stage) plans
     nothing."""
-    from dew.nn.kernels.templates import mosaic_sm80, resources
-
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
 
     def launch(stage_kib: int) -> resources.Launch:
@@ -835,8 +826,6 @@ def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
     """`resources.plan` for one mma.sync consumer at 32 registers a thread and 1 KiB a program, whose
     registers alone would hold sixteen programs: on an A10, an RTX PRO 6000 and an A100 its plan fits each
     part's resident threads (`_fits`), whatever their count (1536 on the first two, 2048 on an A100)."""
-    from dew.nn.kernels.templates import mosaic_sm80, resources
-
     def scope(stages: int) -> resources.Scope:
         return resources.Scope(program=(plgpu.SMEM((stages * 1024,), jnp.uint8),))
 
@@ -854,7 +843,7 @@ def test_a_launch_with_a_producer_plans_within_its_target():
     delta net's states launch (41 KiB of its own, 36 KiB a stage, 96 registers) and as a one-stage launch
     of 64 KiB at 128 registers: each plan fits the block, the registers with the producer's and the
     resident threads (`_fits`); a launch whose own bytes exceed the block plans nothing."""
-    from dew.nn.kernels.templates import bundles, resources
+    from dew.nn.kernels.templates import bundles
 
     def launch(fixed: int, step: int, registers: int, most: int) -> resources.Launch:
         def scope(stages: int) -> resources.Scope:
@@ -874,8 +863,6 @@ def test_a_launch_with_a_producer_plans_within_its_target():
 def _vector_scaled(scale, x, axis: str, *, interpret: bool):
     """An sm80 program scaling a 64 x 128 accumulator by a side vector along `axis` ('rows' or 'columns'),
     the vector loaded as an epilogue's side tile is (`Family.loaded`, its axes stated)."""
-    from dew.nn.kernels.templates import mosaic_sm80
-
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
 
     def body(scale_gmem, x_gmem, out_gmem):
@@ -1243,7 +1230,7 @@ def test_a_launch_walks_the_widest_column_block_its_tensor_memory_holds_as_palla
     beside its scores and their gradients' 192 (448 of 512) and not 256 (704), and Pallas allocates a kernel
     scoping them at the block taken and refuses one at the block above it, so the derivation and the allocator
     agree."""
-    from dew.nn.kernels.templates import mosaic_sm100, resources
+    from dew.nn.kernels.templates import mosaic_sm100
     held = functools.partial(_backward_tensor_memory, 64)
     assert resources.widest_columns(width, 16, held, generation.gpu_target("sm100")) == block
     # A GPU without tensor memory holds no block of it.
@@ -1268,7 +1255,7 @@ def test_a_launch_walks_the_widest_column_block_its_tensor_memory_holds_as_palla
 def test_a_four_bit_tile_takes_the_tensor_memory_columns_pallas_allocates_it():
     """A packed 4-bit tile takes eight elements a column (`resources.tensor_memory_columns`): beside 448 fp32
     columns, a 512-wide fp4 tile's 64 fill a B200's 512, and Pallas allocates a kernel scoping both."""
-    from dew.nn.kernels.templates import mosaic_sm100, resources
+    from dew.nn.kernels.templates import mosaic_sm100
     issuer = mosaic_sm100.RINGS
     held = (issuer.tensor_memory((128, 448)), issuer.tensor_memory((128, 512), jnp.float4_e2m1fn))
     assert resources.tensor_memory_columns(held) == generation.gpu_target("sm100").tmem_columns
@@ -1436,7 +1423,7 @@ def test_a_tpu_launch_plans_one_program_within_its_cores_scoped_vmem():
     floor of two stages the scoped VMEM does not hold plans nothing."""
     from jax.experimental.pallas import tpu as pltpu
 
-    from dew.nn.kernels.templates import mosaic_tpu, resources
+    from dew.nn.kernels.templates import mosaic_tpu
 
     family = mosaic_tpu.MXU
 
@@ -1481,7 +1468,7 @@ def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_g
     import kernel_compile
     from fla_gdn_support import KernelCase
 
-    from dew.nn.kernels.templates import bundles, resources
+    from dew.nn.kernels.templates import bundles
 
     with generation.assumed("sm90"):
         family = bundles.of("sm90", jnp.bfloat16)
@@ -1506,8 +1493,6 @@ def _chained(a, b, c, *, m_warps: int, interpret: bool):
     product's left operand a register value (`a` read from a plain tile, then the first product's
     accumulator) relayed through a tile the consumer binds where the warps split its columns (`relaying`),
     stored through registers."""
-    from dew.nn.kernels.templates import mosaic_sm80, resources
-
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16), m_warps=m_warps)
     rows = a.shape[0]
 
@@ -1548,7 +1533,7 @@ def _negated(a, b, *, path: str, interpret: bool):
     (`READS`) and negated before it is stored: a sign op on the accumulator's registers, which ptxas 12.9
     folded through their value before the MMA where it was an integer op, storing -0.0 (row 4346; the fork's
     float-sign-ops emits it as a float instruction)."""
-    from dew.nn.kernels.templates import mosaic_sm90, resources
+    from dew.nn.kernels.templates import mosaic_sm90
 
     family = mosaic_sm90.FED
     shape = (LANDED, LANDED)
@@ -1648,6 +1633,61 @@ def test_an_accumulator_feeds_the_next_product_on_any_warp_split(rows, m_warps):
             lowering_platforms=("cuda",))
 
 
+def _bounded(a, b, c, bounds, *, family, interpret):
+    """`c + a @ b` by the mma.sync `family`, bounded at each row bound `bounds` holds (`Issuer.bounded`, read
+    at run time), then as `family` itself, in one trace."""
+    rows, count, widest = a.shape[0], bounds.shape[0] + 1, resources.copied_rows(RELAYED, jnp.float32)
+
+    def body(a_gmem, b_gmem, c_gmem, bounds_gmem, out_gmem):
+        def scoped(a_smem, b_smem, *outs):
+            swizzling.copied(a_gmem, a_smem)
+            swizzling.copied(b_gmem, b_smem)
+            mosaic.synced(interpret)
+            acc = plgpu.load(c_gmem, layout=family.layout, optimized=False)
+            issuers = [*(family.bounded(bounds_gmem[index]) for index in range(count - 1)), family]
+            for issuer, out in zip(issuers, outs, strict=True):
+                plgpu.store(out, issuer.products(acc, a_smem, b_smem), optimized=False)
+            mosaic.synced(interpret)
+            for index, out in enumerate(outs):
+                stores.store_rows(out, out_gmem.at[index], 0, 0, jnp.int32(rows), 0, rows,
+                                  copy=swizzling.coalesced, widest=widest)
+
+        staged = (swizzling.staged(shape, jnp.bfloat16, resources.widest_swizzle(jnp.bfloat16, RELAYED))
+                  for shape in ((rows, RELAYED), (RELAYED, RELAYED)))
+        pl.run_scoped(scoped, *staged, *(swizzling.plain((rows, RELAYED), jnp.float32) for _ in range(count)))
+
+    out = jax.ShapeDtypeStruct((count, rows, RELAYED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="bounded")(a, b, c, bounds)
+
+
+@pytest.mark.parametrize("m_warps", [1, 2, 4])
+def test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it(m_warps):
+    """mma.sync's products by a family bounded at a tile's rows (`Issuer.bounded`: a ragged group's last tile)
+    issue for the 16-row blocks before the bound alone, a nonzero accumulator, each row its own, kept in the
+    rest: two run-time bounds in one trace (-1 keeping every row, 65 issuing all), and a constant one a family
+    carries into one jitted helper at each bound (M-FS-56b; exact on a GPU; rows 7091, 12108, 12109)."""
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16), m_warps=m_warps)
+    a, b = (jax.random.randint(key, shape, -2, 3).astype(jnp.bfloat16) for key, shape in
+            zip(jax.random.split(jax.random.key(9)), ((64, RELAYED), (RELAYED, RELAYED)), strict=True))
+    c = np.broadcast_to(np.arange(1, 65, dtype=np.float32)[:, None] * 0.5, (64, RELAYED)).copy()
+    full = c + np.asarray(a, np.float32) @ np.asarray(b, np.float32)
+    starts, on_gpu = np.arange(64)[:, None] // 16 * 16, jax.default_backend() == "gpu"
+    run = jax.jit(_bounded, static_argnames=("family", "interpret"))
+    for bounds, constant in (((-1, 65), -1), ((0, 64), 65), ((1, 47), 16), ((16, 17), 47)):
+        with contextlib.nullcontext() if on_gpu else generation.assumed("sm80"):
+            got = run(a, b, jnp.asarray(c), jnp.array(bounds, jnp.int32), family=family.bounded(constant),
+                      interpret=False if on_gpu else INTERPRETED)
+        expected = [np.where(starts < bound, full, c) for bound in (*bounds, constant)]
+        np.testing.assert_array_equal(np.asarray(got), np.stack(expected))
+    if on_gpu:
+        return
+    shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (a, b, c, np.zeros(2, np.int32))]
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+    with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+        run.trace(*shapes, family=family, interpret=False).lower(lowering_platforms=("cuda",))
+
+
 CODES = (64, 64)
 """A quantized stage's rows and depth."""
 
@@ -1655,7 +1695,7 @@ CODES = (64, 64)
 def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = True):
     """`codes` (int8 or e4m3) converted into a bf16 tile through the generation's family's `converted`, each
     row scaled by `scale`, and copied out."""
-    from dew.nn.kernels.templates import bundles, resources
+    from dew.nn.kernels.templates import bundles
 
     family = bundles.of(generation_name, jnp.bfloat16)
 
@@ -2302,8 +2342,6 @@ def test_a_cp_async_walk_refuses_a_once_stream():
     """mma.sync's walk refuses a once stream (`CpAsync.folded`): its pipeline would allocate the block a
     slot per stage in the walk's scope, where the plan (`lifetimes`) counts one, so a ring depth the plan
     accepts could overflow an A100's shared memory."""
-    from dew.nn.kernels.templates import mosaic_sm80
-
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
     x, w = _persisted_operands(family.rows)
     with generation.assumed("sm80"), pytest.raises(NotImplementedError):

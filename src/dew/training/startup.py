@@ -121,7 +121,7 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
     objective.bind_widths(loader.widths)
     # A schedule whose last stage ends its data bounds the run as tokens= does (`run_tokens`).
     tokens = run_tokens(loader, horizon.token_cap, counts_tokens=objective.counts_tokens)
-    accumulation = update.of_tokens(loader.token_batches or (loader.batch_tokens,))
+    accumulation = update.of_tokens(loader.each_token_batch)
     with startup.phase("count", "counting the steps the run's examples take", when=examples is not None):
         steps = run_steps(loader, horizon, accumulation, tokens)
     count_compilation_cache()

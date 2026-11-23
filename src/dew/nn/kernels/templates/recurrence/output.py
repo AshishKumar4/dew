@@ -36,10 +36,11 @@ def _output_streams(call: Call, bv: int) -> tuple[dict, tuple]:
     """`output_launch`'s streamed blocks and its staging tiles at value blocks `bv` wide: a value block's
     memory entered and values; under a decay a head the queries and keys, the scores staged once for every
     value block's product; under one a key dimension the intra launch's scores, and each key block's gated
-    queries staged, their queries and prefix halves read from global memory at the first step alone
-    (`_gated_queries`), no stream's slots held for the walk: streamed, the queries' and the two fp32
-    prefixes' slots staged Kimi delta attention's output at 147,456 bytes at every value block, past a 99 KB
-    part's block (an sm86's, sm89's and sm120's: its call the port's there, jsf-kda-derive)."""
+    queries staged, their queries and prefix read from global memory at the first step alone
+    (`_gated_queries`), no stream's slots held for the walk: streamed, the queries' and two fp32 prefixes'
+    slots (a compensated prefix's halves) staged Kimi delta attention's output at 147,456 bytes at every
+    value block, past a 99 KB part's block (an sm86's, sm89's and sm120's: its call the port's there,
+    jsf-kda-derive)."""
     chunk = call.chunk
     width, held, memories = call.width, call.held, call.memories
     queries = {} if call.per_key else {"queries": ((chunk, width), call.given)}
@@ -58,12 +59,12 @@ def _output_streams(call: Call, bv: int) -> tuple[dict, tuple]:
 def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> None:
     """Each key block's queries gated by their decays to the chunk's start and scaled (`algebra.key_gated`)
     into its staging tile of `staged`, a decay a key dimension's at the first step: the queries and the
-    prefix's halves (`refs`, the launch's queries and its high and low prefixes) read from global memory a key
+    prefix (`refs`, the launch's queries and its prefix, `intra._prefix`'s) read from global memory a key
     block at a time in the accumulator's layout (`Family.tile_of`), each operand's parts summed as its tiles'
     (`Parts.value`), no slot held past the step, and staged as the parts the products read (`operands.staged`:
     an fp32 call's two under the fast forms, whose first alone staged left the second's buffer unwritten)."""
     family, width, chunk = call.family, call.width, call.chunk
-    q_ref, hi_ref, lo_ref = refs
+    q_ref, *prefix_refs = refs
 
     def read(operand, ref, column):
         tiles = [family.tile_of(view) for view in operand.views(ref, row, chunk, column, call.block)]
@@ -72,7 +73,7 @@ def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> Non
     for c, tile in enumerate(staged):
         column = c * call.block
         query = read(call.given, q_ref, h // call.group * width + column)
-        decays = tuple(read(call.gates, ref, h * width + column) for ref in (hi_ref, lo_ref))
+        decays = tuple(read(call.gates, ref, h * width + column) for ref in prefix_refs)
         operands.staged(family, algebra.key_gated(query, decays, scale), tile)
 
 
@@ -105,8 +106,8 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     step's scores' phase, their sum, their pairs' decays and their masks (an fp32 call's split into parts) and
     their product's fragments. The two phases apart: the scores staged in the first step's branch before the
     value block's products issue, whether the walk takes one value block or steps over several. Under a decay
-    a key dimension the value block's phase, and apart from it the first step's: a key block's prefix halves,
-    its decay raised from them and its queries widened, read from global memory and staged for every step
+    a key dimension the value block's phase, and apart from it the first step's: a key block's prefix, its
+    decay raised from it and its queries widened, read from global memory and staged for every step
     (`_gated_queries`)."""
     chunk = call.chunk
     held, memories, given, family = call.held, call.memories, call.given, call.family
@@ -121,7 +122,7 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
         values = [f32(chunk, bv), *held_tile(held, chunk, bv), f32(chunk, chunk),
                   *held_tile(held, chunk, chunk),
                   *products]
-        return Held(phases=(values, [f32(chunk, call.block)] * 4))
+        return Held(phases=(values, [f32(chunk, call.block)] * (2 + call.prefix_limbs)))
     # Accurate three-part products each take a fresh accumulator (`Issuer.apart`), the memory's output
     # beside the local product's sums: two stated, an unrounded fp32 write gate's output was admitted where
     # ptxas serialized its warpgroup MMAs (C7512, sm90; armada output-values-fresh-sums). Two parts issue
@@ -174,22 +175,26 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
 
 
 @building(lambda launch: ("recurrence_output",))
-def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Tiles, *, scale: float,
+def output_launch(q, k, h, corrected, prefix: tuple, taken, beta, call: Call, tiles: Tiles, *, scale: float,
                   out_dtype, scores=None, skip=None):
     """Each chunk's output `[R, HV * Dv]` in `out_dtype`, a program a chunk and value head and a step each
-    value block: under a decay a head its own pairs' scores taken once, at the first step, and staged for
-    every block's (`algebra.chunk_scores`, `chunk_output`), under one a key dimension the intra launch's
-    (`scores`, `_intra`; `algebra.key_decayed_output`). Where the write gate takes the keys' side
-    (`Call.gated_keys`) the scores' columns take `beta` `[HV, R]` before they are rounded, and a `skip`
-    `[HV]` adds `D v` from the values the step holds (there the corrected ones)."""
+    value block, under the decay's `prefix` (`chunk_forward._Run`'s): under a decay a head its own pairs'
+    scores taken once, at the first step, and staged for every block's (`algebra.chunk_scores`,
+    `chunk_output`), under one a key dimension the intra launch's (`scores`, `_intra`;
+    `algebra.key_decayed_output`). Where the write gate takes the keys' side (`Call.gated_keys`) the scores'
+    columns take `beta` `[HV, R]` before they are rounded, and a `skip` `[HV]` adds `D v` from the values the
+    step holds (there the corrected ones)."""
     chunk = call.chunk
     assert skip is None or call.gated_keys, "a skip reads the values a call whose keys take the gate holds"
     width, value_width, bv = call.width, call.value_width, tiles.output_block
     held, memories, family = dataclasses.replace(call.held, rows=call.rows), call.memories, call.family
     steps = value_width // bv
+    # A decay a head's prefix read as a row's vectors and as a column's, each from its own operand; a key
+    # dimension's a key block at a time (`_gated_queries`).
+    prefixes = prefix if call.per_key else (*prefix, *prefix)
 
-    def program(at, q_ref, k_ref, h_ref, v_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref,
-                beta_ref, *refs, streams, staging, landing):
+    def program(at, q_ref, k_ref, h_ref, v_ref, *refs, streams, staging, landing):
+        prefix_refs, (_taken_ref, beta_ref, *refs) = refs[:len(prefixes)], refs[len(prefixes):]
         *skip_ref, o_ref = refs
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
@@ -209,8 +214,9 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
             """A decay a head's prefix as a row's vectors and a column's, from global memory before the walk
             waits on its tiles. Not streamed: four more rings' stream bookkeeping spilled a value block 64
             wide's output (388 bytes on an H100's, 0a261aae0)."""
-            return (tuple(family.rows_of(ref.at[h, span]) for ref in (hi_ref, lo_ref)),
-                    tuple(family.columns_of(ref.at[h, span]) for ref in (column_hi_ref, column_lo_ref)))
+            rows, columns = prefix_refs[:len(prefix)], prefix_refs[len(prefix):]
+            return (tuple(family.rows_of(ref.at[h, span]) for ref in rows),
+                    tuple(family.columns_of(ref.at[h, span]) for ref in columns))
 
         def step(index, slots, carry, accumulators, loaded=None):
             def block(name, operand, c, *, along_rows=False):
@@ -227,7 +233,7 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
                 # product: computed each step, they were live across the walk's steps beside each one's sum.
                 @pl.when(index == 0)
                 def _():
-                    _gated_queries(call, (q_ref, hi_ref, lo_ref), row, h, scale, gated)
+                    _gated_queries(call, (q_ref, *prefix_refs), row, h, scale, gated)
 
                 out = algebra.key_decayed_output(
                     lambda c: Parts(gated[c], call.given.dtype), entered, width // call.block,
@@ -260,7 +266,6 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
 
     blocks, staging = _output_streams(call, bv)
     out_type = jax.ShapeDtypeStruct((call.rows, call.heads * value_width), out_dtype)
-    # The prefix twice, as the solve's.
     # The chunk's scores once (the intra launch's under a decay a key dimension), then each value block's
     # memory and local products: the model's.
     scored = 0 if call.per_key else 2 * chunk * chunk * width
@@ -270,12 +275,12 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
     keys = None if swizzle is None else {f"keys{p}": swizzle for p in range(call.given.parts)}
     # Its kernel named `recurrence_output` as the profiles and the gate know it (`launch_kernel` names a
     # launch for the function its program is defined in, here `output_launch`).
+    inputs = (q, k if scores is None else scores, h, corrected, *prefixes, taken)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          name="recurrence_output", grid_names=("chunks", "heads"), blocks=blocks, stages=1,
-                         live=chunk_liveness(8), steps=steps, model=model,
+                         live=chunk_liveness(len(inputs) - 1), steps=steps, model=model,
                          held=_output_held(call, bv, swizzle), staging=staging, landing=landing,
                          # A 16-bit call's takes no reduction (an A100's asked for its tiles' 49152 bytes
                          # alone).
                          persistent=True, reduces=held.parts > 1, swizzles=keys)(
-        q, k if scores is None else scores, h, corrected, hi, lo, hi, lo, taken, beta,
-        *(() if skip is None else (skip.astype(jnp.float32),)))
+        *inputs, beta, *(() if skip is None else (skip.astype(jnp.float32),)))

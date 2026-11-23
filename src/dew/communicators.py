@@ -247,8 +247,8 @@ def measured(configured: Mapping, *, measure: Callable[[Mapping], Needs]) -> Nee
 def needs_of(gpus: int | None = None) -> Needs | None:
     """This host's measurement (`measured`), measured by a child process where the cache holds none; None on a
     host of fewer than two GPUs, or in a process that asks JAX for no GPU, where no communicator is made."""
-    platforms = os.environ.get("JAX_PLATFORMS", "")
-    asks_no_gpu = bool(platforms) and not {"cuda", "gpu"} & set(platforms.split(","))
+    named = _pool.named_platforms(os.environ.get("JAX_PLATFORMS"))
+    asks_no_gpu = bool(named) and not named & {"cuda", "gpu"}
     count = len(local_gpus() or ()) if gpus is None else gpus
     if count < 2 or asks_no_gpu:
         return None

@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
-from dew.batch import SEGMENTS_FIELD, Variables, real_slots, thaw
+from dew.batch import SEGMENTS_FIELD, Variables, loop_passes_given, real_slots, thaw
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import rotate_rows
@@ -286,7 +286,8 @@ class GRPOObjective(TokenScorer):
         # groups' shared prompts among them (`packed_coordinates`).
         laid = packed_coordinates(batch)
         scores = self.token_scores(params, ids, coordinates=laid, routes=routes, qk_stats=qk_stats,
-                                   routing=routing, watched=watched, progress=progress)
+                                   routing=routing, watched=watched, progress=progress,
+                                   loop_passes=loop_passes_given(batch))
         support = (None if SUPPORT_KEY not in batch
                    else (batch[SUPPORT_KEY], batch[SUPPORT_COLUMNS_KEY]))
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
