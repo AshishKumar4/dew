@@ -1246,6 +1246,30 @@ def test_a_launchs_rungs_traced_under_a_compile_only_gpus_mesh_are_certified_on_
         each.kernels for each in found), found
 
 
+@CERTIFIES_AT_RUN
+@lowers("sm90")
+def test_a_launch_certified_aside_reads_its_own_refusals_alone():
+    """A launch certified within a block that certifies aside (`report.certifying_aside`) reads its own
+    launch's refusals alone (`report.refusals_of`): what it read answers as it did once another launch is
+    refused, so a trace held past that refusal holds (row 12167: every launch's refusals scanned)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    class Aside(TwoKernels):
+        """`TwoKernels`, a launch of its own: certified here, whatever this process certified before."""
+
+    op = Aside()
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((ROWS, FEATURES), jnp.bfloat16), ((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+        ((EXPERTS,), jnp.int32))]
+    with generation.assumed("sm90"), jax.set_mesh(devices), report.refusals():
+        bound = op.bind(*operands, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+        with generation.recording() as read, report.certifying_aside():
+            report.certified(op, bound, bound.heuristics_config)
+        report.refuse([("a launch none of these is", 1, ("its kernel",))])
+        assert read and generation.still(read), read
+
+
 def test_two_kernels_of_one_name_and_launch_are_refused_not_read_as_one():
     """Two Mosaic GPU calls of one name and launch whose kernels differ (a kernel whose body reads what its
     name holds not, neither its launch's config nor its form) are refused wherever a kernel's evidence is
