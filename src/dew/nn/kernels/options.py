@@ -547,15 +547,18 @@ def compiled_together() -> Iterator[None]:
 
 @dataclasses.dataclass
 class _Kept:
-    """An executable a program keeps under a call's key (`OuterProgram._ready`): the facts its trace read
-    (`reads`), the refusals it was last found to hold under (`under`, `report.refusal_snapshot`), and the
-    compile reservation it settled (`reserved`, `OuterProgram._executables`), which `_bounded` lets go of
-    with it."""
+    """An executable a program keeps (`OuterProgram._kept`) with what it was kept by: the facts its trace read
+    (`reads`), the refusals it was last found to hold under (`under`, `report.refusal_snapshot`), the compile
+    that settled it (`reserved`, `OuterProgram._compiles`), whose bound lets it go, and, compiled within
+    `collecting`, the digest a collection holds it by and its outputs' weak types as its compile's trace gave
+    them. Every compile's future answers with one (`_reserved`), so its facts go wherever it does."""
 
     executable: jax.stages.Compiled
     reads: Facts
     under: tuple
-    reserved: Hashable
+    reserved: tuple[Hashable, tuple]
+    digest: str | None = None
+    weak_types: tuple[bool, ...] = ()
     others: Facts = dataclasses.field(init=False, repr=False)
     """The facts of `reads` but the refusals' (`_apart`), which a call under the refusals it was found
     holding under asks again (`_holding`)."""
@@ -590,19 +593,29 @@ def _holds(reads: Facts, refusals: tuple) -> bool:
     return _facts.still(others)
 
 
-def _holding(kept: Sequence[_Kept], refusals: tuple) -> jax.stages.Compiled | None:
-    """The executable of `kept`, a key's, that a call under `refusals` (`report.refusal_snapshot`) runs: one
-    found to hold under them whose other facts answer still (`_Kept.others`, none for most programs), else
-    one its trace's facts hold under them (`_holds`), found so from here on; None where none does. A key
-    keeps one a refusal scope its calls ran in, so two scopes in turn compile none again."""
+def _holding(kept: Sequence[_Kept], refusals: tuple) -> _Kept | None:
+    """The one of `kept`, a key's, that a call under `refusals` (`report.refusal_snapshot`) runs: one found
+    to hold under them whose other facts answer still (`_Kept.others`, none for most programs), else one its
+    trace's facts hold under them (`_holds`), found so from here on; None where none does. A key keeps one a
+    refusal scope its calls ran in, so two scopes in turn compile none again. Asked outside the program's
+    lock, whose fact readers may call the program."""
     for each in kept:
         if each.under == refusals and _facts.still(each.others):
-            return each.executable
+            return each
     for each in kept:
         if _holds(each.reads, refusals):
             each.under = refusals
-            return each.executable
+            return each
     return None
+
+
+@dataclasses.dataclass(frozen=True)
+class _Shapes:
+    """The key a compile within `collecting` is kept by beside a call's (`OuterProgram._kept`): its call's
+    abstract signature (`OuterProgram.abstract_of`), which a later call over arrays alike in it reaches,
+    tracing nothing (`OuterProgram._shaped_for`)."""
+
+    abstract: Hashable
 
 
 class _Resettled(Exception):
@@ -694,8 +707,8 @@ class OuterProgram:
     enclosing jit), it is its jit, which the enclosing program compiles as its own."""
 
     CACHED: ClassVar[int] = 4096
-    """The executables a program keeps, the latest compiled, so its cache is bounded as jit's is: a call of
-    one compiled before reads it without refreshing its place (row 3326)."""
+    """The compiles a program keeps, in flight or settled, the least recently used let go first, so its cache
+    is bounded as jit's is (row 3326)."""
 
     def __init__(self, function: Callable, **arguments):
         self.function, self.arguments = function, arguments
@@ -716,38 +729,29 @@ class OuterProgram:
         if signature is not None:
             numbers, names = api_util.infer_argnums_and_argnames(signature, numbers, names)
         self.numbers, self.names = _given_tuple(numbers), frozenset(_given_tuple(names))
-        # Each compile reserved and settled by its call's key and the refusals it began under (`_reserved`),
-        # the least recently used first.
-        self._executables: collections.OrderedDict[tuple[Hashable, tuple], Future[jax.stages.Compiled]] = (
+        # Every compile, in flight or settled, by its call's key and the refusals it began under
+        # (`_reserved`), its future answering with what it kept (`_Kept`), the least recently used first and
+        # at most `CACHED` (`_bounded`).
+        self._compiles: collections.OrderedDict[tuple[Hashable, tuple], Future[_Kept]] = (
             collections.OrderedDict())
-        # The executables kept under each call's key, read without the lock: a call of a signature compiled
-        # before costs its key and a lookup (row 3326), and where a refusal moved the registry since, the
-        # refusals its trace read (`_holding`).
-        self._ready: dict[Hashable, tuple[_Kept, ...]] = {}
-        # Each executable compiled within `collecting` over shapes (or arrays) by the call's abstract
-        # signature (`abstract_of`: shapes, dtypes, weak types, shardings, layouts and the static arguments),
-        # which a later call over arrays alike in it runs, tracing nothing (`_shaped_for`): a run's startup
-        # compiles a host step's programs over its state's shapes, and its steps run them (a host step
-        # compiled ahead, `dew.training.compiler`). A call whose arrays differ in any of it (a sharding the
-        # shapes did not state) misses and traces; it never runs another program's executable. An entry
-        # leaves on its first use for `_ready`, under that call's key, and `CACHED` bounds the two together.
-        # Each with the digest a collection holds it by (`collecting`; None for a program none can state),
-        # which every collection that meets it again records (`__call__`).
-        self._shaped: collections.OrderedDict[Hashable, tuple[jax.stages.Compiled, str | None,
-                                                              tuple[bool, ...]]] = (
-            collections.OrderedDict())
-        # The facts each executable's trace read, by the executable, read again by every call it answers with
-        # no trace (row 12296's review P0: a warm call recorded none, a value made from it held past them).
-        self._reads: weakref.WeakKeyDictionary[jax.stages.Compiled, Facts] = weakref.WeakKeyDictionary()
+        # What each call's key runs, read without the lock: a call of a signature compiled before costs its
+        # key and a lookup (row 3326), and where a refusal moved the registry since, the refusals its trace
+        # read (`_holding`). A compile within `collecting` is kept by its call's abstract signature too
+        # (`_Shapes`), which a later call over arrays alike in it runs, tracing nothing (`_shaped_for`): a
+        # run's startup compiles a host step's programs over its state's shapes, and its steps run them (a
+        # host step compiled ahead, `dew.training.compiler`). A call whose arrays differ in any of it (a
+        # sharding the shapes did not state) misses and traces; it never runs another program's executable.
+        self._kept: dict[Hashable, tuple[_Kept, ...]] = {}
+        self._collected = False
         self._compiling = threading.Lock()
         held_until_release(self)
 
     def released(self) -> None:
         """Drop every executable it keeps (`release`), each compiled again at its next call."""
         with self._compiling:
-            self._ready.clear()
-            self._executables.clear()
-            self._shaped.clear()
+            self._compiles.clear()
+            self._kept.clear()
+            self._collected = False
 
     def _jitted(self) -> jax.stages.Wrapped:
         """Its jit, of a callable of its own, past JAX's trace cache (a relowering's, `compiled`)."""
@@ -939,114 +943,85 @@ class OuterProgram:
         # (theme K01-e's review P0).
         refusals = report.refusal_snapshot()
         if (collected := _COLLECTED.get()) is not None:
-            abstract = self.abstract_of(args, kwargs)
-            with self._compiling:
-                held = self._shaped.get(abstract)
+            shapes = _Shapes(self.abstract_of(args, kwargs))
             # Compiled once over these shapes: a pass over shapes again (a host step's next step's, whose
-            # state its first returned; another collection's in this process) takes the one it holds where
-            # its trace's facts hold (`_holds`), and its collection records it as the compile recorded it in
-            # the first.
-            if held is None or not _holds(self._reads.get(held[0], {}), refusals):
-                executable, digest, weak_types, (_, _, reads) = self._compiled_digested(*args, **kwargs)
-                held = executable, digest, weak_types
+            # state its first returned; another collection's in this process) takes the one it keeps where
+            # its trace's facts hold (`_holding`), and its collection records it as the compile recorded it
+            # in the first.
+            kept = _holding(self._kept.get(shapes, ()), refusals)
+            if kept is None:
+                executable, digest, weak_types, (_, refused, reads) = self._compiled_digested(*args, **kwargs)
+                kept = _Kept(executable, reads, refused, (shapes, refused), digest, weak_types)
+                settled: Future[_Kept] = Future()
+                settled.set_result(kept)
                 with self._compiling:
-                    self._reads[executable] = reads
-                    self._shaped[abstract] = held
+                    self._compiles[kept.reserved] = settled
+                    self._kept_under(shapes, kept)
+                    self._collected = True
                     self._bounded()
-            executable, digest, weak_types = held
-            _facts.replay(self._reads.get(executable, {}))
-            if digest is not None:
-                collected[digest] = executable
+            _facts.replay(kept.reads)
+            if kept.digest is not None:
+                collected[kept.digest] = kept.executable
             # Each result with the weak type its compile's own trace gave it, never a trace again (row 11766:
             # a trace after a settle's own missed JAX's cache and traced every program twice).
-            return _outputs(executable.out_info, weak_types)
+            return _outputs(kept.executable.out_info, kept.weak_types)
         key, dynamic, named = self.key_of(args, kwargs)
         if (together := _TOGETHER.get()) is not None:
             return self._together(together, (key, refusals), args, kwargs)
-        ready = _holding(self._ready.get(key, ()), refusals)
-        if ready is None:
-            ready = self._shaped_for(key, args, kwargs, refusals) or self._kept(key, args, kwargs, refusals)
+        kept = _holding(self._kept.get(key, ()), refusals)
+        if kept is None:
+            kept = (self._shaped_for(key, args, kwargs, refusals)
+                    or self._kept_for(key, args, kwargs, refusals))
         # The facts its trace read, which no trace of this call reads (`_settle`).
-        _facts.replay(self._reads.get(ready, {}))
-        return self.invoked(ready, args, kwargs, *dynamic, **named)
+        _facts.replay(kept.reads)
+        return self.invoked(kept.executable, args, kwargs, *dynamic, **named)
 
-    def _shaped_for(self, key: Hashable, args: tuple, kwargs: dict, refusals: tuple
-                    ) -> jax.stages.Compiled | None:
-        """The executable a compile within `collecting` made for a call alike in its abstract signature
-        (`_shaped`), kept from here on under this call's `key` and run, tracing nothing; None where none
-        was made, or its trace's facts hold no longer under `refusals` (`_holds`). It stays held by its
-        abstract signature too: a later call alike in it under another key (an array its last step committed
-        where the first call's was not, or placed under an equal sharding of another object) runs it, where
-        it compiled the program again (a host step's EMA update at its second step). Kept as a compile under
-        `refusals` settled it (`_settle`)."""
-        if not self._shaped:
+    def _shaped_for(self, key: Hashable, args: tuple, kwargs: dict, refusals: tuple) -> _Kept | None:
+        """What a compile within `collecting` kept for a call alike in its abstract signature (`_Shapes`),
+        kept from here on under this call's `key` too and run, tracing nothing; None where none was, or its
+        trace's facts hold no longer under `refusals` (`_holding`). A later call alike in it under another
+        key (an array its last step committed where the first call's was not, or placed under an equal
+        sharding of another object) runs it, where it compiled the program again (a host step's EMA update at
+        its second step)."""
+        if not self._collected:
             return None
-        abstract = self.abstract_of(args, kwargs)
-        with self._compiling:
-            held = self._shaped.get(abstract)
-        # Judged outside the lock, whose fact readers may call the program (its review's P0).
-        if held is None or not _holds(reads := self._reads.get(held[0], {}), refusals):
+        shapes = _Shapes(self.abstract_of(args, kwargs))
+        kept = _holding(self._kept.get(shapes, ()), refusals)
+        if kept is None:
             return None
         with self._compiling:
-            if self._shaped.get(abstract) is not held:
+            if kept not in self._kept.get(shapes, ()):
                 return None
-            self._shaped.move_to_end(abstract)
-            executable = held[0]
-            settled: Future[jax.stages.Compiled] = Future()
-            settled.set_result(executable)
-            self._executables[key, refusals] = settled
-            self._kept_under(key, _Kept(executable, reads, refusals, (key, refusals)))
+            self._compiles.move_to_end(kept.reserved)
+            self._kept_under(key, kept)
             self._bounded()
-        return executable
+        return kept
 
     def _bounded(self) -> None:
-        """Hold no more than `CACHED` executables, kept (`_executables`) and compiled over shapes
-        (`_shaped`) together, one a call alike in its abstract signature runs too (`_shaped_for`) counted
-        once: the least recently made over shapes go first, then the least recently used kept. Called with
-        `_compiling` held."""
-        # Its executables at most `CACHED`, and the keys and abstract signatures that reach them at most twice
-        # that: a handed program reached under many keys holds no index without bound.
-        while self._held() > self.CACHED or len(self._executables) + len(self._shaped) > 2 * self.CACHED:
-            ready = {id(kept.executable) for kept_all in self._ready.values() for kept in kept_all}
-            # The least recently made over shapes that no call runs yet, else the least recently used kept,
-            # with every entry over shapes of its executable no other key still runs.
-            unaliased = next((abstract for abstract, held in self._shaped.items()
-                              if id(held[0]) not in ready), None)
-            if unaliased is not None:
-                self._shaped.pop(unaliased)
-                continue
-            reserved, _ = self._executables.popitem(last=False)
-            evicted = self._let_go(reserved)
-            running = {id(kept.executable) for kept_all in self._ready.values() for kept in kept_all}
-            for executable in (executable for executable in evicted if id(executable) not in running):
-                for abstract in [abstract for abstract, held in self._shaped.items()
-                                 if held[0] is executable]:
-                    self._shaped.pop(abstract)
+        """Hold no more than `CACHED` compiles, the least recently used let go first with what they kept
+        (`_let_go`), and no more than twice as many keys reaching them: a handed program reached under many
+        keys holds no index without bound. Called with `_compiling` held."""
+        while len(self._compiles) > self.CACHED:
+            self._let_go(self._compiles.popitem(last=False)[0])
+        while len(self._kept) > 2 * self.CACHED:
+            self._kept.pop(next(iter(self._kept)))
 
-    def _held(self) -> int:
-        """How many executables it holds, kept, compiling and compiled over shapes, each once however many
-        dispatch keys or abstract signatures run it."""
-        held = {id(kept.executable) for kept_all in self._ready.values() for kept in kept_all}
-        held |= {id(entry[0]) for entry in self._shaped.values()}
-        return len(held) + sum(not pending.done() for pending in self._executables.values())
-
-    def _let_go(self, reserved: tuple[Hashable, tuple]) -> list[jax.stages.Compiled]:
-        """Let go of the executables kept under the call's key that the reservation `reserved` settled
-        (`_Kept.reserved`); the ones let go. Called with `_compiling` held."""
-        key = reserved[0]
-        evicted = [kept.executable for kept in self._ready.get(key, ()) if kept.reserved == reserved]
-        left = tuple(kept for kept in self._ready.get(key, ()) if kept.reserved != reserved)
-        if left:
-            self._ready[key] = left
-        else:
-            self._ready.pop(key, None)
-        return evicted
+    def _let_go(self, reserved: tuple[Hashable, tuple]) -> None:
+        """Let go of what the compile `reserved` kept (`_Kept.reserved`), under every key reaching it. Called
+        with `_compiling` held."""
+        for key in [key for key, kept in self._kept.items()
+                    if any(each.reserved == reserved for each in kept)]:
+            left = tuple(each for each in self._kept[key] if each.reserved != reserved)
+            if left:
+                self._kept[key] = left
+            else:
+                del self._kept[key]
 
     def _kept_under(self, key: Hashable, kept: _Kept) -> None:
-        """Keep `kept` under the call's `key` (`_ready`), first, past any it replaces (its executable's or its
-        reservation's). Called with `_compiling` held."""
-        self._ready[key] = (kept, *(each for each in self._ready.get(key, ()) if each.executable is not
-                                    kept.executable and each.reserved != kept.reserved))
+        """Keep `kept` under `key` (`_kept`), first, past any it replaces (its executable's or its
+        compile's). Called with `_compiling` held."""
+        self._kept[key] = (kept, *(each for each in self._kept.get(key, ()) if each.executable is not
+                                   kept.executable and each.reserved != kept.reserved))
 
     @property
     def options(self) -> jax.stages.CompilerOptions | None:
@@ -1071,9 +1046,9 @@ class OuterProgram:
 
         refusals = report.refusal_snapshot()
         key, _, _ = self.key_of(args, kwargs)
-        ready = _holding(self._ready.get(key, ()), refusals) or self._kept(key, args, kwargs, refusals)
-        _facts.replay(self._reads.get(ready, {}))
-        return ready
+        kept = _holding(self._kept.get(key, ()), refusals) or self._kept_for(key, args, kwargs, refusals)
+        _facts.replay(kept.reads)
+        return kept.executable
 
     def invoked(self, executable: jax.stages.Compiled, args: tuple, kwargs: dict, /, *dynamic, **named):
         """Call `executable`, fetched for these arguments (`executable`), on `dynamic` and `named` inside
@@ -1084,7 +1059,7 @@ class OuterProgram:
         with _ran(self, executable, args, kwargs):
             return communicators.called(executable, lambda: executable(*dynamic, **named))
 
-    def _reserved(self, key: tuple[Hashable, tuple]) -> tuple[Future[jax.stages.Compiled], bool]:
+    def _reserved(self, key: tuple[Hashable, tuple]) -> tuple[Future[_Kept], bool]:
         """The compile kept under `key` (a call's key and the refusals it began under) and whether this caller
         owns it: a future its owner settles (`_keep`, `_released`), reserved where none is, or where the one
         settled holds no longer under them (`_holds`: a fact its trace read answering otherwise), let go with
@@ -1093,47 +1068,43 @@ class OuterProgram:
         readers may call the program (its review's P0), and let go where it is still the reservation."""
         while True:
             with self._compiling:
-                pending = self._executables.get(key)
+                pending = self._compiles.get(key)
                 if pending is None:
-                    pending = self._executables[key] = Future()
-                    self._executables.move_to_end(key)
-                    # One bound over every executable it holds, kept and compiled over shapes (`_bounded`):
-                    # this key, the most recently used, is never the one it lets go.
+                    pending = self._compiles[key] = Future()
+                    # One bound over every compile it keeps (`_bounded`): this one, the most recently used,
+                    # is never the one it lets go.
                     self._bounded()
                     return pending, True
-                self._executables.move_to_end(key)
-            if not (pending.done() and pending.exception() is None) or _holds(
-                    self._reads.get(pending.result(), {}), key[1]):
+                self._compiles.move_to_end(key)
+            if not (pending.done() and pending.exception() is None) or _holds(pending.result().reads, key[1]):
                 return pending, False
             with self._compiling:
-                if self._executables.get(key) is pending:
-                    self._executables.pop(key)
+                if self._compiles.get(key) is pending:
+                    self._compiles.pop(key)
                     self._let_go(key)
 
-    def _kept(self, key: Hashable, args: tuple, kwargs: dict, refusals: tuple) -> jax.stages.Compiled:
-        """The executable a call of `key` under `refusals` runs, compiled where none is (`compiled`), by the
-        caller owning its reservation (`_reserved`, of the key and the refusals)."""
+    def _kept_for(self, key: Hashable, args: tuple, kwargs: dict, refusals: tuple) -> _Kept:
+        """What a call of `key` under `refusals` runs, compiled where nothing is (`compiled`), by the caller
+        owning its reservation (`_reserved`, of the key and the refusals)."""
         from dew.nn.kernels.templates import report
 
         reserved = (key, refusals)
         pending, owner = self._reserved(reserved)
         if owner:
             try:
-                executable, _, _, settled = self._compiled_digested(*args, **kwargs)
+                executable, _, weak_types, settled = self._compiled_digested(*args, **kwargs)
             except BaseException as error:
                 self._released(reserved, pending, error)
             else:
-                self._settle(reserved, pending, executable, settled, args, kwargs)
-                return executable
+                return self._settle(reserved, pending, executable, settled, args, kwargs, weak_types)
         try:
-            executable = pending.result()
+            kept = pending.result()
         except _Resettled:
             # Kept under other refusals than this call's (`_settle`): looked up, or compiled, under its own.
-            return self._kept(key, args, kwargs, report.refusal_snapshot())
+            return self._kept_for(key, args, kwargs, report.refusal_snapshot())
         # Another caller's compile, settled where a fact its trace read may answer otherwise now: taken where
         # it holds, else compiled again (`_reserved` lets it go).
-        return executable if _holds(self._reads.get(executable, {}), refusals) else self._kept(
-            key, args, kwargs, refusals)
+        return kept if _holds(kept.reads, refusals) else self._kept_for(key, args, kwargs, refusals)
 
     def _lowered_aside(self, args: tuple, kwargs: dict, relowered: Relowered
                        ) -> tuple[jax.stages.Lowered, tuple[bool, ...], tuple, Facts]:
@@ -1191,10 +1162,10 @@ class OuterProgram:
         if not owner:
             # Another's compile, done or not: its shapes as the call traces, none waited for; a done one's
             # where its trace's facts hold (`_holds`), read again.
-            if pending.done() and pending.exception() is None and _holds(
-                    reads := self._reads.get(pending.result(), {}), key[1]):
-                _facts.replay(reads)
-                return shapes_of(pending.result().out_info)
+            if pending.done() and pending.exception() is None and _holds((kept := pending.result()).reads,
+                                                                          key[1]):
+                _facts.replay(kept.reads)
+                return shapes_of(kept.executable.out_info)
             return shapes_of(self.trace(*args, **kwargs).out_info)
         try:
             traced, refused, reads = self._snapshot_trace(args, kwargs)
@@ -1209,9 +1180,9 @@ class OuterProgram:
             together[id(self), key] = _Lowering(self, key, pending, lowered, args, kwargs, refused, reads)
         return shapes_of(lowered.out_info)
 
-    def _settle(self, reserved: tuple[Hashable, tuple], pending: Future[jax.stages.Compiled],
+    def _settle(self, reserved: tuple[Hashable, tuple], pending: Future[_Kept],
                 executable: jax.stages.Compiled, settled: tuple[jax.stages.Wrapped | None, tuple, Facts],
-                args: tuple, kwargs: dict) -> None:
+                args: tuple, kwargs: dict, weak_types: tuple[bool, ...] = ()) -> _Kept:
         """Settle the compile reserved under `reserved` (a call's key and the refusals it began under,
         `_reserved`) with `executable`, its waiters given it, and keep it under the call's key with the facts
         its kept program's trace read and the refusals it traced under (`settled`'s, `_accepted`), reserved
@@ -1219,33 +1190,34 @@ class OuterProgram:
         launch's config relowering past it, which a call after it, of those refusals, runs (row 12165), and
         no call of the reservation's refusals runs a program traced past others (theme K01-e's review P0).
         Its jit (`settled`'s, a relowering's) traces under its refusals from here on; the facts its kept
-        program's trace read are read again by every call it answers."""
+        program's trace read are read again by every call it answers. What it kept (`_Kept`)."""
         fresh, refused, reads = settled
         if fresh is not None and (held := self._held_key(args, kwargs)) is not None:
             self._validated(held, fresh)
         key = reserved[0]
         accepted = (key, refused)
-        kept: Future[jax.stages.Compiled] = Future()
-        kept.set_result(executable)
+        kept = _Kept(executable, reads, refused, accepted, weak_types=weak_types)
+        answered: Future[_Kept] = Future()
+        answered.set_result(kept)
         with self._compiling:
-            self._reads[executable] = reads
             if accepted == reserved:
-                if reserved in self._executables:
-                    self._kept_under(key, _Kept(executable, reads, refused, reserved))
+                if reserved in self._compiles:
+                    self._kept_under(key, kept)
             else:
-                if self._executables.get(reserved) is pending:
-                    self._executables.pop(reserved)
-                if accepted not in self._executables:
-                    self._executables[accepted] = kept
-                    self._kept_under(key, _Kept(executable, reads, refused, accepted))
+                if self._compiles.get(reserved) is pending:
+                    self._compiles.pop(reserved)
+                if accepted not in self._compiles:
+                    self._compiles[accepted] = answered
+                    self._kept_under(key, kept)
             self._bounded()
         # Its waiters, joined on its reservation: given it where it is kept under its refusals, else sent to
         # look up or compile under their own (`_Resettled`), once it is kept where it is (theme K01-e's
         # review P0: a waiter given a program traced past refusals its scope holds none of).
         if accepted == reserved:
-            pending.set_result(executable)
+            pending.set_result(kept)
         else:
             pending.set_exception(_Resettled(accepted))
+        return kept
 
     def keeps(self) -> bool:
         """Whether it keeps an executable a call over arrays runs (one compiled at a call, or taken from a
@@ -1253,7 +1225,7 @@ class OuterProgram:
         one is kept, not that it is the one a call over given arguments runs: a caller reads it of a program
         called over one shape alone (a kept start's, `dew.training.distributed.start_compiling`)."""
         with self._compiling:
-            return any(self._ready.values())
+            return any(self._kept.values())
 
     def guided(self, executable: jax.stages.Compiled, replacement: jax.stages.Compiled) -> None:
         """`executable`, one this program holds, replaced by `replacement`, its compile again guided by a
@@ -1273,26 +1245,17 @@ class OuterProgram:
         if differs:
             raise ValueError(f"{self.called}'s guided compile states other {', '.join(differs)} than the "
                              f"executable it replaces: {differs}")
+        # Each record keeping it, which its compile's future and every key reaching it answer with.
         with self._compiling:
-            self._reads[replacement] = self._reads.get(executable, {})
-            for key, pending in list(self._executables.items()):
-                if pending.done() and pending.exception() is None and pending.result() is executable:
-                    settled: Future[jax.stages.Compiled] = Future()
-                    settled.set_result(replacement)
-                    self._executables[key] = settled
-            for kept in (kept for kept_all in self._ready.values() for kept in kept_all):
+            for kept in (kept for kept_all in self._kept.values() for kept in kept_all):
                 if kept.executable is executable:
                     kept.executable = replacement
-            for abstract, (shaped, digest, weak_types) in list(self._shaped.items()):
-                if shaped is executable:
-                    self._shaped[abstract] = (replacement, digest, weak_types)
 
-    def _released(self, key: tuple[Hashable, tuple], pending: Future[jax.stages.Compiled],
-                  failure: BaseException) -> None:
+    def _released(self, key: tuple[Hashable, tuple], pending: Future[_Kept], failure: BaseException) -> None:
         """Fail the compile reserved under `key` (`_reserved`: a call's key and the refusals it began under),
         the program keeping none."""
         with self._compiling:
-            self._executables.pop(key, None)
+            self._compiles.pop(key, None)
         if not pending.done():
             pending.set_exception(failure)
 
@@ -1355,7 +1318,7 @@ class OuterProgram:
         settled = _accepted(kept_from, lowered, relowered, refused, reads)
         lowered = kept_from[-1] if kept_from else lowered
         # A program no file can hold (its trees hold a node no process names: a pullback's closure) is
-        # collected by no digest; a call over arrays alike still runs it (`_shaped`).
+        # collected by no digest; a call over arrays alike still runs it (`_Shapes`).
         digest = None
         if (collected := _COLLECTED.get()) is not None and (
                 digest := stated_digest(lowered, self.options)) is not None:
