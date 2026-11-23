@@ -521,7 +521,7 @@ def keep_unmasked_mark(path) -> None:
         groups: list[JSON] = [] if unmasked is True else [*sorted(unmasked)]
         # The steps that earlier Dew wrote, its record's alone: any a later start writes holds its own.
         steps: list[JSON] = [*sorted(_steps_at(path.parent))]
-        marked: dict[str, JSON] = ({"unmasked_all": True} if unmasked is True else {"unmasked_groups": groups})
+        marked: dict[str, JSON] = {"unmasked_all": True} if unmasked is True else {"unmasked_groups": groups}
         marked["steps"] = steps
         write_atomically(path.parent / MASKED_DECAY_MARK, json.dumps(marked))
 
