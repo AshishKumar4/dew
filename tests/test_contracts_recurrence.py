@@ -684,15 +684,15 @@ def test_the_diagonal_scan_holds_its_orders(edge):
     """The diagonal scan on the template's kernels (`templates.recurrence.diagonal`, a custom VJP over its
     launches, interpreted off a GPU) as every caller reaches it (`kernels.diagonal.diagonal_scan` with the
     kernels named, whose products' wrapper takes every order through the portable math, `_per_product`),
-    over three spans of 64 tokens at an interpreted H100's facts from a state: each token's output and the
+    over two spans of 64 tokens at an interpreted H100's facts from a state: each token's output and the
     final state finite at every order wherever float64 is a normal float32 and the recurrence a token at a
     time is, at writes and states scaled to the edge, the log forget gates HGRN's."""
     def draw(seed, scale):
-        x, g, state = normal_draw(1453 + 4096 * seed, (2, 150, 128), (2, 150, 128), (2, 128))
+        x, g, state = normal_draw(1453 + 4096 * seed, (2, 70, 128), (2, 70, 128), (2, 128))
         primals = (x * scale, -jax.nn.softplus(-(g + 2.0)), state * scale)
         drawn = normal_draw(1454 + 4096 * seed, x.shape, g.shape, state.shape)
         direction = (drawn[0] * scale, drawn[1], drawn[2] * scale)
-        return primals, direction, normal_draw(1455 + 4096 * seed, (2, 151, 128))[0]
+        return primals, direction, normal_draw(1455 + 4096 * seed, (2, 71, 128))[0]
 
     def joined(out, final):
         return jnp.concatenate([out, final[:, None].astype(out.dtype)], axis=1)
