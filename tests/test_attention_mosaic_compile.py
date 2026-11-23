@@ -394,14 +394,14 @@ DECODE_GATE = [(generation_name, width, stored, call) for generation_name in WOR
                if generation_name == "sm90" or width == max(staged_widths(generation_name, jnp.bfloat16))
                for stored in ("bfloat16", "int8", "float32")
                for call, positions, heads, kv_heads in WORK_LISTS
-               if (stored == "bfloat16" or call == "decode")
-               and _served(generation_name, positions, heads, kv_heads, width, stored)]
+               if stored == "bfloat16" or call == "decode"]
 """The work list gate's cases: each family's GPU the route serves the work list on (`WORK_LIST_GPUS`,
 `FAMILY_GPUS`), at its widest staged head and on an H100 each width its bundles stage (row 12438;
 `staged_widths`, the declarations the route's legality reads: a 32-wide call's mma.sync launch was no case
 of the gate's 64 and 128, and its magnitudes' transposed load failed on an H100, IG-FINAL3), each cache of
-a decode step (bf16, int8 codes, an fp32 query's parts) and a bf16 inference call, wherever the route
-serves the call as the work list (`_served`)."""
+a decode step (bf16, int8 codes, an fp32 query's parts) and a bf16 inference call; a cell the route serves
+another way (`_served`) skips as it runs, so collecting them derives no tiles (it took 59 of the module's 67
+s to import, every CI shard's)."""
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize(("generation_name", "width", "stored", "call"), DECODE_GATE,
@@ -420,6 +420,8 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
     from dew.nn.kernels.templates import attention_decode
 
     positions, heads, kv_heads = next(shape for name, *shape in WORK_LISTS if name == call)
+    if not _served(generation_name, positions, heads, kv_heads, width, stored):
+        pytest.skip("the route serves this call another way than the work list")
     rows, keys = 2, 4096 if positions == 1 else positions
     query = jax.ShapeDtypeStruct((rows, positions, heads, width),
                                  jnp.float32 if stored == "float32" else jnp.bfloat16)
