@@ -60,4 +60,7 @@ def test_a_held_trace_made_again_past_its_bound_records_its_facts_afresh():
     with generation.recording() as held:
         generation.held_trace(cache, "first", making("first"), 1)
     assert made == ["first", "second", "first"]
-    assert first and again == first and held == first
+    # Each recording holds the one fact the making read, and its answer.
+    assert first and [(fact, answer) for fact, (_, answer) in first.items()] == [
+        (fact, answer) for fact, (_, answer) in again.items()] == [
+        (fact, answer) for fact, (_, answer) in held.items()]
