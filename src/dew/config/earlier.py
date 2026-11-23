@@ -217,8 +217,8 @@ record, a run that trained, never acts on."""
 
 def _update_and_fit(fields: Mapping[str, _records.JSON]) -> dict[str, _records.JSON]:
     """A trainer config's fields with its earlier batching fields (`EARLIER_TRAINER_FIELDS`) as its update
-    and its fit policy: its token budget or its accumulation as the update, its split, or its pipeline's
-    microbatches, which it read under a mesh of stages alone, as the fit's split; its dynamic scale
+    and its fit policy: its token budget or its accumulation as the update, its split and its pipeline's
+    microbatches as the fit's (`FitPolicy.split`, `FitPolicy.microbatches`); its dynamic scale
     stated as its numerics' loss scaling, unset as theirs, "auto"; its length as its horizon; its publishing
     its W&B sink's; and no target to lower for. Carried to 1.0 (ledger 1552)."""
     from dew.nn.precision import Numerics, numerics_of
@@ -232,21 +232,12 @@ def _update_and_fit(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
         precision = dict(recorded) if isinstance(recorded, Mapping) else {}
         kept["precision"] = {**precision, "loss_scaling": "dynamic" if scaled else "none"}
     tokens, batches = fields.get("update_tokens"), fields.get("accumulation", 1)
-    # Under a mesh of stages the step's split is the microbatches its stages feed (`microbatches`), which
-    # its outer split never was; elsewhere it is the split.
-    staged = _staged(kept.get("mesh"))
-    if staged and fields.get("split") not in (None, 1):
-        raise ValueError(f"an earlier run split its pipeline's step in {fields['split']} beside the "
-                         "microbatches its stages fed, which this Dew's fit does not hold apart "
-                         "(`FitPolicy.split` is the microbatches a pipeline feeds): resume it under the Dew "
-                         "that saved it")
-    split = fields.get("microbatches") if staged else fields.get("split")
     if tokens is not None:
         kept["update"] = {"tokens": tokens}
     elif batches != 1:
         kept["update"] = {"batches": batches}
-    if split is not None:
-        kept["fit"] = {"split": split}
+    if fit := {key: fields[key] for key in ("split", "microbatches") if fields.get(key) is not None}:
+        kept["fit"] = fit
     if lengths := {key: fields[key] for key in EARLIER_LENGTHS if fields.get(key) is not None}:
         kept["horizon"] = lengths
     wandb = kept.get("wandb")
@@ -258,14 +249,6 @@ def _update_and_fit(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
         published: dict[str, _records.JSON] = {**held, "publish": True}
         kept["wandb"] = {**record, "fields": published} if tagged is not None else published
     return kept
-
-
-def _staged(mesh: _records.JSON) -> bool:
-    """Whether a trainer's recorded `mesh` (flat or by its class) holds a pipeline of two stages or more."""
-    tagged = _records.class_record(mesh) if isinstance(mesh, Mapping) else None
-    held = tagged[1] if tagged is not None else mesh
-    stage = held.get("stage", 1) if isinstance(held, Mapping) else 1
-    return isinstance(stage, int) and stage >= 2
 
 
 EARLIER_OPTIMIZER_FIELDS = ("optimizer_opts", "b1", "b2", "weight_decay", "state_dtype")

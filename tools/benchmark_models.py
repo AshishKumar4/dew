@@ -112,9 +112,9 @@ class TrainerMesh(TypedDict):
 
 def trainer_mesh(mesh: Mapping[str, int | tuple[str, ...]]) -> TrainerMesh:
     """The trainer's `mesh` and `fit` a case's mesh record names: its MeshSpec fields (its axes' sizes and the
-    axes it makes explicit) and, under pipeline stages, the pipeline's microbatches as the fit's split, the
-    plan's where it names none; a step of no stages read whole (`split=1`). Refuses a field it lacks, and
-    microbatches where it stages none."""
+    axes it makes explicit), its step read whole (`split=1`) and, under pipeline stages, the microbatches its
+    pipeline feeds (`FitPolicy.microbatches`), one a stage where it names none. Refuses a field it lacks,
+    and microbatches where it stages none."""
     fields = {f.name for f in dataclasses.fields(MeshSpec)}
     unknown = sorted(set(mesh) - fields - {"microbatches"})
     if unknown:
@@ -127,9 +127,9 @@ def trainer_mesh(mesh: Mapping[str, int | tuple[str, ...]]) -> TrainerMesh:
     spec = dataclasses.replace(MeshSpec(), **sizes)
     if microbatches is not None and spec.stage == 1:
         raise ValueError(f"a mesh's microbatches are its pipeline's, and it stages none: {mesh}")
-    # A case's step is read whole, climbing the remat ladder where it must, never split to fit; a pipeline's
-    # microbatches are the ones its record names, else the plan's for its stages.
-    return {"mesh": spec, "fit": FitPolicy(split=1 if spec.stage == 1 else microbatches or "auto")}
+    # A case's step is read whole, climbing the remat ladder where it must, never split to fit; a pipeline
+    # feeds the microbatches its record names, else one a stage.
+    return {"mesh": spec, "fit": FitPolicy(split=1, microbatches=microbatches)}
 
 
 def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:

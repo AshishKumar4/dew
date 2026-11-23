@@ -1729,7 +1729,7 @@ def test_a_ramp_stage_the_pipeline_cannot_cut_into_microbatches_is_refused():
     six microbatches hold batches of twenty-four, six rows a device, and
     stages of eight and sixteen are not ones."""
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0), mesh=MeshSpec(stage=2),
-                      fit=FitPolicy(split=6), layout=Layout(min_shard=1, tolerance=1.0))
+                      fit=FitPolicy(microbatches=6), layout=Layout(min_shard=1, tolerance=1.0))
 
     with pytest.raises(ValueError):
         trainer.fit(ramped(indexed_data(256, 24), Ramp(start=8, increment=8, samples=16)),
@@ -1746,7 +1746,7 @@ def test_a_batch_the_pipeline_cannot_cut_into_microbatches_is_refused_before_it_
     from dew.mesh import LayoutRefused
 
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0), mesh=MeshSpec(fsdp=2, stage=2),
-                      fit=FitPolicy(split=4), layout=Layout(min_shard=1, tolerance=1.0))
+                      fit=FitPolicy(microbatches=4), layout=Layout(min_shard=1, tolerance=1.0))
 
     with pytest.raises(LayoutRefused):
         trainer.fit(indexed_data(256, 8), steps=2, log_every=100)

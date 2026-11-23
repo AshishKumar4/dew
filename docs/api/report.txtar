@@ -338,7 +338,7 @@ class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, vari
   .replace(self, **updates)
   .window: property -> Accumulation | None
   .with_window(self, window: Accumulation | None) -> TrainState
-class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTransformation | OptimConfig, *, key: int | jax.Array, mesh: MeshSpec | Mesh = MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, diloco=1, explicit=()), layout: Layout | None = None, update: UpdateBatch = UpdateBatch(batches=None, tokens=None), fit: FitPolicy = FitPolicy(split='auto', remat='auto'), dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False, checkpoints: Checkpoints | None = None, tracker: Tracker | None = None, step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None, rollout: Rollout | None = None, profile: ProfileWindow | None = None, lower_for: str | None = None, ahead: AheadOfTime | None = None, tune_kernels: bool = False, record: bool = False, links: Mapping[str, Link] | None = None, inspection: Inspection | None = None, param_dtype: str | None = None, diloco: DiLoCo | None = None, phase_passes: Sequence[int] | None = None, sampled_passes: SampledPasses | None = None, data_resume: DataResume = 'relaxed', skip_nonfinite: bool = False)  [dew.training.trainer]
+class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTransformation | OptimConfig, *, key: int | jax.Array, mesh: MeshSpec | Mesh = MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, diloco=1, explicit=()), layout: Layout | None = None, update: UpdateBatch = UpdateBatch(batches=None, tokens=None), fit: FitPolicy = FitPolicy(split='auto', remat='auto', microbatches=None), dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False, checkpoints: Checkpoints | None = None, tracker: Tracker | None = None, step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None, rollout: Rollout | None = None, profile: ProfileWindow | None = None, lower_for: str | None = None, ahead: AheadOfTime | None = None, tune_kernels: bool = False, record: bool = False, links: Mapping[str, Link] | None = None, inspection: Inspection | None = None, param_dtype: str | None = None, diloco: DiLoCo | None = None, phase_passes: Sequence[int] | None = None, sampled_passes: SampledPasses | None = None, data_resume: DataResume = 'relaxed', skip_nonfinite: bool = False)  [dew.training.trainer]
   .compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep
   .device_mesh: cached property -> Mesh
   .executable: property -> jax.stages.Compiled | None
@@ -1164,6 +1164,7 @@ dew.training.inspection.Inspection
 dew.training.policy.FitPolicy
   split: int | Literal['auto'] = 'auto'
   remat: Remat = 'auto'
+  microbatches: int | None = None
 dew.training.policy.UpdateBatch
   batches: int | None = None
   tokens: int | None = None

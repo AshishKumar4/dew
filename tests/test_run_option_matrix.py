@@ -282,11 +282,11 @@ def test_a_kinds_run_feeds_its_microbatches_through_its_stages_or_is_refused(kin
     staged = {"trainer.horizon.steps": 1, "trainer.mesh": {"stage": 2, "tensor": 2}}
     if kind not in STAGED:
         with pytest.raises(ValueError):
-            trained(kind, tmp_path, "staged", **staged, **{"trainer.fit.split": 4})
+            trained(kind, tmp_path, "staged", **staged, **{"trainer.fit.microbatches": 4})
         return
     layers = {"model.num_layers": 2} if kind == "lm" else {}
     temps = {count: recorded(trained(kind, tmp_path, f"staged-{count}", **staged, **layers,
-                                     **{"trainer.fit.split": count}), "StepCompiled")[0]
+                                     **{"trainer.fit.microbatches": count}), "StepCompiled")[0]
              for count in (2, 4)}
     assert temps[4]["memory"]["analysis"]["temp"] < temps[2]["memory"]["analysis"]["temp"]
 

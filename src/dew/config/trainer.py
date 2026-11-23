@@ -258,11 +258,12 @@ class TrainerConfig:
     number of the data's token batches (`Dataset.batch(tokens=)`); unset, one batch."""
     fit: FitPolicy = dataclasses.field(default_factory=FitPolicy)
     """How the step fits the devices (`dew.training.FitPolicy`): the microbatches each step's batch is read
-    in, `--trainer.fit.split 4` (under a mesh of pipeline stages, the microbatches the stages feed, a
-    multiple of them), and what it recomputes, `--trainer.fit.remat selective`; each "auto", the planner's
-    choice, by default: the fewest microbatches that fit the devices before it recomputes anything, at the
-    least recomputation that fits (`Trainer.compile`). A step's tokens and the update's stay as configured
-    either way; only the microbatch shrinks."""
+    in, `--trainer.fit.split 4`, and what it recomputes, `--trainer.fit.remat selective`; each "auto", the
+    planner's choice, by default: the fewest microbatches that fit the devices before it recomputes
+    anything, at the least recomputation that fits (`Trainer.compile`); and under a mesh of pipeline stages
+    the microbatches each of those feeds through them, `--trainer.fit.microbatches 8`, a multiple of the
+    stages, one a stage unset. A step's tokens and the update's stay as configured either way; only the
+    microbatch shrinks."""
     batch_ramp: Ramp | None = None
     """A ramp that grows `batch_size` over the run's first records instead of starting there.
 

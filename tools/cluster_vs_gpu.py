@@ -206,8 +206,8 @@ def main() -> None:
                       key=jax.random.key(0),
                       mesh=MeshSpec(diloco=world, **mesh_of(shape["mesh"], jax.local_device_count()))
                             if args.diloco else MeshSpec(**mesh_of(shape["mesh"], jax.device_count())),
-                      fit=FitPolicy(split=shape.get("microbatches", "auto")), layout=Layout(), checkpoints=None,
-                      tracker=None, diloco=DiLoCo(every=args.diloco) if args.diloco else None)
+                      fit=FitPolicy(microbatches=shape.get("microbatches")), layout=Layout(),
+                      checkpoints=None, tracker=None, diloco=DiLoCo(every=args.diloco) if args.diloco else None)
     # Each process reads its own rows of every global batch, which shard_batch assembles: under DiLoCo a
     # group's share.
     partition = DataPartition.of(trainer.device_mesh)

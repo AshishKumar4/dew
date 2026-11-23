@@ -2396,7 +2396,7 @@ def test_a_mesh_without_stages_takes_its_one_microbatch_asked_for():
         trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), **asked)
         return trainer.fit(dataset(), steps=2, log_every=1)
 
-    named, planned = fit(fit=FitPolicy(split=1)), fit()
+    named, planned = fit(fit=FitPolicy(microbatches=1)), fit()
     for left, right in zip(jax.tree.leaves(named.variables), jax.tree.leaves(planned.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
