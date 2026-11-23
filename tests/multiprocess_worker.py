@@ -597,6 +597,19 @@ def failing_local_directory(checkpoints, directory: Path | None, step: int):
     return observed
 
 
+def mode_fit_refused(args) -> dict:
+    """`mode_fit`'s run, which a holder's read that fails must end on every process (row 12175): each
+    process's error's type, the holder's its read's own and its peer's the agreement's (`PeerFailure`),
+    reported, none left waiting for an answer the holder never sends."""
+    from dew import _coordination
+
+    try:
+        mode_fit(args)
+    except (ValueError, KeyError, OSError, _coordination.PeerFailure) as error:
+        return {"raised": type(error).__name__}
+    return {"raised": None}
+
+
 def mode_fit(args) -> dict:
     import jax
 
@@ -2393,7 +2406,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "decoding_components": mode_decoding_components,
          "rollout": mode_rollout, "mixed_validity": mode_mixed_validity,
          "replicated_rollout": mode_replicated_rollout,
-         "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
+         "steps": mode_steps, "fit": mode_fit, "fit_refused": mode_fit_refused, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
          "training_contract": mode_training_contract,
          "evaluation_contract": mode_evaluation_contract,

@@ -91,6 +91,12 @@ class PlanChanged(ValueError):
         super().__init__(message)
 
 
+class MalformedPosition(ValueError):
+    """A saved data position whose own cursor, the one Dew writes for its readers, lacks what every such
+    cursor holds (a sequential pass's `place` and `rows`): a corrupt position, which no resume reads, relaxed
+    or exact, never a plan or a version that changed (`PlanChanged`)."""
+
+
 def decode(position: bytes) -> Global | None:
     """The global position `position` holds, or None when it is a shard offset.
 
