@@ -283,7 +283,7 @@ def test_packed_products_hold_extreme_scales_forward_and_backward():
         (functools.partial(gemm.ternary_weight_product, weights=formats.TernaryWeights.of(eye, scale=unit),
                            quantize_activations=False), "ternary"),
         (functools.partial(gemm.fp8_weight_product, weights=formats.Fp8Weights.of(eye, scale=unit)), "fp8"))
-    mixed = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** -100)
+    mixed = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** -120)
     cancelling = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(4.0).at[0, 1].set(4.0)
     apart = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(4.0).at[0, 1].set(2.0)
 
@@ -317,12 +317,13 @@ def test_packed_products_hold_extreme_scales_forward_and_backward():
                 want[0, 0] = 2.0 ** 127
                 np.testing.assert_array_equal(np.asarray(dx_apart), want, err_msg=f"{kernel} {label}")
 
-            # A row's tiny cotangent beside a huge one on another input: each pulls back whole.
+            # A row's tiny cotangent beside a huge one on another input, no product past fp32's largest:
+            # each pulls back whole, as the plain transpose gives it.
             for product, label in separate:
                 ran = functools.partial(product, out_dtype=jnp.float32, interpret_on_cpu=True)
                 (dx_mixed,) = jax.vjp(ran, x_cot)[1](mixed)
                 want = np.zeros((16, 256), np.float32)
-                want[0, 0], want[0, 1] = 2.0 ** 126, 2.0 ** -100
+                want[0, 0], want[0, 1] = 2.0 ** 126, 2.0 ** -120
                 np.testing.assert_array_equal(np.asarray(dx_mixed), want, err_msg=f"{kernel} {label}")
 
 
