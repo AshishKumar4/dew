@@ -756,6 +756,24 @@ def test_a_products_launch_decided_outside_a_draw_reports_no_route_within_one():
     assert not drawn, drawn
 
 
+def test_a_products_held_launch_decision_records_the_facts_it_read_wherever_it_is_taken():
+    """A product's launch decided once (`projections.launches`, on an assumed H100) records the facts its
+    decision read (`generation.traced_fact`: the CUTLASS build its candidates ask after) into a recording
+    around a later call that takes the held decision, as one around its making did: a trace kept by them is
+    held where each answers as it did (`generation.held_trace`, row 12134)."""
+    from dew.nn.kernels import projections
+    from dew.nn.kernels.generation import assumed, recording
+
+    rows, matrix = (jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((96, 128), (128, 384)))
+    with assumed("sm90"):
+        with recording() as made:
+            projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
+        with recording() as taken:
+            projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
+    assert made, "the decision reads no fact, so its held one's replaying none says nothing"
+    assert taken.keys() == made.keys()
+
+
 def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
     """Each Mosaic GPU call a thunk names has its binary (`assembled.thunk_kernels`): two calls and two kernel
     protos read as two kernels, their registers and frames their cubins'; two calls and one is refused, as a
