@@ -1245,10 +1245,11 @@ class OuterProgram:
                     reads = self._programs.get(program)
                 else:
                     self._programs[program] = reads
-            if reads is None or not _facts.still(reads):
+            if answered and (reads is None or not _facts.still(reads)):
                 # JAX's trace cache answered the held jit (a jit of its own traces always) with a program
                 # whose facts are not held (another thread's trace not yet returned) or answer otherwise
-                # now (or a fact moved as a trace of its own read it): let go, traced by a jit of its own.
+                # now: let go, traced by a jit of its own. A trace that ran is taken as it ran: a fact it
+                # read under a context of its own (a GPU it assumes) answers otherwise outside it.
                 if held is not None:
                     self._invalidated(key, held)
                 withdrawn(marks)
