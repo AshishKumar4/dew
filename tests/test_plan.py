@@ -660,7 +660,7 @@ def test_a_provisional_plans_search_is_released_where_the_placed_search_after_it
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     gc.collect()
     assert not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
-    assert not options._HELD, list(options._HELD)
+    assert not trainer._compiler._executables, list(trainer._compiler._executables)
 
 
 def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(monkeypatch):
