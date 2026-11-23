@@ -915,9 +915,9 @@ class Selective(base.Template[Tiles]):
         ones): the backward at every other token count a thread's registers hold, each at its own residency
         (`backward_programs`), and the derived tokens at one program a multiprocessor fewer, as the H100's
         sweep timed them (8 tokens at three programs 6.43 ms, at two 8.10, 16 at two 6.48, sel-sweep-sxm at
-        f3040b154); and the forward's chunk halved and doubled. The plan's model ties 4, 8 and 16 tokens on
-        an A100, taking 4 at five programs: its backward 14.33 ms beside mamba_ssm's 9.91, 1.6 times the
-        instructions issued at 119 registers to 168 (M-JS-240)."""
+        f3040b154); and the forward's chunk halved and doubled. On an A100 the plan took the fewest tokens of
+        its model's ties, 119 registers at four programs (occupancy 24.9%): its backward 14.33 ms beside
+        mamba_ssm's 9.91, about 1.6 times the instructions issued (M-JS-240)."""
         facts = self._facts(ba, self.launch_target())
         held = facts.multiprocessor.thread_registers
         counts = [1 << power for power in range(8) if backward_registers(1 << power) <= held]
