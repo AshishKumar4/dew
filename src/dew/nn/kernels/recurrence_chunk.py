@@ -1494,10 +1494,16 @@ def transferred(query, key, value, g, beta, starts=None, *, chunk_size: int = CH
     starts in it (`starts`), each chunk's transition chained onto the chunks' before it in fp32 from the
     operands as they are given (`scan.derive_scan`'s walk carrying its transfer: `prepare(...,
     transition=True)`, `step`), as fla-core 0.5.2's context parallelism chains its transfer from bf16
-    `k^T w` (ops/cp/chunk_delta_h.py:304-315), no product's result rounded on the way. The forms' memory is
-    one value column wide and zero: the transfer reads no value."""
+    `k^T w` (ops/cp/chunk_delta_h.py:304-315), no product's result rounded on the way, in the delta rule's
+    chunks at the keys' width (`held_chunk`, the portable math's). The forms' memory is one value column wide
+    and zero: the transfer reads no value. A slice of no tokens transfers the memory as it is (the
+    identity)."""
     _, work, _, key = _grouped(query, key, value, None)
-    width = key.shape[-1]
+    rows, length, heads, width = key.shape
+    if length == 0:
+        identity = jnp.broadcast_to(jnp.eye(width, dtype=work), (rows, heads, width, width))
+        return varying_like(rows_like(identity, value), key, g, beta, starts)
+    chunk_size = held_chunk(chunk_size, width)
     forms = _delta_forms(delta=True, scale=1.0, per_key=g.ndim == 4, width=width, columns=1,
                          work=jnp.dtype(work), reset=starts is not None, bound=None)
     unread = jnp.zeros((*value.shape[:3], 1), work)
