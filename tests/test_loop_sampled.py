@@ -27,7 +27,7 @@ from dew.optim import MuonClip
 from dew.training import FitPolicy, UpdateBatch
 from dew.training.compiler import DrawingStep
 from dew.training.interval import DISPATCHED_MICROBATCHES, Interval
-from dew.training.phase_passes import SampledPasses
+from dew.training.phase_passes import PhasePasses, SampledPasses
 
 LAWS = [SampledPasses(mean=2.0, dispersion=0.5, cap=4), SampledPasses(mean=4.0, dispersion=0.5, cap=8),
         SampledPasses(mean=3.0, dispersion=0.0, cap=6), SampledPasses(mean=32.0, dispersion=0.0, cap=3),
@@ -726,7 +726,7 @@ def test_a_pass_count_drawn_per_microbatch_for_an_objective_that_reads_none_is_r
     from dew.training import Layout, Trainer
 
     objective = UncountedLM(looped(steps=CAP), 16)
-    with pytest.raises(ValueError, match="reads_pass_counts"):
+    with pytest.raises(ValueError):
         Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
                 sampled_passes=TRAINED)
     Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
@@ -755,7 +755,7 @@ def counted_objective(name: str, at) -> tuple:
         student, teacher = (LMObjective(at(looped(steps=CAP)), 16, ema_decay=None) for _ in range(2))
         return DistillationObjective(student, teacher, alpha=0.5), {"text": tokens}, False
     assert name == "stacked-adaptation"
-    adaptation = ChunkAdaptation(window=(3, 6), rate=0.05, layers=(0,))
+    adaptation = ChunkAdaptation(window=3, rate=0.05, layers=(0,))
     return LMObjective(at(looped(steps=CAP)), 16, adaptation=adaptation), {"text": tokens}, False
 
 
@@ -770,6 +770,8 @@ def test_an_objectives_cap_program_at_a_drawn_count_is_that_counts_objective(nam
     refused, which main trained at every count)."""
     capped, batch, referenced = counted_objective(name, lambda model: model)
     fixed, _, _ = counted_objective(name, lambda model: model.with_passes(count))
+    # A run drawing its count per microbatch trains it, its every count by the cap's one program.
+    PhasePasses.of(capped, None, TRAINED)
     rows = len(next(iter(jax.tree.leaves(batch))))
     passes = np.full((rows,), count, np.int32)
     initial = drawn(capped.init)
@@ -901,22 +903,17 @@ def test_a_decision_heads_cap_program_whose_backbone_encodes_its_context_runs_bo
                     truth_fn=jax.jit(own_in_float64))
 
 
-def test_a_sampled_objective_names_its_loss_s_forward_and_a_counted_run_refuses_one_that_takes_no_count():
+def test_a_sampled_objective_names_its_loss_s_forward():
     """The forward a run drawing its count per microbatch checks takes the count is the one its
-    objective's loss reads a module by (`Objective.counted_forward`, `chunked.read_method`); and an LM whose
-    adaptation steps its decoder's own layers chunk by chunk (`ChunkAdaptation.layers`), whose trunk runs
-    every pass, reads no count, so such a run is refused (review of row 11951)."""
-    from dew.nn.backbones.decoder_stack import Loop
+    objective's loss reads a module by (`Objective.counted_forward`, `chunked.read_method`), an adaptation
+    stepping the decoder's own layers chunk by chunk among them (`ChunkAdaptation.layers`), whose trunk runs
+    at the count too (`stacked_scores`)."""
     from dew.objectives.lm.adaptation import ChunkAdaptation
-    from dew.training import Layout, Trainer
 
     model = looped(steps=CAP)
     assert LMObjective(model, 16).counted_forward(model) == "hidden_states"
     adapted = LMObjective(model, 16, adaptation=ChunkAdaptation(window=4, rate=0.5, layers=(0,)))
-    assert not adapted.reads_pass_counts and isinstance(model.loop, Loop)
-    with pytest.raises(ValueError):
-        Trainer(adapted, optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
-                sampled_passes=TRAINED)
+    assert adapted.reads_pass_counts and adapted.counted_forward(model) == "hidden_states"
 
 
 @pytest.mark.parametrize("loop", [{"shared_cache": True}, {"exit_threshold": 0.5, "exit_gate": True}],

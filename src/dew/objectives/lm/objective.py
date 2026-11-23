@@ -1030,8 +1030,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         collections = (([ROUTER_COLLECTION] if routing else []) + ([QK] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
         stream_depth = depths and _streamed_depths(self.model)
-        opened = [*collections, 'prediction_inputs'] if stream_depth else collections
-        opened = [*opened, EXITS] if exits else opened
+        opened = [*collections, *(['prediction_inputs'] if stream_depth else []), *([EXITS] if exits else [])]
         adaptation = self.adaptation
         if adaptation is not None and adaptation.layers:
             # The decoder's own blocks step chunk by chunk through its cache, which runs the trunk itself.
