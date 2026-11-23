@@ -337,6 +337,16 @@ def test_a_gauss_newton_cap_its_options_state_holds_in_param_groups_as_without(g
     np.testing.assert_array_equal(np.asarray(update["w"]), np.asarray([-0.05], np.float32))
 
 
+def test_a_gauss_newton_capped_by_its_own_setting_and_the_configs_both_is_refused():
+    """Gauss-Newton's direction is capped once: its own cap (`GaussNewton.clip`) beside the config's
+    (`clip_grads`) is refused as the config is made, never one silently written over the other (review of
+    API01)."""
+    from dew.optim import OptimConfig
+
+    with pytest.raises(ValueError, match="capped once"):
+        OptimConfig(optimizer=GaussNewton(clip=0.05), learning_rate=1.0, clip_grads=1.0)
+
+
 def test_a_capped_gauss_newton_direction_keeps_a_cap_far_below_its_norm():
     """A float32 solved direction of norm 1e18 capped at 1e-30 (`solved_directions(clip=)`) is the
     direction scaled to that cap, as Optax's global-norm clip scales a gradient, not a zero underflowed

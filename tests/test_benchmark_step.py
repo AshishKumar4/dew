@@ -424,3 +424,18 @@ def test_a_benchmarks_rows_reach_a_tracker_after_its_cases_one_step_a_case(tmp_p
     assert LocalTracker(tmp_path).scalars() == [
         (0, {"simple_dit/ms_per_step": 12.5, "simple_dit/mfu": 0.31}),
         (1, {"unet/ms_per_step": 30.0, "unet/devices": 1.0})]
+
+
+@pytest.mark.parametrize("mesh, split", [({}, 1), ({"fsdp": 2}, 1), ({"stage": 2}, "auto"),
+                                         ({"stage": 2, "microbatches": 4}, 4),
+                                         ({"stage": -1, "microbatches": 8}, 8)],
+                         ids=["single", "fsdp", "staged", "staged-microbatches", "every-device-stages"])
+def test_a_cases_step_is_read_whole_and_its_pipeline_in_the_microbatches_it_names(mesh, split):
+    """A case's step is read whole (`FitPolicy(split=1)`), as the benchmark has always timed it, the remat
+    ladder its one way to fit, never split behind the timing's back; under pipeline stages it is read in the
+    microbatches its mesh record names, the plan's where it names none; microbatches where it stages none
+    are refused (review of API01: every case's split was left to the plan)."""
+    fields = load("benchmark_models").trainer_mesh(mesh)
+    assert fields["fit"].split == split
+    with pytest.raises(ValueError, match="stages none"):
+        load("benchmark_models").trainer_mesh({"microbatches": 4})

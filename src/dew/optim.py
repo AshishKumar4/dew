@@ -2151,6 +2151,10 @@ class OptimConfig:
 
     def __post_init__(self):
         _checked_decay_mask(self.decay_mask, self.spared, "the optimizer")
+        capped = isinstance(self.optimizer, GaussNewton) and self.optimizer.clip is not None
+        if capped and self.clip_grads > 0:
+            raise ValueError(f"Gauss-Newton's direction is capped once: at its own clip "
+                             f"({self.optimizer}) or the config's clip_grads ({self.clip_grads}), not both")
         if self.learning_rate is None:
             # Unset, the rate is the optimizer's own, recorded as the config's.
             object.__setattr__(self, 'learning_rate', self.optimizer.OWN_RATE)

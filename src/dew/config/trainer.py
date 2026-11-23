@@ -343,7 +343,7 @@ class TrainerConfig:
     def accumulation(self, dataset: Loader) -> int:
         """The steps an update pools over `dataset`: its stated batches, or its tokens over the data's token
         batches, every phase's alike (`UpdateBatch.of_tokens`)."""
-        return self.update.of_tokens(dataset.token_batches or (dataset.batch_tokens,))
+        return self.update.of_tokens(dataset.each_token_batch)
 
     def __post_init__(self):
         # A record names its numerics as a preset's name or by their fields (`numerics_of`).
