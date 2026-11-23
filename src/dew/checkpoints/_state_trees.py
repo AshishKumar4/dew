@@ -484,29 +484,45 @@ def unmasked_decay(record: Mapping[str, JSON]) -> Unmasked:
     return True if not groups else frozenset(str(group.get("name")) for group in read)
 
 
-def earlier_unmasked(directory: str, run_file: str) -> Unmasked:
+def earlier_unmasked(directory: str, run_file: str) -> tuple[Unmasked, frozenset[int]]:
     """Where the checkpoints in `directory` are of a run whose record (`run_file`) is or was an earlier
-    run's whose Dew optimizer read a mask of False among its options (`unmasked_decay`): the one run, and
-    the parts of its state, whose checkpoints a restore reads across its masked decay step
-    (`masked_decay_unsaved`), every other's held to its template as Orbax holds it, an active decay's among
-    them. Read alone, nothing written: the record as it stands, or the mark its run kept beside it as it
-    rewrote that record in its translation (`MASKED_DECAY_MARK`, `keep_unmasked_mark`)."""
+    run's whose Dew optimizer read a mask of False among its options (`unmasked_decay`), and the steps that
+    earlier Dew wrote: the one run, the parts of its state and the steps whose checkpoints a restore reads
+    across its masked decay step (`masked_decay_unsaved`), every other's held to its template as Orbax
+    holds it, an active decay's among them, one a later start of the run wrote this Dew's way among them.
+    Read alone, nothing written: the record as it stands and the steps beside it, or the mark its run kept
+    beside them as it rewrote that record in its translation (`MASKED_DECAY_MARK`, `keep_unmasked_mark`)."""
     root = epath.Path(directory)
     mark = _record_at(root / MASKED_DECAY_MARK)
-    if mark.get("unmasked_all") is True:
-        return True
-    if isinstance(groups := mark.get("unmasked_groups"), list):
-        return frozenset(map(str, groups))
-    return unmasked_decay(_record_at(root / run_file))
+    if mark:
+        steps = mark.get("steps")
+        written = frozenset(int(step) for step in steps if isinstance(step, int)) if isinstance(
+            steps, list) else frozenset()
+        groups = mark.get("unmasked_groups")
+        return (True if mark.get("unmasked_all") is True
+                else frozenset(map(str, groups)) if isinstance(groups, list) else False), written
+    unmasked = unmasked_decay(_record_at(root / run_file))
+    return unmasked, _steps_at(root) if unmasked else frozenset()
+
+
+def _steps_at(root) -> frozenset[int]:
+    """The steps whose checkpoints lie in `root`, by their directories' names."""
+    return frozenset(int(child.name) for child in root.iterdir() if child.name.isdigit()) if (
+        root.exists()) else frozenset()
 
 
 def keep_unmasked_mark(path) -> None:
     """Keep `MASKED_DECAY_MARK` beside the run record at `path` (`run.json`) where that record, about to be
     written over in its translation, is an earlier masked run's (`unmasked_decay`), so the run's checkpoints
-    read it alike once its record no longer says so (`earlier_unmasked`); nothing where it is not."""
+    read it alike once its record no longer says so (`earlier_unmasked`), and the steps it wrote, which
+    alone a restore reads across; nothing where it is not."""
     unmasked = unmasked_decay(_record_at(path))
     if unmasked:
-        marked = {"unmasked_all": True} if unmasked is True else {"unmasked_groups": sorted(unmasked)}
+        groups: list[JSON] = [] if unmasked is True else [*sorted(unmasked)]
+        # The steps that earlier Dew wrote, its record's alone: any a later start writes holds its own.
+        steps: list[JSON] = [*sorted(_steps_at(path.parent))]
+        marked: dict[str, JSON] = ({"unmasked_all": True} if unmasked is True else {"unmasked_groups": groups})
+        marked["steps"] = steps
         write_atomically(path.parent / MASKED_DECAY_MARK, json.dumps(marked))
 
 
@@ -558,9 +574,11 @@ def _masked_as_saved(node, saved, unmasked: Unmasked = True):
         return node._replace(inner_states={
             name: _masked_as_saved(state, _saved_at(held, [str(name)])) if str(name) in unmasked else state
             for name, state in node.inner_states.items()})
-    if isinstance(node, optax.EmptyState):
+    # A node rewritten where the mask was read everywhere alone; scoped to groups, only within them.
+    if unmasked is True and isinstance(node, optax.EmptyState):
         return optax.MaskedState(inner_state=node) if _masked_empty(saved) else node
-    if (type(node) is tuple and node and not isinstance(node[0], optax.EmptyState | optax.MaskedState)
+    if (unmasked is True and type(node) is tuple and node
+            and not isinstance(node[0], optax.EmptyState | optax.MaskedState)
             and isinstance(saved, list | tuple) and len(saved) == 2 and _masked_empty(saved[0])):
         # A chain's state led by the decay step a coupled decay of 0 drops, the solver's state after it.
         return optax.MaskedState(inner_state=optax.EmptyState()), _masked_as_saved(node, saved[1])
