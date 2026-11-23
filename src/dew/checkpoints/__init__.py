@@ -112,6 +112,7 @@ from dew.checkpoints._state_trees import (
     _at,
     _averaged,
     _by_path,
+    _clip_states_unpooled,
     _decode_delta,
     _ema_deltas,
     _from_delta_planes,
@@ -126,6 +127,8 @@ from dew.checkpoints._state_trees import (
     _with,
     _with_ema_deltas,
     decodes_done,
+    formed_as,
+    masked_decay_unsaved,
 )
 from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
 from dew.checkpoints.averaging import (
@@ -802,17 +805,6 @@ def _clip_pooled_unsaved(template, metadata):
         return template
     return dataclasses.replace(template, inner=dataclasses.replace(
         template.inner, opt_state=translated(template.inner.opt_state, inner)))
-
-
-def _clip_states_unpooled(tree) -> bool:
-    """Whether a checkpoint's optimizer-state metadata `tree` holds a QK-Clip state of the form before its
-    pooled maxima: its steps and rescales with no `pooled` beside them, as Orbax names a NamedTuple's
-    fields."""
-    if isinstance(tree, Mapping):
-        if {"steps", "rescales"} <= tree.keys() and "pooled" not in tree:
-            return True
-        return any(_clip_states_unpooled(value) for value in tree.values())
-    return isinstance(tree, list | tuple) and any(_clip_states_unpooled(value) for value in tree)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2209,7 +2201,8 @@ class Checkpoints:
         stored = metadata.keys()
         _check_template(template, metadata, stored, mapping=mapping)
         placed = template
-        template = _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata)
+        template, form = masked_decay_unsaved(
+            _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata), metadata, _OPTIMIZERS)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:
@@ -2270,6 +2263,7 @@ class Checkpoints:
         restored = self._with_frozen(dict(restored), frozen, held)
         table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
+        restored = restored if form is None else formed_as(restored, form, _OPTIMIZERS)
         restored = _filled(placed, restored, step)
         _packed_checked(restored)
         return restored, saved
