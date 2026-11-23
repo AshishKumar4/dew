@@ -23,6 +23,8 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
 from dew.nn.cross_pass import MERGE_PREFIX, MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
+from dew.optim import AdamW
+from dew.training import FitPolicy, UpdateBatch
 
 VOCAB = 37
 
@@ -480,7 +482,7 @@ def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies()
                                         remat=True, messages=CrossPass(block_size=1, rank=4)))
     batch = token_batch()
     with chosen(narrow_copies="on"):
-        trainer = phased_trainer(model, 0, None, sampled_passes=TRAINED, accumulation=2)
+        trainer = phased_trainer(model, 0, None, sampled_passes=TRAINED, update=UpdateBatch(batches=2))
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         interval = Interval(0.0, None, microbatches=0)
@@ -551,10 +553,10 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
             remat=REMAT_POLICIES["full"],
             loop=Loop(steps, step_norm=False, layers=(0, 4), exit_gate=True, messages=messages))
         trainer = Trainer(LMObjective(model, MIXER_LENGTH, exit_entropy=0.1),
-                          OptimConfig(optimizer="adamw", learning_rate=1e-3).build(None),
+                          OptimConfig(optimizer=AdamW(), learning_rate=1e-3).build(None),
                           key=jax.random.key(0),
                           mesh=MeshSpec(fsdp=devices).build(compile_only_gpus("sm90", devices, 2**36)),
-                          layout=STEP_LAYOUT, split=1, inspection=inspection)
+                          layout=STEP_LAYOUT, fit=FitPolicy(split=1), inspection=inspection)
         ahead = compile_ahead(trainer, token_rows(512, MIXER_ROWS, MIXER_LENGTH + 1))
         if inspection is None:
             return ahead.live_bytes - ahead.argument_bytes

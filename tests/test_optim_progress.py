@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
-from dew.optim import Cosine, Exponential, Linear, OneCycle, Power, PowerTail
+from dew.optim import Adam, Cosine, Exponential, Linear, OneCycle, Power, PowerTail
 from dew.optim_schedules import ProgressState, RateState, _Rate
 
 STEPS = 40
@@ -126,7 +126,7 @@ def test_reclocking_into_an_optimizer_built_for_its_steps_keeps_that_optimizers_
     from dew.optim_schedules import reclocked
 
     params = {"w": np.zeros(3, np.float32)}
-    config = OptimConfig(optimizer="adam", learning_rate=Cosine(1.0, warmup_steps=4))
+    config = OptimConfig(optimizer=Adam(), learning_rate=Cosine(1.0, warmup_steps=4))
     clocked = config.build(40, clocked=True).init(params)
     made = config.build(40).init(params)
     held = reclocked(clocked, made)

@@ -477,6 +477,28 @@ def test_a_decoders_residual_norms_run_the_fused_kernel_on_a_data_parallel_step(
     assert {"rms_norm_forward", "rms_norm_backward"} <= set(triton_kernels(lowered.value.lowered))
 
 
+def test_a_full_remat_runs_check_lowers_its_step_at_each_modules_whole_recomputation():
+    """A run of a full-remat fit policy lowered for a GPU it lacks (`LowerFor`) lowers the step its
+    search would compile, each module at the top of its ladder (`FitPolicy.remat`), not the configured
+    rung (review of row 11934)."""
+    import optax
+
+    from dew.nn.backbones import CausalTransformer
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.objectives.lm import LMObjective
+    from dew.training import FitPolicy, Trainer
+    from dew.training._lowering import Lowered
+
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2, mlp_features=64,
+                              max_seq_len=16)
+    trainer = Trainer(LMObjective(model, 16), optax.sgd(1e-2), key=jax.random.key(0), lower_for="sm90",
+                      fit=FitPolicy(split=1, remat="full"))
+    state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+    with pytest.raises(Lowered):
+        trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 17), jnp.int32)})
+    assert trainer.objective.model.remat == REMAT_POLICIES["full"]
+
+
 @pytest.mark.parametrize("bound", [None, 64], ids=["undeclared", "declared"])
 def test_a_packed_delta_net_lowers_for_an_a100_whatever_documents_its_rows_declare(bound):
     """A bf16 gated delta net over packed rows of 128 tokens in 8 documents, their bound undeclared
@@ -1311,27 +1333,36 @@ def test_a_run_over_gpus_of_two_kinds_is_refused():
         _one_kind([gpu(0, 0, h100), gpu(1, 1, a100)])
 
 
+def _named(choice: str) -> str | None:
+    """The kernel a `kernel_choices` block in effect names for `choice`, None where none does."""
+    from dew import _cache
+
+    return dict(_cache.KERNEL_CHOICES.value).get(choice)
+
+
 def test_chosen_kernels_keep_other_choices_and_restore_them_after_an_exception():
     with assumed("sm80"):
         with kernel_choices(attention="xla", ssd="pallas"):
-            assert chosen_kernel("attention", "flash") == "xla"
+            assert _named("attention") == "xla"
             with pytest.raises(RuntimeError), kernel_choices(attention="flash"):
-                assert chosen_kernel("attention", "xla") == "flash"
-                assert chosen_kernel("ssd", "xla") == "pallas"
+                assert _named("attention") == "flash"
+                assert _named("ssd") == "pallas"
                 raise RuntimeError("the comparison ended")
-            assert chosen_kernel("attention", "flash") == "xla"
-        assert chosen_kernel("attention", "flash") == "flash"
+            assert _named("attention") == "xla"
+        assert _named("attention") is None
 
 
 def test_a_function_jitted_before_a_choice_traces_again_within_it():
+    from dew.nn.kernels.generation import Choice
+
     @jax.jit
     def ported(x):
-        return x + (chosen_kernel("ssd", "xla") == "pallas")
+        return x + (chosen_kernel(Choice.NARROW_COPIES, "off") == "on")
 
     x = jnp.zeros((), jnp.int32)
-    with kernel_choices(ssd="xla"):
+    with kernel_choices(narrow_copies="off"):
         assert ported(x) == 0
-        with kernel_choices(ssd="pallas"):
+        with kernel_choices(narrow_copies="on"):
             assert ported(x) == 1
         assert ported(x) == 0
 
@@ -1586,7 +1617,7 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, Trainer
-    from dew.training.ahead import AheadTarget
+    from dew.training.targets import AheadTarget
 
     read: list[int] = []
     data = Loader(train=lambda partition: _Placed(read), val=None, batch=4, records=None)

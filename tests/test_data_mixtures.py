@@ -33,7 +33,7 @@ from token_support import write_token_corpus
 
 from dew import _position
 from dew.batch import VALID_ROWS, freeze, thaw
-from dew.data import Files, Loading, Memory, from_grain, phases, presets, schedule
+from dew.data import Files, Loading, Memory, Phase, Steps, Tokens, from_grain, phases, presets
 from dew.data.compile import compile, held, iterate, publish, validation
 from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, PhasedStream, Ramp, Stage, ramped
 from dew.data.images import EncodeCaptions
@@ -41,7 +41,9 @@ from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
 from dew.data.sources import TokenFiles
 from dew.objectives.base import Aux, Objective, Ratio
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.optim import AdamW
+from dew.training import Checkpoints, FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch
+from dew.training.budget import Horizon
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
 
@@ -604,7 +606,8 @@ def packed_stage(stores: str | dict[str, float]) -> Pipeline:
 
 def phased_packed(*entries: tuple[str | dict[str, float], int | None]) -> Loader:
     """Phases each of `packed_stage`'s rows until its step, in batches of four."""
-    return trained(phases(*((packed_stage(stores), until) for stores, until in entries)))
+    return trained(phases(*(Phase(packed_stage(stores), None if until is None else Steps(until))
+                            for stores, until in entries)))
 
 
 def test_phases_switch_the_mixture_at_a_step(tmp_path):
@@ -632,7 +635,7 @@ def test_a_member_shuffled_for_its_read_continues_its_order_into_the_next_phase(
     first, second = member("first", 0), member("second", 100)
     alone = [int(value) for batch in itertools.islice(trained(first.repeat()).train(DataPartition()), 10)
              for value in batch["id"]]
-    stream = trained(phases((mix([first.repeat(), second.repeat()]), 2), (first.repeat(), None)))
+    stream = trained(phases(Phase(mix([first.repeat(), second.repeat()]), Steps(2)), Phase(first.repeat())))
     read = [int(value) for batch in itertools.islice(stream.train(DataPartition()), 11)
             for value in batch["id"]]
     firsts = [value for value in read if value < 100]
@@ -673,7 +676,7 @@ def test_a_seeded_mix_permutes_each_windows_corpus_choices_at_their_exact_shares
     def both() -> Pipeline:
         return mix([corpus(0).repeat(), corpus(1000).repeat()], seed=3)
 
-    stream = trained(phases((both(), 100), (both(), None)))
+    stream = trained(phases(Phase(both(), Steps(100)), Phase(both())))
     read = [int(value) for batch in itertools.islice(stream.train(DataPartition()), 300)
             for value in batch["id"]]
     for start in (0, 1000):
@@ -783,8 +786,16 @@ def test_phases_are_a_list_of_ends_and_refuse_a_ramp(tmp_path):
 
 
 def scheduled_packed(*entries: tuple[str | dict[str, float], float | None]) -> Loader:
-    """`phased_packed`'s stages as a schedule, each for its committed tokens (`schedule`)."""
-    return trained(schedule([(packed_stage(stores), tokens) for stores, tokens in entries]))
+    """`phased_packed`'s stages on the committed-token clock, each for its own tokens, its end the tokens
+    of every stage before it and its own (`Tokens`)."""
+    return trained(phases(*token_phases([(packed_stage(stores), tokens) for stores, tokens in entries])))
+
+
+def token_phases(stages):
+    """Each `(dataset, tokens)` stage, its tokens its own, as the phase ending at every stage's tokens
+    through its own (`Tokens`), the last's None reading on."""
+    ends = itertools.accumulate(tokens for _, tokens in stages if tokens is not None)
+    return [Phase(data, None if tokens is None else Tokens(next(ends))) for data, tokens in stages]
 
 
 def test_a_schedule_reads_a_stage_until_the_run_ends_it_then_reads_as_its_phases_do(tmp_path):
@@ -848,10 +859,12 @@ def test_a_schedule_counts_the_tokens_of_every_stage_but_its_last(tmp_path):
     the data at its own. Only a stage on the token clock, and not the last, ends where the run
     stands, and phases on the step clock end at their steps."""
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
-    for stages in ((), ((ordered(packed(first)), None), (ordered(packed(second)), 10)),
-                   ((ordered(packed(first)), 0.5), (ordered(packed(second)), None))):
+    for stages in ((), (Phase(ordered(packed(first))), Phase(ordered(packed(second)), Tokens(10))),
+                   (Phase(ordered(packed(first)), Tokens(0.5)), Phase(ordered(packed(second))))):
         with pytest.raises(ValueError):
-            schedule(stages)
+            phases(*stages)
+    with pytest.raises(ValueError):
+        phases(Phase(ordered(packed(first)), Steps(2)), Phase(ordered(packed(second)), Tokens(10)))
     def opened(loader: Loader) -> PhasedStream:
         stream = loader.train(DataPartition())
         assert isinstance(stream, PhasedStream)
@@ -1233,17 +1246,17 @@ def endless_chains(name: str) -> tuple[Pipeline, Pipeline]:
     first = Pipeline(Memory(Indexed(1, 64))).shuffle(0)
     second = Pipeline(Memory(Indexed(2, 64))).shuffle(1)
     if name == "phases":
-        chain = phases((first.repeat(), 3), (second.repeat(), None)).batch(8)
+        chain = phases(Phase(first.repeat(), Steps(3)), Phase(second.repeat())).batch(8)
         return chain, chain
     if name == "mix":
         chain = mix([first.repeat(), second.repeat()]).batch(8)
         return chain, chain
     if name == "batched-phases":
-        chain = phases((first.batch(8), 3), (second.batch(8), None))
+        chain = phases(Phase(first.batch(8), Steps(3)), Phase(second.batch(8)))
         return chain, chain.repeat()
     if name == "bounded-phases":
         # The phases' shared take bounds the one that repeats itself: the chain repeats after it.
-        bounded = phases((first.repeat(), 2), (second, None)).take(16)
+        bounded = phases(Phase(first.repeat(), Steps(2)), Phase(second)).take(16)
         return bounded.batch(8), bounded.repeat().batch(8)
     members = [first.repeat().take(12), second.repeat().take(12)]
     return mix(members).batch(8), mix(members).repeat().batch(8)
@@ -1267,7 +1280,8 @@ def test_phases_of_other_batches_each_read_their_own_steps_in_their_own_rows():
     with the others reads on where the phase before left it, each record once, in the corpus's own order
     (rows 3940, 4812; it was refused, its end once counted at the first phase's 8 records a step)."""
     first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
-    loader = compile(phases((first.batch(8), 1), (first.batch(4), 4), (first.batch(8), None)), read="memory",
+    loader = compile(phases(Phase(first.batch(8), Steps(1)), Phase(first.batch(4), Steps(4)),
+                            Phase(first.batch(8))), read="memory",
                      loading=READ)
     read = ids(itertools.islice(loader.train(DataPartition()), 6))
     alone = [value for batch in ids(itertools.islice(trained(first, batch=4).train(DataPartition()), 9))
@@ -1290,10 +1304,10 @@ def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own():
 
     def accumulating() -> Trainer:
         return Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0), accumulation=2)
+                       layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=2))
 
-    phased = phases(*((corpus.batch(batch), end) for corpus, batch, end in
-                      zip(corpora, batches, (*ends[:-1], None), strict=True)))
+    phased = phases(*(Phase(corpus.batch(batch), None if end is None else Steps(end))
+                      for corpus, batch, end in zip(corpora, batches, (*ends[:-1], None), strict=True)))
     with Compiles("step") as compiles:
         state = accumulating().fit(compile(phased, read="memory", loading=READ), steps=ends[-1])
     assert int(state.step) == ends[-1] and compiles.count == 2
@@ -1304,7 +1318,8 @@ def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own():
     assert_same(parameters(state), parameters(chained), "phases fitted one after another")
     # A phase of another batch begins where an update does, at step 4 of updates of 2, and not at step 3.
     for end, refused in ((4, False), (3, True)):
-        loader = compile(phases((corpora[0].batch(16), end), (corpora[0].batch(8), None)), read="memory",
+        loader = compile(phases(Phase(corpora[0].batch(16), Steps(end)), Phase(corpora[0].batch(8))),
+                         read="memory",
                          loading=READ)
         with pytest.raises(ValueError) if refused else contextlib.nullcontext():
             loader.train(DataPartition(window=2)).close()
@@ -1316,7 +1331,8 @@ def test_an_epoch_over_phases_of_other_batches_counts_each_phases_steps_in_its_o
     `steps_through`), as a ramp's stages count theirs: fourteen, where counting every step in the first
     phase's batch took eight."""
     corpus = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
-    loader = compile(phases((corpus.batch(8), 2), (corpus.batch(4), None)), read="memory", loading=READ)
+    loader = compile(phases(Phase(corpus.batch(8), Steps(2)), Phase(corpus.batch(4))), read="memory",
+                     loading=READ)
     assert loader.steps_per_epoch == 14
 
 
@@ -1332,8 +1348,8 @@ class TokenCounted(Regression):
 
 def token_trainer(directory: Path, tracker: RecordingTracker | None = None,
                   accumulation: int = 1) -> Trainer:
-    return Trainer(TokenCounted(), optax.sgd(0.5), key=jax.random.key(0), accumulation=accumulation,
-                   layout=Layout(min_shard=1, tolerance=1.0),
+    return Trainer(TokenCounted(), optax.sgd(0.5), key=jax.random.key(0),
+                   update=UpdateBatch(batches=accumulation), layout=Layout(min_shard=1, tolerance=1.0),
                    checkpoints=Checkpoints(str(directory), keep=8), tracker=tracker)
 
 
@@ -1346,7 +1362,7 @@ def test_a_cooldown_branch_ends_a_schedules_stage_where_a_run_decayed_there_does
 
     first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
     second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
-    data = schedule([(first, 50), (second, None)]).batch(8)
+    data = phases(Phase(first, Tokens(50)), Phase(second)).batch(8)
     held_out = Pipeline(Memory(Indexed(3, 16))).batch(8)
 
     def run(optimizer, steps: int, tracker=None, cooldowns=None):
@@ -1381,7 +1397,7 @@ def test_a_cooldown_branch_past_a_schedules_last_tokens_records_no_score(tmp_pat
 
     first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
     second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
-    data = schedule([(first, 30), (second, 30)]).batch(8)
+    data = phases(Phase(first, Tokens(30)), Phase(second, Tokens(60))).batch(8)
     held_out = Pipeline(Memory(Indexed(3, 16))).batch(8)
 
     def run(tracker=None, cooldowns=None):
@@ -1404,7 +1420,7 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
     parameters."""
     first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
     second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
-    data = schedule([(first, 50), (second, None)]).batch(8)
+    data = phases(Phase(first, Tokens(50)), Phase(second)).batch(8)
     tracker = RecordingTracker()
     scheduled = token_trainer(tmp_path / "scheduled", tracker, accumulation)
     whole = parameters(scheduled.fit(data, steps=8, log_every=1))
@@ -1412,7 +1428,7 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
                                           if "train/committed_tokens" in scalars))
     step = next(index + 1 for index, tokens in enumerate(committed) if tokens >= 50)
     assert 1 < step < 8
-    phased = phases((first, step), (second, None)).batch(8)
+    phased = phases(Phase(first, Steps(step)), Phase(second)).batch(8)
     switched = token_trainer(tmp_path / "phased", accumulation=accumulation).fit(phased, steps=8)
     assert_same(whole, parameters(switched), "the schedule against phases switching where its commits did")
     assert scheduled.checkpoints is not None
@@ -1426,7 +1442,8 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
     # them, saved as a token budget's last step is, where phases running on to that step land.
     last = next(index + 1 for index, tokens in enumerate(committed) if tokens >= committed[step - 1] + 30)
     ended = token_trainer(tmp_path / "ended", accumulation=accumulation)
-    state = ended.fit(schedule([(first, 50), (second, committed[step - 1] + 30 - 50)]).batch(8))
+    state = ended.fit(phases(Phase(first, Tokens(50)),
+                             Phase(second, Tokens(50 + committed[step - 1] + 30 - 50))).batch(8))
     assert int(state.step) == last and ended.checkpoints is not None and ended.checkpoints.latest == last
     ran_on = token_trainer(tmp_path / "ran-on", accumulation=accumulation).fit(phased, steps=last)
     assert_same(parameters(state), parameters(ran_on),
@@ -1442,11 +1459,14 @@ def test_a_configured_run_on_a_schedule_ends_where_its_data_does(tmp_path):
 
     first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
     second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
-    data = schedule([(first, 50), (second, 30)]).batch(8)
+    data = phases(Phase(first, Tokens(50)), Phase(second, Tokens(80))).batch(8)
     fitted = token_trainer(tmp_path / "fitted").fit(data)
-    config = RunConfig(optim=OptimConfig(optimizer="adamw", learning_rate=1e-3), trainer=TrainerConfig(
-        checkpoint_dir=str(tmp_path / "configured"), steps=None, epochs=None, tokens=None, log_every=1,
-        eval_every=None, checkpoint_every=None))
+    config = RunConfig(optim=OptimConfig(optimizer=AdamW(), learning_rate=1e-3),
+                       trainer=TrainerConfig(checkpoint_dir=str(tmp_path / "configured"),
+                                                                                                       horizon=Horizon(),
+                                                                                                       log_every=1,
+                                                                                                       eval_every=None,
+                                                                                                       checkpoint_every=None))
     configured = config.train(TokenCounted(), data, name="scheduled")
     assert 1 < int(configured.step) == int(fitted.step)
 
@@ -1522,7 +1542,8 @@ def test_a_ramp_stage_begins_where_an_update_does_and_an_update_pools_one_stage(
     assert ramp.stages(16) == (Stage(batch=8, records=0), Stage(batch=16, records=24))
     assert ramp.stages(16, window=2) == (Stage(batch=8, records=0), Stage(batch=16, records=32))
     assert ramp.steps_for(64, 16, window=2) == 6
-    state = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2, layout=layout).fit(
+    state = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), update=UpdateBatch(batches=2),
+                    layout=layout).fit(
         ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
     batched = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), layout=layout).fit(
         stitched_data(records, 16, seed), steps=2, log_every=100)
@@ -1543,8 +1564,8 @@ def test_a_configured_run_counts_its_ramped_epochs_in_stages_aligned_to_its_upda
     from dew.config import TrainerConfig
 
     data = ramped(indexed_data(64, 16), Ramp(start=8, increment=8, samples=24))
-    assert TrainerConfig(epochs=1).total_steps(data) == 6
-    config = TrainerConfig(epochs=1, accumulation=2)
+    assert TrainerConfig(horizon=Horizon(epochs=1)).total_steps(data) == 6
+    config = TrainerConfig(horizon=Horizon(epochs=1), update=UpdateBatch(batches=2))
     assert config.total_steps(data) == config.eval_interval(data) == config.checkpoint_interval(data) == 6
     with pytest.raises(ValueError):
         Ramp(start=8, increment=8, samples=24).stages(16, window=0)
@@ -1588,8 +1609,8 @@ def test_a_window_a_rejection_shifted_is_dropped_where_a_ramp_stage_begins(route
     def trainer():
         checkpoints = Checkpoints(str(tmp_path / "run"), keep=8) if route == "resumed" else None
         return Trainer(Rejecting(int(first["id"][0]), frozen=route == "host-frozen"), optax.sgd(0.5),
-                       key=jax.random.key(0), accumulation=2, dynamic_scale=True, layout=layout,
-                       checkpoints=checkpoints)
+                       key=jax.random.key(0), update=UpdateBatch(batches=2), dynamic_scale=True,
+                       layout=layout, checkpoints=checkpoints)
 
     if route == "resumed":
         trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=2, log_every=100,
@@ -1616,7 +1637,7 @@ def test_a_resumed_runs_step_compiled_ahead_reads_the_batch_its_resume_reads(tmp
         stream.close()
 
     def trainer():
-        return Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+        return Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), update=UpdateBatch(batches=2),
                        layout=Layout(min_shard=1, tolerance=1.0),
                        checkpoints=Checkpoints(str(tmp_path / "run"), keep=8))
 
@@ -1651,8 +1672,8 @@ def test_a_window_that_replays_its_batches_pools_a_ramps_stages_as_batches_of_th
     ramp = Ramp(start=8, increment=8, samples=16)
 
     def trainer(checkpoints: Checkpoints | None = None, accumulation: int = 2) -> Trainer:
-        return Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=accumulation,
-                       layout=layout, checkpoints=checkpoints)
+        return Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0),
+                       update=UpdateBatch(batches=accumulation), layout=layout, checkpoints=checkpoints)
 
     state = trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
     stitched = [trainer(Checkpoints(str(tmp_path / "stitched"), keep=8), accumulation=1).fit(
@@ -1681,7 +1702,7 @@ def test_a_ramp_stage_due_inside_a_window_that_replays_its_batches_begins_at_the
     batch: it begins at the next update instead, and the run trains through both stages."""
     ramp = Ramp(start=8, increment=8, samples=8)
     assert ramp.stages(16, window=2) == (Stage(batch=8, records=0), Stage(batch=16, records=16))
-    trainer = Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+    trainer = Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), update=UpdateBatch(batches=2),
                       layout=Layout(min_shard=1, tolerance=1.0), checkpoints=None)
     state = trainer.fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
     assert (int(state.step), int(state.updates)) == (4, 2)
@@ -1707,9 +1728,8 @@ def test_a_ramp_stage_the_pipeline_cannot_cut_into_microbatches_is_refused():
     is refused before the run reads: two stages beside four row shards and
     six microbatches hold batches of twenty-four, six rows a device, and
     stages of eight and sixteen are not ones."""
-    trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                      mesh=MeshSpec(stage=2), microbatches=6,
-                      layout=Layout(min_shard=1, tolerance=1.0))
+    trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0), mesh=MeshSpec(stage=2),
+                      fit=FitPolicy(split=6), layout=Layout(min_shard=1, tolerance=1.0))
 
     with pytest.raises(ValueError):
         trainer.fit(ramped(indexed_data(256, 24), Ramp(start=8, increment=8, samples=16)),
@@ -1725,9 +1745,8 @@ def test_a_batch_the_pipeline_cannot_cut_into_microbatches_is_refused_before_it_
     fit."""
     from dew.mesh import LayoutRefused
 
-    trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, stage=2), microbatches=4,
-                      layout=Layout(min_shard=1, tolerance=1.0))
+    trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0), mesh=MeshSpec(fsdp=2, stage=2),
+                      fit=FitPolicy(split=4), layout=Layout(min_shard=1, tolerance=1.0))
 
     with pytest.raises(LayoutRefused):
         trainer.fit(indexed_data(256, 8), steps=2, log_every=100)
@@ -1872,7 +1891,7 @@ def test_a_corpus_a_phase_shuffled_after_its_mix_continues_in_the_next_with_each
     windows of its own shuffle, which its steps read whole); and a read stopped in either phase resumed reads
     what the read never stopped reads. Its batches shuffled after its batch, the same."""
     first, second = REORDERED[case]()
-    loader = compile(phases((first, 3), (second, None)), read=read, loading=READ)
+    loader = compile(phases(Phase(first, Steps(3)), Phase(second)), read=read, loading=READ)
     steps = taken(loader.train(DataPartition()), 12)
     before, after = _trained_across(steps, 3)
     assert before != sorted(before), "the first phase trains its draws out of order"
@@ -1899,9 +1918,11 @@ def test_a_schedules_stage_shuffled_after_its_mix_continues_its_corpus_where_the
         first = mix([_ided(1, text=True), _ided(2, text=True)]).shuffle(5, window=16).batch(8)
         return ending(first, mix([_ided(1, text=True), _ided(3, text=True)]).batch(8))
 
-    by_steps = taken(compile(stages(lambda first, second: phases((first, 3), (second, None))), read="memory",
+    by_steps = taken(compile(stages(lambda first, second: phases(Phase(first, Steps(3)), Phase(second))),
+                             read="memory",
                              loading=READ).train(DataPartition()), 12)
-    loader = compile(stages(lambda first, second: schedule([(first, 1e9), (second, None)])), read="memory",
+    loader = compile(stages(lambda first, second: phases(Phase(first, Tokens(1000000000.0)), Phase(second))),
+                     read="memory",
                      loading=READ)
     stream = loader.train(DataPartition())
     assert isinstance(stream, PhasedStream)
@@ -1925,9 +1946,12 @@ def test_a_schedules_third_stage_continues_its_corpus_past_what_a_shuffled_secon
                       mix([_ided(1, text=True), _ided(3, text=True)]).shuffle(5, window=16).batch(8),
                       mix([_ided(1, text=True), _ided(4, text=True)]).batch(8))
 
-    by_steps = taken(compile(stages(lambda *chains: phases(*zip(chains, (2, 5, None), strict=True))),
+    by_steps = taken(compile(stages(lambda *chains: phases(*(
+        Phase(data, None if end is None else Steps(end)) for data, end in zip(chains, (2, 5, None),
+                                                                              strict=True)))),
                              read="memory", loading=READ).train(DataPartition()), 12)
-    loader = compile(stages(lambda *chains: schedule(list(zip(chains, (1e9, 1e9, None), strict=True)))),
+    loader = compile(stages(lambda *chains: phases(*token_phases(list(zip(chains, (1e9, 1e9, None),
+                                                                          strict=True))))),
                      read="memory", loading=READ)
     read: list[list[int]] = []
     state = None
@@ -2346,73 +2370,11 @@ def test_a_phase_on_the_token_clock_of_a_mix_weighed_by_tokens_streamed_is_refus
     order's shares: a phase whose mix weighs its members' rows by their targets as they stream in (rows
     a step rejects), which has no shares to continue by, is refused for that, as any phase of no global
     order on that clock is (on the step clock, each such phase reads its own stream, `StepPhases`)."""
-    from dew.data import schedule
+    from dew.data import phases
 
-    chain = schedule([(_short_and_long(), 40), (_short_and_long(), None)]).batch(1)
+    chain = phases(Phase(_short_and_long(), Tokens(40)), Phase(_short_and_long())).batch(1)
     with pytest.raises(ValueError):
         compile(chain, read=read, loading=READ)
-
-
-def _endless_ids(chain, count: int) -> list[list[int]]:
-    """The ids of the first `count` batches a run reads of `chain`, read on past its end (`fitted`)."""
-    from dew.data.compile import fitted
-    from dew.data.pipeline import ObjectiveData
-
-    loader, _ = fitted(chain, None, objective=ObjectiveData())
-    stream = loader.train(DataPartition())
-    try:
-        return ids(itertools.islice(stream, count))
-    finally:
-        stream.close()
-
-
-def test_a_phase_batched_inside_itself_reads_on_as_a_single_stream_does():
-    """A phase that batches its own records, read on past its end by a run, reads as the same chain read
-    alone does, its repeat before its batch: a pass that holds a batch and a half continues its last into
-    the next pass, where a repeat after the batch dropped it and read the pass again from its start."""
-    first, second = Memory(Indexed(1, 12)), Memory(Indexed(2, 12))
-    phased = phases((Pipeline(first).batch(8), 2), (Pipeline(second).batch(8), None))
-    expected = (_endless_ids(Pipeline(first).batch(8), 2) + _endless_ids(Pipeline(second).batch(8), 2))
-    assert _endless_ids(phased, 4) == expected
-    assert expected[1] == [1008, 1009, 1010, 1011, 1000, 1001, 1002, 1003]
-
-
-def test_a_phase_whose_pass_holds_less_than_a_batch_reads_whole_batches():
-    """A phase that batches its own records, each pass fewer than a batch, reads whole batches of its records
-    on past its end, its repeat before its batch: a repeat after it made every pass one short batch, its
-    last rows padded (and a batch that drops its short last one never yielded one, the run hanging)."""
-    from dew.data.compile import fitted
-    from dew.data.pipeline import ObjectiveData
-
-    phased = phases((Pipeline(Memory(Indexed(1, 6))).batch(8, drop_remainder=False), 1),
-                    (Pipeline(Memory(Indexed(2, 6))).batch(8, drop_remainder=False), None))
-    loader, _ = fitted(phased, None, objective=ObjectiveData())
-    stream = loader.train(DataPartition())
-    try:
-        read = list(itertools.islice(stream, 2))
-    finally:
-        stream.close()
-    assert [int(np.sum(batch.get(VALID_ROWS, np.ones(8, bool)))) for batch in read] == [8, 8]
-    assert ids(read) == [[1000, 1001, 1002, 1003, 1004, 1005, 1000, 1001],
-                         [2000, 2001, 2002, 2003, 2004, 2005, 2000, 2001]]
-
-
-def test_phases_batched_outside_themselves_read_as_they_did():
-    """Phases that batch outside themselves, one stating a repeat of its own and the chain taking from both,
-    read as a run always read them: the first phase's two passes read on to its end, and the second
-    continues the corpus past what the first read of it."""
-    corpus = Pipeline(Memory(Indexed(1, 64)))
-    shared = _endless_ids(phases((corpus, 6), (corpus, None)).take(16).batch(4), 8)
-    assert shared[6] == [1024, 1025, 1026, 1027]
-    finite = Pipeline(Memory(Indexed(1, 8)))
-    second = Pipeline(Memory(Indexed(2, 8)))
-    repeated = _endless_ids(phases((finite.repeat(2), 10), (second, None)).batch(8), 11)
-    assert len(repeated) == 11 and repeated[2][0] // 1000 == 1 and repeated[10][0] // 1000 == 2
-    # A chain that states its own repeat reads as it states it, its phases batched inside themselves too.
-    once = phases((Pipeline(Memory(Indexed(1, 16))).batch(8), 1),
-                  (Pipeline(Memory(Indexed(2, 16))).batch(8), None))
-    assert _endless_ids(once.repeat(1), 4) == [list(range(1000, 1008)), list(range(2000, 2008)),
-                                               list(range(2008, 2016))]
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])

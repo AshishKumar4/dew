@@ -56,10 +56,10 @@ from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.optim import OptimConfig
-from dew.registry import models, projectors, read_arguments, resolve_dtype, towers
+from dew.registry import models, optimizers, projectors, read_arguments, resolve_dtype, towers
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch
 from dew.training.ahead import AheadOfTime, compile_ahead, step_batch
 from dew.training.planning import Trials
 
@@ -107,13 +107,12 @@ class TrainerMesh(TypedDict):
     """The trainer's fields a case's mesh record names (`trainer_mesh`)."""
 
     mesh: MeshSpec
-    microbatches: int | None
+    fit: FitPolicy
 
 
 def trainer_mesh(mesh: Mapping[str, int | tuple[str, ...]]) -> TrainerMesh:
-    """The trainer's `mesh` and `microbatches` a case's mesh record names: its
-    MeshSpec fields (its axes' sizes and the axes it makes explicit) and the pipeline's
-    microbatches, refusing a field it lacks."""
+    """The trainer's `mesh` and `fit` a case's mesh record names: its MeshSpec fields (its axes' sizes and the
+    axes it makes explicit) and the pipeline's microbatches as the fit's split, refusing a field it lacks."""
     fields = {f.name for f in dataclasses.fields(MeshSpec)}
     unknown = sorted(set(mesh) - fields - {"microbatches"})
     if unknown:
@@ -123,7 +122,7 @@ def trainer_mesh(mesh: Mapping[str, int | tuple[str, ...]]) -> TrainerMesh:
     if not (microbatches is None or isinstance(microbatches, int)):
         raise ValueError(f"a mesh's microbatches are a count, not {microbatches!r}")
     sizes = {name: value for name, value in mesh.items() if name != "microbatches"}
-    return {"mesh": dataclasses.replace(MeshSpec(), **sizes), "microbatches": microbatches}
+    return {"mesh": dataclasses.replace(MeshSpec(), **sizes), "fit": FitPolicy(split=microbatches or "auto")}
 
 
 def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:
@@ -307,13 +306,13 @@ def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
     `ahead`, its step compiled ahead (`ahead_of`), runs as its first step where it
     is that program, so the GPU compiles nothing for it."""
     fields = trainer_mesh(case.mesh)
-    trainer = Trainer(
-        build_objective(case, attention_impl),
-        optimizer or OptimConfig(optimizer=case.optimizer, learning_rate=1e-4).build(None),
-        key=0,
-        mesh=fields["mesh"], microbatches=fields["microbatches"],
-        layout=Layout(min_shard=case.fsdp_min_param_size),
-        accumulation=case.accumulation, split=1, checkpoints=None, tracker=None, ahead=ahead)
+    trainer = Trainer(build_objective(case, attention_impl),
+                      optimizer or OptimConfig(optimizer=optimizers.build(case.optimizer),
+                                               learning_rate=1e-4).build(None),
+                      key=0, mesh=fields["mesh"], update=UpdateBatch(batches=case.accumulation),
+                      fit=fields["fit"],
+                      layout=Layout(min_shard=case.fsdp_min_param_size), checkpoints=None, tracker=None,
+                      ahead=ahead)
     if case.device_order is not None:
         by_id = {device.id: device for device in jax.devices()}
         trainer.device_mesh = fields["mesh"].build([by_id[index] for index in case.device_order])

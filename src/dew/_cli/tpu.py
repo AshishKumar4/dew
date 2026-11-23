@@ -541,7 +541,7 @@ class Logs(Named):
     """Show the log of a detached job."""
 
     job: Positional[str]
-    """Job id that run or train printed."""
+    """Job id that run printed."""
     worker: Worker = "0"
     """Worker to read, or all for every worker."""
     follow: bool = False
@@ -679,35 +679,6 @@ def _verify_devices(tpu: Tpu, count: int, expected: int) -> int:
 
 
 @dataclasses.dataclass
-class Train(Named):
-    """Sync the tree and start a recipe on every worker. Recipe after --."""
-
-    job: Job = ""
-    """Name of the job. A timestamp by default."""
-    delete: bool = False
-    """Mirror the tree instead of only adding to it."""
-
-    def run(self, rest: list[str]) -> int:
-        if not rest:
-            raise SystemExit("dew tpu train NAME -- recipes/lm/train.py [FLAGS]")
-        job = _job(self.job, self.name)
-        cfg, _, tpu = self.opened()
-        count, _ = _slice(tpu, cfg)
-        root, code = _sync(tpu, cfg, count, (), self.delete)
-        if code:
-            return code
-        command = shlex.join(["python", *rest, "--trainer.multi-host", "True"])
-        outcomes = tpu.fanout([
-            (index, tpu_setup.detached(command, job, index, home_dir=root.name))
-            for index in range(count)])
-        code = exit_code(outcomes)
-        if code:
-            return code
-        emit(f"job {job} on {count} worker(s), following worker 0")
-        return exit_code(tpu.fanout([(0, tpu_setup.tail(job, 0, follow=True))]))
-
-
-@dataclasses.dataclass
 class Status(Named):
     """Show what each worker is doing."""
 
@@ -817,7 +788,6 @@ COMMANDS = {
     "copy": Copy,
     "sync": Sync,
     "setup": Setup,
-    "train": Train,
     "status": Status,
     "reset": Reset,
     "spawn": Spawn,

@@ -754,7 +754,7 @@ def test_two_processes_run_the_pipeline_one_process_runs(tmp_path):
     piped, _piped_state = worker.pipeline_losses(
         worker.pipeline_trainer(2, 2, 2), worker.token_batch(), steps)
     whole, whole_state = worker.pipeline_losses(
-        worker.pipeline_trainer(1, None, 4), worker.token_batch(), steps)
+        worker.pipeline_trainer(1, "auto", 4), worker.token_batch(), steps)
 
     assert len(pool[0]["losses"]) == steps
     assert np.isfinite(pool[0]["losses"]).all(), "the pool diverged"

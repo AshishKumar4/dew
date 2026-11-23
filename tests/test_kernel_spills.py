@@ -36,7 +36,11 @@ from dew.objectives.supervised import Supervised
 from dew.telemetry.compiles import Compiles
 from dew.training import Trainer
 
-ROWS, FEATURES, WIDTH, EXPERTS = 4096, 2048, 4096, 8
+ROWS, FEATURES, WIDTH, EXPERTS = 2048, 1024, 2048, 8
+"""The experts layer's step and paired product (`Experts`, `_paired_step`): its first derived tile, an H100's
+128 x 256 x 64, still spills, and its step compiled ahead needs 336 MB of a device, which a GPU tier's test
+process holds (row 8733: at 4096 x 2048 x 4096 it needed 1.88 GB of a 1.12 GiB pool, and a run handed the
+step on the H100 refused it; FS-8733-SIZES)."""
 
 
 class Experts(nn.Module):
@@ -643,54 +647,67 @@ def _thunk(calls: int, kernels: list[bytes]) -> bytes:
         _field(3, _field(5, kernel)) for kernel in kernels)
 
 
-def test_a_models_draw_of_its_variables_selects_no_kernel():
-    """A model's draw of its variables (`Objective.init`) runs its forward over a one-row batch no step runs,
-    for the variables its modules make, none of its values drawn: within it every selector takes its op's
-    generic program and reports no route (`generation.drawing`), so no launch is derived, traced or
-    certified at the draw's shapes (row 11803: an every-template decoder's ahead compile certified its
-    draw's kernels, 29% of its main thread), where the model's forward over the same variables selects and
-    reports its kernels."""
-    from dew.nn.kernels.generation import routes
+def _templated(**fields):
+    """A one-layer decoder whose attention is the template's (`attention_impl="template"`), bfloat16: its
+    forward selects and reports kernels, a draw's premise."""
+    from dew.registry import models
+
+    return models.build("causal_transformer", **{"vocab_size": 260, "emb_features": 128, "num_layers": 1,
+                                                  "num_heads": 2, "num_kv_heads": 1, "head_dim": 64,
+                                                  "mlp_features": 256, "max_seq_len": 32, "dtype": "bfloat16",
+                                                  "attention_impl": "template", **fields})
+
+
+def _drawn_objective(kind: str):
+    """An objective of `kind` over templated decoders (`_templated`), and the decoder of its whose forward
+    the premise reads: its own model, a decision model's backbone, PPO's actor (its critic its own init), a
+    distillation's student (its feature probe its own init)."""
     from dew.objectives.lm import LMObjective
-    from dew.registry import models
 
-    model = models.build("causal_transformer", vocab_size=64, emb_features=128, num_layers=1, num_heads=2,
-                         num_kv_heads=1, head_dim=64, mlp_features=256, max_seq_len=128, dtype="bfloat16",
-                         attention_impl="template")
-    objective = LMObjective(model, 128)
-    with routes() as drawn_routes:
-        drawn = jax.eval_shape(objective.init, jax.random.key(0))
-    with routes() as applied_routes:
-        jax.eval_shape(model.apply, drawn, jax.ShapeDtypeStruct((2, 128), jnp.int32))
-    assert not drawn_routes, drawn_routes
-    assert applied_routes, "the model's forward selects no kernel, so its draw's selecting none says nothing"
+    if kind == "lm":
+        model = _templated()
+        return LMObjective(model, 31), model
+    if kind == "decision":
+        from dew.data.text import ByteTokenizer
+        from dew.decision import DecisionObjective, Specials
+        from dew.decision.layout import SegmentLayout
+
+        model = _templated()
+        layout = SegmentLayout.state_first_row(max_len=32, head_max_len=24, option_tokens=6)
+        specials = Specials(None, 10, 0, "\x00", 255)
+        return DecisionObjective(model, tokenizer=ByteTokenizer(), specials=specials, layout=layout), model
+    if kind == "ppo":
+        from dew.objectives.rl import PPOObjective, ValueHead
+
+        model = _templated()
+        return PPOObjective(model, 31, critic=ValueHead(_templated())), model
+    from dew.objectives.distillation import DistillationObjective
+
+    student, teacher = _templated(), _templated(emb_features=256, mlp_features=512, head_dim=128)
+    pair = LMObjective(student, 31), LMObjective(teacher, 31)
+    return DistillationObjective(*pair, features=((0, 0),), beta=0.5), student
 
 
-def test_a_decision_models_draw_of_the_parts_its_tree_lacks_selects_no_kernel():
-    """A decision model's draw (`DecisionObjective.init`), its backbone and its head drawn as the tree lacks
-    them (`complete_variables`, over a one-row batch no step runs), reports no route, where its backbone's
-    forward over the drawn variables reports its kernels (row 12029: the parts a tree lacked were drawn
-    outside `generation.drawing`, their kernels derived and certified at the draw's shapes)."""
-    from dew.data.text import ByteTokenizer
-    from dew.decision import DecisionObjective, Specials
-    from dew.decision.layout import SegmentLayout
+@pytest.mark.parametrize("kind", ["lm", "decision", "ppo", "distillation"])
+def test_an_objectives_draw_of_its_variables_selects_no_kernel(kind):
+    """An objective's draw of its variables (`Objective.initializer`, its `init` within `drawing`) runs
+    forwards over one-row batches no step runs, for the variables its modules make, none of their values
+    drawn: within it every selector takes its op's generic program and reports no route
+    (`generation.drawing`), so no launch is derived, traced or certified at the draw's shapes (row 11803),
+    the parts a decision model's tree lacks among them (row 12029), and an objective's own `init` whole, a
+    PPO critic's and a distillation's feature probe (Train 1205's review F2), where its decoder's forward
+    over the drawn variables selects and reports its kernels."""
     from dew.nn.kernels.generation import routes
-    from dew.registry import models
 
-    model = models.build("causal_transformer", vocab_size=260, emb_features=128, num_layers=1, num_heads=2,
-                         num_kv_heads=1, head_dim=64, mlp_features=256, max_seq_len=32, dtype="bfloat16",
-                         attention_impl="template")
-    objective = DecisionObjective(model, tokenizer=ByteTokenizer(),
-                                  specials=Specials(None, 10, 0, "\x00", 255),
-                                  layout=SegmentLayout.state_first_row(max_len=32, head_max_len=24,
-                                                                       option_tokens=6))
+    objective, model = _drawn_objective(kind)
     with routes() as drawn_routes:
-        drawn = jax.eval_shape(objective.init, jax.random.key(0))
-    tokens = jax.ShapeDtypeStruct((2, 32), jnp.int32)
+        # Its key drawn within the trace too: shapes alone, nothing computed (row 12065).
+        jax.eval_shape(lambda: objective.initializer(jax.random.key(0)))
     with routes() as applied_routes:
-        jax.eval_shape(objective.model.backbone.apply, {"params": drawn["params"]["backbone"]}, tokens)
+        params = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 32), jnp.int32))
+        jax.eval_shape(model.apply, params, jax.ShapeDtypeStruct((2, 32), jnp.int32))
     assert not drawn_routes, drawn_routes
-    assert applied_routes, "the backbone selects no kernel, so its draw's selecting none says nothing"
+    assert applied_routes, "the decoder selects no kernel, so its draw's selecting none says nothing"
 
 
 def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
@@ -919,7 +936,6 @@ def test_an_aside_refusal_stays_in_the_refusals_scope_that_queued_its_launch():
 
 
 @COMPILE_ONLY
-@COMPILE_ONLY
 @lowers("sm90")
 def test_an_aside_refusal_holds_for_the_gpu_its_launch_was_queued_for_whatever_gpu_drains_it():
     """A program whose launch spills at its first tile, lowered for an H100 within a block certifying aside,
@@ -940,6 +956,7 @@ def test_an_aside_refusal_holds_for_the_gpu_its_launch_was_queued_for_whatever_g
     assert not again.missed, again.missed
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_launch_taken_in_two_recordings_of_one_aside_block_records_its_miss_in_each():
     """The same program lowered twice within one block certifying aside, each lowering within a recording of

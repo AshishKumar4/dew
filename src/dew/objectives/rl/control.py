@@ -397,7 +397,7 @@ class ControlRollout:
                                                                     leaf.dtype), carry.observation)
         acted_extras = jax.eval_shape(
             lambda v, c: self.objective.act(v, c.observation, key, c.memory)[1],
-            jax.eval_shape(self.objective.init, key), carry)
+            jax.eval_shape(self.objective.initializer, key), carry)
         gathered = {"observation": obs_shapes,
                     "raw_action": jax.ShapeDtypeStruct((*step_shape, env.action_size),
                                                        acted_extras["raw_action"].dtype),

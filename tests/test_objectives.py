@@ -13,6 +13,7 @@ from dew.data.compile import validation
 from dew.data.pipeline import Pipeline
 from dew.data.steps.generic import Formatting
 from dew.objectives.base import Objective, Ratio, Step
+from dew.training import UpdateBatch
 
 
 def tree():
@@ -146,7 +147,7 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
     assert float(value) == 1.0
     np.testing.assert_array_equal(gradient["w"], rows[0].sum(0) / 8)
 
-    trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+    trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(0), update=UpdateBatch(batches=2),
                       layout=Layout(min_shard=1, tolerance=1.0))
     stepped = trainer.fit(dataset(lambda: iter([{"x": x} for x in rows]), batch=8), steps=2).variables
     expected = -0.5 * (rows[0].sum(0) + rows[1].sum(0)) / 16

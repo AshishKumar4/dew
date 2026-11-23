@@ -51,6 +51,9 @@ from common import (
 )
 from reference_source import dew_revision
 
+from dew.optim import AdamW
+from dew.training import FitPolicy
+
 if TYPE_CHECKING:
     from dew.telemetry.workload import WorkloadWork
 
@@ -70,7 +73,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--split", type=int, default=None,
                         help="the microbatches a step's batch is read in (Trainer's split); unset plans it")
     parser.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32",
-                        help="Adam's moments in memory (OptimConfig.state_dtype)")
+                        help="Adam's moments in memory (dew.optim.Adam.state_dtype)")
     parser.add_argument("--remat", default=None, choices=sorted(REMAT_POLICIES),
                         help="the decoder's starting remat policy; unset, the model's")
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
@@ -160,15 +163,14 @@ def build(args: argparse.Namespace) -> Run:
                       init_value=args.lr_init)
     # One group over every parameter, as torch_lm.py's AdamW decays the norms
     # and biases too.
-    solver = OptimConfig(
-        optimizer="adamw", b1=args.b1, b2=args.b2, optimizer_opts={"eps": args.eps},
-        state_dtype=args.state_dtype, learning_rate=schedule, weight_decay=args.weight_decay,
-        clip_grads=args.clip,
-        param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
+    solver = OptimConfig(optimizer=AdamW(eps=args.eps, b1=args.b1, b2=args.b2, weight_decay=args.weight_decay,
+                                         state_dtype=args.state_dtype),
+                         learning_rate=schedule, clip_grads=args.clip,
+                         param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
-    trainer = Trainer(objective, solver, key=jax.random.key(0),
-                      mesh=mesh, checkpoints=None, tracker=None, split=args.split)
+    trainer = Trainer(objective, solver, key=jax.random.key(0), mesh=mesh, checkpoints=None, tracker=None,
+                      fit=FitPolicy(split=args.split))
     state, _, _ = trainer.place()
     del pretrained
     placement = batch_shardings(trainer.device_mesh, rows(np.arange(args.batch)))

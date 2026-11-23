@@ -98,12 +98,12 @@ def held_trace[Key: Hashable, Value](cache: collections.OrderedDict[Key, tuple[V
     """`cache`'s value at `key` (`_cache.holding`, `held` the most it keeps), made within a recording of the
     facts it reads (`recording`) and held with them while each answers alike (`still`: a hit whose facts
     answer otherwise now is made again), and those facts read again wherever it is returned (`replay`), so a
-    recording around its reader holds them as one around its making did. A held decision a probe trace
-    makes, its routes no program's, goes through here (the algebra's region decisions, recognitions and
-    attention probes); a held trace a program is written from keeps its whole `dew.algebra.fusion.Recorded`
-    (its routes, launches and facts), which its holder replays whole wherever it writes it (a region's
-    written program, a marked span, a rewritten body). Row 7167: only the second kept their facts, so a warm
-    lowering's recording lacked those its declined regions' probes read (row 6708's defect)."""
+    recording around its reader holds them as one around its making did: the one owner of a held trace's
+    facts (Train 1205's review F1). A held probe decision goes through here (the algebra's region decisions,
+    recognitions and attention probes), and so does a held trace a program is written from (a region's
+    written program, a marked span, a rewritten body), whose routes and launches its holder reports again
+    where it writes it (`dew.algebra.fusion.Recorded`). Row 7167: only the second kept their facts, so a
+    warm lowering's recording lacked those its declined regions' probes read (row 6708's defect)."""
     from dew import _cache
 
     def making() -> tuple[Value, dict]:
@@ -242,6 +242,12 @@ class Choice(enum.StrEnum):
 CHOICES = frozenset(choice.value for choice in Choice)
 """The choices' names (`Choice`), those `chosen` may name (`dew.kernels.choices`)."""
 
+SITE_KERNELS: dict[Choice, frozenset[str]] = {Choice.NARROW_COPIES: frozenset({'on', 'off'})}
+"""The kernels of each choice a site decides without a selector (`chosen_kernel`), which `chosen` names
+among: a selector's are its op's own, which its selection refuses a name outside of (`selection.select`);
+one of these a site reads by name alone, a misspelt name read as not its kernel (`narrow_copies="of"`,
+off)."""
+
 
 @contextlib.contextmanager
 def chosen(**kernels: str) -> Iterator[None]:
@@ -255,6 +261,9 @@ def chosen(**kernels: str) -> Iterator[None]:
     if unknown := set(kernels) - CHOICES:
         raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
                          f"the choices are {', '.join(sorted(CHOICES))}")
+    for choice, kernel in kernels.items():
+        if (known := SITE_KERNELS.get(Choice(choice))) is not None and kernel not in known:
+            raise ValueError(f"{choice} has no kernel {kernel!r}; its kernels are {', '.join(sorted(known))}")
     named = {str(choice): kernel for choice, kernel in kernels.items()}
     with _cache.KERNEL_CHOICES(tuple(sorted({**dict(_cache.KERNEL_CHOICES.value), **named}.items()))):
         yield
@@ -1139,7 +1148,7 @@ def built_target(generation: str, multiprocessors: int | None = None, memory: in
 def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
-    its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`TrainerConfig.lower_for`;
+    its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`dew.training.ahead.Lowered`;
     the kernel benchmark's oracle). Its devices state their compute capability, which Mosaic GPU lowers for
     (its `utils._infer_arch`; a device that states none it takes for sm90's, and an sm80 kernel's cp.async
     waits do not lower), as a mesh of compile-only devices of the generation does (`compile_only_gpus`, whose
@@ -1478,9 +1487,10 @@ def _resolved(device, generation: str, real: bool) -> GpuTarget:
 
 def chosen_kernel(choice: Choice, default: str) -> str:
     """The kernel `chosen` names for `choice` within its block, else `default`: a choice a site decides
-    without a selector (a step's narrow copies)."""
+    without a selector (a step's narrow copies), its kernels `SITE_KERNELS`' (`default` among them)."""
     from dew import _cache
 
+    assert default in SITE_KERNELS[choice], (choice, default)
     return dict(_cache.KERNEL_CHOICES.value).get(choice, default)
 
 

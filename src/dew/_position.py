@@ -67,7 +67,7 @@ class Global:
     plan: Mapping[str, object] | None = None
     tokens: tuple[int, ...] = ()
     """The committed tokens each phase of `completed` ended at, for a run on the committed-token clock
-    (`dew.data.pipeline.schedule`), which no record count of a phase states; empty on the record clock."""
+    (`dew.data.phases` on `Tokens`), which no record count of a phase states; empty on the record clock."""
     origin: int = 0
     """How many of `records` the current order's own reader had not read when it was opened: the run's
     count less its phase's start, less the order's own records, so a stream opened at its own start

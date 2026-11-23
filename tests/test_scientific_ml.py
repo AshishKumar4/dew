@@ -24,7 +24,9 @@ from dew.gauss_newton import gauss_newton
 from dew.nn.fourier import FourierPyramid, interpolated
 from dew.objectives.base import Step
 from dew.objectives.residuals import Residuals
-from dew.training import Checkpoints, Layout, Trainer
+from dew.optim import GaussNewton
+from dew.training import Checkpoints, Layout, Trainer, UpdateBatch
+from dew.training.budget import Horizon
 
 LAYOUT = Layout(min_shard=1, tolerance=1.0)
 
@@ -34,7 +36,7 @@ SIZED: dict[str, int] = {
     "gauss-newton 64x8": 128, "gauss-newton 8x64": 256,
     **{f"masked gauss-newton {shape} damping {damping}": 256
        for shape in ("64x8", "8x64") for damping in (0.0, 0.001)},
-    **{f"grouped gauss-newton {named}": 256 for named in ("gauss_newton", "dew.gauss_newton:gauss_newton")},
+    "grouped gauss-newton gauss_newton": 256,
     "configured whole gauss-newton step clip 0.0": 128, "configured whole gauss-newton step clip 0.05": 128,
     "configured gauss-newton": 8,
     "accumulated gauss-newton dual": 8, "accumulated gauss-newton primal": 256,
@@ -227,7 +229,7 @@ def gauss_newton_arm(rows: int, features: int, accumulation: int, optimizer=None
     weights, of a draw's `rows` rows read in `accumulation` microbatches of an accumulation window: its
     weights after it, its bias last where it has one."""
     trainer = Trainer(LeastSquares(features, bias=bias), optimizer or gauss_newton(damping=1e-3), key=0,
-                      layout=LAYOUT, accumulation=accumulation)
+                      layout=LAYOUT, update=UpdateBatch(batches=accumulation))
     template = jax.tree.map(jnp.copy, trainer.initial_state())
     compiled = []
 
@@ -254,15 +256,14 @@ Two microbatches of 32 rows over 8 weights; eight of 8 rows over 16 weights, eac
 than the weights though the update is not; four of 8 rows over 64 weights, the update itself shorter."""
 
 
-@pytest.mark.parametrize("named", ["gauss_newton", "dew.gauss_newton:gauss_newton"])
-def test_a_grouped_gauss_newton_run_scales_each_groups_leaves_of_one_solve(named):
-    """Gauss-Newton under two param groups, a line's kernel and its bias, by its name or its import path:
-    one damped solve over both (the rows' features beside a column of ones), each group's leaves of it
-    scaled by the group's rate, the kernel's half and the bias's a quarter: on par with NumPy's float32
-    solve so scaled from its float64 solve (check 1)."""
+def test_a_grouped_gauss_newton_run_scales_each_groups_leaves_of_one_solve():
+    """Gauss-Newton under two param groups, a line's kernel and its bias: one damped solve over both (the
+    rows' features beside a column of ones), each group's leaves of it scaled by the group's rate, the
+    kernel's half and the bias's a quarter: on par with NumPy's float32 solve so scaled from its float64
+    solve (check 1)."""
     from dew.optim import OptimConfig, ParamGroup
 
-    config = OptimConfig(optimizer=named, learning_rate=0.5, optimizer_opts={"damping": 1e-3},
+    config = OptimConfig(optimizer=GaussNewton(damping=1e-3), learning_rate=0.5,
                          param_groups=(ParamGroup("kernels", ("*kernel",)),
                                        ParamGroup("rest", ("*",), learning_rate_multiplier=0.5)))
     rows, features = 64, 8
@@ -276,14 +277,14 @@ def test_a_grouped_gauss_newton_run_scales_each_groups_leaves_of_one_solve(named
     numpy = as_given(scaled)
     exact = as_given(lambda x, y: scaled(x.astype(np.float64), y.astype(np.float64)))
     grouped = gauss_newton_arm(rows, features, 1, config.build(1), bias=True)
-    label = f"grouped gauss-newton {named}"
+    label = "grouped gauss-newton gauss_newton"
     assert_as_exact(grouped, numpy, draw, label, truth_fn=exact,
                     seeds=SIZED[label])
 
 
 @pytest.mark.parametrize("clip", [0.0, 0.05])
 def test_a_run_that_names_gauss_newton_and_sets_no_rate_takes_its_whole_damped_step(clip, tmp_path):
-    """A run whose command line names Gauss-Newton by its import path and its damping 1e-3, setting no
+    """A run whose command line names Gauss-Newton by its record and its damping 1e-3, setting no
     learning rate: its rate is Gauss-Newton's own, the whole step (1.0, recorded as the config's), so its
     optimizer steps the damped solve's step from zero, on par with NumPy's float32 solve from its float64
     solve (check 1), with `clip_grads` set that step capped to the clip's norm; and the run's own path
@@ -293,10 +294,10 @@ def test_a_run_that_names_gauss_newton_and_sets_no_rate_takes_its_whole_damped_s
     from dew.data.pipeline import Pipeline
     from dew.gauss_newton import solves_equations
 
-    flags = ["--optim.optimizer", "dew.gauss_newton:gauss_newton", "--optim.optimizer-opts",
-             json.dumps({"damping": 1e-3}), "--optim.clip-grads", str(clip)]
-    trainer = TrainerConfig(steps=1, checkpoint_final=False, checkpoint_dir=str(tmp_path), eval_every=None,
-                            checkpoint_every=None)
+    flags = ["--optim.optimizer", json.dumps({"class": "gauss_newton", "fields": {"damping": 1e-3}}),
+             "--optim.clip-grads", str(clip)]
+    trainer = TrainerConfig(horizon=Horizon(steps=1), checkpoint_final=False, checkpoint_dir=str(tmp_path),
+                            eval_every=None, checkpoint_every=None)
     config = dataclasses.replace(RunConfig.cli(flags), trainer=trainer)
     assert config.optim.learning_rate == 1.0
     rows, features = 64, 8
@@ -319,15 +320,14 @@ def test_a_run_that_names_gauss_newton_and_sets_no_rate_takes_its_whole_damped_s
 
 @pytest.mark.parametrize("groups", [False, True])
 def test_a_gauss_newton_cap_its_options_state_holds_in_param_groups_as_without(groups):
-    """Gauss-Newton capped by its own option (`optimizer_opts={"clip": 0.05}`, `clip_grads` unset), under one
+    """Gauss-Newton capped by its own setting (`GaussNewton(clip=0.05)`, `clip_grads` unset), under one
     param group that claims every parameter or under none: the unit system's whole step of 1 capped to
     0.05, the same either way (row 3360's review)."""
     from dew.gauss_newton import NormalEquations
     from dew.optim import OptimConfig, ParamGroup
 
     grouped = (ParamGroup("all", ("*",)),) if groups else ()
-    config = OptimConfig(optimizer="gauss_newton", learning_rate=1.0,
-                         optimizer_opts={"clip": 0.05}, param_groups=grouped)
+    config = OptimConfig(optimizer=GaussNewton(clip=0.05), learning_rate=1.0, param_groups=grouped)
     solver = config.build(1)
     params = {"w": jnp.zeros((1,), jnp.float32)}
     system = NormalEquations(total=jnp.zeros(()), mass=jnp.ones(()), rows=jnp.asarray(1),
@@ -364,8 +364,7 @@ def test_a_configured_gauss_newton_states_its_optimizer_as_the_runs_saved_before
 
     params = LeastSquares(8, bias=True).init(jax.random.key(0))["params"]
     grouped = (ParamGroup("kernels", ("*kernel",)), ParamGroup("rest", ("*",))) if groups else ()
-    config = OptimConfig(optimizer="gauss_newton", optimizer_opts={"damping": 1e-3}, clip_grads=clip,
-                         param_groups=grouped)
+    config = OptimConfig(optimizer=GaussNewton(damping=1e-3), clip_grads=clip, param_groups=grouped)
     if groups:
         solvers = {group.name: group.solver(_rate_only, 1.0, 1, {}) for group in grouped}
         earlier = optax.chain(solved_directions(1e-3), optax.multi_transform(solvers, param_labels(grouped)))
@@ -377,14 +376,14 @@ def test_a_configured_gauss_newton_states_its_optimizer_as_the_runs_saved_before
 
 
 def test_a_run_configured_for_gauss_newton_steps_its_rate_times_the_damped_solve():
-    """A run whose optimizer the command line names (`--optim.optimizer gauss_newton`, its rate 0.5 and
-    its damping 1e-3 among `optimizer_opts`), built as `OptimConfig` builds every optimizer
+    """A run whose optimizer the command line names (`--optim.optimizer` Gauss-Newton's record, its rate 0.5
+    and its damping 1e-3), built as `OptimConfig` builds every optimizer
     (`scheduled_solver`), takes half the damped Gauss-Newton step of its batch: on par with half the float64
     solve's step (check 1)."""
     from dew.config import RunConfig
 
-    config = RunConfig.cli(["--optim.optimizer", "gauss_newton", "--optim.learning-rate", "0.5",
-                            "--optim.optimizer-opts", json.dumps({"damping": 1e-3})])
+    record = {"class": "gauss_newton", "fields": {"damping": 1e-3}}
+    config = RunConfig.cli(["--optim.optimizer", json.dumps(record), "--optim.learning-rate", "0.5"])
     rows, features = 64, 8
     draw = least_squares_draw(rows, features, 0x6C)
     exact = as_given(lambda x, y: -0.5 * solved(x.astype(np.float64), y.astype(np.float64), 1e-3))
@@ -459,7 +458,7 @@ def test_a_gauss_newton_window_the_stream_ends_inside_commits_a_solve_of_the_row
     def trained(count: int) -> np.ndarray:
         rows = Memory([{"x": row, "y": target} for row, target in zip(x[:count], y[:count], strict=True)])
         trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0, layout=LAYOUT,
-                          accumulation=4)
+                          update=UpdateBatch(batches=4))
         # A run of its `count` examples, streamed: its stream ends inside the second window, holding a fifth.
         state = trainer.fit(rows.read("streamed").batch(8), examples=count)
         assert int(state.updates) == -(-count // 32)
@@ -471,7 +470,8 @@ def test_a_gauss_newton_window_the_stream_ends_inside_commits_a_solve_of_the_row
 def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_refused():
     """A Gauss-Newton update inside `optax.MultiSteps`, which hands its inner update no extra arguments and
     pools no system across the steps it holds, is refused as its step is traced, naming the accumulation
-    that pools the update's system (`Trainer(accumulation=k)`), never stepped by a system it lacks."""
+    that pools the update's system (`Trainer(update=UpdateBatch(batches=k))`), never stepped by a system it
+    lacks."""
     held = optax.MultiSteps(gauss_newton(damping=1e-3), every_k_schedule=2).gradient_transformation()
     trainer = Trainer(LeastSquares(4), held, key=0, layout=LAYOUT)
     batch = {"x": np.ones((8, 4), np.float32), "y": np.ones(8, np.float32)}

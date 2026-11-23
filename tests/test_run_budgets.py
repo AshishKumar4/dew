@@ -17,6 +17,7 @@ from data_support import Fanned, Questioned, Twice, jittered
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 from test_barren_reads import Untouched
+from test_trainer import LM_CONTEXT, LM_ROWS, budget_lm_trainer, lm_data
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
@@ -27,9 +28,10 @@ from dew.data.pipeline import ObjectiveData, Pipeline
 from dew.decision.layout import SegmentLayout
 from dew.distributed.batches import batch_signature
 from dew.objectives import Aux, Objective
-from dew.optim import Cosine, Linear, OneCycle, OptimConfig
+from dew.optim import Adam, Cosine, Linear, OneCycle, OptimConfig
 from dew.telemetry.records import FitStarted
-from dew.training import Best, Checkpoints, Pause, Trainer
+from dew.training import Best, Checkpoints, FitPolicy, Pause, Trainer, UpdateBatch
+from dew.training.budget import Horizon
 from dew.training.interval import CONSUMED_COMMITTED, CONSUMED_EXAMPLES
 
 FEATURES = 4
@@ -92,8 +94,8 @@ def descended(x):
 
 
 def trainer(directory=None, tracker=None) -> Trainer:
-    return Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK)), key=0,
-                   accumulation=ACCUMULATION, tracker=tracker,
+    return Trainer(Pulled(), OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK)), key=0,
+                   update=UpdateBatch(batches=ACCUMULATION), tracker=tracker,
                    checkpoints=None if directory is None else Checkpoints(str(directory)))
 
 
@@ -1015,10 +1017,10 @@ def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = No
     tracker = RecordingTracker()
     ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
     chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed")
-    optim = OptimConfig(optimizer="adam", learning_rate=learning_rate or Linear(peak_value=PEAK,
+    optim = OptimConfig(optimizer=Adam(), learning_rate=learning_rate or Linear(peak_value=PEAK,
                                                                                 end_value=CLOCKED_END))
-    trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation, rollout=rollout,
-                      checkpoints=None if directory is None else Checkpoints(str(directory)))
+    trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, update=UpdateBatch(batches=accumulation),
+                      rollout=rollout, checkpoints=None if directory is None else Checkpoints(str(directory)))
     return trainer.fit(chain.batch(BATCH), examples=examples, log_every=log_every, stop=stop), tracker
 
 
@@ -1068,8 +1070,8 @@ def test_a_clocked_run_whose_last_examples_make_no_rows_ends_at_its_bound(accumu
     consumed its whole bound, as its schedule's end reads it, whether its last batch ends a whole update or
     a window of its own."""
     (x,) = clocked_records(0)
-    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
-    state = Trainer(Thin(), optim, key=0, accumulation=accumulation).fit(
+    optim = OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    state = Trainer(Thin(), optim, key=0, update=UpdateBatch(batches=accumulation)).fit(
         clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
     assert CLOCKED_RECORDS % 3 == 0 and int(state.consumed) == CLOCKED_RECORDS
 
@@ -1077,9 +1079,9 @@ def test_a_clocked_run_whose_last_examples_make_no_rows_ends_at_its_bound(accumu
 def thin_fit(x, accumulation: int = 1, **fit):
     """A run of `Thin` over CLOCKED_RECORDS records of `x` (`clocked_chain`) under `Linear`, fitted as
     `fit` says: its final state."""
-    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    optim = OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
     chain = fit.pop("chain", clocked_chain(x))
-    return Trainer(Thin(), optim, key=0, accumulation=accumulation,
+    return Trainer(Thin(), optim, key=0, update=UpdateBatch(batches=accumulation),
                    checkpoints=fit.pop("checkpoints", None)).fit(chain, log_every=1, **fit)
 
 
@@ -1105,10 +1107,10 @@ def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_
     window closed, and its clock at its bound (row 2437)."""
     (x,) = clocked_records(0)
     plain, rolled = RecordingTracker(), RecordingTracker()
-    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
-    alone = Trainer(Thin(), optim, key=0, accumulation=2, tracker=plain).fit(
+    optim = OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    alone = Trainer(Thin(), optim, key=0, update=UpdateBatch(batches=2), tracker=plain).fit(
         clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
-    handed = Trainer(Thin(), optim, key=0, accumulation=2, tracker=rolled,
+    handed = Trainer(Thin(), optim, key=0, update=UpdateBatch(batches=2), tracker=rolled,
                      rollout=lambda state, batch, key, *, objective: batch).fit(
         clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
     assert int(handed.consumed) == int(alone.consumed) == CLOCKED_RECORDS
@@ -1160,10 +1162,10 @@ def test_a_custom_step_trains_a_run_bounded_in_examples_whose_schedule_reads_no_
         return step
 
     (x,) = clocked_records(0)
-    own = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, decay_steps=4))
+    own = OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK, decay_steps=4))
     state = Trainer(Thin(), own, key=0, step=stepped).fit(clocked_chain(x), examples=CLOCKED_RECORDS)
     assert int(state.consumed) == CLOCKED_RECORDS
-    whole = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK))
+    whole = OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK))
     with pytest.raises(ValueError):
         Trainer(Thin(), whole, key=0, step=stepped).fit(clocked_chain(x), examples=CLOCKED_RECORDS)
 
@@ -1206,7 +1208,7 @@ def test_a_shortened_last_update_leaves_its_window_empty_for_the_next_fit_and_a_
         return Pipeline(Memory({"x": x})).read("streamed").batch(BATCH)
 
     def pulled(directory=None) -> Trainer:
-        return Trainer(Pulled(), optax.sgd(0.1), key=0, accumulation=4,
+        return Trainer(Pulled(), optax.sgd(0.1), key=0, update=UpdateBatch(batches=4),
                        checkpoints=None if directory is None else Checkpoints(str(directory)))
 
     def clocks(state) -> tuple[int, int, int]:
@@ -1221,8 +1223,8 @@ def test_a_shortened_last_update_leaves_its_window_empty_for_the_next_fit_and_a_
     # Its emptied window holds nothing, so a fit pooling another window takes the state, where one that
     # read the window's place off the clock refused it as an open window.
     shortened = pulled().fit(stream(), examples=5 * BATCH, log_every=1)
-    pairs = Trainer(Pulled(), optax.sgd(0.1), key=0, accumulation=2, split=1).fit(
-        stream(), steps=7, log_every=1, state=shortened)
+    pairs = Trainer(Pulled(), optax.sgd(0.1), key=0, update=UpdateBatch(batches=2),
+                    fit=FitPolicy(split=1)).fit(stream(), steps=7, log_every=1, state=shortened)
     assert int(pairs.updates) == 3 and int(occupancy(pairs.window)) == 0
 
 
@@ -1239,7 +1241,7 @@ def test_a_window_the_previous_format_saved_restores_the_occupancy_its_contents_
     x = np.random.default_rng(0).normal(size=(9 * BATCH, FEATURES)).astype(np.float32)
 
     def unsaved(**fit):
-        state = Trainer(Pulled(), optax.sgd(0.1), key=0, accumulation=4).fit(
+        state = Trainer(Pulled(), optax.sgd(0.1), key=0, update=UpdateBatch(batches=4)).fit(
             Pipeline(Memory({"x": x})).read("streamed").batch(BATCH), log_every=1, **fit)
         return state.with_window(dataclasses.replace(state.window, fill=None))
 
@@ -1259,12 +1261,13 @@ def test_a_run_of_steps_resumes_a_checkpoint_that_kept_no_count_and_a_clocked_ru
     Every fit reads one loader under one constant rate, so the count is all the checkpoints differ by; a
     clocked run's checkpoint, which kept its count, resumes on the examples clock (the control)."""
     (x,) = clocked_records(0)
-    optim = OptimConfig(optimizer="adam", learning_rate=PEAK)
+    optim = OptimConfig(optimizer=Adam(), learning_rate=PEAK)
     loader, _ = fitted(clocked_chain(x), None, objective=Echoed().data(), examples=CLOCKED_RECORDS)
 
     def fit(directory, **bound):
         checkpoints = Checkpoints(str(directory))
-        state = Trainer(Echoed(), optim, key=0, accumulation=accumulation, checkpoints=checkpoints).fit(
+        state = Trainer(Echoed(), optim, key=0, update=UpdateBatch(batches=accumulation),
+                        checkpoints=checkpoints).fit(
             loader, log_every=1, checkpoint_every=1, **bound)
         checkpoints.wait()
         return state
@@ -1298,7 +1301,7 @@ def test_only_a_run_on_the_examples_clock_carries_its_count_to_the_step(tmp_path
     checkpoints none, while a run whose plan counts none reads the count in its step."""
     (x,) = clocked_records(0)
     ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
-    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    optim = OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
     planned = Pipeline(Memory({"x": x, "id": ids})).read("memory").batch(BATCH)
     loader, _ = fitted(planned, None, objective=Placed().data(), examples=CLOCKED_RECORDS)
     stream = loader.train(DataPartition())
@@ -1327,7 +1330,7 @@ def test_a_clocked_run_whose_split_is_planned_compiles_one_step():
     row 2532)."""
     (x,) = clocked_records(0)
     tracker = RecordingTracker()
-    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    optim = OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
     Trainer(Echoed(), optim, key=0, tracker=tracker).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
                                                          log_every=1)
     # `train/compiles` counts the step's compiles over the whole fit (`Interval.compiles`): the first
@@ -1359,7 +1362,7 @@ def test_a_clocked_runs_cooldown_and_its_step_compiled_ahead_take_its_batches_as
     from dew.training.ahead import first_step_batch, step_batch
 
     (x,) = clocked_records(0)
-    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    optim = OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
     signed, tracker = Signed(), RecordingTracker()
     # A cooldown branch is scored by the run's validation, which reads the corpus's first batch.
     held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
@@ -1532,8 +1535,8 @@ def test_a_pause_on_a_step_that_ranks_a_weights_only_best_writes_the_whole_state
     objective = Pulled()
 
     def fitted(stop):
-        return Trainer(objective, OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK)), key=0,
-                       accumulation=ACCUMULATION, checkpoints=Checkpoints(str(tmp_path))).fit(
+        return Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK)), key=0,
+                       update=UpdateBatch(batches=ACCUMULATION), checkpoints=Checkpoints(str(tmp_path))).fit(
             chain(x), examples=EXAMPLES, stop=stop, eval_every=2 * ACCUMULATION,
             best=Best(objective.loss, weights_only=True))
 
@@ -1556,7 +1559,7 @@ def test_a_stream_that_runs_out_on_an_evaluated_step_scores_that_step_once():
     tracker = RecordingTracker()
     batch = {"x": x[:BATCH]}
     finite = Loader(lambda partition: iter([batch] * 3), lambda partition: iter([batch]), None, BATCH)
-    Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=0.1), key=0, tracker=tracker).fit(
+    Trainer(Pulled(), OptimConfig(optimizer=Adam(), learning_rate=0.1), key=0, tracker=tracker).fit(
         finite, steps=5, eval_every=1, log_every=1)
     assert [step for step, scalars in tracker.scalars if "val/loss" in scalars] == [1, 2, 3]
 
@@ -1567,7 +1570,7 @@ def test_a_stream_that_runs_out_after_a_ranked_step_ends_on_a_whole_checkpoint(t
     (x,) = records(0)
     objective = Pulled()
     finite = Loader(lambda partition: iter([{"x": x[:BATCH]}]), None, None, BATCH)
-    Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
+    Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=0.1), key=0,
             checkpoints=Checkpoints(str(tmp_path))).fit(
         finite, steps=10, eval_every=1, best=Best(objective.loss, weights_only=True))
     assert Checkpoints(str(tmp_path)).latest == 1
@@ -1582,7 +1585,7 @@ def test_a_cooldown_branch_on_a_step_that_ranks_a_weights_only_best_runs_on_past
 
     x = np.random.default_rng(0).normal(size=(6 * BATCH, FEATURES)).astype(np.float32)
     objective = Pulled()
-    state = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
+    state = Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=0.1), key=0,
                     checkpoints=Checkpoints(str(tmp_path))).fit(
         compile(Pipeline(Memory({"x": x})).repeat(1).batch(BATCH), read="memory",
                 validation=Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)), steps=4, eval_every=2,
@@ -1598,7 +1601,7 @@ def test_a_run_resumed_where_its_finite_stream_ran_out_ends_there_with_nothing_t
     (x,) = records(0)
 
     def run(steps):
-        trainer = Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
+        trainer = Trainer(Pulled(), OptimConfig(optimizer=Adam(), learning_rate=0.1), key=0,
                           checkpoints=Checkpoints(str(tmp_path)))
         return trainer.fit(compile(Pipeline(Memory({"x": x})).repeat(1).batch(BATCH), read="memory"),
                            steps=steps)
@@ -1622,7 +1625,7 @@ def test_a_stream_that_runs_out_between_cadences_scores_only_the_suites_its_last
         return iter([batch])
 
     finite = Loader(lambda partition: iter([batch]), None, None, BATCH)
-    Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=0.1), key=0, tracker=tracker).fit(
+    Trainer(Pulled(), OptimConfig(optimizer=Adam(), learning_rate=0.1), key=0, tracker=tracker).fit(
         finite, steps=5, log_every=1, validation={"often": EvalSuite(held, every=1),
                                                    "rare": EvalSuite(held, every=2)})
     reported = [(step, name) for step, scalars in tracker.scalars for name in ("often", "rare")
@@ -1638,7 +1641,7 @@ def test_a_stream_that_runs_out_with_no_final_checkpoint_writes_its_weights_only
     objective = Pulled()
     finite = Loader(lambda partition: iter([{"x": x[:BATCH]}]), lambda partition: iter([{"x": x[:BATCH]}]),
                     None, BATCH)
-    Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
+    Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=0.1), key=0,
             checkpoints=Checkpoints(str(tmp_path))).fit(
         finite, steps=5, checkpoint_final=False, best=Best(objective.loss, weights_only=True))
     assert Checkpoints(str(tmp_path)).latest == 1
@@ -1648,13 +1651,16 @@ def test_a_run_config_counts_examples_and_pauses_as_a_fit_does(tmp_path):
     """A run config's `examples` and `stop` reach the fit, its record holding both: paused halfway it
     stands two updates in, and run again without the pause it goes on to the steps its examples fill."""
     (x,) = records(0)
-    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK))
-    config = RunConfig(optim=optim, trainer=TrainerConfig(
-        checkpoint_dir=str(tmp_path), examples=EXAMPLES, stop=Pause(0.5), accumulation=ACCUMULATION,
-        log_every=1, eval_every=None, checkpoint_every=None))
+    optim = OptimConfig(optimizer=Adam(), learning_rate=Linear(peak_value=PEAK))
+    config = RunConfig(optim=optim, trainer=TrainerConfig(checkpoint_dir=str(tmp_path),
+                                                          horizon=Horizon(examples=EXAMPLES), stop=Pause(0.5),
+                                                          update=UpdateBatch(batches=ACCUMULATION),
+                                                          log_every=1, eval_every=None,
+                                                          checkpoint_every=None))
     assert RunConfig.from_dict(config.to_dict()) == config
-    flags = RunConfig.cli(["--trainer.examples", str(EXAMPLES), "--trainer.stop.fraction", "0.5"]).trainer
-    assert (flags.examples, flags.stop) == (EXAMPLES, Pause(0.5))
+    flags = RunConfig.cli(["--trainer.horizon.examples", str(EXAMPLES), "--trainer.stop.fraction",
+                           "0.5"]).trainer
+    assert (flags.horizon.examples, flags.stop) == (EXAMPLES, Pause(0.5))
     paused = config.train(Pulled(), chain(x), name="budget")
     resumed = dataclasses.replace(config, trainer=dataclasses.replace(config.trainer, stop=None)).train(
         Pulled(), chain(x), name="budget")
@@ -1707,7 +1713,7 @@ def test_a_clocked_runs_validation_records_the_examples_it_had_consumed():
     its bound; a run counted in steps records none."""
     (x,) = clocked_records(0)
     held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
-    optim = OptimConfig(optimizer="adam", learning_rate=PEAK)
+    optim = OptimConfig(optimizer=Adam(), learning_rate=PEAK)
     tracker = RecordingTracker()
     Trainer(Echoed(), optim, key=0, tracker=tracker).fit(
         clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held, eval_every="25%")
@@ -1735,7 +1741,7 @@ def test_a_clocked_runs_cooldown_evaluation_records_the_examples_its_branch_cons
     (x,) = clocked_records(0)
     held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
     tracker = RecordingTracker()
-    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+    Trainer(Echoed(), OptimConfig(optimizer=Adam(), learning_rate=PEAK), key=0, tracker=tracker).fit(
         clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held, eval_every="25%",
         cooldowns=Cooldowns(at=("50%",), length=2))
     trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
@@ -1763,7 +1769,7 @@ def test_each_split_evaluated_at_a_step_records_its_own_counts():
     tracker = RecordingTracker()
     summaries = [Summary(name, {"summary/loss": 1.0, "large/loss": 1.0}, "lower")
                  for name in ("records", "coordinated_batches")]
-    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+    Trainer(Echoed(), OptimConfig(optimizer=Adam(), learning_rate=PEAK), key=0, tracker=tracker).fit(
         clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, eval_every="50%", summaries=summaries,
         validation={"summary": small, "large": large}, cooldowns=Cooldowns(at=("50%",), length=2))
     logged = collections.defaultdict(list)
@@ -1788,7 +1794,7 @@ def test_a_split_named_like_a_cooldowns_suite_is_the_runs_own():
     (x,) = clocked_records(0)
     held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
     tracker = RecordingTracker()
-    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+    Trainer(Echoed(), OptimConfig(optimizer=Adam(), learning_rate=PEAK), key=0, tracker=tracker).fit(
         clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, eval_every="50%",
         validation={"val": held, "cooldown_val": held}, cooldowns=Cooldowns(at=("50%",), length=2))
     trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
@@ -1885,8 +1891,22 @@ def test_a_token_budget_reached_inside_a_split_step_keeps_the_window_its_later_p
         first, second = targets[min(at, len(targets) - 1)]
         return {"target": np.asarray([first, second] * (rows // 2), np.float32)}
 
-    trainer = Trainer(TokenTargeted(), optax.sgd(0.0), key=jax.random.key(0), split=2, dynamic_scale=True)
+    trainer = Trainer(TokenTargeted(), optax.sgd(0.0), key=jax.random.key(0), fit=FitPolicy(split=2),
+                      dynamic_scale=True)
     loader = Loader(train=lambda partition: Replaying(batch_at), val=None, batch=rows, records=None)
     state = trainer.fit(loader, tokens=1, log_every=1)
     assert int(state.step) == 2 and int(state.updates) == 1
     assert state.window is not None and occupied(state.window) == 1 and int(state.microstep) == 3
+
+
+@pytest.mark.parametrize(("steps", "capped", "ends"), [(20, 4, 4), (3, 20, 3)],
+                         ids=["cap-first", "steps-first"])
+def test_a_token_cap_beside_a_runs_steps_ends_it_at_the_first_reached(steps, capped, ends):
+    """A run of `steps` steps capped at `capped` steps' targets (`Horizon.max_tokens`) ends at whichever
+    comes first; a cap beside a run of tokens, and two lengths, are refused before it trains."""
+    trainer = budget_lm_trainer()
+    state = trainer.fit(lm_data(), steps=steps, max_tokens=capped * LM_ROWS * LM_CONTEXT)
+    assert int(state.step) == ends
+    for refused in ({"tokens": 96, "max_tokens": 96}, {"steps": 2, "tokens": 96}):
+        with pytest.raises(ValueError):
+            budget_lm_trainer().fit(lm_data(), **refused)

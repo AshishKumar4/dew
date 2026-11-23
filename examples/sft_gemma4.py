@@ -36,10 +36,11 @@ from dew.data.sources import Read, source as data_source
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
 from dew.objectives.lm import LMObjective, Perplexity, Samples
-from dew.optim import OptimConfig
+from dew.optim import AdamW, OptimConfig
 from dew.registry import ModelConfig
 from dew.state import TrainState
-from dew.training import MeshSpec, prepare_process
+from dew.training import MeshSpec, UpdateBatch, prepare_process
+from dew.training.budget import Horizon
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 SMOKE_MODEL = FIXTURES / "hf/gemma4-ple"
@@ -112,16 +113,15 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
                     .read(config.data_read).loading(loading)),
         tokenizer=tokenizer,
         max_new_tokens=4 if smoke else 64,
-        optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
+        optim=OptimConfig(learning_rate=config.learning_rate, optimizer=AdamW(weight_decay=0.0),
                           clip_grads=1.0),
         # A smoke run stays out of any process pool; a real run joins one
         # when a cluster started it and runs alone otherwise.
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
-                              steps=config.steps,
-                              accumulation=config.accumulation, log_every=1 if smoke else 20,
+                              horizon=Horizon(steps=config.steps),
+                              update=UpdateBatch(batches=config.accumulation), log_every=1 if smoke else 20,
                               eval_every=config.steps, checkpoint_every=config.steps,
-                              multi_host=False if smoke else None,
-                              compilation_cache_dir=None if smoke else
+                              multi_host=False if smoke else None, compilation_cache_dir=None if smoke else
                               TrainerConfig().compilation_cache_dir))
 
 
@@ -132,7 +132,7 @@ def main(config: Config) -> Path:
         tokenizer, chat = config.model, config.dataset
 
     run = run_config(config, tokenizer, chat)
-    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
+    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.diagnostics.xla_flags,
                     run.trainer.compilation_cache_dir)
     # Only now: counting devices opens the backend, which has to come after
     # the pool forms, and a pool's count is every process's devices.

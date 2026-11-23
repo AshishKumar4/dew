@@ -128,7 +128,7 @@ def test_an_expert_mesh_exchanges_by_default_and_any_other_mesh_dispatches_globa
 @pytest.mark.parametrize("expert, exchanged", [(4, True), (1, False)], ids=["expert-mesh", "no-expert-axis"])
 def test_a_config_built_runs_step_exchanges_on_an_expert_mesh_by_default(tmp_path, expert, exchanged):
     """An LM run built from its config, a mixture of eight experts at its default dispatch, lowers its
-    training step (`--trainer.lower-for`) with the exchange's `ragged_all_to_all` on a 4-way expert mesh
+    training step (`LowerFor`) with the exchange's `ragged_all_to_all` on a 4-way expert mesh
     and with none where the mesh has no expert axis (ledger 1711's flow, row 4615)."""
     import dataclasses
 
@@ -136,13 +136,14 @@ def test_a_config_built_runs_step_exchanges_on_an_expert_mesh_by_default(tmp_pat
 
     from dew.nn.kernels.lowered import custom_calls
     from dew.training._lowering import Lowered
+    from dew.training.targets import LowerFor
 
     run = lm(tmp_path, drawn=False)
     fields = {**run.model.fields, "mixture": {"experts": 8, "top_k": 2, "expert_features": 16}}
     run = dataclasses.replace(run, model=dataclasses.replace(run.model, fields=fields))
     with pytest.raises(Lowered) as lowered:
-        trained(run, tmp_path, "lowered", trainer={"mesh": MeshSpec(expert=expert, fsdp=8 // expert),
-                                                   "lower_for": "sm90"})
+        trained(run, tmp_path, "lowered", lowering=LowerFor("sm90"),
+                trainer={"mesh": MeshSpec(expert=expert, fsdp=8 // expert)})
     # The collective as the lowered program calls it (JAX lowers it to a custom call of its name).
     calls = custom_calls(lowered.value.lowered)
     assert any(call.target == "ragged_all_to_all" for call in calls) == exchanged

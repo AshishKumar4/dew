@@ -51,7 +51,7 @@ from dew import _position
 from dew.artifacts import Representations
 from dew.batch import merge, under
 from dew.checkpoints import Ranking
-from dew.data import Memory, presets, schedule
+from dew.data import Memory, Phase, Tokens, phases, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.data.pipeline import Pipeline
@@ -59,9 +59,10 @@ from dew.data.sources.tokens import TokenFiles
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
-from dew.optim import Cosine, OptimConfig, Power
+from dew.optim import Adam, AdamW, Cosine, Muon, OptimConfig, Power
 from dew.state import CHECKPOINTED, TokenCount, TrainState
-from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer, ema_update
+from dew.training import Checkpoints, DiLoCo, FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch, ema_update
+from dew.training.budget import Horizon
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.runtime import Preempted
 
@@ -106,7 +107,8 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
     updates trained on (`train/committed_tokens`): a log that cuts an accumulation window reads its
     steps, not its commits."""
     tracker = RecordingTracker()
-    trainer = make_trainer(objective=TokenRegression(), tracker=tracker, accumulation=accumulation)
+    trainer = make_trainer(objective=TokenRegression(), tracker=tracker,
+                           update=UpdateBatch(batches=accumulation))
     state = trainer.fit(dataset(), tokens=30, log_every=log_every)
     assert int(state.step) == steps
     if log_every == 1:
@@ -132,8 +134,9 @@ def test_a_run_logs_the_share_of_the_tokens_it_computed_that_its_loss_scored(acc
     log; every step's, an update's window committed or not; a validation split's its own; none for an
     objective whose rows declare no tokens."""
     tracker = RecordingTracker()
-    make_trainer(objective=PaddedTokenRegression(), tracker=tracker, accumulation=accumulation).fit(
-        dataset(val=val_batches(3)), steps=4, log_every=log_every, eval_every=4)
+    trainer = make_trainer(objective=PaddedTokenRegression(), tracker=tracker,
+                           update=UpdateBatch(batches=accumulation))
+    trainer.fit(dataset(val=val_batches(3)), steps=4, log_every=log_every, eval_every=4)
     assert [scalars["train/real_token_share"] for _, scalars in tracker.scalars
             if "train/real_token_share" in scalars] == shares
     # A validation split's: its three batches score rows of 1, 2 and 3 of their four tokens.
@@ -159,7 +162,7 @@ def test_a_run_records_where_its_optimizers_split_sent_each_parameter():
         (record,) = [value for _, value in tracker.artifacts if isinstance(value, FitStarted)]
         return record.groups, state.variables["params"]
 
-    groups, params = started(OptimConfig(optimizer="muon", learning_rate=1e-2))
+    groups, params = started(OptimConfig(optimizer=Muon(), learning_rate=1e-2))
     # Each parameter's dimension numbers whole, or None where Muon takes none.
     numbers = jax.tree_util.tree_leaves_with_path(muon_weight_dimension_numbers(params),
                                                   is_leaf=lambda leaf: not isinstance(leaf, Mapping))
@@ -224,12 +227,12 @@ def test_a_token_budget_counts_the_tokens_of_committed_updates(tmp_path):
     """Under an accumulation of two, a run's tokens are those of the updates it committed: a run
     stopped inside a window counts none of its batch, and its resume counts that batch at the
     window's commit, once (spec training §3)."""
-    first = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
+    first = make_trainer(tmp_path, objective=TokenRegression(), update=UpdateBatch(batches=2))
     stopped = first.fit(dataset(), steps=3, log_every=1)
     assert int(stopped.step) == 3
     assert first.checkpoints.control(3)["committed_tokens"] == 24
     assert TokenCount.host(jax.device_get(stopped.accumulation.tokens)) == 24
-    resumed = make_trainer(tmp_path, objective=TokenRegression(), accumulation=2)
+    resumed = make_trainer(tmp_path, objective=TokenRegression(), update=UpdateBatch(batches=2))
     assert int(resumed.fit(dataset(), steps=4, log_every=1).step) == 4
     assert resumed.checkpoints.control(4)["committed_tokens"] == 80
 
@@ -402,9 +405,22 @@ def test_a_token_budget_stops_its_run_at_the_step_it_is_spent(accumulation, step
     `steps` steps' targets stops the run at that step, its windows of one or two microbatches alike. (That
     it reads its count off the devices only at the steps that could spend it, never between, the step
     benchmark's host reads measure.)"""
-    trainer = budget_lm_trainer(accumulation=accumulation)
+    trainer = budget_lm_trainer(update=UpdateBatch(batches=accumulation))
     state = trainer.fit(lm_data(), tokens=steps * LM_ROWS * LM_CONTEXT)
     assert int(state.step) == steps
+
+
+def test_an_update_of_tokens_pools_its_loaders_token_batches_once_one_states_them():
+    """A trainer whose update is a count of tokens (`UpdateBatch(tokens=)`) builds no state and compiles
+    no step before a loader states its token batches, which would hold one batch's window and commit every
+    batch (review of row 11934); read one of 48-token batches, a 192-token update pools four of them, its
+    state's window four steps."""
+    trainer = budget_lm_trainer(update=UpdateBatch(tokens=4 * LM_ROWS * LM_CONTEXT))
+    with pytest.raises(ValueError):
+        trainer.initial_state()
+    trainer.reading(Loader(train=lambda partition: iter(()), val=None, records=None, batch=LM_ROWS,
+                           batch_tokens=LM_ROWS * LM_CONTEXT))
+    assert trainer.accumulation == 4 and int(trainer.initial_state().window_size) == 4
 
 
 def varied_rows(position: int) -> dict[str, np.ndarray]:
@@ -423,9 +439,10 @@ def test_a_token_budget_resumed_inside_an_update_ends_where_an_unbroken_run_does
         return Loader(lambda partition: Replaying(varied_rows), None, batch=LM_ROWS, records=None)
 
     budget = LM_ROWS * (12 + 3 + 3)
-    unbroken = budget_lm_trainer(tmp_path / "unbroken", accumulation=3).fit(data(), tokens=budget)
-    budget_lm_trainer(tmp_path / "broken", accumulation=3).fit(data(), steps=1)
-    resumed = budget_lm_trainer(tmp_path / "broken", accumulation=3).fit(data(), tokens=budget)
+    unbroken = budget_lm_trainer(tmp_path / "unbroken", update=UpdateBatch(batches=3)).fit(data(),
+                                                                                         tokens=budget)
+    budget_lm_trainer(tmp_path / "broken", update=UpdateBatch(batches=3)).fit(data(), steps=1)
+    resumed = budget_lm_trainer(tmp_path / "broken", update=UpdateBatch(batches=3)).fit(data(), tokens=budget)
     assert int(unbroken.step) == int(resumed.step) == 3
 
 
@@ -438,7 +455,8 @@ def context_schedule(tmp_path, longer: int) -> Pipeline:
     def stage(seq_len: int) -> Pipeline:
         return TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=seq_len, batch=None)
 
-    return schedule([(stage(LM_CONTEXT), 2 * LM_ROWS * LM_CONTEXT), (stage(longer), None)]).batch(LM_ROWS)
+    return phases(Phase(stage(LM_CONTEXT), Tokens(2 * LM_ROWS * LM_CONTEXT)),
+                  Phase(stage(longer))).batch(LM_ROWS)
 
 
 def test_a_schedule_trains_each_stage_at_the_row_length_it_lays_out(tmp_path):
@@ -491,7 +509,8 @@ def test_steps_after_the_first_logs_neither_compile_nor_move_data_unasked(varian
             elif step == 24:
                 window.close()
 
-    options = {"ema": {}, "accumulation": {"accumulation": 2}, "dynamic_scale": {"dynamic_scale": True},
+    options = {"ema": {}, "accumulation": {"update": UpdateBatch(batches=2)},
+               "dynamic_scale": {"dynamic_scale": True},
                "schedule": {"optimizer": optax.inject_hyperparams(optax.adam)(
                    learning_rate=optax.cosine_decay_schedule(1e-2, 24))},
                "checkpoints": {"tmp_path": tmp_path}}[variant]
@@ -621,7 +640,7 @@ def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_i
     write's failure noted on it, and leaves no checkpoint writer behind."""
     from dew.config import RunConfig, TrainerConfig
 
-    run = RunConfig(trainer=TrainerConfig(steps=2, checkpoint_dir=str(tmp_path),
+    run = RunConfig(trainer=TrainerConfig(horizon=Horizon(steps=2), checkpoint_dir=str(tmp_path),
                                           eval_every=None, checkpoint_every=1))
     run.train(Regression(), dataset(), name="settled")
     before = checkpoint_writers()
@@ -1210,7 +1229,7 @@ def test_a_param_group_named_as_the_retired_rate_resumes(tmp_path):
     checkpoint its resume reads back."""
     from dew.optim import ParamGroup
 
-    config = OptimConfig(optimizer="adam", learning_rate=0.1, clip_grads=0,
+    config = OptimConfig(optimizer=Adam(), learning_rate=0.1, clip_grads=0,
                          param_groups=(ParamGroup("learning_rate_scale", ("*",)),))
     make_trainer(tmp_path, optimizer=config).fit(dataset(), steps=1, log_every=1)
     # An OptimConfig is built over the run's length, which the resumed fit gives.
@@ -1534,8 +1553,8 @@ def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldown
                  directory=None, rollout=None) -> TrainState:
     """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`,
     checkpointed in `directory` where one is given, its batches through any `rollout`."""
-    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation, rollout=rollout,
-                           optimizer=OptimConfig(optimizer="adamw", learning_rate=schedule))
+    trainer = make_trainer(directory, tracker=tracker, update=UpdateBatch(batches=accumulation),
+                           rollout=rollout, optimizer=OptimConfig(optimizer=AdamW(), learning_rate=schedule))
     return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps,
                        cooldowns=cooldowns)
 
@@ -1638,7 +1657,7 @@ def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best)
     cooldown_run(stable, 12, 1, uninterrupted, cooldowns)
     expected = {step: scalars["cooldown/val/loss"] for step, scalars in uninterrupted.scalars
                 if "cooldown/val/loss" in scalars}
-    optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
+    optimizer = OptimConfig(optimizer=AdamW(), learning_rate=stable)
     # The notice sent after step 3 reaches the run after step 4, as its branch begins.
     stopped = RecordingTracker()
     weights = Best(lambda scores: scores["val/loss"], weights_only=True)
@@ -1675,7 +1694,7 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     expected = {step: scalars["cooldown/val/loss"] for step, scalars in uninterrupted.scalars
                 if "cooldown/val/loss" in scalars}
     assert list(expected) == [8]
-    optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
+    optimizer = OptimConfig(optimizer=AdamW(), learning_rate=stable)
     best = Best(lambda scores: scores["val/loss"], weights_only=True) if saves == "weights-best" else None
     with pytest.raises(Preempted):
         make_trainer(tmp_path, optimizer=optimizer).fit(
@@ -1723,7 +1742,7 @@ def test_a_cooldown_a_run_could_not_score_or_decay_is_refused(refused):
     computed = optax.inject_hyperparams(optax.sgd)(learning_rate=optax.linear_schedule(0.1, 0.0, 8))
     optimizers = {"unheld": optax.sgd(0.1), "computed": computed}
     trainer = make_trainer(optimizer=optimizers.get(refused, OptimConfig()),
-                           accumulation=2 if refused == "inside" else 1)
+                           update=UpdateBatch(batches=2 if refused == "inside" else 1))
     at = 3 if refused == "inside" else 4
     with pytest.raises(ValueError):
         trainer.fit(dataset(val=val_batches(2)), steps=8, eval_every=None if refused == "unscored" else 8,
@@ -1899,7 +1918,8 @@ def test_a_split_step_whose_window_commits_before_its_last_part_logs_that_update
     (target 3, loss 9) commits it at (1 + 9) / 2 = 5, and its second part (target 5) opens the next. The
     step logged its own batch's (9 + 25) / 2 = 17 (spec alignment 2026-11-15, its first finding)."""
     rows = 2 * jax.device_count()
-    trainer = Trainer(Targeted(), optax.sgd(0.0), key=jax.random.key(0), split=2, dynamic_scale=True)
+    trainer = Trainer(Targeted(), optax.sgd(0.0), key=jax.random.key(0), fit=FitPolicy(split=2),
+                      dynamic_scale=True)
     state = trainer.initial_state()
 
     def batch(first, second):
@@ -2376,7 +2396,7 @@ def test_a_mesh_without_stages_takes_its_one_microbatch_asked_for():
         trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), **asked)
         return trainer.fit(dataset(), steps=2, log_every=1)
 
-    named, planned = fit(microbatches=1), fit()
+    named, planned = fit(fit=FitPolicy(split=1)), fit()
     for left, right in zip(jax.tree.leaves(named.variables), jax.tree.leaves(planned.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 

@@ -17,9 +17,10 @@ import pytest
 from run_kinds import MostlyKept, trained
 
 from dew.config import ModelConfig
-from dew.data import Files, Loading, phases
+from dew.data import Files, Loading, Phase, Steps, phases
 from dew.decision import Decide, decisions
 from dew.decision.config import DecisionRunConfig
+from dew.training.budget import Horizon
 
 QWEN35 = Path(__file__).parent / "fixtures" / "hf" / "qwen35-native-tiny"
 """The tiny Qwen 3.5, with its tokenizer, which lays a decision's rows out."""
@@ -69,17 +70,20 @@ def test_a_phased_decision_run_resumes_with_its_loops_passes_recomputed(tmp_path
     (`loop_remat`), memory alone: the resume takes it and trains on through the phase, where a change of
     what the run computes (its phases' passes) it refuses (row 5558)."""
     data = phased(tmp_path)
-    trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 3, "checkpoint_every": 1})
+    trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"horizon": Horizon(steps=3),
+                                                                      "checkpoint_every": 1})
     recomputed = dataclasses.replace(run(tmp_path, STEPS, data), loop_remat=True)
-    resumed, _ = trained(recomputed, tmp_path, "stopped", trainer={"steps": 4, "checkpoint_every": 1})
+    resumed, _ = trained(recomputed, tmp_path, "stopped", trainer={"horizon": Horizon(steps=4),
+                                                                   "checkpoint_every": 1})
     assert int(resumed.step) == 4
     with pytest.raises(ValueError):
-        trained(run(tmp_path, (1, 3), data), tmp_path, "stopped", trainer={"steps": 5, "checkpoint_every": 1})
+        trained(run(tmp_path, (1, 3), data), tmp_path, "stopped", trainer={"horizon": Horizon(steps=5),
+                                                                           "checkpoint_every": 1})
 
 
 def phased(root: Path):
-    return phases((asked(tickets(root, "first", "billing")), PHASE),
-                  (asked(tickets(root, "second", "sales")), None))
+    return phases(Phase(asked(tickets(root, "first", "billing")), Steps(PHASE)),
+                  Phase(asked(tickets(root, "second", "sales"))))
 
 
 def named_leaves_of(variables) -> list:
@@ -110,11 +114,12 @@ def test_a_decision_runs_first_phase_is_a_one_pass_runs_over_its_first_source(tm
     Its own cell apart from the resume's: one cell of both trained five runs (row 5531, 311 s in CI)."""
     with pytest.raises(ValueError):
         run(tmp_path, (1, 2, 3), phased(tmp_path))
-    first, _ = trained(run(tmp_path, STEPS, phased(tmp_path)), tmp_path, "first", trainer={"steps": PHASE})
+    first, _ = trained(run(tmp_path, STEPS, phased(tmp_path)), tmp_path, "first",
+                       trainer={"horizon": Horizon(steps=PHASE)})
     # The comparisons below hold on numbers: NaN equals NaN to them.
     assert all(np.all(np.isfinite(leaf)) for leaf in parameters(first).values())
     alone, _ = trained(run(tmp_path, 1, asked(tickets(tmp_path, "first", "billing"))), tmp_path, "alone",
-                       trainer={"steps": PHASE})
+                       trainer={"horizon": Horizon(steps=PHASE)})
     assert parameters(first).keys() == parameters(alone).keys()
     for name, leaf in parameters(first).items():
         np.testing.assert_array_equal(leaf, parameters(alone)[name], err_msg=name)
@@ -126,12 +131,13 @@ def test_a_decision_run_whose_passes_grow_by_phase_resumes_as_one(tmp_path):
     inside its second phase, and resumed, it lands where the run nobody stopped lands, bit for bit; its
     saved run loads with the last phase's two passes."""
     data = phased(tmp_path)
-    whole, _ = trained(run(tmp_path, STEPS, data), tmp_path, "whole", trainer={"steps": 4})
+    whole, _ = trained(run(tmp_path, STEPS, data), tmp_path, "whole", trainer={"horizon": Horizon(steps=4)})
     assert all(np.all(np.isfinite(leaf)) for leaf in parameters(whole).values())
     assert np.any(theta(whole)), "θ moves once a step runs two passes"
-    trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 3, "checkpoint_every": 1})
+    trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"horizon": Horizon(steps=3),
+                                                                      "checkpoint_every": 1})
     resumed, _ = trained(run(tmp_path, STEPS, data), tmp_path, "stopped",
-                         trainer={"steps": 4, "checkpoint_every": 1})
+                         trainer={"horizon": Horizon(steps=4), "checkpoint_every": 1})
     assert int(resumed.step) == 4
     for name, leaf in parameters(whole).items():
         np.testing.assert_array_equal(leaf, parameters(resumed)[name], err_msg=name)
@@ -152,7 +158,7 @@ def test_a_phased_run_with_a_theta_per_pass_keeps_its_rows_through_its_phases_an
 
     def per_pass(name: str, **trainer):
         return trained(dataclasses.replace(run(tmp_path, STEPS, data), loop_theta_per_pass=True), tmp_path,
-                       name, trainer={"steps": 4, "checkpoint_every": 1, **trainer})[0]
+                       name, trainer={"horizon": Horizon(steps=4), "checkpoint_every": 1, **trainer})[0]
 
     whole = per_pass("whole")
     assert theta(whole).shape[0] == STEPS[-1] - 1 and np.any(theta(whole))
@@ -250,8 +256,8 @@ def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_cou
     from dew.training import Layout, MeshSpec
     from dew.training.inspection import Inspection, inspected
 
-    settings = TrainerConfig(checkpoint_dir=str(tmp_path / "runs"), steps=4, log_every=1, eval_every=None,
-                             checkpoint_every=None, checkpoint_final=False, multi_host=False,
+    settings = TrainerConfig(checkpoint_dir=str(tmp_path / "runs"), horizon=Horizon(steps=4), log_every=1,
+                             eval_every=None, checkpoint_every=None, checkpoint_final=False, multi_host=False,
                              mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=64))
 
     def built(steps, data, name: str):
@@ -260,7 +266,7 @@ def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_cou
         readied, loader, _, _, _ = prepared.run.readied(prepared.objective, prepared.dataset, None, (), name)
         trainer = readied.built(prepared.objective, readied.trainer.mesh, None)
         # Its optimizer built over the run's length, as `fit` builds it.
-        trainer.scheduled(settings.steps)
+        trainer.scheduled(settings.horizon.steps)
         return trainer, loader
 
     stepping, loader = built(STEPS, phased(tmp_path), "phased")
@@ -302,7 +308,8 @@ def test_a_phased_runs_later_phases_are_named_from_the_first_batch_its_loop_read
     from dew.training.distributed import marked
 
     stated = run(tmp_path, STEPS, phased(tmp_path))
-    prepared = dataclasses.replace(stated, trainer=dataclasses.replace(stated.trainer, steps=4)).prepare()
+    prepared = dataclasses.replace(stated, trainer=dataclasses.replace(stated.trainer,
+                                                                       horizon=Horizon(steps=4))).prepare()
     readied = prepared.run.readied(prepared.objective, prepared.dataset, None, (), "named")
     config, loader, steps = readied[0], readied[1], readied[4]
     trainer = config.built(prepared.objective, config.trainer.mesh, prepared.rollout)
@@ -326,7 +333,8 @@ def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_bo
     from dew.nn.kernels.generation import compile_only_gpus
     from dew.nn.kernels.options import program_digest
     from dew.nn.kernels.templates import report
-    from dew.training.ahead import AheadTarget, CompiledAhead
+    from dew.training.ahead import CompiledAhead
+    from dew.training.targets import AheadTarget
 
     topology = tmp_path / "topology.bin"
     host = compile_only_gpus("sm90", 8, 40 * 2**30)
@@ -342,17 +350,19 @@ def test_a_phased_runs_later_phase_compiles_ahead_as_the_run_lowers_it_at_its_bo
     untuned = {}
     for name, target in (("ahead", phases_target), ("prepared", prepared_target)):
         with pytest.raises(CompiledAhead) as cached:
-            trained(run(tmp_path, STEPS, data), tmp_path, name, trainer={"steps": 4, "compile_ahead": target})
+            trained(run(tmp_path, STEPS, data), tmp_path, name, lowering=target,
+                    trainer={"horizon": Horizon(steps=4)})
         assert cached.value.code == 0 and cached.value.path is None and cached.value.ahead is None
         assert not (tmp_path / "runs" / name).exists()
         untuned[name] = cached.value.untuned
     # The phase's step, and the first step beside it.
     assert len(untuned["ahead"]) == 1 and len(set(untuned["prepared"])) == 2
-    trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 3, "checkpoint_every": 1})
+    trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"horizon": Horizon(steps=3),
+                                                                      "checkpoint_every": 1})
     resumed_target = AheadTarget("sm90", 8, path=str(tmp_path / "resumed.ahead"), topology=str(topology))
     with pytest.raises(ValueError) as resumed:
-        trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 4,
-                                                                         "compile_ahead": resumed_target})
+        trained(run(tmp_path, STEPS, data), tmp_path, "stopped", lowering=resumed_target,
+                trainer={"horizon": Horizon(steps=4)})
     refused = resumed.value.__cause__
     assert isinstance(refused, report.Untuned)
     assert untuned["ahead"] == (program_digest(refused.lowered),)

@@ -252,7 +252,7 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         abstract init): none where the pair's widths agree."""
         if not self.features:
             return ()
-        tree = jax.eval_shape(self.init, jax.random.key(0))
+        tree = jax.eval_shape(self.initializer, jax.random.key(0))
         return tuple(leaf.shape for leaf in tree["params"].get(PROJECTIONS, {}).values())
 
     def run_tokenizer(self) -> Tokenizer | None:

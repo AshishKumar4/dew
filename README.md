@@ -957,7 +957,8 @@ To trace a window of training, pass `Trainer` a `ProfileWindow` with the trace `
 ```python
 from dew import Evaluation, LocalTracker
 from dew.config import RunConfig, TrainerConfig
-from dew.optim import OptimConfig
+from dew.training import Horizon
+from dew.optim import Adam, OptimConfig
 from dew.registry import ModelConfig
 from dew.config.sweep import GridSearch
 from dew.data import Memory
@@ -967,8 +968,8 @@ config = RunConfig(
     # stand in for the records this chain reads.
     model=ModelConfig.from_model(objective.model),
     data=Memory(batch).repeat().batch(8),
-    optim=OptimConfig(optimizer="adam"),
-    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=40,
+    optim=OptimConfig(optimizer=Adam()),
+    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", horizon=Horizon(steps=40),
                           eval_every=None, checkpoint_every=None),
 )
 

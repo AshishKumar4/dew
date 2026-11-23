@@ -771,7 +771,7 @@ Every family below runs on one Mosaic mainloop skeleton per overlap structure (ย
    - No new function is needed: the DAG gains a "stage depends on stage" edge, which ยง6's launch DAG already is.
 2. **Mamba1's separable two-axis decay, Mamba3's rotating basis and Gated Oja's value-axis erase**: each a value or specialization of the algebra, below, with no new kernel.
 
-With these and Table 3's compositions, every row of Table 1 is expressed in the design's signatures or mapped to a specialization (state count, separable or complex per-key decay, transposition, scan mainloop), and the C class composes the same ops.
+With these and Table 3's compositions, every row of Table 1 is expressed in the design's signatures or mapped to a specialization (state count, separable per-key decay, a rotating basis's turns, transposition, scan mainloop), and the C class composes the same ops.
 
 
 ### Mamba1, Mamba3 and Gated Oja: their signatures

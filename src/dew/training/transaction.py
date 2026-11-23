@@ -1277,7 +1277,7 @@ class Transaction:
         if holds_back(current.opt_state) and self.aux_shape.effects is not None:
             raise ValueError("an objective with post-step effects (Aux.effects) under an optimizer that "
                              "holds updates back, whose held calls' effects no update applies; accumulate "
-                             "gradients with Trainer(accumulation=k)")
+                             "gradients with Trainer(update=UpdateBatch(batches=k))")
         if holds_back(current.opt_state) and current.deferred is None:
             raise ValueError("the state holds no tokens waiting for the update its optimizer holds back "
                              "(TrainState.deferred): build it with Trainer.initial_state, or restore it "

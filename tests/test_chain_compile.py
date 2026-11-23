@@ -11,12 +11,14 @@ from recording import RecordingTracker
 
 from dew import Trainer
 from dew.batch import VALID_ROWS
-from dew.data import Loading, Memory, from_grain, from_iter, mix, presets
+from dew.data import Loading, Memory, Phase, Steps, Tokens as Committed, from_grain, from_iter, mix, presets
 from dew.data.compile import compile, fitted, validation
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import ObjectiveData
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
+from dew.training import UpdateBatch
+from dew.training.budget import Horizon
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -59,36 +61,39 @@ class Tokens(grain.MapTransform):
 def test_phases_state_each_token_batch_which_one_update_s_tokens_divide_alike():
     """Phases batched by tokens compile to a loader stating each phase's token batch (`Loader.token_batches`),
     on the step clock and the token clock alike, which a run's tokens an update divide into one accumulation
-    for every phase (`TrainerConfig.accumulating`): phases of 64 and 64 tokens accumulate two of them to 128,
+    for every phase (`TrainerConfig.accumulation`): phases of 64 and 64 tokens accumulate two of them to 128,
     and phases of 64 then 32, which one accumulation would pool into updates of 128 then 64 tokens, are
     refused, as phases batched in rows are; phases of other batches with no tokens an update compile and
     train their own (row 4885)."""
     from dew.config import TrainerConfig
-    from dew.data import phases, schedule
+    from dew.data import phases
 
     rows = [{"id": np.int32(index + 1), "length": np.int32(3 + index % 12)} for index in range(32)]
     chain = Memory(rows).map(Tokens()).repeat()
-    budget = TrainerConfig(update_tokens=128, steps=4)
+    budget = TrainerConfig(update=UpdateBatch(tokens=128), horizon=Horizon(steps=4))
 
     def compiled(first, second):
-        stepped = compile(phases((chain.batch(tokens=first), 2), (chain.batch(tokens=second), None)),
+        stepped = compile(phases(Phase(chain.batch(tokens=first), Steps(2)),
+                                 Phase(chain.batch(tokens=second))),
                           read="memory", loading=READ)
-        clocked = compile(schedule([(chain.batch(tokens=first), 256), (chain.batch(tokens=second), None)]),
+        clocked = compile(phases(Phase(chain.batch(tokens=first), Committed(256)),
+                                 Phase(chain.batch(tokens=second))),
                           read="memory", loading=READ)
         return stepped, clocked
 
     for loader in compiled(64, 64):
         assert loader.token_batches == (64, 64)
-        assert budget.accumulating(loader).accumulation == 2
+        assert budget.accumulation(loader) == 2
     for loader in compiled(64, 32):
         assert loader.token_batches == (64, 32)
         with pytest.raises(ValueError):
-            budget.accumulating(loader)
-        assert TrainerConfig(steps=4).accumulating(loader).accumulation == 1
-    rowed = compile(phases((chain.batch(4), 2), (chain.batch(8), None)), read="memory", loading=READ)
+            budget.accumulation(loader)
+        assert TrainerConfig(horizon=Horizon(steps=4)).accumulation(loader) == 1
+    rowed = compile(phases(Phase(chain.batch(4), Steps(2)), Phase(chain.batch(8))), read="memory",
+                    loading=READ)
     assert rowed.token_batches == (None, None)
     with pytest.raises(ValueError):
-        budget.accumulating(rowed)
+        budget.accumulation(rowed)
 
 
 @pytest.mark.parametrize("entry", ["validation", "iterate"])
