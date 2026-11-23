@@ -15,20 +15,32 @@ passes before the last `backprop_steps` pass no gradient back: the cut is static
 scanned, the pass it cuts traced on its own and those after it scanned, so no pass before it keeps
 residuals or runs a backward. Where every pass exits (`Loop.exiting`: an exit gate, or `exits`) each
 pass's exit state leaves as the last pass's does, the coda run on its output under its own cache
-entries, so the later passes are traced one by one.
+entries: inside the scan, before the pass it precedes (`ExitingPass`), its states the scan's outputs and
+sown after it in pass order (`_sown_exits`); a decode's exits write their codas' caches pass by pass, so
+its later passes are traced one by one.
+
+A count of passes given per call (`run_loop`'s `passes`, a count drawn per microbatch) runs under one scan
+of every pass the loop's `steps` allow, each pass a branch of `lax.cond` (`lax.switch` under a cut): run
+where its step is below the count, skipped otherwise, and before the cut the count's last passes leave,
+run passing no gradient back; one program for every count, each skipped pass costing nothing.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+import functools
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax.core import lift
 from flax.core.scope import DenyList
+from flax.linen.transforms import lift_direct_transform
+from jax.sharding import NamedSharding
 
 from dew.batch import sows_appended
+from dew.nn.dense import captures_any_method
 
 from ..precision import at_least_fp32, softplus
 from ..protocols import EXIT_PASSES, EXITS
@@ -44,12 +56,21 @@ def _preamble(model, loop: Loop, x, injected, *, stop: bool, normed=None, theta=
     `theta`, which `_theta` gives an implicit loop alone)."""
     if loop.step_norm:
         x = model.norm(x) if normed is None else normed
-    x = jax.lax.stop_gradient(x) if stop else x
+    x = _stopped(x, stop)
     if loop.reinject:
         x = model.norm(x + injected)
     if theta is not None:
         x = injected + theta.astype(x.dtype) * (x - injected)
     return x
+
+
+def _stopped(value, stop):
+    """`value` cut from the gradient where `stop` says: a static bool, or a traced one (a count of passes
+    given per call, whose cut moves with it, `_Passes.counted_step`), which the gradient passes through
+    where false."""
+    if isinstance(stop, bool):
+        return jax.tree.map(jax.lax.stop_gradient, value) if stop else value
+    return jax.tree.map(lambda leaf: jnp.where(stop, jax.lax.stop_gradient(leaf), leaf), value)
 
 
 def _theta(model, loop: Loop, steps: range, *, rows: bool = False):
@@ -82,6 +103,25 @@ EXIT_ENTROPY = 0.1
 where it states none: Ouro's for its first pretraining stage, which trained its gates from their
 initialization, before it lowered β to 0.05 for the stages after (arXiv 2510.25741 v4, section 4.3.1 and its
 training table)."""
+
+
+NEVER_EXITS = -1e4
+"""The exit-gate logit a pass a call's count left unrun exits by (`never_exiting`): its chance of exiting,
+`sigmoid` of it, rounds to zero in every float a gate computes in, and so does its share of every later
+pass's log survival, so its loss and entropy terms weigh nothing and stay finite."""
+
+
+def never_exiting(logits: Sequence[jax.Array], ran: Sequence[jax.Array | bool]) -> tuple[jax.Array, ...]:
+    """Every pass's exit-gate `logits` (`Looped.exit_passes`), each earlier pass's at `NEVER_EXITS` where it
+    did not run (`ran`, a count of passes given per call, `run_loop`'s `passes`): its share the last
+    pass's, the pass the count stops at. A gate's last logit, the stack's own output's, is that pass's,
+    which always runs."""
+    if not logits or all(each is True for each in ran):
+        return tuple(logits)
+    if len(logits) - len(ran) not in (0, 1):
+        raise ValueError(f"{len(logits)} exit-gate logits for {len(ran)} passes' exits")
+    return (*(jnp.where(valid, logit, jnp.asarray(NEVER_EXITS, logit.dtype))
+              for logit, valid in zip(logits[:len(ran)], ran, strict=True)), *logits[len(ran):])
 
 
 def exit_objective(pass_losses: Sequence[jax.Array], logits: Sequence[jax.Array], entropy_weight: float,
@@ -127,7 +167,7 @@ class PassStack:
     the unrolled passes' sows did. Flax calls `inside` before `outside` within one trace, which holding
     the tree relies on."""
 
-    views: Sequence[PassView]
+    views: Sequence[PassView | ExitingPass]
     shared: bool = False
     appended: frozenset[str] = frozenset()
     held: dict = dataclasses.field(default_factory=dict)
@@ -166,11 +206,32 @@ class PassStack:
                            for name, value in tree.items()}
                 if self._per_pass(collection):
                     out.setdefault(collection, {}).update(
-                        {view._moved(name, view.offset - view.first): value
+                        {view.stored(name): value
                          for name, value in entries.items() if group_layers(name) is not None})
                     entries = {name: value for name, value in entries.items() if group_layers(name) is None}
                 out[collection] = sows_appended(out.get(collection, {}), entries)
         return out
+
+
+@dataclasses.dataclass
+class ExitingPass:
+    """A later pass of a loop whose every pass exits (`Loop.exiting`), as one step of the scan over the
+    passes sees what the stack writes: the exit of the pass before it, the coda run under that exit's own
+    entries (`exit_offset`, `coda`), and its block under its own (`block`), each shown under its layers'
+    own names (`PassView`)."""
+
+    block: PassView
+    coda: PassView
+
+    def inside(self, variables: Mapping[str, Mapping]) -> dict:
+        block, coda = self.block.inside(variables), self.coda.inside(variables)
+        return {collection: {**coda[collection], **block[collection]} for collection in block}
+
+    def stored(self, name: str) -> str:
+        """The name the step's entry `name` is stored by: its block's or its coda's, by its layer."""
+        run = group_layers(name)
+        own = self.coda if run is not None and run.start >= self.coda.first else self.block
+        return own.stored(name)
 
 
 def pass_offset(loop: Loop, layers: int, step: int) -> int:
@@ -247,11 +308,11 @@ def _entered(model, x, bank, injected, *, stop: bool, normed=None, theta=None):
     the pass before left, which the cut stops (`_passed`); else the pass before's state (`_preamble`)."""
     loop = model.loop
     if loop.messages is not None:
-        return injected, jax.lax.stop_gradient(bank) if stop else bank
+        return injected, _stopped(bank, stop)
     return _preamble(model, loop, x, injected, stop=stop, normed=normed, theta=theta), None
 
 
-def run_loop(model, x, *, train: bool, decode: bool, **inputs):
+def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
     """Run `model`'s layer stack over `x` once, or as its `loop` says (the module doc): the layers before
     its block once, the block `steps` times, each later pass reading the last one's output, normed under
     `step_norm`, and the layers after it once; the passes before the last `backprop_steps` pass no gradient
@@ -259,62 +320,178 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
     exits (`Loop.exiting`) each before the last sows its head's states (and gate logit) into `exits`; with
     `exit_threshold` the output is each token's exiting pass's (`exit_choice`) unless the caller collects
     the exits, whose last pass is the model's output. Under `messages` every pass enters the block at its
-    input and each later pass reads the bank of block summaries the pass before left (`_passed`)."""
+    input and each later pass reads the bank of block summaries the pass before left (`_passed`).
+
+    `passes`, a traced int32 scalar from 1 to `steps` the same on every device (a count drawn per
+    microbatch, `dew.training.phase_passes.SampledPasses`), runs that many passes of the one program the
+    loop's `steps` compile (`_Passes.counted`); None runs every pass."""
     loop = model.loop
+    if loop is None and passes is not None:
+        raise ValueError("a count of passes is given a model that loops none of its layers")
     if loop is None:
         return model.stack(x, train=train, decode=decode, **inputs)
-    layers = model.num_layers
-    first, end = loop.layers or (0, layers)
-    block = None if loop.layers is None else (first, end)
-
-    def pass_block(module, x, bank=None, **inputs):
-        return _passed(module, x, bank, block=block, train=train, decode=decode, **inputs)
-
-    run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
+    if passes is not None and (decode or loop.shared_cache or loop.exit_threshold is not None):
+        raise ValueError("a loop runs a count of passes given per call in training alone: not in decode, "
+                         "under a shared cache or an exit threshold, which choose their passes themselves")
+    if passes is not None and captures_any_method(model):
+        raise ValueError("a count of passes given per call runs every pass under one scan, which stacks no "
+                         "method's non-array return: capture the modules' calls (capture_intermediates=True)")
+    run = _Passes(model, train=train, decode=decode, inputs=inputs)
+    layers, (first, end) = model.num_layers, run.span
     if first:
         x = model.stack(x, span=(0, first), train=train, decode=decode, **inputs)
-    injected = x
-    shared = SharedPassView(block or (0, layers)) if loop.shared_cache else None
-    first_pass = run_block if shared is None else nn.map_variables(
-        run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.outside,
-        mutable=True)
-    x, bank = first_pass(model, model.norm(x + injected) if loop.reinject else x, **inputs)
-    cut = None if loop.backprop_steps is None else loop.steps - loop.backprop_steps
-    exited: list[tuple[jax.Array, jax.Array]] = []
+    run.injected = x
+    first_pass = run.run_block if run.shared is None else nn.map_variables(
+        run.run_block, mapped_collections=WRITTEN, trans_in_fn=run.shared.first,
+        trans_out_fn=run.shared.outside, mutable=True)
+    x, bank = first_pass(model, model.norm(x + run.injected) if loop.reinject else x, **inputs)
+    if passes is not None:
+        x, bank = run.counted(x, bank, passes)
+    else:
+        x, bank = run.fixed(x, bank)
+    if loop.reinject:
+        x = model.norm(x)
+    if end < layers:
+        x = model.stack(x, span=(end, layers), train=train, decode=decode, **inputs)
+    if loop.exit_threshold is None or model.is_mutable_collection(EXITS):
+        return x
+    return _handed_on(model, run.exited, x, loop.exit_threshold)
 
-    def entering(module, x, bank, *, stop: bool, normed=None, theta=None):
-        return _entered(module, x, bank, injected, stop=stop, normed=normed, theta=theta)
 
-    def unrolled(x, bank, step: int, view):
+@dataclasses.dataclass
+class _Passes:
+    """A loop's later passes over a model's stack (`run_loop`): traced one by one (`unrolled`), under one
+    scan (`scanned`), or under one scan of every pass the loop's `steps` allow, each pass run where a count
+    given per call reaches it (`counted`). What each exits (`Loop.exiting`) leaves as the scan's outputs,
+    sown after it in pass order (`_sown_exits`), and kept for an exit threshold's choice (`exited`)."""
+
+    model: nn.Module
+    train: bool
+    decode: bool
+    inputs: dict
+    injected: jax.Array | None = None
+    exited: list = dataclasses.field(default_factory=list)
+    span: tuple[int, int] = dataclasses.field(init=False)
+    shared: SharedPassView | None = dataclasses.field(init=False)
+    """Under `shared_cache`, the view every pass's cache is read through: the first's, the scan's and the
+    last's alike (`SharedPassView`)."""
+    run_block: Callable = dataclasses.field(init=False)
+    """One pass of the block (`_passed`), checkpointed under `remat` outside decode."""
+
+    exit_outputs: bool = dataclasses.field(init=False)
+    """Whether a scanned pass's exit leaves its normed output: where the exits are sown or chosen by a
+    threshold, or the gate's parameters made (`_sown_exits`)."""
+    exit_states: bool = dataclasses.field(init=False)
+    """Whether a scanned pass's exit leaves its exit state: where a threshold chooses among them
+    (`_handed_on`), the only reader of the state itself."""
+
+    def __post_init__(self):
+        model, loop = self.model, self.loop
+        self.span = loop.layers or (0, model.num_layers)
+        self.shared = SharedPassView(self.span) if loop.shared_cache else None
+        self.run_block = nn.remat(self.pass_block) if loop.remat and not self.decode else self.pass_block
+        self.exit_states = (loop.exiting and loop.exit_threshold is not None
+                            and not model.is_mutable_collection(EXITS))
+        self.exit_outputs = loop.exiting and (self.exit_states or model.is_mutable_collection(EXITS)
+                                              or model.is_initializing())
+
+    @property
+    def loop(self) -> Loop:
+        return self.model.loop
+
+    def pass_block(self, module, x, bank=None, **inputs):
+        block = None if self.loop.layers is None else self.span
+        return _passed(module, x, bank, block=block, train=self.train, decode=self.decode, **inputs)
+
+    def entering(self, module, x, bank, *, stop: bool, normed=None, theta=None):
+        return _entered(module, x, bank, self.injected, stop=stop, normed=normed, theta=theta)
+
+    def coda(self, module, x):
+        """A pass's exit state from its output `x`: the coda run on it, under the step's view."""
+        _, end = self.span
+        layers = self.model.num_layers
+        if end == layers:
+            return x
+        return module.stack(x, span=(end, layers), train=self.train, decode=self.decode, **self.inputs)
+
+    def fixed(self, x, bank):
+        """Every later pass, the cut static: the passes before it scanned, the one it cuts, alone, and
+        those after it scanned; under a shared cache the last after the scan, as the first runs."""
+        loop, shared = self.loop, self.shared
+        cut = None if loop.backprop_steps is None else loop.steps - loop.backprop_steps
+        scanned = range(1, loop.steps - 1 if shared is not None else loop.steps)
+        segments = ((scanned,) if cut is None or cut not in scanned else
+                    (range(scanned.start, cut), range(cut, cut + 1), range(cut + 1, scanned.stop)))
+        for steps in segments:
+            if not steps:
+                continue
+            # A pass at or before the cut exits without passing its own gradient back.
+            exit_stop, enter_stop = cut is not None and steps.stop - 1 <= cut, steps.start == cut
+            if len(steps) == 1 or (loop.exiting and self.decode) or captures_any_method(self.model):
+                # One pass is its own program; a decode's exits write their codas' caches pass by pass; a
+                # capture of any method keeps what no scan stacks (a method's non-array return).
+                for step in steps:
+                    x, bank = self.unrolled(x, bank, step, self.own_view(step), exit_stop=exit_stop,
+                                            enter_stop=step == cut)
+            else:
+                x, bank = self.scanned(x, bank, steps, exit_stop=exit_stop, enter_stop=enter_stop)
+        if shared is not None and loop.steps > 1:
+            x, bank = self.unrolled(x, bank, loop.steps - 1, shared, exit_stop=False, enter_stop=False)
+        return x, bank
+
+    def own_view(self, step: int):
+        first, end = self.span
+        offset = pass_offset(self.loop, self.model.num_layers, step)
+        return self.shared or PassView(offset, first, end - first)
+
+    def unrolled(self, x, bank, step: int, view, *, exit_stop: bool, enter_stop: bool):
         """A later pass traced alone over `view`'s collections, the one before it exiting first if all do."""
+        model, loop = self.model, self.loop
+        _, end = self.span
         normed = None
         if loop.exiting:
-            # A pass the cut holds back exits without passing its own gradient back.
-            leaving = _exit_state(model, jax.lax.stop_gradient(x) if cut is not None and step <= cut else x,
-                                  step - 1, train=train, decode=decode, **inputs)
+            leaving = _exit_state(model, jax.lax.stop_gradient(x) if exit_stop else x, step - 1,
+                                  train=self.train, decode=self.decode, **self.inputs)
             output, logit = _sown_exit(model, leaving)
             if logit is not None:  # a gated exit, which the threshold's choice weighs (`_exited`)
-                exited.append((leaving, logit))
-            normed = output if end == layers and model.normed_output else None
-        x, bank = entering(model, x, bank, stop=step == cut, normed=normed,
-                           theta=_theta(model, loop, range(step, step + 1)))
-        run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
+                self.exited.append((leaving, logit))
+            normed = output if end == model.num_layers and model.normed_output else None
+        x, bank = self.entering(model, x, bank, stop=enter_stop, normed=normed,
+                                theta=_theta(model, loop, range(step, step + 1)))
+        run = nn.map_variables(self.run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
-        out, bank = run(model, x, bank, **inputs)
-        return _stepped(loop, out, x, injected), bank
+        out, bank = run(model, x, bank, **self.inputs)
+        return _stepped(loop, out, x, self.injected), bank
 
-    def own_view(step: int):
-        return shared or PassView(pass_offset(loop, layers, step), first, end - first)
+    def stepped(self, module, carry, theta, *, exit_stop, enter_stop, block=None):
+        """One later pass inside the scan over its step's collections: the exit of the pass before it
+        where every pass exits (its exit state and its normed output, the scan's outputs where read:
+        `exit_states`, `exit_outputs`), then its block (`block`, `run_block` where None)."""
+        x, bank = carry
+        loop = self.loop
+        _, end = self.span
+        leaving = output = normed = None
+        if loop.exiting:
+            leaving = self.coda(module, _stopped(x, exit_stop))
+            output = module.exit_states(leaving)
+            normed = output if end == module.num_layers and module.normed_output else None
+        x, bank = self.entering(module, x, bank, stop=enter_stop, normed=normed, theta=theta)
+        out, bank = (block or self.run_block)(module, x, bank, **self.inputs)
+        exits = (leaving if self.exit_states else None, output if self.exit_outputs else None)
+        return (_stepped(loop, out, x, self.injected), bank), exits
 
-    def later_passes(x, bank, steps: range):
-        """The later passes `steps` in order, none of them cut: one traced on its own, more under one scan,
-        or each on its own where every pass exits."""
-        if len(steps) == 1 or loop.exiting:
-            # One pass is its own program: a scan of one would only stack and unstack its collections.
-            for step in steps:
-                x, bank = unrolled(x, bank, step, own_view(step))
-            return x, bank
+    def scanned(self, x, bank, steps: range, *, exit_stop: bool, enter_stop: bool, passes=None):
+        """The later passes `steps` under one scan over their collections (`PassStack`): each pass's what
+        it writes stacked under its block's own layer names, and where every pass exits, the exit before
+        it under its coda's (`ExitingPass`). With `passes`, a pass runs where its step is below it
+        (`_counted_step`)."""
+        model, loop, shared = self.model, self.loop, self.shared
+        layers = model.num_layers
+        first, end = self.span
         views = [PassView(pass_offset(loop, layers, step), first, end - first) for step in steps]
+        if loop.exiting:
+            views = [ExitingPass(view, PassView(exit_offset(loop, layers, step - 1), end, layers - end))
+                     for view, step in zip(views, steps, strict=True)]
         # The collections a pass sows into beside those a stack writes, which an unrolled pass appended
         # to: those the first pass made, and captured intermediates, which a capture of a module only the
         # later passes call first makes inside the scan (the final norm `_preamble` reads by).
@@ -327,18 +504,19 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         entering_cache = None if shared is None else (shared.entering if shared.entering is not None
                                                      else model.variables.get('cache') or None)
 
-        def later(module, carry, theta):
+        def later(module, carry, step_inputs):
             # The block's input, its per-layer inputs and the entering cache close over the scan.
-            x, bank = entering(module, *carry, stop=False,
-                               theta=_theta(module, loop, steps) if theta is None else theta)
+            theta, step = step_inputs
+            theta = _theta(module, loop, steps) if theta is None else theta
+            if passes is not None:
+                return self.counted_step(module, carry, theta, step, passes)
             if entering_cache is None:
-                out, bank = run_block(module, x, bank, **inputs)
-                return (_stepped(loop, out, x, injected), bank), None
-            reading = nn.map_variables(run_block, mapped_collections='cache',
-                                       trans_in_fn=lambda variables: {**variables, 'cache': entering_cache},
-                                       mutable=True)
-            out, bank = reading(module, x, bank, **inputs)
-            return (_stepped(loop, out, x, injected), bank), None
+                return self.stepped(module, carry, theta, exit_stop=exit_stop, enter_stop=enter_stop)
+            reading = nn.map_variables(
+                functools.partial(self.stepped, exit_stop=exit_stop, enter_stop=enter_stop),
+                mapped_collections='cache', mutable=True,
+                trans_in_fn=lambda variables: {**variables, 'cache': entering_cache})
+            return reading(module, carry, theta)
 
         stacked = tuple(collection for collection in mapped if shared is None or collection != 'cache')
         scan = nn.scan(later, variable_axes={stacked: 0},
@@ -347,27 +525,126 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
                        length=len(steps), metadata_params={nn.PARTITION_NAME: None})
         run = nn.map_variables(scan, mapped_collections=mapped, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
-        # Each pass's own θ row, if it holds one.
-        (x, bank), _ = run(model, (x, bank), _theta(model, loop, steps, rows=True))
+        # Each pass's own θ row, if it holds one, and its step.
+        (x, bank), (leavings, outputs) = run(model, (x, bank), (
+            _theta(model, loop, steps, rows=True), jnp.arange(steps.start, steps.stop, dtype=jnp.int32)))
+        if self.exit_outputs:
+            ran = None if passes is None else jnp.arange(steps.start, steps.stop) < passes
+            self.exited.extend(_sown_exits(model, leavings, outputs, ran))
         return x, bank
 
-    # Under a shared cache the last pass keeps its writes and runs as the first does, after the scan.
-    scanned = range(1, loop.steps - 1 if shared is not None else loop.steps)
-    # The cut is static: the passes before it, the one it cuts, alone, and those after it.
-    segments = ((scanned,) if cut is None or cut not in scanned else
-                (range(scanned.start, cut), range(cut, cut + 1), range(cut + 1, scanned.stop)))
-    for steps in segments:
-        if steps:
-            x, bank = later_passes(x, bank, steps)
-    if shared is not None and loop.steps > 1:
-        x, bank = unrolled(x, bank, loop.steps - 1, shared)
-    if loop.reinject:
-        x = model.norm(x)
-    if end < layers:
-        x = model.stack(x, span=(end, layers), train=train, decode=decode, **inputs)
-    if loop.exit_threshold is None or model.is_mutable_collection(EXITS):
-        return x
-    return _handed_on(model, exited, x, loop.exit_threshold)
+    def counted(self, x, bank, passes):
+        """Every later pass the loop's `steps` allow under one scan, each run where its step is below
+        `passes` (`counted_step`): one program for every count."""
+        return self.scanned(x, bank, range(1, self.loop.steps), exit_stop=False, enter_stop=False,
+                            passes=passes)
+
+    def counted_step(self, module, carry, theta, step, passes):
+        """A later pass of a count given per call (`counted`): skipped at or past `passes`, its state and
+        bank carried as they are, its exit's state zero; before the cut the last `backprop_steps` passes
+        leave (`passes - backprop_steps`), run passing no gradient back, the state at the cut stopped, as
+        the static cut's passes are (`fixed`); else run. Each branch of `lax.cond`/`lax.switch` runs alone
+        and its transpose alone, so a skipped pass or one before the cut costs nothing backward, and the
+        block's program is traced once a branch."""
+        # The pass checkpointed whole, its branch among them, not its block within the branch: the scan
+        # saves each step's entering carry alone, as a loop of every pass saves its block's. The pass the
+        # cut stops exits and enters stopped, where a static cut stops them (`fixed`).
+        backprop = self.loop.backprop_steps
+
+        def branched(module, carry, step, passes):
+            at_cut = False if backprop is None else step == passes - backprop
+
+            def run(module, carry):
+                return self.stepped(module, carry, theta, exit_stop=at_cut, enter_stop=at_cut,
+                                    block=self.pass_block)
+
+            def skip(module, carry):
+                x, _ = carry
+                zero = jnp.zeros_like(x)
+                output = module.exit_states(zero) if self.exit_outputs else None
+                return carry, (zero if self.exit_states else None, output)
+
+            if backprop is None:
+                return _sown_switch((step < passes).astype(jnp.int32), (skip, run), module, carry)
+
+            def held_back(module, carry):
+                # A pass before the cut passes no gradient back through its block, its state stopped where
+                # it leaves; its exit, read from the state stopped where it enters the coda, still trains
+                # the coda, the norm and the gate, as the static cut's exits do (`fixed`).
+                state, exits = self.stepped(module, carry, theta, exit_stop=True, enter_stop=False,
+                                            block=self.pass_block)
+                return jax.lax.stop_gradient(state), exits
+
+            index = jnp.where(step >= passes, 0, jnp.where(step < passes - backprop, 1, 2))
+            return _sown_switch(index, (skip, held_back, run), module, carry)
+
+        stepping = nn.remat(branched) if self.loop.remat else branched
+        return stepping(module, carry, step, passes)
+
+
+def _sown_switch(index, branches, module, *operands):
+    """`nn.switch` over Flax module functions whose last branch, a pass, sows what the others do not (its
+    attention's statistics, its routers' loads, captures: what a pass writes beside its state): each other
+    branch's collections take the pass's shape, its own entries kept and what it does not sow zero, so
+    the branches agree, as `lax.switch` asks (`_shaped_like`). A skipped pass's sows are zero; a reader
+    weighs them by the count it gave (`run_loop`'s `passes`)."""
+    count = len(branches)
+
+    def transform(*parts):
+        functions, (scope, index, *operands) = parts[:count], parts[count:]
+
+        def inner(scope_fn, repack_fn, variable_groups, rng_groups):
+            def branch(function, *operands):
+                scope = scope_fn(variable_groups, rng_groups)
+                return function(scope, *operands), repack_fn(scope)
+
+            pure = [functools.partial(branch, function) for function in functions]
+            _, sown = jax.eval_shape(pure[-1], *operands)
+
+            def agreeing(function):
+                def run(*operands):
+                    out, variables = function(*operands)
+                    return out, _shaped_like(variables, sown)
+                return run
+
+            return jax.lax.switch(index, [agreeing(function) for function in pure], *operands)
+
+        return lift.pack(inner, (True,), (True,), (True,), name='switch')(scope)
+
+    return lift_direct_transform(transform, tuple(branches), module, index, *operands)
+
+
+def _shaped_like(value, shape):
+    """`value` (a branch's collections) in `shape`'s tree (the pass's, `jax.eval_shape`'s): each entry
+    `value` holds at a place of `shape` kept, each it lacks zeros of its shape; each container rebuilt as
+    `shape`'s own type (a `FrozenDict`, a `dict`, a tuple of sows), so the branches' trees agree."""
+    rebuilt: Callable[..., object] = type(shape)
+    if isinstance(shape, Mapping):
+        held = value if isinstance(value, Mapping) else {}
+        return rebuilt({key: _shaped_like(held.get(key), each) for key, each in shape.items()})
+    if isinstance(shape, (tuple, list)):
+        held = value if isinstance(value, (tuple, list)) else ()
+        return rebuilt([_shaped_like(held[index] if index < len(held) else None, each)
+                        for index, each in enumerate(shape)])
+    if shape is None:
+        return None
+    if value is not None:
+        return value
+    # Any other node (a boxed variable's partitioning, `nn.LogicallyPartitioned`) by its leaves.
+    return jax.tree.map(_zero_like, shape)
+
+
+def _zero_like(shape: jax.ShapeDtypeStruct) -> jax.Array:
+    """A zero typed as the pass's own entry `shape` is, which a zero of its shape alone would differ from:
+    varying over the manual axes it varies over (a batch-split forward's statistic under `shard_map`, its
+    rows' maxima), placed as it is on a mesh whose types carry the split."""
+    placed = shape.sharding if isinstance(shape.sharding, NamedSharding) else None
+    zero = jnp.zeros(shape.shape, shape.dtype, out_sharding=placed)
+    manual = shape.manual_axis_type
+    if manual is not None and manual.varying:
+        # Both at once on a mesh of manual and explicit axes (a `shard_map` over one of its axes).
+        return jax.lax.pcast(zero, tuple(sorted(manual.varying)), to="varying")
+    return zero
 
 
 def _handed_on(model, exited, last, threshold: float) -> jax.Array:
@@ -379,6 +656,24 @@ def _handed_on(model, exited, last, threshold: float) -> jax.Array:
         last, chosen = _exited(exited, last, threshold)
     model.sow(EXIT_PASSES, 'chosen', chosen)
     return last
+
+
+def _sown_exits(model, leavings, outputs, ran) -> list[tuple[jax.Array, jax.Array]]:
+    """The scanned passes' exits (`_Passes.scanned`), their exit states `leavings` (None where no threshold
+    reads them) and normed outputs `outputs` stacked on a leading pass axis, sown into `exits` in pass order
+    as `_sown_exit` sows each: their gate logits (where the loop gates its exits) and the states the head
+    reads; with `ran` (a count given per call), whether each pass ran, sown beside them (`ran`), a
+    skipped pass's exit computed from a zero state. Their `(state, gate logit)` pairs for a threshold's
+    choice (`_exited`)."""
+    logits = model.early_exit_gate(outputs) if model.loop.exit_gate else None
+    if not model.is_initializing():
+        for index in range(outputs.shape[0]):
+            if logits is not None:
+                model.sow(EXITS, 'logits', logits[index])
+            model.sow(EXITS, 'states', model.head_states(outputs[index]))
+            if ran is not None:
+                model.sow(EXITS, 'ran', ran[index])
+    return [] if logits is None or leavings is None else list(zip(leavings, logits, strict=True))
 
 
 def _sown_exit(model, leaving):

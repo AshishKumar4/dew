@@ -70,7 +70,7 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, processor_settings
 from dew.inputs import Field, InputSpec
-from dew.nn.backbones.looping import exit_objective
+from dew.nn.backbones.looping import exit_objective, never_exiting
 from dew.nn.continuum import feedforward_levels
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
@@ -513,7 +513,8 @@ class Scores(NamedTuple):
     logits: jax.Array | None = None
     inspected: dict | None = None
     moved: Mapping | None = None
-    exits: tuple[tuple[jax.Array, ...], tuple[jax.Array, ...], tuple[jax.Array, ...] | None] | None = None
+    exits: tuple[tuple[jax.Array, ...], tuple[jax.Array, ...], tuple[jax.Array, ...] | None,
+                 tuple[jax.Array | bool, ...]] | None = None
 
 
 def _refuse_stacked(collections: Sequence[str], *, depths: bool, layers: Sequence[int], routes,
@@ -777,9 +778,13 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         (`_reads_exits`), the last's alone otherwise."""
         return model.loop.steps if self._reads_exits(model) else 1
 
-    def _weights_over(self, model) -> tuple[float, ...]:
-        """Each pass's weight in the loss over `model`'s passes (`PassWeights.over`), where it weighs them."""
+    def _weights_over(self, model, ran: Sequence[jax.Array | bool] = ()) -> Sequence[float | jax.Array]:
+        """Each pass's weight in the loss over `model`'s passes (`PassWeights.over`), where it weighs them;
+        where a count given per call ran some of them (`ran` traced), over those that ran
+        (`PassWeights.ran`)."""
         assert self.pass_weights is not None
+        if not all(isinstance(each, bool) for each in ran):
+            return self.pass_weights.ran(ran)
         weights = self.pass_weights.over(model.loop.steps)
         assert weights is not None, "the loss weighs a pass before the last"
         return weights
@@ -1082,7 +1087,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         its predecessor's state where forks give them (`before`), the last pass's from `last` (its losses
         and whether it was right); every pass's exit-gate logit; and, where the last pass's correctness is
         asked for, each pass's."""
-        states, logits = self._looped().exit_passes(gathered)
+        exited = self._looped().exit_passes(gathered)
+        states, logits, ran = exited.states, exited.logits, exited.ran
         if before is not None:
             states = tuple(_predicted(state, before) for state in states)
         losses, correct = last
@@ -1090,7 +1096,9 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         earlier = [self.head_terms(self.model, params, state, targets, predict=predict) for state in states]
         right = None if not predict else (
             *((predicted == targets).astype(losses.dtype) for _, predicted, _ in earlier), correct)
-        return (*(terms[0] for terms in earlier), losses), logits, right
+        # A pass the call's count left unrun exits at no chance (`never_exiting`; row 11951's design: one
+        # program at the loop's cap).
+        return (*(terms[0] for terms in earlier), losses), never_exiting(logits, ran), right, ran
 
     def _looped(self) -> Looped:
         """The model as the looped decoder the exit objective weighs (`Looped`)."""
@@ -1790,13 +1798,14 @@ class LMObjective(TokenScorer):
         if correct is not None:
             reported["token_accuracy"] = self.accuracy(correct, batch, weights)
         if passes is not None and self.exit_entropy is None:
-            # Each pass's cross entropy at its weight in the last pass's place, over the same counted targets.
-            term = weighed(self._weights_over(self.model), passes[0])
+            # Each pass's cross entropy at its weight in the last pass's place, over the same counted targets:
+            # where a count given per call ran some of the passes, over those alone (`PassWeights.ran`).
+            term = weighed(self._weights_over(self.model, passes[3]), passes[0])
             units = shares(term, weights)
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
         elif passes is not None and self.exit_entropy is not None:
             # Ouro's exit objective in the cross entropy's place, over the same counted targets.
-            pass_losses, gates, _ = passes
+            pass_losses, gates, _, _ = passes
             term, expected, entropy = exit_objective(pass_losses, gates, self.exit_entropy, width)
             units = shares(term, weights)
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
@@ -1876,13 +1885,18 @@ class LMObjective(TokenScorer):
         scored = TokenScores(scores.losses, scores.weights, scores.correct)
         if self.pass_weights is None or scores.exits is None:
             return scored
-        terms, _, right = scores.exits
+        terms, _, right, ran = scores.exits
         assert right is not None, "a scoring predicts every pass"
-        mass = jax.lax.stop_gradient(self.row_mean(scores.weights, batch).total) if losses else None
-        return scored, PassReports(tuple(
-            (None if mass is None else Ratio(self.row_mean(term, batch, weights=scores.weights).total, mass),
-             TokenScores(term, scores.weights, correct))
-            for term, correct in zip(terms, right, strict=True)))
+        # A pass a count given per call left unrun weighs none of its report (`ExitPasses.ran`).
+        ran = (*ran, True) if ran else (True,) * len(terms)
+        reported = []
+        for term, correct, each in zip(terms, right, ran, strict=True):
+            weights = scores.weights if isinstance(each, bool) else scores.weights * each.astype(
+                scores.weights.dtype)
+            mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total) if losses else None
+            loss = None if mass is None else Ratio(self.row_mean(term, batch, weights=weights).total, mass)
+            reported.append((loss, TokenScores(term, weights, correct)))
+        return scored, PassReports(tuple(reported))
 
     def _validation_scores(self, params, batch, step: Step) -> tuple[
             Ratio | RoutedStatistics, TokenScores | tuple[TokenScores, PassReports]]:

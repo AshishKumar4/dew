@@ -1052,7 +1052,7 @@ class CausalTransformer(LinearProducts):
                  attention_key_valid=None,
                  right_padded: bool = False, coordinates: Coordinates | None = None,
                  conditioning: Mapping[str, jax.Array] | None = None, progress: Progress | None = None,
-                 routed_experts=None, routed=None):
+                 routed_experts=None, routed=None, loop_passes=None):
         # The call's token layout, converted once (`token_coordinates`): the trunk and the
         # prediction depths read its coordinates alone. A routing replay (`routed_experts`, `routed`) as
         # `hidden_and_mtp_inputs` reads it.
@@ -1064,7 +1064,7 @@ class CausalTransformer(LinearProducts):
             attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
             attention_key_runs=attention_key_runs, attention_key_valid=attention_key_valid,
             coordinates=coordinates, conditioning=conditioning,
-            progress=progress, routed_experts=routed_experts, routed=routed)
+            progress=progress, routed_experts=routed_experts, routed=routed, loop_passes=loop_passes)
         if self.is_initializing() and self.dspark is not None:
             decoder_drafts.reach(self, tokens, x.dtype)
         if self.is_initializing() and self.mtp:
@@ -1277,7 +1277,8 @@ class CausalTransformer(LinearProducts):
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
                               coordinates: Coordinates | None = None,
                               conditioning: Mapping[str, jax.Array] | None = None,
-                              whole_blocks: bool = False, progress: Progress | None = None):
+                              whole_blocks: bool = False, progress: Progress | None = None,
+                              loop_passes=None):
         """Return the final normalized states and the prediction depths' input.
 
         V4's depth reads the raw residual streams from before the collapse head
@@ -1327,6 +1328,10 @@ class CausalTransformer(LinearProducts):
           document's whole run of real tokens (`AttentionMetadata.whole_blocks`).
         - `progress` is a training step's (`dew.nn.progress`), which its DEX
           layers anneal over; None is the run's end, outside a training step.
+        - `loop_passes`, a traced int32 scalar the same on every device, is
+          how many of its `loop`'s passes a training call runs, from one
+          program of `loop.steps` (`looping.run_loop`): a count drawn per
+          microbatch. None runs every pass.
         """
         if decode and coordinates is not None and coordinates.max_segments > 1:
             # A cache keeps a packed row's real tokens alone (`real_slots`): its padding writes no key and
@@ -1348,6 +1353,7 @@ class CausalTransformer(LinearProducts):
             decode=decode,
             per_layer_input=ple,
             attention_metadata=attention_metadata,
+            passes=loop_passes,
         )
         return self._exited(residual)
 
@@ -1434,7 +1440,10 @@ class CausalTransformer(LinearProducts):
     def exit_passes(self, collections: Mapping[str, Mapping]) -> ExitPasses:
         """What a forward with `exits` open gathered (`Looped`): a loop of one pass has no earlier pass."""
         exits = collections[EXITS]
-        return tuple(exits.get('states', ())), tuple(exits.get('logits', ()))
+        states = tuple(exits.get('states', ()))
+        # A forward that ran every pass: each `True`, known as it traces.
+        ran = tuple(exits.get('ran', ())) or (True,) * len(states)
+        return ExitPasses(states, tuple(exits.get('logits', ())), ran)
 
     def head_states(self, normed):
         """The states the head reads from the final norm's `normed`: divided by `logits_scaling`, in at
