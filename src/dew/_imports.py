@@ -99,16 +99,19 @@ class Walk:
         seen: set[str] = set()
         sites: set[str] = set()
         pending = list(roots)
-        while pending:
-            module = pending.pop()
-            if module in seen:
-                continue
-            seen.add(module)
-            imported, found = self.imports(module)
-            sites.update(found)
-            pending.extend(imported - seen)
-        self._parsed.clear()
-        self._trees.clear()
+        try:
+            while pending:
+                module = pending.pop()
+                if module in seen:
+                    continue
+                seen.add(module)
+                imported, found = self.imports(module)
+                sites.update(found)
+                pending.extend(imported - seen)
+        finally:
+            # Let go however the walk ends, a module changed under it among them (`_Changed`).
+            self._parsed.clear()
+            self._trees.clear()
         return frozenset(seen), tuple(sorted(sites))
 
 

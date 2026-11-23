@@ -1048,6 +1048,17 @@ def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_i
     np.testing.assert_array_equal(got, expected)
 
 
+def test_a_tcgen05_tiles_stated_chunk_holds_no_more_than_the_piece_its_epilogue_reads_out():
+    """A 128-column tcgen05 tile, read out of tensor memory 64 columns at a time (`Issuer.chunk_columns`),
+    stages its output in a stated chunk of those 64 columns, and is refused one of 128, which holds two of
+    its pieces at once (theme K01-g's review: the tile's width alone was checked)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    outputs, family = (((mosaic_sm100.RINGS.rows, 128), jnp.bfloat16),), mosaic_sm100.RINGS
+    assert family.output_staging(outputs, 1, (64, 1))
+    pytest.raises(ValueError, family.output_staging, outputs, 1, (128, 1))
+
+
 @pytest.mark.parametrize("rows", [4, 8, 16, 24, 32])
 @pytest.mark.parametrize("generation_name", gate_generations())
 def test_a_few_rows_lower_on_every_bundle_their_device_issues(generation_name, rows):

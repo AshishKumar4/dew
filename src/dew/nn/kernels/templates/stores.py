@@ -47,16 +47,20 @@ def staged_columns(columns: int, dtypes) -> int:
     return math.gcd(columns, STAGED_BYTES // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
 
 
-def output_staging(columns: int, dtypes, staging: tuple[int, int] | None = None) -> tuple[int, int]:
+def output_staging(columns: int, dtypes, staging: tuple[int, int] | None = None, *,
+                   piece: int | None = None) -> tuple[int, int]:
     """The columns of each chunk a consumer stages a `columns`-wide output tile in (`staged_columns`) and
     the chunk buffers it holds (`OUTPUT_BUFFERS`, at most its chunks), or `staging`'s (chunk columns,
     buffers) where a launch states them: the tile's output staged in its chunks' shared memory rather than
     its whole width, CUTLASS's sub-tiled epilogue, which leaves the mainloop's ring the rest of the block
     (its StageCountAutoCarveout). Fewer buffers or narrower chunks leave the ring a stage more where the
-    block falls a stage short (an sm120 GEMM's 128 x 256 tile, row 5634, M-FS-62)."""
+    block falls a stage short (an sm120 GEMM's 128 x 256 tile, row 5634, M-FS-62). A chunk divides the
+    `piece` its issuer emits at once (`Issuer.chunk_columns`, the tile's width where none is given): a
+    tcgen05 tile of 128 columns emits pieces of 64, which a 128-column chunk does not hold."""
     chunk, buffers = (staged_columns(columns, dtypes), OUTPUT_BUFFERS) if staging is None else staging
-    if columns % chunk or buffers < 1:
-        raise ValueError(f"a {columns}-column output tile stages in no {buffers} buffers of {chunk} columns")
+    if columns % chunk or (piece or columns) % chunk or buffers < 1:
+        raise ValueError(f"a {columns}-column output tile emitted {piece or columns} columns at once stages "
+                         f"in no {buffers} buffers of {chunk} columns")
     return chunk, min(columns // chunk, buffers)
 
 

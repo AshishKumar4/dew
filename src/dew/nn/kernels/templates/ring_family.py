@@ -175,7 +175,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def output_staging(self, outputs: tuple, consumers: int, chunks: tuple[int, int] | None = None) -> list:
         # Each consumer's share of each output in its chunk buffers, not the whole tile (`output_staging`).
-        staged = [(shape, dtype, output_staging(shape[1], (dtype,), chunks)) for shape, dtype in outputs]
+        staged = [(shape, dtype,
+                   output_staging(shape[1], (dtype,), chunks, piece=self.chunk_columns(shape[1])))
+                  for shape, dtype in outputs]
         return [plgpu.SMEM((consumers, buffers, shape[0], chunk), dtype)
                 for shape, dtype, (chunk, buffers) in staged]
 
