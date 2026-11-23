@@ -30,6 +30,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     column_share,
     head_layout,
     head_slice,
+    head_unlayout,
     held_params,
     issued_into,
     modelled,
@@ -337,7 +338,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                     ((block_q, share[1]),) * (2 if walk.accurate else 1),
                     walk.interpret, first=counted))
             dq, *keyed = accumulated
-            rows = head_slice(family, row, head, pl.ds(first, block_q))
+            rows = head_slice(family, row, head, pl.ds(first, block_q), dq_ref.dtype, width=dq.shape[1])
             written = [(dq, dq_ref.at[rows])]
             if keyed_ref is not None:
                 written.append((keyed[0], keyed_ref.at[rows]))
@@ -367,7 +368,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                       **products)
     # Its outputs as its query's axes (`outputs.Output`): dQ's share of the columns, and its rows' statistics.
     rows, positions, heads_of = (outputs.axis(query, index) for index in range(3))
-    sums = outputs.output(jnp.float32, *head_slice(family, rows, heads_of, positions),
+    sums = outputs.output(jnp.float32, *head_slice(family, rows, heads_of, positions, jnp.float32),
                           column_share(query, share[1]))
     stats_shape = outputs.output(jnp.float32, rows_count, rows, heads_of, positions)
     launch = family.kernel(
@@ -386,4 +387,5 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     out = launch(query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
-    return head_layout(family, dq), None if keyed is None else head_layout(family, keyed), rows
+    return (head_unlayout(family, dq, heads), None if keyed is None else head_unlayout(family, keyed, heads),
+            rows)

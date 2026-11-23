@@ -13,6 +13,7 @@ import dataclasses
 import functools
 import hashlib
 import importlib.metadata
+import json
 import logging
 import os
 import sys
@@ -25,6 +26,8 @@ import jax
 from dew._builds import dew_cache_dir
 from dew._devices import cuda_builds, deterministic_ops_requested, xla_flag
 from dew._facts import Held, recording, replay, still
+from dew._files import is_uri, write_atomically
+from dew._records import JSON
 
 _log = logging.getLogger(__name__)
 
@@ -67,11 +70,7 @@ def hub_answer[Answer](question: tuple[str, ...], ask: Callable[[], Answer]) -> 
     OfflineModeIsEnabled as every Hub call does under HF_HUB_OFFLINE, the answer last recorded
     (`recorded_hub_answer`). What an online run pinned (a revision's commit, a commit's files) so
     resolves the same offline; a question never answered online raises the offline error."""
-    import json
-
     from huggingface_hub.errors import OfflineModeIsEnabled
-
-    from dew._files import write_atomically
 
     try:
         value = ask()
@@ -88,8 +87,6 @@ def hub_answer[Answer](question: tuple[str, ...], ask: Callable[[], Answer]) -> 
 
 def recorded_hub_answer(question: tuple[str, ...]) -> HubAnswer | None:
     """The answer `hub_answer` last recorded to `question`, or None where it recorded none."""
-    import json
-
     record = _hub_record(question)
     if not os.path.isfile(record):
         return None
@@ -102,9 +99,6 @@ def _hub_record(question: tuple[str, ...]) -> str:
     """Where `question`'s answer is recorded: a file named by the hash of its parts, which no
     revision's text can steer outside the answers' directory; the record holds the question
     beside the answer."""
-    import hashlib
-    import json
-
     answers = os.environ.get("DEW_HUB_ANSWERS") or os.path.join(dew_cache_dir(), "hub")
     return os.path.join(answers, hashlib.sha256(json.dumps(list(question)).encode()).hexdigest() + ".json")
 
@@ -131,14 +125,48 @@ def default_compilation_cache_dir() -> str:
     return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}")
 
 
-def beside_compilation_cache(variable: str, name: str) -> Path | None:
-    """Where a record every process sharing the persistent compilation cache shares lives (a step's rungs):
-    the environment `variable` when set, else `name` in the directory JAX is
-    configured with (`jax_compilation_cache_dir`), or nowhere when the process keeps no cache."""
-    if path := os.environ.get(variable):
-        return Path(path)
-    cache = jax.config.jax_compilation_cache_dir
-    return None if not cache else Path(cache) / name
+def kept_beside(name: str, *, variable: str | None = None, configured: bool = False) -> Path | None:
+    """The directory where records that every process sharing the compilation cache shares are kept, for
+    example a step's rungs, a program's communicators or a code's closure. It is the environment
+    `variable`'s directory where that names one, else `name` inside the cache's directory: the directory
+    JAX is configured with (`jax_compilation_cache_dir`), or, where `configured` is False, the one a run
+    keeps by default (`default_compilation_cache_dir`). It is None where `configured` asks for a
+    configured cache and the process keeps none, or where the cache is a bucket's (gs://, `is_uri`),
+    whose client fails in ways of its own: such records are made again in each process. Each record is
+    read with `read_kept` and kept with `keep`."""
+    if variable is not None and (named := os.environ.get(variable)):
+        return Path(named)
+    cache = jax.config.jax_compilation_cache_dir if configured else default_compilation_cache_dir()
+    return None if not cache or is_uri(cache) else Path(cache) / name
+
+
+def read_kept(path: Path) -> JSON | None:
+    """The record kept at `path` (`keep`), or None where none is or it cannot be read (a home it cannot
+    open, whose write the keeping then logs as its miss), or where it does not parse (another writer's
+    partial or truncated file, or bytes no UTF-8 text holds), in which case its maker makes it again, that
+    miss logged."""
+    try:
+        held = path.read_bytes()
+    except OSError as unopened:
+        _log.debug("no record kept at %s to read (%s)", path, unopened)
+        return None
+    try:
+        # Decoding and parsing alike: a `UnicodeDecodeError` is a `ValueError`.
+        return json.loads(held.decode())
+    except ValueError as unread:
+        _log.warning("the record kept at %s is unreadable (%s): it is made again", path, unread)
+        return None
+
+
+def keep(path: Path, record: JSON, what: str) -> None:
+    """`record` kept at `path`, whole or not at all (`write_atomically`). A directory that cannot be
+    written, such as a read-only home or a file where the directory would be, keeps nothing: the miss is
+    logged naming `what`, and a later process makes the record again."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(path, json.dumps(record, sort_keys=True))
+    except OSError as refused:
+        _log.warning("%s is not kept at %s (%s): a later process makes it again", what, path, refused)
 
 
 _UNCACHED = threading.RLock()
@@ -642,8 +670,6 @@ def hub_commit(repo: str, revision: str | None, *, repo_type: str = "model") -> 
     whichever tool moved it."""
     from huggingface_hub import HfApi, constants
     from huggingface_hub.errors import OfflineModeIsEnabled
-
-    from dew._files import write_atomically
 
     branch = revision or constants.DEFAULT_REVISION
     # The keys earlier runs recorded: a model's default branch as main, a dataset's as HEAD.

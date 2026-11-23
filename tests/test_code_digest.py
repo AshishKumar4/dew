@@ -164,6 +164,7 @@ class Kept(logging.Handler):
         logged.append(record.getMessage())
 
 
+logging.getLogger("dew._cache").addHandler(Kept())
 logging.getLogger("dew._code").addHandler(Kept())
 from dew._code import code_digest
 digest = code_digest("dew.communicators")

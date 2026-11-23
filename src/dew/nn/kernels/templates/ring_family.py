@@ -15,7 +15,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import after_walk, emission, handoffs, persistent, resources, swizzling
+from dew.nn.kernels.templates import after_walk, emission, handoffs, persistent, resources, stores, swizzling
 from dew.nn.kernels.templates.cost import Stated, Work
 from dew.nn.kernels.templates.mosaic import (
     Family,
@@ -372,11 +372,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             # Mosaic GPU's interpreter (jax 0.11.2) takes no TMA reduction.
             view[...] = view[...] + value
             return
-        # A TMA reduce from `smem` a chunk of its columns at a time (`chunked`), the reads of it the add
-        # before made done first (`pending` of the earlier ones' through their own buffers still going on);
-        # its writes go on.
-        for index, (piece, place) in enumerate(chunked(value, view, smem)):
-            plgpu.wait_smem_to_gmem(pending if index == 0 else 0, wait_read_only=True)
-            smem[...] = piece
+        # A TMA reduce from `smem` a chunk of its columns at a time (`chunked`), rank-2 as the one-buffer
+        # case of a rank-3 `(buffers, rows, cols)` stage (`stores.buffer_waits`, row 5272), with `pending`
+        # earlier adds reading their own buffers folded into chunk 0's wait.
+        buffers = tuple(smem.at[i] for i in range(smem.shape[0])) if smem.ndim == 3 else (smem,)
+        chunks = chunked(value, view, buffers[0])
+        waits = stores.buffer_waits(len(chunks), len(buffers))
+        for index, ((piece, place), wait) in enumerate(zip(chunks, waits, strict=True)):
+            buf = buffers[index % len(buffers)]
+            plgpu.wait_smem_to_gmem(wait + pending if index == 0 else wait, wait_read_only=True)
+            buf[...] = piece
             plgpu.commit_smem()
-            plgpu.copy_smem_to_gmem(smem, place, reduction_op="add")
+            plgpu.copy_smem_to_gmem(buf, place, reduction_op="add")

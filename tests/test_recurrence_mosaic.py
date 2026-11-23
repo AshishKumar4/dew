@@ -778,7 +778,7 @@ def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():
     infinite and its remainder NaN."""
     largest = float(jnp.finfo(jnp.float32).max)
     x = jnp.array([largest, -largest, 1.0 + 2.0 ** -20, -3.0e-30, 0.0], jnp.float32)
-    parts = product.formed(x, product.EXACT_PARTS)
+    parts = product.formed(x, product.bf16_part_count(jnp.float32, accurate=True))
     assert all(bool(jnp.all(jnp.isfinite(part))) for part in parts)
     total = sum(np.asarray(part, np.float64) for part in parts)
     np.testing.assert_array_equal(total, np.asarray(x, np.float64))
