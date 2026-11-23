@@ -5,18 +5,21 @@ then merges column-tile summaries via `dew.nn.categorical.rescaled` and `dew.nn.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from collections.abc import Callable
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
+from jax.custom_derivatives import zero_from_primal
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn import categorical
-from dew.nn.kernels import generation, grouped_launch, tuning
+from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
+from dew.nn.kernels import generation, grouped_launch, selection, tuning, xla_products
 from dew.nn.kernels.templates import (
     bundles,
     cost as unit_cost,
@@ -37,6 +40,7 @@ from dew.nn.kernels.templates.gemm.mosaic_gpu import (
     _walked_products,
     multicast,
     pair_takes,
+    sides_extended,
 )
 from dew.nn.kernels.templates.gemm.pricing import (
     TilesTemplate,
@@ -47,7 +51,8 @@ from dew.nn.kernels.templates.gemm.pricing import (
     tile_rows,
 )
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, exact_products
+from dew.nn.sharding import automatic_axes
 
 LINEAR_CE = "dew_linear_ce"
 """Kernel name for GEMM-fused linear cross-entropy launches."""
@@ -579,3 +584,126 @@ def linear_ce_backward(x: jax.Array, weight: jax.Array, targets: jax.Array, bias
     d_w = d_w_pad[:v] if transpose_rhs else d_w_pad[:, :v]
     d_b = None if (d_b_pad is None or bias is None) else d_b_pad[:v].astype(bias.dtype)
     return d_x.astype(x.dtype), d_w.astype(weight.dtype), d_b
+
+
+LINEAR_CE_ROW = "ledger 6103"
+
+
+class LinearCECase(NamedTuple):
+    """Facts deciding whether `linear_cross_entropy` runs Mosaic GEMM-fused CE or chunked XLA."""
+    tile: Tiles | None
+    whole: bool
+    exact_products: bool
+    interpret: bool
+    dtype_ok: bool = True
+
+
+LINEAR_CE_OP: selection.Op[LinearCECase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
+    selection.Kernel("mosaic", (
+        selection.Requirement(
+            "dtype", lambda case: case.dtype_ok,
+            "Mosaic linear-CE requires matching bfloat16/float16 operand dtypes", LINEAR_CE_ROW),
+        selection.Requirement(
+            "launch", lambda case: case.tile is not None,
+            "no legal Mosaic linear-CE tile holds this shape/dtype on the target", LINEAR_CE_ROW),
+        selection.Requirement(
+            "sharding", lambda case: case.whole,
+            "automatic mesh axes keep chunked XLA outside per-shard launch", LINEAR_CE_ROW),
+        selection.Requirement(
+            "precision", lambda case: case.exact_products,
+            "precision does not match bf16/fp16 exact fp32 accumulation", LINEAR_CE_ROW),
+        selection.Requirement(
+            "measured", lambda case: case.interpret,
+            "no receipt yet has Mosaic linear-CE beat chunked XLA (pending M-NG-6)",
+            LINEAR_CE_ROW, kind="measured"),
+    )),
+    selection.Kernel("xla", (), generic=True),
+))
+
+
+def _linear_ce_select(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None, *,
+                      transpose_rhs: bool, precision: PrecisionLike, interpret_on_cpu: bool) -> bool:
+    from dew.nn.kernels import gemm
+
+    dtype_ok = supports_dtype(x.dtype) and jnp.dtype(x.dtype) == jnp.dtype(weight.dtype)
+    exact = exact_products(precision, x.dtype) if dtype_ok else False
+    if not dtype_ok:
+        tile = None
+    elif xla_products.interpreted(interpret_on_cpu):
+        target = generation.interpreted_target()
+        tile = derive_linear_ce(
+            (x.shape[0], weight.shape[0] if transpose_rhs else weight.shape[1], x.shape[1]),
+            x.dtype, target, transpose_rhs=transpose_rhs, has_bias=bias is not None, interpret=True)
+    else:
+        ba = MOSAIC_LINEAR_CE.bind(
+            jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct(weight.shape, weight.dtype),
+            jax.ShapeDtypeStruct(targets.shape, jnp.int32),
+            None if bias is None else jax.ShapeDtypeStruct(bias.shape, bias.dtype),
+            transpose_rhs=transpose_rhs, softcap=None, interpret=interpret_on_cpu)
+        tile = gemm._planned(MOSAIC_LINEAR_CE, ba)
+    case = LinearCECase(tile, whole=not automatic_axes(), exact_products=exact,
+                        interpret=interpret_on_cpu, dtype_ok=dtype_ok)
+    return selection.select(LINEAR_CE_OP, case).kernel == "mosaic"
+
+
+def _linear_ce_run(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None, *,
+                   softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
+                   chunk_size: int | None, interpret_on_cpu: bool
+                   ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    if _linear_ce_select(x, weight, targets, bias, transpose_rhs=transpose_rhs, precision=precision,
+                         interpret_on_cpu=interpret_on_cpu):
+        ctx = (generation.assumed(generation.interpreted_target())
+               if xla_products.interpreted(interpret_on_cpu) else contextlib.nullcontext())
+        with ctx:
+            return MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs,
+                                    softcap=softcap, interpret=interpret_on_cpu)
+    return portable_linear_ce(x, weight, targets, bias=bias, softcap=softcap,
+                              transpose_rhs=transpose_rhs, precision=precision, chunk_size=chunk_size)
+
+
+def _linear_ce_value(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None,
+                     softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
+                     chunk_size: int | None, interpret_on_cpu: bool) -> jax.Array:
+    return _linear_ce_run(x, weight, targets, bias, softcap=softcap, transpose_rhs=transpose_rhs,
+                          precision=precision, chunk_size=chunk_size, interpret_on_cpu=interpret_on_cpu)[0]
+
+
+def _linear_ce_fwd(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None,
+                   softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
+                   chunk_size: int | None, interpret_on_cpu: bool):
+    loss, peak, mass, rest = _linear_ce_run(
+        x, weight, targets, bias, softcap=softcap, transpose_rhs=transpose_rhs,
+        precision=precision, chunk_size=chunk_size, interpret_on_cpu=interpret_on_cpu)
+    return loss, (x, weight, targets, bias, peak, mass, rest)
+
+
+def _linear_ce_bwd(softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
+                   chunk_size: int | None, interpret_on_cpu: bool, saved, d_loss: jax.Array):
+    del interpret_on_cpu
+    x, weight, targets, bias, peak, mass, rest = saved
+    d_x, d_w, d_b = linear_ce_backward(
+        x, weight, targets, bias, peak, mass, rest, d_loss, softcap=softcap,
+        transpose_rhs=transpose_rhs, precision=precision, chunk_size=chunk_size)
+    return d_x, d_w, zero_from_primal(targets), d_b
+
+
+_linear_ce_vjp = contracted("test_a_linear_cross_entropy_holds_every_reverse_order")(
+    declared_derivative(KernelGlue(), _linear_ce_value, _linear_ce_fwd, _linear_ce_bwd,
+                        nondiff_argnums=(4, 5, 6, 7, 8)))
+
+
+def linear_cross_entropy(x: jax.Array, weight: jax.Array, targets: jax.Array, *,
+                         bias: jax.Array | None = None, softcap: float | None = None,
+                         transpose_rhs: bool = True, precision: PrecisionLike = None,
+                         chunk_size: int | None = None, interpret_on_cpu: bool = False) -> jax.Array:
+    """GEMM-fused linear cross-entropy (`-log softmax(x @ W^T + bias)[targets]`, kernel-templates.md
+    Appendix C row 25, row 6103): computes per-token cross-entropy without materializing `[..., V]` logits
+    in forward or backward, using Barron et al. zero-sum label derivatives."""
+    lead = x.shape[:-1]
+    if targets.shape != lead:
+        raise ValueError(f"linear_cross_entropy targets shape {targets.shape} != x leading shape {lead}")
+    x_flat = x.reshape(-1, x.shape[-1])
+    t_flat = targets.reshape(-1)
+    loss = _linear_ce_vjp(x_flat, weight, t_flat, bias, softcap, transpose_rhs, precision,
+                          chunk_size, interpret_on_cpu)
+    return loss.reshape(lead)

@@ -692,8 +692,6 @@ def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: 
         transposed=(transpose_lhs or packed_rows, transpose_rhs),
         summed=exact_sums and not family.sums_in_persist)
     return step, _gmm_prefetch(family, matrices, rows) if prefetching else None
-
-
 def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, chained: bool,
                interpret: bool, transposed: tuple[bool, bool], summed: bool) -> bool:
     """Dew: whether a `gmm` walk reads a step's first fragments under the previous step's last product
@@ -702,8 +700,6 @@ def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, 
     tensor-core summed."""
     return (family.prefetches_fragments and matrices == 1 and prologue is None and not scaled and not chained
             and not interpret and not any(transposed) and not summed)
-
-
 def tgmm_prefetches(family: mosaic.Family, *, unstaged: bool, rewritten: bool, k_major: bool,
                     interpret: bool, scaled: bool, summed: bool) -> bool:
     """Dew: whether an unstaged `tgmm` walk prefetches a step's first fragments across steps: disabled on
@@ -1735,7 +1731,6 @@ def _gmm_prefetch(family: mosaic.Family, matrices: dict, rows) -> Callable:
         return family.first_fragments(rows_of[name], oriented[name])
 
     return prefetch
-
 
 def _transformed(prologue, axes_of: tuple, mine: jax.Array, tiles_of: dict, halved: str, half) -> jax.Array:
     """Dew: `mine`, this warpgroup's half of a stage read into registers, transformed by the prologue on its

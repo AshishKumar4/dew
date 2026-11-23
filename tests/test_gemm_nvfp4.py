@@ -662,6 +662,25 @@ def test_stage_decoded_fp8_preserves_nonfinite_codewords(fmt: str):
     if fmt == "e5m2":
         assert np.isposinf(unpermuted[0, 2]) and np.isneginf(unpermuted[0, 3])
         assert np.isnan(unpermuted[0, 4]) and np.isnan(unpermuted[0, 5])
+    # Feed pre-encoded NaN and +-Inf through the public gemm.fp8_weight_product boundary (row 12100).
+    col_codes = np.zeros((64, 64), dtype=np.uint32)
+    col_codes[0, 0], col_codes[0, 1] = 0x7F, 0xFF
+    if fmt == "e5m2":
+        col_codes[0, 2], col_codes[0, 3] = 0x7C, 0xFC
+        col_codes[0, 4], col_codes[0, 5] = 0x7D, 0xFD
+    col_words = bits.fp8_packed(jnp.asarray(col_codes[formats.fp8_staged_rows(64), :].T, jnp.uint32),
+                                minifloat)
+    bank = formats.Fp8Weights(col_words, jnp.ones((), jnp.float32), formats.fp8_form_version(fmt), fmt=fmt)
+    sel = jnp.zeros((64, 64), jnp.bfloat16).at[:, 0].set(1.0)
+    for interpret in (False, True):
+        got = np.asarray(gemm.fp8_weight_product(sel, bank, out_dtype=jnp.float32,
+                                                 interpret_on_cpu=interpret))
+        assert np.isnan(got[0, 0]) and np.isnan(got[0, 1])
+        if fmt == "e5m2":
+            assert np.isposinf(got[0, 2]) and np.isneginf(got[0, 3])
+            assert np.isnan(got[0, 4]) and np.isnan(got[0, 5])
+
+
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])
 def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str):

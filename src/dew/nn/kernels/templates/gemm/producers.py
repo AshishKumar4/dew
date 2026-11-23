@@ -5,6 +5,7 @@ compile finds its kernel spilling, the recurrence's ladder (`resources.Producers
 import dataclasses
 from collections.abc import Iterator
 
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report, resources
 from dew.nn.kernels.templates.gemm import pricing, tiling
 
@@ -19,12 +20,13 @@ def started(op, ba, config: tiling.Tiles, target=None) -> tiling.Tiles:
     they hold, and the producer starts at the least: an H100's gathered kernel gradient at its entry share
     left its consumers 168 registers, which spilled, and certified at its sixth compile (train 952 F2)."""
     target = op.launch_target() if target is None else target
-    top = _top(op, ba, config, target)
-    family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
-    if (top is None or config.producers.of(op.KERNEL) is not None
-            or not family.tensor_columns(pricing.tile_columns(config, family), 1)):
-        return config
-    return dataclasses.replace(config, producers=config.producers.stepped({op.KERNEL: top}))
+    with generation.as_target(target):
+        top = _top(op, ba, config, target)
+        family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
+        if (top is None or config.producers.of(op.KERNEL) is not None
+                or not family.tensor_columns(pricing.tile_columns(config, family), 1)):
+            return config
+        return dataclasses.replace(config, producers=config.producers.stepped({op.KERNEL: top}))
 
 
 def _top(op, ba, config: tiling.Tiles, target=None) -> int | None:
@@ -32,13 +34,15 @@ def _top(op, ba, config: tiling.Tiles, target=None) -> int | None:
     where its program has a producer and that producer gathers a step's rows (`mosaic.Family.gathers_rows`,
     a table among the call's); None elsewhere."""
     target = op.launch_target() if target is None else target
-    family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
-    consumers = config.warpgroups + op.rewritten(ba, family)
-    warpgroups = family.warpgroups(consumers)
-    gathers = family.gathers_rows and any(table is not None for table in _tables(ba.arguments.get('gather')))
-    if warpgroups <= consumers or not gathers:
-        return None
-    return resources.entry_registers(warpgroups, config.programs)
+    with generation.as_target(target):
+        family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
+        consumers = config.warpgroups + op.rewritten(ba, family)
+        warpgroups = family.warpgroups(consumers)
+        gathers = (family.gathers_rows
+                   and any(table is not None for table in _tables(ba.arguments.get('gather'))))
+        if warpgroups <= consumers or not gathers:
+            return None
+        return resources.entry_registers(warpgroups, config.programs)
 
 
 def rungs(op, ba, config: tiling.Tiles, target=None) -> Iterator[tiling.Tiles]:
@@ -50,24 +54,26 @@ def rungs(op, ba, config: tiling.Tiles, target=None) -> Iterator[tiling.Tiles]:
     alone is its consumers', which a raise of the producer starves). The assembler, not a model, finds a
     producer's registers."""
     target = op.launch_target() if target is None else target
-    top = _top(op, ba, config, target)
-    if top is None or not _spilled(op, ba, config, target):
-        return
-    while (stepped := config.producers.stepped({op.KERNEL: top})) is not None:
-        config = dataclasses.replace(config, producers=stepped)
-        yield config
+    with generation.as_target(target):
+        top = _top(op, ba, config, target)
+        if top is None or not _spilled(op, ba, config, target):
+            return
+        while (stepped := config.producers.stepped({op.KERNEL: top})) is not None:
+            config = dataclasses.replace(config, producers=stepped)
+            yield config
 
 
 def settled(op, ba, config: tiling.Tiles, target=None) -> tiling.Tiles:
     """`config` started (`started`), then its ladder's rungs (`rungs`) while a compile refused each: the tile
     a derivation takes, refused (`report.refused`) where its ladder's foot spilled too."""
     target = op.launch_target() if target is None else target
-    config = started(op, ba, config, target)
-    for rung in rungs(op, ba, config, target):
-        if not _spilled(op, ba, config, target):
-            break
-        config = rung
-    return config
+    with generation.as_target(target):
+        config = started(op, ba, config, target)
+        for rung in rungs(op, ba, config, target):
+            if not _spilled(op, ba, config, target):
+                break
+            config = rung
+        return config
 
 
 def _spilled(op, ba, config: tiling.Tiles, target=None) -> bool:
