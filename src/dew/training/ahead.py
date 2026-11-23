@@ -110,7 +110,7 @@ if TYPE_CHECKING:
     from dew.data.pipeline import Dataset
     from dew.state import TrainState
     from dew.training._fit import FitArguments, FitPlan, Start
-    from dew.training.compiler import DrawingStep, HostStartup
+    from dew.training.compiler import HostStartup
     from dew.training.planning import Planned
     from dew.training.trainer import Trainer
 
@@ -383,13 +383,8 @@ class AheadOfTime:
     """The kernel launch configs its compiles found spilling and refused
     (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
     lowers (`FitSearch`), so its derivations step down as the compile's did and it lowers this program."""
-    counts: dict[int, tuple[AheadProgram, AheadProgram | None]] = dataclasses.field(default_factory=dict)
-    """A run that draws its looped model's pass count per microbatch
-    (`dew.training.phase_passes.SampledPasses`): every count's step but its cap's, the step's own, at its
-    plan (`StepCompiler.admitted_at`), with its sampled step where the run inspects, by count, which a run
-    handed the step takes in place of compiling them (`at_count`); none for any other run."""
     at_run: bool = False
-    """Whether any executable it holds, its step's, its sampled step's, its counts' or its starts', leaves a
+    """Whether any executable it holds, its step's, its sampled step's or its starts', leaves a
     choice to run time its device's own compile makes (`report.left_at_run`: a convolution compiled for
     compile-only GPUs): a run handed it compiles its step and starts on its devices in their place
     (`runnable`), whatever it tunes."""
@@ -469,9 +464,7 @@ class AheadOfTime:
             raise ValueError(f"{path} holds a step compiled ahead before its plan said whether XLA tuned it "
                              "(`autotuned`); compile it ahead again")
         sampled = [] if step.sampled is None else [step.sampled.executable]
-        counted = [program.executable for held in step.counts.values() for program in held
-                   if program is not None]
-        _current(path, "step", [step.executable, *sampled, *counted])
+        _current(path, "step", [step.executable, *sampled])
         return step
 
     def loaded(self) -> jax.stages.Compiled:
@@ -516,17 +509,6 @@ class AheadOfTime:
                              f"{device.shared_limit} bytes) does not run (`BuildTarget`); compile it ahead "
                              "for this GPU")
         return self.target
-
-    def at_count(self, passes: int) -> AheadOfTime:
-        """The step of `passes`, one of a sampled pass count's (`counts`), as a step compiled ahead a run
-        takes in place of compiling it (`taken`): refused where the step holds none of it, compiled ahead
-        before steps held their counts or for another law."""
-        if passes not in self.counts:
-            raise ValueError(f"the step compiled ahead holds no step of {passes} passes (its counts "
-                             f"{sorted(self.counts)}); compile it ahead again from this run's config")
-        step, sampled = self.counts[passes]
-        return dataclasses.replace(self, program=step.program, executable=step.executable, sampled=sampled,
-                                   counts={})
 
     def taken(self, lowered: jax.stages.Lowered) -> jax.stages.Compiled:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
@@ -1397,11 +1379,8 @@ class LaterPlans:
     which plans it as it would have. A pooled run, a host-master or rollout run, one that tunes its kernels or
     runs PGLE plans its phases at their boundaries."""
 
-    def __init__(self, futures: Mapping[int, Future], stale: Sequence[Future] = ()) -> None:
+    def __init__(self, futures: Mapping[int, Future]) -> None:
         self.futures = dict(futures)
-        self.stale = list(stale)
-        """Compiles an earlier step began that no plan waits for (`LaterCounts`'s of a superseded batch
-        signature), waited for as the run ends alone."""
 
     @classmethod
     def started[LossT, EffectsT](cls, trainer: Trainer[LossT, EffectsT], batch: Batch,
@@ -1457,76 +1436,12 @@ class LaterPlans:
 
     def stopped(self) -> None:
         """Every phase's plan waited for as the run ends, a pending one not begun, one that failed said."""
-        for passes, future in [*self.futures.items(), *((None, future) for future in self.stale)]:
+        for passes, future in self.futures.items():
             if future.cancel():
                 continue
             if (error := future.exception()) is not None:
                 _log.warning("planning the step of %s passes off the loop failed: %r", passes, error)
         self.futures.clear()
-        self.stale.clear()
-
-
-UPCOMING_STEPS = 64
-"""The steps of draws ahead whose counts a sampled run compiles first off its loop (`LaterCounts`)."""
-
-
-class LaterCounts:
-    """The steps of a sampled run's pass counts below its cap (`dew.training.phase_passes.SampledPasses`),
-    each admitted at the cap's plan on a thread of this process, over an objective and compiler of its own
-    (`PhasePasses.apart`), so the loop's objectives and counts are never touched, in the order the run's
-    draws will ask them from its first (`DrawingStep.upcoming`): each compiled executable the process holds
-    (`dew.nn.kernels.options.hold`), which the loop's own admission of a count, as a call first draws it
-    (`DrawingStep.admit`), finds made once it waited for it. One thread, waited for as the run ends with the
-    later phases' plans (`LaterPlans`, the trainer's `_later`). A run of several processes admits each
-    count on its loop alone, every process at once, its admission's collectives no thread may race (rows
-    7959, 8067)."""
-
-    @staticmethod
-    def begun[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], cap: Planned, shapes: TrainState,
-                               batch: Batch) -> Callable[[DrawingStep, int], None] | None:
-        """What begins compiling `trainer`'s counts off its loop at its first draw (`DrawingStep.begin`),
-        none where it runs on several processes or where its later phases are planned on the loop
-        (`LaterPlans.started`'s exceptions)."""
-        if (jax.process_count() > 1 or trainer.host_master or trainer.rollout is not None
-                or trainer.tune_kernels or pgle_runs() or shapes.inner is not None):
-            return None
-        entered = carried()
-
-        def compiled(count: int) -> None:
-            from dew.training.compiler import StepCompiler
-
-            with entered():
-                phases = trainer.phase_passes.apart(count)
-                links = trainer._compiler.links(trainer.device_mesh)
-                compiler = StepCompiler(phases.base, links, None, phases)
-                stepping = trainer._stepping(phases.base, compiler)
-                # The count its microbatches count their work at, as the loop's step at it states it
-                # (`PhasePasses.drawn_count`): the loop's own count stands at the cap meanwhile.
-                stepping = dataclasses.replace(stepping, settings=dataclasses.replace(
-                    stepping.settings, sampled_passes=count))
-                compiler.admitted_at(stepping, shapes, batch, cap, count, provisional=True).released()
-
-        def begin(step: DrawingStep, position: int) -> None:
-            # An earlier batch signature's counts still compiling off the loop: those not begun give way to
-            # this step's own, and one compiling is kept apart, waited for as the run ends alone.
-            prior = trainer._later or LaterPlans({})
-            # A count still compiling is kept apart and waited for as the run ends, and one that failed is
-            # kept with it, its failure said there (`LaterPlans.stopped`; row 11754: dropped unsaid).
-            stale = [*prior.stale, *(future for future in prior.futures.values() if not future.cancel()
-                                     and (not future.done() or future.exception() is not None))]
-            order = [count for count in step.upcoming(position, UPCOMING_STEPS * step.split)
-                     if count not in step.plans]
-            pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-later-counts")
-            try:
-                futures = {count: pool.submit(contextvars.copy_context().run, compiled, count)
-                           for count in order}
-            finally:
-                pool.shutdown(wait=False)
-            later = LaterPlans(futures, stale)
-            trainer._later = later
-            step.waited = later.waited
-            _log.info("compiling the steps of pass counts %s off the loop, as the draws ask them", order)
-        return begin
 
 
 def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
@@ -1706,23 +1621,22 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
                 start.abstract, start.shardings, trainer.device_mesh)
             stepped = step_batch(trainer, batch)
             planned = trainer._compiled_plan(start.abstract, stepped, None, frontier)
+            if trainer.phase_passes.sampled is not None:
+                # A build ahead refuses a sampled run's window as the run does (`sampled_step`).
+                trainer._compiler._refuse_sampled_window(planned)
             with attempting(begun):
                 starts = started(trainer, start, planned, plan)
-            admitted = {} if trainer.phase_passes.sampled is None else dict(trainer._compiler.admitted_counts(
-                trainer, trainer._stepping, planned, start.abstract, stepped))
-            counts = {count: _held_ahead(each) for count, each in admitted.items()}
     except Unlowerable as refused:
         raise refused.refusing("step") from refused
-    # The sampled step as the search compiled it, as a count's is (`_sampled_ahead`).
+    # The sampled step as the search compiled it (`_sampled_ahead`).
     sampled = _sampled_ahead(planned)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
-    held = [compiled, *starts.values(), *(each.executable for each in admitted.values()),
-            *(each.sampled.executable for each in (planned, *admitted.values()) if each.sampled is not None)]
+    held = [compiled, *starts.values(), *([] if planned.sampled is None else [planned.sampled.executable])]
     memory = compiled_memory(compiled)
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
-    need = _step_need(planned, admitted.values(), starts, devices[0])
+    need = _step_need(planned, starts, devices[0])
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), program_digest(lowered),
         Executable.of(compiled),
@@ -1732,38 +1646,26 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), need, topology=topology, chips=tpu_chips(devices)),
-        refusals=report.refused_launches(), sampled=sampled, counts=counts,
+        refusals=report.refused_launches(), sampled=sampled,
         at_run=any(report.left_at_run(each) for each in held),
         starts={digest: Executable.of(executable) for digest, executable in starts.items()})
 
 
-def _step_need(planned: Planned, counts: Iterable[Planned], starts: Mapping[str, jax.stages.Compiled],
-               device) -> int | None:
-    """What a device must hold to run a step compiled ahead (`programs_need`): its step and every pass
-    count's, each with its sampled step, beside the bytes their loop keeps (`Candidate.held`), and the
-    programs that build its fresh state before it (`AheadOfTime.starts`), beside none."""
-    steps = [planned, *counts]
-    programs = [(compiled_memory(each.executable), each.candidate.held, each.candidate.built)
-                for each in steps]
-    programs += [(compiled_memory(each.sampled.executable), each.candidate.held, each.candidate.built)
-                 for each in steps if each.sampled is not None]
-    programs += [(compiled_memory(executable), 0, 0) for executable in starts.values()]
+def _step_need(planned: Planned, starts: Mapping[str, jax.stages.Compiled], device) -> int | None:
+    """What a device must hold to run a step compiled ahead (`programs_need`): its step, with its sampled
+    step, beside the bytes their loop keeps (`Candidate.held`), and the programs that build its fresh state
+    before it (`AheadOfTime.starts`), beside none."""
+    held, built = planned.candidate.held, planned.candidate.built
+    steps = [planned.executable, *([] if planned.sampled is None else [planned.sampled.executable])]
+    programs = [*((compiled_memory(executable), held, built) for executable in steps),
+                *((compiled_memory(executable), 0, 0) for executable in starts.values())]
     return programs_need(device, programs)
 
 
-def _held_ahead(planned: Planned) -> tuple[AheadProgram, AheadProgram | None]:
-    """A sampled pass count's step admitted at its cap's plan (`StepCompiler.admitted_counts`), and its
-    sampled step where the run inspects (`_sampled_ahead`), as programs compiled ahead
-    (`AheadOfTime.counts`)."""
-    step = AheadProgram.of(program_digest(planned.candidate.lowered), planned.executable)
-    return step, _sampled_ahead(planned)
-
-
 def _sampled_ahead(planned: Planned) -> AheadProgram | None:
-    """A step's sampled step where the run inspects, as a program compiled ahead: the cap's
-    (`AheadOfTime.sampled`) and a count's (`_held_ahead`). Its program is what the search lowered (the plan
-    unreleased, its lowering held), digested as the step's is: a program no file can hold is refused by
-    name."""
+    """A step's sampled step where the run inspects, as a program compiled ahead (`AheadOfTime.sampled`). Its
+    program is what the search lowered (the plan unreleased, its lowering held), digested as the step's is:
+    a program no file can hold is refused by name."""
     if planned.sampled is None:
         return None
     if planned.sampled.lowered is None:

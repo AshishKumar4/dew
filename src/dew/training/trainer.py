@@ -384,7 +384,7 @@ class Trainer(Generic[Loss, Effects]):
                             self.device_mesh, self.accumulation,
                             self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
                             self.microbatches, self.record, self.lower_for, self.state_mesh,
-                            self.skip_nonfinite, self._compiler.ns_group, self.phase_passes.drawn_count())
+                            self.skip_nonfinite, self._compiler.ns_group)
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
@@ -1007,9 +1007,7 @@ class Trainer(Generic[Loss, Effects]):
         with self.phase_passes.scoped(self, self._compiler):
             compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials))
         assert compiled.step is not None
-        # The state the step runs on: `trials`', which its plan's search built its buffers on.
-        stepped = state if trials is None else trials.state
-        return self._compiler.drawing(self, self._stepping, compiled, stepped, batch, self.key)
+        return self._compiler.drawing(compiled, self.key)
 
     @ruled
     def _planned_unplaced(self, run: FitRun, start: Start, batch: Batch) -> None:
@@ -2239,7 +2237,7 @@ class Trainer(Generic[Loss, Effects]):
         settled_heap(run)  # A step the process held, its fit's start collected all the same.
         # The step compiled for this batch's signature, which a profile window that stops after it names.
         run.signature = run.signatures.get(signature)
-        return (*self._compiler.drawn(compiled[signature], interval, run.current, trials.state), trials.state)
+        return (*self._compiler.drawn(compiled[signature], interval, run.current), trials.state)
 
     def _saved_checkpoint(
         self,

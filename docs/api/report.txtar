@@ -146,6 +146,7 @@ class Objective()  [dew.objectives.base]
   .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .check(self, batch: Batch) -> None
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
+  .counted_forward(self, module: nn.Module) -> str | None
   .data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData
   .defines_validation_loss: property -> bool
   .drawn_shapes(self) -> Variables
@@ -176,6 +177,7 @@ class Objective()  [dew.objectives.base]
   .progress(self, step: Step) -> Progress
   .progress_readers(self) -> tuple[nn.Module, ...]
   .projected(self, params: Variables, *, updated: bool) -> Variables
+  .reads_pass_counts: property -> bool
   .real_lengths(self, batch: Batch) -> np.ndarray
   .real_rows(batch: Batch, rows: int) -> jax.Array  [staticmethod]
   .recorded_model(self) -> nn.Module
@@ -253,6 +255,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .check(self, batch: Batch) -> None
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
+  .counted_forward(self, module: nn.Module) -> str | None
   .data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData
   .defines_validation_loss: property -> bool
   .drawn_shapes(self) -> Variables
@@ -283,6 +286,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .progress(self, step: Step) -> Progress
   .progress_readers(self) -> tuple[nn.Module, ...]
   .projected(self, params: Variables, *, updated: bool) -> Variables
+  .reads_pass_counts: property -> bool
   .real_lengths(self, batch: Batch) -> np.ndarray
   .real_rows(batch: Batch, rows: int) -> jax.Array  [staticmethod]
   .recorded_model(self) -> nn.Module

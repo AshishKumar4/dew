@@ -36,7 +36,10 @@ token; QK and AV together contribute `2 * heads * head_dim * L²` for causal
 attention, twice that for non-causal attention. Lookups are excluded; every
 matmul is counted, including patch input projections and per-row timestep or
 conditioning MLPs. Padding and rematerialization are excluded. Every executed
-loop pass counts once.
+loop pass counts once. A run that draws its pass count per microbatch steps one
+program at the loop's cap: its model work counts each microbatch at the count it
+ran, and its hardware work is the cap program's, at most what ran, so its
+utilizations are logged as upper bounds (`train/hfu_upper_bound`).
 
 GDN and KDA contribute `6 * H * Dk * Dv` per token, in addition to their learned
 projections and convolution: the recurrent function has a stored-value

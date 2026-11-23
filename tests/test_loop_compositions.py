@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_loop_sampled import CAP, TRAINED, counts_compiled_off_the_loop, token_batch
+from test_loop_sampled import CAP, TRAINED, token_batch
 from test_pass_weights import phased_trainer
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -19,9 +19,6 @@ from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.kernels.generation import chosen
 from dew.training.compiler import DrawingStep
 from dew.training.interval import Interval
-
-# The counts a test draws as a fit does compiled before it ends (`test_loop_sampled`'s fixture).
-pytestmark = pytest.mark.usefixtures(counts_compiled_off_the_loop.__name__)
 
 COMPOSED = [
     # (drawn, implicit, copies, gated): every pair of the four met, and all four together.
@@ -51,7 +48,7 @@ def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copi
         counts, fixed = [], {}
         for index in range(4):
             if isinstance(step, DrawingStep):
-                step.drawn(interval, index, state)
+                step.drawn(interval, index)
                 counts.extend(step.counts)
             oracle = drawn and implicit and copies and gated
             # The state before the step donates it, read where the fixed-count program steps it too.
@@ -102,12 +99,12 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
     def stepped(trainer) -> float:
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
-        step.drawn(Interval(0.0, None, microbatches=0), 0, state)
+        step.drawn(Interval(0.0, None, microbatches=0), 0)
         return float(step(state, batch)[1])
 
     with pytest.raises(ValueError):
         stepped(trainer_of(2))
-    # A build ahead admits the counts as the run does, and refuses alike.
+    # A build ahead builds the step as the run does, and refuses alike.
     def built(law=TRAINED):
         trainer = trainer_of(2, law)
         trainer.device_mesh = MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2 ** 30))
@@ -118,38 +115,5 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
     # The same build of a one-count law, which reads no other count's statistics, is made.
     assert built(dataclasses.replace(TRAINED, cap=1)) is not None
     assert np.isfinite(stepped(trainer_of(1)))
-    # A law of one count compiles its cap's step alone, whose parts read the statistics of their own model.
+    # A law of one count's parts read the statistics of their own count.
     assert np.isfinite(stepped(trainer_of(2, dataclasses.replace(TRAINED, cap=1))))
-
-
-def test_a_drawn_count_whose_metric_is_another_kind_of_mean_over_the_same_leaves_is_refused():
-    """A count whose step returns the same pooled metric over the same leaves as its cap's, as another kind
-    of mean (an `Exponentiated` where the cap's is a `Ratio`), read in two parts a step, would pool with the
-    cap's as the cap's: its admission is refused, where the same metric as one kind at every count steps
-    (row 10815)."""
-    import optax
-    from test_pass_weights import looped
-
-    from dew.objectives.base import Exponentiated, Ratio
-    from dew.objectives.lm import LMObjective
-    from dew.training import Layout, Trainer
-
-    def objective(kind_at):
-        class Kinded(LMObjective):
-            def loss(self, variables, batch, step):
-                stats, aux = super().loss(variables, batch, step)
-                kind = kind_at(self.model.loop.steps)
-                pooled = {**aux.pooled, "spread": kind(jnp.zeros(()), jnp.ones(()))}
-                return stats, dataclasses.replace(aux, pooled=pooled)
-        return Kinded(looped(steps=CAP), 16)
-
-    def compiled(kind_at):
-        trainer = Trainer(objective(kind_at), optax.sgd(0.1), key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED, split=2,
-                          accumulation=2)
-        state, _, _ = trainer.place()
-        return trainer.compile(state, token_batch())
-
-    with pytest.raises(ValueError):
-        compiled(lambda steps: Ratio if steps == CAP else Exponentiated)
-    assert isinstance(compiled(lambda steps: Ratio), DrawingStep)

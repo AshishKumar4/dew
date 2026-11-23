@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import inspect
 import itertools
 import math
 from collections.abc import Collection, Hashable, Iterator, Sequence
@@ -37,6 +38,35 @@ class Holding[L, E](Protocol):
 def _looped(module: nn.Module) -> bool:
     """Whether `module` runs a block of its layers in passes it can be given (`Looped`, `Looping`)."""
     return isinstance(module, Looped) and isinstance(module, Looping) and module.loop is not None
+
+
+def _chooses_passes(module: nn.Module) -> bool:
+    """Whether `module` loops choosing its passes itself: one cache shared across them (`Loop.shared_cache`)
+    or each token handed on at an exit threshold (`Loop.exit_threshold`), which `run_loop` runs at no count
+    given per call."""
+    loop = module.loop if _looped(module) and isinstance(module, Looped) else None
+    return loop is not None and (loop.shared_cache or loop.exit_threshold is not None)
+
+
+DELEGATED = "hidden_and_mtp_inputs"
+"""The forward a decoder's `hidden_states` hands its keywords to (`CausalTransformer`), which names the count
+a call runs where its caller's takes it among them (`_takes_counts`)."""
+
+
+def _takes_counts(module: nn.Module, method: str | None) -> bool:
+    """Whether `method`, the forward an objective reads `module` by (`Objective.counted_forward`), takes the
+    count of its loop's passes a call runs (`loop_passes`): by name, or among its keywords where it hands
+    them to a forward that names it (`DELEGATED`), as Dew's decoders and its multimodal wrapper do; an
+    adapter's that names none would run every pass at its cap."""
+    forward = None if method is None else getattr(type(module), method, None)
+    if forward is None:
+        return False
+    parameters = inspect.signature(forward).parameters
+    if "loop_passes" in parameters:
+        return True
+    keywords = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    delegated = getattr(type(module), DELEGATED, None) if method != DELEGATED else None
+    return keywords and delegated is not None and "loop_passes" in inspect.signature(delegated).parameters
 
 
 def _horizons[L, E](objective: Objective[L, E]) -> tuple[int | None, ...]:
@@ -94,6 +124,25 @@ class PhasePasses[L, E]:
             if stated is not None:
                 raise ValueError("a run states its loop's pass counts once: one a phase of its data "
                                  "(phase_passes) or one drawn per microbatch (sampled_passes)")
+            if not objective.reads_pass_counts:
+                raise ValueError(f"{type(objective).__name__} runs its loop at the cap whatever count a "
+                                 "microbatch draws, reading none (Objective.reads_pass_counts): "
+                                 "sampled_passes trains an objective that does, as LMObjective and "
+                                 "DecisionObjective do; phase_passes runs this one at a phase's count")
+            if uncounted := [type(entry.module).__name__ for entry in objective.program_key()
+                             if _looped(entry.module)
+                             and not _takes_counts(entry.module, objective.counted_forward(entry.module))]:
+                raise ValueError(f"{', '.join(uncounted)} loops and its forward takes no count of passes a "
+                                 "call runs (`loop_passes`), so it would run every pass at the cap whatever "
+                                 "count a microbatch draws: sampled_passes needs it; phase_passes runs it at "
+                                 "a phase's count")
+            if unrunnable := [type(entry.module).__name__ for entry in objective.program_key()
+                              if _chooses_passes(entry.module)]:
+                raise ValueError(f"{', '.join(unrunnable)} loops sharing one cache across its passes "
+                                 "(`Loop.shared_cache`) or handing each token on at an exit threshold "
+                                 "(`Loop.exit_threshold`), which the one program at its cap does not run "
+                                 "at a count given per call (`run_loop`): sampled_passes refuses it; "
+                                 "phase_passes runs it at a phase's count")
             # Its loop holding the cap, checked as a phase's count is; no phase's count beside it.
             return replace(cls.of(objective, (sampled.cap,)), counts=(), current=sampled.cap, sampled=sampled)
         if stated is None:
@@ -133,11 +182,6 @@ class PhasePasses[L, E]:
         another schedule of passes from the same key and positions (row 10783)."""
         sampled = {} if self.sampled is None else {"sampled_passes": asdict(self.sampled)}
         return {**objective.training_record(), **sampled}
-
-    def drawn_count(self) -> int | None:
-        """The count the step being compiled runs where the run draws one per microbatch
-        (`StepSettings.sampled_passes`); None for any other run."""
-        return None if self.sampled is None else self.current
 
     def drawn_cap(self) -> int | None:
         """The cap of the pass count a run draws per microbatch, a batch's counted work's width

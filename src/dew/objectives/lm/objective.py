@@ -55,6 +55,7 @@ from dew.batch import (
     freeze,
     laid_coordinates,
     leaves_by_path,
+    loop_passes_given,
     merge,
     prefix_groups,
     real_slots,
@@ -134,6 +135,7 @@ from dew.objectives.lm.chunked import (
     logits_cross_entropy,
     logits_support_log_probs,
     model_logits,
+    read_method,
     refuse_without_logits,
     support_log_probs,
 )
@@ -778,13 +780,14 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         (`_reads_exits`), the last's alone otherwise."""
         return model.loop.steps if self._reads_exits(model) else 1
 
-    def _weights_over(self, model, ran: Sequence[jax.Array | bool] = ()) -> Sequence[float | jax.Array]:
+    def _weights_over(self, model, ran: Sequence[jax.Array | bool] = (),
+                      dtype: jax.typing.DTypeLike = jnp.float32) -> Sequence[float | jax.Array]:
         """Each pass's weight in the loss over `model`'s passes (`PassWeights.over`), where it weighs them;
-        where a count given per call ran some of them (`ran` traced), over those that ran
-        (`PassWeights.ran`)."""
+        where a count given per call ran some of them (`ran` traced), over those that ran, in the terms'
+        `dtype` (`PassWeights.ran`)."""
         assert self.pass_weights is not None
         if not all(isinstance(each, bool) for each in ran):
-            return self.pass_weights.ran(ran)
+            return self.pass_weights.ran(ran, dtype)
         weights = self.pass_weights.over(model.loop.steps)
         assert weights is not None, "the loss weighs a pass before the last"
         return weights
@@ -944,7 +947,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                      indexer: bool = False, layers: Sequence[int] = (), watched: bool = False,
                      routes: tuple[jax.Array | Mapping[str, jax.Array], jax.Array | None] | None = None,
                      predict: bool | None = None, z_loss: float | None = None, logits: bool = False,
-                     progress: Progress = END, rows: jax.Array | None = None, exits: bool = False):
+                     progress: Progress = END, rows: jax.Array | None = None, exits: bool = False,
+                     loop_passes: jax.Array | None = None):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns `Scores`: the losses, the weight of each target, whether each
@@ -1026,8 +1030,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             return self._stacked_scores(params, prepared, inputs, targets, roles, rows, adaptation,
                                         predict=predict, logits=logits, train=train, rngs=rngs)
         with self._watched(prepared, watched):
-            hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened, {**packing, **replay},
-                                                   layers, progress, exiting(self.model) if exits else None)
+            passes = {} if loop_passes is None else {"loop_passes": loop_passes}
+            hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
+                                                   {**packing, **replay, **passes}, layers, progress,
+                                                   exiting(self.model) if exits else None)
         before = self._predecessors(prepared, depths)
         if before is not None:
             # Each target's state its predecessor's, a document's first token's its parent's last.
@@ -1489,6 +1495,16 @@ class LMObjective(TokenScorer):
     resumable: ClassVar[tuple[str, ...]] = ("token_accuracy",)
     """Whether it reports its token accuracy, which no loss reads."""
 
+    @property
+    def reads_pass_counts(self) -> bool:
+        """Its loss runs its model at a microbatch's count (`token_scores`), but where an adaptation steps
+        the decoder's own layers chunk by chunk (`ChunkAdaptation.layers`), whose trunk runs every pass."""
+        return self.adaptation is None or not self.adaptation.layers
+
+    def counted_forward(self, module: nn.Module) -> str | None:
+        """The method its loss reads `module` by (`chunked.read_method`), which takes a call's count."""
+        return read_method(module)
+
     untraced: ClassVar[Mapping[str, str]] = {
         "phase": "the parameters its draw freezes (`_phase_filter`), a function of its indexer, its model "
                  "and the settings the key holds"}
@@ -1780,7 +1796,7 @@ class LMObjective(TokenScorer):
             qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
             watched=step.watched is not None,
             z_loss=self.z_loss if summed and not exits else None, logits=logits,
-            predict=predict, rows=rows, exits=exits)
+            predict=predict, rows=rows, exits=exits, loop_passes=loop_passes_given(batch))
         losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _, _, passes = scores
         width, length = at_least_fp32(losses.dtype), losses.shape[1]
 
@@ -1800,7 +1816,7 @@ class LMObjective(TokenScorer):
         if passes is not None and self.exit_entropy is None:
             # Each pass's cross entropy at its weight in the last pass's place, over the same counted targets:
             # where a count given per call ran some of the passes, over those alone (`PassWeights.ran`).
-            term = weighed(self._weights_over(self.model, passes[3]), passes[0])
+            term = weighed(self._weights_over(self.model, passes[3], width), passes[0])
             units = shares(term, weights)
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
         elif passes is not None and self.exit_entropy is not None:

@@ -85,6 +85,20 @@ trainer's transaction reads it for the examples' draws (`Step.example_index`) an
 batch the objective sees."""
 
 
+LOOP_PASSES = "loop_passes"
+"""A training batch's column of the pass count each row's microbatch runs its looped model's block, int32,
+one value across a microbatch's rows: the count a run that draws its pass count per microbatch drew for it
+(`dew.training.phase_passes.SampledPasses`), which the one program at its cap runs (row 11951's design:
+the model's `loop_passes`). The objective reads it (`loop_passes_given`); no other step does."""
+
+
+def loop_passes_given(batch: Mapping[str, object]) -> jax.Array | None:
+    """The pass count `batch`'s microbatch runs its looped model's block (`LOOP_PASSES`), one value across its
+    rows read as one scalar the same on every device, None where the batch gives none."""
+    passes = batch.get(LOOP_PASSES)
+    return None if passes is None else jnp.max(jnp.asarray(passes, jnp.int32))
+
+
 EXAMPLES_CONSUMED = "examples_consumed"
 """A training batch's column of the source examples each row is the last of, int32, in a run bounded in
 examples (`dew.data.pipeline.CONSUMED`): the batch's sum over its real rows is the examples its dispatch
@@ -1198,6 +1212,7 @@ __all__ = [
     "COORDINATES_FIELD",
     "EXAMPLE_ROWS",
     "FROZEN",
+    "LOOP_PASSES",
     "PARAMETER_ROOTS",
     "PHASE",
     "SCAN_BLOCKS",
