@@ -1437,10 +1437,14 @@ class FitSearch[LossT, EffectsT]:
 
     def said(self, named: list[str]) -> None:
         """Log every rung the search asked (`named`, as `rung` names each), in the ladder's order, with the
-        least it was short by where it missed (its misses' figures, `misses`); the last fits where one did."""
+        least it was short by where it missed (its misses' figures, `misses`), as fitting only where a split
+        of it fit (`fits_at`), and as refused where it missed with no shortfall measured: an admission that
+        refused it (`dew.communicators.CommunicatorRoom`), or a compile that read no memory."""
         def short(rung: str) -> str:
             missed = [miss.shortfall // self.factor for (at, _), miss in self.misses.items() if at == rung]
-            return f"{rung}: short by {min(missed)} bytes" if missed else f"{rung}: fits"
+            if missed:
+                return f"{rung}: short by {min(missed)} bytes"
+            return f"{rung}: fits" if rung in self.fits_at else f"{rung}: refused, no shortfall measured"
         _log.info("the rungs the step's search asked, in the ladder's order: %s",
                   "; ".join(short(rung) for rung in named))
 

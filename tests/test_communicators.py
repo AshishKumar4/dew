@@ -597,11 +597,12 @@ def test_a_program_compiled_ahead_for_absent_gpus_is_not_admitted_here():
 
 
 @pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
-def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search_naming_it():
+def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search_naming_it(caplog):
     """A fit search whose every candidate's admission refuses it (`dew.communicators.CommunicatorRoom`: the
     runtime's need past the room the pool left) asks each candidate as a step that misses, and refuses the
     step naming that admission, never ending at the first candidate's (row 12131's review: a losing rung's
-    admission ended the search)."""
+    admission ended the search), nor reporting any rung it asked as fitting (`FitSearch.said`; review of
+    row 12131: a refused rung with no shortfall was said to fit)."""
     import numpy as np
     import optax
 
@@ -623,11 +624,14 @@ def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search
     held = communicators.held()
     communicators.hold(communicators.Sizing(starved, 0.95, 0.9, {gpu: 2 * GIB}, {gpu: GIB}))
     try:
-        with pytest.raises(PlanRefused) as refused:
+        with caplog.at_level(logging.INFO, "dew.training.planning"), pytest.raises(PlanRefused) as refused:
             trainer.compile(state, {"text": np.zeros((2, 9), np.int32)})
     finally:
         communicators.hold(held)
     assert isinstance(refused.value.__cause__, CommunicatorRoom), refused.value.__cause__
+    [asked] = [record.args[0] for record in caplog.records
+               if record.msg.startswith("the rungs the step's search asked")]
+    assert not [rung for rung in asked.split("; ") if rung.endswith(": fits")], asked
 
 
 @pytest.mark.parametrize("fetched", [False, True], ids=["called", "fetched"])
