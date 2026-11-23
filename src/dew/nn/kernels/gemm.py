@@ -38,7 +38,7 @@ import dataclasses
 import enum
 import functools
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
@@ -48,6 +48,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import bits
+from dew.nn import float_bits
 from dew.nn.derivatives import (
     KernelGlue,
     contracted,
@@ -71,7 +72,14 @@ from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import scattered, tiling
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
-from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
+from dew.nn.precision import (
+    accumulated,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    power2,
+    twice_scaled,
+)
 from dew.nn.programs import called, read_by
 from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
 
@@ -771,27 +779,41 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
 FP8_WEIGHT_ROW = 'ledger 8548'
 
 
-class Fp8WeightCase(NamedTuple):
-    """Facts deciding whether `fp8_weight_product` runs the inline-decoding Mosaic GEMM mainloop."""
-    tile: tiling.Tiles | None
+@dataclasses.dataclass(eq=False)
+class WordPackedCase:
+    """Facts deciding whether a word-packed matrix's product (`fp8_weight_product`,
+    `ternary_weight_product`) runs the inline-decoding Mosaic GEMM mainloop: its tile (`plan`'s), planned
+    only once the requirements before `launch` take the call."""
+    plan: Callable[[], tiling.Tiles | None]
     whole: bool
 
+    @functools.cached_property
+    def tile(self) -> tiling.Tiles | None:
+        return self.plan()
 
-FP8_WEIGHT: selection.Op[Fp8WeightCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
-    selection.Kernel('mosaic', (
-        selection.Requirement(
-            'launch', lambda case: case.tile is not None,
-            "no legal Mosaic FP8-packed tile holds this shape on the target", FP8_WEIGHT_ROW),
-        selection.Requirement(
-            'sharding', lambda case: case.whole,
-            "automatic mesh axes keep decoded XLA outside per-shard launch", FP8_WEIGHT_ROW),
-        selection.Requirement(
-            'measured', lambda case: False,
-            "no receipt yet has Mosaic FP8-packed beat decoded GEMM (pending M-NG-6)",
-            FP8_WEIGHT_ROW, kind='measured'),
-    )),
-    selection.Kernel('xla', (), generic=True),
-))
+
+def word_packed_op(format_name: str, row: str, receipt: str) -> selection.Op[WordPackedCase]:
+    """The selector of a word-packed matrix's product of `format_name` words (ledger `row`): the Mosaic
+    launch decoding them inline where a measurement (`receipt`) found it faster and its tile holds, else the
+    decoded matrix's GEMM."""
+    return selection.Op(generation.Choice.GROUPED_MATMUL, (
+        selection.Kernel('mosaic', (
+            selection.Requirement(
+                'sharding', lambda case: case.whole,
+                "automatic mesh axes keep decoded XLA outside per-shard launch", row),
+            selection.Requirement(
+                'measured', lambda case: False,
+                f"no receipt yet has Mosaic {format_name}-packed beat decoded GEMM (pending {receipt})", row,
+                kind='measured'),
+            selection.Requirement(
+                'launch', lambda case: case.tile is not None,
+                f"no legal Mosaic {format_name}-packed tile holds this shape on the target", row),
+        )),
+        selection.Kernel('xla', (), generic=True),
+    ))
+
+
+FP8_WEIGHT = word_packed_op('FP8', FP8_WEIGHT_ROW, 'M-NG-6')
 
 def _packed_weight_rules(launch: grouped_matmul.MosaicWordPackedGmm, make_bank,
                          interpret: bool, *, dense: bool):
@@ -857,21 +879,92 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
         bound = launch.bind(_spec(rows), bank_spec, _spec(sizes), (), (), None, None, None,
                             out_dtype='float32', trans_rhs=False, interpret=interpreting,
                             dense=dense, exact_sums=False)
-        tile = _planned(launch, bound)
-        case = Fp8WeightCase(tile, not automatic_axes())
+        case = WordPackedCase(functools.partial(_planned, launch, bound), not automatic_axes())
         if selection.select(FP8_WEIGHT, case).kernel == 'mosaic':
             form_b, one = jnp.zeros((8,), jnp.uint8), jnp.ones((), jnp.float32)
             rules = _packed_weight_rules(launch, lambda w: Fp8Weights(w, one, form_b, fmt=weights.fmt),
                                          interpret_on_cpu, dense=dense)
-            differentiable = contracted("test_an_fp8_weight_product_holds_every_order")(
+            product = contracted("test_an_fp8_weight_product_holds_every_order")(
                 generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
-            summed = differentiable(rows, words, sizes)
+            operands = (words, sizes)
         else:
-            summed = gemm(rows, weights.unscaled(jnp.bfloat16), group_sizes, out_dtype=jnp.float32,
-                          precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu)
-            assert isinstance(summed, jax.Array)
-    factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape, dense)
-    return (summed * factor).astype(lhs.dtype if out_dtype is None else out_dtype)
+            product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
+            operands = (weights.unscaled(jnp.bfloat16), group_sizes)
+        factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape,
+                            dense)
+        scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs)
+        return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
+
+
+def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None, *,
+                    interpret_on_cpu: bool) -> jax.Array:
+    """A packed matrix's portable product: bf16 `rows` times its decoded bf16 `matrix` (grouped by
+    `group_sizes`, or dense), each product exact and summed in fp32."""
+    summed = gemm(rows, matrix, group_sizes, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT,
+                  interpret_on_cpu=interpret_on_cpu)
+    assert isinstance(summed, jax.Array), "an unpaired product has one output"
+    return summed
+
+
+def _interpreted(product: Callable, interpret_on_cpu: bool, *operands) -> jax.Array:
+    """`product(*operands)` interpreted on a CPU where `interpret_on_cpu` asks, wherever it is traced."""
+    with xla_products.interpreted_context(interpret_on_cpu):
+        return product(*operands)
+
+
+def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array) -> jax.Array:
+    """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows, each output
+    row its own input row's (no gather), and `factor` a packed matrix's fp32 scales broadcast against its
+    output (`formats.fp8_factor`). Its transpose is the plain one, the cotangent times its factor through
+    `run`'s pullback, but for a row whose largest such product passes `2**FACTORED_HEADROOM`: that row is
+    moved down by a power of two to it before the pullback and back after (`precision.power2`), so a
+    cotangent times a factor past fp32's largest, whose products cancel, sums to their finite value, not
+    inf - inf (ledger 1464); only its terms below `2**-149` once moved, `2**-249` of its largest at least,
+    are lost. Devices of a checked `shard_map` sum their partials moved to one shared power, then move
+    back."""
+    shape, dtype = rows.shape, rows.dtype
+    held = frozenset(jax.typeof(rows).mat.varying)
+    placed = explicit_spec(rows)
+
+    def apply(residuals, moving):
+        scale, ran = residuals
+        return run(moving.astype(jnp.bfloat16), *ran) * scale
+
+    def pullback(residuals, cotangent):
+        scale, ran = residuals
+        c = cotangent.astype(jnp.float32)
+        f = jnp.broadcast_to(scale.astype(jnp.float32), c.shape)
+        e_c, e_f = (float_bits.binade_of(jax.lax.stop_gradient(v)) for v in (c, f))
+        # A row's largest product's binade, among entries both finite and nonzero (an infinity's binade 128).
+        counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
+        top = jnp.max(jnp.where(counted, e_c + e_f, -1024), axis=-1, keepdims=True, initial=-1024)
+        moved = jnp.maximum(top - FACTORED_HEADROOM, 0)
+        # The cotangent times the factor's significand (in [1, 2)), halved where the cotangent's own binade
+        # would carry it past fp32's largest: finite wherever both are, then moved by the factor's exponent.
+        e_f = jnp.clip(e_f, -126, 127)
+        halved = e_c >= 126
+        near = power2((c * jnp.where(halved, 0.5, 1.0)) * (f * float_bits.exact_power2(-e_f)),
+                      e_f + halved - moved)
+        # The pullback at zeros typed as the rows are (placed, and varying as the cotangent's partials do).
+        at = varying_like(jnp.zeros(shape, jnp.bfloat16, out_sharding=placed), near, *jax.tree.leaves(ran))
+        _, pulled = jax.vjp(lambda each: run(each, *ran), at)
+        (partial,) = pulled(near)
+        partial = partial.astype(jnp.float32)
+        excess = tuple(sorted(jax.typeof(partial).mat.varying - held))
+        if excess:
+            # Each device's partial at the power every device's row shares, summed, then moved back.
+            shared = jax.lax.pmax(moved, excess)
+            partial = jax.lax.psum(power2(partial, moved - shared), excess)
+            moved = shared
+        return power2(partial, moved).astype(dtype)
+
+    return generation.linear_map(apply, pullback, (factor, operands), rows)
+
+
+FACTORED_HEADROOM = 100
+"""The binade a row's largest cotangent-times-factor product is moved down to in `factored`'s transpose
+where it passes it: its products' sum over any width a matrix holds (a decoded FP8 entry at most 448) stays
+within fp32, and a row below it pulls back as the plain transpose does."""
 
 
 def ternary_weight_product(lhs: jax.Array, weights, group_sizes: jax.Array | None = None, **kw) -> jax.Array:

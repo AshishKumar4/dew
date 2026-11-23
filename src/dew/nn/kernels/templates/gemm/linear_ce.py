@@ -6,8 +6,9 @@ then merges column-tile summaries via `dew.nn.categorical.rescaled` and `dew.nn.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable
-from typing import ClassVar, NamedTuple
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -117,10 +118,11 @@ def linear_ce_launch_of(tiles: Tiles, shape: tuple[int, int, int], dtype, *, tra
 
 def _linear_ce_finish_tile(wg, tile, accs, *, targets_gmem, bias_gmem, side_smems, side_barriers, row_stage,
                            out_m, out_l, out_t, out_r, vocab: int, softcap: float | None, columns: int,
-                           family: mosaic.Family, tiles: Tiles) -> None:
+                           family: mosaic.Family, tiles: Tiles, round_logits: bool = False) -> None:
     """Reduce one `[share, columns]` fp32 logit tile into per-row `(m, l, target_logit, rest)` summaries
     through the toolkit's native side-operand staging (`family.loaded`/`side_tile`) and vector store
-    (`family.stored`/`as_row`)."""
+    (`family.stored`/`as_row`); with `round_logits` each logit rounds to bf16 before its bias and softmax,
+    as a bf16 head's product does (`precision.bf16_product`)."""
     row_start, ni, col_tile = tile
     part_row = row_start + tiles.share_row(wg)
     row_slice = pl.ds(part_row, tiles.share)
@@ -134,7 +136,7 @@ def _linear_ce_finish_tile(wg, tile, accs, *, targets_gmem, bias_gmem, side_smem
 
     m_acc = l_acc = t_acc = r_acc = None
     for start, (chunk,) in family.chunks(accs):
-        z = chunk
+        z = chunk.astype(jnp.bfloat16).astype(jnp.float32) if round_logits else chunk
         if bias_gmem is not None:
             bias_col = family.side_tile(side_smems[1].at[wg].at[slice(start, start + z.shape[1])],
                                         ("columns",)).astype(jnp.float32)
@@ -187,9 +189,9 @@ def _merge_summaries(out_m: jax.Array, out_l: jax.Array, out_t: jax.Array, out_r
 
 def linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *, tiles: Tiles,
               transpose_rhs: bool = True, bias: jax.Array | None = None, softcap: float | None = None,
-              multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False,
-              registers: int | None = None, shared: int | None = None
-              ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+              round_logits: bool = False, multiprocessors: int,
+              interpret: bool | plgpu.InterpretGPUParams = False, registers: int | None = None,
+              shared: int | None = None) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """GEMM-fused linear cross-entropy forward returning `(loss, peak, l, rest)` each `[M]` fp32 without
     materializing `[M, V]` logits in global memory (row 6103)."""
     if x.ndim != 2 or weight.ndim != 2 or targets.ndim != 1:
@@ -224,19 +226,20 @@ def linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *, tiles: Til
         bias_f32 = jnp.pad(bias_f32, ((0, v_pad - v),))
     out_m, out_l, out_t, out_r = _linear_ce_mainloop(
         x, weight, targets_i32, bias_f32, (m_pad, v_pad, k_pad, v), tiles=tiles,
-        transpose_rhs=transpose_rhs, softcap=softcap, multiprocessors=multiprocessors,
-        interpret=interpret, has_bias=bias_f32 is not None, registers=registers, shared=shared)
+        transpose_rhs=transpose_rhs, softcap=softcap, round_logits=round_logits,
+        multiprocessors=multiprocessors, interpret=interpret, has_bias=bias_f32 is not None,
+        registers=registers, shared=shared)
     if m_pad != m:
         out_m, out_l, out_t, out_r = out_m[:, :m], out_l[:, :m], out_t[:, :m], out_r[:, :m]
     return _merge_summaries(out_m, out_l, out_t, out_r)
 
 
-@tuning.lowered_once(("shape", "tiles", "transpose_rhs", "softcap", "multiprocessors", "interpret",
-                      "has_bias", "registers", "shared"))
+@tuning.lowered_once(("shape", "tiles", "transpose_rhs", "softcap", "round_logits", "multiprocessors",
+                      "interpret", "has_bias", "registers", "shared"))
 def _linear_ce_mainloop(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None,
                         shape: tuple[int, int, int, int], *, tiles: Tiles, transpose_rhs: bool,
-                        softcap: float | None, multiprocessors: int, interpret, has_bias: bool = False,
-                        registers: int | None = None, shared: int | None = None
+                        softcap: float | None, round_logits: bool = False, multiprocessors: int, interpret,
+                        has_bias: bool = False, registers: int | None = None, shared: int | None = None
                         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Compiled/interpreted persistent Mosaic GEMM + online-softmax summary mainloop."""
     m, v_pad, k, vocab = shape
@@ -295,8 +298,7 @@ def _linear_ce_mainloop(x: jax.Array, weight: jax.Array, targets: jax.Array, bia
                     wg, tile, accs, targets_gmem=targets_gmem, bias_gmem=bias_gmem,
                     side_smems=side_smems, side_barriers=side_barriers, row_stage=row_stage,
                     out_m=out_m, out_l=out_l, out_t=out_t, out_r=out_r, vocab=vocab, softcap=softcap,
-                    columns=block_n, family=family, tiles=tiles)
-
+                    columns=block_n, family=family, tiles=tiles, round_logits=round_logits)
             family.persist(streams, (total_tiles,), schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=True, accumulators=(part,),
@@ -425,17 +427,17 @@ class MosaicLinearCE(TilesTemplate):
                                 refused=lambda candidate: report.refused(self, ba, candidate, target), ba=ba)
 
     def _fwd(self, x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None = None, *,
-             transpose_rhs: bool = True, softcap: float | None = None, interpret: bool = False,
-             config: Tiles, return_residuals: bool = False):
+             transpose_rhs: bool = True, softcap: float | None = None, round_logits: bool = False,
+             interpret: bool = False, config: Tiles, return_residuals: bool = False):
         del return_residuals
         target = generation.gpu_target()
         bound = self.bind(x, weight, targets, bias, transpose_rhs=transpose_rhs, softcap=softcap,
-                          interpret=interpret)
+                          round_logits=round_logits, interpret=interpret)
         mp = config.cluster if interpret else (target.multiprocessors or 1) * config.programs
         regs = self.registers(bound, config, target)
         shared = regs and self.staged_bytes(bound, config, target)
         out = linear_ce(x, weight, targets, tiles=config, transpose_rhs=transpose_rhs, bias=bias,
-                        softcap=softcap, multiprocessors=mp,
+                        softcap=softcap, round_logits=round_logits, multiprocessors=mp,
                         interpret=grouped_launch.INTERPRETED if interpret else False,
                         registers=regs, shared=shared)
         return out, None
@@ -447,12 +449,19 @@ MOSAIC_LINEAR_CE = MosaicLinearCE()
 LINEAR_CE_ROW = "ledger 6103"
 
 
-class LinearCECase(NamedTuple):
-    """Facts deciding whether `chunked._forward` runs Mosaic GEMM-fused CE or chunked XLA."""
-    tile: Tiles | None
+@dataclasses.dataclass(eq=False)
+class LinearCECase:
+    """Facts deciding whether `chunked._forward` runs Mosaic GEMM-fused CE or chunked XLA: its operands'
+    dtypes, sharding and precision, and its tile (`plan`'s), planned only once the requirements before
+    `launch` take the call, so a call the `measured` gate keeps on chunked XLA plans no tile."""
     whole: bool
     exact_products: bool
-    dtype_ok: bool = True
+    dtype_ok: bool
+    plan: Callable[[], Tiles | None]
+
+    @functools.cached_property
+    def tile(self) -> Tiles | None:
+        return self.plan()
 
 
 LINEAR_CE_OP: selection.Op[LinearCECase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
@@ -460,9 +469,6 @@ LINEAR_CE_OP: selection.Op[LinearCECase] = selection.Op(generation.Choice.GROUPE
         selection.Requirement(
             "dtype", lambda case: case.dtype_ok,
             "Mosaic linear-CE requires matching bfloat16/float16 operand dtypes", LINEAR_CE_ROW),
-        selection.Requirement(
-            "launch", lambda case: case.tile is not None,
-            "no legal Mosaic linear-CE tile holds this shape/dtype on the target", LINEAR_CE_ROW),
         selection.Requirement(
             "sharding", lambda case: case.whole,
             "automatic mesh axes keep chunked XLA outside per-shard launch", LINEAR_CE_ROW),
@@ -473,9 +479,15 @@ LINEAR_CE_OP: selection.Op[LinearCECase] = selection.Op(generation.Choice.GROUPE
             "measured", lambda case: False,
             "no receipt yet has Mosaic linear-CE beat chunked XLA (pending M-NG-6)",
             LINEAR_CE_ROW, kind="measured"),
+        selection.Requirement(
+            "launch", lambda case: case.tile is not None,
+            "no legal Mosaic linear-CE tile holds this shape/dtype on the target", LINEAR_CE_ROW),
     )),
     selection.Kernel("xla", (), generic=True),
 ))
+"""The LM loss's fused linear cross-entropy selector, under the grouped products' choice: `grouped_matmul`
+named `mosaic` or `xla` names its kernel; any other name the choice takes (`cutlass`, `triton`, a grouped
+product's) is none of CE's, whose loss keeps its chunked XLA program (`mosaic_linear_ce`)."""
 
 
 def mosaic_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array,
@@ -484,30 +496,35 @@ def mosaic_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array,
                      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None:
     """Run `MOSAIC_LINEAR_CE` when `LINEAR_CE_OP` selects `'mosaic'` (returning `(loss, peak, mass,
     rest)`), else `None` so `dew.objectives.lm.chunked._forward` runs its portable chunked XLA path
-    untouched (rows 6103, 12136)."""
+    untouched (rows 6103, 12136). A bf16 head (`precision` the `BF16_BF16_F32` algorithm) rounds each logit
+    to bf16 before its bias and softmax, as `chunked._tile_logits` does forward and backward."""
     from dew.nn.kernels import gemm
 
+    named = selection.forced(LINEAR_CE_OP.choice)
+    if named is not None and named not in {kernel.name for kernel in LINEAR_CE_OP.kernels}:
+        return None
     dtype_ok = supports_dtype(x.dtype) and jnp.dtype(x.dtype) == jnp.dtype(weight.dtype)
     exact = exact_products(precision, x.dtype) if dtype_ok else False
+    # A bf16 head's algorithm (`chunked.BF16`), whose every logit rounds to bf16.
+    round_logits = precision is jax.lax.DotAlgorithmPreset.BF16_BF16_F32
     with (xla_products.committed_context((x, weight, targets)),
           xla_products.interpreted_context(interpret_on_cpu=True)):
         interpreting = xla_products.interpreted(interpret_on_cpu=True)
-        if not dtype_ok:
-            tile = None
-        elif interpreting:
-            target = generation.interpreted_target()
-            tile = derive_linear_ce(
-                (x.shape[0], weight.shape[0] if transpose_rhs else weight.shape[1], x.shape[1]),
-                x.dtype, target, transpose_rhs=transpose_rhs, has_bias=bias is not None, interpret=True)
-        else:
-            ba = MOSAIC_LINEAR_CE.bind(
+
+        def plan() -> Tiles | None:
+            if interpreting:
+                return derive_linear_ce(
+                    (x.shape[0], weight.shape[0] if transpose_rhs else weight.shape[1], x.shape[1]),
+                    x.dtype, generation.interpreted_target(), transpose_rhs=transpose_rhs,
+                    has_bias=bias is not None, interpret=True)
+            return gemm._planned(MOSAIC_LINEAR_CE, MOSAIC_LINEAR_CE.bind(
                 jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct(weight.shape, weight.dtype),
                 jax.ShapeDtypeStruct(targets.shape, jnp.int32),
                 None if bias is None else jax.ShapeDtypeStruct(bias.shape, bias.dtype),
-                transpose_rhs=transpose_rhs, softcap=None, interpret=False)
-            tile = gemm._planned(MOSAIC_LINEAR_CE, ba)
-        case = LinearCECase(tile, whole=not automatic_axes(), exact_products=exact, dtype_ok=dtype_ok)
+                transpose_rhs=transpose_rhs, softcap=None, round_logits=round_logits, interpret=False))
+
+        case = LinearCECase(not automatic_axes(), exact, dtype_ok, plan)
         if selection.select(LINEAR_CE_OP, case).kernel != "mosaic":
             return None
-        return MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs,
-                                softcap=None, interpret=interpreting)
+        return MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs, softcap=None,
+                                round_logits=round_logits, interpret=interpreting)

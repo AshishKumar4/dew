@@ -2074,33 +2074,45 @@ def test_vmap_unfolded_named_triton_lowers_for_cuda():
             xs, gw, gs)
 
 
-def test_underfilled_dense_gemm_derives_depth_split_and_holds_check_1():
-    """Deep underfilled multi-row-tile dense GEMMs (`512x16384->1024` on sm90 and sm80 without balanced
-    tail) derive `splits > 1`, while shallow-K or well-filled dense GEMMs stay unsplit (`splits == 1`,
-    row 10151)."""
+def test_dense_gemm_takes_split_and_unsplit_pins_and_holds_check_1():
+    """A deep dense GEMM's tile on sm90, and its transposed input gradient's on sm80, run split in two or
+    unsplit alike (both legal), and pinned split or unsplit an sm90 product holds check 1 against float64
+    truth (row 10151)."""
+    from dew.nn.kernels import tuning
+
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     one = jax.ShapeDtypeStruct((1,), jnp.int32)
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        deep_ba = launch.bind(bf16((512, 16384)), bf16((1, 16384, 1024)), one, out_dtype="bfloat16",
-                              trans_rhs=False, interpret=False, dense=True)
-        deep_tile = launch.derived(deep_ba, target)
-        assert deep_tile is not None and deep_tile.splits > 1, deep_tile
-        shallow_ba = launch.bind(bf16((2048, 2560)), bf16((1, 2560, 1024)), one, out_dtype="bfloat16",
-                                 trans_rhs=False, interpret=False, dense=True)
-        shallow_tile = launch.derived(shallow_ba, target)
-        assert shallow_tile is not None and shallow_tile.splits == 1, shallow_tile
-        full_ba = launch.bind(bf16((8192, 4096)), bf16((1, 4096, 4096)), one, out_dtype="bfloat16",
-                              trans_rhs=False, interpret=False, dense=True)
-        full_tile = launch.derived(full_ba, target)
-        assert full_tile is not None and full_tile.splits == 1, full_tile
-    with generation.assumed("sm80"):
-        target = generation.gpu_target()
-        dx_ba = launch.bind(bf16((512, 16384)), bf16((1, 1024, 16384)), one, out_dtype="bfloat16",
-                            trans_rhs=True, interpret=False, dense=True)
-        dx_tile = launch.derived(dx_ba, target)
-        assert dx_tile is not None and dx_tile.splits > 1, dx_tile
+    for name, transposed, matrix in (("sm90", False, (1, 16384, 1024)), ("sm80", True, (1, 1024, 16384))):
+        with generation.assumed(name):
+            target = generation.gpu_target()
+            ba = launch.bind(bf16((512, 16384)), bf16(matrix), one, out_dtype="bfloat16",
+                             trans_rhs=transposed, interpret=False, dense=True)
+            tile = launch.derived(ba, target)
+            assert tile is not None, name
+            for splits in (1, 2):
+                assert launch.legal(ba, dataclasses.replace(tile, splits=splits), target), (name, splits)
+
+    # Exercise explicit unsplit and split pins numerically against float64 truth.
+    def draw(seed):
+        rng = np.random.default_rng(10151 + seed)
+        return (jnp.asarray(rng.standard_normal((128, 256)) / 16.0, jnp.bfloat16),
+                jnp.asarray(rng.standard_normal((256, 128)) / 16.0, jnp.bfloat16))
+
+    for splits in (1, 2):
+        pin = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family="wgmma", splits=splits)
+
+        def dew_fn(x, w, *, pinned=pin):
+            with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+                  tuning.pinned({grouped_matmul.MosaicGmm: pinned})):
+                return gemm.gemm(x, w, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+        assert_as_exact(
+            jax.jit(dew_fn),
+            jax.jit(lambda x, w: jax.lax.dot(x, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16)),
+            draw, f"dense explicit splits={splits}", seeds=8,
+            truth_fn=lambda x, w: jax.lax.dot(x.astype(jnp.float64), w.astype(jnp.float64),
+                                              preferred_element_type=jnp.float64))
 
 
 def test_sm80_transposed_dx_and_tgmm_skip_regressing_fragment_prefetch():
@@ -2147,11 +2159,13 @@ def test_explicit_target_b200_gathered_settles_under_ambient_sm80():
     with generation.assumed("sm80"):
         got = launch.derived(ba, sm100)
         assert got is not None and got.producers.of(launch.KERNEL) is not None
+        assert launch.legal(ba, got, sm100)
         unsettled = dataclasses.replace(got, producers=resources.Producers())
         assert not launch._refused(ba, unsettled, sm100)
         assert producers.settled(launch, ba, unsettled, sm100) == got
     with generation.assumed("sm100"):
         want = producers.settled(launch, ba, unsettled, sm100)
+        assert launch.legal(ba, got, sm100)
     assert got == want
 
 

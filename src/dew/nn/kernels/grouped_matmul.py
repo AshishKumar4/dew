@@ -487,7 +487,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 found.append(moved)
         return tuple(found)
 
-    def legal(self, ba, config: tiling.Tiles, target) -> bool:
+    def _legal(self, ba, config: tiling.Tiles, target) -> bool:
         """Whether `config` runs the call on `target` (`Template.legal`): a candidate (`candidate`) whose
         ring of `config.stages` and registers the planner holds at its programs (`resources.plan`, as the
         derivation sizes them). A cluster's legality is each multiprocessor's: its staged bytes and
@@ -1154,7 +1154,7 @@ class MosaicGmm(_Mosaic):
             swapped = self.bind(*swapped.args, **{**swapped.kwargs, 'out_dtype': 'float32'})
         return swapped, dataclasses.replace(config, swapped=False, splits=1)
 
-    def legal(self, ba, config: tiling.Tiles, target) -> bool:
+    def _legal(self, ba, config: tiling.Tiles, target) -> bool:
         from .templates.gemm import mosaic_gpu, pricing
 
         if config.swapped and (self._swapped(ba, target) is None or not self._left_fits(ba, config, target)):
@@ -1177,7 +1177,7 @@ class MosaicGmm(_Mosaic):
                 or pricing.family_of(config, ba.arguments['tokens'].dtype, target).pairs_product
                 or not mosaic_gpu.split_runs(-(-depth // config.block_k), config.splits)):
             return False
-        return super().legal(ba, config, target)
+        return super()._legal(ba, config, target)
 
     def candidate(self, ba, config: tiling.Tiles, target) -> bool:
         # Matrices side by side, or chained products, take a tile of their own (`_takes_beside`,
@@ -1386,8 +1386,8 @@ class MosaicPackedGmm(MosaicGmm):
             prologue_axes=(), prologue_dtypes=(), epilogue_axes=(), epilogue_dtypes=(),
             dtypes=(ba.arguments['out_dtype'],), packed=True, packed_rows=rows)
 
-    def legal(self, ba, config: tiling.Tiles, target) -> bool:
-        return config.splits == 1 and super().legal(ba, config, target)
+    def _legal(self, ba, config: tiling.Tiles, target) -> bool:
+        return config.splits == 1 and super()._legal(ba, config, target)
     def candidate(self, ba, config: tiling.Tiles, target) -> bool:
         # A swapped call's consumers each decode 64 rows of the matrix, its fragment's; the matrix's columns
         # take whole 64-column fragments otherwise (`packed.rows_taken`, `packed.taken`).
@@ -1679,14 +1679,14 @@ class MosaicTgmm(_Mosaic):
         return (family.bounded_loads and rows % cooperative != 0
                 and mosaic_gpu.ragged_rows(rows, prologue=prologue, k_major=self.K_MAJOR))
 
-    def legal(self, ba, config: tiling.Tiles, target) -> bool:
+    def _legal(self, ba, config: tiling.Tiles, target) -> bool:
         from .templates.gemm import pricing
 
         if config.splits > 1 and (
                 self.K_MAJOR
                 or pricing.family_of(config, ba.arguments['tokens'].dtype, target).pairs_product):
             return False
-        return super().legal(ba, config, target)
+        return super()._legal(ba, config, target)
 
     def candidate(self, ba, config: tiling.Tiles, target) -> bool:
         """`_Mosaic.candidate` on a family whose products read registers loading its transposed stage in whole

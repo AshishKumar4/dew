@@ -205,3 +205,59 @@ def test_linear_cross_entropy_derives_on_tpu_and_honors_shared_limit():
                 c, (256, 256, 256), jnp.bfloat16, transpose_rhs=True, has_bias=False, target=tight),
             grouped=False, dense=True)
         assert clamped is None
+
+
+def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_choices():
+    """Fused BF16 `MOSAIC_LINEAR_CE` rounds each completed logit to bf16 before its softmax, as the chunked
+    head's product does forward and backward (`chunked._tile_logits`, `bf16_product`): logits near 128,
+    where bf16's places are 0.5 below and 1 above, hold check 1 on loss, log Z and gradients against
+    float64 truth of the rounded logits (a softmax of the unrounded ones is 0.25 off where a target's 128.25
+    rounds to 128). Unrelated `grouped_matmul` choices (`cutlass`, `triton`) leave chunked XLA untouched,
+    bit-equal (rows 6103, 12136)."""
+    m, k, v = 64, 64, 64
+
+    def draw(seed):
+        rng = np.random.default_rng(12136 + seed)
+        x = jnp.zeros((m, k), jnp.float32).at[:, 0].set(1.0).at[:, 1].set(rng.integers(-3, 4, m) / 4.0)
+        w = jnp.zeros((v, k), jnp.float32).at[:, 0].set(128.0).at[:, 1].set(rng.integers(-1, 2, v))
+        targets = jnp.asarray(rng.integers(0, v, size=(m,)), jnp.int32)
+        cot = jnp.asarray(rng.standard_normal((m,)), jnp.float32)
+        return x.astype(jnp.bfloat16), w.astype(jnp.bfloat16), targets, cot
+
+    def run(kernel: str, x, w, targets, cot):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
+            def fwd(a, b):
+                loss, _, log_z = chunked.chunked_cross_entropy(
+                    a, OutputTable(b, vocab_major=True, precision=chunked.BF16), targets,
+                    chunks=1, tile=(64, 64), predict=False)
+                return loss, log_z
+            (loss, log_z), pull = jax.vjp(fwd, x, w)
+            return loss, log_z, pull((cot, jnp.zeros_like(cot)))
+
+    def truth(x, w, targets, cot):
+        def fwd(a, b):
+            logits = a @ b.T
+            # Each logit rounded to bf16 as the head's product rounds it, its derivative the product's.
+            logits = logits + jax.lax.stop_gradient(logits.astype(jnp.bfloat16).astype(jnp.float64) - logits)
+            log_z = jax.nn.logsumexp(logits, axis=1)
+            return log_z - jnp.take_along_axis(logits, targets[:, None], axis=1)[:, 0], log_z
+
+        (loss, log_z), pull = jax.vjp(fwd, x.astype(jnp.float64), w.astype(jnp.float64))
+        return loss, log_z, pull((cot.astype(jnp.float64), jnp.zeros_like(cot, jnp.float64)))
+
+    dew_fn, ref_fn = (jax.jit(functools.partial(run, kernel)) for kernel in ("mosaic", "xla"))
+    label = "linear_ce bf16 logits near 128"
+    assert_as_exact(dew_fn, ref_fn, draw, label, seeds=seeds_for(ref_fn, draw, label, truth_fn=truth,
+                                                                  dew_fn=dew_fn), truth_fn=truth)
+
+    x, w, targets, _ = draw(0)
+    head = OutputTable(w, vocab_major=True, precision=chunked.BF16)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"):
+        want_loss, _, want_logz = chunked.chunked_cross_entropy(x, head, targets, chunks=1, tile=(64, 64),
+                                                                predict=False)
+    for other in ("cutlass", "triton"):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul=other):
+            got_loss, _, got_logz = chunked.chunked_cross_entropy(
+                x, head, targets, chunks=1, tile=(64, 64), predict=False)
+        np.testing.assert_array_equal(np.asarray(got_loss), np.asarray(want_loss))
+        np.testing.assert_array_equal(np.asarray(got_logz), np.asarray(want_logz))

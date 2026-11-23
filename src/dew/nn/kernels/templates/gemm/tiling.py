@@ -153,6 +153,14 @@ class TilesTemplate(base.Template[Tiles]):
         return resources.program_shared(super().program_shared(config, target), config.programs)
 
     def legal(self, ba, config: Tiles, target) -> bool:
+        """Whether `config` runs the call `ba` binds on `target` (`_legal`), read under `target` whatever GPU
+        is in effect (`generation.as_target`): its family's registers and resources are `target`'s."""
+        with generation.as_target(target):
+            return self._legal(ba, config, target)
+
+    def _legal(self, ba, config: Tiles, target) -> bool:
+        """`legal`'s judgment under `target`: a candidate whose ring of `config.stages` and registers the
+        planner holds at its programs (`resources.plan`)."""
         from . import pricing
 
         if not self.candidate(ba, config, target):
