@@ -661,3 +661,31 @@ def test_splash_tangents_take_the_kernels_products_and_starting_maximum():
                            (jnp.asarray(value),), (jnp.ones_like(jnp.asarray(value)),))
     np.testing.assert_array_equal(np.asarray(out), 0.0)
     np.testing.assert_array_equal(np.asarray(tangent), 0.0)
+
+
+def test_splash_mixed_derivatives_read_no_omitted_key():
+    """An omitted tile's keys (`block_mask == 0`) reach no derivative: 256 queries over 256 keys whose mask
+    visits the first 128 alone, the rest NaN in keys and values, finite visible operands; dQ's pullback moved
+    along its output cotangent (forward over reverse, the portable rule's) stays finite, where the omitted
+    keys entered the scores' contraction and their transpose met a score cotangent of zero (`0 * NaN`)."""
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+
+    from dew.nn.kernels import splash
+
+    visible = np.zeros((256, 256), bool)
+    visible[:, :128] = True
+    mask = splash_attention_mask.MultiHeadMask([splash_attention_mask.NumpyMask(visible)])
+    blocks = splash.BlockSizes(128, 128, 128, 128, 128, 128, 128, 128)
+    kernel = splash.make_splash_mha(mask, block_sizes=blocks, interpret=True)
+    rng = np.random.default_rng(2654)
+    query = jnp.asarray(rng.normal(size=(1, 256, 128)), jnp.float32)
+    key = jnp.asarray(rng.normal(size=(1, 256, 128)), jnp.float32).at[:, 128:].set(jnp.nan)
+    value = jnp.asarray(rng.normal(size=(1, 256, 128)), jnp.float32).at[:, 128:].set(jnp.nan)
+    cotangent = jnp.ones((1, 256, 128), jnp.float32)
+
+    def query_gradient(q, ct):
+        _, pull = jax.vjp(lambda x: kernel(x, key, value), q)
+        return pull(ct)[0]
+
+    _, moved = jax.jvp(query_gradient, (query, cotangent), (jnp.zeros_like(query), cotangent))
+    assert np.isfinite(np.asarray(moved)).all()

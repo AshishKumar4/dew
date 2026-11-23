@@ -1304,12 +1304,30 @@ def _splash_portable(
                                                          blocks.block_kv_compute)
     values_precision = programs.mosaic_tpu_dot_precision(jnp.float32, jnp.float32, blocks.block_q,
                                                          blocks.block_kv_compute, head_dim_v)
-    logits = float32_einsum("hgqd,hkd->hgqk", q_grouped, k, precision=scores_precision,
-                            preferred_element_type=wide).reshape(num_q_heads, q_seq_len, kv_seq_len)
-    if call.attn_logits_soft_cap is not None:
-        logits = jnp.tanh(logits / call.attn_logits_soft_cap) * call.attn_logits_soft_cap
     visited, entry = _splash_mask(fwd_mask_info, segment_ids, q_seq_len=q_seq_len, kv_seq_len=kv_seq_len,
                                   blocks=blocks, call=call)
+    if visited is None:
+        logits = float32_einsum("hgqd,hkd->hgqk", q_grouped, k, precision=scores_precision,
+                                preferred_element_type=wide).reshape(num_q_heads, q_seq_len, kv_seq_len)
+    else:
+        # Omitted `block_mask == 0` tiles' keys masked out per query block before the scores' contraction, as
+        # their values are below: an omitted key's NaN met a score cotangent of zero in the transpose, `0 *
+        # NaN`, and poisoned dQ's derivatives (row 2654).
+        q_tiles = q_seq_len // blocks.block_q
+        seen = jnp.swapaxes(visited[:, ::blocks.block_q, :], 0, 1)
+        q_by_tile = jnp.swapaxes(q.reshape(num_q_heads, q_tiles, blocks.block_q, head_dim_qk), 0, 1)
+        k_q = jnp.repeat(k, groups, axis=0)
+
+        def _block_scores(_, pair):
+            q_qb, seen_qb = pair
+            k_safe = jnp.where(seen_qb[..., None], k_q, jnp.zeros((), k_q.dtype))
+            return None, float32_einsum("hqd,hkd->hqk", q_qb, k_safe, precision=scores_precision,
+                                        preferred_element_type=wide)
+
+        _, scored = lax.scan(_block_scores, None, (q_by_tile, seen))
+        logits = jnp.swapaxes(scored, 0, 1).reshape(num_q_heads, q_seq_len, kv_seq_len)
+    if call.attn_logits_soft_cap is not None:
+        logits = jnp.tanh(logits / call.attn_logits_soft_cap) * call.attn_logits_soft_cap
     if entry is not None:
         logits = jnp.where(entry, logits, call.mask_value)
     if visited is not None:
