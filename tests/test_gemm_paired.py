@@ -1305,3 +1305,96 @@ def test_grouped_low_rank_walks_in_place_and_holds_check_1_and_compiles():
             assert not rec.get("error"), rec
             assert rec["kernels"], rec
             assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_an_adapted_products_gradient_keeps_a_wide_cotangent(grouped):
+    """An adapted product of fp16 rows with an fp32 output pulls its cotangent back at the cotangent's width:
+    `2**16`, past fp16's largest, against a kernel of `2**-10` gives the rows exactly 64, not the inf of a
+    cotangent rounded to fp16 first, dense and grouped (row 1304)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    half = functools.partial(jnp.zeros, dtype=jnp.float16)
+    x = jnp.ones((8, 16), jnp.float16)
+    kernel = jnp.full((2, 16, 8) if grouped else (16, 8), 2.0 ** -10, jnp.float16)
+    a, b = half((2, 16, 4) if grouped else (16, 4)), half((2, 4, 8) if grouped else (4, 8))
+    sizes = jnp.asarray([4, 4], jnp.int32) if grouped else None
+    _, pull = jax.vjp(lambda rows: low_rank(rows, kernel, a, b, 1.0, sizes, out_dtype=jnp.float32), x)
+    (d_x,) = pull(jnp.zeros((8, 8), jnp.float32).at[0, 0].set(2.0 ** 16))
+    want = np.zeros((8, 16), np.float16)
+    want[0] = 64.0
+    np.testing.assert_array_equal(np.asarray(d_x), want)
+
+    # An fp32 kernel's `1 + 2**-12` the forward multiplied as fp16's 1: against -1 its gradient cancels.
+    exact = jnp.zeros(kernel.shape, jnp.float32).at[..., 0, 0].set(1.0 + 2.0 ** -12).at[..., 0, 1].set(-1.0)
+    _, pull = jax.vjp(lambda rows: low_rank(rows, exact, a, b, 1.0, sizes, out_dtype=jnp.float32), x)
+    (d_x,) = pull(jnp.zeros((8, 8), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(1.0))
+    assert np.asarray(d_x)[0, 0] == 0.0, np.asarray(d_x)[0, :2]
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("grouped", [False, True])
+def test_an_adapted_product_in_a_checked_map_sums_its_replicated_operands_gradients(grouped):
+    """An adapted product inside a `shard_map` over two CPU devices that checks the axes its values vary over
+    (`check_vma`), each device its own rows and every device the same kernel, factors and scale: their
+    gradients are each device's partial summed over the rows' axis, invariant, equal to the base product and
+    its update written plainly, exactly, over small integers (row 1304)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    rng = np.random.default_rng(1304)
+
+    def ints(*shape):
+        return jnp.asarray(rng.integers(-2, 3, shape), jnp.bfloat16)
+
+    stacked = (2,) if grouped else ()
+    x, kernel = ints(8, 16), ints(*stacked, 16, 8)
+    a, b, scale = ints(*stacked, 16, 4), ints(*stacked, 4, 8), jnp.float32(1.0)
+    # Each device's 4 rows, two to each group.
+    sizes = jnp.asarray([2, 2], jnp.int32) if grouped else None
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def plain(rows, w, a_, b_, s):
+        rows, w, a_, b_ = (operand.astype(jnp.float32) for operand in (rows, w, a_, b_))
+        if sizes is None:
+            return rows @ w + s * ((rows @ a_) @ b_)
+        # Each row's group's matrices, gathered.
+        owner = jnp.repeat(jnp.arange(2), sizes, total_repeat_length=rows.shape[0])
+        update = jnp.einsum('rk,rkw->rw', jnp.einsum('rd,rdk->rk', rows, a_[owner]), b_[owner])
+        return jnp.einsum('rd,rdw->rw', rows, w[owner]) + s * update
+
+    def adapted(rows, w, a_, b_, s):
+        return low_rank(rows, w, a_, b_, s, sizes, out_dtype=jnp.float32)
+
+    def gradients(product):
+        def each_device(rows, w, a_, b_, s):
+            return jax.grad(lambda *ops: jnp.sum(product(rows, *ops)), argnums=(0, 1, 2, 3))(w, a_, b_, s)
+
+        return jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, whole, whole, whole),
+                                     out_specs=whole, check_vma=True))(x, kernel, a, b, scale)
+
+    for got, want in zip(gradients(adapted), gradients(plain), strict=True):
+        np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(want, np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_adapted_products_replicated_gradient_sums_before_it_rounds():
+    """A replicated fp16 kernel's gradient in a checked `shard_map` over two CPU devices is their partials
+    summed wide, then rounded once: `65536` (fp16's inf alone) and `-65504` sum to 32 (row 1304)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    x = jnp.zeros((2, 8), jnp.float16).at[:, 0].set(1.0)
+    kernel, a, b = (jnp.zeros(shape, jnp.float16) for shape in ((8, 8), (8, 4), (4, 8)))
+    cotangent = jnp.zeros((2, 8), jnp.float32).at[0, 0].set(65536.0).at[1, 0].set(-65504.0)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def each_device(rows, w, dy):
+        _, pull = jax.vjp(lambda w_: low_rank(rows, w_, a, b, 1.0, out_dtype=jnp.float32), w)
+        return pull(dy)[0]
+
+    d_kernel = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, whole, data), out_specs=whole,
+                                     check_vma=True))(x, kernel, cotangent)
+    want = np.zeros((8, 8), np.float16)
+    want[0, 0] = 32.0
+    np.testing.assert_array_equal(np.asarray(d_kernel), want)
