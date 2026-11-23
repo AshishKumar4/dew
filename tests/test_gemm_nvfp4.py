@@ -842,8 +842,8 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
         want[0, 0], want[0, 1] = 2.0 ** -28, 2.0 ** 89
         np.testing.assert_array_equal(np.asarray(d_token), want, err_msg=kernel)
 
-    # One route's products cancelling at 2**252 with a third, 2**-126 times its factor, on the same input,
-    # which the route's fp32 pullback at one power cannot keep: NaN, as the plain transpose gives, not 0.
+    # One route's products cancelling at 2**252 beside a third, 2**-126 times its factor, on the same input:
+    # each band of the route pulled back apart, the third keeps its 2**-8.
     three = jnp.zeros((1, 512, 128), jnp.float32).at[0, 0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
     lone = formats.NvFp4.of(three, scales[None], jnp.asarray([2.0 ** 118], jnp.float32))
     with generation.assumed("sm90"), generation.chosen(nvfp4="xla"):
@@ -852,25 +852,9 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
                           token)
         cotangent = jnp.zeros((1, 128), jnp.float32).at[0, :2].set(2.0 ** 126).at[0, 2].set(2.0 ** -126)
         (d_token,) = pull(cotangent)
-    assert np.isnan(np.asarray(d_token)[0, 0]), np.asarray(d_token)[0, :2]
-    np.testing.assert_array_equal(np.asarray(d_token)[0, 1:], np.zeros((511,), np.float32))
-
-    # Dense, one row: codes +1, -1, +1 under 2**100, 2**100, 2**79 at a factor of 2**30 move without flushing,
-    # so the rescue is exact, 2**101; with a fourth code +1 on input 1 under 2**126 at a factor of 2**126, the
-    # move flushes the 2**-126 that input 0's cancelling products leave: NaN there, as the plain transpose's.
-    row = jnp.zeros((1, 512), jnp.float32).at[0, :2].set(1.0)
-    spread = jnp.zeros((512, 128), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0])).at[1, 3].set(1.0)
-
-    def pulled(tensor, cotangent):
-        matrix = formats.NvFp4.of(spread, scales, jnp.float32(tensor))
-        _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32), row)
-        (d_row,) = pull(jnp.zeros((1, 128), jnp.float32).at[0, :4].set(jnp.asarray(cotangent, jnp.float32)))
-        return np.asarray(d_row)[0, :2]
-
-    exact = pulled(2.0 ** 22, (2.0 ** 100, 2.0 ** 100, 2.0 ** 79, 0.0))
-    np.testing.assert_array_equal(exact, np.float32([2.0 ** 101, 0.0]))
-    flushed = pulled(2.0 ** 118, (2.0 ** 100, 2.0 ** 100, 2.0 ** -126, 2.0 ** 126))
-    assert np.isnan(flushed[0]) and np.isinf(flushed[1]), flushed
+    want = np.zeros((1, 512), np.float32)
+    want[0, 0] = 2.0 ** -8
+    np.testing.assert_array_equal(np.asarray(d_token), want)
 
     # A gather routing no token pulls back zeros.
     none, nowhere = jnp.asarray([0, 0], jnp.int32), jnp.zeros((0,), jnp.int32)
@@ -945,3 +929,33 @@ def test_an_nvfp4_products_gathered_rescue_sums_devices_routes_before_it_moves_t
     want = np.zeros((1, 512), np.float32)
     want[0, 0] = 2.0 ** -38
     np.testing.assert_array_equal(np.asarray(d_token), want)
+
+
+def test_an_nvfp4_products_dense_rescue_keeps_each_product_through_its_band():
+    """An NVFP4 product's input gradient past fp32's largest, one row: input 0's codes +1, -1, +1 and input
+    1's +1 under four cotangents, each product kept through its band (`factored`'s), whatever lies beside it:
+    2**101 of 2**100, 2**100, 2**79 at a factor of 2**30; 2**-8 of 2**-126 beside 2**126s at a factor of
+    2**126, input 1's 2**244 past fp32's largest; 2**9 of a 2**-99 through an entry of 2**-18 (a code of 0.5
+    at a block scale of 2**-9) beside cancelling 2**126s; and 2**33 of 2**-85 beside cancelling 2**-126s
+    (row 1464)."""
+    scales = jnp.ones((32, 128), jnp.float8_e4m3fn)
+    row = jnp.zeros((1, 512), jnp.float32).at[0, :2].set(1.0)
+    spread = jnp.zeros((512, 128), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0])).at[1, 3].set(1.0)
+    fine = scales.at[0, 2].set(jnp.float8_e4m3fn(2.0 ** -9))
+
+    def pulled(tensor, cotangent, codes=spread, blocks=scales):
+        matrix = formats.NvFp4.of(codes, blocks, jnp.float32(tensor))
+        _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32), row)
+        (d_row,) = pull(jnp.zeros((1, 128), jnp.float32).at[0, :4].set(jnp.asarray(cotangent, jnp.float32)))
+        return np.asarray(d_row)[0, :2]
+
+    np.testing.assert_array_equal(pulled(2.0 ** 22, (2.0 ** 100, 2.0 ** 100, 2.0 ** 79, 0.0)),
+                                  np.float32([2.0 ** 101, 0.0]))
+    np.testing.assert_array_equal(pulled(2.0 ** 118, (2.0 ** 100, 2.0 ** 100, 2.0 ** -126, 2.0 ** 126)),
+                                  np.float32([2.0 ** -8, np.inf]))
+    halves = spread.at[0, 2].set(0.5)
+    np.testing.assert_array_equal(pulled(2.0 ** 118, (2.0 ** 126, 2.0 ** 126, 2.0 ** -99, 0.0), halves, fine),
+                                  np.float32([2.0 ** 9, 0.0]))
+    plus = spread.at[0, :3].set(jnp.asarray([1.0, 1.0, -1.0]))
+    cotangent = (2.0 ** -85, 2.0 ** -126, 2.0 ** -126, 2.0 ** 126)
+    np.testing.assert_array_equal(pulled(2.0 ** 118, cotangent, plus), np.float32([2.0 ** 33, np.inf]))
