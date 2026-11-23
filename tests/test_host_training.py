@@ -1574,17 +1574,21 @@ def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout(caplog):
 
 
 @pytest.mark.usefixtures("scanned_stacks")
-@pytest.mark.tpu(reason="a TPU v6e prices the streamed step by its stated host link (row 7908)")
+@pytest.mark.tpu(reason="a TPU prices the streamed step by its stated host link (row 7908)")
 def test_a_tpu_that_holds_only_the_streamed_step_streams_on_par_with_its_device_plan():
-    """A fresh bf16 fit on a v6e stated to hold the decoder's streamed step and not its device plan (its
+    """A fresh bf16 fit on a TPU stated to hold the decoder's streamed step and not its device plan (its
     memory between their needs, each its compiled program's arguments and temporaries there) takes the
-    streamed plan, priced by the TPU's host link, and trains its steps bit for bit as a run given the host
-    layout; and a host step on the TPU is on par with its device plan's from float64 (check 1, `crossed`):
-    the streamed layout the planner may now choose on a TPU, run on one."""
+    streamed plan where its part states a host-link rate (a v6e's), priced by it, and trains its steps bit
+    for bit as a run given the host layout; and a host step on the TPU is on par with its device plan's
+    from float64 (check 1, `crossed`): the streamed layout the planner may now choose on a TPU, run on one.
+    A part that states none (a v5e's) cannot price the streamed step, which is no candidate: its fit is
+    refused, its layout choice naming why, never streamed unpriced (row 12117)."""
     from model_support import memory_limited_to
 
+    from dew.nn.kernels.generation import gpu_target
     from dew.telemetry import instrumentation as memory
     from dew.training.ahead import stand_in_gpus
+    from dew.training.planning import PlanRefused
 
     def on_one(trainer: Trainer) -> Trainer:
         # One TPU, whose CPU companion a TPU host holds whatever its CPU device count.
@@ -1598,6 +1602,14 @@ def test_a_tpu_that_holds_only_the_streamed_step_streams_on_par_with_its_device_
     start = held.place()[0]
     whole = memory.compiled_memory(streamed_program(held, start, *memory_streamed_arguments(held, start)))
     between = memory_limited_to((device.argument + device.temp + whole.argument + whole.temp) // 2)
+    if gpu_target().host_link_rate is None:
+        with stand_in_gpus(jax.devices()[:1], between):
+            unpriced = on_one(streaming_decoder(dtype=jnp.bfloat16))
+            with pytest.raises(PlanRefused):
+                unpriced.fit(streaming_data(), steps=1, log_every=100)
+        choice = unpriced.layout_choice
+        assert choice is not None and not choice.streams and choice.refused is not None, choice
+        return
     with stand_in_gpus(jax.devices()[:1], between):
         chosen = on_one(streaming_decoder(dtype=jnp.bfloat16))
         trained = chosen.fit(streaming_data(), steps=2, log_every=100)
