@@ -738,7 +738,7 @@ def varying(*operands) -> frozenset[str]:
     operation's result. The one owner of that union: a launch's results (`computed_from`), operands made
     to vary alike (`varied_alike`) and the algebra's primitives' result types (`dew.algebra.scaled.varying`)
     read it (rows 10531, 10571)."""
-    typed = (leaf if isinstance(leaf, jax.core.ShapedArray) else jax.typeof(leaf)
+    typed = (leaf if isinstance(leaf, jax_core.ShapedArray) else jax.typeof(leaf)
              for leaf in jax.tree.leaves(operands))
     return frozenset().union(*(each.mat.varying for each in typed))
 

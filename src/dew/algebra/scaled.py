@@ -43,7 +43,7 @@ from dew.nn import float_bits
 from dew.nn.derivatives import contracted
 from dew.nn.float_bits import exact_power2
 from dew.nn.precision import correctly_rounded_divide, power2, two_product, two_sum
-from dew.nn.sharding import varied_alike, varying as sharding_varying
+from dew.nn.sharding import varied_alike, varying as sharding_varying  # the union; `varying` types by it
 
 
 @dataclasses.dataclass(frozen=True)
