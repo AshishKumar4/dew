@@ -694,9 +694,9 @@ def test_the_tuners_variants_lead_with_the_derived_config_each_legal(target):
 
 
 def _planned_variants() -> list[selective.Tiles]:
-    """The configs the opt-in tuner may pick (`Selective.variants`) for the planned shape (`SHAPES['planned']`,
-    512 tokens: blocks of 128, 256 and 512 tokens at 1, 2 and 4 tokens a thread, 8 and 16 clamped to 512's),
-    one of each the scan runs apart: its backward's block, residency and forward chunk."""
+    """The configs the opt-in tuner may pick (`Selective.variants`) for the planned shape, 512 tokens
+    (`SHAPES['planned']`: blocks of 128, 256 and 512 tokens at 1, 2 and 4 tokens a thread, 8 and 16 clamped
+    to 512's), one of each the scan runs apart: its backward's block, residency and forward chunk."""
     rows, length, channels, states = SHAPES["planned"]
     operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
         jax.ShapeDtypeStruct((channels, states), jnp.float32),
@@ -710,7 +710,7 @@ def _planned_variants() -> list[selective.Tiles]:
 
 
 PLANNED_VARIANTS = _planned_variants()
-"""`_planned_variants`, each a check-1 site of its own (`test_every_tuner_variant_is_as_exact_interpreted`)."""
+"""`_planned_variants`, each a check-1 site of its own (the every-variant test below)."""
 
 
 @pytest.mark.parametrize('tiles', PLANNED_VARIANTS, ids=lambda tiles: (
