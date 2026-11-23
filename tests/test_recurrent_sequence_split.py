@@ -389,10 +389,10 @@ TRANSFER_SEEDS = 16
 @pytest.mark.parametrize("per_key", [False, True], ids=["a decay a head", "a decay a key dimension"])
 def test_a_slices_transfer_is_on_par_with_the_rule_from_the_identity(per_key, length):
     """A sequence shard's transfer (`recurrence_chunk.transferred`: each chunk's transition from the derived
-    forms, joined pairwise in fp32, row 1437) and its VJP along the keys, decays and write gates, on par from
+    forms, chained in fp32, row 1437) and its VJP along the keys, decays and write gates, on par from
     float64 with the delta rule's fp32 final memory over zero values from the identity and its VJP, which
     `entering_memory` took before (check 1), both in 16-token chunks (not the rule's 64; the summary took
-    the layer's chunk, as the transfer now does): one chunk, ten and eleven (the join's odd one carried),
+    the layer's chunk, as the transfer now does): one chunk, ten and eleven,
     off their grid but the first; a row whose document starts halfway (the transfer zero across it) and a
     row whose one document spans the slice, its transfer 0.2 to 0.7% of the identity's norm under these
     gates at ten chunks (float64, four draws); a reset on every row made every transfer zero, whatever its
@@ -458,9 +458,9 @@ def test_a_slices_transfer_stays_finite_where_its_chain_in_order_does():
     """`recurrence_chunk.transferred` over four one-token chunks of a key dimension of one, keys 0, 0, 2^34,
     2^34, write gates 0, 0, 1/2, 1/2 and log decays -64, 0, 0, 0: transitions exp(-64), 1, 1 - 2^67 and
     1 - 2^67, their product in order about 3.5e12, where the later pair's alone, (1 - 2^67)^2, is past
-    fp32's range: joined pairwise without its powers of two apart, inf (#3771's review). On par from float64
-    with the rule's final memory from the identity, which walks them in order (check 1, every draw the
-    same)."""
+    fp32's range: joined pairwise, inf (#3771's review), and scaled apart by powers of two, other ranges'
+    entries lost (#3777's); chained in order as the rule walks them, on par from float64 with the rule's final
+    memory from the identity (check 1, every draw the same)."""
     from dew.nn.kernels import generation
     from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, recurrent_delta_rule, transferred
 
