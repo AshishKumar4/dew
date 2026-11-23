@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from affine_run import TimingRegression as Regression, batches
 from diffusion_support import images_of
@@ -1042,10 +1043,11 @@ def test_a_run_saved_before_its_retired_and_unsettable_fields_loads_as_it_traine
      GaussNewton(damping=1e-3)),
     ({"optimizer": "dew.optim:_muonclip_groups"}, MuonClip()),
     ({"optimizer": "optax:sgd", "optimizer_opts": {"momentum": 0.9}}, Optax("optax:sgd", {"momentum": 0.9})),
-    # Its decay masked off and spared: its own mask was written over the options'.
+    # Its decay masked off, unspared: it decayed nothing; spared, its own mask was written over it.
+    ({"optimizer": "adamw", "optimizer_opts": {"mask": False}, "spared": False}, AdamW(weight_decay=0.0)),
     ({"optimizer": "adamw", "optimizer_opts": {"mask": False}}, AdamW()),
 ], ids=["muon-moments-apart", "adamw-params-moments", "adam-int8", "gauss-newton-path", "muonclip-path",
-        "optax-path", "adamw-masked-spared"])
+        "optax-path", "adamw-masked-unspared", "adamw-masked-spared"])
 def test_a_run_saved_before_each_optimizer_held_its_settings_loads_its_optimizer_as_it_trained(
         tmp_path, earlier, built):
     """A run saved while its optimizer config held the optimizer's settings (row 11933) loads its optimizer
@@ -1075,10 +1077,10 @@ def test_a_run_saved_before_each_optimizer_held_its_settings_loads_its_optimizer
 MASKED = json.loads((Path(__file__).parent / "fixtures" / "optimizers" / "masked-decay-65609490a.json")
                     .read_text())
 """Optimizers an earlier Dew (main 65609490a) built with their decay masked off among their options
-(`optimizer_opts={"mask": False}`) over `OptimConfig(learning_rate=1e-2)`'s other settings, which this Dew
-loads, each with the state its first step held, its tree's structure (`treedef`, every node a checkpoint's
-metadata holds, empty ones among them) and each leaf's path, shape and dtype, and that step's updates of two
-parameters with unit gradients, recorded by that Dew's own `OptimConfig.build`."""
+(`optimizer_opts={"mask": False}`) over `OptimConfig(learning_rate=1e-2)`'s other settings, each with the
+state its first step held, its tree's structure (`treedef`, every node a checkpoint's metadata holds, empty
+ones among them) and each leaf's path, shape and dtype, and that step's updates of two parameters with unit
+gradients, recorded by that Dew's own `OptimConfig.build`."""
 
 
 def _saved_optimizer(tmp_path, earlier):
@@ -1099,15 +1101,19 @@ def _saved_optimizer(tmp_path, earlier):
 
 @pytest.mark.parametrize("case", sorted(MASKED))
 def test_a_run_whose_decay_its_options_masked_off_resumes_its_optimizers_state_as_it_trained(tmp_path, case):
-    """A run saved while its optimizer's options masked its decay off (`optimizer_opts={"mask": False}`)
-    where that built the optimizer state this Dew builds, Adam's coupled decay of 0, which held no decay
-    step, loads an optimizer whose state its checkpoint restores into: its tree's every node, each leaf at
-    the path, shape and dtype the earlier Dew's held, and whose step updates as that one's did."""
+    """A run saved while its optimizer's options masked its decay off (`optimizer_opts={"mask": False}`),
+    unspared or in a param group that did not spare (`ParamGroup.spared`), whatever the config spared, loads
+    an optimizer that decays nothing there (its decay 0), each leaf of its state at the path, shape and
+    dtype the earlier Dew's held, and whose step updates as that one's did; Adam's coupled decay of 0, which
+    held no decay step, holds its tree's every node as it did. AdamW's masked decay step held an empty state
+    of a mask's, which a decay of 0 holds bare: a checkpoint of it restores
+    (`test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optimizer_its_record_loads`)."""
     held = MASKED[case]
     optimizer = _saved_optimizer(tmp_path, held["optim"]).build(None)
     params = {"w": jnp.arange(4.0).reshape(2, 2) / 10, "b": jnp.arange(2.0) / 10}
     state = optimizer.init(params)
-    assert str(jax.tree.structure(state)) == held["treedef"]
+    if case.startswith("adam-coupled"):
+        assert str(jax.tree.structure(state)) == held["treedef"]
     leaves = [[jax.tree_util.keystr(path), list(leaf.shape), str(leaf.dtype)]
               for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]]
     assert leaves == held["state"], leaves
@@ -1116,23 +1122,61 @@ def test_a_run_whose_decay_its_options_masked_off_resumes_its_optimizers_state_a
 
 
 @pytest.mark.parametrize("earlier", [
-    {"optimizer": "adamw", "optimizer_opts": {"mask": False}, "spared": False, "weight_decay": 0.1},
-    {"optimizer": "adamw", "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
-     "param_groups": [{"name": "kernel", "patterns": ["w"]},
-                      {"name": "rest", "patterns": ["*"], "spared": True}]},
     {"optimizer": "adam", "optimizer_opts": {"mask": False}, "spared": False, "weight_decay": 0.1},
     {"optimizer": "adam", "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
      "param_groups": [{"name": "kernel", "patterns": ["w"]}]},
     {"optimizer": "adamw", "optimizer_opts": {"mask": {"w": False}}, "spared": False}],
-    ids=["decoupled-unspared", "decoupled-grouped", "coupled-unspared", "coupled-grouped", "tree-mask"])
+    ids=["coupled-unspared", "coupled-grouped", "tree-mask"])
 def test_a_run_whose_masked_decay_this_dew_holds_no_state_of_is_refused_as_it_loads(tmp_path, earlier):
-    """A run whose options masked its decay off where the config or a param group read the mask: AdamW's
-    decay step wrapped in a mask of its own (`optax.masked`), whose state node its checkpoint holds and no
-    decay of this Dew's builds (review of API01: a decay of 0 in its place was refused by Orbax's restore),
-    Adam's coupled decay, whose state held a decay step this Dew's Adam holds only where it decays; or masked
-    its decay by a tree no record rebuilds: refused as it loads, never loaded into another optimizer state."""
+    """A run whose options masked off Adam's coupled decay, whose state held a decay step ahead of its
+    moments this Dew's Adam holds only where it decays, ungrouped or in an unspared group, or masked its
+    decay by a tree no record rebuilds, is refused as it loads, never loaded into another optimizer state."""
     with pytest.raises(ValueError):
         _saved_optimizer(tmp_path, earlier)
+
+
+@pytest.mark.parametrize("case", ["adamw-unspared", "adamw-grouped"])
+def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optimizer_its_record_loads(
+        tmp_path, case):
+    """A checkpoint an earlier Dew wrote of a run whose options masked AdamW's decay off holds its decay
+    step's empty state as a mask's (`optax.MaskedState`), a node the optimizer its record now loads holds
+    bare (its decay 0): written here by an optimizer whose state is that earlier one's tree, node for node
+    (`MASKED`'s `treedef`), it restores into the loaded optimizer through Orbax, its every leaf as written,
+    and the run steps on (`dew.checkpoints._masked_decay_unsaved`; review of API01: Orbax refused it)."""
+    from dew.data.dataset import Loader
+    from dew.objectives.lm import LMObjective
+    from dew.optim import ParamGroup
+    from dew.training import Trainer
+
+    earlier = MASKED[case]["optim"]
+    # Its earlier optimizer's state, a masked decay step's empty one where it read its mask, as a spared
+    # decay's holds: the same tree the earlier Dew built.
+    groups = tuple(ParamGroup(group["name"], tuple(group["patterns"]), spared=True)
+                   for group in earlier.get("param_groups", ()))
+    written = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2, param_groups=groups)
+    params = {"w": jnp.arange(4.0).reshape(2, 2) / 10, "b": jnp.arange(2.0) / 10}
+    if not groups:
+        assert str(jax.tree.structure(written.build(None).init(params))) == MASKED[case]["treedef"]
+    loaded = _saved_optimizer(tmp_path, earlier)
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
+                              max_seq_len=8)
+    batch = {"text": jnp.arange(10, dtype=jnp.int32).reshape(2, 5) % 32}
+
+    def fitted(optimizer, steps):
+        trainer = Trainer(LMObjective(model, seq_len=4), optimizer, key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0),
+                          checkpoints=Checkpoints(str(tmp_path / "run")))
+        state = trainer.fit(Loader(train=lambda partition: iter([batch] * 4), val=None, records=2, batch=2),
+                            steps=steps, log_every=1, checkpoint_every=1)
+        trainer.checkpoints.wait()
+        return state
+
+    saved = fitted(written, 1)
+    resumed = fitted(loaded, 1)
+    assert jax.tree.structure(resumed.opt_state) != jax.tree.structure(saved.opt_state)
+    for got, want in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(saved.opt_state), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert int(fitted(loaded, 2).step) == 2
 
 
 @pytest.mark.parametrize("mask", [False, None], ids=["masked-off", "named-none"])

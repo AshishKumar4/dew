@@ -804,6 +804,59 @@ def _clip_pooled_unsaved(template, metadata):
         template.inner, opt_state=translated(template.inner.opt_state, inner)))
 
 
+def _masked_decay_unsaved(template, metadata):
+    """A restore's `template`, a train state's, read against a checkpoint whose optimizer state holds a decay
+    step masked off whole where the template's holds it bare: an earlier Dew's `optimizer_opts={"mask":
+    False}`, its masked step's empty state (`optax.MaskedState` over `optax.EmptyState`), which the record's
+    translation trains as a decay of 0, an empty state bare (`dew.config.earlier._unmasked`). Each such
+    node of each optimizer's state the tree holds (`_OPTIMIZERS`) templated as the checkpoint holds it, so
+    the restore reads its leaves alike, both nodes holding none, and the template's own form returned
+    beside it, which the restored state takes back (`_formed_as`). The one translation of that form at the
+    restore boundary (CONTRIBUTING), deleted at 1.0. Any other template as it is, with no form."""
+    from dew.state import TrainState
+
+    if not isinstance(template, TrainState):
+        return template, None
+    outer, inner = _OPTIMIZERS
+    masked = dataclasses.replace(template,
+                                 opt_state=_masked_empties(template.opt_state, _at(metadata, outer)))
+    if template.inner is not None:
+        masked = dataclasses.replace(masked, inner=dataclasses.replace(
+            template.inner, opt_state=_masked_empties(template.inner.opt_state, _at(metadata, inner))))
+    return (template, None) if masked == template else (masked, template)
+
+
+def _masked_empties(node, saved):
+    """`node`, an optimizer state, with each bare empty state (`optax.EmptyState`) where the checkpoint's
+    `saved` metadata holds a masked one over an empty state (`{"inner_state": ...}` holding nothing) as the
+    checkpoint holds it (`_masked_decay_unsaved`)."""
+    import optax
+
+    if isinstance(node, optax.EmptyState):
+        empty = isinstance(saved, Mapping) and saved.keys() == {"inner_state"} and not saved["inner_state"]
+        return optax.MaskedState(inner_state=node) if empty else node
+    if isinstance(node, tuple) and hasattr(node, "_fields") and isinstance(saved, Mapping):
+        return type(node)(*(_masked_empties(getattr(node, name), saved.get(name)) for name in node._fields))
+    if isinstance(node, tuple | list) and isinstance(saved, list | tuple) and len(saved) == len(node):
+        return type(node)(_masked_empties(part, held) for part, held in zip(node, saved, strict=True))
+    if isinstance(node, Mapping) and isinstance(saved, Mapping):
+        return {key: _masked_empties(value, saved.get(key)) for key, value in node.items()}
+    return node
+
+
+def _formed_as(restored: Mapping, form) -> dict:
+    """`restored`'s optimizer states in `form`'s own structure (`_masked_decay_unsaved`): the same leaves, in
+    the same order, each node the template holds as it holds it."""
+    held = dict(restored)
+    held["opt_state"] = jax.tree.unflatten(jax.tree.structure(form.opt_state),
+                                           jax.tree.leaves(held["opt_state"]))
+    if form.inner is not None and held.get("inner") is not None:
+        state = held["inner"]
+        held["inner"] = dataclasses.replace(state, opt_state=jax.tree.unflatten(
+            jax.tree.structure(form.inner.opt_state), jax.tree.leaves(state.opt_state)))
+    return held
+
+
 def _clip_states_unpooled(tree) -> bool:
     """Whether a checkpoint's optimizer-state metadata `tree` holds a QK-Clip state of the form before its
     pooled maxima: its steps and rescales with no `pooled` beside them, as Orbax names a NamedTuple's
@@ -2209,7 +2262,8 @@ class Checkpoints:
         stored = metadata.keys()
         _check_template(template, metadata, stored, mapping=mapping)
         placed = template
-        template = _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata)
+        template, form = _masked_decay_unsaved(
+            _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata), metadata)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:
@@ -2270,6 +2324,8 @@ class Checkpoints:
         restored = self._with_frozen(dict(restored), frozen, held)
         table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
+        if form is not None:
+            restored = _formed_as(restored, form)
         restored = _filled(placed, restored, step)
         _packed_checked(restored)
         return restored, saved
