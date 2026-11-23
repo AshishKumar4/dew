@@ -1136,7 +1136,9 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
     chunk's forms (`Derived.prepare`'s `window`), the state stored in its document's slot where the segment
     ends a storing document, and the chunk's next memory where it ends the chunk. The segments are at most
     the chunks and the documents, each one window's work, as many as a row laid a chunk a document took; no
-    value is sized by the documents' bound."""
+    value is sized by the documents' bound, and the walk stops at the row's last segment (rows walked
+    together, at their most segments'): a scan over the bound's every place evaluated the forms past them,
+    a 2048-token row of six documents at chunk 64 2080 windows at a bound of 2048 against 38 (row 7952)."""
     loads, stores, begun, adds, entry, turning = forked
     chunks, count = loads.shape
     place = jnp.arange(count)
@@ -1184,7 +1186,15 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
     start = (((decayed, zero), varying_like(jnp.asarray(-1), origins), (decayed, zero)), table,
              varying_like(jnp.zeros((chunks, *shaped.shape), shaped.dtype), *reaching),
              varying_like(jnp.zeros((chunks, *zero.shape), zero.dtype), *reaching))
-    ((_, _, last), table, outputs, entering), _ = jax.lax.scan(segment, start, (origins, following))
+    segments = jnp.minimum(jnp.sum(marks), events)
+
+    def walked(state):
+        at, carried = state
+        carried, _ = segment(carried, (origins[at], following[at]))
+        return at + 1, carried
+
+    _, ((_, _, last), table, outputs, entering) = jax.lax.while_loop(
+        lambda state: state[0] < segments, walked, (varying_like(jnp.asarray(0), origins), start))
     return outputs, entering, last[1], table
 
 
