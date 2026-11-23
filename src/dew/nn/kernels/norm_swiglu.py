@@ -102,7 +102,7 @@ from ..sharding import (
     manual_map,
     on_shards,
     summed_to,
-    varying_like,
+    varied_alike,
 )
 from . import generation, tuning
 from .generation import INHERENT, Choice, device_generation
@@ -427,7 +427,7 @@ def _placed(axes, operands, *, whole_last: bool) -> bool:
     `whole_last` leave its last axis whole, or every axis splitting it is
     explicit, its type its placement (`_shard_spec`). In a `shard_map` checking varying
     axes, each shard its own, the launch states its outputs' varying type
-    (`_varying`) where a GPU compiles it; Pallas's interpreter evaluates the
+    (`sharding.varied_alike`) where a GPU compiles it; Pallas's interpreter evaluates the
     kernel's body on the shards' varying values, whose gathers by unvarying
     indices JAX refuses, so an interpreted call runs XLA's arithmetic there."""
     if not generation.triton_runs() and any(
@@ -991,15 +991,6 @@ def _scale_sum(partial, correction):
     return summed_total((partial, correction), (0,))
 
 
-def _varying(operands: tuple) -> tuple:
-    """`operands` (None where a call has none) each varying over every manual axis any varies over
-    (`sharding.varying_like`): `launches.pallas_call` then types every declared output from them."""
-    present = [operand for operand in operands if operand is not None]
-    if not any(jax.typeof(operand).mat.varying for operand in present):
-        return operands
-    return tuple(None if operand is None else varying_like(operand, *present) for operand in operands)
-
-
 class _Sized(NamedTuple):
     """An output axis derived from `operands[operand]`'s `axis` at static size `size` (`Dim.sized`)."""
     operand: int
@@ -1034,12 +1025,12 @@ def _realize_output(operands: tuple, spec):
 def _typed(backward, parameters: int = 0):
     """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type and
     dtype: summed over each manual axis it varies over and its operand does not (a weight replicated in a
-    checked `shard_map`, whose shards' partial gradients its varying cast's transpose sums: `_varying`),
-    then rounded to the operand's dtype (summed widened over the shards); the inputs' cotangents returned
-    only with the last `parameters` operands' gradients formed (a norm's weight,
-    `derivatives.with_gradients_formed`), each as its device forms it: a gradient no shards sum rounded to
-    its stored dtype, a per-shard partial before its sum, so an input's cotangent waits on no cross-device
-    sum, as a projection's per-shard reverse mode ties its own."""
+    checked `shard_map`, whose shards' partial gradients its varying cast's transpose sums:
+    `sharding.varied_alike`), then rounded to the operand's dtype (summed widened over the shards); the
+    inputs' cotangents returned only with the last `parameters` operands' gradients formed (a norm's weight,
+    `derivatives.with_gradients_formed`), each as its device forms it: a gradient no shards sum rounded to its
+    stored dtype, a per-shard partial before its sum, so an input's cotangent waits on no cross-device sum, as
+    a projection's per-shard reverse mode ties its own."""
     def typed(saved, operands, cotangents):
         gradients = backward(saved, operands, cotangents)
         local = tuple(gradient if gradient is None or operand is None or excess_axes(gradient, operand)
@@ -1082,7 +1073,7 @@ def _launched(*operands, kernel, name: str, outputs, grid: tuple[int, ...], warp
     warps and arithmetic static. In a `shard_map` checking varying axes, its operands are made varying over
     every axis any of them varies over and its outputs vary over them too, as an elementwise primitive's do
     (row 822)."""
-    operands = _varying(operands)
+    operands = tuple(varied_alike(operands))
     out_shape = _realize_output(operands, outputs)
     return launches.pallas_call(
         functools.partial(kernel, interpret=interpret, **dict(arithmetic)), grid=grid, out_shape=out_shape,
