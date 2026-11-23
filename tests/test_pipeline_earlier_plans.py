@@ -258,11 +258,13 @@ def test_a_position_another_grain_wrote_whose_read_fails_to_open_raises_that_fai
         stream.close()
 
 
-def test_a_position_whose_own_cursor_holds_no_rows_is_refused_as_corrupt_never_restarted():
-    """A saved position another Grain wrote whose own sequential cursor, Dew's, holds no `rows` is refused
-    as corrupt (`MalformedPosition`), never as the other Grain's (`PlanChanged`), which a relaxed resume
-    would answer by reading the data afresh (review of row 12178: every error the restore raised was
-    taken as a version's, so a corrupt cursor restarted a run's data)."""
+@pytest.mark.parametrize("lost", ["rows", "place"])
+def test_a_position_whose_own_cursor_holds_no_rows_is_refused_as_corrupt_never_restarted(lost):
+    """A saved position another Grain wrote whose own sequential cursor, Dew's, holds no `rows` or no
+    `place` is refused as corrupt (`MalformedPosition`), never taken for an earlier Dew's interleave nor as
+    the other Grain's (`PlanChanged`), which a relaxed resume would answer by reading the data afresh
+    (review of row 12178: every error the restore raised was taken as a version's, so a corrupt cursor
+    restarted a run's data; review of d21: a cursor without its place was read as an interleave's)."""
     from dew import _position
     from dew.data.plan import PlanChanged
 
@@ -273,7 +275,7 @@ def test_a_position_whose_own_cursor_holds_no_rows_is_refused_as_corrupt_never_r
     def corrupt(node):
         if isinstance(node, dict):
             if {"place", "rows"} <= node.keys():
-                del node["rows"]
+                del node[lost]
                 cut.append(node)
             for value in list(node.values()):
                 corrupt(value)

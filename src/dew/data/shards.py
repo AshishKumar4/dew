@@ -269,9 +269,6 @@ class _SequentialIterator(grain.DatasetIterator):
     def set_state(self, state: Mapping[str, object]) -> None:
         self.close()
         position = _sequential_position(state)
-        if not {"place", "rows"} <= position.keys():
-            raise _position.MalformedPosition(
-                f"a sequential shard pass's saved position holds no place and rows: {sorted(position)}")
         self.place = integer(position["place"], "sequential shard pass's place")
         rows = position["rows"]
         if rows is not None:
@@ -284,15 +281,25 @@ class _SequentialIterator(grain.DatasetIterator):
         self.rows = None
 
 
+_INTERLEAVED = frozenset({"iterators_in_use_indices", "exhausted", "iterators_in_use_states",
+                          "next_index_in_datasets"})
+"""The fields of the position an earlier Dew's interleave of one place at a time saved
+(`_sequential_position`)."""
+
+
 def _sequential_position(state: Mapping[str, object]) -> Mapping[str, object]:
     """`state`, a sequential pass's position (`_SequentialIterator`), or one an earlier Dew saved of the
     same rows in the same order, Grain's interleave of one place at a time, read as the sequential one: the
     place its iterator in use read and that iterator's position there (each place read by the same reader,
     so its rows' position is the one the sequential reader keeps), or, its iterator exhausted or none open,
     the next place it opens from its start. The one translation of it, at the restore, the run reading on
-    by the sequential reader (row 4079); deleted at 1.0."""
-    if "place" in state:
+    by the sequential reader (row 4079); deleted at 1.0. Either recognized by its own fields; any other
+    is a corrupt cursor (`MalformedPosition`), never taken for the other form."""
+    if {"place", "rows"} <= state.keys():
         return state
+    if not state.keys() >= _INTERLEAVED:
+        raise _position.MalformedPosition(f"a sequential shard pass's saved position holds neither a place "
+                                          f"and its rows nor an interleave's places: {sorted(state)}")
     (index,) = integers(state["iterators_in_use_indices"], "interleave's places in use")
     (exhausted,) = integers(state["exhausted"], "interleave's exhausted places")
     (rows,) = listed(state["iterators_in_use_states"], "interleave's places' positions",
