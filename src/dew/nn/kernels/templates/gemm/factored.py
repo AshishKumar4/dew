@@ -104,8 +104,8 @@ class _Transpose:
         """The plain transpose, the cotangent times its factor pulled back; where an entry of it is not
         finite, the moved one's (`moved`)."""
         plain = self.summed(*self.pulled(cotangent * scale, ran))
-        if 0 in self.shape:
-            # No row or no depth: the plain transpose's empty or zero gradient is the whole of it.
+        if 0 in self.shape or cotangent.shape[-1] == 0:
+            # No row, no depth or no column: the plain transpose's empty or zero gradient is the whole of it.
             return plain
 
         def moved():
@@ -163,9 +163,7 @@ class _Transpose:
                                                                    - self.held))))
         depth, width = self.shape[-1], cotangent.shape[-1]
         chunk = math.gcd(depth, FACTORED_DEPTH)
-        # An empty cotangent's width is no chunk's: its rows' gradient is the zeros the loop starts from.
-        columns_a_chunk = max((d for d in range(1, min(width, FACTORED_WIDTH) + 1) if width % d == 0),
-                              default=1)
+        columns_a_chunk = max(d for d in range(1, min(width, FACTORED_WIDTH) + 1) if width % d == 0)
         # The products' limbs below `FACTORED_HEADROOM` limbs over them that their sums carry into.
         limbs_count = FACTORED_HEADROOM + FACTORED_ROW_SLICES + FACTORED_MATRIX_SLICES - 1
 
@@ -315,12 +313,16 @@ def _rounded(limbs: jax.Array, unit: jax.Array) -> jax.Array:
     limbs = _carried(jnp.where(negative[None], -limbs, limbs))
     nonzero = limbs != 0
     lead = jnp.argmax(nonzero, axis=0)
-    padded = jnp.concatenate([limbs, jnp.zeros((5, *limbs.shape[1:]), limbs.dtype)])
-    mantissa = sum(jnp.left_shift(jnp.take_along_axis(padded, (lead + k)[None], axis=0)[0], width * (4 - k))
-                   for k in range(5))
+    # Limb `index` of each sum (0 past the last), picked by a comparison with the limbs' positions: placed as
+    # the limbs are, where a gather or a padded copy would take a placement of its own.
+    positions = jnp.arange(limbs.shape[0], dtype=lead.dtype).reshape(-1, *(1,) * (limbs.ndim - 1))
+
+    def at(values, index):
+        return jnp.sum(jnp.where(positions == index[None], values, 0), axis=0, dtype=values.dtype)
+
+    mantissa = sum(jnp.left_shift(at(limbs, lead + k), width * (4 - k)) for k in range(5))
     later = jnp.cumsum(nonzero[::-1].astype(jnp.int32), axis=0)[::-1]
-    later = jnp.concatenate([later, jnp.zeros((5, *later.shape[1:]), later.dtype)])
-    sticky = jnp.take_along_axis(later, (lead + 5)[None], axis=0)[0] > 0
+    sticky = at(later, lead + 5) > 0
     top = 31 - jax.lax.clz(jnp.maximum(mantissa, 1))
     binade = unit - width * (lead + 4) + top
     kept = jnp.where(binade >= -126, 24, 24 - (-126 - binade))
