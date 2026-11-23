@@ -1259,7 +1259,9 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
     ds = where(lag >= 0, ds, zeros)
     if write == "delta":
         ds = staged(ds, lane)
-    narrow, scored = point(step.ds), (given if keyed_gate else held)
+    # The scores' gradient as `_query_key` reads it: the held form's under the delta rule, else the
+    # operands' (`mainloop_backward._score_grads`).
+    narrow, scored = point(step.ds), (held if write == "delta" else given)
     entered = tr(point(step.h))
     dq = fp32(add(fp32(mul(fp32(mul(blocked(do, entered, lane, parts=(given, held)), rows), lane), factor),
                        lane), dot(narrow, k, lane, parts=(scored, given))), lane)
@@ -1431,13 +1433,15 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
         """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where
         the call holds its values in parts (`Lane.held`), the parts' sum (`staged`); the queries' and keys'
         sums rounded once whatever the parts (`mainloop_backward._query_key_summed`; staged, a correctly
-        rounded bf16 sum lay outside its unrounded three parts' enclosure, row 11849), and so the values'
-        gradient without the delta rule, the walk's gated one finished in the operands' form
-        (`mainloop_backward._reverse_values`; as three parts, none of a values-gated call's lay inside, row
-        11873)."""
+        rounded bf16 sum lay outside its unrounded three parts' enclosure, row 11849), and so without the
+        delta rule the values' gradient, the walk's gated one finished in the operands' form
+        (`mainloop_backward._reverse_values`), and the scores', a key head's in the operands' form
+        (`mainloop_backward._score_grads`): as three parts, none of a values-gated call's values' gradient
+        and 56% of its scores' lay inside (row 11873)."""
         if dtype == np.float32:
             return iv
-        once = run.held == 1 or name in ("dq", "dk") or (name == "dv" and run.write != "delta")
+        once = (run.held == 1 or name in ("dq", "dk")
+                or (name in ("dv", "ds") and run.write != "delta"))
         return cast(iv, {"bfloat16": BFLOAT16, "float16": FLOAT16}[str(dtype)]) if once else staged(iv, lane)
 
     found: dict[str, list] = {}
