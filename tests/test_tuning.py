@@ -478,7 +478,8 @@ def a_pulled_launch_is_timed_with_its_backward():
         one = next(tiles for tiles in ba.autotuning_configs
                    if tiles.positions == 1 and tiles.chunk == derived.chunk)
         timings = tuning._measured(op, ba)
-        found[name] = {tiles: float(np.median(timings[tiles].evaluation_times_ms)) for tiles in (derived, one)}
+        found[name] = {tiles: float(np.median(timings[tiles].evaluation_times_ms))
+                       for tiles in (derived, one)}
         found[name]["fastest"] = timings.prune().fastest_config
     forward, backward = (list(found[name].values())[:2] for name in ("forward", "pulled"))
     assert 0.8 < forward[1] / forward[0] < 1.25, found
