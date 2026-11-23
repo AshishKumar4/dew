@@ -855,6 +855,23 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
     assert np.isnan(np.asarray(d_token)[0, 0]), np.asarray(d_token)[0, :2]
     np.testing.assert_array_equal(np.asarray(d_token)[0, 1:], np.zeros((511,), np.float32))
 
+    # Dense, one row: codes +1, -1, +1 under 2**100, 2**100, 2**79 at a factor of 2**30 move without flushing,
+    # so the rescue is exact, 2**101; with a fourth code +1 on input 1 under 2**126 at a factor of 2**126, the
+    # move flushes the 2**-126 that input 0's cancelling products leave: NaN there, as the plain transpose's.
+    row = jnp.zeros((1, 512), jnp.float32).at[0, :2].set(1.0)
+    spread = jnp.zeros((512, 128), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0])).at[1, 3].set(1.0)
+
+    def pulled(tensor, cotangent):
+        matrix = formats.NvFp4.of(spread, scales, jnp.float32(tensor))
+        _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32), row)
+        (d_row,) = pull(jnp.zeros((1, 128), jnp.float32).at[0, :4].set(jnp.asarray(cotangent, jnp.float32)))
+        return np.asarray(d_row)[0, :2]
+
+    exact = pulled(2.0 ** 22, (2.0 ** 100, 2.0 ** 100, 2.0 ** 79, 0.0))
+    np.testing.assert_array_equal(exact, np.float32([2.0 ** 101, 0.0]))
+    flushed = pulled(2.0 ** 118, (2.0 ** 100, 2.0 ** 100, 2.0 ** -126, 2.0 ** 126))
+    assert np.isnan(flushed[0]) and np.isinf(flushed[1]), flushed
+
     # A gather routing no token pulls back zeros.
     none, nowhere = jnp.asarray([0, 0], jnp.int32), jnp.zeros((0,), jnp.int32)
     routed = functools.partial(gemm.nvfp4_product, matrix=bank, group_sizes=none, gather=nowhere,

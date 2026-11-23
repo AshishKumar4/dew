@@ -105,6 +105,8 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         product = functools.partial(gemm.decoded_product, interpret_on_cpu=interpret_on_cpu)
         operands = (weights.unscaled(jnp.bfloat16), group_sizes)
     run = functools.partial(gemm._interpreted, product, interpret_on_cpu)
+    reach = functools.partial(gemm.reached_through, interpret_on_cpu=interpret_on_cpu)
+    reached = (weights, group_sizes)
 
     def run_dot(rows_bf16: jax.Array) -> jax.Array:
         return run(rows_bf16, *operands)
@@ -114,7 +116,7 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
 
     scale_f32 = jnp.asarray(weights.scale, jnp.float32)
     if not quantize_activations:
-        scaled = factored(run, operands, factor_of(scale_f32), lhs)
+        scaled = factored(run, operands, factor_of(scale_f32), lhs, reach=reach, reached=reached)
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
     def ste_value(a: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -134,7 +136,7 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         prod_held = jax.lax.stop_gradient(prod)
         factor = factor_of(s)
         d_factor = factor_of(d_s)
-        dy_a = factored(run, operands, factor, d_a)
+        dy_a = factored(run, operands, factor, d_a, reach=reach, reached=reached)
         once = prod_held * peak_col
         tiny = jnp.finfo(prod_held.dtype).tiny
         kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (prod_held == 0))

@@ -885,8 +885,19 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
             operands = (weights.unscaled(jnp.bfloat16), group_sizes)
         factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape,
                             dense)
-        scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs)
+        scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs,
+                          reach=functools.partial(reached_through, interpret_on_cpu=interpret_on_cpu),
+                          reached=(weights, group_sizes))
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
+
+
+def reached_through(cotangent: jax.Array, matrix, group_sizes: jax.Array | None, *,
+                    interpret_on_cpu: bool) -> jax.Array:
+    """A packed matrix's (`Fp8Weights`, `TernaryWeights`, `NvFp4`: decoded here, where a rescue asks)
+    transpose of `cotangent` through its decoded values' magnitudes (`_wide_transpose`): which of the rows'
+    entries the cotangent's products reach (`factored`'s `reach`)."""
+    decoded = matrix.decoded() if isinstance(matrix, NvFp4) else matrix.unscaled(jnp.bfloat16)
+    return _wide_transpose(cotangent, decoded, group_sizes, interpret_on_cpu=interpret_on_cpu, magnitude=True)
 
 
 def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None,
@@ -1192,7 +1203,12 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
         bank.factor, sizes, total_repeat_length=count)[:, None]
     # Each row's (its group's) factor joins the sum as `factored` takes a row's: a cancelling cotangent
     # under a factor past fp32's largest pulls back its finite sum, each route at its own power.
-    return factored(product, operands, factor, lhs, wide=wide,
+    if gather is None:
+        reach = functools.partial(reached_through, interpret_on_cpu=interpret_on_cpu)
+        reached = (bank, group_sizes)
+    else:
+        reach, reached = functools.partial(wide, magnitude=True), routed
+    return factored(product, operands, factor, lhs, wide=wide, reach=reach, reached=reached,
                     routes=() if gather is None else (gather, routed)).astype(out_dtype)
 
 
