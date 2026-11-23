@@ -11,7 +11,7 @@ from jax.custom_derivatives import zero_from_primal
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, selection, xla_products
 from dew.nn.kernels.gemm import gemm_t, joined_depths
-from dew.nn.precision import at_least_fp32, refuse_recipe
+from dew.nn.precision import at_least_fp32, precision_names, refuse_recipe
 from dew.nn.sharding import excess_axes, summed_to
 
 LOW_RANK_ROW = 'ledger 1304'
@@ -104,14 +104,24 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
     scaled = scale.astype(wide) * through
     d_lhs = d_kernel = d_a = d_b = d_scale = None
     if wants_lhs:
-        # The matrices as the forward multiplied them, in the rows' dtype, then at the cotangent's width.
-        # Joined at a width whose range holds the scaled update's cotangent (`scaled`, wide): the
-        # cotangent's own, unless that is fp16's, whose largest a scale's 2**16 passes.
-        joined = work if jnp.finfo(work).maxexp >= jnp.finfo(wide).maxexp else wide
-        d_lhs = joined_depths(((dy.astype(joined), kernel.astype(lhs.dtype)),
-                               (scaled.astype(joined), a.astype(lhs.dtype))),
-                              group_sizes, transpose_rhs=True, out_dtype=lhs.dtype, precision=precision,
-                              interpret_on_cpu=interpret_on_cpu)
+        # The matrices as the forward multiplied them, in the rows' dtype, joined with the cotangents at the
+        # cotangent's width; where the scaled update's cotangent (`scaled`, wide) passes that width's largest
+        # (2**16 of an fp16 output's, bf16's top binade), at fp32, its precision one that keeps fp32
+        # operands (`_kept`): the narrow product is the fast one every in-range call takes.
+        matrices = (kernel.astype(lhs.dtype), a.astype(lhs.dtype))
+
+        def joined(dtype):
+            wide_operands = jnp.dtype(dtype).itemsize >= 4
+            return joined_depths(((dy.astype(dtype), matrices[0]), (scaled.astype(dtype), matrices[1])),
+                                 group_sizes, transpose_rhs=True, out_dtype=lhs.dtype,
+                                 precision=_kept(precision) if wide_operands else precision,
+                                 interpret_on_cpu=interpret_on_cpu)
+
+        if jnp.dtype(work).itemsize >= 4:
+            d_lhs = joined(work)
+        else:
+            held = jnp.all(jnp.abs(scaled) <= jnp.finfo(work).max)
+            d_lhs = jax.lax.cond(held, lambda: joined(work), lambda: joined(wide))
 
     # A replicated operand's gradient inside a checked `shard_map` is each device's partial over the rows it
     # holds, summed over the axes the rows vary over and the operand does not (`sharding.summed_to`), each
@@ -124,25 +134,34 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
         d_kernel = gemm_t(lhs.astype(work), dy, group_sizes, out_dtype=formed_in(kernel), precision=precision,
                           interpret_on_cpu=interpret_on_cpu)
         d_kernel = d_kernel[0] if group_sizes is None else d_kernel
-    # The factors' gradients from the wide `scaled` and `t` (the rank-wide products' sums, unrounded), as
-    # the adapter's own program differentiates its fp32 low-rank products.
+    # The factors' gradients from the wide `scaled` (the rank-wide product's sum, unrounded) and from `t` as
+    # the forward multiplied it, rounded to the rows' dtype: fp32 operands each, at a precision keeping them.
+    kept = _kept(precision)
     if wants_a:
-        d_a = (jnp.dot(lhs.T.astype(wide), scaled, precision=precision, preferred_element_type=wide)
+        d_a = (jnp.dot(lhs.T.astype(wide), scaled, precision=kept, preferred_element_type=wide)
                if group_sizes is None
-               else gemm_t(lhs.astype(wide), scaled, group_sizes, out_dtype=formed_in(a), precision=precision,
+               else gemm_t(lhs.astype(wide), scaled, group_sizes, out_dtype=formed_in(a), precision=kept,
                            interpret_on_cpu=interpret_on_cpu))
     if wants_b:
         # `t` holds the scale already: tᵀ · dy is the factor's gradient whole.
-        d_b = (jnp.dot(t.T, dy.astype(wide), precision=precision, preferred_element_type=wide)
+        rank = t.astype(lhs.dtype).astype(wide)
+        d_b = (jnp.dot(rank.T, dy.astype(wide), precision=kept, preferred_element_type=wide)
                if group_sizes is None
-               else gemm_t(t.astype(wide), dy.astype(wide), group_sizes, out_dtype=formed_in(b),
-                           precision=precision, interpret_on_cpu=interpret_on_cpu))
+               else gemm_t(rank, dy.astype(wide), group_sizes, out_dtype=formed_in(b), precision=kept,
+                           interpret_on_cpu=interpret_on_cpu))
     if wants_scale:
         d_scale = jnp.sum(through * _rank_product(lhs, a, jnp.ones((), wide), precision, group_sizes))
     gradients = tuple(None if d is None else summed_to(d, operand).astype(operand.dtype) for d, operand in
                       zip((d_kernel, d_a, d_b, d_scale), (kernel, a, b, scale), strict=True))
     d_lhs, gradients = with_gradients_formed(d_lhs, gradients)
     return d_lhs, *gradients, zero_from_primal(group_sizes)
+
+
+def _kept(precision: PrecisionLike) -> PrecisionLike:
+    """`precision` for a product of fp32 operands: as given, unless it names an algorithm of narrower
+    operands (an F16 or BF16 preset), which would round them back to those, then `HIGHEST`."""
+    narrow = any(name.startswith(("BF16", "F16", "F8", "ANY_F8")) for name in precision_names(precision))
+    return jax.lax.Precision.HIGHEST if narrow else precision
 
 
 # The launches' derivative glue (`derivatives.KernelGlue`): an operand no reverse pass reaches is a symbolic

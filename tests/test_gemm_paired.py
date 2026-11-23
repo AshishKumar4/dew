@@ -1335,12 +1335,34 @@ def test_an_adapted_products_gradient_keeps_a_wide_cotangent(grouped):
     # 2**-10 gives the rows 64: the scaled update's cotangent stays wide where fp16 would not hold it.
     rank_a = jnp.full((*a.shape[:-1], 1), 2.0 ** -10, jnp.float16)
     rank_b = jnp.ones((*b.shape[:-2], 1, b.shape[-1]), jnp.float16)
-    _, pull = jax.vjp(lambda rows: low_rank(rows, jnp.zeros_like(kernel), rank_a, rank_b, 2.0 ** 16, sizes,
-                                            out_dtype=jnp.float16), jnp.zeros_like(x))
-    (d_x,) = pull(jnp.zeros((8, 8), jnp.float16).at[0, 0].set(1.0))
-    want = np.zeros((8, 16), np.float16)
-    want[0] = 64.0
-    np.testing.assert_array_equal(np.asarray(d_x), want)
+    for precision in (None, jax.lax.DotAlgorithmPreset.F16_F16_F32):
+        _, pull = jax.vjp(lambda rows, precision=precision: low_rank(
+            rows, jnp.zeros_like(kernel), rank_a, rank_b, 2.0 ** 16, sizes, out_dtype=jnp.float16,
+            precision=precision), jnp.zeros_like(x))
+        (d_x,) = pull(jnp.zeros((8, 8), jnp.float16).at[0, 0].set(1.0))
+        want = np.zeros((8, 16), np.float16)
+        want[0] = 64.0
+        np.testing.assert_array_equal(np.asarray(d_x), want, err_msg=str(precision))
+
+    # A bf16 cotangent of 1 through a scale of (2 - 2**-8) * 2**127, finite in fp32 but past bf16's largest,
+    # and a factor of 2**-120 gives the rows 255.5, rounded to bf16's 256.
+    huge = (2.0 - 2.0 ** -8) * 2.0 ** 127
+    tiny_a, one_b = jnp.full(rank_a.shape, 2.0 ** -120, jnp.bfloat16), jnp.ones(rank_b.shape, jnp.bfloat16)
+    _, pull = jax.vjp(lambda rows: low_rank(rows, jnp.zeros(kernel.shape, jnp.bfloat16), tiny_a, one_b, huge,
+                                            sizes, out_dtype=jnp.bfloat16), jnp.zeros(x.shape, jnp.bfloat16))
+    (d_x,) = pull(jnp.zeros((8, 8), jnp.bfloat16).at[0, 0].set(1.0))
+    want = np.zeros((8, 16), np.float32)
+    want[0] = 256.0
+    np.testing.assert_array_equal(np.asarray(d_x, np.float32), want)
+
+    # The factor's gradient reads the rank operand as the forward multiplied it: 2**-26 rounds to fp16's 0,
+    # so b's gradient under a cotangent of 2**14 is 0, not 2**-12.
+    first = jnp.zeros(x.shape, jnp.float16).at[:, 0].set(1.0)
+    small_a = jnp.full(rank_a.shape, 2.0 ** -14, jnp.float16)
+    _, pull = jax.vjp(lambda b_: low_rank(first, jnp.zeros_like(kernel), small_a, b_, 2.0 ** -12, sizes,
+                                          out_dtype=jnp.float16), jnp.zeros_like(rank_b))
+    (d_b,) = pull(jnp.full((8, 8), 2.0 ** 14, jnp.float16))
+    np.testing.assert_array_equal(np.asarray(d_b), np.zeros(rank_b.shape, np.float16))
 
 
 @pytest.mark.mesh(devices=2)
