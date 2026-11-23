@@ -25,6 +25,7 @@ from dew.nn.mixers.lightning import LightningAttention
 from dew.nn.mixers.mamba import Mamba
 from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.mixers.mamba3 import Mamba3
+from dew.parity import FEWEST_SEEDS
 from dew.training import MeshSpec
 
 WIDTH = 32
@@ -397,7 +398,8 @@ def test_a_split_delta_rules_transfer_takes_its_layers_chunk(name, monkeypatch):
     module = WIDE_HEADS[name]
     hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
     variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
-    assert_split_as_whole(module, variables, "all_valid", 1, f"{name}'s transfer chunk", width=WIDTH)
+    assert_split_as_whole(module, variables, "all_valid", FEWEST_SEEDS, f"{name}'s transfer chunk",
+                          width=WIDTH)
     assert taken and set(taken) == {module.chunk_size}, taken
 
 
@@ -421,7 +423,7 @@ def test_a_slices_transfer_is_on_par_with_the_rule_from_the_identity(per_key):
 
     def draw(seed):
         generator = np.random.default_rng([1437, seed])
-        query, key = (generator.standard_normal((rows, length, 1, width)) for _ in range(2))
+        query, key = (generator.standard_normal((rows, length, heads, width)) for _ in range(2))
         key = key / np.linalg.norm(key, axis=-1, keepdims=True)
         decay = (rows, length, heads) + ((width,) if per_key else ())
         g = -np.log1p(np.exp(generator.standard_normal(decay) + 2.0)) / 4
