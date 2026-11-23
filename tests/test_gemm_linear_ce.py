@@ -152,25 +152,39 @@ def test_linear_cross_entropy_compiles_spill_free(gpu: str, with_bias: bool):
 
 def test_linear_cross_entropy_mixed_dtype_matches_vjp_and_refuses_native():
     """Mixed-dtype `linear_cross_entropy` (bf16 activations, fp32 master weights) uses one promoted
-    contraction policy in both forward and backward, matching materialized VJP and finite differences, and
-    refuses native 16-bit lowering that would silently narrow weights (row 6103)."""
+    contraction policy in both forward and backward, holding check 1 against materialized VJP from float64
+    truth, and refuses native 16-bit lowering that would silently narrow weights (row 6103)."""
     x0 = jnp.asarray([[1.0]], jnp.bfloat16)
     w0 = jnp.asarray([[1.0 + 2.0 ** -9], [1.0]], jnp.float32)
     t0 = jnp.asarray([0], jnp.int32)
+    loss0, (dx0, _) = jax.value_and_grad(
+        lambda a, w: jnp.sum(gemm.linear_cross_entropy(a, w, t0, transpose_rhs=True)), argnums=(0, 1))(x0, w0)
+    # Promoted contraction preserves the 2^-9 weight delta in forward loss (narrowing gave log(2) exactly).
+    assert float(loss0) < float(np.log(2.0)) and float(dx0[0, 0]) < 0.0
 
-    def lce_loss(a, w):
-        return jnp.sum(gemm.linear_cross_entropy(a, w, t0, transpose_rhs=True))
+    def draw(seed):
+        rng = np.random.default_rng(61030 + seed)
+        x = jnp.asarray(rng.standard_normal((16, 32)) / np.sqrt(32), jnp.bfloat16)
+        w = jnp.asarray(rng.standard_normal((48, 32)) / np.sqrt(32), jnp.float32)
+        targets = jnp.asarray(rng.integers(0, 48, size=(16,)), jnp.int32)
+        cot = jnp.asarray(rng.standard_normal((16,)), jnp.float32)
+        return x, w, targets, cot
 
-    def ref_loss(a, w):
-        return jnp.sum(_dense_ref(a, w, t0, None, transpose_rhs=True, softcap=None, dtype=jnp.float32))
+    def run_dew(x, w, targets, cot):
+        y, pull = jax.vjp(lambda a, m: gemm.linear_cross_entropy(a, m, targets, transpose_rhs=True), x, w)
+        return y, *pull(cot)
 
-    got_val, (got_dx, got_dw) = jax.value_and_grad(lce_loss, argnums=(0, 1))(x0, w0)
-    ref_val, (ref_dx, ref_dw) = jax.value_and_grad(ref_loss, argnums=(0, 1))(x0, w0)
-    np.testing.assert_allclose(np.asarray(got_val), np.asarray(ref_val), atol=1e-6, rtol=1e-6)
-    np.testing.assert_allclose(np.asarray(got_dx, np.float32), np.asarray(ref_dx, np.float32),
-                               atol=1e-6, rtol=1e-6)
-    np.testing.assert_allclose(np.asarray(got_dw, np.float32), np.asarray(ref_dw, np.float32),
-                               atol=1e-6, rtol=1e-6)
+    def run_ref(x, w, targets, cot, *, dtype=jnp.float32):
+        def fn(a, m):
+            return _dense_ref(a, m, targets, None, transpose_rhs=True, softcap=None, dtype=dtype)
+        if dtype == jnp.float64:
+            y, pull = jax.vjp(fn, x.astype(dtype), w.astype(dtype))
+            return y, *pull(cot.astype(dtype))
+        y, pull = jax.vjp(fn, x, w)
+        return y, *pull(cot)
+
+    assert_as_exact(jax.jit(run_dew), jax.jit(run_ref), draw, "linear_ce mixed bf16/fp32", seeds=8,
+                    truth_fn=functools.partial(run_ref, dtype=jnp.float64))
     with generation.assumed("sm90"):
         ba = linear_ce.MOSAIC_LINEAR_CE.bind(
             jax.ShapeDtypeStruct((64, 64), jnp.bfloat16), jax.ShapeDtypeStruct((64, 64), jnp.float32),
