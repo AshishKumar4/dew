@@ -541,7 +541,7 @@ def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
             call = base.call((syrk_mod.MOSAIC_SYRK,), flat, poly_spec, transpose=transpose,
                              out_dtype=out_dtype.name, interpret=interpreting)
             admitted = (not has_poly and not interpreting
-                        and syrk_mod.measured_gram(generation.gpu_target(), flat.shape, transpose))
+                        and syrk_mod.measured_gram(generation.gpu_target(), flat.shape, op_dtype, transpose=transpose))
             case = SyrkCase(op_dtype, out_dtype, call, no_x64=not jax.config.jax_enable_x64,
                             no_auto=not automatic_axes(), precision_ok=exact_products(precision, op_dtype),
                             measured=admitted)
@@ -1720,10 +1720,11 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     reached = [(d, matrix.astype(compute)) for d, matrix in zip(d_products, matrices, strict=True)
                if d is not None]
     entrywise = _entrywise(lhs, prologue, prologue_arrays, prologue_axes, plain)
-    wide, d_operand = at_least_fp32(lhs.dtype), None
+    operand_dtype = jnp.dtype(lhs.dtype if prologue is None else compute)
+    wide, d_operand = at_least_fp32(jnp.promote_types(lhs.dtype, operand_dtype)), None
     whole = not automatic_axes()
     taken = (None if entrywise
-             else _one_launch(reached, group_sizes, lhs.dtype, prologue, options, whole=whole))
+             else _one_launch(reached, group_sizes, operand_dtype, prologue, options, whole=whole))
     if taken is not None:
         # The cotangents through their matrices, one product over their joined depths (`_one_launch`'s
         # form): one launch, one accumulator, rounded once (row 6783: lm-moe's start certified and built a
@@ -1731,9 +1732,9 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
         # wrote the fp32 sum, 1.145 ms on a GH200's 8b input gradient), a chain's overflowing tiles summed
         # again bounded (`mosaic_gpu.guarded_walk`).
         d, matrix, form, route = taken
-        out = wide if prologue is not None else jnp.dtype(lhs.dtype)
+        out = wide if prologue is not None else operand_dtype
         d_operand = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), None, (), (), (out,),
-                                      several=False, summed_as=(lhs.dtype,), selected=route, **form,
+                                      several=False, summed_as=(operand_dtype,), selected=route, **form,
                                       **options))
         reached = []
     # Where its rows are gathered, or the last product's epilogue pulls an entrywise prologue back, a paired
@@ -1750,16 +1751,16 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
                                       compute, options)
             if pulled is not None:
                 return pulled
-        out = wide if not last or (at and prologue is not None) else jnp.dtype(lhs.dtype)
+        out = wide if (not last or prologue is not None) else operand_dtype
         if d_operand is not None and _keeps_launch(d, matrix, group_sizes, _added, (d_operand,), (out,),
-                                                   (lhs.dtype,), options):
+                                                   (operand_dtype,), options):
             d_operand = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), _added, (d_operand,),
                                           (('rows', 'columns'),), (out,), several=False,
-                                          summed_as=(lhs.dtype,), **options))
+                                          summed_as=(operand_dtype,), **options))
             continue
         product = jnp.asarray(_gemm(d, matrix, group_sizes, None, (), (), None, (), (),
                                     (out if d_operand is None else wide,), several=False,
-                                    summed_as=(lhs.dtype,), **options))
+                                    summed_as=(operand_dtype,), **options))
         d_operand = product if d_operand is None else (d_operand + product).astype(out)
     if d_operand is None:
         return jnp.zeros(lhs.shape, lhs.dtype), tuple(_as_cotangent(jnp.zeros(a.shape, wide), a)

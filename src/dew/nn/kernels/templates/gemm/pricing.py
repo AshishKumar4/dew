@@ -250,10 +250,9 @@ def prefetch_registers(family: mosaic.Family, config: "Tiles", *, ba, staged_row
     summed = bool(ba.arguments.get('exact_sums')) and not family.sums_in_persist
     scaled = bool(ba.arguments.get('scales')) or bool(ba.arguments.get('step_scales'))
     if staged_rows:
-        active = mosaic_gpu.tgmm_prefetches(
-            family, unstaged=unstaged, rewritten=rewritten, k_major=scaled, interpret=interpret,
-            scaled=scaled, summed=summed)
-        return (32 if config.block_k > 32 else 16) if active else 0
+        # `tgmm` does not prefetch across steps (`M-NG-45-a100`, `FS-DENSE-AB1`).
+        del unstaged, rewritten
+        return 0
     hooks = ba.arguments['hooks']
     trans_lhs = (bool(ba.arguments.get('packed_rows')) or bool(ba.arguments.get('trans_lhs'))
                  or config.swapped)
