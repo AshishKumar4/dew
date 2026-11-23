@@ -16,10 +16,10 @@ from dew.data import Memory
 from dew.data.pipeline import Pipeline
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
-from dew.training import MeshSpec
+from dew.training import FitPolicy, MeshSpec, UpdateBatch
 
 
-@pytest.mark.parametrize("split", [2, None], ids=["two-microbatches", "planned"])
+@pytest.mark.parametrize("split", [2, "auto"], ids=["two-microbatches", "planned"])
 def test_a_steps_logged_loss_is_its_rows_whatever_its_split(split):
     """A run accumulating two steps an update logs at each step the loss of the rows that step consumed:
     read in two microbatches a step, or in the split its plan chooses, it logs every step's loss as the run
@@ -27,17 +27,17 @@ def test_a_steps_logged_loss_is_its_rows_whatever_its_split(split):
     training.md, the logged loss), where a split step once logged its last microbatch's alone."""
     from reference_error import assert_fp32_reduction_bound
 
-    def logged(**kwargs) -> list[float]:
+    def logged(split: int | str) -> list[float]:
         tracker = RecordingTracker()
-        trainer = make_trainer(tracker=tracker, accumulation=2, **kwargs)
+        trainer = make_trainer(tracker=tracker, update=UpdateBatch(batches=2), fit=FitPolicy(split=split))
         trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
         trainer.fit(dataset(), steps=6, log_every=1)
         return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
 
-    whole = np.asarray(logged(split=1))
+    whole = np.asarray(logged(1))
     assert len(whole) == 6
     # Each step's loss, a mean of BATCH squared errors, pooled in another order: one fp32 reduction apart.
-    assert_fp32_reduction_bound(logged(split=split), whole, np.abs(whole), terms=BATCH)
+    assert_fp32_reduction_bound(logged(split), whole, np.abs(whole), terms=BATCH)
 
 
 def test_a_steps_logged_metrics_are_its_rows_whatever_its_split():
@@ -59,7 +59,7 @@ def test_a_steps_logged_metrics_are_its_rows_whatever_its_split():
 
     def logged(split: int) -> dict[str, np.ndarray]:
         tracker = RecordingTracker()
-        trainer = make_trainer(tracker=tracker, accumulation=2, split=split,
+        trainer = make_trainer(tracker=tracker, update=UpdateBatch(batches=2), fit=FitPolicy(split=split),
                                objective=LMObjective(model, seq_len=LM_CONTEXT, pad_id=0))
         trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
         trainer.fit(Pipeline(Memory({"text": rows})).repeat().batch(LM_ROWS), steps=4, log_every=1)

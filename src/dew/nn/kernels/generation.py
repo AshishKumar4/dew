@@ -1064,7 +1064,7 @@ def built_target(generation: str, multiprocessors: int | None = None, memory: in
 def gpu_mesh(mesh: Mesh | AbstractMesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
-    its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`TrainerConfig.lower_for`;
+    its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`dew.training.ahead.Lowered`;
     the kernel benchmark's oracle). Its devices state their compute capability, which Mosaic GPU lowers for
     (its `utils._infer_arch`; a device that states none it takes for sm90's, and an sm80 kernel's cp.async
     waits do not lower), as a mesh of compile-only devices of the generation does (`compile_only_gpus`, whose

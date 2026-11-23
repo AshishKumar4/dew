@@ -402,8 +402,7 @@ class _DecisionSource(View[Source]):
         if read == "memory" and self.slots is None and not self._facts:
             rows = prepared_rows(records, self.before) if self.before else records
             if self.table is not None:
-                stated = self.source.metadata().get("class_names", {})
-                names = record(stated, "class names").get(self.table.label)
+                names = self._stated_names().get(self.table.label)
                 first = rows[0] if len(rows) else None
                 # The store's class names hold where the stages before keep its labels: a relabelling
                 # map's values are read from its rows instead.
@@ -478,8 +477,12 @@ class _DecisionSource(View[Source]):
             return ()
         if self.table.options or self._classes:
             return self.table.options or tuple(self._classes)
-        stated = record(asked(self.source, frozenset({"class_names"})).get("class_names", {}), "class names")
-        return _records.strings(stated.get(self.table.label, ()), "class names")
+        return _records.strings(self._stated_names().get(self.table.label, ()), "class names")
+
+    def _stated_names(self) -> Mapping[str, object]:
+        """The class names the store states by column, asked of it alone (`asked`: none of its other facts
+        computed)."""
+        return record(asked(self.source, frozenset({"class_names"})).get("class_names", {}), "class names")
 
 
 

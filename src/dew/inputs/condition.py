@@ -149,6 +149,9 @@ class BackboneCall:
     train: bool = False
     rngs: dict[str, jax.Array] | None = None
     progress: Progress = END
+    loop_passes: jax.Array | None = None
+    """The count of its loop's passes the call runs, where given (`dew.batch.LOOP_PASSES`); every pass where
+    None."""
 
 
 class BackboneEncoder(ConditionEncoder[Raw, Encoded]):

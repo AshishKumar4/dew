@@ -1975,7 +1975,7 @@ def test_an_exports_files_of_one_place_shard_apart(tmp_path):
     concatenation of them, holds every record of both."""
     import array_record.python.array_record_module as array_record
 
-    from dew.data.sources import Concatenate
+    from dew.data.sources.concatenate import Concatenate
 
     root = tmp_path / "export"
     for writer, values in (("a", (0, 1)), ("b", (2, 3))):
@@ -2105,11 +2105,11 @@ class Stated(Memory):
 
 
 def test_a_concatenation_states_what_its_stores_state_of_their_records():
-    """Two splits of one token store joined (`dew.data.Concatenate`) state its tokenizer contract and
+    """Two splits of one token store joined (`dew.data.concat`) state its tokenizer contract and
     class names, the targets of both and the rows of both, so a token mixture weighs the joined
     store and a run checks its contract as of either split; a fact one split alone states or the
     two state apart is none of the join's, and two contracts make no one store."""
-    from dew.data import Concatenate
+    from dew.data.sources.concatenate import Concatenate
 
     contract = (("tokenizer", "gpt2"), ("vocab_size", 50257), ("class_names", {"label": ("a", "b")}))
     first = Stated([{"id": np.int32(index)} for index in range(3)],
@@ -2129,7 +2129,7 @@ def test_stores_whose_tokenizers_hold_one_files_join_whatever_they_name_them():
     though each names its tokenizer by the place or hub revision it was read from, as runs of one tokenizer
     blend; stores whose files differ in one hash do not. A store's tokenizer was its name and revision, so
     one tokenizer at two places made two contracts (train 968's review, F5)."""
-    from dew.data import Concatenate
+    from dew.data.sources.concatenate import Concatenate
 
     files = {"tokenizer.json": "a" * 64, "tokenizer_config.json": "b" * 64}
 
@@ -2147,12 +2147,12 @@ def test_stores_whose_tokenizers_hold_one_files_join_whatever_they_name_them():
 
 @pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
 def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(read):
-    """Two stores read in turn (`dew.data.Concatenate`) are one store to the verbs: a pass over it
+    """Two stores read in turn (`dew.data.concat`) are one store to the verbs: a pass over it
     holds every record of both once, in their order, steps chain on it as on any store, and a
     training run resumed after two batches reads the batches the uninterrupted run reads."""
-    from dew.data import Concatenate
     from dew.data.compile import validation
     from dew.data.pipeline import Pipeline
+    from dew.data.sources.concatenate import Concatenate
 
     train = Memory([{"id": np.int32(index)} for index in range(6)])
     held = Memory([{"id": np.int32(index)} for index in range(100, 104)])
@@ -2211,7 +2211,7 @@ def test_a_concatenation_of_cold_stores_is_prepared_through_its_own_stores(tmp_p
     from dew.data.compile import validation
     from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Pipeline
-    from dew.data.sources import Concatenate
+    from dew.data.sources.concatenate import Concatenate
 
     for name, ids in (("first", range(5)), ("second", range(5, 9))):
         (tmp_path / f"{name}.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in ids))
@@ -2230,8 +2230,9 @@ def test_a_concatenation_of_unindexed_files_is_provisioned_by_its_stores(tmp_pat
     """`source(..., provision=True)` over a concatenation of JSON-lines stores that take no indexed read
     prepares each store's index, so the concatenation reads indexed, in its stores' order (row 5755): the
     stores it provisioned were a hand-written list of kinds, which a concatenation was not among."""
-    from dew.data import Concatenate, Files
+    from dew.data import Files
     from dew.data.sources import source
+    from dew.data.sources.concatenate import Concatenate
 
     parts = []
     for name, ids in (("a", (1, 2)), ("b", (3, 4))):

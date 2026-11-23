@@ -1758,6 +1758,53 @@ def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
     assert reused[0] and not any(reused[0]) and not any(reused[1])
 
 
+
+def test_a_held_body_rewritten_under_another_tile_pin_takes_that_pin():
+    """A body's rewrite is keyed by the tiles a tuning pins (`tuning.pinned`, which a launch reads at its
+    rewrite, `KernelOp.pinned`): one held program rewritten again under another legal pin of its product's
+    tile launches the product at that pin, not as the first rewrite wrote it (row 12169: the body's cache
+    keyed the kernel choices but not the pins, so the second pin was never read)."""
+    from jax.sharding import PartitionSpec
+
+    from dew.nn.kernels import grouped_matmul, tuning
+    from dew.nn.kernels.templates.gemm import tiling
+
+    mesh = jax.make_mesh((1,), ("data",), devices=jax.devices()[:1])
+
+    def projected(x, w):
+        def local(x, w):
+            return jnp.dot(x, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+
+        return jax.shard_map(local, mesh=mesh, in_specs=(PartitionSpec(), PartitionSpec()),
+                             out_specs=PartitionSpec())(x, w)
+
+    closed = jax.make_jaxpr(projected)(jax.ShapeDtypeStruct((256, 512), jnp.bfloat16),
+                                       jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    for tile in (tiling.Tiles(128, 128, 64, 4, 1, warpgroups=2, family="wgmma"),
+                 tiling.Tiles(128, 64, 64, 2, 1, warpgroups=2, family="wgmma")):
+        with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+              tuning.pinned({grouped_matmul.MosaicGmm: tile}), tuning.seen() as launches):
+            algebra.rewritten_program(closed)
+        taken = [config for config, _ in launches.taken]
+        assert len(taken) == 1, taken
+        assert [(config.block_n, config.stages) for config in taken if isinstance(config, tiling.Tiles)] == [
+            (tile.block_n, tile.stages)], taken
+    # Pins of two kinds named in either order are one set of pins, one trace context: a program jitted under
+    # one order runs under the other without tracing again (the head review: a tuple's order keyed two
+    # contexts, two traces and two rewrites of one body).
+    traces = []
+
+    def counted(x):
+        traces.append(None)
+        return x + 1
+
+    stepped = jax.jit(counted)
+    for pins in ({grouped_matmul.MosaicGmm: tile, grouped_matmul.MosaicTgmm: tile},
+                 {grouped_matmul.MosaicTgmm: tile, grouped_matmul.MosaicGmm: tile}):
+        with tuning.pinned(pins):
+            stepped(jnp.ones(()))
+    assert len(traces) == 1, len(traces)
+
 def _scaled_twice(s, q_pos, k_pos, a, b):
     """A score hook the pass rewrites: two bounded scales of the bounded logits summed (the magnitudes the
     pass's reordering reads), one product of their sum."""

@@ -695,6 +695,20 @@ def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding
     return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*padded))
 
 
+def whole_along(x: jax.Array, axis: int) -> jax.Array:
+    """`x` with its dimension `axis` whole on each device where an Explicit axis splits it, its other
+    dimensions placed as they were: the one reshard that makes a dimension whole, a local attention's
+    sequence (`dew.nn.local_attention`) and a packed projection's gate-and-up pair
+    (`dew.nn.activations.packed_gated_product`) alike (row 12224)."""
+    placed = explicit_spec(x)
+    if placed is None or placed.spec[axis] is None:
+        return x
+    entries = list(placed.spec)
+    entries[axis] = None
+    return jax.sharding.reshard(x, jax.sharding.NamedSharding(placed.mesh,
+                                                             jax.sharding.PartitionSpec(*entries)))
+
+
 def rows_taken(table: jax.Array, index: jax.Array) -> jax.Array:
     """`table`'s rows at `index` (`jnp.take` on its first axis), placed as `index` is where an Explicit
     axis splits it: a replicated table read by each device's own indices, as a schedule's is by each

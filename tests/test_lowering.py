@@ -477,6 +477,28 @@ def test_a_decoders_residual_norms_run_the_fused_kernel_on_a_data_parallel_step(
     assert {"rms_norm_forward", "rms_norm_backward"} <= set(triton_kernels(lowered.value.lowered))
 
 
+def test_a_full_remat_runs_check_lowers_its_step_at_each_modules_whole_recomputation():
+    """A run of a full-remat fit policy lowered for a GPU it lacks (`LowerFor`) lowers the step its
+    search would compile, each module at the top of its ladder (`FitPolicy.remat`), not the configured
+    rung (review of row 11934)."""
+    import optax
+
+    from dew.nn.backbones import CausalTransformer
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.objectives.lm import LMObjective
+    from dew.training import FitPolicy, Trainer
+    from dew.training._lowering import Lowered
+
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2, mlp_features=64,
+                              max_seq_len=16)
+    trainer = Trainer(LMObjective(model, 16), optax.sgd(1e-2), key=jax.random.key(0), lower_for="sm90",
+                      fit=FitPolicy(split=1, remat="full"))
+    state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+    with pytest.raises(Lowered):
+        trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 17), jnp.int32)})
+    assert trainer.objective.model.remat == REMAT_POLICIES["full"]
+
+
 @pytest.mark.parametrize("bound", [None, 64], ids=["undeclared", "declared"])
 def test_a_packed_delta_net_lowers_for_an_a100_whatever_documents_its_rows_declare(bound):
     """A bf16 gated delta net over packed rows of 128 tokens in 8 documents, their bound undeclared
@@ -1037,7 +1059,8 @@ def test_a_gated_delta_net_split_over_the_sequence_runs_each_devices_own_slice()
     """A gated delta net on a mesh splitting its sequence runs the recurrence on each device's slice, as its
     lowered H100 program states it: over two devices and 384 tokens, every kernel call of the layer over one
     device's 192 tokens is among its calls, operand for operand, but the conv's, which reads its three-token
-    halo too, beside its slice's summary (the rule from `[0 | I]`), where the rule ran the whole sequence on
+    halo too, beside its slice's summary (the rule's write from zero, its transfer chained in XLA,
+    `recurrence_chunk.transferred`), where the rule ran the whole sequence on
     every device before (row 1437); and its collectives are the halo's and the summaries' gathers alone, no
     activation reduced (`recurrence_chunk.entering_memory`, `linear.sequence_conv`)."""
     def kernels(operations: list[Operation]) -> list[tuple]:
@@ -1595,7 +1618,7 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, Trainer
-    from dew.training.ahead import AheadTarget
+    from dew.training.targets import AheadTarget
 
     read: list[int] = []
     data = Loader(train=lambda partition: _Placed(read), val=None, batch=4, records=None)

@@ -38,7 +38,7 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.distributed.batches import Signature
-from dew.distributed.placement import Layout, Placement, link_topology, placed_shapes
+from dew.distributed.placement import Layout, MeshSpec, Placement, link_topology, placed_shapes
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
 from dew.nn.kernels.options import Compiling, OuterProgram, Placements, compiling, owned_program
 from dew.nn.sharding import microbatched
@@ -46,6 +46,12 @@ from dew.objectives.base import Held, Initializer
 from dew.objectives.drawn import Parts, drawing, drawn_rest, reassembled
 from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
+
+
+def mesh_stages(mesh: MeshSpec | Mesh) -> int:
+    """The pipeline stages `mesh` lays out: a `MeshSpec`'s `stage`, a native mesh's stage axis, one where it
+    has none."""
+    return mesh.stage if isinstance(mesh, MeshSpec) else mesh.shape.get(STAGE_AXIS, 1)
 
 
 def stage_microbatches(mesh: Mesh, asked: int | None) -> int:
@@ -290,7 +296,12 @@ def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[b
     not the shardings', says where its leaves are."""
     arguments, _ = executable.input_shardings
     tree, _ = signature
-    return tuple(sharding is not None for sharding in tree.flatten_up_to(arguments[STEP_BATCH]))
+    placed = arguments[STEP_BATCH]
+    # A field the step adds to the batch it fetched (a drawn pass count, `LOOP_PASSES`) is none of its leaves.
+    fetched = tree.unflatten(range(tree.num_leaves))
+    if isinstance(placed, dict) and isinstance(fetched, dict):
+        placed = {name: placed[name] for name in fetched}
+    return tuple(sharding is not None for sharding in tree.flatten_up_to(placed))
 
 
 @dataclasses.dataclass

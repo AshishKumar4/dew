@@ -25,7 +25,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _solves_apart,
     _states,
     _weighted,
-    _weighted_values,
     family_of,
     padded_widths,
     per_key_refusal,
@@ -384,12 +383,10 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         # The forward's inverse given without its states (a recomputed forward, `delta_memory`): its weights
         # from the inverse, the system's launch and the solve not repeated.
         a = inverse
-        w, keys = _weighted(k, v, a, prefix, beta, taken, call)
-        u = _weighted_values(v, a, beta, taken, call)
+        w, u, keys = _weighted(k, v, a, prefix, beta, taken, call)
     elif per_key and delta:
         a = _intra_solve(system[0], taken, call)
-        w, keys = _weighted(k, v, a, prefix, beta, taken, call)
-        u = _weighted_values(v, a, beta, taken, call)
+        w, u, keys = _weighted(k, v, a, prefix, beta, taken, call)
     elif per_key:
         (keys,) = _weighted(k, v, None, prefix, beta, taken, call)
     elif delta and inverse is None:

@@ -22,9 +22,9 @@ FLOAT64 = Numerics(dtypes=Dtypes(params="float64", compute="float64", output="fl
 """A float64 run's numerics, under which an optimizer's matrix iteration multiplies in float64
 (`dew.nn.precision.iteration_dtype`)."""
 
-WIDE_MOMENTS = {"mu_dtype": None, "nu_dtype": None}
-"""An optimizer's `optimizer_opts` keeping its moments in its parameters' dtype, a float64 truth's, where
-`OptimConfig.state_dtype`'s float32 holds them in float32 whatever the parameters'."""
+WIDE_MOMENTS = {"state_dtype": "params"}
+"""An optimizer's settings keeping its moments in its parameters' dtype, a float64 truth's, where its
+default float32 holds them in float32 whatever the parameters' (`dew.optim.Adam.state_dtype`)."""
 
 
 def counting(rate: float) -> optax.GradientTransformation:

@@ -15,7 +15,7 @@ from dew.data.dataset import Loader
 from dew.held_updates import phased
 from dew.objectives.base import Aux, Objective
 from dew.optim import power_profiles
-from dew.training import Trainer
+from dew.training import FitPolicy, Trainer, UpdateBatch
 
 
 def held_optimizer(held: str, rate: float = 0.1):
@@ -74,7 +74,7 @@ def test_an_optimizer_that_holds_updates_back_counts_its_clocks_by_the_updates_i
     tracker, window = RecordingTracker(), RecordingTracker()
     state = make_trainer(objective=Drawing(), optimizer=held_optimizer(held), tracker=tracker).fit(
         dataset(), tokens=30, log_every=1)
-    pooled = make_trainer(objective=Drawing(), tracker=window, accumulation=2).fit(
+    pooled = make_trainer(objective=Drawing(), tracker=window, update=UpdateBatch(batches=2)).fit(
         dataset(), tokens=30, log_every=1)
     assert int(state.step) == int(pooled.step) == 4 and int(state.updates) == int(pooled.updates) == 2
 
@@ -107,7 +107,8 @@ def test_a_token_budget_ends_at_the_update_whose_held_tokens_reach_it():
     and stepped once more past the budget (row 3930)."""
     multi = optax.MultiSteps(optax.sgd(0.1), every_k_schedule=3).gradient_transformation()
     held = make_trainer(objective=PaddedTokenRegression(), optimizer=multi).fit(dataset(), tokens=40)
-    window = make_trainer(objective=PaddedTokenRegression(), accumulation=3).fit(dataset(), tokens=40)
+    window = make_trainer(objective=PaddedTokenRegression(), update=UpdateBatch(batches=3)).fit(dataset(),
+                                                                                              tokens=40)
     assert (int(held.step), int(held.updates)) == (int(window.step), int(window.updates)) == (3, 1)
 
 
@@ -143,7 +144,7 @@ def test_a_held_optimizers_inputs_each_draw_once_however_the_trainer_reads_them(
     wide = 2 * jax.device_count()
     rows = Loader(train=lambda partition: Counting(wide), val=None, batch=wide, records=None)
     make_trainer(objective=Drawing(), optimizer=held_optimizer("multi_steps"), tracker=tracker,
-                 accumulation=2, split=split).fit(rows, steps=8, log_every=1)
+                 update=UpdateBatch(batches=2), fit=FitPolicy(split=split)).fit(rows, steps=8, log_every=1)
     # The draw states no pooling, so a step read in two parts logs its last part's, named so (`Aux.metrics`).
     name = "train/draw" if split == 1 else "train/draw/last_microbatch"
     draws = [scalars[name] for _, scalars in tracker.scalars if name in scalars]
@@ -249,7 +250,7 @@ def test_an_unsplit_step_whose_optimizer_holds_its_update_logs_its_own_batchs_lo
     (25 + 49) / 2 = 37 (spec alignment 2026-11-15, the evening pass's second finding)."""
     rows = jax.device_count()
     held = optax.MultiSteps(optax.sgd(0.0), 2).gradient_transformation()
-    trainer = Trainer(Targeted(), held, key=jax.random.key(0), accumulation=2)
+    trainer = Trainer(Targeted(), held, key=jax.random.key(0), update=UpdateBatch(batches=2))
     state = trainer.initial_state()
 
     def batch(target):

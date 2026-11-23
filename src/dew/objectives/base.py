@@ -989,6 +989,19 @@ class Objective(ABC, Generic[Loss, Effects]):
     (`dew.nn.progress.ReadsProgress`); an objective that passes none refuses such a model, which would
     otherwise train at the run's end. An objective over another's model, a distillation's over its
     student, passes as that one does."""
+    @property
+    def reads_pass_counts(self) -> bool:
+        """Whether its training loss runs a looped model at the count of passes its batch gives each row
+        (`dew.batch.LOOP_PASSES`), which a run drawing its count per microbatch hands it
+        (`dew.training.phase_passes.SampledPasses`); one that reads none would run every pass at the cap
+        whatever count was drawn, so such a run refuses it."""
+        return False
+
+    def counted_forward(self, module: nn.Module) -> str | None:
+        """The method its training loss reads a looped program module by (`program_key`), which takes the
+        count of passes a call runs where its loss reads counts (`reads_pass_counts`); None where it reads
+        none."""
+        return None
     resumable: ClassVar[tuple[str, ...]] = ()
     """The arguments that weigh how the objective learns rather than say what it trains, which a run resumed
     under its name may change (`dew.config.RunConfig.check_resume`, a direct resume's `training_record`), as

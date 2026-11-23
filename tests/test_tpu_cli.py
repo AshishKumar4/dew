@@ -619,21 +619,16 @@ def test_launch_reaches_a_tpu_only_once_it_is_ready_in_its_zone(fake):
 # ----------------------------------------------------------------------- syncing
 
 
-def test_train_runs_the_synced_recipe_on_every_worker_and_follows_worker_zero(fake, capsys, tmp_path,
-                                                                             monkeypatch):
-    """`train` copies the working tree to every worker, each at its own address, starts the recipe there
-    as one multi-host job, each worker logging its own output, and follows worker 0's log. A sync keeps
-    what a worker holds beside the tree, and mirrors the tree with `--delete`; what it excludes is left
-    alone either way."""
+def test_sync_copies_the_tree_to_every_worker_and_mirrors_it_on_request(fake, tmp_path, monkeypatch):
+    """`sync` copies the working tree to every worker, each at its own address, where `dew launch --tpu
+    --cwd` runs a recipe from it. A sync keeps what a worker holds beside the tree, and mirrors the tree with
+    `--delete`; what it excludes is left alone either way."""
     monkeypatch.chdir(project(tmp_path / "project"))
     fake.offer("slice", "us-central2-b")
     fake.host(worker_tools())
     homes = [fake.home("slice", worker) / "project" for worker in (0, 1)]
-    assert run("train", "slice", "--job", "fit", "--", "recipe.py", "--steps", "3") == 0
-    ran = "recipe --steps 3 --trainer.multi-host True"
-    assert [(home.parent / "dew-runs" / "fit" / f"worker-{worker}.log").read_text()
-            for worker, home in enumerate(homes)] == [f"{ran}\n"] * 2
-    assert f"[worker 0] {ran}" in printed(capsys)
+    assert run("sync", "slice") == 0
+    assert all((home / "recipe.py").is_file() for home in homes)
     for home in homes:
         (home / "outputs").mkdir()
         (home / "outputs" / "kept.txt").write_text("")

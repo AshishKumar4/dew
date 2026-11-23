@@ -95,7 +95,9 @@ FINITE_SEEDS = 2
 
 
 def assert_finite(fn, truth, operands, regime: str) -> None:
-    """`fn`'s leaves finite wherever the float64 truth's are, on `operands`."""
+    """`fn`'s leaves finite wherever the float64 truth's are, on `operands`, each jitted: one compile every
+    draw shares where its caller passes the same function (a fresh closure a draw compiled again, a seed's
+    interpreted template gradient about half of Kimi's floor cell's 143 s, train 1211's CI, row 12151)."""
     mine = jax.tree.leaves(jax.jit(fn)(*operands))
     with jax.enable_x64(new_val=True):
         exact = jax.tree.leaves(jax.jit(truth)(*widened(operands)))
@@ -340,20 +342,20 @@ SHARDED_ORDINARY = (('vector delta', 'resets on chunk edges'), ('vector delta', 
                     ('rated', 'resets on chunk edges'), ('gated', 'resets on chunk edges'),
                     ('scalar delta', 'resets on chunk edges'))
 """The ordinary regimes' cases past a task whole, each a check-1 site of its own recorded seeds over map
-tasks: Kimi delta attention's 16 seeds of 23 interpreted chunks (its 18 documents laid apart) at 10 s a draw,
-and its 64 seeds under the decay bound at 2.2 s (179 and 146 s whole at CI's rate, train of 2026-11-14
-05:20Z); the rated scan's 64 seeds under resets on chunk edges, each of its forms (121 s whole under the
-accurate ones, train 861's CI); the gated delta net's 32 there (130 to 143 s whole, tests/test_durations.json
-at dc7ebf822, row 10861); the gated delta net with a decay a head, its 32 draws there (125 s whole, train
-1196's CI, row 11974). Their marks are literal parameters (`pytest.param`), as the plan reads a site's
-from the source."""
+tasks: Kimi delta attention's 32 seeds of 23 interpreted chunks (its 18 documents laid apart) at 10 s a draw
+(16 before its unit queries' recording, M-JS-233), and its 64 seeds under the decay bound at 2.2 s (179 and
+146 s whole at CI's rate, train of 2026-11-14 05:20Z); the rated scan's 64 seeds under resets on chunk
+edges, each of its forms (121 s whole under the accurate ones, train 861's CI); the gated delta net's 32
+there (130 to 143 s whole, tests/test_durations.json at dc7ebf822, row 10861); the gated delta net with a
+decay a head, its 32 draws there (125 s whole, train 1196's CI, row 11974). Their marks are literal
+parameters (`pytest.param`), as the plan reads a site's from the source."""
 
 
 @pytest.mark.parametrize(('name', 'regime', 'forms'), [
     *((name, regime, forms) for name, regime, product, forms in CASES
       if product == 'forward' and regime in ORDINARY and (name, regime) not in SHARDED_ORDINARY),
     pytest.param('vector delta', 'resets on chunk edges', None, id='vector_delta-resets_on_chunk_edges',
-                 marks=pytest.mark.check1_shards(seeds=16, per_task=8)),
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=8)),
     pytest.param('vector delta', 'the decay bound', None, id='vector_delta-the_decay_bound',
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param('rated', 'resets on chunk edges', 'fast', id='rated-resets_on_chunk_edges-fast',
@@ -411,11 +413,10 @@ def test_kimis_unit_keys_under_tiny_gates_at_the_floor_stays_finite_interpreted(
     from fla_sites import chunk_of, sites
 
     site = sites()[FLOOR_GATES]
-    mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
-    truth = functools.partial(token_by_token, site.hooks)
+    mosaic = with_gradients(_arms('vector delta', 'the decay bound', 'forward', None)[0])
+    truth = with_gradients(functools.partial(token_by_token, site.hooks))
     for seed in range(FINITE_SEEDS):
-        operands = chunk_of(site.arrays(seed))
-        assert_finite(with_gradients(mosaic), with_gradients(truth), operands, FLOOR_GATES)
+        assert_finite(mosaic, truth, chunk_of(site.arrays(seed)), FLOOR_GATES)
 
 
 @COMPILES_ON_CPU

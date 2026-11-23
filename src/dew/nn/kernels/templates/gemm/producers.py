@@ -23,7 +23,16 @@ def started(op, ba, config: tiling.Tiles) -> tiling.Tiles:
     if (top is None or config.producers.of(op.KERNEL) is not None
             or not family.tensor_columns(pricing.tile_columns(config, family), 1)):
         return config
-    return dataclasses.replace(config, producers=config.producers.stepped({op.KERNEL: top}))
+    regs = op.registers(ba, config)
+    consumers = config.warpgroups + op.rewritten(ba, family)
+    stated = None
+    if regs is not None and regs > top:
+        cap = resources.stated_producer(regs, family.warpgroups(consumers), consumers, config.programs)
+        if cap is None:
+            return config
+        stated = {op.KERNEL: cap}
+    stepped = config.producers.stepped({op.KERNEL: top}, stated)
+    return config if stepped is None else dataclasses.replace(config, producers=stepped)
 
 
 def _top(op, ba, config: tiling.Tiles) -> int | None:

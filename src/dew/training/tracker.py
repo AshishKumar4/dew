@@ -818,7 +818,9 @@ class Wandb:
     (a forecaster, an evaluator) log into the same run on axes of their own
     (`WandbTracker`'s `primary=False`), whose rows a run opened plainly drops: two
     processes on one run, 30 rows and 0 plainly, 30 and 3 shared (wandb 0.31.0).
-    A shared run is one W&B's server holds, so an offline one is refused (`WandbTracker`).
+    A shared run is one W&B's server holds, so an offline one is refused (`WandbTracker`). `publish` links
+    the checkpoint the run ends on into W&B's registry (`dew.io.publish`), which an offline run cannot
+    reach: the run's save policy keeps that checkpoint (`TrainerConfig.checkpoint_final`), W&B publishes it.
     """
 
     project: str
@@ -826,3 +828,4 @@ class Wandb:
     offline: bool = False
     name: str | None = None
     shared: bool = False
+    publish: bool = False
