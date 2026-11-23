@@ -1493,9 +1493,9 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, chun
 def transferred(query, key, value, g, beta, starts=None, *, chunk_size: int = CHUNK_SIZE) -> jax.Array:
     """The delta rule's transfer over a slice of its tokens, `[B, Hv, Dk, Dk]` in at least fp32: the linear
     map `F` the slice's tokens apply to the memory entering it (`S_out = F S_in + Z`), zero where a document
-    starts in it (`starts`), each chunk's transition chained onto the chunks' before it in fp32 from the
-    operands as they are given (`scan.derive_scan`'s walk carrying its transfer: `prepare(...,
-    transition=True)`, `step`), as fla-core 0.5.2's context parallelism chains its transfer from bf16
+    starts in it (`starts`), each chunk's transition composed with the others' in fp32 from the operands
+    as they are given (`scan.derive_scan`'s walk carrying its transfer: `prepare(..., transition=True)`,
+    `step`, `merge`), as fla-core 0.5.2's context parallelism chains its transfer from bf16
     `k^T w` (ops/cp/chunk_delta_h.py:304-315), no product's result rounded on the way, in the delta rule's
     chunks at the keys' width (`held_chunk`, the portable math's). The forms' memory is one value column wide
     and zero: the transfer reads no value. A slice of no tokens transfers the memory as it is (the
@@ -1513,12 +1513,25 @@ def transferred(query, key, value, g, beta, starts=None, *, chunk_size: int = CH
     varying = (key, g, beta, starts)
 
     def walked(chunks: dict) -> jax.Array:
-        """One row's and head's transfer over its chunks `[chunks, C, ...]`."""
+        """One row's and head's transfer over its chunks `[chunks, C, ...]`: each chunk's walk from the
+        start (its transition), joined pairwise a level at a time (`forms.merge`, associative), so the
+        chunks' transitions compose in log2 of their count's batched products rather than one after
+        another: walked in turn, the 27B's split summary took 10.9 ms of a GH200 at 4096 tokens against
+        the layer's bf16 pass's 2.2 (M-JS-236)."""
         start = jax.tree.map(lambda x: varying_like(x, *varying),
                              forms.init(jax.tree.map(lambda x: x[0], chunks)))
         prepared = jax.vmap(functools.partial(forms.prepare, transition=True))(chunks)
-        last, _ = jax.lax.scan(lambda walk, chunk: (forms.step(walk, chunk), None), start, prepared)
-        return last.transfer
+        walks = jax.vmap(lambda chunk: forms.step(start, chunk))(prepared)
+        count = jax.tree.leaves(chunks)[0].shape[0]
+        while count > 1:
+            pairs, odd = count // 2, count % 2
+            first, later = (jax.tree.map(lambda x, at=at: x[at:2 * pairs:2], walks) for at in (0, 1))
+            joined = jax.vmap(lambda a, b: forms.merge(a, b, None))(first, later)
+            if odd:
+                joined = jax.tree.map(lambda j, x: jnp.concatenate([j, x[-1:]]), joined, walks)
+            walks = joined
+            count = pairs + odd
+        return walks.transfer[0]
 
     return jax.vmap(jax.vmap(walked))(operands)
 
