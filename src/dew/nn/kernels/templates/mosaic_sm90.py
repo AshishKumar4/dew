@@ -87,8 +87,9 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
                         then: tuple[Callable | None, ...] | None = None) -> tuple[Callable, ...]:
         # Every group issued into its own scoped accumulator, then each read as its own groups complete,
         # the later ones running on (`read`'s `pending`, counted by the groups each committed), `then[i]` of
-        # it run there; interpreted, or `apart`, each summed in turn.
-        if launches.interpreting() or apart:
+        # it run there, interpreted alike (the interpreter's own MMA, as `product`'s); `apart`, each summed
+        # in turn.
+        if apart:
             return super().summed_together(shapes, issues, apart=apart, then=then)
         after = (None,) * len(shapes) if then is None else then
 
@@ -115,9 +116,10 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
     def products(self, acc, lhs, rhs, *, accumulate: bool = True):
         interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         mosaic.committed()
-        if interpret:
+        if interpret and isinstance(acc, jax.Array):
             fresh = jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
             return acc + fresh if accumulate else fresh
+        # A scoped accumulator, interpreted too: the interpreter's own MMA, as a fresh product's (`product`).
         if not accumulate:
             # A fresh product into a walk's accumulator: zeroed in its registers, then issued, no wait.
             acc[...] = jnp.zeros(acc.shape, jnp.float32)
@@ -148,8 +150,11 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         for formed in parts:
             part = mosaic.unscaled_part(formed)
             mosaic.committed()
-            if interpret:
+            if interpret and isinstance(acc, jax.Array):
                 acc = acc + jnp.dot(part, rhs[...], preferred_element_type=jnp.float32)
+            elif interpret:
+                # A scoped accumulator interpreted: its value read and written back (`summed_together`'s).
+                acc[...] = acc[...] + jnp.dot(part, rhs[...], preferred_element_type=jnp.float32)
             else:
                 plgpu.wgmma(acc, part, rhs)
                 # Operand A is read from its registers until its group retires, and the next part or the
