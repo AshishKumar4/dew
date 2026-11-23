@@ -173,7 +173,7 @@ class _Reads:
         (states, chunk_logits), mutated = self.model.apply(
             held, tokens[None], decode=True, train=self.train, rngs=self.rngs, mutable=["cache"],
             method="states_and_logits", coordinates=row_layout,
-            block_groups=None if row_blocks is None else row_blocks[None],
+            block_groups=None if row_blocks is None else row_blocks[None], capture_intermediates=False,
             **({} if self.loop_passes is None else {"loop_passes": self.loop_passes}))
         return states[0], chunk_logits[0], mutated["cache"]
 
