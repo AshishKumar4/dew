@@ -1360,9 +1360,14 @@ def test_an_earlier_muons_mask_and_gauss_newtons_cap_load_as_they_trained(tmp_pa
     alone, as it trained (review of API01: both records were refused)."""
     from dew.optim import GaussNewton, Muon
 
-    muon = _saved_optimizer(tmp_path / "muon", {"optimizer": "muon", "weight_decay": 0.1,
-                                                 "optimizer_opts": {"weight_decay_mask": {"w": False}}})
-    assert isinstance(muon.optimizer, Muon) and muon.decay_mask == {"w": False}
+    for name, mask in (("tree", {"w": False}), ("off", False), ("on", True)):
+        muon = _saved_optimizer(tmp_path / name, {"optimizer": "muon", "weight_decay": 0.1,
+                                                  "optimizer_opts": {"weight_decay_mask": mask}})
+        assert isinstance(muon.optimizer, Muon) and muon.decay_mask == mask
+    grouped = _saved_optimizer(tmp_path / "grouped", {
+        "optimizer": "muon", "weight_decay": 0.1, "optimizer_opts": {"weight_decay_mask": {"w": False}},
+        "param_groups": [{"name": "all", "patterns": ["*"], "spared": True}]})
+    assert [(group.decay_mask, group.spared) for group in grouped.param_groups] == [({"w": False}, False)]
     capped = _saved_optimizer(tmp_path / "gauss", {"optimizer": "gauss_newton", "clip_grads": 1.0,
                                                    "optimizer_opts": {"clip": 0.5}})
     assert capped.optimizer == GaussNewton() and capped.clip_grads == 1.0
