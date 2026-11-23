@@ -350,7 +350,7 @@ def test_a_walk_takes_each_step_of_its_range_once_in_order_at_its_turn(stages, u
         taken.append((index, turn.slot, turn.rotation, before))
         return state
 
-    with jax.default_device(jax.devices("cpu")[0]):
+    with _on_the_host():
         for first in (0, 3):
             for lo in range(first, first + 3 * stages):
                 for hi in range(lo, lo + 3 * stages + 1):
@@ -506,7 +506,7 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
     tier's prepare computes on no device)."""
     from dew.nn.kernels.templates import bundles, mosaic_sm100
 
-    with jax.default_device(jax.devices("cpu")[0]):
+    with _on_the_host():
         ref = jax.new_ref(jnp.arange(256 * 512, dtype=jnp.float32).reshape(256, 512))
         block = (64, 128)
         split = rings.viewed((ref, lambda step: rings.Paired((1, step), along=0)), block, 2)
@@ -1293,15 +1293,22 @@ def test_a_tpu_core_walks_the_persistent_tiles_interpreted():
     """Interpreted on any host: the persistent walk on a TPU core's bundle (`mosaic_tpu.MXU`), each step's
     blocks DMA'd into its VMEM ring a step ahead and multiplied by the MXU, each tile's rows stored from
     VMEM, over three tiles with the middle one multiplying nothing: each tile's rows exactly its product,
-    the middle's zeros. On the host's CPU, its program compiled in a tier's prepare (`ahead_arm`)."""
+    the middle's zeros. On the host's CPU (`_on_the_host`)."""
     from dew.nn.kernels.templates import mosaic_tpu
     family = mosaic_tpu.MXU
     x, w = _persisted_operands(family.rows)
-    got = np.asarray(ahead_arm(jax.jit(functools.partial(_persisted_products, family=family, interpret=True)),
-                               "a TPU core's persistent walk", host=True)(x, w))
+    with _on_the_host():
+        got = np.asarray(_persisted_products(x, w, family=family, interpret=True))
     expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
     expected[family.rows:2 * family.rows] = 0
     np.testing.assert_array_equal(got, expected)
+
+
+def _on_the_host():
+    """The host's CPU as the default device: where a cell's interpreted kernels and eager host work run, a
+    GPU tier's prepare computing on no device (its default a compile-only GPU), and an interpreter's
+    callbacks making no program its store holds (`reference_error.ahead_arm`)."""
+    return jax.default_device(jax.devices("cpu")[0])
 
 
 @contextlib.contextmanager
@@ -1311,7 +1318,7 @@ def _on_a_v5e():
     from jax.sharding import AbstractDevice, AbstractMesh
 
     device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
-    with jax.default_device(jax.devices("cpu")[0]), jax.sharding.use_abstract_mesh(
+    with _on_the_host(), jax.sharding.use_abstract_mesh(
             AbstractMesh((1,), ("data",), abstract_device=device)):
         yield
 
@@ -1352,11 +1359,12 @@ def _read_through(x, rows, index, *, interpret):
 def test_a_tpu_core_reads_its_hbm_operands_through_its_family():
     """A TPU core's tile, row vector and scalar read from operands left in HBM (`VmemRings.tile_of`,
     `rows_of`, `scalar_of`, each through a copy): interpreted on any host, exactly `x * index[0] + rows`, on
-    the host's CPU, its program compiled in a tier's prepare (`ahead_arm`); lowered for a TPU v5e."""
+    the host's CPU (`_on_the_host`: its interpreter's callbacks make no program a tier's prepare stores);
+    lowered for a TPU v5e."""
     x = np.arange(8 * 128, dtype=np.float32).reshape(8, 128)
     rows, index = np.arange(8, dtype=np.float32) * 1000, np.asarray([3], np.int32)
-    got = ahead_arm(jax.jit(functools.partial(_read_through, interpret=True)), "a TPU core's HBM reads",
-                    host=True)(x, rows, index)
+    with _on_the_host():
+        got = _read_through(x, rows, index, interpret=True)
     np.testing.assert_array_equal(np.asarray(got), x * 3 + rows[:, None])
     shapes = [jax.ShapeDtypeStruct(each.shape, each.dtype) for each in (x, rows, index)]
     with _on_a_v5e():
@@ -1394,11 +1402,11 @@ def _added_in_place(x, *, interpret):
 def test_a_tpu_cores_programs_add_into_an_in_place_ref_in_turn():
     """Three programs of a TPU core adding into one ref the launch takes in place (a launch's dQ, its grouped
     dK and dV), each read-modify-write through VMEM in turn: interpreted on any host, the ref holds the three
-    adds' sum exactly, and the launch's own output each program's row, on the host's CPU, its program
-    compiled in a tier's prepare (`ahead_arm`); lowered for a TPU v5e."""
+    adds' sum exactly, and the launch's own output each program's row, on the host's CPU (`_on_the_host`);
+    lowered for a TPU v5e."""
     x = np.arange(8 * 128, dtype=np.float32).reshape(8, 128)
-    summed, out = ahead_arm(jax.jit(functools.partial(_added_in_place, interpret=True)),
-                            "a TPU core's adds in place", host=True)(x)
+    with _on_the_host():
+        summed, out = jax.jit(functools.partial(_added_in_place, interpret=True))(x)
     np.testing.assert_array_equal(np.asarray(summed), x * 6)
     np.testing.assert_array_equal(np.asarray(out), np.repeat(np.arange(3, dtype=np.int32)[:, None], 128, 1))
     with _on_a_v5e():
@@ -1471,17 +1479,11 @@ def test_a_tpu_launch_plans_one_program_within_its_cores_scoped_vmem():
 @pytest.mark.parametrize("case", ["dense bias", "grouped", "grouped transposed", "kernel gradient"])
 def test_the_gemms_kernel_bodies_run_on_a_tpu_core(case):
     """Interpreted on any host, each of the GEMM template's kernel bodies on a TPU core's bundle gives its
-    product exactly, and it lowers for a TPU v5e, its devices abstract. Interpreted on the host's CPU, its
-    program compiled in a tier's prepare (`ahead_arm`), its operands NumPy's."""
+    product exactly, and it lowers for a TPU v5e, its devices abstract. Interpreted on the host's CPU
+    (`_on_the_host`), its operands NumPy's."""
     call, operands, expected = _gemm_on_a_tpu_core()[case]
-
-    def interpreted(*arrays):
-        given = iter(arrays)
-        return call(*(None if each is None else next(given) for each in operands), interpret=True)
-
-    got = ahead_arm(jax.jit(interpreted), f"a TPU core's GEMM: {case}", host=True)(
-        *(each for each in operands if each is not None))
-    np.testing.assert_array_equal(np.asarray(got), expected)
+    with _on_the_host():
+        np.testing.assert_array_equal(np.asarray(call(*operands, interpret=True)), expected)
     abstract = [None if each is None else jax.ShapeDtypeStruct(each.shape, each.dtype) for each in operands]
     with _on_a_v5e():
         jax.jit(call).trace(*abstract).lower(lowering_platforms=("tpu",))
@@ -2097,14 +2099,14 @@ def test_a_register_left_product_on_tcgen05s_chunks_is_its_shared_memory_product
 @pytest.mark.parametrize("shift", [0, 5, -7])
 def test_a_row_shift_takes_each_row_from_its_groups_row_shift_up(shift):
     """A tile's rows shifted within groups of 16 (`Issuer.row_shifted`, interpreted at an H100's facts):
-    each row whose source lies in its group holds that row's values, the rest masked; on the host's CPU, its
-    program compiled in a tier's prepare (`ahead_arm`)."""
+    each row whose source lies in its group holds that row's values, the rest masked, on the host's CPU
+    (`_on_the_host`)."""
     from dew.nn.kernels.templates import bundles
 
     tile = np.arange(64 * 32, dtype=np.float32).reshape(64, 32)
     family = bundles.of("sm90", jnp.bfloat16)
-    shifted = jax.jit(functools.partial(family.row_shifted, period=16, interpret=True))
-    out = np.asarray(ahead_arm(shifted, "a row shift", host=True)(tile, np.int32(shift)))
+    with _on_the_host():
+        out = np.asarray(family.row_shifted(tile, np.int32(shift), period=16, interpret=True))
     rows = np.arange(64)
     kept = (rows % 16 - shift >= 0) & (rows % 16 - shift < 16)
     np.testing.assert_array_equal(out[kept], tile[rows[kept] - shift])
@@ -2316,13 +2318,12 @@ def test_a_walks_once_stream_loads_once_and_every_step_reads_it(bundle):
     block, so the walk sums that block times every step's: exactly, small integers in fp32. (tcgen05's plain
     walks' accumulators are their persist's or their launch's tensor memory, which this one scopes none of;
     mma.sync's pipeline refuses a once stream, `test_a_cp_async_walk_refuses_a_once_stream`.) On the host's
-    CPU (`ahead_arm`)."""
+    CPU (`_on_the_host`)."""
     family, target, interpret = _once_bundle(bundle)
     x, w = _persisted_operands(family.rows)
     x = x[:family.rows]
-    with generation.assumed(target):
-        walked = jax.jit(functools.partial(_walked_once, family=family, interpret=interpret))
-        got = np.asarray(ahead_arm(walked, f"a once stream: {bundle}", host=True)(x, w))
+    with generation.assumed(target), _on_the_host():
+        got = np.asarray(_walked_once(x, w, family=family, interpret=interpret))
     blocks = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
     np.testing.assert_array_equal(got, np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ blocks)
 
@@ -2349,14 +2350,12 @@ def test_a_walks_prologue_value_reaches_every_step_beside_its_once_stream(bundle
 def test_a_walk_whose_every_operand_is_a_once_stream_reads_them_at_each_step(bundle):
     """Interpreted: a plain walk of two operands both once streams, no ring to rotate (a consumer-fed
     bundle's loading consumer one step deep, as a ring family's walk is): every step reads the two step-zero
-    blocks, so the walk sums their product once a step, on the host's CPU (`ahead_arm`)."""
+    blocks, so the walk sums their product once a step, on the host's CPU (`_on_the_host`)."""
     family, target, interpret = _once_bundle(bundle)
     x, w = _persisted_operands(family.rows)
     x = x[:family.rows]
-    with generation.assumed(target):
-        got = np.asarray(ahead_arm(jax.jit(functools.partial(_walked_once, family=family, interpret=interpret,
-                                                             all_once=True)), f"once streams: {bundle}",
-                                   host=True)(x, w))
+    with generation.assumed(target), _on_the_host():
+        got = np.asarray(_walked_once(x, w, family=family, interpret=interpret, all_once=True))
     first = np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ np.asarray(w, np.float32)[:PERSISTED_DEPTH]
     np.testing.assert_array_equal(got, PERSISTED_STEPS * first)
 
@@ -2426,7 +2425,7 @@ def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loo
     before its third) every buffer is rewritten only once its last TMA store has read it, the output the
     tiles' values; a wait allowing one group more at a tile's first chunk or its third rewrites a buffer a
     store still reads, which the detector names (its second's buffer the first's drain already freed). On
-    the host's CPU, its program compiled in a tier's prepare (`ahead_arm`)."""
+    the host's CPU (`_on_the_host`)."""
     from jax._src.pallas.mosaic_gpu.interpret.interpret_pallas_call import reset_gpu_interpret_mode_state
 
     rows, width, chunks = STAGED
@@ -2434,18 +2433,18 @@ def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loo
     assert waits == [0, 2, 1]
     if loosened is not None:
         waits[loosened] += 1
-    kernel = ahead_arm(jax.jit(_staged_launch(tuple(waits), interpret=plgpu.InterpretGPUParams(
-        detect_races=True))), f"staged chunks: {loosened} loosened", host=True)
-    if loosened is None:
-        tiles = 1000.0 * np.repeat([0, 1], rows)[:, None]
-        columns = np.arange(chunks * width, dtype=np.float32)
-        np.testing.assert_array_equal(np.asarray(kernel()), columns + tiles)
-        return
-    try:
-        with pytest.raises(jax.errors.JaxRuntimeError):
-            kernel()
-    finally:
-        reset_gpu_interpret_mode_state()
+    kernel = _staged_launch(tuple(waits), interpret=plgpu.InterpretGPUParams(detect_races=True))
+    with _on_the_host():
+        if loosened is None:
+            tiles = 1000.0 * np.repeat([0, 1], rows)[:, None]
+            columns = np.arange(chunks * width, dtype=np.float32)
+            np.testing.assert_array_equal(np.asarray(kernel()), columns + tiles)
+            return
+        try:
+            with pytest.raises(jax.errors.JaxRuntimeError):
+                kernel()
+        finally:
+            reset_gpu_interpret_mode_state()
 
 
 SKIPPED = (STAGED[0], 0, STAGED[0])
@@ -2462,13 +2461,13 @@ def test_a_share_storing_no_rows_stages_no_chunk_between_stored_tiles():
     storing no rows (`SKIPPED`), under the GPU interpreter's race detection: `stores.staged_chunks` stages
     nothing for it, no race is named and the output holds the first and third tiles' values. The race a
     zero-row share staged anyway makes is the protocol checker's, which counts store groups (the next
-    test; base review 5028c8148 F2). On the host's CPU, its program compiled in a tier's prepare
-    (`ahead_arm`)."""
+    test; base review 5028c8148 F2). On the host's CPU (`_on_the_host`)."""
     rows, width, _ = STAGED
     chunks = len(SKIPPED_WAITS)
     assert SKIPPED_WAITS == (1, 1)
     kernel = _staged_launch(SKIPPED_WAITS, SKIPPED, interpret=plgpu.InterpretGPUParams(detect_races=True))
-    out = np.asarray(ahead_arm(jax.jit(kernel), "a share storing no rows", host=True)())
+    with _on_the_host():
+        out = np.asarray(kernel())
     columns = np.broadcast_to(np.arange(chunks * width, dtype=np.float32), (rows, chunks * width))
     np.testing.assert_array_equal(out[:rows], columns)
     np.testing.assert_array_equal(out[2 * rows:], columns + 2000.0)
@@ -2485,7 +2484,7 @@ def test_a_share_storing_no_rows_issues_no_write_and_no_group(staging):
     from ring_protocol import Violation, commits_group, explore, programs
 
     chunks = len(SKIPPED_WAITS)
-    with jax.default_device(jax.devices("cpu")[0]):
+    with _on_the_host():
         threads, arrivals = programs(_staged_launch(SKIPPED_WAITS, SKIPPED, staging), threads=1)
     [program] = threads
     writes = sum(event.kind == "write" for event in program)

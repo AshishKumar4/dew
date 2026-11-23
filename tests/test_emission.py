@@ -9,6 +9,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from kernel_compile import lowered_for
+from reference_error import ahead_arm
 
 from dew.nn import programs
 from dew.nn.kernels import generation
@@ -342,7 +343,8 @@ def test_a_folds_known_predicate_is_the_one_each_warpgroup_computes(predicate, e
     is the one that warpgroup computes on this GPU, the kernel lowered by the semantics holding it
     (`_semantics`), each warpgroup writing its predicate to its own part of the output: the fold priced
     against the GPU, not against expectations stated by hand (base review 117cc9088 F4, row 8799). An
-    unknown predicate, both branches priced, holds whatever the GPU computes."""
+    unknown predicate, both branches priced, holds whatever the GPU computes. Its program compiled in a
+    tier's prepare (`ahead_arm`)."""
     del exponentials
 
     def body(out_gmem, staged):
@@ -353,9 +355,11 @@ def test_a_folds_known_predicate_is_the_one_each_warpgroup_computes(predicate, e
         plgpu.copy_smem_to_gmem(staged.at[at], out_gmem.at[at])
         plgpu.wait_smem_to_gmem(0)
 
-    computed = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((256,), jnp.int32), num_threads=2,
-                            thread_name="wg", scratch_types=[plgpu.SMEM((256,), jnp.int32)],
-                            compiler_params=_semantics(predicate))()
+    named = SCALAR_IDS[[each[0] for each in SCALAR_PREDICATES].index(predicate)]
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((256,), jnp.int32), num_threads=2,
+                          thread_name="wg", scratch_types=[plgpu.SMEM((256,), jnp.int32)],
+                          compiler_params=_semantics(predicate))
+    computed = ahead_arm(jax.jit(launch), f"a warpgroup's predicate: {named}")()
     on_the_gpu = [bool(value) for value in np.asarray(computed).reshape(2, 128)[:, 0]]
     known = _known(predicate)
     assert all(held is None or held == gpu for held, gpu in zip(known, on_the_gpu, strict=True)), (
