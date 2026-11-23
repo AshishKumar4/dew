@@ -102,17 +102,13 @@ and `FED`'s fed consumers and its shared keys, which an A100's mma.sync, one war
 HOOKED_FORMS = ("default", "accurate")
 """The forms every hooked call takes: its fast form's one launch takes a hook of no parameters, an initial
 state or a draw alone."""
-
-
 WALKED_CASES = ("full", "causal", "causal-window", "documents", "cross-causal-lengths-starts", "block-causal",
                 "valid", "widest-window", "runs", "runs-documents-valid")
 """The call forms a one-launch walk (`WGMMA_FORMS`) is checked over: one of each mechanism its block map and
 masks meet (`attention.block_map`, `algebra.seen`), whole tiles, causality's diagonal, a window's band,
 documents' ids, another sequence's documents aligned with key lengths and starts, block groups, key validity
-and its empty rows, a window at int32's largest, and runs alone and beside documents and validity. Every
-other call form combines these mechanisms, each checked on the two launches' walks and the accurate form's,
-which every call form runs on (`test_the_backward_is_on_par_over_every_call_form_interpreted`)."""
-
+and its empty rows, a window at int32's largest, and runs alone and beside documents and validity; every
+other call form combines them, each checked on an H100's two launches' walks and its accurate form's."""
 
 FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128}
 """The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
@@ -198,10 +194,8 @@ an fp32 call's bf16 parts, which an A100's pipeline loads in no pieces, row 4475
 def on_each_family_for(names: str | tuple[str, ...], values, ids=None, *,
                        mechanisms_elsewhere: str | None = None) -> pytest.MarkDecorator:
     """`ON_EACH_FAMILY` crossed with `values` of the parameters `names`, one of them `form`: the cells each
-    GPU's family takes, a backward form of an H100's layouts alone (`WGMMA_FORMS`) on its family alone. Where
-    `mechanisms_elsewhere` names the parameter of a call form, a family but an H100's takes only the call
-    forms of one mechanism each (`WALKED_CASES`), every combination of them checked on an H100's walks (the
-    interpreted cells' CI time, 2026-11-23)."""
+    GPU's family takes, an H100's layouts' backward forms (`WGMMA_FORMS`) on its family alone, another's one
+    mechanism's call forms alone (`WALKED_CASES`) of the parameter `mechanisms_elsewhere`."""
     names = (names,) if isinstance(names, str) else tuple(names)
     values = list(values)
     if callable(ids):
