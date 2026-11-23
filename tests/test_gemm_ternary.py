@@ -148,13 +148,12 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
                                 trans_rhs=True, interpret=False, dense=False, exact_sums=False)
         dw_ba = tgmm_launch.bind(f32((256, 128)), f32((256, 128)), sizes, out_dtype="float32",
                                  interpret=False, dense=False, exact_sums=False)
-        if gpu in ("sm80", "sm100"):
-            assert gmm_launch.derived(dx_ba, target) is not None
-            assert tgmm_launch.derived(dw_ba, target) is not None
+        assert gmm_launch.derived(dx_ba, target) is not None
+        assert tgmm_launch.derived(dw_ba, target) is not None
         if generation.compile_only_gpus(gpu):
             def run_tf32(x, w, s):
                 with generation.chosen(grouped_matmul="mosaic"):
-                    return gemm.gemm(x, w, s, out_dtype=jnp.float32,
+                    return gemm.gemm(x, w, s, transpose_rhs=(gpu == "sm90"), out_dtype=jnp.float32,
                                      precision=jax.lax.Precision.DEFAULT)
 
             records = compile_mosaic_kernels(

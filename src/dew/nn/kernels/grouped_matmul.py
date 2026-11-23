@@ -355,12 +355,14 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
 
     def _tf32(self, ba, dtype, family: mosaic.Family) -> bool:
         """Whether an fp32 TF32 call runs here (`product.declared` at DEFAULT precision, `takes_tf32`,
-        row 3428): plain unscaled unhooked call, transposed only where `family.transposes_tf32`."""
-        transposed = self._matrix_transposed(ba) or self.STAGED_ROWS
+        row 3428): plain unscaled unhooked call; non-transposing TF32 families (Hopper WGMMA) require
+        K-major B (`trans_rhs=True`, not `STAGED_ROWS`), while transposing families (Ampere/Blackwell) take
+        both orientations and kernel gradients."""
+        k_major = not self.STAGED_ROWS and self._matrix_transposed(ba)
         return (jnp.dtype(dtype) == jnp.float32 and family.takes_tf32
                 and not ba.arguments.get('exact_sums') and not self._scaled
                 and ba.arguments['hooks'] == NO_HOOKS and ba.arguments.get('paired') is None
-                and (family.transposes_tf32 or not transposed))
+                and (family.transposes_tf32 or k_major))
 
     def _families(self, ba, target) -> tuple[mosaic.Family, ...]:
         """The bundles the launch may run on `target`, in preference order: the most capable issuer's whose
