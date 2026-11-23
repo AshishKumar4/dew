@@ -145,15 +145,50 @@ def _forward(x, taps, bias, valid, documents, parts, activation: bool, eps: floa
 
 def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bool, eps: float,
               interpret: bool):
-    """Every piece's gradients in one launch (`templates.recurrence.conv.backward`)."""
+    """Every piece's gradients in one launch (`templates.recurrence.conv.backward`), a normalised piece's
+    norm's transpose taken before it (`_through_norms`), so the launch walks every piece unnormalised."""
     from .templates.recurrence import conv
 
-    dx, dw, db = conv.backward(x, taps, bias, valid, documents, tuple(cotangents), parts=tuple(parts),
-                               activation=activation, eps=eps, **_launched(interpret))
+    cotangents = _through_norms(x, taps, bias, valid, documents, tuple(cotangents), parts, activation, eps,
+                                interpret)
+    plain = tuple((width, None) for width, _ in parts)
+    dx, dw, db = conv.backward(x, taps, bias, valid, documents, cotangents, parts=plain,
+                               activation=activation, **_launched(interpret))
     # The taps' and bias's gradients formed in their dtypes before the input's cotangent leaves (row 6027).
     dx, (d_taps, d_bias) = with_gradients_formed(
         dx, (dw.T.astype(taps.dtype), None if bias is None else db.astype(bias.dtype)))
     return dx, d_taps, d_bias
+
+
+def _through_norms(x, taps, bias, valid, documents, cotangents: tuple, parts, activation: bool, eps: float,
+                   interpret: bool) -> tuple:
+    """Each piece's cotangent before its norm: a normalised piece's (a delta rule's queries and keys, `head`
+    channels a head) `scale (dy - (u . dy) u)`, `u` its activation's unit along each head and `scale` its
+    inverse norm, from its activation recomputed in fp32 by the forward's launch unnormalised, every product
+    and sum in fp32, the root and inverse each rounded once (`scan.inverse_norm`'s arithmetic); every other
+    piece's as given. Taken inside the backward's walk, the head's two sums a token were a warp's shuffles on
+    its sequential path, at 255 registers a thread: Qwen3.5-4B's conv backward 0.75 ms a layer on a GH200
+    against its forward's 0.07, 19 ms of its training step (M-JS-250)."""
+    from .templates.recurrence import conv
+
+    if all(head is None for _, head in parts):
+        return cotangents
+    through = []
+    for (first, width, head), dy in zip(conv.pieces(parts), cotangents, strict=True):
+        if head is None:
+            through.append(dy)
+            continue
+        channels = slice(first, first + width)
+        (out,) = conv.forward(x[..., channels], taps[channels], None if bias is None else bias[channels],
+                              valid, documents, parts=((width, None),), activation=activation, eps=eps,
+                              dtype=jnp.float32, **_launched(interpret))
+        headed = out.reshape(*out.shape[:-1], width // head, head)
+        scale = 1.0 / jnp.sqrt(jnp.sum(headed * headed, axis=-1, keepdims=True) + eps)
+        unit = headed * scale
+        grad = dy.astype(jnp.float32).reshape(headed.shape)
+        projected = jnp.sum(unit * grad, axis=-1, keepdims=True)
+        through.append((scale * (grad - projected * unit)).reshape(dy.shape))
+    return tuple(through)
 
 
 def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float, dtype, interpret: bool):
