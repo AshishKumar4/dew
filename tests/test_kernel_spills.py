@@ -663,7 +663,8 @@ def test_a_models_draw_of_its_variables_selects_no_kernel():
                          attention_impl="template")
     objective = LMObjective(model, 128)
     with routes() as drawn_routes:
-        drawn = jax.eval_shape(objective.init, jax.random.key(0))
+        # Its key drawn within the trace too: shapes alone, nothing computed (row 12065).
+        drawn = jax.eval_shape(lambda: objective.init(jax.random.key(0)))
     with routes() as applied_routes:
         jax.eval_shape(model.apply, drawn, jax.ShapeDtypeStruct((2, 128), jnp.int32))
     assert not drawn_routes, drawn_routes
@@ -689,7 +690,8 @@ def test_a_decision_models_draw_of_the_parts_its_tree_lacks_selects_no_kernel():
                                   layout=SegmentLayout.state_first_row(max_len=32, head_max_len=24,
                                                                        option_tokens=6))
     with routes() as drawn_routes:
-        drawn = jax.eval_shape(objective.init, jax.random.key(0))
+        # Its key drawn within the trace too: shapes alone, nothing computed (row 12065).
+        drawn = jax.eval_shape(lambda: objective.init(jax.random.key(0)))
     tokens = jax.ShapeDtypeStruct((2, 32), jnp.int32)
     with routes() as applied_routes:
         jax.eval_shape(objective.model.backbone.apply, {"params": drawn["params"]["backbone"]}, tokens)
@@ -923,7 +925,6 @@ def test_an_aside_refusal_stays_in_the_refusals_scope_that_queued_its_launch():
 
 
 @COMPILE_ONLY
-@COMPILE_ONLY
 @lowers("sm90")
 def test_an_aside_refusal_holds_for_the_gpu_its_launch_was_queued_for_whatever_gpu_drains_it():
     """A program whose launch spills at its first tile, lowered for an H100 within a block certifying aside,
@@ -944,6 +945,7 @@ def test_an_aside_refusal_holds_for_the_gpu_its_launch_was_queued_for_whatever_g
     assert not again.missed, again.missed
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_launch_taken_in_two_recordings_of_one_aside_block_records_its_miss_in_each():
     """The same program lowered twice within one block certifying aside, each lowering within a recording of
