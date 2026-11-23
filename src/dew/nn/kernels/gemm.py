@@ -807,10 +807,10 @@ FP8_WEIGHT: selection.Op[Fp8WeightCase] = selection.Op(generation.Choice.GROUPED
     selection.Kernel('xla', (), generic=True),
 ))
 
-def _packed_weight_tangent(launch: grouped_matmul.MosaicFp8PackedGmm, make_bank,
-                           interpret: bool, *, dense: bool):
-    """Build `generation.linear_tangent` for an inline-decoding packed weight product (`fp8_weight_product`,
-    `ternary_weight_product`); callers wrap with their literal `contracted(...)` test name."""
+def _packed_weight_rules(launch: grouped_matmul.MosaicFp8PackedGmm, make_bank,
+                         interpret: bool, *, dense: bool):
+    """Build `(forward, backward, portable)` rules for an inline-decoding packed weight product
+    (`fp8_weight_product`, `ternary_weight_product`); callers wrap `linear_tangent` with `contracted(...)`."""
     def decoded(packed_words: jax.Array) -> jax.Array:
         matrices = make_bank(packed_words).unscaled()
         return matrices[0] if dense else matrices
@@ -843,8 +843,7 @@ def _packed_weight_tangent(launch: grouped_matmul.MosaicFp8PackedGmm, make_bank,
                      precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
         leaves = (d_rows.astype(r.dtype), zero_from_primal(w), zero_from_primal(s))
         return tuple(leaves[index] for index in live)
-
-    return generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue())
+    return forward, backward, portable
 
 def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Array | None = None, *,
                        out_dtype=None, interpret_on_cpu: bool = False) -> jax.Array:
@@ -879,9 +878,10 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
         case = Fp8WeightCase(tile, not automatic_axes(), interpret_on_cpu)
         if selection.select(FP8_WEIGHT, case).kernel == 'mosaic':
             form_b, one = jnp.zeros((8,), jnp.uint8), jnp.ones((), jnp.float32)
+            rules = _packed_weight_rules(launch, lambda w: Fp8Weights(w, one, form_b, fmt=weights.fmt),
+                                         interpret_on_cpu, dense=dense)
             differentiable = contracted("test_an_fp8_weight_product_holds_every_order")(
-                _packed_weight_tangent(launch, lambda w: Fp8Weights(w, one, form_b, fmt=weights.fmt),
-                                       interpret_on_cpu, dense=dense))
+                generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
             summed = differentiable(rows, words, sizes)
         else:
             summed = gemm(rows, weights.unscaled(jnp.bfloat16), group_sizes, out_dtype=jnp.float32,

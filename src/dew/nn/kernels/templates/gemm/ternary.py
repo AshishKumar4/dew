@@ -14,7 +14,7 @@ import jax.numpy as jnp
 from jax.core import Tracer
 
 from dew.nn import precision
-from dew.nn.derivatives import contracted
+from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, fp8_factor, fp8_scale_checked
 from dew.nn.kernels.templates import resources
@@ -114,9 +114,10 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         if selection.select(TERNARY_WEIGHT, case).kernel == "mosaic":
             form_bytes = jnp.zeros((8,), jnp.uint8)
             one = jnp.ones((), jnp.float32)
+            rules = gemm._packed_weight_rules(launch, lambda w: TernaryWeights(w, one, form_bytes),
+                                              interpret_on_cpu, dense=dense)
             differentiable = contracted("test_a_ternary_weight_product_holds_every_order")(
-                gemm._packed_weight_tangent(launch, lambda w: TernaryWeights(w, one, form_bytes),
-                                            interpret_on_cpu, dense=dense))
+                generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
             summed = differentiable(rows, words, sizes)
         else:
             summed = gemm.gemm(rows, weights.unscaled(jnp.bfloat16), group_sizes, out_dtype=jnp.float32,
