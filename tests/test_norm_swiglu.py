@@ -969,11 +969,10 @@ def test_a_packed_mlp_model_trains_on_an_explicit_data_mesh():
     rng = np.random.default_rng(7)
     xs = rng.normal(size=(4, 8, 16)).astype(np.float32)
     ys = rng.normal(size=(4, 8, 16)).astype(np.float32)
-    raw = {"x": jnp.asarray(xs, jnp.bfloat16), "y": jnp.asarray(ys, jnp.bfloat16)}
+    raw = {"x": jnp.asarray(xs), "y": jnp.asarray(ys)}
 
     def rows():
-        return Memory([{"x": np.asarray(raw["x"][i]), "y": np.asarray(raw["y"][i])}
-                       for i in range(4)]).read("streamed").batch(4)
+        return Memory([{"x": xs[i], "y": ys[i]} for i in range(4)]).read("streamed").batch(4)
 
     def run(mesh):
         objective = PackedMlpObjective()
