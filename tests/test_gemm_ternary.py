@@ -367,10 +367,14 @@ def test_a_packed_products_transpose_holds_in_a_checked_map_linear_transpose_and
 
     np.testing.assert_array_equal(np.asarray(gradient(packed)), np.asarray(gradient(plain)))
 
-    # One replicated scale of 2**126 and each device's cotangent its own, +4 and -4: their partials sum to 0
-    # before the scale joins, not to inf - inf.
+    # The rows the same on every device, each device's codes its own (a matrix split over the map's axis), one
+    # replicated scale of 2**126 and each device's cotangent +4 or -4: their partials sum to 0 before the
+    # scale joins, not to inf - inf.
     def cancelled(rows, dy):
-        return jax.vjp(lambda r: packed(r, jnp.full((1,), 2.0 ** 126, jnp.float32)), rows)[1](dy)[0]
+        own = dataclasses.replace(weights, words=jax.lax.pcast(weights.words, ("data",), to="varying"),
+                                  scale=jnp.float32(2.0 ** 126))
+        return jax.vjp(lambda r: gemm.ternary_weight_product(r, own, quantize_activations=False,
+                                                             out_dtype=jnp.float32), rows)[1](dy)[0]
 
     signs = jnp.zeros((32, 32), jnp.float32).at[0, 0].set(4.0).at[16, 0].set(-4.0)
     d_rows = jax.jit(jax.shard_map(cancelled, mesh=mesh, in_specs=(whole, data), out_specs=whole,
