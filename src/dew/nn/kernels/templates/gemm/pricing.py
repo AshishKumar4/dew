@@ -197,7 +197,8 @@ def best_splits(walk: "SplitWalk | None", stages: int) -> int:
 
 
 def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,
-                       vectors: int = 0, tile_count: int = 0, has_hook: bool = False) -> int:
+                       vectors: int = 0, tile_count: int = 0, has_hook: bool = False,
+                       staging: tuple[int, int] | None = None) -> int:
     """Extra consumer-thread registers held across epilogue hook evaluation and staged stores:
     the single owner shared by `_Mosaic._epilogue_registers` and `syrk_registers` (row 11982)."""
     from dew.nn.kernels.templates import resources, stores
@@ -206,7 +207,7 @@ def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: 
     def _staging(dtype) -> int:
         if family.stores_through_registers:
             return 0
-        chunk = stores.output_staging(columns, (dtype,))[0]
+        chunk = stores.output_staging(columns, (dtype,), staging, piece=family.chunk_columns(columns))[0]
         return (-(-share * chunk * jnp.dtype(dtype).itemsize // (4 * resources.THREADS))
                 + resources.CONTROL_REGISTERS)
 

@@ -210,7 +210,8 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         # Kernel gradient prepares its depth half of each step's rows stage (`_staged_halves`, DECIDE1/3117).
         staged = rewritten = 0
         if self.STAGED_ROWS and not family.operands_in_registers and not family.tensor_columns(columns, 1):
-            chunk = stores.staged_columns(columns, stored)
+            chunk = stores.output_staging(
+                columns, stored, config.staging, piece=family.chunk_columns(columns))[0]
             tgmm_tiles = [((1,), jnp.int32)] * 6 + [((config.share, chunk), stored[0])]
             plain += family.scalar_registers(tgmm_tiles) - family.scalar_registers()
         if self.STAGED_ROWS and not family.operands_in_registers and not self.unstaged(ba):
@@ -279,15 +280,15 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
         columns = pricing.tile_columns(config, family)
         if hooks.epilogue is None:
-            return pricing.epilogue_registers(family, config.share, columns, stored, has_hook=False)
+            return pricing.epilogue_registers(family, config.share, columns, stored, staging=config.staging)
         vectors = sum(family.column_registers(columns, side.dtype)
                       for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
                                             strict=True) if held_axes(axes) == ('columns',))
         vectors += family.column_registers(columns, jnp.float32) if hooks.accumulators > 1 else 0
         tile_count = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes)
         out_dtypes = hooks.out_dtypes or stored
-        return pricing.epilogue_registers(family, config.share, columns, out_dtypes,
-                                          vectors=vectors, tile_count=tile_count, has_hook=True)
+        return pricing.epilogue_registers(family, config.share, columns, out_dtypes, vectors=vectors,
+                                          tile_count=tile_count, has_hook=True, staging=config.staging)
 
     def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba
@@ -591,7 +592,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         from .templates.axes import held as held_axes
-        from .templates.gemm import mosaic_gpu
+        from .templates.gemm import mosaic_gpu, pricing
         family = next((bundle for group in self._groups(ba, target) for bundle in group
                        if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
@@ -599,9 +600,11 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)
                 or not self._divides(ba, config, target) or self._refused(ba, config, target)):
             return False
-        if not self._granular(ba, config, family, target):
-            return False
         hooks = ba.arguments['hooks']
+        if not self._granular(ba, config, family, target) or not config.staged_whole(
+                hooks.out_dtypes or (ba.arguments['out_dtype'],),
+                family.specialized(config.share, pricing.tile_columns(config, family))):
+            return False
         sides = (('prologue_operands', hooks.prologue_axes), ('epilogue_operands', hooks.epilogue_axes))
         vectors = {(axis, jnp.dtype(side.dtype)) for name, axes_of in sides
                    for side, side_axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)

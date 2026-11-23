@@ -34,7 +34,7 @@ from dew.nn.kernels import (
     grouped_triton,
     tuning,
 )
-from dew.nn.kernels.templates.gemm import mosaic_gpu, row_tiles, tiling
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
 from dew.nn.moe import expert_projection
 
 pytestmark = pytest.mark.kernel
@@ -1390,7 +1390,7 @@ def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
 def test_tpu_gemm_derives_legal_vmem_bounded_tiles_from_step_seconds(tpu_name):
     """On TPU v5e and v6e (`mxu`), `MosaicGmm` and `MosaicTgmm` derive legal VMEM-bounded tiles through the
     shared `pricing.step_seconds` cost model (rows 10152, 11944)."""
-    from dew.nn.kernels.templates.gemm import derivation, pricing
+    from dew.nn.kernels.templates.gemm import derivation
 
     target = generation.gpu_target(tpu_name)
     gmm, tgmm = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()
@@ -1427,7 +1427,6 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
     """On Ampere (`mma.sync`), `pricing.dense_tail` prices multi-wave persistent L2 drift once so planner
     (`_merges`, `_balances`) and kernel (`_dense_tail`) agree by construction, and a multi-wave dense
     input gradient holds check 1 via `assert_as_exact` (rows 5363, 11945, 11947)."""
-    from dew.nn.kernels.templates.gemm import pricing
 
     sm80 = generation.gpu_target("sm80")
     gmm, tgmm = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()
@@ -1496,7 +1495,6 @@ def test_sm80_prefetch_registers_and_tgmm_prefetch_predicate():
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
-    from dew.nn.kernels.templates.gemm import pricing
 
     sm80 = generation.gpu_target("sm80")
     gmm, tgmm = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()
@@ -1538,7 +1536,6 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
     """Hopper `cluster=2` dense forward (`gmm`) and kernel gradient (`tgmm`) with balanced tail across
     cluster pairs (`pairs = mp // 2`, leading `pair` axis on `workspace`/`ready`), including ragged
     `m % (2*bm) != 0` and `iterations < pairs`, hold check 1 via `assert_as_exact` (row 10151)."""
-    from dew.nn.kernels.templates.gemm import pricing
 
     tile = tiling.Tiles(128, 256, 64, 2, 1, warpgroups=2, cluster=2, family="wgmma")
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=mp, measured={})
@@ -2119,7 +2116,7 @@ def test_sm80_transposed_dx_and_tgmm_skip_regressing_fragment_prefetch():
     """Ampere `CpAsync` skips cross-step fragment prefetch on transposed `dX` (`M-FS-53-a100`, `M-NG-2-a100`:
     gate_up dX +32-34% slower) and `tgmm` (`M-NG-45-a100`: dW geomean 1.019x, 4B key +11.6%), keeping forward
     untransposed prefetch active with its +16/+32 register cost (row 5271)."""
-    from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
 
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -2177,7 +2174,6 @@ def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
-    from dew.nn.kernels.templates.gemm import pricing
 
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
