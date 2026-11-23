@@ -326,9 +326,10 @@ def test_what_an_adapting_decoder_cannot_draw_is_refused():
     prompt = jnp.zeros((ROWS, PROMPT), jnp.int32)
     for strategy in (Beam(width=2), Speculative()):
         with pytest.raises(ValueError):
-            TextGeneration(model, variables, strategy=strategy)
+            TextGeneration(model, variables, sampling=Sampling(strategy=strategy))
         with pytest.raises(ValueError):
-            generate(model, variables, ModelInputs(prompt), 4, key=jax.random.key(0), strategy=strategy)
+            generate(model, variables, ModelInputs(prompt), 4, key=jax.random.key(0),
+                     sampling=Sampling(strategy=strategy))
     for adaptation in (ChunkAdaptation(damped=True), ChunkAdaptation(layers=(0,))):
         with pytest.raises(ValueError):
             InContextDecoder(plain(jnp.float32), adaptation)

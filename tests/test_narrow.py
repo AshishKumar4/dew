@@ -185,7 +185,7 @@ def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False, see
     from dew.objectives.routing import ExpertBalance
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
                               num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
-                              tie_embeddings=True, dtype=dtype, scan_layers=scanned, remat=remat,
+                              tie_embeddings=True, dtype=dtype, remat=remat,
                               mixture={"experts": 4, "top_k": 2} if mixture else None)
     if dex:
         from dew.nn.dex import DifferentialExtension
@@ -224,7 +224,8 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
                                 dtype=jnp.float64 if wide else jnp.bfloat16)
     long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
                                              jnp.int32)}
-    with chosen(narrow_copies='on' if copies else 'off'):
+    # A `scanned` decoder's stack scans, any other's runs a layer at a time (`generation.Choice.LAYER_SCAN`).
+    with chosen(narrow_copies='on' if copies else 'off', layer_scan='scanned' if scanned else 'plain'):
         trainer = Trainer(objective, optimizer, key=jax.random.key(seed), mesh=mesh or MeshSpec(),
                           layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=accumulation),
                           fit=FitPolicy(split=split), param_dtype="float64" if wide else None)

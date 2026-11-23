@@ -26,10 +26,9 @@ from serving_support import Served, assert_served_as_exact
 from dew.batch import BLOCKS_FIELD, TEXT_KEY, coordinates, prefix_blocks
 from dew.data.chat import Role
 from dew.data.steps.blocks import Blocks
-from dew.inference.serving import Server
+from dew.inference.serving import PagedKV, Server
 from dew.inference.tasks import TextGeneration
 from dew.nn.inputs import ModelInputs
-from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
 from dew.nn.visibility import prompt_blocks, served_blocks
 from dew.objectives.lm import LMObjective
@@ -436,9 +435,9 @@ def test_a_prefix_runs_stage_keeps_the_blocks_a_record_carries(prefix):
 
 WHOLE = {"slots": 2, "capacity": 64, "admission": 2}
 """A dense server prefilling each prompt whole, its three requests queued past its two slots."""
-PIECES = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=16, pages=8), "chunk": 2}
+PIECES = {"slots": 2, "capacity": 64, "cache": PagedKV(page_size=16, pages=8), "chunk": 2}
 """A paged server prefilling in pieces of 2 tokens, shorter than the prompts' blocks."""
-SHARED = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pages=40), "prefix_cache": True}
+SHARED = {"slots": 2, "capacity": 64, "cache": PagedKV(page_size=4, pages=40, prefix_cache=True)}
 """A paged server sharing its full pages of 4 prompt tokens with a later prompt that agrees with them."""
 
 
@@ -656,8 +655,8 @@ def test_a_shared_prefix_page_inside_a_block_is_reused_only_with_a_block_of_the_
     decoder = blocky().clone(max_seq_len=128)
     variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     task = TextGeneration(decoder, variables, sampling=Sampling(temperature=0, pad_token_id=0), prefix=8)
-    server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=4, pages=40),
-                              prefix_cache=True)
+    server = Server.from_task(task, slots=2, capacity=64,
+                              cache=PagedKV(page_size=4, pages=40, prefix_cache=True))
     prompts = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [1, 2, 3, 4, 5, 6, 7, 8, 12, 13, 14],
                [1, 2, 3, 4, 20, 21, 22, 23, 24]]
     reused, tickets = [], []

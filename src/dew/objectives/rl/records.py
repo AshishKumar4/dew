@@ -7,7 +7,7 @@ from dataclasses import asdict
 
 from dew._records import finite, listed, record as section
 from dew.inference.rollouts import Draw, routing_json
-from dew.registry import from_record
+from dew.registry import from_record, to_record
 from dew.sampling.text import Sampling
 
 from .episodes import Episode
@@ -22,9 +22,13 @@ messages = functools.partial(listed, read=json_object, what="a list of chat mess
 
 def record_json(value: Episode | Draw) -> str:
     """`value` as JSON, its fields as `asdict` writes them and its arrays, a draw's routing among them, as
-    `routing_json` writes a routing record (nested lists, an object of them by site): the text
+    `routing_json` writes a routing record (nested lists, an object of them by site), an episode's policy as
+    the registry records it (`to_record`: a function by its import path, Train 1208's review F2): the text
     `episode_from_record` and `draw_record` read back."""
-    return json.dumps(asdict(value), allow_nan=False, default=routing_json)
+    fields = asdict(value)
+    if isinstance(value, Episode):
+        fields["sampling"] = to_record(value.sampling, Sampling)
+    return json.dumps(fields, allow_nan=False, default=routing_json)
 
 
 def draw_record(value: Mapping[str, object], sampling: Sampling) -> Draw:

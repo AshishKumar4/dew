@@ -13,6 +13,7 @@ import pytest
 
 from dew.config import ObjectiveConfig, RunConfig
 from dew.config.diffusion import DiffusionRunConfig
+from dew.config.earlier import earlier_run
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
 from dew.decision.config import DecisionRunConfig
@@ -82,6 +83,61 @@ def test_the_published_run_reads_back_as_it_was_written(live):
     stated = held["fields"]["objective"]["fields"]
     built = RunConfig.read(held).objective.arguments
     assert (built["guidance"], built["steps"]) == (stated["guidance"], stated["steps"])
+
+
+def test_a_run_saved_with_a_field_its_class_lost_since_reads_as_the_run_it_trained():
+    """The published run as an earlier Dew saved it, its source options stating the layer scan they lost
+    since (row 4074: a decoder's structure decides it), reads as the run it trained and writes back as
+    today's record, the field left out (`dew.config.earlier.earlier_removed`), as `RunConfig.load` reads a
+    saved run."""
+    held = json.loads(PUBLISHED.read_text())
+    source = {**held["fields"]["source"], "scan_layers": False}
+    earlier = {**held, "fields": {**held["fields"], "source": source}}
+    assert changed(json.loads(json.dumps(RunConfig.read(earlier_run(earlier)).record())), held) == []
+
+
+def test_a_run_saved_scanning_its_stack_resumes_scanned():
+    """A run an earlier Dew saved with its stack scanned (`scan_layers=True`, its source options' or its
+    model's until row 4074) reads as a run whose kernel choices scan it (`Diagnostics.kernels`'
+    `layer_scan`), every program it traces within `RunConfig.traced` scanning its stacks, a host-streamed
+    resume's among them, where it resumed a layer at a time and its host placement raised (the API02 review on
+    API02a); its own choice, where it names one, stands."""
+    from dew.nn.backbones.decoder_stages import scanned
+
+    held = json.loads(PUBLISHED.read_text())
+    source = {**held["fields"]["source"], "scan_layers": True}
+    run = RunConfig.read(earlier_run({**held, "fields": {**held["fields"], "source": source}}))
+    assert run.diagnostics.kernels == {"layer_scan": "scanned"}
+    with run.traced():
+        assert scanned()
+    assert not scanned()
+    diagnostics = {**held["fields"]["diagnostics"], "kernels": {"layer_scan": "plain"}}
+    named = {**held, "fields": {**held["fields"], "source": source, "diagnostics": diagnostics}}
+    assert RunConfig.read(earlier_run(named)).diagnostics.kernels == {"layer_scan": "plain"}
+
+
+WRAPPERS = [("diffusion_gemma", "text"), ("dew.nn.multimodal:MultimodalTransformer", "language_model")]
+"""Models that wrap a decoder in a field they declare, by alias and by import path."""
+
+
+@pytest.mark.parametrize("recorded", ["by its fields", "by its class"])
+@pytest.mark.parametrize(("wrapper", "field"), WRAPPERS)
+def test_a_run_saved_scanning_a_wrapped_decoders_stack_resumes_scanned(wrapper, field, recorded):
+    """A run an earlier Dew saved whose model wraps its decoder (`DiffusionGemma.text`,
+    `MultimodalTransformer.language_model`), the decoder scanning its stack (`scan_layers=True` until row
+    4074), recorded by its fields alone or by its class, reads as a run whose kernel choices scan it, where
+    the root model alone was read and the wrapped decoder's field left out unread (the API02 review)."""
+    from dew.config.earlier import earlier_layer_scan
+
+    def saved(decoder: dict) -> dict:
+        held = decoder if recorded == "by its fields" else {"class": "causal_transformer", "fields": decoder}
+        model = {"name": wrapper, "fields": {field: held}}
+        return {"class": "dew.config:RunConfig", "fields": {"model": model}}
+
+    assert earlier_layer_scan(saved({"vocab_size": 16, "scan_layers": True}))["fields"]["kernels"] == {
+        "layer_scan": "scanned"}
+    plain = saved({"vocab_size": 16})
+    assert earlier_layer_scan(plain) == plain
 
 
 LAYOUT = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "layout.json"

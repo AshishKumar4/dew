@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import stacked as stack_scanned
 from reference_error import assert_as_exact, with_gradients
 
 from dew.batch import Coordinates
@@ -28,14 +29,11 @@ norm's gradient, one sum over every token the draw holds, has 16 elements a draw
 
 TRUTH = STACKED.clone(dtype=jnp.float64, attention_impl="reference")
 """The decoder in float64 on the reference kernel: the loops' truth."""
-SCANNED = STACKED.clone(scan_layers=True)
-"""`STACKED` scanning its run of layers, which stores them as its own layers, one subtree a layer."""
 BLOCKED = STACKED.clone(layer_types=("full_attention",) * 2,
                         kinds={"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}})
 """`STACKED` whose attention reads a row's blocks whole (`AttentionMixer.bidirectional_blocks`), as a prefix
-run's decoder does, and its float64 truth and scanned form."""
+run's decoder does, and its float64 truth."""
 BLOCKED_TRUTH = BLOCKED.clone(dtype=jnp.float64, attention_impl="reference")
-BLOCKED_SCANNED = BLOCKED.clone(scan_layers=True)
 
 STACKING_SEEDS = {"zero": 8, ((1,), (3,)): 8, ((0, 1), (3, 6)): 8, ((1, 0), (6, 3)): 8, "gradient": 512,
                   "blocks": 8}
@@ -72,62 +70,63 @@ def chunk_loop(model, variables, tokens, adaptation: ChunkAdaptation, *, truth: 
     sums its chunks' loss gradients in it, the earlier chunks' versions fixed; at a window's end its level
     steps by its rate times it. A row's `blocks` `[B, S]` (-1 for none), each read whole, put a block's
     tokens in the chunk its first token is in, every other token in its own. The decoder runs the plain
-    loop, as the interceptor reads each layer's feed-forward by its own module (`layers_N`), which a scan
-    runs as one body of its run."""
-    model = model.clone(scan_layers=False)
-    layers = adaptation.layers
-    windows, rates = adaptation.windows(len(layers)), adaptation.rates(len(layers))
-    chunk = min(windows)
-    starts = feedforward_levels(model.stored_view(variables), variables, layers)
-    names = tuple(starts)
-    inputs, targets = tokens[:, :-1], tokens[:, 1:]
-    length = targets.shape[1]
-    slots = jnp.arange(length)
-    blocks = jnp.full(targets.shape, -1, jnp.int32) if blocks is None else jnp.asarray(blocks, jnp.int32)
+    loop (`stack_scanned`), as the interceptor reads each layer's feed-forward by its own module (`layers_N`),
+    which a scan runs as one body of its run."""
+    with stack_scanned(scanned=False):
+        layers = adaptation.layers
+        windows, rates = adaptation.windows(len(layers)), adaptation.rates(len(layers))
+        chunk = min(windows)
+        starts = feedforward_levels(model.stored_view(variables), variables, layers)
+        names = tuple(starts)
+        inputs, targets = tokens[:, :-1], tokens[:, 1:]
+        length = targets.shape[1]
+        slots = jnp.arange(length)
+        blocks = jnp.full(targets.shape, -1, jnp.int32) if blocks is None else jnp.asarray(blocks, jnp.int32)
 
-    def logits_at(history, which, row_tokens, row_blocks, valid):
-        def versions(next_fun, args, kwargs, context):
-            path = context.module.path
-            if (context.method_name != "__call__" or len(path) < 2 or path[-1] != "mlp"
-                    or path[-2] not in names):
-                return next_fun(*args, **kwargs)
-            alone = context.module.clone(parent=None)
-            read = [alone.apply({"params": levels[path[-2]]}, *args, **kwargs) for levels in history]
-            kept = read[0]
-            for at, alternative in enumerate(read[1:], start=1):
-                kept = jnp.where((which == at)[None, :, None], alternative, kept)
-            return kept
+        def logits_at(history, which, row_tokens, row_blocks, valid):
+            def versions(next_fun, args, kwargs, context):
+                path = context.module.path
+                if (context.method_name != "__call__" or len(path) < 2 or path[-1] != "mlp"
+                        or path[-2] not in names):
+                    return next_fun(*args, **kwargs)
+                alone = context.module.clone(parent=None)
+                read = [alone.apply({"params": levels[path[-2]]}, *args, **kwargs) for levels in history]
+                kept = read[0]
+                for at, alternative in enumerate(read[1:], start=1):
+                    kept = jnp.where((which == at)[None, :, None], alternative, kept)
+                return kept
 
-        with nn.intercept_methods(versions):
-            return model.apply(variables, row_tokens[None], coordinates=Coordinates(valid=valid[None]),
-                               block_groups=row_blocks[None])[0]
+            with nn.intercept_methods(versions):
+                return model.apply(variables, row_tokens[None], coordinates=Coordinates(valid=valid[None]),
+                                   block_groups=row_blocks[None])[0]
 
-    def row(row_inputs, row_targets, row_blocks):
-        # A token continuing the block of the token before it is in that block's first token's chunk.
-        continues = jnp.concatenate([jnp.zeros(1, bool),
-                                     (row_blocks[1:] >= 0) & (row_blocks[1:] == row_blocks[:-1])])
-        which = jax.lax.cummax(jnp.where(continues, 0, slots)) // chunk
-        levels, history, losses = dict(starts), [], jnp.zeros(length)
-        partials = jax.tree.map(jnp.zeros_like, starts)
-        for index in range(-(-length // chunk)):
-            for at, name in enumerate(names):
-                if index and index % (windows[at] // chunk) == 0:
-                    levels[name] = jax.tree.map(lambda leaf, grad, rate=rates[at]: leaf - rate * grad,
-                                                levels[name], partials[name])
-                    partials[name] = jax.tree.map(jnp.zeros_like, partials[name])
+        def row(row_inputs, row_targets, row_blocks):
+            # A token continuing the block of the token before it is in that block's first token's chunk.
+            continues = jnp.concatenate([jnp.zeros(1, bool),
+                                         (row_blocks[1:] >= 0) & (row_blocks[1:] == row_blocks[:-1])])
+            which = jax.lax.cummax(jnp.where(continues, 0, slots)) // chunk
+            levels, history, losses = dict(starts), [], jnp.zeros(length)
+            partials = jax.tree.map(jnp.zeros_like, starts)
+            for index in range(-(-length // chunk)):
+                for at, name in enumerate(names):
+                    if index and index % (windows[at] // chunk) == 0:
+                        levels[name] = jax.tree.map(lambda leaf, grad, rate=rates[at]: leaf - rate * grad,
+                                                    levels[name], partials[name])
+                        partials[name] = jax.tree.map(jnp.zeros_like, partials[name])
 
-            def chunk_loss(current, index=index):
-                logits = logits_at([*history, current], which, row_inputs, row_blocks, which <= index)
-                chunk_losses = jnp.where(which == index, token_losses(logits, row_targets, truth=truth), 0)
-                return jnp.sum(chunk_losses), chunk_losses
+                def chunk_loss(current, index=index):
+                    logits = logits_at([*history, current], which, row_inputs, row_blocks, which <= index)
+                    losses_here = token_losses(logits, row_targets, truth=truth)
+                    chunk_losses = jnp.where(which == index, losses_here, 0)
+                    return jnp.sum(chunk_losses), chunk_losses
 
-            (_, chunk_losses), gradient = jax.value_and_grad(chunk_loss, has_aux=True)(dict(levels))
-            partials = jax.tree.map(jnp.add, partials, gradient)
-            history.append(dict(levels))
-            losses = losses + chunk_losses
-        return losses
+                (_, chunk_losses), gradient = jax.value_and_grad(chunk_loss, has_aux=True)(dict(levels))
+                partials = jax.tree.map(jnp.add, partials, gradient)
+                history.append(dict(levels))
+                losses = losses + chunk_losses
+            return losses
 
-    return jax.vmap(row)(inputs, targets, blocks)
+        return jax.vmap(row)(inputs, targets, blocks)
 
 
 def stacked(adaptation: ChunkAdaptation, model=STACKED, store=None):
@@ -177,10 +176,10 @@ def test_a_decoders_own_blocks_at_rate_zero_score_as_its_forward():
                     truth_fn=plain(TRUTH, truth=True))
 
 
-@pytest.mark.parametrize("model", [STACKED, SCANNED], ids=["layers", "scanned"])
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
 @pytest.mark.parametrize(("layers", "windows"), [((1,), (3,)), ((0, 1), (3, 6)), ((1, 0), (6, 3))],
                          ids=["one-layer", "faster-first", "slower-first"])
-def test_a_decoders_own_blocks_step_as_the_literal_chunk_loop(layers, windows, model):
+def test_a_decoders_own_blocks_step_as_the_literal_chunk_loop(layers, windows, stack_scan):
     """A decoder's feed-forward blocks step in context at their own windows and rates, each target's loss
     on par with the literal chunk loop's (`chunk_loop`, check 1): one layer's block, and two at windows of
     three and six in either order; a stack of its own layers and one that scans them alike (a store that
@@ -191,7 +190,7 @@ def test_a_decoders_own_blocks_step_as_the_literal_chunk_loop(layers, windows, m
         return jax.jit(lambda variables, tokens: chunk_loop(reference, variables, tokens, adaptation,
                                                             truth=truth))
 
-    assert_as_exact(jax.jit(stacked(adaptation, model)), literal(STACKED, truth=False), draw,
+    assert_as_exact(jax.jit(stacked(adaptation, STACKED)), literal(STACKED, truth=False), draw,
                     f"stacked blocks of layers {layers} at windows {windows}",
                     seeds=STACKING_SEEDS[layers, windows], truth_fn=literal(TRUTH, truth=True))
 

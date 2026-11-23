@@ -19,7 +19,7 @@ from interop_support import (
     transformers_arms,
     transformers_model,
 )
-from model_support import decode_steps, flat_tree, prediction_logits, stepped_outputs
+from model_support import decode_steps, flat_tree, prediction_logits, stepped_outputs, unrolled
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
@@ -413,15 +413,15 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
                     truth_fn=decoded_in_float64(source))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():
-    """An MXFP4 GPT-OSS loaded packed with its layers scanned (`packed_weights` with `scan_layers`, row
-    4861): the scan stacks each bank's three leaves as it stacks a dense matrix and slices a layer's back,
-    so its logits and their gradient are the unscanned packed load's bit for bit."""
+    """An MXFP4 GPT-OSS loaded packed with its layers scanned (`packed_weights`, row 4861): the scan stacks
+    each bank's three leaves as it stacks a dense matrix and slices a layer's back, so its logits and their
+    gradient are the same load's run a layer at a time (`unrolled`) bit for bit."""
     import tempfile
 
     source = _mxfp4_gpt_oss(Path(tempfile.mkdtemp()))
-    scanned, plain = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_weights=True,
-                                      scan_layers=scan) for scan in (True, False))
+    scanned = plain = Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_weights=True)
     tokens = jax.random.randint(jax.random.key(0), (2, 8), 0, PACKED_CONFIG["vocab_size"])
 
     def loss(loaded):
@@ -429,8 +429,8 @@ def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():
             lambda params: jnp.sum(loaded.model.apply({**loaded.variables, "params": params}, tokens) ** 2)))(
                 loaded.variables["params"])
 
-    # A scan is how the model runs, its stored tree the same (`Pretrained.load`'s `Scanning`).
-    (scanned_loss, scanned_grad), (plain_loss, plain_grad) = loss(scanned), loss(plain)
+    # A scan is how the model runs, its stored tree the same.
+    (scanned_loss, scanned_grad), (plain_loss, plain_grad) = loss(scanned), unrolled(loss)(plain)
     np.testing.assert_array_equal(np.asarray(scanned_loss), np.asarray(plain_loss))
     jax.tree.map(lambda left, right: np.testing.assert_array_equal(np.asarray(left), np.asarray(right)),
                  scanned_grad, plain_grad)

@@ -739,7 +739,7 @@ class RolloutScheduler:
         devices, which every process steps together as it admits each call's groups and reloads at each
         push (`NativeRolloutServer.waited`): its draws run between the trainer's steps, not beside them."""
         from dew.inference.rollouts import NativeRolloutServer
-        from dew.inference.serving import Server
+        from dew.inference.serving import Server, named_cache
 
         from .sources import PromptSource
 
@@ -749,7 +749,7 @@ class RolloutScheduler:
         def built(variables: Variables, version: int) -> Server:
             return Server.from_task(
                 objective.policy(variables, drawing, Progress(jnp.asarray(version, jnp.int32))),
-                slots=slots, capacity=width, kv_cache="shared" if page_size is None else page_size)
+                slots=slots, capacity=width, cache=named_cache(page_size))
 
         server = NativeRolloutServer.deferred(built, drawing)
         source = PromptSource(server, reward, decode=decode, max_new_tokens=max_new_tokens)
@@ -778,17 +778,20 @@ class RolloutScheduler:
         `served_layout`, one row a prompt):
         each turn prefills only what follows its row's history, where the policy drawn whole ('whole')
         prefills every turn's history again (row 5374)."""
-        from dew.inference.serving import served_layout
+        from dew.inference.serving import named_cache, served_layout
         from dew.inference.tasks import TextGeneration
 
         if not isinstance(policy, TextGeneration) and page_size not in (None, "whole"):
             raise TypeError(f"a cohort served over pages of {page_size} slots serves a TextGeneration "
                             f"policy, not a {type(policy).__name__}")
         # A served cohort draws one row a prompt (`EpisodeCollector.kv_cache`); a policy drawing more is
-        # drawn whole where no page size is named.
-        layout = (served_layout(policy, max_prompt_tokens + max_new_tokens,
-                                "shared" if page_size is None else page_size)
-                  if isinstance(policy, TextGeneration) and (policy.n == 1 or page_size is not None)
+        # drawn whole where no page size is named. Its turns draw under the collector's `sampling`
+        # (`_ServedTurns.over`), whose strategy the layout serves, not the policy's own (the review of
+        # API02b: a speculative collector was laid on shared pages its policy's sampler took).
+        drawn = (dataclasses.replace(policy, sampling=sampling.with_defaults_of(policy.sampling))
+                 if isinstance(policy, TextGeneration) else policy)
+        layout = (served_layout(drawn, max_prompt_tokens + max_new_tokens, named_cache(page_size))
+                  if isinstance(drawn, TextGeneration) and (drawn.n == 1 or page_size is not None)
                   else None)
         # A cohort over whole rows draws its policy whole.
         layout = layout if layout is not None and layout.page_size is not None else None

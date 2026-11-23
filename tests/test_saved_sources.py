@@ -10,6 +10,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from model_support import stacked
 from process_support import run_pool
 from run_kinds import SEQ, captioned, decision, diffusion, lm, pictures, trained
 from saved_run_kinds import over, windows
@@ -472,19 +473,19 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
 
 @pytest.mark.mesh(devices=8)
 def test_a_run_resumes_whether_its_decoder_scans_its_layers_or_not(tmp_path):
-    """How a decoder executes its layers (`scan_layers`, `RunConfig.EXECUTED`) is no part of what a run
-    computes or stores, its checkpoint holding every layer `layers_N` either way: a run saved running a
-    layer at a time resumes scanning them, and back, where its resume refused it as another model (row
-    4104)."""
+    """How a decoder executes its layers (scanned or a layer at a time, `generation.Choice.LAYER_SCAN`) is no
+    part of what a run computes or stores, its checkpoint holding every layer `layers_N` either way: a run
+    saved running a layer at a time resumes scanning them, and back, where its resume refused it as another
+    model (row 4104)."""
     first = lm(tmp_path, drawn=False)
     deeper = dataclasses.replace(first, model=ModelConfig("causal_transformer",
                                                           {**first.model.fields, "num_layers": 2}))
-    trained(deeper, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
+    with stacked(scanned=False):
+        trained(deeper, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
     for scanned, steps in ((True, 2), (False, 3)):
-        run = dataclasses.replace(deeper, model=ModelConfig("causal_transformer", {
-            **deeper.model.fields, "scan_layers": scanned}))
-        trained(run, tmp_path, "run", trainer={"name": "run", "horizon": Horizon(steps=steps),
-                                               "checkpoint_final": True})
+        with stacked(scanned):
+            trained(deeper, tmp_path, "run",
+                    trainer={"name": "run", "horizon": Horizon(steps=steps), "checkpoint_final": True})
         assert str(steps) in {path.name for path in (tmp_path / "runs" / "run").iterdir()}
 
 

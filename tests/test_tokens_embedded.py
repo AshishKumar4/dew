@@ -219,6 +219,7 @@ def test_a_masked_request_whose_image_fills_a_placeholder_past_the_table_is_fill
     assert outside(raised) == (40, 32)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_block_request_whose_image_fills_an_id_past_the_table_is_served():
     """A block generation over DiffusionGemma, which replaces the id at each slot its image fills before its
     table reads it (`DiffusionGemma.replaces_media`), is bounded as a text request is: an id past the table

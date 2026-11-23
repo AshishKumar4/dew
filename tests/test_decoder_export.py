@@ -659,12 +659,26 @@ def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it
                     "full-width rotary export logits", seeds=FULL_ROTARY_SEEDS, truth_fn=theirs(wide))
 
 
-def test_a_policy_transformers_cannot_hold_is_refused_not_dropped():
+@pytest.mark.parametrize("held", ["presence penalty", "chain", "criteria", "speculation", "one beam",
+                                  "stochastic beams", "beams stopping elsewhere"])
+def test_a_policy_transformers_cannot_hold_is_refused_not_dropped(held):
+    """A policy's part transformers' generation config holds no field of is refused, not dropped: a
+    presence penalty, a logits chain of its own, criteria beside its EOS, a speculation, or a beam search a
+    source's config reads back as another (one beam, beams at a positive temperature, beams stopping on
+    other than the policy's EOS ids) (the review of API02b)."""
     from dew.interop.generation_config import generation_config_of
-    from dew.sampling import Sampling
+    from dew.sampling import Beam, Sampling, Speculative, decoding
 
+    policy = {"presence penalty": lambda: Sampling(presence_penalty=0.5),
+              "chain": lambda: Sampling(logits=(decoding.Greedy(),)),
+              "criteria": lambda: Sampling(stopping=(decoding.MaxNewTokens(3),)),
+              "speculation": lambda: Sampling(strategy=Speculative(block=3)),
+              "one beam": lambda: Sampling(temperature=0, eos_token_ids=2, strategy=Beam(width=1)),
+              "stochastic beams": lambda: Sampling(eos_token_ids=2, strategy=Beam(width=2)),
+              "beams stopping elsewhere": lambda: Sampling(temperature=0, eos_token_ids=(2, 3),
+                                                           strategy=Beam(width=2))}[held]
     with pytest.raises(ValueError):
-        generation_config_of(Sampling(presence_penalty=0.5))
+        generation_config_of(policy())
 
 
 def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_path):
@@ -1443,7 +1457,8 @@ def test_a_standalone_glm5_exports_prediction_depths_that_draft_as_they_did(vari
     ordinary = generate(model, variables, jnp.asarray(ids[:, :5]), 4, key=jax.random.key(0),
                         sampling=Sampling(temperature=0)).host()
     speculative = restored.text_generation(sampling=Sampling(temperature=0))(
-        ids[:, :5], max_new_tokens=4, key=0, strategy=Speculative(block=3)).host()
+        ids[:, :5], max_new_tokens=4, key=0,
+        sampling=Sampling(temperature=0, strategy=Speculative(block=3))).host()
     np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
     np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
 

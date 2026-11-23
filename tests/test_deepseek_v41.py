@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 from deepseek_v41_support import ROOT, TINY
 from flax.traverse_util import flatten_dict, unflatten_dict
-from model_support import decode_through
+from model_support import decode_through, unrolled
 from quantized_arms import QUANTIZERS
 from quantized_basis import dequantized_in_own_basis
 from reference_error import FACTOR, as_given, assert_as_exact, distance
@@ -396,8 +396,8 @@ def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(sourc
     loaded, plain, _ = source
     tokens, valid, _, steps, walk = padded_walk
     speculated = generate(plain, loaded.variables, ModelInputs(tokens, {"attention_mask": valid}), steps,
-                          key=jax.random.key(1), sampling=Sampling(temperature=0),
-                          strategy=Speculative(block=3))
+                          key=jax.random.key(1), sampling=Sampling(temperature=0,
+                                                                   strategy=Speculative(block=3)))
     np.testing.assert_array_equal(np.asarray(speculated.tokens), np.asarray(walk))
     np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
 
@@ -719,9 +719,10 @@ def test_a_quantized_drafting_cache_drafts_what_dequantizing_in_the_own_basis_co
                                   np.asarray(own(variables, context, block)))
 
 
-def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():
+@pytest.mark.usefixtures("scanned_stacks")
+def test_consecutive_reindex_layers_publish_their_selections_when_scanned():
     """Two Reindex layers of one kind in a row stay two runs of one under
-    scan_layers, so the Reuse layer after them attends the second one's
+    the scan, so the Reuse layer after them attends the second one's
     selection, as it does unrolled, to within twice the fixture logits' fp32
     rounding; scanned together, their publications would stay inside the
     loop."""
@@ -730,14 +731,13 @@ def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers()
     config = {**config, "text_config": {**text, "index_source_layer_ids": [2, 4, 6, 7, 8, 10]}}
     fields = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
     ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
-    unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
-                         for scan in (False, True))
-    variables = unrolled.init(jax.random.key(0), ids)
-    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
-        "logits"
-    )
+    model = models.build("causal_transformer", **fields)
+    variables = model.init(jax.random.key(0), ids)
+    assert distance(model.apply(variables, ids), unrolled(model.apply)(variables, ids)) <= (
+        2 * FACTOR * rounding("logits"))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_reindex_layer_reads_its_full_layers_publications_with_no_reuse_layer():
     """A stack whose CSA2 layers are a Full layer and the Reindex layers after it,
     with no Reuse layer and so no shared keys and values, still threads the store
@@ -754,12 +754,10 @@ def test_a_reindex_layer_reads_its_full_layers_publications_with_no_reuse_layer(
     fields = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
     assert not fields.get("kv_shared_layers")
     ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
-    unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
-                         for scan in (False, True))
-    variables = unrolled.init(jax.random.key(0), ids)
-    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
-        "logits"
-    )
+    model = models.build("causal_transformer", **fields)
+    variables = model.init(jax.random.key(0), ids)
+    assert distance(model.apply(variables, ids), unrolled(model.apply)(variables, ids)) <= (
+        2 * FACTOR * rounding("logits"))
 
 
 def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeypatch):

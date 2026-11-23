@@ -20,7 +20,7 @@ from arm_arithmetic import float64_held
 from flax import linen as nn
 from jax.experimental import checkify
 from map_judge import marked_seeds
-from model_support import Digits, decoder, serving_task as task
+from model_support import Digits, compiled_apply, decoder, serving_task as task
 from reference_error import as_given, assert_as_exact, dew_path
 from serving_support import (
     Served,
@@ -37,7 +37,7 @@ from tool_policy import ToolPolicy
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.banks import HeldBanks
 from dew.inference.loading import place
-from dew.inference.serving import Server
+from dew.inference.serving import DenseKV, PagedKV, Server
 from dew.interop.decoder_parts import decoder_axes
 from dew.mesh import BATCH_AXES
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -122,8 +122,8 @@ def test_a_meshless_server_draws_on_the_selected_default_device():
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("scanned", [False, True], ids=["layers", "scanned"])
-def test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows(scanned):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows(stack_scan):
     """A bf16 decoder served on a two-device mesh whose slots split its rows, its layers each its own or
     scanned as one stack, the GEMM template named and interpreted as an H100's: its projections take the
     template's launch on each device's own rows, each weight entering whole (`dew.nn.sharding.FORWARD`,
@@ -132,8 +132,7 @@ def test_a_server_over_split_rows_takes_its_projections_on_each_devices_rows(sca
     partitioner, which no launch takes."""
     from dew.nn.kernels import generation
 
-    model = decoder().clone(dtype="bfloat16", emb_features=64, max_seq_len=128, num_layers=2,
-                            scan_layers=scanned)
+    model = decoder().clone(dtype="bfloat16", emb_features=64, max_seq_len=128, num_layers=2)
     served = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
                             RunProcessor(Digits()), sampling=task().sampling)
     with boxed(decoder_axes(model)):
@@ -297,7 +296,7 @@ def test_a_served_length_limit_truncates_a_request_as_a_direct_call_does():
 
     prompt = np.asarray([1, 2, 3], np.int32)
     for stopping, terminated in (((decoding.MaxNewTokens(2),), False), ((at_two,), True)):
-        bound = dataclasses.replace(task(Sampling(temperature=0, eos_token_ids=None)), stopping=stopping)
+        bound = task(Sampling(temperature=0, eos_token_ids=None, stopping=stopping))
         direct = bound(prompt[None], 8, key=0)
         server = Server.from_task(bound, slots=2, capacity=32)
         ticket = server.submit(prompt, 8, key=0)
@@ -800,7 +799,7 @@ def test_more_requests_than_slots_queue_and_all_complete():
     assert all(ticket.admitted is not None and ticket.admitted >= ticket.submitted for ticket in tickets)
 
 
-@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+@pytest.mark.parametrize("options", [{}, {"cache": PagedKV(page_size=16, pages=12)}],
                          ids=["dense", "paged"])
 def test_requests_submitted_while_another_thread_steps_are_served_in_order(options):
     """A thread submits while another steps the server: each request is
@@ -841,7 +840,7 @@ def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serve
     assert_same_draws(ticket.result(), bound(prompt, 50, key=0))
 
 
-@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+@pytest.mark.parametrize("options", [{}, {"cache": PagedKV(page_size=16, pages=12)}],
                          ids=["dense", "paged"])
 def test_a_multimodal_model_serves_over_its_language_models_cache(options):
     """A wrapper that conditions its language model on images, as Qwen3.5 and Gemma 3 load,
@@ -915,8 +914,8 @@ def hybrid_task(stack=hybrid_model):
 
 @pytest.mark.parametrize("stack", [hybrid_model, parallel_hybrid_model], ids=["layered", "parallel"])
 @pytest.mark.parametrize("options", [
-    {}, {"kv_cache": KVCache(page_size=4, pages=64)},
-    {"kv_cache": KVCache(page_size=4, pages=64), "chunk": 3},
+    {}, {"cache": PagedKV(page_size=4, pages=64)},
+    {"cache": PagedKV(page_size=4, pages=64), "chunk": 3},
 ], ids=["dense", "paged", "paged-chunked"])
 def test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages(options, stack):
     """A paged server keeps the attention layer's keys in its pool and each row's recurrent state
@@ -932,7 +931,9 @@ def test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages(options, sta
         assert_same_draws(ticket.result(), lone)
 
 
-HYBRID_SHARED = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pages=40), "prefix_cache": True}
+HYBRID_CACHE = PagedKV(page_size=4, pages=40, prefix_cache=True)
+"""Full pages of 4 prompt tokens shared, a row's recurrent state kept beside them."""
+HYBRID_SHARED = {"slots": 2, "capacity": 64, "cache": HYBRID_CACHE}
 """A paged server sharing full pages of 4 prompt tokens, its rows' recurrent state beside them."""
 
 
@@ -958,9 +959,10 @@ NARROW_HYBRID, NARROW_HYBRID_TAILED = HybridSite(seeds=256), HybridSite(seeds=51
 as evicted's did, which the every-page site's server now holds to the bit."""
 
 
-EVERY_PAGE = {"prefix_state_every": 1}
+EVERY_PAGE = {"cache": dataclasses.replace(HYBRID_CACHE, prefix_state_every=1)}
 """A state kept at every page of a shared prefix."""
-FROM_THE_HOST = {"slots": 1, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 8, "prefix_states": 4}
+FROM_THE_HOST = {"slots": 1, "cache": PagedKV(page_size=4, pages=6, prefix_cache=True, prefix_states=4,
+                                                host_pages=8)}
 """One slot over a pool of six pages with a host tier of eight and a store of four states."""
 
 
@@ -988,17 +990,21 @@ def test_a_hybrid_stack_reads_a_shared_prefix_from_a_store_of_one_entry_booked_t
     repeat of it reads; the other's row, with no entry to keep its state in, prefills in one piece, another
     sum than a row cut at its deepest page, so this site is no other's program and is sized itself."""
     assert_reads_a_shared_prefix((Served(12), Served(12, flipped=(1,)), Served(12), Served(12, flipped=(1,))),
-                                 {"prefix_states": 1}, (0, 8), (2, 2), NARROW_HYBRID_TAILED)
+                                 {"cache": dataclasses.replace(HYBRID_CACHE, prefix_states=1)}, (0, 8),
+                                 (2, 2), NARROW_HYBRID_TAILED)
 
 
 @pytest.mark.parametrize("requests, options, hits, sized, draws", [
-    ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 1}, (0, 0, 0), EVERY_PAGE, 512),
+    ((Served(12), Served(12, flipped=(1,)), Served(12)),
+     {"cache": dataclasses.replace(HYBRID_CACHE, prefix_states=1)}, (0, 0, 0), EVERY_PAGE, 512),
     ((Served(9), Served(12, flipped=(0,)), Served(12, flipped=(0, 1)), Served(9)),
-     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
-      "prefix_states": 4}, (0, 0, 0, 0), FROM_THE_HOST, 256),
+     {"slots": 1, "admission": 1,
+      "cache": PagedKV(page_size=4, pages=8, prefix_cache=True, prefix_states=4, host_pages=1)},
+     (0, 0, 0, 0), FROM_THE_HOST, 256),
     ((Served(9), Served(9, flipped=(0,)), Served(9)),
-     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 6,
-      "prefix_states": 1}, (0, 0, 8), FROM_THE_HOST, 256)],
+     {"slots": 1, "admission": 1,
+      "cache": PagedKV(page_size=4, pages=8, prefix_cache=True, prefix_states=1, host_pages=6)},
+     (0, 0, 8), FROM_THE_HOST, 256)],
     ids=["evicted", "from-one-host-slot", "a-state-from-the-host"])
 def test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server(
         requests, options, hits, sized, draws):
@@ -1061,8 +1067,8 @@ def test_a_hybrid_servers_host_states_fit_the_bytes_of_its_host_pages(host_pages
     `host_pages` states would take several times the host memory it names. Each group's state slots,
     times one entry's bytes in the server's own store, are within its host pages' bytes in the server's
     own pool, and one more would not be."""
-    server = Server.from_task(hybrid_task(), **{**HYBRID_SHARED, "host_pages": host_pages,
-                                                 "prefix_states": 2})
+    server = Server.from_task(hybrid_task(), **{**HYBRID_SHARED, "cache": dataclasses.replace(
+        HYBRID_CACHE, host_pages=host_pages, prefix_states=2)})
     part = server.rows.pages[0]
     assert part.states is not None
     leaves = jax.tree_util.tree_leaves_with_path(server._states)
@@ -1089,11 +1095,11 @@ def test_a_host_tier_of_more_states_than_pages_reads_each_state_back():
                           sampling=Sampling(temperature=0, pad_token_id=0))
     requests = (Served(9), Served(9, flipped=(0,)), Served(9, flipped=(0, 1)), Served(9, flipped=(0, 2)),
                 Served(9, flipped=(0, 1)), Served(9, flipped=(0,)))
-    serving = {**HYBRID_SHARED, "slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8),
-               "host_pages": 2, "prefix_states": 1}
+    serving = {**HYBRID_SHARED, "slots": 1, "admission": 1,
+               "cache": PagedKV(page_size=4, pages=8, prefix_cache=True, prefix_states=1, host_pages=2)}
     server = Server.from_task(task, **serving)
     # More states than pages, whatever count the tier derives for them (its budget's own test above).
-    assert server.rows.pages[0].states.host.slots > serving["host_pages"]
+    assert server.rows.pages[0].states.host.slots > serving["cache"].host_pages
     assert_served_as_exact(task, requests, "thin hybrid host states", serving=serving,
                            rounds=(1,) * len(requests), budget=8, seeds=(256, 256))
 
@@ -1110,7 +1116,8 @@ def test_a_one_tap_convolutions_empty_state_fits_any_host_tier():
     task = TextGeneration(model, params, RunProcessor(Digits()),
                           sampling=Sampling(temperature=0, eos_token_ids=EOS))
     for host_pages in (0, 3):
-        server = Server.from_task(task, **{**HYBRID_SHARED, "host_pages": host_pages})
+        server = Server.from_task(task, **{**HYBRID_SHARED,
+                                           "cache": dataclasses.replace(HYBRID_CACHE, host_pages=host_pages)})
         part = server.rows.pages[0]
         assert part.states is not None and part.states.host.slots == part.host == host_pages
 
@@ -1136,15 +1143,15 @@ def shared_page(options: dict) -> int:
     page of four where the server pages its cache in fours and shares prefixes, as a paged server does
     unless told not to (`prefix_cache` None), its last token prefilled again; none in pages of 16, which
     the prompt fills none of, or over a dense cache."""
-    layout = options.get("kv_cache")
-    return 4 if layout is not None and layout.page_size == 4 and options.get("prefix_cache", True) else 0
+    cache = options.get("cache")
+    return 4 if isinstance(cache, PagedKV) and cache.page_size == 4 and cache.prefix_cache is not False else 0
 
 
 @pytest.mark.parametrize("options", [
-    {"kv_cache": KVCache(page_size=16, pages=12)},
-    {"kv_cache": KVCache(page_size=16, pages=12), "chunk": 2},
-    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True},
-    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True, "decode_steps": 3},
+    {"cache": PagedKV(page_size=16, pages=12)},
+    {"cache": PagedKV(page_size=16, pages=12), "chunk": 2},
+    {"cache": PagedKV(page_size=4, pages=40, prefix_cache=True), "chunk": 3},
+    {"cache": PagedKV(page_size=4, pages=40, prefix_cache=True), "chunk": 3, "decode_steps": 3},
     {"chunk": 2},
 ], ids=["paged", "chunked", "prefix", "prefix-three-steps", "dense-chunked"])
 def test_a_paged_server_draws_what_each_request_draws_alone(options):
@@ -1205,14 +1212,15 @@ ARITHMETIC = {
                 {"slots": 3, "capacity": 64}, (Served(7), Served(5), Served(9)), 3),
     "several-steps-over-pages": (
         lambda: measured_task(measured_decoder()),
-        {"slots": 3, "capacity": 64, "kv_cache": KVCache(page_size=16, pages=12), "decode_steps": 3},
+        {"slots": 3, "capacity": 64, "cache": PagedKV(page_size=16, pages=12), "decode_steps": 3},
         (Served(7), Served(5), Served(9)), 8),
     "a-parallel-hybrid": (
         lambda: measured_task(parallel_hybrid_model(vocab_size=256)),
-        {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pages=40)},
+        {"slots": 2, "capacity": 64, "cache": PagedKV(page_size=4, pages=40)},
         (Served(12), Served(9), Served(12, flipped=(6,))), 8),
     "speculative-blocks": (
-        lambda: measured_task(measured_decoder(num_nextn_predict_layers=1), strategy=Speculative(block=3)),
+        lambda: measured_task(measured_decoder(num_nextn_predict_layers=1),
+                              dataclasses.replace(GREEDY, strategy=Speculative(block=3))),
         {"slots": 3, "capacity": 64}, (Served(7), Served(5), Served(9)), 8),
 }
 """The cells of a server's arithmetic no other sized site holds (`assert_served_as_exact`), by name: the task,
@@ -1249,13 +1257,15 @@ def test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic(cell, r
 
 
 QUANTIZED_CACHES = {
-    "int8": ({"slots": 2, "capacity": 64, "kv_cache": KVCache(quantized="int8")},
+    "int8": ({"slots": 2, "capacity": 64, "cache": DenseKV(quantized="int8")},
              (Served(7), Served(5), Served(9)), None),
-    "float8-over-pages": ({"slots": 2, "capacity": 64, "decode_steps": 3, "prefix_cache": False,
-                           "kv_cache": KVCache(quantized="float8_e4m3fn", page_size=4, pages=12)},
+    "float8-over-pages": ({"slots": 2, "capacity": 64, "decode_steps": 3,
+                           "cache": PagedKV(quantized="float8_e4m3fn", page_size=4, pages=12,
+                                            prefix_cache=False)},
                           (Served(7), Served(5), Served(9)), None),
-    "int8-over-a-shared-prefix": ({"slots": 2, "capacity": 64, "prefix_cache": True,
-                                   "kv_cache": KVCache(quantized="int8", page_size=4, pages=24)},
+    "int8-over-a-shared-prefix": ({"slots": 2, "capacity": 64,
+                                   "cache": PagedKV(quantized="int8", page_size=4, pages=24,
+                                                    prefix_cache=True)},
                                   (Served(7), Served(5), Served(9, flipped=(4,))), (0, 4, 4)),
 }
 """The cells of a server over a quantized cache (`assert_served_through_its_cache_as_exact`), by name: its
@@ -1367,8 +1377,8 @@ def test_prompts_seated_together_share_the_pages_the_first_writes_in_that_step(c
     bound = task(Sampling(temperature=1.0))
     prompts, budget = ["123456781", "123456789", "1234567812"], 4
     alone = [bound(held, budget, key=index) for index, held in enumerate(prompts)]
-    server = Server.from_task(bound, slots=4, capacity=64, admission=4, prefix_cache=True, chunk=chunk,
-                              kv_cache=KVCache(page_size=4, pages=32))
+    server = Server.from_task(bound, slots=4, capacity=64, admission=4,
+                              cache=PagedKV(page_size=4, pages=32, prefix_cache=True), chunk=chunk)
     cancelled = server.submit("1234567811", budget, key=9)
     assert cancelled.cancel()
     tickets = [server.submit(held, budget, key=index) for index, held in enumerate(prompts)]
@@ -1395,9 +1405,10 @@ def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits, offl
     shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
     requests = [shared, *others, shared]
     alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
-    server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
-                              kv_cache=KVCache(page_size=4, pages=8, offloaded=offloaded),
-                              host_pages=host_pages)
+    server = Server.from_task(bound, slots=1, capacity=64, admission=1,
+                              cache=PagedKV(page_size=4, pages=8, offloaded=offloaded, prefix_cache=True,
+                                            host_pages=host_pages),
+                              )
     drawn = []
     for index, held in enumerate(requests):
         ticket = server.submit(held, budget, key=index)
@@ -1408,6 +1419,7 @@ def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits, offl
         assert_same_draws(generation, lone)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaimed():
     """`test_a_host_tier_keeps_prefix_pages_the_pool_reclaims`'s host case over a banked store, whose paged
     pool holds its run's layers first (`dew.nn.kv_cache.row_axis`): the reclaimed pages go to host memory
@@ -1417,8 +1429,9 @@ def test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaim
     shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
     requests = [shared, *others, shared]
     alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
-    server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
-                              kv_cache=KVCache(page_size=4, pages=8), host_pages=8)
+    server = Server.from_task(bound, slots=1, capacity=64, admission=1,
+                              cache=PagedKV(page_size=4, pages=8, prefix_cache=True, host_pages=8),
+                              )
     drawn = []
     for index, held in enumerate(requests):
         ticket = server.submit(held, budget, key=index)
@@ -1441,7 +1454,7 @@ def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alon
     requests = [prompt] * 4 + [other]
     alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
     server = Server.from_task(bound, slots=4, capacity=128, admission=4,
-                              kv_cache=KVCache(page_size=4, pages=64), prefix_cache=True)
+                              cache=PagedKV(page_size=4, pages=64, prefix_cache=True))
     tickets = [server.submit(held, budget, key=index) for index, held in enumerate(requests)]
     server.run()
     assert server.prefix_hits == 3 * 16
@@ -1462,7 +1475,7 @@ def test_a_finished_requests_history_is_read_by_a_prompt_that_continues_it(kind,
     model = (decoder() if kind == "attention" else hybrid_model(VOCAB)).clone(max_seq_len=128)
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     bound = TextGeneration(model, params, sampling=Sampling(temperature=0))
-    server = Server.from_task(bound, slots=2, capacity=64, kv_cache=KVCache(page_size=4, pages=40))
+    server = Server.from_task(bound, slots=2, capacity=64, cache=PagedKV(page_size=4, pages=40))
     prompt = [1, 2, 3, 4, 5, 6, 7, 3]
     first = server([prompt], budget, key=0)[0].host()
     count = int(first.lengths[0])
@@ -1489,14 +1502,13 @@ def test_a_paged_server_serves_layers_that_read_their_keys_places(fields, prefix
     bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    server, tickets = served_alongside(bound, kv_cache=KVCache(page_size=4, pages=40),
-                                       prefix_cache=prefix_cache)
+    server, tickets = served_alongside(bound, cache=PagedKV(page_size=4, pages=40, prefix_cache=prefix_cache))
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_draws(ticket.result(), lone)
     assert server.prefix_hits == (4 if prefix_cache else 0)
 
 
-@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+@pytest.mark.parametrize("options", [{}, {"cache": PagedKV(page_size=16, pages=12)}],
                          ids=["dense", "paged"])
 def test_a_server_runs_a_model_with_prediction_depths_without_them(options):
     """The server only samples, so it allocates and seeds no prediction
@@ -1529,8 +1541,8 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     reload with a row running, whose next block would open on the old weights' logits."""
     model = decoder().clone(max_seq_len=128, num_nextn_predict_layers=1)
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
-    bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=temperature),
-                           strategy=Speculative(block=3))
+    bound = TextGeneration(model, params, RunProcessor(Digits()),
+                           sampling=Sampling(temperature=temperature, strategy=Speculative(block=3)))
     with contextlib.nullcontext() if keys is None else jax.default_prng_impl(keys):
         alone = [bound(prompt, budget, key=index)
                  for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
@@ -1538,7 +1550,7 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
     server, tickets = served_by(server)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_draws(ticket.result(), lone)
-    for options in ({"kv_cache": KVCache(page_size=16, pages=12)}, {"chunk": 3}):
+    for options in ({"cache": PagedKV(page_size=16, pages=12)}, {"chunk": 3}):
         with pytest.raises(ValueError):
             Server.from_task(bound, slots=2, capacity=128, **options)
     server.submit(PROMPTS[0], 50, key=0)
@@ -1598,7 +1610,7 @@ def test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_
     adapters = AdapterSet.of({"first": drawn_adapter(model, params, "project_in", 1),
                               "second": drawn_adapter(model, params, "project_in", 2)})
     served = TextGeneration(adapters.model, adapters.variables, RunProcessor(Digits()),
-                            sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+                            sampling=Sampling(temperature=0, strategy=Speculative(block=3)))
     server = Server.from_task(served, slots=3, capacity=32)
     prompts, names = ([1, 2, 3], [7, 8, 9], [4, 5, 6]), ("first", None, "second")
     tickets = [server.submit(np.asarray([prompt]), 6, key=0, adapter=name)
@@ -1620,7 +1632,8 @@ def test_a_speculating_server_over_an_adapter_set_reseeds_its_depths_under_each_
     assert len({tuple(walk) for walk in walks}) > 1
 
 
-@pytest.mark.parametrize("cache", [None, KVCache(page_size=2, pages=64)], ids=["dense", "paged"])
+@pytest.mark.parametrize("cache", [None, PagedKV(page_size=2, pages=64, prefix_cache=True)],
+                         ids=["dense", "paged"])
 def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(tmp_path, cache):
     """One server over an adapter set (`dew.lora.AdapterSet`) of a published decoder: the fixture's PEFT
     adapter (rank 8 over q and v, with an alpha pattern) and one of rank 2 over q alone, saved side by side
@@ -1668,8 +1681,7 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
                  None: decoder.text_generation(sampling=sampling)}
     prompts = ([1, 5, 9, 13, 2], [2, 4], [7, 7, 7, 3, 1], [1, 5, 9, 13, 2], [1, 5, 9, 13, 2])
     names = ("fixture", "second", None, "second", "fixture")
-    server = Server.from_task(served, slots=4, capacity=64, admission=2, kv_cache=cache,
-                              prefix_cache=cache is not None)
+    server = Server.from_task(served, slots=4, capacity=64, admission=2, cache=cache)
 
     def draw(seed):
         return (np.arange(len(prompts)) + len(prompts) * seed,)
@@ -1774,8 +1786,9 @@ def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
         lambda leaf: leaf * 1e30, fixture.variables["params"])})
     adapters = AdapterSet.of({"huge": huge})
     tokens = jnp.asarray([[1, 5, 9, 13], [2, 4, 6, 8]], jnp.int32)
-    served = adapters.model.apply(adapters.variables, tokens, adapters=jnp.asarray([0, -1], jnp.int32))
-    base = decoder.model.apply(decoder.variables, tokens)
+    served = compiled_apply(adapters.model, adapters.variables, tokens,
+                            adapters=jnp.asarray([0, -1], jnp.int32))
+    base = compiled_apply(decoder.model, decoder.variables, tokens)
     assert not np.isfinite(np.asarray(served[0])).all()
     np.testing.assert_array_equal(np.asarray(served[1]), np.asarray(base[1]))
 
@@ -1827,8 +1840,8 @@ def test_an_adapter_sets_decode_carries_each_rows_adapter_through_a_reindex():
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("mesh, options", [
     (MeshSpec(), {}),
-    (MeshSpec(tensor=2), {"kv_cache": KVCache(page_size=4, pages=64), "chunk": 3, "prefix_cache": True}),
-    (MeshSpec(fsdp=2, tensor=2), {"kv_cache": KVCache(page_size=16, pages=16), "decode_steps": 4}),
+    (MeshSpec(tensor=2), {"cache": PagedKV(page_size=4, pages=64, prefix_cache=True), "chunk": 3}),
+    (MeshSpec(fsdp=2, tensor=2), {"cache": PagedKV(page_size=16, pages=16), "decode_steps": 4}),
 ], ids=["data", "data-tensor-chunked-prefix", "data-fsdp-tensor-paged-four-steps"])
 def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
     """Weights placed on a mesh serve on it: the slots and the pool's pages
@@ -1857,7 +1870,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
         assert_sharded(placed.variables["params"], server.mesh)
         assert server.groups == jax.device_count() // mesh.tensor
         assert server.prefix_hits == shared_page(options)
-        if "kv_cache" in options:
+        if "cache" in options:
             pool = next(leaf for leaf in jax.tree.leaves(server.cache) if leaf.ndim == 4)
             pages = pool.sharding.spec[1]
             assert ((pages,) if isinstance(pages, str) else tuple(pages)) == tuple(
@@ -1932,7 +1945,7 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     with boxed(decoder_axes(lone.model)):
         placed = place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
     served = generation(dispatch, placed)
-    server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32),
+    server, tickets = served_alongside(served, slots=8, admission=8, cache=PagedKV(page_size=16, pages=32),
                                        decode_steps=decode_steps)
     assert_sharded(served.variables["params"], server.mesh)
     assert server.groups == jax.device_count()
@@ -1944,19 +1957,17 @@ def banked_task(sampling: Sampling, *, layers: int = 4, devices: int = 1) -> Tex
     """A scanned MoE decoder's task over a banked store (`dew.inference.banks.HeldBanks.place`, the run's
     `layers` weights one array a leaf, `layers_0_3`), on one device, as the task's lone calls run (a mesh
     over the suite's devices splits the slots), or on a mesh of the last `devices` rows' devices."""
-    def routed(*, scanned: bool) -> CausalTransformer:
-        return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=layers, num_heads=2,
-                                 head_dim=8, mlp_features=32, max_seq_len=128, dtype="float32",
-                                 scan_layers=scanned, mixture=Mixture(experts=4, top_k=2))
-
-    scanned = routed(scanned=True)
-    weights = routed(scanned=False).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    scanned = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=layers, num_heads=2, head_dim=8,
+                                mlp_features=32, max_seq_len=128, dtype="float32",
+                                mixture=Mixture(experts=4, top_k=2))
+    weights = scanned.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     mesh = MeshSpec(fsdp=devices).build(jax.devices()[-devices:] if devices > 1 else jax.devices()[:1])
     banked = HeldBanks(weights).place(scanned, mesh=mesh)
     return TextGeneration(scanned, banked, RunProcessor(Digits()), sampling=sampling)
 
 
-@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+@pytest.mark.usefixtures("scanned_stacks")
+@pytest.mark.parametrize("options", [{}, {"cache": PagedKV(page_size=16, pages=12)}],
                          ids=["dense", "paged"])
 def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_task_draws(options):
     """A scanned MoE decoder over a banked store keeps its resident cache banked as its weights are, the
@@ -1973,6 +1984,7 @@ def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_
 
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=4)
 def test_a_banked_server_over_row_groups_seats_its_paged_prompts_in_every_layer_of_their_rows():
     """A banked server whose slots split into two row groups, paged, prefills its prompts in a forward of
@@ -1984,12 +1996,13 @@ def test_a_banked_server_over_row_groups_seats_its_paged_prompts_in_every_layer_
     alone = [lone(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server, tickets = served_alongside(banked_task(sampling, devices=2),
-                                       kv_cache=KVCache(page_size=16, pages=12))
+                                       cache=PagedKV(page_size=16, pages=12))
     assert server.groups == 2 and server.mixed_refusal is not None and "layers_0_3" in server.cache
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_draws(ticket.result(), row)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=4)
 def test_a_banked_server_that_prefills_on_a_mesh_of_its_own_moves_its_rows_past_the_banks_layers():
     """A banked server that prefills on a mesh of its own, its bank three layers deep, which the decoding
@@ -2219,8 +2232,9 @@ def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote(finished):
     three when the reload lands: its first piece kept the old weights'
     keys, so its pages are never shared."""
     bound = task()
-    server = Server.from_task(bound, slots=2, capacity=128, kv_cache=KVCache(page_size=4, pages=40),
-                              chunk=3, prefix_cache=True)
+    server = Server.from_task(bound, slots=2, capacity=128,
+                              cache=PagedKV(page_size=4, pages=40, prefix_cache=True),
+                              chunk=3)
     server.submit("1234567", 8, key=0)
     if finished:
         server.run()
@@ -2236,7 +2250,7 @@ def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote(finished):
     assert_same_draws(ticket.result(), bound.bind(other)("1234567", 8, key=0))
 
 
-@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=4, pages=3), "prefix_cache": True}],
+@pytest.mark.parametrize("options", [{}, {"cache": PagedKV(page_size=4, pages=3, prefix_cache=True)}],
                          ids=["dense", "paged"])
 def test_a_request_cancelled_while_it_waits_leaves_its_peers_running(options):
     """One slot, three requests: the second is cancelled while the first
@@ -2301,7 +2315,7 @@ def test_a_served_request_is_forced_to_end_at_its_own_budget():
     from dew.sampling import decoding
 
     forced = (decoding.Greedy(), decoding.ForcedEOS(jnp.array([5], jnp.int32)))
-    bound = dataclasses.replace(task(Sampling(temperature=0)), logits=forced)
+    bound = task(Sampling(temperature=0, logits=forced))
     server = Server.from_task(bound, slots=2, capacity=64)
     ticket = server.submit("12", 3, key=0)
     server.run()
@@ -2342,8 +2356,8 @@ def test_a_padding_positions_value_is_not_part_of_a_served_row():
     np.testing.assert_array_equal(ticket.result().tokens, expected.tokens)
 
 
-@pytest.mark.parametrize("kv_cache", [KVCache(page_size=16), KVCache()], ids=["paged", "dense"])
-def test_an_offloaded_cache_serves_what_a_resident_one_serves(kv_cache):
+@pytest.mark.parametrize("cache", [PagedKV(page_size=16), DenseKV()], ids=["paged", "dense"])
+def test_an_offloaded_cache_serves_what_a_resident_one_serves(cache):
     """A server whose keys and values live in host memory (`KVCache.offloaded`, Hugging Face's offloaded
     cache), each layer's brought to the device for its step and written back after it, serves every
     request what the same server over a resident cache serves, its pool held in pinned host memory: the
@@ -2351,7 +2365,7 @@ def test_an_offloaded_cache_serves_what_a_resident_one_serves(kv_cache):
     cache's host tier beside it is `test_a_host_tier_keeps_prefix_pages_the_pool_reclaims`'s."""
     bound = task()
     resident, offloaded = (Server.from_task(bound, slots=4, capacity=128, admission=2,
-                                            kv_cache=dataclasses.replace(kv_cache, offloaded=held))
+                                            cache=dataclasses.replace(cache, offloaded=held))
                            for held in (False, True))
     pooled = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(offloaded.cache)
               if leaf_name(path) in POOLED]
@@ -2382,17 +2396,18 @@ def test_a_cache_config_beside_an_offloaded_cache_configures_nothing():
             source_decoding({}, controls, model, 1, None)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("kv_cache", [KVCache(page_size=16), KVCache()], ids=["paged", "dense"])
 def test_an_offloaded_caches_scanned_decode_compiles_for_a_gpu(kv_cache):
-    """An offloaded cache's decode step over scanned layers whose banks lie in host memory (`scan_layers`,
-    read a layer at a time) compiles for an A100 (`compile_programs`): its first and last layers read and
+    """An offloaded cache's decode step over scanned layers whose banks lie in host memory (read a layer at
+    a time) compiles for an A100 (`compile_programs`): its first and last layers read and
     write their keys, values and weights at a constant index of a host bank, which XLA:GPU takes where each
     copy keeps the bank's axis in host memory and reshapes in device memory (`dew.nn.host_memory`), the one
     owner of that movement for the stack and the cache alike."""
     from dew.nn.kv_cache import offloaded
     from dew.training.ahead import compile_programs
 
-    model = decoder().clone(num_layers=2, max_seq_len=64, scan_layers=True,
+    model = decoder().clone(num_layers=2, max_seq_len=64,
                             kv_cache=dataclasses.replace(kv_cache, offloaded=True))
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))["params"]
     leaves, tree = jax.tree.flatten(params)

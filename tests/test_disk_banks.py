@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import unrolled
 from reference_error import assert_as_exact, widened
 
 from dew.inference.banks import HeldBanks
@@ -33,13 +34,14 @@ def single_mesh():
 
 def decoder(config, bank_layers, dtype="float32"):
     record = {**translate_config(config), "dtype": dtype, "attention_impl": "reference"}
-    return models.build("causal_transformer", {**record, "scan_layers": True,
+    return models.build("causal_transformer", {**record,
                                                "bank_layers": bank_layers})
 
 
 BANKED_SEEDS = 8
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("bank_layers", [None, 1])
 @pytest.mark.parametrize("read_ahead", [True, False])
 def test_disk_moe_logits_and_cached_decode_equal_resident(bank_layers, read_ahead):
@@ -138,6 +140,7 @@ def test_disk_source_reads_shards_and_bounds_cache(fused_experts, tmp_path):
         assert source.stats().bytes_read > 0
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("bank_layers", [None, 1])
 def test_disk_source_also_builds_ordinary_resident_banks(bank_layers):
     from dew.inference.banks import SafetensorsBanks
@@ -171,6 +174,7 @@ def test_disk_rows_preserve_requested_physical_formats():
             assert actual.format.sharding == target.sharding
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_streaming_keeps_captured_layers_and_refuses_training_and_closed_sources():
     from dew.inference.banks import SafetensorsBanks
 
@@ -233,19 +237,21 @@ def test_disk_banks_read_safetensors_alone_before_converting_the_model(tmp_path)
         assert source.stats().misses == 0
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_disk_loading_rejects_unbounded_layouts_before_reading_rows():
     from dew.inference.banks import SafetensorsBanks
 
     with SafetensorsBanks(FIXTURE, cache_bytes=0) as source:
         model = decoder(source.config, None)
         with pytest.raises(ValueError):
-            source.stream(model.clone(scan_layers=False), mesh=single_mesh(), layout=DEVICE)
+            unrolled(source.stream)(model, mesh=single_mesh(), layout=DEVICE)
         with pytest.raises(ValueError):
             source.stream(model, mesh=single_mesh(), layout=Layout(
                 min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",)))
         assert source.stats().misses == 0
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_disk_bank_memory_plan_has_no_decoder_weight_arguments():
     from dew.inference.banks import SafetensorsBanks
 
@@ -263,6 +269,7 @@ def test_disk_bank_memory_plan_has_no_decoder_weight_arguments():
         assert source.stats().misses == 0
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_long_disk_scan_is_the_resident_moe(tmp_path):
     from dew.inference.banks import SafetensorsBanks
 
@@ -286,6 +293,7 @@ def test_a_long_disk_scan_is_the_resident_moe(tmp_path):
         np.testing.assert_array_equal(score(streamed, tokens), score(resident, tokens))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_decision_release_streams_its_wrappers_float64_layers_as_the_resident_load(tmp_path):
     """A slot release over a media wrapper streams its native backbone's layers from disk: the banked
     float64 forward, its blocks read both ways, is the resident load's bit for bit, and reads every
@@ -301,7 +309,7 @@ def test_a_decision_release_streams_its_wrappers_float64_layers_as_the_resident_
         bundle = Pretrained.load(directory, weights=False, dtype="float64", param_dtype="float64",
                                   attention_impl="reference")
         model = bundle.model.clone(language_model=bundle.model.language_model.clone(
-            scan_layers=True, bank_layers=1))
+            bank_layers=1))
         with SafetensorsBanks(directory, cache_bytes=0, param_dtype="float64", read_ahead=False) as source:
             streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
             assert source.stats().misses == 0
@@ -321,6 +329,7 @@ def test_a_decision_release_streams_its_wrappers_float64_layers_as_the_resident_
             assert source.stats().misses >= len(model.bank_sites(resident.variables)[0].view.groups)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("bank_layers", [1, None])
 def test_a_float64_bank_streams_on_a_thread_that_never_enabled_x64(bank_layers):
     """`jax.enable_x64` is thread-local, and JAX narrows what a callback returns by it on the thread XLA
@@ -345,6 +354,7 @@ def test_a_float64_bank_streams_on_a_thread_that_never_enabled_x64(bank_layers):
         assert source.stats().misses >= 2 * model.num_layers
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_config_naming_expert_dtype_alone_streams_as_the_unquantized_load(tmp_path):
     """`expert_dtype` names a quantized source's expert storage only beside its quantization config
     (`codecs.source_quantization`): a config that states it alone is the unquantized checkpoint the

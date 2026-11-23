@@ -316,9 +316,10 @@ with or without `text_only`. A run passes both through `--source.text-only` and
 `--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is, the load's
 `modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional,
 and its differential extension through `--source.dex`, the `DifferentialExtension`'s record as JSON
-(`dew.nn.dex`), and `scan_layers` through `--source.scan-layers`, which scans a decoder's runs of
-like layers, its periodic pattern among them, its stored tree unchanged, and refuses a model with no
-layers to scan (`Pretrained.load`); a diffusion pipeline, which no override reaches, refuses them. `dew.pipeline` takes
+(`dew.nn.dex`); a diffusion pipeline, which no override reaches, refuses them. How a decoder runs its
+layers is none of a source's choices: under `generation.chosen(layer_scan="scanned")` it scans its runs of
+like layers, its periodic pattern among them, by its structure, its stored tree unchanged, and a layer at a
+time otherwise, the default until row 4074 makes the scan it. `dew.pipeline` takes
 the same choices for a source as `options=SourceOptions(...)`, and refuses them for a run directory,
 whose record holds its own.
 
@@ -343,7 +344,7 @@ within its own bounds, runs them with one bounded device call a `step`, and sett
 `Timed` future. The engine steps each busy kind once a turn from one thread, so a long queue of one
 kind never holds another back, and it orders a kind's weight reload with its steps. Two kinds ship:
 autoregressive generation's `Server`, a slot scheduler over a resident cache, its prefix cache on by
-default wherever its layout pages (`Server.from_task`'s `prefix_cache` None), a finished request's
+default wherever its layout pages (`PagedKV.prefix_cache` None), a finished request's
 history (its prompt and every draw its cache holds) named for a later prompt that continues it,
 `server(prompts, max_new_tokens, key=..., first=0)` folding row `i`'s key by `first + i`; an episode
 cohort's turns run through it in process

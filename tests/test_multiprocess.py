@@ -2083,7 +2083,9 @@ def test_a_pool_agrees_on_its_decoding_components_or_refuses_the_request(tmp_pat
 
     The disagreements keep every shape and dtype identical: one rank bans a
     different token, one names a different function, one suppresses a
-    different token. A pool comparing only the schema would accept all three
+    different token, one function by one name reads a global set apart, and one
+    mapping holds the same pairs in another order (row 12171: a name and its
+    cells, a mapping sorted). A pool comparing only the schema would accept them
     and run two different policies without saying so.
     """
     reports = run_pool("decoding_components", tmp_path, 2, devices=2, fsdp_size=2, timeout=240)
@@ -2091,7 +2093,8 @@ def test_a_pool_agrees_on_its_decoding_components_or_refuses_the_request(tmp_pat
 
     for rank, report in enumerate(reports):
         assert report["rows"] == 3
-        assert report["refused"] == ["criterion payload", "transform identity", "transform payload"]
+        assert report["refused"] == ["criterion payload", "transform identity", "transform payload",
+                                     "transform globals", "transform mapping order"]
         # A chain both ranks agreed on, undefined on rank 1's rows alone,
         # is refused on both; weights on no mesh answer each rank's own
         # request of its own size as one process answers it.

@@ -53,6 +53,7 @@ from dew.interop.generation_config import (
     return_sequences,
     source_cache,
     source_decoding,
+    written_part,
 )
 from dew.interop.layouts import SourceLayout, Unwritable, unwritten_extension
 from dew.interop.pipeline_assembly import (
@@ -108,7 +109,7 @@ from dew.registry import (
     towers,
     trusts_source,
 )
-from dew.sampling.text import Sampling, with_ids_of
+from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
@@ -436,7 +437,8 @@ class Pretrained:
             # refuses it (`PretrainedDecoder.carrying`, a wrapper's and a decoder's alike).
             generation = (masked_generation_config(budget, None, held.eos_token_ids)
                           if isinstance(held, MaskedSettings) else
-                          generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
+                          generation_config_of(written_part(held.sampling), budget)
+                          if isinstance(held, TextSettings)
                           else None)
             from dew.interop.layouts import source_layout
 
@@ -509,7 +511,7 @@ class Pretrained:
              modeling_overrides: Mapping[str, object] | None = None,
              trust_remote_code: bool | None = None, text_only: bool = False,
              prediction_depths: int | None = None, dex: DifferentialExtension | None = None,
-             precision: Numerics | str | None = None, scan_layers: bool = False,
+             precision: Numerics | str | None = None,
              step: int | str | None = None, ema: bool | None = None, packed_weights: bool = False) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
@@ -590,7 +592,7 @@ class Pretrained:
         "block_bidirectional"}}` lets that layer kind's tokens read their whole block
         (`AttentionMixer.bidirectional_blocks`, a call's `block_groups`) on any decoder or wrapper this
         loads natively, and "causal" turns a release's back off. A saved model states it in its own
-        config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
+        config. `dex` attaches DEX (`with_dex`) from key 0.
         `packed_weights` serves a quantized source's 4-bit weights as their codes, frozen NVFP4 matrices
         (`quantized_loads.packed_banks`, exactly its values) in `QUANTIZATION` that their layers multiply
         (`gemm.nvfp4_product`) and an export decodes: an MXFP4 source's routed experts (row 4516) and a
@@ -608,14 +610,14 @@ class Pretrained:
                 "single_file": single_file, "dduf_file": dduf_file, "fallback": fallback,
                 "text_only": text_only, "modeling_overrides": modeling_overrides or None,
                 "prediction_depths": prediction_depths, "dex": dex, "precision": precision,
-                "scan_layers": scan_layers, "packed_weights": packed_weights})
+                "packed_weights": packed_weights})
         return cls._from_family(
             name_or_dir, trust_remote_code, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, revision=revision, subfolder=subfolder,
             gguf_file=gguf_file, single_file=single_file, dduf_file=dduf_file, fallback=fallback, mesh=mesh,
             layout=layout, on_host=on_host, weights=weights, modeling_overrides=modeling_overrides,
             text_only=text_only, prediction_depths=prediction_depths, dex=dex, precision=precision,
-            scan_layers=scan_layers, packed_weights=packed_weights)
+            packed_weights=packed_weights)
 
 
     @classmethod
@@ -627,7 +629,7 @@ class Pretrained:
                      layout: Layout | None, on_host: bool, weights: bool,
                      modeling_overrides: Mapping[str, object] | None, text_only: bool,
                      prediction_depths: int | None, dex: DifferentialExtension | None,
-                     precision: Numerics | str | None, scan_layers: bool, packed_weights: bool) -> Self:
+                     precision: Numerics | str | None, packed_weights: bool) -> Self:
         """`load` of a source a family's loader reads, its every option as `load` states it."""
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
@@ -651,7 +653,7 @@ class Pretrained:
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
         loaded = replace(loaded, model=with_rounding(loaded.model, loading.rounds))
         extended = _extended(_published(loaded, name_or_dir, selected=bool(selected) or extracted
-                                        or reference.subfolder is not None), dex, placed, scan_layers)
+                                        or reference.subfolder is not None), dex, placed)
         return replace(_resident(extended, weights=weights, streaming=streaming, on_host=on_host),
                        settings=loading.settings, numerics=loading.numerics)
 
@@ -806,7 +808,7 @@ class Pretrained:
         return replace(self, model=model, variables=variables)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
-        """Return the tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
+        """Return the tensors `save` writes, by their source names; `dew.inference.nccl.NCCLPush` sends these.
 
         An adapted bundle (`lora`) writes the source's own tensors with the factors
         merged into their kernels, as PEFT's `merge_and_unload` does, from its
@@ -1235,11 +1237,10 @@ def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGener
         task = TextGeneration.from_settings(loaded.model, loaded.variables, loaded.settings,
                                             loaded.text_processor)
         # A policy given in its place stops and pads where the run's does, where it names no ids.
-        policy = None if sampling is None else with_ids_of(sampling, task.sampling)
+        policy = None if sampling is None else sampling.with_defaults_of(task.sampling)
         return loaded.formed(task if policy is None else replace(task, sampling=policy))
     rows = return_sequences(loaded.config, loaded.generation_config)
-    policy, logits, strategy = source_decoding(loaded.config, loaded.generation_config, loaded.model, rows,
-                                               sampling)
+    policy = source_decoding(loaded.config, loaded.generation_config, loaded.model, rows, sampling)
     return loaded.formed(TextGeneration(
         source_cache(loaded.config, loaded.generation_config, loaded.model),
         loaded.variables,
@@ -1248,8 +1249,6 @@ def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGener
         max_new_tokens=generation_limit(loaded.config, loaded.generation_config, "max_new_tokens"),
         max_length=generation_limit(loaded.config, loaded.generation_config, "max_length"),
         n=rows,
-        logits=logits,
-        strategy=strategy,
     ))
 
 
@@ -1290,7 +1289,6 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
                           prediction_depths: int | None = None,
                           modeling_overrides: Mapping[str, object] | None = None,
                           dex: DifferentialExtension | None = None,
-                          scan_layers: bool = False,
                           packed_weights: bool = False,
                           step: int | str | None = None,
                           ema: bool | None = None, weights: bool = True) -> PretrainedPipeline | RunPipeline:
@@ -1315,11 +1313,11 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     (`TextToImage.prepare(conditions=...)`), and a prompt, training or
     `save`, which read the text encoder, are refused.
 
-    `text_only`, `prediction_depths`, `modeling_overrides`, `dex`,
-    `scan_layers` and `packed_weights` read as `Pretrained.load`'s do: a
-    pipeline has no wrapper's language model for `text_only` to take, its
-    components hold no prediction depths, so any count keeps them all, and
-    overrides, DEX, layer scanning and packed weights are refused.
+    `text_only`, `prediction_depths`, `modeling_overrides`, `dex` and
+    `packed_weights` read as `Pretrained.load`'s do: a pipeline has no
+    wrapper's language model for `text_only` to take, its components hold no
+    prediction depths, so any count keeps them all, and overrides, DEX and
+    packed weights are refused.
     `weights=False` reads a published pipeline's weights' shapes alone, from its files' headers, as
     `Pretrained.load`'s does: a resumed run's start, which its checkpoint's restore fills. A saved run's
     tree is restored either way, its task built over it (`pipeline_of_run`).
@@ -1331,8 +1329,6 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     _unpacked(packed_weights, "a diffusion pipeline")
     if dex is not None:
         raise TypeError("a diffusion pipeline takes no differential extension")
-    if scan_layers:
-        raise TypeError("scan_layers scans a decoder's layers; a diffusion pipeline has none")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")
     run = pinned_run(checkpoint, step=step, ema=ema, mesh=mesh, layout=layout)
@@ -1962,20 +1958,10 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
 
 
 def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | None,
-                                   placed: Callable[[Variables], Variables], scan: bool = False) -> Loaded:
+                                   placed: Callable[[Variables], Variables]) -> Loaded:
     """`loaded` with DEX attached where a load names it (`Pretrained.with_dex`), drawn from key 0, its
-    parameters placed as the load places the source's (`placed`), before the load's residency; and its
-    decoder, or a wrapper's language model, scanning its runs where `scan` says (`Scanning`), a
-    field of how the model runs, its stored tree unchanged, as its stack reads the layers through its
-    view."""
-    from dew.nn.protocols import Scanning
-
-    extended = loaded if dex is None else loaded.with_dex(dex, key=0).map_variables(placed)
-    if not scan:
-        return extended
-    if not isinstance(extended.model, Scanning):
-        raise TypeError(f"scan_layers scans a decoder's layers; a {type(extended.model).__name__} has none")
-    return replace(extended, model=extended.model.with_scanned_layers())
+    parameters placed as the load places the source's (`placed`), before the load's residency."""
+    return loaded if dex is None else loaded.with_dex(dex, key=0).map_variables(placed)
 
 
 def _unwritten(layout: Unwritable) -> Callable[..., Mapping[str, np.ndarray]]:

@@ -233,7 +233,7 @@ tuple, against 5.4 s for the same 57 MB as one buffer ([openxla/xla#50283](https
 The `fsdp` shape (1.6B parameters) does not fit, because XLA:CPU keeps all 170 gathered weights live at once: 21.4 GB
 of temporaries on 12 GiB containers ([openxla/xla#50284](https://github.com/openxla/xla/issues/50284)). Its
 breadth-first scheduler does that: with `--xla_cpu_enable_concurrency_optimized_scheduler=false` the step holds 19.5
-GB, and 17.6 GB with its layers scanned (`--scan-layers`; 18.7 GB under the default scheduler). The rest is mostly the
+GB a layer at a time, and 17.6 GB with its layers scanned (`--scanned`; 18.7 GB under the default scheduler). The rest is mostly the
 gradient, which XLA:CPU all-reduces whole, 6.2 GB, where a GPU reduce-scatters it: the CPU pipeline runs no
 `ReduceScatterCreator`. Neither fits a 12 GiB container, so Dew leaves the scheduler at XLA's default. The `moe`
 and `pipe` layouts are refused across containers: each container is its own slice, and only the data and fsdp axes

@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import token_draw
-from model_support import stepped_decode
+from model_support import compiled_apply, stepped_decode, unrolled
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -32,6 +32,7 @@ def load() -> Pretrained:
     return Pretrained.load(TINY, dtype='float32', attention_impl='reference')
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_releases_own_config_and_its_transformers_config_read_as_one_model():
     """MiniMax-Text-01's own config (`attn_type_list`, `layernorm_*`, remote code) and the config its
     -hf release states for transformers (`layer_types`, `*_factor`) translate to the same model, whose
@@ -44,7 +45,7 @@ def test_a_releases_own_config_and_its_transformers_config_read_as_one_model():
               'rotary_dim': 4, 'intermediate_size': 16, 'num_local_experts': 2, 'num_experts_per_tok': 1,
               'vocab_size': 32, 'max_position_embeddings': 64}
     model = from_record(CausalTransformer, {**translate_config({**released('minimax-text-01'), **narrow}),
-                                            'scan_layers': True, 'attention_impl': 'reference'})
+                                            'attention_impl': 'reference'})
     ids = jnp.zeros((1, 1), jnp.int32)
     variables = jax.eval_shape(lambda: model.init(jax.random.key(0), ids))
     cache = jax.eval_shape(lambda: model.init(jax.random.key(0), ids, decode=True))['cache']
@@ -58,18 +59,19 @@ SCAN_SEEDS = 8
 """The scanned decode's declared draws (check 1)."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_minimax_decodes_as_its_plain_loop():
     """A MiniMax of minimax-tiny's config over eight layers repeating three lightning layers and a softmax
-    one, at Dew's initialization, decodes under `scan_layers` (one scan of the period's two repeats,
-    each lightning layer's rates by its place) as exactly as its plain loop, both from the plain loop's
+    one, at Dew's initialization, decodes scanned (one scan of the period's two repeats, each lightning
+    layer's rates by its place) as exactly as its plain loop (`unrolled`), both from the plain loop's
     float64 steps (check 1)."""
     config = {**released('minimax-tiny'), 'num_hidden_layers': 8, 'attn_type_list': [0, 0, 0, 1] * 2}
     record = {**translate_config(config), 'attention_impl': 'reference'}
-    plain, scanned = (from_record(CausalTransformer, {**record, 'scan_layers': scan})
-                      for scan in (False, True))
+    plain = scanned = from_record(CausalTransformer, record)
     variables = plain.init(jax.random.key(0), jnp.zeros((2, 4), jnp.int32))
 
     @as_given
+    @unrolled
     def truth(ids):
         with jax.enable_x64(new_val=True):
             return np.asarray(stepped_decode(plain.clone(dtype=jnp.float64), widened(variables), ids)[0])
@@ -77,7 +79,7 @@ def test_a_scanned_minimax_decodes_as_its_plain_loop():
     def steps(model):
         return lambda ids: stepped_decode(model, variables, ids)[0]
 
-    assert_as_exact(steps(scanned), steps(plain), token_draw(0x2564, config['vocab_size'], (2, 10)),
+    assert_as_exact(steps(scanned), unrolled(steps(plain)), token_draw(0x2564, config['vocab_size'], (2, 10)),
                     'scanned MiniMax decode', seeds=SCAN_SEEDS, truth_fn=truth)
 
 
@@ -103,8 +105,8 @@ def test_a_record_saved_with_a_kind_for_each_lightning_layer_computes_as_it_did(
     saved = {'class': import_path(CausalTransformer), 'fields': {**legacy, 'attention_impl': 'reference'}}
     model = from_record(CausalTransformer, earlier_model({'model': saved})['model'])
     ids = np.load(TINY / 'input_ids.npy')
-    np.testing.assert_array_equal(model.apply(loaded.variables, ids),
-                                  loaded.model.apply(loaded.variables, ids))
+    np.testing.assert_array_equal(compiled_apply(model, loaded.variables, ids),
+                                  compiled_apply(loaded.model, loaded.variables, ids))
 
 
 def test_a_minimax_model_writes_no_checkpoint_another_runtime_would_misread(tmp_path):

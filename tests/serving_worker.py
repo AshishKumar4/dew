@@ -27,9 +27,8 @@ def mode_pooled_server(args) -> dict:
 
     from dew.inference import Engine
     from dew.inference.loading import place
-    from dew.inference.serving import Server
+    from dew.inference.serving import PagedKV, Server
     from dew.interop.decoder_parts import decoder_axes
-    from dew.nn.kv_cache import KVCache
     from dew.nn.sharding import boxed
     from dew.training import Layout, MeshSpec
 
@@ -43,7 +42,7 @@ def mode_pooled_server(args) -> dict:
         with boxed(decoder_axes(bound.model)):
             bound = bound.bind(place(bound.variables, MeshSpec(fsdp=args.fsdp_size),
                                      Layout(min_shard=1, tolerance=1.0)))
-    paged = {"kv_cache": KVCache(page_size=4, pages=128), "prefix_cache": True} if args.paged else {}
+    paged = {"cache": PagedKV(page_size=4, pages=128, prefix_cache=True)} if args.paged else {}
     server = Server.from_task(bound, slots=4 * args.fsdp_size, capacity=128, admission=2 * args.fsdp_size,
                               **paged)
     first = [8, 1, 4]
@@ -83,9 +82,8 @@ def mode_pooled_host_tier(args) -> dict:
     from model_support import serving_task
 
     from dew.inference.loading import place
-    from dew.inference.serving import Server
+    from dew.inference.serving import PagedKV, Server
     from dew.interop.decoder_parts import decoder_axes
-    from dew.nn.kv_cache import KVCache
     from dew.nn.sharding import boxed
     from dew.training import Layout, MeshSpec
 
@@ -97,8 +95,10 @@ def mode_pooled_host_tier(args) -> dict:
             bound = bound.bind(place(bound.variables, MeshSpec(fsdp=args.fsdp_size),
                                      Layout(min_shard=1, tolerance=1.0)))
     groups = args.fsdp_size
-    server = Server.from_task(bound, slots=groups, capacity=64, admission=groups, prefix_cache=True,
-                              kv_cache=KVCache(page_size=4, pages=8 * groups), host_pages=2 * groups)
+    server = Server.from_task(bound, slots=groups, capacity=64, admission=groups,
+                              cache=PagedKV(page_size=4, pages=8 * groups, prefix_cache=True,
+                                            host_pages=2 * groups),
+                              )
     shared = ["123456781", "432143211"]
     others = ["987654329876", "555544443333"]
     rounds = [shared, [others[0]] * 2, [others[1]] * 2, shared]

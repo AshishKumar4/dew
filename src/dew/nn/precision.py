@@ -1006,6 +1006,67 @@ def l2_squares(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return wide, jnp.sum(jnp.square(wide), axis=-1, keepdims=True)
 
 
+def l2_normed(x: jax.Array, dtype, eps: float = L2NORM_EPS) -> jax.Array:
+    """`l2norm` of `x`'s rows rounded once to `dtype`, as `l2_unit(*l2_squares(x), dtype, eps)` computes it,
+    its derivative the unit norm's own, `r (t - y <y, t>)` for the unit row `y = x r` and its transpose
+    `r (c - y <y, c>)`: every term at the row's own scale, where JAX's derivative of `rsqrt` reads
+    `rsqrt(s) / s`, which flushes to zero at a row of length 2^55 and leaves a radial cotangent its
+    `r c` term alone, 2^-55 where the exact gradient is 0 (nGPT's join and hidden norm, row 11940's
+    review: their written transposes cancelled it)."""
+    return _unit_rows(eps, *l2_squares(x)).astype(dtype)
+
+
+def _unit_rows_value(eps: float, wide: jax.Array, squares: jax.Array) -> jax.Array:
+    """The rows `wide` over their lengths, from their sums of squares (`l2_normed`'s, in its wide dtype)."""
+    return wide * jax.lax.rsqrt(squares + eps)
+
+
+def _unit_rows_tangent(eps: float, primals, tangents):
+    wide, squares = primals
+    along, _ = tangents
+    inverse = _inverse_length(eps, wide, squares)
+    unit = wide * inverse
+
+    def projected(v: jax.Array) -> jax.Array:
+        return v - unit * jnp.sum(unit * v, axis=-1, keepdims=True)
+
+    # The sums of squares are the rows' own (`l2_squares`): their tangent is the rows' through the norm.
+    # r P(t) for P(t) = t - y <y, t>, the unit row y (`1 - eps r^2` long), written as
+    # P(r P(t)) + r eps r^2 y <y, t> (P P = P - eps r^2 y y^T, and P its own transpose): every term
+    # projected or summed before it is scaled, both forward and in the reverse JAX transposes it into, so a
+    # radial tangent or cotangent as large as float32 holds meets a short row's inverse length only as the
+    # small part the eps leaves, where either order of one projection scaled one direction's first and
+    # overflowed to inf - inf (the API02 review).
+    radial = (inverse * (eps * inverse * inverse)) * jnp.sum(unit * along, axis=-1, keepdims=True)
+    return unit, projected(inverse * projected(along)) + unit * radial
+
+
+def _inverse_length_value(eps: float, wide: jax.Array, squares: jax.Array) -> jax.Array:
+    del wide
+    return jax.lax.rsqrt(squares + eps)
+
+
+def _inverse_length_tangent(eps: float, primals, tangents):
+    wide, squares = primals
+    along, _ = tangents
+    inverse = _inverse_length(eps, wide, squares)
+    # dr = -r^3 <x, dx> = -r (r <y, dx>) for the unit row y = x r, read from the row's own tangent: every
+    # factor at the row's scale in both directions, where through its squares' tangent (2 <x, dx>, 2^56 at a
+    # row of length 2^55) a second order's reverse met r^3 first and flushed to 0 (2^-166, the API02 review).
+    return inverse, -inverse * (inverse * jnp.sum(wide * inverse * along, axis=-1, keepdims=True))
+
+
+_inverse_length = contracted("test_ngpts_join_and_normed_hidden_hold_every_order")(
+    declared_tangent(Protected(), _inverse_length_value, _inverse_length_tangent, nondiff_argnums=(0,)))
+"""The rows' inverse lengths `rsqrt(squares + eps)` from the rows `wide` and their sums of squares, its
+derivative the rows' own (`_unit_rows`')."""
+
+
+_unit_rows = contracted("test_ngpts_join_and_normed_hidden_hold_every_order")(
+    declared_tangent(Protected(), _unit_rows_value, _unit_rows_tangent, nondiff_argnums=(0,)))
+"""`_unit_rows_value` with the unit norm's own tangent, every term at the row's scale (`l2_normed`)."""
+
+
 def l2_unit(wide: jax.Array, squares: jax.Array, dtype, eps: float = L2NORM_EPS) -> jax.Array:
     """`l2norm` of the rows `wide` from their sums of squares (`l2_squares`), rounded once to `dtype`."""
     return (wide * jax.lax.rsqrt(squares + eps)).astype(dtype)

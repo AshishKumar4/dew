@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, scanning, unrolled
 from reference_error import as_given, assert_as_exact, widened
 
 import dew.nn.dex
@@ -342,7 +342,7 @@ def scanned_site():
     draw of their variables with each layer's lambda and projections moved off their start, and the
     plain decoder's float64 as truth."""
     plain = every_layer()
-    start = nn.unbox(plain.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32)))
+    start = nn.unbox(unrolled(plain.init)(jax.random.key(0), jnp.zeros((2, 7), jnp.int32)))
 
     def draw(seed):
         rng = np.random.default_rng([0xD5, seed])
@@ -354,8 +354,8 @@ def scanned_site():
         return {**start, "params": unflatten_dict(flat)}, tokens
 
     wide = mid_anneal(plain.clone(dtype=jnp.float64))
-    return (mid_anneal(every_layer(scan_layers=True)), mid_anneal(plain), draw,
-            jax.jit(lambda variables, tokens: wide(variables, tokens)))
+    return (scanning(mid_anneal(plain)), unrolled(mid_anneal(plain)), draw,
+            unrolled(jax.jit(lambda variables, tokens: wide(variables, tokens))))
 
 
 def test_layers_that_choose_their_own_heads_scan_and_pipeline_as_one_run():
@@ -366,7 +366,7 @@ def test_layers_that_choose_their_own_heads_scan_and_pipeline_as_one_run():
     assert every_layer().stage_split(2).per_stage == 2
     scanned, plain, draw, truth = scanned_site()
     variables, _ = draw(0)
-    assert every_layer(scan_layers=True).apply(variables, method=lambda module: module.groups) == ((0, 4),)
+    assert scanning(every_layer().apply)(variables, method=lambda module: module.groups) == ((0, 4),)
     assert_as_exact(scanned, plain, draw, "dex scanned", seeds=SEEDS["dex scanned"], truth_fn=truth)
 
 
@@ -391,7 +391,7 @@ def test_a_pipelined_run_reads_its_rows_progress():
     def staged(variables, tokens):
         with jax.set_mesh(mesh), pipeline_microbatches(2):
             laid = jax.device_put(variables, Layout(min_shard=16).shardings(mesh, variables))
-            return jax.device_get(mid_anneal(every_layer())(laid, shard_batch(mesh, tokens)))
+            return jax.device_get(unrolled(mid_anneal(every_layer()))(laid, shard_batch(mesh, tokens)))
 
     assert_as_exact(staged, plain, rows, "dex pipelined", seeds=SEEDS["dex pipelined"], truth_fn=truth)
 

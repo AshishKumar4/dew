@@ -16,6 +16,7 @@ import pytest
 from flax import linen as nn
 from flax.core import freeze as frozen_dict
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
+from model_support import stacked
 from placement_parity import layouts_agree, widened_start, x64
 from steady_state import steady_state
 from test_training_transactions import SHORT_SCALE, Terms, Tiny, batches
@@ -219,6 +220,7 @@ def test_a_host_window_that_replays_steps_on_its_startups_programs_alone():
     equal(run(quiet=True), run(quiet=False))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_fits_misses_are_its_own_record_never_another_fits(caplog, tmp_path):
     """A host step that misses its startup's programs (let go at its fit's second step by an observer on
     the fit's loop, `options.release` and JAX's own caches, as an input no pass foresaw would miss them)
@@ -260,6 +262,7 @@ def test_a_host_fits_misses_are_its_own_record_never_another_fits(caplog, tmp_pa
     assert {row["train/step_misses"] for _, row in clean if "train/step_misses" in row} == {0.0}, clean
     assert not any("train/step_misses" in row for _, row in fitted(Layout(), released=False))
 
+
 def three_steps(trainer: Trainer, vocabulary: int):
     """`trainer`'s run of three steps over one batch of `vocabulary`'s tokens, from its fresh start, held
     to the programs its startup compiled (`executable_only`): the state after them."""
@@ -289,6 +292,7 @@ class _CountedProjection(LMObjective):
         return super().projected(params, updated=updated)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_projecting_decoders_host_steps_run_on_its_startups_programs_alone():
     """A host decoder whose parameters a step reads projected (Gemma 3n's AltUp prediction coefficients
     clamped, `ProjectsParameters`) runs its steps on the programs its startup compiled: the projection,
@@ -296,36 +300,40 @@ def test_a_projecting_decoders_host_steps_run_on_its_startups_programs_alone():
     leaves as it is handed back as the array it is. Over its startup and three steps the projection's Python
     runs twice: once in the read's one trace, whose program computes the changed leaves from that trace,
     and once in the step's commit; the read's program traced it a third time when it lowered (row 8397)."""
-    from dew.nn.gemma3n import AltUp
+    with stacked(scanned=False):
+        from dew.nn.gemma3n import AltUp
 
-    model = decoder(altup=AltUp(num_inputs=2, coef_clip=.5), scan_layers=False)
-    objective = _CountedProjection(model, 8, head_chunks=1, ema_decay=None)
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(3), layout=HOST)
-    assert int(three_steps(trainer, 16).updates) == 3
-    assert 0 < len(objective.reads) < 3
+        model = decoder(altup=AltUp(num_inputs=2, coef_clip=.5))
+        objective = _CountedProjection(model, 8, head_chunks=1, ema_decay=None)
+        trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(3), layout=HOST)
+        assert int(three_steps(trainer, 16).updates) == 3
+        assert 0 < len(objective.reads) < 3
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_an_inspecting_host_runs_sampled_and_unsampled_steps_compile_nothing():
     """A host run that inspects a watched block's output and cotangent steps sampled and unsampled steps on
     the programs its startup compiled, both bodies passed (`HostRun.startup`): nothing traced, lowered or
     compiled at either (`executable_only`)."""
-    from dew.telemetry.compiles import executable_only
-    from dew.training import Inspection
+    with stacked(scanned=False):
+        from dew.telemetry.compiles import executable_only
+        from dew.training import Inspection
 
-    model = decoder(scan_layers=False)
-    trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.01),
-                      key=jax.random.key(3), layout=HOST,
-                      inspection=Inspection(modules=("layers_0",), targets=("params",), cotangents=True))
-    state, _, _ = trainer.place()
-    rows = np.stack([np.arange(row, row + 9) % 16 for row in range(jax.device_count())]).astype(np.int32)
-    batch = placed_batch(trainer, {"text": jnp.asarray(rows)})
-    step = trainer.compile(state, batch)
-    for sampled in (False, True, False, True):
-        with executable_only():
-            state, *_, committed = step(state, batch, sampled=sampled)
-    assert int(state.updates) == 4 and committed.inspected is not None
+        model = decoder()
+        trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.01),
+                          key=jax.random.key(3), layout=HOST,
+                          inspection=Inspection(modules=("layers_0",), targets=("params",), cotangents=True))
+        state, _, _ = trainer.place()
+        rows = np.stack([np.arange(row, row + 9) % 16 for row in range(jax.device_count())]).astype(np.int32)
+        batch = placed_batch(trainer, {"text": jnp.asarray(rows)})
+        step = trainer.compile(state, batch)
+        for sampled in (False, True, False, True):
+            with executable_only():
+                state, *_, committed = step(state, batch, sampled=sampled)
+        assert int(state.updates) == 4 and committed.inspected is not None
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_an_inspecting_fits_streamed_step_is_admitted_with_its_sampled_step():
     """A fresh bf16 fit on stand-in H100s whose host prices the streamed step: its layout choice admits the
     streamed step, and where the run inspects a watched block's output and cotangent, its sampled step too,
@@ -334,40 +342,43 @@ def test_an_inspecting_fits_streamed_step_is_admitted_with_its_sampled_step():
     the choice records. On devices between the two needs the inspecting run's streamed step is refused,
     where the sampled one went unadmitted and an inspecting streamed run could run out of memory at its
     first sampled step (row 8455)."""
-    import contextlib
+    with stacked(scanned=False):
+        import contextlib
 
-    from model_support import memory_limited_to
+        from model_support import memory_limited_to
 
-    from dew._devices import DEW_SHARE, allocator_limit
-    from dew.mesh import LayoutRefused
-    from dew.training import Inspection
-    from dew.training.ahead import stand_in_gpus
-    from dew.training.memory import host_memory_stated
-    from dew.training.planning import PlanRefused
+        from dew._devices import DEW_SHARE, allocator_limit
+        from dew.mesh import LayoutRefused
+        from dew.training import Inspection
+        from dew.training.ahead import stand_in_gpus
+        from dew.training.memory import host_memory_stated
+        from dew.training.planning import PlanRefused
 
-    model = decoder(scan_layers=False, dtype=jnp.bfloat16)
-    rows = np.stack([np.arange(row, row + 9) % 16 for row in range(jax.device_count())]).astype(np.int32)
+        model = decoder(dtype=jnp.bfloat16)
+        rows = np.stack([np.arange(row, row + 9) % 16 for row in range(jax.device_count())]).astype(np.int32)
 
-    def chosen(memory: int, *, inspected: bool):
-        inspection = Inspection(modules=("layers_0",), targets=("params",), cotangents=True)
-        with (assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory), host_memory_stated(1e20),
-              contextlib.suppress(PlanRefused, LayoutRefused)):
-            trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.01),
-                              key=jax.random.key(3), inspection=inspection if inspected else None)
-            trainer.fit({"text": rows}, steps=1, log_every=100)
-        assert trainer.layout_choice is not None
-        return trainer.layout_choice
+        def chosen(memory: int, *, inspected: bool):
+            inspection = Inspection(modules=("layers_0",), targets=("params",), cotangents=True)
+            with (assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory), host_memory_stated(1e20),
+                  contextlib.suppress(PlanRefused, LayoutRefused)):
+                trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.01),
+                                  key=jax.random.key(3), inspection=inspection if inspected else None)
+                trainer.fit({"text": rows}, steps=1, log_every=100)
+            assert trainer.layout_choice is not None
+            return trainer.layout_choice
 
-    roomy = 80 * 2 ** 30
-    plain, probed = (chosen(roomy, inspected=inspected).streamed_headroom for inspected in (False, True))
-    assert plain is not None and probed is not None and probed < plain, (plain, probed)
-    # Devices whose allocators hold the unsampled step and not the sampled one: the streamed step is
-    # refused, its margin the sampled step's shortfall, the unsampled step's need below the limit.
-    limit = allocator_limit(roomy, DEW_SHARE)
-    between = limit - (plain + probed) // 2
-    refused = chosen(memory_limited_to(between), inspected=True)
-    assert not refused.fits and not refused.streams, refused
-    assert refused.streamed_headroom is not None and refused.streamed_headroom < 0 < between - (limit - plain)
+        roomy = 80 * 2 ** 30
+        plain, probed = (chosen(roomy, inspected=inspected).streamed_headroom for inspected in (False, True))
+        assert plain is not None and probed is not None and probed < plain, (plain, probed)
+        # Devices whose allocators hold the unsampled step and not the sampled one: the streamed step is
+        # refused, its margin the sampled step's shortfall, the unsampled step's need below the limit.
+        limit = allocator_limit(roomy, DEW_SHARE)
+        between = limit - (plain + probed) // 2
+        refused = chosen(memory_limited_to(between), inspected=True)
+        assert not refused.fits and not refused.streams, refused
+        assert refused.streamed_headroom is not None
+        assert refused.streamed_headroom < 0 < between - (limit - plain)
+
 
 def test_a_casting_projection_is_the_identity_where_its_leaves_are_of_its_dtype_alone():
     """A host step's read of its variables (`Read`) hands back as they are only the leaves its projection
@@ -385,6 +396,7 @@ def test_a_casting_projection_is_the_identity_where_its_leaves_are_of_its_dtype_
 
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone():
     """A host decoder whose embedding is frozen, outside its scanned stack (the run's frozen collection),
     runs its steps on the programs its startup compiled: the startup tells a frozen leaf by its path, as a
@@ -401,6 +413,8 @@ def test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone():
     state = three_steps(trainer, 16)
     assert "embed_tokens" in state.variables[FROZEN] and int(state.updates) == 3
 
+
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_decoders_steps_run_on_its_startups_programs_alone():
     """A host decoder's step, its layers banked and stacked on the CPU each step, runs every step on the
     programs its startup compiled over its state's shapes, nothing traced, lowered or compiled
@@ -460,9 +474,10 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
     equal(resumed, run(HOST, *data))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_decoder_scan_training_keeps_the_original_logical_state():
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
-                              mlp_features=16, max_seq_len=8, scan_layers=True)
+                              mlp_features=16, max_seq_len=8)
     data = {"text": jnp.tile(jnp.arange(9, dtype=jnp.int32)[None], (jax.device_count(), 1))}
     states = []
     for layout in (DEVICE, HOST):
@@ -479,9 +494,10 @@ def test_decoder_scan_training_keeps_the_original_logical_state():
     close(*states)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_dropout_composite_replay_restarts_with_effects_and_ema_intact(tmp_path):
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
-                              mlp_features=16, max_seq_len=8, scan_layers=True, dropout_rate=.4,
+                              mlp_features=16, max_seq_len=8, dropout_rate=.4,
                               mixture=Mixture(experts=4, top_k=2, bias=True))
     objective = LMObjective(model, 8, head_chunks=1, ema_decay=.9,
                             balance=ExpertBalance(balance_rate=.01, aux_loss_alpha=.2, seq_aux=False))
@@ -666,7 +682,7 @@ def tokens(width=9):
 
 def decoder(**overrides):
     fields = {"vocab_size": 16, "emb_features": 8, "num_layers": 2, "num_heads": 2,
-                  "mlp_features": 16, "max_seq_len": 8, "scan_layers": True}
+                  "mlp_features": 16, "max_seq_len": 8}
     return CausalTransformer(**{**fields, **overrides})
 
 
@@ -685,6 +701,7 @@ def _moments(opt_state) -> optax.ScaleByAdamState:
     raise AssertionError("the optimizer state carries no Adam moments")
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_warm_host_run_traces_nothing():
     """Once a CPU-owned run has stepped through an accumulation window, the
     next windows run the programs it compiled: an eager vjp handed the
@@ -703,6 +720,7 @@ def test_a_warm_host_run_traces_nothing():
     assert int(state.updates) == 3
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_master_steps_phases_compile_with_the_options_dew_compiles_with(tmp_path):
     """A host-master step compiles each phase of its transaction on its own (`Transaction.step(host=True)`),
     and each takes the options Dew's one seam holds open (`compiled_with`), as the step's own compile does:
@@ -752,7 +770,7 @@ from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 directory, where, steps = sys.argv[2], sys.argv[3], int(sys.argv[4])
 model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
-                          max_seq_len=8, scan_layers=True)
+                          max_seq_len=8)
 trainer = Trainer(LMObjective(model, 8, head_chunks=1), optax.adam(.01), key=jax.random.key(5),
                   layout=Layout(host=("variables",) if where == "host" else (), min_shard=1, tolerance=1.),
                   checkpoints=None if directory == "-" else Checkpoints(directory), tracker=None)
@@ -777,6 +795,7 @@ print(json.dumps({"started": started, "step": int(state.step),
 """
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("where", ["device", "host"])
 def test_a_resumed_run_continues_on_the_programs_its_first_process_compiled(tmp_path, where):
     """A run resumed by a new process continues where the first stopped, to
@@ -803,6 +822,7 @@ def test_a_resumed_run_continues_on_the_programs_its_first_process_compiled(tmp_
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stack(tmp_path):
     """Per-layer and per-leaf freezing through one banked decoder.
 
@@ -896,6 +916,7 @@ DISTILLED_SEEDS = 8
 """Check 1's declared seeds for the host distilled step against the device one."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_distillation_steps_as_the_device_layout_does():
     """A distilled run's step under a host layout, its frozen teacher banked beside the accelerator and
     read from there a layer at a time (`run_stack`, row 4405), is the device layout's step: its loss and
@@ -944,6 +965,7 @@ def test_a_host_distillation_steps_as_the_device_layout_does():
     assert stacked_reads(objective.teacher.reads[-1]) == ({jax.memory.Space.Host}, {jax.memory.Space.Device})
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_distillations_frozen_teacher_stays_the_arrays_it_was_placed_as(tmp_path):
     """A host distilled run's teacher split by LoRA, its base frozen beside its factors under one
     module's names, is banked whole beside the accelerator (row 4405's review): its forward reads both
@@ -970,6 +992,7 @@ def test_a_host_distillations_frozen_teacher_stays_the_arrays_it_was_placed_as(t
     equal(state, restored)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_path):
     """A LoRA run whose frozen base the CPU owns stores it banked; a fresh
     process loads it through `dew.pipeline` with its layers spread back, its
@@ -1051,6 +1074,7 @@ def media_batch(scale=1.):
     return {"text": ModelInputs(ids, {"image_indices": indices}, {"pixel_values": pixels})}
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
     """A multimodal wrapper declares its decoder under `language_model`.
 
@@ -1095,6 +1119,7 @@ def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
         np.testing.assert_array_equal(value, initial[name], err_msg=name)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("detached", [False, True])
 def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
     """DiffusionGemma reads one physical stack twice: encoder and denoiser.
@@ -1113,7 +1138,7 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
     loaded = Pretrained.load(fixture, dtype="float32", attention_impl="xla", max_seq_len=32)
     source = loaded.model
     assert isinstance(source, DiffusionGemma)
-    scanned = source.clone(text=source.text.clone(scan_layers=True))
+    scanned = source.clone(text=source.text.clone())
     assert isinstance(scanned, DiffusionGemma)
     with np.load(fixture / "reference.npz") as arrays:
         rows = jax.device_count() // arrays["tokens"].shape[0]
@@ -1145,6 +1170,7 @@ def _named_leaves(tree):
     return [(jax.tree_util.keystr(path), leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(tree)]
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_place_streams_the_held_tree_and_releases_each_source():
     """The objective's held leaves become the placed arrays as they land, so
     the state and the objective share one array per leaf and no numpy copy
@@ -1187,6 +1213,7 @@ def test_place_streams_the_held_tree_and_releases_each_source():
     )
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_tree_of_frozen_dicts_is_placed_as_a_tree_of_dicts_is():
     """An objective given its tree as Flax `FrozenDict`s, as a loaded task holds one, holds it as
     dicts: the placed arrays stream into it as they land and its frozen rows become the run's bank,
@@ -1326,13 +1353,14 @@ def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | N
     (`Trainer._step_key`) and a run compared with another traces its own step; decoders handed one Adam
     key theirs alike, as a resumed run's and the run it resumes do, and read the step the first traced."""
     model = CausalTransformer(vocab_size=256, emb_features=64, num_layers=4, num_heads=2, mlp_features=256,
-                              max_seq_len=8, scan_layers=True, dtype=dtype)
+                              max_seq_len=8, dtype=dtype)
     given = {} if layout is None else {"layout": layout}
     return Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None),
                    optax.adam(.001) if optimizer is None else optimizer, key=jax.random.key(6),
                    checkpoints=checkpoints, rollout=rollout, fit=FitPolicy(split=split, remat=remat), **given)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_fit_choosing_its_layout_prices_the_streamed_step_at_its_policys_rung():
     """A fresh fit whose devices (the host's CPUs standing in for H100s) hold only the step streaming its
     parameters from the host chooses it pricing that step at the rung it compiles at
@@ -1355,6 +1383,7 @@ def test_a_fit_choosing_its_layout_prices_the_streamed_step_at_its_policys_rung(
     assert spared[1] > spared[0], spared
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_step_under_a_full_remat_policy_recomputes_every_layer():
     """A step whose variables live on the host (`Layout(host=("variables",))`), which no fit search climbs,
     under a fit policy recomputing everything (`FitPolicy(remat="full")`) compiles at that rung: every
@@ -1435,6 +1464,7 @@ def streamed_only() -> int:
     return (below + device) // 2
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_fit_whose_devices_hold_neither_step_searches_the_devices_once_before_placing(caplog):
     """A fresh fit on stand-in H100s that hold its state and neither its devices' step nor the streamed one
     (`streaming_needs`): the layout choice's search of the devices' step before the state is placed finds no
@@ -1458,6 +1488,7 @@ def test_a_fit_whose_devices_hold_neither_step_searches_the_devices_once_before_
     assert len(searched) == 1, [record.getMessage()[:120] for record in searched]
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_states():
     """A fresh fit on GPUs (the host's CPUs standing in for H100s, `stand_in_gpus`) that hold the step
     streaming its parameters from the host and not the step keeping the state on them (its Adam state
@@ -1488,47 +1519,55 @@ def test_a_fit_its_devices_hold_only_streamed_trains_as_the_streamed_layout_stat
 
 
 
-def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout():
-    """A fresh LoRA fit whose frozen base is a decoder of a plain loop (scan_layers=False) on GPUs that
+def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout(caplog):
+    """A fresh LoRA fit whose frozen base is a decoder of a plain loop (`stacked(scanned=False)`) on GPUs that
     price the streamed step (the host's CPUs standing in for H100s): no host layout holds a plain loop's
     stack in bank memory (`execution.unscanned`), so the streamed step is no candidate, said by name, and
     the run trains in its device layout, or, its device plan refused too, is refused by that plan. Before,
     the chooser laid the streamed start out and its frozen base's placement raised (rows 8336, 8358:
-    test_dory's LoRA cell on every GPU tier; row 8639)."""
-    from model_support import memory_limited_to
+    test_dory's LoRA cell on every GPU tier; row 8639). The refusal is said as a warning naming the scan
+    that streams it, a plain stack the default (the API02 review: said at info, the host layout a
+    scanned default chose lost unsaid)."""
+    with stacked(scanned=False):
+        from model_support import memory_limited_to
 
-    from dew.lora import LoRA
-    from dew.mesh import LayoutRefused
-    from dew.training.ahead import stand_in_gpus
+        from dew.lora import LoRA
+        from dew.mesh import LayoutRefused
+        from dew.training.ahead import stand_in_gpus
 
-    model = CausalTransformer(vocab_size=256, emb_features=64, num_layers=2, num_heads=2, mlp_features=128,
-                              max_seq_len=8, scan_layers=False)
-    variables = nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
-    adapted = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables, key=2)
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
-        trainer = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
-                                      variables=adapted.variables), optax.adam(.001), key=jax.random.key(6))
-        trainer.fit(streaming_data(), steps=1, log_every=100)
-    choice = trainer.layout_choice
-    assert not trainer.host_master and not choice.streams and choice.refused is not None, choice
-    # Its device plan refused too (a split no batch divides into whole rows), no layout runs: that refusal,
-    # never the host layout's placement raising over the plain loop (row 8639).
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
-        split = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
-                                    variables=adapted.variables), optax.adam(.001), key=jax.random.key(6),
-                        fit=FitPolicy(split=3))
-        with pytest.raises(LayoutRefused):
-            split.fit(streaming_data(), steps=1, log_every=100)
-    # Its devices too small for its state between steps, which the given layout's placement refuses before
-    # any plan: refused so, the streamed step read ineligible from the objective's draw first, never the
-    # host layout's placement raising over the plain loop (row 8784).
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to(2 ** 18)):
-        small = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
-                                    variables=adapted.variables), optax.adam(.001), key=jax.random.key(6))
-        with pytest.raises(LayoutRefused):
-            small.fit(streaming_data(), steps=1, log_every=100)
+        model = CausalTransformer(vocab_size=256, emb_features=64, num_layers=2, num_heads=2,
+                                  mlp_features=128, max_seq_len=8)
+        variables = nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+        adapted = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables, key=2)
+        with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+            trainer = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
+                                          variables=adapted.variables), optax.adam(.001),
+                              key=jax.random.key(6))
+            with caplog.at_level("WARNING", logger="dew.training.streaming"):
+                trainer.fit(streaming_data(), steps=1, log_every=100)
+        choice = trainer.layout_choice
+        assert not trainer.host_master and not choice.streams and choice.refused is not None, choice
+        assert any("layer_scan='scanned'" in record.getMessage() for record in caplog.records
+                   if record.levelname == "WARNING")
+        # Its device plan refused too (a split no batch divides into whole rows), no layout runs: that
+        # refusal, never the host layout's placement raising over the plain loop (row 8639).
+        with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
+            split = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
+                                        variables=adapted.variables), optax.adam(.001), key=jax.random.key(6),
+                            fit=FitPolicy(split=3))
+            with pytest.raises(LayoutRefused):
+                split.fit(streaming_data(), steps=1, log_every=100)
+        # Its devices too small for its state between steps, which the given layout's placement refuses before
+        # any plan: refused so, the streamed step read ineligible from the objective's draw first, never the
+        # host layout's placement raising over the plain loop (row 8784).
+        with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to(2 ** 18)):
+            small = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
+                                        variables=adapted.variables), optax.adam(.001), key=jax.random.key(6))
+            with pytest.raises(LayoutRefused):
+                small.fit(streaming_data(), steps=1, log_every=100)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.tpu(reason="a TPU v6e prices the streamed step by its stated host link (row 7908)")
 def test_a_tpu_that_holds_only_the_streamed_step_streams_on_par_with_its_device_plan():
     """A fresh bf16 fit on a v6e stated to hold the decoder's streamed step and not its device plan (its
@@ -1563,6 +1602,7 @@ def test_a_tpu_that_holds_only_the_streamed_step_streams_on_par_with_its_device_
     crossed(optax.adam(.01), "three updates across a TPU's execution boundary", jax.devices()[:1])
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_run_that_chose_to_stream_resumes_streamed_where_it_would_have_stood(tmp_path):
     """A run that chose to stream its parameters from the host (its devices holding that step alone),
     stopped after its first step and resumed on devices that hold either step, resumes in its checkpoint's
@@ -1587,6 +1627,7 @@ def test_a_run_that_chose_to_stream_resumes_streamed_where_it_would_have_stood(t
     equal(trained.variables, expected.variables)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("host_rate", [1e6, 1e20], ids=["slow host", "fast host"])
 def test_a_fit_compiles_its_streamed_step_only_where_its_device_plan_is_dearer_than_its_update(host_rate):
     """A fresh bf16 fit on stand-in H100s that hold its device plan weighs the streamed step only where the
@@ -1630,6 +1671,7 @@ def streamed_priced(trainer: Trainer, data):
     return choice.streamed
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_rollout_run_keeps_its_devices_layout_its_first_batch_pricing_no_step():
     """A fresh fit whose rollout makes its steps' batches, on a stand-in H100 holding both plans, keeps its
     devices' layout, said by name: its stream's first batch is the rollout's input, no step's, so the
@@ -1664,6 +1706,7 @@ def streamed_program(trainer: Trainer, state, variables, step):
                                                                              jnp.int32)}, step)[0]
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_fit_whose_device_plan_no_datasheet_prices_keeps_it_compiling_no_streamed_step():
     """A fresh float32 fit on stand-in H100s that hold its device plan, its host's memory as fast as any:
     no datasheet rates a float32 step (`memory.DENSE`), so its device plan is unpriced, which the streamed
@@ -1682,6 +1725,7 @@ def test_a_fit_whose_device_plan_no_datasheet_prices_keeps_it_compiling_no_strea
     assert streamed.count == 0, streamed.programs
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_ramped_fit_plans_and_compiles_its_first_step_once():
     """A fresh fit whose batch of two rows a device ramps from one (`Ramp`), on stand-in H100s whose host's
     memory is slow (its device plan priced under the streamed step's update): the layout choice plans the
@@ -1707,6 +1751,7 @@ def test_a_ramped_fit_plans_and_compiles_its_first_step_once():
     assert [program.kind for program in steps.programs] == ["traced", "compiled"], steps.programs
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_ramped_fits_streamed_step_is_priced_over_its_first_stage_read_whole():
     """A fresh fit given two microbatches a step whose batch ramps from one row a device to two, on stand-in
     H100s whose host prices the streamed step: the streamed step is priced over the first stage's batch read
@@ -1787,6 +1832,7 @@ def test_a_phased_runs_two_prices_are_at_its_first_phases_pass_count():
     assert phased[0] is not None and phased == single, prices
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_distillations_streamed_price_reads_its_teachers_banks():
     """A fresh bf16 distillation's streamed step reads its frozen teacher's layers from host memory every
     forward (`frozen_trees`' banks), which its price's link counts: above the same student's alone."""
@@ -1857,6 +1903,7 @@ def prepared_untuned(beside: bool = False) -> dict:
     return fresh(PREPARED_HOST, "beside" if beside else "alone", flags=untuned, platforms="cpu")
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companions_here(tmp_path, monkeypatch):
     """A host step prepared for GPUs this process lacks (one compile-only H100, `prepare_host_step`), over its
     fresh state's shapes, compiles the accelerator's programs for them as a device will run them
@@ -1929,6 +1976,7 @@ def rolled_out_fit(rollout, steps: int = 2, tracker=None):
                                 eval_every=None, checkpoint_every=None)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=4)
 def test_a_host_runs_rollout_samples_from_a_copy_of_its_weights_on_its_devices():
     """A run that keeps its variables on the host hands its rollout a state whose weights are on the step's
@@ -1959,6 +2007,7 @@ def test_a_host_runs_rollout_samples_from_a_copy_of_its_weights_on_its_devices()
     assert len(copied) == 2 and copied[0] == copied[1] > 0, copied
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=4)
 def test_a_host_runs_rollout_program_past_its_devices_room_is_refused_by_name():
     """A program a host run's rollout compiles on its devices (here a 64 MiB draw, as a generation's KV cache
@@ -2132,6 +2181,8 @@ def test_a_host_step_under_autopgle_runs_its_programs_guided_by_a_trials_profile
     profiled = {id(executable) for _, executable, _, _ in ran}
     assert stepped and profiled.isdisjoint(id(each) for each in stepped), (len(stepped), len(ran))
 
+
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_step_lowers_for_a_gpu_here_compiling_nothing():
     """A step that keeps its variables on the host, lowered on this CPU for an H100 (`Trainer(lower_for=)`,
     its norms Pallas's), raises the dry run's `Lowered` with each program its steady steps call: its
@@ -2157,6 +2208,7 @@ def test_a_host_step_lowers_for_a_gpu_here_compiling_nothing():
     assert {"rms_norm_forward"} <= {launch["name"] for launch in lowered.value.kernels.record()["launches"]}
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_streamed_step_on_gpus_is_priced_over_the_hosts_cpu_companion():
     """The streamed step of a bf16 decoder on GPUs (one compile-only H100) is admitted over this host's CPUs
     as its companion (`streaming.streamed`): the companion read outside the GPUs' mesh, whose trace no CPU
@@ -2174,6 +2226,7 @@ def test_a_streamed_step_on_gpus_is_priced_over_the_hosts_cpu_companion():
     assert fits
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_lora_run_with_a_frozen_base_is_priced_streamed():
     """A fresh bf16 LoRA run, its adapted weights' base frozen (the run's frozen collection), is priced
     streamed, no longer refused: its frozen base's banks are read once a forward, its other leaves resident
@@ -2189,6 +2242,7 @@ def test_a_lora_run_with_a_frozen_base_is_priced_streamed():
     assert streamed_priced(trainer, {"text": rows}).link > 0
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_part_stating_no_host_link_prices_no_streamed_step():
     """A fresh fit on a part whose table states no host link (a TPU's, `GpuTarget.host_links`) keeps its
     devices' layout, the streamed step refused by name in the choice it keeps."""

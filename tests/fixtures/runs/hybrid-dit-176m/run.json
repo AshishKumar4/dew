@@ -48,7 +48,6 @@
       "prediction_depths": null,
       "attention": null,
       "dex": null,
-      "scan_layers": false,
       "packed_weights": false,
       "param_dtype": null,
       "step": null,

@@ -38,12 +38,11 @@ import numpy as np
 
 import dew
 from dew._accuracy import rms
-from dew.inference.serving import Server
+from dew.inference.serving import DenseKV, Server
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.categorical import token_log_probs
 from dew.nn.inputs import ModelInputs
 from dew.nn.kernels.generation import chosen
-from dew.nn.kv_cache import KVCache
 from dew.sampling import Sampling
 from dew.sampling.text import decode_ops, prefill_state
 
@@ -57,8 +56,7 @@ BLOCK = 64
 
 def greedy(task):
     """`task` decoding greedily with no end: no EOS, no source logits transform or stopping."""
-    return dataclasses.replace(task, sampling=Sampling(temperature=0, eos_token_ids=None), logits=None,
-                               stopping=(), strategy=None, n=1)
+    return dataclasses.replace(task, sampling=Sampling(temperature=0, eos_token_ids=None), n=1)
 
 
 def capacity_for(prompt: int, steps: int) -> int:
@@ -68,8 +66,8 @@ def capacity_for(prompt: int, steps: int) -> int:
 def served(task, rows: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray]:
     """Row 0's greedy tokens and their log-probabilities, `rows` served together by Dew's server."""
     server = Server.from_task(task, slots=len(rows), capacity=capacity_for(rows.shape[1], steps),
-                                  admission=len(rows), kv_cache=KVCache(page_size=None), chunk=None,
-                                  prefix_cache=False, decode_steps=1)
+                                  admission=len(rows), cache=DenseKV(), chunk=None,
+                                  decode_steps=1)
     tickets = [server.submit(row, max_new_tokens=steps, key=0) for row in rows]
     server.run()
     first = tickets[0].result().host()

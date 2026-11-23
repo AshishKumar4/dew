@@ -38,7 +38,7 @@ from interop_support import (
     tiny_pipeline,
     transformers_arms,
 )
-from model_support import flat_tree
+from model_support import compiled_apply, flat_tree, unrolled
 from reference_error import as_given, assert_as_exact, dew_programs, indexed_recording, recording, widened
 from run_kinds import stated
 from safetensors.numpy import load_file
@@ -585,8 +585,8 @@ def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, referenc
                                     ("params", "layers_1", "mlp", "up_proj")}
     assert {target.alpha for target in adapter.targets.values()} == {6.0}
     tokens = jnp.asarray(reference["input_ids"])
-    np.testing.assert_array_equal(np.asarray(adapter.model.apply(variables, tokens)),
-                                  np.asarray(decoder.model.apply(decoder.variables, tokens)))
+    np.testing.assert_array_equal(np.asarray(compiled_apply(adapter.model, variables, tokens)),
+                                  np.asarray(compiled_apply(decoder.model, decoder.variables, tokens)))
     a = variables["params"]["layers_1"]["mlp"]["up_proj"]["lora_A"]
     assert a.shape == (64, 3) and 0 < float(jnp.abs(a).max()) <= 1 / 8
     assert not bool(jnp.any(variables["params"]["layers_1"]["mlp"]["up_proj"]["lora_B"]))
@@ -595,15 +595,15 @@ def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, referenc
             decoder.model, decoder.variables, key=0, layouts=decoder.layouts)
 
 
-@pytest.mark.parametrize("scan", [False, True])
-def test_an_adapter_on_gate_and_up_keeps_its_branch_where_the_row_joins_them(decoder, reference, scan):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_an_adapter_on_gate_and_up_keeps_its_branch_where_the_row_joins_them(decoder, reference, stack_scan):
     """An adapted model's gate and up, with their projections apart or a join
     of them into one GEMM chosen (`dew.nn.joined`), keep the adapter's branch,
     in a scanned stack too: the branch moves the logits off the base model's
     either way."""
     adapter = LoRA(rank=3, modules=("gate_proj", "up_proj")).apply(
         decoder.model, decoder.variables, key=0, layouts=decoder.layouts)
-    model = adapter.model.clone(scan_layers=scan)
+    model = adapter.model
     variables = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
         if path[-1].key == "lora_B" else leaf, adapter.variables)
@@ -615,12 +615,13 @@ def test_an_adapter_on_gate_and_up_keeps_its_branch_where_the_row_joins_them(dec
         assert np.max(np.abs(adapted - base)) > 1e-2, joins
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_layers_adapted_at_their_own_ranks_scan_apart(decoder, loaded, reference):
     """PEFT's rank pattern adapts layer 1's v_proj at rank 2 beside layer 0's 4: their factors cannot
     stack, so a scanned stack runs the two as runs of their own (`StackView.layer_structures` keys a layer
     by its leaves' shapes too, row 4095: as one run, their factors' stack raised), and the adapter's
     branch moves its logits off the base model's as in the plain loop."""
-    model = loaded.model.clone(scan_layers=True)
+    model = loaded.model.clone()
     variables = jax.tree_util.tree_map_with_path(
         lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
         if path[-1].key == "lora_B" else leaf, loaded.variables)
@@ -1224,11 +1225,12 @@ UNEVEN_SEEDS = 8
 """Check 1's declared seeds for layers adapted otherwise, scanned apart against the plain loop."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
     """A scanned stack runs its like layers as one module, `layers_0_1`; the
     adapter's targets are named per layer, so the branch resolves the run to
     its layers and every layer's factors carry gradient. Before this, a
-    stack cloned to `scan_layers=True` after adapting silently trained only
+    stack scanned after adapting silently trained only
     the layers that ran alone. Layers whose targets differ (another alpha at
     one rank, the factors' shapes alike) run as runs of their own
     (`CausalTransformer.scanned_like`), computing what the plain loop does,
@@ -1236,9 +1238,9 @@ def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
     adapter = LoRA(rank=2, modules=("q_proj",), alpha=4.0).apply(decoder.model, decoder.variables, key=1,
                                                                  layouts=decoder.layouts)
     variables = adapter.variables
-    scanned = adapter.model.clone(scan_layers=True)
+    scanned = adapter.model
     tokens = jnp.asarray(reference["input_ids"])
-    plain = adapter.model.apply(variables, tokens)
+    plain = unrolled(adapter.model.apply)(variables, tokens)
     np.testing.assert_allclose(
         np.asarray(scanned.apply(variables, tokens)), np.asarray(plain), rtol=1e-5, atol=1e-5
     )
@@ -1251,18 +1253,17 @@ def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
         factors = grads[layer]["self_attn"]["q_proj"]
         assert float(jnp.abs(factors["lora_B"]).max()) > 0, layer
     uneven = {**adapter.targets, ("params", "layers_1", "self_attn", "q_proj"): Target(2, 8.0)}
-    looped = _rebound(adapter, decoder.model.clone(scan_layers=False), targets=uneven).model
-    rerun = _rebound(adapter, decoder.model.clone(scan_layers=True), targets=uneven).model
-    wide = _rebound(adapter, decoder.model.clone(scan_layers=False, dtype=jnp.float64), targets=uneven).model
+    looped = rerun = _rebound(adapter, decoder.model, targets=uneven).model
+    wide = _rebound(adapter, decoder.model.clone(dtype=jnp.float64), targets=uneven).model
 
     def draw(seed):
         return (jax.random.randint(jax.random.key(seed), tokens.shape, 0, decoder.model.vocab_size),)
 
     # Two programs, the runs scanned apart and the plain loop: on par (check 1).
     assert_as_exact(jax.jit(lambda ids: rerun.apply(variables, ids)),
-                    jax.jit(lambda ids: looped.apply(variables, ids)), draw,
+                    unrolled(jax.jit(lambda ids: looped.apply(variables, ids))), draw,
                     "layers adapted otherwise as runs of their own", seeds=UNEVEN_SEEDS,
-                    truth_fn=jax.jit(lambda ids: wide.apply(widened(variables), ids)))
+                    truth_fn=unrolled(jax.jit(lambda ids: wide.apply(widened(variables), ids))))
 
 
 # --------------------------------------------------------------------------

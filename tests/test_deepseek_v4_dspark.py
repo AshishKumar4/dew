@@ -91,7 +91,7 @@ def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(sourc
     valid = jnp.ones(ids.shape, bool).at[1, :3].set(False)
     inputs = ModelInputs(jnp.where(valid, ids, 0), {"attention_mask": valid})
     walked, speculated = (generate(source.model, source.variables, inputs, 6, key=jax.random.key(0),
-                                   sampling=Sampling(temperature=0), strategy=strategy)
+                                   sampling=Sampling(temperature=0, strategy=strategy))
                           for strategy in (Sample(), Speculative(block=3)))
     np.testing.assert_array_equal(np.asarray(speculated.tokens), np.asarray(walked.tokens))
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
@@ -114,15 +114,15 @@ def test_load_balancing_moves_the_routers_the_trunk_ran_and_no_other(source):
         assert unchanged == (path[0] not in ran), path
 
 
-@pytest.mark.parametrize("scan_layers", [False, True])
-def test_a_stack_in_host_memory_writes_what_its_caller_opens_as_a_resident_one_does(source, scan_layers):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_a_stack_in_host_memory_writes_what_its_caller_opens_as_a_resident_one_does(source, stack_scan):
     """The layers left in host memory run one at a time in a scope of their own
     (`decoder_stack.run_stack`), and read and write every collection the caller
     opens as a resident stack does: with the routers' balancing biases moved off
     zero and opened beside the DSpark target layers' `prediction_inputs` and the
     router's choices, the logits, the state and the drafted context are the
     resident stack's, on a first call and on a second reading the first's state."""
-    model = source.model.clone(scan_layers=scan_layers)
+    model = source.model
     ids = jnp.asarray(ROWS["rows"][0])[:, :6]
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
 

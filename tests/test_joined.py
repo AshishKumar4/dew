@@ -237,14 +237,14 @@ def test_quantized_projection_calls_keep_their_own_paths_under_a_joined_row(wrap
         assert dots(layer.apply, plain, inputs) == 2
 
 
-@pytest.mark.parametrize("scan", [False, True])
-def test_direct_qwix_preserves_projection_sites_in_plain_and_scanned_decoders(scan):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_direct_qwix_preserves_projection_sites_in_plain_and_scanned_decoders(stack_scan):
     qwix = pytest.importorskip("qwix")
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2,
-                              mlp_features=32, max_seq_len=8, scan_layers=scan, attention_impl="reference")
+                              mlp_features=32, max_seq_len=8, attention_impl="reference")
     provider = qwix.QtProvider([qwix.QtRule(module_path=".*gate_proj", weight_qtype=jnp.int8,
                                            act_qtype=jnp.int8)])
     quantized = qwix.quantize_model(model, provider)

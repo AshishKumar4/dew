@@ -23,7 +23,7 @@ import pytest
 import torch
 from flax import linen as nn
 from map_judge import marked_seeds
-from model_support import TINY_DECODER, Digits, decoder, flat_tree, stepped_outputs
+from model_support import TINY_DECODER, Digits, compiled_apply, decoder, flat_tree, stepped_outputs, unrolled
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from serving_support import Served, assert_same_draws, assert_served_as_exact
 
@@ -31,7 +31,7 @@ from dew.batch import FROZEN, coordinates, thaw
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.inference import RunProcessor, TextGeneration
-from dew.inference.serving import Server
+from dew.inference.serving import PagedKV, Server
 from dew.interop.pretrained import Pretrained
 from dew.lora import LoRA
 from dew.nn.attention_residuals import AttentionResiduals
@@ -49,7 +49,6 @@ from dew.nn.cross_attention import (
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext, ModelInputs
-from dew.nn.kv_cache import KVCache
 from dew.nn.mlp import GatedMLP
 from dew.nn.ngpt import NGPT
 from dew.nn.precision import WIDE_CPU_ARITHMETIC
@@ -395,12 +394,13 @@ def test_a_cached_document_reads_its_own_context_without_it(cross):
     assert not np.array_equal(decoded(ids, context, named=False), decoded(ids, second, named=False))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_stack_runs_its_blocks_as_the_plain_one():
     """With a block on every layer the layers scan as one run, its blocks' leaves stacked, on par with
     the plain loop from its float64 (check 1)."""
     every = dataclasses.replace(MODEL, cross_attention=dataclasses.replace(CROSS, layer_ids=(0, 1, 2)))
-    assert_as_exact(logits(every.clone(scan_layers=True)), logits(every), model_draw(every), "scanned blocks",
-                    seeds=SEEDS["scan"], truth_fn=logits(float64(every)))
+    assert_as_exact(logits(every), unrolled(logits(every)), model_draw(every), "scanned blocks",
+                    seeds=SEEDS["scan"], truth_fn=unrolled(logits(float64(every))))
 
 
 def test_a_decoder_refuses_what_its_blocks_cannot_read():
@@ -549,8 +549,8 @@ def test_the_blocks_train_beside_a_whole_source_where_it_is_not_frozen(source):
     for path, leaf in own.items():
         np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(leaf), err_msg=path)
     tokens = jnp.arange(8, dtype=jnp.int32)[None] % 256
-    np.testing.assert_array_equal(np.asarray(attached.model.apply(attached.variables, tokens)),
-                                  np.asarray(source.model.apply(source.variables, tokens)))
+    np.testing.assert_array_equal(np.asarray(compiled_apply(attached.model, attached.variables, tokens)),
+                                  np.asarray(compiled_apply(source.model, source.variables, tokens)))
     lora = LoRA(rank=2, modules=("q_proj",))
     later = attached.adapt(lora, key=1)
     earlier = source.adapt(lora, key=1).with_cross_attention(cross, key=0, frozen=False)
@@ -616,9 +616,9 @@ def request(index: int, length: int | None = None) -> ModelInputs:
 
 @pytest.mark.parametrize("options", [
     {},
-    {"kv_cache": KVCache(page_size=4, pages=40)},
-    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3},
-    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True},
+    {"cache": PagedKV(page_size=4, pages=40)},
+    {"cache": PagedKV(page_size=4, pages=40), "chunk": 3},
+    {"cache": PagedKV(page_size=4, pages=40, prefix_cache=True), "chunk": 3},
 ], ids=["dense", "paged", "chunked", "prefix"])
 def test_a_served_request_reads_its_own_context(options):
     """Requests of their own contexts, one with none, served together over a dense cache, a pool of
@@ -646,17 +646,17 @@ def test_a_served_request_reads_its_own_context(options):
                                       lone.host().behavior_log_probs)
     # "1234567" keeps its last token to prefill: one full page of four is shared, under its context alone.
     # A paged server shares prefixes unless told not to (`prefix_cache` None).
-    shares = "kv_cache" in options and options.get("prefix_cache", True)
+    shares = "cache" in options and options["cache"].prefix_cache is not False
     assert (hits, server.prefix_hits) == ((4, 4) if shares else (0, 0))
 
 
 @pytest.mark.parametrize("options", [
     pytest.param({}, id="dense", marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
-    pytest.param({"kv_cache": KVCache(page_size=4, pages=40)}, id="paged",
+    pytest.param({"cache": PagedKV(page_size=4, pages=40)}, id="paged",
                  marks=pytest.mark.check1_shards(seeds=512, per_task=128)),
-    pytest.param({"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3}, id="chunked",
+    pytest.param({"cache": PagedKV(page_size=4, pages=40), "chunk": 3}, id="chunked",
                  marks=pytest.mark.check1_shards(seeds=256, per_task=128)),
-    pytest.param({"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True}, id="prefix",
+    pytest.param({"cache": PagedKV(page_size=4, pages=40, prefix_cache=True), "chunk": 3}, id="prefix",
                  marks=pytest.mark.check1_shards(seeds=256, per_task=128))])
 def test_served_requests_score_their_draws_from_their_own_contexts(options, request):
     """Requests of their own contexts, one with none, served together as

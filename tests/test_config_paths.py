@@ -11,7 +11,7 @@ import json
 import typing
 
 import pytest
-from option_witness import alternatives, flag, held_at, replaced
+from option_witness import alternatives, flag, held_at, members_of, replaced
 from run_kinds import KINDS, saved_record, scalars, trained_by_cli, trained_record
 
 from dew import registry
@@ -61,6 +61,21 @@ def option(kind: str, path: str, index: int) -> tuple[RunConfig, object, object]
     base = registry.runs[kind]()
     held = [(hint, value) for name, hint, value in options(base) if name == path]
     return base, *held[index]
+
+
+def test_a_strategy_is_witnessed_by_the_classes_its_call_binds_to_and_no_other():
+    """The witnesses of a protocol of a call alone (`dew.sampling.Strategy`) are the classes its call's
+    arguments bind to (`option_witness.members_of`): Dew's sampling loop among them, and no metric, which
+    is called with a pass's artifact and batch alone (Train 1209: a perplexity built as a strategy), nor a
+    class its instances are not called on, whose constructor takes any arguments (an optimizer's spec).
+    """
+    from dew.objectives.lm.objective import Perplexity
+    from dew.optim import MuonClip
+    from dew.sampling import Sample, Strategy
+
+    found = members_of(Strategy)
+    assert any(isinstance(value, Sample) for value in found)
+    assert not any(isinstance(value, Perplexity | MuonClip) for value in found)
 
 
 @pytest.mark.parametrize(("kind", "path", "index"), cases(), ids=lambda part: str(part))

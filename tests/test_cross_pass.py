@@ -15,7 +15,14 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from map_judge import marked_seeds
-from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
+from model_support import (
+    TINY_DECODER,
+    as_stepped,
+    compiled_apply,
+    decode_steps,
+    model_draw,
+    with_logit_cotangent,
+)
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.attention_residuals import AttentionResiduals
@@ -47,19 +54,38 @@ MESSAGES = CrossPass(block_size=2, rank=4)
 """Messages over blocks of two layers through a controller of rank 4."""
 
 
+SCANNED_FORMS = ("scanned", "periodic")
+"""The forms whose decoder scans its stack (`decoder`)."""
+
+
+@pytest.fixture(autouse=True)
+def scanned_forms(request):
+    """A test of a form `decoder` scans (`SCANNED_FORMS`, its `form` or its case's first element) runs its
+    decoders' stacks scanned (`generation.chosen(layer_scan="scanned")`), every other form's a layer at a
+    time."""
+    from dew.nn.kernels import generation
+
+    named = getattr(getattr(request.node, "callspec", None), "params", {})
+    case = named.get("case")
+    form = named.get("form", case[0] if isinstance(case, tuple) else None)
+    with generation.chosen(layer_scan="scanned" if form in SCANNED_FORMS else "plain"):
+        yield
+
+
 def decoder(form: str, **loop) -> CausalTransformer:
     """A tiny decoder of four layers in `form`: attention alone ('attention'), a hybrid of gated delta nets
     and attention ('hybrid'), attention under Kimi K3's attention residuals in blocks of two ('depth'), or
-    six attention layers scanned as one run (`scan_layers`, 'scanned'), or a hybrid whose block of four is
-    two periods of a delta net and an attention layer, scanned (a periodic run, 'periodic'); its block
+    six attention layers scanned as one run ('scanned'), or a hybrid whose block of four is
+    two periods of a delta net and an attention layer, scanned (a periodic run, 'periodic'), each scanned
+    as its test runs it (`scanned_forms`); its block
     [`first`, end) looped as `loop` says where it says anything, passing `MESSAGES` (blocks of four where
     scanned)."""
     fields = {"vocab_size": VOCAB, **TINY_DECODER, "num_layers": 4, "attention_impl": "reference",
               "tie_embeddings": False}
     if form == "scanned":
-        fields |= {"num_layers": 6, "scan_layers": True}
+        fields |= {"num_layers": 6}
     if form == "periodic":
-        fields |= {"num_layers": 5, "scan_layers": True, "kinds": DELTA_NETS,
+        fields |= {"num_layers": 5, "kinds": DELTA_NETS,
                    "layer_types": ("full_attention",) + ("linear_attention", "full_attention") * 2}
     if form == "hybrid":
         fields |= {"layer_types": ("linear_attention", "full_attention") * 2, "kinds": DELTA_NETS}
@@ -205,8 +231,8 @@ def test_at_its_gates_draw_a_loop_passing_messages_computes_the_decoder_it_repea
     if steps == 1:
         variables, ids, _ = draw(0)
         np.testing.assert_array_equal(
-            np.asarray(looped.apply(variables, ids)),
-            np.asarray(plain.apply({"params": _without_merges(variables["params"])}, ids)))
+            np.asarray(compiled_apply(looped, variables, ids)),
+            np.asarray(compiled_apply(plain, {"params": _without_merges(variables["params"])}, ids)))
         return
     looped_results = _results(looped.apply)
 

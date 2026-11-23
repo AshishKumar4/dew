@@ -28,8 +28,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.inference import NCCLPush, OpenAICompletion, OpenAIRolloutServer, SafetensorsReload
-from dew.inference.nccl import _DTYPES
+from dew.inference import OpenAICompletion, OpenAIRolloutServer
+from dew.inference.nccl import _DTYPES, NCCLPush
+from dew.inference.rollouts import SafetensorsReload
 from dew.interop import Pretrained
 from dew.sampling import Sampling
 

@@ -12,6 +12,7 @@ likelihood stays the model's own.
 
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -44,8 +45,8 @@ def task(tokenizer, grammar, sampling=_DEFAULT_TASK_SAMPLING):
     model = CausalTransformer(vocab_size=EOS + 1, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=256, dtype="float32")
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    return TextGeneration(model, params, RunProcessor(tokenizer), sampling=sampling,
-                          strategy=Sample(grammar))
+    return TextGeneration(model, params, RunProcessor(tokenizer),
+                          sampling=replace(sampling, strategy=Sample(grammar)))
 
 
 def continuation(tokenizer, generation):

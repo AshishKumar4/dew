@@ -36,7 +36,7 @@ from dew.telemetry.instrumentation import step_flops
 from dew.training._fit import Start, handed, staged
 from dew.training.diloco import DILOCO_ON_HOST
 from dew.training.distributed import marked, microbatch_shapes
-from dew.training.execution import HostExecution, frozen_trees, stack_sites, unscanned
+from dew.training.execution import PLAIN_LOOP, HostExecution, frozen_trees, stack_sites, unscanned
 from dew.training.memory import (
     StepPrice,
     Unpriced,
@@ -299,7 +299,10 @@ def said(choice: Choice) -> None:
         _log.info("the run resumes its checkpoint's layout: the parameters %s",
                   "streamed from the host" if choice.streams else "on the devices")
     elif choice.refused is not None:
-        _log.info("the step does not stream its parameters from the host: %s", choice.refused)
+        # A plain loop's refusal said as loudly as the streaming it costs (the API02 review: a default
+        # plain decoder lost the host layout its scanned default chose, unsaid): its remedy names the scan.
+        (_log.warning if choice.refused.startswith(PLAIN_LOOP) else _log.info)(
+            "the step does not stream its parameters from the host: %s", choice.refused)
     elif choice.streams:
         _log.warning("the step streams its parameters from the host (Layout(host=('variables',))): %s",
                      choice.record())

@@ -1624,3 +1624,26 @@ def test_a_saved_decoder_naming_a_layer_kind_at_its_defaults_reads_as_its_class_
                         "fields": {"kinds": {"dense": kind}}}}
     assert earlier_shapes(record)["model"]["fields"]["kinds"] == {"dense": {**kind, "fields": {}}}
 
+
+
+def test_a_calls_sampling_keeps_the_tasks_criteria_and_strategy_where_it_names_none():
+    """A call's `sampling=` runs over its task's policy by one rule (`Sampling.with_defaults_of`): what it
+    leaves at its defaults, its EOS id, its stopping criteria and its strategy, it keeps of the task's;
+    what it names is its own (Train 1208's review F1: a call's sampling dropped its task's criteria and its
+    beam search, drawing past the one and sampling where the other searched)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.sampling import Sampling
+    from dew.sampling.decoding import MaxNewTokens
+    from dew.sampling.strategies import Beam
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8)
+    bound = Sampling(eos_token_ids=(15,), stopping=(MaxNewTokens(3),), strategy=Beam(width=2))
+    task = TextGeneration(model, jax.eval_shape(model.init, jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+                          sampling=bound)
+    kept = task.controls(Sampling(temperature=0.5))
+    assert (kept.temperature, kept.eos_token_ids, kept.strategy) == (0.5, (15,), Beam(width=2))
+    assert MaxNewTokens(3) in kept.stopping
+    named = task.controls(Sampling(temperature=0.5, stopping=(MaxNewTokens(2),), strategy=Beam(width=3)))
+    assert named.strategy == Beam(width=3)
+    assert MaxNewTokens(2) in named.stopping and MaxNewTokens(3) not in named.stopping

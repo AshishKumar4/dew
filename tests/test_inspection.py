@@ -1098,6 +1098,7 @@ def test_a_distribution_matching_student_updates_cotangent_reaches_its_trained_c
     assert trained and all(leaf[..., 0].min() > 0 and np.isfinite(leaf[..., 2]).all() for leaf in trained)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("stacked", ["scanned", "pipelined"])
 def test_a_path_glob_selects_the_layer_its_log_names(stacked):
@@ -1113,7 +1114,7 @@ def test_a_path_glob_selects_the_layer_its_log_names(stacked):
     from dew.training import MeshSpec
 
     def logged(*modules: str) -> dict[str, float]:
-        fields = {**TINY_DECODER, "num_layers": 4, **({"scan_layers": True} if stacked == "scanned" else {})}
+        fields = {**TINY_DECODER, "num_layers": 4}
         model = models.build("causal_transformer", vocab_size=64, **fields, num_kv_heads=2)
         staged = MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])
         placed = {"fit": FitPolicy(microbatches=2), "mesh": staged} if stacked == "pipelined" else {}

@@ -37,7 +37,7 @@ from dew.data.dataset import Loader, replayed
 from dew.decision import Choice, DecisionModel, DecisionObjective, Example, JointSchemaHead
 from dew.decision.layout import SegmentLayout
 from dew.inference import TextGeneration
-from dew.inference.serving import Server
+from dew.inference.serving import PagedKV, Server
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
 from dew.interop.sources import load_shards
 from dew.lora import LoRA
@@ -45,7 +45,6 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import ModelInputs
 from dew.nn.kernels import generation
-from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.ngpt import stepped
@@ -381,8 +380,8 @@ def test_prompts_of_two_lengths_decode_side_by_side_as_each_does_alone(mode):
 
 @pytest.mark.parametrize(('mode', 'options'), [
     ('per_loop', {}),
-    ('per_loop', {'kv_cache': KVCache(page_size=4, pages=40), 'chunk': 2, 'prefix_cache': True}),
-    ('last_loop', {}), ('last_loop', {'kv_cache': KVCache(page_size=4, pages=40)})],
+    ('per_loop', {'cache': PagedKV(page_size=4, pages=40, prefix_cache=True), 'chunk': 2}),
+    ('last_loop', {}), ('last_loop', {'cache': PagedKV(page_size=4, pages=40)})],
     ids=['per_loop-dense', 'per_loop-paged-chunked-prefix', 'last_loop-dense', 'last_loop-paged'])
 @pytest.mark.compiles_at_run(reason="a server's tokens against the reference's continuation, no check-1 site")
 def test_a_server_draws_each_prompt_as_the_reference_continues_it(mode, options):
@@ -399,7 +398,7 @@ def test_a_server_draws_each_prompt_as_the_reference_continues_it(mode, options)
     for ticket, continuation in zip(tickets, expected, strict=True):
         served = ticket.result().host()
         np.testing.assert_array_equal(served.tokens[0, served.prompt_width:], continuation)
-    assert (server.prefix_hits > 0) == bool(options.get('prefix_cache'))
+    assert (server.prefix_hits > 0) == ('cache' in options and bool(options['cache'].prefix_cache))
 
 
 @pytest.mark.parametrize('change', [
@@ -413,8 +412,8 @@ def test_a_shared_cache_no_pass_rewrites_serves_prompts_in_pieces(tmp_path, chan
     shared = changed(tmp_path / 'changed', {**change, 'recurrent_kv_cache_mode': 'last_loop'})
     loaded = Pretrained.load(shared, dtype='float32', attention_impl='xla')
     task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0.0))
-    server = Server.from_task(task, slots=2, capacity=32, kv_cache=KVCache(page_size=4, pages=40), chunk=2,
-                              prefix_cache=True)
+    server = Server.from_task(task, slots=2, capacity=32,
+                              cache=PagedKV(page_size=4, pages=40, prefix_cache=True), chunk=2)
     prompts = [*ragged_prompts(), ragged_prompts()[1]]
     tickets = [server.submit(prompt, 6, key=index) for index, prompt in enumerate(prompts)]
     server.run()
@@ -426,7 +425,7 @@ def test_a_shared_cache_no_pass_rewrites_serves_prompts_in_pieces(tmp_path, chan
 
 
 @pytest.mark.parametrize('options', [
-    {'chunk': 2}, {'kv_cache': KVCache(page_size=4, pages=40), 'prefix_cache': True}],
+    {'chunk': 2}, {'cache': PagedKV(page_size=4, pages=40, prefix_cache=True)}],
     ids=['chunked', 'prefix'])
 def test_a_shared_loop_cache_takes_each_prompt_whole(options):
     """A last-loop cache holds the last pass's keys of every token before a call, so a prompt's

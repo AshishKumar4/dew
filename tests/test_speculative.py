@@ -41,7 +41,7 @@ def test_speculation_reproduces_the_greedy_walk_on_a_real_model(kind):
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     params = jax.jit(model.init)(jax.random.key(0), prompts)
     drawn = generate(model, params, prompts, 6, key=jax.random.key(1),
-                     sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+                     sampling=Sampling(temperature=0, strategy=Speculative(block=3)))
 
     walked = np.asarray(prompts)
     for _ in range(6):
@@ -151,7 +151,7 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind, 
     held, steps = LONGROPE_CASES[case]
     prompts = jnp.asarray(held)
     speculated = generate(model, params, prompts, steps, key=jax.random.key(1),
-                          sampling=Sampling(temperature=0), strategy=Speculative(block=3))
+                          sampling=Sampling(temperature=0, strategy=Speculative(block=3)))
     np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, prompts.shape[1]:],
                                   greedy_walk(model, params, prompts, steps))
     np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
@@ -358,8 +358,8 @@ def test_tree_speculation_reproduces_the_greedy_walk_to_the_end_of_its_cache(sha
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     params = jax.jit(model.init)(jax.random.key(0), prompts)
     budget = model.max_seq_len - prompts.shape[1]
-    drawn = generate(model, params, prompts, budget, key=jax.random.key(1), sampling=Sampling(temperature=0),
-                     strategy=TreeSpeculative(TREES[shape]))
+    drawn = generate(model, params, prompts, budget, key=jax.random.key(1),
+                     sampling=Sampling(temperature=0, strategy=TreeSpeculative(TREES[shape])))
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[:, prompts.shape[1]:],
                                   greedy_walk(model, params, prompts, budget))
     np.testing.assert_array_equal(np.asarray(drawn.lengths), budget)
@@ -375,7 +375,7 @@ def test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(k
     held, steps = LONGROPE_CASES[0]
     prompts = jnp.asarray(held)
     speculated = generate(model, params, prompts, steps, key=jax.random.key(1),
-                          sampling=Sampling(temperature=0), strategy=TreeSpeculative(TreeShape.widths(2, 1)))
+                          sampling=Sampling(temperature=0, strategy=TreeSpeculative(TreeShape.widths(2, 1))))
     np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, prompts.shape[1]:],
                                   greedy_walk(model, params, prompts, steps))
     np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
@@ -415,8 +415,8 @@ def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
         return jnp.where((state.step == 1)[:, None], forced, logits)
 
     drawn = generate(model, params, prompt, 6, key=jax.random.key(1),
-                     sampling=Sampling(temperature=0, eos_token_ids=eos, pad_token_id=0),
-                     logits=(script, decoding.Greedy()), strategy=Speculative(block=3))
+                     sampling=Sampling(temperature=0, eos_token_ids=eos, pad_token_id=0,
+                                       logits=(script, decoding.Greedy()), strategy=Speculative(block=3)))
     assert int(drawn.lengths[0]) == 2 and bool(drawn.terminated[0])
     assert int(np.asarray(drawn.tokens)[0, 4]) == eos
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[0, 5:], 0)
@@ -451,7 +451,7 @@ def test_a_blocks_tokens_are_drawn_as_the_target_draws_them():
 
     def counts(seed):
         drawn = generate(model, params, rows, 2, key=jax.random.key(seed),
-                         sampling=Sampling(temperature=LAW_TEMPERATURE), strategy=Speculative(block=3))
+                         sampling=Sampling(temperature=LAW_TEMPERATURE, strategy=Speculative(block=3)))
         tokens = np.asarray(drawn.tokens)[:, 3:5]
         return np.bincount(tokens[:, 0] * vocab + tokens[:, 1], minlength=vocab * vocab)
 
@@ -475,8 +475,8 @@ def test_a_trees_tokens_are_drawn_as_the_target_draws_them():
 
     def counts(seed):
         drawn = generate(model, params, rows, 2, key=jax.random.key(seed),
-                         sampling=Sampling(temperature=LAW_TEMPERATURE),
-                         strategy=TreeSpeculative(TreeShape.widths(3, 2)))
+                         sampling=Sampling(temperature=LAW_TEMPERATURE,
+                                           strategy=TreeSpeculative(TreeShape.widths(3, 2))))
         tokens = np.asarray(drawn.tokens)[:, 3:5]
         return np.bincount(tokens[:, 0] * vocab + tokens[:, 1], minlength=vocab * vocab)
 
