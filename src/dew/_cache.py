@@ -168,14 +168,16 @@ def kept_beside(name: str, *, variable: str | None = None, configured: bool = Fa
 
 
 def read_kept(path: Path) -> JSON | None:
-    """The record kept at `path` (`keep`), or None where none is, or where it cannot be read or parsed (a
-    read-only home, another writer's partial or truncated file), in which case its maker makes it again,
-    the miss logged; one never kept is no miss to log."""
+    """The record kept at `path` (`keep`), or None where none is or it cannot be read (a home it cannot
+    open, whose write the keeping then logs as its miss), or where it does not parse (another writer's
+    partial or truncated file), in which case its maker makes it again, that miss logged."""
     try:
-        return json.loads(path.read_text())
-    except FileNotFoundError:
+        text = path.read_text()
+    except OSError:
         return None
-    except (OSError, ValueError) as unread:
+    try:
+        return json.loads(text)
+    except ValueError as unread:
         _log.warning("the record kept at %s is unreadable (%s): it is made again", path, unread)
         return None
 
