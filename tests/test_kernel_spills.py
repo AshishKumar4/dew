@@ -1113,6 +1113,28 @@ def test_a_runs_launch_traced_outside_its_mesh_is_certified_on_the_gpu_it_target
     assert certified.device == devices.devices.flat[0], certified.device
 
 
+def test_a_launch_outside_any_mesh_is_certified_on_its_own_processs_device(tmp_path):
+    """In each process of a two-process run, a launch traced outside any mesh and any run's target is
+    certified on the device a plain call runs on there (JAX's default, the process's first local device),
+    never another process's: every process's first device was process 0's, which a second process cannot
+    address (rows 7211, 7224)."""
+    import sys
+    from pathlib import Path
+
+    from process_support import ProcessGroup, coordinator_port, report_of, start_process
+
+    worker = Path(__file__).with_name("certifying_device_worker.py")
+    coordinator = f"127.0.0.1:{coordinator_port()}"
+    outs = [tmp_path / f"process{rank}.json" for rank in range(2)]
+    with ProcessGroup() as pool:
+        for rank, out in enumerate(outs):
+            pool.running.append(start_process([sys.executable, str(worker), str(rank), coordinator, str(out)],
+                                              devices=1, environment={"JAX_PLATFORMS": "cpu"}))
+        reports = [report_of(process, out, timeout=300, pool=pool.running)
+                   for process, out in zip(pool.running, outs, strict=True)]
+    assert [(report["devices"], report["certifying"]) for report in reports] == [(2, 0), (2, 1)], reports
+
+
 @CERTIFIES_AT_RUN
 @pytest.mark.gpu(reason="certifies and runs a kernel on this host's GPU")
 def test_a_plain_jit_on_this_gpu_certifies_its_launch_there_and_runs():
