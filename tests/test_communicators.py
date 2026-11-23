@@ -639,8 +639,10 @@ def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(
     review: losers and programs that ran stayed charged for ever)."""
     import gc
 
-    from test_plan import free, lm, needs, trained
+    from affine_run import Replaying
+    from test_plan import BATCH, ROWS, free, lm, needs, trained
 
+    from dew.data.dataset import Loader
     from dew.nn.kernels import options
 
     whole, halves = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=2))
@@ -677,8 +679,10 @@ def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(
         assert len(trainer.plan["probes"]) >= 2 and trainer.plan["split"] > 1, trainer.plan["probes"]
         gc.collect()
         assert charged(probe) == alone + each, (alone, each)
-        # The step run once: its call returned, so nothing is charged ahead of a later program.
-        trained(trainer, steps=1)
+        # The step's first run, its completion seen (`dew.training.memory.first_run`): nothing is charged
+        # ahead of a later program.
+        rows = Replaying(lambda position: {"text": jax.device_get(BATCH["text"])})
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
         gc.collect()
         assert charged(probe) == alone, (alone, each)
     finally:
