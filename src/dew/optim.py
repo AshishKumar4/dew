@@ -1272,20 +1272,37 @@ def _keep_within(lower: float, upper: float) -> optax.GradientTransformation:
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-def _checked_decay_mask(mask: JsonDict | None, spared: bool, owner: str) -> None:
+_DECAY_MASK = tyro.constructors.PrimitiveConstructorSpec(
+    nargs=1,
+    metavar="JSON",
+    instance_from_str=lambda args: json.loads(args[0]),
+    is_instance=lambda value: isinstance(value, (dict, bool)),
+    str_from_instance=lambda value: [json.dumps(value)],
+)
+
+DecayMask = Annotated[Mapping[str, object] | bool, _DECAY_MASK]
+"""A decay's mask as Optax's decay takes it (`optax.add_decayed_weights`' `mask`): a tree of booleans by
+parameter name, a prefix of the parameters' tree, or one boolean over all of them; on the command line one
+JSON value."""
+
+
+def _checked_decay_mask(mask: DecayMask | None, spared: bool, owner: str) -> None:
     """Refuse a decay mask (`OptimConfig.decay_mask`) beside a decay that spares, which writes its own over
-    it, or one whose leaves are not booleans."""
+    it, or one that is neither a boolean nor a tree of them."""
     if mask is None:
         return
     if spared:
         raise ValueError(f"{owner} spares its decay, which writes its own mask over decay_mask: set spared "
                          "False to decay where decay_mask says")
+    if type(mask) is bool:
+        return
     leaves = jax.tree.leaves(mask, is_leaf=lambda leaf: leaf is None)
     if not isinstance(mask, Mapping) or not leaves or not all(type(leaf) is bool for leaf in leaves):
-        raise ValueError(f"{owner}'s decay_mask is a tree of booleans by parameter name, got {mask!r}")
+        raise ValueError(f"{owner}'s decay_mask is a boolean or a tree of them by parameter name, got "
+                         f"{mask!r}")
 
 
-def _decay_masked(mask: JsonDict | None, optimizer: OptimizerSpec) -> dict[str, JsonDict]:
+def _decay_masked(mask: DecayMask | None, optimizer: OptimizerSpec) -> dict[str, DecayMask]:
     """The mask the optimizer's decay takes (`decay_mask`) by its own keyword (`OptimizerSpec.masked_by`),
     where it is given; refused for an optimizer that takes none."""
     keyword = optimizer.masked_by()
@@ -1333,7 +1350,7 @@ class ParamGroup:
     """Whether the group claims the modules its run draws fresh beside a loaded base, ahead of its own
     `patterns` (`Objective.fresh_modules`): what `OptimConfig.with_fresh` names before a run records
     the group."""
-    decay_mask: JsonDict | None = None
+    decay_mask: DecayMask | None = None
     """The parameters the group's decay applies to where it does not spare them (`spared` False): a tree of
     booleans by parameter name, a prefix of its parameters' tree, as Optax's decay takes its mask
     (`optax.add_decayed_weights`); None decays every parameter it claims. An earlier run's mask among its
@@ -2130,7 +2147,7 @@ class OptimConfig:
     a bias toward zero regularizes nothing a matrix's decay does and shifts what the layer computes.
     Optax decays every parameter (`mask=None`), which False restores. A param group decays all it claims
     unless its own `spared` says otherwise (`ParamGroup.spared`); a run's default groups follow this."""
-    decay_mask: JsonDict | None = None
+    decay_mask: DecayMask | None = None
     """The parameters the decay applies to where it does not spare them (`spared` False): a tree of
     booleans by parameter name, a prefix of the parameters' tree, as Optax's decay takes its mask
     (`optax.add_decayed_weights`); None decays every parameter. An earlier run's mask among its optimizer's
@@ -2306,11 +2323,13 @@ class OptimConfig:
         taken = {group.name for group in named}
         names = itertools.chain(("fresh",), (f"fresh{index}" for index in itertools.count(1)))
         name = next(name for name in names if name not in taken)
-        # The fresh group decays as the run's ungrouped optimizer would, its mask among it.
-        fresh = ParamGroup(name, fresh=True, learning_rate_multiplier=multiplier, spared=self.spared,
+        # The fresh group decays as the run's ungrouped optimizer would, its mask among it; an optimizer that
+        # spares nothing (Muon) spares none of a group's either.
+        spared = self.spared and self.optimizer.spares()
+        fresh = ParamGroup(name, fresh=True, learning_rate_multiplier=multiplier, spared=spared,
                            decay_mask=self.decay_mask)
         if not named:
-            return fresh, ParamGroup("base", ("*",), spared=self.spared, decay_mask=self.decay_mask)
+            return fresh, ParamGroup("base", ("*",), spared=spared, decay_mask=self.decay_mask)
         at = next((index for index, group in enumerate(named) if "*" in group.patterns), len(named))
         return (*named[:at], fresh, *named[at:])
 

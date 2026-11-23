@@ -607,6 +607,9 @@ def test_a_decay_mask_reaches_the_groups_a_fresh_module_makes_and_is_refused_bes
     claimed = OptimConfig(optimizer=AdamW(weight_decay=0.1), spared=False, decay_mask=mask).claiming(["head"])
     assert claimed.decay_mask is None and claimed.param_groups
     assert all(group.decay_mask == mask for group in claimed.param_groups)
+    # Muon spares nothing, so its groups decay where the mask says, its run's `spared` read as none.
+    muon = OptimConfig(optimizer=Muon(weight_decay=0.1), decay_mask=mask).claiming(["head"])
+    assert all(group.decay_mask == mask and not group.spared for group in muon.param_groups)
 
 
 def test_muon_takes_qwen35s_hidden_matrices_and_adamw_its_filters_vectors_and_lookups():
