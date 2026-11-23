@@ -1212,6 +1212,42 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
     assert int(_checkpointed(run, loaded, 3, local=local).step) == 3
 
 
+@pytest.mark.parametrize(("optimizer", "decay"), [("adamw", 0.1), ("adam", 0.1), ("adamw", 0.0)],
+                         ids=["adamw-decayed", "adam-coupled-decayed", "adamw-undecayed"])
+def test_a_run_an_intermediate_dew_rewrote_beside_its_mark_resumes_as_it_trained(tmp_path, optimizer, decay):
+    """A run whose earlier record masked its decay off, resumed by an intermediate Dew (main f124c76b5),
+    holds that Dew's rewrite of its record (its decay written as 0) beside its mark
+    (`earlier-masked-decay.json`) and the earlier checkpoint it had not written again: its record loads its
+    decay masked off by its own mask (`decay_mask=False`), a decay of 0 given an inert one, so a checkpoint
+    holding the masked decay step restores as it was written, every leaf, and the run steps on; a run whose
+    earlier decay was 0, which held no such step, is refused at its restore, its tree another, never read
+    across (review of d22: the intermediate format was dropped with its translation)."""
+    import json as json_
+
+    from dew.config.earlier import INERT_DECAY
+    from dew.config.lm import LMRunConfig
+
+    spec = AdamW if optimizer == "adamw" else Adam
+    # The earlier optimizer: a decay masked off, its step held where its decay was not 0.
+    written = OptimConfig(optimizer=spec(weight_decay=decay), learning_rate=1e-2, spared=decay > 0)
+    run = tmp_path / "run"
+    saved = _checkpointed(run, written, 1)
+    rewritten = OptimConfig(optimizer=spec(weight_decay=0.0), learning_rate=1e-2, spared=False)
+    LMRunConfig(optim=rewritten).save(str(run))
+    (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
+    loaded = LMRunConfig.load(str(run)).optim
+    assert (loaded.decay_mask, loaded.spared, loaded.optimizer.weight_decay) == (False, False, INERT_DECAY)
+    if decay == 0:
+        with pytest.raises(ValueError):
+            _checkpointed(run, loaded, 2)
+        return
+    resumed = _checkpointed(run, loaded, 1)
+    assert jax.tree.structure(resumed.opt_state) == jax.tree.structure(saved.opt_state)
+    for got, want in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(saved.opt_state), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert int(_checkpointed(run, loaded, 2).step) == 2
+
+
 @pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
 def test_a_checkpoint_whose_decay_its_options_masked_by_a_tree_restores_into_the_optimizer_its_record_loads(
         tmp_path, optimizer):

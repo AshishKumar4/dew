@@ -43,7 +43,14 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.checkpoints import RUN_FILE, Checkpoints
-from dew.config.earlier import ADDITIVE_UNSETTABLE, LAYOUT_UNSETTABLE, MARKERS, earlier_run
+from dew.config.earlier import (
+    ADDITIVE_UNSETTABLE,
+    LAYOUT_UNSETTABLE,
+    MARKERS,
+    MASKED_DECAY_MARK,
+    earlier_run,
+    unmarked,
+)
 from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.config.trainer import (
@@ -957,7 +964,12 @@ class RunConfig:
         `trust` names the packages outside Dew the record may import."""
         path = epath.Path(directory)
         named_file = str(directory).endswith(".json")
+        # A record an intermediate Dew rewrote beside its mark, as its run trained (`unmarked`).
+        mark = (path.parent if named_file else path) / MASKED_DECAY_MARK
+        marked = json.loads(mark.read_text()) if mark.exists() else None
         record = json.loads((path if named_file else path / RUN_FILE).read_text())
+        if marked is not None:
+            record = unmarked(record, marked)
         # The packages trusted first, so the record's earlier shapes are read with its classes imported.
         registry.import_trusted(record, trust)
         # A field its record left to its checkpoints (`earlier_checkpointed`) is read where the run resumes

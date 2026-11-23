@@ -353,6 +353,53 @@ def mask_readers(config: Mapping[str, JSON]) -> tuple[list[JSON], Sequence[Mappi
     return groups, held if groups else ([] if config.get("spared", True) else [config])
 
 
+MASKED_DECAY_MARK = "earlier-masked-decay.json"
+"""The file an intermediate Dew (main f124c76b5 until row 12338's deletion of its restore translation) kept
+beside a run whose earlier record masked its decay off as it rewrote that record, its masked parts' decay
+written as 0 (`{"unmasked_all": true}` or `{"unmasked_groups": [...]}`): read by `unmarked`."""
+
+INERT_DECAY = 1e-4
+"""The decay a part masked off is given where its rewritten record holds 0: one its mask makes inert,
+which builds the masked decay step its checkpoints hold (`unmarked`)."""
+
+
+def unmarked(record: Mapping[str, object], mark: Mapping[str, object]) -> Mapping[str, object]:
+    """A run record an intermediate Dew rewrote beside its `MASKED_DECAY_MARK` (`mark`), as its earlier run
+    trained: each part the mark names (its optimizer config ungrouped, or each named param group) masked
+    off by its own mask (`OptimConfig.decay_mask`, `ParamGroup.decay_mask`) and unspared, its decay of 0,
+    which that Dew wrote in its place, given `INERT_DECAY`, so its optimizer holds the masked decay step its
+    checkpoints hold. The decay it trained at is not recorded: one of 0 held no step, so a checkpoint of
+    such a run is refused at its restore, its tree another, never read across (Main, review of d22)."""
+    named = _records.class_record(record)
+    if named is None:
+        return record
+    fields = dict(_records.record(named[1], "run fields"))
+    optim = fields.get("optim")
+    tagged = _records.class_record(optim) if isinstance(optim, Mapping) else None
+    config = dict(_records.record(tagged[1] if tagged is not None else optim, "optim"))
+
+    def masked(part: Mapping[str, _records.JSON], decay_of) -> dict[str, _records.JSON]:
+        return {**decay_of(part), "decay_mask": False, "spared": False}
+
+    def decayed(fields_: Mapping[str, _records.JSON]) -> dict[str, _records.JSON]:
+        return {**fields_, "weight_decay": fields_.get("weight_decay") or INERT_DECAY}
+
+    if mark.get("unmasked_all") is True:
+        optimizer = config.get("optimizer")
+        held = _records.class_record(optimizer) if isinstance(optimizer, Mapping) else None
+        if held is not None:
+            config["optimizer"] = {"class": held[0], "fields": decayed(_records.record(held[1], "optimizer"))}
+        config = masked(config, lambda part: dict(part))
+    else:
+        names = set(_records.listed(mark.get("unmasked_groups"), "unmasked groups", read=_records.text))
+        groups = config.get("param_groups") or []
+        assert isinstance(groups, list), groups
+        config["param_groups"] = [masked(group, decayed) if isinstance(group, Mapping)
+                                  and group.get("name") in names else group for group in groups]
+    fields["optim"] = {"class": tagged[0], "fields": config} if tagged is not None else config
+    return {**record, "fields": fields}
+
+
 def _masked(mask: _records.JSON, config: _Fields) -> _Fields:
     """An earlier optimizer's `mask` among its options (`optimizer_opts`), which Dew's own optimizers take no
     longer, as its config's decay mask (`OptimConfig.decay_mask`) or each param group's that read it
