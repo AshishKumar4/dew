@@ -543,20 +543,22 @@ def cublas_version() -> int | None:
     return None
 
 
-def unsafe_cublas(devices: Sequence, cublas: int | None, driver: str | None) -> str | None:
-    """Why a process may not run its GPUs (`devices`, JAX's) under the cuBLAS it selected (`cublas`), with
-    what runs there; None where it may: any whose architecture holds tensor memory (`tmem_columns` of the
-    target its own generation gives, `dew.nn.kernels.generation.device_target`) is refused under a cuBLAS
-    below 13.2
-    (`dew._builds.LEAST_CUBLAS_BESIDE_TENSOR_MEMORY`)."""
-    major, minor = LEAST_CUBLAS_BESIDE_TENSOR_MEMORY
-    if cublas is None or cublas >= major * 10000 + minor * 100:
-        return None
+def unsafe_cublas(devices: Sequence, selected: Callable[[], int | None], driver: str | None) -> str | None:
+    """Why a process may not run its GPUs (`devices`, JAX's) under the cuBLAS it selected (`selected()`, its
+    version: `cublas_version`), with what runs there; None where it may: any whose architecture holds tensor
+    memory (`tmem_columns` of the target its own generation gives,
+    `dew.nn.kernels.generation.device_target`) is refused under a cuBLAS below 13.2
+    (`dew._builds.LEAST_CUBLAS_BESIDE_TENSOR_MEMORY`). cuBLAS is asked only where a GPU holds tensor memory:
+    a process of none never loads it here (an emulated device whose cuBLAS cannot start runs on)."""
     from dew.nn.kernels import generation
 
     holding = sorted({device.device_kind for device in devices if device.platform == "gpu"
                       and generation.device_target(device).architecture.tmem_columns})
     if not holding:
+        return None
+    major, minor = LEAST_CUBLAS_BESIDE_TENSOR_MEMORY
+    cublas = selected()
+    if cublas is None or cublas >= major * 10000 + minor * 100:
         return None
     driver_least = next(least for name, least, _, _ in CUDA_BUILDS if name == "cuda13")
     install = f'uv pip install --extra-index-url {PACKAGE_INDEX} "dewml[cuda13]"'
@@ -582,7 +584,7 @@ def refuse_unsafe_cublas() -> None:
     if not any(device.platform == "gpu" for device in devices):
         return
     listed = nvidia_gpus()
-    refusal = unsafe_cublas(devices, cublas_version(), listed[0] if listed else None)
+    refusal = unsafe_cublas(devices, cublas_version, listed[0] if listed else None)
     if refusal:
         raise UnsafeCublas(refusal)
 

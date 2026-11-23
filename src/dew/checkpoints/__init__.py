@@ -81,7 +81,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import _records
 from dew._cleanup import attempted
-from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
+from dew._coordination import agreed, broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew._files import is_uri, write_atomically
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
@@ -1354,8 +1354,9 @@ class Checkpoints:
 
     def _from_holder(self, holders: frozenset[int], read: Callable[[], JSON]) -> JSON:
         """What `read` gives on the first of `holders`, the processes holding the local step a process
-        lost, handed to every process (`from_every_process`); every process calls it alike."""
-        return from_every_process(read() if jax.process_index() == min(holders) else None)[min(holders)]
+        lost, handed to every process: a read that fails on the holder raises on all (`agreed`, row 12175)."""
+        held = agreed("a holder's read", lambda: read() if jax.process_index() == min(holders) else None)
+        return from_every_process(held)[min(holders)]
 
     def _lost(self, step: int) -> bool:
         """Whether this process lost its copy of local `step`, which it recovers from the processes
