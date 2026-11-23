@@ -1460,8 +1460,7 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands, parameters: tu
                                   nested=False, kind=KernelGlue()))(*operands)
 
 
-def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, state=None,
-                    chunk_size: int = CHUNK_SIZE):
+def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, chunk_size: int, state=None):
     """The memory this shard of a sequence the mesh axis `axis` splits enters its slice with, `[B, Hv, Dk,
     Dv]` in at least fp32, inside a `shard_map` that holds `axis` manual: fla's context-parallel
     summary-then-states (fla/ops/cp/chunk_delta_h.py, fla-core 0.5.2). A delta rule's slice is affine in
