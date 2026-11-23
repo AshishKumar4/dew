@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import INTERPRETS
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, seeds_for
 from test_algebra import traces_cheaper
 from test_algebra_program import _scaled_twice
 
@@ -629,9 +629,11 @@ def test_fused_product_fuses_prologue_and_epilogue_with_gather_and_scatter():
     """`fused_gemm.product(..., gather=..., scatter=...)` fuses both a token-order RMSNorm producer into the
     prologue (even with top-k `M_routed != M_tok`) and a post-scatter bias+residual consumer into the
     epilogue, holding check 1 forward and VJP against float64 truth (rows 5391, 12306)."""
-    tokens_n, rows, depth, width, groups = 32, 64, 64, 64, 4
+    # 512 routed rows: the bias's gradient, a sum over them of bf16 cotangents, rounds in fp32 on most draws,
+    # so its error from float64 resolves (at 64 rows it was exact on most, its ratio inconclusive).
+    tokens_n, rows, depth, width, groups = 256, 512, 64, 64, 4
     rng = np.random.default_rng(53910)
-    sizes = jnp.asarray([16, 0, 24, 24], jnp.int32)
+    sizes = jnp.asarray([128, 0, 192, 192], jnp.int32)
     gather = jnp.asarray(rng.integers(0, tokens_n, size=(rows,)), jnp.int32)
     scatter = jnp.asarray(rng.permutation(rows), jnp.int32)
 
@@ -686,5 +688,7 @@ def test_fused_product_fuses_prologue_and_epilogue_with_gather_and_scatter():
     choices = {r.choice: r.kernel for r in seen}
     assert choices.get("gemm_prologue") == "fused", choices
     assert choices.get("gemm_epilogue") == "fused", choices
-    assert_as_exact(jax.jit(dew_vjp), jax.jit(plain_vjp), draw,
-                    "fused_gemm gather+scatter+prologue+epilogue", seeds=8, truth_fn=truth)
+    dew_fn, ref_fn = jax.jit(dew_vjp), jax.jit(plain_vjp)
+    label = "fused_gemm gather+scatter+prologue+epilogue"
+    assert_as_exact(dew_fn, ref_fn, draw, label, truth_fn=truth,
+                    seeds=seeds_for(ref_fn, draw, label, truth_fn=truth, dew_fn=dew_fn))
