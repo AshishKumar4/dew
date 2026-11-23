@@ -14,6 +14,8 @@ import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
 
+from dew import _cache
+from dew._facts import Held
 from dew.mesh import mesh_axes
 from dew.nn.derivatives import (
     Protected,
@@ -550,14 +552,14 @@ def launches(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype
     return taken
 
 
-_DECISIONS: collections.OrderedDict[Hashable, tuple[tuple[bool, tuple[generation.Route, ...]], dict]] = (
+_DECISIONS: collections.OrderedDict[Hashable, Held[tuple[bool, tuple[generation.Route, ...]]]] = (
     collections.OrderedDict())
 
 
 def _decided(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype: jnp.dtype, product,
              whole: bool) -> tuple[bool, tuple[generation.Route, ...]]:
     """`launched`'s decision and the routes it found, held as every held kernel decision is
-    (`generation.held_trace`, `fusion.DECISIONS_HELD` of them, as the algebra's): by the operands' shapes
+    (`_cache.holding`, `fusion.DECISIONS_HELD` of them, as the algebra's): by the operands' shapes
     and dtypes, the product and whether each is seen whole, in the context a kernel is chosen in
     (`fusion.choice_context`: the target, the kernels a block names or pins, a draw's, the refused launches),
     the facts it read recorded again wherever it is taken (row 12134: a hand-kept subset of that context
@@ -571,7 +573,7 @@ def _decided(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype
         return taken, tuple(found)
 
     key = (rows, matrix, out_dtype, product, whole, choice_context())
-    return generation.held_trace(_DECISIONS, key, made, DECISIONS_HELD)
+    return _cache.holding(_DECISIONS, key, made, DECISIONS_HELD)
 
 
 def _launched_once(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype, product,

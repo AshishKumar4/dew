@@ -28,6 +28,7 @@ from jax.extend import core as jcore
 
 from dew import _cache
 from dew._cache import ALGEBRA
+from dew._facts import Held
 from dew.algebra import cost, extract, fusion, rules, terms
 from dew.algebra.extract import Linear
 from dew.nn.derivatives import Activation, Algebra, KernelGlue, Surrogate, marked_call_p
@@ -272,7 +273,7 @@ WINDOWS_HELD = 4096
 distinct windows of the steps it compiles (161 of the 2,799 a UNet's planner traced over its compiles, each
 33 ms on average to derive again; row 3764)."""
 
-_DERIVED: collections.OrderedDict[Hashable, Rewrite] = collections.OrderedDict()
+_DERIVED: collections.OrderedDict[Hashable, Held[Rewrite]] = collections.OrderedDict()
 """Each window's rewrite by what derived it (`_derived`, held through `_cache.holding`), the least recently
 read first."""
 
@@ -1008,8 +1009,8 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten)))
         return fresh[0]
 
-    # Held with the facts its rewrite read while each answers alike (`generation.held_trace`).
-    body = generation.held_trace(rewrites, key, rewrite, fusion.DECISIONS_HELD)
+    # Held with the facts its rewrite read while each answers alike (`_cache.holding`).
+    body = _cache.holding(rewrites, key, rewrite, fusion.DECISIONS_HELD)
     reused = not fresh
     # Reported where it is written, as its rewrite reported it, and on a reuse its regions' reports too, so a
     # report around the program holds the body's however often it is written (`fusion._traced`'s, a

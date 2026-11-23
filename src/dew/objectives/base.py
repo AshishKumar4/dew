@@ -46,7 +46,7 @@ from jax._src import core as jax_core
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
-from dew import _cache
+from dew import _cache, _facts
 from dew._distributions import counter_key
 from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts
@@ -2342,7 +2342,7 @@ def frozen_value(value: TracedSetting) -> Hashable:
 _TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] = (
     weakref.WeakKeyDictionary())
 
-_KEYED_FLOPS: collections.OrderedDict[Hashable, tuple[float, float]] = collections.OrderedDict()
+_KEYED_FLOPS: collections.OrderedDict[Hashable, _facts.Held[tuple[float, float]]] = collections.OrderedDict()
 """`traced_update_flops`' counts of objectives that state their trace (`Objective.trace_key`), by that key
 and the batch's shapes, the `KEYED_FLOPS` latest (`_cache.holding`): a refit's objective, built anew, reads
 its equal's."""

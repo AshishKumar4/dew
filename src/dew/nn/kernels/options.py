@@ -33,8 +33,9 @@ from jax.sharding import AbstractMesh, NamedSharding, Sharding
 
 from dew import _cache, _stated, algebra
 from dew._devices import xla_flag
+from dew._facts import stated, traced_fact
 from dew._stated import Unestablished
-from dew.nn.kernels.generation import route_marks, stated, traced_fact, withdrawn
+from dew.nn.kernels.generation import route_marks, withdrawn
 from dew.nn.nested import staged
 from dew.telemetry.benchmark import UNGRAPHED_FLAG, options_of
 from dew.telemetry.compiles import Span, spanning
@@ -1282,11 +1283,11 @@ def trace_context() -> Hashable:
     (`dew.nn.sharding.trace_context` and the declared axes' table frozen, in place of the variables that
     entry sets anew, `sharding.STATED`); every other context variable set in this context but those no trace
     reads (`_cache.untraced`, and Python's decimal context); the logical axis rules Flax holds; the
-    environment's variables of Dew's own, each value by its contents (`generation.stated`); and whether
+    environment's variables of Dew's own, each value by its contents (`_facts.stated`); and whether
     XLA's flags ask for deterministic operations (`_devices.deterministic_ops_requested`), which no `DEW_`
     variable holds and kernel selection reads where it selects (FlashAttention's and cuDNN's eligibility),
     not under the trace's target, so a trace kept under one setting would serve the other. The process's
-    facts a trace reads (`generation.traced_fact`) are no part of it: each is answered where a trace asks
+    facts a trace reads (`_facts.traced_fact`) are no part of it: each is answered where a trace asks
     it, under the trace's own target, and one read outside a trace may have no answer (a compile-only GPU
     mesh's devices hold no memory statistics); a caller whose trace reads one names it beside this key (the
     compiles' refusals, `report.refusal_entries`). A value it leaves out costs a trace, never a program

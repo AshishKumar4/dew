@@ -33,7 +33,7 @@ import tokamax
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
-from dew import _cache, communicators
+from dew import _cache, _facts, communicators
 from dew._code import op_provenance, provenance_code
 from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
@@ -521,7 +521,7 @@ def derivation_inputs(op, arguments: tokamax.BoundArguments, target
     return identity, target, refusals_of(identity), deterministic_ops_requested()
 
 
-@generation.traced_fact
+@_facts.traced_fact
 def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]:
     """Each config this context's compiles refused the launch of `identity` (`_identity`), with the kernels
     refused at it and their roles (`Refused`): what a launch's derivation and legality read of the
@@ -1385,7 +1385,7 @@ def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:
     return np.zeros(out.shape, jax.dtypes.float0)
 
 
-@generation.traced_fact
+@_facts.traced_fact
 def refusal_entries() -> tuple[tuple[str, Hashable, frozenset[Refused]], ...]:
     """Every (launch identity, config, spilled kernels with their roles, `Refused`) refused in this context (a
     `refusals` scope's or the process's), ordered. A validated plan can hand them to another process

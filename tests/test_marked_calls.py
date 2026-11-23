@@ -315,7 +315,7 @@ def test_a_marked_span_with_an_effect_is_traced_at_every_call_and_runs_it():
     """A marked span whose program has an effect (a host callback), which no call may take from another's
     trace (`derivatives._holdable`), held as none, is traced again at a second call of the same arguments'
     types, in the same state, and runs its effect with each call's values (Train 1205's review F1, its facts
-    held by `generation.held_trace`)."""
+    held by `_cache.holding`)."""
     seen = []
 
     def logged(x, y):

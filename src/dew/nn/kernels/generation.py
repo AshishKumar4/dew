@@ -11,9 +11,7 @@ generations.
 
 from __future__ import annotations
 
-import collections
 import contextlib
-import contextvars
 import dataclasses
 import enum
 import functools
@@ -24,6 +22,8 @@ import os
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
+from dew import _facts
+
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
@@ -33,109 +33,6 @@ if TYPE_CHECKING:
     from .selection import Refusal
 
 _log = logging.getLogger(__name__)
-
-_RECORDINGS: contextvars.ContextVar[tuple[dict[Hashable, tuple[Callable[[], Hashable], Hashable]], ...]] = (
-    contextvars.ContextVar("fact_recordings", default=()))
-"""The facts read within each open `recording`, innermost last: what a trace records into, no trace reads,
-so a trace held by its state (`dew.nn.kernels.options.trace_context`) is held in any recording's scope
-(`recording` registers it `dew._cache.untraced` as it first sets it; generation imports no JAX as it
-loads)."""
-
-
-def stated(value) -> Hashable:
-    """`value` as a fact's answer or question is held and compared: by its contents, equal wherever they
-    are however often its holder is built anew (a reader returning a fresh mapping): a hashable value by
-    itself, a mapping, sequence or set by its members, a dataclass by its type and fields; an array, which a
-    program reading it closes over, by itself (`dew._cache.Same`), as an object that states none of these
-    is."""
-    import jax
-
-    from dew import _cache
-
-    if isinstance(value, jax.Array):
-        return _cache.Same(value)
-    if isinstance(value, Mapping):
-        return tuple(sorted(((key, stated(answer)) for key, answer in value.items()), key=repr))
-    if isinstance(value, list | tuple):
-        return tuple(stated(element) for element in value)
-    if isinstance(value, set | frozenset):
-        return frozenset(stated(member) for member in value)
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return type(value), tuple(stated(getattr(value, field.name)) for field in dataclasses.fields(value))
-    return value if isinstance(value, Hashable) else _cache.Same(value)
-
-
-@contextlib.contextmanager
-def recording() -> Iterator[dict[Hashable, tuple[Callable[[], Hashable], Hashable]]]:
-    """Each fact read within the block (`traced_fact`), by its reader and question, with the answer it got
-    (`stated`): what a trace kept for a later one read, which holds where each answers as it did (`still`).
-    Recordings nest; a read records into each open one."""
-    from dew import _cache
-
-    _cache.untraced(_RECORDINGS)
-    reads: dict[Hashable, tuple[Callable[[], Hashable], Hashable]] = {}
-    token = _RECORDINGS.set((*_RECORDINGS.get(), reads))
-    try:
-        yield reads
-    finally:
-        _RECORDINGS.reset(token)
-
-
-def still(reads: Mapping[Hashable, tuple[Callable[[], Hashable], Hashable]]) -> bool:
-    """Whether each fact of `reads` (a `recording`'s) answers now as it did when it was read."""
-    return all(asked() == answer for asked, answer in reads.values())
-
-
-def replay(reads: Mapping[Hashable, tuple[Callable[[], Hashable], Hashable]]) -> None:
-    """`reads`, a kept trace's (`recording`'s), recorded into each open recording, as if read again: a trace
-    taking a kept one read what it read."""
-    for recorded in _RECORDINGS.get():
-        recorded.update(reads)
-
-
-def held_trace[Key: Hashable, Value](cache: collections.OrderedDict[Key, tuple[Value, dict]], key: Key,
-                                     made: Callable[[], Value], held: int) -> Value:
-    """`cache`'s value at `key` (`_cache.holding`, `held` the most it keeps), made within a recording of the
-    facts it reads (`recording`) and held with them while each answers alike (`still`: a hit whose facts
-    answer otherwise now is made again), and those facts read again wherever it is returned (`replay`), so a
-    recording around its reader holds them as one around its making did: the one owner of a held trace's
-    facts (Train 1205's review F1). A held probe decision goes through here (the algebra's region decisions,
-    recognitions and attention probes), and so does a held trace a program is written from (a region's
-    written program, a marked span, a rewritten body), whose routes and launches its holder reports again
-    where it writes it (`dew.algebra.fusion.Recorded`). Row 7167: only the second kept their facts, so a
-    warm lowering's recording lacked those its declined regions' probes read (row 6708's defect)."""
-    from dew import _cache
-
-    def making() -> tuple[Value, dict]:
-        with recording() as reads:
-            value = made()
-        return value, reads
-
-    value, reads = _cache.holding(cache, key, making, held, still=lambda entry: still(entry[1]))
-    replay(reads)
-    return value
-
-
-def traced_fact[**Question, Answer](reader: Callable[Question, Answer]) -> Callable[Question, Answer]:
-    """Declare `reader` a fact a trace reads of the process or its host (the memory a device holds, a wheel's
-    presence, a launch config a compile refused), where it is defined: a program compiled under one answer
-    is another under the next (a route taken, a kernel refused). Its reader is the fact's one accessor: a
-    read records its question and answer into each open `recording`, so a kept trace holds where each answer
-    it read holds (`still`). A fact read but by its reader is an input no recording holds, a stale
-    trace's."""
-    name = f"{reader.__module__}.{reader.__qualname__}"
-
-    @functools.wraps(reader)
-    def read(*question: Question.args, **named: Question.kwargs) -> Answer:
-        answer = reader(*question, **named)
-        if recordings := _RECORDINGS.get():
-            held = stated((question, named))
-            for recorded in recordings:
-                recorded[name, held] = (lambda: stated(reader(*question, **named))), stated(answer)
-        return answer
-
-    return read
-
 
 @dataclasses.dataclass(frozen=True)
 class Assumption:
@@ -178,7 +75,8 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False,
     from dew import _cache
 
     if isinstance(generation, GpuTarget):
-        value = Assumption(generation.generation, generation, stated(generation), interpreted, portable)
+        value = Assumption(generation.generation, generation, _facts.stated(generation), interpreted,
+                           portable)
     else:
         value = None if generation is None else Assumption(generation, interpreted=interpreted,
                                                            portable=portable)
@@ -2028,7 +1926,7 @@ def placed_platform() -> str:
     return 'gpu' if platform in ('cuda', 'rocm') else platform
 
 
-@traced_fact
+@_facts.traced_fact
 def cutlass_built() -> dict[str, str | None]:
     """The generation of the installed dew_cutlass's kernels each CUDA GPU Dew names runs, as the wheel
     dispatches on its compute capability (`dew_cutlass.architecture`, the one statement of it), None for
@@ -2055,7 +1953,7 @@ def _cutlass_built_by(origin: str | None) -> dict[str, str | None]:
     return {name: wheel.architecture(*found) for name, found in capabilities.items()}
 
 
-@traced_fact
+@_facts.traced_fact
 def gpu_placed() -> bool:
     """Whether a call runs on this process's own GPU: what a CUDA library call needs, which its trace
     asks the installed plugin about and its lowering the devices, where `backend()` also takes an
@@ -2065,7 +1963,7 @@ def gpu_placed() -> bool:
     return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
 
 
-@traced_fact
+@_facts.traced_fact
 @functools.cache
 def host_memory_share() -> int:
     """A CPU device's share of the memory this process can hold, in bytes: the least of its host's physical
@@ -2113,7 +2011,7 @@ def cgroup_memory_limits(root: str = "/") -> list[int]:
     return limits
 
 
-@traced_fact
+@_facts.traced_fact
 def device_memory() -> int | None:
     """The bytes one device a call is chosen for holds: the least allocator limit of the devices this
     process places it on (`placed_devices`; `Device.memory_stats`' `bytes_limit`, what an allocation fails

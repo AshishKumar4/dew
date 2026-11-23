@@ -6,13 +6,15 @@ import collections
 import jax
 import jax.numpy as jnp
 
-from dew import _cache
+from dew import _cache, _facts
 
 
-def test_a_held_none_is_read_back_and_a_value_no_longer_holding_is_made_again():
-    """A value of None is held as any value is, made once; a held value `still` refuses (a held trace whose
-    facts answer otherwise now, row 6708) is made again and held in its place."""
-    cache, made = collections.OrderedDict(), []
+def test_a_held_none_is_read_back_and_a_value_whose_fact_answers_otherwise_is_made_again():
+    """A value of None is held as any value is, made once; a held value whose making read a fact that
+    answers otherwise now (`dew._facts.traced_fact`: a launch refused since, row 6708) is made again and held
+    in its place, and one whose fact answers alike is read back, its fact read again around it (row 12296:
+    every held value held with the facts its making read, `_cache.holding` their one owner)."""
+    cache, made, facts = collections.OrderedDict(), [], {"refused": 0}
 
     def nothing():
         made.append("nothing")
@@ -21,25 +23,26 @@ def test_a_held_none_is_read_back_and_a_value_no_longer_holding_is_made_again():
     assert _cache.holding(cache, "none", nothing, 4) is None
     assert made == ["nothing"]
 
-    facts = {"refused": 0}
+    @_facts.traced_fact
+    def refused() -> int:
+        return facts["refused"]
 
     def traced():
         made.append("traced")
-        return dict(facts)
+        return refused()
 
-    def still(held):
-        return held == facts
-
-    assert _cache.holding(cache, "trace", traced, 4, still=still) == {"refused": 0}
-    assert _cache.holding(cache, "trace", traced, 4, still=still) == {"refused": 0}
+    assert _cache.holding(cache, "trace", traced, 4) == 0
+    with _facts.recording() as again:
+        assert _cache.holding(cache, "trace", traced, 4) == 0
     facts["refused"] = 1
-    assert _cache.holding(cache, "trace", traced, 4, still=still) == {"refused": 1}
-    assert _cache.holding(cache, "trace", traced, 4, still=still) == {"refused": 1}
+    assert _cache.holding(cache, "trace", traced, 4) == 1
+    assert _cache.holding(cache, "trace", traced, 4) == 1
     assert made == ["nothing", "traced", "traced"]
+    assert [answer for _, answer in again.values()] == [0]
 
 
 def test_a_held_trace_made_again_past_its_bound_records_its_facts_afresh():
-    """A held trace (`generation.held_trace`) dropped past its cache's bound by others is made again where it
+    """A held trace (`_cache.holding`) dropped past its cache's bound by others is made again where it
     is read next, and the facts its making reads (`gpu_placed`) are recorded around that read as around its
     first: its holder's report of a reuse is exact across an eviction, never a stale replay (Train 1205's
     review F1, the one owner of a held trace's facts)."""
@@ -55,13 +58,13 @@ def test_a_held_trace_made_again_past_its_bound_records_its_facts_afresh():
             return key
         return make
 
-    with generation.recording() as first:
-        assert generation.held_trace(cache, "first", making("first"), 1) == "first"
-    generation.held_trace(cache, "second", making("second"), 1)
-    with generation.recording() as again:
-        assert generation.held_trace(cache, "first", making("first"), 1) == "first"
-    with generation.recording() as held:
-        generation.held_trace(cache, "first", making("first"), 1)
+    with _facts.recording() as first:
+        assert _cache.holding(cache, "first", making("first"), 1) == "first"
+    _cache.holding(cache, "second", making("second"), 1)
+    with _facts.recording() as again:
+        assert _cache.holding(cache, "first", making("first"), 1) == "first"
+    with _facts.recording() as held:
+        _cache.holding(cache, "first", making("first"), 1)
     assert made == ["first", "second", "first"]
     # Each recording holds the one fact the making read, and its answer.
     assert first and [(fact, answer) for fact, (_, answer) in first.items()] == [

@@ -24,36 +24,9 @@ import jax
 
 from dew._builds import dew_cache_dir
 from dew._devices import cuda_builds, deterministic_ops_requested, xla_flag
+from dew._facts import Held, recording, replay, still
 
 _log = logging.getLogger(__name__)
-
-def holding[Key: Hashable, Value](cache: collections.OrderedDict[Key, Value], key: Key,
-                                  made: Callable[[], Value], held: int,
-                                  still: Callable[[Value], bool] | None = None) -> Value:
-    """`cache`'s entry at `key`, made (`made()`) where it holds none, or where `still` finds the one it holds
-    no longer what `made` would make (a held trace whose facts answer otherwise now), outside the lock every
-    held value shares (`_HOLDING`: compiles trace on several threads, and a value made may hold another), the
-    least recently read dropped past `held`, each cache's own bound. Two threads missing one key at once each
-    make it, the later kept: a held value is a function of its key, so either is the same. How a process holds
-    what it decides and derives once for what it reads: the algebra's kernel decisions, written programs,
-    recognitions, window derivations and scan forms (`dew.algebra`), a declared walk's forms
-    (`derive.derived`), a launch's derived config (`templates.base`), a module's counted work (`dew.nn.flops`)
-    and a keyed objective's traced work (`objectives.base.traced_update_flops`)."""
-    with _HOLDING:
-        # The held value boxed, so a value of None is held too.
-        found = (cache[key],) if key in cache else None
-        if found is not None:
-            cache.move_to_end(key)
-    if found is not None and (still is None or still(found[0])):
-        return found[0]
-    value = made()
-    with _HOLDING:
-        cache[key] = value
-        cache.move_to_end(key)
-        if len(cache) > held:
-            cache.popitem(last=False)
-    return value
-
 
 _HOLDING = threading.Lock()
 """Held while a held value's cache is read or written (`holding`, `cleared`)."""
@@ -515,7 +488,7 @@ def untraced[Variable: contextvars.ContextVar](variable: Variable) -> Variable:
 class Same:
     """A value that hashes by no value of its own, held by itself: equal to its own holder alone, and kept
     alive while a key holds it, so no other value takes its identity. The one such holder of a trace's keys
-    (`dew.nn.kernels.generation.stated`, which `dew.nn.kernels.options.trace_context` reads each value by)
+    (`dew._facts.stated`, which `dew.nn.kernels.options.trace_context` reads each value by)
     and of a cache keyed by an object's identity."""
 
     __slots__ = ("value",)
@@ -528,6 +501,38 @@ class Same:
 
     def __eq__(self, other) -> bool:
         return isinstance(other, Same) and other.value is self.value
+
+
+def holding[Key: Hashable, Value](cache: collections.OrderedDict[Key, Held[Value]], key: Key,
+                                  made: Callable[[], Value], held: int) -> Value:
+    """`cache`'s value at `key`, made (`made()`) within a recording of the facts it reads (`recording`) where
+    it holds none, or where a fact its making read answers otherwise now (`still`), and held with them; those
+    facts read again wherever it is taken (`replay`), so a recording around its reader holds them as one
+    around its making did. Made outside the lock every held value shares (`_HOLDING`: compiles trace on
+    several threads, and a value made may hold another), the least recently read dropped past `held`, each
+    cache's own bound. Two threads missing one key at once each make it, the later kept: a held value is a
+    function of its key and its facts, so either is the same. The one owner of what a process decides and
+    derives once and the facts it read (rows 7167, 12296: a held value its facts did not hold kept a choice
+    an enclosing trace's key alone answered): the algebra's kernel decisions, written programs, recognitions,
+    window derivations and scan forms (`dew.algebra`), a declared walk's forms (`derive.derived`), a marked
+    span (`dew.nn.derivatives`), a launch's derived config and its decision (`templates.base`,
+    `projections`), a module's counted work (`dew.nn.flops`) and a keyed objective's traced work
+    (`objectives.base.traced_update_flops`)."""
+    with _HOLDING:
+        found = cache.get(key)
+        if found is not None:
+            cache.move_to_end(key)
+    if found is not None and still(found[1]):
+        replay(found[1])
+        return found[0]
+    with recording() as reads:
+        value = made()
+    with _HOLDING:
+        cache[key] = (value, reads)
+        cache.move_to_end(key)
+        if len(cache) > held:
+            cache.popitem(last=False)
+    return value
 
 
 def unintercepted[**Arguments, Result](function: Callable[Arguments, Result]) -> Callable[Arguments, Result]:
