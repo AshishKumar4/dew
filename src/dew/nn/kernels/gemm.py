@@ -917,12 +917,11 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
     """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows, each output
     row its own input row's (no gather), and `factor` a packed matrix's fp32 scales broadcast against its
     output (`formats.fp8_factor`). Its transpose is the plain one, the cotangent times its factor through
-    `run`'s pullback, but for a row whose largest such product passes `2**FACTORED_HEADROOM`: that row is
-    moved down by a power of two to it before the pullback and back after (`precision.power2`), so a
-    cotangent times a factor past fp32's largest, whose products cancel, sums to their finite value, not
-    inf - inf (ledger 1464); only its terms below `2**-149` once moved, `2**-249` of its largest at least,
-    are lost. Devices of a checked `shard_map` sum their partials moved to one shared power, then move
-    back."""
+    `run`'s pullback, wherever that is finite. Where a row's largest such product passes
+    `2**FACTORED_HEADROOM`, the row is also pulled back moved down by a power of two to it and back after
+    (`precision.power2`), which serves each entry the plain transpose overflowed: a cotangent times a factor
+    past fp32's largest, whose products cancel, sums to their finite value, not inf - inf (ledger 1464).
+    Devices of a checked `shard_map` sum their plain partials, and their moved ones at one shared power."""
     shape, dtype = rows.shape, rows.dtype
     held = frozenset(jax.typeof(rows).mat.varying)
     placed = explicit_spec(rows)
@@ -935,37 +934,48 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
         scale, ran = residuals
         c = cotangent.astype(jnp.float32)
         f = jnp.broadcast_to(scale.astype(jnp.float32), c.shape)
+
+        def pulled(near):
+            # The pullback at zeros typed as the rows are: placed, and varying as the cotangent's partials do.
+            zeros = jnp.zeros(shape, jnp.bfloat16, out_sharding=placed)
+            at = varying_like(zeros, near, *jax.tree.leaves(ran))
+            (partial,) = jax.vjp(lambda each: run(each, *ran), at)[1](near)
+            partial = partial.astype(jnp.float32)
+            return partial, tuple(sorted(jax.typeof(partial).mat.varying - held))
+
+        plain, excess = pulled(c * f)
+        plain = jax.lax.psum(plain, excess) if excess else plain
         e_c, e_f = (float_bits.binade_of(jax.lax.stop_gradient(v)) for v in (c, f))
         # A row's largest product's binade, among entries both finite and nonzero (an infinity's binade 128).
         counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
         top = jnp.max(jnp.where(counted, e_c + e_f, -1024), axis=-1, keepdims=True, initial=-1024)
         moved = jnp.maximum(top - FACTORED_HEADROOM, 0)
-        # The cotangent times the factor's significand (in [1, 2)), halved where the cotangent's own binade
-        # would carry it past fp32's largest: finite wherever both are, then moved by the factor's exponent.
-        e_f = jnp.clip(e_f, -126, 127)
-        halved = e_c >= 126
-        near = power2((c * jnp.where(halved, 0.5, 1.0)) * (f * float_bits.exact_power2(-e_f)),
-                      e_f + halved - moved)
-        # The pullback at zeros typed as the rows are (placed, and varying as the cotangent's partials do).
-        at = varying_like(jnp.zeros(shape, jnp.bfloat16, out_sharding=placed), near, *jax.tree.leaves(ran))
-        _, pulled = jax.vjp(lambda each: run(each, *ran), at)
-        (partial,) = pulled(near)
-        partial = partial.astype(jnp.float32)
-        excess = tuple(sorted(jax.typeof(partial).mat.varying - held))
         if excess:
-            # Each device's partial at the power every device's row shares, summed, then moved back.
-            shared = jax.lax.pmax(moved, excess)
-            partial = jax.lax.psum(power2(partial, moved - shared), excess)
-            moved = shared
-        return power2(partial, moved).astype(dtype)
+            moved = jax.lax.pmax(moved, excess)
+
+        def rescued(plain):
+            # The cotangent times the factor's significand (in [1, 2)), halved where the cotangent's own
+            # binade would carry it past fp32's largest, moved by the factor's exponent and the row's.
+            e = jnp.clip(e_f, -126, 127)
+            halved = e_c >= 126
+            near = power2((c * jnp.where(halved, 0.5, 1.0)) * (f * float_bits.exact_power2(-e)),
+                          e + halved - moved)
+            partial, _ = pulled(near)
+            partial = jax.lax.psum(partial, excess) if excess else partial
+            return jnp.where(jnp.isfinite(plain), plain, power2(partial, moved))
+
+        if excess:
+            # Every device of a sum pulls back alike, its collectives in step.
+            return rescued(plain).astype(dtype)
+        return jax.lax.cond(jnp.any(moved > 0), rescued, lambda plain: plain, plain).astype(dtype)
 
     return generation.linear_map(apply, pullback, (factor, operands), rows)
 
 
 FACTORED_HEADROOM = 100
-"""The binade a row's largest cotangent-times-factor product is moved down to in `factored`'s transpose
-where it passes it: its products' sum over any width a matrix holds (a decoded FP8 entry at most 448) stays
-within fp32, and a row below it pulls back as the plain transpose does."""
+"""The binade a row's largest cotangent-times-factor product is moved down to where `factored`'s transpose
+pulls it back again: its products' sum over any width a matrix holds (a decoded FP8 entry at most 448)
+stays within fp32."""
 
 
 def ternary_weight_product(lhs: jax.Array, weights, group_sizes: jax.Array | None = None, **kw) -> jax.Array:
