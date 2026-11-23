@@ -1,5 +1,5 @@
-"""A diagonal linear recurrence (`recurrence_chunk.diagonal_scan`: HGRN's, fla's `chunk_hgrn`), `h_t = exp(g_t)
-h_{t-1} + x_t` a channel, held to the token recurrence (row 1453)."""
+"""A diagonal linear recurrence (`recurrence_chunk.diagonal_scan`: HGRN's, fla's `chunk_hgrn`),
+`h_t = exp(g_t) h_{t-1} + x_t` a channel, held to the token recurrence (row 1453)."""
 
 import jax
 import jax.numpy as jnp
