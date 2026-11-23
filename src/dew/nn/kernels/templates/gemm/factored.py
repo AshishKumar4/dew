@@ -274,7 +274,7 @@ routes into a token, devices into their sum; `2**24` of them sum below int32's l
 
 FACTORED_MATRIX_SLICES = 6
 """A decoded packed matrix's slices on its grid: 36 bits, past any format's span (NVFP4's E2M1 codes times
-E4M3 block scales, 2 bits over 27 binades; ternary's one)."""
+E4M3 block scales, 21 binades and 5 bits; ternary's one)."""
 
 
 def _limbs(count: int, like: jax.Array, columns: int) -> jax.Array:
