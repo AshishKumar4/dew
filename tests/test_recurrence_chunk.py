@@ -890,11 +890,13 @@ def test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole(hooks):
 
         return both
 
-    split = arm(lambda tree: jax.tree.map(lambda x: jax.device_put(x, rows), tree))
+    # The split arm jitted once for check 1 and the placement read after it: jitted again, its program
+    # compiled again, about 10 s of each case's 87 to 137 (jsf-misses3, row 12055).
+    split = jax.jit(arm(lambda tree: jax.tree.map(lambda x: jax.device_put(x, rows), tree)))
     with jax.set_mesh(mesh):
-        assert_as_exact(jax.jit(split), jax.jit(arm(lambda tree: tree)), drawn,
+        assert_as_exact(split, jax.jit(arm(lambda tree: tree)), drawn,
                         f'forked {hooks} on an explicit row axis', seeds=FEWEST_SEEDS)
-        ((out, last), grads), tangents = jax.jit(split)(*drawn(0))
+        ((out, last), grads), tangents = split(*drawn(0))
     for placed in (out, last, grads.value, *tangents):
         assert jax.typeof(placed).sharding.spec[0] == 'data'
 
