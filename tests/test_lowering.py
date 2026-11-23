@@ -1037,7 +1037,8 @@ def test_a_gated_delta_net_split_over_the_sequence_runs_each_devices_own_slice()
     """A gated delta net on a mesh splitting its sequence runs the recurrence on each device's slice, as its
     lowered H100 program states it: over two devices and 384 tokens, every kernel call of the layer over one
     device's 192 tokens is among its calls, operand for operand, but the conv's, which reads its three-token
-    halo too, beside its slice's summary (the rule from `[0 | I]`), where the rule ran the whole sequence on
+    halo too, beside its slice's summary (the rule's write from zero, its transfer chained in XLA,
+    `recurrence_chunk.transferred`), where the rule ran the whole sequence on
     every device before (row 1437); and its collectives are the halo's and the summaries' gathers alone, no
     activation reduced (`recurrence_chunk.entering_memory`, `linear.sequence_conv`)."""
     def kernels(operations: list[Operation]) -> list[tuple]:
