@@ -763,23 +763,26 @@ def sequence_halo(mixed, valid, segments, width: int):
     return jnp.where((halo_documents == first)[:, :, None], halo, 0)
 
 
-def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, parts, dtype, rule):
+def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, parts, dtype, rule,
+                     chunk_size: int = CHUNK_SIZE):
     """A delta-rule mixer's conv and rule over this shard's slice of whole training sequences and of its
     heads, inside a `shard_map` that holds the sequence axis manual (`sequence_delta_rule`): the conv with
     its halo (`sequence_conv`, its `parts` the queries', keys' and values' channels and l2-normed widths,
     `mixed` and `taps` each this shard's heads of each part laid in turn), the pieces in heads of their
     `widths`, and `rule(query, key, value, g, beta, state, starts=)` from the memory this shard's slice
-    enters with (`entering_memory`), its output named as `held_scan`'s."""
+    enters with (`entering_memory`, its transfer at the rule's `chunk_size`), its output named as
+    `held_scan`'s."""
     query, key, value = (piece.reshape(*piece.shape[:2], -1, width) for piece, width in
                          zip(sequence_conv(mixed, taps, None, segments, valid, parts=parts, dtype=dtype),
                              widths, strict=True))
-    state = entering_memory(rule, query, key, value, g, beta, starts, axis=SEQUENCE_AXIS)
+    state = entering_memory(rule, query, key, value, g, beta, starts, axis=SEQUENCE_AXIS,
+                            chunk_size=chunk_size)
     out, _ = rule(query, key, value, g, beta, state, starts=starts)
     return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
 
 
 def sequence_delta_rule(mixed, taps, g, beta, coordinates, valid, *, shards: int, key_heads: int, widths,
-                        parts: Pieces, dtype, rule):
+                        parts: Pieces, dtype, rule, chunk_size: int = CHUNK_SIZE):
     """A delta-rule mixer's conv and rule (`split_delta_rule`) on shards that split the rows, the sequence and
     the heads (`over_sequence`, the split dividing its `key_heads`): each of `parts`' channels of `mixed`
     `[B, S, C]` and of the conv's `taps` `[C, K]` an operand split by its heads, the queries', keys' and
@@ -796,7 +799,7 @@ def sequence_delta_rule(mixed, taps, g, beta, coordinates, valid, *, shards: int
         mine = tuple((piece.shape[-1], head) for piece, (_, head) in zip(pieces, parts, strict=True))
         return split_delta_rule(jnp.concatenate(pieces, axis=-1), g, beta, segments, starts, valid,
                                 jnp.concatenate(held, axis=0), widths=widths, parts=mine, dtype=dtype,
-                                rule=rule)
+                                rule=rule, chunk_size=chunk_size)
 
     tokens = (*jnp.split(mixed, edges, axis=-1), g, beta, coordinates.segments, coordinates.starts, valid)
     at = dict.fromkeys(range(count + 2), 2) | dict.fromkeys(range(len(tokens), len(tokens) + count), 0)
@@ -1390,7 +1393,8 @@ class GatedDeltaNet(nn.Module):
                                      max_segments=tokens.max_segments, write_bound=1.0)
             out = sequence_delta_rule(mixed, self.conv1d()[0], g, beta, tokens, valid, shards=shards,
                                       key_heads=self.num_k_heads, widths=widths, parts=heads,
-                                      dtype=operand if ported else wide, rule=rule)
+                                      dtype=operand if ported else wide, rule=rule,
+                                      chunk_size=self.chunk_size)
         else:
             out = held_scan(self, mixed, self.conv1d()[0], None, scan,
                             (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
