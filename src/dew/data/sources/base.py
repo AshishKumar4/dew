@@ -184,10 +184,14 @@ class ShardManifest:
     index_ordered: bool = False
     counted: Callable[[int], tuple[int, ...]] | None = None
     fixed_parts: bool = False
+    subdivided_by: str | None = None
+    """The rule its `subdivide` cuts by where that rule changed from its first (`EVEN_CUT`), None where it
+    cuts as it always has: a read that cuts by it holds it in its position (`cut`)."""
     cut: str | None = None
-    """The rule its shards were cut finer by (`EVEN_CUT`), where they were (`dew.data.shards.cut`): a
-    read's position names its places in the shards it was dealt, so one saved under another cut is refused
-    where it resumes (`dew.data.shards._Passing`), and one of a read that cut nothing resumes as it was."""
+    """The rule its shards were cut finer by, where they were by a changed one (`subdivided_by`,
+    `dew.data.shards.cut`): a read's position names its places in the shards it was dealt, so one saved
+    under another cut is refused where it resumes (`dew.data.shards._Passing`), and one of a read its store
+    cut by an unchanged rule, or not at all, resumes as it was."""
 
     @property
     def digest(self) -> str:
@@ -448,6 +452,7 @@ def _indexed_manifest(source: Source, uri: str, rows: int, reader: ShardOpener |
     subdivide = functools.partial(_even_ranges, uri, count, lambda start, end: f"records:{start}")
     return ShardManifest(_ranges(uri, count, rows), _IndexedSlice(source) if reader is None else reader,
                          subdivide=subdivide if subdivides else None,
+                         subdivided_by=EVEN_CUT if subdivides else None,
                          index_ordered=True)
 
 
@@ -523,6 +528,7 @@ def _single_indexed_manifest(source: Source, uri: str) -> ShardManifest:
         (Shard(uri, uri, 0, count, count),),
         _IndexedSlice(source),
         subdivide=functools.partial(_even_ranges, uri, count, lambda start, end: f"{uri}:{start}:{end}"),
+        subdivided_by=EVEN_CUT,
         index_ordered=True,
     )
 

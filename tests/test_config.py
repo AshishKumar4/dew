@@ -1235,6 +1235,7 @@ def test_a_run_an_intermediate_dew_rewrote_beside_its_mark_resumes_as_it_trained
     LMRunConfig(optim=rewritten).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
     loaded = LMRunConfig.load(str(run)).optim
+    assert isinstance(loaded.optimizer, AdamW), loaded
     assert (loaded.decay_mask, loaded.spared) == (False, False) and loaded.optimizer.weight_decay > 0, loaded
     if decay == 0:
         with pytest.raises(ValueError):
@@ -1267,11 +1268,43 @@ def test_a_run_an_intermediate_dew_resumed_and_saved_after_its_mark_loads_its_re
     LMRunConfig(optim=rewritten).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
     loaded = LMRunConfig.load(str(run)).optim
+    assert isinstance(loaded.optimizer, AdamW), loaded
     assert (loaded.decay_mask, loaded.optimizer.weight_decay) == (None, 0.0), loaded
     resumed = _checkpointed(run, loaded, 2)
     for got, want in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(saved.opt_state), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     assert int(_checkpointed(run, loaded, 3).step) == 3
+
+
+def test_an_intermediate_dews_newer_local_step_decides_its_mark_once_and_for_good(tmp_path):
+    """A run an intermediate Dew resumed under its rewritten record and saved again on the host's own disk
+    alone (`local_directory`), its newest committed step that Dew's own, loads its record as written, as
+    the step a resume restores is that one, not the persistent tier's earlier; and once a run writes its
+    record again (`RunConfig.save`) its mark is decided for good, gone, so a later load never reads it
+    across steps this Dew saved (review of d22: the persistent tier's newest step decided, and a second
+    resume read the mark again)."""
+    import json as json_
+
+    from dew.config.lm import LMRunConfig
+    from dew.config.trainer import TrainerConfig
+
+    rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), learning_rate=1e-2, spared=False)
+    run, local = tmp_path / "run", tmp_path / "local"
+    _checkpointed(run, rewritten, 1)
+    _checkpointed(run, rewritten, 2, local=local, persistent=False)
+    [newest] = [path for path in local.rglob("_CHECKPOINT_METADATA") if path.parent.name == "2"]
+    metadata = json_.loads(newest.read_text())
+    metadata["custom_metadata"] = {**(metadata.get("custom_metadata") or {}), "typed_optimizer": True}
+    newest.write_text(json_.dumps(metadata))
+    config = LMRunConfig(optim=rewritten, trainer=TrainerConfig(local_directory=str(local)))
+    config.save(str(run))
+    mark = run / "earlier-masked-decay.json"
+    mark.write_text(json_.dumps({"unmasked_all": True}))
+    loaded = LMRunConfig.load(str(run))
+    assert isinstance(loaded.optim.optimizer, AdamW), loaded.optim
+    assert (loaded.optim.decay_mask, loaded.optim.optimizer.weight_decay) == (None, 0.0), loaded.optim
+    loaded.save(str(run))
+    assert not mark.exists()
 
 
 @pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])

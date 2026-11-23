@@ -259,7 +259,7 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
     path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(130)))
     files = Files(str(path))
     files.provision()
-    chain = Pipeline(files).map_with_index(lambda index, row: {**row, "at": np.int64(index)}).batch(1)
+    chain = Pipeline(files).map_with_index(lambda index, row: {**row, "at": np.int64(index)}).batch(shares)
     loading = Loading(workers=0, threads=1, read_buffer=1)
     partition = DataPartition(index=0, count=shares)
 
@@ -294,8 +294,54 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
             with pytest.raises(PlanChanged) as refused:
                 resumed.set_state(json.dumps(earlier).encode())
             assert "shards.cut" in refused.value.differs, refused.value.differs
+            # Written by another Grain too: the cut refused as itself, never as that Grain's.
+            earlier["dew_data_plan"]["rules"]["grain"] = "0.0.1"
+            with pytest.raises(PlanChanged) as other:
+                resumed.set_state(json.dumps(earlier).encode())
+            assert "shards.cut" in other.value.differs, other.value.differs
         else:
             resumed.set_state(json.dumps(earlier).encode())
             assert int(next(iter(resumed))["at"][0]) == int(following["at"][0]) != int(first["at"][0])
     finally:
         resumed.close()
+
+
+@pytest.mark.parametrize("positioned", [True, False], ids=["positioned-ranges", "plain-lines"])
+def test_a_bounded_reads_position_holds_the_cut_its_store_was_dealt_by_and_a_plain_streams_none(
+        tmp_path, positioned):
+    """A bounded endless read's share of a positioned store cut for its 80 readers reads its places among
+    the bound (`bounded_places`) and holds its store's cut beside its rows' position, refusing one saved
+    under the first cut (review of d22: the bound's places dropped the cut); a plain stream of lines,
+    whose store is split as it always was (`Files.manifest`), holds none, so a position saved before any
+    cut was named resumes."""
+    from dew._position import PlanChanged
+    from dew.data.shards import bounded_places, cut, streamed
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(130)))
+    files = Files(str(path))
+    files.provision()
+    partition, loading = DataPartition(index=0, count=80), Loading(workers=0, threads=1, read_buffer=1)
+    manifest = cut(files.positioned_manifest() if positioned else files.manifest(), partition=partition,
+                   loading=loading)
+    # The positioned store's places among the bound; the plain lines', read whole, its every share's own.
+    places = bounded_places(manifest, partition=partition, seed=None, loading=loading, epochs=None,
+                            examples=200) if positioned else None
+    assert places or not positioned, places
+
+    def read():
+        return iter(streamed(manifest, partition=partition, loading=loading,
+                             epochs=None if positioned else 1, places=places))
+
+    rows = read()
+    next(rows)
+    state = rows.get_state()
+    held = state.get("cut") if isinstance(state, dict) and set(state) == {"rows", "cut"} else None
+    assert held == ("even" if positioned else None), state
+    if positioned:
+        with pytest.raises(PlanChanged):
+            read().set_state(state["rows"])
+    else:
+        resumed = read()
+        resumed.set_state(state)
+        assert next(resumed) == next(rows)

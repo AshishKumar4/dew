@@ -14,7 +14,7 @@ from dew import _position
 from dew._records import boolean, integer, integers, listed, record
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
-from .sources.base import EVEN_CUT, Shard, ShardManifest, ShardOpener
+from .sources.base import Shard, ShardManifest, ShardOpener
 
 _log = logging.getLogger(__name__)
 
@@ -45,13 +45,14 @@ def streamed(
         raise ValueError(f"{described} holds no rows, so reading it endlessly reads nothing forever")
     if not manifest.shards:
         return grain.MapDataset.source(()).to_iter_dataset()
-    if places is not None:
-        reader = _Taken(manifest.reader)
-        return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described)
     shards = _shards(manifest, partition=partition, loading=loading)
     # The cut its places were dealt from, which its position holds (`_Passing`): the manifest's own, or
-    # the one that cut it finer here.
-    dealt = manifest.cut or (EVEN_CUT if shards != tuple(manifest.shards) else None)
+    # the changed rule that cut it finer here (`ShardManifest.subdivided_by`).
+    dealt = manifest.cut or (manifest.subdivided_by if shards != tuple(manifest.shards) else None)
+    if places is not None:
+        reader = _Taken(manifest.reader)
+        return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described,
+                          dealt=dealt)
     # An endless read whose shards are found empty, every place this reader can read, with no row read
     # between, reads nothing forever, which data.md §10 refuses (`_EmptyRun`), whether or not its store counts
     # its rows, as a store whose shards all state none is refused above.
@@ -143,7 +144,8 @@ def cut(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) 
     shards = _shards(manifest, partition=partition, loading=loading)
     if shards == manifest.shards:
         return manifest
-    return dataclasses.replace(manifest, shards=shards, subdivide=None, counted=None, cut=EVEN_CUT)
+    return dataclasses.replace(manifest, shards=shards, subdivide=None, counted=None,
+                               cut=manifest.subdivided_by)
 
 
 def _shards(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) -> tuple[Shard, ...]:

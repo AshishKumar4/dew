@@ -363,14 +363,23 @@ INERT_DECAY = 1e-4
 which builds the masked decay step its checkpoints hold (`unmarked`)."""
 
 
-def typed_since(directory) -> bool:
-    """Whether the newest step a run saved in `directory` (a `dew.checkpoints` directory of numbered steps)
-    is an intermediate Dew's own, its metadata saying its optimizer state was its typed optimizer's
-    (`typed_optimizer`): one saved after that Dew resumed the run under the record it rewrote, which then
-    loads as it is, not as the earlier run trained (`unmarked`)."""
+def typed_since(record: Mapping[str, object], directory) -> bool:
+    """Whether the step a resume of the run `record` names restores, the newest committed one of its
+    persistent `directory` and of the host's own beside it (its trainer's `local_directory`, under the run's
+    name, as `dew.checkpoints.Checkpoints` reads the newer of the two), is an intermediate Dew's own, its
+    metadata saying its optimizer state was its typed optimizer's (`typed_optimizer`): one saved after that
+    Dew resumed the run under the record it rewrote, which then loads as it is, not as the earlier run
+    trained (`unmarked`)."""
     import orbax.checkpoint as ocp
+    from etils import epath
 
-    steps = [entry for entry in directory.iterdir() if entry.name.isdigit()]
+    named = _records.class_record({key: value for key, value in record.items() if key not in MARKERS})
+    fields = {} if named is None else named[1]
+    trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
+    local = trainer.get("local_directory") if isinstance(trainer, Mapping) else None
+    roots = [directory, *([epath.Path(local) / directory.name] if isinstance(local, str) else [])]
+    steps = [entry for root in roots if root.exists() for entry in root.iterdir() if entry.name.isdigit()
+             and (entry / "_CHECKPOINT_METADATA").exists()]
     if not steps:
         return False
     custom = ocp.metadata.get_step_metadata(max(steps, key=lambda entry: int(entry.name))).custom_metadata
@@ -405,7 +414,8 @@ def unmarked(record: Mapping[str, object], mark: Mapping[str, object]) -> Mappin
             config["optimizer"] = {"class": held[0], "fields": decayed(_records.record(held[1], "optimizer"))}
         config = masked(config, lambda part: dict(part))
     else:
-        names = set(_records.listed(mark.get("unmasked_groups"), "unmasked groups", read=_records.text))
+        names = set(_records.listed(mark.get("unmasked_groups"), "unmasked groups", read=_records.text,
+                                    what="the names of the param groups the mark unmasked"))
         groups = config.get("param_groups") or []
         assert isinstance(groups, list), groups
         config["param_groups"] = [masked(group, decayed) if isinstance(group, Mapping)

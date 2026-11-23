@@ -349,8 +349,9 @@ class _PerShare(Forwarding):
         read = self._open()
         try:
             read.set_state(self._saved)
-        except _position.MalformedPosition:
-            # A corrupt cursor of Dew's own, whatever Grain wrote beside it: refused as it is.
+        except (_position.MalformedPosition, PlanChanged):
+            # A corrupt cursor of Dew's own, or a position its plan refuses (another cut of its store),
+            # whatever Grain wrote beside it: refused as it is.
             read.close()
             raise
         except (KeyError, TypeError, ValueError, IndexError) as error:

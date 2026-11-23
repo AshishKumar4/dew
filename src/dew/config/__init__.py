@@ -804,6 +804,9 @@ class RunConfig:
         target = path / RUN_FILE
         # Whole or not at all: `load` reads it while a run is resumed.
         write_atomically(target, json.dumps(self.record(), indent=2, sort_keys=True))
+        # The record written is the run's whole account from here on: an intermediate Dew's mark beside
+        # it, read where this run was loaded (`load`), is decided and read no more.
+        (path / MASKED_DECAY_MARK).unlink(missing_ok=True)
         return str(target)
 
     def record(self) -> dict[str, JSON]:
@@ -967,12 +970,12 @@ class RunConfig:
         named_file = str(directory).endswith(".json")
         # A record an intermediate Dew rewrote beside its mark, as its run trained (`unmarked`).
         directory = path.parent if named_file else path
-        mark = directory / MASKED_DECAY_MARK
-        # Its newest step that Dew's own, saved under the record it rewrote, the record read as it is.
-        marked = json.loads(mark.read_text()) if mark.exists() and not typed_since(directory) else None
         record = json.loads((path if named_file else path / RUN_FILE).read_text())
-        if marked is not None:
-            record = unmarked(record, marked)
+        # A record an intermediate Dew rewrote beside its mark, as its run trained (`unmarked`), but where
+        # the step a resume restores is that Dew's own, saved under the record it rewrote, read as it is.
+        mark = directory / MASKED_DECAY_MARK
+        if mark.exists() and not typed_since(record, directory):
+            record = unmarked(record, json.loads(mark.read_text()))
         # The packages trusted first, so the record's earlier shapes are read with its classes imported.
         registry.import_trusted(record, trust)
         # A field its record left to its checkpoints (`earlier_checkpointed`) is read where the run resumes
