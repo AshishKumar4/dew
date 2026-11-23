@@ -312,6 +312,27 @@ def phased_params(trainer, tokens, steps: int = 4, **fitted) -> dict:
     return {"params": state.variables["params"]}
 
 
+def phase_needs(monkeypatch, tokens) -> tuple[int, int, int]:
+    """The bytes a phased run's steps need on a device, each measured as in a process apart (the runs after
+    compile nothing of them): its first phase's of one pass, its state's bytes beside it, as a plan made
+    before its state is placed counts them (`StepCompiler.planned_unplaced`), and its second phase's
+    whole and in halves."""
+    from test_plan import LIMIT, free
+
+    from dew.distributed.placement import placed_bytes
+    from dew.nn.kernels import options
+
+    def needed(model, split, *, startup=False):
+        free(monkeypatch, LIMIT)
+        trainer = phased_trainer(model, 0, None, fit=FitPolicy(split=split))
+        state, _, _ = trainer.place()
+        trainer.compile(state, {"text": jnp.asarray(tokens)})
+        options.unhold()
+        return LIMIT - trainer.plan["probes"][0]["headroom"] + (placed_bytes(state) if startup else 0)
+
+    return needed(looped(steps=1), 1, startup=True), needed(looped(), 1), needed(looped(), 2)
+
+
 @attending("xla")
 def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp_path):
     """A run whose loop runs 1 pass in its first phase and 3 in its second (`phase_passes`), on devices with
@@ -327,24 +348,13 @@ def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp
     from test_plan import LIMIT, free
 
     from dew.checkpoints import Checkpoints
-    from dew.distributed.placement import placed_bytes
-    from dew.nn.kernels import options
 
     tokens, _ = phased_draw(0)
-
-    def needed(model, split, *, startup=False):
-        free(monkeypatch, LIMIT)
-        trainer = phased_trainer(model, 0, None, fit=FitPolicy(split=split))
-        state, _, _ = trainer.place()
-        trainer.compile(state, {"text": jnp.asarray(tokens)})
-        # Measured as in a process apart: the run below compiles nothing of it.
-        options.unhold()
-        return LIMIT - trainer.plan["probes"][0]["headroom"] + (placed_bytes(state) if startup else 0)
 
     # The first phase is planned before its state is placed, the state's bytes beside its step
     # (`StepCompiler.planned_unplaced`), and the run keeps that plan: the devices' free bytes, which
     # `free` states, do not fall as the state is placed, so its room counts the state's bytes.
-    once, whole, halves = needed(looped(steps=1), 1, startup=True), needed(looped(), 1), needed(looped(), 2)
+    once, whole, halves = phase_needs(monkeypatch, tokens)
     assert max(once, halves) < whole, (once, halves, whole)
     free(monkeypatch, (max(once, halves) + whole) // 2)
     planned = phased_trainer(looped(), 0)
@@ -362,6 +372,35 @@ def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp
 
 
 @attending("xla")
+def test_a_later_phases_search_off_the_loop_keeps_no_program_its_boundary_passes_over(monkeypatch):
+    """A later phase planned off the loop (`dew.training.ahead.LaterPlans`) whose search compiled the step
+    whole, which missed, and in halves, which fit, holds both until its boundary takes a plan, then keeps
+    that plan's alone: each other program it compiled dropped, by the release its boundary takes
+    (`LaterPlans.waited`), whose executable would hold its code and collectives' room outside XLA's pool
+    while it lives (review of row 12131: a later phase's search was never released)."""
+    import gc
+
+    from test_plan import free
+
+    from dew.nn.kernels import options
+    from dew.training import _candidates
+
+    tokens, _ = phased_draw(0)
+
+    once, whole, halves = phase_needs(monkeypatch, tokens)
+    assert max(once, halves) < whole, (once, halves, whole)
+    free(monkeypatch, (max(once, halves) + whole) // 2)
+    options.release()
+    gc.collect()
+    planned = phased_trainer(looped(), 0)
+    phased_params(planned, tokens)
+    assert [(probe["split"], probe["ahead"]) for probe in planned.plan["probes"]] == [(1, True), (2, True)]
+    gc.collect()
+    # The first phase's plan and the second's, one program each, kept; the second's whole step dropped.
+    assert len(options._HELD) == 2, list(options._HELD)
+    assert len(_candidates._CANDIDATES) <= 2, list(_candidates._CANDIDATES)
+
+
 def test_a_phased_runs_later_phase_is_compiled_off_its_loop(monkeypatch, tmp_path):
     """A run whose loop runs 1 pass in its first phase and 3 in its second plans its second phase's step on
     a thread of its own once its first step is dispatched (`dew.training.ahead.LaterPlans`): the plan at the

@@ -612,7 +612,9 @@ class RunConfig:
     EXECUTED: ClassVar[tuple[str, ...]] = ("loop_remat",)
     """The model and source fields, by name, that say how a model's layers execute and not what they
     compute or store: a looped block's passes recomputed in its backward or held (`loop_remat`), memory
-    alone, compute the same step, so a run resumes under either (`check_resume`). A source's
+    alone, compute the same step, so a run resumes under either (`check_resume`). A model's own fields that
+    say how it runs, its recompute (`remat`) among them, are its class's to mark (`dew._records.RUNS`), which
+    a resume reads by its class (`registry.computing_fields`). A source's
     weights packed or decoded (`SourceOptions.packed_weights`) are not: packed, its banks are no trainable
     parameters and hold no optimizer moments, so a resume across them is refused by name."""
 

@@ -1330,7 +1330,7 @@ class LaterPlans:
     which plans it as it would have. A pooled run, a host-master or rollout run, one that tunes its kernels or
     runs PGLE plans its phases at their boundaries."""
 
-    def __init__(self, futures: Mapping[int, Future]) -> None:
+    def __init__(self, futures: Mapping[int, Future[Release]]) -> None:
         self.futures = dict(futures)
 
     @classmethod
@@ -1358,7 +1358,7 @@ class LaterPlans:
         # hold per thread), its context variables copied.
         entered = carried()
 
-        def planned(phase: int) -> None:
+        def planned(phase: int) -> Release:
             with entered():
                 return _phase_plan(trainer, shapes, split_fields(phase_batch(trainer, batch, phase))[0],
                                    counts[phase])
@@ -1372,31 +1372,45 @@ class LaterPlans:
         _log.info("planning the steps of data phases %s off the loop", begun)
         return cls(futures)
 
-    def waited(self, passes: int | None) -> None:
+    def waited(self, passes: int | None) -> Release:
         """The plan of the phase whose step runs `passes` waited for, so the executables it compiled, which
-        the process holds (`dew.nn.kernels.options.held`), are there for the boundary's plan; one that
-        failed said, the boundary planning it as it would have."""
+        the process holds (`dew.nn.kernels.options.held`), are there for the boundary's plan, and what drops
+        every one of them but those the boundary's plan takes, which the boundary calls once it takes one
+        (`FitSearch.released_unplanned`); one that failed said, the boundary planning it as it would have."""
         future = self.futures.pop(passes, None) if passes is not None else None
         if future is None:
-            return
+            return _kept
         try:
-            future.result()
+            return future.result()
         except Exception as error:  # the boundary plans the phase as it would have
             _log.warning("planning the step of %d passes off the loop failed; its boundary plans it: %r",
                          passes, error)
+            return _kept
 
     def stopped(self) -> None:
-        """Every phase's plan waited for as the run ends, a pending one not begun, one that failed said."""
+        """Every phase's plan waited for as the run ends, a pending one not begun, one that failed said, and
+        every program a phase the run never reached compiled dropped (`Release`)."""
         for passes, future in self.futures.items():
             if future.cancel():
                 continue
             if (error := future.exception()) is not None:
                 _log.warning("planning the step of %s passes off the loop failed: %r", passes, error)
+            else:
+                future.result()(None)
         self.futures.clear()
 
 
+type Release = Callable[[Planned | None], None]
+"""What drops every program a later phase's plan off the loop held (`FitSearch.released_unplanned`) but the
+plan its boundary took, all of them where none (a phase its run never reached)."""
+
+
+def _kept(planned: Planned | None) -> None:
+    """The release of a phase planned off the loop by nothing: nothing to drop."""
+
+
 def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
-                                 passes: int) -> None:
+                                 passes: int) -> Release:
     """A plan of `trainer`'s step at `passes` over `state`'s shapes and `batch` (`LaterPlans`), on a compiler
     and objective of its own, its executables held by the process (`dew.nn.kernels.options.hold`), those it
     compiled before a refusal where no candidate fit the devices as they stand off the loop among them, which
@@ -1413,6 +1427,13 @@ def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Train
     except PlanRefused as refused:
         _log.info("the step of %d passes fits no plan off the loop; its boundary plans it: %s", passes,
                   refused)
+    except BaseException:
+        # Its search's programs dropped where it raised otherwise, its error the boundary's to plan past.
+        if (settle := compiler._provisional()) is not None:
+            settle(None)
+        raise
+    settle = compiler._provisional()
+    return _kept if settle is None else settle
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
                                  partition: DataPartition | None = None) -> Batch:
