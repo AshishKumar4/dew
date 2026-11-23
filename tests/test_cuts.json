@@ -422,7 +422,7 @@
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm80-128-fast-temperature]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm80-256-acc-none]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm80-256-fast-none]",
-"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm80-64-acc-custom-vjp]",
+"tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm80-64-acc-key-bias]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm80-64-acc-row-indexed]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm80-64-acc-sinks]",
 "tests/test_attention_mosaic_compile.py::test_the_backward_compiles_spill_free_as_its_model_decides[sm80-64-acc-softcap]",
@@ -634,7 +634,7 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-OUTPUT-bfloat16-temperature]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-bfloat16-key-bias]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-bfloat16-row-indexed]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-bfloat16-softcap-sinks-alibi]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-bfloat16-softcap]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-float16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-bfloat16-key-bias]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-bfloat16-row-indexed]",
@@ -1097,8 +1097,8 @@
 "tests/test_compile_ahead.py::test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets",
 "tests/test_compile_ahead.py::test_a_gemm_asked_to_interpret_on_a_cpu_traced_ahead_for_a_gpu_holds_no_interpreter",
 "tests/test_compile_ahead.py::test_a_run_takes_an_untuned_step_only_where_its_own_compile_tunes_nothing",
-"tests/test_compile_ahead.py::test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_eight_devices_does[fsdp4_tensor2]",
-"tests/test_compile_ahead.py::test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_runs[sm100-auto]",
+"tests/test_compile_ahead.py::test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_eight_devices_does[fsdp8]",
+"tests/test_compile_ahead.py::test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gpus",
 "tests/test_compile_ahead.py::test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_runs[sm100-template]",
 "tests/test_compile_ahead.py::test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_runs[sm120-auto]",
 "tests/test_compile_ahead.py::test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_runs[sm80-template]",
@@ -1977,8 +1977,8 @@
 "tests/test_grouped_gemm.py::test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie[False-h100]",
 "tests/test_grouped_gemm.py::test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie[True-h100-stack-layer]",
 "tests/test_grouped_gemm.py::test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie[True-h100]",
-"tests/test_grouped_gemm.py::test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain_product_takes",
-"tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_lower_for_an_h100_at_their_tile_and_a_narrow_pin[MosaicGmm-transposed]",
+"tests/test_grouped_gemm.py::test_an_ampere_gpus_mosaic_and_triton_launches_are_each_as_exact_as_xla[aligned-bf16]",
+"tests/test_grouped_gemm.py::test_hopper_cluster2_balanced_tail_lowers_spill_free",
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[bfloat16-tile-boundaries]",
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-all-empty]",
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-tile-boundaries]"
@@ -2365,9 +2365,6 @@
 "tests/test_kv_cache.py": [
 "tests/test_kv_cache.py::test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages"
 ],
-"tests/test_layer_banks.py": [
-"tests/test_layer_banks.py::test_declared_banks_preserve_canonical_values_layout_and_model_reads[shared-diffusion]"
-],
 "tests/test_layer_stack.py": [
 "tests/test_layer_stack.py::test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop",
 "tests/test_layer_stack.py::test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop",
@@ -2407,9 +2404,6 @@
 "tests/test_linear_attention.py::test_the_layer_decodes_as_it_prefills",
 "tests/test_linear_attention.py::test_the_layer_reads_a_holed_row_as_the_row_without_its_holes",
 "tests/test_linear_attention.py::test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound"
-],
-"tests/test_live_bridge.py": [
-"tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
 ],
 "tests/test_llama4.py": [
 "tests/test_llama4.py::test_a_paged_cache_draws_what_the_dense_cache_draws[paged]"
@@ -2894,10 +2888,10 @@
 ],
 "tests/test_norm_swiglu.py": [
 "tests/test_norm_swiglu.py::test_a_weight_folded_into_the_inverse_associates_as_flax_and_takes_every_gradient[False-float32-bfloat16]",
-"tests/test_norm_swiglu.py::test_gated_norm_and_every_gradient_hold_the_float64_gate[same-shape1-bfloat16-sigmoid]",
-"tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[bfloat16-distinct]",
+"tests/test_norm_swiglu.py::test_rms_variants_and_every_gradient[False-False-None-float32]",
+"tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[bfloat16-repeated]",
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float16-repeated]",
-"tests/test_norm_swiglu.py::test_stream_seam_takes_the_add_and_the_stream_cotangent[shape0-float32-False]"
+"tests/test_norm_swiglu.py::test_seam_and_product_launch_their_kernels_inside_a_checked_shard_map"
 ],
 "tests/test_online_loader.py": [
 "tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[indexed-processes-map]"
@@ -3130,7 +3124,7 @@
 "tests/test_recurrence.py::test_each_covering_hook_combination_steps_as_its_float64_form[l2norm=True]"
 ],
 "tests/test_recurrence_chunk.py": [
-"tests/test_recurrence_chunk.py::test_a_forked_call_of_entry_writes_of_no_terms_lowers_on_the_template[Hooks(conv=None, l2norm=False, scale=0.25, decay='scalar', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=None, write_bound=1.0, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)]",
+"tests/test_recurrence_chunk.py::test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it[Hooks(conv=None, l2norm=False, scale=None, decay='scalar', gates=None, delta=False, write_gate=True, rated=False, skip=False, output=None, write_bound=None, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[an additive erase]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[no decay]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[the delta rule]",
@@ -3145,8 +3139,8 @@
 "tests/test_recurrence_chunk.py::test_a_turned_gradients_overflowed_term_reaches_no_later_tokens_sum",
 "tests/test_recurrence_chunk.py::test_a_turned_states_long_documents_under_a_short_memory_are_as_exact_as_the_recurrence[forked]",
 "tests/test_recurrence_chunk.py::test_a_turned_states_long_documents_under_a_short_memory_are_as_exact_as_the_recurrence[one sequence]",
-"tests/test_recurrence_chunk.py::test_an_oja_decode_tokens_gate_scales_its_formed_correction[a gated value past the least]",
-"tests/test_recurrence_chunk.py::test_the_derived_rule_runs_in_a_shard_map_that_checks_varying_axes[a memory entering-values and memory whole]"
+"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=False, scale=0.25, decay='scalar', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=OutputNorm(epsilon=1e-05, activation='sigmoid', read_in=None), write_bound=1.0, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-one sequence]",
+"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=True, scale=None, decay='vector', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=OutputNorm(epsilon=1e-06, activation='silu', read_in=None), write_bound=1.0, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-packed]"
 ],
 "tests/test_recurrence_mosaic.py": [
 "tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-kimi-linear-kda-True]",
@@ -3171,10 +3165,10 @@
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm100-8]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm120-0]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm80-0]",
-"tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm80-1]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm86-0]",
-"tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm89-0]",
-"tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-0]",
+"tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm86-2]",
+"tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm89-1]",
+"tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm89-2]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-10]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-12]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-13]",
@@ -3182,7 +3176,7 @@
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-16]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-18]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-2]",
-"tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-4]",
+"tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-3]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-5]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-6]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm90-7]",
@@ -3200,8 +3194,8 @@
 "tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks32-False]",
 "tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks4-False]",
 "tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks49-False]",
-"tests/test_recurrence_mosaic.py::test_lightning_attentions_training_step_starts_unspilled_asking_each_rung_once",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-a 192-wide value head-bfloat16-training-variant-two roles]",
+"tests/test_recurrence_mosaic.py::test_the_identity_tests_cover_is_its_targets_reach[sm80]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-a write gate-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-a write gate-float32-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-kimi-linear-kda-bfloat16-training-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-kimi-linear-kda-bfloat16-training]",
@@ -3210,7 +3204,7 @@
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-qwen3.5-27b-gdn-float32-forward]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-kimi-linear-kda-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-kimi-linear-kda-bfloat16-forward]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-nemotron-h-4b-ssd-bfloat16-training]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-minimax-text-01-lightning-bfloat16-training-variant-two roles]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-qwen3.5-27b-gdn-bfloat16-forward]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-qwen3.5-27b-gdn-bfloat16-training-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-kimi-linear-kda-bfloat16-forward]",
@@ -3218,8 +3212,8 @@
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-qwen3.5-27b-gdn-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-qwen3.5-27b-gdn-bfloat16-training-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-a write gate-bfloat16-forward-packed]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-kimi-linear-kda-bfloat16-forward-packed]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-minimax-text-01-lightning-bfloat16-forward-variant-1]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-kimi-linear-kda-bfloat16-forward-variant-0]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-minimax-text-01-lightning-bfloat16-training-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-qwen3.5-27b-gdn-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-qwen3.5-27b-gdn-bfloat16-training]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-kimi-linear-kda-bfloat16-forward-packed]",
@@ -3283,15 +3277,15 @@
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[rated-decays near one-accurate]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[rated-steep then mild-accurate]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[rated-the decay bound-fast]",
-"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar delta-resets on chunk edges-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar delta-saturated gates-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar delta-the decay bound-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar write-resets on chunk edges-None]",
-"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar write-steep then mild-None]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar write-spread gates-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[vector delta-saturated gates-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[vector delta-spread gates-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[vector delta-steep then mild-None]",
-"tests/test_recurrence_template_stability.py::test_kimis_unit_keys_under_tiny_gates_at_the_floor_stays_finite_interpreted"
+"tests/test_recurrence_template_stability.py::test_kimis_unit_keys_under_tiny_gates_at_the_floor_stays_finite_interpreted",
+"tests/test_recurrence_template_stability.py::test_the_narrow_gated_delta_gradient_compiles_for_an_h100"
 ],
 "tests/test_recurrence_witness.py": [
 "tests/test_recurrence_witness.py::test_a_grouped_backwards_records_lie_in_their_key_heads_enclosures[keys gated-sm90]"
