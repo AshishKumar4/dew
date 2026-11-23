@@ -1272,6 +1272,29 @@ def _keep_within(lower: float, upper: float) -> optax.GradientTransformation:
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+def _checked_decay_mask(mask: JsonDict | None, spared: bool, owner: str) -> None:
+    """Refuse a decay mask (`OptimConfig.decay_mask`) beside a decay that spares, which writes its own over
+    it, or one whose leaves are not booleans."""
+    if mask is None:
+        return
+    if spared:
+        raise ValueError(f"{owner} spares its decay, which writes its own mask over decay_mask: set spared "
+                         "False to decay where decay_mask says")
+    leaves = jax.tree.leaves(mask, is_leaf=lambda leaf: leaf is None)
+    if not isinstance(mask, Mapping) or not leaves or not all(type(leaf) is bool for leaf in leaves):
+        raise ValueError(f"{owner}'s decay_mask is a tree of booleans by parameter name, got {mask!r}")
+
+
+def _decay_masked(mask: JsonDict | None, optimizer: OptimizerSpec) -> dict[str, JsonDict]:
+    """The mask the optimizer's decay takes (`decay_mask`), where it is given; refused for an optimizer
+    that takes no mask (`OptimizerSpec.spares`)."""
+    if mask is None:
+        return {}
+    if not optimizer.spares():
+        raise ValueError(f"{type(optimizer).__name__} takes no decay mask: its decay_mask is none it reads")
+    return {'mask': mask}
+
+
 @dataclasses.dataclass(frozen=True)
 class ParamGroup:
     """A group of parameters the optimizer updates with their own learning
@@ -1309,11 +1332,17 @@ class ParamGroup:
     """Whether the group claims the modules its run draws fresh beside a loaded base, ahead of its own
     `patterns` (`Objective.fresh_modules`): what `OptimConfig.with_fresh` names before a run records
     the group."""
+    decay_mask: JsonDict | None = None
+    """The parameters the group's decay applies to where it does not spare them (`spared` False): a tree of
+    booleans by parameter name, a prefix of its parameters' tree, as Optax's decay takes its mask
+    (`optax.add_decayed_weights`); None decays every parameter it claims. An earlier run's mask among its
+    optimizer's options (`dew.config.earlier`)."""
 
     def __post_init__(self):
         object.__setattr__(self, "patterns", tuple(self.patterns))
         if not self.patterns and not self.fresh:
             raise ValueError(f"param group {self.name!r} matches no pattern")
+        _checked_decay_mask(self.decay_mask, self.spared, f"param group {self.name!r}")
         if self.learning_rate_multiplier <= 0:
             raise ValueError(
                 f"param group {self.name!r} scales the learning rate by a positive "
@@ -2087,6 +2116,11 @@ class OptimConfig:
     a bias toward zero regularizes nothing a matrix's decay does and shifts what the layer computes.
     Optax decays every parameter (`mask=None`), which False restores. A param group decays all it claims
     unless its own `spared` says otherwise (`ParamGroup.spared`); a run's default groups follow this."""
+    decay_mask: JsonDict | None = None
+    """The parameters the decay applies to where it does not spare them (`spared` False): a tree of
+    booleans by parameter name, a prefix of the parameters' tree, as Optax's decay takes its mask
+    (`optax.add_decayed_weights`); None decays every parameter. An earlier run's mask among its optimizer's
+    options (`dew.config.earlier`); a param group's own its group's (`ParamGroup.decay_mask`)."""
     param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
     """Per-group learning rates, momentum schedules, weight decay and bounds; the first
     matching group wins.
@@ -2116,6 +2150,7 @@ class OptimConfig:
         return self.learning_rate
 
     def __post_init__(self):
+        _checked_decay_mask(self.decay_mask, self.spared, "the optimizer")
         if self.learning_rate is None:
             # Unset, the rate is the optimizer's own, recorded as the config's.
             object.__setattr__(self, 'learning_rate', self.optimizer.OWN_RATE)
@@ -2199,7 +2234,8 @@ class OptimConfig:
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
                 grouped = {**opts, **decay}
-                spared = {'mask': weight_decay_mask} if group.spared and self.optimizer.spares() else {}
+                spared = ({'mask': weight_decay_mask} if group.spared and self.optimizer.spares()
+                          else _decay_masked(group.decay_mask, self.optimizer))
                 solvers[group.name] = group.solver(make, self.rate, steps, {**grouped, **spared},
                                                    clocked=clocked, stated=stated)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
@@ -2208,6 +2244,8 @@ class OptimConfig:
         else:
             if self.spared and self.optimizer.spares():
                 opts['mask'] = weight_decay_mask
+            else:
+                opts.update(_decay_masked(self.decay_mask, self.optimizer))
             solver = scheduled_solver(make, self.rate, steps, opts, clocked=clocked, stated=stated)
 
         if self.clip_grads > 0:

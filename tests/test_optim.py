@@ -540,6 +540,41 @@ def test_weight_decay_spares_the_biases_and_the_norms_unless_a_group_claims_them
         np.testing.assert_array_equal(node(spared, path), node(grouped, path), err_msg=str(path))
 
 
+@pytest.mark.parametrize("grouped", [False, True], ids=["config", "param-group"])
+def test_a_decay_mask_decays_the_parameters_its_tree_names_alone(grouped):
+    """On a zero gradient an update is the decay alone: an unspared decay masked by a tree of booleans
+    (`OptimConfig.decay_mask`, `ParamGroup.decay_mask`) moves the parameters its tree names True, the rest
+    not at all."""
+    params = {"w": jnp.ones((2, 2)), "b": jnp.ones(2)}
+    mask = {"w": False, "b": True}
+    held = ({"param_groups": (ParamGroup("all", ("*",), decay_mask=mask),)} if grouped
+            else {"spared": False, "decay_mask": mask})
+    solver = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=LR, **held).build(1)
+    updates = solver.update(jax.tree.map(jnp.zeros_like, params), solver.init(params), params)[0]
+    assert not np.any(updates["w"]) and np.all(updates["b"] < 0)
+
+
+@pytest.mark.parametrize("held, refusal", [
+    ({"decay_mask": {"w": False}}, "spares its decay"),
+    ({"spared": False, "decay_mask": {"w": 0}}, "tree of booleans"),
+    ({"spared": False, "decay_mask": {"w": None}}, "tree of booleans"),
+    ({"spared": False, "decay_mask": {}}, "tree of booleans"),
+    ({"param_groups": (ParamGroup("all", ("*",), spared=True, decay_mask={"w": True}),)}, "spares its decay"),
+], ids=["spared", "int-leaf", "none-leaf", "empty", "spared-group"])
+def test_a_decay_mask_a_spared_decay_writes_over_or_of_other_leaves_than_booleans_is_refused(held, refusal):
+    """A decay mask beside a decay that spares, whose own mask is written over it, or whose leaves are not
+    booleans, is refused as the config is built, never trained under another mask than it names."""
+    with pytest.raises(ValueError, match=refusal):
+        OptimConfig(optimizer=AdamW(weight_decay=0.1), **held)
+
+
+def test_a_decay_mask_on_an_optimizer_that_takes_none_is_refused():
+    """Muon's decay takes no mask (`OptimizerSpec.spares`): a decay mask it would never read is refused as
+    its solver is built."""
+    with pytest.raises(ValueError, match="takes no decay mask"):
+        OptimConfig(optimizer=Muon(weight_decay=0.1), spared=False, decay_mask={"w": True}).build(1)
+
+
 def test_muon_takes_qwen35s_hidden_matrices_and_adamw_its_filters_vectors_and_lookups():
     """Qwen3.5-0.8B's parameter tree, built from its released config with no weights: Muon takes its
     hidden matrices, every rank-2 projection of its attention, its Gated DeltaNet and its MLP, as the
