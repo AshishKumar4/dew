@@ -886,7 +886,7 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
         factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape,
                             dense)
         scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs,
-                          wide=functools.partial(wide_transpose, interpret_on_cpu=interpret_on_cpu),
+                          wide=interpreted_wide(interpret_on_cpu),
                           wide_operands=(weights, group_sizes), prepared=decoded_operands)
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
@@ -907,6 +907,13 @@ def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array |
                   interpret_on_cpu=interpret_on_cpu, gather=gather)
     assert isinstance(summed, jax.Array), "an unpaired product has one output"
     return summed
+
+
+def interpreted_wide(interpret_on_cpu: bool) -> Callable:
+    """`wide_transpose` as `factored`'s `wide`, interpreted where `interpret_on_cpu` asks, as the product's
+    own pullback is (`_interpreted`), wherever the rescue traces it."""
+    wide = functools.partial(wide_transpose, interpret_on_cpu=interpret_on_cpu)
+    return functools.partial(_interpreted, wide, interpret_on_cpu)
 
 
 def _interpreted(product: Callable, interpret_on_cpu: bool, *operands) -> jax.Array:
@@ -1197,7 +1204,7 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     # Each row's (its group's) factor joins the sum as `factored` takes a row's: a cancelling cotangent
     # under a factor past fp32's largest pulls back its finite sum, the bank decoded only where it does.
     return factored(product, operands, factor, lhs, gather=gather,
-                    wide=functools.partial(wide_transpose, interpret_on_cpu=interpret_on_cpu),
+                    wide=interpreted_wide(interpret_on_cpu),
                     wide_operands=(bank, group_sizes), prepared=decoded_operands).astype(out_dtype)
 
 

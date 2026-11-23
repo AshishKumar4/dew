@@ -105,7 +105,7 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         product = functools.partial(gemm.decoded_product, interpret_on_cpu=interpret_on_cpu)
         operands = (weights.unscaled(jnp.bfloat16), group_sizes)
     run = functools.partial(gemm._interpreted, product, interpret_on_cpu)
-    wide = functools.partial(gemm.wide_transpose, interpret_on_cpu=interpret_on_cpu)
+    wide = gemm.interpreted_wide(interpret_on_cpu)
     # The codes alone for the rescue's decoded matrix, no scale: a derivative rule closes over no
     # differentiated value.
     codes = (dataclasses.replace(weights, scale=jnp.ones((), jnp.float32)), group_sizes)
