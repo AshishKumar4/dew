@@ -1632,32 +1632,32 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
 @INTERPRETS
 def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
     """One-consumer `mma.sync` grouped tiles (`tiles.sharing == 1`) bind `group.actual_end - row_start` onto
-    `family.bounded` (`_row_bound`), holding check 1 on ragged `[64, 64]` groupings interpreted and
+    `family.bounded` (`_row_bound`), emitting runtime `int32` row-bound operands on every native `mma` (none
+    on dense), holding check 1 on `[64, 64]` and unaligned+zero-row `[48, 0, 35, 45]` groupings, and
     compiling spill-free on `sm80` (rows 5623, 7091)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
-    from dew.nn.kernels.templates.gemm import row_tiles
-
     tile_128 = tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
-    grp = row_tiles.GroupInfo(
-        group_id=jnp.int32(0), block_start=jnp.int32(0), actual_start=jnp.int32(0),
-        actual_end=jnp.int32(64), start_within_block=jnp.int32(0), actual_size=jnp.int32(64),
-        matrix=jnp.int32(0))
-    assert mosaic_gpu._row_bound(tile_128, grp, jnp.int32(0), dense=True) is None
-    bound0 = mosaic_gpu._row_bound(tile_128, grp, jnp.int32(0), dense=False)
-    bound64 = mosaic_gpu._row_bound(tile_128, grp, jnp.int32(64), dense=False)
-    assert bound0 is not None and int(bound0) == 64
-    assert bound64 is not None and int(bound64) == 0
-
-    def draw(seed):
-        rng = np.random.default_rng(7091 + seed)
-        x = jnp.asarray(rng.standard_normal((128, 64)) / np.sqrt(64), jnp.bfloat16)
-        w = jnp.asarray(rng.standard_normal((2, 64, 128)) / np.sqrt(64), jnp.bfloat16)
-        return x, w, jnp.asarray([64, 64], jnp.int32)
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    with (generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"),
+          tuning.pinned({grouped_matmul.MosaicGmm: tile_128})):
+        grouped_graph = jax.make_jaxpr(
+            lambda x, w, s: gemm.gemm(x, w, s, out_dtype=jnp.bfloat16)
+        )(bf16((192, 64)), bf16((3, 64, 128)), jax.ShapeDtypeStruct((3,), jnp.int32))
+        dense_graph = jax.make_jaxpr(
+            lambda x, w: gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+        )(bf16((128, 64)), bf16((64, 128)))
+    grouped_mmas = [eq for eq in equations(grouped_graph, platform="cuda") if eq.primitive.name == "mma"]
+    dense_mmas = [eq for eq in equations(dense_graph, platform="cuda") if eq.primitive.name == "mma"]
+    assert grouped_mmas and all(
+        len(eq.invars) == 4 and eq.invars[3].aval.dtype == jnp.int32 and eq.invars[3].aval.shape == ()
+        for eq in grouped_mmas), grouped_mmas
+    assert dense_mmas and all(len(eq.invars) == 3 for eq in dense_mmas), dense_mmas
 
     def dew_fn(x, w, sizes):
-        with generation.assumed("sm80"), tuning.pinned({grouped_matmul.MosaicGmm: tile_128}):
+        with (generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"),
+              tuning.pinned({grouped_matmul.MosaicGmm: tile_128})):
             return gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
     def ref_fn(x, w, sizes, *, dtype=jnp.float32):
@@ -1665,11 +1665,17 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
                                   preferred_element_type=dtype).astype(
             jnp.float64 if dtype == jnp.float64 else jnp.bfloat16)
 
-    assert_as_exact(jax.jit(dew_fn), jax.jit(ref_fn), draw, "sm80 bounded [64, 64]", seeds=8,
-                    truth_fn=functools.partial(ref_fn, dtype=jnp.float64))
+    for tag, counts in (("[64, 64]", (64, 64)), ("[48, 0, 35, 45]", (48, 0, 35, 45))):
+        def draw(seed, counts=counts):
+            rng = np.random.default_rng(7091 + len(counts) * 100 + seed)
+            x = jnp.asarray(rng.standard_normal((128, 64)) / np.sqrt(64), jnp.bfloat16)
+            w = jnp.asarray(rng.standard_normal((len(counts), 64, 128)) / np.sqrt(64), jnp.bfloat16)
+            return x, w, jnp.asarray(counts, jnp.int32)
+
+        assert_as_exact(jax.jit(dew_fn), jax.jit(ref_fn), draw, f"sm80 bounded {tag}", seeds=8,
+                        truth_fn=functools.partial(ref_fn, dtype=jnp.float64))
 
     if generation.compile_only_gpus("sm80"):
-        bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
         s_spec = jax.ShapeDtypeStruct((3,), jnp.int32)
 
         def compiled(x, w, s):
