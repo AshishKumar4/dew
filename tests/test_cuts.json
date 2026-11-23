@@ -885,8 +885,8 @@
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm86-forward-128]",
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm86-forward-256]",
 "tests/test_attention_triton.py::test_the_derived_launches_compile_within_a_99_kb_block[sm86-forward-64]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two[80-48-triton]",
-"tests/test_attention_triton.py::test_the_forward_is_on_par_over_every_call_form[lengths-starts-Tiles(block_q=32, block_k=32, warps=4, stages=2)]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_over_every_call_form[causal-Tiles(block_q=128, block_k=64, warps=4, stages=2)]",
+"tests/test_attention_triton.py::test_the_forward_is_on_par_over_every_call_form[full-Tiles(block_q=64, block_k=32, warps=4, stages=2)]",
 "tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[alibi-bfloat16-fold]",
 "tests/test_attention_triton.py::test_the_forward_is_on_par_under_every_hook[softcap-bfloat16-fold]",
 "tests/test_attention_triton.py::test_the_frozen_mainloop_is_on_par_over_runs[runs-chunk-places-Tiles(block_q=64, block_k=32, warps=4, stages=2)]",
@@ -2193,7 +2193,7 @@
 "tests/test_kernel_configs.py::test_a_route_whose_launch_runs_no_trip_does_not_take_it",
 "tests/test_kernel_configs.py::test_an_amperes_gemm_copies_its_blocks_promised_in_bounds",
 "tests/test_kernel_configs.py::test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it",
-"tests/test_kernel_configs.py::test_each_family_emits_every_launch_form_at_each_consumer_count[sm86]",
+"tests/test_kernel_configs.py::test_each_family_emits_every_launch_form_at_each_consumer_count[sm80]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-dense kernel gradient]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-forward bf16]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-forward fp16]",
@@ -2887,6 +2887,9 @@
 "tests/test_norm_swiglu.py::test_rms_weight_gradient_accumulates_a_full_step_of_rows[float16-repeated]",
 "tests/test_norm_swiglu.py::test_seam_and_product_launch_their_kernels_inside_a_checked_shard_map"
 ],
+"tests/test_online_loader.py": [
+"tests/test_online_loader.py::test_a_stage_declaring_its_pool_runs_there_and_reads_in_order_and_resumes[indexed-threads-flat_map]"
+],
 "tests/test_optim.py": [
 "tests/test_optim.py::test_a_matrix_declared_on_one_side_is_orthogonalized_as_one_matrix[output-whole]",
 "tests/test_optim.py::test_a_scheduled_rate_is_as_near_float64_as_optaxs[cosine]",
@@ -3180,8 +3183,8 @@
 "tests/test_recurrence_mosaic.py::test_an_h100_training_steps_start_certifies_each_kernel_at_most_twice",
 "tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks14-False]",
 "tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks32-False]",
-"tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks4-False]",
-"tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks6-False]",
+"tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks46-True]",
+"tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks7-True]",
 "tests/test_recurrence_mosaic.py::test_the_identity_tests_cover_is_its_targets_reach[sm86]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-a write gate-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-a write gate-float32-forward-packed]",
