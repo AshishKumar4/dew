@@ -279,7 +279,7 @@ def drawing() -> Iterator[None]:
     trace and compile caches on it (`dew._cache.DRAWING`)."""
     from dew import _cache
 
-    with _cache.DRAWING(_cache.DRAWING.value + 1):
+    with _cache.DRAWING(1):
         yield
 
 

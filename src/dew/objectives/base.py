@@ -1326,10 +1326,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         """`init` within `generation.drawing`: its forward runs for the variables its modules make, none of
         its values reaching them, so every selector takes its op's generic program and no launch is derived,
         traced or certified at the draw's shapes (row 11803). The one way a draw runs (`initializer`,
-        `drawn.traced_draw`), so every objective's passes through it once, its own `init` whole: a
-        critic's, an encoder and predictor's, a feature probe's (Train 1205's review F2)."""
+        `drawn.traced_draw`, `parameter_axes`, row 12090), so every objective's passes through it once, its
+        own `init` whole: a critic's, an encoder and predictor's, a feature probe's (Train 1205's review
+        F2)."""
         with drawing():
-            return self.init(key, variables)
+            # An override may take its variables by keyword alone, as the base names them.
+            return self.init(key) if variables is None else self.init(key, variables=variables)
 
     _held_parts: ClassVar[bool] = False
     """Whether the held tree may be parts a fresh draw goes beside (a
@@ -1416,7 +1418,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         if held is None and (drawn_axes := self.__dict__.get("_drawn_axes")) is not None:
             return {**self.tower_axes(), **drawn_axes}
         try:
-            drawn = abstract(functools.partial(self.init, variables={}), jax.random.key(0))
+            drawn = abstract(functools.partial(self._drawn, variables={}), jax.random.key(0))
         except NotImplementedError:
             return self.tower_axes()
         if held is not None and "params" in held:
