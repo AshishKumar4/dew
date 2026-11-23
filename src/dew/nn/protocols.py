@@ -940,6 +940,35 @@ class Recomputing(Protocol):
     def restore_recompute(self, record: JSON) -> Self: ...
 
 
+@dataclasses.dataclass(frozen=True)
+class RecomputeStatement:
+    """What a model's remat rung recomputes in place of keeping it, as a compile's live set names it
+    (`jax.stages.Compiled.peak_live`): within its blocks (`scope`, a part of the `op_name` of each value its
+    blocks' forward makes), every value `save` names none of where its rung keeps names (`save`, a
+    checkpoint policy keeping those alone: the unnamed ones too), else only the values it names
+    `recompute` (a rung that recomputes those alone and keeps the rest); no remat keeps all."""
+
+    scope: str
+    save: frozenset[str] | None
+    recompute: frozenset[str] = frozenset()
+
+    def drops(self, op_name: str, names: tuple[str, ...]) -> bool:
+        """Whether this rung keeps no value made by `op_name` that carries `names` for its backward."""
+        if self.scope not in op_name:
+            return False
+        if self.save is None:
+            return bool(self.recompute.intersection(names))
+        return not self.save.intersection(names)
+
+
+@runtime_checkable
+class StatesRecompute(Protocol):
+    """A model that states what its remat rung recomputes (`RecomputeStatement`), which a fit search reads
+    a miss's live set by, to ask first the rung that recomputes what the miss was short of."""
+
+    def recompute_statement(self) -> RecomputeStatement: ...
+
+
 @runtime_checkable
 class OffloadsResiduals(Protocol):
     """A model at the top of its remat ladder with a sibling that keeps the residuals a lighter rung saves

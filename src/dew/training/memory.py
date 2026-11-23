@@ -741,6 +741,10 @@ class LiveSet:
 
     scaled: int
     unknown: int
+    made: tuple[tuple[int, str, tuple[str, ...]], ...] = ()
+    """Each buffer not an argument's: its bytes, the `op_name` of the op that made it and the
+    `checkpoint_name` names it carries, which a search reads what a remat rung or a release frees by
+    (`forward_bytes`)."""
 
     @staticmethod
     def of(executable: jax.stages.Compiled, rows: frozenset[tuple[int, int]]) -> LiveSet | None:
@@ -750,14 +754,28 @@ class LiveSet:
         if live is None:
             return None
         scaled = unknown = 0
+        made = []
         for buffer in live:
             if buffer.kind == "parameter":
                 continue
+            made.append((buffer.bytes, buffer.op_name, tuple(buffer.names)))
             if any(dimension is None for dimension in buffer.dims):
                 unknown += buffer.bytes
             elif any(dimension is not None and dimension & rows for dimension in buffer.dims):
                 scaled += buffer.bytes
-        return LiveSet(scaled, unknown)
+        return LiveSet(scaled, unknown, tuple(made))
+
+    def forward_bytes(self, dropped: Callable[[str, tuple[str, ...]], bool]) -> int:
+        """The bytes of the values its step's forward made (its op name's first scope under the step a
+        `jvp(`) that `dropped` (an op name and the names its value carries) says a rung would not keep: those
+        a backward reads, never the backward's own temporaries, which recomputation does not free."""
+        return sum(size for size, op_name, names in self.made
+                   if op_name.split("/")[1:2] and op_name.split("/")[1].startswith("jvp(")
+                   and dropped(op_name, names))
+
+    def scoped_bytes(self, scope: str) -> int:
+        """The bytes of its values made within the name scope `scope` (`jax.named_scope`)."""
+        return sum(size for size, op_name, _ in self.made if f"/{scope}/" in f"/{op_name}/")
 
 
 def fits_everywhere(read: Callable[[], int | None]) -> tuple[bool, int | None]:
