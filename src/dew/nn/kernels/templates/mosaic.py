@@ -1646,13 +1646,13 @@ class Transport[Allocated, Opened](abc.ABC):
 
     @abc.abstractmethod
     def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
-                  joined: tuple = ()) -> int:
+                  joined: handoffs.Joined = ()) -> int:
         """The registers a thread of each of `consumers` consumer roles may hold, `programs` programs a
         multiprocessor at once, beside a producer role lowered to `producer` where the family has one
         (`roles`; setmaxnreg's least where None) and the `joined` roles (`role_schedule`); asked of a family
         that budgets them alone (`budgets_registers`)."""
 
-    def role_schedule(self, consumers: int, producer: int | None = None, joined: tuple = ()
+    def role_schedule(self, consumers: int, producer: int | None = None, joined: handoffs.Joined = ()
                       ) -> handoffs.Schedule:
         """The family's roles (`roles`) with `joined`'s, each `(role, count)` (`handoffs.Schedule.joined`: a
         correction warpgroup beside the consumers, a launch's reducing warps)."""
@@ -1660,12 +1660,12 @@ class Transport[Allocated, Opened](abc.ABC):
                                 self.roles(consumers, producer))
 
     @staticmethod
-    def joined_shares(joined: tuple) -> "resources.Joined":
+    def joined_shares(joined: handoffs.Joined) -> "resources.JoinedShares":
         """`joined`'s raised warpgroup roles as the register model reads them, each its weight and count
-        (`resources.Joined`); its warp roles share the last warpgroup's least."""
+        (`resources.JoinedShares`); its warp roles share the last warpgroup's least."""
         return tuple((role.weight, count) for role, count in joined if not role.warp)
 
-    def warpgroups(self, consumers: int, joined: tuple = ()) -> int:
+    def warpgroups(self, consumers: int, joined: handoffs.Joined = ()) -> int:
         """The warpgroups a program of `consumers` compute roles runs: theirs, a producer's where the
         family streams from a role of its own (`roles`), and its `joined` roles' (`role_schedule`)."""
         return self.role_schedule(consumers, joined=joined).warpgroups()
@@ -1686,7 +1686,7 @@ class Transport[Allocated, Opened](abc.ABC):
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None, tmem: int = 0,
-               moves: bool | None = None, joined: tuple = ()) -> Callable:
+               moves: bool | None = None, joined: handoffs.Joined = ()) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own and its
         `joined` roles (`role_schedule`: their warpgroups among its threads, their registers in its model),
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
@@ -1735,15 +1735,22 @@ class Transport[Allocated, Opened](abc.ABC):
 
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
                   exclusive: bool = False, static_consumers: bool = False, issuer: Callable | None = None,
-                  joined: tuple = ()):
+                  joined: handoffs.Joined = (), bodies: Mapping[str, Callable] | None = None):
         """The family's roles run (`role_schedule`, its producer at `floor`): `consumer(index)`, `producer()`,
-        `issuer()` where it issues on a role (`Issuer.places_on_role`), each `joined` role's body at its index
-        (`(role, count, body)`: a correction warpgroup's, a launch's reducing warps'), a switch's branches
-        where `exclusive`, a consumer's at a static index where `static_consumers`; the consumers' value."""
-        schedule = self.role_schedule(consumers, floor, tuple((role, count) for role, count, _ in joined))
+        `issuer()` where it issues on a role (`Issuer.places_on_role`), each `joined` role's body by its name
+        at its index (`bodies`: a correction warpgroup's, a launch's reducing warps'), `joined` the value its
+        launch was sized by (`kernel`), a switch's branches where `exclusive`, a consumer's at a static index
+        where `static_consumers`; the consumers' value. A joined role with no body, or a body of no joined
+        role, is refused as it traces (row 9785: a warpgroup launched beside no body hung its hand-offs)."""
+        bodies = {} if bodies is None else bodies
+        named = {role.name for role, _ in joined}
+        if named != set(bodies):
+            raise ValueError(f"{self.name}'s joined roles {sorted(named)} and their bodies {sorted(bodies)} "
+                             "differ: each role its launch was sized by runs its own body")
+        schedule = self.role_schedule(consumers, floor, joined)
         # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
         units = {"producer": producer, "issuer": issuer}
-        bodies = {"consumer": consumer, **{role.name: body for role, _, body in joined},
+        bodies = {"consumer": consumer, **bodies,
                   **{name: lambda index, body=body: body() for name, body in units.items()}}
         return schedule.run(exclusive=exclusive, static="consumer" if static_consumers else None,
                             **{role.name: bodies[role.name] for role in schedule.roles})
@@ -2174,7 +2181,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         return into
 
     def programs(self, consumers: int, registers: int | None = None, producer: int | None = None,
-                 joined: tuple = ()) -> int:
+                 joined: handoffs.Joined = ()) -> int:
         """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
         consumer roles holding `registers` (None: the family's budget, `registers`) beside a producer
         lowered to `producer`: at warpgroup MMA's budget, one, its consumers raised to the register file's
