@@ -61,7 +61,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tables, tuning
-from dew.nn.kernels.templates import bundles, cost, mosaic, product, resources, swizzling
+from dew.nn.kernels.templates import bundles, mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Stated, stored
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.table import (
@@ -218,7 +218,7 @@ def _parts(dtype, family: mosaic.Family, fast: bool = False) -> int:
     `_fast_parts` under the run's fast forms (`fast`), else three."""
     if jnp.dtype(dtype) != jnp.float32:
         return 1
-    return _fast_parts(family) if fast else product.bf16_part_count(jnp.float32, accurate=True)
+    return _fast_parts(family) if fast else product.EXACT_PARTS
 
 
 def diagonal(size: int, family: mosaic.Family) -> jax.Array:
@@ -641,9 +641,8 @@ def summing_staging(call: Call) -> tuple:
     the parts' 24 KB put the scores' backward at keys 256 wide past its block (174080 bytes against 166912,
     wide-bwd at b3de8f293)."""
     chunk = call.chunk
-    exact_parts = product.bf16_part_count(jnp.float32, accurate=True)
     staged = (() if call.family.operands_in_registers
-              else staging_tiles(Operand(chunk, exact_parts, jnp.dtype(jnp.float32)), (chunk, chunk)))
+              else staging_tiles(Operand(chunk, product.EXACT_PARTS, jnp.dtype(jnp.float32)), (chunk, chunk)))
     return (*staged, (plgpu.SMEM((chunk, chunk), jnp.bfloat16),), column_sums_scratch(call))
 
 
@@ -664,8 +663,7 @@ def summed_issuer(staging: tuple, call: Call) -> tuple:
     """`algebra.summed_pairs`' issuer and column sums on `summing_staging`'s staging: its fp32 operand's parts
     staged, or held in registers where the family's products read them there."""
     *staged, exact, scratch = staging
-    parts = (product.bf16_part_count(jnp.float32, accurate=True)
-             if call.family.operands_in_registers else staged[0])
+    parts = product.EXACT_PARTS if call.family.operands_in_registers else staged[0]
     return Issuer(call, {"summed": parts, "summed.exact": exact}), column_sums(call, scratch)
 
 
@@ -963,7 +961,7 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
         launch = resources.Launch(scope, 1, registers, floor=1, most=most, entry=entry,
                                   most_programs=most_programs)
         found = _planned_launch(call, launch)
-        held = cost.wave(call.target, found.programs if found else 1)
+        held = (call.target.multiprocessors or 1) * (found.programs if found else 1)
         return found, min(tiles, held), launch
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
     launch = resources.Launch(scope, consumers, registers, floor=floor, most=most, entry=entry,
@@ -1708,13 +1706,12 @@ def _weighted_swizzles(call: Call, keyed: int) -> dict:
 
 
 def _weighted_split(call: Call, keyed: int, once: tuple[str, ...]) -> tuple[dict, dict]:
-    """`_weighted`'s streams' blocks at key block `keyed` (`_weighted_streamed`) split by name in one pass
-    into those its walk steps through and those loaded `once` (`_weighted_once`, its names the streams' own
-    parts': `part_names` and `vector_blocks`, as `_weighted_streamed` names them)."""
-    stepped, held = {}, {}
-    for name, block in _weighted_streamed(call, keyed).items():
-        (held if name in once else stepped)[name] = block
-    return stepped, held
+    """`_weighted`'s streams' blocks at key block `keyed` (`_weighted_streamed`) split into those its walk
+    steps through and those loaded `once`, its names its streams' own (`part_names`, `vector_blocks`, as
+    `_weighted_once` builds them)."""
+    streamed = _weighted_streamed(call, keyed)
+    return ({name: block for name, block in streamed.items() if name not in once},
+            {name: block for name, block in streamed.items() if name in once})
 
 
 def _weighted_once(call: Call) -> tuple[str, ...]:
