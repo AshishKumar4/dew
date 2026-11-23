@@ -1287,8 +1287,10 @@ class OuterProgram:
                 if shaped is executable:
                     self._shaped[abstract] = (replacement, digest, weak_types)
 
-    def _released(self, key: Hashable, pending: Future[jax.stages.Compiled], failure: BaseException) -> None:
-        """Fail the compile reserved under `key` (`_reserved`), the program keeping none."""
+    def _released(self, key: tuple[Hashable, tuple], pending: Future[jax.stages.Compiled],
+                  failure: BaseException) -> None:
+        """Fail the compile reserved under `key` (`_reserved`: a call's key and the refusals it began under),
+        the program keeping none."""
         with self._compiling:
             self._executables.pop(key, None)
         if not pending.done():
