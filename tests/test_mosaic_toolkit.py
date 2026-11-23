@@ -1655,7 +1655,7 @@ def _bounded(a, b, c, bounds, *, m_warps: int, interpret):
     from dew.nn.kernels.templates import mosaic_sm80, resources
 
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16), m_warps=m_warps)
-    rows, widest = a.shape[0], resources.copied_rows(RELAYED, jnp.float32)
+    rows, count, widest = a.shape[0], bounds.shape[0], resources.copied_rows(RELAYED, jnp.float32)
 
     def body(a_gmem, b_gmem, c_gmem, bounds_gmem, out_gmem):
         def scoped(a_smem, b_smem, *outs):
@@ -1673,9 +1673,9 @@ def _bounded(a, b, c, bounds, *, m_warps: int, interpret):
 
         staged = (swizzling.staged(shape, jnp.bfloat16, resources.widest_swizzle(jnp.bfloat16, RELAYED))
                   for shape in ((rows, RELAYED), (RELAYED, RELAYED)))
-        pl.run_scoped(scoped, *staged, *(swizzling.plain((rows, RELAYED), jnp.float32) for _ in bounds))
+        pl.run_scoped(scoped, *staged, *(swizzling.plain((rows, RELAYED), jnp.float32) for _ in range(count)))
 
-    out = jax.ShapeDtypeStruct((bounds.shape[0], rows, RELAYED), jnp.float32)
+    out = jax.ShapeDtypeStruct((count, rows, RELAYED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
                          interpret=interpret, name="bounded")(a, b, c, bounds)
 
