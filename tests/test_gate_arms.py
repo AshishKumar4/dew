@@ -137,6 +137,32 @@ def test_a_prepared_sites_reference_as_written_is_prepared_and_fails_dews_arm_in
     assert not (tmp_path / UNPREPARED).exists()
 
 
+def test_a_compile_only_gpu_prepare_holds_a_reference_of_its_own_compiler_options_whole(tmp_path, monkeypatch):
+    """A reference compiled with its own compiler options (`without_ynn`'s, as cuBLASLt's is,
+    `generation_support.cublas_compiled`) prepared by a compile-only sm90 GPU-tier part
+    (`truths_ahead.prepared`): held whole and read as itself, it prepares, where the store's read of whether
+    its program calls the host traced it inside another trace, which its options refuse (row 12062, #8613:
+    "`compiler_options` can only be passed to top-level `jax.jit`")."""
+    import generation_support
+    import model_flows
+    import tier_wire
+    from truths_ahead import prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
+                                                                                   gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+
+    def product(rows, matrix):
+        return jnp.dot(rows, matrix, preferred_element_type=jnp.float32)
+
+    truth = as_given(lambda rows, matrix: np.asarray(rows, np.float64) @ np.asarray(matrix, np.float64))
+    reference = without_ynn(product, compiler_options={"xla_gpu_enable_triton_gemm": False})
+    with prepared(tmp_path / "store", stamp="whole", target=generation_support.node_target()):
+        assert_as_exact(jax.jit(product), reference, normal_drawn(0x12062, (64, 32), (32, 16)),
+                        "a reference of its own options", seeds=32, truth_fn=truth)
+    assert not (tmp_path / "store" / UNPREPARED).exists(), (tmp_path / "store" / UNPREPARED).read_text()
+
+
 def test_an_arm_of_the_cpu_lanes_options_is_built_by_where_its_calls_are_placed():
     """`arm_forms.without_ynn` takes XLA:CPU's options (WITHOUT_YNN) where the context places its calls on a
     CPU, and none where it places them on a GPU, whatever the process's default backend: a GPU tier part's
@@ -211,7 +237,7 @@ def test_an_arm_ahead_returns_the_launches_of_the_program_it_ran(tmp_path):
     around it (row 9550: a witness retraced a program of its own to see them); a jit of its own compiler
     options (`without_ynn`'s) lowered as itself, never nested in another; and prepared into a store and run
     from it, a plain function's and a whole jit's, its prepare's lowering's launches once, its run's alike (a
-    relowering past a spill, a GPU's, keeps its own: `_arm_program`'s `again`, `_Whole.lower`)."""
+    relowering past a spill, a GPU's, keeps its own: `_arm_program`'s `again`, `Whole.lower`)."""
     sizes = np.asarray([128, 128], np.int32)
     rng = np.random.default_rng(9550)
     x = rng.standard_normal((256, 128)).astype(np.float32)
