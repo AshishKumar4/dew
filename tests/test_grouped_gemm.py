@@ -1775,3 +1775,27 @@ def test_prologued_custom_jvp_is_picklable():
     primal_r, tangent_r = restored((x, y), (dx, dy))
     np.testing.assert_array_equal(np.asarray(primal_r), np.asarray(x + y))
     np.testing.assert_array_equal(np.asarray(tangent_r), np.asarray(dx + dy))
+
+
+def test_explicit_target_b200_gathered_settles_under_ambient_sm80():
+    """Deriving and settling a B200 (`sm100`) gathered tile under ambient `sm80` binds `sm100`'s
+    register/raise facts via `generation.as_target(target)` instead of crashing on Ampere's `None` raises
+    (row 12098)."""
+    from dew.nn.kernels.templates import resources
+    from dew.nn.kernels.templates.gemm import producers
+
+    launch = grouped_matmul.MosaicGmm()
+    sm100 = generation.gpu_target("sm100")
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    gather = jax.ShapeDtypeStruct((256,), jnp.int32)
+    ba = launch.bind(bf16((256, 256)), bf16((2, 256, 256)), sizes, (), (), None, None, gather,
+                     out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=False)
+    # Cold cache under ambient sm80 first so `_DERIVED` cannot mask producer settlement.
+    with generation.assumed("sm80"):
+        got = launch.derived(ba, sm100)
+        assert got is not None and got.producers.of(launch.KERNEL) is not None
+        assert not launch._refused(ba, got, sm100)
+    with generation.assumed("sm100"):
+        want = producers.settled(launch, ba, dataclasses.replace(got, producers=resources.Producers()), sm100)
+    assert got == want
