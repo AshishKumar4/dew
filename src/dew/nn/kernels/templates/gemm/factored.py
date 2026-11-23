@@ -56,7 +56,7 @@ class _Transpose:
     shape: tuple
     dtype: jnp.dtype
     held: frozenset
-    placed: object
+    placed: jax.sharding.NamedSharding | jax.sharding.PartitionSpec | None
     gathered: bool
 
     @functools.cached_property
