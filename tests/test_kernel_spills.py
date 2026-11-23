@@ -659,14 +659,16 @@ def _templated(**fields):
 
 
 def _drawn_objective(kind: str):
-    """An objective of `kind` over templated decoders (`_templated`), and the decoder of its whose forward
-    the premise reads: its own model, a decision model's backbone, PPO's actor (its critic its own init), a
-    distillation's student (its feature probe its own init)."""
+    """An objective of `kind` over templated decoders (`_templated`), the decoder of its whose forward the
+    premise reads, and that decoder's variables out of the objective's: its own model, a decision model's
+    backbone, PPO's actor (its critic its own init), a distillation's student (its feature probe its own
+    init)."""
     from dew.objectives.lm import LMObjective
 
     if kind == "lm":
         model = _templated()
-        return LMObjective(model, 31), model
+        objective = LMObjective(model, 31)
+        return objective, model, objective.model_variables
     if kind == "decision":
         from dew.data.text import ByteTokenizer
         from dew.decision import DecisionObjective, Specials
@@ -675,17 +677,20 @@ def _drawn_objective(kind: str):
         model = _templated()
         layout = SegmentLayout.state_first_row(max_len=32, head_max_len=24, option_tokens=6)
         specials = Specials(None, 10, 0, "\x00", 255)
-        return DecisionObjective(model, tokenizer=ByteTokenizer(), specials=specials, layout=layout), model
+        objective = DecisionObjective(model, tokenizer=ByteTokenizer(), specials=specials, layout=layout)
+        return objective, model, lambda tree: {name: part["backbone"] for name, part in tree.items()}
     if kind == "ppo":
         from dew.objectives.rl import PPOObjective, ValueHead
 
         model = _templated()
-        return PPOObjective(model, 31, critic=ValueHead(_templated())), model
+        objective = PPOObjective(model, 31, critic=ValueHead(_templated()))
+        return objective, model, objective.model_variables
     from dew.objectives.distillation import DistillationObjective
 
     student, teacher = _templated(), _templated(emb_features=256, mlp_features=512, head_dim=128)
     pair = LMObjective(student, 31), LMObjective(teacher, 31)
-    return DistillationObjective(*pair, features=((0, 0),), beta=0.5), student
+    objective = DistillationObjective(*pair, features=((0, 0),), beta=0.5)
+    return objective, student, objective.model_variables
 
 
 @pytest.mark.parametrize("kind", ["lm", "decision", "ppo", "distillation"])
@@ -695,19 +700,41 @@ def test_an_objectives_draw_of_its_variables_selects_no_kernel(kind):
     drawn: within it every selector takes its op's generic program and reports no route
     (`generation.drawing`), so no launch is derived, traced or certified at the draw's shapes (row 11803),
     the parts a decision model's tree lacks among them (row 12029), and an objective's own `init` whole, a
-    PPO critic's and a distillation's feature probe (Train 1205's review F2), where its decoder's forward
-    over the drawn variables selects and reports its kernels."""
+    PPO critic's and a distillation's feature probe (Train 1205's review F2), and the draw its parameters'
+    axes read (`Objective.parameter_axes`, row 12090), where its decoder's forward over the drawn variables
+    selects and reports its kernels (row 12093)."""
     from dew.nn.kernels.generation import routes
 
-    objective, model = _drawn_objective(kind)
+    objective, model, decoders = _drawn_objective(kind)
     with routes() as drawn_routes:
         # Its key drawn within the trace too: shapes alone, nothing computed (row 12065).
-        jax.eval_shape(lambda: objective.initializer(jax.random.key(0)))
+        drawn = jax.eval_shape(lambda: objective.initializer(jax.random.key(0)))
+    with routes() as axes_routes:
+        objective.parameter_axes()
     with routes() as applied_routes:
-        params = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 32), jnp.int32))
-        jax.eval_shape(model.apply, params, jax.ShapeDtypeStruct((2, 32), jnp.int32))
+        jax.eval_shape(model.apply, decoders(drawn), jax.ShapeDtypeStruct((2, 32), jnp.int32))
     assert not drawn_routes, drawn_routes
+    assert not axes_routes, axes_routes
     assert applied_routes, "the decoder selects no kernel, so its draw's selecting none says nothing"
+
+
+def test_a_draw_within_a_draw_takes_the_draws_program():
+    """A draw traced within another (`generation.drawing` nested: `drawn.traced_draw` around an objective's
+    own draw) is that draw to JAX's trace and compile caches, which key on whether a thread draws, not how
+    deep: a probe's draw and a trainer start's of one objective take one program (row 12092)."""
+    from dew.nn.kernels.generation import drawing
+    from dew.telemetry import compiles
+
+    def drawn_scale(x):
+        return x * 2.0 + 1.0
+
+    draw = jax.jit(drawn_scale)
+    with drawing():
+        cold = draw(jnp.arange(3.0))
+    with compiles.Compiles("drawn_scale") as again, drawing(), drawing():
+        warm = draw(jnp.arange(3.0))
+    assert not again.programs, again.programs
+    np.testing.assert_array_equal(np.asarray(warm), np.asarray(cold))
 
 
 def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
