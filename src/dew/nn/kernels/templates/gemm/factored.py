@@ -163,14 +163,15 @@ class _Transpose:
                                                                    - self.held))))
         depth, width = self.shape[-1], cotangent.shape[-1]
         chunk = math.gcd(depth, FACTORED_DEPTH)
-        columns_a_chunk = max(d for d in range(1, min(width, FACTORED_WIDTH) + 1) if width % d == 0)
+        # An empty cotangent's width is no chunk's: its rows' gradient is the zeros the loop starts from.
+        columns_a_chunk = max((d for d in range(1, min(width, FACTORED_WIDTH) + 1) if width % d == 0),
+                              default=1)
         # The products' limbs below `FACTORED_HEADROOM` limbs over them that their sums carry into.
         limbs_count = FACTORED_HEADROOM + FACTORED_ROW_SLICES + FACTORED_MATRIX_SLICES - 1
-        rows = cotangent.shape[0]
 
         def pulled_chunk(at, out):
             columns = jax.lax.dynamic_slice_in_dim(matrix, at * chunk, chunk, axis=-2)
-            limbs = varying_like(jnp.zeros((limbs_count, rows, chunk), jnp.int32), cotangent, columns,
+            limbs = varying_like(_limbs(limbs_count, cotangent, chunk), cotangent, columns,
                                  *jax.tree.leaves(rest), grid)
 
             def width_chunk(index, limbs):
@@ -208,8 +209,8 @@ class _Transpose:
 
             limbs = jax.lax.fori_loop(0, width // columns_a_chunk, width_chunk, limbs)
             if gather is not None:
-                limbs = varying_like(jnp.zeros((limbs_count, self.shape[0], chunk), jnp.int32), limbs,
-                                     gather).at[:, gather].add(limbs)
+                tokens = varying_like(_limbs(limbs_count, plain, chunk), limbs, gather)
+                limbs = tokens.at[:, gather].add(limbs)
             axes = tuple(sorted(jax.typeof(limbs).mat.varying - self.held))
             limbs = _carried(jax.lax.psum(limbs, axes) if axes else limbs)
             sums_grid = grid if gather is None else _edge(token)
@@ -257,6 +258,15 @@ to 254, the largest product's grid rounded up a slice) and 24 bits of significan
 FACTORED_MATRIX_SLICES = 6
 """A decoded packed matrix's slices on its grid: 36 bits, past any format's span (E5M2's 31 binades and 3
 bits; NVFP4's codes times E4M3 block scales; ternary's one)."""
+
+
+def _limbs(count: int, like: jax.Array, columns: int) -> jax.Array:
+    """`count` int32 limbs of zeros, each `like`'s rows by `columns`, its rows placed as `like`'s are where an
+    Explicit axis splits them (a chunk's sums, which the GEMMs' row-placed products add into)."""
+    placed = explicit_spec(like)
+    rows = None if placed is None else placed.spec[0]
+    return jnp.zeros((count, like.shape[0], columns), jnp.int32, out_sharding=None if placed is None else
+                     jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(None, rows, None)))
 
 
 def _edge(top: jax.Array) -> jax.Array:
