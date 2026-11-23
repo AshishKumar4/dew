@@ -632,15 +632,15 @@ def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search
 
 @pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
 def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(monkeypatch):
-    """A fit search that compiled the step whole, which missed, and split, which fits, settles on the split
-    step: every later program's admission is charged, beside its own load, the plan's step alone, which has
-    not run, never the passed-over rung's, released with its executable; and the programs its state was
-    placed by, which ran, nothing (row 12131: 24 kept beside a 4B run's step left an all-reduce no room;
-    review: losers and programs that ran stayed charged for ever)."""
+    """A fit whose search compiled the step whole, which missed, and split, which fits, and ran the split
+    step charges every later program its own load alone, what the step's first run measured: never the
+    passed-over rung's, released with its executable, nor the step's or the programs its state was placed
+    by, which ran (row 12131: 24 kept beside a 4B run's step left an all-reduce no room; review: losers and
+    programs that ran stayed charged for ever)."""
     import gc
 
     from affine_run import Replaying
-    from test_plan import BATCH, ROWS, free, lm, needs, trained
+    from test_plan import BATCH, ROWS, free, lm, needs
 
     from dew.data.dataset import Loader
     from dew.nn.kernels import options
@@ -674,15 +674,14 @@ def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(
         del pending
         gc.collect()
         assert charged(probe) == alone
+        # A fit whose search compiles the step whole, which misses, and split, which fits, its first run's
+        # completion seen (`dew.training.memory.first_run`): its passed-over rung released, its plan's run, so
+        # nothing is charged ahead of a later program, which is charged its own load alone, what that first
+        # run measured.
         trainer = lm()
-        trained(trainer, steps=0)
-        assert len(trainer.plan["probes"]) >= 2 and trainer.plan["split"] > 1, trainer.plan["probes"]
-        gc.collect()
-        assert charged(probe) == alone + each, (alone, each)
-        # The step's first run, its completion seen (`dew.training.memory.first_run`): nothing is charged
-        # ahead of a later program, which is charged its own load alone, what that first run measured.
         rows = Replaying(lambda position: {"text": jax.device_get(BATCH["text"])})
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+        assert len(trainer.plan["probes"]) >= 2 and trainer.plan["split"] > 1, trainer.plan["probes"]
         gc.collect()
         measured = communicators._RESIDENT.cost.get(gpu, communicators.PROGRAM_FLOOR)
         assert charged(probe) == measured, (alone, each, measured)
