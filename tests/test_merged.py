@@ -1061,6 +1061,19 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
         spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
         output_mod=lambda o, x: o * x, output_params=(template.Param(query_scale, template.Kind.QUERY),))
     np.testing.assert_array_equal(np.asarray(got_unsh[0]), np.asarray(ref_unsh))
+    # A gate shared across the batch (`Kind.OUTPUT`, `[1, T, H, Dv]` a mapped element) reads as each row's.
+    shared_gate = jax.random.normal(k4, (1, tokens, out_heads, width), jnp.bfloat16)
+    gates = jnp.stack([shared_gate, shared_gate * 2.0], axis=0)
+
+    def gated(p, s, g):
+        return merged.merged_finished(
+            spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+            output_mod=lambda o, x: o * x, output_params=(template.Param(g, template.Kind.OUTPUT),))
+
+    got_gated = jax.vmap(gated)(p2, s2, gates)
+    for idx in range(2):
+        np.testing.assert_array_equal(np.asarray(got_gated[idx]), np.asarray(
+            gated(p2[idx], s2[idx], jnp.broadcast_to(gates[idx], (batch, *gates.shape[2:])))))
 
     def branch_a(o, g):
         return o * g if g.dtype == jnp.float32 else o + g
@@ -1198,3 +1211,21 @@ def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matche
             out_heads=out_heads)
         per_block_hook = float((width / blocks) * gate.dtype.itemsize + head.dtype.itemsize)
         assert roles_hooked[0].fixed.device_bytes - roles_base[0].fixed.device_bytes == per_block_hook
+
+
+def test_a_finished_merge_reads_its_output_parameters_as_a_launch_keeps_them():
+    """A finished merge's output hook reads a float64 parameter in the fp32 a launch's epilogue keeps it in
+    (`kept_dtype`, `template.padded_call`), as a single slice's fused hook does: a gate of `1 + 2^-25` is
+    1 there, so `gate - 1` gives 0 whatever the slices (the head review of 7188133e84a: 2^-25 on a merge)."""
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
+    batch, slices, rows, kv_heads, group, tokens, width = 1, 2, 8, 1, 2, 1, 8
+    with jax.enable_x64(new_val=True):
+        padded = jnp.ones((batch, slices, rows, kv_heads, width), jnp.float32)
+        stacked = jnp.stack([jnp.zeros((batch, kv_heads, slices, rows), jnp.float32),
+                             jnp.ones((batch, kv_heads, slices, rows), jnp.float32)])
+        gate = jnp.full((batch, tokens, kv_heads * group, width), 1 + 2.0 ** -25, jnp.float64)
+        out = merged.merged_finished(
+            spec, padded, stacked, queries=tokens * group, width=width, out_dtype=jnp.float32,
+            out_heads=kv_heads * group, output_mod=lambda o, g: o * (g - 1),
+            output_params=(template.Param(gate, template.Kind.OUTPUT),))
+    np.testing.assert_array_equal(np.asarray(out), 0.0)

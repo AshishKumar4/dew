@@ -1246,6 +1246,7 @@ def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name):
     sm80/sm90/sm100/sm120 for both batched single-slice and one-row split-KV, with split-KV carrying
     `output_mod` directly on the `merged_padded` primitive."""
     from fla_gdn_support import KernelCase
+    from jax.core import ShapedArray
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn import programs
@@ -1299,7 +1300,8 @@ def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name):
                 merge_h = [eq for eq in programs.equations(traced_h.jaxpr)
                            if eq.primitive is merged.merged_padded_p]
                 assert len(merge_h) == 1 and merge_h[0].params.get("output_mod") is fn, merge_h
-                assert merge_h[0].invars[0].aval.shape[1] == 1
+                padded_aval = merge_h[0].invars[0].aval
+                assert isinstance(padded_aval, ShapedArray) and padded_aval.shape[1] == 1
             cases.append(KernelCase(label, lambda s=deferred, args=(qh, kh, kh, param_v): (s, args)))
 
     with generation.assumed(generation_name):
@@ -1357,6 +1359,22 @@ def test_softcap_folds_into_base2_and_decode_segments_interior_tiles():
         segs_win = prog.segmented(lambda *a, **kw: None, (jnp.int32(16), jnp.int32(64)),
                                   jnp.int32(15), jnp.int32(64))
         assert [(int(s), int(e)) for _, s, e in segs_win] == [(15, 16), (16, 64), (64, 64)]
+
+
+def test_a_folded_cap_and_a_state_resumed_at_it_hold_one_logit():
+    """A saturated key's folded logit under `Capped(c)` (`logits_of`, base 2) is the logit a state resumed
+    at a natural maximum `c` takes (`resumed`, `base2_maximum`), bit for bit: `Capped(32768 + 2^-10)`, whose
+    cap is 32768 in fp32, folded its base-2 cap from float64 an ulp above the state's, so a key of value 1
+    over a state of mass 1 and sum -1 at that maximum gave 0.00135 where the two cancel to 0 (the head
+    review of 7188133e84a, F3)."""
+    cap = template.Capped(32768 + 2.0 ** -10)
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, score_mod=cap, natural=False)
+    assert spec.base2
+    places = jnp.zeros((1, 1), jnp.int32)
+    saturated = algebra.logits_of(spec, jnp.full((1, 1), 2.0 ** 30, jnp.float32),
+                                  algebra.Coords(places, places, (), None, None), masked=False)[0]
+    state = algebra.resumed(spec, jnp.full((1,), 32768.0), jnp.ones((1,)), -jnp.ones((1, 1)))
+    np.testing.assert_array_equal(np.asarray(saturated)[0], np.asarray(state.m))
 
 
 @COMPILES_ON_CPU

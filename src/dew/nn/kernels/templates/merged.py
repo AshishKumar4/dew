@@ -88,8 +88,9 @@ def _value(padded, stacked, *extra, units: windows.Units, queries: int, width: i
            output_mod: Callable | None = None, output_kinds: tuple[Kind, ...] = ()):
     """The law's merge of a split walk's padded slices (`_trimmed`), optional raw `Initial` state, and
     optional fused `output_mod`/`output_params`, delegated directly to `algebra.merged_state`. When
-    `out_dtype` and `out_heads` are given (row 7926), finishes, ungroups, applies `output_mod` in
-    promoted float precision (matching `template.padded_call`), and casts to `[B, T, out_heads, width]`."""
+    `out_dtype` and `out_heads` are given (row 7926), finishes, ungroups, applies `output_mod` with
+    its parameters as a launch keeps them (`kept_dtype`, `template.padded_call`'s), and casts to
+    `[B, T, out_heads, width]`."""
     init_args, out_args = _split_extra(extra, output_kinds)
     initial = Initial(*init_args) if init_args else None
     state = algebra.merged_state(units, *_trimmed(padded, stacked, queries=queries, width=width),
@@ -99,10 +100,10 @@ def _value(padded, stacked, *extra, units: windows.Units, queries: int, width: i
     assert out_heads is not None
     ungrouped = ungrouped_rows(state.acc, out_heads)
     if output_mod is not None:
-        params = tuple(
-            Param(arg.astype(jnp.promote_types(arg.dtype, state.acc.dtype))
-                  if jnp.issubdtype(arg.dtype, jnp.floating) else arg, kind)
-            for arg, kind in zip(out_args, output_kinds, strict=True))
+        # Its parameters in the dtype a launch's epilogue reads them (`kept_dtype`, `padded_call`'s), so a
+        # single slice's fused hook and a merge's compute alike (an fp64 gate of 1 + 2^-25: 0 against 2^-25).
+        params = tuple(Param(arg.astype(kept_dtype(arg.dtype)), kind)
+                       for arg, kind in zip(out_args, output_kinds, strict=True))
         ungrouped = jnp.swapaxes(output_hooked(jnp.swapaxes(ungrouped, 1, 2), output_mod, params), 1, 2)
     return (ungrouped.astype(out_dtype),)
 
@@ -179,8 +180,10 @@ def _batched(args, dims, **params):
                 else:
                     folded_extra.append(moved.reshape(size * batch, *moved.shape[2:]))
         else:
+            # A gate shared across the batch (`[N, 1, ...]` or unmapped) broadcast to each row, as a query's.
             moved = jnp.broadcast_to(arg, (size, *arg.shape)) if dim is None else jnp.moveaxis(arg, dim, 0)
-            folded_extra.append(moved.reshape(size * batch, *moved.shape[2:]))
+            folded_extra.append(jnp.broadcast_to(moved, (size, batch, *moved.shape[2:])).reshape(
+                size * batch, *moved.shape[2:]))
     folded = merged_padded_p.bind(padded.reshape(size * batch, *padded.shape[2:]),
                                   jnp.moveaxis(stacked, 0, 1).reshape(2, size * batch, *stacked.shape[3:]),
                                   *folded_extra, **params)

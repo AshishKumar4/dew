@@ -991,7 +991,9 @@ def logits_of(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Arr
         return (products if spec.raw else products * factor), products
     if (capped := _built_in_capped(spec.score_mod)) is not None and spec.base2:
         cap = capped.softcap
-        logits = float(np.float32(cap * LOG2E)) * jnp.tanh(s * float(np.float32(spec.scale / cap)))
+        # `base2_maximum`'s fp32 product: a key at the cap cancels a state resumed there (`resumed`).
+        logits = (float(np.float32(cap) * np.float32(LOG2E))
+                  * jnp.tanh(s * float(np.float32(spec.scale / cap))))
         return _chosen(masked, lambda: _masked(spec, logits, coords, -jnp.inf), lambda: logits), None
     logits = s * factor
     if spec.score_mod is not None:
