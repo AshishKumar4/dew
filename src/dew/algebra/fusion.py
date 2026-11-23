@@ -496,7 +496,7 @@ class RegionDecision(NamedTuple):
     launched: bool
 
 
-_held: collections.OrderedDict[Hashable, RegionDecision] = collections.OrderedDict()
+_held: collections.OrderedDict[Hashable, tuple[RegionDecision, dict]] = collections.OrderedDict()
 
 
 def choice_context() -> Hashable:
@@ -522,12 +522,12 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
 
 def _decided(identity: Hashable, decide: Callable[[], RegionDecision]) -> RegionDecision:
     """A region's decision (`decide`), weighed once for its structure (`_identity`) in the context a kernel
-    is chosen in (`choice_context`), held (`holding`)."""
+    is chosen in (`choice_context`), held with the facts its probes read (`generation.held_trace`)."""
     def weighed() -> RegionDecision:
         # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
         with generation.routes(alone=True):
             return decide()
-    return _cache.holding(_held, (identity, choice_context()), weighed, DECISIONS_HELD)
+    return generation.held_trace(_held, (identity, choice_context()), weighed, DECISIONS_HELD)
 
 
 def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:

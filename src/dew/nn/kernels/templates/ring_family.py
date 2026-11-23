@@ -14,6 +14,7 @@ from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import after_walk, emission, handoffs, persistent, resources, swizzling
 from dew.nn.kernels.templates.cost import Stated, Work
 from dew.nn.kernels.templates.mosaic import (
@@ -104,7 +105,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                       model=(None if registers is None
                              else resources.register_model(self, consumers, registers, producer=producer,
                                                            programs=resident, shared=shared, tmem=tmem,
-                                                           moves=moves, joined=joined)),
+                                                           moves=moves, joined=joined,
+                                                           target=generation.gpu_target())),
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       compiled=dataclasses.replace(
                           compiled, min_blocks_per_sm=resident,

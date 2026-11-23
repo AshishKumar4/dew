@@ -606,15 +606,17 @@ def certifying(device) -> Iterator[None]:
 
 @dataclasses.dataclass(frozen=True)
 class _AsideLaunch:
-    """A launch certified aside (`certifying_aside`): what `certified` read of it, the reporting scope it was
-    queued in (`_reporting`), and its replay's kernels to come once its call was reached (`capture`)."""
+    """A launch certified aside (`certifying_aside`): what `certified` read of it, each reporting scope it
+    was taken in (`_reporting`; the first its queueing's, another for each scope that took it again, which
+    its one replay's verdict is recorded in too, row 12007), and its replay's kernels to come once its call
+    was reached (`capture`)."""
     op: "KernelOp"
     arguments: tokamax.BoundArguments
     config: Hashable
     reverse: bool
     device: Hashable
     stored: str | None
-    reporting: tuple
+    reporting: list[tuple]
     kernels: Future | None = None
 
 
@@ -683,13 +685,18 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
                                        read=read).refused
         if spilling:
             refused.add(key)
-            # Refused in the scope its call was queued in, whatever scope drains it.
-            with _reported_in(each.reporting):
-                refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling},
-                              {binary.kernel: binary.spilled_in for binary in spilling})
-            # Held by the settle (`settling`) until a retry, under its own context, steps past it (row 11786).
-            settlement.deferred.append((key, Launch(key[0], type(each.op).__name__, each.config),
-                                        tuple(spilling), each.reporting))
+            with _GUARD:
+                scopes = tuple(each.reporting)
+            for reporting in scopes:
+                # Refused in each scope its call was taken in, whatever scope drains it.
+                with _reported_in(reporting):
+                    refuse_launch(each.op, each.arguments, each.config,
+                                  {binary.kernel for binary in spilling},
+                                  {binary.kernel: binary.spilled_in for binary in spilling})
+                # Held by the settle (`settling`) until a retry, under its own context, steps past it (row
+                # 11786).
+                settlement.deferred.append((key, Launch(key[0], type(each.op).__name__, each.config),
+                                            tuple(spilling), reporting))
     return frozenset(refused)
 
 
@@ -870,12 +877,18 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     if isinstance(verdict, dict):
         return _kept_certification(key, op, config, reverse, verdict, (), device, read=True).refused
     aside = _ASIDE.get()
-    if aside is not None and key in aside.pending:
+    reporting = _reporting()
+    with _GUARD:
+        taken = None if aside is None else aside.pending.get(key)
+        if taken is not None and not any(held[0] is reporting[0] and held[1] is reporting[1]
+                                         for held in taken.reporting):
+            taken.reporting.append(reporting)
+    if taken is not None:
         return ()
     if aside is not None and not _refused_before(op, arguments) and _traced_for(device):
         # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
         # compiled aside (`capture`), the block's end settling it (`settled_aside`), once a block.
-        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, _reporting())
+        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, [reporting])
         aside.awaiting[(_launched(key[0], config, reverse), reverse)] = key
         return ()
     # Its verdict where its kernels' was stored however their Dew tree named it (`_lowered_verdict_key`),
@@ -961,10 +974,13 @@ def _lowered_verdict_key(calls) -> str | None:
     verdict, not the Dew tree that lowered them: a tree whose own key (`_verdict_key`) finds none, an edit's
     anywhere outside them, lowers the launch and reads its verdict, compiling nothing (row 8650: 23 of an
     edited tree's 51 seconds certifying a hybrid decoder's step ahead, FS-8650-SPLIT). None where the
-    installation has no seal."""
-    kernels = sorted((call.kind, call.name, hashlib.sha256(call.ir).hexdigest(), call.config)
-                     for call in calls if call.kind in ("mosaic_gpu", "triton"))
-    return _sealed_key("lowered", _assemblers(), _verdict_fields(), kernels)
+    installation has no seal, its kernels' IR read and hashed for none (row 12009)."""
+    def stated() -> tuple:
+        kernels = sorted((call.kind, call.name, hashlib.sha256(call.ir).hexdigest(), call.config)
+                         for call in calls if call.kind in ("mosaic_gpu", "triton"))
+        return "lowered", _assemblers(), _verdict_fields(), kernels
+
+    return _sealed_key(stated)
 
 
 def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
@@ -974,22 +990,24 @@ def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
     Pallas lowering cache's seal of them), caller-specific `fields`, and the environment a kernel's lowering
     and compile read (that cache's policy). None where the installation has no seal (an edited or a source
     install of JAX), whose code no key states: decisions are not stored."""
-    return _sealed_key(provenance_code(__name__, provenance), *fields)
+    return _sealed_key(lambda: (provenance_code(__name__, provenance), *fields))
 
 
-def _sealed_key(head, *fields) -> str | None:
+def _sealed_key(stated: Callable[[], tuple]) -> str | None:
     """A stored decision's key in the installation's sealed frame, the one owner of it (`stored_key`'s, a
-    lowered verdict's, row 11653): `head` (its code's provenance, or what names its kind), the installed JAX,
-    jaxlib and CUDA plugins (the Pallas lowering cache's seal of them), `fields`, and the environment a
-    kernel's lowering and compile read (that cache's policy); None where the installation has no seal."""
+    lowered verdict's, row 11653): what `stated()` gives (its head, its code's provenance or what names its
+    kind, then its fields) beside the installed JAX, jaxlib and CUDA plugins (the Pallas lowering cache's
+    seal of them) and the environment a kernel's lowering and compile read (that cache's policy); None where
+    the installation has no seal, `stated` called only where it has one (row 12009)."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
     installed = seal().digest
     if installed is None:
         return None
-    stated = [head, installed.hex(), *fields, _keyed_environment()]
-    return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+    head, *fields = stated()
+    keyed = [head, installed.hex(), *fields, _keyed_environment()]
+    return hashlib.sha256(json.dumps(keyed, sort_keys=True).encode()).hexdigest()
 
 
 def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: frozenset[str] | None

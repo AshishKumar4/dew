@@ -11,6 +11,7 @@ generations.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
@@ -90,6 +91,29 @@ def replay(reads: Mapping[Hashable, tuple[Callable[[], Hashable], Hashable]]) ->
     taking a kept one read what it read."""
     for recorded in _RECORDINGS.get():
         recorded.update(reads)
+
+
+def held_trace[Key: Hashable, Value](cache: collections.OrderedDict[Key, tuple[Value, dict]], key: Key,
+                                     made: Callable[[], Value], held: int) -> Value:
+    """`cache`'s value at `key` (`_cache.holding`, `held` the most it keeps), made within a recording of the
+    facts it reads (`recording`) and held with them while each answers alike (`still`: a hit whose facts
+    answer otherwise now is made again), and those facts read again wherever it is returned (`replay`), so a
+    recording around its reader holds them as one around its making did. A held decision a probe trace
+    makes, its routes no program's, goes through here (the algebra's region decisions, recognitions and
+    attention probes); a held trace a program is written from keeps its whole `dew.algebra.fusion.Recorded`
+    (its routes, launches and facts), which its holder replays whole wherever it writes it (a region's
+    written program, a marked span, a rewritten body). Row 7167: only the second kept their facts, so a warm
+    lowering's recording lacked those its declined regions' probes read (row 6708's defect)."""
+    from dew import _cache
+
+    def making() -> tuple[Value, dict]:
+        with recording() as reads:
+            value = made()
+        return value, reads
+
+    value, reads = _cache.holding(cache, key, making, held, still=lambda entry: still(entry[1]))
+    replay(reads)
+    return value
 
 
 def traced_fact[**Question, Answer](reader: Callable[Question, Answer]) -> Callable[Question, Answer]:
@@ -226,6 +250,27 @@ def chosen(**kernels: str) -> Iterator[None]:
     named = {str(choice): kernel for choice, kernel in kernels.items()}
     with _cache.KERNEL_CHOICES(tuple(sorted({**dict(_cache.KERNEL_CHOICES.value), **named}.items()))):
         yield
+
+
+@contextlib.contextmanager
+def drawing() -> Iterator[None]:
+    """Within the block, a model's draw of its variables (`dew.objectives.base.Objective.init`): its forward
+    runs for the variables its modules make, and none of its values reaches the variables drawn, so every
+    selector takes its op's generic program and reports no route (`selection.select`): no launch is derived,
+    traced or certified at the draw's shapes, a dummy batch no step runs (row 11803: an every-template
+    decoder's ahead compile certified its one-row draw's kernels, 29% of its main thread). JAX keys its
+    trace and compile caches on it (`dew._cache.DRAWING`)."""
+    from dew import _cache
+
+    with _cache.DRAWING(_cache.DRAWING.value + 1):
+        yield
+
+
+def draws() -> bool:
+    """Whether this thread traces a model's draw of its variables (`drawing`)."""
+    from dew import _cache
+
+    return _cache.DRAWING.value > 0
 
 
 def numerics() -> Numerics:

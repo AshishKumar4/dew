@@ -91,14 +91,15 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), fusion.choice_context())
     def recognizing() -> list:
         return [_positioned(jaxpr, written) for written in _recognizing(jaxpr, index, held, families)]
-    found = _cache.holding(_HELD_BODIES, key, recognizing, fusion.DECISIONS_HELD)
+    found = generation.held_trace(_HELD_BODIES, key, recognizing, fusion.DECISIONS_HELD)
     return [_placed(jaxpr, written) for written in found]
 
 
-_HELD_BODIES: collections.OrderedDict[Hashable, list] = collections.OrderedDict()
+_HELD_BODIES: collections.OrderedDict[Hashable, tuple[list, dict]] = collections.OrderedDict()
 """Each body's recognition by its structure, its constants and the context it was weighed in
-(`recognized`), positioned (`_positioned`): every retrace of a step, and every layer body of one structure,
-recognized once, the latest `fusion.DECISIONS_HELD` held."""
+(`recognized`), positioned (`_positioned`), with the facts its regions' probes read
+(`generation.held_trace`): every retrace of a step, and every layer body of one structure, recognized once,
+the latest `fusion.DECISIONS_HELD` held."""
 
 
 def _keyed(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
@@ -177,7 +178,7 @@ def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[
             # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
             with generation.routes(alone=True):
                 return _chosen(index, places, members, accurate)
-        chosen = _cache.holding(_HELD_REGIONS, key, chose, fusion.DECISIONS_HELD)
+        chosen = generation.held_trace(_HELD_REGIONS, key, chose, fusion.DECISIONS_HELD)
         if chosen is not None:
             candidate = members[chosen]
             # Its call's identity: the region's (its structure and its constants' values) and the candidate.
@@ -186,9 +187,10 @@ def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[
     return None
 
 
-_HELD_REGIONS: collections.OrderedDict[Hashable, int | None] = collections.OrderedDict()
-"""Each region's chosen call (`_chosen`) by `_region_key`, the latest `fusion.DECISIONS_HELD` held: every
-layer of a stack weighs its norm once."""
+_HELD_REGIONS: collections.OrderedDict[Hashable, tuple[int | None, dict]] = collections.OrderedDict()
+"""Each region's chosen call (`_chosen`) by `_region_key`, with the facts its probes read
+(`generation.held_trace`), the latest `fusion.DECISIONS_HELD` held: every layer of a stack weighs its norm
+once."""
 
 
 def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...],
@@ -977,11 +979,13 @@ def _attention_taken(attend: Callable, operands: Sequence[jcore.Var], options: H
     of `KEPT`), asked once by what it reads (`_TAKEN`): its operands' shapes and dtypes, the call's
     `options` and the context its kernels are chosen in (`fusion.choice_context`)."""
     key = (tuple((aval(var).shape, aval(var).dtype) for var in operands), options, fusion.choice_context())
-    return _cache.holding(_TAKEN, key, lambda: _traced_taken(attend, operands), fusion.DECISIONS_HELD)
+    return generation.held_trace(_TAKEN, key, lambda: _traced_taken(attend, operands), fusion.DECISIONS_HELD)
 
 
-_TAKEN: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
-"""Whether an attention call takes a kernel (`_attention_taken`), the latest `fusion.DECISIONS_HELD` held:
+_TAKEN: collections.OrderedDict[Hashable, tuple[bool, dict]] = collections.OrderedDict()
+"""Whether an attention call takes a kernel (`_attention_taken`), with the facts its trace read
+(`generation.held_trace`: the device's memory, FlashAttention's lowering), the latest
+`fusion.DECISIONS_HELD` held:
 each shape and option asked of the selector once, however many regions and programs offer it (a Dory step's
 recognition traced the call 832 times for 113 regions, 37 of its 46 s, row 6799)."""
 

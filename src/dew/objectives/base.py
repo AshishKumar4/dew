@@ -65,6 +65,7 @@ from dew.batch import (
 from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.inspection import INSPECTED, QK, Watched, watching
+from dew.nn.kernels.generation import drawing
 from dew.nn.kernels.options import Option, compiler_options, owned_program
 from dew.nn.precision import (
     ROUNDING_STREAM,
@@ -1359,8 +1360,10 @@ class Objective(ABC, Generic[Loss, Effects]):
 
             tree = stored_layers(self, held)
         elif not held or self._held_parts:
-            # None or an empty tree draws afresh: `parameter_axes` traces the objective's draw so.
-            tree = self.fresh_variables(key, held or None)
+            # None or an empty tree draws afresh: `parameter_axes` traces the objective's draw so. Its
+            # forward runs for the variables its modules make, so it selects no kernel (`drawing`).
+            with drawing():
+                tree = self.fresh_variables(key, held or None)
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
