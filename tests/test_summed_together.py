@@ -1,15 +1,15 @@
 """Groups of products summed together (`Issuer.summed_together`): every group issued before any is read,
 a warpgroup MMA's each read as its own groups complete, the later ones running on, what each is read into
 (`then`) made there (row 10734)."""
-import re
-
 import jax
 import jax.experimental.mosaic.gpu as mgpu
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend.mlir import ir
 from jax.sharding import Mesh
 
 from dew.nn.kernels import generation
@@ -21,20 +21,25 @@ TILE = 64
 INTERPRETED = plgpu.InterpretGPUParams()
 
 
-def _together(a, b, c, d, *, interpret):
+def _together(a, b, c, d, issued, *, interpret, predicated: bool = True):
     """`a @ b` doubled and `c @ d`, both products a warpgroup MMA's (`mosaic_sm90.FED`, one warpgroup),
-    summed together, the first doubled where it is read (`then`)."""
+    summed together, the first doubled where it is read (`then`); `predicated`, the second issued where
+    `issued[0]` (an int32 a run reads) is nonzero, its accumulator zero elsewhere."""
     family = mosaic_sm90.FED
     widest = resources.copied_rows(TILE, jnp.float32)
 
-    def body(a_gmem, b_gmem, c_gmem, d_gmem, out_gmem):
+    def body(a_gmem, b_gmem, c_gmem, d_gmem, issued_gmem, out_gmem):
         def scoped(a_smem, b_smem, c_smem, d_smem, *outs):
             for source, staged in ((a_gmem, a_smem), (b_gmem, b_smem), (c_gmem, c_smem), (d_gmem, d_smem)):
                 swizzling.copied(source, staged)
             mosaic.synced(interpret)
+            def second(acc):
+                def issued():
+                    return family.products(acc, c_smem, d_smem)
+                return family.issued_when(issued_gmem[0] != 0, acc, issued) if predicated else issued()
+
             readers = family.summed_together(
-                ((TILE, TILE), (TILE, TILE)), (lambda acc: family.products(acc, a_smem, b_smem),
-                                               lambda acc: family.products(acc, c_smem, d_smem)),
+                ((TILE, TILE), (TILE, TILE)), (lambda acc: family.products(acc, a_smem, b_smem), second),
                 then=(lambda value: 2.0 * value, None))
             for out, read in zip(outs, readers, strict=True):
                 plgpu.store(out, read(), optimized=False)
@@ -49,7 +54,7 @@ def _together(a, b, c, d, *, interpret):
 
     out = jax.ShapeDtypeStruct((2, TILE, TILE), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
-                         interpret=interpret, name="together")(a, b, c, d)
+                         interpret=interpret, name="together")(a, b, c, d, issued)
 
 
 def _operands():
@@ -58,30 +63,55 @@ def _operands():
 
 
 @INTERPRETS
-def test_groups_summed_together_are_each_read_into_what_their_caller_makes_of_them():
+@pytest.mark.parametrize("issued", [1, 0])
+def test_groups_summed_together_are_each_read_into_what_their_caller_makes_of_them(issued):
     """Interpreted: two groups of a warpgroup MMA's products summed together, the first read doubled (its
-    `then`): exactly `2 a @ b` and `c @ d`."""
+    `then`), the second issued or not as a run decides: exactly `2 a @ b`, and `c @ d` or zero."""
     a, b, c, d = _operands()
     with generation.assumed("sm90"):
-        found = np.asarray(_together(a, b, c, d, interpret=INTERPRETED))
+        found = np.asarray(_together(a, b, c, d, jnp.array([issued], jnp.int32), interpret=INTERPRETED))
     f32 = [np.asarray(x, np.float32) for x in (a, b, c, d)]
-    np.testing.assert_array_equal(found, np.stack([2 * f32[0] @ f32[1], f32[2] @ f32[3]]))
+    np.testing.assert_array_equal(found, np.stack([2 * f32[0] @ f32[1], issued * (f32[2] @ f32[3])]))
+
+
+def _groups_and_waits(module: bytes) -> list[str]:
+    """A Mosaic GPU kernel's warpgroup MMA commits and waits in program order (its typed module's inline
+    assembly, `wgmma.commit_group` and `wgmma.wait_group`), each wait with the groups it leaves in flight,
+    each commit within a branch marked so."""
+    found: list[str] = []
+
+    def walk(operation: ir.Operation, *, branched: bool) -> None:
+        for region in operation.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    op = inner.operation
+                    if op.name == "llvm.inline_asm":
+                        text = ir.StringAttr(op.attributes["asm_string"]).value
+                        if text.startswith("wgmma.commit_group"):
+                            found.append("commit if" if branched else "commit")
+                        elif text.startswith("wgmma.wait_group.sync.aligned "):
+                            found.append(f"wait {text.split()[-1].rstrip(';')}")
+                    walk(op, branched=branched or op.name == "scf.if")
+
+    typed = mgpu.deserialized(module)
+    with typed.context:
+        walk(typed.operation, branched=False)
+    return found
 
 
 @COMPILES_ON_CPU
-def test_a_warpgroup_mmas_groups_summed_together_are_each_read_as_their_own_complete():
-    """Lowered for an H100: both groups issued before either is read, the first read once its own group is
-    done with the second still in flight (a warpgroup MMA wait leaving one group pending), then the second;
-    where each group was summed in turn, every wait left none in flight (row 10734: the attention backward's
-    `product_pair` its own such path)."""
-    shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in _operands()]
+@pytest.mark.parametrize("predicated", [False, True])
+def test_a_warpgroup_mmas_groups_summed_together_are_each_read_as_their_own_complete(predicated):
+    """Lowered for an H100: both groups committed before either is read, the first read once its own group
+    is done with the second still in flight (a wait leaving one group in flight), then the second; where
+    the second is issued under a predicate a run decides, the first's wait leaves none in flight, as a run
+    that skips the second would read the first unfinished (row 10734; theme K01-e's review P0)."""
+    shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in _operands()] + [
+        jax.ShapeDtypeStruct((1,), jnp.int32)]
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(lambda *operands: _together(*operands, interpret=False)).trace(*shapes).lower(
-            lowering_platforms=("cuda",))
+        run = jax.jit(lambda *operands: _together(*operands, interpret=False, predicated=predicated))
+        lowered = run.trace(*shapes).lower(lowering_platforms=("cuda",))
     (call,) = [call for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
-    typed = mgpu.deserialized(call.ir)
-    with typed.context:
-        waits = [int(left) for left in re.findall(r"wgmma\.wait_group\.sync\.aligned (\d+);", str(typed))]
-    assert waits == [1, 0], waits
-
+    second, first_wait = ("commit if", "wait 0") if predicated else ("commit", "wait 1")
+    assert _groups_and_waits(call.ir) == ["commit", second, first_wait, "wait 0"]

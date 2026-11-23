@@ -101,3 +101,26 @@ def test_a_program_called_after_a_seeded_refusal_traces_past_it():
         report.refuse([("a launch", 1, ("its kernel",))])
         after = float(run(x))
     assert (before, after) == (0.0, 1.0)
+
+
+def test_a_program_whose_trace_a_refusal_follows_runs_a_trace_past_it_after():
+    """A program whose trace reads a launch's refusals, a refusal of that launch recorded as it traces
+    (before its executable is kept, as another thread's compile records one): a call after it runs a
+    program traced past the refusal, never the executable traced before it kept under the refusal's key
+    (theme K01-e's review P0: the key read after the compile)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    seeded = []
+
+    def chosen(x):
+        seen = report.refusals_of("a launch")
+        if not seeded:
+            seeded.append(True)
+            report.refuse([("a launch", 1, ("its kernel",))])
+        return x + (1.0 if seen else 0.0)
+
+    run, x = owned_program(chosen), jnp.zeros((), jnp.float32)
+    with report.refusals():
+        run(x)
+        assert float(run(x)) == 1.0

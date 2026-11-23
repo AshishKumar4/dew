@@ -127,12 +127,15 @@ from dew.nn.kernels.generation import compile_only_gpus
 from dew.training.ahead import AheadOfTime, compile_ahead
 
 nonce, refused = float(sys.argv[1]), sys.argv[3] == "refused"
-# An H100's 80 GiB, which a step is compiled ahead against (`compile_only_gpus`' memory), or the memory named.
+# An H100's 80 GiB at Dew's share, which a step is compiled ahead against (`compile_only_gpus`' memory and
+# share), or the memory and share named.
 memory = int(sys.argv[4]) if len(sys.argv) > 4 else 80 * 2**30
+share = float(sys.argv[5]) if len(sys.argv) > 5 else None
 with report.refusals():
     if refused:
         report.refuse(pickle_load(sys.argv[2]))
-    ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1, memory)), nonce), BATCH)
+    devices = compile_only_gpus("sm90", 1, memory, share=share)
+    ahead = compile_ahead(experts(MeshSpec().build(devices), nonce), BATCH)
     ahead.save(sys.argv[2] + (".again" if refused else ""))
     # The saved plan read back beside every field of each miss the compile made, its config by its text.
     misses = [{**{field.name: getattr(miss, field.name) for field in dataclasses.fields(miss)},
@@ -380,12 +383,14 @@ def test_a_run_handed_a_step_compiled_ahead_for_the_canonical_h100_takes_it_on_o
     step is compiled ahead against the memory this host's GPU states at the run's share: a GH200 shared at a
     GPU tier's share states less than an H100's 80 GiB there, and a run is refused a plan of more memory than
     its GPU holds (row 12193)."""
-    from dew._devices import pool_share
+    from dew._devices import allocator_limit, pool_share
 
     step = str(tmp_path / "step.dew-aot")
-    # The memory whose allocator limit at the run's share is this GPU's own, at most.
-    memory = int(jax.devices()[0].memory_stats()["bytes_limit"] / pool_share())
-    spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh", str(memory))
+    # The memory and share whose allocator limit is this GPU's own at the run's share, at most.
+    limit, share = jax.devices()[0].memory_stats()["bytes_limit"], pool_share()
+    memory = int(limit / share)
+    assert allocator_limit(memory, share) <= limit
+    spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh", str(memory), str(share))
     canonical = generation.gpu_target("sm90").multiprocessors
     if generation.device_target(jax.devices()[0]).multiprocessors != canonical:
         from dew.training.ahead import AheadOfTime, handed
@@ -918,7 +923,8 @@ def _rejected_instruction(ctx) -> None:
 
 
 class AssemblerRejected(grouped_matmul.MosaicGmm):
-    """The grouped forward beside a kernel of its launch that lowers and that the assembler refuses."""
+    """The grouped forward beside a kernel of its launch that lowers and that the assembler refuses, its
+    result a residual alone."""
 
     @functools.wraps(grouped_matmul.MosaicGmm._fwd)  # its binding reads its forward's signature
     def _fwd(self, tokens, kernel, sizes, *args, **kwargs):
@@ -930,7 +936,9 @@ class AssemblerRejected(grouped_matmul.MosaicGmm):
 
         flag = plgpu.kernel(rejected, out_type=jax.ShapeDtypeStruct((128,), jnp.float32))(
             jnp.zeros((128,), jnp.float32))
-        return jax.tree.map(lambda out: out + flag[0].astype(out.dtype), outputs), residuals
+        # A residual alone: the launch certified alone keeps it, and a forward that discards its residuals
+        # compiles without it.
+        return outputs, (residuals, flag)
 
 
 @COMPILE_ONLY
@@ -939,13 +947,15 @@ def test_a_launch_the_assembler_refuses_alone_fails_the_compile_gate_uncertified
     """A launch whose kernel lowers and whose PTX the assembler refuses, through the compile gate on a
     compile-only H100: certification's own compile of it fails (`report.certified`'s refusal by XLA), it is
     recorded uncertified (`report.uncertified`), and the gate's record names it, so the gate fails the case
-    (row 6002: the route tested on a hand-made record alone)."""
+    (row 6002: the route tested on a hand-made record alone). The program itself compiles, the refused
+    kernel's result discarded there: the gate fails it as uncertified alone."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, failures
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures, refused
 
     _, made, operands = _paired(AssemblerRejected())
     [record] = compile_mosaic_kernels([KernelCase("refused", lambda: (made(), tuple(operands)))], "sm90")
-    assert record["uncertified"] and failures([record]), record
+    assert record["uncertified"] and not refused(record), record
+    assert mosaic_failures([record]) and not mosaic_failures([{**record, "uncertified": []}]), record
 
 
 class TwiceUncounted(Uncounted):
