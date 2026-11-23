@@ -288,14 +288,15 @@ def joined_in_place(pairs: list[tuple[jax.Array, jax.Array]], *, group_sizes=Non
     m0_spec = jax.ShapeDtypeStruct((1, *m0.shape) if dense else m0.shape, m0.dtype)
     rest_spec = tuple(padded_spec(r, m, step, transpose_rhs=transpose_rhs, dense=dense)
                       for r, m in pairs[1:])
-    sizes_spec = jax.ShapeDtypeStruct((1,) if dense else group_sizes.shape, jnp.int32)
+    sizes_spec = jax.ShapeDtypeStruct((1,) if group_sizes is None else group_sizes.shape, jnp.int32)
     options = {'interpret_on_cpu': interpret_on_cpu, 'precision': precision, 'transpose_rhs': transpose_rhs,
                'dense': dense, 'first': None, 'gather': None}
     route = launch_route(r0_spec, m0_spec, {'chained': rest_spec}, sizes_spec, out_d, None, options,
                          whole=not automatic_axes())
     if not route:
         return None
-    sizes_arg = jnp.full((1,), r0.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
+    sizes_arg = (jnp.full((1,), r0.shape[0], jnp.int32) if group_sizes is None
+                 else group_sizes.astype(jnp.int32))
     wide = at_least_fp32(dtype)
     count = len(pairs)
 

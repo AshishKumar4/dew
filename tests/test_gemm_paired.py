@@ -1218,7 +1218,6 @@ def test_joined_depths_walks_lora_in_place_without_concatenating_base():
                     truth_fn=functools.partial(ref_vjp, dtype=jnp.float64))
 
 
-
 def test_grouped_low_rank_walks_in_place_and_holds_check_1_and_compiles():
     """Grouped MoE `low_rank.low_rank` (`group_sizes` given, row 1304) walks base experts `(x, W)` and LoRA
     `(t, B)` in place via `mosaic_gpu.gmm`'s grouped `chained` launch without concatenating base weights,
