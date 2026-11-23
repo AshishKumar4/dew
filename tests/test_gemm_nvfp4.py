@@ -842,6 +842,19 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
         want[0, 0], want[0, 1] = 2.0 ** -28, 2.0 ** 89
         np.testing.assert_array_equal(np.asarray(d_token), want, err_msg=kernel)
 
+    # One route's products cancelling at 2**252 with a third, 2**-126 times its factor, on the same input,
+    # which the route's fp32 pullback at one power cannot keep: NaN, as the plain transpose gives, not 0.
+    three = jnp.zeros((1, 512, 128), jnp.float32).at[0, 0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
+    lone = formats.NvFp4.of(three, scales[None], jnp.asarray([2.0 ** 118], jnp.float32))
+    with generation.assumed("sm90"), generation.chosen(nvfp4="xla"):
+        _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, lone, jnp.asarray([1], jnp.int32),
+                                                          jnp.asarray([0], jnp.int32), out_dtype=jnp.float32),
+                          token)
+        cotangent = jnp.zeros((1, 128), jnp.float32).at[0, :2].set(2.0 ** 126).at[0, 2].set(2.0 ** -126)
+        (d_token,) = pull(cotangent)
+    assert np.isnan(np.asarray(d_token)[0, 0]), np.asarray(d_token)[0, :2]
+    np.testing.assert_array_equal(np.asarray(d_token)[0, 1:], np.zeros((511,), np.float32))
+
     # A gather routing no token pulls back zeros.
     none, nowhere = jnp.asarray([0, 0], jnp.int32), jnp.zeros((0,), jnp.int32)
     routed = functools.partial(gemm.nvfp4_product, matrix=bank, group_sizes=none, gather=nowhere,

@@ -138,16 +138,31 @@ class _Transpose:
         if not routed:
             partial, excess = self.pulled(near, ran)
             return power2(self.summed(partial, excess), -lift)
-        return self.routed_moved(near, lift, routed)
+        # Products the move takes below fp32's least normal, which it flushes or rounds.
+        tiny = counted & (e_c + e_f + lift < jnp.finfo(jnp.float32).minexp)
+        return self.routed_moved(near, lift, routed, tiny)
 
-    def routed_moved(self, near, lift, routed):
+    def routed_moved(self, near, lift, routed, tiny):
         """A gathered product's rescue: each route pulled back wide at its own power (`lift`, so what cancels
         within it cancels there), then each moved back and summed into its token, and over the devices that
         route it, exactly, rounded once (`aligned.aligned_segment_sum`): routes of +-2**140 from two devices
-        sum to 0 beside a 2**-38 one, and 2**128 - 2**105 to its finite value."""
+        sum to 0 beside a 2**-38 one, and 2**128 - 2**105 to its finite value. Within a route the pullback
+        sums in fp32: where its products past `FACTORED_WINDOW` binades below the route's largest reach an
+        entry whose larger products cancel to below `2**-FACTORED_WINDOW` of their magnitude, the entry is
+        NaN, as the plain transpose's is, not a sum that dropped them (ledger row of the exact rescue)."""
         assert self.wide is not None, "a routed product's rescue pulls its routes back wide"
         gather, wide_operands = routed
         partial = self.wide(near, *wide_operands).astype(jnp.float32)
+        # Each route's entries past the window below its largest, moved to fp32's least normal where their
+        # move flushed them: what they reach, and what the rest reach, bounded through the matrices'
+        # magnitudes.
+        scale = float_bits.binade_of(near)
+        small = ((near != 0) & (scale < FACTORED_RESCUE - FACTORED_WINDOW)) | tiny
+        held = jnp.where(small, jnp.maximum(jnp.abs(near), jnp.finfo(jnp.float32).tiny), 0.0)
+        low = self.wide(held, *wide_operands, magnitude=True).astype(jnp.float32)
+        high = self.wide(jnp.where(small, 0.0, jnp.abs(near)), *wide_operands, magnitude=True)
+        unsure = (low > 0) & (jnp.abs(partial) < high.astype(jnp.float32) * 2.0 ** -FACTORED_WINDOW)
+        partial = jnp.where(unsure, jnp.nan, partial)
         # The power each route moves back by, as three factors each a normal float's.
         powers, rest = [], -lift
         for _ in range(3):
@@ -169,6 +184,10 @@ class _Transpose:
             return value, jnp.zeros_like(value)
         return value, self.summed(*self.pulled(functools.reduce(jnp.add, terms), ran))
 
+
+FACTORED_WINDOW = 20
+"""The binades below a route's largest cotangent-times-factor product past which its rescue's fp32 pullback
+may drop a product (`_Transpose.routed_moved`), and the cancellation below which such a drop is refused."""
 
 FACTORED_RESCUE = 100
 """The binade `factored`'s transpose moves a row's largest term to where its plain transpose overflowed: its

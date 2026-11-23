@@ -1197,17 +1197,19 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
 
 
 def _wide_transpose_packed(cotangent: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Array, *,
-                           interpret_on_cpu: bool) -> jax.Array:
+                           interpret_on_cpu: bool, magnitude: bool = False) -> jax.Array:
     """`_wide_transpose` of a bank's packed `words` and `scales`, decoded here (`_undeferred`)."""
     return _wide_transpose(cotangent, _undeferred(words, scales).decoded(), sizes,
-                           interpret_on_cpu=interpret_on_cpu)
+                           interpret_on_cpu=interpret_on_cpu, magnitude=magnitude)
 
 
 def _wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array | None, *,
-                    interpret_on_cpu: bool) -> jax.Array:
+                    interpret_on_cpu: bool, magnitude: bool = False) -> jax.Array:
     """The rows' transpose of a product with decoded bf16 `matrices` (grouped by `sizes`, or one), in fp32:
     the cotangent as its bf16 parts (`_bf16_parts`), each part's product exact and summed in fp32, the
-    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding."""
+    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding; with
+    `magnitude`, through the matrices' magnitudes (a bound on what each entry of a cotangent reaches)."""
+    matrices = jnp.abs(matrices) if magnitude else matrices
     parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
     return functools.reduce(jnp.add, [
         jnp.asarray(gemm(part, matrices, sizes, transpose_rhs=True, out_dtype=jnp.float32,
