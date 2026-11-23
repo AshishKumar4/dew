@@ -312,8 +312,8 @@ def _levels(parts, lowest: int, digit: int, levels: int, limits, axes: tuple[str
             most = jnp.maximum(most, jnp.max(jnp.where(limb != 0, place + width, most), initial=most))
     if axes:
         # Varying over every one of `axes` first: a bound every device holds alike agrees as it is.
-        least, most = (jax.lax.pvary(bound, tuple(sorted(set(axes) - jax.typeof(bound).mat.varying)))
-                       for bound in (least, most))
+        least, most = (jax.lax.pcast(bound, missing, to="varying") if (missing := tuple(sorted(
+            set(axes) - jax.typeof(bound).mat.varying))) else bound for bound in (least, most))
         least, most = jax.lax.pmin(least, axes), jax.lax.pmax(most, axes)
     count = sum(extent for _, _, extent in parts)
     first = jnp.clip((least - lowest) // digit, 0, levels)
