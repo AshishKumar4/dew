@@ -825,7 +825,7 @@ def _packed_weight_rules(launch: grouped_matmul.MosaicWordPackedGmm, make_bank,
     def portable(r: jax.Array, w: jax.Array, s: jax.Array) -> jax.Array:
         matrices = decoded(w)
         return (jax.lax.dot(r, matrices, preferred_element_type=jnp.float32) if dense
-                else jax.lax.ragged_dot(r, matrices, s, preferred_element_type=jnp.float32))
+                else xla_products.placed_ragged_dot(r, matrices, s, preferred_element_type=jnp.float32))
 
     def forward(r: jax.Array, w: jax.Array, s: jax.Array):
         with xla_products.interpreted_context(interpret):

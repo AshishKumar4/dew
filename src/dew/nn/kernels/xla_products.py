@@ -183,6 +183,18 @@ _GROUPED_ROWS = jax.lax.RaggedDotDimensionNumbers(
 """`jax.lax.ragged_dot`'s own: each group's rows of `[rows, depth]` times its `[depth, width]` matrix."""
 
 
+def placed_ragged_dot(values: jax.Array, matrices: jax.Array, group_sizes: jax.Array, *,
+                      precision: PrecisionLike = None,
+                      preferred_element_type: Dtype | None = None) -> jax.Array:
+    """`jax.lax.ragged_dot` as written (its one primitive, which a fuser reads as the program's dot), placed
+    where an Explicit mesh axis places its operands (`ragged_placement`): JAX infers no placement for a
+    ragged dot there (row 12401)."""
+    return jax.lax.ragged_dot_general(
+        values, matrices, group_sizes, _GROUPED_ROWS, precision=precision,
+        preferred_element_type=preferred_element_type,
+        out_sharding=ragged_placement(((values, 0), (matrices, matrices.ndim - 1))))
+
+
 def ragged_placement(sources: tuple) -> jax.sharding.NamedSharding | None:
     """Where a ragged product lands where an operand's type places it on a mesh with Explicit axes, split or
     not (`out_sharding`: JAX infers no placement for a ragged dot, "Explicit sharding inference for
