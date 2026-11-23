@@ -1291,10 +1291,9 @@ class RunConfig:
         # review); a loader compiled already reads as every version this Dew reads does
         # (`dew.data.plan.read_by`).
         named = dataclasses.replace(self, trainer=dataclasses.replace(self.trainer, name=name))
-        planned = named.resumed(("data_plan_version",))
-        dataset, held = planned.compiled(objective.data(), dataset, validation)
-        sized, dataset, steps = planned.trainer.resolved(dataset)
-        run = dataclasses.replace(planned, trainer=sized)
+        run = named.resumed(("data_plan_version",))
+        dataset, held = run.compiled(objective.data(), dataset, validation)
+        dataset, steps = run.trainer.resolved(dataset)
         # Each split scores the metrics its suite or `val_metrics` names, or else `metrics`, the kind's, at
         # its cadence read as the run's is: over the sized trainer and the loader its batch ramp reads.
         suites = run.evaluation_suites(dataset, held, metrics)

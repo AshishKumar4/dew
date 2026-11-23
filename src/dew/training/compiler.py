@@ -954,9 +954,8 @@ class StepCompiler[L, E]:
             if settings.host_master:
                 raise Lowered(target, *routed(lambda: self._lowered_host(stepping, state, batch, target)))
             self.at_base_rung(batch)
-            if self.remat == "full":
-                # The rung the run's policy starts its step at, which its search would compile (`FitSearch`).
-                remat_topmost(self.objective)
+            # The rung the run's policy starts its step at, which its search would compile (`FitSearch`).
+            self.unsearched_rung(self.objective)
             raise Lowered(target, *routed(
                 lambda: [("step", lowered_for(stepping, state, batch, target, self.narrow))]))
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
@@ -1400,6 +1399,14 @@ class StepCompiler[L, E]:
         return planned, Compiled(split, plan, memory, planned.executable, flops and split * flops, links,
                                  validation), keep
 
+    def unsearched_rung(self, objective: Objective[L, E]) -> None:
+        """Put `objective` at the rung the run's remat policy starts a step at where no fit search climbs it
+        (`FitPolicy.remat`): a host step's, which streams, priced and compiled alike
+        (`dew.training.streaming`), and a lowering's for another GPU: every module recomputed whole under
+        "full" (`remat_topmost`), its own otherwise, which "none" and "selective" admit."""
+        if self.remat == "full":
+            remat_topmost(objective)
+
     def _plan_key(self, batch: Batch) -> tuple[str, int | None]:
         """The step a plan is kept for (`_plans`): its batch's layout and the pass count it runs
         (`PhasePasses.current`), a phase of other passes another program."""
@@ -1689,8 +1696,7 @@ class StepCompiler[L, E]:
         recomputed whole under "full" (`remat_topmost`), the run's own otherwise, which "none" and "selective"
         admit."""
         settings = stepping.settings
-        if self.remat == "full":
-            remat_topmost(self.objective)
+        self.unsearched_rung(self.objective)
         from dew.training.execution import HostExecution, frozen_trees, stack_sites
         cpu = settings.state_mesh
         sites = stack_sites(self.objective, state.variables)

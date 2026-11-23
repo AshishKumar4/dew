@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import jax
 import jax.numpy as jnp
 import pytest
 from affine_run import TimingRegression as Regression, batches
@@ -163,16 +164,12 @@ def test_a_token_budget_sets_the_accumulation_over_its_datas_token_batches():
     """The data's batch stage is the run's one batch: a budget of tokens an update sets the
     accumulation to that many of the data's token batches (`TrainerConfig.accumulation`), and refuses
     data batched in rows, a budget no whole number of its batches, or phases of other token batches; an
-    update of tokens and of batches together is refused as it is stated, and a run resolved against its
-    loader keeps the update as authored."""
+    update of tokens and of batches together is refused as it is stated."""
     trainer = TrainerConfig(update=UpdateBatch(tokens=98304), horizon=Horizon(steps=1))
     tokens = Loader(train=lambda partition: iter(()), val=None, records=None, batch=8, batch_tokens=24576)
     assert trainer.accumulation(tokens) == 4
     recorded = json.loads(json.dumps(RunConfig(trainer=trainer).to_dict()))
     assert RunConfig.from_dict(recorded).trainer == trainer
-    # The run resolved against the loader keeps its update as authored, which its record (run.json) holds:
-    # its steps read the accumulation, its trainer the tokens (review of API01).
-    assert trainer.resolved(tokens)[0].update == UpdateBatch(tokens=98304)
     for refused in (dataclasses.replace(tokens, batch_tokens=None),
                     dataclasses.replace(tokens, batch_tokens=24575)):
         with pytest.raises(ValueError):
@@ -1076,15 +1073,82 @@ def test_a_run_saved_before_each_optimizer_held_its_settings_loads_its_optimizer
         assert loaded.trainer == LMRunConfig().trainer
 
 
+MASKED = json.loads((Path(__file__).parent / "fixtures" / "optimizers" / "masked-decay-65609490a.json")
+                    .read_text())
+"""Optimizers an earlier Dew (main 65609490a) built with their decay masked off among their options
+(`optimizer_opts={"mask": False}`) over `OptimConfig(learning_rate=1e-2)`'s other settings, each with the
+state its first step held, by the path of each leaf, its shape and dtype, and that step's updates of two
+parameters with unit gradients, recorded by that Dew's own `OptimConfig.build`."""
+
+
+def _saved_optimizer(tmp_path, earlier):
+    """The optimizer a language run saved with the optimizer config `earlier` (its earlier fields, over
+    `OptimConfig(learning_rate=1e-2)`'s others) loads."""
+    from dew.config.lm import LMRunConfig
+    from dew.registry import to_record
+
+    today = LMRunConfig().record()
+    fields = today["fields"]
+    held = to_record(OptimConfig(learning_rate=1e-2), OptimConfig)
+    assert isinstance(fields, dict) and isinstance(held, dict)
+    optim = {key: value for key, value in held.items() if key != "optimizer"}
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps({**today, "fields": {**fields, "optim": {**optim, **earlier}}}))
+    return LMRunConfig.load(str(path)).optim
+
+
+@pytest.mark.parametrize("case", sorted(MASKED))
+def test_a_run_whose_decay_its_options_masked_off_resumes_its_optimizers_state_as_it_trained(tmp_path, case):
+    """A run saved while its optimizer's options masked its decay off (`optimizer_opts={"mask": False}`),
+    unspared or in a param group that did not spare (`ParamGroup.spared`), whatever the config spared,
+    loads an optimizer whose state its checkpoint restores into, each leaf at the path, shape and dtype the
+    earlier Dew's held, and whose step updates as that one's did: no parameter decayed where the mask read
+    (review of API01: the grouped mask was dropped, decaying its group's parameters)."""
+    held = MASKED[case]
+    optimizer = _saved_optimizer(tmp_path, held["optim"]).build(None)
+    params = {"w": jnp.arange(4.0).reshape(2, 2) / 10, "b": jnp.arange(2.0) / 10}
+    state = optimizer.init(params)
+    leaves = [[jax.tree_util.keystr(path), list(leaf.shape), str(leaf.dtype)]
+              for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]]
+    assert leaves == held["state"], leaves
+    updates, _ = optimizer.update(jax.tree.map(jnp.ones_like, params), state, params)
+    assert jax.tree.map(lambda leaf: leaf.tolist(), updates) == held["updates"]
+
+
+@pytest.mark.parametrize("earlier", [
+    {"optimizer": "adam", "optimizer_opts": {"mask": False}, "spared": False, "weight_decay": 0.1},
+    {"optimizer": "adam", "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
+     "param_groups": [{"name": "kernel", "patterns": ["w"]}]},
+    {"optimizer": "adamw", "optimizer_opts": {"mask": {"w": False}}, "spared": False}],
+    ids=["coupled-unspared", "coupled-grouped", "tree-mask"])
+def test_a_run_whose_masked_decay_this_dew_holds_no_state_of_is_refused_as_it_loads(tmp_path, earlier):
+    """A run whose options masked off Adam's coupled decay, whose state held a decay step this Dew's Adam
+    holds only where it decays, ungrouped or in an unspared group, or masked its decay by a tree no record
+    rebuilds, is refused as it loads, never loaded into another optimizer state."""
+    with pytest.raises(ValueError):
+        _saved_optimizer(tmp_path, earlier)
+
+
+def test_an_optax_factory_takes_the_mask_its_earlier_options_gave_it(tmp_path):
+    """An Optax factory an earlier run named by its path takes the mask its options gave it as it took it
+    (`Optax.settings`), the config's sparing written over it as before."""
+    optimizer = _saved_optimizer(tmp_path, {"optimizer": "optax:adamw", "optimizer_opts": {"mask": False},
+                                            "spared": False}).optimizer
+    assert optimizer == Optax("optax:adamw", {"mask": False})
+
+
 @pytest.mark.parametrize(("stage", "earlier", "split"), [
     (2, {"split": 1, "microbatches": None}, "auto"), (2, {"split": 1, "microbatches": 4}, 4),
-    (1, {"split": 2, "microbatches": None}, 2)], ids=["staged-outer-split", "staged-feeds", "unstaged"])
+    (1, {"split": 2, "microbatches": None}, 2), (2, {"split": 2, "microbatches": 4}, None)],
+    ids=["staged-outer-split", "staged-feeds", "unstaged", "staged-split-refused"])
 def test_a_run_saved_with_its_split_and_its_pipelines_microbatches_loads_its_fit_by_its_mesh(
         tmp_path, stage, earlier, split):
     """A run saved while its trainer held a step's split and a pipeline's microbatches apart (row 11934)
     loads its fit's split (`FitPolicy.split`) by the mesh it saved: under a pipeline of stages the
     microbatches its stages fed, the planner's where it named none, never its outer split; elsewhere its
-    split (review of API01: an outer split of 1 read as a pipeline's feed, which a staged trainer refuses)."""
+    split (review of API01: an outer split of 1 read as a pipeline's feed, which a staged trainer refuses).
+    An outer split beside a pipeline's microbatches, which this Dew's fit does not hold apart, is refused
+    rather than dropped."""
     from dew.config.lm import LMRunConfig
 
     today = LMRunConfig(trainer=TrainerConfig(mesh=MeshSpec(stage=stage))).record()
@@ -1093,7 +1157,11 @@ def test_a_run_saved_with_its_split_and_its_pipelines_microbatches_loads_its_fit
     trainer = {key: value for key, value in fields["trainer"].items() if key != "fit"}
     path = tmp_path / "run.json"
     path.write_text(json.dumps({**today, "fields": {**fields, "trainer": {**trainer, **earlier}}}))
-    assert LMRunConfig.load(str(path)).trainer.fit.split == split
+    if split is None:
+        with pytest.raises(ValueError):
+            LMRunConfig.load(str(path))
+    else:
+        assert LMRunConfig.load(str(path)).trainer.fit.split == split
 
 
 def test_a_run_saved_with_its_experts_packed_loads_with_its_weights_packed(tmp_path):

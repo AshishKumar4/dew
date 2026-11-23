@@ -12,7 +12,7 @@ import logging
 import os
 import re
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Annotated, Self
+from typing import TYPE_CHECKING, Annotated
 
 import tyro
 
@@ -439,15 +439,15 @@ class TrainerConfig:
             return {"on_host": True}
         return {"mesh": self.mesh, "layout": layout}
 
-    def resolved(self, dataset: Loader) -> tuple[Self, Loader, int | None]:
-        """This config and `dataset` as a run trains on them, and the run's steps: the dataset its batch ramp
+    def resolved(self, dataset: Loader) -> tuple[Loader, int | None]:
+        """`dataset` as a run of this config trains on it, and the run's steps: the dataset its batch ramp
         reads, and the step cap over that (`total_steps`), before which the ramp goes, since it reads fewer
         records a step early and a pass over the data is that many steps longer. Its updates are the steps
         over the accumulation, an update of tokens read against the loader's token batches
-        (`accumulation`); the config keeps its update as authored, which its record holds and its trainer
-        resolves as it reads the loader (`Trainer.reading`)."""
+        (`accumulation`): the config stays as authored, which its record holds and its trainer resolves as
+        it reads the loader (`Trainer.reading`)."""
         dataset = dataset if self.batch_ramp is None else ramped(dataset, self.batch_ramp)
-        return self, dataset, self.total_steps(dataset)
+        return dataset, self.total_steps(dataset)
 
     def total_steps(self, dataset: Loader) -> int | None:
         """Return the step cap from `steps`, `epochs` or `examples`, None for a run its tokens bound
@@ -460,9 +460,9 @@ class TrainerConfig:
         """Return the optimizer updates the run takes over `dataset` as `RunConfig.train` finalizes it,
         its token budget's accumulation and its batch ramp applied: what an average that moves once an
         update ramps over. None for a token-only run."""
-        trainer, _, steps = self.resolved(dataset)
+        _, steps = self.resolved(dataset)
         # A window the run ends inside is never committed, as the trainer counts its updates.
-        return None if steps is None else steps // trainer.accumulation(dataset)
+        return None if steps is None else steps // self.accumulation(dataset)
 
     def eval_interval(self, dataset: Loader) -> int | str | Counted | None:
         """Return the steps between validation passes over `data`, or None for never."""
