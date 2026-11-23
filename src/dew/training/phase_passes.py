@@ -48,25 +48,13 @@ def _chooses_passes(module: nn.Module) -> bool:
     return loop is not None and (loop.shared_cache or loop.exit_threshold is not None)
 
 
-DELEGATED = "hidden_and_mtp_inputs"
-"""The forward a decoder's `hidden_states` hands its keywords to (`CausalTransformer`), which names the count
-a call runs where its caller's takes it among them (`_takes_counts`)."""
-
-
 def _takes_counts(module: nn.Module, method: str | None) -> bool:
-    """Whether `method`, the forward an objective reads `module` by (`Objective.counted_forward`), takes the
-    count of its loop's passes a call runs (`loop_passes`): by name, or among its keywords where it hands
-    them to a forward that names it (`DELEGATED`), as Dew's decoders and its multimodal wrapper do; an
-    adapter's that names none would run every pass at its cap."""
+    """Whether `method`, the forward an objective reads `module` by (`Objective.counted_forward`), names the
+    count of its loop's passes a call runs (`loop_passes`) among its own parameters, as Dew's decoders' and
+    its multimodal wrapper's do; one that names it not, an adapter's handing its keywords on among them,
+    states no count it reads."""
     forward = None if method is None else getattr(type(module), method, None)
-    if forward is None:
-        return False
-    parameters = inspect.signature(forward).parameters
-    if "loop_passes" in parameters:
-        return True
-    keywords = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-    delegated = getattr(type(module), DELEGATED, None) if method != DELEGATED else None
-    return keywords and delegated is not None and "loop_passes" in inspect.signature(delegated).parameters
+    return forward is not None and "loop_passes" in inspect.signature(forward).parameters
 
 
 def _horizons[L, E](objective: Objective[L, E]) -> tuple[int | None, ...]:

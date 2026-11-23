@@ -930,15 +930,17 @@ def test_a_multimodal_cap_program_at_a_drawn_count_is_that_counts_model_over_its
 
 
 def test_a_pass_count_drawn_per_microbatch_over_a_loop_whose_forward_takes_none_is_refused():
-    """A looped module whose forward names no count of passes a call runs (`loop_passes`), an adapter's,
-    would run every pass at its cap whatever a microbatch draws: a run drawing its count per microbatch over
-    it is refused as it is built, and the same module at a phase's count is not."""
+    """A looped module whose forward its loss reads by names no count of passes a call runs (`loop_passes`),
+    an adapter's handing its keywords on, which states no count it reads, would run every pass at its cap
+    whatever a microbatch draws: a run drawing its count per microbatch over it is refused as it is built,
+    and the same module at a phase's count is not (review of row 11951: a forward taking any keyword was
+    read as taking the count where the decoder's did)."""
     from dew.training import Layout, Trainer
 
     class Uncounted(CausalTransformer):
-        def hidden_and_mtp_inputs(self, tokens, **kwargs):
-            kwargs.pop("loop_passes", None)
-            return super().hidden_and_mtp_inputs(tokens, **kwargs)
+        def hidden_states(self, tokens, **kwargs):
+            return super().hidden_states(tokens, **{key: value for key, value in kwargs.items()
+                                                    if key != "loop_passes"})
 
     base = looped(steps=CAP)
     model = Uncounted(**{field.name: getattr(base, field.name) for field in dataclasses.fields(base)

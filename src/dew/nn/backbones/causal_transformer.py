@@ -1220,9 +1220,10 @@ class CausalTransformer(LinearProducts):
         state them (`decoder_cache.named_caches`), tracing no forward."""
         put_opened(self, named_caches(self.mtp, batch_size))
 
-    def hidden_states(self, tokens, **kwargs):
-        """Return the final normalized states, without the vocabulary projection."""
-        return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
+    def hidden_states(self, tokens, loop_passes=None, **kwargs):
+        """Return the final normalized states, without the vocabulary projection, its loop at `loop_passes`
+        passes where a call gives a count (`hidden_and_mtp_inputs`)."""
+        return self.hidden_and_mtp_inputs(tokens, loop_passes=loop_passes, **kwargs)[0]
 
     @nn.nowrap
     @pre_call_capture
@@ -1259,10 +1260,11 @@ class CausalTransformer(LinearProducts):
             raise ValueError(f"the model kept no layer {layer}; it kept layers {held}")
         return kept["__call__"][-1]
 
-    def logits(self, tokens, *, train: bool = False, **fields):
+    def logits(self, tokens, *, train: bool = False, loop_passes=None, **fields):
         """Return `__call__`'s fp32 logits over `hidden_states(tokens, **fields)`, which
-        write no cache unless `fields` ask to `decode`."""
-        return self.logits_from_hidden(self.hidden_states(tokens, train=train, **fields))
+        write no cache unless `fields` ask to `decode`, its loop at `loop_passes` passes where given."""
+        return self.logits_from_hidden(self.hidden_states(tokens, train=train, loop_passes=loop_passes,
+                                                          **fields))
 
     def logits_from_hidden(self, hidden):
         """Return the logits of final states `hidden`: the head `__call__` and every MTP depth score with,
