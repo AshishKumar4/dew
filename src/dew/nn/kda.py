@@ -255,7 +255,8 @@ class KimiDeltaAttention(nn.Module):
                                      max_segments=tokens.max_segments, **self.declared)
             out = sequence_delta_rule(projected, taps, g, beta, tokens, valid, shards=shards,
                                       key_heads=self.num_heads, widths=(self.head_dim,) * 3, parts=heads,
-                                      dtype=projected.dtype if ported else wide, rule=rule)
+                                      dtype=projected.dtype if ported else wide, rule=rule,
+                                      chunk_size=self.chunk_size)
         else:
             out = held_scan(self, projected, taps, None, scan,
                             (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
