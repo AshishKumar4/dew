@@ -630,10 +630,10 @@ FOUR_STAGED = MeshSpec(fsdp=2, stage=4)
                          ids=["a-row-a-step", "two-rows-a-step", "a-remainder-mapped-apart"])
 def test_a_loop_over_a_stack_trains_stage_local_as_its_layers_whole_do(batch_size, mesh, devices):
     """An eight-layer decoder's stages each holding their layers, a transformation's loop over each stacked
-    leaf's first axis (`mapped_by_row`, a stage or two a step; over four stages three a step, the last a
-    remainder JAX maps apart and concatenates, review of Train 1224) keeps each run stage-local and trains
-    on par with the same run with every layer whole on every stage (`Layout.stage_local=False`), against
-    one device's float64 (check 1)."""
+    leaf's first axis (`mapped_by_row`, one, two or three stored layers a step; at three over eight, the
+    last two a remainder JAX maps apart and concatenates, review of Train 1224) keeps each run stage-local
+    and trains on par with the same run with every layer whole on every stage (`Layout.stage_local=False`),
+    against one device's float64 (check 1)."""
     assert_trains_as_replicated(decoder(num_layers=8), mapped_by_row(batch_size),
                                 f"a loop over a stack, {batch_size} a step over {mesh.stage} stages",
                                 mesh=mesh, devices=devices)
