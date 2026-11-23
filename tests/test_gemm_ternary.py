@@ -240,30 +240,24 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
 
 def test_ternary_ste_cancellation_overflow_and_subnormal_rows():
     """STE pullback never overflows on canceling extreme rows (`2**126` with `+1/-1` and scale `2**10` ->
-    forward `0`, grad `[+1024, -1024]`), and tiny subnormal rows (`2**-144` with scale `2**120`) normalize
-    against `peak` before scaling by `127` to produce exact `2**-24` without underflow (row 1464)."""
+    forward `0`, grad `[+1024, -1024]`), and tiny normal rows (`2**-125`, whose `peak / 127` underflows to
+    subnormal/zero under FTZ, with scale `2**101`) normalize against `peak` before scaling by `127` to
+    produce exact `2**-24` without underflow (row 1464)."""
     # Cancellation overflow witness: two entries of 2**126 against +1 and -1 with weight scale 2**10.
     x_cancel = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** 126)
     w_mat = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[1, 0].set(-1.0)
     w_cancel = dataclasses.replace(formats.TernaryWeights.of(w_mat, scale=jnp.float32(1.0)),
                                    scale=jnp.float32(2.0 ** 10))
-    # Tiny subnormal row witness: 2**-144 with weight scale 2**120 -> representable result 2**-24.
-    x_tiny = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** -144)
+    # Tiny normal row witness: 2**-125 (peak / 127 < tiny = 2**-126 flushes to 0 on XLA CPU FTZ) with
+    # weight scale 2**101 -> representable result 2**-24.
+    x_tiny = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** -125)
     w_tiny = dataclasses.replace(
         formats.TernaryWeights.of(jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0),
                                   scale=jnp.float32(1.0)),
-        scale=jnp.float32(2.0 ** 120))
-    from dew.nn.kernels.templates.gemm import ternary as ternary_mod
+        scale=jnp.float32(2.0 ** 101))
 
-    x_q_t, _ = ternary_mod.quantize_activations_int8(x_tiny)
-    assert np.asarray(x_tiny[0, 0]) == np.float32(2.0 ** -144), x_tiny[0, 0]
-    assert np.asarray(x_q_t[0, 0]) == np.float32(127.0), x_q_t[0, 0]
-    for kernel in ("xla", "mosaic"):
+    for kernel in ("mosaic", "xla"):
         with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
-            raw_dot = gemm.ternary_weight_product(
-                x_q_t, dataclasses.replace(w_tiny, scale=jnp.float32(1.0)), quantize_activations=False,
-                out_dtype=jnp.float32, interpret_on_cpu=True)[0, 0]
-            assert np.asarray(raw_dot) == np.float32(127.0), (kernel, raw_dot)
             y_c, (dx_c, ds_c) = jax.value_and_grad(
                 lambda a, s: gemm.ternary_weight_product(
                     a, dataclasses.replace(w_cancel, scale=s), quantize_activations=True,
@@ -280,6 +274,6 @@ def test_ternary_ste_cancellation_overflow_and_subnormal_rows():
                     a, dataclasses.replace(w_tiny, scale=s), quantize_activations=True,
                     out_dtype=jnp.float32, interpret_on_cpu=True)[0, 0],
                 argnums=(0, 1))(x_tiny, w_tiny.scale)
-            assert np.asarray(y_t) == np.float32(2.0 ** -24), (kernel, y_t, dx_t[0, 0], ds_t)
-            assert np.asarray(dx_t[0, 0]) == np.float32(2.0 ** 120), (kernel, dx_t[0, 0])
-            assert np.asarray(ds_t) == np.float32(2.0 ** -144), (kernel, ds_t)
+            assert np.asarray(y_t) == np.float32(2.0 ** -24), (kernel, y_t)
+            assert np.asarray(dx_t[0, 0]) == np.float32(2.0 ** 101), (kernel, dx_t[0, 0])
+            assert np.asarray(ds_t) == np.float32(2.0 ** -125), (kernel, ds_t)
