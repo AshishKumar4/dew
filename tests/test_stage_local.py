@@ -620,21 +620,21 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
         assert run.plan["layers_whole_for"]
 
 
-THREE_STAGED = MeshSpec(fsdp=2, stage=3)
-"""Three stages beside two fsdp shards, over six of the eight devices: a six-layer decoder's two a stage."""
+FOUR_STAGED = MeshSpec(fsdp=2, stage=4)
+"""Four stages beside two fsdp shards over the eight devices: an eight-layer decoder's two a stage."""
 
 
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize(("batch_size", "mesh", "devices"),
-                         [(1, STAGED, 8), (2, STAGED, 8), (2, THREE_STAGED, 6)],
+                         [(1, STAGED, 8), (2, STAGED, 8), (3, FOUR_STAGED, 8)],
                          ids=["a-row-a-step", "two-rows-a-step", "a-remainder-mapped-apart"])
 def test_a_loop_over_a_stack_trains_stage_local_as_its_layers_whole_do(batch_size, mesh, devices):
-    """A six-layer decoder's stages each holding their layers, a transformation's loop over each stacked
-    leaf's first axis (`mapped_by_row`, a stage or two a step; over three stages two a step, the last a
+    """An eight-layer decoder's stages each holding their layers, a transformation's loop over each stacked
+    leaf's first axis (`mapped_by_row`, a stage or two a step; over four stages three a step, the last a
     remainder JAX maps apart and concatenates, review of Train 1224) keeps each run stage-local and trains
     on par with the same run with every layer whole on every stage (`Layout.stage_local=False`), against
     one device's float64 (check 1)."""
-    assert_trains_as_replicated(decoder(num_layers=6), mapped_by_row(batch_size),
+    assert_trains_as_replicated(decoder(num_layers=8), mapped_by_row(batch_size),
                                 f"a loop over a stack, {batch_size} a step over {mesh.stage} stages",
                                 mesh=mesh, devices=devices)
 

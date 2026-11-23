@@ -1264,8 +1264,8 @@ def test_a_checkpoint_resumes_across_what_a_models_class_marks_as_how_it_runs_al
         return {"model": to_record(ModelConfig.from_model(model), ModelConfig)}
 
     def decoder(**fields):
-        return CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                                 mlp_features=32, max_seq_len=4, **fields)
+        return CausalTransformer(**{"vocab_size": 13, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+                                    "head_dim": 8, "mlp_features": 32, "max_seq_len": 4, **fields})
 
     assert differing_records(inference(decoder(**before)), inference(decoder(**after)), None, None) == refused
     own = [inference(RecomputedAsItComputes(remat=remat)) for remat in (False, True)]
