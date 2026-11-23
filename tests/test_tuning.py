@@ -452,6 +452,39 @@ def a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
     assert set(alone.prune_errors()) == set(norm.autotuning_configs)
 
 
+def a_pulled_launch_is_timed_with_its_backward():
+    """The selective scan's launch measured on this GPU (`tuning._measured`) as a gradient calls it (its op
+    pulled, `KernelOp.moded`) and as a forward alone: its backward's tokens a thread change its backward
+    alone, so at one token against the derived count the forward times alike and the pulled times apart,
+    the pulled pick never the one token (row 12340: the tuner timed the forward alone, every backward
+    variant a tie)."""
+    import numpy as np
+
+    from dew.nn.kernels.templates import report
+    from dew.nn.kernels.templates.recurrence import selective
+
+    rows, length, channels, states = 2, 2048, 1024, 16
+    specs = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+    with report.pulled():
+        pulled = selective.SELECTIVE.moded()
+    assert pulled.pulled
+    found = {}
+    for name, op in (("forward", selective.SELECTIVE), ("pulled", pulled)):
+        ba = op.keyed(op.bind(*specs))
+        derived = ba.heuristics_config
+        one = next(tiles for tiles in ba.autotuning_configs
+                   if tiles.positions == 1 and tiles.chunk == derived.chunk)
+        timings = tuning._measured(op, ba)
+        found[name] = {tiles: float(np.median(timings[tiles].evaluation_times_ms)) for tiles in (derived, one)}
+        found[name]["fastest"] = timings.prune().fastest_config
+    forward, backward = (list(found[name].values())[:2] for name in ("forward", "pulled"))
+    assert 0.8 < forward[1] / forward[0] < 1.25, found
+    assert backward[1] > 1.5 * backward[0] and found["pulled"]["fastest"].positions != 1, found
+
+
 TWO_CPU_MEASURE = """
 import json, os, threading, time
 os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:2])

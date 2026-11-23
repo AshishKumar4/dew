@@ -1217,21 +1217,36 @@ def _lowered_launch(op, arguments: tokamax.BoundArguments, config: Hashable, dev
                                    out_specs=jax.sharding.PartitionSpec(), axis_names=manual, check_vma=False)
         specs = [jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=placed) for shape in shapes]
 
-        def pulled_back(*operands):
-            # Its outputs too, as a step reads them: dropped, the kernels writing only them were dead code
-            # to XLA and went uncertified (the 4B decision step's recurrence_output, LF-PROMO3, whose
-            # program then stepped its producer down a whole-step relowering a rung).
-            out, pullback = jax.vjp(launch, *operands)
-            return out, pullback(jax.tree.map(_unit_cotangent, out))
-
         def certified(*operands):
-            return (pulled_back if reverse else launch)(*operands)
+            return (reversed_run(launch) if reverse else launch)(*operands)
 
         identity = _identity(op, arguments, generation.gpu_target())
         certified.__name__ = certified.__qualname__ = _certification_name(type(op).__name__, identity, config,
                                                                           reverse)
         lowered = owned_program(certified).trace(*specs).lower()
     return lowered, *_lowered_kernels(lowered)
+
+
+def reversed_run(launch: Callable) -> Callable:
+    """`launch` as reverse mode runs it, the one construction certification compiles (`_lowered_launch`) and
+    the tuner times (`tuning._measured`) a launch whose call carries its derivative by: its forward and its
+    pullback at unit cotangents, differentiated along its inexact operands alone, the others closed over.
+    Its outputs too, as a step reads them: dropped, the kernels writing only them were dead code to XLA and
+    went uncertified (the 4B decision step's recurrence_output, LF-PROMO3, whose program then stepped its
+    producer down a whole-step relowering a rung)."""
+    def run(*operands):
+        inexact = [jnp.issubdtype(jnp.result_type(operand), jnp.inexact) for operand in operands]
+
+        def along(*varied):
+            given = iter(varied)
+            return launch(*(next(given) if moves else operand
+                            for operand, moves in zip(operands, inexact, strict=True)))
+
+        out, pullback = jax.vjp(along, *(operand for operand, moves in zip(operands, inexact, strict=True)
+                                         if moves))
+        return out, pullback(jax.tree.map(_unit_cotangent, out))
+
+    return run
 
 
 def _certification_name(op: str, identity: str, config: Hashable, reverse: bool) -> str:

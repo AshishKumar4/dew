@@ -600,6 +600,17 @@ class KernelOp(tokamax.Op):
     template's fast backward): a gradient's product certifies it as reverse mode runs it (`report.pulled`).
     Every other op's derivative is its caller's custom VJP, of launches of their own."""
     revision: int = 1
+    pulled: bool = False
+    """Whether the call is a gradient's product of an op that carries its derivative (`moded`): part of its
+    picks' identity, so a pick timed by the forward alone never answers a gradient's call, nor the reverse,
+    and the tuner times it as reverse mode runs it (`_measured`, `report.reversed_run`)."""
+
+    def moded(self) -> "KernelOp":
+        """This op as the call traced here runs it: pulled where a gradient's product is traced
+        (`report.pulling`) and its call carries its derivative (`CARRIES_DERIVATIVE`), else itself."""
+        if self.CARRIES_DERIVATIVE and report.pulling() and not self.pulled:
+            return dataclasses.replace(self, pulled=True)
+        return self
 
     def __post_init__(self):
         # Each hook field as every launch takes it (`prepared`): an op built or replaced around a hook holds
@@ -625,7 +636,10 @@ class KernelOp(tokamax.Op):
     def __call__(self, *args, **kwargs):
         # One path for every config (row 1866): bound once, the op's own config, a pin or a pick checked
         # against the call itself (`pinnable`: a template's legality), the heuristic otherwise. The launch's
-        # key, which traces its hooks, is built only where a collector, a pin or a tuning read reads it.
+        # key, which traces its hooks, is built only where a collector, a pin or a tuning read reads it. A
+        # gradient's call of an op carrying its derivative is its pulled op's (`moded`), keyed and timed so.
+        if (moded := self.moded()) is not self:
+            return moded(*args, **kwargs)
         ba = self.bind(*args, **kwargs)
         config = self.config
         if config is None:
@@ -1281,9 +1295,18 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     def compiled(config):
         configured = op.replace(config=config)
 
-        def launched(arrays):
-            args, kwargs = fill(arrays)
+        def run(*arrays):
+            args, kwargs = fill(list(arrays))
             return configured(*args, **kwargs)
+
+        # A pulled op's call timed as reverse mode runs it (`report.reversed_run`), its backward's kernels
+        # read beside its forward's, as certification compiles it: a forward's time alone picked a pulled
+        # call's backward unseen (row 12340, the selective scan's tokens a thread, which its forward reads
+        # none of).
+        timed = report.reversed_run(run) if op.pulled else run
+
+        def launched(arrays):
+            return timed(*arrays)
 
         start = time.perf_counter()
         # A candidate's lowering and its compile timed apart, the compile of its config as it is, never

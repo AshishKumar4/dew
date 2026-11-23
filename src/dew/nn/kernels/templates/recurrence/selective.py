@@ -881,6 +881,9 @@ class Selective(base.Template[Tiles]):
     name: ClassVar[str] = "mosaic_gpu"
     config_cls: ClassVar[type[Tiles]] = Tiles
     GENERATES: ClassVar[bool] = True
+    # Its call carries its derivative, the backward's launch its config's tokens a thread and residency set:
+    # a gradient's call is tuned and certified as reverse mode runs it (`tuning.KernelOp.moded`, row 12340).
+    CARRIES_DERIVATIVE: ClassVar[bool] = True
     # 2: the backward's exp2, its token-only products and its scans' fused joins (row 1300) change its speed
     # at every config, so a pick measured before them stops matching (`tuning.KernelOp.revision`).
     revision: int = 2
