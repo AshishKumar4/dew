@@ -53,14 +53,17 @@ TERNARY_WEIGHT: selection.Op[TernaryWeightCase] = selection.Op(generation.Choice
 
 
 def _quantize_activations_peak(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Per-token absmax int8 quantization normalized by `peak` BEFORE multiplying by `127.0`, so tiny
-    subnormal nonzero rows (e.g. `2**-144`) never divide by an underflowed `peak / 127.0` (row 1464)."""
+    """Per-token absmax int8 quantization normalized by `peak` BEFORE multiplying by `127.0`, prescaling
+    subnormal rows by `2**32` and dividing via `precision.divided` so tiny subnormal nonzero rows (e.g.
+    `2**-144`) never divide by an underflowed `peak / 127.0` or overflow reciprocal `1 / peak` (row 1464)."""
     if x.shape[-1] == 0:
         return x.astype(jnp.bfloat16), jnp.zeros(x.shape[:-1], jnp.float32)
     x_f32 = x.astype(jnp.float32)
     peak = jnp.max(jnp.abs(x_f32), axis=-1)
-    safe_peak = jnp.where(peak > 0, peak, jnp.float32(1.0))
-    normalized = x_f32 / safe_peak[:, None]
+    tiny = jnp.finfo(jnp.float32).tiny
+    scale_up = jnp.where((peak > 0) & (peak < tiny), jnp.float32(2.0 ** 32), jnp.float32(1.0))
+    safe_peak = jnp.where(peak > 0, peak * scale_up, jnp.float32(1.0))
+    normalized = precision.divided(x_f32 * scale_up[:, None], safe_peak[:, None])
     quantized = jnp.clip(jnp.round(normalized * jnp.float32(127.0)), jnp.float32(-128.0), jnp.float32(127.0))
     return quantized.astype(jnp.bfloat16), peak
 
