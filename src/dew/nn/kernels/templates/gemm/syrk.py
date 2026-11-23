@@ -701,7 +701,7 @@ def measured_gram(target: generation.GpuTarget, shape: tuple[int, int, int], dty
                   transpose: bool, out_dtype=None) -> bool:
     """Whether symmetric Gram `(target, shape, transpose, dtype, out_dtype)` is admitted by the derived
     whole-tile bf16 shape-class rule on measured generations (`MEASURED_GRAM_GENERATIONS`, rows 11941,
-    12163): whole square super-tile `m` and step `k`, with at least one full SM wave of upper-triangle CTAs."""
+    12163): whole square super-tile `m` and step `k`, filling at least one SM wave of upper-triangle CTAs."""
     if generation.tpu(target) or target.generation not in MEASURED_GRAM_GENERATIONS:
         return False
     in_dtype = jnp.dtype(dtype)

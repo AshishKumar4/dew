@@ -525,7 +525,7 @@ def test_syrk_measured_gram_gates_to_measured_bf16_cells():
     sm80, sm90 = generation.gpu_target("sm80"), generation.gpu_target("sm90")
     assert syrk.measured_gram(sm80, (28, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
     assert syrk.measured_gram(sm90, (36, 4096, 14336), jnp.bfloat16, transpose=True, out_dtype=jnp.bfloat16)
-    # Derived shape-class rule admits arbitrary model layer counts and single large matrices filling >= 1 wave.
+    # Derived shape-class rule admits arbitrary model layer counts and single large matrices >= 1 wave.
     assert syrk.measured_gram(sm80, (29, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
     assert syrk.measured_gram(sm90, (1, 4096, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
     # Refuses non-whole-tile shapes, underfilled grids, non-bf16 dtypes, and unmeasured generations.
@@ -545,7 +545,8 @@ def test_syrk_measured_gram_gates_to_measured_bf16_cells():
     # on XLA.
     for shape in ((28, 2560, 4096), (29, 2560, 4096)):
         with generation.routes() as measured_seen:
-            lowered_for(lambda a: gemm.symmetric_gram(a), (jax.ShapeDtypeStruct(shape, jnp.bfloat16),), "sm90")
+            lowered_for(lambda a: gemm.symmetric_gram(a),
+                        (jax.ShapeDtypeStruct(shape, jnp.bfloat16),), "sm90")
         assert any(r.kernel == "mosaic" for r in measured_seen), (shape, measured_seen)
     for shape, out_dtype in (((1, 512, 512), jnp.bfloat16), ((28, 2560, 4096), jnp.float32)):
         with generation.routes() as unmeasured_seen:
