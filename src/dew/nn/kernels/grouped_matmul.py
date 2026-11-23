@@ -1097,8 +1097,11 @@ class MosaicGmm(_Mosaic):
         if ba.arguments['tokens'].shape[0] > ba.arguments['sizes'].shape[0] * tile.block_m:
             return tile
         splits = pricing.split_count(tile, **self._contraction(ba, tile, target))
-        split = dataclasses.replace(tile, splits=splits)
-        return split if splits > 1 and self.takes(ba, split, target) else tile
+        if splits > 1:
+            for stages in range(tile.stages, 1, -1):
+                if self.takes(ba, split := dataclasses.replace(tile, splits=splits, stages=stages), target):
+                    return split
+        return tile
 
     def _left_fits(self, ba, config: tiling.Tiles) -> bool:
         """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,
