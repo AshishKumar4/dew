@@ -383,6 +383,11 @@ add to, whose differences across a walk's step are its groups (`commits`), its o
 reads (`dew._cache.untraced`)."""
 
 
+def then_read(read: Callable, after: Callable | None) -> Callable:
+    """`read`, then `after` of its value where given (`Issuer.summed_together`'s `then`)."""
+    return read if after is None else lambda: after(read())
+
+
 def committed() -> None:
     """One product group committed by an asynchronous issuer (a warpgroup MMA, which `Issuer.settled` waits
     on by groups): counted as the program traces, so a walk knows a step's groups (`commits`); a product
@@ -1091,19 +1096,24 @@ class Issuer[Accumulator](abc.ABC):
         accumulator is a ref scopes (wgmma's)."""
         return issue(self.zeros(shape))
 
-    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False
-                        ) -> tuple[Callable, ...]:
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False,
+                        then: tuple[Callable | None, ...] | None = None) -> tuple[Callable, ...]:
         """Groups of products none of which reads another's sum, each `issues[i](acc) -> acc` into a fresh
-        fp32 accumulator of `shapes[i]`: a reader of each group's value, which its caller calls where it uses
-        it, so no more sums are held in registers at once than it reads together. Where the issuer awaits its
-        products (tensor memory's), every group is issued before any is awaited, one wait for them all, and a
-        reader reads its group's accumulator (`Tcgen05ChunksIssuer`'s); `apart`, each group's products
-        awaited before the next group issues, as groups that stage their operands into shared tiles need (a
-        group's staging would overwrite a tile another group's product in flight reads). Elsewhere a reader
-        sums its group where it is read (`summed`), in the caller's order, each group done before the next."""
+        fp32 accumulator of `shapes[i]`: a reader of each group's value, `then[i]` of it where given (any
+        tree), which its caller calls where it uses it, so no more sums are held in registers at once than
+        it reads together. Where the issuer awaits its products (tensor memory's), every group is issued
+        before any is awaited, one wait for them all, and a reader reads its group's accumulator
+        (`Tcgen05ChunksIssuer`'s); where it reads them as each completes (a warpgroup MMA's), every group is
+        issued, each read in turn as its own completes, `then[i]` run on it while the later groups run on
+        (`WgmmaIssuer`'s: a backward's weights made while its value products run, row 10734); `apart`, each
+        group's products awaited before the next group issues, as groups that stage their operands into
+        shared tiles need (a group's staging would overwrite a tile another group's product in flight
+        reads). Elsewhere a reader sums its group where it is read (`summed`), then `then[i]` of it, in the
+        caller's order, each group done before the next."""
         del apart
-        return tuple(functools.partial(self.summed, shape, issue)
-                     for shape, issue in zip(shapes, issues, strict=True))
+        after = (None,) * len(shapes) if then is None else then
+        return tuple(then_read(functools.partial(self.summed, shape, issue), each)
+                     for shape, issue, each in zip(shapes, issues, after, strict=True))
 
     @abc.abstractmethod
     def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:
@@ -1265,13 +1275,6 @@ class Issuer[Accumulator](abc.ABC):
         operands' fragments in registers, each step's loaded within it, so a product beside others holds no
         fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
         return self.products(acc, lhs, rhs, accumulate=accumulate)
-
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
-                     between: Callable = lambda value: value) -> tuple:
-        """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
-        (`WgmmaIssuer`), else in turn (`product`). `between` runs on the first product's value while the
-        second is in flight, where the issuer pipelines them, returning `(between(first), second)`."""
-        return between(self.product(lhs1, rhs1, shape)), self.product(lhs2, rhs2, shape)
 
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""

@@ -1194,8 +1194,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         return self._summed(shape, issue)
 
-    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False
-                        ) -> tuple[Callable, ...]:
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False,
+                        then: tuple[Callable | None, ...] | None = None) -> tuple[Callable, ...]:
         """`Issuer.summed_together` in tensor memory: each group issued into its own accumulator of the
         role's together scratch (`product_scratch`'s `together`, a width's groups its accumulators in turn),
         then one commit and one wait for every group, each group's reader then reading its accumulator, until
@@ -1216,7 +1216,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
                                    for shape, issue in zip(shapes, issues, strict=True)]
         if not wide:
             # No product pending: a commit here would stand behind the role's last wait (row 5671).
-            return tuple(readers)
+            return super().summed_together(shapes, issues, then=then)
         found, role = self._scoped(), mosaic.ROLE.get()
         taken: collections.Counter = collections.Counter()
         accumulators = []
@@ -1241,7 +1241,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
             self._waited(self._done())
         for index, tmem in zip(wide, accumulators, strict=True):
             readers[index] = functools.partial(_read, tmem)
-        return tuple(readers)
+        after = (None,) * len(shapes) if then is None else then
+        return tuple(mosaic.then_read(reader, each) for reader, each in zip(readers, after, strict=True))
 
     def keeps_sums(self, width: int) -> bool:
         # A sum at least an accumulator's least width: a narrower one's columns are no column slice of the

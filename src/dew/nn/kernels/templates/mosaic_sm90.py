@@ -3,6 +3,7 @@ templates' Mosaic mainloops, which take every other primitive from the shared to
 warpgroup MMA reads its right operand from shared memory and its left from shared memory or registers,
 accumulates in a warpgroup's registers in the WGMMA layout, and runs asynchronously until waited for."""
 
+import functools
 from collections.abc import Callable
 
 import jax
@@ -82,20 +83,28 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
-                     between: Callable = lambda value: value) -> tuple:
-        if launches.interpreting():
-            return super().product_pair(lhs1, rhs1, lhs2, rhs2, shape, between=between)
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False,
+                        then: tuple[Callable | None, ...] | None = None) -> tuple[Callable, ...]:
+        # Every group issued into its own scoped accumulator, then each read as its own groups complete,
+        # the later ones running on (`read`'s `pending`, counted by the groups each committed), `then[i]` of
+        # it run there; interpreted, or `apart`, each summed in turn.
+        if launches.interpreting() or apart:
+            return super().summed_together(shapes, issues, apart=apart, then=then)
+        after = (None,) * len(shapes) if then is None else then
 
-        def both(acc1, acc2):
-            plgpu.wgmma(acc1, lhs1, rhs1)
-            mosaic.committed()
-            plgpu.wgmma(acc2, lhs2, rhs2)
-            mosaic.committed()
-            return between(self.read(acc1, pending=1)), self.read(acc2)
+        def scoped(*accumulators):
+            ends = []
+            for issue, acc in zip(issues, accumulators, strict=True):
+                issue(acc)
+                ends.append(mosaic.commits())
+            values = []
+            for acc, end, each in zip(accumulators, ends, after, strict=True):
+                value = self.read(acc, pending=mosaic.commits() - end)
+                values.append(value if each is None else each(value))
+            return tuple(values)
 
-        return pl.run_scoped(both, plgpu.WGMMAAccumulatorRef(shape, jnp.float32),
-                             plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+        values = pl.run_scoped(scoped, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
+        return tuple(functools.partial(lambda value: value, value) for value in values)
 
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
