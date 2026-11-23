@@ -937,7 +937,7 @@ class OuterProgram:
         ready = self._ready.get(key)
         return self._kept(key, args, kwargs) if ready is None else ready
 
-    def invoked(self, executable: jax.stages.Compiled, args: tuple, kwargs: dict, *dynamic, **named):
+    def invoked(self, executable: jax.stages.Compiled, args: tuple, kwargs: dict, /, *dynamic, **named):
         """Call `executable`, fetched for these arguments (`executable`), on `dynamic` and `named` inside
         every enclosing `running` block's contexts, entered here, as a call through the program enters them
         (row 8480: a rollout's executables fetched once and called each step, `dew.rl.simulator`, `Fetched`,

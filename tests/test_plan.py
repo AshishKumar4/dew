@@ -612,6 +612,37 @@ def test_a_provisional_plans_search_keeps_no_program_once_its_plan_is_taken(monk
     assert len(options._HELD) == 1, list(options._HELD)
 
 
+def test_a_provisional_plans_search_is_released_where_the_placed_search_after_it_refuses(monkeypatch):
+    """A fresh fit plans its step before placing its state (`Trainer._planned_unplaced`), its search
+    keeping the programs it compiled; where the devices, once the state is placed, hold no plan and the
+    placed search refuses, every program the provisional search kept is dropped with it, none outliving the
+    refused compile (review of row 12131's P0: the plan taken out of the compiler before the placed search
+    leaked its programs where that search raised)."""
+    from affine_run import Replaying
+
+    from dew.data.dataset import Loader
+    from dew.training import _candidates
+    from dew.training.planning import PlanRefused
+
+    options.release()
+    gc.collect()
+
+    def held(device) -> int:
+        return sum(array.nbytes for array in jax.live_arrays() if device in array.devices())
+
+    before = {device: held(device) for device in jax.devices()}
+    # Room for every plan until the state is placed, none once it is.
+    monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {
+        "bytes_limit": LIMIT, "bytes_in_use": 0 if held(device) <= before[device] else LIMIT - (1 << 10)})
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    trainer = lm()
+    with pytest.raises(PlanRefused):
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    gc.collect()
+    assert not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
+    assert not options._HELD, list(options._HELD)
+
+
 def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(monkeypatch):
     """With room for the step at two microbatches and not at one, the plan
     reads the batch in microbatches under no recomputation, and the run

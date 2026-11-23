@@ -630,6 +630,24 @@ def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search
     assert isinstance(refused.value.__cause__, CommunicatorRoom), refused.value.__cause__
 
 
+@pytest.mark.parametrize("fetched", [False, True], ids=["called", "fetched"])
+def test_a_program_whose_keywords_are_named_as_its_own_call_runs(fetched):
+    """A function whose keyword arguments are named `args`, `kwargs` and `executable`, run through Dew's
+    compile point, called or its executable fetched and called (`OuterProgram.invoked`), takes them as its
+    own, never as the call's (review of row 12131's P0: `invoked`'s named parameters took them, a
+    TypeError before dispatch)."""
+    from dew.nn.kernels import options
+
+    def named(x, *, args, kwargs, executable):
+        return x * args + kwargs - executable
+
+    compiled = options.program(named)
+    given = {"args": jnp.float32(2.0), "kwargs": jnp.float32(3.0), "executable": jnp.float32(1.0)}
+    x = jnp.arange(3.0)
+    ran = options.Fetched(compiled)(x, **given) if fetched else compiled(x, **given)
+    assert jax.device_get(ran).tolist() == jax.device_get(x * 2.0 + 3.0 - 1.0).tolist()
+
+
 def _charged(program, gpu: int) -> int:
     """What admitting `program` charges on `gpu` past its free bytes, none free: the refusal's need."""
     with pytest.raises(CommunicatorRoom) as refused:

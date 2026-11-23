@@ -681,7 +681,13 @@ def called[T](executable: jax.stages.Compiled, call: Callable[[], T]) -> T:
 
     before, pooled = read()
     outputs = call()
-    jax.block_until_ready(outputs)
+    try:
+        jax.block_until_ready(outputs)
+    except jax.errors.JaxRuntimeError:
+        # A run that failed on its devices, returned as its caller would have read it: its error raised
+        # where the caller waits (a step's first run's diagnosis, `dew.training.memory.first_run`), the
+        # program charged as not run.
+        return outputs
     after, grown = read()
     _RESIDENT.ran(id(executable), before, after,
                   {gpu: grown[gpu] - pooled[gpu] for gpu in grown if gpu in pooled})

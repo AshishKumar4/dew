@@ -1427,7 +1427,12 @@ def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Train
     except PlanRefused as refused:
         _log.info("the step of %d passes fits no plan off the loop; its boundary plans it: %s", passes,
                   refused)
-    settle, compiler._settle = compiler._settle, None
+    except BaseException:
+        # Its search's programs dropped where it raised otherwise, its error the boundary's to plan past.
+        if (settle := compiler._provisional()) is not None:
+            settle(None)
+        raise
+    settle = compiler._provisional()
     return _kept if settle is None else settle
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,

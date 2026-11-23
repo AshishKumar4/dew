@@ -866,15 +866,23 @@ class StepCompiler[L, E]:
 
     def compile(self, stepping: Stepping, state: TrainState, batch: Batch,
                 trials: Trials | None = None) -> Compiled:
-        """`_compiled`, every search off the loop it was handed (`settle_with`) released with no winner where
-        it raises (a boundary's placed search refused), so none outlives a compile that took no plan."""
+        """`_compiled`, every search this compile's plan is taken in place of (`_settles`: the plan made
+        before the state was placed, `Unplaced`, and each off the loop, `settle_with`) released by it, with
+        the plan it takes, or with no winner where it raises (its placed search refused), so none outlives
+        it."""
+        if self._unplaced is not None:
+            self._settles.append(self._unplaced.release)
         try:
             return self._compiled(stepping, state, batch, trials)
         except BaseException:
-            settles, self._settles = self._settles, []
-            for settle in settles:
-                settle(None)
+            self._settled(None)
             raise
+
+    def _settled(self, planned: Planned | None) -> None:
+        """Release every search `_settles` holds, with `planned`, the plan taken in their place, or none."""
+        settles, self._settles = self._settles, []
+        for settle in settles:
+            settle(planned)
 
     def _compiled(self, stepping: Stepping, state: TrainState, batch: Batch,
                   trials: Trials | None = None) -> Compiled:
@@ -927,10 +935,9 @@ class StepCompiler[L, E]:
             # Its startup's record, AutoPGLE's outcome among it, the fit's compile report's plan
             # (`StepCompiled.plan`): a host step plans no rung, and its startup is what its compile did.
             assert self.host_startup is not None, "a host step's compile runs its startup pass"
+            self._settled(None)
             return Compiled(stepping.shape.split, plan={"startup": self.host_startup.record()}, step=run)
         held, self._unplaced = self._unplaced, None
-        # Its search's programs, which whatever plan this compile takes leaves held no more but its own.
-        unplaced = held
         mesh = settings.device_mesh
         # A fresh run's first plan, made before its state was placed, judged with its narrow copies built on
         # the state its loop steps (`Building`): owned by its fit's trials, holding no copies (a start's own;
@@ -989,21 +996,22 @@ class StepCompiler[L, E]:
             # Where the devices, the state placed, hold no block for it, the plan's search runs here, on them.
             planned, compiled, keep = self._plan(stepping, state, batch, trials)
             keep()
-        return self._taken(stepping, planned, compiled, unplaced)
+        return self._taken(stepping, planned, compiled)
 
-    def _taken(self, stepping: Stepping[L, E], planned: Planned, compiled: Compiled,
-               unplaced: Unplaced | None) -> Compiled:
+    def _taken(self, stepping: Stepping[L, E], planned: Planned, compiled: Compiled) -> Compiled:
         """`compiled` stepping by the plan `compile` took: every search it was made in place of released
         while the plan's programs are still read (the plan made before the state was placed, `Unplaced`, and
         each off the loop, `settle_with`), then the plan's own lowerings let go (`Planned.released`)."""
-        if unplaced is not None:
-            unplaced.release(planned)
-        settles, self._settles = self._settles, []
-        for settle in settles:
-            settle(planned)
+        self._settled(planned)
         kept = planned.released()
         return dataclasses.replace(compiled, step=self.runner(stepping, kept, stepping.settings.device_mesh),
                                    planned=kept)
+
+    def _provisional(self) -> Callable[[Planned | None], None] | None:
+        """The release of the provisional search the last plan was made in (`_settle`), handed to its one
+        owner and held here no more."""
+        settle, self._settle = self._settle, None
+        return settle
 
     def settle_with(self, release: Callable[[Planned | None], None]) -> None:
         """Release a search made off the loop for the step the next compile plans (a later phase's,
@@ -1045,11 +1053,16 @@ class StepCompiler[L, E]:
         try:
             planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced,
                                                  placed=placed)
-        except PlanRefused as refused:
-            _log.info(UNPLACED_REFUSED, refused)
-            self._unplaced, self._refused = None, (signature, refused)
+        except BaseException as raised:
+            # Its search's programs dropped where it took no plan, refused or not (`_provisional`).
+            if (settle := self._provisional()) is not None:
+                settle(None)
+            if not isinstance(raised, PlanRefused):
+                raise
+            _log.info(UNPLACED_REFUSED, raised)
+            self._unplaced, self._refused = None, (signature, raised)
             return signature
-        settle, self._settle = self._settle, None
+        settle = self._provisional()
         assert settle is not None, "a plan made before the state was placed is a provisional search's"
         self._unplaced = Unplaced(signature, planned, compiled, keep, settle)
         return signature
