@@ -356,38 +356,12 @@ def mask_readers(config: Mapping[str, JSON]) -> tuple[list[JSON], Sequence[Mappi
 MASKED_DECAY_MARK = "earlier-masked-decay.json"
 """The file an intermediate Dew (main f124c76b5 until row 12338's deletion of its restore translation) kept
 beside a run whose earlier record masked its decay off as it rewrote that record, its masked parts' decay
-written as 0 (`{"unmasked_all": true}` or `{"unmasked_groups": [...]}`): read by `unmarked`."""
+written as 0 (`{"unmasked_all": true}` or `{"unmasked_groups": [...]}`): read by `unmarked`, where the run
+resumes (`dew.config.RunConfig.resumed`)."""
 
 INERT_DECAY = 1e-4
 """The decay a part masked off is given where its rewritten record holds 0: one its mask makes inert,
 which builds the masked decay step its checkpoints hold (`unmarked`)."""
-
-
-def typed_since(record: Mapping[str, object], directory) -> bool:
-    """Whether the step a resume of the run `record` restores, as its checkpoints choose it
-    (`dew.checkpoints.Checkpoints.latest`: the newer of its persistent `directory`'s steps a resume reads and
-    the local step every process holds of its trainer's `local_directory`, under the run's name), is an
-    intermediate Dew's own, its metadata saying its optimizer state was its typed optimizer's
-    (`typed_optimizer`): one saved after that Dew resumed the run under the record it rewrote, which then
-    loads as it is, not as the earlier run trained (`unmarked`)."""
-    from etils import epath
-
-    from dew.checkpoints import Checkpoints
-
-    named = _records.class_record({key: value for key, value in record.items() if key not in MARKERS})
-    fields = {} if named is None else named[1]
-    held = fields.get("trainer") if isinstance(fields, Mapping) else None
-    # Its trainer's fields, under its class record where it names one.
-    tagged = _records.class_record(held) if isinstance(held, Mapping) else None
-    trainer = tagged[1] if tagged is not None else held
-    trainer = trainer if isinstance(trainer, Mapping) else {}
-    local, every = trainer.get("local_directory"), trainer.get("local_every")
-    with Checkpoints(str(directory), local_directory=str(epath.Path(local) / directory.name)
-                     if isinstance(local, str) else None,
-                     local_every=(every if isinstance(every, (int, str)) else 1) if isinstance(local, str)
-                     else None) as checkpoints:
-        step = checkpoints.latest
-        return step is not None and checkpoints.saved_with(step, "typed_optimizer") is True
 
 
 def unmarked(record: Mapping[str, object], mark: Mapping[str, object]) -> Mapping[str, object]:

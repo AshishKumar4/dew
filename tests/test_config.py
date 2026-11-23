@@ -1113,6 +1113,12 @@ def _saved_optimizer(tmp_path, earlier):
     return LMRunConfig.load(str(path)).optim
 
 
+def _named(directory) -> TrainerConfig:
+    """A trainer whose run is `directory`, its name and its checkpoints' directory, which a resume of it
+    reads (`RunConfig.resumed`)."""
+    return TrainerConfig(name=directory.name, checkpoint_dir=str(directory.parent))
+
+
 def _checkpointed(directory, optimizer, steps, local=None, persistent: bool = True):
     """A tiny language run of `optimizer` fitted to `steps`, checkpointed each step in `directory` where
     `persistent`, and on this host in `local` where given (`local_every`), which resumes from its latest
@@ -1237,9 +1243,9 @@ def test_a_run_an_intermediate_dew_rewrote_beside_its_mark_resumes_as_it_trained
     run = tmp_path / "run"
     saved = _checkpointed(run, written, 1)
     rewritten = OptimConfig(optimizer=spec(weight_decay=0.0), learning_rate=1e-2, spared=False)
-    LMRunConfig(optim=rewritten).save(str(run))
+    LMRunConfig(optim=rewritten, trainer=_named(run)).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
-    loaded = LMRunConfig.load(str(run)).optim
+    loaded = LMRunConfig.load(str(run)).resumed(()).optim
     assert type(loaded.optimizer) is spec, loaded
     assert (loaded.decay_mask, loaded.spared) == (False, False) and loaded.optimizer.weight_decay > 0, loaded
     if decay == 0:
@@ -1270,9 +1276,9 @@ def test_a_run_an_intermediate_dew_resumed_and_saved_after_its_mark_loads_its_re
     metadata = json_.loads(newest.read_text())
     metadata["custom_metadata"] = {**(metadata.get("custom_metadata") or {}), "typed_optimizer": True}
     newest.write_text(json_.dumps(metadata))
-    LMRunConfig(optim=rewritten).save(str(run))
+    LMRunConfig(optim=rewritten, trainer=_named(run)).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
-    loaded = LMRunConfig.load(str(run)).optim
+    loaded = LMRunConfig.load(str(run)).resumed(()).optim
     assert isinstance(loaded.optimizer, AdamW), loaded
     assert (loaded.decay_mask, loaded.optimizer.weight_decay) == (None, 0.0), loaded
     resumed = _checkpointed(run, loaded, 2)
@@ -1291,7 +1297,6 @@ def test_an_intermediate_dews_newer_local_step_decides_its_mark_once_and_for_goo
     import json as json_
 
     from dew.config.lm import LMRunConfig
-    from dew.config.trainer import TrainerConfig
 
     rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), learning_rate=1e-2, spared=False)
     run, local = tmp_path / "run", tmp_path / "local"
@@ -1302,11 +1307,14 @@ def test_an_intermediate_dews_newer_local_step_decides_its_mark_once_and_for_goo
     metadata = json_.loads(newest.read_text())
     metadata["custom_metadata"] = {**(metadata.get("custom_metadata") or {}), "typed_optimizer": True}
     newest.write_text(json_.dumps(metadata))
-    config = LMRunConfig(optim=rewritten, trainer=TrainerConfig(local_directory=str(local)))
+    config = LMRunConfig(optim=rewritten, trainer=dataclasses.replace(
+        _named(run), local_directory=str(local), local_every=1))
     config.save(str(run))
     mark = run / "earlier-masked-decay.json"
     mark.write_text(json_.dumps({"unmasked_all": True}))
-    loaded = LMRunConfig.load(str(run))
+    # Read as written, opening nothing: the mark is decided where the run resumes, its process joined.
+    assert LMRunConfig.load(str(run)) == config
+    loaded = LMRunConfig.load(str(run)).resumed(())
     assert isinstance(loaded.optim.optimizer, AdamW), loaded.optim
     assert (loaded.optim.decay_mask, loaded.optim.optimizer.weight_decay) == (None, 0.0), loaded.optim
     loaded.save(str(run))
@@ -1333,9 +1341,9 @@ def test_a_marked_runs_newest_save_no_resume_reads_leaves_its_mark_to_decide(tmp
     metadata["custom_metadata"] = {**(metadata.get("custom_metadata") or {}), "typed_optimizer": True,
                                    "weights_only": True}
     newest.write_text(json_.dumps(metadata))
-    LMRunConfig(optim=rewritten).save(str(run))
+    LMRunConfig(optim=rewritten, trainer=_named(run)).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
-    loaded = LMRunConfig.load(str(run)).optim
+    loaded = LMRunConfig.load(str(run)).resumed(()).optim
     assert loaded.decay_mask is False and loaded.optimizer.weight_decay > 0, loaded
 
 

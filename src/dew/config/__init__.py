@@ -49,7 +49,6 @@ from dew.config.earlier import (
     MARKERS,
     MASKED_DECAY_MARK,
     earlier_run,
-    typed_since,
     unmarked,
 )
 from dew.config.release import Release
@@ -969,12 +968,6 @@ class RunConfig:
         path = epath.Path(directory)
         named_file = str(directory).endswith(".json")
         record = json.loads((path if named_file else path / RUN_FILE).read_text())
-        # A record an intermediate Dew rewrote beside its mark, as its run trained (`unmarked`), but where
-        # the step a resume restores is that Dew's own, saved under the record it rewrote, read as it is.
-        held = path.parent if named_file else path
-        mark = held / MASKED_DECAY_MARK
-        if mark.exists() and not typed_since(record, held):
-            record = unmarked(record, json.loads(mark.read_text()))
         # The packages trusted first, so the record's earlier shapes are read with its classes imported.
         registry.import_trusted(record, trust)
         # A field its record left to its checkpoints (`earlier_checkpointed`) is read where the run resumes
@@ -1027,7 +1020,7 @@ class RunConfig:
         trainer = self.trainer
         built = self.BUILT if paths is None else paths
         unset = [path for path in built if _holds(self, path) and _recorded_at(self, path) is None]
-        run = self
+        run = self._marked() if trainer.name is not None and trainer.resume != "never" else self
         # The classes' defaults are resolved where the run builds its objective and model from them
         # (`prepare`, every field), never where they are built already (`readied`'s data plan version).
         defaulting = paths is None
@@ -1049,6 +1042,25 @@ class RunConfig:
                 trainer.data_resume == "relaxed")):
             run = dataclasses.replace(run, data_plan_version=PLAN_VERSIONS[-1])
         return run
+
+    def _marked(self) -> Self:
+        """This run as its earlier run trained where an intermediate Dew rewrote its record beside its mark
+        (`MASKED_DECAY_MARK`), decided by the step its resume restores (`Checkpoints.latest`), here, where
+        its process has joined its pool (`resumed`, after `prepare_process`): its optimizer's decay masked off
+        as that run's (`unmarked`), or as it is where that step is the intermediate Dew's own
+        (`typed_optimizer`), saved under the record it rewrote."""
+        name = self.trainer.name
+        assert name is not None, "a run resumes under its name"
+        mark = epath.Path(self.trainer.directory(name)) / MASKED_DECAY_MARK
+        if not mark.exists():
+            return self
+        with self.trainer.checkpoints(name) as checkpoints:
+            step = checkpoints.latest
+            if step is not None and checkpoints.saved_with(step, "typed_optimizer") is True:
+                return self
+        earlier = unmarked(self.record(), json.loads(mark.read_text()))
+        fields = _records.record(earlier["fields"], "run fields")
+        return dataclasses.replace(self, optim=from_record(OptimConfig, fields["optim"]))
 
     def _defaulted_as(self, recorded: Self) -> Self:
         """This run with each class it names (`Registered`: its model, its objective) that `recorded`, the

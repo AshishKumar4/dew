@@ -296,20 +296,21 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
         if shares > 1:
             # Refused as its restore is asked, exact or relaxed alike, where a relaxed fit reads its data
             # afresh (`dew.training._fit`), never at its first read.
+            same = json.dumps(earlier).encode()
             with pytest.raises(PlanChanged) as refused:
-                resumed.set_state(json.dumps(earlier).encode())
+                resumed.set_state(same)
             assert "shards.cut" in refused.value.differs, refused.value.differs
+            if resume == "relaxed":
+                # A relaxed fit's restore of it (`restored_or_restarted`), written by this Grain, reads its
+                # data afresh, naming the cut, never aborting.
+                differs = restored_or_restarted(resumed, same, resume=resume, step=1)
+                assert "shards.cut" in differs, differs
+                assert int(next(iter(resumed))["at"][0]) == int(first["at"][0]), first
             # Written by another Grain too: the cut refused as itself, never as that Grain's.
             earlier["dew_data_plan"]["rules"]["grain"] = "0.0.1"
             with pytest.raises(PlanChanged) as other:
                 resumed.set_state(json.dumps(earlier).encode())
             assert "shards.cut" in other.value.differs, other.value.differs
-            if resume == "relaxed":
-                # A relaxed fit's restore of it (`restored_or_restarted`) reads its data afresh, naming the
-                # cut, never aborting.
-                differs = restored_or_restarted(resumed, json.dumps(earlier).encode(), resume=resume, step=1)
-                assert "shards.cut" in differs, differs
-                assert int(next(iter(resumed))["at"][0]) == int(first["at"][0]), first
         else:
             resumed.set_state(json.dumps(earlier).encode())
             assert int(next(iter(resumed))["at"][0]) == int(following["at"][0]) != int(first["at"][0])
