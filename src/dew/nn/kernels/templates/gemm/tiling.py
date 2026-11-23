@@ -124,15 +124,26 @@ class Tiles:
         return self.staging
 
     def staged_whole(self, dtypes) -> bool:
-        """Whether each output chunk this tile states (`staging`) is whole TMA store quanta in every one of
-        the call's output `dtypes` (`TMA_STORE_BYTES`); a tile stating none stages at its family's own."""
-        return self.staging is None or all(
-            self.staging[0] * jnp.dtype(dtype).itemsize % TMA_STORE_BYTES == 0 for dtype in dtypes)
+        """Whether each output chunk this tile states (`staging`) slices its accumulator at whole fragments
+        (`ACCUMULATOR_COLUMNS`) and is whole TMA store quanta in every one of the call's output `dtypes`
+        by their bits (`TMA_STORE_BYTES`: a 4-bit float's 16 columns are 64 bits, no store); a tile stating
+        none stages at its family's own."""
+        if self.staging is None:
+            return True
+        chunk = self.staging[0]
+        bits = (jax.dtypes.itemsize_bits(jnp.dtype(dtype)) for dtype in dtypes)
+        return chunk % ACCUMULATOR_COLUMNS == 0 and all(chunk * each % (8 * TMA_STORE_BYTES) == 0
+                                                         for each in bits)
 
 
 TMA_STORE_BYTES = 16
 """The bytes a TMA store's box row steps by (128 bits): a staged output chunk's row is whole multiples of it
 in its dtype, so a bf16 chunk is a multiple of 8 columns and an fp32 one of 4 (`Tiles.staged_whole`)."""
+
+ACCUMULATOR_COLUMNS = 8
+"""The columns an MMA accumulator's register fragment holds together (mma.sync's n8, a warpgroup MMA's
+8-column tiles): a staged chunk slices the accumulator at whole fragments, so an fp32 chunk of 4 columns,
+whole TMA stores, is still none (`Tiles.staged_whole`)."""
 
 
 CONSUMERS = 2

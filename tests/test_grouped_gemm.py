@@ -2412,12 +2412,15 @@ def test_sm120_output_staging_admits_three_stage_128x256_and_compiles():
         assert gmm.staged_bytes(ba, base, sm120) - gmm.staged_bytes(ba, arm_64x1, sm120) == 16384
         assert gmm.staged_bytes(ba, arm_64x1, sm120) == gmm.staged_bytes(ba, arm_32x2, sm120)
         # Four bf16 columns are 8 bytes a chunk's row: no whole 16-byte TMA store, which the launch refuses
-        # and its kernel too where called at that pin; four fp32 columns are one store.
+        # and its kernel too where called at that pin; four fp32 columns are one store but half an
+        # accumulator fragment, and sixteen 4-bit floats 64 bits; eight fp32 or bf16 columns are both.
         narrow = dataclasses.replace(base, staging=(4, 1))
         assert not gmm.legal(ba, narrow, sm120)
-        with pytest.raises(ValueError):
-            narrow.stated((((64, 256), jnp.bfloat16),))
-        assert narrow.stated((((64, 256), jnp.float32),)) == (4, 1)
+        for chunk, dtype in ((4, jnp.bfloat16), (4, jnp.float32), (16, jnp.float4_e2m1fn)):
+            with pytest.raises(ValueError):
+                dataclasses.replace(base, staging=(chunk, 1)).stated((((64, 256), dtype),))
+        for dtype in (jnp.bfloat16, jnp.float32):
+            assert dataclasses.replace(base, staging=(8, 1)).stated((((64, 256), dtype),)) == (8, 1)
 
     def ref_fn(x, w, *, dtype=jnp.float32):
         return jax.lax.dot(x.astype(dtype), w.astype(dtype), preferred_element_type=dtype).astype(
@@ -2480,3 +2483,27 @@ def test_stated_output_staging_narrows_with_a_chained_replay_and_stays_off_syrk_
     with pytest.raises(ValueError):
         linear_ce.linear_ce(jnp.zeros((128, 128), jnp.bfloat16), jnp.zeros((256, 128), jnp.bfloat16),
                             jnp.zeros((128,), jnp.int32), tiles=staged, multiprocessors=1, interpret=True)
+
+
+@lowers("sm90")
+def test_a_hopper_product_stating_fp32_staging_at_whole_fragments_lowers():
+    """An sm90 warpgroup-MMA product of fp32 output staged in 8-column chunks, whole accumulator fragments
+    and whole 16-byte TMA stores, is legal and lowers to a kernel; at 4 columns, whole stores but half a
+    fragment, the launch refuses it (row 5634)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    gmm = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    tile = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family="wgmma", staging=(8, 2))
+    with generation.assumed("sm90"):
+        sm90 = generation.gpu_target()
+        ba = gmm.bind(bf16((256, 128)), bf16((1, 128, 256)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                      out_dtype="float32", trans_rhs=False, interpret=False, dense=True)
+        assert gmm.legal(ba, tile, sm90)
+        assert not gmm.legal(ba, dataclasses.replace(tile, staging=(4, 2)), sm90)
+        case = KernelCase("fp32_staging_8", lambda: gmm.lowering(ba, tile))
+        records = compile_mosaic_kernels([case], "sm90")
+    for rec in records:
+        assert not rec.get("error"), rec
+        assert rec["kernels"], rec
