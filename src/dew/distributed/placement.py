@@ -852,7 +852,7 @@ def _refuse_overfull(held: list[tuple[str, frozenset[int], int]], device_bytes: 
         f"({parts} GiB), over the {limits[fullest] / 2 ** 30:.2f} GiB it has. Split the state over more "
         f"devices (a larger fsdp axis), keep the optimizer state and the EMA in pinned host memory "
         f"(Layout(host=('opt_state', 'ema'))), or keep Adam's moments in bfloat16 "
-        f"(OptimConfig.state_dtype)")
+        f"(AdamW(state_dtype='bfloat16'))")
 
 
 def placeable(field) -> bool:

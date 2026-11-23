@@ -8,7 +8,6 @@ from os import PathLike, fspath
 from huggingface_hub import HfUri, parse_hf_uri
 
 from .base import Read, Shard, ShardManifest, Source
-from .concatenate import Concatenate
 from .files import Files, Format
 from .grain import from_grain
 from .hf import from_hf
@@ -75,7 +74,6 @@ def _repository(url: str) -> HfUri | None:
 
 __all__ = [
     "TFDS",
-    "Concatenate",
     "Files",
     "Hub",
     "Memory",

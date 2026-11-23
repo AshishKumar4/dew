@@ -256,25 +256,38 @@ def _grids_recorded(written: Mapping[str, JSON]) -> JSON:
     return None if written.get("grid") is None else [written["grid"]]
 
 
+@dataclasses.dataclass(frozen=True)
+class _Laid:
+    """How a run's trainer laid out the state a checkpoint holds, which a resume of it reads back and no
+    other caller of `Checkpoints.save` states (`dew.training.Trainer`'s alone, row 11935): the rung its
+    plan trained on, what its objective's loss computes (`training`), the axes its model boxed on its own
+    parameters, and whether the state holds a pipeline's rows each on its own stage's devices
+    (`dew.training.stages.StageLocal.saved`), which each tier writes by the processes holding them
+    (`submesh.HeldApart`)."""
+
+    rung: JSON = None
+    training: JSON = None
+    boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None
+    held_apart: bool = False
+
+
+NOT_LAID = _Laid()
+"""A state saved by a caller other than a run's trainer, laid out as nothing records."""
+
+
 class Envelope(TypedDict):
     """What a checkpoint of a run's state holds on every tier, as `Checkpoints.save` and `save_local` each
     take it, their own metadata beside it: the state as saved, its data position (`saved`), the partition
-    it was read by, the stop control, the rung, the artifact, what its objective's loss computes
-    (`training`), the boxed axes and the rollout's tree (`dew.training.Trainer`'s one envelope, row 4126)."""
+    it was read by, the stop control, the artifact, the rollout's tree and how the trainer laid it out
+    (`_laid`; `dew.training.Trainer`'s one envelope, row 4126)."""
 
     state: TrainState
     saved: bytes | None
     share: DataPartition | None
     control: dict | None
-    rung: JSON
     artifact: JSON
-    training: JSON
-    boxed: Mapping[tuple[str, ...], LogicalAxes] | None
     rollout: Mapping[str, object] | None
-    held_apart: bool
-    """Whether `state` holds a pipeline's rows each on its own stage's devices
-    (`dew.training.stages.StageLocal.saved`), which each tier writes by the processes holding them
-    (`submesh.HeldApart`)."""
+    _laid: _Laid
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1440,21 +1453,19 @@ class Checkpoints:
         control: dict | None = None,
         weights_only: bool = False,
         primary: str | None = None,
-        rung: JSON = None,
         artifact: JSON = None,
-        training: JSON = None,
-        boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
         tokenizer: Tokenizer | None = None,
-        held_apart: bool = False,
+        _laid: _Laid = NOT_LAID,
     ) -> None:
         """Write `state` under `step`, asynchronously, a train state with its rollout's tree of arrays where
         it holds one (`rollout`), which `rollout_state` reads back, and the run holding `tokenizer`, where
         given, the one the step's inference declaration (`artifact`) states the files of, before the step is
-        written (`dew.inference.tasks.hold_tokenizer`): a committed step's tokenizer is in its run.
-        `held_apart` writes each array on part of the pool by the processes holding it (`Envelope`): for a
-        pipeline's rows, each leaf one global array placed alike on every process, never a value each
-        process holds of its own under one name, which Orbax refuses as host-local.
+        written (`dew.inference.tasks.hold_tokenizer`): a committed step's tokenizer is in its run. A run's
+        trainer states how it laid the state out (`_Laid`): a pipeline's rows held apart are written each
+        array on part of the pool by the processes holding it, each leaf one global array placed alike on
+        every process, never a value each process holds of its own under one name, which Orbax refuses as
+        host-local.
 
         `state` is a run's `TrainState`, or a mapping of arrays in its place
         for a state that is not a training run's, such as a simulation's,
@@ -1489,9 +1500,8 @@ class Checkpoints:
         hosts that keep the state there because device memory is short.
         """
         mapping = isinstance(state, Mapping)
-        if mapping and (saved is not None or share is not None or weights_only or rung is not None
-                        or artifact is not None or training is not None or rollout is not None
-                        or tokenizer is not None):
+        if mapping and (saved is not None or share is not None or weights_only or _laid != NOT_LAID
+                        or artifact is not None or rollout is not None or tokenizer is not None):
             raise ValueError("a mapping is saved as it is: it takes no data position, share, weights-only "
                              "split, rung, artifact, training record or rollout, which a train state's save "
                              "records")
@@ -1509,7 +1519,7 @@ class Checkpoints:
             # A run's trainer hands its objective's tokenizer (`Trainer`); a direct save holds none.
             self._hold(artifact, tokenizer)
             profiles, state_tree, frozen, deltas, payloads = self._state_items(state, saved, share, rollout,
-                                                                               weights_only, held_apart)
+                                                                               weights_only, _laid.held_apart)
         profile_metadata = None if profiles is None else {**_profile_record(profiles[1]),
                                                           'at': _named(profiles[0])}
         self._metadata = None
@@ -1518,7 +1528,8 @@ class Checkpoints:
         scores = {**(metrics or {}), **({'checkpoint/weights_only': 1.0} if weights_only else {})}
         rankings = () if ranking is None else (ranking,) if isinstance(ranking, Ranking) else ranking
         rules = self._ranked(rankings, scores)
-        custom = {**step_record(deltas, control, rung, artifact, training, boxed, state_tree),
+        custom = {**step_record(deltas, control, _laid.rung, artifact, _laid.training, _laid.boxed,
+                                state_tree),
                   "profiles": profile_metadata, "rankings": rules,
                   "primary": primary or (rankings[0].metric if rankings else None),
                   "weights_only": weights_only, "frozen": frozen, "tree": mapping}
@@ -1529,7 +1540,7 @@ class Checkpoints:
         try:
             with region("checkpoint.submit"):
                 persistent.save(step, args=ocp.args.Composite(**{
-                    name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, held_apart))
+                    name: ocp.args.PyTreeSave(tree, save_args=save_args(tree, _laid.held_apart))
                     for name, tree in payloads.items()}),
                                 metrics=scores, force=True, custom_metadata=custom)
         except BaseException:
@@ -1853,16 +1864,13 @@ class Checkpoints:
         *,
         share: DataPartition | None = None,
         control: dict | None = None,
-        rung: JSON = None,
         artifact: JSON = None,
-        training: JSON = None,
-        boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
         rollout: Mapping[str, object] | None = None,
-        held_apart: bool = False,
+        _laid: _Laid = NOT_LAID,
     ) -> None:
         """Write `state` under `step` to this process's local directory, asynchronously, with its
-        rollout's tree where it holds one (`rollout`, replicated: every process writes it whole);
-        `held_apart` as `save` takes it, for a pipeline's rows alone.
+        rollout's tree where it holds one (`rollout`, replicated: every process writes it whole), laid out
+        as `save` takes it (`_Laid`).
 
         The new step replaces the previous local step. As with `save`, a state
         with arrays in pinned host memory is written before this returns. The
@@ -1889,10 +1897,11 @@ class Checkpoints:
         with region("checkpoint.submit_local"):
             local.save(
                 step,
-                args=ocp.args.PyTreeSave(state_tree, save_args=save_args(state_tree, held_apart)),
+                args=ocp.args.PyTreeSave(state_tree, save_args=save_args(state_tree, _laid.held_apart)),
                 force=True,
                 custom_metadata={
-                    **step_record(deltas, control, rung, artifact, training, boxed, state_tree),
+                    **step_record(deltas, control, _laid.rung, artifact, _laid.training, _laid.boxed,
+                                  state_tree),
                     "processes": jax.process_count(),
                     "placement": written,
                     "grids": None if grids is None else [to_record(grid, Grid) for grid in grids],

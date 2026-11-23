@@ -963,7 +963,7 @@ class Files(Dataset):
         rows = max(1, min(-(-count * self.shard_bytes // max(self.preparation_bytes(), 1)),
                           count // self.PARTS))
         return _indexed_manifest(self, f"places:{hashlib.sha256(places.encode()).hexdigest()[:16]}", rows,
-                                 count=count)
+                                 count=count, subdivides=True)
 
     PARTS = 64
     """The fewest shards a positioned stream's store is cut into where it holds as many records

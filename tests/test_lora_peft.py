@@ -37,7 +37,7 @@ from dew.interop.pretrained import Pretrained
 from dew.lora import Adapter, LoRA, Target
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.optim import OptimConfig
+from dew.optim import Optax, OptimConfig
 
 ROOT = Path(__file__).resolve().parents[1]
 LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"
@@ -82,7 +82,7 @@ def trainer(case: str):
     objective = LMObjective(adapter.model, reference["input_ids"].shape[1] - 1, variables=adapter.variables,
                             ema_decay=None)
     params = nn.unbox(objective.init(jax.random.key(0)))
-    sgd = OptimConfig(optimizer="optax:sgd", learning_rate=rate, clip_grads=0.0).build(2)
+    sgd = OptimConfig(optimizer=Optax('optax:sgd'), learning_rate=rate, clip_grads=0.0).build(2)
 
     @jax.jit
     def run(tokens, factors, masks):

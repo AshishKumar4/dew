@@ -32,10 +32,10 @@ from dew.mesh import DEFAULT_RULES, LayoutRefused, mesh_axes
 from dew.nn.kernels.generation import assumed
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.optim import OptimConfig
+from dew.optim import Adam, OptimConfig
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
-from dew.training.distributed import STEP_BATCH
+from dew.training import FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch
+from dew.training.distributed import STEP_BATCH, mesh_stages
 from dew.training.memory import step_compiler_options
 
 pytestmark = pytest.mark.mesh
@@ -73,9 +73,12 @@ CASES = {
 
 
 def fine_tune(mesh, layout, accumulation=1, optimizer=None):
+    """A tiny decoder's fine-tune over `mesh`, its step's batch read whole, or one microbatch a pipeline
+    stage where the mesh has stages (`FitPolicy.split`)."""
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN, ema_decay=0.999), optimizer or optax.adam(1e-3),
-                   key=jax.random.key(0), mesh=mesh, layout=layout, accumulation=accumulation, split=1)
+                   key=jax.random.key(0), mesh=mesh, layout=layout, update=UpdateBatch(batches=accumulation),
+                   fit=FitPolicy(split=mesh_stages(mesh)))
 
 
 def step_batch():
@@ -271,11 +274,11 @@ def test_a_fine_tune_over_a_devices_capacity_is_refused_before_anything_is_place
     holds of the state alone and of the state with the accumulator its steps pool, the state alone
     passes and the whole is refused, and exactly the whole passes."""
     mesh, layout, accumulation = CASES["fsdp_tensor_accumulating"]
-    run = fine_tune(mesh(), layout, accumulation, OptimConfig(optimizer="adam", learning_rate=1e-3))
+    run = fine_tune(mesh(), layout, accumulation, OptimConfig(optimizer=Adam(), learning_rate=1e-3))
     alone = max(run.validate(steps=8).device_bytes.values())
     whole = max(run.validate(step_batch(), steps=8).device_bytes.values())
     assert alone < whole
-    optimizer = OptimConfig(optimizer="adam", learning_rate=1e-3)
+    optimizer = OptimConfig(optimizer=Adam(), learning_rate=1e-3)
     short = fine_tune(holding(mesh(), whole - 1), layout, accumulation, optimizer)
     short.validate(steps=8)
     with pytest.raises(LayoutRefused):
@@ -316,7 +319,7 @@ def test_a_fresh_state_is_built_from_the_one_trace_of_its_init():
     program (36 s on a B200 host)."""
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
     run = Trainer(Traced(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(jax.devices()[:1]), split=1)
+                  mesh=MeshSpec().build(jax.devices()[:1]), fit=FitPolicy(split=1))
     TRACED.clear()
     state, _, _ = run.place()
     assert len(TRACED) == 1 and int(state.step) == 0
@@ -335,7 +338,7 @@ def test_a_fresh_fit_compiles_its_step_and_its_start_once_each_before_placing_it
 
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
     run = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(jax.devices()[:1]), split=1)
+                  mesh=MeshSpec().build(jax.devices()[:1]), fit=FitPolicy(split=1))
     # A chain of four batches, bounded as a run on the examples clock reads one.
     chain = Pipeline(Memory(token_rows(VOCAB, 4 * BATCH, SEQ_LEN + 1))).batch(BATCH)
     with Compiles("step") as steps, Compiles("joined") as starts:
@@ -353,7 +356,8 @@ def test_a_fit_whose_whole_state_overflows_its_devices_is_refused_before_it_init
     whole = max(fine_tune(mesh(), layout, accumulation).validate(step_batch()).device_bytes.values())
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
     run = Trainer(Watched(model, SEQ_LEN, ema_decay=0.999), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=holding(mesh(), whole - 1), layout=layout, accumulation=accumulation, split=1)
+                  mesh=holding(mesh(), whole - 1), layout=layout, update=UpdateBatch(batches=accumulation),
+                  fit=FitPolicy(split=1))
     INITIALIZED.clear()
     with pytest.raises(LayoutRefused):
         run.fit(Loader(train=lambda partition: repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1), val=None,
@@ -386,16 +390,16 @@ def test_the_check_before_placing_reads_a_run_in_the_splits_its_plan_may_take():
     `fit` checks)."""
     mesh, layout, _ = CASES["fsdp_tensor_accumulating"]
 
-    def peak(split: int | None, limit: int | None = None) -> int:
+    def peak(split: int | str, limit: int | None = None) -> int:
         model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
         trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=0.999), optax.adam(1e-3),
                           key=jax.random.key(0), mesh=mesh() if limit is None else holding(mesh(), limit),
-                          layout=layout, split=split)
+                          layout=layout, fit=FitPolicy(split=split))
         return max(trainer.validate(step_batch()).device_bytes.values())
 
     whole = peak(1)
     assert peak(2) > whole
-    assert peak(None, limit=whole) == whole
+    assert peak("auto", limit=whole) == whole
     with pytest.raises(LayoutRefused):
         peak(2, limit=whole)
 

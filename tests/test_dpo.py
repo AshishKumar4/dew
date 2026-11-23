@@ -27,6 +27,7 @@ from dew.data.preferences import HALVES_KEY, IDS_KEY, MASK_KEY, REAL_KEY, pair_w
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 from dew.rl import preference_logsigmoid_terms
+from dew.training import FitPolicy
 
 
 def test_preference_rewards_and_gradients_ignore_nonfinite_completion_padding():
@@ -506,8 +507,8 @@ def test_a_step_split_over_parts_and_shards_trains_as_each_pair_a_row(segments):
 
     def trainer_for(seed, split=2):
         objective = DPOObjective(model, half - 1, beta=0.5, segments=segments, pairs=pairs)
-        trainer = Trainer(objective, optax.sgd(rate),
-                          key=jax.random.key(seed), split=split, checkpoints=None, tracker=None)
+        trainer = Trainer(objective, optax.sgd(rate), key=jax.random.key(seed), fit=FitPolicy(split=split),
+                          checkpoints=None, tracker=None)
         # Two devices, the data axis taking both: two data shards.
         trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
         return trainer

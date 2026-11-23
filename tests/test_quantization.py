@@ -45,6 +45,7 @@ from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
 from dew.quantization import UNQUANTIZED, Quantization, quantize_for_serving, quantize_with
 from dew.registry import models
+from dew.training.budget import Horizon
 
 import_module("dew.nn.backbones")  # registers the fixture kind
 
@@ -1316,9 +1317,9 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
                                          "num_layers": 1, "num_heads": 2, "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", RES, batch=batch), text=None,
             val_metrics=(),
-        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory),
-                              steps=1, eval_every=None, checkpoint_every=None,
-                              compilation_cache_dir=None, **trainer), objective=ObjectiveConfig("diffusion",
+        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), horizon=Horizon(steps=1),
+                              eval_every=None, checkpoint_every=None, compilation_cache_dir=None, **trainer),
+                              objective=ObjectiveConfig("diffusion",
                               {"guidance": None, "steps": 2}))
 
 

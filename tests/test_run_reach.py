@@ -28,7 +28,7 @@ from run_kinds import (
 )
 from test_block_sft import assert_tree_equal
 from test_eval_harness import instance
-from test_lm_recipe import SEQ, export_tiny_decoder, recipe_args, write_token_files
+from test_lm_recipe import SEQ, export_tiny_decoder, recipe_run, write_token_files
 from test_run_option_matrix import recorded
 
 from dew._cli.main import main
@@ -38,9 +38,11 @@ from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.sources.tokens import TokenFiles
 from dew.nn.precision import DTYPE_PRESETS, MATMUL_PRECISIONS, Numerics
-from dew.optim import OneCycle, OptimConfig, ParamGroup, optimizers
+from dew.optim import OneCycle, Optax, OptimConfig, ParamGroup, optimizers
 from dew.registry import ModelConfig
 from dew.training._lowering import Lowered
+from dew.training.budget import Horizon
+from dew.training.targets import LowerFor
 
 pytestmark = pytest.mark.mesh
 
@@ -57,9 +59,9 @@ def descending(tokens, *flags: str, pretrained=None) -> LMRunConfig:
     default = LMRunConfig(data=windows.repeat().batch(8).loading(Loading(workers=0)),
                           validation=windows.batch(8).loading(Loading(workers=0)))
     source = () if pretrained is None else ("--pretrained", str(pretrained))
-    return LMRunConfig.cli(recipe_args(tokens, *source, *flags, "--trainer.best",
-                                       json.dumps({"metric": "val/perplexity", "mode": "max"}),
-                                       model_config="{}" if pretrained else TINY), default=default)
+    return recipe_run(LMRunConfig, tokens, *source, *flags, "--trainer.best",
+                      json.dumps({"metric": "val/perplexity", "mode": "max"}),
+                      model_config="{}" if pretrained else TINY, default=default)
 
 
 def test_a_run_stops_on_its_plateau_and_ends_on_its_best_model(tmp_path):
@@ -70,7 +72,7 @@ def test_a_run_stops_on_its_plateau_and_ends_on_its_best_model(tmp_path):
     perplexity a ranking of the highest keeps (`descending`), with that checkpoint's weights."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
     state = descending(
-        tokens, "--trainer.name", "plateau", "--trainer.steps", "8", "--trainer.eval-every", "1",
+        tokens, "--trainer.name", "plateau", "--trainer.horizon.steps", "8", "--trainer.eval-every", "1",
         "--trainer.checkpoint-every", "1", "--trainer.keep", "8", "--trainer.restore-best",
         "trainer.stop:plateau", "--trainer.stop.metric", "val/perplexity", "--trainer.stop.evals", "1",
         "--trainer.stop.min-delta", "1e9").run()
@@ -81,7 +83,7 @@ def test_a_run_stops_on_its_plateau_and_ends_on_its_best_model(tmp_path):
 
 
 def test_a_saved_run_scores_a_split_at_its_own_cadence_and_writes_its_local_tier(tmp_path):
-    """`dew train --set` over a run.json scores each split at its own cadence, `val_every` naming one's
+    """`dew train` over a run.json scores each split at its own cadence, its suite naming one's
     and the others at `trainer.eval_every` (row 2240), stops on a plateau of a split's metric named by
     its record (row 2239), and writes the local checkpoint tier its `trainer.local_directory` and
     `trainer.local_every` name (row 2241): of eight steps scored every step, the test split is scored
@@ -96,8 +98,8 @@ def test_a_saved_run_scores_a_split_at_its_own_cadence_and_writes_its_local_tier
                "fields": {"metric": "test/perplexity", "evals": 1, "min_delta": 1e9}}
     for name in ("cadenced", "other"):
         trained_record(record, cli_settings(tmp_path, name, {
-            "trainer.steps": "8", "trainer.log_every": "1", "trainer.eval_every": "1",
-            "val_every": json.dumps({"test": 2}), "trainer.stop": json.dumps(plateau),
+            "trainer.horizon.steps": "8", "trainer.log_every": "1", "trainer.eval_every": "1",
+            "suites": {"test": {"every": 2}}, "trainer.stop": plateau,
             "trainer.local_directory": str(local), "trainer.local_every": "1"}))
     logged = scalars(runs / "cadenced")
     assert sorted(step for step, row in logged.items() if "val/loss" in row) == [1, 2, 3, 4]
@@ -115,7 +117,8 @@ def test_dew_export_reads_the_step_a_ranking_chose(tmp_path):
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
-    descending(tokens, "--trainer.name", "ranked", "--trainer.steps", "3", "--trainer.eval-every", "1",
+    descending(tokens, "--trainer.name", "ranked", "--trainer.horizon.steps", "3", "--trainer.eval-every",
+               "1",
                "--trainer.checkpoint-every", "1", "--trainer.keep", "3", "--max-new-tokens", "0",
                pretrained=checkpoint).run()
     run, exported = tmp_path / "runs" / "ranked", tmp_path / "exported"
@@ -127,10 +130,10 @@ def test_dew_export_reads_the_step_a_ranking_chose(tmp_path):
 
 
 def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run(tmp_path):
-    """`OptimConfig(optimizer="optax:sgd")` builds Optax's SGD with the options the config gives, its
+    """`OptimConfig(optimizer=Optax("optax:sgd"))` builds Optax's SGD with the options the config gives, its
     updates the factory's own over three steps, and a saved run trains on it through `dew train`, where
     the optimizer was one of five names (row 2243)."""
-    config = OptimConfig(optimizer="optax:sgd", optimizer_opts={"momentum": 0.9}, learning_rate=0.05)
+    config = OptimConfig(optimizer=Optax('optax:sgd', {'momentum': 0.9}), learning_rate=0.05)
     params = {"w": np.linspace(-1, 1, 6, dtype=np.float32).reshape(2, 3)}
     gradients = [{"w": np.full((2, 3), scale, np.float32)} for scale in (0.5, -1.0, 2.0)]
 
@@ -143,12 +146,12 @@ def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run
     assert_tree_equal(updates(config.build(10)), updates(optax.sgd(0.05, momentum=0.9)))
 
     # A group's momentum schedule needs a factory that takes b1, which Optax's adamw names.
-    grouped = OptimConfig(optimizer="optax:adamw", param_groups=(ParamGroup("all", ("*",), b1=OneCycle(
+    grouped = OptimConfig(optimizer=Optax('optax:adamw'), param_groups=(ParamGroup("all", ("*",), b1=OneCycle(
         peak_value=0.85, init_value=0.95, end_value=0.95)),)).build(10)
     grouped.update(gradients[0], grouped.init(params), params)
 
     record = saved_record(dataclasses.replace(lm(tmp_path, drawn=False), optim=config), tmp_path, "sgd")
-    settings = cli_settings(tmp_path, "sgd", {"trainer.steps": "2", "trainer.log_every": "1"})
+    settings = cli_settings(tmp_path, "sgd", {"trainer.horizon.steps": "2", "trainer.log_every": "1"})
     run = trained_record(record, settings)
     assert all(row["train/learning_rate"] == float(np.float32(0.05)) for row in scalars(run).values()
                if "train/learning_rate" in row)
@@ -173,14 +176,14 @@ def test_a_runs_recorded_forms_are_the_forms_it_trains_in(tmp_path):
         return {route["kernel"] for route in compiled["plan"]["kernels"]["routes"]
                 if route["choice"] == "attention"}
 
-    # On an H100 target, which its step is lowered for (`--trainer.lower-for`), a 16-bit run takes an old
+    # On an H100 target, which its step is lowered for (`LowerFor`), a 16-bit run takes an old
     # route in the fast form, so the routes it lowers say which form the run took.
     sixteen = dataclasses.replace(run, model=ModelConfig(run.model.name, {**run.model.fields,
                                                                           "dtype": "bfloat16"}))
 
     def lowered(name: str, fields) -> set[str]:
         with pytest.raises(Lowered) as raised:
-            trained(sixteen, tmp_path, name, trainer={**fields, "lower_for": "sm90"})
+            trained(sixteen, tmp_path, name, lowering=LowerFor("sm90"), trainer=fields)
         return {route["kernel"] for route in raised.value.kernels.record()["routes"]
                 if route["choice"] == "attention"}
 
@@ -291,12 +294,12 @@ def test_a_record_naming_a_function_for_its_optimizer_is_refused_before_it_is_ca
     and no decay mask, builds with one (row 2351)."""
     made = tmp_path / "made"
     with pytest.raises(ValueError):
-        OptimConfig(optimizer="os:mkdir", optimizer_opts={"path": str(made)}).build(4)
+        OptimConfig(optimizer=Optax('os:mkdir', {'path': str(made)})).build(4)
     assert not made.exists()
     params = {"w": np.ones((2, 3), np.float32)}
     # Dew's own optimizers name the same factory by their alias and by their import path.
     assert optimizers["adamw"] is optimizers[optimizers.paths["adamw"]]
-    solver = OptimConfig(optimizer="optax:lars", learning_rate=0.1, weight_decay=1e-4).build(4)
+    solver = OptimConfig(optimizer=Optax('optax:lars', {'weight_decay': 1e-4}), learning_rate=0.1).build(4)
     update, _ = solver.update({"w": np.full((2, 3), 0.5, np.float32)}, solver.init(params), params)
     assert np.all(np.asarray(update["w"]) < 0)
 
@@ -315,9 +318,10 @@ def test_a_decision_run_that_ends_on_its_best_loads_at_its_calibrated_step(tmp_p
 
     runs = tmp_path / "runs"
     run = decision(tmp_path, drawn=False)
-    trainer = dataclasses.replace(run.trainer, name="ended", checkpoint_dir=str(runs), steps=3, eval_every=1,
-                                  checkpoint_every=1, keep=3, restore_best=True, multi_host=False,
-                                  compilation_cache_dir=None, best=Best("val/accuracy", mode="min"))
+    trainer = dataclasses.replace(run.trainer, name="ended", checkpoint_dir=str(runs),
+                                  horizon=Horizon(steps=3), eval_every=1, checkpoint_every=1, keep=3,
+                                  restore_best=True, multi_host=False, compilation_cache_dir=None,
+                                  best=Best("val/accuracy", mode="min"))
     dataclasses.replace(run, trainer=trainer).prepare().train("ended")
     checkpoints = Checkpoints(str(runs / "ended"))
     best = checkpoints.resolve("best")
@@ -476,7 +480,7 @@ def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):
     written = json.loads((record / "run.json").read_text())
     written["fields"]["trainer"]["stop"] = {"fraction": 0.5}
     (record / "run.json").write_text(json.dumps(written))
-    settings = cli_settings(tmp_path, "paused", {"trainer.steps": "4", "trainer.log_every": "1"})
+    settings = cli_settings(tmp_path, "paused", {"trainer.horizon.steps": "4", "trainer.log_every": "1"})
     run = trained_record(record, settings)
     assert max(scalars(run)) == 2
 
@@ -507,7 +511,7 @@ def test_a_run_saved_with_its_earlier_dtype_knobs_reads_as_the_numerics_they_nam
     loaded = RunConfig.load(str(earlier(pretrained, tmp_path, pretrained_param_dtype="bfloat16",
                                         trainer={"dynamic_scale": True})))
     assert loaded.source.param_dtype == "bfloat16" and loaded.trainer.precision.dtypes.params == "float32"
-    assert loaded.drawn_dtype() is None and loaded.trainer.dynamic_scale is True
+    assert loaded.drawn_dtype() is None and loaded.trainer.precision.loss_scaling == "dynamic"
     with pytest.raises(ValueError):
         LMRunConfig.read(json.loads((tmp_path / "earlier" / "run.json").read_text()))
 

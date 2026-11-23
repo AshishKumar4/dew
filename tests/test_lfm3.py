@@ -12,6 +12,7 @@ import pytest
 from flax import linen as nn
 from interop_support import respelled
 from release_support import under_release
+from run_kinds import stated
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained
@@ -114,14 +115,17 @@ def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_ca
     for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'):
         shutil.copy(QWEN / name, tmp_path / 'release' / name)
     looped = ["--loop-layers", "1", "5", "--loop-steps", "2"] if arm == "looped" else []
-    config = DecisionRunConfig.cli([
-        "--pretrained", str(tmp_path / 'release'), "--trainer.name", arm,
-        "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "2",
-        "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None", "--trainer.log-every", "1",
-        "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
-        "--model.dtype", "float32", "--optim.learning-rate", "5e-06", *looped],
-        default=DecisionRunConfig(data=TICKETS, source=SourceOptions(
-            text_only=True, prediction_depths=0, attention={"full_attention": "block_bidirectional"})))
+    config = DecisionRunConfig.cli(["--pretrained", str(tmp_path / 'release'), "--trainer.name", arm,
+                                    "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                                    "--trainer.horizon.steps",
+                                    "2", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None",
+                                    "--trainer.log-every", "1", "--trainer.multi-host", "False",
+                                    "--trainer.compilation-cache-dir", "None", "--optim.learning-rate",
+                                    "5e-06", *looped],
+                                   default=stated(DecisionRunConfig(data=TICKETS, source=SourceOptions(
+                                       text_only=True, prediction_depths=0,
+                                       attention={"full_attention": "block_bidirectional"})),
+                                       model_fields={"dtype": "float32"}))
     state = config.run()
     trained = flat_tree(jax.device_get(state.variables["params"]["backbone"]))
     start = flat_tree(variables["params"])
@@ -156,10 +160,10 @@ def test_a_config_that_omits_its_pattern_and_rotary_reads_lfm3s_own():
     with pytest.raises(ValueError):
         translate_config({**config, 'hidden_act': 'gelu'})
     # A stated rotary names a record for each attention type its layers hold, as Lfm3Config checks.
-    for stated in ({}, {'full_attention': None, 'sliding_attention': {'rope_theta': 1e4}},
+    for rotary in ({}, {'full_attention': None, 'sliding_attention': {'rope_theta': 1e4}},
                    {'full_attention': {'rope_theta': 1e6}}):
         with pytest.raises(ValueError):
-            translate_config({**config, 'num_hidden_layers': 9, 'rope_parameters': stated})
+            translate_config({**config, 'num_hidden_layers': 9, 'rope_parameters': rotary})
 
 
 def wrapped(directory: Path, **wrapper: object) -> Path:

@@ -16,13 +16,14 @@ import pytest
 import test_run_budgets
 from objective_cases import cases
 from reference_error import assert_computes_the_oracle, assert_fp32_reduction_bound
-from run_kinds import KINDS, cli_arguments, cli_settings, lm, saved_record, scalars, trained_record
+from run_kinds import KINDS, cli_settings, lm, saved_record, scalars, set_record, trained_record
 
 from dew._cli.main import main
 from dew.data.dataset import Loader
 from dew.nn.inspection import HISTOGRAM_EDGES, statistics
+from dew.optim import Adam
 from dew.telemetry.compiles import Compiles
-from dew.training import Inspection, MeshSpec, Trainer, inspected
+from dew.training import FitPolicy, Inspection, MeshSpec, Trainer, UpdateBatch, inspected
 
 BATCH, RATE = 8, 0.25
 FEATURES = test_run_budgets.FEATURES
@@ -206,7 +207,7 @@ def test_an_offline_view_builds_a_configured_optimizer():
     moves, where SGD's would be the gradient's quarter."""
     from dew.optim import OptimConfig
 
-    config = OptimConfig(optimizer="adam", learning_rate=RATE)
+    config = OptimConfig(optimizer=Adam(), learning_rate=RATE)
     configured = Trainer(Pulled(), config, key=jax.random.key(0),
                          inspection=Inspection(paths=("w",), targets=("updates",)))
     logged = inspected(configured, {"x": QUARTERS}, steps=4)
@@ -222,7 +223,7 @@ def test_a_recorded_run_inspects_what_its_command_line_names(tmp_path):
     inspection = {"class": "dew.training.inspection:Inspection",
                   "fields": {"paths": ["*q_proj*"], "every": 2}}
     run = trained_record(saved_record(lm(tmp_path, drawn=False), tmp_path, "inspected"), cli_settings(
-        tmp_path, "inspected", {"trainer.steps": "2", "trainer.log_every": "1",
+        tmp_path, "inspected", {"trainer.horizon.steps": "2", "trainer.log_every": "1",
                                 "trainer.inspection": json.dumps(inspection)}))
     logged = scalars(run)
     assert "inspect/grads/l2" in logged[2] and "inspect/grads/l2" not in logged[1]
@@ -241,7 +242,7 @@ def test_a_saved_runs_view_from_the_command_line_is_what_it_logs(tmp_path, capsy
     settings = cli_settings(tmp_path, "viewed", {"trainer.log_every": "1",
                                                  "trainer.inspection": json.dumps(inspection)})
     capsys.readouterr()
-    assert main(["inspect", str(record / "run.json"), *cli_arguments(settings)]) == 0
+    assert main(["inspect", str(set_record(record, settings) / "run.json")]) == 0
     offline = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert not runs.exists()
     run = trained_record(record, settings)
@@ -381,7 +382,8 @@ def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp
                   "fields": {"modules": ["*Attention*", "*Block*", "*Mlp*", "*MLP*"], "every": 2,
                              "targets": ["params"], "cotangents": True}}
     logged = scalars(trained_record(record, cli_settings(tmp_path, "watched", {
-        "trainer.steps": "2", "trainer.log_every": "1", "trainer.inspection": json.dumps(inspection)})))
+        "trainer.horizon.steps": "2", "trainer.log_every": "1",
+        "trainer.inspection": json.dumps(inspection)})))
     watched = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/activations/")}
     assert {"mean", "std", "abs_max", "non_finite"} <= watched
     cotangents = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/cotangents/")}
@@ -537,8 +539,8 @@ def accumulating(inspection, tracker=None, checkpoints=None, split=1, accumulati
     from dew.training import MeshSpec
 
     return Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, inspection=inspection,
-                   accumulation=accumulation, checkpoints=checkpoints, split=split,
-                   mesh=MeshSpec().build(jax.devices()[:4]))
+                   update=UpdateBatch(batches=accumulation), fit=FitPolicy(split=split),
+                   checkpoints=checkpoints, mesh=MeshSpec().build(jax.devices()[:4]))
 
 
 def test_a_log_at_a_step_that_commits_nothing_keeps_the_sample_before():
@@ -573,7 +575,7 @@ def test_an_examples_runs_short_last_window_samples_its_commit():
 
     tracker = Kept()
     chain = Pipeline(Memory({"x": np.concatenate([ROWS] * 5)})).read("streamed").batch(BATCH)
-    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, accumulation=3,
+    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, update=UpdateBatch(batches=3),
             inspection=Inspection(paths=("w",), targets=("params",), every=2)).fit(
         chain, examples=5 * BATCH, log_every=1, eval_every=None, checkpoint_every=None)
     sampled = [step for step, row in sorted(tracker.rows.items()) if "inspect/params/l2" in row]
@@ -597,7 +599,7 @@ def test_a_rejected_step_skips_one_sample_and_the_run_samples_on():
     from flax.training.dynamic_scale import DynamicScale
 
     tracker = Kept()
-    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, accumulation=3,
+    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, update=UpdateBatch(batches=3),
             dynamic_scale=DynamicScale(), inspection=Inspection(paths=("w",), targets=("params",), every=2)
             ).fit(Loader(rows, None, batch=BATCH, records=None), steps=12, log_every=1, eval_every=None,
                   checkpoint_every=None)
@@ -728,8 +730,8 @@ def padding_invariant_summaries(tail, *, packed: bool = False, pipelined: bool =
              else models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                                num_kv_heads=2))
     indexer = {"indexer": IndexerTraining("warmup")} if warmup else {}
-    staged = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])} if pipelined
-              else {})
+    staged = ({"fit": FitPolicy(split=2), "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
+              if pipelined else {})
     run = Trainer(LMObjective(model, 16, pad_id=None if packed else tail, **indexer), optax.sgd(RATE),
                   key=jax.random.key(0), inspection=Inspection(modules=("*MLP",), targets=("params",)),
                   **staged)
@@ -809,7 +811,7 @@ def test_a_pipelined_stacks_watched_layers_each_report_every_microbatch():
 
     model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                          num_kv_heads=2)
-    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), microbatches=2,
+    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), fit=FitPolicy(split=2),
                   mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
                   inspection=Inspection(modules=("*MLP",), targets=("params",)))
     tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
@@ -832,7 +834,7 @@ def test_a_watched_cotangent_is_the_updates_loss_whatever_its_split():
             # A loss its objective states as one scalar, pooled by the microbatches' mean.
             objective.loss = lambda variables, batch, step, loss=objective.loss: (
                 lambda stats, aux: (stats.mean()[0], aux))(*loss(variables, batch, step))
-        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), split=split,
+        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), fit=FitPolicy(split=split),
                       mesh=MeshSpec().build(jax.devices()[:1]),
                       inspection=Inspection(modules=("Block_1",), targets=("params",), cotangents=True))
         # One row throughout, so any microbatch's rows are the batch's own, however the split deals them.
@@ -1028,7 +1030,7 @@ def test_a_pipelined_stacks_watched_cotangents_are_each_layers_over_its_microbat
         return {name: value for name, value in inspected(run, {"text": tokens}).items()
                 if name.startswith("inspect/cotangents/")}
 
-    piped = cotangents(microbatches=2, mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]))
+    piped = cotangents(fit=FitPolicy(split=2), mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]))
     whole = cotangents(mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
     assert set(piped) == set(whole)
     assert {f"inspect/cotangents/layers_{layer}/mlp/rms" for layer in range(4)} <= set(piped)
@@ -1113,7 +1115,7 @@ def test_a_path_glob_selects_the_layer_its_log_names(stacked):
     def logged(*modules: str) -> dict[str, float]:
         fields = {**TINY_DECODER, "num_layers": 4, **({"scan_layers": True} if stacked == "scanned" else {})}
         model = models.build("causal_transformer", vocab_size=64, **fields, num_kv_heads=2)
-        placed = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
+        placed = ({"fit": FitPolicy(split=2), "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
                   if stacked == "pipelined" else {})
         run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
                       inspection=Inspection(modules=modules, targets=("params",), cotangents=True))
@@ -1149,7 +1151,7 @@ def test_a_pipeline_stage_modules_cotangent_is_refused():
 
     model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                          num_kv_heads=2)
-    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), microbatches=2,
+    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), fit=FitPolicy(split=2),
                   mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
                   inspection=Inspection(modules=("stages",), targets=("params",), cotangents=True))
     with pytest.raises(ValueError):

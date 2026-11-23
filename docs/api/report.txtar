@@ -3,8 +3,8 @@ Dew's public surface (tools/api_report.py). A moved line is an API change: regen
 -- exports --
 class Aux(metrics: Mapping[str, jax.Array | Pooled], variables: Variables | None = None, qk_stats: Variables | None = None, effects: Effects | None = None, inspected: Variables | None = None, record: Evaluated | Recorded | None = None, pooled: Mapping[str, Pooled] = <factory>) -> None  [dew.objectives.base]
   .replace(self, **updates)
-class Best(metric: str | Metric | TrainingScalar | Summary | types.MethodType | Callable[[Mapping], float], top: int = 1, mode: Literal['min', 'max'] | None = None, threshold: float | None = None, weights_only: bool = False, split: str | None = None, *, _source: Source | None = None)  [dew.training.selection]
-  .resolved(self, scored: Mapping[str, Sequence[Declared]]) -> Best
+class Best(metric: str | Metric | TrainingScalar | Summary | Callable[[Mapping], float], top: int = 1, mode: Literal['min', 'max'] | None = None, threshold: float | None = None, weights_only: bool = False, split: str | None = None, *, score: Callable[[Mapping], float] | None = None)  [dew.training.selection]
+  .resolved(self, scored: Mapping[str, Sequence[Declared]], scalar: Callable[[str], TrainingScalar] | None = None) -> Best
 class CFG(scale: float, interval: tuple[float, float] = (0.0, 1.0), rescale: float = 0.0) -> None  [dew.sampling.guidance]
   .modules(self) -> tuple[nn.Module, ...]
   .replace(self, **updates)
@@ -37,8 +37,8 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .resumed(self, resume: Resume = 'auto') -> int | None
   .rollout_state(self, step: int, template: Mapping[str, object]) -> dict | None
   .rung(self, step: int) -> JSON
-  .save(self, step: int, state: TrainState | Mapping[str, object], saved: bytes | None = None, metrics: Mapping[str, float] | None = None, *, share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None, weights_only: bool = False, primary: str | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None, tokenizer: Tokenizer | None = None, held_apart: bool = False) -> None
-  .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None, training: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None, held_apart: bool = False) -> None
+  .save(self, step: int, state: TrainState | Mapping[str, object], saved: bytes | None = None, metrics: Mapping[str, float] | None = None, *, share: DataPartition | None = None, ranking: Ranking | Sequence[Ranking] | None = None, control: dict | None = None, weights_only: bool = False, primary: str | None = None, artifact: JSON = None, rollout: Mapping[str, object] | None = None, tokenizer: Tokenizer | None = None, _laid: _Laid = _Laid(rung=None, training=None, boxed=None, held_apart=False)) -> None
+  .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, artifact: JSON = None, rollout: Mapping[str, object] | None = None, _laid: _Laid = _Laid(rung=None, training=None, boxed=None, held_apart=False)) -> None
   .source(self, step: int) -> str
   .stored(self, step: int | str | None = None) -> Variables
   .training(self, step: int) -> JSON
@@ -80,7 +80,6 @@ class Dataset()  [dew.data.pipeline]
   .snapshot(self, url: str, *, format: Literal['array_record', 'parquet'] | Writer = 'array_record', rows_per_shard: int = 100000, deduplicate: NearDuplicates | None = None, seed: int = 0) -> Mapping[str, object]
   .stats(self, records: int = 1000) -> dict[str, float]
   .take(self, count: int) -> Pipeline
-  .threads(self, count: int) -> Pipeline
   .windows(self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = ('text',)) -> Pipeline
   .workers(self, count: int, *, buffer: int = 1) -> Pipeline
 class EMASpec(decay: optax.Schedule, select: PathFilter = <function everything>, progressed: bool = False, stated: Hashable = None) -> None  [dew.objectives.base]
@@ -335,7 +334,7 @@ class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, vari
   .replace(self, **updates)
   .window: property -> Accumulation | None
   .with_window(self, window: Accumulation | None) -> TrainState
-class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTransformation | OptimConfig, *, key: int | jax.Array, mesh: MeshSpec | Mesh = MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, diloco=1, explicit=()), layout: Layout | None = None, microbatches: int | None = None, accumulation: int = 1, split: int | None = None, dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False, checkpoints: Checkpoints | None = None, tracker: Tracker | None = None, step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None, rollout: Rollout | None = None, profile: ProfileWindow | None = None, lower_for: str | None = None, ahead: AheadOfTime | None = None, tune_kernels: bool = False, record: bool = False, links: Mapping[str, Link] | None = None, inspection: Inspection | None = None, param_dtype: str | None = None, diloco: DiLoCo | None = None, phase_passes: Sequence[int] | None = None, sampled_passes: SampledPasses | None = None, data_resume: DataResume = 'relaxed', skip_nonfinite: bool = False)  [dew.training.trainer]
+class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTransformation | OptimConfig, *, key: int | jax.Array, mesh: MeshSpec | Mesh = MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, diloco=1, explicit=()), layout: Layout | None = None, update: UpdateBatch = UpdateBatch(batches=None, tokens=None), fit: FitPolicy = FitPolicy(split='auto', remat='auto'), dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False, checkpoints: Checkpoints | None = None, tracker: Tracker | None = None, step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None, rollout: Rollout | None = None, profile: ProfileWindow | None = None, lower_for: str | None = None, ahead: AheadOfTime | None = None, tune_kernels: bool = False, record: bool = False, links: Mapping[str, Link] | None = None, inspection: Inspection | None = None, param_dtype: str | None = None, diloco: DiLoCo | None = None, phase_passes: Sequence[int] | None = None, sampled_passes: SampledPasses | None = None, data_resume: DataResume = 'relaxed', skip_nonfinite: bool = False)  [dew.training.trainer]
   .compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep
   .device_mesh: cached property -> Mesh
   .executable: property -> jax.stages.Compiled | None
@@ -395,7 +394,7 @@ dew.config.DecoderRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  kernels: dict[str, str] = builtins.dict()
+  diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
@@ -403,7 +402,7 @@ dew.config.DecoderRunConfig
   objective: dew.config.ObjectiveConfig | None = None
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   loop_steps: int | tuple[int, ...] | None = None
   loop_layers: tuple[int, int] | None = None
@@ -425,7 +424,6 @@ dew.config.MetricConfig
   name: str
   fields: JsonDict = builtins.dict()
   defaults: JsonRecords = builtins.dict()
-  split: str | None = None
 dew.config.ObjectiveConfig
   name: str
   fields: JsonDict = builtins.dict()
@@ -444,7 +442,7 @@ dew.config.RunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  kernels: dict[str, str] = builtins.dict()
+  diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
@@ -452,14 +450,17 @@ dew.config.RunConfig
   objective: dew.config.ObjectiveConfig | None = None
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
+dew.config.Suite
+  metrics: tuple[dew.config.MetricConfig, ...] | None = None
+  every: int | str | None = None
 dew.config.diffusion.DiffusionRunConfig
   model: ModelConfig = (lambda: ModelConfig('unet', dict(DEFAULT_MODEL_CONFIG)))()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  kernels: dict[str, str] = builtins.dict()
+  diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
@@ -467,7 +468,7 @@ dew.config.diffusion.DiffusionRunConfig
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('diffusion', {'solver': to_record(EulerAncestral(), Solver)}))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   preset: PresetSpec | None = dew.diffusion.presets.EDM()
   text: TextCondition | None = dew.inputs.spec.TextCondition()
@@ -493,7 +494,7 @@ dew.config.env.EnvRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  kernels: dict[str, str] = builtins.dict()
+  diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
@@ -501,7 +502,7 @@ dew.config.env.EnvRunConfig
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.rl.dreamer:DreamerV3Objective'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   env: Annotated[EnvConfig, tyro.conf.subcommand('env')] | None = None
   rollout: RolloutConfig = dew.config.env.RolloutConfig()
@@ -526,7 +527,7 @@ dew.config.jepa.JepaRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  kernels: dict[str, str] = builtins.dict()
+  diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.001))()
@@ -534,7 +535,7 @@ dew.config.jepa.JepaRunConfig
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('jepa'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   predictor: JsonDict = builtins.dict()
   num_target_blocks: int = 4
@@ -547,15 +548,15 @@ dew.config.lm.LMRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  kernels: dict[str, str] = builtins.dict()
+  diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
-  optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.0006, weight_decay=0.1, clip_grads=1.0))()
+  optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.0006, optimizer=AdamW(weight_decay=0.1), clip_grads=1.0))()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('lm'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   loop_steps: int | tuple[int, ...] | None = None
   loop_layers: tuple[int, int] | None = None
@@ -602,6 +603,11 @@ dew.config.sweep.OptunaSearch
   seed: int = 0
 dew.config.sweep.RandomSearch
   seed: int = 0
+dew.config.trainer.Diagnostics
+  kernels: dict[str, str] = builtins.dict()
+  links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = builtins.dict()
+  tune_kernels: bool = False
+  xla_flags: str | None = None
 dew.config.trainer.TrainerConfig
   name: str | None = None
   checkpoint_dir: str = './checkpoints'
@@ -610,12 +616,8 @@ dew.config.trainer.TrainerConfig
   data_resume: DataResume = 'relaxed'
   skip_nonfinite: bool = False
   best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
-  update_tokens: int | None = None
   key: int = 0
-  steps: int | None = None
-  epochs: int | None = None
-  tokens: int | None = None
-  examples: int | None = None
+  horizon: Horizon = dew.training.budget.Horizon()
   stop: Annotated[Pause, tyro.conf.subcommand('pause')] | Annotated[Plateau, tyro.conf.subcommand('plateau')] | None = None
   restore_best: bool = False
   cooldowns: Annotated[Cooldowns, tyro.conf.subcommand('cooldowns')] | None = None
@@ -626,29 +628,21 @@ dew.config.trainer.TrainerConfig
   local_directory: str | None = None
   local_every: int | str | None = None
   scored_to: str | None = None
-  accumulation: int = 1
-  split: int | None = None
+  update: UpdateBatch = dew.training.policy.UpdateBatch()
+  fit: FitPolicy = dew.training.policy.FitPolicy()
   batch_ramp: Ramp | None = None
-  dynamic_scale: bool | None = None
   precision: Annotated[Numerics, _numerics_argument()] = dew.nn.precision.Numerics()
   mesh: MeshSpec = dew.distributed.placement.MeshSpec()
-  microbatches: int | None = None
   layout: Annotated[Layout, tyro.conf.subcommand('layout')] | None = None
   profile: ProfileWindow | None = None
   run_profile: RunProfile | None = dew.training.profiling.RunProfile()
   compilation_cache_dir: str | None = None
   wandb: Wandb | None = None
-  publish: bool = False
   multi_host: bool | None = None
-  xla_flags: str | None = None
   quantization: Quantization | None = None
-  lower_for: str | None = None
-  compile_ahead: Annotated[AheadTarget, tyro.conf.subcommand('ahead')] | None = None
   ahead: str | None = None
   inspection: Annotated[Inspection, tyro.conf.subcommand('inspect')] | None = None
   diloco: Annotated[DiLoCo, tyro.conf.subcommand('diloco')] | None = None
-  links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = builtins.dict()
-  tune_kernels: bool = False
 dew.config.world_model.TokenizerConfig
   run: str
   step: int | str | None = None
@@ -657,7 +651,7 @@ dew.config.world_model.WorldModelRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  kernels: dict[str, str] = builtins.dict()
+  diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
@@ -665,7 +659,7 @@ dew.config.world_model.WorldModelRunConfig
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.world_model:TokenizerObjective'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   tokenizer: Annotated[TokenizerConfig, tyro.conf.subcommand('tokenizer')] | None = None
 dew.data.dataset.Ramp
@@ -677,7 +671,7 @@ dew.decision.config.DecisionRunConfig
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
   validation: Annotated[dew.data.pipeline.Dataset | collections.abc.Mapping[str, dew.data.pipeline.Dataset] | None, Suppress] = None
   data_seed: int = 0
-  kernels: dict[str, str] = builtins.dict()
+  diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=2.5e-05))()
@@ -685,7 +679,7 @@ dew.decision.config.DecisionRunConfig
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('decision'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   loop_steps: int | tuple[int, ...] | None = None
   loop_layers: tuple[int, int] | None = None
@@ -951,6 +945,7 @@ dew.nn.precision.Numerics
   matmul: str | jax.lax.DotAlgorithmPreset = 'default'
   forms: Literal['fast', 'accurate'] = 'fast'
   low_precision: LowPrecision | None = None
+  loss_scaling: Literal['auto', 'none', 'dynamic'] = 'auto'
 dew.nn.sharding.Link
   bytes_per_second: float | None
   flops_per_second: float | None
@@ -964,6 +959,22 @@ dew.objectives.base.TrainingScalar
   owner: Objective[Statistics, Additions]
   name: str
   shown: Shown
+dew.optim.Adam
+  b1: float = 0.9
+  b2: float = 0.999
+  eps: float = 1e-08
+  eps_root: float = 0.0
+  weight_decay: float = 0.0
+  nesterov: bool = False
+  state_dtype: Literal['float32', 'bfloat16', 'int8', 'params'] | tuple[str | None, str | None] = 'float32'
+dew.optim.AdamW
+  b1: float = 0.9
+  b2: float = 0.999
+  eps: float = 1e-08
+  eps_root: float = 0.0
+  weight_decay: float = 0.0001
+  nesterov: bool = False
+  state_dtype: Literal['float32', 'bfloat16', 'int8', 'params'] | tuple[str | None, str | None] = 'float32'
 dew.optim.Cosine
   every: int = 1  [keyword-only]
   peak_value: float
@@ -977,6 +988,20 @@ dew.optim.Exponential
   end_value: float
   decay_steps: int | None = None
   offset: float = 0.0
+dew.optim.GaussNewton
+  damping: float = 0.0
+  clip: float | None = None
+dew.optim.LaProp
+  b1: float = 0.9
+  b2: float = 0.999
+  eps: float = 1e-20
+  agc: float = 0.3
+dew.optim.Lamb
+  b1: float = 0.9
+  b2: float = 0.999
+  eps: float = 1e-06
+  eps_root: float = 0.0
+  weight_decay: float = 0.0
 dew.optim.Linear
   every: int = 1  [keyword-only]
   peak_value: float
@@ -984,23 +1009,62 @@ dew.optim.Linear
   decay_start: int | None = None
   decay_steps: int | None = None
   end_value: float = 0.0
+dew.optim.Muon
+  weight_decay: float = 0.0
+  adam_weight_decay: float | None = None
+  ns_coeffs: tuple[float, ...] | tuple[tuple[float, float, float], ...] | str = (3.4445, -4.775, 2.0315)
+  ns_steps: int = 5
+  beta: float = 0.95
+  eps: float = 1e-08
+  nesterov: bool = True
+  adaptive: bool = False
+  preconditioning: Preconditioning = 'frobenius'
+  consistent_rms: float | None = None
+  ns_precision: str | None = None
+  per_head: Mapping[str, int] | None = None
+  neuron_beta2: float | None = None
+  adam_b1: float = 0.9
+  adam_b2: float = 0.999
+  adam_eps_root: float = 0.0
+  adam_learning_rate: float | None = None
+  ns_group: int | None = None
+  state_dtype: Literal['float32', 'params'] | tuple[str | None, str | None] = 'float32'
+dew.optim.MuonClip
+  weight_decay: float = 0.0
+  adam_weight_decay: float | None = None
+  ns_coeffs: tuple[float, ...] | tuple[tuple[float, float, float], ...] | str = (3.4445, -4.775, 2.0315)
+  ns_steps: int = 5
+  beta: float = 0.95
+  eps: float = 1e-08
+  nesterov: bool = True
+  adaptive: bool = False
+  preconditioning: Preconditioning = 'frobenius'
+  consistent_rms: float | None = None
+  ns_precision: str | None = None
+  per_head: Mapping[str, int] | None = None
+  neuron_beta2: float | None = None
+  adam_b1: float = 0.9
+  adam_b2: float = 0.999
+  adam_eps_root: float = 0.0
+  adam_learning_rate: float | None = None
+  ns_group: int | None = None
+  state_dtype: Literal['float32', 'params'] | tuple[str | None, str | None] = 'float32'
+  qk_clip_threshold: float = 100.0
 dew.optim.OneCycle
   every: int = 1  [keyword-only]
   peak_value: float
   init_value: float | None = None
   end_value: float | None = None
   warmup_fraction: float | str = 0.3
+dew.optim.Optax
+  path: str = 'optax:sgd'
+  settings: JsonDict = builtins.dict()
 dew.optim.OptimConfig
-  optimizer: Optimizer | str = 'adamw'
-  optimizer_opts: JsonDict = builtins.dict()
+  optimizer: Annotated[OptimizerSpecs, _optimizer_argument()] = dew.optim.AdamW()
   learning_rate: Annotated[float | ScheduleSpec | None, _rate_argument()] = None
-  weight_decay: float | None = None
   spared: bool = True
-  b1: float | None = None
-  b2: float | None = None
   param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
   clip_grads: float = 0.0
-  state_dtype: Literal['float32', 'bfloat16', 'int8'] = 'float32'
   forced_weight_normalization: bool = False
   ema_profiles: tuple[float, ...] = ()
 dew.optim.ParamGroup
@@ -1062,16 +1126,12 @@ dew.telemetry.profile.CaptureOptions
   host_tracer_level: int = 2
   python_tracer_level: int = 0
   activity_cap: int = 2097152
-dew.training.ahead.AheadTarget
-  generation: str
-  devices: int
-  path: str | None = None
-  capacity_gib: float | None = None
-  frontier: bool = False
-  multiprocessors: int | None = None
-  topology: str | None = None
-  phases: tuple[int, ...] = ()
-  share: float = 0.95
+dew.training.budget.Horizon
+  steps: int | None = None
+  epochs: int | None = None
+  tokens: int | None = None
+  examples: int | None = None
+  max_tokens: int | None = None
 dew.training.budget.Pause
   fraction: float
 dew.training.budget.Plateau
@@ -1088,7 +1148,6 @@ dew.training.diloco.DiLoCo
   every: int
   rate: float = 0.7
   momentum: float = 0.9
-dew.training.evaluation.SplitLoss
 dew.training.inspection.Inspection
   paths: tuple[str, ...] = ()
   targets: tuple[Target, ...] = ('params', 'grads', 'updates', 'deltas')
@@ -1096,6 +1155,12 @@ dew.training.inspection.Inspection
   modules: tuple[str, ...] = ()
   cotangents: bool = False
   histogram: bool = False
+dew.training.policy.FitPolicy
+  split: int | Literal['auto'] = 'auto'
+  remat: Remat = 'auto'
+dew.training.policy.UpdateBatch
+  batches: int | None = None
+  tokens: int | None = None
 dew.training.profiling.ProfileWindow
   directory: str
   steps: int
@@ -1114,13 +1179,14 @@ dew.training.selection.Best
   threshold: float | None = None
   weights_only: bool = False
   split: str | None = None
-  _source: Source | None = None
+  score: Callable[[Mapping], float] | None = None
 dew.training.tracker.Wandb
   project: str
   entity: str | None = None
   offline: bool = False
   name: str | None = None
   shared: bool = False
+  publish: bool = False
 -- cli --
 dew  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew export  [dew._cli.main.Export]
@@ -1131,7 +1197,6 @@ dew export  [dew._cli.main.Export]
   trust: tuple[str, ...] = ()
 dew inspect  [dew._cli.main.Inspect]
   run: str  [Positional]
-  set: tuple[str, ...] = ()  [UseAppendAction]
   trust: tuple[str, ...] = ()
 dew launch  [dew._cli.launch.Launch]
   command: tuple[str, ...]  [Positional]
@@ -1146,19 +1211,21 @@ dew launch  [dew._cli.launch.Launch]
   env: tuple[str, ...] = ()  [metavar='NAME=VALUE']  [UseAppendAction]
   cwd: str | None = None  [metavar='DIR']
   dry_run: bool = False
+dew lower  [dew._cli.main.Lower]
+  run: str  [Positional]
+  target: Annotated[dew.training.targets.AheadTarget, _SubcommandConfig] | Annotated[dew.training.targets.LowerFor, _SubcommandConfig]
+  trust: tuple[str, ...] = ()
 dew profile  [dew._cli.main.Profile]
   run: str  [Positional]
   warmup: int = 20
   steps: int = 10
   out: str | None = None
-  set: tuple[str, ...] = ()  [UseAppendAction]
   trust: tuple[str, ...] = ()
   host_tracer_level: int | None = None
   python_tracer_level: int | None = None
   activity_cap: int | None = None
 dew train  [dew._cli.main.Train]
   run: str  [Positional]
-  set: tuple[str, ...] = ()  [UseAppendAction]
   trust: tuple[str, ...] = ()
 dew data  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew data export  [dew._cli.main.DataExport]
@@ -1167,10 +1234,10 @@ dew data export  [dew._cli.main.DataExport]
   format: Literal['parquet', 'array_record'] | None = None
   rows_per_shard: int = 100000
   branch: Literal['train', 'validation'] = 'train'
-  read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
+  read: Literal['memory', 'indexed', 'streamed'] | None = None
   provision: bool = False
   tokenizer: str | None = None
-  eos: bool = False
+  eos: bool = True
   trust: tuple[str, ...] = ()
 dew data provision  [dew._cli.main.DataProvision]
   source: str  [Positional]
@@ -1292,12 +1359,6 @@ dew tpu sync  [dew._cli.tpu.Sync]
   dry_run: bool = False
   name: str  [Positional]
   exclude: tuple[str, ...] = ()  [UseAppendAction]  [metavar='PATTERN']
-  delete: bool = False
-dew tpu train  [dew._cli.tpu.Train]
-  zone: str | None = None  [metavar='ZONE']
-  dry_run: bool = False
-  name: str  [Positional]
-  job: str = ''  [metavar='JOB']
   delete: bool = False
 -- records --
 dew.telemetry.records.RunRecord

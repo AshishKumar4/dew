@@ -29,7 +29,7 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.moe import global_router_loss
 from dew.objectives.routing import router_moments, router_scores, router_z_terms
-from dew.optim import OptimConfig, ParamGroup, Power, linear_schedule, param_labels, power_schedule
+from dew.optim import AdamW, OptimConfig, ParamGroup, Power, linear_schedule, param_labels, power_schedule
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "lm_engine"
 COEF = 0.01  # the fixture's router_aux_loss_coef
@@ -170,10 +170,9 @@ def test_mup_groups_and_adamw_steps_match_lm_engine(reference):
             node = node[key]
         assert node == membership[source], (path, node, membership[source])
 
-    config = OptimConfig(
-        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-10},
-        learning_rate=Power(peak_value=0.01, warmup_steps=2, a=0.05, b=-0.51, c=16.0),
-        weight_decay=0.1, param_groups=groups)
+    config = OptimConfig(optimizer=AdamW(eps=1e-10, b1=0.9, b2=0.95, weight_decay=0.1),
+                         learning_rate=Power(peak_value=0.01, warmup_steps=2, a=0.05, b=-0.51, c=16.0),
+                         param_groups=groups)
     with float64():
         solver = config.build(3)
         params = tree(params0)

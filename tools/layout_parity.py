@@ -431,7 +431,7 @@ def _trainer(case, fields: Layout, *, one_device: bool = False, accumulation: in
     from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
     from dew.nn.kernels.generation import gpu_target
     from dew.nn.sharding import Link
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import Layout, MeshSpec, Trainer, UpdateBatch
 
     class Drawn(Trainer):
         def initial_state(self, initializer=None, key=None):
@@ -462,7 +462,8 @@ def _trainer(case, fields: Layout, *, one_device: bool = False, accumulation: in
     trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
                       key=jax.random.key(0), **bench.trainer_mesh(fields),
                       layout=Layout(min_shard=case.fsdp_min_param_size, tolerance=1.0),
-                      accumulation=accumulation, checkpoints=None, tracker=None, links=links, record=record)
+                      update=UpdateBatch(batches=accumulation), checkpoints=None, tracker=None, links=links,
+                      record=record)
     if one_device:
         trainer.device_mesh = MeshSpec().build([jax.local_devices()[0]])
     elif devices is not None:

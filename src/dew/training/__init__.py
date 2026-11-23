@@ -17,13 +17,14 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.checkpoints import Checkpoints, Keep
     from dew.distributed.placement import Layout, MeshSpec
     from dew.objectives.base import Aux, EMASpec, Metric, Objective, Step
-    from dew.training.budget import Pause, Plateau
+    from dew.training.budget import Horizon, Pause, Plateau
     from dew.training.cooldown import Cooldowns
     from dew.training.diloco import DiLoCo
     from dew.training.evaluation import Episodes, EvalSuite, Evaluation
     from dew.training.inspection import Inspection, inspected
     from dew.training.observe import Observe
     from dew.training.phase_passes import SampledPasses
+    from dew.training.policy import FitPolicy, UpdateBatch
     from dew.training.profiling import ProfileWindow, RunProfile
     from dew.training.runtime import Preempted, prepare_process, run_timestamp, share_pool
     from dew.training.selection import Best
@@ -51,6 +52,7 @@ _EXPORTS = {
     "EMASpec": "dew.objectives.base",
     "Episodes": "dew.training.evaluation",
     "EvalSuite": "dew.training.evaluation",
+    "FitPolicy": "dew.training.policy",
     "Evaluation": "dew.training.evaluation",
     "Keep": "dew.checkpoints",
     "Layout": "dew.distributed.placement",
@@ -60,6 +62,7 @@ _EXPORTS = {
     "Metric": "dew.objectives.base",
     "Objective": "dew.objectives.base",
     "Observe": "dew.training.observe",
+    "Horizon": "dew.training.budget",
     "Pause": "dew.training.budget",
     "Plateau": "dew.training.budget",
     "PassesProgress": "dew.training.transaction",
@@ -73,6 +76,7 @@ _EXPORTS = {
     "Tracker": "dew.training.tracker",
     "Trackers": "dew.training.tracker",
     "Trainer": "dew.training.trainer",
+    "UpdateBatch": "dew.training.policy",
     "Wandb": "dew.training.tracker",
     "WandbTracker": "dew.training.tracker",
     "ema_update": "dew.averaging",
@@ -97,6 +101,8 @@ __all__ = [
     "Episodes",
     "EvalSuite",
     "Evaluation",
+    "FitPolicy",
+    "Horizon",
     "Inspection",
     "Keep",
     "Layout",
@@ -119,6 +125,7 @@ __all__ = [
     "Tracker",
     "Trackers",
     "Trainer",
+    "UpdateBatch",
     "Wandb",
     "WandbTracker",
     "ema_update",

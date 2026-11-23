@@ -18,9 +18,9 @@ from dew.nn.backbones.layer_names import group_layers
 from dew.nn.kernels.generation import compile_only_gpus
 from dew.nn.kernels.options import program
 from dew.objectives.lm import LMObjective
-from dew.optim import OptimConfig, ParamGroup
+from dew.optim import AdamW, OptimConfig, ParamGroup
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import FitPolicy, Layout, MeshSpec, Trainer
 from dew.training.ahead import compile_ahead
 from dew.training.narrow import forward_variables
 
@@ -43,9 +43,9 @@ def trainer(model, optimizer: OptimConfig, *, key: int = 0) -> Trainer:
     return run
 
 
-ADAMW = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1)
+ADAMW = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2)
 
-GROUPED = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1,
+GROUPED = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2,
                       param_groups=(ParamGroup("embedding", ("*embed_tokens*",), learning_rate_multiplier=.5),
                                     ParamGroup("attention", ("*self_attn*",), learning_rate_multiplier=2.0),
                                     ParamGroup("rest", ("*",))))
@@ -164,8 +164,8 @@ def test_what_every_layer_of_a_run_updating_in_its_backward_reads_takes_its_laye
                     seeds=SHARED_SEEDS)
 
 
-EIGHT_BIT = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8")
-"""Adamw keeping its moments in 8 bits (`OptimConfig.state_dtype`), codes and their blocks' scales no
+EIGHT_BIT = OptimConfig(optimizer=AdamW(weight_decay=0.1, state_dtype="int8"), learning_rate=1e-2)
+"""Adamw keeping its moments in 8 bits (`AdamW(state_dtype='int8')`), codes and their blocks' scales no
 backward writes as a float cotangent: its step takes the whole gradient first."""
 
 
@@ -213,9 +213,8 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype, 
     def built(optimizer: OptimConfig):
         gpu = compile_only_gpus(generation, 1, 80 * 2**30)
         model = decoder(scan=True, dtype=dtype, num_layers=LAYERS, **wider)
-        run = Trainer(LMObjective(model, SEQ), optimizer,
-                      key=jax.random.key(0), mesh=MeshSpec().build(gpu),
-                      layout=Layout(min_shard=TINY_SHARD), split=1, accumulation=1, checkpoints=None,
+        run = Trainer(LMObjective(model, SEQ), optimizer, key=jax.random.key(0), mesh=MeshSpec().build(gpu),
+                      layout=Layout(min_shard=TINY_SHARD), fit=FitPolicy(split=1), checkpoints=None,
                       tracker=None)
         run.validate(steps=8)
         return run

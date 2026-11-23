@@ -20,6 +20,7 @@ import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.optim import (
+    Adam,
     Cosine,
     Exponential,
     Linear,
@@ -87,16 +88,16 @@ def test_every_counts_the_schedules_fields_in_its_own_steps():
                   np.repeat(TORCH["exponential/lr"], 4), "exponential held four updates")
 
 
-FLOAT64_MOMENTS = {"mu_dtype": "float64", "nu_dtype": "float64"}
-"""Adam's moments stored in float64, where a run stores them in float32 (`OptimConfig.state_dtype`):
-the same algorithm read in float64 for the oracle rule."""
+FLOAT64_MOMENTS = {"state_dtype": "params"}
+"""Adam's moments stored in its float64 parameters' dtype, where a run stores them in float32
+(`dew.optim.Adam.state_dtype`): the same algorithm read in float64 for the oracle rule."""
 
 
 def snn_delays_config(**opts) -> OptimConfig:
     """SNN-delays' optimizer at the reference's size, as records only; `opts` its optimizer's."""
     rate = OneCycle(peak_value=5e-3, every=PER_EPOCH)
     b1 = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95, every=PER_EPOCH)
-    return OptimConfig(optimizer="adam", optimizer_opts=opts, param_groups=(
+    return OptimConfig(optimizer=Adam(**opts), param_groups=(
         ParamGroup("delays", ("delay",), schedule=Cosine(peak_value=0.1, warmup_steps=0, every=PER_EPOCH),
                    bounds=(0.0, 3.0)),
         ParamGroup("weights", ("kernel",), schedule=rate, b1=b1, weight_decay=WEIGHT_DECAY),
@@ -269,7 +270,7 @@ def test_a_fit_moves_its_weights_by_its_named_chains_post_step_effects_in_its_or
 
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
     params = {"delay": jnp.asarray([0.05, 2.95]), "kernel": jnp.asarray([0.05, 2.95])}
-    config = OptimConfig(optimizer="adam", learning_rate=0.5, param_groups=(
+    config = OptimConfig(optimizer=Adam(), learning_rate=0.5, param_groups=(
         ParamGroup("delays", ("delay",), bounds=(0.0, 3.0)), ParamGroup("rest", ("*",))))
     solver = config.build(1)
     grads = {"delay": jnp.asarray([1.0, -1.0]), "kernel": jnp.asarray([1.0, -1.0])}
@@ -285,7 +286,7 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
     with jax.enable_x64(new_val=True):
         wide = {name: jnp.asarray(value, jnp.float64) for name, value in params.items()}
         widened = {name: jnp.asarray(value, jnp.float64) for name, value in grads.items()}
-        read = dataclasses.replace(config, optimizer_opts=FLOAT64_MOMENTS).build(1)
+        read = dataclasses.replace(config, optimizer=Adam(**FLOAT64_MOMENTS)).build(1)
 
         def step(params, grads):
             first = read.init(params)

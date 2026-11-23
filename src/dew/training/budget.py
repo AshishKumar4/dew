@@ -1,5 +1,5 @@
 """How long a run trains and what ends it early: its one budget, in steps, epochs, examples or tokens
-(`run_length`, `run_steps`), the stop policies `Trainer.fit` takes beside it (`Plateau`, `Pause`), and
+(`Horizon`, `run_steps`), the stop policies `Trainer.fit` takes beside it (`Plateau`, `Pause`), and
 its cadences resolved against it (`every_step`)."""
 
 from __future__ import annotations
@@ -19,28 +19,56 @@ from dew.scores import Summary
 from dew.training.cadence import Cadence, Counted
 
 
-def run_length(steps: int | None, epochs: int | None, tokens: int | None, examples: int | None = None, *,
-               required: bool = True) -> None:
-    """Refuse a run whose length is named twice, by two of `steps`, `epochs`, `examples` and `tokens`, or,
-    where `required`, not at all: one budget (row 5725). The tokens a schedule's last stage ends its data at
-    bound a run of any length beside it (`budget_tokens`), as the data's own end does."""
-    named = [name for name, value in (("steps", steps), ("epochs", epochs), ("examples", examples),
-                                      ("tokens", tokens)) if value is not None]
-    if len(named) > 1:
-        raise ValueError(f"{' and '.join(named)} each name the run length; set one")
-    if required and not named:
-        raise ValueError("the run length is steps, epochs, examples or tokens; set one")
+@dataclasses.dataclass(frozen=True)
+class Horizon:
+    """How long a run trains, named once (row 5725): `steps`; `epochs`, passes over its data; `tokens`, the
+    targets its loss scores across every microbatch, a resume's before it among them, counted without
+    padding as committed updates trained on them (`train/committed_tokens`), the final microbatch crossing
+    it; or `examples`, the data's first source examples, each read once with every row it makes, counted
+    before they are packed and before an objective makes several rows of one (a decision layout's row a
+    question). Unnamed, the run is as long as its data, or a schedule's last stage ends it at its tokens
+    (`budget_tokens`), as it bounds a run of any length beside it. A token-only run needs a constant
+    learning rate or a schedule with its own step horizon. `max_tokens` caps a run of any other length at
+    tokens counted as `tokens` counts them, the first of the two reached ending it."""
+
+    steps: int | None = None
+    epochs: int | None = None
+    tokens: int | None = None
+    examples: int | None = None
+    max_tokens: int | None = None
+
+    def __post_init__(self):
+        if len(self.named()) > 1:
+            raise ValueError(f"{' and '.join(self.named())} each name the run length; set one")
+        if self.tokens is not None and self.max_tokens is not None:
+            raise ValueError("a run of tokens is capped at them; max_tokens caps a run of another length")
+        for name in (*self.named(), "max_tokens"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"a run's {name} is a count, not {value}")
+
+    def named(self) -> tuple[str, ...]:
+        """The length it names, its one field of steps, epochs, tokens and examples set, none where it
+        names none."""
+        return tuple(name for name in ("steps", "epochs", "tokens", "examples")
+                     if getattr(self, name) is not None)
+
+    @property
+    def token_cap(self) -> int | None:
+        """The tokens the run stops at: its length in tokens, or its cap beside another length."""
+        return self.tokens if self.tokens is not None else self.max_tokens
 
 
-def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int | None,
-              accumulation: int, examples: int | None = None) -> int | None:
+def run_steps(loader: Loader, horizon: Horizon, accumulation: int, tokens: int | None) -> int | None:
     """The microsteps a run takes over `loader`, the one policy for a fit's and a config's run length:
-    `steps`, `epochs` of it, whose ramp stages begin where updates do, as the stream cuts them, or the
-    steps that read the `examples` it is bounded to (`Loader.example_steps`), a read with no record count
-    bounded to its epochs' source examples among them, or None where `tokens` alone bounds it. Refuses a
-    run with no length or two, and epochs of a stream with no count of either. `tokens` is the run's token
-    budget (`budget_tokens`), which a schedule's data bounds beside a length named otherwise."""
-    run_length(steps, epochs, None, examples, required=tokens is None)
+    `horizon`'s steps, its epochs of it, whose ramp stages begin where updates do, as the stream cuts them,
+    or the steps that read the examples it is bounded to (`Loader.example_steps`), a read with no record
+    count bounded to its epochs' source examples among them, or None where `tokens` alone bounds it.
+    Refuses a run with no length, and epochs of a stream with no count of either. `tokens` is the run's
+    token budget (`budget_tokens`), which a schedule's data bounds beside a length named otherwise."""
+    steps, epochs, examples = horizon.steps, horizon.epochs, horizon.examples
+    if tokens is None and not horizon.named():
+        raise ValueError("the run length is steps, epochs, examples or tokens; set one")
     if examples is not None:
         return loader.example_steps(examples, accumulation)
     if epochs is None:
@@ -57,7 +85,7 @@ def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int
 
 def budget_tokens(loader: Loader, tokens: int | None) -> int | None:
     """The run's token budget: `tokens`, or where a schedule's last stage ends the data at its tokens
-    (`dew.data.pipeline.schedule`), the first reached; what a fit's and a config's run length read."""
+    (`dew.data.phases` on `Tokens`), the first reached; what a fit's and a config's run length read."""
     last = None if loader.token_ends is None else loader.token_ends[-1]
     return last if tokens is None else tokens if last is None else min(tokens, last)
 
@@ -153,5 +181,12 @@ class Pause:
         return step, real, consumed
 
 
-__all__ = ["Pause", "Plateau", "every_step", "recorded", "run_length", "run_steps",
-           "run_tokens"]
+__all__ = [
+    "Horizon",
+    "Pause",
+    "Plateau",
+    "every_step",
+    "recorded",
+    "run_steps",
+    "run_tokens",
+]

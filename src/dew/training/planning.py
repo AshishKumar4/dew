@@ -72,12 +72,15 @@ from dew.training.memory import (
     recompute_record,
     remat_offloaded,
     remat_stated,
+    remat_topmost,
+    remat_topped,
     rung_record,
     step_fits,
     step_fits_admitted,
     temporaries_factor,
 )
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
+from dew.training.policy import Remat
 from dew.training.profiling import PGLE_CAPTURE
 
 if TYPE_CHECKING:
@@ -839,6 +842,9 @@ class FitSearch[LossT, EffectsT]:
     ns_group: int | None
     base: tuple[int, int] | None
     resumed: JSON
+    remat: Remat = "auto"
+    """What the step may recompute (`FitPolicy.remat`): "auto" its whole ladder, "selective" short of each
+    module's whole recomputation, "none" and "full" its start's remat alone, its head's rungs above it."""
     probes: list[Probe] = dataclasses.field(default_factory=list)
     refusals: list[RuntimeError] = dataclasses.field(default_factory=list)
     lowered: dict[tuple[int, str], Candidate] = dataclasses.field(default_factory=dict)
@@ -889,13 +895,23 @@ class FitSearch[LossT, EffectsT]:
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh)
+        if self.remat == "full":
+            # Every module at the top of its ladder, its whole recomputation, before the search starts there.
+            remat_topmost(self.objective)
         self.started = self.remat_rung()
-        # Whether any module the run trains sets its own remat, which it compiles at alone.
-        self.remat_set = remat_stated(self.objective)
+        # Whether the run sets its remat, which it compiles at alone: a module's own, or "none" or "full".
+        self.remat_set = self.remat in ("none", "full") or remat_stated(self.objective)
+        # The modules at their ladders' tops as the search starts, past which a "selective" one climbs none.
+        self.topped = remat_topped(self.objective)
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
         # step's own (`options`) are made; the target's own policy is the compile point's
         # (`report.targeted`).
         self.required = compiler_options() or None
+
+    def past_selective(self) -> bool:
+        """Whether a "selective" run's climb has put a module at the top of its ladder (`remat_topped`), its
+        whole recomputation, which the run asks none of (`remat`)."""
+        return self.remat == "selective" and remat_topped(self.objective) > self.topped
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
         """The first fitting plan the split-and-rung search finds (`searched`), and every compile it made:
@@ -934,7 +950,7 @@ class FitSearch[LossT, EffectsT]:
         self.resumed = None
         fewer, found = list(candidates[:candidates.index(split)]), []
         top = (split, self.rung_now()) if offloads(self.objective) else None
-        while fewer and recompute_more(self.objective, self.base):
+        while fewer and recompute_more(self.objective, self.base) and not self.past_selective():
             asked = len(self.probes)
             fewest = walked(fewer, 0, self.fits_here, functools.partial(self.after, fewer))
             if fewest is not None:
@@ -1143,11 +1159,11 @@ class FitSearch[LossT, EffectsT]:
     def told(self, admitted: Planned) -> None:
         """Tell a run that kept the remat it set itself how to learn what else fits: a run compiles its
         own rung alone (row 2111), and planning it ahead at each policy, with each GPU's memory stated
-        (`--trainer.compile-ahead.capacity-gib`), compiles the others offline."""
+        (`--target.capacity-gib`), compiles the others offline."""
         remat = admitted.rung["remat"]
         if self.remat_set and json.dumps(remat, sort_keys=True) == self.started:
-            _log.info("the run sets remat %r and compiles at it alone; --trainer.compile-ahead with "
-                      "--trainer.compile-ahead.capacity-gib plans it on its GPUs offline, at each remat "
+            _log.info("the run sets remat %r and compiles at it alone; dew lower target:ahead with "
+                      "--target.capacity-gib plans it on its GPUs offline, at each remat "
                       "policy asked, to tell what else fits", remat)
 
     def rung_now(self) -> Rung:
@@ -1183,7 +1199,7 @@ class FitSearch[LossT, EffectsT]:
         (`below`)."""
         self.at(start)
         places = [Rung.of(self.objective, xla_defaults=False, narrow=narrow, ns_group=ns_group)]
-        while recompute_more(self.objective, self.base):
+        while recompute_more(self.objective, self.base) and not self.past_selective():
             place = Rung.of(self.objective, xla_defaults=False, narrow=narrow, ns_group=ns_group)
             if remat_set and place.modules != start.modules:
                 break

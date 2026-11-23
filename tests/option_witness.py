@@ -4,7 +4,6 @@
 
 import dataclasses
 import inspect
-import json
 import types
 import typing
 from collections.abc import Mapping
@@ -320,15 +319,14 @@ def replaced(value, name: str, option):
     return dataclasses.replace(value, **{head: inner})
 
 
-def flag(value, annotation) -> str:
-    """`value` as `--set` writes it for a field of `annotation`: a record's JSON, a tuple's values, or its
-    text."""
-    if value is None or isinstance(value, bool | int | str):
-        return str(value)
-    # A tuple of numbers or texts as its values in turn, as the command line reads one.
-    if isinstance(value, tuple) and all(isinstance(item, bool | int | str) for item in value):
-        return " ".join(map(str, value))
-    return json.dumps(registry.to_record(value, bare(annotation)))
+def flag(value, annotation) -> object:
+    """`value` as a run's record holds it for a field of `annotation` (`RunConfig.override` sets it): a
+    scalar as itself, a tuple as its list, anything else as its record."""
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if isinstance(value, tuple) and all(isinstance(item, bool | int | float | str) for item in value):
+        return list(value)
+    return registry.to_record(value, bare(annotation))
 
 
 """What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
@@ -476,11 +474,11 @@ EVERY = slice(None)
 
 def witnessed_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]],
                  consumed, part: slice = EVERY) -> dict[str, list[str]]:
-    """Each option of `queued` set alone through `dew train` (`flags` writes its `--set`s), so what its
-    task holds differs from the run that sets none by it alone, at each alternative in turn until one is
-    consumed (`consumed`: why the saved settings and the loaded task do not witness it, or None); of its
-    alternatives `part` alone, each named by its place among them all. Why each alternative failed, for
-    each option none witnesses."""
+    """Each option of `queued` set alone in its run's record through `dew train` (`flags` writes its
+    settings), so what its task holds differs from the run that sets none by it alone, at each alternative
+    in turn until one is consumed (`consumed`: why the saved settings and the loaded task do not witness it,
+    or None); of its alternatives `part` alone, each named by its place among them all. Why each alternative
+    failed, for each option none witnesses."""
     failed: dict[str, list[str]] = {}
     for name, values in queued.items():
         for index, value in [*enumerate(values)][part]:
@@ -554,8 +552,8 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
     reachable = {name: option.found for name, option in options.items() if option.found is not None}
     hints = annotations_of(type(run), include_extras=True)
 
-    def flags(assigned: dict[str, object]) -> dict[str, str]:
-        """The `--set`s of each option `assigned`, and of what its reader takes it only beside (`BESIDE`)."""
+    def flags(assigned: dict[str, object]) -> dict[str, object]:
+        """The settings of each option `assigned`, and of what its reader takes it only beside (`BESIDE`)."""
         beside = {path: flag(value, hints[path])
                   for name in assigned for path, value in BESIDE.get(name, {}).items()}
         return {**beside, **{reachable[name].path: flag(value, reachable[name].annotation)
@@ -630,7 +628,7 @@ def unread(task, before: dict[str, object], option) -> str | None:
 
 def the_attention_forms_a_run_names_reach_its_step(tmp_path):
     """A GPU flow's cell (tests/test_gpu_training.py): the attention forms a run's numerics name on the
-    command line (`--set trainer.precision`, `Numerics.forms`) reach its step through the default route: a
+    record (`trainer.precision`, `Numerics.forms`) reach its step through the default route: a
     step in the accurate forms (the template's kernels) and one in the fast (the fast route's), the model's
     compute float32 in both, differentiate its batch apart, so the route reads the run's forms, not its
     record alone (ledger 2350). Each parameter's gradient summaries tell them apart where the loss cannot:
