@@ -645,13 +645,13 @@ def test_a_red_that_read_the_rows_state_before_another_red_still_revokes_the_gre
     def red(stale: bool = False) -> None:
         read = []
 
-        def send(method: str, url: str, headers, body, timeout: float):
+        def send(method: str, url: str, headers, body, timeout: float, until=None):
             # Its first read of the row's state as before the other red's write: the row had none then.
             if stale and method == "GET" and ("-reds/" in url or "-epochs/" in url) and "test_a" in url \
                     and not read:
                 read.append(url)
                 return 404, {}, io.BytesIO(b"")
-            return sender(method, url, headers, body, timeout)
+            return sender(method, url, headers, body, timeout, until)
 
         with monkeypatch.context() as patched:
             patched.setattr(ci.records, "SEND", send)
@@ -677,10 +677,10 @@ def test_a_lookup_whose_epoch_is_unread_or_gone_reuses_nothing(ci, tmp_path, mon
     # The Worker unavailable for the rows' epochs alone.
     sender = ci.records.SEND
 
-    def send(method: str, url: str, headers, body, timeout: float):
+    def send(method: str, url: str, headers, body, timeout: float, until=None):
         if "-epochs/" in url:
             raise ConnectionResetError("the connection to the Worker was reset")
-        return sender(method, url, headers, body, timeout)
+        return sender(method, url, headers, body, timeout, until)
 
     with monkeypatch.context() as patched:
         patched.setattr(ci.records, "SEND", send)
@@ -703,10 +703,10 @@ def test_a_red_runs_epoch_write_sent_again_after_a_later_one_never_puts_it_back(
     sent: list[tuple] = []
     sender = ci.records.SEND
 
-    def keeping(method: str, url: str, headers, body, timeout: float):
+    def keeping(method: str, url: str, headers, body, timeout: float, until=None):
         if method == "PUT" and "-epochs/" in url and "test_a" in url:
             sent.append((method, url, dict(headers), body, timeout))
-        return sender(method, url, headers, body, timeout)
+        return sender(method, url, headers, body, timeout, until)
 
     def red() -> None:
         with monkeypatch.context() as patched:

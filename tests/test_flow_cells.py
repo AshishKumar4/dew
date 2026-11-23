@@ -209,11 +209,12 @@ def test_a_matrix_case_pinned_to_the_nodes_generation_runs_in_its_prepare(tmp_pa
 
 def test_a_cell_that_computes_in_a_parts_prepare_is_deferred_to_its_run(tmp_path, monkeypatch):
     """In a GPU tier part's prepare (`tier_wire.preparing`, its store open), a cell that raises, computing
-    where nothing computes, is recorded deferred, where it raised (`truths_ahead.DEFERRED`), and the flow
+    where nothing computes, is recorded deferred, where it raised (`tier_wire.DEFERRED`), and the flow
     passes its prepare, its other cells run; outside a prepare the same cell fails its flow (rows 8505 and
     8506: such a cell beside a flow's prepared sites turned its test red in the prepare)."""
     import tier_wire
-    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths
+    from tier_wire import DEFERRED
+    from truths_ahead import UNPREPARED, compiled_truths
 
     def computing():
         raise AttributeError("'jaxlib._jax.Executable' object has no attribute 'local_devices'")
@@ -243,7 +244,8 @@ def test_a_cell_raising_after_its_prepare_compiled_its_programs_passes_it_unreco
     import numpy as np
     import tier_wire
     from reference_error import ahead_arm, assert_as_exact
-    from truths_ahead import DEFERRED, UNPREPARED, CompiledTruths, compiled_truths
+    from tier_wire import DEFERRED
+    from truths_ahead import UNPREPARED, CompiledTruths, compiled_truths
 
     def checked():
         made = ahead_arm(jax.jit(lambda x: x + 1.0), "a checked product")(np.zeros(3, np.float32))
@@ -319,7 +321,8 @@ def test_a_cell_compiling_at_its_run_is_passed_by_in_a_parts_prepare(tmp_path, m
     deferred, and its flow passes its prepare; outside a prepare it runs, its failure its flow's (rows 8074,
     8635: every such cell was deferred and its test named unprepared)."""
     import tier_wire
-    from truths_ahead import DEFERRED, compiled_truths
+    from tier_wire import DEFERRED
+    from truths_ahead import compiled_truths
 
     ran = []
 
@@ -460,7 +463,8 @@ def test_a_parts_prepare_passes_by_its_cells_placed_on_the_hosts_cpu(tmp_path, m
     import test_gpu_numerics
     import tier_wire
     from generation_support import node_target
-    from truths_ahead import DEFERRED, prepared
+    from tier_wire import DEFERRED
+    from truths_ahead import prepared
 
     monkeypatch.setenv(model_flows.TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
     monkeypatch.setenv(tier_wire.PREPARE, "1")

@@ -769,6 +769,8 @@ def test_the_census_plans_the_whole_suite_cold_whatever_its_environment_says(ci,
     assert all(entry["split"] != ci.COLLECT for entry in census)
     pushed = planned()
     assert {(entry["cache"], entry["census"]) for entry in pushed} == {("on", "0")}
+    # Each entry carries main's commit as its plan found it (`mainline`), which its task's checkout lacks.
+    assert {entry["main"] for entry in pushed} == {ci.mainline() or ""}
     assert any(entry["split"] == ci.COLLECT for entry in pushed)
 
 

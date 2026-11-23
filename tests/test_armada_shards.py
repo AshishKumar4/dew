@@ -268,12 +268,12 @@ def test_a_sites_heavy_units_are_a_task_alone_and_its_light_ones_merge_by_each_s
                **{f"site.unit-{unit}-{unit + 1}": 190.0 for unit in range(3)}}
     cost = ci.costs.recorded("site", timings, weighed=False)
     mark = ci.costs.Mark(units=18, per_task=6, line=1, timed=18)
-    spans = ci.cut_draws(mark, {False: cost, True: None}, 120.0)
+    spans = ci.costs.cut_draws(mark, {False: cost, True: None}, 120.0)
     assert spans == [(0, 1), (1, 2), (2, 3), (3, 6), (6, 9), (9, 12), (12, 15), (15, 18)]
     assert max(cost.seconds(start, stop) for start, stop in spans) <= 120.0 * ci.costs.SITE_TARGETS
     # Its median rate alone, as before each span's was kept: every task three places, the first 580 s.
     median = ci.costs.Cost(10.0, 60.0)
-    assert ci.cut_draws(mark, {False: median, True: None}, 120.0)[0] == (0, 3)
+    assert ci.costs.cut_draws(mark, {False: median, True: None}, 120.0)[0] == (0, 3)
     # A span measured past the bound draws each of its units alone, never one beside a neighbour's: its rate
     # is its units' mean, and a 60 s unit beside a 190 s one read at 125 s each would join the next span's
     # 60 s unit, the cut swinging between two that both pass the bound.
@@ -552,16 +552,16 @@ def test_sites_past_one_judges_jobs_inputs_together_are_planned_and_one_past_it_
         return f"import pytest\n\n@pytest.mark.{mark}\ndef test_site():\n    pass\n"
 
     # Two sites a Python, each within one job's inputs and past them together on every Python.
-    seeds = ci.MAX_INPUTS // (2 * staged_units(1))
-    units = ci.MAX_INPUTS - 1
+    seeds = ci.costs.MAX_INPUTS // (2 * staged_units(1))
+    units = ci.costs.MAX_INPUTS - 1
     written(tmp_path, {"test_a.py": marked(f"check1_shards(seeds={seeds}, per_task=1)"),
                        "test_b.py": marked(f"shards(units={units}, per_task=1)")})
     # Cold, as the census plans every site on every Python.
     judges = [entry for entry in ci.plan(120.0, {}, census=True) if "after" in entry]
     assert len(judges) == 2 * len(ci.PYTHONS)
-    assert sum(len(entry["after"]) for entry in judges) > ci.MAX_INPUTS
-    assert max(len(entry["after"]) for entry in judges) <= ci.MAX_INPUTS
-    written(tmp_path, {"test_b.py": marked(f"shards(units={ci.MAX_INPUTS + 1}, per_task=1)")})
+    assert sum(len(entry["after"]) for entry in judges) > ci.costs.MAX_INPUTS
+    assert max(len(entry["after"]) for entry in judges) <= ci.costs.MAX_INPUTS
+    written(tmp_path, {"test_b.py": marked(f"shards(units={ci.costs.MAX_INPUTS + 1}, per_task=1)")})
     with pytest.raises(SystemExit):
         ci.plan(120.0, {})
     assert ci.sites("tests/test_b.py")["test_site"].line == 3
@@ -917,12 +917,15 @@ def test_a_sites_map_task_past_the_target_is_reported_though_its_test_is_recorde
     """A check-1 site's map task that runs past the plan's bound on one (two targets, `cut_draws`) is a slow
     test to report, though main's record holds the site's test (its whole run's time): it names its map task
     and the fix, fewer units a task, where a map task within the bound, the site's judge and a recorded test
-    of a file's own row pass unreported (row 3729: a map task ran 1,366 s, and nothing said so)."""
+    of a file's own row pass unreported (row 3729: a map task ran 1,366 s, and nothing said so), as does a dry
+    prepare's test, whose seconds are its prepare's."""
     test = "tests/test_site.py::test_site"
     rows = [{"name": "3.12:tests/test_site.py#test_site.draws-0-512", "tests": {test: 600.0}},
             {"name": "3.12:tests/test_site.py#test_site.draws-512-1024", "tests": {test: 240.0}},
             {"name": "3.12:tests/test_site.py#test_site", "tests": {test: 240.0}},
-            {"name": "3.12:tests/test_other.py", "tests": {"tests/test_other.py::test_old": 240.0}}]
+            {"name": "3.12:tests/test_other.py", "tests": {"tests/test_other.py::test_old": 240.0}},
+            {"name": "3.12:tests/test_gpu_vae.py#@prepare-sm90",
+             "tests": {"tests/test_gpu_vae.py::test_a": 400.0}}]
     base = {test: 700.0, "tests/test_other.py::test_old": 240.0}
     assert ci.slow({"rows": rows}, 120.0, base) == [
         {"test": test, "file": "tests/test_site.py", "seconds": 600.0, "target": 240.0,

@@ -396,7 +396,8 @@ def compiled_ahead(request):
         yield
         return
     import model_flows
-    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths, reasoned
+    from tier_wire import DEFERRED
+    from truths_ahead import UNPREPARED, compiled_truths, reasoned
 
     if not tier_wire.preparing():
         record = store / UNPREPARED
@@ -412,7 +413,7 @@ def compiled_ahead(request):
         if (store / DEFERRED).exists():
             deferred = json.loads((store / DEFERRED).read_text())
             for reason in deferred["reasons"]:
-                reasoned(record, deferred["test"], reason["where"], reason["error"])
+                reasoned(record, deferred["test"], reason["where"], reason["error"], reason.get("cell"))
         _named_records(request, store)
         return
 

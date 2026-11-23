@@ -369,7 +369,8 @@ def test_a_packed_windows_site_prepares_its_terms_whole_and_runs_from_its_store(
     float64 terms beside each attention's (`AttentionTerms`), traces whole and compiles, and its run
     computes its truths and terms from those programs, nothing deferred or unprepared (row 7359; the review
     of train 1058: its truth's float64 terms converted to the host, and its prepare raised)."""
-    from truths_ahead import DEFERRED, UNPREPARED, compiled_truths
+    from tier_wire import DEFERRED
+    from truths_ahead import UNPREPARED, compiled_truths
 
     for prepare in (True, False):
         with compiled_truths(tmp_path, prepare=prepare, stamp="a"):

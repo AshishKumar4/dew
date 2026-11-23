@@ -156,7 +156,7 @@ def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
     (`tried_before`, its store's sites tried before the cell, `_tried`), where nothing computes. A cell that
     tried no site before it raised, or one its check's prepare did not finish whole (a trace or a compile that
     raised, an arm's after its site's truths were written: `truths_ahead.CompiledTruths.preparing`), computed
-    past or failed within the programs its prepare holds, and is recorded deferred (`truths_ahead.DEFERRED`,
+    past or failed within the programs its prepare holds, and is recorded deferred (`tier_wire.DEFERRED`,
     where it raised and why), its run computing and judging it with the flow's other cells served by the store
     and naming the test unprepared (tests/conftest.py); one whose every site it began its prepare finished,
     and then raised, checked what its prepare gives in their place (`CompiledTruths.judged_its_zeros`, a
@@ -167,13 +167,14 @@ def _deferred(label: str, error: BaseException, frames: list[tuple[str, int]],
     import os
 
     import store_wire
+    import tier_wire
     import truths_ahead
 
     store = store_wire.COMPILED.get()
     if not store.judged_its_zeros(error, tried_before):
         test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
         truths_ahead.unprepared(store.directory, test, frames[::-1], f"{label}: {_raised(error)[:400]}",
-                                truths_ahead.DEFERRED)
+                                tier_wire.DEFERRED, cell=label)
         print(f"cell deferred to its run: {label}", flush=True)
     return True
 
@@ -357,6 +358,13 @@ def when(holds: bool, reason: str, check: Callable[[], None]) -> Callable[[], No
             pytest.skip(reason)
         check()
     return run
+
+
+def on_two_gpus(check: Callable[[], None]) -> Callable[[], None]:
+    """`check` where this process sees two GPUs, else skipped (`when`): a two-GPU flow's cell."""
+    import jax
+
+    return when(jax.default_backend() == "gpu" and jax.device_count() >= 2, "needs two GPUs", check)
 
 
 def isolated(tmp_path_factory) -> Callable[..., Callable[[], None]]:

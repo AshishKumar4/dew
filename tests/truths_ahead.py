@@ -47,6 +47,7 @@ from typing import Any
 import jax
 import numpy as np
 from store_wire import COMPILED, SITE_IN_PROGRESS
+from tier_wire import UNPREPARED
 from tool_support import load
 
 
@@ -62,11 +63,6 @@ PROGRAMS, HELD, SITE = "programs", "held.pkl", "site.json"
 constants and output tree (`held`), and its record, written last, so a prepare cut short leaves none a run
 reads."""
 
-UNPREPARED = "unprepared.json"
-"""A test's record, in its store, that it ran unprepared (`unprepared`): `{"test", "where", "error",
-"reasons"}`, its first reason's where and why and every reason it gave, each once (a site, an arm, a cell:
-their count shows a tier drifting from its prepares), the GPU tier's list of unprepared tests read from these
-alone (a ledger row each, the tier's)."""
 
 AT_RUN = "at_run.json"
 """A test's record, in its store, of what its run compiled on its GPU as its prepare declared, as
@@ -75,9 +71,6 @@ AT_RUN = "at_run.json"
 algorithm), and a terms walk its values steer (`float64_terms._termed`); a decision named in the run's
 summary, not drift."""
 
-DEFERRED = "deferred.json"
-"""A test's record, in its store, of a GPU flow's cell its prepare deferred to its run (`unprepared`'s, as
-`UNPREPARED`'s), which its run serves from the store beside it and then records unprepared."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -539,24 +532,26 @@ def running() -> tuple[CompiledTruths, str] | None:
 
 
 def unprepared(directory: Path, test: str, frames: Sequence[tuple[str, int]], why: str,
-               record: str = UNPREPARED) -> None:
+               record: str = UNPREPARED, cell: str | None = None) -> None:
     """The writer of a test's record that it ran unprepared (`UNPREPARED`, in its store `directory`),
     compiling a site or an arm on its devices with every site judged: its node id and each reason it gives,
     where (`frames`, innermost first, `(file, line)`: the first of the test's own file, else the test's file)
-    and why (`reasoned`). Under `DEFERRED`, a GPU flow's cell its prepare deferred to its run
+    and why (`reasoned`). Under `tier_wire.DEFERRED`, a GPU flow's cell its prepare deferred to its run
     (`gpu_flow.run_cells`), which its run's store still serves, and which the run names unprepared
-    (tests/conftest.py's `compiled_ahead`)."""
+    (tests/conftest.py's `compiled_ahead`); `cell` its label, so the flow's cells deferred at one line are
+    each their own."""
     # The test's file as CI's grading reads a node id (`tools/armada/grading.py`'s `owning`).
     path = Path(load("grading", "tools/armada").owning(test))
     lines = [line for file, line in frames if Path(file).name == path.name]
-    reasoned(directory / record, test, f"{path}:{lines[0]}" if lines else str(path), why)
+    reasoned(directory / record, test, f"{path}:{lines[0]}" if lines else str(path), why, cell)
 
 
-def reasoned(record: Path, test: str, where: str, why: str) -> None:
-    """Into a test's `record` (`UNPREPARED`, `DEFERRED`), a reason it ran unprepared, `where` and `why`, each
-    reason once in the order given, its first's its record's own `where` and `error` (a prepare's, before
-    its run's): a test with three unprepared arms names three (Main)."""
-    reason = {"where": where, "error": why}
+def reasoned(record: Path, test: str, where: str, why: str, cell: str | None = None) -> None:
+    """Into a test's `record` (`UNPREPARED`, `tier_wire.DEFERRED`), a reason it ran unprepared, `where` and
+    `why`, each reason once in the order given, its first's its record's own `where` and `error` (a
+    prepare's, before its run's): a test with three unprepared arms names three (Main); `cell` a flow's cell's
+    label, where the reason is one."""
+    reason = {"where": where, "error": why, **({"cell": cell} if cell else {})}
     if record.exists():
         held = json.loads(record.read_text())
         if reason not in held["reasons"]:

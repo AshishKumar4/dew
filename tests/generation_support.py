@@ -31,9 +31,8 @@ def interprets() -> bool:
     return not tier_wire.preparing() and jax.default_backend() != "gpu"
 
 
-TOPOLOGY = "DEW_NODE_TOPOLOGY"
-"""The node's GPUs' serialized topology (a GPU node's session hands a prepare its node's): the GPU a flow's
-programs are compiled for."""
+TOPOLOGY = tier_wire.TOPOLOGY
+"""The node's GPUs' serialized topology, the tier's contract's variable (`tier_wire.TOPOLOGY`)."""
 
 
 def node_target():

@@ -142,7 +142,7 @@ import time
 import tomllib
 import xml.etree.ElementTree as ET
 from collections import Counter
-from collections.abc import Collection, Container, Mapping, Sequence
+from collections.abc import Callable, Collection, Container, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -188,21 +188,21 @@ progress = _loaded(HERE / "progress.py")
 natives, digests, grading = (_loaded(HERE / f"{name}.py") for name in ("natives", "digests", "grading"))
 host, stalls, temp_roots = (_loaded(HERE / f"{name}.py") for name in ("host", "stalls", "temp_roots"))
 costs, cuts, partition = (_loaded(HERE / f"{name}.py") for name in ("costs", "cuts", "partition"))
-# A site's mark and the map tasks its units are cut into (costs.py), as this file and its tests name them.
-MAX_INPUTS, stages_of, draws_of, cut_draws, refused_sites = (
-    costs.MAX_INPUTS, costs.stages_of, costs.draws_of, costs.cut_draws, costs.refused_sites)
+prepares = _loaded(HERE / "prepares.py")
+VARIANTS = prepares.VARIANTS
 fold = _loaded(HERE / "fold.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
 grouped_rows = rows.grouped_rows
 # The test cache's records (records.py), by the names this file and its tests read them.
-(store, record_key, green_key, main_key, epoch_key, Unread, UNREAD, epoch, begun, standing,
- recorded, record_of, written, listed, CACHE_PREFIX, RECORD_TRIES) = (
-    records.store, records.record_key, records.green_key, records.main_key,
+(store, record_key, green_key, main_key, baseline_key, epoch_key, Unread, UNREAD, epoch, begun, standing,
+ recorded, record_of, written, listed, CACHE_PREFIX, RECORD_TRIES, MAINLINE, mainline, merge_base,
+ given_mainline) = (
+    records.store, records.record_key, records.green_key, records.main_key, records.baseline_key,
     records.epoch_key, records.Unread, records.UNREAD, records.epoch, records.begun, records.standing,
     records.recorded, records.record_of, records.written, records.listed, records.CACHE_PREFIX,
-    records.RECORD_TRIES)
+    records.RECORD_TRIES, records.MAINLINE, records.mainline, records.merge_base, records.given_mainline)
 VARIED, varied, cut_of, place_variant = rows.VARIED, rows.varied, rows.cut_of, rows.place_variant
 shares, collection = (_loaded(HERE / f"{name}.py") for name in ("shares", "collection"))
 gpu_measures = _loaded(HERE / "measures.py")
@@ -361,10 +361,11 @@ def shared(python: str, locks: tuple[str, ...] = ()) -> str:
 
 def lane_inputs(python: str) -> str:
     """The hash of what a GPU lane's file shares (`gpu_lane`): what every test file's run shares (`shared`),
-    and this file, which sets the environment, share and deadline each file runs under on a GPU, where a
-    CPU task's are the session's."""
+    and this file and prepares.py, which set the environment (a user's process's, `VARIANTS`), share and
+    deadline each file runs under on a GPU, where a CPU task's are the session's."""
     locks = tuple(map(str, Path("locks").glob("*.txt")))
-    return hashlib.sha256((shared(python, locks) + code_of(__file__).hex()).encode()).hexdigest()
+    own = code_of(__file__).hex() + code_of(str(HERE / "prepares.py")).hex()
+    return hashlib.sha256((shared(python, locks) + own).encode()).hexdigest()
 
 
 @dataclasses.dataclass
@@ -379,21 +380,23 @@ class Reading:
     modules: dict[str, dict[str, bytes] | bytes] = dataclasses.field(default_factory=dict)
     durations: dict[str, dict[str, float]] | None = None
     stored: dict[str, list[str]] | None = None
-    cuts: dict[tuple[str, int], list[list[str]]] = dataclasses.field(default_factory=dict)
+    cuts: dict[tuple[str, int, bool], list[list[str]]] = dataclasses.field(default_factory=dict)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
-    def cut(self, name: str, count: int) -> list[list[str]]:
-        """File `name`'s tests cut into `count` groups (`members`), the record parted by file once a reading
-        and each cut once (train 662's plan: 3,620 group keys each parsed the record, a minute of two)."""
+    def cut(self, name: str, count: int, *, evenly: bool = False) -> list[list[str]]:
+        """File `name`'s tests cut into `count` groups (`members`), a dry prepare's by their count where
+        `evenly` (prepares.py's `prepared_cut`), the record parted by file once a reading and each cut once
+        (train 662's plan: 3,620 group keys each parsed the record, a minute of two)."""
         # Under the lock: the plan's threads share a reading (train 679: a half-parted record cut empty).
         with self.lock:
             if self.durations is None:
                 self.durations, self.stored = parted_record(session.cut_record()), session.stored_cuts()
-            if (name, count) not in self.cuts:
+            if (name, count, evenly) not in self.cuts:
                 own = own_tests(name, self.durations.get(name, {}))
-                self.cuts[(name, count)] = session.planned(name, list(own), list(own.values()), count,
-                                                           self.stored)
-            return self.cuts[(name, count)]
+                self.cuts[(name, count, evenly)] = (
+                    prepares.prepared_cut(list(own), count) if evenly
+                    else session.planned(name, list(own), list(own.values()), count, self.stored))
+            return self.cuts[(name, count, evenly)]
 
     def named(self, name: str) -> list[str]:
         """Every test of file `name` the cut's record names (`cut`), whatever group holds it."""
@@ -444,7 +447,8 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
         # And every test its record names for the file: one it drops joins a group by the collection alone
         # (`session.kept`), a group whose own tests, and key, stood (review: its row reused, the test unrun).
         cut = cut_of(split)
-        held = [members(name, cut, reading), reading.named(name)] if cut else []
+        evenly = prepares.prepared_group(split, VARIED)
+        held = [members(name, cut, reading, evenly=evenly), reading.named(name)] if cut else []
         digest.update(split.encode() + (json.dumps(held).encode() if cut else b""))
     return digest.hexdigest()
 
@@ -502,19 +506,23 @@ def head_commit() -> str | None:
     return (found.stdout.strip() or None) if found.returncode == 0 else None
 
 
-@functools.cache
-def mainline() -> str | None:
-    """The commit of main this checkout descends from (its merge-base with origin/main: a train's base, a
-    lane's branch point), whose own runs' records a lookup finds behind a later run of another tree
-    (`green_record`), or None where the checkout has no origin/main."""
-    found = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], capture_output=True, text=True)
-    return (found.stdout.strip() or None) if found.returncode == 0 else None
+def baselined(python: str, place: str, held: str, token: str, ran: Mapping) -> bool:
+    """Whether a dry prepare's green row (`ran`, `place`, graded) on class `held` has this commit's baseline,
+    the cells it left unprepared (`baseline_key`), written now, tried once; True where none is due (a row
+    that is no green dry prepare, or no commit). A green row with none stands stale (`unbaselined`): main
+    landed with its baseline lost would let the next train read a new omission as main's first run."""
+    if (commit := head_commit()) is None or ran.get("exitCode") != 0 or "unprepared" not in ran:
+        return True
+    return written(baseline_key(commit, python, place, held), token,
+                   json.dumps({"unprepared": ran["unprepared"]}).encode(), tries=1)
 
 
 def named_at_commit(python: str, place: str, held: str, key: str, token: str) -> None:
     """Row `place`'s green run of `key` on class `held` named this commit's own (`main_key`), tried once: a
     name lost costs a later lookup that row's rerun, never this task its deadline (review: a kept task of 120
-    rows retrying each write against an unavailable Worker would wait past its 1,800 s)."""
+    rows retrying each write against an unavailable Worker would wait past its 1,800 s). A dry prepare's row
+    is named only once its baseline is written (`baselined`): a name with no baseline beside is a baseline
+    lost, which prepares.py's `before` reads as unread, never as main's first run of the file."""
     if (commit := head_commit()) is not None:
         written(main_key(commit, python, place, held), token, json.dumps({"key": key}).encode(), tries=1)
 
@@ -632,7 +640,9 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
     kept among them, and each kept row's class and key by its file and group."""
     names, kept = [], {}
     for test in tests:
-        at_row, _, at = test.partition(session.KEPT_AT)
+        # Where its green run is kept follows the last mark: a row's group may hold one of its own (a process
+        # variant's, `varied`).
+        at_row, _, at = test.rpartition(session.KEPT_AT) if session.KEPT_AT in test else (test, "", "")
         name, _, group = at_row.partition(session.GROUP_AT)
         if not group:
             names.append(name)
@@ -697,13 +707,16 @@ def reused_classes(network: bool = False) -> list[str]:
 
 
 def reused(python: str, name: str, split: str, common: str, network: bool = False,
-           kept: tuple[str, str] | None = None, reading: Reading | None = None) -> dict | None:
+           kept: tuple[str, str] | None = None, reading: Reading | None = None,
+           named: dict[str, tuple[str, str]] | None = None) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on a class this host reuses
     (`reused_classes`), if it ran green there on exactly these inputs, `cached` with that run's key (armada
     counts it reused and times no file by it); else None. A file its plan kept
     (`kept`: its green run's class and key, `reusable`) reads that run, fresh here; any other, the record of
     the last run on these shared inputs: a key hashes them (`cache_key`), so no run on others, whose record
-    the last run's may be, can be fresh here, all from one reading of the inputs (`Reading`)."""
+    the last run's may be, can be fresh here, all from one reading of the inputs (`Reading`). The run it
+    reads is the commit's to name (`named_at_commit`) once its row is graded: `named` takes its row's name to
+    that run's class and key (`reused_rows`)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
@@ -716,12 +729,14 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
             found = None
         if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading) and standing(
                 found, current):
-            named_at_commit(python, place, kept[0], kept[1], token)
+            if named is not None:
+                named[found["row"]["name"]] = kept
             return {**found["row"], "cached": found["key"]}
     hit = green_record(python, name, split, common, token, reused_classes(network), reading, [])
     if hit is None:
         return None
-    named_at_commit(python, place, hit[1], hit[0]["key"], token)
+    if named is not None:
+        named[hit[0]["row"]["name"]] = (hit[1], hit[0]["key"])
     return {**hit[0]["row"], "cached": hit[0]["key"]}
 
 
@@ -771,13 +786,13 @@ def durations_record(path: Path = session.DURATIONS) -> dict[str, float]:
     return session.costs(path)
 
 
-def members(name: str, split: str, reading: Reading | None = None) -> list[str]:
+def members(name: str, split: str, reading: Reading | None = None, *, evenly: bool = False) -> list[str]:
     """The node ids split.py cuts into group `split` ("G/N") of test file `name`'s recorded tests but its
-    sites' (`own_tests`), by their seconds, a shared setup's together, once a reading (`Reading.cut`): by the
-    record the task's groups are cut by (`session.cut_record`), so a GPU tier's group, cut by its GPUs' own
-    seconds, is keyed by the tests that cut gives it, and its row stands for no other cut's group."""
+    sites' (`own_tests`), once a reading (`Reading.cut`): as the task's groups are cut, by their record's
+    seconds (`session.cut_record`: a GPU tier's, its GPUs'), a dry prepare's by their count where `evenly`
+    (`session.SPLIT_EVENLY`), so a row stands for no other cut's group."""
     index, count = (int(part) for part in split.split("/"))
-    return (Reading() if reading is None else reading).cut(name, count)[index - 1]
+    return (Reading() if reading is None else reading).cut(name, count, evenly=evenly)[index - 1]
 
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
@@ -1045,7 +1060,7 @@ def site_entries(python: str, marked: "Mapping[str, Mapping[str, Mark]]",
             mark = held[test]
             rates = {weighed: site_rate(python, name, test, mark, timings, weighed=weighed)
                      for weighed in (False, True)}
-            spans = cut_draws(mark, rates, target)
+            spans = costs.cut_draws(mark, rates, target)
             maps = []
             for start, stop in spans:
                 group = f"{test}.draws-{start}-{stop}"
@@ -1078,13 +1093,14 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
     map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is the whole
     suite with the cache off, whatever this environment says, each entry carrying it to its task."""
     cache = "off" if census else os.environ.get("DEW_TEST_CACHE") or "on"
-    # What every entry carries to its task (.armada.json's command): the cache's policy and the census.
-    stamped = {"cache": cache, "census": "1" if census else "0"}
+    # What every entry carries to its task (.armada.json's command): the cache's policy, the census, and
+    # main's commit, which a task's checkout cannot find (`mainline`).
+    stamped = {"cache": cache, "census": "1" if census else "0", "main": mainline() or ""}
     every = test_files()
     # Every file's check-1 sites its marks shard, refused where one site's map tasks outnumber what its
     # judges' job takes (`refused_sites`).
     shards = {name: held for name in every if (held := sites(name))}
-    refused_sites(shards)
+    costs.refused_sites(shards)
     # Every file's shared setups, read so a mark the plan cannot read refuses its file now
     # (`session.shared_setups`), not where a cut first reads it.
     for name in every:
@@ -1149,6 +1165,10 @@ def plan(target: float, timings: dict, census: bool = False, reach: dict | None 
         entries += [{**entry, "weight": entry["weight"] + (COLD_SECONDS if cache != "on" else 0.0),
                      **stamped}
                     for entry in site_entries(python, marked, found, timings, target, eager)]
+        # The GPU tier's files prepared dry on the floor Python's CPU (`prepare_entries`), beside its rows,
+        # apart from what reach and the census read.
+        if python == PYTHONS[0] and not census:
+            entries += prepares.entries(sys.modules[__name__], python, timings, target, cache, stamped)
     # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.
     rest = [] if census else [name for name in every if name not in NEWEST_FILES]
     collecting = collect_entries(rest, timings, target)
@@ -1205,6 +1225,14 @@ def stale_row(python: str, name: str, group: str, why: str) -> dict:
             **grading.red_as(grading.STALE, [])}
 
 
+def unbaselined(python: str, found: dict) -> dict:
+    """A dry prepare's green row whose baseline the CI store did not take (`baselined`), said stale: it
+    runs again rather than stand green with no baseline main's next prepare is held to."""
+    _, name, group = parsed_row(found["name"])
+    return stale_row(python, name, group,
+                     "its prepare's baseline was not written to the CI store; it runs again")
+
+
 def stale_cost(name: str, group: str, reading: Reading) -> float:
     """What a kept row of test file `name` (in `group`'s group) costs a task that runs it, its record not
     found: its tests' recorded seconds, its check-1 sites' aside, which run apart (`own_tests`; a group's,
@@ -1212,7 +1240,8 @@ def stale_cost(name: str, group: str, reading: Reading) -> float:
     a cold row; a file the record does not name, that alone."""
     reading.cut(name, 1)
     own = own_tests(name, (reading.durations or {}).get(name, {}))
-    nodes = members(name, cut, reading) if (cut := cut_of(group)) else list(own)
+    evenly = prepares.prepared_group(group, VARIED)
+    nodes = members(name, cut, reading, evenly=evenly) if (cut := cut_of(group)) else list(own)
     return sum(own.get(node, 0.0) for node in nodes) + COLD_SECONDS
 
 
@@ -1401,14 +1430,15 @@ def stages_file() -> Path:
 
 
 def reused_rows(python: str, tests: list[str], group: str, common: str, network: bool,
-                kept: Mapping[str, tuple[str, str]] | None = None) -> list[dict]:
+                kept: Mapping[str, tuple[str, str]] | None = None,
+                named: dict[str, tuple[str, str]] | None = None) -> list[dict]:
     """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), those
-    its plan kept read where it found them (`kept`), said. They are looked up before any test runs, from one
-    reading of the checkout (`Reading`)."""
+    its plan kept read where it found them (`kept`), said, each one's run (its class and key) in `named` by
+    its row's name. They are looked up before any test runs, from one reading of the checkout (`Reading`)."""
     kept = kept or {}
     reading = Reading()
     rows = [found for name in tests
-            if (found := reused(python, name, group, common, network, kept.get(name), reading))]
+            if (found := reused(python, name, group, common, network, kept.get(name), reading, named))]
     if rows:
         print(f"{len(rows)} files ran green on these inputs on {', '.join(reused_classes(network))}; "
               "their rows are reused")
@@ -1510,26 +1540,48 @@ def watched_pytest(command: list[str], environment: dict[str, str], deadline: fl
                                                               "artifacts": [str(kept.relative_to(root))]}
 
 
+def unrun(python: str, tests: list[str], group: str, site: re.Match[str] | None, cache: str, common: str,
+          network: bool, kept: Mapping[str, tuple[str, str]] | None,
+          judged: Callable[[list[dict]], list[dict]] | None, deadline: float) -> tuple[list[dict], list[str]]:
+    """`tested`'s rows it need not run, and the tests it must: a green row reused as the cache's policy allows
+    (never a check-1 site's map task, its draws its judge's), a kept row afforded within `deadline`
+    (`afforded`, its stale rows among them), graded by `judged` first. A reused row's run is named the
+    commit's (`named_at_commit`) only as its grade leaves it green, its baseline the cells it keeps then
+    (review: named before its grade, a reuse graded red had published its cells as main's)."""
+    began = time.monotonic()
+    named: dict[str, tuple[str, str]] = {}
+    rows = ([] if cache == "off" or (site is not None and site["start"] is not None)
+            else reused_rows(python, tests, group, common, network, kept, named))
+    tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
+    if kept:
+        tests, stale_rows = afforded(python, tests, group, kept, deadline - (time.monotonic() - began))
+        rows += stale_rows
+    rows = judged(rows) if judged else rows
+    if token := os.environ.get("DEW_XLA_CACHE_TOKEN"):
+        unnamed = {found["name"] for found in rows if found["name"] in named and found["exitCode"] == 0
+                   and not baselined(python, found["name"], named[found["name"]][0], token, found)}
+        for found in rows:
+            if found["name"] in named and found["exitCode"] == 0 and found["name"] not in unnamed:
+                named_at_commit(python, found["name"], *named[found["name"]], token)
+        rows = [unbaselined(python, found) if found["name"] in unnamed else found for found in rows]
+    return rows, tests
+
+
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, kept: Mapping[str, tuple[str, str]] | None = None, recorded: bool = True,
-           variant: str = "") -> int:
+           variant: str = "", judged: Callable[[list[dict]], list[dict]] | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`). A check-1
     site's map task (`session.SITE`) is never reused: its draws, among its artifacts, are what its judge
     reads. A run that is no test of its files (a GPU lane's prepare, `recorded` false) records no row. A
     process of the files under other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the
-    same cut of them, its rows and their records named apart (`varied`)."""
+    same cut of them, its rows and their records named apart (`varied`); `judged` grades its rows first."""
     began = time.monotonic()
     group = varied(split, variant)
     site = session.SITE.fullmatch(group)
-    rows = ([] if cache == "off" or (site is not None and site["start"] is not None)
-            else reused_rows(python, tests, group, common, network, kept))
-    tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
-    if kept:
-        tests, stale_rows = afforded(python, tests, group, kept, deadline - (time.monotonic() - began))
-        rows += stale_rows
+    rows, tests = unrun(python, tests, group, site, cache, common, network, kept, judged, deadline)
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
@@ -1543,7 +1595,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # SET_ASIDE); a site's map task (its artifacts its judge's draws) and a trace resume none, nor
     # does a run that records none (a prepare's: a test it prepared has not passed, and a test an earlier
     # attempt passed still prepares into this one's store).
-    resumes = recorded and site is None and coverage is None
+    resumes = recorded and site is None and coverage is None and not variant.startswith(prepares.PREPARE)
     done_before, cold_before, peak_before = (progress.resumed(tests, grading.owning) if resumes
                                              else ({}, set(), None))
     aside = out.with_name(f"{out.name}.set-aside.json")
@@ -1553,7 +1605,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         environment = session.pytest_environment({
             **environ, **site_environment(site), "DEW_EXECUTED_LOG": str(log), "PYTEST_DEBUG_TEMPROOT": root,
             "DEW_COLLECTED": str(collection), "DEW_UNRECORDED": str(unrecorded), "DEW_PYTEST_PID": str(pid),
-            "DEW_STACKS_READER": str(os.getpid()), **({progress.SET_ASIDE: str(aside)} if resumes else {})})
+            "DEW_STACKS_READER": str(os.getpid()), **({progress.SET_ASIDE: str(aside)} if resumes else {}),
+            **({session.SPLIT_EVENLY: "1"} if prepares.prepared_group(group, VARIED) else {})})
         if network:
             environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
         returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
@@ -1615,17 +1668,22 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      **({"peak": peak} if peak is not None else {}),
                      # A judge's, beside its pooling, what its map tasks' records say they paid
                      # (`site_costs`).
-                     "timings": {row(python, name, group if site else ""): seconds,
+                     "timings": {row(python, name, group if site or variant.startswith(prepares.PREPARE)
+                                     else ""): seconds,
                                  **(site_costs(python, name, site["test"]) if site and site["start"] is None
                                     else {})}, **cause, **asked(site),
                      **later_judged(site)})
+    ran = judged(ran) if judged else ran
     out.write_text(json.dumps({"rows": rows + ran}))
     if (recorded and coverage is None and not (environ and check1_wire().CENSUS in environ)
             and not done_before):
         # A traced run's rows, timed under tracing, are no rows to reuse, nor the census's, nor a resumed
         # one's, whose earlier attempt's opens no record holds, nor a prepare's, which ran no test to its end.
-        record(python, ran, log, common, network, opened,
-               set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), wrote)
+        unnamed = record(python, ran, log, common, network, opened,
+                         set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), wrote)
+        if unnamed:
+            ran = [unbaselined(python, found) if found["name"] in unnamed else found for found in ran]
+            out.write_text(json.dumps({"rows": rows + ran}))
     return 0
 
 
@@ -1717,7 +1775,7 @@ def drawn_whole(spans: Sequence[tuple[int, ...]], start: int, stop: int) -> bool
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
            opened: set[str] | None = None, unkeyed: Container[str] = (),
-           changed: Collection[str] = ()) -> None:
+           changed: Collection[str] = ()) -> set[str]:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
     they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
@@ -1725,10 +1783,13 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     row has none, so a later run never reuses an earlier green row of its file; nor has one that read a file
     the task's processes wrote (`changed`, `watched.changed`), whose key would hash the bytes they left, not
     those it read (row 2559). A check-1 site's judge keeps its map tasks' inputs with its own
-    (`site_inputs`). A row whose key keeps no inputs keeps what its run read (`read`, reach.py's)."""
+    (`site_inputs`). A row whose key keeps no inputs keeps what its run read (`read`, reach.py's). Returns
+    the green rows whose baseline the store did not take (`baselined`), which stand stale
+    (`unbaselined`)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
-        return
+        return set()
+    unnamed: set[str] = set()
     # Each file's record in the process's log (followed.py's `recorded`): none for a file it never reached.
     executed = followed.recorded(log)
     held = device_class(network)
@@ -1736,6 +1797,10 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         recorded = {read for ran in executed.values() for read in ran["depends"] or ()}
         opened = opened | native_inputs(opened, recorded)
     for row_ in rows:
+        # A green dry prepare's baseline, whatever of its record below is kept: its admission to reuse (a
+        # record written, a key, its epoch) is apart from main's baseline, which a later prepare is held to.
+        if not baselined(python, row_["name"], held, token, row_):
+            unnamed.add(row_["name"])
         name = parsed_row(row_["name"])[1]
         # A test node's row (`file::test`) keeps its file's record, the one its process's log holds.
         file = grading.owning(name)
@@ -1795,8 +1860,9 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
                 common, name, parsed_row(row_["name"])[2], ran["depends"])
             if ran_on is not None:
                 written(green_key(python, row_["name"], held, ran_on), token, body)
-            if key is not None:
+            if key is not None and row_["name"] not in unnamed:
                 named_at_commit(python, row_["name"], held, key, token)
+    return unnamed
 
 
 def gpu_tier(python: str) -> dict[str, list[str]]:
@@ -1910,12 +1976,25 @@ def borrowed_records(names: list[str], python: str, held: str, token: str,
         if names else {}
 
 
-VARIANTS = {"users": ("users_process", {"DEW_TEST_USERS_ARITHMETIC": "1"})}
-"""A GPU lane's processes of a file beside its own, by name: the mark of the tests one runs and the
-environment it runs under. XLA reads a process's flags once, so tests that must open under a user's flags
-(no deterministic ops, JAX's own matmul precision) are a process of their own: under its word the suite's
-conftest runs the marked GPU tests and skips the others, as without it it skips the marked ones, so both
-processes select and cut a file alike and each test runs in one."""
+def prepare_shared(python: str) -> str:
+    """What every dry prepare's row shares: every row's (`shared`) and the prepare's own recipe
+    (`prepares.RECIPE`), which runs beside what its tests record."""
+    digest = hashlib.sha256(shared(python).encode())
+    for path in prepares.RECIPE:
+        digest.update(path.encode() + Path(path).read_bytes())
+    return digest.hexdigest()
+
+
+def prepared_row(name: str) -> bool:
+    """Whether a verdict's row `name` is a dry prepare's (`dry_prepared`), no run of its file's tests."""
+    return ":" in name and prepares.prepared_group(parsed_row(name)[2], VARIED)
+
+
+def dry_prepared(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str) -> int:
+    """A task's dry prepares of GPU tier files on this CPU (prepares.py's `run`)."""
+    return prepares.run(sys.modules[__name__], python, tests, split, out, deadline, cache)
+
+
 def lane_units(python: str, tests: list[str], within: float | None = None) -> dict[str, tuple[str, str, str]]:
     """Each process a GPU lane runs for `tests`, by its name, as its file, its group and its variant: each
     test's own, and after it one for each of `VARIANTS` whose marked tests its file holds, as pytest collects
@@ -1968,17 +2047,8 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
 
     def prepared(name: str, verdict: Path) -> int:
         file, group, variant = units[name]
-        # What a process's own end may take past its deadline is kept back (its grace, its group's settling,
-        # its reader's last ten seconds); with none left, it is not started.
-        if (mine := left() - session.GRACE - SETTLE - 10.0) <= 0:
-            verdict.write_text(json.dumps({"rows": [{
-                "name": row(python, file, varied(group, variant)), "exitCode": 1, "seconds": 0.0, "tests": {},
-                "output": "not prepared: its lane's prepare had no time left for it"}]}))
-            return 0
-        return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
-                      {"JAX_PLATFORMS": "cpu", tier_wire().PREPARE: "1", "OMP_NUM_THREADS": threads,
-                       **(VARIANTS[variant][1] if variant else {}), tier_wire().UNIT: name},
-                      recorded=False, variant=variant)
+        return prepares.process(sys.modules[__name__], python, file, group, verdict, left(), unit=name,
+                                threads=threads, users=bool(variant), variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:
@@ -2208,10 +2278,11 @@ ARTIFACTS = "/armada/task/artifacts"
 """Where an armada task's files are kept for `armada map --artifacts`."""
 def coverage_items(target: float, timings: dict, scenarios: bool = False) -> list[str]:
     """The coverage pass's armada map items (`coverage_report.items`): the plan's tasks for the oldest Python,
-    but its collections, and a check-1 site's judge, which pools its map tasks' draws and has none to pool
-    here."""
+    but its collections, a check-1 site's judge, which pools its map tasks' draws and has none to pool here,
+    and a dry prepare, which runs no test of its file (`dry_prepared`)."""
     entries = [entry for entry in plan(target, timings)
-               if entry["python"] == PYTHONS[0] and entry["split"] != COLLECT and "after" not in entry]
+               if entry["python"] == PYTHONS[0] and entry["split"] != COLLECT and "after" not in entry
+               and not entry["tests"].startswith(prepares.TOKEN)]
     return coverage_report.items(entries, ARTIFACTS, scenarios)
 
 
@@ -2262,9 +2333,12 @@ def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> 
     target is reported). With `base` (main's durations record), only the tests it lacks: a new slow test
     (owner, 2026-10-28). A check-1 site's map task past the plan's bound on one (`cut_draws`: four
     targets) is reported whatever the record holds (its test is recorded whole): its mark gives a task too
-    many units, which fewer a task (per_task, conditioning_per_task) bring within it (row 3729: 1,366 s)."""
+    many units, which fewer a task (per_task, conditioning_per_task) bring within it (row 3729: 1,366 s). A
+    dry prepare's row (`dry_prepared`) times its tests' prepares, not their runs, and reports none."""
     found = []
     for row_ in verdict["rows"]:
+        if "name" in row_ and prepared_row(row_["name"]):
+            continue
         drawn = session.SITE.fullmatch(parsed_row(row_["name"])[2]) if "name" in row_ else None
         mapped = drawn is not None and drawn["start"] is not None
         most = target * costs.SITE_TARGETS if mapped else target
@@ -2321,7 +2395,8 @@ def main() -> int:
     if args.operation == "partition":
         nodes = partition.collected(line for listed in args.collected
                                     for line in listed.read_text().splitlines())
-        wrong = partition.compared(nodes, json.loads(args.verdict.read_text())["rows"], PYTHONS[0], SKIPPED)
+        wrong = partition.compared(nodes, [found for found in json.loads(args.verdict.read_text())["rows"]
+                                           if not prepared_row(found["name"])], PYTHONS[0], SKIPPED)
         print(f"{sum(map(len, nodes.values()))} tests of {len(nodes)} files collected: "
               + ("each in one row" if not wrong else f"{len(wrong)} lines of rows that are not their tests"),
               *wrong, sep="\n")
@@ -2383,8 +2458,13 @@ def main() -> int:
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
-    return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
-                coverage=args.coverage, census=args.census == "1")
+    # A dry prepare's task, or its row run again by its file and its group, as the land queue runs one.
+    with given_mainline(args.main):
+        if args.tests.startswith(prepares.TOKEN) or prepares.prepared_group(args.split, VARIED):
+            return dry_prepared(args.python, args.tests.split(), args.split, args.out, args.deadline,
+                                args.cache)
+        return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
+                    coverage=args.coverage, census=args.census == "1")
 
 
 def pinned(argv: list[str]) -> None:

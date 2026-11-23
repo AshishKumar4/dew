@@ -29,8 +29,10 @@ def loaded(tmp_path: Path, monkeypatch):
 
 
 APART = ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE",
-         "ARMADA_ARTIFACTS", "ARMADA_RESUME")
-"""What CI's environment names that these tests' runs of its tools must not see (`apart`)."""
+         "ARMADA_ARTIFACTS", "ARMADA_RESUME", "DEW_UNRECORDED", "DEW_SPLIT_EVENLY")
+"""What CI's environment names that these tests' runs of its tools must not see (`apart`): the task's own
+test cache, artifacts and recalled progress, and its split task's report of the tests its record lacks and
+its cut (split.py), which a nested run must neither write nor take."""
 
 
 def apart(monkeypatch) -> None:

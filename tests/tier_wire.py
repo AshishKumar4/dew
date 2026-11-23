@@ -13,6 +13,20 @@ PREPARE = "DEW_TIER_PREPARE"
 """Set to 1, a flow prepares rather than runs: on the node's CPU, before its GPU run."""
 TRUTHS = "DEW_TIER_TRUTHS"
 """The directory a part's prepare writes its flows' programs and their truths to, which its run reads."""
+UNPREPARED = "unprepared.json"
+"""A test's record, in its store's directory of the test (`<TRUTHS>/sites/<digest>/`), that it ran
+unprepared (truths_ahead.py's `unprepared`): `{"test", "where", "error", "reasons"}`, its first reason's
+where and why and every reason it gave, each once (a site, an arm, a cell: their count shows a tier
+drifting from its prepares), the GPU tier's list of unprepared tests read from these alone (a ledger row
+each, the tier's), and a dry prepare's (tools/armada/ci.py's `dry_prepared`)."""
+DEFERRED = "deferred.json"
+"""A test's record, in its store's directory of the test, of a GPU flow's cell its prepare deferred to its
+run (tests/gpu_flow.py's `_deferred`), as `UNPREPARED`'s, which its run serves from the store and names
+unprepared, and a dry prepare reads as unprepared (tools/armada/ci.py's `dry_prepared`); a cell that declares
+it compiles at its run (`Cell.at_run`) is recorded neither."""
+TOPOLOGY = "DEW_NODE_TOPOLOGY"
+"""The node's GPUs' serialized topology (a GPU node's session hands a prepare its node's, a dry prepare
+one compile-only GPU's, tools/armada/ci.py's `dry_prepared`): the GPU a flow's programs are compiled for."""
 UNIT = "DEW_TIER_UNIT"
 """The name the lane runs a prepare's unit under (a file, `<file>#G/N` for a group, or a variant's process
 of either), set in the prepare's environment: the unit's flows' needs are filed under it (`needs_file`)."""

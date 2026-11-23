@@ -5,12 +5,17 @@ green run recorded before it stands again (`epoch`). What a record holds and whe
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import importlib.util
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -80,6 +85,55 @@ def main_key(commit: str, python: str, row_name: str, held: str) -> str:
     commit, a train's tip that published, names each of its rows whatever later runs of other trees re-record
     them (a lane's, on its branch: Main, 2026-11-14)."""
     return f"{CACHE_PREFIX}-main/{commit}/{python}/{row_place(row_name, held)}"
+
+
+MAINLINE = "DEW_MAINLINE"
+"""Where a task finds main's commit, its plan's (`mainline`, the task's --main): a task's checkout on armada
+holds no origin/main, so its own merge-base names none."""
+
+
+def mainline() -> str | None:
+    """The commit of main this checkout descends from (its merge-base with origin/main: a train's base, a
+    lane's branch point), whose own runs' records a lookup finds behind a later run of another tree
+    (`green_record`), and whose baselines a dry prepare is held to (prepares.py's `before`): a task's, its
+    plan's (`MAINLINE`), a full commit id or none (never a name a baseline is listed under); else the
+    checkout's merge-base, None where it has no origin/main."""
+    if given := os.environ.get(MAINLINE):
+        return given if re.fullmatch(r"[0-9a-f]{40}", given) else None
+    return merge_base()
+
+
+@functools.cache
+def merge_base() -> str | None:
+    """This checkout's merge-base with origin/main (`mainline`), None where it has none, read once."""
+    found = subprocess.run(["git", "merge-base", "HEAD", "origin/main"], capture_output=True, text=True)
+    return (found.stdout.strip() or None) if found.returncode == 0 else None
+
+
+@contextlib.contextmanager
+def given_mainline(commit: str | None) -> Iterator[None]:
+    """Main's commit a task's plan gave it (`--main`; "" for none, which leaves its checkout's own), as
+    `mainline` reads it while the task runs, and as it was again after; None, as its caller's environment
+    gave it (the land queue's regrades, DEW_MAINLINE)."""
+    if commit is None:
+        yield
+        return
+    before = os.environ.get(MAINLINE)
+    os.environ[MAINLINE] = commit
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop(MAINLINE, None)
+        else:
+            os.environ[MAINLINE] = before
+
+
+def baseline_key(commit: str, python: str, row_name: str, held: str) -> str:
+    """Where commit `commit`'s own green run of dry prepare row `row_name` on class `held` keeps the cells it
+    left unprepared (`named_at_commit`): a head's prepare is held to them (prepares.py's `before`). Written
+    only by a green run, never over by a red one, as the green record a red run of the same inputs is."""
+    return f"{CACHE_PREFIX}-baseline/{commit}/{python}/{row_place(row_name, held)}"
 
 
 def epoch_key(python: str, row_name: str, held: str, common: str) -> str:
