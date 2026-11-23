@@ -76,7 +76,7 @@ class PassWeights:
             weights = self.stated
         return None if all(weight == 0.0 for weight in weights[:-1]) else weights
 
-    def ran(self, ran: Sequence[jax.Array]) -> tuple[jax.Array, ...]:
+    def ran(self, ran: Sequence[jax.Array | bool]) -> tuple[jax.Array, ...]:
         """Each pass's weight where a count given per call ran some of a loop's passes (`ran`, whether each
         pass before the last ran, `dew.nn.protocols.ExitPasses.ran`; the last always runs): "mean" weighs
         the passes that ran alike, `1/c` over the `c` of them, and a skipped pass none, as a loop of `c`
@@ -111,7 +111,7 @@ def exiting[M](model: M) -> M:
     return passing
 
 
-def weighed(weights: Sequence[float], terms: Sequence[jax.Array]) -> jax.Array:
+def weighed(weights: Sequence[float | jax.Array], terms: Sequence[jax.Array]) -> jax.Array:
     """`Σ_k weights[k] · terms[k]` in pass order, each term in its own dtype: the passes' terms of one loss,
     each a pass's per-token or per-question loss, combined before the loss's mean, whose mass every pass
     shares."""

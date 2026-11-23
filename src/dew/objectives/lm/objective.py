@@ -514,7 +514,7 @@ class Scores(NamedTuple):
     inspected: dict | None = None
     moved: Mapping | None = None
     exits: tuple[tuple[jax.Array, ...], tuple[jax.Array, ...], tuple[jax.Array, ...] | None,
-                 tuple[jax.Array, ...]] | None = None
+                 tuple[jax.Array | bool, ...]] | None = None
 
 
 def _refuse_stacked(collections: Sequence[str], *, depths: bool, layers: Sequence[int], routes,
@@ -778,9 +778,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         (`_reads_exits`), the last's alone otherwise."""
         return model.loop.steps if self._reads_exits(model) else 1
 
-    def _weights_over(self, model) -> tuple[float, ...]:
-        """Each pass's weight in the loss over `model`'s passes (`PassWeights.over`), where it weighs them."""
+    def _weights_over(self, model, ran: Sequence[jax.Array | bool] = ()) -> Sequence[float | jax.Array]:
+        """Each pass's weight in the loss over `model`'s passes (`PassWeights.over`), where it weighs them; where
+        a count given per call ran some of them (`ran` traced), over those that ran (`PassWeights.ran`)."""
         assert self.pass_weights is not None
+        if not all(isinstance(each, bool) for each in ran):
+            return self.pass_weights.ran(ran)
         weights = self.pass_weights.over(model.loop.steps)
         assert weights is not None, "the loss weighs a pass before the last"
         return weights
@@ -1796,10 +1799,7 @@ class LMObjective(TokenScorer):
         if passes is not None and self.exit_entropy is None:
             # Each pass's cross entropy at its weight in the last pass's place, over the same counted targets:
             # where a count given per call ran some of the passes, over those alone (`PassWeights.ran`).
-            ran = passes[3]
-            counted = not all(isinstance(each, bool) for each in ran)
-            stated = self.pass_weights.ran(ran) if counted else self._weights_over(self.model)
-            term = weighed(stated, passes[0])
+            term = weighed(self._weights_over(self.model, passes[3]), passes[0])
             units = shares(term, weights)
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
         elif passes is not None and self.exit_entropy is not None:

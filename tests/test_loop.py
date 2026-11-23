@@ -991,6 +991,12 @@ def test_a_count_of_passes_given_per_call_sows_its_statistics_placed_as_its_rows
     assert all(bool(jnp.any(each != 0)) for each in maxima[:2])
 
 
+def _counted_maxima(looped, tree, ids, count):
+    """`looped`'s first looped layer's attention maxima at each pass, given `count` passes per call."""
+    sown = looped.apply(tree, ids, mutable=[QK], loop_passes=count)[1][QK]
+    return tuple(sown['layers_1']['self_attn']['max_logits'])
+
+
 @pytest.mark.mesh
 def test_a_count_of_passes_given_per_call_sows_its_statistics_typed_as_its_rows_are_under_a_manual_axis(rng):
     """A looped stack given a count of its passes per call inside `shard_map`, its rows split over a manual
@@ -1004,16 +1010,13 @@ def test_a_count_of_passes_given_per_call_sows_its_statistics_typed_as_its_rows_
     ids = tokens(rng, rows=4)
     variables = nn.unbox(looped.init(rng, ids))
 
-    def maxima(tree, ids, count):
-        sown = looped.apply(tree, ids, mutable=[QK], loop_passes=count)[1][QK]
-        return tuple(sown['layers_1']['self_attn']['max_logits'])
-
     with jax.set_mesh(mesh):
         replicated = NamedSharding(mesh, PartitionSpec())
         tree = jax.tree.map(lambda leaf: jax.device_put(leaf, replicated), variables)
         placed = jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data")))
         rows, whole = PartitionSpec("data"), PartitionSpec()
-        held = jax.jit(jax.shard_map(maxima, in_specs=(whole, rows, whole), out_specs=rows))(
+        counted = functools.partial(_counted_maxima, looped)
+        held = jax.jit(jax.shard_map(counted, in_specs=(whole, rows, whole), out_specs=rows))(
             tree, placed, jnp.int32(2))
     assert len(held) == 3 and not bool(jnp.any(held[2]))
     assert all(bool(jnp.any(each != 0)) for each in held[:2])
@@ -1035,16 +1038,13 @@ def test_a_count_of_passes_given_per_call_sows_its_statistics_typed_under_a_manu
     ids = tokens(rng, rows=8)
     variables = nn.unbox(looped.init(rng, ids))
 
-    def maxima(tree, ids, count):
-        sown = looped.apply(tree, ids, mutable=[QK], loop_passes=count)[1][QK]
-        return tuple(sown['layers_1']['self_attn']['max_logits'])
-
     with jax.set_mesh(mesh):
         replicated = NamedSharding(mesh, PartitionSpec())
         tree = jax.tree.map(lambda leaf: jax.device_put(leaf, replicated), variables)
         placed = jax.device_put(ids, NamedSharding(mesh, PartitionSpec(("data", "rows"))))
         rows, whole = PartitionSpec("data"), PartitionSpec()
-        held = jax.jit(jax.shard_map(maxima, in_specs=(whole, rows, whole), out_specs=rows,
+        counted = functools.partial(_counted_maxima, looped)
+        held = jax.jit(jax.shard_map(counted, in_specs=(whole, rows, whole), out_specs=rows,
                                      axis_names={"data"}))(tree, placed, jnp.int32(2))
     assert len(held) == 3 and not bool(jnp.any(held[2]))
     assert all(bool(jnp.any(each != 0)) for each in held[:2])
