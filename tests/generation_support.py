@@ -196,8 +196,7 @@ PRODUCTION = ("qwen3.5-27b-gdn", "kimi-linear-kda")
 """The geometries whose 16-bit calls the recurrence resource gate requires to derive tiles on every family,
 Dew's production cells (tests/test_recurrence_mosaic.py's `production_refusals`)."""
 
-FAST_BACKWARD_REFUSED = {("kimi-linear-kda", "sm86"): 10153, ("kimi-linear-kda", "sm89"): 10153,
-                         ("kimi-linear-kda", "sm120"): 10153, ("qwen3.5-27b-gdn", "sm120"): 10153}
+FAST_BACKWARD_REFUSED = {("qwen3.5-27b-gdn", "sm120"): 10153}
 """The production geometries' 16-bit training whose fast backward does not hold at its derived tiles on a
 target (`template.backward_holds`), its gradient the port's or the portable math's there, each by the open
 row tracking it. The gate fails a refusal not declared here and a declared one that holds again, so a

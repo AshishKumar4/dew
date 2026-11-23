@@ -239,10 +239,11 @@ def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
 
     @pl.loop(0, walked)
     def _(step):
-        # Each view's index map evaluated once at the step (base review ae8a242ed F5), its view fixed there.
-        fixed = {name: view if not isinstance(view, tuple) else
+        # Each view its rings load, its index map evaluated once at the step (base review ae8a242ed F5), its
+        # view fixed there; a view whose ring another warp loads is not evaluated here (row 8700).
+        fixed = {name: view if not isinstance(view := views[name], tuple) else
                  (view[0], functools.partial(lambda indices, _: indices, view[1](step)))
-                 for name, view in views.items()}
+                 for name in rings}
 
         def ahead(name, ring):
             view = fixed[name]

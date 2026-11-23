@@ -209,10 +209,10 @@ unresolved within 40 seeds, its extra seeds taking 784 and 934 s."""
 
 def case_hooks(case: str) -> recurrence.Hooks:
     """Case `case`'s rule: the gated delta rule with a decay a head or a key dimension (Kimi delta
-    attention's), its queries scaled by `Dk^-1/2`."""
+    attention's), its queries scaled by `Dk^-1/2`, its write gates and unit queries declared as `draw`'s."""
     per_key = SHAPES[case].get('per_key')
     return recurrence.Hooks(decay='vector' if per_key else 'scalar', scale=SHAPES[case]['key_width'] ** -0.5,
-                            write_bound=1.0)
+                            write_bound=1.0, unit_queries=True)
 
 
 def geometry(case: str) -> dict:
@@ -574,7 +574,7 @@ def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(ta
         jax.ShapeDtypeStruct((rows, length, value_heads, value_width), jnp.bfloat16),
         jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.float32),
         jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
-    hooks = recurrence.Hooks(decay='vector', scale=width ** -0.5, write_bound=1.0)
+    hooks = recurrence.Hooks(decay='vector', scale=width ** -0.5, write_bound=1.0, unit_queries=True)
 
     def rule(*given):
         return chunk_on('mosaic_gpu', hooks, Chunk(*given[:3], log_decay=given[3], beta=given[4]))
@@ -1683,8 +1683,8 @@ def test_a_launchs_call_and_its_gradients_product_are_two_launches_in_either_ord
     assert digests[False] != digests[True]
     launches = {reverse: report.traced(found) for reverse, found in digests.items()}
     assert {reverse: launch.reverse for reverse, launch in launches.items()} == {False: False, True: True}
-    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse, launch.provenance)
-            for launch in launches.values()}
+    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse, launch.provenance,
+                                generation.gpu_target().generation) for launch in launches.values()}
     assert len(keys) == 2 or keys == {None}, keys
 
 
@@ -2197,8 +2197,9 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
     found = report._misses_of([dataclasses.replace(binary, spilled=8)])
     report._held(found, programs[1])
     (identity, _), _, refused = found[0]
-    keys = [report._verdict_key(identity, rung, refused.reverse, refused.provenance) for rung in rungs]
-    verdicts = [tuning.stored_verdict(report.verdict_target(device), key) for key in keys]
+    where = report.verdict_target(device)
+    keys = [report._verdict_key(identity, rung, refused.reverse, refused.provenance, where) for rung in rungs]
+    verdicts = [tuning.stored_verdict(where, key) for key in keys]
 print(json.dumps({"stored": [v is not None for v in verdicts],
                   "refused": [v is not None and any(b.refused for _, b in v.values()) for v in verdicts]}))
 """
@@ -2433,7 +2434,7 @@ def _dealt(units: list, tasks: int, task: int) -> list:
     return [each for name in names for each in parts[int(name)]]
 
 
-IDENTITY_TASKS = {'sm90': 19, 'sm100': 20, 'sm80': 3, 'sm86': 2, 'sm89': 2, 'sm120': 2}
+IDENTITY_TASKS = {'sm90': 19, 'sm100': 20, 'sm80': 3, 'sm86': 3, 'sm89': 3, 'sm120': 2}
 """The shards a target's identity units are dealt among (`_dealt`): only how the work is split, every unit
 dealt to some shard whatever the count, and the count a function of the code alone, so a shard's units are its
 id's at one revision whatever a run's timings (row 7254: a count from the durations record moved each id's

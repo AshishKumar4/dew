@@ -203,7 +203,7 @@ class RouterProbe:
         def scores(params, tokens):
             routing = objective.token_scores(params, tokens, routing=True).routing
             loads, entropies = [], []
-            for _, (probs, indices) in router_scores(routing):
+            for _, (probs, indices, _) in router_scores(routing):
                 loads.append(jnp.bincount(indices.ravel(), length=probs.shape[-1]) / indices.size)
                 p = probs.astype(jnp.float32)
                 entropies.append(-jnp.mean(jnp.sum(p * jnp.log(jnp.maximum(p, 1e-30)), axis=-1)))

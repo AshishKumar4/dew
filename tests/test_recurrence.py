@@ -526,3 +526,11 @@ def test_the_gated_delta_nets_forward_lowers_for_an_h100_with_x64_on():
         lowered_for(forward, operands, 'sm90')
     assert ('gated_delta_rule', 'mosaic_gpu') in {(route.choice, route.kernel) for route in routes}, routes
 
+
+@pytest.mark.parametrize('bound', [0.0, 5.0, float('nan'), float('inf'), -float('inf')])
+def test_a_misstated_decay_bound_is_refused(bound):
+    """A decay bound (`Hooks.decay_bound`) that is no least log decay a token, zero, positive, NaN or
+    infinite: a ValueError, so a misstated bound never reads as the proof a decay a key dimension's rounded
+    prefix takes (row 12067)."""
+    with pytest.raises(ValueError):
+        recurrence.Hooks(decay='vector', decay_bound=bound)

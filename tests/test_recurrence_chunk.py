@@ -2431,7 +2431,7 @@ def test_a_turned_gradients_overflowed_term_reaches_no_later_tokens_sum():
     """Two tokens, no turn, decay or write, a memory entering of `(0, 2^126)` read by the first token's query
     `(1, 0)` under its output's cotangent 4 alone: the first token's turn gradient overflows (`2^128`), and
     the second's, which no term of the first reaches, is exactly zero, as the scan of its suffix keeps it
-    (`recurrence_algebra.suffix_sums(scanned=True)`), where a triangle's dot multiplied the first token's
+    (`recurrence_algebra.suffix_sums`), where a triangle's dot multiplied the first token's
     infinity by zero, NaN (rows 7969 and 7975's head review)."""
     q = jnp.zeros((1, 2, 1, 2), jnp.float32).at[0, 0, 0, 0].set(1.0)
     k = jnp.zeros((1, 2, 1, 2), jnp.float32)

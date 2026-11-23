@@ -248,12 +248,11 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
 
     @functools.cached_property
     def _projection_shapes(self) -> tuple[tuple[int, int], ...]:
-        """Each feature pair's projection, `[student, teacher]` widths, as `init` makes them (from an
-        abstract init): none where the pair's widths agree."""
+        """Each feature pair's projection, `[student, teacher]` widths, as `init` makes them (its one traced
+        draw, `drawn_shapes`): none where the pair's widths agree."""
         if not self.features:
             return ()
-        tree = jax.eval_shape(self.initializer, jax.random.key(0))
-        return tuple(leaf.shape for leaf in tree["params"].get(PROJECTIONS, {}).values())
+        return tuple(leaf.shape for leaf in self.drawn_shapes()["params"].get(PROJECTIONS, {}).values())
 
     def run_tokenizer(self) -> Tokenizer | None:
         """The student's tokenizer, whose record a saved distillation loads as."""

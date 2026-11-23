@@ -124,7 +124,7 @@ def objective(model, tokens):
         lm = -jnp.mean(jnp.take_along_axis(logp, tokens[:, 1:, None], axis=-1))
         routing = sown["router"]
         switch = sum(global_router_loss(router_moments(s, i, {}), 1.0)
-                     for _, (s, i) in router_scores(routing))
+                     for _, (s, i, _) in router_scores(routing))
         z = sum(term.total / term.mass for term in router_z_terms(routing, 1.0, {}))
         aux = switch + 0.1 * z
         return lm + COEF * aux, (logits, lm, aux)
