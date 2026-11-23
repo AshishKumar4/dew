@@ -1018,5 +1018,6 @@ def test_an_fp8_weight_product_holds_every_order(edge):
         return jax.lax.dot(rows.astype(jnp.bfloat16), decoded, preferred_element_type=jnp.float32)
 
     without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
-    assert_contract(product, (x,), (dx,), cotangent, f"fp8 weight product {edge}",
-                    truth_fn=plain, plain_fn=plain, without=without)
+    with generation.assumed("sm90"):
+        assert_contract(product, (x,), (dx,), cotangent, f"fp8 weight product {edge}",
+                        truth_fn=plain, plain_fn=plain, without=without)
