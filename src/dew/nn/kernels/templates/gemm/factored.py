@@ -111,7 +111,7 @@ class _Transpose:
             # vary over that the rows do not, the operands', from types alone.
             before = self.alone(ran, cotangent, scale)
             excess = tuple(sorted(self.operand_axes(ran) - self.held))
-            rescued = self.moved(cotangent, scale, ran, routed, before, excess)
+            rescued = self.moved(cotangent, scale, ran, routed, before, excess, plain)
             # A product of a cotangent or factor not finite pulled back as IEEE's, as the plain transpose's.
             special = ~jnp.isfinite(cotangent) | ~jnp.isfinite(jnp.broadcast_to(scale, cotangent.shape))
             ieee = self.summed(*self.pulled(jnp.where(special, cotangent * scale, 0.0), ran))
@@ -122,7 +122,7 @@ class _Transpose:
         # the plain transpose summed over its axes.
         return jax.lax.cond(jnp.all(jnp.isfinite(plain)), lambda: plain, moved)
 
-    def moved(self, cotangent, scale, ran, routed, before, excess):
+    def moved(self, cotangent, scale, ran, routed, before, excess, plain):
         """The banded rescue (`factored`): every product `cotangent * scale` from its significands and
         binades, each band of it moved by its row's (token's) power to fp32's middle and pulled back wide, a
         chunk of the depth at a time, and every band's rows summed into their segments (tokens, gathered;
@@ -186,10 +186,9 @@ class _Transpose:
             return jax.lax.dynamic_update_slice_in_dim(out, varying_like(summed, out), at * chunk, axis=-1)
 
         near_typed = jax.lax.psum(cotangent, before) if before else cotangent
-        # The rows' gradient, typed as the rows are: each chunk's sum varies over their axes at most.
-        out = jnp.zeros(self.shape, jnp.float32)
-        held = tuple(sorted(self.held))
-        out = jax.lax.pcast(out, held, to="varying") if held else out
+        # The rows' gradient, typed as the plain transpose's is (its devices' sums taken, as each chunk's
+        # are), so the loop's carry and the branch it returns from keep its type.
+        out = varying_like(jnp.zeros(self.shape, jnp.float32), plain)
         return jax.lax.fori_loop(0, depth // chunk, pulled_chunk, out)
 
     def tangent(self, ran, routed, primals, tangents):
