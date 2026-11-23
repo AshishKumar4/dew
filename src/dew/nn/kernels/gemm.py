@@ -48,6 +48,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import bits
+from dew.nn import float_bits
 from dew.nn.derivatives import (
     KernelGlue,
     contracted,
@@ -71,7 +72,14 @@ from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import scattered, tiling
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
-from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
+from dew.nn.precision import (
+    accumulated,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    power2,
+    twice_scaled,
+)
 from dew.nn.programs import called, read_by
 from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
 
@@ -908,12 +916,13 @@ def _interpreted(product: Callable, interpret_on_cpu: bool, *operands) -> jax.Ar
 def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array) -> jax.Array:
     """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows, each output
     row its own input row's (no gather), and `factor` a packed matrix's fp32 scales broadcast against its
-    output (`formats.fp8_factor`). A factor every column of a row shares (a tensor's scale, or a group's
-    under a grouped call) is applied after the transpose's sum, as it is after the forward's: the
-    cotangent's products with the codes cancel first and the factor rounds once, so a scale of 2**126 under
-    cotangents that cancel pulls back 0, not inf - inf (ledger 1464), and the transpose overflows only where
-    its result does. A factor of each column, which the transpose sums over, multiplies the cotangent first,
-    as the plain product's transpose does. A checked `shard_map`'s devices sum their partials."""
+    output (`formats.fp8_factor`). Its transpose is the plain one, the cotangent times its factor through
+    `run`'s pullback, but for a factor past 1 that every column of a row shares (a tensor's scale, a group's
+    under a grouped call): its power of two leaves the cotangent's product (`precision.power2`) and joins
+    after the pullback's sum, so a scale of 2**126 under cotangents that cancel pulls back 0, not inf - inf
+    (ledger 1464), each value otherwise the plain transpose's, rounded where it rounds; a replicated factor
+    joins after a checked `shard_map`'s devices sum their partials. A factor of each column, which the
+    transpose sums over, stays with the cotangent, as the plain transpose has it."""
     if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
         return run(rows.astype(jnp.bfloat16), *operands) * factor
     shape, dtype = rows.shape, rows.dtype
@@ -924,16 +933,38 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
         scale, ran = residuals
         return run(moving.astype(jnp.bfloat16), *ran) * scale
 
+    def pulled(near, ran):
+        # The pullback at zeros typed as the rows are: placed, and varying as the cotangent's partials do.
+        at = varying_like(jnp.zeros(shape, jnp.bfloat16, out_sharding=placed), near, *jax.tree.leaves(ran))
+        (partial,) = jax.vjp(lambda each: run(each, *ran), at)[1](near)
+        partial = partial.astype(jnp.float32)
+        return partial, tuple(sorted(jax.typeof(partial).mat.varying - held))
+
+    @jax.custom_jvp
+    def transposed(cotangent, scale, ran):
+        # A row's factor past 1 as its significand and its power of two (a scale of a row, `[rows, 1]`, or of
+        # all, `[1]` or `[]`, broadcasting against the rows' gradient alike); at most 1, itself and none.
+        binade = float_bits.binade_of(scale)
+        power = jnp.where((jnp.abs(scale) > 1) & (binade < 128), binade, 0)
+        partial, excess = pulled(cotangent * power2(scale, -power), ran)
+        if excess and not jax.typeof(power).mat.varying & set(excess):
+            # Every device's partial at the one power the factor shares, summed, then moved.
+            return power2(jax.lax.psum(partial, excess), power)
+        partial = power2(partial, power)
+        return jax.lax.psum(partial, excess) if excess else partial
+
+    @transposed.defjvp
+    def _transposed_tangent(primals, tangents):
+        # Its derivatives the plain transpose's, `cotangent * scale` pulled back, which a higher order reads:
+        # its moved power is the value's alone.
+        cotangent, scale, ran = primals
+        d_cotangent, d_scale, _ = tangents
+        partial, excess = pulled(d_cotangent * scale + cotangent * d_scale, ran)
+        return transposed(cotangent, scale, ran), jax.lax.psum(partial, excess) if excess else partial
+
     def pullback(residuals, cotangent):
         scale, ran = residuals
-        c = cotangent.astype(jnp.float32)
-        # The pullback at zeros typed as the rows are: placed, and varying as the cotangent's partials do.
-        at = varying_like(jnp.zeros(shape, jnp.bfloat16, out_sharding=placed), c, *jax.tree.leaves(ran))
-        (partial,) = jax.vjp(lambda each: run(each, *ran), at)[1](c)
-        # A scale of a row (`[rows, 1]`) or of all (`[1]`, `[]`) broadcasts against the rows' gradient alike.
-        partial = partial.astype(jnp.float32) * scale.astype(jnp.float32)
-        excess = tuple(sorted(jax.typeof(partial).mat.varying - held))
-        return (jax.lax.psum(partial, excess) if excess else partial).astype(dtype)
+        return transposed(cotangent.astype(jnp.float32), scale.astype(jnp.float32), ran).astype(dtype)
 
     return generation.linear_map(apply, pullback, (factor, operands), rows)
 
