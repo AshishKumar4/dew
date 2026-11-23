@@ -625,19 +625,25 @@ def test_a_copy_into_a_rings_slot_waits_as_the_ring_hides_it():
 
 
 def test_a_copy_one_warpgroup_issues_waits_in_the_warpgroup_that_reads_it():
-    """A tile copy a producer warpgroup issues onto one of a ring's barriers, which the consumer warpgroup
-    waits on: the launch's path waits for the copy as the ring's three stages hide it, where the consumer
-    read the wait as another warpgroup's arrival, one barrier round trip, and the copy waited on no path (row
-    4123, the pricing head's review: a GH200's recurrence reverse priced at 0.29 of its time, its producer's
-    copies on none of its paths, M-FS-64)."""
+    """A tile copy a producer warpgroup issues onto one of a ring's barriers each trip of a loop, which the
+    consumer warpgroup waits on: the launch's path waits for the copy as the ring's three stages hide it,
+    where the consumer read the wait as another warpgroup's arrival, one barrier round trip, and the copy
+    waited on no path (row 4123, the pricing head's review: a GH200's recurrence reverse priced at 0.29 of its
+    time, its producer's copies on none of its paths, M-FS-64)."""
     def split(out_gmem, tiles, ready):
-        @pl.when(lax.axis_index("wg") == 1)
-        def _():
-            plgpu.copy_gmem_to_smem(out_gmem, tiles.at[1], ready.at[1])
+        def trip(step):
+            @pl.when(lax.axis_index("wg") == 1)
+            def _():
+                plgpu.copy_gmem_to_smem(out_gmem, tiles.at[1], ready.at[1])
 
-        @pl.when(lax.axis_index("wg") == 0)
-        def _():
-            plgpu.barrier_wait(ready.at[1])
+            @pl.when(lax.axis_index("wg") == 0)
+            def _():
+                plgpu.barrier_wait(ready.at[1])
+
+            return step + 1
+
+        # Trips of a loop the program's walk runs (a while loop's, as a walk's own), the copy one trip's.
+        lax.while_loop(lambda step: step < 4, trip, 0)
 
     kernel = plgpu.kernel(split, out_type=_ROW, num_threads=2, thread_name="wg",
                           scratch_types=[plgpu.SMEM((3, 128), jnp.float32), plgpu.Barrier(num_barriers=3)])
