@@ -32,7 +32,6 @@ from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_launch
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_launch, dq_sums
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_launch
 from dew.nn.kernels.templates.attention_mosaic_program import (
-    BackwardRegisters,
     BackwardTiles,
     _columns,
     _Program,
@@ -42,6 +41,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     hook_reduces,
     score_places,
 )
+from dew.nn.kernels.templates.attention_mosaic_registers import BackwardRegisters
 from dew.nn.kernels.templates.attention_mosaic_scores import _Backward
 
 

@@ -13,7 +13,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import launches, tuning
+from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, stacked, stores, swizzling
 from dew.nn.kernels.templates.attention_mosaic_fused import (
     _statistics,
@@ -44,7 +44,8 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
 
 
 def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
-                      reduced: int = 0, streamed: int | None = None) -> tuple[list, dict]:
+                      reduced: int = 0, streamed: int | None = None,
+                      target: generation.GpuTarget | None = None) -> tuple[list, dict]:
     """The shared-keys launch's allocations as `Family.scoped` takes them, in `_coop_launch`'s order: the
     program's resident keys and values; a tile's weights and score cotangents, every consumer's share of
     the keys whole rows of their swizzle, the widest whose row divides it and the products' contractions
@@ -66,7 +67,7 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
         scoped.append(family.staged_memory((2, consumers, block_q), jnp.float32))
     if streamed is None:
         streamed = streamed_statistics(family, config, width, dtype, stages, reduced=reduced,
-                                       allocations_of=_coop_allocations, anchored=False)
+                                       allocations_of=_coop_allocations, anchored=False, target=target)
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype),
               **{name: ((block_q,), STATISTICS[name])
                  for name in streamed_statistics_order(streamed, anchored=False)}}
@@ -194,7 +195,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         key_head = lax.div(head, heads // kv_heads)
         statistics, rows_of = _statistics(family, stat_refs, row, head, block_q, streamed=stats_streamed,
                                           anchored=False)
-        views = {**_views_of(family, {"queries": q_ref, "douts": do_ref}, row, head), **statistics}
+        views = {**_views_of(family, {"queries": q_ref, "douts": do_ref}, row, head, heads=heads),
+                 **statistics}
         streams = family.opened(streams, views)
         k_first = family.program_index("k_tiles") * block_k
         lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)

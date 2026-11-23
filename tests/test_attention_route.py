@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 from attention_oracle import attention_terms, kept, traced_attention_terms
 from flax import linen as nn
+from generation_support import here
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import assert_as_exact, with_gradients
 from sharded import MOVES, assert_runs_per_shard
@@ -790,8 +791,7 @@ def test_a_biased_query_of_one_key_has_nonzero_gradient_terms_where_its_gradient
     assert bias_terms.shape == bias.shape
 
 
-@pytest.mark.skipif(generation.device_generation() != "sm90",
-                    reason="composes the route's mainloops, on an H100")
+@pytest.mark.skipif(here() != "sm90", reason="composes the route's mainloops, on an H100")
 @pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
 def an_fp16_call_on_an_h100_is_on_par(case):
     """fp16 on an H100, its Mosaic backward in two launches (row 3497: its parts scaled, each product

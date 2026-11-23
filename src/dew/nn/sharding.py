@@ -825,7 +825,12 @@ def varying(*operands) -> frozenset[str]:
 def varying_like(x: jax.Array, *operands) -> jax.Array:
     """`x` varying over every manual axis any of `operands` varies over (`varying`): a scan's carry seeded
     so keeps its type through steps that read them, as a step's output varies wherever an input does."""
-    missing = tuple(sorted(varying(*operands) - jax.typeof(x).mat.varying))
+    return _varying_over(x, varying(*operands))
+
+
+def _varying_over(x: jax.Array, axes: frozenset[str]) -> jax.Array:
+    """`x` varying over `axes` too, cast where it misses one of them alone."""
+    missing = tuple(sorted(axes - jax.typeof(x).mat.varying))
     return jax.lax.pcast(x, missing, to="varying") if missing else x
 
 
@@ -837,12 +842,7 @@ def varied_alike(operands: Sequence) -> list:
     contraction, `dew.algebra.scan`), where a quotient of a replicated value by each device's own was refused
     as it lowered (row 12152)."""
     axes = varying(*operands)
-
-    def alike(operand):
-        missing = tuple(sorted(axes - jax.typeof(operand).mat.varying))
-        return jax.lax.pcast(operand, missing, to="varying") if missing else operand
-
-    return [None if operand is None else alike(operand) for operand in operands]
+    return [None if operand is None else _varying_over(operand, axes) for operand in operands]
 
 
 def excess_axes(value: jax.Array, of: jax.Array) -> tuple[str, ...]:
@@ -955,22 +955,13 @@ def abstract[TreeT](fn: Callable[..., TreeT], *args) -> TreeT:
     """`fn(*args)` traced for shapes alone (`jax.eval_shape`), Flax's logical axis rules unbound: a draw
     read for its shapes and its boxes' names places nothing, so it asks no mesh for the axes its names
     map to (Flax's `param` constrains a box it draws under rules a trainer binds, and a mesh without
-    those axes refuses it). A `jax.tree_util.Partial`'s bound arguments (`Objective.initializer`'s held
-    variables) are traced as its arguments, not closed over: a shape pass reads shapes, so a tree held as
-    shapes (`jax.ShapeDtypeStruct`, a resumed run's base) is read as the arrays it stands for, where it
-    was handed to the draw as the structs themselves, which have no array's methods (a head's start
-    reading the base's vocabulary table took `.T` of one)."""
+    those axes refuses it). A tree `args` holds is traced as the arrays it stands for: a caller passes a
+    draw holding shapes (`Objective.initializer`'s held variables, `jax.ShapeDtypeStruct`s of a resumed
+    run's base) among `args`, never closed over in `fn`, where it was handed to the draw as the structs
+    themselves, which have no array's methods (a head's start reading the base's vocabulary table took
+    `.T` of one; `Objective.drawn_shapes`)."""
     with nn.logical_axis_rules(()):
-        match fn:
-            case jax.tree_util.Partial():
-                return jax.eval_shape(_called, fn, *args)
-            case _:
-                return jax.eval_shape(fn, *args)
-
-
-def _called[TreeT](fn: Callable[..., TreeT], *args) -> TreeT:
-    """`fn(*args)`, `fn` an argument of the trace (`abstract`)."""
-    return fn(*args)
+        return jax.eval_shape(fn, *args)
 
 
 def drawn_axes(init: Callable[..., Mapping], *inputs) -> dict[Suffix, LogicalAxes]:

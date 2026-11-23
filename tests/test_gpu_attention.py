@@ -246,7 +246,19 @@ def mosaic_cells() -> list[Cell]:
         *cells_of(mosaic.the_forward_runs_back_to_back_at_128_key_tiles_on_a_b200, "sm100",
                   fault=lambda: "row 5671's wedge: a consumer's tensor-core barrier committed again before "
                                 "a lagging warp saw its phase"),
+        *cells_of(_mma_sync_fused_32x32_backward_is_on_par_on_an_a100, "sm80",
+                  fault=lambda: "row 5272 / 11964: 32x32 mma.sync fused backward native qualification at "
+                                "width 128"),
     ]
+
+
+def _mma_sync_fused_32x32_backward_is_on_par_on_an_a100():
+    """Rows 5272, 11964: native `interpret=False` check-1 qualification of 32x32 `mma.sync` fused backward
+    at width 128 on sm80."""
+    from dew.nn.kernels.templates import attention_mosaic
+
+    pin = attention_mosaic.BackwardTiles(32, 32, 2, 1, fused=True, family="mma.sync")
+    mosaic._check_backward("causal", (1, 128, 4, 2), width=128, form=None, config=pin, interpret=False)
 
 
 KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misread,

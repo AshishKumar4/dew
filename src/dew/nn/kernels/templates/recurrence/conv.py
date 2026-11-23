@@ -20,7 +20,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, short_conv, tuning
-from dew.nn.kernels.templates import mosaic, outputs, scan
+from dew.nn.kernels.templates import cost, mosaic, outputs, scan
 from dew.nn.precision import compensated_add, compensated_sum, logistic_and_slope, logistic_value
 
 TOKENS = 64
@@ -274,7 +274,7 @@ def span(length: int, rows: int, programs: int, target: generation.GpuTarget) ->
     tokens = _tokens(length)
     blocks = -(-length // tokens)
     held = target.multiprocessor
-    wave = (target.multiprocessors or 1) * (held.registers // (scan.THREADS * held.thread_registers))
+    wave = cost.wave(target, held.registers // (scan.THREADS * held.thread_registers))
     spans = min(blocks, -(-wave // (rows * programs)))
     return -(-blocks // spans) * tokens
 
