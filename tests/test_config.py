@@ -1143,7 +1143,7 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
     bare (its decay 0): written here by an optimizer whose state is that earlier one's tree, node for node
     (`MASKED`'s `treedef`), it restores into the loaded optimizer through Orbax, its every leaf as written,
     and the run steps on (`dew.checkpoints._masked_decay_unsaved`; review of API01: Orbax refused it)."""
-    from dew.data.dataset import Loader
+    from dew.data.dataset import Loader, replayed
     from dew.objectives.lm import LMObjective
     from dew.optim import ParamGroup
     from dew.training import Trainer
@@ -1166,7 +1166,8 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
         trainer = Trainer(LMObjective(model, seq_len=4), optimizer, key=jax.random.key(0),
                           layout=Layout(min_shard=1, tolerance=1.0),
                           checkpoints=Checkpoints(str(tmp_path / "run")))
-        state = trainer.fit(Loader(train=lambda partition: iter([batch] * 4), val=None, records=8, batch=8),
+        state = trainer.fit(Loader(train=replayed(lambda partition: iter([batch] * 4)), val=None, records=8,
+                                   batch=8),
                             steps=steps, log_every=1, checkpoint_every=1)
         trainer.checkpoints.wait()
         return state
