@@ -274,11 +274,6 @@ def reading(entries: tuple, *, frozen: bool = False) -> Iterator[Reading]:
         _READING.reset(token)
 
 
-def current_reading() -> Reading | None:
-    """The `reading` a trace in this context reads its refusals from, None outside one."""
-    return _READING.get()
-
-
 class Exhausted(ValueError):
     """A derivation that finds no config left for a launch (`base.Unfitted`): a relowering after a spill
     that ends so refuses the program (`compiled`), which no compile keeps spilling."""

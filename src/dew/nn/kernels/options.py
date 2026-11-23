@@ -669,13 +669,6 @@ class OuterProgram:
         self._shaped: collections.OrderedDict[Hashable, tuple[jax.stages.Compiled, str | None,
                                                               tuple[bool, ...]]] = (
             collections.OrderedDict())
-        # Its jits within another trace: by the reading each enclosing trace reads (`_nested`), and outside
-        # one, the refusals the latest were made under; each with the facts its traces read (`_answered`).
-        self._nested_read: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-        self._nested_jits: dict[bool, tuple[jax.stages.Wrapped, Facts]] = {}
-        self._nested_refusals: tuple | None = None
-        # The facts its eager jit's traces read (`_eager`, `_answered`).
-        self._eager_reads: Facts = {}
         # The facts each executable's trace read, by the executable, read again by every call it answers with
         # no trace (row 12296's review P0: a warm call recorded none, a value made from it held past them).
         self._reads: weakref.WeakKeyDictionary[jax.stages.Compiled, Facts] = weakref.WeakKeyDictionary()
@@ -798,60 +791,25 @@ class OuterProgram:
                                      static_argnames=tuple(self.names), kernels=True)(*args, **kwargs)
         return traced
 
-    @functools.cached_property
     def _eager(self) -> jax.stages.Wrapped:
         """Its jit called under an eager transformation, which traces it where no trace of it can be read
-        first: the function rewritten as it traces (`_rewriting`), one program as its compiles'."""
+        first: the function rewritten as it traces (`_rewriting`), one program as its compiles'; a jit of its
+        own each call, as a nested one is (`_nested`)."""
         return jax.jit(_fresh(self._rewriting), **self.arguments)
 
-    def _answered[R](self, call: Callable[[], R], held: Facts) -> R:
-        """`call()`, a call of a jit it holds across calls (a nested or eager one's), its traces' facts
-        `held`: those a trace of it reads added to them, and where JAX's trace cache answered it, read again
-        (`_read_by`), so a value made within the call holds them (row 12296's review P0: a nested jit's
-        cached trace, reused by another enclosing jit, recorded none)."""
-        result, reads = _read_by(call)
-        with self._compiling:
-            if reads is not None:
-                held.update(reads)
-                return result
-            answered = dict(held)
-        _facts.replay(answered)
-        return result
-
-    def _nested(self, whole: bool) -> tuple[jax.stages.Wrapped, Facts]:
-        """Its jit within another trace and the facts its traces read (`_answered`), the enclosing program's
-        own options the ones it compiles under, as
-        JAX takes compiler options on the outermost jit alone, keyed by whether the pass reads the
-        enclosing program whole (`_PASSING`): as written where it does (one of these, `_traced`); rewritten
-        as it traces where it does not, so a transformation outside it (`jax.grad` of it within a plain
-        `jax.jit`) reads the pass's program, the templates' derivatives among it (row 3450). One of the
-        launches refused so far (`report.refusal_snapshot`), which JAX's trace cache keys on none of: a trace
-        after a refusal traces it afresh, its launches deriving past the refused config and their routes
-        reported (`report.settled_trace`'s retry, row 11783), where its jit's cached trace kept the config.
-        Within an enclosing trace's reading (`report.reading`) its jits are that trace's alone, its refusals
-        and its own its trace cache's, never another thread's; outside one the latest refusals' are held, a
-        refusal only adding to them, so an older one's jit is stale."""
-        from dew.nn.kernels.templates import report
-
+    def _nested(self, whole: bool) -> jax.stages.Wrapped:
+        """Its jit within another trace, the enclosing program's own options the ones it compiles under, as
+        JAX takes compiler options on the outermost jit alone: as written where the pass reads the enclosing
+        program whole (`_PASSING`; one of these, `_traced`); rewritten as it traces where it does not, so a
+        transformation outside it (`jax.grad` of it within a plain `jax.jit`) reads the pass's program, the
+        templates' derivatives among it (row 3450). A jit of its own each call, which JAX's trace cache
+        answers none of: its trace runs at each, its launches reading the refusals as they stand (a refused
+        config derived past, its routes reported, `report.settled_trace`'s retry, row 11783) and every fact
+        it reads recorded into the recordings open there (`_facts.recording`), where a jit held across calls
+        answered a later one from a trace whose facts were another signature's, or not yet held where a
+        second caller took it (row 12296's reviews' P0s)."""
         arguments = {name: value for name, value in self.arguments.items() if name != "compiler_options"}
-
-        def made() -> dict[bool, tuple[jax.stages.Wrapped, Facts]]:
-            # Each of a callable of its own, which JAX's trace cache keys anew: it keys a trace on the
-            # function a jit wraps, not the jit; each with the facts its traces read (`_answered`).
-            return {mode: (jax.jit(_fresh(self.function if mode else self._rewriting), **arguments), {})
-                    for mode in (True, False)}
-
-        read = report.current_reading()
-        with self._compiling:
-            if read is not None:
-                held = self._nested_read.get(read)
-                if held is None:
-                    held = self._nested_read[read] = made()
-                return held[whole]
-            refusals = report.refusal_snapshot()
-            if self._nested_refusals != refusals:
-                self._nested_jits, self._nested_refusals = made(), refusals
-            return self._nested_jits[whole]
+        return jax.jit(_fresh(self.function if whole else self._rewriting), **arguments)
 
     def __call__(self, *args, **kwargs):
         from dew.nn.kernels.templates import report
@@ -860,10 +818,9 @@ class OuterProgram:
         # own options (`_nested`); under an eager transformation alone, or `jax.disable_jit`, its jit
         # compiles itself with its options, or runs the function as Python.
         if staged():
-            nested, reads = self._nested(_PASSING.get())
-            return self._answered(lambda: nested(*args, **kwargs), reads)
+            return self._nested(_PASSING.get())(*args, **kwargs)
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
-            return self._answered(lambda: self._eager(*args, **kwargs), self._eager_reads)
+            return self._eager()(*args, **kwargs)
         if (lowering := _LOWERING.get()) is not None:
             platforms, lowerings = lowering
             traced = self.trace(*args, **kwargs)
