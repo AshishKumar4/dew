@@ -24,6 +24,8 @@ from pathlib import Path
 
 import numpy as np
 
+from dew.optim import Adam
+
 VOCAB = 64
 SEQ_LEN = 16
 BATCH = 8
@@ -216,7 +218,7 @@ def main() -> None:
                              num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN, dtype=dtype)
         # The optimizer as a config, which keys the step (`Trainer._step_key`): each draw's fit reads the step
         # the first traced and lowered (`candidate_for`), where a built optimizer had each trace its own.
-        return Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer="adam", learning_rate=1e-2),
+        return Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer=Adam(), learning_rate=1e-2),
                        key=jax.random.key(0),
                        mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD), **options)
 

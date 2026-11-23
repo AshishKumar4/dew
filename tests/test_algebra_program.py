@@ -1322,15 +1322,16 @@ def test_a_template_walks_span_is_priced_at_its_gpus_kernel_step(generation_name
 
 def test_a_template_walks_chain_is_priced_at_its_parts_latencies():
     """A tile walk's dependent path (`Chain`) waits on its products and its warpgroups' barriers, each at the
-    part's measured latency (a GH200's: a waited 64 x N product 12.9 ns and 1.194 ns a column, a barrier
-    round trip 80.1 ns, FS-4123-LATENCIES1-gh200): a recurrence chunk step waiting on four products of 128
-    columns and two round trips costs their sum, where its span alone priced one reduction (row 4123: a states
-    launch's chunk step measured 13 times one)."""
+    part's measured latency (a GH200's: a waited 64 x N product's fixed seconds and seconds a column, a
+    barrier round trip, M-FS-19): a recurrence chunk step waiting on four products of 128 columns and two
+    round trips costs their sum, where its span alone priced one reduction (row 4123: a states launch's chunk
+    step measured 13 times one)."""
     target = generation.gpu_target("NVIDIA GH200 480GB")
     chain = kernel_cost.Chain(span=1, products=4, columns=4 * 128, barriers=2)
     chained = kernel_cost.walked(kernel_cost.Work(flops=1.0, chains=(chain,)), target)
     spanned = kernel_cost.walked(kernel_cost.Work(flops=1.0, span=1), target)
-    expected = target.kernel_step_seconds + 4 * 12.9e-9 + 512 * 1.194e-9 + 2 * 80.1e-9
+    (fixed, per_column), barrier = target.product_latency, target.barrier_seconds
+    expected = target.kernel_step_seconds + 4 * fixed + 512 * per_column + 2 * barrier
     assert_computes_the_oracle(np.float64(chained), np.float64(expected), "the chain's seconds", roundings=8)
     assert chained > 4 * spanned
 
@@ -1756,6 +1757,53 @@ def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
             reused.append([made.reused for made in report.rewrites()])
     assert reused[0] and not any(reused[0]) and not any(reused[1])
 
+
+
+def test_a_held_body_rewritten_under_another_tile_pin_takes_that_pin():
+    """A body's rewrite is keyed by the tiles a tuning pins (`tuning.pinned`, which a launch reads at its
+    rewrite, `KernelOp.pinned`): one held program rewritten again under another legal pin of its product's
+    tile launches the product at that pin, not as the first rewrite wrote it (row 12169: the body's cache
+    keyed the kernel choices but not the pins, so the second pin was never read)."""
+    from jax.sharding import PartitionSpec
+
+    from dew.nn.kernels import grouped_matmul, tuning
+    from dew.nn.kernels.templates.gemm import tiling
+
+    mesh = jax.make_mesh((1,), ("data",), devices=jax.devices()[:1])
+
+    def projected(x, w):
+        def local(x, w):
+            return jnp.dot(x, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+
+        return jax.shard_map(local, mesh=mesh, in_specs=(PartitionSpec(), PartitionSpec()),
+                             out_specs=PartitionSpec())(x, w)
+
+    closed = jax.make_jaxpr(projected)(jax.ShapeDtypeStruct((256, 512), jnp.bfloat16),
+                                       jax.ShapeDtypeStruct((512, 256), jnp.bfloat16))
+    for tile in (tiling.Tiles(128, 128, 64, 4, 1, warpgroups=2, family="wgmma"),
+                 tiling.Tiles(128, 64, 64, 2, 1, warpgroups=2, family="wgmma")):
+        with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+              tuning.pinned({grouped_matmul.MosaicGmm: tile}), tuning.seen() as launches):
+            algebra.rewritten_program(closed)
+        taken = [config for config, _ in launches.taken]
+        assert len(taken) == 1, taken
+        assert [(config.block_n, config.stages) for config in taken if isinstance(config, tiling.Tiles)] == [
+            (tile.block_n, tile.stages)], taken
+    # Pins of two kinds named in either order are one set of pins, one trace context: a program jitted under
+    # one order runs under the other without tracing again (the head review: a tuple's order keyed two
+    # contexts, two traces and two rewrites of one body).
+    traces = []
+
+    def counted(x):
+        traces.append(None)
+        return x + 1
+
+    stepped = jax.jit(counted)
+    for pins in ({grouped_matmul.MosaicGmm: tile, grouped_matmul.MosaicTgmm: tile},
+                 {grouped_matmul.MosaicTgmm: tile, grouped_matmul.MosaicGmm: tile}):
+        with tuning.pinned(pins):
+            stepped(jnp.ones(()))
+    assert len(traces) == 1, len(traces)
 
 def _scaled_twice(s, q_pos, k_pos, a, b):
     """A score hook the pass rewrites: two bounded scales of the bounded logits summed (the magnitudes the

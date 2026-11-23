@@ -11,7 +11,7 @@ import pytest
 
 from dew.data import Files
 from dew.data.compile import compile
-from dew.data.dataset import DataPartition, Loading
+from dew.data.dataset import Closeable, DataPartition, Loading
 from dew.data.pipeline import Pipeline
 
 
@@ -110,32 +110,39 @@ def _numbered(log: str, index, row):
     return {**row, "at": np.int64(index)}
 
 
+def numbered_cache(tmp_path, rows: int):
+    """A JSONL store of `rows` records read by a stream that numbers its rows before a cache, the cache, and
+    the log of every row a read numbered (`_numbered`)."""
+    import functools
+
+    from dew.data.cache import Cache
+    from dew.data.pipeline import Pipeline
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(rows)))
+    files = Files(str(path))
+    files.provision()
+    log = tmp_path / "numbered"
+    log.touch()
+    chain = Pipeline(files).map_with_index(functools.partial(_numbered, str(log)), identity="numbered@1")
+    return chain, Cache(str(tmp_path / "cache")), log
+
+
 def test_a_positioned_fill_by_two_shares_of_two_workers_is_replayed_by_one_reader(tmp_path):
     """An indexed JSONL store of a few rows read by a stream that numbers its rows before its cache: two
     shares of two worker processes each fill its cache, every row numbered, and one reader in the process
     then reads it back from the published generation, numbering none again: every topology reads the same
     fixed shards (row 11637: one shard cut by the readers' count named parts no other topology's fill
     found)."""
-    import functools
-
-    from dew.data.cache import Cache
     from dew.data.compile import compile, iterate
-    from dew.data.dataset import DataPartition, Loading
-    from dew.data.pipeline import Pipeline
 
-    path = tmp_path / "rows.jsonl"
-    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(12)))
-    files = Files(str(path))
-    files.provision()
-    cache = Cache(str(tmp_path / "cache"))
-    log = tmp_path / "numbered"
-    log.touch()
-    chain = Pipeline(files).map_with_index(functools.partial(_numbered, str(log)), identity="numbered@1")
+    chain, cache, log = numbered_cache(tmp_path, 12)
     data = compile(chain.cache(cache).batch(2), read="streamed", loading=Loading(workers=2, threads=1,
                                                                                  read_buffer=1))
     filled = []
     for index in range(2):
         reader = data.train(DataPartition(index=index, count=2))
+        assert isinstance(reader, Closeable)
         try:
             filled += [(int(at), int(id_)) for batch in (next(reader) for _ in range(6))
                        for at, id_ in zip(batch["at"], batch["id"], strict=True)]
@@ -153,7 +160,6 @@ def test_a_positioned_stream_of_fewer_records_than_its_readers_is_refused(tmp_pa
     it reads, as any store of fewer shards than its readers is: each share steps in lockstep with the
     others, which a share with no records cannot."""
     from dew.data.compile import compile
-    from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Pipeline
 
     path = tmp_path / "rows.jsonl"
@@ -181,3 +187,56 @@ def test_a_positioned_streams_store_is_cut_into_as_many_shards_as_its_records_al
     assert [(shard.start, shard.stop) for shard in shards] == [
         (start, min(start + shards[0].rows, records)) for start in range(0, records, shards[0].rows)]
 
+
+
+def test_a_positioned_streams_store_is_cut_into_as_many_shards_as_its_readers_and_workers_read(tmp_path):
+    """A positioned stream's store of 130 records, held in 65 ranges, read by 40 shares of two workers each
+    is cut into ranges of whole records in order, at least one for each of its 80 readers, every record
+    read once (docs/design/data.md: a store of fewer shards than its readers × workers is cut into that
+    many; train 1192's review: it was refused past 64 readers)."""
+    from dew.data.shards import cut
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(130)))
+    files = Files(str(path))
+    files.provision()
+    shards = cut(files.positioned_manifest(), partition=DataPartition(index=0, count=40),
+                 loading=Loading(workers=2)).shards
+    assert len(shards) >= 80, len(shards)
+    assert [(shard.start, shard.stop) for shard in shards] == [
+        (start, min(start + shards[0].rows, 130)) for start in range(0, 130, shards[0].rows)]
+
+
+def test_a_positioned_read_cut_finer_than_its_store_fills_no_cache_another_topology_publishes(tmp_path):
+    """A positioned stream's store of 160 records in 80 fixed ranges of two read before its cache by 160
+    shares, each a range of one record (`subdivide`): a share whose range starts inside one of the
+    store's (`records:1` of its range), read past its end, is keyed by a cut no fill of the store names
+    and fills nothing, so one reader's read of the store's own ranges after it publishes the generation,
+    and the next read numbers nothing again (review of row 11948: the cut's completions, named as the
+    store's ranges are, blocked every later fill's publication; its share 0 began a range of the store's
+    own)."""
+    from dew.data.compile import compile, iterate
+
+    chain, cache, log = numbered_cache(tmp_path, 160)
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    reader = compile(chain.cache(cache).batch(160), read="streamed", loading=loading).train(
+        DataPartition(index=1, count=160))
+    assert isinstance(reader, Closeable)
+    try:
+        # The share's row, its own range of one record, numbered as the store holds it, and the next, read
+        # past the range's end, where a fill would complete.
+        batches = list(itertools.islice(reader, 2))
+    finally:
+        reader.close()
+    at, numbered = (int(value) for value in (batches[0]["at"][0], batches[0]["id"][0]))
+    # The second record of one of the store's ranges of two (`records:1`), so its cut is none of them.
+    assert len(batches) == 2 and at == numbered and at % 2 == 1, (at, numbered)
+
+    def whole() -> list[tuple[int, int]]:
+        rows = iterate(chain.cache(cache), read="streamed", loading=loading)
+        return sorted((int(row["at"]), int(row["id"])) for row in rows)
+
+    first = whole()
+    numbered = log.read_text().split()
+    assert first == whole() == [(index, index) for index in range(160)]
+    assert log.read_text().split() == numbered

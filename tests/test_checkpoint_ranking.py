@@ -18,7 +18,7 @@ from affine_run import Counting, dataset, val_batches
 from recording import RecordingTracker
 
 from dew.artifacts import TokenScores
-from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking
+from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking, _Laid
 from dew.data.dataset import DataPartition
 from dew.objectives.base import Aux, Objective, Shown
 from dew.scores import Summary
@@ -180,6 +180,23 @@ def test_an_aggregate_is_asked_only_where_an_evaluation_scored(tmp_path):
             best=Best(accuracy, mode='max'))
     run.checkpoints.wait()
     assert seen and np.isfinite(seen).all()
+    assert run.checkpoints.resolve('best:aggregate:0') == 4
+
+
+def test_an_aggregate_given_as_a_bound_method_ranks_as_any_callable_does(tmp_path):
+    """A custom score that is a bound method of the run's own (`Best(evaluator.score)`) ranks the
+    checkpoints as any callable over the fit's scores does: only the objective's own `loss` is its training
+    scalar's shorthand (review of API01: every bound method was taken for it and refused)."""
+    metric = Value('accuracy', Shown(better='higher'))
+
+    class Evaluator:
+        def score(self, scores):
+            return scores['val/accuracy']
+
+    run = trainer(tmp_path / 'run')
+    run.fit(data(), steps=4, log_every=1, eval_every=2, checkpoint_every=2, metrics=[metric],
+            best=Best(Evaluator().score, mode='max'))
+    run.checkpoints.wait()
     assert run.checkpoints.resolve('best:aggregate:0') == 4
 
 
@@ -1206,8 +1223,9 @@ def test_a_resume_under_another_loss_setting_is_refused_as_a_fresh_run_beside_it
     executed = lm(tmp_path / "run", head_tile="tiled", token_accuracy=False)
     assert int(executed.fit(lm_data(), steps=2).step) == 2
     other = lm(tmp_path / "model", z_loss=1e-4)
+    # Saved as the run's trainer writes it, its loss's settings beside the state (`_Laid`).
     other.checkpoints.save(5, other.initial_state(), None, weights_only=True, artifact=other._artifact(),
-                           training=other.objective.training_record())
+                           _laid=_Laid(training=other.objective.training_record()))
     other.checkpoints.wait()
     with pytest.raises(ValueError):
         lm(tmp_path / "model").fit(lm_data(), steps=1)

@@ -4,6 +4,7 @@ is set from, and the `dew train` step that trains one (`trained_by_cli`)."""
 
 import csv
 import dataclasses
+import hashlib
 import json
 import os
 import typing
@@ -19,7 +20,7 @@ from token_support import write_token_corpus
 
 from dew import registry
 from dew._cli.main import main
-from dew.config import ObjectiveConfig, RunConfig, SourceOptions, TrainerConfig
+from dew.config import LowerTarget, ObjectiveConfig, RunConfig, SourceOptions, TrainerConfig
 from dew.config.diffusion import DEFAULT_MODEL_CONFIG, DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
@@ -34,6 +35,7 @@ from dew.inputs import TextCondition
 from dew.registry import ModelConfig
 from dew.sampling import Euler
 from dew.training import Layout, LocalTracker, MeshSpec
+from dew.training.budget import Horizon
 
 TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
@@ -183,15 +185,19 @@ def scalars(run: Path) -> dict[int, dict[str, float]]:
     return logged
 
 
-def trained(run: RunConfig, root: Path, name: str, **fields):
+def trained(run: RunConfig, root: Path, name: str, lowering: LowerTarget | None = None, **fields):
     """`run` trained one step from Python (`prepare().train`) over a mesh of four data shards by two
     fsdp shards, its trainer the fields given, over its defaults here: its state, and its step's
-    scalars."""
-    trainer = TrainerConfig(**{"checkpoint_dir": str(root / "runs"), "steps": 1, "log_every": 1,
-                               "eval_every": None, "checkpoint_every": None, "checkpoint_final": False,
-                               "multi_host": False, "mesh": MeshSpec(fsdp=2), "layout": Layout(min_shard=64),
-                               **fields.pop("trainer", {})})
-    state = dataclasses.replace(run, trainer=trainer, **fields).prepare().train(name)
+    scalars; lowered for `lowering` in place of training where given (`Prepared.lower`), which ends by
+    raising."""
+    trainer = TrainerConfig(**{"checkpoint_dir": str(root / "runs"), "horizon": Horizon(steps=1),
+                               "log_every": 1, "eval_every": None, "checkpoint_every": None,
+                               "checkpoint_final": False, "multi_host": False, "mesh": MeshSpec(fsdp=2),
+                               "layout": Layout(min_shard=64), **fields.pop("trainer", {})})
+    prepared = dataclasses.replace(run, trainer=trainer, **fields).prepare()
+    if lowering is not None:
+        prepared.lower(name, lowering)
+    state = prepared.train(name)
     return state, scalars(root / "runs" / name)[1]
 
 
@@ -322,33 +328,70 @@ def saved_record(run: RunConfig, root: Path, name: str) -> Path:
 
 def cli_settings(root: Path, name: str, assigned: Mapping[str, object] = MappingProxyType({})
                  ) -> dict[str, object]:
-    """`dew train`'s settings (`--set path=value`) for a run named `name` under `root`: one step, no
-    evaluation or checkpoint between steps, one host, its programs compiled into the suite's cache, which a
-    run naming its own would leave the training process holding; each of `assigned` over them."""
-    return {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.steps": "1",
-            "trainer.eval_every": "None", "trainer.checkpoint_every": "None", "trainer.multi_host": "False",
-            "trainer.compilation_cache_dir": "None", **assigned}
+    """A run's settings, by dotted path (`RunConfig.override`), for a run named `name` under `root`: one
+    step, no evaluation or checkpoint between steps, one host, its programs compiled into the suite's cache,
+    which a run naming its own would leave the training process holding; each of `assigned` over them."""
+    return {"trainer.name": name, "trainer.checkpoint_dir": str(root / "runs"), "trainer.horizon.steps": 1,
+            "trainer.eval_every": None, "trainer.checkpoint_every": None, "trainer.multi_host": False,
+            "trainer.compilation_cache_dir": None, **assigned}
 
 
-def cli_arguments(settings: Mapping[str, object], trust: tuple[str, ...] = ()) -> list[str]:
-    """`settings` as a command's `--set path=value` flags (a mapping as JSON), `trust` its `--trust`."""
-    return [*(part for path, value in settings.items()
-              for part in ("--set", f"{path}={json.dumps(value) if isinstance(value, dict) else value}")),
-            *(part for package in trust for part in ("--trust", package))]
+def stated[R: RunConfig](run: R, *, model: str | None = None,
+                         model_fields: Mapping[str, object] = MappingProxyType({}),
+                         objective: str | None = None,
+                         objective_fields: Mapping[str, object] = MappingProxyType({})) -> R:
+    """`run` with its model of the class `model` names (its own where None) and `model_fields` over its
+    fields, and its objective alike, each field as its record holds it: what a run file states of what the
+    run trains."""
+    held = run.model if model is None else ModelConfig(model)
+    goal = run.objective if objective is None else ObjectiveConfig(objective)
+    assert goal is not None or not objective_fields, "a run of no objective takes none of its fields"
+    return dataclasses.replace(
+        run, model=dataclasses.replace(held, fields={**held.fields, **model_fields}),
+        objective=None if goal is None else dataclasses.replace(goal,
+                                                                fields={**goal.fields, **objective_fields}))
+
+
+def settled(settings: Mapping[str, object]) -> dict[str, object]:
+    """`settings` by dotted path as `RunConfig.override` sets them: a value given as text read as its JSON
+    where it is JSON ("4", "null"; Python's None, True and False as theirs), any other as it is."""
+    def value(given: object) -> object:
+        if not isinstance(given, str):
+            return given
+        text = {"None": "null", "True": "true", "False": "false"}.get(given, given)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return given
+
+    return {path: value(given) for path, given in settings.items()}
+
+
+def set_record(record: Path, settings: Mapping[str, object], trust: tuple[str, ...] = ()) -> Path:
+    """The run saved at `record` with each of `settings` set at its dotted path (`settled`), saved beside it
+    as the run record a command reads: a run is set in its record or its Python file, which `dew train`
+    trains as it is."""
+    given = settled(settings)
+    run = RunConfig.load(str(record), trust=trust).override(given)
+    # Its own directory for its own settings: runs set from one record side by side write each its own.
+    digest = hashlib.sha256(json.dumps(given, sort_keys=True, default=str).encode()).hexdigest()[:12]
+    written = record.parent / f"{record.name}-set-{digest}"
+    run.save(str(written))
+    return written
 
 
 def trained_record(record: Path, settings: Mapping[str, object], devices: int | None = None,
                    trust: tuple[str, ...] = ()) -> Path:
-    """The run directory `dew train` writes for the run saved at `record` with `settings` set and `trust`
-    trusted, as a user's command trains it: in this process where `devices` is None, else in a fresh one
-    that sees `devices` CPU devices (`process_support.worker_env`), a run's device count being its
-    process's, fixed as its backend opens. It writes where its trainer names (`TrainerConfig.directory`),
-    its record's name and directory under those `settings` sets: a run resumed from its record its own."""
-    trainer = RunConfig.load(str(record), trust=trust).trainer
-    directory = dataclasses.replace(trainer, checkpoint_dir=str(settings.get(
-        "trainer.checkpoint_dir", trainer.checkpoint_dir))).directory(str(settings.get("trainer.name",
-                                                                                         trainer.name)))
-    arguments = [str(record / "run.json"), *cli_arguments(settings, trust)]
+    """The run directory `dew train` writes for the run saved at `record` with `settings` set in its record
+    (`set_record`) and `trust` trusted, as a user's command trains it: in this process where `devices` is
+    None, else in a fresh one that sees `devices` CPU devices (`process_support.worker_env`), a run's device
+    count being its process's, fixed as its backend opens. It writes where its trainer names
+    (`TrainerConfig.directory`), its record's name and directory under those `settings` sets: a run resumed
+    from its record its own."""
+    written = set_record(record, settings, trust)
+    trainer = RunConfig.load(str(written), trust=trust).trainer
+    directory = trainer.directory(str(trainer.name))
+    arguments = [str(written / "run.json"), *(part for package in trust for part in ("--trust", package))]
     if devices is None:
         assert main(["train", *arguments]) == 0
     else:
@@ -358,7 +401,7 @@ def trained_record(record: Path, settings: Mapping[str, object], devices: int | 
 
 
 def trained_by_cli(run: RunConfig, root: Path, name: str, assigned: dict[str, str]) -> Path:
-    """The run directory one step of `dew train` writes for `run` with each `path=value` of `assigned`
+    """The run directory one step of `dew train` writes for `run` with each of `assigned` set at its path
     (`saved_record`, `cli_settings`, `trained_record`), in this process."""
     return trained_record(saved_record(run, root, name), cli_settings(root, name, assigned))
 

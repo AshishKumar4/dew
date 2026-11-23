@@ -49,7 +49,7 @@ from dew._files import write_atomically
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig
-from dew.optim import Linear, OptimConfig
+from dew.optim import LaProp, Linear, OptimConfig
 from dew.registry import ModelConfig
 from dew.rl.hyperlux import HyperLuxRenderer
 from dew.rl.skydreamer import Sky, SkyDreamerRace
@@ -154,7 +154,7 @@ def run(out: Path, assets: Path, drones: int = ENVIRONMENTS, setting: Setting = 
         rollout=RolloutConfig("dreamer", {"batch": WINDOWS, "length": phase.length,
                                           "train_ratio": TRAIN_RATIO, "capacity": setting.replay // drones,
                                           "prefill": phase.length}),
-        optim=OptimConfig(optimizer="laprop", learning_rate=Linear(peak_value=phase.learning_rate,
+        optim=OptimConfig(optimizer=LaProp(), learning_rate=Linear(peak_value=phase.learning_rate,
                                                                    warmup_steps=1000,
                                                                    end_value=phase.learning_rate)),
         trainer=TrainerConfig(checkpoint_dir=str(out), log_every=500, eval_every=None, checkpoint_every=None,
@@ -281,7 +281,8 @@ def trained(out: Path, assets: Path, steps: int, every: int, setting: Setting = 
                             pending=state is None and done > 0 and done not in scored_at)
         if reached is None:
             break
-        prepared = dataclasses.replace(prepared, run=prepared.run.override({"trainer.steps": reached}))
+        prepared = dataclasses.replace(prepared,
+                                       run=prepared.run.override({"trainer.horizon.steps": reached}))
         state = prepared.train("base")
         done, taken = int(state.step), rollout.environment_steps
         if done in scored_at:

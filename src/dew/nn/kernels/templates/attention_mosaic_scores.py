@@ -4,7 +4,9 @@ forward's statistics (`_scores`)."""
 
 import dataclasses
 import functools
-from collections.abc import Callable
+import weakref
+from collections.abc import Callable, Hashable
+from types import MappingProxyType
 
 import jax
 import jax.numpy as jnp
@@ -12,32 +14,39 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.extend import core as jax_core
 
+from dew.nn import programs
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_gradient as gradient,
     mosaic,
     swizzling,
 )
-from dew.nn.kernels.templates.attention import DQ_GRADS, Kind, by_power
+from dew.nn.kernels.templates.attention import DQ_GRADS, Draw, Kind, by_power
 from dew.nn.kernels.templates.attention_backward_algebra import (
     derived_cotangents,
     derived_from_weights,
     derived_weights,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
-    BackwardRegisters,
     BackwardTiles,
     _param,
     _Program,
     _streamed,
     _views_of,
+    bundle,
     head_slice,
     indexed_views,
     riding,
     score_stream,
     score_views,
 )
+from dew.nn.kernels.templates.attention_mosaic_registers import BackwardRegisters
 from dew.nn.precision import scalar_power2
+
+KEY_ROWS = MappingProxyType({Kind.KEY: lambda entries: entries.sum(axis=-1)})
+"""`gradient.pulled`'s sums of a dK/dV tile, its keys its rows (`_dkv_step`): a key's over its row; the dK/dV
+program writes no head's or query's gradient (`DKV_GRADS`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,7 +163,7 @@ def _read(value):
 
 
 def _splits_scores(walk: _Backward) -> bool:
-    """Whether a backward tile's scores split into `_score_weights` (inside `product_pair`'s `between`) and
+    """Whether a backward tile's scores split into `_score_weights` (`summed_together`'s `then` of `S`) and
     `_score_cotangents` (rows 11707, 11715): undropped fast-form walks without score-hook parameters on
     overlapping shared-memory issuers (keeping synchronous issuers on `_scores`)."""
     family = walk.program.family
@@ -168,17 +177,20 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                  on_weights: Callable | None = None, after_weights: Callable | None = None
                  ) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
-    (`_fused_step`'s, `_coop_step`'s): its `S` and `dP` products (issued through `product_pair`, overlapping
-    `_score_weights` with `dP` where `_splits_scores` and `masked is not None`), masked where `masked`, or
-    where it is None chosen at run time, unmasked where every query sees the tile `whole`. When `on_weights`
-    and `after_weights` are supplied on an overlapped step, stages narrowed `P` during `dP` and issues `dV`
-    before computing `dS`. Returns its weights narrowed for dV (`algebra.value_weights`), a dropping call's
-    dropped (`algebra.drawn`), and its score cotangents through the hook (`gradient.pulled`), one part in
-    the operands' dtype (dK's and dQ's); with `whole_operands` (fp16's, `algebra.running_parts`), both fp32:
-    the normalized weights, dropped, and the scaled cotangents."""
+    (`_fused_step`'s, `_coop_step`'s): its `S` and `dP` products (issued together, `summed_together`,
+    overlapping `_score_weights` with `dP` where `_splits_scores` and `masked is not None`), masked where
+    `masked`, or where it is None chosen at run time, unmasked where every query sees the tile `whole`. When
+    `on_weights` and `after_weights` are supplied on an overlapped step, stages narrowed `P` during `dP` and
+    issues `dV` before computing `dS`. Returns its weights narrowed for dV (`algebra.value_weights`), a
+    dropping call's dropped (`algebra.drawn`), and its score cotangents through the hook (`gradient.pulled`),
+    one part in the operands' dtype (dK's and dQ's); with `whole_operands` (fp16's, `algebra.running_parts`),
+    both fp32: the normalized weights, dropped, and the scaled cotangents."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
+    # S's products and dP's, issued together (`Issuer.summed_together`).
+    score_products = (lambda acc: family.products(acc, q_slot, held),
+                      lambda acc: family.products(acc, do_slot, values_t))
     if not family.operands_in_registers:
         rows = tuple(_read(row) for row in rows)
         coords = _read(coords)
@@ -193,21 +205,26 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
             return w, sl, sn
 
         if walk.scaled:
+            # Retire prescaled Q registers before scoping dP and free S before allocating dP so peak
+            # registers hold even at the deepest ring (0 spills at 231.6 KB SMEM), while overlapping dV
+            # with dP and `_score_cotangents` via `product_with(..., pending=1)` (rows 5272, 11998).
             s = family.registers_product(by_power(family.left_of(q_slot), walk.spec.prescale), held)
-            if stages_weights:
-                weights, slopes, seen = prepare_weights(s)
-                dp = family.product(do_slot, values_t, shape)
+            weights, slopes, seen = prepare_weights(s)
+            if after_weights is not None and not whole_operands:
+                _, dp = family.product_with(do_slot, values_t, shape, after_weights, pending=1)
             else:
                 dp = family.product(do_slot, values_t, shape)
-                weights, slopes, seen = prepare_weights(s)
         elif stages_weights:
-            (weights, slopes, seen), dp = family.product_pair(
-                q_slot, held, do_slot, values_t, shape, between=prepare_weights)
+            # S's weights made as dP runs on (`Issuer.summed_together`'s `then`).
+            (weights, slopes, seen), dp = (read() for read in family.summed_together(
+                (shape, shape), score_products, then=(prepare_weights, None)))
+            if after_weights is not None and not whole_operands:
+                after_weights()
         else:
-            s, dp = family.product_pair(q_slot, held, do_slot, values_t, shape)
+            s, dp = (read() for read in family.summed_together((shape, shape), score_products))
             weights, slopes, seen = prepare_weights(s)
-        if after_weights is not None and not whole_operands:
-            after_weights()
+            if after_weights is not None and not whole_operands:
+                after_weights()
         exponentials = weights
         cotangents = _score_cotangents(tile_coords, weights, dp, rows[2], rows[3], seen)
         cotangents = gradient.pulled(cotangents, slopes, seen, ())[0]
@@ -216,7 +233,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
             s = family.registers_product(by_power(family.left_of(q_slot), walk.spec.prescale), held)
             dp = family.product(do_slot, values_t, shape)
         else:
-            s, dp = family.product_pair(q_slot, held, do_slot, values_t, shape)
+            s, dp = (read() for read in family.summed_together((shape, shape), score_products))
 
         def scores(*, is_masked: bool):
             # A tile every query sees whole (`is_masked` False) takes no mask (`_dq_step`'s choice).
@@ -240,6 +257,10 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
 
 def _score_logits(walk: _Backward, coords: algebra.Coords, params: tuple, s, *, masked: bool):
     """Shared mask and hooked-logits prologue for `_score_weights` and `_scores`."""
+    if walk.hooked[0]:
+        # Hold query places in the accumulator's layout (matching `attention_mosaic_forward._step`, row
+        # 5279) so row-indexed hooks (`q_pos[:, :1]`) lower at 32-row tiles on `mma.sync` (row 7360).
+        coords = coords._replace(q_pos=walk.program.family.as_tile(coords.q_pos))
     seen = algebra.seen(walk.spec, coords, s) if masked else None
     how = walk.how
     logits, slopes = gradient.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
@@ -332,9 +353,13 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
     row, head = place
     rows = dq.shape[0]
     view = dq_ref.at[index if walk.interpret else 0,
-                     *head_slice(walk.program.family, row, head, pl.ds(q_first, rows))]
+                     *head_slice(walk.program.family, row, head, pl.ds(q_first, rows), dq_ref.dtype,
+                                 width=dq.shape[1])]
     if out_smem is None:
         walk.program.family.added(dq, view, walk.interpret, smem=None)
+        return
+    if out_smem.ndim == 4:
+        walk.program.family.added(dq, view, walk.interpret, smem=out_smem.at[index, :, pl.ds(0, rows)])
         return
     slots = out_smem.shape[1] // rows
     slot = lax.rem(lax.div(q_first, rows), slots) if slots > 1 else 0
@@ -353,7 +378,8 @@ def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, score: tu
     row, head = family.program_index("batch"), family.program_index("heads")
     pair = consumers * block_q
     refs, kinds = score
-    views = _views_of(family, {"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
+    views = _views_of(family, {"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads),
+                      heads=kv_heads)
     if riding(family, kinds, "keys"):
         views |= score_views(family, refs, kinds, "keys", row, head, program.query_tile(queries // pair))
     if spans is not None and spans.walk_count is not None:
@@ -372,25 +398,30 @@ def _query_tile_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: 
     """Consumer `index`'s query tile from `first` and its output cotangents, each `(ref, smem)` of `refs`
     and `smem` loaded whole against its `loaded` barrier at the program's batch row and head (`place`)."""
     row, head = place
-    rows = head_slice(family, row, head, pl.ds(first, smem[0].shape[1]))
-    family.loaded(tuple((ref.at[rows], stage.at[index], barrier.at[index])
-                        for ref, stage, barrier in zip(refs, smem, loaded, strict=True)))
+    family.loaded(tuple(
+        (ref.at[head_slice(family, row, head, pl.ds(first, stage.shape[1]), ref.dtype,
+                           width=stage.shape[-1])],
+         stage.at[index], barrier.at[index])
+        for ref, stage, barrier in zip(refs, smem, loaded, strict=True)))
 
 
 def _peak_live_tiles(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> int:
     """Peak live `tile`-shaped arrays across `jaxpr`, recursively counting nested-call transients beyond
-    the inputs already live in the parent frame."""
+    the inputs already live in the parent frame (`programs.live`, row 11993)."""
     def is_tile(v) -> bool:
         return not isinstance(v, jax_core.Literal) and getattr(v.aval, "shape", None) == tile
 
-    last_use = {v: pos for pos, eqn in enumerate(jaxpr.eqns) for v in eqn.invars if is_tile(v)}
-    last_use.update({v: len(jaxpr.eqns) for v in jaxpr.outvars if is_tile(v)})
-    live = {v for v in jaxpr.invars if is_tile(v)}
+    eqns = programs.live(jaxpr.eqns, jaxpr.outvars)
+    last_use = {v: pos for pos, eqn in enumerate(eqns) for v in eqn.invars if is_tile(v)}
+    last_use.update({v: len(eqns) for v in jaxpr.outvars if is_tile(v)})
+    live = {v for v in jaxpr.invars if is_tile(v) and v in last_use}
     peak = len(live)
-    for pos, eqn in enumerate(jaxpr.eqns):
+    for pos, eqn in enumerate(eqns):
         sub_extra = 0
         for sub in jax_core.jaxprs_in_params(eqn.params):
-            shared_in = sum(1 for v in sub.invars if is_tile(v))
+            sub_live = {v for e in programs.live(sub.eqns, sub.outvars) for v in e.invars if is_tile(v)}
+            sub_live.update(v for v in sub.outvars if is_tile(v))
+            shared_in = sum(1 for v in sub.invars if is_tile(v) and v in sub_live)
             sub_extra = max(sub_extra, _peak_live_tiles(sub, tile) - shared_in)
         peak = max(peak, len(live) + sub_extra)
         live.update(v for v in eqn.outvars if is_tile(v))
@@ -398,89 +429,161 @@ def _peak_live_tiles(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> int:
         live = {v for v in live if last_use.get(v, -1) > pos}
     return peak
 
-
 def _score_param_avals(score_types: tuple[tuple[Kind, str], ...],
                        tile: tuple[int, int]) -> tuple[jax.ShapeDtypeStruct, ...]:
-    """Abstract shapes for a score hook's per-tile parameters when tracing a step's live tiles."""
-    shapes = {Kind.HEAD: (), Kind.QUERY: (tile[0], 1), Kind.KEY: (1, tile[1]), Kind.TILE: tile}
+    """Abstract shapes for a score hook's per-tile parameters matching emitted `_param`, where HEAD is
+    scalar and QUERY/KEY/TILE are broadcast to the whole score tile (row 11963)."""
+    shapes = {Kind.HEAD: ()}
     return tuple(jax.ShapeDtypeStruct(shapes.get(kind, tile), jnp.dtype(dt)) for kind, dt in score_types)
+
+
+def _visibility_facts(spec: algebra.Forward, block_k: int, *,
+                      runs: int = 1) -> tuple[str, bool, bool, bool, int, bool, bool, bool]:
+    """Canonical hashable visibility and recompute facts matching `algebra.seen`, `_query_bounds`, and
+    `algebra.recompute` (rows 11963, 11988, 11994, 11999)."""
+    ragged_q = algebra.padded_queries(spec) is not None
+    ragged_k = spec.form != "spans" and (spec.keys % block_k != 0 or spec.walked_keys is not None)
+    span_runs = max(1, runs) if spec.form == "spans" else 0
+    return spec.form, spec.ids, ragged_q, ragged_k, span_runs, spec.raw, spec.natural, spec.subtracted
 
 
 def _trace_step_tile_count(*, block_q: int, block_k: int, backward: bool, natural_form: bool,
                            scaled: bool, accurate: bool, dropped: bool, dtype: str,
                            score_mod: Callable | None, score_types: tuple[tuple[Kind, str], ...],
-                           masked: bool) -> int:
-    """Trace the call's own attention algebra step (`jax.make_jaxpr`) at its emitted `(block_q, block_k)`
-    tile geometry with hooks, dropout, accuracy, masking/padding visibility, and operand dtype and return
-    its peak live 2D score tiles (rows 10965, 11652, 11904)."""
-    tile = (block_q, block_k)
+                           form: str, ids: bool, ragged_q: bool, ragged_k: bool, span_runs: int,
+                           raw: bool, natural: bool, subtracted: bool,
+                           keys_first: bool = False, fused: bool = False) -> int:
+    """Trace the emitted step (`_scores` / `algebra.modify` + `peak` + `weights`) at its `(block_q, block_k)`
+    geometry, orientation, pullback, `algebra.recompute` mode, and `algebra.seen` visibility (`span_runs`
+    intervals) and return its peak live 2D score tiles (rows 10965, 11652, 11904, 11963, 11988, 11994)."""
+    tile = (block_k, block_q) if keys_first else (block_q, block_k)
     out_dtype = jnp.dtype(dtype)
-    s_in, row = jax.ShapeDtypeStruct(tile, jnp.float32), jax.ShapeDtypeStruct((tile[0],), jnp.float32)
-    q_pos = jax.ShapeDtypeStruct((tile[0], 1), jnp.int32)
-    k_pos = jax.ShapeDtypeStruct((1, tile[1]), jnp.int32)
-    keep_tile = jax.ShapeDtypeStruct(tile, jnp.float32)
+    s_in, row = jax.ShapeDtypeStruct(tile, jnp.float32), jax.ShapeDtypeStruct((block_q,), jnp.float32)
+    chosen_in = jax.ShapeDtypeStruct((block_q,), jnp.int32)
+    q_pos, k_pos = jax.ShapeDtypeStruct(tile, jnp.int32), jax.ShapeDtypeStruct(tile, jnp.int32)
     param_avals = _score_param_avals(score_types, tile)
     kinds = tuple(kind for kind, _ in score_types)
-    spec = algebra.Forward("causal" if masked else "full", max(block_q, block_k), ids=False,
-                           scale=1.0 / 8.0, natural=natural_form, headroom=scaled, score_mod=score_mod)
+    has_mask = form != "full" or ids or ragged_q or ragged_k
+    spec = algebra.Forward(form, block_k - 1 if ragged_k else block_k, ids=ids, scale=1.0 / 8.0,
+                           natural=natural_form or natural, headroom=scaled, score_mod=score_mod,
+                           queries=block_q - 1 if ragged_q else None,
+                           walked_keys=block_k if ragged_k else None,
+                           subtracted=subtracted if raw else False)
+    span_avals = ((jax.ShapeDtypeStruct((block_q,), jnp.int32),
+                   jax.ShapeDtypeStruct((block_q,), jnp.int32)) * span_runs)
+    id_avals = (jax.ShapeDtypeStruct((block_q,), jnp.int32),
+                jax.ShapeDtypeStruct((block_k,), jnp.int32)) if span_runs and ids else ()
+    drop_avals = ((jax.ShapeDtypeStruct((), jnp.uint32), jax.ShapeDtypeStruct((), jnp.uint32),
+                   jax.ShapeDtypeStruct((), jnp.int32), jax.ShapeDtypeStruct((), jnp.int32))
+                  if dropped else ())
+    n_span, n_id, n_drop = len(span_avals), len(id_avals), len(drop_avals)
+    extra_avals = (*span_avals, *id_avals, *drop_avals)
+    n_extra = len(extra_avals)
+
+    def build_coords(q, k, extra):
+        span_args = (tuple((extra[2 * i], extra[2 * i + 1]) for i in range(span_runs))
+                     if span_runs else None)
+        id_args = extra[n_span:n_span + n_id] if n_id else None
+        drop_args = extra[n_span + n_id:n_span + n_id + n_drop]
+        draw = Draw((drop_args[0], drop_args[1]), drop_args[2], drop_args[3], 0.1) if drop_args else None
+        return algebra.Coords(q, k, spans=span_args, ids=id_args, drop=draw, keys_first=keys_first)
+
     if backward:
-        anchor_tile = jax.ShapeDtypeStruct(tile, jnp.bool_)
-        def backward_step(s, dp, peak, total, anchor, delta, q, k, at_anchor, keep, *params):
-            seen = algebra.seen(spec, algebra.Coords(q, k), s) if masked else None
-            logits, slopes = gradient.tile_logits(score_mod, s, seen, q, k, params,
-                                                  scale=spec.scale, slopes=True)
-            anchored = accurate or dropped
-            forms = derived_cotangents(keys_first=False, dropped=dropped, masked=masked,
-                                       accurate=accurate, anchored=anchored)
-            tiles = {"logits": logits, "products": dp, "peak": peak, "total": total, "anchor": anchor,
-                     "delta": delta}
-            if seen is not None:
-                tiles["seen"] = seen
-            if dropped:
-                tiles["keep"] = keep
-            if anchored:
-                tiles["at_anchor"] = at_anchor
-            exps, weights, ds = forms.mapped(tiles)
-            ds, param_grads = gradient.pulled(ds, slopes, seen, kinds)
-            return (algebra.value_weights(exps, weights, out_dtype, dropped),
-                    ds.astype(out_dtype), *param_grads)
+        family = bundle("v5e", jnp.bfloat16)
+        assert family is not None
+        tiles = BackwardTiles(max(block_q, family.rows), max(block_k, family.rows), 2, 1,
+                              fused=fused, family=family.name)
+        prog = _Program(family, tiles, 1, 1, spec.keys, spec.form == "causal")
+        walk = _Backward(prog, spec, accurate=accurate, consumers=1, interpret=False, fused=fused,
+                         kinds=kinds, approx_math=not accurate, hooked=(False, False), dropped=dropped,
+                         reduces=False)
+
+        def backward_step(s, dp, peak, total, anchor, delta, q, k, chosen, carry_row, *rest):
+            extra, params = rest[:n_extra], rest[n_extra:]
+            coords = build_coords(q, k, extra)
+            exps, weights, ds, slopes, seen = _scores(walk, coords, params, s, dp, peak, total, anchor,
+                                                      delta, chosen, masked=has_mask)
+            if keys_first:
+                ds_out, param_grads = gradient.pulled(ds, slopes, seen, kinds, KEY_ROWS)
+                kept = tuple(grad for grad in param_grads if grad is not None)
+                weights_out = (algebra.value_weights(exps, weights, out_dtype, dropped) if fused
+                               else algebra.value_parts(weights, out_dtype))
+                return weights_out, ds_out.astype(out_dtype), *kept
+            if fused:
+                ds_out = gradient.pulled(ds, slopes, seen, ())[0]
+                return algebra.value_weights(exps, weights, out_dtype, dropped), ds_out.astype(out_dtype)
+            empty = jnp.zeros((), jnp.float32)
+            summed = tuple(kind in DQ_GRADS for kind in kinds)
+            sums = gradient.DqSums(empty, carry_row, carry_row, (carry_row,) * len(kinds),
+                                   (carry_row,) * len(kinds), empty, carry_row, carry_row)
+            terms, scaled_ds, keyed = gradient.dq_issued(
+                sums, exps, ds, slopes, seen, out_dtype, total, scale=spec.scale,
+                kinds=kinds, summed=summed, accurate=accurate, rows=True)
+            parts = tuple(algebra.formed_parts(scaled_ds, out_dtype, accurate=accurate, rows=True))
+            return (terms.residual, terms.mass, terms.grads, terms.weighed, terms.keyed_mass,
+                    terms.keyed_shift, parts, keyed)
+
         jaxpr = jax.make_jaxpr(backward_step)(
-            s_in, s_in, row, row, row, row, q_pos, k_pos, anchor_tile, keep_tile, *param_avals).jaxpr
+            s_in, s_in, row, row, row, row, q_pos, k_pos, chosen_in, row, *extra_avals, *param_avals).jaxpr
     else:
-        def forward_step(s, m, l_val, q, k, keep, *params):
-            mod = algebra.modify(spec, s, algebra.Coords(q, k), params, masked=masked)
+        def forward_step(s, m, l_val, q, k, *rest):
+            extra, params = rest[:n_extra], rest[n_extra:]
+            coords = build_coords(q, k, extra)
+            mod = algebra.modify(spec, s, coords, params, masked=has_mask)
             new_m, alpha = algebra.peak(spec, m, mod)
             w = algebra.weights(spec, mod, new_m)
-            if dropped:
+            keep = algebra.drawn(coords, q, k)
+            if keep is not None:
                 w = w * keep
             if scaled:
-                exp = jnp.ones((tile[0],), jnp.int32)
+                exp = jnp.ones((block_q,), jnp.int32)
                 held = algebra.Scaled(exp, exp, algebra.raised_weights(spec, mod, lambda: new_m))
                 return (*algebra.at_scale(w, held), new_m, alpha)
             return w.astype(out_dtype), algebra.total(l_val, alpha, w), new_m
-        jaxpr = jax.make_jaxpr(forward_step)(s_in, row, row, q_pos, k_pos, keep_tile, *param_avals).jaxpr
+
+        jaxpr = jax.make_jaxpr(forward_step)(
+            s_in, row, row, q_pos, k_pos, *extra_avals, *param_avals).jaxpr
     return _peak_live_tiles(jaxpr, tile)
 
 
-_cached_step_tile_count = functools.cache(_trace_step_tile_count)
+_STEP_TILE_CACHE: dict[Hashable, tuple[tuple[weakref.ref, ...], int]] = {}
+_TRACE_Q, _TRACE_K = 128, 256
 
 
-def step_live_tiles(block_q: int, block_k: int, *, backward: bool = False, natural_form: bool = False,
-                    scaled: bool = False, accurate: bool = False, dropped: bool = False,
-                    dtype=jnp.bfloat16, score_mod: Callable | None = None,
-                    score_types: tuple = (), masked: bool = True) -> tuple:
-    """Live `(block_q, block_k)` fp32 score tiles in TPU VMEM derived from the traced step (rows 10965,
-    11652)."""
+def step_live_tiles(block_q: int, block_k: int, *, spec: algebra.Forward, backward: bool = False,
+                    natural_form: bool = False, scaled: bool = False, accurate: bool = False,
+                    dropped: bool = False, dtype=jnp.bfloat16, score_mod: Callable | None = None,
+                    score_types: tuple = (), keys_first: bool = False, fused: bool = False,
+                    runs: int = 1) -> tuple:
+    """Live score tiles in TPU VMEM derived by tracing the emitted step, cached via `tuning._held_key`
+    (rows 10965, 11652, 11904, 11963, 11973, 11988, 11993, 11994, 11999, 12073). Hookless calls are
+    shape-invariant once visibility facts (`ragged_q`, `ragged_k`) are fixed and share one canonical
+    non-square trace `(_TRACE_Q, _TRACE_K)`; hook-bearing calls key and trace at `(block_q, block_k)` so
+    geometry-dependent score hooks reflect their actual tile live set."""
     dtype_name = jnp.dtype(dtype).name
     typed_scores = tuple((kind, jnp.dtype(dt).name) for kind, dt in score_types)
+    form, ids, ragged_q, ragged_k, span_runs, raw, natural, subtracted = _visibility_facts(
+        spec, block_k, runs=runs)
+    leaves: list = []
+    hook_key = None if score_mod is None else tuning._held_key(score_mod, leaves)
+    trace_q, trace_k = (_TRACE_Q, _TRACE_K) if score_mod is None else (block_q, block_k)
+    cache_key: Hashable = (trace_q, trace_k, backward, natural_form, scaled, accurate, dropped, dtype_name,
+                           hook_key, typed_scores, form, ids, ragged_q, ragged_k, span_runs, raw, natural,
+                           subtracted, keys_first, fused)
+    tile = (block_k, block_q) if keys_first else (block_q, block_k)
+    entry = _STEP_TILE_CACHE.get(cache_key)
+    if entry is not None and all(ref() is leaf for ref, leaf in zip(entry[0], leaves, strict=True)):
+        return ((tile, jnp.float32),) * entry[1]
+    count = _trace_step_tile_count(
+        block_q=trace_q, block_k=trace_k, backward=backward, natural_form=natural_form,
+        scaled=scaled, accurate=accurate, dropped=dropped, dtype=dtype_name,
+        score_mod=score_mod, score_types=typed_scores, form=form, ids=ids, ragged_q=ragged_q,
+        ragged_k=ragged_k, span_runs=span_runs, raw=raw, natural=natural, subtracted=subtracted,
+        keys_first=keys_first, fused=fused)
     try:
-        count = _cached_step_tile_count(
-            block_q=block_q, block_k=block_k, backward=backward, natural_form=natural_form,
-            scaled=scaled, accurate=accurate, dropped=dropped, dtype=dtype_name,
-            score_mod=score_mod, score_types=typed_scores, masked=masked)
+        refs = tuple(weakref.ref(leaf, lambda _, key=cache_key: _STEP_TILE_CACHE.pop(key, None))
+                     for leaf in leaves)
     except TypeError:
-        count = _trace_step_tile_count(
-            block_q=block_q, block_k=block_k, backward=backward, natural_form=natural_form,
-            scaled=scaled, accurate=accurate, dropped=dropped, dtype=dtype_name,
-            score_mod=score_mod, score_types=typed_scores, masked=masked)
-    return (((block_q, block_k), jnp.float32),) * count
+        return ((tile, jnp.float32),) * count
+    _STEP_TILE_CACHE[cache_key] = (refs, count)
+    return ((tile, jnp.float32),) * count

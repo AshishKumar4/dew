@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import Trainer
-from dew.optim import OptimConfig
+from dew.optim import Adam, OptimConfig
 from dew.data.dataset import Loader
 from dew.data import ByteTokenizer, Memory, presets
 from dew.data.chat import Role
@@ -84,7 +84,7 @@ pair = {"chosen": prompt + response, "rejected": prompt + rejected,
 width = max(len(pair["chosen"]), len(pair["rejected"]))
 pairs = Memory([pair] * 8).repeat().pipe(presets.preferences, seq_len=width, batch=8)
 dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, variables=sft_state.variables)
-dpo_state = Trainer(dpo, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(2)).fit(
+dpo_state = Trainer(dpo, OptimConfig(optimizer=Adam(), learning_rate=1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
 
@@ -201,7 +201,7 @@ import jax
 import numpy as np
 
 from dew import Trainer
-from dew.optim import OptimConfig
+from dew.optim import Adam, OptimConfig
 from dew.data import Memory, presets
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.rl import DPOObjective
@@ -217,7 +217,7 @@ data = Memory(rows * 4).repeat().pipe(presets.preferences, seq_len=row_width, ba
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=2 * row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
-trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3).build(2), key=jax.random.key(0))
+trainer = Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=1e-3).build(2), key=jax.random.key(0))
 initial = trainer.initial_state()
 # Copy the snapshot to host memory before training donates device buffers.
 reference = jax.tree.map(lambda x: np.array(x, copy=True), initial.ema)
@@ -645,7 +645,7 @@ import itertools
 import jax
 import numpy as np
 from dew import Field, InputSpec, Trainer
-from dew.optim import OptimConfig
+from dew.optim import Adam, OptimConfig
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import SimpleDiT
@@ -663,7 +663,7 @@ def brightness(images, batch):
 rollout = FlowRollout(objective, brightness, groups=4, steps=5, train_steps=2)
 batch = {"image": np.zeros((2, 4, 4, 1), dtype=np.uint8)}
 data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=2, batch=2)
-trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(0), rollout=rollout)
+trainer = Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=1e-3), key=jax.random.key(0), rollout=rollout)
 state = trainer.fit(data, steps=2, log_every=1)
 print(int(state.updates))
 ```

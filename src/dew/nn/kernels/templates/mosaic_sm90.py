@@ -3,6 +3,7 @@ templates' Mosaic mainloops, which take every other primitive from the shared to
 warpgroup MMA reads its right operand from shared memory and its left from shared memory or registers,
 accumulates in a warpgroup's registers in the WGMMA layout, and runs asynchronously until waited for."""
 
+import functools
 from collections.abc import Callable
 
 import jax
@@ -71,31 +72,41 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         accumulator = min(widest, self.widest_product or widest) * self.rows // resources.THREADS
         return accumulator + self.assembled if widest else 0
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
 
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
             mosaic.committed()
-            if then is not None:
-                then()
-            return acc_ref[...] if pending == 0 else self.read(acc_ref, pending=pending)
+            value = between()
+            return value, (acc_ref[...] if pending == 0 else self.read(acc_ref, pending=pending))
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
-                     between: Callable = lambda value: value) -> tuple:
-        if launches.interpreting():
-            return super().product_pair(lhs1, rhs1, lhs2, rhs2, shape, between=between)
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False,
+                        then: tuple[Callable | None, ...] | None = None) -> tuple[Callable, ...]:
+        # Every group issued into its own scoped accumulator, then each read as its own groups complete,
+        # the later ones running on (`read`'s `pending`, counted by the groups every run commits), `then[i]`
+        # of it run there, interpreted alike (the interpreter's own MMA, as `product`'s); `apart`, each summed
+        # in turn.
+        if apart:
+            return super().summed_together(shapes, issues, apart=apart, then=then)
+        after = (None,) * len(shapes) if then is None else then
 
-        def both(acc1, acc2):
-            plgpu.wgmma(acc1, lhs1, rhs1)
-            mosaic.committed()
-            plgpu.wgmma(acc2, lhs2, rhs2)
-            mosaic.committed()
-            return between(self.read(acc1, pending=1)), self.read(acc2)
-
-        return pl.run_scoped(both, plgpu.WGMMAAccumulatorRef(shape, jnp.float32),
-                             plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+        def scoped(*accumulators):
+            ends = []
+            for issue, acc in zip(issues, accumulators, strict=True):
+                issue(acc)
+                ends.append(mosaic.sure_commits())
+            values = []
+            for acc, end, each in zip(accumulators, ends, after, strict=True):
+                # In flight past the group read: the groups after it every run commits, which complete
+                # after it, whichever predicated groups a run commits too (`mosaic.sure_commits`).
+                value = self.read(acc, pending=mosaic.sure_commits() - end)
+                values.append(value if each is None else each(value))
+            return tuple(values)
+        values = pl.run_scoped(scoped, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
+        return tuple(functools.partial(lambda value: value, value) for value in values)
 
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
@@ -106,9 +117,10 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
     def products(self, acc, lhs, rhs, *, accumulate: bool = True):
         interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
         mosaic.committed()
-        if interpret:
+        if interpret and isinstance(acc, jax.Array):
             fresh = jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
             return acc + fresh if accumulate else fresh
+        # A scoped accumulator, interpreted too: the interpreter's own MMA, as a fresh product's (`product`).
         if not accumulate:
             # A fresh product into a walk's accumulator: zeroed in its registers, then issued, no wait.
             acc[...] = jnp.zeros(acc.shape, jnp.float32)
@@ -125,7 +137,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
 
         @pl.when(issuing)
         def _():
-            issue()  # into `acc` in place; its returned ref no branch's value
+            mosaic.predicated(issue)  # into `acc` in place; its returned ref no branch's value
 
         return acc
     def read(self, acc, *, first: int = 0, columns: int | None = None, pending: int = 0) -> jax.Array:
@@ -135,18 +147,25 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         return super().read(value, first=first, columns=columns)
 
     def register_products(self, acc, parts, rhs):
-        interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
-        for formed in parts:
-            part = mosaic.unscaled_part(formed)
-            mosaic.committed()
-            if interpret:
-                acc = acc + jnp.dot(part, rhs[...], preferred_element_type=jnp.float32)
-            else:
+        if not launches.interpreting():  # the launch's (`launches.interpreting`)
+            for formed in parts:
+                part = mosaic.unscaled_part(formed)
+                mosaic.committed()
                 plgpu.wgmma(acc, part, rhs)
                 # Operand A is read from its registers until its group retires, and the next part or the
                 # walk's next step writes them (`retires_register_products`): retired now, the groups
                 # before it with it, as they retire in order.
                 plgpu.wgmma_wait(0)
+            return acc
+        for formed in parts:
+            part = mosaic.unscaled_part(formed)
+            mosaic.committed()
+            product = jnp.dot(part, rhs[...], preferred_element_type=jnp.float32)
+            if isinstance(acc, jax.Array):
+                acc = acc + product
+            else:
+                # A scoped accumulator interpreted: its value read and written back (`summed_together`'s).
+                acc[...] = acc[...] + product
         return acc
 
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:

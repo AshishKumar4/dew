@@ -57,13 +57,16 @@ from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.parity_stages import staged_units
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5, write_bound=1.0),
-         'vector delta': recurrence.Hooks(decay='vector', scale=KEY_WIDTH ** -0.5, write_bound=1.0),
+         'vector delta': recurrence.Hooks(decay='vector', scale=KEY_WIDTH ** -0.5, write_bound=1.0,
+                                          unit_queries=True),
          'scalar write': recurrence.Hooks(decay='scalar', delta=False, write_gate=True),
          'gated': recurrence.Hooks(decay='scalar', gates=recurrence.Gates(), l2norm=True),
          'rated': recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)}
 """The template's families as hooks: the gated delta rule's decay a head and a key dimension (its draws'
-sigmoid write gates of unit keys declared, `write_bound`), a decay with a write gate and no delta rule, the
-gated delta net's formed gates, and Mamba2's rated decay."""
+sigmoid write gates of unit keys declared, `write_bound`; Kimi delta attention's unit queries too,
+`unit_queries`, so its own pairs fold their decays as Kimi Linear's layer runs them,
+`recurrence_chunk._unit_pairs`, row 12213), a decay with a write gate and no delta rule, the gated delta net's
+formed gates, and Mamba2's rated decay."""
 
 PORTABLE_SITES = {**SITES, 'turned': TURNED, 'mamba3': dataclasses.replace(TURNED, reads='apart')}
 """The portable math's sites: the template's families, and a state turning its key pairs (`Hooks.turns`)

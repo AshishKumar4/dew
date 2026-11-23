@@ -14,14 +14,14 @@ import typing
 from pathlib import Path
 
 import pytest
-from run_kinds import KINDS, cli_arguments, cli_settings, saved_record, scalars, trained_record
+from run_kinds import KINDS, cli_settings, saved_record, scalars, set_record, trained_record
 
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig, TrainerConfig
 from dew.quantization import Quantization
 from dew.registry import to_record
 from dew.training._lowering import Lowered
-from dew.training.budget import Plateau
+from dew.training.budget import Pause, Plateau
 
 pytestmark = pytest.mark.mesh(devices=8)
 
@@ -60,9 +60,9 @@ def train_record(kind: str, root: Path, name: str, run: RunConfig | None = None,
     record = saved_record(run or KINDS[kind](data, drawn=False), root, name)
     given = cli_settings(root, name, {"trainer.log_every": "1", "trainer.mesh": MESH, "val_metrics": "[]",
                                       **settings})
-    if "trainer.steps" not in settings:
+    if "trainer.horizon.steps" not in settings:
         # The run's own steps, as it states them.
-        del given["trainer.steps"]
+        del given["trainer.horizon.steps"]
     return record, given
 
 
@@ -71,8 +71,17 @@ def trained(kind: str, root: Path, name: str, run: RunConfig | None = None, **se
     return trained_record(*train_record(kind, root, name, run, **settings))
 
 
+def lowered(kind: str, root: Path, name: str, *target: str, **settings: object) -> None:
+    """`dew lower` here over `train_record` for the target its flags name (`target:check --target.generation
+    sm80`), which ends by raising what it did."""
+    from dew._cli.main import main
+
+    record, given = train_record(kind, root, name, None, **settings)
+    main(["lower", str(set_record(record, given) / "run.json"), *target])
+
+
 def trainer_record(field: str, value: object) -> object:
-    """`value` as the run's record holds `TrainerConfig.field`, the form `--set` reads it in."""
+    """`value` as the run's record holds `TrainerConfig.field`."""
     return to_record(value, typing.get_type_hints(TrainerConfig, include_extras=True)[field])
 
 
@@ -95,8 +104,9 @@ def test_a_kinds_run_pauses_splits_and_ranks_as_set(kind, tmp_path):
     checkpoint is the saved step whose logged training loss is the higher, as no default ranking
     picks."""
     best = {"metric": "train/loss", "mode": "max"}
-    run = trained(kind, tmp_path, "paused", **{"trainer.steps": 4, "trainer.stop": {"fraction": 0.5},
-                                                 "trainer.split": 2, "trainer.checkpoint_every": 1,
+    run = trained(kind, tmp_path, "paused", **{"trainer.horizon.steps": 4,
+                                                 "trainer.stop": trainer_record("stop", Pause(0.5)),
+                                                 "trainer.fit.split": 2, "trainer.checkpoint_every": 1,
                                                  "trainer.keep": 4, "trainer.best": best})
     assert saved(run) == [1, 2]
     assert {plan["plan"]["split"] for plan in recorded(run, "StepCompiled")} == {2}
@@ -109,7 +119,8 @@ def test_a_kinds_run_cools_down_and_skips_its_final_save_as_set(kind, tmp_path):
     """Four steps with a cooldown branched at the second (`cooldowns`) and no checkpoint, the final
     save off (`checkpoint_final`): the second step's scalars hold the cooled branch's scores, and the
     run saves nothing."""
-    run = trained(kind, tmp_path, "cooled", **{"trainer.steps": 4, "trainer.checkpoint_final": "False",
+    run = trained(kind, tmp_path, "cooled", **{"trainer.horizon.steps": 4,
+                                               "trainer.checkpoint_final": "False",
                                                  "trainer.cooldowns": {"at": [2], "length": 1}})
     assert any(name.startswith("cooldown/") for name in scalars(run)[2])
     assert saved(run) == []
@@ -121,16 +132,18 @@ def test_a_kinds_run_is_as_long_as_its_epochs_and_examples(kind, tmp_path):
     states its record count, and consumes twice the source examples one epoch does where it states none,
     an epoch a pass over them (row 1902); one of twice the examples ends at twice the step (`examples`)."""
     if kind in COUNTED_RECORDS:
-        once = saved(trained(kind, tmp_path, "once", **{"trainer.epochs": 1}))[-1]
-        twice = saved(trained(kind, tmp_path, "twice", **{"trainer.epochs": 2}))[-1]
+        once = saved(trained(kind, tmp_path, "once", **{"trainer.horizon.epochs": 1}))[-1]
+        twice = saved(trained(kind, tmp_path, "twice", **{"trainer.horizon.epochs": 2}))[-1]
         assert twice == 2 * once
     else:
         def consumed(epochs: int) -> int:
-            logged = scalars(trained(kind, tmp_path, f"epochs-{epochs}", **{"trainer.epochs": epochs}))
+            logged = scalars(trained(kind, tmp_path, f"epochs-{epochs}",
+                                     **{"trainer.horizon.epochs": epochs}))
             return int(logged[max(logged)]["train/examples_consumed"])
         assert consumed(2) == 2 * consumed(1) > 0
-    few = saved(trained(kind, tmp_path, "few", **{"trainer.examples": EXAMPLES[kind]}))[-1]
-    assert saved(trained(kind, tmp_path, "more", **{"trainer.examples": 2 * EXAMPLES[kind]}))[-1] == 2 * few
+    few = saved(trained(kind, tmp_path, "few", **{"trainer.horizon.examples": EXAMPLES[kind]}))[-1]
+    assert saved(trained(kind, tmp_path, "more",
+                         **{"trainer.horizon.examples": 2 * EXAMPLES[kind]}))[-1] == 2 * few
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
@@ -138,10 +151,10 @@ def test_a_kinds_token_budget_ends_its_run_or_is_refused(kind, tmp_path):
     """A budget of one token ends a run of a kind that counts tokens at its first step (`tokens`); a
     kind whose objective counts none refuses it."""
     if kind in COUNTED:
-        assert saved(trained(kind, tmp_path, "budget", **{"trainer.tokens": 1})) == [1]
+        assert saved(trained(kind, tmp_path, "budget", **{"trainer.horizon.tokens": 1})) == [1]
     else:
         with pytest.raises(ValueError):
-            trained(kind, tmp_path, "budget", **{"trainer.tokens": 1})
+            trained(kind, tmp_path, "budget", **{"trainer.horizon.tokens": 1})
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
@@ -152,9 +165,9 @@ def test_a_kinds_batch_ramp_compiles_a_step_for_each_batch_it_reads(kind, tmp_pa
     ramp = {"start": 4, "increment": 4, "samples": 8}
     if kind not in GLOBAL_ORDER:
         with pytest.raises(TypeError):
-            trained(kind, tmp_path, "ramped", **{"trainer.steps": 4, "trainer.batch_ramp": ramp})
+            trained(kind, tmp_path, "ramped", **{"trainer.horizon.steps": 4, "trainer.batch_ramp": ramp})
         return
-    run = trained(kind, tmp_path, "ramped", **{"trainer.steps": 4, "trainer.batch_ramp": ramp})
+    run = trained(kind, tmp_path, "ramped", **{"trainer.horizon.steps": 4, "trainer.batch_ramp": ramp})
     assert len(recorded(run, "StepCompiled")) == 2
 
 
@@ -164,11 +177,11 @@ def test_a_ramped_run_accumulating_two_microbatches_resumes_at_a_stage_its_updat
     (`Ramp.stages`): a run saved there resumes, its data position admitted as the run's stream reads it
     (`resume_admitted`, the stream's window its accumulation's) before its record is written."""
     kind = next(kind for kind in KINDS if kind in GLOBAL_ORDER)
-    settings = {"trainer.batch_ramp": {"start": 4, "increment": 4, "samples": 4}, "trainer.accumulation": 2}
-    run = trained(kind, tmp_path, "ramped", **{"trainer.steps": 2, **settings})
+    settings = {"trainer.batch_ramp": {"start": 4, "increment": 4, "samples": 4}, "trainer.update.batches": 2}
+    run = trained(kind, tmp_path, "ramped", **{"trainer.horizon.steps": 2, **settings})
     first = saved(run)[-1]
     # Resumed from its record, as `dew train <run>/run.json` resumes it.
-    trained_record(run, {"trainer.steps": "4"})
+    trained_record(run, {"trainer.horizon.steps": "4"})
     started = recorded(run, "FitStarted")[-1]
     assert (started["start_step"], started["resumed_from"] is not None) == (first, True)
     assert saved(run)[-1] > first
@@ -176,17 +189,19 @@ def test_a_ramped_run_accumulating_two_microbatches_resumes_at_a_stage_its_updat
 
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_lowered_for_a_gpu_lowers_its_step_and_trains_nothing(kind, tmp_path):
-    """Set to lower for an A100 (`lower_for`), a kind's run lowers its first step for that GPU on this
-    CPU and ends with status 0, saving and stepping nothing."""
-    with pytest.raises(Lowered) as lowered:
-        trained(kind, tmp_path, "lowered", **{"trainer.steps": 2, "trainer.lower_for": "sm80"})
-    assert lowered.value.code == 0 and lowered.value.generation == "sm80"
+    """Lowered for an A100 (`dew lower ... target:check`), a kind's run lowers its first step for that GPU
+    on this CPU and ends with status 0, saving and stepping nothing."""
+    with pytest.raises(Lowered) as ended:
+        lowered(kind, tmp_path, "lowered", "target:check", "--target.generation", "sm80",
+                **{"trainer.horizon.steps": 2})
+    assert ended.value.code == 0 and ended.value.generation == "sm80"
     assert not any(path.name.isdigit() for path in (tmp_path / "runs" / "lowered").iterdir())
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_handed_a_step_compiled_ahead_for_other_devices_refuses_it(kind, tmp_path):
-    """A kind's run compiled ahead for eight 80 GB A100s it lacks (`compile_ahead`) writes its first step and
+    """A kind's run compiled ahead for eight 80 GB A100s it lacks (`dew lower ... target:ahead`) writes its
+    first step and
     ends with status 0; the same run handed that step (`ahead`) on this host's CPUs is refused it as its fit
     starts, the step another target's (`AheadOfTime.held`), before the run trains, saving and stepping
     nothing (train 286's review). Which refusal is the program's is tests/test_compile_ahead.py's to show,
@@ -194,23 +209,22 @@ def test_a_kinds_run_handed_a_step_compiled_ahead_for_other_devices_refuses_it(k
     from dew.training.ahead import CompiledAhead
 
     step = tmp_path / "step.dew-aot"
-    target = {"generation": "sm80", "devices": 8, "capacity_gib": 80, "path": str(step)}
     with pytest.raises(CompiledAhead) as ended:
-        trained(kind, tmp_path, "ahead", **{"trainer.steps": 2, "trainer.compile_ahead": target})
+        lowered(kind, tmp_path, "ahead", "target:ahead", "--target.generation", "sm80", "--target.devices",
+                "8", "--target.capacity-gib", "80", "--target.path", str(step),
+                **{"trainer.horizon.steps": 2})
     assert ended.value.code == 0 and step.exists()
     with pytest.raises(ValueError):
-        trained(kind, tmp_path, "handed", **{"trainer.steps": 2, "trainer.ahead": str(step)})
+        trained(kind, tmp_path, "handed", **{"trainer.horizon.steps": 2, "trainer.ahead": str(step)})
     assert not any(path.name.isdigit() for path in (tmp_path / "runs" / "handed").iterdir())
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
-@pytest.mark.parametrize("option", ["microbatches", "update_tokens"])
-def test_an_option_a_kinds_mesh_or_data_cannot_take_is_refused(kind, option, tmp_path):
-    """Microbatches fed through a stage axis the mesh does not have (`microbatches`), and an update's
-    token count over batches of rows (`update_tokens`), are refused before the run trains."""
-    value = {"microbatches": 2, "update_tokens": 64}[option]
+@pytest.mark.parametrize("option", ["update.tokens"])
+def test_an_option_a_kinds_data_cannot_take_is_refused(kind, option, tmp_path):
+    """An update's token count over batches of rows (`update.tokens`) is refused before the run trains."""
     with pytest.raises(ValueError):
-        trained(kind, tmp_path, option, **{"trainer.steps": 2, f"trainer.{option}": value})
+        trained(kind, tmp_path, option, **{"trainer.horizon.steps": 2, f"trainer.{option}": 64})
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
@@ -223,11 +237,13 @@ def test_a_kinds_run_is_tracked_on_wandb_offline_and_publishes_only_there(kind, 
     wandb.teardown()
     monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     monkeypatch.chdir(tmp_path)
-    trained(kind, tmp_path, "tracked", **{"trainer.steps": 2,
+    trained(kind, tmp_path, "tracked", **{"trainer.horizon.steps": 2,
                                             "trainer.wandb": {"project": "dew-tests", "offline": True}})
     assert list((tmp_path / "wandb").glob("offline-run-*"))
     with pytest.raises(ValueError):
-        trained(kind, tmp_path, "published", **{"trainer.steps": 2, "trainer.publish": "True"})
+        trained(kind, tmp_path, "published", **{"trainer.horizon.steps": 2,
+                                                  "trainer.checkpoint_final": "False",
+                                                  "trainer.wandb": {"project": "dew-tests", "publish": True}})
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
@@ -235,7 +251,7 @@ def test_a_kinds_run_stops_on_a_plateau_of_its_training_loss(kind, tmp_path):
     """A plateau of one evaluation of the training loss that nothing improves past (`stop`) stops a run of
     six steps evaluated every step at its second evaluation, its last checkpoint there."""
     plateau = trainer_record("stop", Plateau("train/loss", evals=1, min_delta=1e9))
-    run = trained(kind, tmp_path, "plateau", **{"trainer.steps": 6, "trainer.eval_every": 1,
+    run = trained(kind, tmp_path, "plateau", **{"trainer.horizon.steps": 6, "trainer.eval_every": 1,
                                                   "trainer.checkpoint_every": 1, "trainer.keep": 6,
                                                   "trainer.stop": plateau})
     assert saved(run)[-1] == 2
@@ -250,10 +266,10 @@ def test_a_kinds_run_is_profiled_and_trains_quantized_as_set(kind, tmp_path):
     quantized trunk, where a DiT's first loss reads none of it (its output projection is zero at init,
     adaLN-zero)."""
     window = {"directory": str(tmp_path / "trace"), "steps": 1, "warmup": 1}
-    profiled = trained(kind, tmp_path, "profiled", **{"trainer.steps": 3, "trainer.profile": window})
+    profiled = trained(kind, tmp_path, "profiled", **{"trainer.horizon.steps": 3, "trainer.profile": window})
     assert list((tmp_path / "trace").rglob("*.xplane.pb")) and saved(profiled) == [3]
     quantized = trained(kind, tmp_path, "quantized", **{
-        "trainer.steps": 2, "trainer.quantization": trainer_record("quantization", Quantization())})
+        "trainer.horizon.steps": 2, "trainer.quantization": trainer_record("quantization", Quantization())})
     assert scalars(quantized)[2]["train/loss"] != scalars(profiled)[2]["train/loss"]
 
 
@@ -263,14 +279,14 @@ def test_a_kinds_run_feeds_its_microbatches_through_its_stages_or_is_refused(kin
     microbatches a step (`microbatches`) each hold half the rows two do, and the compiled step's
     temporaries are fewer, where the kind's model runs in stages (an LM's decoder of two layers); a
     kind whose model takes no stages refuses the mesh."""
-    staged = {"trainer.steps": 1, "trainer.mesh": {"stage": 2, "tensor": 2}}
+    staged = {"trainer.horizon.steps": 1, "trainer.mesh": {"stage": 2, "tensor": 2}}
     if kind not in STAGED:
         with pytest.raises(ValueError):
-            trained(kind, tmp_path, "staged", **staged, **{"trainer.microbatches": 4})
+            trained(kind, tmp_path, "staged", **staged, **{"trainer.fit.microbatches": 4})
         return
     layers = {"model.num_layers": 2} if kind == "lm" else {}
     temps = {count: recorded(trained(kind, tmp_path, f"staged-{count}", **staged, **layers,
-                                     **{"trainer.microbatches": count}), "StepCompiled")[0]
+                                     **{"trainer.fit.microbatches": count}), "StepCompiled")[0]
              for count in (2, 4)}
     assert temps[4]["memory"]["analysis"]["temp"] < temps[2]["memory"]["analysis"]["temp"]
 
@@ -293,21 +309,21 @@ def test_an_lm_run_over_token_batches_accumulates_its_update_token_budget(tmp_pa
             tokens=8 * SEQ))
     run = dataclasses.replace(KINDS["lm"](tmp_path, drawn=False), data=windows(corpus.train),
                               validation=windows(corpus.val))
-    logged = scalars(trained("lm", tmp_path, "budgeted", run, **{"trainer.steps": 4,
-                                                                  "trainer.update_tokens": 16 * SEQ}))
+    logged = scalars(trained("lm", tmp_path, "budgeted", run, **{"trainer.horizon.steps": 4,
+                                                                  "trainer.update.tokens": 16 * SEQ}))
     assert sorted(step for step, row in logged.items() if "train/grad_norm" in row) == [2, 4]
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_trains(kind, tmp_path,
                                                                                        monkeypatch):
-    """A run tracked on W&B offline that would publish its final checkpoint (`publish`) is refused before
-    it trains: publishing links the checkpoint into W&B's registry, which an offline run cannot reach,
+    """A run tracked on W&B offline that would publish its final checkpoint (`Wandb.publish`) is refused
+    before it trains: publishing links the checkpoint into W&B's registry, which an offline run cannot reach,
     and where it was not refused the run trained and then failed at its last call."""
     monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     with pytest.raises(ValueError):
-        trained(kind, tmp_path, "published", **{"trainer.steps": 1, "trainer.publish": "True",
-                                                  "trainer.wandb": {"project": "dew-tests", "offline": True}})
+        trained(kind, tmp_path, "published", **{"trainer.horizon.steps": 1, "trainer.wandb": {
+            "project": "dew-tests", "offline": True, "publish": True}})
     assert not (tmp_path / "runs" / "published").exists()
 
 
@@ -345,10 +361,10 @@ def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
                    "PYTHONPATH": str(REPO_ROOT / "src"), "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                    "XLA_FLAGS": measuring}
     record, settings = train_record("lm", tmp_path, "tuned", **{
-        "trainer.steps": 1, "trainer.tune_kernels": "True", "trainer.mesh": {},
+        "trainer.horizon.steps": 1, "diagnostics.tune_kernels": "True", "trainer.mesh": {},
         "trainer.compilation_cache_dir": str(compiled), "model.attention_impl": "template",
         "model.head_dim": 16})
-    dew_train(tmp_path, environment, str(record / "run.json"), *cli_arguments(settings))
+    dew_train(tmp_path, environment, str(set_record(record, settings) / "run.json"))
     assert json.loads(picks.read_text())["data"]
 
 
@@ -367,9 +383,9 @@ def an_lm_run_whose_launches_are_tokamaxs_refuses_to_tune(tmp_path):
                    "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
                    "XLA_FLAGS": without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))}
     record, settings = train_record("lm", tmp_path, "untuned", **{
-        "trainer.steps": 1, "trainer.tune_kernels": "True", "trainer.mesh": {},
+        "trainer.horizon.steps": 1, "diagnostics.tune_kernels": "True", "trainer.mesh": {},
         "model.attention_impl": "triton", "model.head_dim": 16})
-    arguments = [str(record / "run.json"), *cli_arguments(settings)]
+    arguments = [str(set_record(record, settings) / "run.json")]
     done = subprocess.run([sys.executable, "-m", "dew._cli.main", "train", *arguments], cwd=tmp_path,
                           env=environment, capture_output=True, text=True, timeout=900)
     assert done.returncode != 0
@@ -382,8 +398,8 @@ def test_a_kinds_run_spreads_its_split_axis_by_the_link_it_states(kind, tmp_path
     one its devices would measure, and its checkpoint records the figure for a resume to trace with
     again (ledger 2464, where only a step compiled ahead could state one)."""
     stated = {"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}
-    run = trained(kind, tmp_path, "linked", **{"trainer.steps": 1, "trainer.checkpoint_every": 1,
-                                                "trainer.links": stated})
+    run = trained(kind, tmp_path, "linked", **{"trainer.horizon.steps": 1, "trainer.checkpoint_every": 1,
+                                                "diagnostics.links": stated})
     with Checkpoints(str(run)) as checkpoints:
         figures = checkpoints.rung(checkpoints.latest)["links"]
     assert list(figures.values()) == [4.5e11]

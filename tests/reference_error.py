@@ -434,9 +434,75 @@ def _ulp(magnitude: np.ndarray, dtype) -> np.ndarray:
     exponent = np.frexp(np.maximum(magnitude, float(info.tiny)))[1]
     return np.maximum(np.ldexp(1.0, exponent - 1 - info.nmant), float(info.smallest_subnormal))
 
+class EvaluatedDraw(NamedTuple):
+    """One seed's inputs and host leaves (`assert_as_exact(..., returns=True)`): Dew's leaves with paths,
+    the primary reference's leaves and the float64 truth's leaves."""
+
+    inputs: tuple
+    dew: list[tuple[tuple, np.ndarray]]
+    reference: list[np.ndarray]
+    truth: list[np.ndarray]
+
+
+def _record_draw(captured: dict[int, EvaluatedDraw] | None, seed: int, limit: int,
+                 inputs, dew, other, truth) -> None:
+    """Store one draw's host leaves in `captured` when `seed < limit`, for explicit downstream checks."""
+    if captured is None or seed >= limit or seed in captured:
+        return
+    captured[seed] = EvaluatedDraw(
+        inputs,
+        [(path, np.asarray(leaf)) for path, leaf in jax.tree_util.tree_leaves_with_path(jax.device_get(dew))],
+        [np.asarray(leaf) for leaf in jax.tree.leaves(jax.device_get(other))],
+        [np.asarray(leaf) for leaf in jax.tree.leaves(jax.device_get(truth))],
+    )
+
+
+def _grouped(mine: np.ndarray, theirs: np.ndarray, exact: np.ndarray,
+             held: np.ndarray | None = None):
+    """Finite entries of 1D `[N]` or 2D `[R, N]` row arrays sorted by `(row, mine)` with group `starts`."""
+    mine, theirs, exact = (np.atleast_2d(x) for x in (mine, theirs, exact))
+    rows, cols = mine.shape
+    mask = np.isfinite(mine) & np.isfinite(theirs) & np.isfinite(exact)
+    if held is not None:
+        held = np.atleast_2d(held)
+        mask &= np.isfinite(held)
+    flat = mask.ravel()
+    if not flat.any():
+        return None
+    row = np.repeat(np.arange(rows, dtype=np.intp), cols)[flat]
+    m, t, e = mine.ravel()[flat], theirs.ravel()[flat], exact.ravel()[flat]
+    order = np.lexsort((m, row))
+    row, m, t, e = row[order], m[order], t[order], e[order]
+    starts = np.flatnonzero(np.concatenate([[True], (row[1:] != row[:-1]) | (m[1:] != m[:-1])]))
+    h = None if held is None else held.ravel()[flat][order]
+    return starts, m.size, t, e, h
+
+
+def _has_candidate_tie(mine: np.ndarray, theirs: np.ndarray, exact: np.ndarray, dtype) -> bool:
+    """Whether any row in `[R, N]` holds a group equal in `mine` and apart in `theirs` that can fail
+    `_merged`: for pairs, truths spread past the plain bound; for 3+ equal entries, also past the minimum
+    subset bound in case `rounded_fn` yields a non-finite entry on part of the group."""
+    grouped = _grouped(mine, theirs, exact)
+    if grouped is None:
+        return False
+    starts, size, kept, true, _ = grouped
+    spread_kept = np.maximum.reduceat(kept, starts) - np.minimum.reduceat(kept, starts)
+    if not np.any(spread_kept > 0):
+        return False
+    spread_true = np.maximum.reduceat(true, starts) - np.minimum.reduceat(true, starts)
+    err = np.abs(kept - true)
+    abs_true = np.abs(true)
+    plain = (spread_true > 2 * np.maximum.reduceat(err, starts)
+             + _ulp(np.maximum.reduceat(abs_true, starts), dtype))
+    counts = np.diff(np.append(starts, size))
+    subset = (counts >= 3) & (spread_true > 2 * np.minimum.reduceat(err, starts)
+                              + _ulp(np.minimum.reduceat(abs_true, starts), dtype))
+    return bool(np.any((spread_kept > 0) & (plain | subset)))
+
 
 def assert_merges_no_ties(dew_fn, reference_fn, truth_fn, draw, label: str, *, seeds: int,
-                          along: int = 1, rounded_fn=None) -> None:
+                          along: int = 1, rounded_fn=None,
+                          evaluated: Mapping[int, EvaluatedDraw] | None = None) -> None:
     """A kernel's ties (docs/design/testing.md, fast and accurate forms: the accurate form's claim) over
     `seeds` draws, among a leaf's entries along `along` (an attention leaf's positions, `[B, S, H, D]`'s
     second axis), every other coordinate held: no group of them `dew_fn` returns equal that the reference
@@ -451,23 +517,40 @@ def assert_merges_no_ties(dew_fn, reference_fn, truth_fn, draw, label: str, *, s
     6302's collisions across batches). A pair a correctly rounded computation merges is no pair the
     reference keeps apart but by its own error: keys an ulp apart whose float64 logits round to one fp32
     logit, which Dew's correctly rounded logits share and the reference's, 0.55 ulps off, split, their dV
-    6 ulps apart at the truth (row 6302)."""
-    truth_of = jax.jit(truth_fn)
-    rounded_of = None if rounded_fn is None else jax.jit(rounded_fn)
+    6 ulps apart at the truth (row 6302). When `evaluated` comes from `assert_as_exact(..., returns=True)`,
+    its per-seed leaves are read directly without re-running the arms; `rounded_fn` is jitted and evaluated
+    lazily only on seeds where some leaf has a candidate group."""
+    truth_of = None
+    rounded_of = None
     for seed in range(seeds):
-        inputs = draw(seed)
-        with jax.enable_x64(new_val=True):
-            truth = jax.tree.leaves(truth_of(*widened(inputs)))
-            rounded = truth if rounded_of is None else jax.tree.leaves(rounded_of(*widened(inputs)))
-        found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
-        theirs_all = jax.tree.leaves(reference_fn(*inputs))
-        for (path, mine), theirs, exact, held in zip(found, theirs_all, truth, rounded, strict=True):
-            dtype = np.asarray(mine).dtype
-            mine, theirs, exact, held = (_rows_along(np.asarray(x, np.float64), along)
-                                         for x in (mine, theirs, exact, held))
-            merged = [_merged(*row, dtype) for row in zip(mine, theirs, exact, held, strict=True)]
-            widest = max((ulps for count, ulps in merged if count), default=0.0)
-            count = sum(count for count, _ in merged)
+        if evaluated is not None and seed in evaluated:
+            inputs, found, theirs_all, truth = evaluated[seed]
+        else:
+            inputs = draw(seed)
+            if truth_of is None:
+                truth_of = jax.jit(truth_fn)
+            with jax.enable_x64(new_val=True):
+                truth = jax.tree.leaves(truth_of(*widened(inputs)))
+            found = jax.tree_util.tree_leaves_with_path(dew_fn(*inputs))
+            theirs_all = jax.tree.leaves(reference_fn(*inputs))
+        laid = [(path, np.asarray(mine).dtype,
+                 _rows_along(np.asarray(mine, np.float64), along),
+                 _rows_along(np.asarray(theirs, np.float64), along),
+                 _rows_along(np.asarray(exact, np.float64), along))
+                for (path, mine), theirs, exact in zip(found, theirs_all, truth, strict=True)]
+        if rounded_fn is not None:
+            if not any(_has_candidate_tie(mine_r, theirs_r, exact_r, dtype)
+                       for _, dtype, mine_r, theirs_r, exact_r in laid):
+                continue
+            if rounded_of is None:
+                rounded_of = jax.jit(rounded_fn)
+            with jax.enable_x64(new_val=True):
+                rounded_leaves = jax.tree.leaves(rounded_of(*widened(inputs)))
+            held_rows = [_rows_along(np.asarray(x, np.float64), along) for x in rounded_leaves]
+        else:
+            held_rows = [exact_r for _, _, _, _, exact_r in laid]
+        for (path, dtype, mine_r, theirs_r, exact_r), held_r in zip(laid, held_rows, strict=True):
+            count, widest = _merged(mine_r, theirs_r, exact_r, held_r, dtype)
             assert not count, (f"{label}{jax.tree_util.keystr(path)} seed {seed}: {count} groups of equal "
                                f"values the reference keeps apart, the widest {widest:.0f} ulps")
 
@@ -482,15 +565,14 @@ def _rows_along(x: np.ndarray, along: int) -> np.ndarray:
 
 def _merged(mine: np.ndarray, theirs: np.ndarray, exact: np.ndarray, held: np.ndarray,
             dtype) -> tuple[int, float]:
-    """A row's ties Dew merges that the reference keeps apart (`assert_merges_no_ties`), `held` its truths
-    with the format's own roundings (`rounded_fn`'s, else the truths): their count and the widest's truths'
-    spread in ulps."""
-    finite = np.isfinite(mine) & np.isfinite(theirs) & np.isfinite(exact) & np.isfinite(held)
-    order = np.lexsort((exact[finite], mine[finite]))
-    tied, kept, true, rounded = (x[finite][order] for x in (mine, theirs, exact, held))
-    if not tied.size:
+    """The ties Dew merges across rows `[R, N]` (or a 1D row `[N]`) that the reference keeps apart
+    (`assert_merges_no_ties`), `held` its truths with the format's own roundings (`rounded_fn`'s, else the
+    truths): their count and the widest's truths' spread in ulps."""
+    grouped = _grouped(mine, theirs, exact, held)
+    if grouped is None:
         return 0, 0.0
-    starts = np.flatnonzero(np.concatenate([[True], tied[1:] != tied[:-1]]))
+    starts, _, kept, true, rounded = grouped
+    assert rounded is not None
 
     def spread(x):
         return np.maximum.reduceat(x, starts) - np.minimum.reduceat(x, starts)
@@ -499,7 +581,6 @@ def _merged(mine: np.ndarray, theirs: np.ndarray, exact: np.ndarray, held: np.nd
     merged = ((spread(kept) > 0) & (spread(true) > 2 * np.maximum.reduceat(np.abs(kept - true), starts) + ulp)
               & (spread(rounded) > ulp))
     return int(merged.sum()), float(np.max(spread(true)[merged] / ulp[merged], initial=0.0))
-
 
 def dot_precisions(function, *arguments) -> list:
     """The precision of every dot_general `function` traces over `arguments` under JAX's own default
@@ -936,7 +1017,8 @@ def _ordered(orders, inputs, their_inputs) -> list[tuple]:
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
            label: str = "", examples: bool = False, conditioning=None, timed: dict | None = None,
-           followed=None, library_also: int | None = None, *, repeats: bool) -> list[_Draws]:
+           followed=None, library_also: int | None = None, *, repeats: bool,
+           captured: dict[int, EvaluatedDraw] | None = None, capture_seeds: int = 0) -> list[_Draws]:
     """Every leaf's errors (`_Draws`) over `seeds`, a list (the reference's, each further one's after): both
     functions run on `draw(seed)`'s inputs, truth `truth_fn` (else `reference_fn`) on them widened,
     unrewritten. With `reference_seeds`, the reference runs on those draws instead, each held to its own
@@ -957,22 +1039,16 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     (`Weighed.weighed`). With `followed`, each arm is held to the truth of its own decisions (`_draw_truth`,
     `_followed_truth`). Its first draw is held to be its seed's and each arm a function of its inputs, run
     again on them, where `repeats`, which each driver states: its site's first draw, once a site, not a map
-    task's or a later stage's past it (rows 7603, 7604: each task repeated its own first draw's arms; row
-    10880: a later stage's and a sizing's later blocks', by a default); each null run's first draw is its
-    own run's, a block every such run checks (ledger 2641)."""
+    task's or a later stage's past it (rows 7603, 7604, 10880); each null run's first draw is its own run's,
+    a block every such run checks (ledger 2641). When `captured` is given, records draws `< capture_seeds`."""
     if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
     names, widths = None, None
     prepared_followed = None if followed is None else _truth_program(followed.truth)
-    # Each arm's evidence, its per-example ratios of the draw being read and of every draw read (`examples`).
-    stacked: list = [None for _ in arms]
-    stacked_rows: list = [None for _ in arms]
+    stacked, stacked_rows = ([None for _ in arms] for _ in range(2))
     evidence, per_example, per_example_rows = ([[] for _ in arms] for _ in range(3))
-
-    def truth_and_terms(inputs):
-        return _truth_and_terms(truth_fn or reference_fn, terms_fn, inputs)
-
+    truth_and_terms = functools.partial(_truth_and_terms, truth_fn or reference_fn, terms_fn)
     def rows_at(at, seed):
         """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
         nonlocal names, widths
@@ -1026,6 +1102,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                             if site_first and mine_at is ordered[0][0] else None)
                     other = _arm_ran(label, arm, dew_fn, dew, here, mine_at, true_here, name)
                 other, true_here = _own_truth(prepared_followed, followed, other, here, true_here, arm)
+                if at_arm == 0 and mine_at is ordered[0][0]:
+                    _record_draw(captured, seed, capture_seeds, inputs, dew, other, true_here)
                 shared = true_here is truth
                 if weighed is not None:
                     terms_here = weighed[id(true_here)].ones
@@ -1165,13 +1243,37 @@ def _recorded(label: str, drawn_for, verdict: "Verdict", arms, upto: int | None 
     return record_units(label, payload, upto=upto, offset=offset, verdict=verdict,
                         phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0), **(first or {})})
 
+def _prepare_site(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
+                  also, terms, conditioning, followed, returns: bool) -> tuple[bool, bool]:
+    """Validate `assert_as_exact` options and handle `store.prepare`; return `(plain, done)`."""
+    # A plain site has no library arm, further reference, custom terms program, or weighed check beside Dew
+    # and its reference (`arm_store.compile_site`, row 9044).
+    plain = not (library_fn or also or callable(terms) or conditioning)
+    refuse_rounded(label, reference_fn, *(also or {}).values(), truth_fn=truth_fn, followed=followed,
+                   conditioning=conditioning)
+    if returns and (conditioning is not None or followed is not None
+                    or getattr(reference_fn, "recorded", False)):
+        raise ValueError(f"{label}: returns=True is unsupported with conditioning, followed, or recorded "
+                         "references")
+    store = COMPILED.get()
+    if store is not None and conditioning is not None:
+        raise ValueError(f"{label}: a weighed site reads its reference's own rounding at its truth's inputs, "
+                         "which no program compiled ahead holds")
+    if store is not None and store.prepare:
+        from arm_store import compile_site
+        compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms,
+                     also=also, orders=orders, plain=plain, library_fn=library_fn)
+        return plain, True
+    return plain, False
+
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
                     orders=None, library_fn=None, library_row: int | None = None,
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
                     terms: bool | Callable | None = None, examples: bool = False,
                     conditioning: int | None = None, conditioning_scale: Callable | None = None,
-                    followed: Callable | None = None, held: Callable | None = None) -> None:
+                    followed: Callable | None = None, held: Callable | None = None,
+                    returns: bool = False) -> dict[int, EvaluatedDraw] | None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1261,22 +1363,12 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     (tests/certified.py)."""
     terms = terms if followed is None else _followed_site(label, truth_fn, orders, library_fn, terms,
                                                           conditioning, examples)
-    # Its verdict the plain pair's, the one a qualification run sizes (`_qualified`, and the draws a prepare
-    # compiles its arms at, `arm_store.compile_site`): no library arm, further reference, terms program of its
-    # own or weighed check beside Dew and its reference; the gate's own terms (`terms=True`) are the plain
-    # pair's still, sizing reading none (spec alignment, 9044).
-    plain = not (library_fn or also or callable(terms) or conditioning)
-    refuse_rounded(label, reference_fn, *(also or {}).values(), truth_fn=truth_fn, followed=followed,
-                   conditioning=conditioning)
-    store = COMPILED.get()
-    if store is not None and conditioning is not None:
-        raise ValueError(f"{label}: a weighed site reads its reference's own rounding at its truth's inputs, "
-                         "which no program compiled ahead holds")
-    if store is not None and store.prepare:
-        from arm_store import compile_site
-        compile_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, terms=terms,
-                     also=also, orders=orders, plain=plain, library_fn=library_fn)
-        return
+    plain, prepared = _prepare_site(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn,
+                                    orders=orders, library_fn=library_fn, also=also, terms=terms,
+                                    conditioning=conditioning, followed=followed, returns=returns)
+    if prepared:
+        return None
+    captured: dict[int, EvaluatedDraw] | None = {} if returns and not (drawing() or judging()) else None
     with holding(held):
         if os.environ.get(QUALIFY) and not (drawing() or judging()):
             _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
@@ -1285,12 +1377,13 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
             _judged_site(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                          library_fn=library_fn, library_row=library_row, library_leaves=library_leaves,
                          also=also, terms=terms, examples=examples, conditioning=conditioning,
-                         conditioning_scale=conditioning_scale, followed=followed)
+                         conditioning_scale=conditioning_scale, followed=followed, captured=captured)
+    return captured
 
 
 def _judged_site(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
                  library_row, library_leaves, also, terms, examples, conditioning, conditioning_scale,
-                 followed) -> None:
+                 followed, captured: dict[int, EvaluatedDraw] | None = None) -> None:
     """`assert_as_exact`'s site judged, deferred to the weighed check where it states `conditioning`: its
     truths computed by the programs a store compiled ahead where one is read (`truths_ahead.running`).
 
@@ -1314,8 +1407,8 @@ def _judged_site(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     # own, the shards cut at the most of them, and a recording holds no more.
     _site_judged(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                  library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
-                 terms=terms, examples=examples, weighing=None, upto=staged_units(seeds), followed=followed)
-
+                 terms=terms, examples=examples, weighing=None, upto=staged_units(seeds), followed=followed,
+                 captured=captured)
 
 def _followed_site(label: str, truth_fn, orders, library_fn, terms, conditioning, examples) -> bool:
     """The terms of a site of followed roundings, none (`assert_as_exact`'s `followed`, testing.md): each
@@ -1460,7 +1553,8 @@ def _written_pair(store, label: str, dew_fn, reference_fn, draw, arms):
 
 def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
                  library_row, library_leaves, also, terms, examples: bool, weighing, upto: int | None = None,
-                 offset: int = 0, followed=None, defers_to: str | None = None) -> None:
+                 offset: int = 0, followed=None, defers_to: str | None = None,
+                 captured: dict[int, EvaluatedDraw] | None = None) -> None:
     """`assert_as_exact`'s judgment of one site under `label`, weighed where `weighing` is given (dew.parity's
     `Conditioning`: built of the site's compiled reference and truth where it draws, never in its judge), a
     map task recording its range's draws up to `upto` where given, its classes' digest beside them, its
@@ -1532,7 +1626,8 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
                                              library_leaves=library_leaves, also=further, terms_fn=terms_fn,
                                              label=label, examples=examples,
                                              conditioning=conditioning_now(), timed=first, followed=followed,
-                                             library_also=library_also, repeats=start == 0)
+                                             library_also=library_also, repeats=start == 0,
+                                             captured=captured, capture_seeds=seeds)
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
         return drawn

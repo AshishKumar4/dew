@@ -1,9 +1,9 @@
 """Every option of a run kind's config reaches the same run by each path that sets it (MF01): set in Python
-(`dataclasses.replace`), on the command line (`dew train --set path=value`, `RunConfig.assigned`), read back
-from the run's JSON record (`RunConfig.read`) and from the run.json it saves (`RunConfig.save`,
+(`dataclasses.replace`), at its dotted path (`RunConfig.override`, as a run file or a sweep sets it), read
+back from the run's JSON record (`RunConfig.read`) and from the run.json it saves (`RunConfig.save`,
 `RunConfig.load`), each value an alternative its field's type declares (`option_witness.alternatives`): each
 path holds the value as Python's does and writes the record the others write, and a value Python refuses,
-the command line refuses as well. The fields every run holds are swept on a language model's run, each
+the path refuses as well. The fields every run holds are swept on a language model's run, each
 kind's own on its own."""
 
 import dataclasses
@@ -17,9 +17,10 @@ from run_kinds import KINDS, saved_record, scalars, trained_by_cli, trained_reco
 from dew import registry
 from dew.config import RunConfig, TrainerConfig
 from dew.training import Layout, MeshSpec
+from dew.training.budget import Horizon
 
 SUPPRESSED = ("data", "validation")
-"""The fields a run's record writes as its chains (`dew.data.records`), which `--set` sets one setting of a
+"""The fields a run's record writes as its chains (`dew.data.records`), which a path sets one setting of a
 recorded chain's call at a time; their paths are the data layer's (tests/test_config_cli.py)."""
 
 
@@ -64,20 +65,20 @@ def option(kind: str, path: str, index: int) -> tuple[RunConfig, object, object]
 
 @pytest.mark.parametrize(("kind", "path", "index"), cases(), ids=lambda part: str(part))
 def test_each_path_that_sets_an_option_sets_the_same_run(kind, path, index, tmp_path):
-    """The option set in Python, on the command line, and read back from the run's record and its
-    run.json, is the value set, and each writes one record; refused in Python, it is refused on the
-    command line."""
+    """The option set in Python, at its path, and read back from the run's record and its run.json, is the
+    value set, and each writes one record; refused in Python, it is refused at its path."""
     base, hint, value = option(kind, path, index)
-    given = f"{path}={flag(value, hint)}"
+    # The value as a record holds it, which a path sets (`RunConfig.override`).
+    given = {path: registry.to_record(value, hint)}
     try:
         python = replaced(base, path, value)
     except (TypeError, ValueError) as refused:
         with pytest.raises(type(refused)):
-            base.assigned([given])
+            base.override(given)
         return
     record = json.loads(json.dumps(python.record()))
     python.save(str(tmp_path / "saved"))
-    paths = {"command line": base.assigned([given]), "record": RunConfig.read(record),
+    paths = {"path": base.override(given), "record": RunConfig.read(record),
              "run.json": RunConfig.load(str(tmp_path / "saved"))}
     # The value as the run holds it: a field may read a value as its own form (a tuple of one id, a rate
     # its default resolves).
@@ -89,7 +90,7 @@ def test_each_path_that_sets_an_option_sets_the_same_run(kind, path, index, tmp_
 
 
 
-SET = ("optim.learning_rate=0.0123", "data_seed=3", "trainer.key=5")
+SET = {"optim.learning_rate": 0.0123, "data_seed": 3, "trainer.key": 5}
 """Options a run trained both ways is set with, each beside its default."""
 
 
@@ -103,18 +104,18 @@ def test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_rec
     its first step's checkpoint and resumed for the second by `dew train` over the run's own record. Every
     way logs the same two losses, and the run.json each writes reads back as one run, but for the name each
     trains under (row 4511: prepare, train, the command and a saved, reloaded and resumed run agree)."""
-    run = KINDS[kind](tmp_path, drawn=False).assigned(list(SET))
+    run = KINDS[kind](tmp_path, drawn=False).override(SET)
     hints = typing.get_type_hints(TrainerConfig)
     given = {"mesh": MeshSpec(fsdp=2), "layout": Layout(min_shard=64), "log_every": 1}
-    trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"), steps=2,
-                                  eval_every=None, checkpoint_every=None, multi_host=False,
-                                  compilation_cache_dir=None, **given)
+    trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"),
+                                  horizon=Horizon(steps=2), eval_every=None, checkpoint_every=None,
+                                  multi_host=False, compilation_cache_dir=None, **given)
     python = dataclasses.replace(run, trainer=trainer)
     python.prepare().train("python")
     RunConfig.load(str(saved_record(python, tmp_path, "saved"))).prepare().train("reloaded")
     stopped = trained_by_cli(run, tmp_path, "cli", {f"trainer.{name}": flag(value, hints[name])
                                                     for name, value in given.items()})
-    trained_record(stopped, {"trainer.steps": "2"})
+    trained_record(stopped, {"trainer.horizon.steps": "2"})
     runs = tmp_path / "runs"
     losses = {name: [scalars(runs / name)[step]["train/loss"] for step in (1, 2)]
               for name in ("python", "reloaded", "cli")}

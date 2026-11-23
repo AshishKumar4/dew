@@ -68,10 +68,10 @@ class EnvConfig(Registered):
 
     `name` is an alias of `dew.registry.envs` or an import path, held as the path: a JAX `Env` class, a host
     `Simulator` class, or a function or classmethod that returns one (`Playground.load`). `fields` are its
-    arguments as given, a nested value as its record (a race's `Racing`, a `GateRace`'s renderer as
-    `{"class": ..., "fields": ...}`), set one at a time by `--set env.<argument>=...`; `defaults` holds
-    every other argument the class defaults, as a model's are held. An `Env` of one environment is wrapped
-    as `dew.rl.playground.playground` wraps one: each episode cut after `episode_length` steps of
+    arguments as given, a nested value as its record (a race's `Racing`, a `GateRace`'s renderer as `{"class":
+    ..., "fields": ...}`), set one at a time by `RunConfig.override({"env.<argument>": ...})`; `defaults`
+    holds every other argument the class defaults, as a model's are held. An `Env` of one environment is
+    wrapped as `dew.rl.playground.playground` wraps one: each episode cut after `episode_length` steps of
     `action_repeat` repeats where that is set (`TimeLimit`), then `count` of them stepped together
     (`Batched`). A `Simulator` is a batch of its own, and takes neither."""
 
@@ -192,16 +192,17 @@ class EnvRunConfig(RunConfig):
     that states one is refused. A run that starts from a saved run trains that run's model, and names none."""
     objective: ObjectiveConfig = dataclasses.field(
         default_factory=lambda: ObjectiveConfig("dew.objectives.rl.dreamer:DreamerV3Objective"))
-    """The agent's objective and its arguments (`--objective.imitation 1 --objective.imitates label`); a
-    `ControlPPOObjective`'s `observation_size` is derived, the width of the views it `reads`."""
+    """The agent's objective and its arguments (`ObjectiveConfig(..., {"imitation": 1, "imitates":
+    "label"})`); a `ControlPPOObjective`'s `observation_size` is derived, the width of the views it
+    `reads`."""
     trainer: TrainerConfig = dataclasses.field(
         default_factory=lambda: TrainerConfig(eval_every=None, checkpoint_every=None))
     env: Annotated[EnvConfig, tyro.conf.subcommand("env")] | None = None
     """The environment the agent acts in (`EnvConfig`): `--env.name flight --env.count 4096 --env.fields
-    '{"racing": {"hz": 60}}'`, an argument at a time `--set env.difficulty=0.5`."""
+    '{"racing": {"hz": 60}}'`, an argument at a time `override({"env.difficulty": 0.5})`."""
     rollout: RolloutConfig = dataclasses.field(default_factory=RolloutConfig)
     """The rollout and its settings (`RolloutConfig`): `--rollout.name control --rollout.fields
-    '{"unroll_length": 64}'`, a setting at a time `--set rollout.train_ratio=128`."""
+    '{"unroll_length": 64}'`, a setting at a time `override({"rollout.train_ratio": 128})`."""
     teacher: Annotated[TeacherConfig, tyro.conf.subcommand("teacher")] | None = None
     """A privileged teacher's saved run (`TeacherConfig`), turned on by its flags: `--teacher.run runs/teacher
     --teacher.demonstrates`."""

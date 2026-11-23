@@ -21,8 +21,9 @@ from dew.data.pipeline import Dataset, ObjectiveData
 from dew.data.plan import DataResume
 from dew.telemetry.instrumentation import count_compilation_cache
 from dew.training._fit import data_resumed
-from dew.training.budget import run_length, run_steps, run_tokens
+from dew.training.budget import Horizon, run_steps, run_tokens
 from dew.training.evaluation import EvalSuite, Split
+from dew.training.policy import UpdateBatch
 from dew.training.runtime import ready_process
 
 if TYPE_CHECKING:
@@ -101,27 +102,30 @@ class DataObjective(Protocol):
 
 def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
              validation: Dataset | Mapping[str, Dataset | Split | EvalSuite] | None, *,
-             steps: int | None, epochs: int | None, tokens: int | None, examples: int | None,
-             accumulation: int, startup: Startup, resume: DataResume = "relaxed",
-             ) -> tuple[Loader, Mapping[str, Split | EvalSuite] | None, int | None, int | None, int | None]:
-    """A fit's data and its length: its length named once (`run_length`), the process readied, the data and
+             horizon: Horizon, update: UpdateBatch, startup: Startup, resume: DataResume = "relaxed",
+             ) -> tuple[Loader, Mapping[str, Split | EvalSuite] | None, int | None, int | None, int | None,
+                        int]:
+    """A fit's data and its length (`horizon`, named once): the process readied, the data and
     its validation compiled with the objective's steps for a resume of `resume` (`fitted`), its token budget,
-    its microsteps and its bound in examples, `epochs` of a read with no record count read as passes over
-    its source examples among them (`Loader.pass_examples`) (`run_tokens`, `run_steps`), each long phase
-    reported (`Startup`)."""
-    run_length(steps, epochs, tokens, examples, required=False)
+    its microsteps and its bound in examples, `epochs` of a read with no record count read as passes over its
+    source examples among them (`Loader.pass_examples`) (`run_tokens`, `run_steps`), each long phase reported
+    (`Startup`); and the steps an update pools, `update`'s batches or its tokens' over the data's token
+    batches (`UpdateBatch.of_tokens`)."""
     ready_process()
+    examples = horizon.examples
     with startup.phase("data", "preparing the data"):
         loader, validation = fitted(dataset, validation, objective=objective.data(), examples=examples,
-                                    epochs=epochs, steps=steps, tokens=tokens, resume=resume)
+                                    epochs=horizon.epochs, steps=horizon.steps, tokens=horizon.tokens,
+                                    resume=resume)
     # The widths the data bound: what a saved run of the objective records.
     objective.bind_widths(loader.widths)
     # A schedule whose last stage ends its data bounds the run as tokens= does (`run_tokens`).
-    tokens = run_tokens(loader, tokens, counts_tokens=objective.counts_tokens)
+    tokens = run_tokens(loader, horizon.token_cap, counts_tokens=objective.counts_tokens)
+    accumulation = update.of_tokens(loader.each_token_batch)
     with startup.phase("count", "counting the steps the run's examples take", when=examples is not None):
-        steps = run_steps(loader, steps, epochs, tokens, accumulation, examples)
+        steps = run_steps(loader, horizon, accumulation, tokens)
     count_compilation_cache()
-    return loader, validation, tokens, steps, loader.examples
+    return loader, validation, tokens, steps, loader.examples, accumulation
 
 
 def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader: Loader,

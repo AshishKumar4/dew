@@ -279,16 +279,23 @@ def climb_to[LossT, EffectsT](objective: Objective[LossT, EffectsT], rung: Mappi
     if rung.get('head_fused') is False:
         objective.unfuse_head()
     entries = objective.program_key()
+    modules = _climbed(objective, rung)
+    if any(module is not entry.module for module, entry in zip(modules, entries, strict=True)):
+        objective.substitute(modules)
+
+
+def _climbed[LossT, EffectsT](objective: Objective[LossT, EffectsT], rung: Mapping[str, object]) -> list:
+    """The objective's modules, in program order, each trained one at the remat `rung` records where that is
+    above its own (`Recomputing.restore_recompute`), the objective left as it is."""
+    entries = objective.program_key()
     trained = [index for index, entry in enumerate(entries) if entry.trained]
     recorded = json_value(rung.get("remat"), "rung remat")
     # One trained module records its rung alone, several a list in program order.
     records = [recorded] if len(trained) == 1 else recorded if isinstance(recorded, list) else []
     rungs = dict(zip(trained, records, strict=False))
-    modules = [entry.module.restore_recompute(rungs[index])
-               if index in rungs and isinstance(entry.module, Recomputing) else entry.module
-               for index, entry in enumerate(entries)]
-    if any(module is not entry.module for module, entry in zip(modules, entries, strict=True)):
-        objective.substitute(modules)
+    return [entry.module.restore_recompute(rungs[index])
+            if index in rungs and isinstance(entry.module, Recomputing) else entry.module
+            for index, entry in enumerate(entries)]
 
 
 def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> JSON:
@@ -827,6 +834,39 @@ def remat_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
     moved."""
     return moved(objective, lambda module: module.recompute_more() if isinstance(module, Recomputing)
                  else None)
+
+
+def remat_topped[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> int:
+    """How many modules the objective trains stand at the top of their remat ladders (`Recomputing`, whose
+    `recompute_more` is None there): their whole recomputation, which a "selective" run's search stops short
+    of (`dew.training.policy.FitPolicy.remat`)."""
+    return sum(1 for entry in objective.program_key()
+               if entry.trained and isinstance(entry.module, Recomputing)
+               and entry.module.recompute_more() is None)
+
+
+def remat_topmost[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> None:
+    """Climb every module the objective trains to the top of its remat ladder (`remat_more`), its whole
+    recomputation: where a "full" run's step starts (`dew.training.policy.FitPolicy.remat`), its search's and
+    its lowering's alike."""
+    while remat_more(objective):
+        pass
+
+
+def remat_admits[LossT, EffectsT](objective: Objective[LossT, EffectsT], rung: Mapping[str, object],
+                                  remat: str) -> bool:
+    """Whether the remat a saved `rung` records (an ahead step's plan, a checkpoint's) is one the run's
+    policy takes (`dew.training.policy.FitPolicy.remat`), its objective climbed to it and not moved: any under
+    "auto" and "full", which climbs on to the ladders' tops; none recomputing under "none"; no module more at
+    its ladder's top than the run's configuration puts there under "selective"."""
+    if remat in ("auto", "full"):
+        return True
+    trained = [entry.trained for entry in objective.program_key()]
+    climbed = [module for module, held in zip(_climbed(objective, rung), trained, strict=True)
+               if held and isinstance(module, Recomputing)]
+    if remat == "none":
+        return all(module.recompute_record() is None for module in climbed)
+    return sum(module.recompute_more() is None for module in climbed) <= remat_topped(objective)
 
 
 def remat_offloaded[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:

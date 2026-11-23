@@ -57,6 +57,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
     splash_attention_mask_info as mask_info_lib,
 )
 
+from dew.nn import programs
 from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, launches
@@ -442,8 +443,7 @@ def _forward_step(
     m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
     assert m_prev.shape == (bq, NUM_LANES)
     assert l_prev.shape == (bq, NUM_LANES)
-    qk = _dot(q_ref[...], k_ref[slice_k, :], NT_DIM_NUMBERS, _precision(q_ref.dtype, k_ref.dtype),
-              interpret=interpret)
+    qk = _dot(q_ref[...], k_ref[slice_k, :], NT_DIM_NUMBERS, interpret=interpret)
     assert qk.shape == (bq, bkv_compute)
     assert isinstance(slice_k, pl.Slice)
     # Where the iteration space is shrunk (local attention), a key block's program id is not its place:
@@ -477,8 +477,8 @@ def _forward_step(
     alpha = jnp.exp(m_prev - shift)
     l_next = l_curr + alpha * l_prev
     m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
-    o_curr = _dot(s_curr, v_ref[slice_k, :].astype(jnp.float32), NN_DIM_NUMBERS, _precision(v_ref.dtype),
-                  interpret=interpret)
+    o_curr = _dot(s_curr, v_ref[slice_k, :].astype(jnp.float32), NN_DIM_NUMBERS,
+                  rhs_dtype=v_ref.dtype, interpret=interpret)
     alpha_o = jnp.tile(alpha, (1, pl.cdiv(head_dim_v, NUM_LANES)))[..., : o_scratch_ref.shape[-1]]
     o_scratch_ref[:] = alpha_o * o_scratch_ref[:] + o_curr
 
@@ -731,8 +731,7 @@ def _dq_kernel(
         k, v = k_ref[...], v_ref[...]
         peak, inverse = jnp.expand_dims(peak_ref[0], -1), jnp.expand_dims(inverse_ref[0], -1)
         do = do_ref[...]
-        qk_uncapped = _dot(q_ref[...], k, NT_DIM_NUMBERS, _precision(q_ref.dtype, k.dtype),
-                           interpret=interpret)
+        qk_uncapped = _dot(q_ref[...], k, NT_DIM_NUMBERS, interpret=interpret)
         k_slice = pl.ds(0, bkv)
         assert isinstance(k_slice, pl.Slice)
         qk = _apply_mask_and_soft_cap(
@@ -750,7 +749,7 @@ def _dq_kernel(
             mask_function=mask_function,
         )
         p = _weights(qk, peak, inverse)
-        dp = _dot(do.astype(v.dtype), v, NT_DIM_NUMBERS, _precision(v.dtype), interpret=interpret)
+        dp = _dot(do.astype(v.dtype), v, NT_DIM_NUMBERS, interpret=interpret)
         if delta:
             # Dew: the block's share of the query's delta, sum_k p * dp, lane-broadcast.
             dq_scratch_ref[...] += jnp.broadcast_to(
@@ -758,8 +757,7 @@ def _dq_kernel(
             )
             return
         ds = _through_soft_cap((dp - jnp.expand_dims(di_ref[0], -1)) * p, qk_uncapped, attn_logits_soft_cap)
-        dq_scratch_ref[...] += _dot(ds.astype(k.dtype), k, NN_DIM_NUMBERS, _precision(k.dtype),
-                                    interpret=interpret)
+        dq_scratch_ref[...] += _dot(ds.astype(k.dtype), k, NN_DIM_NUMBERS, interpret=interpret)
 
     @pl.when(j == grid_width - 1)
     def end():
@@ -910,7 +908,7 @@ def _dkv_step(
     peak, inverse = peak_ref[:1, :], inverse_ref[:1, :]
     do = do_ref[...]
     di = di_ref[:1, :]
-    qk_uncapped = _dot(k, q, NT_DIM_NUMBERS, _precision(k.dtype, q.dtype), interpret=interpret)
+    qk_uncapped = _dot(k, q, NT_DIM_NUMBERS, interpret=interpret)
     assert isinstance(slice_k, pl.Slice)
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
@@ -928,11 +926,11 @@ def _dkv_step(
         mask_function=mask_function,
     )
     p = _weights(qk, peak, inverse)
-    dv = _dot(p.astype(do.dtype), do, NN_DIM_NUMBERS, _precision(do.dtype), interpret=interpret)
+    dv = _dot(p.astype(do.dtype), do, NN_DIM_NUMBERS, interpret=interpret)
     dv_scratch_ref[slice_k, :] = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
-    dp = _dot(v, do, NT_DIM_NUMBERS, _precision(v.dtype, do.dtype), interpret=interpret)
+    dp = _dot(v, do, NT_DIM_NUMBERS, interpret=interpret)
     ds = _through_soft_cap((dp - di) * p, qk_uncapped, attn_logits_soft_cap)
-    dk = _dot(ds.astype(do.dtype), q, NN_DIM_NUMBERS, _precision(do.dtype, q.dtype), interpret=interpret)
+    dk = _dot(ds.astype(do.dtype), q, NN_DIM_NUMBERS, interpret=interpret)
     dk_scratch_ref[slice_k, :] = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
 
 
@@ -1150,18 +1148,15 @@ def _shift(peak: jax.Array) -> jax.Array:
     return jnp.where(peak == -jnp.inf, 0.0, peak)
 
 
-def _precision(*dtypes) -> lax.Precision | None:
-    """Dew: a product of float32 operands at full float32 precision, a narrower one at the default: a TPU's
-    default runs a float32 product as one bf16 pass, which left splash's float32 output 5.1e-4 rms from
-    float64 against 1.9e-7 and its sinks' gradient 0.104 against 5.8e-4 (row 1331)."""
-    return lax.Precision.HIGHEST if all(jnp.dtype(dtype) == jnp.float32 for dtype in dtypes) else None
-
-
-def _dot(lhs: jax.Array, rhs: jax.Array, dimension_numbers, precision: lax.Precision | None, *,
+def _dot(lhs: jax.Array, rhs: jax.Array, dimension_numbers, *, rhs_dtype=None,
          interpret: bool) -> jax.Array:
-    """Dew: a kernel's product into fp32 at `precision` (`_precision`); interpreted on a CPU, the product its
-    operands declare there issued by the declaration's owner (`product.interpreted`), as every interpreted
-    template's is, so its sums are the ones its reference's contractions take on that CPU."""
+    """Dew: a kernel's product into fp32 at `programs.mosaic_tpu_dot_precision` (row 11970); interpreted on
+    a CPU, the product its operands declare there issued by the declaration's owner (`product.interpreted`),
+    as every interpreted template's is, so its sums are the ones its reference's contractions take there."""
+    (lhs_c, rhs_c), _ = dimension_numbers
+    m, k, n = lhs.shape[1 - lhs_c[0]], lhs.shape[lhs_c[0]], rhs.shape[1 - rhs_c[0]]
+    precision = programs.mosaic_tpu_dot_precision(
+        lhs.dtype, rhs.dtype if rhs_dtype is None else rhs_dtype, m, k, n)
     if interpret:
         declared = product.declared(products_dtype(lhs, rhs), precision, outputs=(jnp.float32,))
         return product.interpreted(declared, lhs, rhs, dimension_numbers)
