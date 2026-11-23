@@ -382,6 +382,22 @@ _COMMITTED = _cache.untraced(contextvars.ContextVar("committed", default=0))
 add to, whose differences across a walk's step are its groups (`commits`), its own value no trace's program
 reads (`dew._cache.untraced`)."""
 
+_PREDICATED = _cache.untraced(contextvars.ContextVar("predicated", default=0))
+"""How many predicates a run decides products are issued under (`Issuer.issued_when`), one within another."""
+
+_UNSURE = _cache.untraced(contextvars.ContextVar("unsure", default=0))
+"""The product groups `_COMMITTED` counts that were committed under a predicate a run decides
+(`_PREDICATED`), which a run may commit none of (`sure_commits`)."""
+
+_ONCE_PREDICATED = _cache.untraced(contextvars.ContextVar("once_predicated", default=0))
+"""The product groups committed under one predicate alone, none within it (`issued_one_of`'s cases'
+own)."""
+
+
+def then_read(read: Callable, after: Callable | None) -> Callable:
+    """`read`, then `after` of its value where given (`Issuer.summed_together`'s `then`)."""
+    return read if after is None else lambda: after(read())
+
 
 def committed() -> None:
     """One product group committed by an asynchronous issuer (a warpgroup MMA, which `Issuer.settled` waits
@@ -389,12 +405,34 @@ def committed() -> None:
     reading shared memory asynchronously, so refused within `Family.staged_together` (`issuing`)."""
     issuing()
     _COMMITTED.set(_COMMITTED.get() + 1)
+    if _PREDICATED.get():
+        _UNSURE.set(_UNSURE.get() + 1)
+    if _PREDICATED.get() == 1:
+        _ONCE_PREDICATED.set(_ONCE_PREDICATED.get() + 1)
 
 
 def commits() -> int:
     """The product groups committed so far in this trace (`committed`): a walk's completion tokens, the
     difference across a step its groups."""
     return _COMMITTED.get()
+
+
+def sure_commits() -> int:
+    """The product groups `commits` counts that every run commits, none under a predicate a run decides
+    (`predicated`): a wait leaving as many of them in flight as were committed after a group waits on that
+    group, whichever predicated ones a run commits too, as groups complete in their order (theme K01-e's
+    review P0: a wait counting a predicated group a run skipped read the group before it unfinished)."""
+    return _COMMITTED.get() - _UNSURE.get()
+
+
+def predicated(issue: Callable):
+    """`issue()`, its groups committed under a predicate a run decides, within any it is issued under
+    (`sure_commits`)."""
+    token = _PREDICATED.set(_PREDICATED.get() + 1)
+    try:
+        return issue()
+    finally:
+        _PREDICATED.reset(token)
 
 
 def workspace(shape: tuple, dtype, *, interpret) -> jax.Ref:
@@ -1091,19 +1129,24 @@ class Issuer[Accumulator](abc.ABC):
         accumulator is a ref scopes (wgmma's)."""
         return issue(self.zeros(shape))
 
-    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False
-                        ) -> tuple[Callable, ...]:
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False,
+                        then: tuple[Callable | None, ...] | None = None) -> tuple[Callable, ...]:
         """Groups of products none of which reads another's sum, each `issues[i](acc) -> acc` into a fresh
-        fp32 accumulator of `shapes[i]`: a reader of each group's value, which its caller calls where it uses
-        it, so no more sums are held in registers at once than it reads together. Where the issuer awaits its
-        products (tensor memory's), every group is issued before any is awaited, one wait for them all, and a
-        reader reads its group's accumulator (`Tcgen05ChunksIssuer`'s); `apart`, each group's products
-        awaited before the next group issues, as groups that stage their operands into shared tiles need (a
-        group's staging would overwrite a tile another group's product in flight reads). Elsewhere a reader
-        sums its group where it is read (`summed`), in the caller's order, each group done before the next."""
+        fp32 accumulator of `shapes[i]`: a reader of each group's value, `then[i]` of it where given (any
+        tree), which its caller calls where it uses it, so no more sums are held in registers at once than
+        it reads together. Where the issuer awaits its products (tensor memory's), every group is issued
+        before any is awaited, one wait for them all, and a reader reads its group's accumulator
+        (`Tcgen05ChunksIssuer`'s); where it reads them as each completes (a warpgroup MMA's), every group is
+        issued, each read in turn as its own completes, `then[i]` run on it while the later groups run on
+        (`WgmmaIssuer`'s: a backward's weights made while its value products run, row 10734); `apart`, each
+        group's products awaited before the next group issues, as groups that stage their operands into
+        shared tiles need (a group's staging would overwrite a tile another group's product in flight
+        reads). Elsewhere a reader sums its group where it is read (`summed`), then `then[i]` of it, in the
+        caller's order, each group done before the next."""
         del apart
-        return tuple(functools.partial(self.summed, shape, issue)
-                     for shape, issue in zip(shapes, issues, strict=True))
+        after = (None,) * len(shapes) if then is None else then
+        return tuple(then_read(functools.partial(self.summed, shape, issue), each)
+                     for shape, issue, each in zip(shapes, issues, after, strict=True))
 
     @abc.abstractmethod
     def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:
@@ -1229,9 +1272,9 @@ class Issuer[Accumulator](abc.ABC):
         `issued_unless`'s branch the other way, stated positively, as a warp's own code lowers a predicate
         (no boolean `not` there): a value accumulator's by a branch, one its instructions write in place by
         its issuer's own (`WgmmaIssuer`, `Tcgen05Issuer`). Its groups count as committed either way
-        (`commits`), which a walk's waits meet where no step issues them; a choice among products that
-        varies by step is `issued_one_of`'s."""
-        return lax.cond(issuing, issue, lambda: acc)
+        (`commits`), which a walk's waits meet where no step issues them, though not as committed by every
+        run (`sure_commits`); a choice among products that varies by step is `issued_one_of`'s."""
+        return lax.cond(issuing, functools.partial(predicated, issue), lambda: acc)
 
     def issued_one_of(self, which: jax.Array, accumulators: Sequence, issue: Callable) -> tuple:
         """Each of `accumulators` as `issue(case, acc)`'s products into it leave it where `which` (traced,
@@ -1240,15 +1283,23 @@ class Issuer[Accumulator](abc.ABC):
         `gemm.chained`). Its groups count as one case's (`commits`), each case committing as many: counted
         as every case traced, a walk's wait for a step's groups left a step of its ring in flight past its
         slot's release (base review of f86cb5b03, F2)."""
-        before, issued, groups = commits(), [], set()
+        before, unsure, once = commits(), _UNSURE.get(), _ONCE_PREDICATED.get()
+        issued, groups, sure = [], set(), []
         for case, acc in enumerate(accumulators):
-            began = commits()
+            began, began_once = commits(), _ONCE_PREDICATED.get()
             issued.append(self.issued_when(which == case, acc, functools.partial(issue, case, acc)))
             groups.add(commits() - began)
+            # The case's groups no predicate within it guards, which a run choosing it commits.
+            sure.append(_ONCE_PREDICATED.get() - began_once)
         if len(groups) > 1:
             raise ValueError(f"a choice among products commits one count of groups whichever it issues, not "
                              f"{sorted(groups)}")
-        _COMMITTED.set(before + max(groups, default=0))
+        # One case's groups, as sure as the choice's own issue is: those every case commits whatever a
+        # predicate within it decides (theme K01-e's review P0: an inner predicate's groups read as sure).
+        count = max(groups, default=0)
+        _COMMITTED.set(before + count)
+        _UNSURE.set(unsure + (count if _PREDICATED.get() else count - min(sure, default=0)))
+        _ONCE_PREDICATED.set(once)
         return tuple(issued)
 
     def added_onto(self, acc, adds: jax.Array):
@@ -1265,13 +1316,6 @@ class Issuer[Accumulator](abc.ABC):
         operands' fragments in registers, each step's loaded within it, so a product beside others holds no
         fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
         return self.products(acc, lhs, rhs, accumulate=accumulate)
-
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
-                     between: Callable = lambda value: value) -> tuple:
-        """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
-        (`WgmmaIssuer`), else in turn (`product`). `between` runs on the first product's value while the
-        second is in flight, where the issuer pipelines them, returning `(between(first), second)`."""
-        return between(self.product(lhs1, rhs1, shape)), self.product(lhs2, rhs2, shape)
 
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""

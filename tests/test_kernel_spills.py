@@ -21,7 +21,10 @@ import optax
 import pytest
 from lane_environment import DETERMINISTIC_OPS
 from generation_support import lowers
+from jax._src.lib.mlir.dialects import llvm
 from jax.experimental.layout import Format, Layout
+from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend.mlir import ir
 from kernel_compile import Uncounted
 from process_support import fresh, keeping_picks
 
@@ -124,11 +127,15 @@ from dew.nn.kernels.generation import compile_only_gpus
 from dew.training.ahead import AheadOfTime, compile_ahead
 
 nonce, refused = float(sys.argv[1]), sys.argv[3] == "refused"
+# An H100's 80 GiB at Dew's share, which a step is compiled ahead against (`compile_only_gpus`' memory and
+# share), or the memory and share named.
+memory = int(sys.argv[4]) if len(sys.argv) > 4 else 80 * 2**30
+share = float(sys.argv[5]) if len(sys.argv) > 5 else None
 with report.refusals():
     if refused:
         report.refuse(pickle_load(sys.argv[2]))
-    # An H100's 80 GiB, which a step is compiled ahead against (`compile_only_gpus`' memory).
-    ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30)), nonce), BATCH)
+    devices = compile_only_gpus("sm90", 1, memory, share=share)
+    ahead = compile_ahead(experts(MeshSpec().build(devices), nonce), BATCH)
     ahead.save(sys.argv[2] + (".again" if refused else ""))
     # The saved plan read back beside every field of each miss the compile made, its config by its text.
     misses = [{**{field.name: getattr(miss, field.name) for field in dataclasses.fields(miss)},
@@ -372,9 +379,18 @@ def test_a_run_handed_a_step_compiled_ahead_for_the_canonical_h100_takes_it_on_o
     multiprocessors: it derives its launches for the target the step was compiled for
     (`AheadOfTime.target`), within the step's refusals, and trains from it, its plan's first compile the
     step compiled ahead (ledger 2453). Where it counts others (an H100 PCIe's 114) the run is refused, as a
-    balanced tail's grid derived past a GPU's residency waits on a program that never starts (row 3606)."""
+    balanced tail's grid derived past a GPU's residency waits on a program that never starts (row 3606). The
+    step is compiled ahead against the memory this host's GPU states at the run's share: a GH200 shared at a
+    GPU tier's share states less than an H100's 80 GiB there, and a run is refused a plan of more memory than
+    its GPU holds (row 12193)."""
+    from dew._devices import allocator_limit, pool_share
+
     step = str(tmp_path / "step.dew-aot")
-    spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
+    # The memory and share whose allocator limit is this GPU's own at the run's share, at most.
+    limit, share = jax.devices()[0].memory_stats()["bytes_limit"], pool_share()
+    memory = int(limit / share)
+    assert allocator_limit(memory, share) <= limit
+    spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh", str(memory), str(share))
     canonical = generation.gpu_target("sm90").multiprocessors
     if generation.device_target(jax.devices()[0]).multiprocessors != canonical:
         from dew.training.ahead import AheadOfTime, handed
@@ -872,9 +888,9 @@ def test_a_programs_spilling_triton_launch_is_recorded_with_no_mosaic_kernel_bes
     assert missed == [("dew_softmax", True)]
 
 
-def _paired_step(launch):
-    """A compile-only H100's mesh, and a lowering of one paired SwiGLU step through `launch` over it, traced
-    afresh at each call (a compile's `relower`)."""
+def _paired(launch):
+    """A compile-only H100's mesh, a maker of one paired SwiGLU step through `launch` (a function of its own
+    each call, which JAX's trace cache keys anew), and its operands placed on the mesh."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.nn.kernels.generation import compile_only_gpus
@@ -883,15 +899,69 @@ def _paired_step(launch):
     operands = [jax.ShapeDtypeStruct(shape, jnp.bfloat16, sharding=NamedSharding(devices, PartitionSpec()))
                 for shape in ((ROWS, FEATURES), (EXPERTS, FEATURES, WIDTH), (EXPERTS, FEATURES, WIDTH))]
 
-    def lowered():
+    def made():
         def stepped(x, gate, up):
             sizes = jnp.full((EXPERTS,), ROWS // EXPERTS, jnp.int32)
             return launch(x, gate, sizes, paired=up, out_dtype="bfloat16", trans_rhs=False,
-                          hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u),
-                          interpret=False)
-        return jax.jit(stepped).trace(*operands).lower()
+                          hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u), interpret=False)
+        return stepped
 
-    return devices, lowered
+    return devices, made, operands
+
+
+def _paired_step(launch):
+    """A compile-only H100's mesh, and a lowering of one paired SwiGLU step through `launch` over it, traced
+    afresh at each call (a compile's `relower`)."""
+    devices, made, operands = _paired(launch)
+    return devices, lambda: jax.jit(made()).trace(*operands).lower()
+
+
+def _rejected_instruction(ctx) -> None:
+    """An instruction no PTX names, inlined: a module that lowers and that the assembler refuses."""
+    del ctx
+    llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "dew.rejected.instruction;", "", has_side_effects=True)
+
+
+class AssemblerRejected(grouped_matmul.MosaicGmm):
+    """The grouped forward beside a kernel of its launch that lowers and that the assembler refuses, its
+    result added to every output."""
+
+    @functools.wraps(grouped_matmul.MosaicGmm._fwd)  # its binding reads its forward's signature
+    def _fwd(self, tokens, kernel, sizes, *args, **kwargs):
+        outputs, residuals = super()._fwd(tokens, kernel, sizes, *args, **kwargs)
+
+        def rejected(x_ref, o_ref):
+            plgpu.inline_mgpu()(_rejected_instruction)()
+            o_ref[...] = x_ref[...]
+
+        flag = plgpu.kernel(rejected, out_type=jax.ShapeDtypeStruct((128,), jnp.float32))(
+            jnp.zeros((128,), jnp.float32))
+        return jax.tree.map(lambda out: out + flag[0].astype(out.dtype), outputs), residuals
+
+
+@COMPILE_ONLY
+@lowers("sm90")
+def test_a_launch_the_assembler_refuses_alone_fails_the_compile_gate_uncertified():
+    """A launch whose kernel lowers and whose PTX the assembler refuses, through the compile gate on a
+    compile-only H100: certification's own compile of it fails (`report.certified`'s refusal by XLA), it is
+    recorded uncertified (`report.uncertified`), and the gate's record names it, so the gate fails the case
+    (row 6002: the route tested on a hand-made record alone). The program discards the launch's result, so
+    it compiles without the refused kernel, which the launch's own certification, made as it traces, keeps:
+    the gate fails it as uncertified alone."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures, refused
+
+    _, made, operands = _paired(AssemblerRejected())
+
+    def discarding(x, gate, up):
+        made()(x, gate, up)
+        return x
+
+    [record] = compile_mosaic_kernels([KernelCase("refused", lambda: (discarding, tuple(operands)))], "sm90")
+    assert record["uncertified"] and not refused(record), record
+    # The failure its uncertified launch adds, what the gate reads past its program's own record.
+    added = set(mosaic_failures([record])) - set(mosaic_failures([{**record, "uncertified": []}]))
+    assert added and all("not certified" in failure for failure in added), added
 
 
 class TwiceUncounted(Uncounted):
@@ -1200,6 +1270,30 @@ def test_a_launchs_rungs_traced_under_a_compile_only_gpus_mesh_are_certified_on_
     assert sorted(map(repr, (each.config for each in found))) == sorted(map(repr, configs)), found
     assert {each.device for each in found} == set(devices.devices.flat) and all(
         each.kernels for each in found), found
+
+
+@CERTIFIES_AT_RUN
+@lowers("sm90")
+def test_a_launch_certified_aside_reads_its_own_refusals_alone():
+    """A launch certified within a block that certifies aside (`report.certifying_aside`) reads its own
+    launch's refusals alone (`report.refusals_of`): what it read answers as it did once another launch is
+    refused, so a trace held past that refusal holds (row 12167: every launch's refusals scanned)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    class Aside(TwoKernels):
+        """`TwoKernels`, a launch of its own: certified here, whatever this process certified before."""
+
+    op = Aside()
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    operands = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in (
+        ((ROWS, FEATURES), jnp.bfloat16), ((EXPERTS, FEATURES, WIDTH), jnp.bfloat16),
+        ((EXPERTS,), jnp.int32))]
+    with generation.assumed("sm90"), jax.set_mesh(devices), report.refusals():
+        bound = op.bind(*operands, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+        with generation.recording() as read, report.certifying_aside():
+            report.certified(op, bound, bound.heuristics_config)
+        report.refuse([("a launch none of these is", 1, ("its kernel",))])
+        assert read and generation.still(read), read
 
 
 def test_two_kernels_of_one_name_and_launch_are_refused_not_read_as_one():

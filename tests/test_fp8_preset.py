@@ -15,7 +15,15 @@ from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bou
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation, low_rank, projections
-from dew.nn.precision import FP8, NUMERICS_PRESETS, LowPrecision, Numerics, RecipeRefused, numerics_of
+from dew.nn.precision import (
+    FP8,
+    NUMERICS_PRESETS,
+    PROJECTION_ROLES,
+    LowPrecision,
+    Numerics,
+    RecipeRefused,
+    numerics_of,
+)
 
 VOCAB, WIDTH = 256, 128
 SEEDS = 64
@@ -56,25 +64,47 @@ def test_the_fp8_preset_names_the_recipe_and_keeps_the_runs_dtypes():
         pass
 
 
-def test_the_routers_gates_and_head_never_reach_the_fp8_projection():
+def test_a_models_projections_take_the_recipe_or_are_refused_for_their_role_alone():
     """Under the 'fp8' numerics a model's forward routes each projection by its role (the routes its trace
-    reports, `generation.routes`): every attention projection, the dense feed-forward's, the shared
-    expert's and the experts' three take the recipe, seventeen in all; the shared expert's gate keeps the
-    run's dtypes, its route naming its role, and the router, whose scores are an fp32 einsum, the untied
-    head, whose product keeps its fp32 result, the norms and the embedding reach no product the recipe
-    reads."""
+    reports, `generation.routes`): every projection the recipe considers is taken, or refused for its role
+    (`kept_role`: the shared expert's gate's), never for its shape; the router, whose scores are an fp32
+    einsum, the untied head, whose product keeps its fp32 result, the norms and the embedding reach no
+    product the recipe considers."""
     model = mixed()
     tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (2, 64)), jnp.int32)
     params = jax.eval_shape(model.init, jax.random.key(0), tokens)
     with generation.run_precision(FP8), generation.routes() as found:
         jax.eval_shape(model.apply, params, tokens)
     recipe = [route for route in found if route.choice == "blockwise_fp8"]
-    kept = sorted(str(route.refusal) for route in recipe if route.kernel == "unquantized")
-    taken = [route for route in recipe if route.kernel != "unquantized"]
-    assert kept == ["a shared_gate projection keeps the run's dtypes under blockwise_fp8"], kept
-    # Layer 0: q, k, v, o and the dense gate, up and down; layer 1: q, k, v, o, the shared expert's three
-    # and the experts' gate, up and down.
-    assert len(taken) == 17, [route.site for route in taken]
+    refused = {route.refusal.code for route in recipe if route.kernel == "unquantized" and route.refusal}
+    assert any(route.kernel != "unquantized" for route in recipe) and refused == {"kept_role"}, recipe
+
+
+@pytest.mark.parametrize("role", [*PROJECTION_ROLES, None])
+def test_a_projection_takes_the_recipe_for_its_role_alone(role):
+    """A 128-wide projection under the 'fp8' numerics in `role` (`projection_role`; None, a head's or an
+    embedding's, plays none): where the recipe names its role it takes it, its output the recipe's blockwise
+    FP8 product, which differs from the run's own; any other role's is refused for its role (`kept_role`),
+    its output the run's own product exactly, in the run's dtype."""
+    from dew.nn.dense import Dense
+    from dew.nn.precision import projection_role
+
+    layer = Dense(WIDTH, use_bias=False, dtype=jnp.bfloat16)
+    x = jnp.asarray(np.random.default_rng(3).normal(size=(4, WIDTH)), jnp.bfloat16)
+    params = layer.init(jax.random.key(0), x)
+    played = contextlib.nullcontext() if role is None else projection_role(role)
+    with generation.run_precision(FP8), played, generation.routes() as found:
+        out = layer.apply(params, x)
+    with generation.run_precision(Numerics("bf16-mixed")):
+        own = layer.apply(params, x)
+    [route] = [route for route in found if route.choice == "blockwise_fp8"]
+    out, own = (np.asarray(value) for value in (out, own))
+    assert out.dtype == own.dtype == jnp.bfloat16
+    if role in (() if FP8.low_precision is None else FP8.low_precision.roles):
+        assert route.kernel != "unquantized" and not np.array_equal(out, own)
+    else:
+        assert route.refusal is not None and route.refusal.code == "kept_role", route
+        np.testing.assert_array_equal(out, own)
 
 
 def test_a_grouped_output_projection_takes_the_recipe_group_by_group():
