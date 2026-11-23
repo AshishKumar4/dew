@@ -998,7 +998,7 @@ class MosaicGmm(_Mosaic):
         candidates = [] if plain is None else [plain]
         if plain is not None and plain.warpgroups == 1:
             family = pricing.family_of(plain, ba.arguments['tokens'].dtype, target)
-            for count in range(pricing.max_programs(family, 1), plain.programs, -1):
+            for count in range(pricing.max_programs(family, 1, target), plain.programs, -1):
                 alt_base = self._derived(ba, target, programs=count)
                 if alt_base is not None and alt_base.stages >= 1 + family.loads_ahead + family.in_flight:
                     alt = self._decode_split(ba, alt_base, target)

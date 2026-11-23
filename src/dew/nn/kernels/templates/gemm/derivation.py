@@ -132,7 +132,10 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     from dew.nn.kernels import generation
     with generation.as_target(target):
         for consumers in dict.fromkeys((most if whole else 1, 1)):
-            program_counts = (range(pricing.max_programs(family, consumers), 0, -1)
+            # Default loop uses family's register-budget programs (raising cooperative wgmma/tgmm to
+            # scalar-floor 2 programs drops caps to 80/56 regs, fatal ptxas C7602); `MosaicGmm._tile`
+            # probes higher 1-consumer residencies via `pricing.max_programs` and prices plans together.
+            program_counts = (range(family.programs(consumers), 0, -1)
                               if programs is None else (programs,))
             held = [tiled(consumers, count) for count in program_counts]
             tile = next((tile for tile, balanced in held if balanced), None)
