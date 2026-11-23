@@ -153,13 +153,11 @@ class _Transpose:
         assert self.wide is not None, "a routed product's rescue pulls its routes back wide"
         gather, wide_operands = routed
         partial = self.wide(near, *wide_operands).astype(jnp.float32)
-        # Each route's entries past the window below its largest, moved to fp32's least normal where their
-        # move flushed them: what they reach, and what the rest reach, bounded through the matrices'
-        # magnitudes.
+        # Each route's entries past the window below its largest, or flushed by its move: which entries they
+        # reach (each counted one, through the matrices' magnitudes), and what the rest reach.
         scale = float_bits.binade_of(near)
         small = ((near != 0) & (scale < FACTORED_RESCUE - FACTORED_WINDOW)) | tiny
-        held = jnp.where(small, jnp.maximum(jnp.abs(near), jnp.finfo(jnp.float32).tiny), 0.0)
-        low = self.wide(held, *wide_operands, magnitude=True).astype(jnp.float32)
+        low = self.wide(jnp.where(small, 1.0, 0.0), *wide_operands, magnitude=True).astype(jnp.float32)
         high = self.wide(jnp.where(small, 0.0, jnp.abs(near)), *wide_operands, magnitude=True)
         unsure = (low > 0) & (jnp.abs(partial) < high.astype(jnp.float32) * 2.0 ** -FACTORED_WINDOW)
         partial = jnp.where(unsure, jnp.nan, partial)
