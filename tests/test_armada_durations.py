@@ -121,7 +121,7 @@ def test_a_recorded_test_the_file_no_longer_defines_cuts_it_into_no_group(ci, tm
                and entry["tests"] == "tests/test_cut.py"]
     assert [entry["weight"] for entry in planned] == [100.0] * 6
     count = len(planned)
-    members = [ci.members("tests/test_cut.py", f"{group}/{count}") for group in range(1, count + 1)]
+    members = [ci.run_keys.members("tests/test_cut.py", f"{group}/{count}") for group in range(1, count + 1)]
     assert sorted(node.partition("::")[2] for group in members for node in group) == [
         "TestHeld::test_inherited", "test_kept[0]", "test_kept[1]", "test_kept[2]", "test_kept[3]",
         "test_made"]
@@ -362,7 +362,7 @@ def test_a_cold_run_is_kept_as_its_tests_cold_times_and_every_cut_weighs_them(ci
     folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
     a, b, c = (f"tests/test_cells.py::test_{name}" for name in "abc")
     assert folded == {a: [1.0, 30.0], b: [2.0, 40.0], c: [20.0, 20.0]}
-    assert ci.durations_record() == {a: 30.0, b: 40.0, c: 20.0}
+    assert ci.run_keys.durations_record() == {a: 30.0, b: 40.0, c: 20.0}
     # A red run past a cold time raises it; a green warm run moves only the warm time.
     rows = [{"name": "3.12:tests/test_cells.py", "exitCode": 1, "seconds": 60.0,
              "tests": {"tests/test_cells.py::test_a": 60.0}, "cold": ["tests/test_cells.py::test_a"]}]
@@ -507,7 +507,7 @@ def test_a_tasks_peak_bounds_its_tests_and_a_heavy_files_tasks_run_large(ci, tmp
     assert folded == {"tests/test_ranks.py::test_a": [10.0, None, ranks],
                       "tests/test_ranks.py::test_b": [5.0, 30.0, ranks],
                       "tests/test_light.py::test_a": [1.0, None, light]}
-    assert ci.durations_record()["tests/test_ranks.py::test_b"] == 30.0
+    assert ci.run_keys.durations_record()["tests/test_ranks.py::test_b"] == 30.0
     assert ci.session.heavy_files() == {"tests/test_ranks.py"}
     entries = [entry for entry in ci.plan(240.0, {"files": {}}) if entry["python"] == "3.12"]
     # The task that runs the heavy file, light files packed beside it or not, is large.

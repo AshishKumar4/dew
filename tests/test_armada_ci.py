@@ -482,7 +482,8 @@ def said_why(ci, stored) -> None:
     """Each file the gpu tier's test runs that started a process no record follows says in its record what
     it started and from where (`followed.WHY`); a file that keeps its key says nothing."""
     names = ("test_machine.py", "test_spawn.py", "test_forkserver.py", "test_fork.py", "test_shell.py")
-    why = {name: json.loads(stored["/" + ci.record_key("3.12", f"3.12:tests/{name}", ci.cpu_class())])["why"]
+    held = ci.run_keys.cpu_class()
+    why = {name: json.loads(stored["/" + ci.record_key("3.12", f"3.12:tests/{name}", held)])["why"]
            for name in names}
     assert why.pop("test_machine.py") is None
     starts = {"test_spawn.py": "SpawnProcess (spawn start)", "test_fork.py": "ForkProcess (fork start)",
@@ -579,7 +580,7 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
             f"3.12:{name}": 0 for name in tests}
     (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
     # A group of test_lost.py's the Worker lists and does not return.
-    stored["/" + ci.record_key("3.12", "3.12:tests/test_lost.py#2/2", ci.cpu_class())] = None
+    stored["/" + ci.record_key("3.12", "3.12:tests/test_lost.py#2/2", ci.run_keys.cpu_class())] = None
     assert ci.gpu_tier("3.12") == {
         "tests/test_imported.py": ["tests/devices.py:placed"],
         "tests/test_imported_too.py": ["tests/devices.py:placed"],
@@ -790,7 +791,7 @@ def test_a_census_task_runs_its_tests_under_the_census_and_records_no_row(ci, tm
     interpreter(tmp_path, "3.12")
     url, stored, _ = cache_worker
     cached(monkeypatch, url)
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     out = tmp_path / "verdict.json"
     [row] = armada_task(ci, monkeypatch, out, census=True)
     assert row["exitCode"] == 0, row["output"]
@@ -871,7 +872,7 @@ def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci,
     interpreter(tmp_path, "3.12")
     url, stored, _ = cache_worker
     cached(monkeypatch, url)
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
     out = tmp_path / "verdict.json"
     # An attempt that ran whole kept both tests as it went.
@@ -948,7 +949,7 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     out = tmp_path / "verdict.json"
 
     def run(cpu, policy="on"):
-        monkeypatch.setattr(ci, "cpu_class", lambda: cpu)
+        monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: cpu)
         [only] = armada_task(ci, monkeypatch, out, policy)
         assert (only["exitCode"] == 0) == (not os.environ.get("FAIL") and not os.environ.get("EXIT"))
         return len((tmp_path / "runs").read_text())
@@ -1296,7 +1297,8 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     together, alone = [nodes[0], nodes[2]], [nodes[1]]
     assert {row["name"]: sorted(row["tests"]) for row in rows} == {
         "3.12:tests/test_shared.py#1/2": [*together, nodes[3]], "3.12:tests/test_shared.py#2/2": alone}
-    assert [ci.members("tests/test_shared.py", f"{group}/2") for group in (1, 2)] == [together, alone]
+    members = ci.run_keys.members
+    assert [members("tests/test_shared.py", f"{group}/2") for group in (1, 2)] == [together, alone]
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2", "3"]
     # Recorded b, a, c, each its own group; a new test sorted before b shares a's setup: it rides with a,
     # whose group keeps a's place, so each task runs the recorded tests the plan gave it.
@@ -1314,7 +1316,7 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
         "3.12:tests/test_order.py#1/3": [order["1b"]],
         "3.12:tests/test_order.py#2/3": [order["0new"], order["2a"]],
         "3.12:tests/test_order.py#3/3": [order["3c"]]}
-    assert [ci.members("tests/test_order.py", f"{group}/3") for group in (1, 2, 3)] == [
+    assert [ci.run_keys.members("tests/test_order.py", f"{group}/3") for group in (1, 2, 3)] == [
         [order["1b"]], [order["2a"]], [order["3c"]]]
     # A new lone test, or a new setup's pair, before recorded a, b, c joins the first group, a, b and c each
     # staying in its planned group, and the file's groups are not reused.
@@ -1336,7 +1338,7 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
         assert {row["name"]: sorted(row["tests"]) for row in rows if f"test_{name}" in row["name"]} == {
             f"3.12:tests/test_{name}.py#{group}/3": sorted(node[name, test] for test in tests)
             for group, tests in enumerate(cut, start=1)}
-        assert [ci.members(f"tests/test_{name}.py", f"{group}/3") for group in (1, 2, 3)] == [
+        assert [ci.run_keys.members(f"tests/test_{name}.py", f"{group}/3") for group in (1, 2, 3)] == [
             [node[name, test]] for test in ("1a", "2b", "3c")]
         common = ci.shared("3.12")
         assert [ci.reused("3.12", f"tests/test_{name}.py", f"{group}/3", common) for group in (1, 2, 3)] == [
@@ -1391,7 +1393,8 @@ def test_a_parameters_shared_setup_runs_its_tests_in_one_group_across_functions_
         assert key(node.format(f"test_forward[{beyond}]"), ("models", r"^.")) is None
     assert key(node.format("test_forward[m-a-tiny]"), ("models", r"m-[a-z]-tiny")) == ("models", "m-a-tiny")
     count = len(ran)
-    assert [set(ci.members("tests/test_models.py", f"{group}/{count}")) for group in range(1, count + 1)] == [
+    members = ci.run_keys.members
+    assert [set(members("tests/test_models.py", f"{group}/{count}")) for group in range(1, count + 1)] == [
         ran[f"3.12:tests/test_models.py#{group}/{count}"] for group in range(1, count + 1)]
     assert sorted((tmp_path / "runs").read_text().splitlines()) == sorted(
         f"{kind} {model}" for kind in "fg" for model in models)
@@ -1476,7 +1479,7 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
     handle that reads and writes, a truncation, a mapped page, a removal and a new file in its place, through
     an alias of what it read, under a nested hidden directory, a copy that puts the file's time back, or a
     native writer (sqlite's); nor does one that found a file absent and made it, a package beside a module
-    it imported among them, which only its key's import lookups cover (`ci.inputs`; row 10800): its key would
+    it imported among them, which only its key's import lookups cover (`inputs`; row 10800): its key would
     hash the checkout the run left, not what it read, so it is never reused and runs again (row 2559 and its
     review), its record saying so (row 10775). A file a run only writes, as each run here appends to `runs`,
     is no input and leaves its key."""
@@ -1534,13 +1537,13 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
         first = run()
         if test == "shadowed":
             # Its first run's record, before the second (which finds the package made) records its own.
-            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
+            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.run_keys.cpu_class())
             kept = json.loads(cache_worker[1][place])
             assert kept["key"] is None and "its task wrote its input src/held" in kept["why"], kept["why"]
         assert [first, run()] == ([1, 1] if test == "plain" else [1, 2]), test
         # Its record keeps what it read all the same, which a change's reach reads (`reached`).
         if test == "python":
-            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.cpu_class())
+            place = "/" + ci.record_key("3.12", "3.12:tests/test_a.py", ci.run_keys.cpu_class())
             kept = json.loads(cache_worker[1][place])
             assert kept["key"] is None and kept["depends"] is None
             assert any(path.partition(ci.followed.CODE)[0].endswith("docs/page.txt") for path in kept["read"])
@@ -1548,10 +1551,10 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
 
 
 def test_a_lookups_entries_are_its_names_alone(ci):
-    """A write counts against an import lookup (`ci.looked_entry`) only where it is an entry the lookup
+    """A write counts against an import lookup (`run_keys.looked_entry`) only where it is an entry the lookup
     lists: its name, a module or package of any suffix beside it, a package's own __init__; none of another
     name, a deeper file, or one under a namesake package (review: `held/__init__report.json`)."""
-    entry = ci.looked_entry
+    entry = ci.run_keys.looked_entry
     assert all(entry(path, "src/held") for path in ("src/held", "src/held.py", "src/held.cpython-312.so",
                                                     "src/held/__init__.py", "src/held/__init__.pyc"))
     assert not any(entry(path, "src/held") for path in ("src/held/__init__report.json", "src/held/mod.py",
@@ -1574,7 +1577,7 @@ def test_a_conftest_fixture_is_the_input_of_the_files_whose_runs_took_it_alone(c
         "test_none.py": "def test_none():\n" + counted.format("none") + "    assert True\n"})
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     out, names = tmp_path / "verdict.json", ("user", "none")
 
@@ -2165,7 +2168,7 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
         for name, package in (("uses", "pkg.space.sub.used"), ("lone", "other.lone"))})
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     out = tmp_path / "verdict.json"
 
@@ -2218,7 +2221,7 @@ def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whos
                           "    assert value() and json.dumps(1)\n"})
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     out = tmp_path / "verdict.json"
 

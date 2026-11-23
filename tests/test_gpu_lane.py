@@ -426,12 +426,12 @@ def test_a_dry_prepares_groups_are_its_tests_by_count_in_its_task_and_its_key(
 
     def record(group: str) -> dict:
         return json.loads(stored["/" + ci.record_key("3.12", f"3.12:{name}#{group}@prepare-sm90",
-                                                     ci.device_class())])
+                                                     ci.run_keys.device_class())])
 
     assert [ran(f"{index}/3")[0] for index in range(1, 4)] == [
         ["test_cpu", "test_flow[0]"], ["test_flow[1]", "test_flow[2]"],
         ["test_flow[3]", "test_flow[4]", "test_flow[5]"]]
-    assert [ci.members(name, f"{index}/3", evenly=True) for index in range(1, 4)] == [
+    assert [ci.run_keys.members(name, f"{index}/3", evenly=True) for index in range(1, 4)] == [
         nodes[:2], nodes[2:4], nodes[4:]]
     assert record("1/3")["key"] is not None
     # Its row's tests unchanged, it is reused.
@@ -496,7 +496,7 @@ def test_a_dry_prepares_baseline_is_mains_whatever_cut_main_made_of_it(ci, monke
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
     monkeypatch.setattr(ci.r2, "Store", Store)
     monkeypatch.setattr(ci, "mainline", lambda: "main")
-    monkeypatch.setattr(ci, "device_class", lambda: "cls")
+    monkeypatch.setattr(ci.run_keys, "device_class", lambda: "cls")
     monkeypatch.setattr(ci, "baseline_key", lambda commit, python, place, held: f"baseline/{place}")
 
     def before(name: str, group: str, seconds: float = 600.0):
@@ -559,7 +559,7 @@ def test_a_task_takes_mains_commit_from_its_plan_its_checkout_holding_no_origin_
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
     monkeypatch.delenv(ci.MAINLINE, raising=False)
     monkeypatch.setattr(ci.r2, "Store", Store)
-    monkeypatch.setattr(ci, "device_class", lambda network=False: "cls")
+    monkeypatch.setattr(ci.run_keys, "device_class", lambda network=False: "cls")
     monkeypatch.setattr(ci.records, "merge_base", lambda: None)
     monkeypatch.setattr(ci, "dry_prepared", dry_prepared)
     seen: list[object] = []
@@ -587,14 +587,14 @@ def test_a_commits_baseline_is_its_green_prepares_and_a_red_run_writes_none(ci, 
     so main's stays readable; a row that is no dry prepare has none due."""
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
-    monkeypatch.setattr(ci, "head_commit", lambda: "main")
+    monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "main")
     place = "3.12:tests/test_gpu_a.py#1/2@prepare-sm90"
     baseline = "/" + ci.baseline_key("main", "3.12", place, "cls")
-    assert ci.baselined("3.12", place, "cls", "token", {"exitCode": 1, "unprepared": ["a @ x"]})
+    assert ci.run_keys.baselined("3.12", place, "cls", "token", {"exitCode": 1, "unprepared": ["a @ x"]})
     assert baseline not in stored
-    assert ci.baselined("3.12", place, "cls", "token", {"exitCode": 0, "unprepared": ["a @ x"]})
+    assert ci.run_keys.baselined("3.12", place, "cls", "token", {"exitCode": 0, "unprepared": ["a @ x"]})
     assert json.loads(stored[baseline]) == {"unprepared": ["a @ x"]}
-    assert ci.baselined("3.12", place, "cls", "token", {"exitCode": 0})
+    assert ci.run_keys.baselined("3.12", place, "cls", "token", {"exitCode": 0})
     assert json.loads(stored[baseline]) == {"unprepared": ["a @ x"]}
 
 
@@ -608,15 +608,16 @@ def test_a_green_dry_row_keeps_its_baseline_whatever_its_record_does(ci, monkeyp
     url, stored, _ = cache_worker
     monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
-    monkeypatch.setattr(ci, "head_commit", lambda: "main")
-    monkeypatch.setattr(ci, "device_class", lambda network=False: "cls")
+    monkeypatch.setattr(ci.run_keys, "head_commit", lambda: "main")
+    monkeypatch.setattr(ci.run_keys, "device_class", lambda network=False: "cls")
     writes = ci.written
-    monkeypatch.setattr(ci, "written", lambda key, *args, **kwargs: (
+    monkeypatch.setattr(ci.run_keys, "written", lambda key, *args, **kwargs: (
         taken or "-baseline/" not in key) and writes(key, *args, **kwargs))
     place = "3.12:tests/test_gpu_a.py#1/2@prepare-sm90"
     log = tmp_path / "lifetime.log"
     log.write_text("")
-    unnamed = ci.record("3.12", [{"name": place, "exitCode": 0, "unprepared": ["a @ x"]}], log, "common")
+    green = [{"name": place, "exitCode": 0, "unprepared": ["a @ x"]}]
+    unnamed = ci.run_keys.record("3.12", green, log, "common")
     assert (unnamed, "/" + ci.baseline_key("main", "3.12", place, "cls") in stored) == (
         (set(), True) if taken else ({place}, False))
 
@@ -637,8 +638,8 @@ def test_a_reused_row_is_named_the_commits_only_as_its_grade_leaves_it_green(ci,
     monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
     monkeypatch.setattr(ci, "reused_rows", reused_rows)
     monkeypatch.setattr(ci, "row", lambda python, name, group: row["name"])
-    monkeypatch.setattr(ci, "baselined", lambda *args: taken)
-    monkeypatch.setattr(ci, "named_at_commit", lambda *args: calls.append(args))
+    monkeypatch.setattr(ci.run_keys, "baselined", lambda *args: taken)
+    monkeypatch.setattr(ci.run_keys, "named_at_commit", lambda *args: calls.append(args))
     ci.tested("3.12", ["tests/test_gpu_a.py"], "", tmp_path / "rows.json", 60.0, "on", 5.0, "common", {},
               judged=lambda rows: [{**found, "exitCode": exit_code} for found in rows])
     named = [(row["name"], "cls", "key")] if exit_code == 0 and taken else []
@@ -844,7 +845,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     # The spawner's child took its fraction, so it holds two shares: 12 GiB beside the others' 24.
     common = ci.lane_inputs("3.12")
     for name, inputs in itertools.product([*names, "tests/test_spawner.py"], (None, common)):
-        at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)
+        at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), ci.run_keys.device_class(), inputs)
         stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30,
                                  "shares": int(name == "tests/test_spawner.py"), "pools": 0}).encode()
     # Their first green runs gone, as the bucket's expiry takes them, so the lane runs them again by these
@@ -1157,7 +1158,7 @@ def test_a_tier_cut_group_is_admitted_on_the_most_its_file_held_and_no_need_is_c
 
     def measured(row_name: str, peak: int, shares: int = 0, followed: bool = True) -> None:
         for inputs in (None, common):
-            at = "/" + ci.record_key("3.12", row_name, ci.device_class(), inputs)
+            at = "/" + ci.record_key("3.12", row_name, ci.run_keys.device_class(), inputs)
             stored[at] = json.dumps({"key": None, "depends": ["tests/test_long.py"] if followed else None,
                                      "row": {}, "reads": [], "peak": peak, "shares": shares,
                                      "pools": 0}).encode()
@@ -1236,7 +1237,7 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
     def measured() -> None:
         # Its measured 2 GiB, as each run here records its own (with no GPU, none) over it.
         for inputs in (None, ci.lane_inputs("3.12")):
-            at = "/" + ci.record_key("3.12", "3.12:tests/test_flow.py", ci.device_class(), inputs)
+            at = "/" + ci.record_key("3.12", "3.12:tests/test_flow.py", ci.run_keys.device_class(), inputs)
             stored[at] = json.dumps({"key": None, "depends": ["tests/test_flow.py"], "row": {}, "reads": [],
                                      "peak": 2 * gib, "shares": 0, "pools": 0}).encode()
 
@@ -1282,7 +1283,8 @@ def test_a_unit_is_given_no_less_than_dews_admission_of_the_programs_its_prepare
         assert need > budget and len(lane_runs(tmp_path, "test_flow")) == runs and row["exitCode"] == 1
         # No verdict of its tests (`grading.STALE`): Platform's harness evidence, never its file's verdict.
         assert row["kind"] == ci.grading.STALE and f"{need / gib:.2f} GiB" in row["output"]
-        assert ci.device_class() in row["output"] and ("holds it" in row["output"]) == (need <= whole)
+        held = ci.run_keys.device_class()
+        assert held in row["output"] and ("holds it" in row["output"]) == (need <= whole)
 
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(

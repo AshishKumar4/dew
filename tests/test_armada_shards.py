@@ -766,7 +766,7 @@ def cached_checkout(ci, tmp_path: Path, monkeypatch, cache_worker, site: str) ->
     written."""
     out = site_checkout(tmp_path, site)
     url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     monkeypatch.setenv("DEW_XLA_CACHE_READ_TOKEN", "token")
     config = json.loads((ROOT / ".armada.json").read_text())

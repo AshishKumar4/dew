@@ -104,7 +104,7 @@ def ran_by_script(ci, root: Path, cache_worker, names: tuple[str, ...], module: 
     whose .armada.json pins its tasks to this host's class: the environment a plan of theirs runs in, which
     names the cache and its tokens."""
     interpreter(root, "3.12")
-    held = ci.cpu_class().split("-")
+    held = ci.run_keys.cpu_class().split("-")
     config = json.loads((ROOT / ".armada.json").read_text())
     config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
     (root / ".armada.json").write_text(json.dumps(config))
@@ -513,7 +513,7 @@ def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
     armada_task(ci, monkeypatch, verdict)
     (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\nCHANGED = 1\n")
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
-    monkeypatch.setattr(ci, "cpu_class", lambda: "AuthenticAMD-25-17")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "AuthenticAMD-25-17")
     rows = armada_task(ci, monkeypatch, verdict)
     assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
@@ -528,7 +528,7 @@ def test_mains_own_run_of_a_row_is_found_behind_a_lanes_later_run_on_its_branch(
     the row runs again."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     commit = {"head": "a" * 40}
-    monkeypatch.setattr(ci, "head_commit", lambda: commit["head"])
+    monkeypatch.setattr(ci.run_keys, "head_commit", lambda: commit["head"])
     monkeypatch.setattr(ci, "mainline", lambda: "a" * 40)
     armada_task(ci, monkeypatch, verdict)
     test_a = tmp_path / "tests/test_a.py"

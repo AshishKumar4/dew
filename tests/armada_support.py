@@ -136,7 +136,7 @@ def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:
     input)."""
     interpreter(root, "3.12")
     url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setattr(ci.run_keys, "cpu_class", lambda: "GenuineIntel-6-143")
     cached(monkeypatch, url)
     (root / ".verdict").mkdir()
     return root / ".verdict/verdict.json"

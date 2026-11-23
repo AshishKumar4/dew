@@ -302,7 +302,8 @@ def entries(ci, python: str, timings: dict, target: float, cache: str, stamped: 
                   if group.partition(ci.VARIED)[2] == row_variant}
         found = ci.cuts.measured_rows(groups)
         return None if found is None else (sum(found), max(found))
-    files = tier_files(ci.test_files(), {name: list(tests) for name, tests in ci.parted_record().items()})
+    parted = ci.run_keys.parted_record()
+    files = tier_files(ci.test_files(), {name: list(tests) for name, tests in parted.items()})
     rows_ = planned(files, took, target, ci.VARIED, ci.session.DEADLINE)
     if not rows_:
         return []
@@ -396,7 +397,7 @@ def before(ci, python: str, name: str, group: str, until: float) -> set[str] | s
     commit = ci.mainline()
     if not token or commit is None or "DEW_XLA_CACHE_URL" not in os.environ or time.monotonic() >= until:
         return UNREAD
-    held, row_variant = ci.device_class(), group.partition(ci.VARIED)[2]
+    held, row_variant = ci.run_keys.device_class(), group.partition(ci.VARIED)[2]
     place = ci.row_place(ci.row(python, name, ""), held).rpartition("/")[0] + "/"
     store = ci.r2.Store(os.environ["DEW_XLA_CACHE_URL"], token, "dew-ci-test-cache", timeout=10.0,
                         send=ci.records.SEND)
