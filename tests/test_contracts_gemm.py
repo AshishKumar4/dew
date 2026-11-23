@@ -1054,27 +1054,29 @@ def test_a_ternary_weight_product_holds_every_order(edge):
     weights = formats.TernaryWeights.of(raw_w, scale=jnp.float32(0.75))
     (x,) = normal_draw(1465, (64, 256), scale=1.0)
     (dx,) = normal_draw(1466, (64, 256), scale=1.0)
-    # Independent integer-dot forward oracle and straight-through activation + scale tangent oracle.
+    # Independent integer-dot forward oracle and unquantized STE activation + scale tangent oracles.
     w_bf16 = weights.unscaled(jnp.bfloat16)
-    absmax = jnp.max(jnp.abs(x.astype(jnp.float32)), axis=-1)
-    act_scale = jnp.where(absmax > 0, prec.divided(absmax, jnp.float32(127.0)), jnp.float32(1.0))
-    x_int = jnp.clip(jnp.round(x.astype(jnp.float32) / act_scale[:, None]),
+    x_f32 = x.astype(jnp.float32)
+    peak = jnp.max(jnp.abs(x_f32), axis=-1)
+    safe_peak = jnp.where(peak > 0, peak, jnp.float32(1.0))
+    x_int = jnp.clip(jnp.round((x_f32 / safe_peak[:, None]) * jnp.float32(127.0)),
                      -128.0, 127.0).astype(jnp.bfloat16)
-    fwd_oracle = prec.twice_scaled(
-        jax.lax.dot(x_int, w_bf16, preferred_element_type=jnp.float32), act_scale[:, None], weights.scale)
-    x_tan_oracle = prec.twice_scaled(
-        jax.lax.dot((dx.astype(jnp.float32) / act_scale[:, None]).astype(jnp.bfloat16), w_bf16,
-                    preferred_element_type=jnp.float32), act_scale[:, None], weights.scale)
-    s_tan_oracle = jax.lax.dot(x_int, w_bf16, preferred_element_type=jnp.float32) * act_scale[:, None]
-    for interpret in (False, True):
-        with generation.assumed("sm90"):
-            def fn(a, s, *, interp=interpret):
+    dot_int = jax.lax.dot(x_int, w_bf16, preferred_element_type=jnp.float32)
+    fwd_oracle = prec.twice_scaled(dot_int / jnp.float32(127.0), peak[:, None], weights.scale)
+    x_tan_oracle = jax.lax.dot(dx.astype(jnp.bfloat16), w_bf16,
+                               preferred_element_type=jnp.float32) * weights.scale
+    s_tan_oracle = prec.twice_scaled(dot_int / jnp.float32(127.0), peak[:, None], jnp.float32(1.0))
+    for kernel in ("mosaic", "xla"):
+        with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
+              generation.routes() as seen):
+            def fn(a, s):
                 return gemm.ternary_weight_product(
                     a, dataclasses.replace(weights, scale=s), quantize_activations=True,
-                    out_dtype=jnp.float32, interpret_on_cpu=interp)
+                    out_dtype=jnp.float32, interpret_on_cpu=True)
 
             out, dy_x = jax.jvp(lambda a: fn(a, weights.scale), (x,), (dx,))
             _, dy_s = jax.jvp(lambda s: fn(x, s), (weights.scale,), (jnp.float32(1.0),))
+        assert any(r.kernel == kernel for r in seen), (kernel, seen)
         np.testing.assert_array_equal(np.asarray(out), np.asarray(fwd_oracle))
         np.testing.assert_array_equal(np.asarray(dy_x), np.asarray(x_tan_oracle))
         np.testing.assert_array_equal(np.asarray(dy_s), np.asarray(s_tan_oracle))
