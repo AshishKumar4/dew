@@ -1313,6 +1313,32 @@ def test_an_intermediate_dews_newer_local_step_decides_its_mark_once_and_for_goo
     assert not mark.exists()
 
 
+def test_a_marked_runs_newest_save_no_resume_reads_leaves_its_mark_to_decide(tmp_path):
+    """A run an intermediate Dew rewrote beside its mark whose newest save is one no resume reads, that Dew's
+    model alone (a weights-only save of its typed optimizer), loads as its earlier run trained: the mark is
+    decided by the step its resume restores (`Checkpoints.latest`), the untyped one before it, its decay
+    masked off by its own mask (review of d22 r8: the newest numbered save decided, whatever a resume
+    reads)."""
+    import json as json_
+    import shutil
+
+    from dew.config.lm import LMRunConfig
+
+    rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), learning_rate=1e-2, spared=False)
+    run = tmp_path / "run"
+    _checkpointed(run, rewritten, 1)
+    shutil.copytree(run / "1", run / "2")
+    newest = run / "2" / "_CHECKPOINT_METADATA"
+    metadata = json_.loads(newest.read_text())
+    metadata["custom_metadata"] = {**(metadata.get("custom_metadata") or {}), "typed_optimizer": True,
+                                   "weights_only": True}
+    newest.write_text(json_.dumps(metadata))
+    LMRunConfig(optim=rewritten).save(str(run))
+    (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
+    loaded = LMRunConfig.load(str(run)).optim
+    assert loaded.decay_mask is False and loaded.optimizer.weight_decay > 0, loaded
+
+
 @pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
 def test_a_checkpoint_whose_decay_its_options_masked_by_a_tree_restores_into_the_optimizer_its_record_loads(
         tmp_path, optimizer):

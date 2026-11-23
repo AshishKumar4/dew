@@ -339,12 +339,14 @@ class _PerShare(Forwarding):
         self._grain_restores(json_value(rules.get("grain"), "saved grain rule"))
 
     def _grain_restores(self, written: JSON) -> None:
-        """Restore the saved iterator state now, through the iterators that own it, where a Grain of another
-        version wrote it (`written`, its `grain` rule): a state that Grain's iterators read otherwise
-        than this Grain's is refused, naming both, where its restore refuses its form; one they read alike
-        resumes. The read opened before it, its failure (a file it cannot open) is its own, never a version's
-        (row 12178), as a cursor of Dew's own that holds no position is (`MalformedPosition`)."""
-        if written == GRAIN or self._saved is None:
+        """Restore the saved iterator state now, as its restore is asked, through the iterators that own it,
+        so what they refuse is refused where a resume asks it (`dew.training._fit`, which a relaxed one
+        reads afresh), never at the first read past it: a position of another cut of its store
+        (`dew.data.shards._Passing`), a corrupt cursor of Dew's own (`MalformedPosition`), and, where a
+        Grain of another version wrote it (`written`, its `grain` rule), a state that Grain's iterators read
+        otherwise than this Grain's, naming both; one they read alike resumes. The read opened before it,
+        its failure (a file it cannot open) is its own, never a version's (row 12178)."""
+        if self._saved is None:
             return
         read = self._open()
         try:
@@ -356,6 +358,8 @@ class _PerShare(Forwarding):
             raise
         except (KeyError, TypeError, ValueError, IndexError) as error:
             read.close()
+            if written == GRAIN:
+                raise
             raise PlanChanged(("rules.grain",),
                               f"the saved data position's iterator state was written by grain {written}, "
                               f"which this grain {GRAIN} does not read (docs/design/data.md, the rules): "

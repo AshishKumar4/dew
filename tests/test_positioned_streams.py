@@ -244,9 +244,10 @@ def test_a_positioned_read_cut_finer_than_its_store_fills_no_cache_another_topol
     assert log.read_text().split() == numbered
 
 
+@pytest.mark.parametrize("resume", ["exact", "relaxed"])
 @pytest.mark.parametrize("shares", [80, 1], ids=["cut-for-its-readers", "read-whole"])
 def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_cut_dealt_resumes(
-        tmp_path, shares):
+        tmp_path, shares, resume):
     """A positioned store of 130 records in 65 ranges read by 80 shares is cut into 80 ranges
     (`EVEN_CUT`), which each share's position holds: a position saved under the store's first cut, which
     held none, is refused where it resumes (`PlanChanged`, "shards.cut"), never read at the rows its
@@ -254,6 +255,7 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
     so, before any cut was named, resumes at its next row (review of d22: the cut was named in the store's
     fact whatever its readers, refusing reads it never cut)."""
     from dew._position import PlanChanged
+    from dew.training._fit import restored_or_restarted
 
     path = tmp_path / "rows.jsonl"
     path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(130)))
@@ -265,8 +267,7 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
     partition = DataPartition(index=0, count=shares)
 
     def opened():
-        # Resumed exactly, as a run that refuses to read its data afresh is.
-        reader = compile(chain, read="streamed", loading=loading, resume="exact").train(partition)
+        reader = compile(chain, read="streamed", loading=loading, resume=resume).train(partition)
         assert isinstance(reader, Checkpointable) and isinstance(reader, Closeable)
         return reader
 
@@ -293,17 +294,22 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
     resumed = opened()
     try:
         if shares > 1:
-            # Refused where the share restores its rows, as it first reads.
+            # Refused as its restore is asked, exact or relaxed alike, where a relaxed fit reads its data
+            # afresh (`dew.training._fit`), never at its first read.
             with pytest.raises(PlanChanged) as refused:
                 resumed.set_state(json.dumps(earlier).encode())
-                next(iter(resumed))
             assert "shards.cut" in refused.value.differs, refused.value.differs
             # Written by another Grain too: the cut refused as itself, never as that Grain's.
             earlier["dew_data_plan"]["rules"]["grain"] = "0.0.1"
             with pytest.raises(PlanChanged) as other:
                 resumed.set_state(json.dumps(earlier).encode())
-                next(iter(resumed))
             assert "shards.cut" in other.value.differs, other.value.differs
+            if resume == "relaxed":
+                # A relaxed fit's restore of it (`restored_or_restarted`) reads its data afresh, naming the
+                # cut, never aborting.
+                differs = restored_or_restarted(resumed, json.dumps(earlier).encode(), resume=resume, step=1)
+                assert "shards.cut" in differs, differs
+                assert int(next(iter(resumed))["at"][0]) == int(first["at"][0]), first
         else:
             resumed.set_state(json.dumps(earlier).encode())
             assert int(next(iter(resumed))["at"][0]) == int(following["at"][0]) != int(first["at"][0])
@@ -350,3 +356,39 @@ def test_a_bounded_reads_position_holds_the_cut_its_store_was_dealt_by_and_a_pla
         resumed = read()
         resumed.set_state(state)
         assert next(resumed) == next(rows)
+
+
+def test_a_single_shard_store_read_by_several_shares_holds_no_cut_and_resumes_exactly():
+    """A store of one whole shard (a Grain source's or a Hugging Face one's, `_single_indexed_manifest`) read
+    by more shares than its shards is cut by the rule it always was, so each share's position names no cut
+    and resumes exactly at its next row, as a position an earlier Dew saved does (review of d22 r8: every
+    such read was marked cut, refusing the exact resume of an unchanged source)."""
+    import grain.python as grain
+
+    from dew.data.sources.grain import from_grain
+
+    rows = from_grain(grain.MapDataset.source([{"id": np.int32(index)} for index in range(40)]),
+                      identity="forty-ids")
+    chain = Pipeline(rows).batch(2)
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    partition = DataPartition(index=0, count=4)
+
+    def opened():
+        reader = compile(chain, read="streamed", loading=loading, resume="exact").train(partition)
+        assert isinstance(reader, Checkpointable) and isinstance(reader, Closeable)
+        return reader
+
+    reader = opened()
+    try:
+        next(iter(reader))
+        saved = reader.get_state()
+        following = next(iter(reader))
+    finally:
+        reader.close()
+    assert b'"cut"' not in saved, saved
+    resumed = opened()
+    try:
+        resumed.set_state(saved)
+        assert np.array_equal(next(iter(resumed))["id"], following["id"])
+    finally:
+        resumed.close()

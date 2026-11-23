@@ -1162,6 +1162,11 @@ class Checkpoints:
         Dew recorded it."""
         return json_value(self._custom_of(step).get('training'), 'training')
 
+    def saved_with(self, step: int, key: str) -> JSON:
+        """What `step` was saved with under `key` among its custom metadata, None where it holds none: the
+        local step's as its process holds it, a committed one's from the persistent directory."""
+        return json_value(self._custom_of(step).get(key), key)
+
     def control(self, step: int) -> dict:
         if step != self._local_latest():
             self.kept()

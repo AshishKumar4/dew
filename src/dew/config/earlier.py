@@ -364,14 +364,15 @@ which builds the masked decay step its checkpoints hold (`unmarked`)."""
 
 
 def typed_since(record: Mapping[str, object], directory) -> bool:
-    """Whether the step a resume of the run `record` names restores, the newest committed one of its
-    persistent `directory` and of the host's own beside it (its trainer's `local_directory`, under the run's
-    name, as `dew.checkpoints.Checkpoints` reads the newer of the two), is an intermediate Dew's own, its
-    metadata saying its optimizer state was its typed optimizer's (`typed_optimizer`): one saved after that
-    Dew resumed the run under the record it rewrote, which then loads as it is, not as the earlier run
-    trained (`unmarked`)."""
-    import orbax.checkpoint as ocp
+    """Whether the step a resume of the run `record` restores, as its checkpoints choose it
+    (`dew.checkpoints.Checkpoints.latest`: the newer of its persistent `directory`'s steps a resume reads and
+    the local step every process holds of its trainer's `local_directory`, under the run's name), is an
+    intermediate Dew's own, its metadata saying its optimizer state was its typed optimizer's
+    (`typed_optimizer`): one saved after that Dew resumed the run under the record it rewrote, which then
+    loads as it is, not as the earlier run trained (`unmarked`)."""
     from etils import epath
+
+    from dew.checkpoints import Checkpoints
 
     named = _records.class_record({key: value for key, value in record.items() if key not in MARKERS})
     fields = {} if named is None else named[1]
@@ -379,17 +380,14 @@ def typed_since(record: Mapping[str, object], directory) -> bool:
     # Its trainer's fields, under its class record where it names one.
     tagged = _records.class_record(held) if isinstance(held, Mapping) else None
     trainer = tagged[1] if tagged is not None else held
-    local = trainer.get("local_directory") if isinstance(trainer, Mapping) else None
-    # The host's own tier holds each process's steps apart (`Checkpoints`: `<local>/<name>/process<i>`).
-    tier = epath.Path(local) / directory.name if isinstance(local, str) else None
-    roots = [directory, *(() if tier is None or not tier.exists() else
-                          (entry for entry in tier.iterdir() if entry.name.startswith("process")))]
-    steps = [entry for root in roots if root.exists() for entry in root.iterdir() if entry.name.isdigit()
-             and (entry / "_CHECKPOINT_METADATA").exists()]
-    if not steps:
-        return False
-    custom = ocp.metadata.get_step_metadata(max(steps, key=lambda entry: int(entry.name))).custom_metadata
-    return isinstance(custom, Mapping) and custom.get("typed_optimizer") is True
+    trainer = trainer if isinstance(trainer, Mapping) else {}
+    local, every = trainer.get("local_directory"), trainer.get("local_every")
+    with Checkpoints(str(directory), local_directory=str(epath.Path(local) / directory.name)
+                     if isinstance(local, str) else None,
+                     local_every=(every if isinstance(every, (int, str)) else 1) if isinstance(local, str)
+                     else None) as checkpoints:
+        step = checkpoints.latest
+        return step is not None and checkpoints.saved_with(step, "typed_optimizer") is True
 
 
 def unmarked(record: Mapping[str, object], mark: Mapping[str, object]) -> Mapping[str, object]:

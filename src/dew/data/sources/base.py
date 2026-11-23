@@ -527,8 +527,8 @@ def _single_indexed_manifest(source: Source, uri: str) -> ShardManifest:
     return ShardManifest(
         (Shard(uri, uri, 0, count, count),),
         _IndexedSlice(source),
+        # Cut by its first rule, its ranges and their names as earlier runs saved them: no cut to name.
         subdivide=functools.partial(_even_ranges, uri, count, lambda start, end: f"{uri}:{start}:{end}"),
-        subdivided_by=EVEN_CUT,
         index_ordered=True,
     )
 
