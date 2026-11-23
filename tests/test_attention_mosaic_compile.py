@@ -708,9 +708,10 @@ def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("split_cols", [False, True], ids=["whole", "split"])
 @pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
 @pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
-def test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200(rows, kept):
+def test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200(rows, kept, split_cols):
     """Qwen3.5-4B's attention (16 query heads over 4, 256 wide, 12,288 causal tokens: its step's two rows and
     the planner's one-row decision) on a compile-only B200: every config of each tcgen05 family legal for the
     call (`MosaicForward.offered`: the family's configs its derivation searches, each as it launches), pinned,
@@ -731,13 +732,12 @@ def test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200(rows, kept
                                                   natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, residuals=kept, interpret=False)
         legal = [config for family in attention_mosaic_program.layouts("sm100", jnp.bfloat16, tokens)
-                 if family.name.startswith("tcgen05") for config in op.offered(ba, family, target)]
+                 if family.name.startswith("tcgen05") for config in op.offered(ba, family, target)
+                 if (config.columns is not None) == split_cols]
         assert legal
         for config in legal:
             with tuning.pinned({attention_mosaic.MosaicForward: config}):
                 jax.jit(forward).trace(query, key, key).lower(lowering_platforms=("cuda",))
-
-
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
 @pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])

@@ -253,6 +253,10 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
 
 def _score_logits(walk: _Backward, coords: algebra.Coords, params: tuple, s, *, masked: bool):
     """Shared mask and hooked-logits prologue for `_score_weights` and `_scores`."""
+    if walk.hooked[0]:
+        # Hold query places in the accumulator's layout (matching `attention_mosaic_forward._step`, row
+        # 5279) so row-indexed hooks (`q_pos[:, :1]`) lower at 32-row tiles on `mma.sync` (row 7360).
+        coords = coords._replace(q_pos=walk.program.family.as_tile(coords.q_pos))
     seen = algebra.seen(walk.spec, coords, s) if masked else None
     how = walk.how
     logits, slopes = gradient.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,

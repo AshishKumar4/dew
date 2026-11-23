@@ -279,17 +279,13 @@ def _least_keys(family: mosaic.Family, rows: int) -> int:
     return WARPGROUP_WARPS * 16 if rows < family.role_rows else 1
 
 
-def _fewer_hooked(score_mod, reads_queries: bool, family: mosaic.Family) -> bool:
+def _fewer_hooked(score_mod, family: mosaic.Family) -> bool:
     """Whether a backward of `score_mod` takes fewer rows a consumer than a role's on `family` (`fewer_rows`):
     a call of no score hook, or one whose family reads its products' fragments from registers
-    (`Family.operands_in_registers`, mma.sync's) under a hook reading no query's place (`reads_queries`,
-    `MosaicBackward.score_reads`' first, its builder's reading of the hook). An sm80 accurate-form backward
-    under a score hook held its keys 32 a tile (q64 x k32: a key bias's dQ kernel 251 registers, a tile
-    bias's, its columns in two, 255, spilling nothing) where every tile of a role's rows spilled (et-k32;
-    rows 7279, 7280); a row-indexed hook's term of its query places (`q_pos[:, :1]`) found no layout at 32
-    rows on sm80, sm86 and sm89 (et-fewer-stack), as the forward's did before it held them in the
-    accumulator's layout (row 5279)."""
-    return score_mod is None or (family.operands_in_registers and not reads_queries)
+    (`Family.operands_in_registers`, mma.sync's), where `_score_logits` places query coordinates in the
+    accumulator's layout so row-indexed hooks (`q_pos[:, :1]`) lower at 32-row tiles too (rows 7279, 7280,
+    7360)."""
+    return score_mod is None or family.operands_in_registers
 
 
 def _sides(rows: int, family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
@@ -867,8 +863,8 @@ class MosaicForward(_Mainloop[Tiles]):
                 continue
 
             def fits(config: Tiles) -> bool:
-                return self._launchable(ba, config, target, priced=priced) not in (None, *refused)
-
+                return (self._columns_help(ba, config, target)
+                        and self._launchable(ba, config, target, priced=priced) not in (None, *refused))
             choose = functools.partial(self._choose_consumers, ba, target=target) if priced else None
             residency = functools.partial(self.resident, ba, target=target) if priced else None
             config = self._searched(ba, family, fits, choose=choose, residency=residency)
@@ -960,6 +956,26 @@ class MosaicForward(_Mainloop[Tiles]):
             tuning.store_choice(target.generation, key, (best.block_q, best.consumers, best.block_k))
         return best
 
+    def _columns_help(self, ba: tokamax.BoundArguments, config: Tiles,
+                      target: generation.GpuTarget) -> bool:
+        """Whether splitting value columns (`config.columns is not None`) relieves shared memory, tensor
+        memory, or residency on a `places_on_role` family (`tcgen05.rows`): its consumer registers hold no
+        value columns (sums live in tensor memory), so when `columns=None` already fits SMEM and TMEM at the
+        same residency and was refused for register spills, splitting columns is doomed (row 5535)."""
+        if config.columns is None:
+            return True
+        family = bundle_of(config, ba.arguments["query"].dtype, target=target)
+        if not family.places_on_role:
+            return True
+        whole = dataclasses.replace(config, columns=None)
+        if not self._ahead(ba, whole, target):
+            return True
+        if family.product_columns(self._products(ba, whole, target)) > (target.tmem_columns or 0):
+            return True
+        if self.staged_bytes(ba, whole, target) > self.program_shared(whole, target):
+            return True
+        return self.resident(ba, config, target) > self.resident(ba, whole, target)
+
     def offered(self, ba: tokamax.BoundArguments, family: mosaic.Family, target: generation.GpuTarget
                 ) -> tuple[Tiles, ...]:
         """Every config of `family` its derivation searches for the call of `ba` (`_searched`) that is legal,
@@ -970,7 +986,8 @@ class MosaicForward(_Mainloop[Tiles]):
         found: dict[Tiles, None] = {}
 
         def fits(config: Tiles) -> bool:
-            if (launched := self._launchable(ba, config, target)) is not None:
+            if (self._columns_help(ba, config, target)
+                    and (launched := self._launchable(ba, config, target)) is not None):
                 found[launched] = None
             return False
 
@@ -1865,8 +1882,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         if config.fused and deterministic_ops_requested():
             return False
         if (family is not None and min(config.block_q, config.block_k) < family.role_rows
-                and not _fewer_hooked(self.score_mod, self.score_reads[0], family)):
-            # A score hook's tiles at a role's rows (`derived`'s fewer rows a consumer) where its family
+                and not _fewer_hooked(self.score_mod, family)):
             # takes none fewer (`_fewer_hooked`): a hooked call's tiles of fewer fail to lower there.
             return False
         if config.shared_keys:
@@ -2150,7 +2166,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             lambda config: fits(config) and self.resident(ba, config, target) >= 2]
         for wanted in (*residing, fits):
             for columns in (1, 2, 4):
-                fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, self.score_reads[0], dq) else ()
+                fewer = fewer_rows(dq) if _fewer_hooked(self.score_mod, dq) else ()
                 for rows in (None, *fewer):
                     walks = _query_walk(rows)
                     for staged in (False, True):

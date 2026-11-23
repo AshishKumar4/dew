@@ -1021,3 +1021,71 @@ def test_sm90_roofline_forward_and_fused_backward_compile_spill_free():
                     (q, k, k, q, res))))
     found = compile_mosaic_kernels(cases, "sm90")
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_tcgen05_rows_prices_natural_exp_and_skips_doomed_column_splits():
+    """Row 5535: `forward_registers` for `tcgen05.rows` (`places_on_role`) charges the `natural_exp` phase
+    when `natural=True` (enabling `setmaxnreg` register transfer on 128x64 instead of capping at the flat
+    share, while leaving `natural=False` unchanged), and `MosaicForward._columns_help` rejects split columns
+    when `columns=None` already fits SMEM and TMEM at the same residency while admitting splits when
+    `columns=None` exceeds SMEM."""
+    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program as program, resources
+    from dew.nn.kernels.templates.attention_mosaic_registers import forward_registers
+
+    spans = template.spans(1024, 1024, 1, causal=True)
+    q = jax.ShapeDtypeStruct((1, 1024, 16, 256), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((1, 1024, 4, 256), jnp.bfloat16)
+    with generation.assumed("sm100"):
+        target = generation.gpu_target()
+        tiles_64 = attention_mosaic.Tiles(128, 64, 2, 1, family="tcgen05.rows")
+        tiles_128 = attention_mosaic.Tiles(128, 128, 2, 1, family="tcgen05.rows")
+        rows_family = program.bundle_of(tiles_64, jnp.bfloat16, target=target)
+        folded_regs = forward_registers(rows_family, tiles_64, 256, jnp.bfloat16,
+                                        residuals=False, natural=False)
+        natural_regs = forward_registers(rows_family, tiles_64, 256, jnp.bfloat16,
+                                         residuals=False, natural=True)
+        assert natural_regs > folded_regs, (folded_regs, natural_regs)
+        op_nat, args_nat = attention_mosaic._forward_call(q, k, k, spans, None, scale=None, natural=True)
+        ba_nat = op_nat.bind(*args_nat, residuals=template.Kept.NONE, interpret=False)
+        op_fold, args_fold = attention_mosaic._forward_call(q, k, k, spans, None, scale=None, natural=False)
+        ba_fold = op_fold.bind(*args_fold, residuals=template.Kept.NONE, interpret=False)
+        assert op_nat.registers(ba_nat, tiles_64, target=target) == natural_regs
+        assert op_fold.registers(ba_fold, tiles_64, target=target) == folded_regs
+        joined = op_nat.joined_roles(ba_nat, tiles_64, target)
+        folded_model = resources.register_model(rows_family, 1, folded_regs, target=target, joined=joined)
+        natural_model = resources.register_model(rows_family, 1, natural_regs, target=target, joined=joined)
+        assert natural_model.moves and not folded_model.moves
+        # Negative pair: 128x64 whole at d256 already fits SMEM/TMEM at same residency -> split rejected.
+        split_64 = dataclasses.replace(tiles_64, columns=128)
+        assert op_nat._columns_help(ba_nat, tiles_64, target)
+        assert not op_nat._columns_help(ba_nat, split_64, target)
+        # Positive pair: 128x128 whole at d256 exceeds SMEM on sm100 -> column split admitted.
+        split_128 = dataclasses.replace(tiles_128, columns=128)
+        assert op_fold.staged_bytes(ba_fold, tiles_128, target) > op_fold.program_shared(tiles_128, target)
+        assert op_fold._columns_help(ba_fold, split_128, target)
+
+
+def test_fewer_hooked_admits_row_indexed_hooks_on_mma_sync():
+    """Row 7360: `_fewer_hooked` admits `mma.sync` 32-row backward tiles under row-indexed hooks (`q_pos[:,
+    :1]`) now that `_score_logits` holds query places in the accumulator's layout."""
+    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program as program
+
+    spans = template.spans(512, 512, 1, causal=True)
+    q = jax.ShapeDtypeStruct((1, 512, 4, 64), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((1, 512, 2, 64), jnp.bfloat16)
+    hooks = template.Hooks(score_mod=lambda s, q_pos, _k: s + 0.01 * q_pos[:, :1].astype(s.dtype))
+    zero_row = jax.ShapeDtypeStruct((1, 4, 512), jnp.float32)
+    zero_idx = jax.ShapeDtypeStruct((1, 4, 512), jnp.int32)
+    split = template.Split(jax.ShapeDtypeStruct((1, 4, 512, 64), jnp.float32),
+                           zero_row, zero_row, zero_row)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        op, args = attention_mosaic._backward_call(
+            q, k, k, spans, hooks, q, residuals=(zero_row, zero_row, zero_idx, split),
+            scale=None, natural=attention_mosaic.NATURAL, accurate=True)
+        ba = op.bind(*args, interpret=False)
+        tiles = attention_mosaic.BackwardTiles(
+            block_q=32, block_k=32, stages=2, consumers=1, fused=False, family="mma.sync")
+        family = program.bundle_of(tiles, jnp.bfloat16, target=target)
+        assert attention_mosaic._fewer_hooked(hooks.score_mod, family)
+        assert op.takes(ba, tiles, target)

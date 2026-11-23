@@ -136,6 +136,21 @@ def _epilogue_registers(family: mosaic.Family, carried: list, block_q: int, valu
     return max(fin, live(family, [], [(block_q, value_width, ed)] * 2) + r) if masked else fin
 
 
+def _role_forward_registers(family: mosaic.Family, block_q: int, block_k: int, dtype, *,
+                            natural: bool) -> int:
+    """Registers for a consumer of role-issued products (`Issuer.places_on_role`, tcgen05's rows): row maxima
+    and denominators carried, logits fp32 from tensor memory beside narrowed weights (sums kept in TMEM,
+    rescaled by column blocks; mask places are row scalars beside constant columns; ptxas held 4B 128x64
+    width 256 in 196 regs, et-rows-abi, and 8B width 128 in 176 at 128x64 and 248 at 128x128, et-sm100-128).
+    Natural-form exponentials (`algebra.natural_exp`) additionally hold logits and exponent bits beside the
+    reduced argument (row 5535)."""
+    logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
+    phases = [[logits, weights]]
+    if natural:
+        phases.append([logits, logits, (block_q, block_k, jnp.int32)])
+    return resources.live_registers(family, [(block_q, 1, jnp.float32)] * 2, *phases)
+
+
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                       natural: bool = False, params: tuple = (), width: int | None = None, parts: int = 1,
                       scaled: bool = False, codes: bool = False, positions: int = 0, per_span: int = 1,
@@ -182,16 +197,7 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
     """
     block_q, block_k = tiles.block_q, tiles.block_k
     if family.places_on_role:
-        # A consumer of products a role issues (`Issuer.places_on_role`, tcgen05's rows): its rows' maxima
-        # and denominators carried, and at a step's widest its logits read from tensor memory, fp32, beside
-        # their weights narrowed to the operands' dtype for the product, two to a register where 16-bit (its
-        # sums kept there, rescaled a block of columns at a time once the weights are written; its mask's
-        # places a row's scalar beside constant columns). A thread holds its row: ptxas held the 4B call's
-        # 128 x 64 walk at width 256 in 196 registers (et-rows-abi), and the 8B's at width 128 in 176 at
-        # 128 x 64 and 248 at 128 x 128, spilling none (et-sm100-128), where two fp32 tiles priced the
-        # 128-key tile past its budget.
-        return resources.live_registers(family, [(block_q, 1, jnp.float32)] * 2,
-                                        [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)])
+        return _role_forward_registers(family, block_q, block_k, dtype, natural=natural)
     hooked, vectors = _hook_live(family, block_q, block_k, params, held=True)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
