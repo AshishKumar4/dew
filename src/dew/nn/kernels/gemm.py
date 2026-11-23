@@ -459,7 +459,7 @@ class SyrkCase:
     no_x64: bool = True
     no_auto: bool = True
     precision_ok: bool = True
-
+    measured: bool = False
 
 SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
     selection.Kernel('mosaic', (
@@ -479,8 +479,8 @@ SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
             'sharding', lambda case: case.no_auto,
             "automatic mesh axes keep XLA's dot outside per-shard launch", SYRK_ROW),
         selection.Requirement(
-            'measured', lambda case: False, "no receipt yet has Mosaic SYRK beat XLA's batched dot "
-            "(pending M-NG-5)", SYRK_ROW, kind='measured'),
+            'measured', lambda case: case.measured, "no receipt yet has Mosaic SYRK beat XLA's batched dot "
+            "(M-NG-45-a100 admits whole-tile mma.sync Gram; GH200 & poly pending)", SYRK_ROW, kind='measured'),
         selection.Requirement(
             'launch', lambda case: case.call.eligible('mosaic'),
             "no legal square super-tile holds this symmetric product on the target", SYRK_ROW))),
@@ -540,8 +540,11 @@ def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
         with ctx:
             call = base.call((syrk_mod.MOSAIC_SYRK,), flat, poly_spec, transpose=transpose,
                              out_dtype=out_dtype.name, interpret=interpreting)
+            admitted = (not has_poly and not interpreting
+                        and syrk_mod.measured_gram(generation.gpu_target(), flat.shape, transpose))
             case = SyrkCase(op_dtype, out_dtype, call, no_x64=not jax.config.jax_enable_x64,
-                            no_auto=not automatic_axes(), precision_ok=exact_products(precision, op_dtype))
+                            no_auto=not automatic_axes(), precision_ok=exact_products(precision, op_dtype),
+                            measured=admitted)
             return selection.select(SYRK, case).kernel == 'mosaic'
 
 

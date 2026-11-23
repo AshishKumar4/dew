@@ -175,6 +175,22 @@ def test_unforced_syrk_skips_mosaic_certification_while_forced_certifies():
                for c in report.certifications())
 
 
+def test_syrk_measured_gate_admits_sm80_whole_tile_gram_only():
+    """`M-NG-45-a100` admits whole-tile `mma.sync` symmetric Gram (1.66-1.80x XLA, digests equal) while
+    keeping ragged shapes (1.71-2.53x slower), polynomials (pending Check 1), and unmeasured `sm90` on XLA."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    with generation.assumed("sm80"):
+        assert gemm._syrk_select(bf16((28, 2560, 4096)), has_poly=False, transpose=False,
+                                 precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+        assert not gemm._syrk_select(bf16((4, 150, 200)), has_poly=False, transpose=False,
+                                     precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+        assert not gemm._syrk_select(bf16((28, 2560, 2560)), has_poly=True, transpose=False,
+                                     precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+    with generation.assumed("sm90"):
+        assert not gemm._syrk_select(bf16((28, 2560, 4096)), has_poly=False, transpose=False,
+                                     precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+
+
 @INTERPRETS
 def test_syrk_cluster2_square_super_tile_holds_check_1():
     """Hopper `cluster=2` square super-tile (`128x256x64` -> `256x256` super-tile) SYRK holds check 1."""

@@ -686,28 +686,33 @@ def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: 
         transpose_rhs=transpose_rhs, matrices=matrices, interpret=interpret, first=tile[3],
         transpose_lhs=transpose_lhs, block_scaled=mx, packed_rows=packed_rows,
         scaling=_gmm_scaling(scaled[0], scaled[1], scaled[2], tile[2], rows), chosen=chosen, **refs)
-    scaled_step = refs.get('decoded') is not None or mx or packed_rows
     prefetching = idle is None and prefetches(
-        family, matrices=len(matrices), prologue=hook, scaled=scaled_step, chained=chosen is not None,
-        interpret=interpret, transposed=(transpose_lhs, transpose_rhs),
+        family, matrices=len(matrices), prologue=hook, scaled=refs.get('decoded') is not None or mx,
+        chained=chosen is not None, interpret=interpret,
+        transposed=(transpose_lhs or packed_rows, transpose_rhs),
         summed=exact_sums and not family.sums_in_persist)
-    return step, (_gmm_prefetch(family, matrices, rows, transpose_lhs=transpose_lhs,
-                                transpose_rhs=transpose_rhs) if prefetching else None)
+    return step, _gmm_prefetch(family, matrices, rows) if prefetching else None
+
+
 def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, chained: bool,
                interpret: bool, transposed: tuple[bool, bool], summed: bool) -> bool:
     """Dew: whether a `gmm` walk reads a step's first fragments under the previous step's last product
-    (`_gmm_prefetch`, `Transport.prefetches_fragments`, row 5271): plain, unscaled, unchained, compiled, and
-    tensor-core summed (supports untransposed forward and transposed dX/lhs)."""
-    del transposed
+    (`_gmm_prefetch`, `Transport.prefetches_fragments`): plain, unscaled, unchained, compiled, untransposed
+    (transposed-RHS prefetch regressed A100 deep-K gate_up dX by +32-34% in M-FS-53-a100 & M-NG-2-a100), and
+    tensor-core summed."""
     return (family.prefetches_fragments and matrices == 1 and prologue is None and not scaled and not chained
-            and not interpret and not summed)
+            and not interpret and not any(transposed) and not summed)
+
+
 def tgmm_prefetches(family: mosaic.Family, *, unstaged: bool, rewritten: bool, k_major: bool,
                     interpret: bool, scaled: bool, summed: bool) -> bool:
-    """Dew: whether an unstaged `tgmm` walk prefetches a step's first fragments under the previous step's
-    last product (`Transport.prefetches_fragments`): compiled, unstaged dense steps, not rewritten or
-    k-major, unscaled, and summed by the tensor cores."""
-    return (family.prefetches_fragments and unstaged and not rewritten and not k_major and not interpret
-            and not scaled and not summed)
+    """Dew: whether an unstaged `tgmm` walk prefetches a step's first fragments across steps: disabled on
+    `mma.sync` (`M-NG-45-a100` 20261123T015937Z: dW geomean 1.019x, 9/13 slower, 4B key +11.6%, confirming
+    `FS-DENSE-AB1`)."""
+    del family, unstaged, rewritten, k_major, interpret, scaled, summed
+    return False
+
+
 def _gmm_streamed(paired, scales, joined, bounded: "Chained | None" = None) -> tuple[dict, tuple, int]:
     """Dew: `_gmm_mainloop`'s matrices (its own, a paired one), each to the stream of the rows it multiplies
     (the rows', the joined rows' for a joined pair's paired matrix), the streams beyond the rows in its
@@ -1719,17 +1724,19 @@ def _rows_of(slots, matrices: dict, mine_rows, transpose_lhs: bool) -> dict:
             for name, stream in matrices.items()}
 
 
-def _gmm_prefetch(family: mosaic.Family, matrices: dict, rows, *, transpose_lhs: bool = False,
-                  transpose_rhs: bool = False) -> Callable:
-    """Dew: the walk's prefetch of a plain `_gmm_step`'s slots (`prefetches_fragments`, row 5271)."""
+def _gmm_prefetch(family: mosaic.Family, matrices: dict, rows) -> Callable:
+    """Dew: the walk's prefetch of a plain `_gmm_step`'s slots (`prefetches_fragments`): untransposed rows
+    and matrix only (`prefetches`)."""
     (name,) = matrices
 
     def prefetch(slots):
-        rows_of = _rows_of(slots, matrices, rows, transpose_lhs=transpose_lhs)
-        oriented = _oriented(slots, matrices, transpose_rhs=transpose_rhs)
+        rows_of = _rows_of(slots, matrices, rows, transpose_lhs=False)
+        oriented = _oriented(slots, matrices, transpose_rhs=False)
         return family.first_fragments(rows_of[name], oriented[name])
 
     return prefetch
+
+
 def _transformed(prologue, axes_of: tuple, mine: jax.Array, tiles_of: dict, halved: str, half) -> jax.Array:
     """Dew: `mine`, this warpgroup's half of a stage read into registers, transformed by the prologue on its
     side tiles (`tiles_of`, by operand) cut to the same half along the `halved` launch axis, a side operand by

@@ -253,17 +253,7 @@ def prefetch_registers(family: mosaic.Family, config: "Tiles", *, ba, staged_row
         family, matrices=1 + (ba.arguments.get('paired') is not None), prologue=hooks.prologue,
         scaled=scaled, chained=bool(ba.arguments.get('chained')), interpret=interpret,
         transposed=(trans_lhs, trans_rhs), summed=summed)
-    if not active:
-        return 0
-    extra = 0
-    if trans_rhs:
-        inst = family.fragment_depth(config.block_k)
-        rhs_loaded = family.rhs_fragment_depth(config.block_k, transposed=True)
-        itemsize = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
-        extra = (max(0, rhs_loaded - inst) * config.block_n * family.rhs_copies
-                 * itemsize // (4 * resources.THREADS))
-    return (32 if config.block_k > 32 else 16) + extra
-
+    return (32 if config.block_k > 32 else 16) if active else 0
 @dataclasses.dataclass(frozen=True)
 class SplitWalk:
     """Dew: a contraction's walk at a tile as `split_count` prices it (`split_walk`): its `output` tiles
