@@ -158,8 +158,9 @@ def _abstract(*arrays, form: Form):
     def value(*operands):
         return _value(*operands, form=form)
 
-    return pe.abstract_eval_fun(value, *arrays, debug_info=api_util.debug_info("scaled_contraction", value,
-                                                                                arrays, {}))
+    (typed,) = pe.abstract_eval_fun(value, *arrays, debug_info=api_util.debug_info(
+        "scaled_contraction", value, arrays, {}))
+    return typed
 
 
 scaled_contraction_p.def_impl(lambda *arrays, form: _value(*arrays, form=form))
