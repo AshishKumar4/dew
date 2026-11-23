@@ -93,3 +93,14 @@ def test_a_spec_and_its_rate_train_as_the_config_holding_them():
     held = Trainer(Regression(), OptimConfig(optimizer=AdamW(), **stated), key=0).fit(dataset(), steps=3,
                                                                                       log_every=100)
     jax.tree.map(np.testing.assert_array_equal, *jax.device_get((beside.variables, held.variables)))
+
+
+def test_a_flag_of_a_recipes_optimizer_moves_that_optimizer():
+    """A flag of an optimizer's settings given alone moves the optimizer of the run the command line parses
+    over (`cli`'s `default`, a recipe's), never the class's default one: a recipe's Adam takes
+    `--optim.optimizer.b2 0.95` as its own b2 and stays Adam (review of API03: it became an AdamW)."""
+    from dew.optim import Adam
+
+    recipe = RunConfig(optim=OptimConfig(optimizer=Adam()))
+    parsed = RunConfig.cli(["--optim.optimizer.b2", "0.95"], default=recipe).optim.optimizer
+    assert type(parsed) is Adam and parsed == Adam(b2=0.95), parsed

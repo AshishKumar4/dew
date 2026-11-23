@@ -2182,12 +2182,20 @@ def test_a_rate_named_twice_is_refused(config):
 
 def test_a_schedule_naming_no_peak_climbs_to_its_configs_rate():
     """A schedule that names no peak (`Peaked.peak_value` None) climbs to the rate of the config holding it
-    (`OptimConfig.lr`), a param group's too, which its multiplier then scales: the config is the one whose
-    schedules name that peak; one naming none outside a config is refused as its rates are read."""
+    (`OptimConfig.lr`), a param group's too, which its multiplier then scales: its solvers run the rates of
+    the config whose schedules name that peak; one naming none outside a config is refused as its rates are
+    read. The config holds the rate once, so moving `lr` after it is made (`RunConfig.override`, a sweep)
+    moves the schedules' peak with it, through a save and a load too (review of API03: the peak written
+    into the schedule refused a moved `lr` as named twice)."""
+    from dew.config import RunConfig
+
     named = OptimConfig(optimizer=Adam(), schedule=Cosine(peak_value=1e-2, warmup_steps=1),
                         param_groups=(ParamGroup("all", ("*",), schedule=Linear(peak_value=1e-2)),))
     filled = OptimConfig(optimizer=Adam(), lr=1e-2, schedule=Cosine(warmup_steps=1),
                          param_groups=(ParamGroup("all", ("*",), schedule=Linear()),))
-    assert filled == named, (filled, named)
+    assert filled.grouped_rates() == named.grouped_rates(), (filled, named)
+    moved = RunConfig.from_dict(RunConfig(optim=filled).override({"optim.lr": 2e-2}).to_dict()).optim
+    assert moved.grouped_rates() == {"all": (Linear(peak_value=2e-2), 1.0)}, moved
+    assert moved.rate == Cosine(peak_value=2e-2, warmup_steps=1), moved
     with pytest.raises(ValueError):
         Linear().rates()

@@ -138,7 +138,7 @@ def waiting(opt_state: optax.OptState) -> jax.Array | None:
 
 
 _WHOLE = ("hold the whole update back: optax.MultiSteps(optimizer, k), or optax.chain(optimizer, "
-          "optax.apply_every(k)); or accumulate gradients with Trainer(update=UpdateBatch(batches=k))")
+          "optax.apply_every(k)); or accumulate gradients with Trainer(accumulation=k)")
 """The compositions whose held updates the trainer counts by, which a refusal names."""
 
 

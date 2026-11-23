@@ -1380,16 +1380,12 @@ class ParamGroup:
                 raise ValueError(f"param group {self.name!r} bounds its parameters from a lower to a "
                                  f"higher value, got {self.bounds}")
 
-    def rate[R](self, learning_rate: R) -> R | ScheduleBase:
-        """The rate its solver runs at: its own schedule, or the config's (`OptimConfig.rate`) where it
-        names none."""
-        return learning_rate if self.schedule is None else self.schedule
-
     def solver(self, make: Callable[..., optax.GradientTransformation],
                learning_rate: float | ScheduleBase, steps: int | None,
                opts: Mapping[str, object], *, clocked: bool = False, stated: bool = False
                ) -> optax.GradientTransformation:
-        """Build this group's optimizer: `make` at the group's rate, its fields held in state
+        """Build this group's optimizer: `make` at the group's rate (`learning_rate`, as its config resolves
+        it, `OptimConfig.grouped_rates`), its fields held in state
         (`scheduled_solver`, `stated` as there), with the group's `b1` schedule and `bounds`, over a run of
         `steps` updates, or of the progress of a `clocked` one.
 
@@ -1399,7 +1395,7 @@ class ParamGroup:
         if self.b1 is not None and 'b1' not in inspect.signature(make).parameters:
             raise ValueError(f"param group {self.name!r} schedules b1, and its optimizer "
                              f"takes no b1 (adam, adamw and lamb do)")
-        solver = scheduled_solver(make, self.rate(learning_rate), steps, opts, self.b1,
+        solver = scheduled_solver(make, learning_rate, steps, opts, self.b1,
                                   self.learning_rate_multiplier, clocked=clocked, stated=stated)
         if self.bounds is not None:
             solver = optax.chain(solver, _keep_within(*self.bounds))
@@ -2139,11 +2135,23 @@ class OptimConfig:
 
     @property
     def rate(self) -> float | ScheduleBase:
-        """Its learning rate: its schedule, at its peak (`__post_init__`), or its constant rate."""
+        """Its learning rate: its schedule, climbing to `lr` where it names no peak of its own (`Peaked`),
+        or its constant rate. Each holds the rate it is given alone, so a run that moves `lr` after it is
+        made (`RunConfig.override`, a sweep) moves the schedule's peak with it."""
         if self.schedule is not None:
-            return self.schedule
+            return self._peaked(self.schedule)
         assert self.lr is not None, "a config resolves its rate as it is made"
         return self.lr
+
+    def _peaked(self, schedule: ScheduleBase) -> ScheduleBase:
+        """`schedule` climbing to `lr` where it is a `Peaked` one that names no peak."""
+        if isinstance(schedule, Peaked) and schedule.peak_value is None and self.lr is not None:
+            return dataclasses.replace(schedule, peak_value=self.lr)
+        return schedule
+
+    def _rated(self, group: ParamGroup) -> float | ScheduleBase:
+        """`group`'s rate: its own schedule, climbing to `lr` where it names no peak, or the config's."""
+        return self.rate if group.schedule is None else self._peaked(group.schedule)
 
     def __post_init__(self):
         _checked_decay_mask(self.decay_mask, not self.decay_norms_and_biases and self.optimizer.spares(),
@@ -2163,26 +2171,20 @@ class OptimConfig:
             if self.lr is not None:
                 raise ValueError(f"{type(self.schedule).__name__} holds its rates in its own fields, which "
                                  f"lr {self.lr} is none of")
-        else:
-            # Unset, the rate is the schedule's peak, else the optimizer's own, recorded as the config's.
-            rate = self.lr if self.lr is not None else named if named is not None else self.optimizer.OWN_RATE
-            object.__setattr__(self, 'lr', rate)
-            if self.schedule is not None:
-                object.__setattr__(self, 'schedule', dataclasses.replace(self.schedule, peak_value=rate))
-        if self.lr is not None:
-            # A group's schedule that names no peak climbs to the config's rate, which its multiplier scales.
-            object.__setattr__(self, 'param_groups', tuple(
-                dataclasses.replace(group, schedule=dataclasses.replace(group.schedule, peak_value=self.lr))
-                if isinstance(group.schedule, Peaked) and group.schedule.peak_value is None else group
-                for group in self.param_groups))
+        elif self.lr is not None and named is not None:
+            # Named twice alike, held once: as `lr`, which the schedule then climbs to.
+            object.__setattr__(self, 'schedule', dataclasses.replace(self.schedule, peak_value=None))
+        elif self.lr is None and named is None:
+            # Unset, the rate is the optimizer's own, recorded as the config's.
+            object.__setattr__(self, 'lr', self.optimizer.OWN_RATE)
 
     def schedules(self) -> list[tuple[str, ScheduleBase]]:
         """The schedules its solvers run, by where the config holds them: its learning rate's, or each
-        param group's rate (`ParamGroup.rate`, the config's own where the group names none) and b1."""
+        param group's rate (`_rated`, the config's own where the group names none) and b1."""
         held: list[tuple[str, object]] = [] if self.param_groups else [("schedule", self.rate)]
         for group in self.param_groups:
             rate = "schedule" if group.schedule is None else f"param_groups.{group.name}.schedule"
-            held += [(rate, group.rate(self.rate)), (f"param_groups.{group.name}.b1", group.b1)]
+            held += [(rate, self._rated(group)), (f"param_groups.{group.name}.b1", group.b1)]
         return [(name, schedule) for name, schedule in held if isinstance(schedule, ScheduleBase)]
 
     def reads_progress(self) -> bool:
@@ -2258,7 +2260,7 @@ class OptimConfig:
                 spares = not group.decay_norms_and_biases and self.optimizer.spares()
                 masked = ({'mask': weight_decay_mask} if spares
                           else _decay_masked(group.decay_mask, self.optimizer))
-                solvers[group.name] = group.solver(make, self.rate, steps, {**grouped, **masked},
+                solvers[group.name] = group.solver(make, self._rated(group), steps, {**grouped, **masked},
                                                    clocked=clocked, stated=stated)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
             if solved is not None:
@@ -2363,10 +2365,10 @@ class OptimConfig:
     def grouped_rates(self) -> dict[str | None, tuple[float | ScheduleBase, float]]:
         """Each of `build`'s solvers' rate and its multiplier, by param group, or under None for the one
         solver of a config without groups: the config's rate, or a group's own schedule
-        (`ParamGroup.rate`), and the group's `learning_rate_multiplier`."""
+        (`_rated`), and the group's `learning_rate_multiplier`."""
         if not self.param_groups:
             return {None: (self.rate, 1.0)}
-        return {group.name: (group.rate(self.rate), group.learning_rate_multiplier)
+        return {group.name: (self._rated(group), group.learning_rate_multiplier)
                 for group in self.param_groups}
 
     def horizons(self, steps: int | None, clocked: bool = False) -> dict[str | None, dict[str, int | float]]:

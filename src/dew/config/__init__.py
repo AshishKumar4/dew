@@ -74,6 +74,7 @@ from dew.nn.kernels import generation
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
 from dew.registry import (
+    Configured,
     ModelConfig,
     Registered,
     declared_type,
@@ -309,11 +310,14 @@ _SUBCOMMAND = _SubcommandConfig
 an object of this class)."""
 
 
-def flag_subcommands(config: type, prefix: str = "") -> dict[str, str]:
+def flag_subcommands(config: type, prefix: str = "", held: Configured = None) -> dict[str, str]:
     """The optional settings `config` declares that `cli` turns on by their own flags (`flag_selected`),
     by flag path, each with the subcommand its flags imply: a field annotated as one or more subcommands or
     None (`tyro.conf.subcommand`), its first; and those within each such setting's settings and within a
-    nested run setting (a `dew.config` dataclass, the trainer's), parents before their own."""
+    nested run setting (a `dew.config` dataclass, the trainer's), parents before their own. A field's
+    default is `held`'s, the run the command line parses over (`cli`'s `default`, a recipe's), where given,
+    else the class's own, so a flag of a recipe's optimizer implies that optimizer, never the class's
+    default one (review of API03)."""
     found: dict[str, str] = {}
     hints = typing.get_type_hints(config, include_extras=True)
     for field in dataclasses.fields(config):
@@ -324,7 +328,8 @@ def flag_subcommands(config: type, prefix: str = "") -> dict[str, str]:
                   if typing.get_origin(option) is Annotated
                   for marker in typing.get_args(option)[1:]
                   if isinstance(marker, _SUBCOMMAND) and marker.name is not None]
-        default = (field.default_factory() if callable(field.default_factory)
+        default = (vars(held)[field.name] if held is not None
+                   else field.default_factory() if callable(field.default_factory)
                    else None if field.default is dataclasses.MISSING else field.default)
         # A default's own subcommand, which a flag of its fields given alone implies: a chosen record's
         # (`dew.registry.implied_subcommand`), or the one member of its own class: `--optim.optimizer.b2 0.95`
@@ -344,7 +349,8 @@ def flag_subcommands(config: type, prefix: str = "") -> dict[str, str]:
         for kind in nested:
             if (isinstance(kind, type) and dataclasses.is_dataclass(kind)
                     and kind.__module__.startswith(("dew.config", "dew.optim"))):
-                found.update(flag_subcommands(kind, f"{path}."))
+                found.update(flag_subcommands(kind, f"{path}.",
+                                              default if isinstance(default, kind) else None))
     return found
 
 
@@ -956,7 +962,8 @@ class RunConfig:
         without an adapter. What the run trains, its model, objective and data, is built in Python, as
         `default` holds them, and takes no flag (`dew train` reads a run a Python file builds).
         """
-        given = flag_selected(list(sys.argv[1:] if args is None else args), flag_subcommands(cls))
+        given = flag_selected(list(sys.argv[1:] if args is None else args),
+                              flag_subcommands(cls, held=default))
         # The run parses with its model and objective held as `default` holds them, or as the class
         # declares them; every other field from `default`, or from its own declared default, which a value
         # a field's default resolves (an optimizer's own rate) follows where its flags move it.

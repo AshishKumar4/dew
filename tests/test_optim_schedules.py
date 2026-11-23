@@ -339,7 +339,7 @@ def test_a_one_cycle_rise_may_be_a_share_of_the_run():
 
 
 def test_a_config_records_the_warmups_of_the_schedules_its_optimizer_runs():
-    """A config records the warmups of the schedules its solvers run (`ParamGroup.rate`): where every
+    """A config records the warmups of the schedules its solvers run (`grouped_rates`): where every
     group names its own, the config's rate runs nowhere and is not resolved, so a share of a run with
     no planned length is no error; a group naming none runs the config's rate, recorded once."""
     unused = Power(peak_value=1.0, warmup_steps="5%", a=0.5)

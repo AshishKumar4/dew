@@ -119,7 +119,7 @@ def solved_directions(damping: float = 0.0,
             raise ValueError("a Gauss-Newton update was handed no statistics: a wrapper that hands its inner "
                              "update no extra arguments (optax.MultiSteps) holds it, which pools no system "
                              "across the steps it holds; accumulate with "
-                             "Trainer(update=UpdateBatch(batches=k)), which pools the update's system whole")
+                             "Trainer(accumulation=k), which pools the update's system whole")
         if not isinstance(statistics, NormalEquations | RowEquations):
             raise ValueError("a Gauss-Newton update solves its objective's system (NormalEquations or "
                              "RowEquations, dew.objectives.Step.equations), which this run's statistics are "
