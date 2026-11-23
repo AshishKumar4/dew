@@ -273,8 +273,8 @@ FACTORED_FAN_IN = 1 << 24
 routes into a token, devices into their sum; `2**24` of them sum below int32's largest."""
 
 FACTORED_MATRIX_SLICES = 6
-"""A decoded packed matrix's slices on its grid: 36 bits, past any format's span (E5M2's 31 binades and 3
-bits; NVFP4's codes times E4M3 block scales; ternary's one)."""
+"""A decoded packed matrix's slices on its grid: 36 bits, past any format's span (NVFP4's E2M1 codes times
+E4M3 block scales, 2 bits over 27 binades; ternary's one)."""
 
 
 def _limbs(count: int, like: jax.Array, columns: int) -> jax.Array:
