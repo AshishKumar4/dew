@@ -132,9 +132,13 @@ class Template[Config: Hashable](tuning.KernelOp):
     def proposes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget, *,
                  held: Callable[[], bool] | None = None) -> bool:
         """Whether the derivation offers `config` for `ba` on `target` to its legality: any config where the
-        call ranks alone (`ranks_alone`), else one its register model holds (`held`, evaluated lazily so a
-        rank-only launch computes no register estimate, row 9477)."""
-        return self.ranks_alone(ba, target) or (self.held(ba, config) if held is None else held())
+        call ranks alone (`ranks_alone`), else one its register model holds on `target` (`held`, or the
+        launch's own proposal, `held`: evaluated lazily so a rank-only launch computes no register estimate,
+        row 9477; under `target` whatever GPU is in effect, row 12000)."""
+        if self.ranks_alone(ba, target):
+            return True
+        with generation.as_target(target):
+            return self.held(ba, config) if held is None else held()
 
     def program_shared(self, config: Config, target: generation.GpuTarget) -> int:
         """The shared memory a program of the launch at `config` may stage on `target`: a block's
@@ -193,7 +197,8 @@ class Template[Config: Hashable](tuning.KernelOp):
         their registers stages, against the budget; None where none does (a generating launch that
         generates none)."""
         named = () if self.GENERATES else self.space(ba)
-        held = [config for config in named if self.held(ba, config)]
+        with generation.as_target(target):
+            held = [config for config in named if self.held(ba, config)]
         least = min((self.staged_bytes(ba, config, target) for config in held), default=None)
         return Unfitted(type(self).__name__, least, generation.shared_budget(target), target.generation)
 
