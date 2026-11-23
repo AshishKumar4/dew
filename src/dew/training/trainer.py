@@ -169,7 +169,7 @@ from dew.training.distributed import (
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
-from dew.training.memory import first_run, recompute_record, refuse_wide_floats, split_share
+from dew.training.memory import first_run, recompute_record, refuse_wide_floats, remat_stated, split_share
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepare_counts, uncounted
 from dew.training.observe import Observe
 from dew.training.phase_passes import PhasePasses, SampledPasses
@@ -345,6 +345,10 @@ class Trainer(Generic[Loss, Effects]):
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
         _custom_step_refusal(step, record, inspection, rollout, sampled_passes)
+        if fit.remat != "auto" and remat_stated(objective):
+            # The model as configured, before any climb, states none of its own beside the run's.
+            raise ValueError(f"a model that states its own remat trains at it; a run's remat {fit.remat!r} "
+                             "states it for every module (FitPolicy.remat): state one")
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile

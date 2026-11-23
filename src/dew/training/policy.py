@@ -73,11 +73,10 @@ class FitPolicy:
     microbatches: int | None = None
 
     def __post_init__(self):
-        if self.split != "auto" and (not isinstance(self.split, int) or self.split < 1):
+        if self.split != "auto" and (type(self.split) is not int or self.split < 1):
             raise ValueError(f"a step's split is 'auto' or a positive count of microbatches, not "
                              f"{self.split!r}")
-        if self.microbatches is not None and (not isinstance(self.microbatches, int)
-                                              or self.microbatches < 1):
+        if self.microbatches is not None and (type(self.microbatches) is not int or self.microbatches < 1):
             raise ValueError(f"a pipeline's microbatches are a positive count, not {self.microbatches!r}")
         if self.remat not in ("auto", "none", "selective", "full"):
             raise ValueError(f"a step's remat is auto, none, selective or full, not {self.remat!r}")

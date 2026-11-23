@@ -1286,13 +1286,14 @@ def _checked_decay_mask(mask: JsonDict | None, spared: bool, owner: str) -> None
 
 
 def _decay_masked(mask: JsonDict | None, optimizer: OptimizerSpec) -> dict[str, JsonDict]:
-    """The mask the optimizer's decay takes (`decay_mask`), where it is given; refused for an optimizer
-    that takes no mask (`OptimizerSpec.spares`)."""
+    """The mask the optimizer's decay takes (`decay_mask`) by its own keyword (`OptimizerSpec.masked_by`),
+    where it is given; refused for an optimizer that takes none."""
+    keyword = optimizer.masked_by()
     if mask is None:
         return {}
-    if not optimizer.spares():
+    if keyword is None:
         raise ValueError(f"{type(optimizer).__name__} takes no decay mask: its decay_mask is none it reads")
-    return {'mask': mask}
+    return {keyword: mask}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1884,8 +1885,14 @@ class OptimizerSpec:
         return self.factory()(learning_rate, **self.options())
 
     def spares(self) -> bool:
-        """Whether its decay takes timm's split (`weight_decay_mask`): a factory that takes a decay mask."""
-        return 'mask' in inspect.signature(self.factory()).parameters
+        """Whether its decay takes timm's split (`weight_decay_mask`) unless a run says otherwise
+        (`OptimConfig.spared`): a factory that takes a decay mask."""
+        return self.masked_by() is not None
+
+    def masked_by(self) -> str | None:
+        """The keyword its factory takes a decay mask by (`OptimConfig.decay_mask`): `mask`, Optax's, where
+        it takes one; None where it takes none."""
+        return 'mask' if 'mask' in inspect.signature(self.factory()).parameters else None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1984,7 +1991,14 @@ class Muon(OptimizerSpec):
         return {**opts, **_moment_dtypes(self.state_dtype)}
 
     def spares(self) -> bool:
+        """It decays every parameter it updates, as Moonlight does, unless a run masks its matrices' decay
+        (`masked_by`)."""
         return False
+
+    def masked_by(self) -> str | None:
+        """Its matrices' decay takes a mask by `weight_decay_mask` (`_muon_groups`); the AdamW group decays
+        every parameter it holds."""
+        return "weight_decay_mask"
 
     def update_flops(self, params) -> float:
         """One update's Newton-Schulz products over each matrix it orthogonalizes (`muon_update_flops`), at
@@ -2150,7 +2164,10 @@ class OptimConfig:
         return self.learning_rate
 
     def __post_init__(self):
-        _checked_decay_mask(self.decay_mask, self.spared, "the optimizer")
+        _checked_decay_mask(self.decay_mask, self.spared and self.optimizer.spares(), "the optimizer")
+        if self.decay_mask is not None and self.param_groups:
+            raise ValueError("decay_mask masks an ungrouped optimizer's decay; a param group states its own "
+                             "(ParamGroup.decay_mask)")
         capped = isinstance(self.optimizer, GaussNewton) and self.optimizer.clip is not None
         if capped and self.clip_grads > 0:
             raise ValueError(f"Gauss-Newton's direction is capped once: at its own clip "
@@ -2289,10 +2306,11 @@ class OptimConfig:
         taken = {group.name for group in named}
         names = itertools.chain(("fresh",), (f"fresh{index}" for index in itertools.count(1)))
         name = next(name for name in names if name not in taken)
-        # The fresh group decays as the run's ungrouped optimizer would.
-        fresh = ParamGroup(name, fresh=True, learning_rate_multiplier=multiplier, spared=self.spared)
+        # The fresh group decays as the run's ungrouped optimizer would, its mask among it.
+        fresh = ParamGroup(name, fresh=True, learning_rate_multiplier=multiplier, spared=self.spared,
+                           decay_mask=self.decay_mask)
         if not named:
-            return fresh, ParamGroup("base", ("*",), spared=self.spared)
+            return fresh, ParamGroup("base", ("*",), spared=self.spared, decay_mask=self.decay_mask)
         at = next((index for index, group in enumerate(named) if "*" in group.patterns), len(named))
         return (*named[:at], fresh, *named[at:])
 
@@ -2308,7 +2326,9 @@ class OptimConfig:
                           for group in self.param_groups):
             return self
         groups = self.fresh_groups() if claims else self.param_groups
-        return dataclasses.replace(self, param_groups=groups).with_fresh(modules, leaves)
+        # An ungrouped decay's mask moves into the groups it is now (`fresh_groups`).
+        masked = None if claims else self.decay_mask
+        return dataclasses.replace(self, param_groups=groups, decay_mask=masked).with_fresh(modules, leaves)
 
     def with_fresh(self, modules: Sequence[str], leaves: Sequence[str] = ()) -> OptimConfig:
         """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the

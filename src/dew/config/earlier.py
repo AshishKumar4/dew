@@ -278,8 +278,13 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     assert isinstance(named, str), named
     typed = earlier_typed(named) is not None
     named = EARLIER_OPTIMIZER_PATHS.get(named, named)
-    # Dew's own optimizers take no mask; an Optax factory takes its options as they were given.
+    # Dew's own optimizers take no mask; an Optax factory takes its options as they were given. Muon's took
+    # its matrices' decay mask by its own keyword, which is the decay's own mask now (`decay_mask`).
     mask = opts.pop("mask", None) if typed else None
+    muon_mask = opts.pop("weight_decay_mask", None) if named in MUON_GROUPS else None
+    if named == "gauss_newton" and (fields.get("clip_grads") or 0) > 0:
+        # Its own cap the config's clip wrote over (`OptimConfig.build`), which caps it once now.
+        opts.pop("clip", None)
     stated = {key: fields[key] for key in ("b1", "b2", "weight_decay") if fields.get(key) is not None}
     if fields.get("state_dtype", "float32") != "float32":
         stated["state_dtype"] = fields["state_dtype"]
@@ -293,6 +298,7 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     kept = {key: value for key, value in fields.items() if key not in EARLIER_OPTIMIZER_FIELDS}
     if typed:
         settings, kept = _unmasked(mask, settings, kept)
+        kept = _muon_masked(muon_mask, kept)
         optimizer = {"class": named, "fields": settings}
     else:
         optimizer = {"class": "optax", "fields": {"path": named, "settings": settings}}
@@ -300,6 +306,27 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
 
 
 type _Fields = dict[str, _records.JSON]
+
+MUON_GROUPS = ("muon", "muonclip")
+"""The optimizers an earlier run named whose matrices' decay took its mask by `weight_decay_mask`
+(`dew.optim.Muon.masked_by`)."""
+
+
+def _muon_masked(mask: _records.JSON, config: _Fields) -> _Fields:
+    """An earlier Muon's matrices' decay `mask` (its options' `weight_decay_mask`) as its config's decay
+    mask (`OptimConfig.decay_mask`), or each of its param groups' where it groups (`ParamGroup.decay_mask`);
+    none where it masked by none. Refused where it is no tree of booleans, which no record rebuilds."""
+    if mask is None:
+        return config
+    if not isinstance(mask, Mapping):
+        raise ValueError(f"an earlier Muon masked its matrices' decay by {mask!r}, which no record of this "
+                         "Dew states: set OptimConfig.decay_mask in its place")
+    groups = config.get("param_groups") or []
+    assert isinstance(groups, list), groups
+    if not groups:
+        return {**config, "decay_mask": mask}
+    return {**config, "param_groups": [{**group, "decay_mask": mask} if isinstance(group, Mapping) else group
+                                       for group in groups]}
 
 
 def _unmasked(mask: _records.JSON, settings: _Fields, config: _Fields) -> tuple[_Fields, _Fields]:
