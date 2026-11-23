@@ -263,7 +263,7 @@ def test_a_position_whose_own_cursor_holds_no_rows_is_refused_as_corrupt_never_r
     as corrupt (`MalformedPosition`), never as the other Grain's (`PlanChanged`), which a relaxed resume
     would answer by reading the data afresh (review of row 12178: every error the restore raised was
     taken as a version's, so a corrupt cursor restarted a run's data)."""
-    from dew._position import MalformedPosition
+    from dew import _position
     from dew.data.plan import PlanChanged
 
     chain = Pipeline(Memory({"id": np.arange(1, 25, dtype=np.int32)}, identity="ids")).repeat().batch(2)
@@ -288,10 +288,12 @@ def test_a_position_whose_own_cursor_holds_no_rows_is_refused_as_corrupt_never_r
     edited = _edited(saved, other_grain_corrupt)
     assert cut, "the saved position holds a sequential cursor"
     stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    assert isinstance(stream, Checkpointable) and isinstance(stream, Closeable)
     try:
-        with pytest.raises(MalformedPosition) as raised:
+        with pytest.raises(ValueError) as raised:
             stream.set_state(edited)
-        assert not isinstance(raised.value, PlanChanged)
+        assert not isinstance(raised.value, PlanChanged), raised.value
+        assert isinstance(raised.value, _position.MalformedPosition), raised.value
     finally:
         stream.close()
 
