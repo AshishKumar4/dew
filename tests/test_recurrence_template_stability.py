@@ -340,7 +340,8 @@ SHARDED_ORDINARY = (('vector delta', 'resets on chunk edges'), ('vector delta', 
                     ('rated', 'resets on chunk edges'), ('gated', 'resets on chunk edges'),
                     ('scalar delta', 'resets on chunk edges'))
 """The ordinary regimes' cases past a task whole, each a check-1 site of its own recorded seeds over map
-tasks: Kimi delta attention's 16 seeds of 23 interpreted chunks (its 18 documents laid apart) at 10 s a draw,
+tasks: Kimi delta attention's 32 seeds of 23 interpreted chunks (its 18 documents laid apart) at 10 s a draw
+(16 before its unit queries' recording, M-JS-233),
 and its 64 seeds under the decay bound at 2.2 s (179 and 146 s whole at CI's rate, train of 2026-11-14
 05:20Z); the rated scan's 64 seeds under resets on chunk edges, each of its forms (121 s whole under the
 accurate ones, train 861's CI); the gated delta net's 32 there (130 to 143 s whole, tests/test_durations.json
@@ -353,7 +354,7 @@ from the source."""
     *((name, regime, forms) for name, regime, product, forms in CASES
       if product == 'forward' and regime in ORDINARY and (name, regime) not in SHARDED_ORDINARY),
     pytest.param('vector delta', 'resets on chunk edges', None, id='vector_delta-resets_on_chunk_edges',
-                 marks=pytest.mark.check1_shards(seeds=16, per_task=8)),
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=8)),
     pytest.param('vector delta', 'the decay bound', None, id='vector_delta-the_decay_bound',
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param('rated', 'resets on chunk edges', 'fast', id='rated-resets_on_chunk_edges-fast',
