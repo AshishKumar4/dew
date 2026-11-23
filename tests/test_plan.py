@@ -914,8 +914,10 @@ def test_the_executable_a_profile_replaces_goes_with_its_program(earlier):
     assert trainer.plan["pgle"] == {"runs": 2, "bytes": len(COST)}
     assert trials.unguided is not None and trials.unguided() is None
     live = live_executables()
-    assert live == trials.live and int(state.step) == 3, (live - trials.live, trials.live - live,
-                                                            holding(live - trials.live))
+    # Nothing live past what the trial held with the admitted step alive: the earlier trainer's, which no
+    # store keeps (row 12131), may be freed with the unguided lowering the two shared.
+    assert not live - trials.live and int(state.step) == 3, (live - trials.live, trials.live - live,
+                                                              holding(live - trials.live))
 
 
 def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path,
