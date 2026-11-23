@@ -108,9 +108,11 @@ class Tiles:
         if self.staging is not None:
             if self.staging[0] <= 0:
                 raise ValueError(f"{self}: output staging needs a positive chunk, got {self.staging}")
-            # Its chunks against the tile's columns and its issuer's pieces, which no dtype changes
+            # A family that stages its outputs whole refuses chunks (`Family.output_staging` of no outputs);
+            # its chunks against the tile's columns and its issuer's pieces, which no dtype changes
             # (`stores.staging_refusal` of no dtypes); a chunk's bytes in the call's output dtypes are its
             # launch's to judge (`staging_refusal`).
+            family.output_staging((), self.warpgroups, self.staging)
             columns = self.block_n * (self.cluster if family.pairs_product else 1)
             refusal = stores.staging_refusal(columns, (), self.staging, piece=family.chunk_columns(columns))
             if refusal is not None:
