@@ -68,7 +68,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import core as jcore
 
 from dew.nn import derivatives
-from dew.nn.kernels.templates import across, gathered
+from dew.nn.kernels.templates import across, after_walk, gathered
 from dew.nn.programs import called
 
 THREAD_AXIS = "wg"
@@ -111,9 +111,10 @@ class _Interpreter:
     step over a gathered ring's entries (`entry_steps`, by the entries' ref and the warp: its awaits so far,
     `_started`), which tags its fills and reads."""
 
-    def __init__(self, thread: int, rare: bool = False):
+    def __init__(self, thread: int, rare: bool = False, moves: Callable[[int, int], bool] | None = None):
         self.thread, self.events, self.refs, self.allocated, self.rare = thread, [], 0, [], rare
         self.warp, self.warps, self.initialized, self.entry_steps = None, [], {}, {}
+        self.moves, self.decided = moves, 0
 
     def programs(self) -> list[list[Event]]:
         """The warpgroup's program, or its warps' each, where it runs warp roles: those alone, a warpgroup's
@@ -147,6 +148,12 @@ class _Interpreter:
         if name == "layout_cast":
             # A register layout's statement (`plgpu.layout_cast`), its value its operand's.
             return [values[0]]
+        stepwise = name == "marked_call" and isinstance(params["kind"], after_walk.Stepwise)
+        if stepwise and self.moves is not None:
+            # A role's own decision at a step (`after_walk.Stepwise`): `moves`'s for this warpgroup at its
+            # count of them so far.
+            self.decided += 1
+            return [np.bool_(self.moves(self.thread, self.decided - 1))]
         if name == "marked_call" and isinstance(params["kind"], derivatives.Rare):
             # A rare span's verdict (a decided walk's, `derivatives.Rare`): the run's own (`programs`'
             # `rare`), each program's alike.
@@ -902,21 +909,24 @@ register form) takes a reader that emits nothing, its reason beside it; one of n
 
 
 def programs(kernel: Callable, *operands, threads: int, launch: int = 0, rare: bool = False,
+             moves: Callable[[int, int], bool] | None = None,
              known: Callable[[int, Any], np.ndarray | None] = lambda index, aval: None
              ) -> tuple[list[list[Event]], dict[str, int]]:
     """Each program of `kernel`'s `launch`-th Mosaic GPU launch (one the toolkit built, `mosaic.kernel`, in
     the order its trace makes them: a chained input gradient's flagged walk, then its bounded one) over
     `operands`, of its `threads` warpgroups, its rare spans taken where `rare` (`derivatives.Rare`: a decided
-    walk's second): a warpgroup's events, or where it runs warp roles, each of its warps' in turn
-    (`_Interpreter.programs`), by warpgroup index; and each barrier's arrivals a phase, by name: a barrier
-    allocation's, or a shared `uint64`'s its inlined initialization states (`gathered.Initialized`).
+    walk's second), a role's own decisions at its steps where `moves(warpgroup, step)` says where given
+    (`after_walk.Stepwise`: a consumer's step moving its sums), else as `rare`: a warpgroup's events, or
+    where it runs warp roles, each of its warps' in turn (`_Interpreter.programs`), by warpgroup index; and
+    each barrier's arrivals a phase, by name: a barrier allocation's, or a shared `uint64`'s its inlined
+    initialization states (`gathered.Initialized`).
     `known(index, aval)`, a global operand's value where the caller states it (a bounded walk's flags, which
     decide the tiles it walks), else None: its reads give it."""
     closed = jax.make_jaxpr(kernel)(*operands)
     body = list(_bodies(closed.jaxpr))[launch]
     found, arrivals = [], {}
     for thread in range(threads):
-        interpreter = _Interpreter(thread, rare)
+        interpreter = _Interpreter(thread, rare, moves)
         interpreter.run(body.jaxpr, body.consts, [
             Ref(f"gmem{index}", barrier=False, num_arrivals=0, value=known(index, variable.aval.inner_aval))
             for index, variable in enumerate(body.jaxpr.invars)])

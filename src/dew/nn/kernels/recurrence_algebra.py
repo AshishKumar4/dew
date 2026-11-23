@@ -41,6 +41,7 @@ from dew.nn.precision import (
     float32_matmul,
     power2,
     two_product,
+    two_sum,
 )
 
 Issue = Callable[[str, "Operand", "Operand"], jax.Array]
@@ -74,28 +75,32 @@ def portable_einsum(subscripts: str, *operands):
     return float32_einsum(subscripts, *operands, precision=STATE_PRECISION)
 
 
-def suffix_sums(x: jax.Array, *, scanned: bool = False) -> jax.Array:
+def suffix_sums(x: jax.Array) -> jax.Array:
     """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a chunk's
-    tokens), in at least float32 (a float64 truth's own): a product with the chunk's upper triangle of ones
-    (`portable_einsum`, its ones exact in every form a product splits `x` into), one dot batched over `x`'s
-    leading axes, a chunk's triangle against its own tokens: one triangle against every chunk's tokens
-    contracted a middle axis XLA transposed `x` for, 134 of Kimi delta attention's training's 1723 MB of XLA
-    traffic on an A100 (row 5260). As a reversed cumulative sum, XLA's GPU reduce-window summed each
-    position's window apart: Kimi delta attention's decay gradient's, the one cumulative sum its training
-    traces, took 0.336 ms of its 5.806 ms on a B200 (M-JS-114). Where `scanned`, that reversed cumulative sum:
-    a term no position's sum takes meets no arithmetic of it, where the dot multiplies it by zero, a nonfinite
-    one NaN in every sum (a turned gradient's entering-memory term of 2^126 times its cotangent,
-    `templates.recurrence.turned`)."""
+    tokens), in at least float32 (a float64 truth's own): a reversed cumulative sum, a term no position's sum
+    takes meeting no arithmetic of it, where a product with the chunk's upper triangle of ones multiplied it
+    by zero, a nonfinite one NaN in every sum (a turned gradient's entering-memory term of 2^126 times its
+    cotangent, `templates.recurrence.turned`). Kimi delta attention's decay gradient's sums run in its own
+    pairs' launch (`suffix_summed`)."""
     x = _wide(x)
-    if scanned:
-        return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
-    upper = jnp.triu(jnp.ones((x.shape[-2],) * 2, x.dtype))
-    return portable_einsum('...ij,...jt->...it', jnp.broadcast_to(upper, (*x.shape[:-2], *upper.shape)), x)
+    return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
+
+
+def suffix_summed(terms: jax.Array, start: jax.Array) -> jax.Array:
+    """Each position's sum over its tile's positions at and after it along `terms`' first axis (a chunk's
+    tokens), each column's `start` added, a running compensated pair down each column from its last position
+    (`precision.compensated_add`), each sum rounded once: the arithmetic `templates.scan.suffix_columns` runs
+    natively, a column a thread (Kimi delta attention's decay gradient finished in its own pairs' launch,
+    `own_pairs.key_pairs_own`)."""
+    terms = _wide(terms)
+    pairs = (terms, jnp.zeros_like(terms))
+    hi, lo = jax.lax.associative_scan(compensated_add, pairs, reverse=True, axis=0)
+    return compensated_add((hi, lo), (_wide(start)[None], jnp.zeros_like(hi[:1])))[0]
 
 
 def sums_before(x: jax.Array) -> jax.Array:
     """Each position's sum over its chunk's positions before it, along `x`'s second-last axis, in at least
-    float32 (`suffix_sums`' exclusive prefix twin, as `scanned`): a cumulative sum shifted a position, each
+    float32 (`suffix_sums`' exclusive prefix twin): a cumulative sum shifted a position, each
     sum of the earlier terms alone, a later term meeting none of its arithmetic, where an inclusive sum less
     its own term lost a small sum beside a large term to its rounding (a chunk's last writer's whole weight
     beside its earlier ones' exp(-30) each, Mamba-3's turns' gradient's worst row 3.75 from float64 over its
@@ -168,8 +173,9 @@ def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk
     return pair
 
 
-def raised(whole, part):
-    """`exp2(whole + part)` of a compensated base-2 exponent to fp32's resolution at any size: its integer
+def raised(whole, part: jax.Array | float = 0.0):
+    """`exp2(whole + part)` of a compensated base-2 exponent (`part` zero where it is one fp32: a decay a key
+    dimension's rounded prefix, `intra._prefix`) to fp32's resolution at any size: its integer
     `n = floor(whole)` an exact power of two (`precision.power2`) and its
     fraction `(whole - n) + part`, near [0, 1), through exp2. The exponent rounded to one fp32 lost up to half
     its ulp, 1.9e-6 near -43 (a pair of tokens at -30 a token), a decay's relative 1.3e-6, which put the
@@ -204,14 +210,24 @@ def decayed(rows, rows_lo, columns, columns_lo):
                    (column_whole[None, :], column_fraction[None, :]))
 
 
-def range_decay(later, later_low, earlier, earlier_low):
-    """`exp2(later - earlier)` of a compensated prefix's halves at two positions (broadcasting): `raised` of
-    their difference, compensated (`compensated_add`), so no rounding of the halves' difference reaches
-    it: a range's decay, which from the difference rounded to one fp32 lost a fraction's last bits at the
-    prefix's size (1e-6 of the decay near -43). The template's ranges, on its halves' vectors; separating
-    both sides for `between` held more registers, one of sm80's training launches spilling 48 bytes (a
-    port's prefix, stored separated, takes `between`)."""
-    return raised(*compensated_add((later, later_low), (-earlier, -earlier_low)))
+def prefix_difference(later: tuple, earlier: tuple) -> tuple:
+    """`later - earlier` of a decay's prefix at two positions (broadcasting), each its limbs (`(hi, lo)` a
+    compensated pair's, `(hi,)` a decay a key dimension's rounded sum alone, `Call.prefix_limbs`), as a pair
+    whose sum it is exactly: one limb's difference rounded and what the rounding dropped (`two_sum`), a
+    pair's compensated (`compensated_add`), so no rounding of the difference reaches what it raises."""
+    if len(later) == 1:
+        (left,), (right,) = later, earlier
+        return two_sum(left, -right)
+    return compensated_add(later, tuple(-half for half in earlier))
+
+
+def range_decay(later: tuple, earlier: tuple):
+    """`exp2(later - earlier)` of a decay's prefix at two positions (broadcasting), each its limbs: `raised`
+    of their difference, exact (`prefix_difference`): a range's decay, which from the difference rounded to
+    one fp32 lost a fraction's last bits at the prefix's size (1e-6 of the decay near -43). The template's
+    ranges, on its limbs' vectors; separating both sides for `between` held more registers, one of sm80's
+    training launches spilling 48 bytes (a port's prefix, stored separated, takes `between`)."""
+    return raised(*prefix_difference(later, earlier))
 
 
 PAIR_CEILING = 120.0
@@ -219,10 +235,11 @@ PAIR_CEILING = 120.0
 which every caller masks) stay finite."""
 
 
-def separated(hi, lo):
+def separated(hi, lo: jax.Array | float = 0.0):
     """A compensated base-2 exponent `(hi, lo)` as its whole part and fraction `(n, f)`: `n` the integer
-    `floor(hi)` (`hi` itself past 2^23, where every fp32 is one), `f` what `hi` holds past it and `lo`, the
-    form whose differences are exact at any size (`between`). Once a call, where its prefix is cumulated."""
+    `floor(hi)` (`hi` itself past 2^23, where every fp32 is one), `f` what `hi` holds past it and `lo` (zero
+    where the exponent is one fp32, a decay a key dimension's rounded prefix), the form whose differences are
+    exact at any size (`between`). Once a call, where its prefix is cumulated."""
     whole = _floor(hi)
     return whole, (hi - whole) + lo
 
@@ -256,7 +273,7 @@ def decay(later, earlier):
     return jnp.exp2(fraction - its_fraction) * exact_power2(jnp.maximum(whole - other, -127.0))
 
 
-def first_decays(dg, entered, d_entered, first, memory, takes, live):
+def first_decays(dg, entered, d_entered, first, memory, takes, live, passed=None):
     """`dg` `[N, ...]`, a decay a key dimension's gradient summed back over each chunk (a token or a laid
     row a row), with each sequence's first token's taken from the memory its decay scales: the memory it
     enters (`entered` `[M, ..., Dv]`, its index `memory` among them) against that memory's gradient
@@ -265,11 +282,14 @@ def first_decays(dg, entered, d_entered, first, memory, takes, live):
     back, that token's gradient is every term of its chunk, which cancel to fp32's residue where the memory
     is zero: rows of float64 zero 1.5e-7 from it against fla's 3.3e-9 (row 5194, M-JS-26-a100), 2.7e-11 on a
     zero initial memory, as a float64 recurrence holds it exactly. fla_kda's port and the template read
-    it alike."""
+    it alike. Where `passed` (`dg`'s shape) is given, a token's value only where it holds: a clamped log
+    decay's derivative zero (`templates.recurrence.mainloop.clamped_gradient`)."""
     shared = jnp.sum(entered.astype(jnp.float32) * d_entered, axis=-1).reshape(-1, *dg.shape[1:])
     taking = takes.reshape(-1, *(1,) * (dg.ndim - 1))
     value = jnp.where(taking, shared[memory], 0.0)
     index = jnp.where(live, first, dg.shape[0])
+    if passed is not None:
+        value = jnp.where(passed[jnp.minimum(index, dg.shape[0] - 1)], value, 0.0)
     return dg.at[index].set(value.astype(dg.dtype), mode="drop")
 
 
@@ -648,7 +668,7 @@ def keys_gated_carried(state, keys: TileLoad, values, gate, decay, dtype, issue:
 
 def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
     """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves."""
-    return corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
+    return corrected_values * range_decay((last, last_lo), (gate, gate_lo))[:, None]
 
 
 def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issue: Issue, *,
@@ -741,7 +761,7 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
 
 
 def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub: int = SUB,
-                       unit_keys: bool = False) -> list:
+                       unit_pairs: bool = False) -> list:
     """Each sub-chunk's own pairs of one key block under a decay a key dimension, each its own decay, as a
     band `[C, sub]` a product: its row `i`'s column `e` the pair `(i, i - e)`, `sum_k r_ik k_(i-e)k
     exp2(g_ik - g_(i-e)k)`, zero where token `i - e` precedes `i`'s sub-chunk (fla_kda's token-parallel
@@ -761,11 +781,14 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     form and its transpose, each issue-bound (an emulated B200 at 8aab1729e65). Summed over a chunk's key
     blocks, a launch's bands are placed by its caller (`placed_bands`): placed a key block and an offset at a
     time, the `[C, C]` selects took an H100's Kimi Linear intra launch from 492 to 1982 us (M-JS-50d).
-    Where the keys are at most one in size (`unit_keys`, `mainloop.Call.unit_keys`), each row takes its
-    decay first instead, a multiply an element and a term's fused multiply-add (fla's token-parallel
-    diagonal folds it so, into the key): all the decayed row loses is below normal in the exact term too.
-    Unnormalised keys keep the row times the key first, which loses no term in range to the decay (row
-    7299; a decayed row lost 2^-100 against a key of 2^60, base review 6ce025bc7 F1)."""
+    Where the keys and rows are at most one in size (`unit_pairs`, `mainloop.Call.unit_pairs`), each key
+    takes its pair's decay first instead, once for every product (`decayed_key`), and each row's term is a
+    fused multiply-add of it (fla's token-parallel diagonal folds it so, into the key): all the decayed key
+    loses is below normal in the exact term too. Each product's row decayed apart, a thread's own pairs
+    issued twice the multiplies, an emulated GH200's intra_own issue-bound (M-JS-170). Other operands keep
+    the row times the key first, which loses no term in range to the decay (row 7299; a decayed row lost
+    2^-100 against a key of 2^60, base review 6ce025bc7 F1; a decayed key 2^-160 against a row of 2^100,
+    #3703 review)."""
     index, _ = _grid(rows[0].shape)
     lane = jax.lax.broadcasted_iota(jnp.int32, (index.shape[0], sub), 1)
     token = jax.lax.broadcasted_iota(jnp.int32, lane.shape, 0)
@@ -774,25 +797,24 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
         bands, pair, following = carried
         keys, decays = shifted(e)
         pair = pair * following
-        summed = [jnp.sum(band_term(row, keys, pair, unit_keys=False), axis=1) for row in rows]
+        summed = [jnp.sum(band_term(row, keys, pair, unit_pairs=False), axis=1) for row in rows]
         return (tuple(jnp.where(lane == e, total[:, None], band)
                       for band, total in zip(bands, summed, strict=True)), pair, decays)
 
     def folded(e, carried):
-        # Each row's decay folded in: a multiply an element and a term's fused multiply-add, where keys at
-        # most one in size (`unit_keys`) make what the decayed row loses below normal in the exact term too.
-        bands, decayed, following = carried
+        # Each key's decay folded in once for every product (`decayed_key`): a multiply an element and each
+        # row's term a fused multiply-add, where keys and rows at most one in size (`unit_pairs`) make what
+        # the decayed key loses below normal in the exact term too.
+        bands, pair, following = carried
         keys, decays = shifted(e)
-        decayed = tuple(row * following for row in decayed)
-        summed = [jnp.sum(band_term(row, keys, None, unit_keys=True), axis=1) for row in decayed]
+        pair = pair * following
+        keyed = decayed_key(keys, pair)
+        summed = [jnp.sum(band_term(row, keyed, None, unit_pairs=True), axis=1) for row in rows]
         return (tuple(jnp.where(lane == e, total[:, None], band)
-                      for band, total in zip(bands, summed, strict=True)), decayed, decays)
+                      for band, total in zip(bands, summed, strict=True)), pair, decays)
 
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
-    if unit_keys:
-        bands = jax.lax.fori_loop(0, sub, folded, ((zero,) * len(rows), tuple(rows), one))[0]
-    else:
-        bands = jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), one, one))[0]
+    bands = jax.lax.fori_loop(0, sub, folded if unit_pairs else offset, ((zero,) * len(rows), one, one))[0]
     # Each column written once, by its offset's select; a row before its offset selected out once, at the end.
     return [jnp.where(token % sub >= lane, band, 0.0) for band in bands]
 
@@ -850,11 +872,18 @@ def gated(word, strength):
     return word * strength
 
 
-def band_term(row, key, pair, *, unit_keys: bool):
+def band_term(row, key, pair, *, unit_pairs: bool):
     """A sub-chunk's own pair's term (`key_diagonal_bands`): the row times the key, then times the pair's
-    decay; or where keys are at most one in size (`unit_keys`), the decayed row `row` (`row * pair`, carried
-    across the offsets) times the key, `pair` unread. On any values that multiply, as `gated`."""
-    return row * key if unit_keys else row * key * pair
+    decay; or where keys and rows are at most one in size (`unit_pairs`), the row times the decayed key `key`
+    (`decayed_key`'s, formed once for every product's row), `pair` unread. On any values that multiply, as
+    `gated`."""
+    return row * key if unit_pairs else row * key * pair
+
+
+def decayed_key(key, pair):
+    """A key decayed by its pair's decay, rounded once (`band_term`'s `unit_pairs` key): what it loses below
+    normal, a key at most one in size and every row at most one, is below normal in the exact term too."""
+    return key * pair
 
 
 def columns_before(found: jax.Array, start: int) -> jax.Array:
@@ -872,16 +901,17 @@ def band_masked(band: jax.Array, *, strict: bool, scale: float) -> jax.Array:
     return jnp.where(lane > 0, band, 0.0) if strict else band * scale
 
 
-def key_decayed_write(key, gate, low, last, last_low):
-    """A chunk's keys gated to its end under a decay a key dimension, `k exp2(g_last - g)` over both prefix
-    halves, in the keys' arithmetic: the write the memory takes (`carried`)."""
-    return key * range_decay(last, last_low, gate, low)
+def key_decayed_write(key, gates: tuple, last: tuple):
+    """A chunk's keys gated to its end under a decay a key dimension, `k exp2(g_last - g)` of its prefix
+    `gates` and the chunk's last token's `last` (each its limbs), their difference exact (`range_decay`), in
+    the keys' arithmetic: the write the memory takes (`carried`)."""
+    return key * range_decay(last, gates)
 
 
 def key_gated(query, gates: tuple, scale: float):
     """A key block's queries gated by their decays to the chunk's start and scaled, `scale q exp2(g)`
-    (`gates` the prefix's halves, `raised`), rounded to the queries' dtype: `key_decayed_output`'s left
-    operand, as fla's chunk_gla output kernel scales its gated queries."""
+    (`gates` the prefix's limbs, `raised`; `Call.prefix_limbs`), rounded to the queries'
+    dtype: `key_decayed_output`'s left operand, as fla's chunk_gla output kernel scales its gated queries."""
     return (query * raised(*gates) * scale).astype(query.dtype)
 
 
@@ -938,7 +968,7 @@ def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad | None, querie
     (`weights` None) nothing was corrected, and the memory entered takes no `w^T dv`."""
     dv = functools.reduce(jnp.add, (issue("values_dv", keys(i), part.astype(dtype))
                                     for i, part in enumerate(grad)))
-    dv = dv * range_decay(last, last_low, gate, low)[:, None] + local
+    dv = dv * range_decay((last, last_low), (gate, low))[:, None] + local
     read = out_grad.astype(jnp.float32) * raised(gate, low)[:, None]
 
     def slice_entered(i, part):
@@ -1021,22 +1051,23 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
                      summed: Callable[[list], jax.Array], *, emit: Callable[[str, jax.Array], None],
                      columns: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """One key block's part of a decay a key dimension's backward (`templates.recurrence.key_backward`), its
-    queries `query` and keys `key` `[C, BK]`, their prefix halves from the chunk's start `gates` `[C, BK]` and
-    the chunk's last token's `last` as a row's vectors, and each value block `j`'s memory entered `entered(j)`
-    and its gradient leaving `leaving(j)` `[BK, BV]`: over the value blocks `dq = scale exp2(g) do h^T`, `dk =
-    exp2(g_last - g) v_new dh^T`, the weights' `dw = -dv h^T` ('memory_dq', 'memory_dk', 'memory_dw'); then
-    `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`, `emit('dk', ...)` and the log decay's
-    terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's `sum(k dk)` on its last token, and `(dA,
-    dbeta)`: the inverse's gradient over the key blocks so far `system` `[C, C]` with this block's part `-dw
-    (kg beta)^T` added as its product forms, so the part is held no longer, and the write gates' `sum(kg d(kg
-    beta))`, fp32. The last prefix's other term, the memory's decay across the chunk (`key_memory_decay`), is
-    the caller's: a key block's memory tiles' rows met the keys' columns here, which Mosaic GPU's layout
-    inference ran out of fuel laying (kda-lower5-sm90 at 6e03eb57e). Each sum over the value blocks issued
-    into one accumulator (`summed`, `memory_gradients`'): a list of each block's products, their accumulators
-    at once, spilled 744 bytes a thread on an H100 (kda-gate3 at ee3734584). `columns`, where given, sums a
-    tile's columns (the mainloop's, `summed_pairs`')."""
+    queries `query` and keys `key` `[C, BK]`, their prefix from the chunk's start `gates` `[C, BK]` and the
+    chunk's last token's `last` as a row's vectors (each its limbs, `Call.prefix_limbs`), and each value block
+    `j`'s memory entered `entered(j)` and its gradient leaving `leaving(j)` `[BK, BV]`: over the value blocks
+    `dq = scale exp2(g) do h^T`, `dk = exp2(g_last - g) v_new dh^T`, the weights' `dw = -dv h^T` ('memory_dq',
+    'memory_dk', 'memory_dw'); then `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`,
+    `emit('dk', ...)` and the log decay's terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's
+    `sum(k dk)` on its last token, and `(dA, dbeta)`: the inverse's gradient over the key blocks so far
+    `system` `[C, C]` with this block's part `-dw (kg beta)^T` added as its product forms, so the part is held
+    no longer, and the write gates' `sum(kg d(kg beta))`, fp32. The last prefix's other term, the memory's
+    decay across the chunk (`key_memory_decay`), is the caller's: a key block's memory tiles' rows met the
+    keys' columns here, which Mosaic GPU's layout inference ran out of fuel laying (kda-lower5-sm90 at
+    6e03eb57e). Each sum over the value blocks issued into one accumulator (`summed`, `memory_gradients`'): a
+    list of each block's products, their accumulators at once, spilled 744 bytes a thread on an H100
+    (kda-gate3 at ee3734584). `columns`, where given, sums a tile's columns (the mainloop's,
+    `summed_pairs`')."""
     decays = raised(*gates)
-    to_last = range_decay(*(half[None, :] for half in last), *gates)
+    to_last = range_decay(tuple(limb[None, :] for limb in last), gates)
     # Each sum in turn, the log decay's terms gathered as each one's term is formed, so one sum and its
     # terms are live at a time: the three sums at once, beside the terms every one fed, spilled 240 bytes a
     # thread on an H100 (kda-gate5 at db546905d); the weights' first, 232 (kda-gate8 at b1e1fcb9b).
@@ -1237,7 +1268,7 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
     for all, each read where it is used: a reader a sum), each issued where it is read where not."""
     row_decay = raised(gate, low)[:, None]
     gathered = summed_all or (lambda groups: tuple(functools.partial(summed, group) for group in groups))
-    leaving_decay = range_decay(last, last_low, gate, low)[:, None]
+    leaving_decay = range_decay((last, last_low), (gate, low))[:, None]
     leaving_terms, after = [], []
     for c in range(columns):
         groups = [[("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks)],

@@ -486,6 +486,62 @@ def doubled_gains() -> optax.GradientTransformation:
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
 
 
+def mapped_by_row(batch_size: int | None = None) -> optax.GradientTransformation:
+    """Each leaf's update through a loop over its leading axis where it holds a stack of matrices
+    (`jax.lax.map`, `batch_size` of them a step, as a chunked Newton-Schulz maps its matrices), each matrix
+    by itself otherwise: over a stacked leaf the loop scans the stack along its own rows, each step its next
+    stored layers, read as over each layer."""
+    def update(updates, state, params=None):
+        def mapped(gradient):
+            if gradient.ndim < 3:
+                return jnp.tanh(gradient)
+            return jax.lax.map(jnp.tanh, gradient, batch_size=batch_size)
+        return jax.tree.map(mapped, updates), state
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
+def carried_across_rows() -> optax.GradientTransformation:
+    """Each stacked leaf's update through a loop over its leading axis that carries a running sum of the
+    rows before each: each row's update reads every earlier stored layer, no expression of its own."""
+    def update(updates, state, params=None):
+        def carried(gradient):
+            if gradient.ndim < 3:
+                return gradient
+            return jax.lax.scan(lambda before, row: (before + row, row + before), jnp.zeros_like(gradient[0]),
+                                gradient)[1]
+        return jax.tree.map(carried, updates), state
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
+def mapped_beside_a_callback() -> optax.GradientTransformation:
+    """`mapped_by_row`'s loop whose steps each hand the whole stacked leaf's sum to a callback: a step that
+    acts beside what it returns, reading every stored layer, compared by no result."""
+    def update(updates, state, params=None):
+        def mapped(gradient):
+            if gradient.ndim < 3:
+                return jnp.tanh(gradient)
+
+            def step(row):
+                jax.debug.callback(lambda total: None, jnp.sum(gradient))
+                return jnp.tanh(row)
+            return jax.lax.map(step, gradient)
+        return jax.tree.map(mapped, updates), state
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
+def mapped_over_none() -> optax.GradientTransformation:
+    """`mapped_by_row`'s update beside a loop over none of a stacked leaf's rows (`gradient[:0]`), whose
+    empty result it adds: a loop of no steps over a stack."""
+    def update(updates, state, params=None):
+        def mapped(gradient):
+            if gradient.ndim < 3:
+                return jnp.tanh(gradient)
+            empty = jax.lax.map(jnp.tanh, gradient[:0].reshape(0, 2, *gradient.shape[1:]))
+            return jnp.tanh(gradient) + jnp.sum(empty)
+        return jax.tree.map(mapped, updates), state
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
 def spread_sums() -> optax.GradientTransformation:
     """Each leaf's update from a primitive of its own named `copy`, JAX's entrywise copy's name, that
     broadcasts its operand's sum over it: no operation one entry at a time, whatever its name."""
@@ -508,7 +564,9 @@ def spread_sums() -> optax.GradientTransformation:
 STAGE_LOCAL = {"adam": lambda: optax.adam(1e-3), "sgd-momentum": lambda: optax.sgd(1e-3, momentum=0.9),
                "adamw-scheduled": lambda: optax.adamw(optax.cosine_decay_schedule(1e-3, 8), weight_decay=0.1),
                "progress-scaled": lambda: optax.chain(scaled_by_progress(), optax.sgd(1e-3)),
-               "clipped-adamw": lambda: optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(1e-3))}
+               "clipped-adamw": lambda: optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(1e-3)),
+               "mapped-by-row": mapped_by_row,
+               "mapped-two-rows-a-step": functools.partial(mapped_by_row, batch_size=2)}
 """Transformations whose update reads each stored layer of a stacked leaf by the same expression of that
 layer's entries as over the stored layers (`whole_reading`): each run stays stage-local."""
 WHOLE = {"lamb": lambda: optax.lamb(1e-3), "adafactor": lambda: optax.adafactor(1e-3),
@@ -517,7 +575,10 @@ WHOLE = {"lamb": lambda: optax.lamb(1e-3), "adafactor": lambda: optax.adafactor(
                                                                                      params)),
          # An OptimConfig's transformation is built over the run's length, which fit gives.
          "adafactor-config": lambda: OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3),
-         "doubled-gains": doubled_gains, "spread-sums": spread_sums}
+         "doubled-gains": doubled_gains, "spread-sums": spread_sums,
+         # A loop over a stack that carries across its rows, acts beside its results, or takes no step.
+         "carried-across-rows": carried_across_rows, "mapped-beside-a-callback": mapped_beside_a_callback,
+         "mapped-over-none": mapped_over_none}
 """Transformations whose update reads a leaf whole, or whose build reads its tree's shapes: each keeps every
 layer whole on every stage."""
 
@@ -528,8 +589,10 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     """Over two stages, a transformation given built whose update reads each stored layer of a stacked leaf
     by the same expression of that layer's entries as over the stored layers keeps each run stage-local
     (`whole_reading`): optax's Adam and SGD with momentum at a constant rate, AdamW's decay on a schedule,
-    a scale by the run's progress, their moments, decay and scales a number at a time, and AdamW after a
-    clip by the global norm, its layers' sum (rows 3995, 4015, 4036), over two runs of unequal depth too.
+    a scale by the run's progress, their moments, decay and scales a number at a time, AdamW after a clip
+    by the global norm, its layers' sum (rows 3995, 4015, 4036), and a loop over a leaf's leading axis
+    (`mapped_by_row`, a chunked Newton-Schulz's `lax.map`), which scans a stack along its own rows, over two
+    runs of unequal depth too.
     One whose update reads a leaf whole, optax's LAMB, whose trust ratio would take one ratio over both
     stages, and Adafactor, whose factored moments and block clip read the leaf, given built or named by its
     import path in an `OptimConfig`, one whose build reads its tree's shapes (a decay masked by rank), one
@@ -556,6 +619,25 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
     else:
         assert saved == 0
         assert run.plan["layers_whole_for"]
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("batch_size", [1, 2], ids=["a-row-a-step", "two-rows-a-step"])
+def test_a_loop_over_a_stack_trains_stage_local_as_its_layers_whole_do(batch_size):
+    """Two stages of three layers each, a transformation's loop over each stacked leaf's rows
+    (`mapped_by_row`, a row or two a step, the two's last step a remainder JAX maps apart and concatenates)
+    keeps each run stage-local and trains its step to the same weights, bit for bit, as the same run with
+    every layer whole on every stage (`Layout.stage_local=False`)."""
+    model = decoder(num_layers=6)
+    assert saving(functools.partial(trainer, model, mapped_by_row(batch_size), STAGED, 8, ema=None)) > 0
+    # Each run's state read on its stored layers (`Trainer.stored`), the stage-local one's runs unstacked.
+    stored = []
+    for local in (True, False):
+        run = trainer(model, mapped_by_row(batch_size), STAGED, 8, ema=None, stage_local=local)
+        stored.append(on_host(run.stored(run.fit(stream(), steps=1, log_every=1)).variables))
+    assert jax.tree.structure(stored[0]) == jax.tree.structure(stored[1])
+    for local, whole in zip(*(jax.tree.leaves(variables) for variables in stored), strict=True):
+        np.testing.assert_array_equal(local, whole)
 
 
 @pytest.mark.mesh(devices=8)

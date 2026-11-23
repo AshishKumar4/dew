@@ -195,7 +195,11 @@ def _exact_sum(terms, spec, dtype) -> jax.Array:
 def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
     """The parts' exact sum as the nearest float, ties to even: each of `levels` digits of `digit` bits from
     bit `lowest` every limb's bits there summed, carried as the number's and its negation's, the last carry
-    its sign; the magnitude's highest digits and a sticky bit kept, then written as its bits (`_written`)."""
+    its sign; the magnitude's highest digits and a sticky bit kept, then written as its bits (`_written`).
+    The sticky bit and the bits under the window are integers, zero or one, each read a nonzero test or an
+    OR: as bools, a select taking them as values (`jnp.where(nonzero, under, sticky)`, the sign's choice of
+    states) took Mosaic TPU an i1 vector of a splat's layout, which its widening to i8 could not relayout,
+    every forked TPU scan with an entry write refused (rows 12124, 12125)."""
     ints = jnp.dtype(f"int{limits.bits}")
     # A limb's bits, two of `split_bits`' low halves (`_product`).
     bits, mask, width = limits.bits, (1 << digit) - 1, 2 * split_bits(limits.dtype)[2]
@@ -222,7 +226,7 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
         for total in sums:
             value, carry = value + (total & mask), carry + (total >> digit)  # No partial past one term's.
             carry, value = carry + (value >> digit), value & mask
-        under = under | (window[-1] != 0)
+        under = under | (window[-1] != 0).astype(under.dtype)
         window = (value, *window[:-1])
         nonzero = window[0] != 0
         return (carry, window, under, jnp.where(nonzero, level, lead),
@@ -235,7 +239,7 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
 
     zeros = functools.reduce(jnp.add, [reduced(jnp.zeros_like(product.place), jnp.sum, dtype=ints)
                                        for product, reduced, _ in parts])
-    start = (zeros, (zeros,) * held, zeros != 0, zeros - 1, (zeros,) * held, zeros != 0)
+    start = (zeros, (zeros,) * held, zeros, zeros - 1, (zeros,) * held, zeros)
     first, last = _levels(parts, lowest, digit, levels, limits)
     # A counter of the value's integers: x64 traced a 64-bit index where Mosaic's is 32 (row 8757).
     _, states = jax.lax.while_loop(lambda carried: carried[0] < last,
@@ -282,8 +286,9 @@ def _may_split(limbs) -> bool:
 
 
 def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> jax.Array:
-    """The magnitude's digits from its highest nonzero one at `lead` (`kept`), `sticky` where any under them
-    is nonzero, as the nearest float's bits, ties to even, signed where `negative`, rounded in integers."""
+    """The magnitude's digits from its highest nonzero one at `lead` (`kept`), `sticky` (an integer, zero or
+    one) where any under them is nonzero, as the nearest float's bits, ties to even, signed where `negative`,
+    rounded in integers."""
     ints = lead.dtype
     bits = jnp.iinfo(ints).bits
     length = bits - jax.lax.clz(kept[0])
@@ -298,8 +303,9 @@ def _written(lead, kept, sticky, negative, lowest: int, digit: int, limits) -> j
         down = value >> jnp.clip(-offset, 0, bits - 1)
         whole = whole + jnp.where(offset >= 0, up, jnp.where(-offset < digit, down, 0))
         below = value & ((1 << jnp.clip(-offset, 0, digit)) - 1)
-        sticky = sticky | (jnp.where(offset >= 0, 0, jnp.where(-offset < digit, below, value)) != 0)
-    whole = whole | sticky.astype(ints)
+        dropped = jnp.where(offset >= 0, 0, jnp.where(-offset < digit, below, value))
+        sticky = sticky | (dropped != 0).astype(ints)
+    whole = whole | sticky
     tail, significand = whole & 3, whole >> 2
     significand = significand + ((tail > 2) | ((tail == 2) & ((significand & 1) == 1))).astype(ints)
     # The float's bits: its significand (a carry into the next binade its exponent's unit) at its place.

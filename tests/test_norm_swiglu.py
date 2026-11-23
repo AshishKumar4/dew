@@ -830,6 +830,96 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
     assert_runs_per_shard(_checked_shard_run, _checked_shard_operands, specs, mesh,
                           "per shard over an explicit mesh", seeds=SEEDS["per shard"], truth_fn=portable)
 
+    # Packed SwiGLU (`[..., 2, H]`) also runs per shard on an Explicit mesh with axes=None (splitting rows
+    # or features) and refuses splitting the pair axis `-2` (row 822).
+    from dew.nn.kernels import selection
+    from dew.nn.sharding import MLP_HIDDEN
+
+    def draw_packed(draw: int = 0):
+        return (jax.random.normal(drawn_key(33, draw), (4, 8, 2, 24)),
+                jax.random.normal(drawn_key(34, draw), (4, 8, 24)))
+
+    def packed_run(a, d):
+        return evaluated(fused_packed(), (a,), d)
+
+    def packed_ref(a, d):
+        return evaluated(packed_gated_product("swiglu", implementation="xla"), (a,), d)
+    for tag, spec_p, out_spec in (
+            ("rows", PartitionSpec("data"), PartitionSpec("data")),
+            ("features", PartitionSpec(None, None, None, "data"), PartitionSpec(None, None, "data"))):
+        with jax.set_mesh(mesh):
+            sharded_p, sharded_d = placed_on(draw_packed(), [spec_p, out_spec], mesh)
+            with generation.assumed("sm90"):
+                assert norm_swiglu.packed_swiglu_kernel("pallas", sharded_p) == "pallas"
+            assert any(eq.primitive.name == "shard_map"
+                       for eq in traced(packed_run, sharded_p, sharded_d))
+            assert not any(eq.primitive.name == "reshard"
+                           for eq in traced(packed_ref, sharded_p, sharded_d))
+        assert_runs_per_shard(packed_run, draw_packed, [spec_p, out_spec], mesh,
+                              f"packed swiglu explicit mesh {tag}", seeds=SEEDS["per shard"],
+                              truth_fn=packed_ref)
+    # Length-2 spec `P("data", None)` on rank-3 `[B, 2, H]` pads trailing None so axis 0 is never mistaken
+    # for pair axis `-2`.
+    with jax.set_mesh(mesh):
+        r3_p, r3_d = placed_on((jax.random.normal(drawn_key(33, 0), (8, 2, 24)),
+                                jax.random.normal(drawn_key(34, 0), (8, 24))),
+                               [PartitionSpec("data", None), PartitionSpec("data")], mesh)
+        with generation.assumed("sm90"):
+            assert norm_swiglu.packed_swiglu_kernel("pallas", r3_p) == "pallas"
+        assert not any(eq.primitive.name == "reshard" for eq in traced(packed_ref, r3_p, r3_d))
+    raw_p, raw_d = draw_packed()
+    for dtype in (jnp.float32, jnp.bfloat16):
+        p_dt, d_dt = raw_p.astype(dtype), raw_d.astype(dtype)
+        expected_y, expected_dx = jax.jit(packed_ref)(p_dt, d_dt)
+        with jax.set_mesh(mesh):
+            bad_pair, bad_dy = placed_on((p_dt, d_dt), [PartitionSpec(None, None, "data", None),
+                                                        PartitionSpec()], mesh)
+            for named_axes in (None, MLP_HIDDEN):
+                if dtype == jnp.float32:
+                    with generation.assumed("sm90"):
+                        assert norm_swiglu.packed_swiglu_kernel("auto", bad_pair, axes=named_axes) == "xla"
+                        assert norm_swiglu.packed_swiglu_kernel("pallas", bad_pair, axes=named_axes) == "xla"
+                        with generation.chosen(swiglu="pallas"), pytest.raises(selection.KernelRefused):
+                            norm_swiglu.packed_swiglu_kernel("auto", bad_pair, axes=named_axes)
+                for impl in ("auto", "xla"):
+                    fn = packed_gated_product("swiglu", implementation=impl, axes=named_axes)
+                    got_y, got_dx = jax.jit(lambda a, d, f=fn: evaluated(f, (a,), d))(bad_pair, bad_dy)
+                    np.testing.assert_array_equal(np.asarray(got_y), np.asarray(expected_y))
+                    np.testing.assert_array_equal(np.asarray(got_dx), np.asarray(expected_dx))
+
+
+@pytest.mark.mesh(devices=4)
+def test_packed_gated_product_pair_reshard_preserves_other_explicit_axes():
+    """Resharding a pair-sharded `[..., 2, H]` input onto `None` along `-2` preserves other Explicit axes
+    splitting rows or features on output and input-gradient shardings alongside bit equality (row 822)."""
+    from jax.sharding import AxisType
+
+    mesh = jax.make_mesh((2, 2), ("data", "model"), axis_types=(AxisType.Explicit, AxisType.Explicit),
+                         devices=jax.devices()[:4])
+    raw_p = jax.random.normal(drawn_key(33, 0), (4, 8, 2, 24))
+    raw_d = jax.random.normal(drawn_key(34, 0), (4, 8, 24))
+
+    def packed_ref(a, d):
+        return evaluated(packed_gated_product("swiglu", implementation="xla"), (a,), d)
+
+    def padded(arr) -> tuple:
+        spec = arr.sharding.spec
+        return (*spec, *(None,) * (arr.ndim - len(spec)))
+
+    expected_y, expected_dx = jax.jit(packed_ref)(raw_p, raw_d)
+    for in_spec, out_spec in (
+            (PartitionSpec("data", None, "model", None), PartitionSpec("data", None, None)),
+            (PartitionSpec(None, None, "model", "data"), PartitionSpec(None, None, "data"))):
+        with jax.set_mesh(mesh):
+            sharded_p, sharded_d = placed_on((raw_p, raw_d), [in_spec, out_spec], mesh)
+            for impl in ("auto", "xla"):
+                fn = packed_gated_product("swiglu", implementation=impl)
+                got_y, got_dx = jax.jit(lambda a, d, f=fn: evaluated(f, (a,), d))(sharded_p, sharded_d)
+                np.testing.assert_array_equal(np.asarray(got_y), np.asarray(expected_y))
+                np.testing.assert_array_equal(np.asarray(got_dx), np.asarray(expected_dx))
+                assert padded(got_y) == tuple(out_spec), (impl, padded(got_y), out_spec)
+                assert padded(got_dx) == tuple(in_spec), (impl, padded(got_dx), in_spec)
+
 
 def _checked_shard_operands(draw: int = 0):
     """The per-shard tests' operands (`_checked_shard_run`'s): the seam's and SwiGLU's, and their

@@ -260,7 +260,7 @@ class Tcgen05Placed(Tcgen05Rings):
                     summed.wait(summed.turn(slots.n - 1))
                     _rescaled(self, acc, scale)
 
-                pl.when(after_walk.rare(scale.moves))(rescaled)
+                pl.when(after_walk.stepwise(scale.moves))(rescaled)
             weighed.published(weighed.turn(slots.n))
             return acc
 
@@ -328,7 +328,7 @@ class Tcgen05Placed(Tcgen05Rings):
                 summed.wait(summed.turn(n - 1))
                 _rescaled(self, sums, lambda acc: acc * factor[:, None])
 
-            pl.when(after_walk.rare(jnp.any(factor != 1.0)))(rescaled)
+            pl.when(after_walk.stepwise(jnp.any(factor != 1.0)))(rescaled)
             weighed.published(weighed.turn(n))
 
         def trip(pair, carry, accumulators):

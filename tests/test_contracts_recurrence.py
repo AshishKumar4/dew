@@ -68,6 +68,24 @@ def test_a_run_updating_in_its_backward_moves_as_its_step_would(edge):
                           without=REVERSE_ONLY)
 
 
+def draw_stream(salt: int, seed: int, at: int, *, fixture: int | None = None) -> int | list[int]:
+    """The seed of a contract cell's draw `at` at seed `seed` (`normal_draw`'s, NumPy's): seed zero's its
+    fixture's (`fixture`, by default `salt + at`: the cell's own inputs, their streams as its contract was
+    measured), a later seed's `[salt, seed, at]` (`SeedSequence` entropy), each of the cell's draws a stream
+    of its own, where `salt + at + 4096 seed` gave two of a cell's draws one: the KDA port's query direction
+    and cotangent, the template's, the turned call's turns and primals (row 8449)."""
+    if seed == 0:
+        return salt + at if fixture is None else fixture
+    return [salt, seed, at]
+
+
+def tangent_keys(key: jax.Array, count: int, seed: int) -> tuple:
+    """A cell's `count` operands' tangent keys from its one tangent key `key`: seed zero's that key for each
+    (its fixture's, as its contract was measured), a later seed's each operand its own (`jax.random.split`),
+    where one key drew every operand's tangent, a call's queries', keys' and values' the same (row 8449)."""
+    return (key,) * count if seed == 0 else tuple(jax.random.split(key, count))
+
+
 def seeded_key(seed: int) -> jax.Array:
     """`jax.random.key(seed)` with every bit of `seed`: formed with 64-bit integers on (its draws taken after,
     in float32), where a 32-bit one wrapped a draw's `salt + 4096 seed` past 2^32 onto a smaller seed's, the
@@ -165,8 +183,8 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
         g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
         beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
         primals = (query, key, value, g, beta)
-        direction = tuple(jax.random.normal(keys[6], x.shape) * (scale if at < 3 else 1.0)
-                          for at, x in enumerate(primals))
+        direction = tuple(jax.random.normal(along, x.shape) * (scale if at < 3 else 1.0) for at, (along, x)
+                          in enumerate(zip(tangent_keys(keys[6], len(primals), seed), primals, strict=True)))
         return primals, direction, jax.random.normal(keys[7], query.shape)
 
     def rule(query, key, value, g, beta):
@@ -255,22 +273,27 @@ def plain_ssd(x, dt, a, b, c, skip, state):
     return y + skip[:, None] * x, final
 
 
-def delta_rule_draw(seed: int, scale: float, *, key_heads: int, value_heads: int, width: int, length: int,
-                    per_key: bool, unit_keys: bool = False):
+def delta_rule_draw(salt: int, seed: int, scale: float, *, key_heads: int, value_heads: int, width: int,
+                    length: int, per_key: bool, unit_keys: bool = False, fixture: int | None = None):
     """A delta rule's operands `(query, key, value, g, beta, state)`, their direction and the outputs'
-    cotangents: queries, values and memory at `scale`, keys at it or of unit norm, a log decay in (-inf, 0)
-    a head or a key dimension, write gates in (0, 1)."""
+    cotangents, a cell's draws 0 to 2 at `seed` (`draw_stream`, its `salt`; seed zero's from `fixture` where
+    another cell's fixture is its own): queries, values and memory at `scale`, keys at it or of unit norm, a
+    log decay in (-inf, 0) a head or a key dimension, write gates in (0, 1)."""
+    def stream(at):
+        return draw_stream(salt, seed, at, fixture=None if fixture is None else fixture + at)
+
     query, key, value, decay, gate, state = normal_draw(
-        seed, (1, length, key_heads, width), (1, length, key_heads, width), (1, length, value_heads, width),
-        (1, length, value_heads, *((width,) if per_key else ())), (1, length, value_heads),
+        stream(0), (1, length, key_heads, width), (1, length, key_heads, width),
+        (1, length, value_heads, width), (1, length, value_heads, *((width,) if per_key else ())),
+        (1, length, value_heads),
         (1, value_heads, width, width))
     key = key / jnp.linalg.norm(key, axis=-1, keepdims=True) if unit_keys else key * scale
     primals = (query * scale, key, value * scale, -jax.nn.softplus(decay), jax.nn.sigmoid(gate),
                state * scale)
-    drawn = normal_draw(seed + 1, *(x.shape for x in primals))
+    drawn = normal_draw(stream(1), *(x.shape for x in primals))
     direction = tuple(along * (scale if at in (0, 2, 5) or (at == 1 and not unit_keys) else 1.0)
                       for at, along in enumerate(drawn))
-    cotangent = normal_draw(seed + 2, value.shape, state.shape)
+    cotangent = normal_draw(stream(2), value.shape, state.shape)
     return primals, direction, cotangent
 
 
@@ -336,9 +359,9 @@ def test_the_delta_rule_ports_hold_their_orders(per_key, edge, taken):
     float64 the truth), at queries, keys and values whose products near float32's least normal."""
     def draw(seed, scale):
         (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
-            2661 + per_key + 4096 * seed, scale, key_heads=2, value_heads=2, width=64, length=64,
-            per_key=per_key)
-        return (query, key, value, g, beta), direction[:5], normal_draw(2663 + 4096 * seed, value.shape)[0]
+            2661 + per_key, seed, scale, key_heads=2, value_heads=2, width=64, length=64, per_key=per_key)
+        cotangent = normal_draw(draw_stream(2661 + per_key, seed, 3, fixture=2663), value.shape)[0]
+        return (query, key, value, g, beta), direction[:5], cotangent
 
     memory = jnp.zeros((1, 2, 64, 64), jnp.float32)
 
@@ -376,13 +399,13 @@ def test_the_template_rule_holds_its_orders(edge, taken):
     float32's least normal."""
     def draw(seed, scale):
         (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
-            2664 + 4096 * seed, scale, key_heads=1, value_heads=1, width=64, length=64,
-            per_key=False, unit_keys=True)
+            2664, seed, scale, key_heads=1, value_heads=1, width=64, length=64, per_key=False,
+            unit_keys=True)
         primals = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16), g,
                    beta.astype(jnp.bfloat16))
         direction = tuple(along.astype(operand.dtype)
                           for along, operand in zip(direction, primals, strict=False))
-        return primals, direction, normal_draw(2665 + 4096 * seed, value.shape)[0]
+        return primals, direction, normal_draw(draw_stream(2664, seed, 3, fixture=2665), value.shape)[0]
 
     def rule(*operands):
         with generation.chosen(gated_delta_rule="mosaic_gpu"):
@@ -488,13 +511,13 @@ def test_the_chunked_op_holds_every_order(edge):
     whose products near float32's ends; near float32's largest wherever fla's own chunked form with the skip
     is (`precedent_chunked`, as the portable rule's edge: ledger 2470)."""
     def draw(seed, scale):
+        # Its own streams past seed zero (2680), its fixture the template cell's (2664).
         (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
-            2664 + 4096 * seed, scale, key_heads=2, value_heads=2, width=8, length=12,
-            per_key=False)
-        (skip,) = normal_draw(2667 + 4096 * seed, (2,))
-        (skip_direction,) = normal_draw(2668 + 4096 * seed, (2,))
+            2680, seed, scale, key_heads=2, value_heads=2, width=8, length=12, per_key=False, fixture=2664)
+        (skip,) = normal_draw(draw_stream(2680, seed, 3, fixture=2667), (2,))
+        (skip_direction,) = normal_draw(draw_stream(2680, seed, 4, fixture=2668), (2,))
         return ((query, key, value, g, beta, skip), (*direction[:5], skip_direction),
-                normal_draw(2669 + 4096 * seed, value.shape)[0])
+                normal_draw(draw_stream(2680, seed, 5, fixture=2669), value.shape)[0])
     hooks = recurrence.Hooks(decay="scalar", skip=True, scale=8 ** -0.5)
 
     def chunked(query, key, value, g, beta, skip):
@@ -533,10 +556,9 @@ def assert_decode_contract(edge: str, seeds: int | None = None) -> None:
     warpgroup takes a value column a thread)."""
     def draw(seed, scale):
         (query, key, value, g, beta, state), direction, cotangent = delta_rule_draw(
-            2669 + 4096 * seed, scale, key_heads=1, value_heads=2, width=128, length=1,
-            per_key=False)
-        (skip,) = normal_draw(2672 + 4096 * seed, (2,))
-        (skip_direction,) = normal_draw(2673 + 4096 * seed, (2,))
+            2669, seed, scale, key_heads=1, value_heads=2, width=128, length=1, per_key=False)
+        (skip,) = normal_draw(draw_stream(2669, seed, 3, fixture=2672), (2,))
+        (skip_direction,) = normal_draw(draw_stream(2669, seed, 4, fixture=2673), (2,))
         flat = jnp.concatenate([cotangent[0][:, 0].ravel(), cotangent[1].ravel()])
         return (query, key, value, g, beta, state, skip), (*direction, skip_direction), flat
     hooks = recurrence.Hooks(decay="scalar", skip=True)
@@ -690,8 +712,10 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge, taken):
         g = -jax.nn.softplus(jax.random.normal(draws[3], (tokens, keys_) if per_key else (tokens,)))
         beta = jax.nn.sigmoid(jax.random.normal(draws[4], (tokens,)))
         primals = (q, k, v, g, beta)
-        return (primals, tuple(jax.random.normal(draws[5], x.shape) for x in primals),
-                jax.random.normal(draws[6], (tokens, values)))
+        tangents = tangent_keys(draws[5], len(primals), seed)
+        direction = tuple(jax.random.normal(along, x.shape)
+                          for along, x in zip(tangents, primals, strict=True))
+        return primals, direction, jax.random.normal(draws[6], (tokens, values))
     axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
             "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
     forms = scan.derive_scan(scan.Scan(_gated, _read, axes, walked="time",
@@ -806,11 +830,12 @@ def test_a_turned_template_call_holds_every_order(edge, taken):
     forward mode through its launch's own tangent (row 8573), an order set a case (`ORDER_SETS`)."""
     shapes = ((1, 40, 1, 6),) * 2 + ((1, 40, 1, 2),)
     def draw(seed, scale):
-        operands = normal_draw(7419 + 4096 * seed, *shapes, scale=scale)
-        turns = np.random.default_rng(7419 + 4096 * seed).uniform(-3.0, 3.0, (1, 40, 1, 2))
-        turn = jnp.asarray(turns, jnp.float32)
-        return ((*operands, turn), normal_draw(7420 + 4096 * seed, *shapes, (1, 40, 1, 2), scale=scale),
-                normal_draw(7421 + 4096 * seed, (1, 40, 1, 2), (1, 1, 6, 2)))
+        operands = normal_draw(draw_stream(7419, seed, 0), *shapes, scale=scale)
+        turns = np.random.default_rng(draw_stream(7419, seed, 1, fixture=7419))
+        turn = jnp.asarray(turns.uniform(-3.0, 3.0, (1, 40, 1, 2)), jnp.float32)
+        direction = normal_draw(draw_stream(7419, seed, 2, fixture=7420), *shapes, (1, 40, 1, 2), scale=scale)
+        return ((*operands, turn), direction,
+                normal_draw(draw_stream(7419, seed, 3, fixture=7421), (1, 40, 1, 2), (1, 1, 6, 2)))
     ones, decays = jnp.ones((1, 40, 1), jnp.float32), jnp.full((1, 40, 1), -0.05, jnp.float32)
 
     def launch(context, query, key, value, g, beta, state, skip, entry, turning):

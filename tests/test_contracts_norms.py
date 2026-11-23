@@ -48,6 +48,21 @@ def test_silu_holds_every_order(edge):
                     truth_fn=jax.nn.silu, plain_fn=jax.nn.silu)
 
 
+@pytest.mark.parametrize("target", ["tpu", "v6e"])
+def test_every_tpu_target_takes_the_v5es_exp(target):
+    """`precision.accurate_exp` traced for a TPU's generation (a generic TPU, a v6e) computes the exp a v5e
+    traces, Dew's own (`GpuTarget.accurate_exp` false on every TPU), where the backend's own differs from it:
+    a generic TPU's facts, its kind no TPU's, took the backend's exp (row 7375)."""
+    from dew.nn.kernels import generation
+
+    x = jnp.asarray(np.random.default_rng(7375).uniform(-20.0, 20.0, 4096), jnp.float32)
+    own = np.asarray(jax.jit(on_a_tpu(precision.accurate_exp))(x))
+    with generation.assumed(target):
+        traced = np.asarray(jax.jit(precision.accurate_exp)(x))
+    assert not np.array_equal(own, np.asarray(jnp.exp(x))), "Dew's own exp is the backend's: no contrast"
+    np.testing.assert_array_equal(traced, own)
+
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_accurate_exp_holds_every_order(edge):
     """`precision.accurate_exp` as a TPU takes it (Dew's own exp, `e^x` and `2^x`, its tangent declared, row

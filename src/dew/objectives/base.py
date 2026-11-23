@@ -1320,7 +1320,18 @@ class Objective(ABC, Generic[Loss, Effects]):
         compilation, and the call always goes through the public `init`.
         """
         held = self.held_variables()
-        return Partial(self.init) if held is None else Partial(self.init, variables=held)
+        return Partial(self._drawn) if held is None else Partial(self._drawn, variables=held)
+
+    def _drawn(self, key: jax.Array, variables: Variables | None = None) -> Variables:
+        """`init` within `generation.drawing`: its forward runs for the variables its modules make, none of
+        its values reaching them, so every selector takes its op's generic program and no launch is derived,
+        traced or certified at the draw's shapes (row 11803). The one way a draw runs (`initializer`,
+        `drawn.traced_draw`, `parameter_axes`, row 12090), so every objective's passes through it once, its
+        own `init` whole: a critic's, an encoder and predictor's, a feature probe's (Train 1205's review
+        F2)."""
+        with drawing():
+            # An override may take its variables by keyword alone, as the base names them.
+            return self.init(key) if variables is None else self.init(key, variables=variables)
 
     _held_parts: ClassVar[bool] = False
     """Whether the held tree may be parts a fresh draw goes beside (a
@@ -1361,15 +1372,11 @@ class Objective(ABC, Generic[Loss, Effects]):
             tree = stored_layers(self, held)
         elif not held or self._held_parts:
             # None or an empty tree draws afresh: `parameter_axes` traces the objective's draw so.
-            with drawing():
-                tree = self.fresh_variables(key, held or None)
+            tree = self.fresh_variables(key, held or None)
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
-        # The parts the tree lacks drawn too (a decision model's backbone and head). A draw's forward runs
-        # for the variables its modules make, so it selects no kernel (`drawing`, row 12029).
-        with drawing():
-            tree = self.complete_variables(key, tree)
+        tree = self.complete_variables(key, tree)
         # What a pass observes is that pass's own, never the state's: a module that sows its maxima or its
         # watched activations as it initializes leaves none for a step to read before its own (`OBSERVED`).
         tree = with_projected({name: part for name, part in tree.items() if name not in OBSERVED},
@@ -1390,8 +1397,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         16 s its start traced."""
         found = self.__dict__.get("_drawn_shapes")
         if found is None:
-            found = self.__dict__.setdefault("_drawn_shapes",
-                                             _shapes_of(abstract(self.initializer, jax.random.key(0))))
+            # Its key made within the trace, nothing computed on any device (rows 12147-12150); the
+            # initializer an argument, its held tree traced as the arrays it stands for (`abstract`, 7386).
+            drawn = abstract(lambda initializer: initializer(jax.random.key(0)), self.initializer)
+            found = self.__dict__.setdefault("_drawn_shapes", _shapes_of(drawn))
         return found
 
     @functools.cached_property
@@ -1411,7 +1420,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         if held is None and (drawn_axes := self.__dict__.get("_drawn_axes")) is not None:
             return {**self.tower_axes(), **drawn_axes}
         try:
-            drawn = abstract(functools.partial(self.init, variables={}), jax.random.key(0))
+            # Its key made within the trace: nothing computed, on any device (rows 12147-12150).
+            drawn = abstract(lambda: self._drawn(jax.random.key(0), variables={}))
         except NotImplementedError:
             return self.tower_axes()
         if held is not None and "params" in held:
