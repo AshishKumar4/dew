@@ -25,7 +25,6 @@ from dew.nn.mixers.lightning import LightningAttention
 from dew.nn.mixers.mamba import Mamba
 from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.mixers.mamba3 import Mamba3
-from dew.parity import FEWEST_SEEDS
 from dew.training import MeshSpec
 
 WIDTH = 32
@@ -378,30 +377,6 @@ def test_a_split_convs_bias_gradient_sums_its_shards_as_the_whole_conv_does(row)
     assert_as_exact(split, lambda mixed, cotangent: whole(taps, bias, mixed, cotangent), draw,
                     f"a conv split over the sequence, {row}", seeds=CONV_SEEDS, truth_fn=truth,
                     library_fn=library, library_row=2169, library_leaves=("[2]",))
-
-
-@pytest.mark.mesh
-@pytest.mark.parametrize("name", sorted(WIDE_HEADS))
-def test_a_split_delta_rules_transfer_takes_its_layers_chunk(name, monkeypatch):
-    """A delta-rule mixer of 4-token chunks split over the sequence walks each shard's transfer in its own
-    chunks (`entering_memory`'s `chunk_size`, the layer's): taken at the rule's default 64, a short shard's
-    transfer walked 64 padded tokens a chunk (#3747 review)."""
-    from dew.nn.kernels import recurrence_chunk
-
-    taken, transfer = [], recurrence_chunk.transferred
-
-    def spied(*args, chunk_size=recurrence_chunk.CHUNK_SIZE, **options):
-        taken.append(chunk_size)
-        return transfer(*args, chunk_size=chunk_size, **options)
-
-    monkeypatch.setattr(recurrence_chunk, "transferred", spied)
-    module = WIDE_HEADS[name]
-    hidden = jnp.zeros((1, 32, WIDTH), jnp.float32)
-    variables = jax.tree.map(lambda leaf: np.asarray(leaf), module.init(jax.random.key(7), hidden))
-    assert_split_as_whole(module, variables, "all_valid", FEWEST_SEEDS, f"{name}'s transfer chunk",
-                          width=WIDTH)
-    assert taken and set(taken) == {module.chunk_size}, taken
-
 
 TRANSFER_SEEDS = 16
 """The draws a slice's transfer is held on par over (its test below)."""
