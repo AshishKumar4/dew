@@ -297,9 +297,11 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     given = fields.get("optimizer_opts") or {}
     assert isinstance(given, Mapping), given
     opts: dict[str, _records.JSON] = dict(given)
-    mask = opts.pop("mask", None)
     assert isinstance(named, str), named
     named = EARLIER_OPTIMIZER_PATHS.get(named, named)
+    typed = named in registry.optimizers.paths and named != "optax"
+    # Dew's own optimizers take no mask; an Optax factory takes its options as they were given.
+    mask = opts.pop("mask", None) if typed else None
     stated = {key: fields[key] for key in ("b1", "b2", "weight_decay") if fields.get(key) is not None}
     if fields.get("state_dtype", "float32") != "float32":
         stated["state_dtype"] = fields["state_dtype"]
@@ -311,54 +313,43 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
             stated["state_dtype"] = list(moments)
     settings = {**opts, **stated}
     kept = {key: value for key, value in fields.items() if key not in EARLIER_OPTIMIZER_FIELDS}
-    if named in registry.optimizers.paths and named != "optax":
-        settings, kept = _decay_mask(mask, registry.optimizers[named], settings, kept)
+    if typed:
+        _masked_alike(mask, registry.optimizers[named], settings, kept)
         optimizer = {"class": named, "fields": settings}
     else:
-        # An Optax factory takes its mask as it took it, the config's sparing writing its own over it alike.
-        masked = {} if mask is None else {"mask": mask}
-        optimizer = {"class": "optax", "fields": {"path": named, "settings": {**settings, **masked}}}
+        optimizer = {"class": "optax", "fields": {"path": named, "settings": settings}}
     return {**kept, "optimizer": optimizer}
 
 
-type _Fields = dict[str, _records.JSON]
-
-
-def _decay_mask(mask: _records.JSON, spec: type, settings: _Fields,
-                config: _Fields) -> tuple[_Fields, _Fields]:
-    """An earlier optimizer's `mask` among its options (`optimizer_opts`) as its spec's `settings` and its
-    config's param groups (`config`'s `param_groups`), each returned. Where the config spared its decay
-    (`OptimConfig.spared`, on by default) its own mask was written over it, as a group's that spared
-    (`ParamGroup.spared`, off by default) was, every group reading it alike whatever the config said. A mask
-    of True or None decayed every parameter, as unspared; one of False decayed none where it was read: its
-    decay 0 there, the config's ungrouped, each unspared group's grouped. Refused where that is not the same
-    optimizer state: Adam's coupled decay (`Adam.COUPLED`) kept a decay step of its own while it decayed,
-    which a decay of 0 drops; and a mask naming a tree, which no record rebuilds."""
+def _masked_alike(mask: _records.JSON, spec: type, settings: Mapping[str, _records.JSON],
+                  config: Mapping[str, _records.JSON]) -> None:
+    """Refuse an earlier optimizer's `mask` among its options (`optimizer_opts`), which Dew's own optimizers
+    take no longer, where the optimizer state it built is no state this Dew builds. Where the config spared
+    its decay (`OptimConfig.spared`, on by default) its own mask was written over it, as a group's that
+    spared (`ParamGroup.spared`, off by default) was, every group reading it alike: it changed nothing, as a
+    mask of True or None did not. A mask of False read anywhere wrapped the decay step in a mask of its own
+    (`optax.masked`), whose state node a checkpoint holds and no decay of this Dew's builds, but for Adam's
+    coupled decay of 0, which held no decay step at all (`Adam.COUPLED`); a mask naming a tree no record
+    rebuilds."""
     groups = config.get("param_groups") or []
     assert isinstance(groups, list), groups
     if mask is None or mask is True:
-        return settings, config
-    held = [group for group in groups if isinstance(group, Mapping) and not group.get("spared", False)]
-    read = held if groups else ([] if config.get("spared", True) else [config])
+        return
+    read = ([group for group in groups if isinstance(group, Mapping) and not group.get("spared", False)]
+            if groups else ([] if config.get("spared", True) else [config]))
     if not read:
-        return settings, config
-    if mask is not False:
-        raise ValueError(f"an earlier run masked its decay by {mask!r}, which no record of this Dew states: "
-                         "set OptimConfig.spared or its param groups' (ParamGroup.spared) in its place")
+        return
+    from dew.optim import Adam
+
     default = next((field.default for field in dataclasses.fields(spec) if field.name == "weight_decay"), 0.0)
     decays = [group.get("weight_decay") if group.get("weight_decay") is not None
               else settings.get("weight_decay", default) for group in read]
-    from dew.optim import Adam
-
-    if issubclass(spec, Adam) and spec.COUPLED and any(decays):
-        raise ValueError("an earlier run masked off Adam's coupled weight decay, whose state held a decay "
-                         "step that this Dew's Adam holds only where it decays: resume it under the Dew that "
-                         "saved it, or start it afresh with weight_decay 0")
-    if not groups:
-        return {**settings, "weight_decay": 0.0}, config
-    unmasked: list[_records.JSON] = [{**group, "weight_decay": 0.0} if group in held else group
-                                     for group in groups]
-    return settings, {**config, "param_groups": unmasked}
+    if mask is False and issubclass(spec, Adam) and spec.COUPLED and not any(decays):
+        return
+    raise ValueError(f"an earlier run masked its decay by {mask!r} among its optimizer's options, "
+                     "whose state this Dew's optimizer does not hold: resume it under the Dew that saved "
+                     "it, or start it afresh sparing its decay (OptimConfig.spared, ParamGroup.spared) or "
+                     "with weight_decay 0")
 
 
 def _recorded_class(name: str) -> type | None:
