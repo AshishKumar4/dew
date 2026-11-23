@@ -37,9 +37,9 @@ other's pinned recording as it stands."""
 
 
 def simple_gla(hooks) -> bool:
-    """Whether fla-core's simple GLA runs a site's form: a write gate without the delta rule under a decay a
-    head (`chunk_simple_gla`, its keys gated)."""
-    return hooks.write_gate and not hooks.delta and hooks.decay == 'scalar'
+    """Whether fla-core's simple GLA runs a site's form: no delta rule under a decay a head, a write gate on
+    its keys where the form has one (`chunk_simple_gla`; lightning attention's has none)."""
+    return not hooks.delta and hooks.decay == 'scalar' and not hooks.rated
 
 
 def recorded_at(site: str) -> Path:
@@ -52,6 +52,9 @@ LEAVES = ("out", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
 OWN_LEAVES = ("out", "final", "dq", "dk", "dv", "dg", "down", "dh0")
 """A site's leaves whose readout weighs its own write and reads no write gate (`RWKV6`'s): the own weight's
 gradient in the write gate's place."""
+
+LIGHTNING_LEAVES = ("out", "final", "dq", "dk", "dv", "dg", "dh0")
+"""Lightning attention's leaves (`_lightning_sites`): its draws gate no write, so no write gate's gradient."""
 
 RWKV6 = recurrence.Hooks(decay='vector', delta=False, reads='before', own_weight=True, scale=128 ** -0.5)
 """RWKV6's recurrence as fla-core's `chunk_rwkv6` computes it: `o_t = scale q_t^T (S_{t-1} + (u k_t)
@@ -151,6 +154,16 @@ def _mosaic_sites() -> dict[str, Site]:
             lambda seed, at=at: mosaic.draw(jnp.bfloat16, seed, **at)[0]))
     sites["near two"] = Site(mosaic.NEAR_TWO_HOOKS, _with_cotangents(mosaic.near_two), FORWARD)
     return sites
+
+
+def _lightning_sites() -> dict[str, Site]:
+    """Lightning attention's sites (test_lightning_template): its bf16 draws, and its draws with a write at
+    fp32's edge, whose final memory alone its test reads."""
+    import test_lightning_template as lightning
+
+    return {"lightning": Site(lightning.HOOKS, _with_cotangents(lightning.drawn), LIGHTNING_LEAVES),
+            "lightning at fp32's edge": Site(lightning.HOOKS, _with_cotangents(lightning.at_fp32s_edge),
+                                             FORWARD)}
 
 
 def _stability_sites() -> dict[str, Site]:
@@ -261,7 +274,7 @@ def _faint_cross_sites() -> dict[str, Site]:
 def sites() -> dict[str, Site]:
     """Every recorded site by name."""
     return {**_mosaic_sites(), **_stability_sites(), **_rwkv6_sites(), **_floor_gate_sites(),
-            **_faint_cross_sites()}
+            **_faint_cross_sites(), **_lightning_sites()}
 
 
 def the_template_is_as_exact_as_fla(rule: Callable[[Chunk], tuple], site: str,
