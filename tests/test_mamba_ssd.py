@@ -236,12 +236,15 @@ def the_template_is_as_exact_as_mamba_ssm():
                     truth_fn=truth)
 
 
+@pytest.mark.check1_shards(seeds=8, per_task=4)
 def test_a_packed_calls_skip_gradient_on_the_template_is_as_exact_as_on_mamba_ssms_port():
     """A bf16 SSD over packed documents on the recurrence template under the fast forms, its skip in the
     template's own walk (`recurrence_chunk._rated_scan`'s `fused`), interpreted at the interpreter's route:
     the skip's gradient on par with the port of mamba_ssm's kernels' (check 1; the portable math's sums it
     exactly). Summed over every laid row, it read the rows of chunks no sequence takes, which the walk never
-    writes: not finite on every draw, natively on an H100 and interpreted (M-JS-63, jsf-ssdfin)."""
+    writes: not finite on every draw, natively on an H100 and interpreted (M-JS-63, jsf-ssdfin). Its eight
+    draws (`SKIPPED_SEEDS`) two map tasks: in one, 127 s, past a group's 120, of which its traces, lowerings
+    and compiles took 40 and its draws' interpreted runs the rest (jsf-timing3, row 12096)."""
     def skip_gradient(kernel):
         def run(arrays):
             with generation.chosen(ssd=kernel):
