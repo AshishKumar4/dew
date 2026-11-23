@@ -98,7 +98,7 @@ EXACT = launches(("mosaic", "sm90"), ("triton", "sm80"), ("triton", "sm90"))
 """The launches of a kernel gradient's exact sums: Triton's, and Mosaic GPU's on Hopper alone (Ampere's
 bundle counts no running sum in its registers, `mosaic.Family.counts_sums`, so it refuses them)."""
 CUTLASS = launches(("cutlass", "sm90"))
-"""The vendored CUTLASS grouped GEMM's launch (`grouped_matmul.CutlassGmm`, the dew-cutlass wheel's): bf16
+"""The vendored CUTLASS grouped GEMM's launch (`grouped_cutlass.CutlassGmm`, the dew-cutlass wheel's): bf16
 operands on Hopper, its one tile, no exact sums or steps of its own, so its products' cell alone (row 2084
 (a)); a GPU whose installed wheel holds no sm90 kernels refuses it."""
 GRADIENTS = {"mosaic": grouped_matmul.MosaicTgmm, "triton": grouped_triton.Tgmm}

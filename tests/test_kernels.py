@@ -88,13 +88,15 @@ def flash_through_dews_attention_refuses_rows_it_would_misread(without_determini
     flash_here()
     rng = np.random.default_rng(31)
 
+    # Host arrays its refusals read by type alone (`jax.eval_shape`): a GPU tier part's prepare computes and
+    # places nothing.
     def normal(*shape):
-        return jnp.asarray(rng.normal(size=shape), jnp.bfloat16)
+        return np.asarray(rng.normal(size=shape), jnp.bfloat16)
 
     query, key = normal(2, 32, 4, 64), normal(2, 32, 2, 64)
-    own = {"segment_ids": jnp.asarray(documents([[20, 12, 0], [9, 23, 0]])), "max_segments": 2}
+    own = {"segment_ids": documents([[20, 12, 0], [9, 23, 0]]), "max_segments": 2}
     cross = {"segment_ids": own["segment_ids"], "max_segments": 2,
-             "key_segment_ids": jnp.asarray(documents([[10, 6, 0], [4, 12, 0]]))}
+             "key_segment_ids": documents([[10, 6, 0], [4, 12, 0]])}
 
     def attend(implementation, causal=True, **packed):
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
@@ -178,9 +180,11 @@ def a_fused_kernel_takes_forward_mode_through_the_reference(implementation, with
                 return jax.jvp(attend(name), arrays[:3], arrays[3:])[1]
         return run
 
-    query, key, value = qkv(shape)
+    # Refused as it traces (`jax.eval_shape`), computing nothing in a GPU tier part's prepare.
+    operands = (jax.ShapeDtypeStruct(shape, jnp.bfloat16),) * 3
     with pytest.raises(TypeError):
-        jax.jvp(attend(implementation), (query, key, value), qkv(shape, seed=1))
+        jax.eval_shape(lambda *arrays: jax.jvp(attend(implementation), arrays[:3], arrays[3:]),
+                       *operands, *operands)
     # The truth the reference path's own float64 run, as `test_cpu_fp32_attention_summed_in_float64_takes_
     # forward_mode` takes it.
     draw = normal_drawn(0xF0E, *[shape] * 6, dtype=jnp.bfloat16)

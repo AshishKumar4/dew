@@ -1439,3 +1439,25 @@ def test_an_adapted_products_replicated_gradient_sums_before_it_rounds():
     want = np.zeros((8, 8), np.float16)
     want[0, 0] = 32.0
     np.testing.assert_array_equal(np.asarray(d_kernel), want)
+
+
+def test_an_adapted_products_backward_keeps_fp32_products_whole_under_any_preset():
+    """An adapted product's backward runs its fp32 factor products in arithmetic that keeps an fp32
+    operand's 24 digits (`low_rank._kept`, read by `programs.dot_arithmetic`) under every dot algorithm
+    preset JAX names, those of narrower operands (BF16, TF32, F16), those JAX refuses fp32 operands for (an
+    FP8 one) and split ones (X3, X6, X9) alike, never raising; one that already keeps them is unchanged
+    (row 12394)."""
+    from dew.nn.kernels.low_rank import _kept
+    from dew.nn.programs import dot_arithmetic
+
+    for preset in jax.lax.DotAlgorithmPreset:
+        kept = _kept(preset)
+        arithmetic = dot_arithmetic(kept, jnp.float32, jnp.float32)
+        assert arithmetic is None or arithmetic.digits >= 24, (preset, kept, arithmetic)
+        try:
+            own = dot_arithmetic(preset, jnp.float32, jnp.float32)
+        except ValueError:
+            continue
+        if own is None or own.digits >= 24:
+            assert kept is preset, (preset, kept)
+

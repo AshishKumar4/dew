@@ -408,6 +408,8 @@ def syrk(x: jax.Array, *, tiles: Tiles, transpose: bool = False, out_dtype, mult
     (row 11941)."""
     if x.ndim != 3:
         raise ValueError(f"syrk expects 3D [batches, m, k] (or [batches, k, m]), got {x.shape}")
+    if tiles.staging is not None:
+        raise ValueError(f"syrk stages its outputs at its family's own chunks, not {tiles.staging}")
     out_dtype = jnp.dtype(out_dtype)
     if not supports_out_dtype(out_dtype):
         raise ValueError(f"syrk supports 16-bit and 32-bit float outputs, got {out_dtype}")

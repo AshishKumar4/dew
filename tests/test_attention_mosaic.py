@@ -23,7 +23,7 @@ import pytest
 from attention_oracle import traced_attention_terms
 from fla_gdn_support import KernelCase
 from float64_terms import float64_terms
-from generation_support import COMPILES_ON_CPU, INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS, here
 from jax.sharding import Mesh
 from kernel_compile import compile_mosaic_kernels, mosaic_failures
 from reference_error import assert_as_exact
@@ -56,10 +56,9 @@ from dew.nn.kernels.templates import (
 
 pytestmark = pytest.mark.kernel
 
-ON_HOPPER = pytest.mark.skipif(generation.device_generation() != "sm90",
-                               reason="runs the sm90 mainloop compiled, on an H100")
-ON_BLACKWELL = pytest.mark.skipif(generation.device_generation() != "sm100",
-                                  reason="runs the sm100 mainloop compiled, on a B200")
+# The node's generation in a GPU tier part's prepare (`here`), so its cells prepare where their run runs them.
+ON_HOPPER = pytest.mark.skipif(here() != "sm90", reason="runs the sm90 mainloop compiled, on an H100")
+ON_BLACKWELL = pytest.mark.skipif(here() != "sm100", reason="runs the sm100 mainloop compiled, on a B200")
 CALLS = {"full": {}, "causal": {"causal": True}}
 """The call forms the mainloop takes."""
 SHAPES = {"interpreted": (1, 160, 2, 1), "compiled": (2, 400, 4, 2)}

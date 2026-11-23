@@ -37,7 +37,7 @@ from kernel_matrix import AXES
 from reference_error import assert_as_exact, with_gradients
 
 from dew.mesh import DEFAULT_RULES
-from dew.nn.kernels import gemm, generation, grouped_matmul, selection
+from dew.nn.kernels import gemm, generation, grouped_cutlass, grouped_matmul, selection
 from dew.nn.sharding import placing
 
 ROWS, DEPTH, WIDTH = 256, 256, 384
@@ -215,10 +215,10 @@ def _cutlass_takes(case: dict[str, str]) -> bool:
     sizes = jax.ShapeDtypeStruct((len(SIZES),), jnp.int32)
     transposed = case["matrix"] == "k-major"
     options = {"out_dtype": case["dtype"], "interpret": False}
-    binds = (grouped_matmul.CutlassGmm().bind(x, matrix, sizes, trans_rhs=transposed, **options),
-             grouped_matmul.CutlassGmm().bind(dout, matrix, sizes, trans_rhs=not transposed, **options),
-             grouped_matmul.CutlassTgmm().bind(x, dout, sizes, **options))
-    return case["hook"] == "plain" and all(grouped_matmul.CutlassGmm.in_contract(ba) for ba in binds)
+    binds = (grouped_cutlass.CutlassGmm().bind(x, matrix, sizes, trans_rhs=transposed, **options),
+             grouped_cutlass.CutlassGmm().bind(dout, matrix, sizes, trans_rhs=not transposed, **options),
+             grouped_cutlass.CutlassTgmm().bind(x, dout, sizes, **options))
+    return case["hook"] == "plain" and all(grouped_cutlass.CutlassGmm.in_contract(ba) for ba in binds)
 
 
 def route_of(case: dict[str, str]) -> str | None:

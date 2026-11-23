@@ -176,8 +176,7 @@ def simulator_rollout(simulator: Stepped, policy: Policy, params: Params, carry:
         # began in), so the second step's executable is the one every later step runs.
         if step == 1:
             acting = acted.executable(policy, params, carry)
-        with acted.ran(acting, (policy, params, carry), {}):
-            action, extras, memory, key = acting(params, carry)
+        action, extras, memory, key = acted.invoked(acting, (policy, params, carry), {}, params, carry)
         following = received(simulator.step(action))
         following = TimeStep(following.observation, following.reward, following.terminated.astype(bool),
                              following.truncated.astype(bool))

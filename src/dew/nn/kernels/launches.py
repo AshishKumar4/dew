@@ -29,13 +29,37 @@ def _register_triton_lowerings() -> None:
     scaled.triton_lowerings()
 
 
+_MOSAIC_GPU_REGISTERED: set[jax_core.Primitive] = set()
+
+
+def _register_mosaic_gpu(prim: jax_core.Primitive, value: Callable) -> None:
+    """Register one Dew primitive's Pallas Mosaic GPU warpgroup lowering by tracing `value`: the one
+    lowering-by-jaxpr adapter of every Dew primitive a Mosaic GPU kernel runs (rows 12267, 12330)."""
+    if prim in _MOSAIC_GPU_REGISTERED:
+        return
+    from jax._src.pallas.mosaic_gpu import lowering as mosaic_lowering
+    from jax.experimental.mosaic import gpu as mgpu
+
+    def _lower(ctx, *args, **params):
+        ir_args = tuple(mosaic_lowering._ensure_ir_value(v, a.dtype)
+                        for v, a in zip(args, ctx.avals_in, strict=True))
+        closed = jax.make_jaxpr(functools.partial(value, **params))(*ctx.avals_in)
+        out = mosaic_lowering.lower_jaxpr_to_mosaic_gpu(
+            ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, ir_args, closed.consts)
+        return out if prim.multiple_results else out[0]
+
+    mosaic_lowering.register_lowering_rule(prim, mgpu.LoweringSemantics.Warpgroup)(_lower)
+    _MOSAIC_GPU_REGISTERED.add(prim)
+
+
 def _register_mosaic_gpu_lowerings() -> None:
-    """Register Dew's primitive owners' Pallas Mosaic GPU lowerings on first `kernel` (row 9795)."""
+    """Register Dew's primitive owners' Pallas Mosaic GPU lowerings on first `kernel` (rows 9795, 12330)."""
     from dew.algebra import scaled
     from dew.nn import precision
 
-    precision.mosaic_gpu_lowerings()
-    scaled.mosaic_gpu_lowerings()
+    _register_mosaic_gpu(precision.correctly_rounded_divide_p, precision._correctly_rounded_divide)
+    for made, (value, _) in scaled.MADE.items():
+        _register_mosaic_gpu(made, value)
 
 
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:

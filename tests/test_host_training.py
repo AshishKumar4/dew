@@ -5,6 +5,7 @@ Streamed-bank ownership and placement are Dew execution policies; Optax oracles 
 import contextlib
 import dataclasses
 import functools
+import gc
 import json
 import os
 
@@ -1314,6 +1315,13 @@ def test_a_node_two_places_share_goes_to_each_places_own_target():
     assert held["params"]["kernel"] is placed["params"]["kernel"]
 
 
+def streaming_model(dtype=None) -> CausalTransformer:
+    """The decoder `streaming_decoder` trains: four scanned layers computing in `dtype`, its parameters'
+    where None."""
+    return CausalTransformer(vocab_size=256, emb_features=64, num_layers=4, num_heads=2, mlp_features=256,
+                             max_seq_len=8, scan_layers=True, dtype=dtype)
+
+
 def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | None = None,
                       dtype=None, rollout=None, optimizer: optax.GradientTransformation | None = None,
                       split: int | str = "auto", remat: str = "auto") -> Trainer:
@@ -1325,10 +1333,8 @@ def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | N
     Adam's, so two decoders key their steps apart
     (`Trainer._step_key`) and a run compared with another traces its own step; decoders handed one Adam
     key theirs alike, as a resumed run's and the run it resumes do, and read the step the first traced."""
-    model = CausalTransformer(vocab_size=256, emb_features=64, num_layers=4, num_heads=2, mlp_features=256,
-                              max_seq_len=8, scan_layers=True, dtype=dtype)
     given = {} if layout is None else {"layout": layout}
-    return Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None),
+    return Trainer(LMObjective(streaming_model(dtype), 8, head_chunks=1, ema_decay=None),
                    optax.adam(.001) if optimizer is None else optimizer, key=jax.random.key(6),
                    checkpoints=checkpoints, rollout=rollout, fit=FitPolicy(split=split, remat=remat), **given)
 
@@ -1529,17 +1535,21 @@ def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout():
             small.fit(streaming_data(), steps=1, log_every=100)
 
 
-@pytest.mark.tpu(reason="a TPU v6e prices the streamed step by its stated host link (row 7908)")
+@pytest.mark.tpu(reason="a TPU prices the streamed step by its stated host link (row 7908)")
 def test_a_tpu_that_holds_only_the_streamed_step_streams_on_par_with_its_device_plan():
-    """A fresh bf16 fit on a v6e stated to hold the decoder's streamed step and not its device plan (its
+    """A fresh bf16 fit on a TPU stated to hold the decoder's streamed step and not its device plan (its
     memory between their needs, each its compiled program's arguments and temporaries there) takes the
-    streamed plan, priced by the TPU's host link, and trains its steps bit for bit as a run given the host
-    layout; and a host step on the TPU is on par with its device plan's from float64 (check 1, `crossed`):
-    the streamed layout the planner may now choose on a TPU, run on one."""
+    streamed plan where its part states a host-link rate (a v6e's), priced by it, and trains its steps bit
+    for bit as a run given the host layout; and a host step on the TPU is on par with its device plan's
+    from float64 (check 1, `crossed`): the streamed layout the planner may now choose on a TPU, run on one.
+    A part that states none (a v5e's) cannot price the streamed step, which is no candidate: its fit is
+    refused, its layout choice naming why, never streamed unpriced (row 12117)."""
     from model_support import memory_limited_to
 
+    from dew.nn.kernels.generation import gpu_target
     from dew.telemetry import instrumentation as memory
     from dew.training.ahead import stand_in_gpus
+    from dew.training.planning import PlanRefused
 
     def on_one(trainer: Trainer) -> Trainer:
         # One TPU, whose CPU companion a TPU host holds whatever its CPU device count.
@@ -1553,6 +1563,14 @@ def test_a_tpu_that_holds_only_the_streamed_step_streams_on_par_with_its_device_
     start = held.place()[0]
     whole = memory.compiled_memory(streamed_program(held, start, *memory_streamed_arguments(held, start)))
     between = memory_limited_to((device.argument + device.temp + whole.argument + whole.temp) // 2)
+    if gpu_target().host_link_rate is None:
+        with stand_in_gpus(jax.devices()[:1], between):
+            unpriced = on_one(streaming_decoder(dtype=jnp.bfloat16))
+            with pytest.raises(PlanRefused):
+                unpriced.fit(streaming_data(), steps=1, log_every=100)
+        choice = unpriced.layout_choice
+        assert choice is not None and not choice.streams and choice.refused is not None, choice
+        return
     with stand_in_gpus(jax.devices()[:1], between):
         chosen = on_one(streaming_decoder(dtype=jnp.bfloat16))
         trained = chosen.fit(streaming_data(), steps=2, log_every=100)
@@ -1613,6 +1631,63 @@ def test_a_fit_compiles_its_streamed_step_only_where_its_device_plan_is_dearer_t
     else:
         assert choice.streamed is not None and streamed.count > 0, (choice, streamed.programs)
     equal(trained.variables, expected.variables)
+
+
+def test_a_fit_that_streams_over_its_device_plans_search_keeps_none_of_what_that_search_compiled():
+    """A fresh fit whose devices hold only the step streaming its parameters from the host
+    (`streamed_only`) searched its devices' step first and streams, the layout it took in place of that
+    search's (`streaming.laid_start`): every candidate the passed-over search compiled is dropped, none
+    outliving the layout the run turned from while the run lives (`StepCompiler.abandoned`; review of row
+    12131's P0: the device plan's candidates stayed pinned)."""
+    from model_support import memory_limited_to
+
+    from dew.nn.kernels import options
+    from dew.training import _candidates
+    from dew.training.ahead import stand_in_gpus
+
+    memory = memory_limited_to(streamed_only())
+    # The runs that measured the window keep their plans' steps for a refit: none of this run's.
+    options.release()
+    gc.collect()
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory):
+        trainer = streaming_decoder()
+        trainer.fit(streaming_data(), steps=1, log_every=100)
+    choice = trainer.layout_choice
+    assert choice is not None and choice.streams, choice
+    gc.collect()
+    assert not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
+
+
+def test_a_fit_that_fails_placing_its_state_keeps_none_of_its_device_plan():
+    """A fresh fit that keeps its device plan (`streaming.laid_start`) and fails placing its state, its
+    start's program failing on its devices before the run's first compile takes that plan, keeps none of
+    it: the trainer that ran it holds no plan no compile took, and no candidate its search compiled
+    outlives the fit (`StepCompiler.abandoned`; review of row 12131's P0 r7: a start whose state's
+    placement raised left its plan on the trainer's compiler)."""
+    from dew.training import _candidates
+    from dew.training.ahead import stand_in_gpus
+    from dew.training.memory import host_memory_stated
+
+    def refused():
+        raise RuntimeError("the devices refused the start")
+
+    class Unplaceable(LMObjective):
+        """An LM whose start's program fails as it runs on the devices, its variables drawn as an LM's."""
+
+        def init(self, key, variables=None):
+            drawn = super().init(key, variables)
+            jax.debug.callback(refused)
+            return drawn
+
+    trainer = Trainer(Unplaceable(streaming_model(), 8, head_chunks=1, ema_decay=None), optax.adam(.001),
+                      key=jax.random.key(6))
+    with (assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30), host_memory_stated(1e6),
+          pytest.raises(jax.errors.JaxRuntimeError)):
+        trainer.fit(streaming_data(), steps=1, log_every=100)
+    choice = trainer.layout_choice
+    assert choice is not None and choice.held and not choice.streams, choice
+    gc.collect()
+    assert trainer._compiler.unplaced is None and not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
 
 
 def streamed_priced(trainer: Trainer, data):

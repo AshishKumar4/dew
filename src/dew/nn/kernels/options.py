@@ -31,7 +31,7 @@ from jax._src.interpreters import pxla
 from jax.experimental.layout import Format
 from jax.sharding import AbstractMesh, NamedSharding, Sharding
 
-from dew import _cache, _stated, algebra
+from dew import _cache, _stated, algebra, communicators
 from dew._devices import xla_flag
 from dew._stated import Unestablished
 from dew.nn.kernels.generation import route_marks, stated, traced_fact, withdrawn
@@ -428,11 +428,9 @@ def _ran(program: OuterProgram, executable: jax.stages.Compiled, args: tuple, kw
     """The contexts every enclosing `running` block runs `executable`, `program`'s for these arguments,
     inside, the outermost first, each entered here, at the call, not at the caller's `with`, which leaves
     them; none outside any."""
-    if not (arounds := _RUNNING.get()):
-        return contextlib.nullcontext()
     stack = contextlib.ExitStack()
     with stack:
-        for around in arounds:
+        for around in _RUNNING.get():
             stack.enter_context(around(program, executable, args, kwargs))
         return stack.pop_all()
 
@@ -862,8 +860,7 @@ class OuterProgram:
         ready = self._ready.get(key)
         if ready is None:
             ready = self._shaped_for(key, args, kwargs, refusals) or self._kept(key, args, kwargs)
-        with _ran(self, ready, args, kwargs):
-            return ready(*dynamic, **named)
+        return self.invoked(ready, args, kwargs, *dynamic, **named)
 
     def _shaped_for(self, key: Hashable, args: tuple, kwargs: dict, refusals: tuple
                     ) -> jax.stages.Compiled | None:
@@ -940,14 +937,14 @@ class OuterProgram:
         ready = self._ready.get(key)
         return self._kept(key, args, kwargs) if ready is None else ready
 
-    def ran(self, executable: jax.stages.Compiled, args: tuple, kwargs: dict
-            ) -> contextlib.AbstractContextManager:
-        """The contexts a call of `executable`, fetched for these arguments (`executable`), runs inside:
-        every enclosing `running` block's, entered here, as a call through the program enters them
+    def invoked(self, executable: jax.stages.Compiled, args: tuple, kwargs: dict, /, *dynamic, **named):
+        """Call `executable`, fetched for these arguments (`executable`), on `dynamic` and `named` inside
+        every enclosing `running` block's contexts, entered here, as a call through the program enters them
         (row 8480: a rollout's executables fetched once and called each step, `dew.rl.simulator`, `Fetched`,
-        a server's `dispatched`, ran past its admission and a trial's record). Its caller runs the
-        executable within it, each call."""
-        return _ran(self, executable, args, kwargs)
+        a server's `dispatched`, ran past its admission and a trial's record), its first run taken as run
+        once it completes (`dew.communicators.called`): the one call of a fetched executable."""
+        with _ran(self, executable, args, kwargs):
+            return communicators.called(executable, lambda: executable(*dynamic, **named))
 
     def _reserved(self, key: Hashable) -> tuple[Future[jax.stages.Compiled], bool]:
         """The compile kept under `key` and whether this caller owns it: a future its owner settles
@@ -1460,8 +1457,7 @@ class Fetched:
         executable = self._executables.get(context)
         if executable is None:
             executable = self._executables[context] = self.program.executable(*args, **kwargs)
-        with self.program.ran(executable, args, kwargs):
-            return executable(*args, **kwargs)
+        return self.program.invoked(executable, args, kwargs, *args, **kwargs)
 
 
 _Structure = tuple[jax.tree_util.PyTreeDef]
