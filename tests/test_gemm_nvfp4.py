@@ -760,7 +760,8 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
     tensor scale of 2**110) passes fp32's largest, against codes +1 and -1 that cancel: 0, not inf - inf.
     Gathered, one token routed to two experts, the first's cancelling (cotangents 2**20 at a factor of
     2**118) beside the second's single 2**-8 value under a cotangent of 2**110 at a factor of 2**-110: the
-    token's gradient is that second route's 2**-8 (row 1464's transpose, `factored`)."""
+    token's gradient is that second route's 2**-8; a gather routing none pulls back zeros (row 1464's
+    transpose, `factored`)."""
     codes = jnp.zeros((512, 128), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
     scales = jnp.ones((32, 128), jnp.float8_e4m3fn)
     x = jnp.zeros((4, 512), jnp.float32).at[:, 0].set(1.0)
@@ -780,3 +781,11 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
     want = np.zeros((1, 512), np.float32)
     want[0, 0] = 2.0 ** -8
     np.testing.assert_array_equal(np.asarray(d_token), want)
+
+    # A gather routing no token pulls back zeros.
+    none, nowhere = jnp.asarray([0, 0], jnp.int32), jnp.zeros((0,), jnp.int32)
+    routed = functools.partial(gemm.nvfp4_product, matrix=bank, group_sizes=none, gather=nowhere,
+                               out_dtype=jnp.float32)
+    _, pull = jax.vjp(routed, token)
+    (d_none,) = pull(jnp.zeros((0, 128), jnp.float32))
+    np.testing.assert_array_equal(np.asarray(d_none), np.zeros((1, 512), np.float32))
