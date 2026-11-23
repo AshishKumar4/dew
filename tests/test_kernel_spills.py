@@ -36,7 +36,11 @@ from dew.objectives.supervised import Supervised
 from dew.telemetry.compiles import Compiles
 from dew.training import Trainer
 
-ROWS, FEATURES, WIDTH, EXPERTS = 4096, 2048, 4096, 8
+ROWS, FEATURES, WIDTH, EXPERTS = 2048, 1024, 2048, 8
+"""The experts layer's step and paired product (`Experts`, `_paired_step`): its first derived tile, an H100's
+128 x 256 x 64, still spills, and its step compiled ahead needs 336 MB of a device, which a GPU tier's test
+process holds (row 8733: at 4096 x 2048 x 4096 it needed 1.88 GB of a 1.12 GiB pool, and a run handed the
+step on the H100 refused it; FS-8733-SIZES)."""
 
 
 class Experts(nn.Module):
