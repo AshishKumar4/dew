@@ -98,12 +98,12 @@ def held_trace[Key: Hashable, Value](cache: collections.OrderedDict[Key, tuple[V
     """`cache`'s value at `key` (`_cache.holding`, `held` the most it keeps), made within a recording of the
     facts it reads (`recording`) and held with them while each answers alike (`still`: a hit whose facts
     answer otherwise now is made again), and those facts read again wherever it is returned (`replay`), so a
-    recording around its reader holds them as one around its making did. A held decision a probe trace
-    makes, its routes no program's, goes through here (the algebra's region decisions, recognitions and
-    attention probes); a held trace a program is written from keeps its whole `dew.algebra.fusion.Recorded`
-    (its routes, launches and facts), which its holder replays whole wherever it writes it (a region's
-    written program, a marked span, a rewritten body). Row 7167: only the second kept their facts, so a warm
-    lowering's recording lacked those its declined regions' probes read (row 6708's defect)."""
+    recording around its reader holds them as one around its making did: the one owner of a held trace's
+    facts (Train 1205's review F1). A held probe decision goes through here (the algebra's region decisions,
+    recognitions and attention probes), and so does a held trace a program is written from (a region's
+    written program, a marked span, a rewritten body), whose routes and launches its holder reports again
+    where it writes it (`dew.algebra.fusion.Recorded`). Row 7167: only the second kept their facts, so a
+    warm lowering's recording lacked those its declined regions' probes read (row 6708's defect)."""
     from dew import _cache
 
     def making() -> tuple[Value, dict]:
