@@ -21,7 +21,7 @@ from jax.extend.mlir.dialects import arith, memref, scf
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import emission, mosaic, native, resources, scan, swizzling
 from dew.nn.kernels.templates.cost import Work
-from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, pair_streams, systems
+from dew.nn.kernels.templates.recurrence.intra import _named, _rows_of, intra_rows, pair_streams, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
@@ -587,7 +587,7 @@ def _key_own_staged(call: Call, keys: int, *, summed: Operand) -> tuple:
 def _suffix_summed(call: Call, suffix: list, start, terms: jax.Array) -> jax.Array:
     """A key block's decay gradient `terms` `[C, keys]` summed back over its chunk, each column started at
     `start` (`key_pairs_own`'s): natively through the staged tile `suffix` (its terms' rows, then the starts'
-    row, `scan.suffix_columns`), read back row-major (`intra.plain_rows`); interpreted, as a tile
+    row, `scan.suffix_columns`), read back row-major (`intra._rows_of`); interpreted, as a tile
     (`algebra.suffix_summed`)."""
     if call.interpret:
         return algebra.suffix_summed(terms, start)
@@ -596,7 +596,7 @@ def _suffix_summed(call: Call, suffix: list, start, terms: jax.Array) -> jax.Arr
     tile[chunk, :] = start
     mosaic.synced(call.interpret)
     scan.suffix_columns(tile)
-    return plain_rows(tile.at[pl.ds(0, chunk)], terms.shape[1])
+    return _rows_of(tile.at[pl.ds(0, chunk)], terms.shape[1])
 
 
 def _key_own_held(call: Call, keys: int) -> Held:
