@@ -7,6 +7,7 @@ snapshot. Everything here drives the real pipeline from a checkpoint the
 trainer has just written.
 """
 
+import contextlib
 import dataclasses
 import datetime
 import json
@@ -21,6 +22,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from diffusion_stubs import STUB_TEXT
+from model_support import attending
 from reference_error import assert_computes_the_oracle
 from steady_state import steady_state
 
@@ -55,7 +57,7 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, 
     """The resolved config of a tiny conditional DiT run in `directory`; the
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32", "attention_impl": "reference"}),
+        model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32"}),
         data=source("tfds://oxford_flowers102").pipe(presets.images, RES, batch=8),
         trainer=TrainerConfig(checkpoint_dir=str(directory), steps=2, keep=Keep(latest=1)),
         preset=preset, text=TextCondition(encoder=encoder, checkpoint=checkpoint),
@@ -97,6 +99,7 @@ def make_run(
     return objective, state
 
 
+@attending("reference")
 def test_pipeline_generates_from_a_run_directory(tmp_path):
     """The whole offline path: the run.json and checkpoint a run wrote, the
     model, process, inputs and weights rebuilt from them, and a sample out."""
@@ -121,6 +124,7 @@ def test_pipeline_generates_from_a_run_directory(tmp_path):
         pipe(["a water lily", "a sunflower"], steps=3, guidance=2.0, key=0).host().images)
 
 
+@attending("reference")
 def test_repeated_image_requests_reuse_their_programs_and_read_back_only_results(tmp_path):
     """Prompts of the same count and sampling settings after the first run
     the programs it compiled, and nothing comes back to the host but the
@@ -186,6 +190,7 @@ def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
         Images(jnp.zeros((1, 4, 2, 3, 3)), rows=1).pil()
 
 
+@attending("reference")
 def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path):
     """A published run may hold its weights once, with no average beside
     them; the default reads that copy, and asking for an average it does not
@@ -206,6 +211,7 @@ def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path
         TextToImage.from_run(str(single), ema=True)
 
 
+@attending("reference")
 def test_sampler_and_guidance_are_call_arguments(tmp_path):
     """Two steps of training leave the zero-initialised head near zero, so
     the weights are nudged off it for the conditional and unconditional
@@ -225,6 +231,7 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
                           pipe(["x"], steps=8, guidance=CFG(4.0), solver=Heun(), key=key).host().images)
 
 
+@attending("reference")
 def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
     """A request's CFG scale, a Brownian solver's seed and an explicit grid's values are data to the
     image walk: another value changes the sample and runs the program the first value compiled."""
@@ -251,6 +258,7 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
     assert compiled.count == 0
 
 
+@attending("reference")
 def test_validation_metrics_follow_the_sample_field(tmp_path):
     """A video run scores its `VideoGrid` against its `video` field: a PSNR stating no field reads
     that grid there, and an image-only metric raises a ValueError naming it as the run builds its
@@ -301,6 +309,7 @@ def validated_run(directory, *, validates: bool, **fields):
         return journal.scalars(), checkpoints.latest
 
 
+@attending("reference")
 def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_names(tmp_path, monkeypatch):
     """An image run's default metric is CLIP's distance where its data validates: the run trains,
     validates and logs `val/clip_similarity` from the CLIP its metric names, here the committed tiny
@@ -320,6 +329,7 @@ def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_nam
     assert latest == 2 and not any(name.startswith("val/") for _, values in scalars for name in values)
 
 
+@attending("reference")
 def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_update(tmp_path):
     """A run that names a metric asks for it whatever its data holds, so data with no validation
     split refuses the run as it builds its splits' metrics (`RunConfig.suites`), before its first
@@ -330,6 +340,7 @@ def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_updat
     assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None
 
 
+@attending("xla")
 def test_an_lm_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
     """An LM objective over a loaded source takes the source's end-of-sequence ids into the policy it
     trains, its task and its saved run, where its own sampling names none: each stops a greedy response
@@ -338,8 +349,7 @@ def test_an_lm_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
     from dew.objectives.lm import LMObjective, Samples
     from dew.sampling import Sampling
 
-    source = Pretrained.load(Path(__file__).resolve().parent / "fixtures/hf/qwen3-tiny", dtype="float32",
-                             attention_impl="xla")
+    source = Pretrained.load(Path(__file__).resolve().parent / "fixtures/hf/qwen3-tiny", dtype="float32")
     greedy = Samples([1, 2, 3], 0, sampling=Sampling(temperature=0))
     prompt = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
 
@@ -420,12 +430,12 @@ def _tiny_lm(processor):
 
     model = ModelConfig("causal_transformer", {"vocab_size": 256, "emb_features": 16, "num_layers": 1,
                                                "num_heads": 2, "head_dim": 8, "mlp_features": 32,
-                                               "max_seq_len": 16, "dtype": "float32",
-                                               "attention_impl": "reference"}).build()
+                                               "max_seq_len": 16, "dtype": "float32"}).build()
     objective = LMObjective(model, 8, ema_decay=None, processor=processor)
     return objective, Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(0)).initial_state()
 
 
+@attending("reference")
 def test_a_saved_runs_own_processor_reloads_and_reads_text_as_the_live_one(tmp_path):
     """A run trained over a processor of its user's own that a record describes (a dataclass at module
     level) saves it beside its model, and the task its saved run loads under the package it trusts holds an
@@ -442,6 +452,7 @@ def test_a_saved_runs_own_processor_reloads_and_reads_text_as_the_live_one(tmp_p
                                   np.asarray(live.processor("hi").tokens))
 
 
+@attending("reference")
 def test_a_saved_runs_processor_no_record_describes_saves_without_it(tmp_path, caplog):
     """A run over a processor no record describes (a class made inside a function, which no import path
     names) saves without raising, recording why, and its run loads its model with no processor, as every
@@ -471,6 +482,7 @@ def test_a_saved_runs_processor_record_builds_a_trusted_processor_class_alone(tm
             saved_custom({"class": named, "fields": {}})
 
 
+@attending("reference")
 def test_a_saved_runs_processor_keeps_its_fields_as_recorded_and_its_settings_hash(tmp_path):
     """A saved run's processor whose field is a dtype's name rebuilds holding that name (the task record's
     `dtype` policy), and the run's task settings hash beside its record (row 9065's review)."""
@@ -491,6 +503,7 @@ class Timed(PrefixedBytes):
     label: str = "tests.label: text"
 
 
+@attending("reference")
 def test_a_saved_runs_processor_reads_its_durations_and_texts_back(tmp_path):
     """A saved run's processor holding a duration and a text shaped as an import path rebuilds holding the
     duration and the text, where the duration read back as its text and the text was imported as a module
@@ -526,7 +539,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=N
     fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
               "mlp_features": 32, "max_seq_len": max_seq_len, **(fields or {})}
     model_config = ModelConfig("causal_transformer", {**fields,
-                                                    "dtype": "float32", "attention_impl": "reference"})
+                                                    "dtype": "float32"})
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
                             samples=Samples([1, 2, 3], 4,
                                             sampling=Sampling(temperature=0, eos_token_ids=255)),
@@ -549,6 +562,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=N
     return objective, state
 
 
+@attending("reference")
 @pytest.mark.parametrize("family", ["qwen3_5", "mimo"])
 def test_an_earlier_projector_record_reloads_its_saved_image_model(tmp_path, family):
     """A Qwen3.5 or MiMo run saved when its projector recorded `vision_width`, `merge_size` and
@@ -564,7 +578,7 @@ def test_an_earlier_projector_record_reloads_its_saved_image_model(tmp_path, fam
         hidden_size=4, spatial_merge_size=2, width=16, out_width=8, bias=family == "qwen3_5")
     model = MultimodalTransformer(
         CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=2,
-                          mlp_features=16, max_seq_len=16, attention_impl="reference"),
+                          mlp_features=16, max_seq_len=16),
         SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1, num_heads=1,
                       image_size=4, patch_size=2), projector, family, 30)
     objective = LMObjective(model, 4, ema_decay=None)
@@ -597,6 +611,7 @@ def reloaded(directory, state, record) -> TextGeneration:
     return TextGeneration.from_run(str(directory), step=0)
 
 
+@attending("reference")
 def test_an_earlier_yarn_record_reloads_its_saved_decoder(tmp_path):
     """A run saved when a decoder and its layer kinds stated YaRN in a field of its own beside
     `rope_scaling` reloads (`earlier_shapes`), its YaRN read as today's one rope scaling (ledger
@@ -609,7 +624,7 @@ def test_an_earlier_yarn_record_reloads_its_saved_decoder(tmp_path):
 
     yarn = YarnScaling(factor=4.0, original_max_position_embeddings=8)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
-                              max_seq_len=16, attention_impl="reference", rope_scaling=yarn,
+                              max_seq_len=16, rope_scaling=yarn,
                               layer_types=("sliding_attention", "full_attention"),
                               kinds={"sliding_attention": LayerKind(window=4, rope_scaling=yarn)})
     objective = LMObjective(model, 4, ema_decay=None)
@@ -630,6 +645,7 @@ def test_an_earlier_yarn_record_reloads_its_saved_decoder(tmp_path):
                                   model.apply(inference_projections(model, state.variables), tokens))
 
 
+@attending("reference")
 def test_an_earlier_mova_record_reloads_its_saved_decoder(tmp_path):
     """A MoVA run saved when its value experts recorded the layer dispatch they ran under, at its
     defaults, reloads (ledger 2751): the experts read their layer's routed MLP today, and the restored
@@ -639,7 +655,7 @@ def test_an_earlier_mova_record_reloads_its_saved_decoder(tmp_path):
     from dew.objectives.lm import LMObjective
 
     mova = Path(__file__).parent / "fixtures" / "hf" / "k2-horizon-mova-tiny"
-    model = Pretrained.load(mova, weights=False, dtype="float32", attention_impl="reference").model
+    model = Pretrained.load(mova, weights=False, dtype="float32").model
     objective = LMObjective(model, 4, ema_decay=None)
     state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
     record = objective.inference_record()
@@ -652,6 +668,7 @@ def test_an_earlier_mova_record_reloads_its_saved_decoder(tmp_path):
                                   model.apply(inference_projections(model, state.variables), tokens))
 
 
+@attending("reference")
 @pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "yarn"])
 def test_an_earlier_multimodal_record_reloads_its_saved_decoder(tmp_path, scaled):
     """A multimodal run saved when its nested decoder, which the wrapper records as its fields alone
@@ -667,7 +684,7 @@ def test_an_earlier_multimodal_record_reloads_its_saved_decoder(tmp_path, scaled
     yarn = YarnScaling(factor=4.0, original_max_position_embeddings=8) if scaled else None
     model = MultimodalTransformer(
         CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
-                          max_seq_len=16, attention_impl="reference", rope_scaling=yarn),
+                          max_seq_len=16, rope_scaling=yarn),
         SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1, num_heads=1, image_size=4,
                      patch_size=2),
         Qwen35Projector(hidden_size=4, spatial_merge_size=2, width=16, out_width=8, bias=True), "qwen3_5", 30)
@@ -689,6 +706,7 @@ def test_an_earlier_multimodal_record_reloads_its_saved_decoder(tmp_path, scaled
                     image_indices=images))
 
 
+@attending("reference")
 def test_every_route_generates_through_the_same_packed_projections(tmp_path):
     """A run's task and a source's hold their query/key/value and gate/up packed, packed once at
     their load from the weights they own; a live objective's task keeps the trainer's own arrays,
@@ -743,6 +761,7 @@ def test_every_route_generates_through_the_same_packed_projections(tmp_path):
         np.testing.assert_array_equal(np.asarray(exported[name]), np.asarray(tensor), err_msg=name)
 
 
+@attending("reference")
 def test_a_generation_reads_its_models_groups_once_for_every_call(tmp_path):
     """A generate call finds the groups a borrowed tree packs in the call (`pending`) without
     binding the model again: the groups a model declares are a function of the model and its
@@ -782,6 +801,7 @@ def test_a_generation_reads_its_models_groups_once_for_every_call(tmp_path):
     assert len(asked) == 2
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=3)
 def test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole(tmp_path):
     """A packed kernel's columns are its members' outputs side by side, so a run's task packs a
@@ -827,6 +847,7 @@ by `seeds_for` on armada's CPUs (2026-11-12, eg-sized2 at 0aed05577f7), 8 for ev
 sized them again."""
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("spec", [{"sequence": 2}, {"fsdp": 2, "stage": 2}, {"tensor": 2, "sequence": 2}],
                          ids=["sequence", "fsdp-stage", "tensor-sequence"])
@@ -877,6 +898,7 @@ def test_a_run_samples_on_every_trainer_layout_what_one_device_samples(tmp_path,
     assert_as_exact(served, drawn(alone), draw, label, seeds=LAYOUT_SEEDS, truth_fn=drawn(wide, "float64"))
 
 
+@attending("reference")
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     """A just-trained state is the pipeline: the averaged weights when the
     objective keeps them, the live ones on request, the objective's own
@@ -934,6 +956,7 @@ def test_a_pipeline_continues_a_conversation_its_processors_chat_template_render
     np.testing.assert_array_equal(drawn[:, :prompt.shape[1]], prompt)
 
 
+@attending("reference")
 def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
     """An LM run directory becomes a `TextGeneration` over the rebuilt model
     and restored weights, decoding through the run's tokenizer, budgeted by
@@ -959,6 +982,7 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
 
 
+@attending("xla")
 @pytest.mark.parametrize("earlier", [False, True])
 def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path, earlier):
     """A decoder fine-tuned from a checkpoint encodes text with the processor the
@@ -970,7 +994,7 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path,
     from dew.objectives.lm import LMObjective
 
     source = tokenized_qwen3(tmp_path / "source")
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="xla", max_seq_len=32)
+    loaded = Pretrained.load(source, dtype="float32", max_seq_len=32)
     objective = LMObjective(loaded, 8)
     batch = {"text": np.random.RandomState(0).randint(1, 100, (8, 9)).astype(np.int32)}
     run = tmp_path / "run"
@@ -992,6 +1016,7 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path,
                                   np.asarray(loaded.text_processor("the cat sat").tokens))
 
 
+@attending("reference")
 def test_a_checkpoints_inference_declaration_is_read_opening_no_array(tmp_path, monkeypatch):
     """A saved run's inference declaration (`Checkpoints.artifact`, which `SavedRun.at` reads before it
     loads anything) is its step's custom metadata, read from the step's own metadata file: no array of the
@@ -1013,9 +1038,11 @@ def test_a_checkpoints_inference_declaration_is_read_opening_no_array(tmp_path, 
     assert not opened
 
 
+@attending("reference")
 def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tmp_path):
     """An LM run records its decoder's task settings (`TextSettings`) and nothing else beside
-    its objective, its model and the numerics it trained under (rows 2255 and 2500), and they read back as
+    its objective, its model, the numerics it trained under (rows 2255 and 2500) and the attention kernel it
+    pinned (here the test's, `attending`), and they read back as
     the objective's own; a record holding
     another field, as a sampling temperature no LM run writes, is refused rather than loaded
     with the field ignored."""
@@ -1025,7 +1052,7 @@ def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tm
     checkpoints = Checkpoints(str(tmp_path), keep=2)
     record = checkpoints.artifact()
     assert isinstance(record, dict)
-    assert set(record) == {"objective", "model", "precision", *settings_fields(TextSettings)}
+    assert set(record) == {"objective", "model", "precision", "kernels", *settings_fields(TextSettings)}
     assert saved_settings(record, TextSettings) == objective.task_settings()
     dew.pipeline(str(tmp_path))
     checkpoints.save(int(state.step) + 1, state, artifact={**record, "temperature": 0.5})
@@ -1046,6 +1073,7 @@ def test_a_step_or_an_ema_choice_beside_a_source_is_refused(selection):
     assert isinstance(dew.pipeline(source), TextGeneration)
 
 
+@attending("reference")
 def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp_path, monkeypatch):
     """A Hub repository holding a run, as `HfApi().upload_folder` publishes
     it, loads as that run: pulled whole at the commit its metadata resolved
@@ -1072,6 +1100,7 @@ def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp
                                   local("the ", key=2, sampling=greedy).host().tokens)
 
 
+@attending("reference")
 def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp_path):
     """An LM keeps no EMA unless asked, so each reader's default takes the
     live weights of such a run: the objective's pipeline, `dew.pipeline`
@@ -1087,12 +1116,13 @@ def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp
     ):
         assert bound is expected
     Pretrained.from_run(str(run)).save(tmp_path / "export")
-    reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(tmp_path / "export", dtype="float32")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(published.model.apply(published.variables, ids)))
 
 
+@attending("reference")
 def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     """The quantization knob is the trainer's, so `RunConfig.train` writes it
     under `trainer` in run.json and `dew.pipeline` reads it back there: the
@@ -1111,7 +1141,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     ids = np.random.RandomState(0).randint(1, 250, (batch, seq + 1)).astype(np.int32)
     config = LMRunConfig(
         model=ModelConfig("causal_transformer", {**fields,
-                                               "dtype": "float32", "attention_impl": "reference"}),
+                                               "dtype": "float32"}),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, eval_every=None,
                               checkpoint_every=1, compilation_cache_dir=None, quantization=Quantization()))
     state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),
@@ -1130,6 +1160,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     assert int(state.step) == 1
 
 
+@attending("reference")
 @pytest.mark.mesh
 def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
     """A text-to-image task served by a `ScoringServer` (`TextToImage.scoring`), as an `Engine` serves it
@@ -1227,6 +1258,7 @@ def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
     assert_as_exact(served, alone, draw, label, seeds=8, truth_fn=truth)
 
 
+@attending("reference")
 def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
     """Placed under the trainer's layout, the weights shard over the mesh,
     prompts split over its batch axes, the result keeps that sharding, and
@@ -1247,6 +1279,7 @@ def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):
                                atol=2e-5, rtol=2e-5)
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("spec", [{"tensor": 2}, {"sequence": 2}, {"fsdp": 2, "stage": 2}],
                          ids=["tensor", "sequence", "fsdp-stage"])
@@ -1298,6 +1331,7 @@ def test_a_run_draws_images_on_every_trainer_layout_as_one_device_does(tmp_path,
     assert_as_exact(served, drawn(alone), draw, label, seeds=PLACED_IMAGES_SEEDS, truth_fn=truth)
 
 
+@attending("reference")
 def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajectory(tmp_path):
     """A source whose sampler pairs its own tables hands the task a `grid`:
     for a step count it answers the process and the explicit time grid the
@@ -1329,6 +1363,7 @@ def test_a_grid_prepares_the_process_and_times_and_final_denoise_ends_the_trajec
         start(prepared, steps=3, key=3)
 
 
+@attending("reference")
 def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
     objective, state = make_lm_run(tmp_path, ema_decay=None)
     with pytest.raises(ValueError):
@@ -1359,7 +1394,7 @@ def make_block_run(directory, fixture="diffusion-gemma-workflow", scale=0.0, tok
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf" / fixture
-    bundle = Pretrained.load(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
+    bundle = Pretrained.load(str(fixture), dtype="float32", max_seq_len=32)
     objective = BlockDiffusionObjective(bundle.model, prompt_length=3, variables=bundle.variables,
                                         pad_token_id=pad_token_id,
                                         processor=RunProcessor(tokenizer_for(tokenizer)))
@@ -1383,7 +1418,7 @@ def make_masked_run(directory):
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 
     fixture = Path(__file__).resolve().parent / "fixtures/hf/llada-tiny"
-    source = Pretrained.load(fixture, dtype="float32", attention_impl="xla")
+    source = Pretrained.load(fixture, dtype="float32")
     objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
                                          variables=source.variables, ema_decay=None,
                                          processor=RunProcessor(ByteTokenizer()))
@@ -1415,6 +1450,7 @@ def test_every_saved_text_kind_constructs_through_its_own_task_class(
     assert all(isinstance(row, str) for row in direct.decode(drawn))
 
 
+@attending("xla")
 def test_a_saved_block_run_pads_rows_as_its_live_task_does(tmp_path):
     """The block objective's pad id is a control of its task that a loader
     cannot read off the model, so the run records it: a restored task pads a
@@ -1431,6 +1467,7 @@ def test_a_saved_block_run_pads_rows_as_its_live_task_does(tmp_path):
     np.testing.assert_array_equal(actual.tokens, expected.tokens)
 
 
+@attending("reference")
 def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
     from dew.sampling import Sampling
 
@@ -1451,6 +1488,7 @@ def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
 
 
+@attending("reference")
 @pytest.mark.parametrize("compute,storage", [("bfloat16", None), (None, "bfloat16")])
 def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weights(
     tmp_path, compute, storage
@@ -1493,6 +1531,7 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
     np.testing.assert_array_equal(result.raw_log_probs, wanted.raw_log_probs)
 
 
+@attending("reference")
 def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_path):
     import jax.numpy as jnp
 
@@ -1556,6 +1595,7 @@ def saved_clip_run(directory):
     return config, objective, state
 
 
+@attending("reference")
 def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
     """Fit, save, restore, sample: the restored task's unconditional branch is the one the training
     step encoded (`DiffusionObjective.blank_conditions` over the step's own towers), to the bit, with a
@@ -1573,6 +1613,7 @@ def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
                                   original(["a bird", "a cat"], steps=8, key=0).host().images)
 
 
+@attending("reference")
 def test_binding_new_encoder_weights_encodes_both_branches_with_them(tmp_path):
     """A restored task binds a new encoder tree: its conditional and unconditional features and
     samples match a fresh task over those weights, not the old ones."""
@@ -1623,3 +1664,137 @@ def test_a_saved_decoder_naming_a_layer_kind_at_its_defaults_reads_as_its_class_
                         "fields": {"kinds": {"dense": kind}}}}
     assert earlier_shapes(record)["model"]["fields"]["kinds"] == {"dense": {**kind, "fields": {}}}
 
+
+def _attention_routes(task, prompt) -> set[str]:
+    """The kernels `task`'s attention routes a call of `prompt` through (`generation.routes`)."""
+    from dew.nn.kernels import generation
+
+    with generation.routes() as found:
+        task(prompt, 2, key=7)
+    return {route.kernel for route in found if route.choice == "attention"}
+
+
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned", "unpinned"])
+def test_a_run_pinning_its_attention_loads_as_tasks_routing_through_it(tmp_path, pinned):
+    """A run trained and checkpointed under its attention pin (`Diagnostics.kernels`, which `RunConfig.traced`
+    names, as `dew.kernels.use` does here) saves its steps pinned (`Objective.inference_record`): its task
+    (`TextGeneration.from_run`), its decoder bundle's (`PretrainedDecoder.from_run`) and its export's
+    reloaded (`PretrainedDecoder.load`) each route their attention through the pin, a caller's own choice
+    standing over it; a run pinning none saves no pin and loads unpinned. Where the step dropped the pin, its
+    loaded tasks fell to the selector's kernel (the API02 review)."""
+    from dew import kernels
+    from dew.interop import PretrainedDecoder
+
+    run = tmp_path / "run"
+    with kernels.use(attention="reference") if pinned else contextlib.nullcontext():
+        make_lm_run(run, ema_decay=None)
+    decoder = PretrainedDecoder.from_run(str(run))
+    decoder.save(tmp_path / "export")
+    tasks = {"from_run": TextGeneration.from_run(str(run)), "decoder": decoder.text_generation(),
+             "release": PretrainedDecoder.load(tmp_path / "export").text_generation()}
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    for name, task in tasks.items():
+        assert task.kernels == ((("attention", "reference"),) if pinned else ()), name
+        if pinned:
+            assert _attention_routes(task, prompt) == {"reference"}, name
+        with kernels.use(attention="template"):
+            assert _attention_routes(task, prompt) == {"template"}, name
+
+
+def test_a_step_an_earlier_dew_saved_naming_its_attention_kernel_loads_pinned(tmp_path):
+    """A step an earlier Dew saved whose model named its attention kernel (`attention_impl`, moved to the
+    record's pin as it is read, `earlier_shapes`) loads as a task routing its attention through it, a caller's
+    own choice standing over it (the API02 review)."""
+    from dew import kernels
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=16)
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+    record["model"]["fields"]["attention_impl"] = "reference"
+    with Checkpoints(str(tmp_path), keep=1) as checkpoints:
+        checkpoints.save(0, state, artifact=record)
+        checkpoints.wait()
+    task = TextGeneration.from_run(str(tmp_path), step=0)
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    assert task.kernels == (("attention", "reference"),)
+    assert _attention_routes(task, prompt) == {"reference"}
+    with kernels.use(attention="template"):
+        assert _attention_routes(task, prompt) == {"template"}
+
+
+def test_a_decision_releases_envelope_holds_its_runs_pin_and_states_none_unpinned():
+    """A decision release's envelope (`decision_envelope`), the task record its loader builds its bundle's
+    task under (`dew.interop.release.released`), holds the run's attention pin, read back as the release
+    task's, and writes no key where the run pinned none (the API02 review: the envelope dropped it)."""
+    from dew.decision.release import decision_envelope
+    from dew.interop.release import ReleaseTask
+    from dew.interop.release_record import Release
+
+    pinned = decision_envelope(Release(), compute="float32", kernels=(("attention", "reference"),))
+    assert pinned.task is not None and ReleaseTask.read(pinned.task).kernels == {"attention": "reference"}
+    unpinned = decision_envelope(Release(), compute="float32")
+    assert unpinned.task is not None and "kernels" not in unpinned.task
+
+
+@pytest.mark.parametrize("wrapper", ["dew.nn.multimodal:MultimodalTransformer", "diffusion_gemma"])
+def test_a_saved_wrapped_decoders_attention_pin_is_its_steps(wrapper):
+    """A step an earlier Dew saved whose wrapper's decoder named its attention kernel (`attention_impl`,
+    `MultimodalTransformer.language_model`, `DiffusionGemma.text`) reads as a declaration pinning it, the
+    field dropped (`earlier_shapes`), as a decoder's own does (above; the API02 review)."""
+    from dew.inference.tasks import SavedRun, earlier_shapes
+
+    field = "text" if wrapper == "diffusion_gemma" else "language_model"
+    record = earlier_shapes({"model": {"name": wrapper, "fields": {
+        field: {"vocab_size": 16, "attention_impl": "reference"}}}})
+    assert SavedRun("", record, 0).kernels == (("attention", "reference"),)
+    assert "attention_impl" not in json.dumps(record["model"])
+
+
+def test_a_run_naming_its_attention_kernel_by_any_selector_name_traces_under_it():
+    """A run naming its attention kernel `inference` (the attention selector's, `attention_kernels.INFERENCE`:
+    the template for a call no derivative is taken of, xla's attention for one differentiated) traces every
+    attention layer under it, each call routed to that kernel and the forward finite, where the run's name
+    was narrowed to a call's names and refused before any selection (the API02 review)."""
+    from tiny_models import build_model
+
+    from dew import kernels
+    from dew.nn.attention import chosen_attention
+    from dew.nn.kernels import generation
+
+    model = build_model("causal_transformer", dtype="float32")
+    tokens = jnp.arange(8, dtype=jnp.int32)[None] % 16
+    variables = model.init(jax.random.key(0), tokens)
+    with kernels.use(attention="inference"), generation.routes() as found:
+        assert chosen_attention() == "inference"
+        inferred = jax.jit(model.apply)(variables, tokens)
+    taken = {route.kernel for route in found if route.choice == "attention"}
+    assert taken == {"inference"}, taken
+    assert bool(jnp.all(jnp.isfinite(inferred)))
+
+
+
+def test_a_calls_sampling_keeps_the_tasks_criteria_and_strategy_where_it_names_none():
+    """A call's `sampling=` runs over its task's policy by one rule (`Sampling.with_defaults_of`): what it
+    leaves at its defaults, its EOS id, its stopping criteria and its strategy, it keeps of the task's;
+    what it names is its own (Train 1208's review F1: a call's sampling dropped its task's criteria and its
+    beam search, drawing past the one and sampling where the other searched)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.sampling import Sampling
+    from dew.sampling.decoding import MaxNewTokens
+    from dew.sampling.strategies import Beam
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8)
+    bound = Sampling(eos_token_ids=(15,), stopping=(MaxNewTokens(3),), strategy=Beam(width=2))
+    task = TextGeneration(model, jax.eval_shape(model.init, jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+                          sampling=bound)
+    kept = task.controls(Sampling(temperature=0.5))
+    assert (kept.temperature, kept.eos_token_ids, kept.strategy) == (0.5, (15,), Beam(width=2))
+    assert MaxNewTokens(3) in kept.stopping
+    named = task.controls(Sampling(temperature=0.5, stopping=(MaxNewTokens(2),), strategy=Beam(width=3)))
+    assert named.strategy == Beam(width=3)
+    assert MaxNewTokens(2) in named.stopping and MaxNewTokens(3) not in named.stopping

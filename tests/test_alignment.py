@@ -11,6 +11,7 @@ import pytest
 from diffusion_support import TanhLayer
 from flax import linen as nn
 from interop_support import extract_fixture
+from model_support import attending
 from recorded_runs import assert_as_exact_as_recorded
 from reference_error import assert_as_exact_over_orders, distance
 
@@ -283,6 +284,7 @@ def test_from_run_publishes_the_model_without_the_alignment_head(tmp_path):
                                   published([{}, {}], key=9).host().images)
 
 
+@attending("xla")
 def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     """A REPA run on the tiny Flux holds the encoder its tree lacks and draws
     the projector; a step moves both sides. (REPA-E over a published pipeline tunes

@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from arm_arithmetic import float64_held
+from model_support import attending
 from reference_error import assert_as_exact
 from test_decision_objective import SPECIALS, TOKENIZER
 
@@ -45,7 +46,7 @@ READOUT_SEEDS = 8
 
 def backbone(softcap: float | None = 3.0) -> CausalTransformer:
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                             max_seq_len=128, attention_impl="xla", final_logit_softcap=softcap)
+                             max_seq_len=128, final_logit_softcap=softcap)
 
 
 def ids(count: int = 3) -> tuple[tuple[int, ...], ...]:
@@ -78,6 +79,7 @@ def test_a_labelled_row_writes_lettered_lines_and_reads_its_answer_at_the_cue():
     assert laid.label_ids == ids()
 
 
+@attending("xla")
 def test_the_tied_readout_is_the_backbones_own_logit_at_each_label():
     """The tied readout is the backbone's softcapped logit at each label at the answer cue: on par
     from float64 with the backbone's full logits there, the labels' columns taken (check 1)."""
@@ -100,11 +102,12 @@ def test_the_tied_readout_is_the_backbones_own_logit_at_each_label():
                     seeds=READOUT_SEEDS)
 
 
+@attending("reference")
 def test_a_lora_adapted_heads_readout_is_its_own_logits_at_the_labels():
     """A backbone whose output head carries a LoRA adapter is no single table (`output_table` None):
     the tied readout reads its exact head over the answer states (`LogitsFromHidden`), on par from
     float64 with the adapted backbone's full logits at each label (check 1), its factors nonzero."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=128)
+    source = Pretrained.load(LLAMA, dtype="float32", max_seq_len=128)
     adapted = source.adapt(LoRA(rank=2, modules=("lm_head",)), key=0)
     objective = DecisionObjective(adapted, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   head=LabelReadout(64, ids()))
@@ -174,6 +177,7 @@ def test_an_untied_readout_drawn_from_a_table_is_its_tied_readout():
     assert_as_exact(drawn, columns, draw, "untied drawn", seeds=READOUT_SEEDS)
 
 
+@attending("xla")
 def test_a_runs_untied_readout_starts_as_its_tied_readout():
     """The objective draws an untied readout from its backbone's table (`complete_variables`): a run's
     first logits, over rows its head admits (`validate_rows`), are the tied readout's over the same
@@ -195,6 +199,7 @@ def test_a_runs_untied_readout_starts_as_its_tied_readout():
                     seeds=READOUT_SEEDS)
 
 
+@attending("xla")
 def test_a_slot_heads_scores_are_the_releases_law_with_its_query_and_key_trained():
     """A release's slot head scores slot i as <slot_i, h> + <q h, k m_i> / sqrt(head_dim), m_i the mean
     final state over option i's line, with no bias and no softcap: on par from float64 with that law
@@ -241,6 +246,7 @@ def written_law(decision, params, trained, batch):
     return jnp.where(batch.options, logits, -jnp.inf)
 
 
+@attending("xla")
 def test_a_slot_head_reads_none_of_the_tokens_its_options_lines_leave_out():
     """A slot head pools each option's line alone: states that are NaN at every token no line holds
     and no answer cue reads, as a padded or diverged row's can be, give the logits the finite states
@@ -273,6 +279,7 @@ def padded(batch: DecisionInputs, width: int) -> DecisionInputs:
                                option_spans=jnp.pad(batch.option_spans, ((0, 0), (0, 0), (0, more), (0, 0))))
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["tied", "untied", "slots"])
 def test_a_readout_of_as_many_labels_as_options_reads_a_pass_padded_past_them(kind):
     """A pass pads its option slots past a question's (`Decide`'s shape buckets): a readout of exactly
@@ -300,6 +307,7 @@ def test_a_slot_heads_work_is_each_real_options_slot_key_and_pooling():
     assert head.decision_flops(lengths, questions, options) == expected
 
 
+@attending("xla")
 def test_a_parallel_labelled_rows_lines_read_none_of_each_other():
     """In the parallel layout each lettered line starts at the first one's position, a slot of its own,
     and the cue after the longest reads them all: over a causal backbone no line reads another,
@@ -350,6 +358,7 @@ def _exit_passes(gates: np.ndarray, threshold: float) -> np.ndarray:
     return np.where(reached.any(axis=0), reached.argmax(axis=0) + 1, len(gates))
 
 
+@attending("xla")
 @pytest.mark.parametrize("head", ["labels", "slots"])
 def test_a_served_looped_readout_reports_the_pass_each_answer_cue_exited_at(head):
     """A readout of labels over a looped backbone served under an exit threshold reports each answer's

@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import transformers_arms
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
@@ -31,9 +32,10 @@ WORKFLOW = FIXTURES / "diffusion-gemma-workflow"
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def system():
     config = json.loads((WORKFLOW / "config.json").read_text())
-    model = adapter.build(config, dtype="float32", attention_impl="xla")
+    model = adapter.build(config, dtype="float32")
     variables, _ = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
     process = adapter.generation_process(
         config, json.loads((WORKFLOW / "generation_config.json").read_text())
@@ -150,6 +152,7 @@ def assert_canvas_logits(model, variables, network, draw, label: str, seeds: int
     assert_as_exact(dew_canvas(model, variables), reference, draw, label, seeds=seeds, truth_fn=truth)
 
 
+@attending("xla")
 def test_diffusion_gemma_deferred_translation_materializes_the_same_model(system):
     """Text checkpoint leaves stay deferred until placement asks for their arrays, while their
     materialized tree retains the eager decoder's parameter values."""
@@ -164,6 +167,7 @@ def test_diffusion_gemma_deferred_translation_materializes_the_same_model(system
         np.testing.assert_array_equal(actual, expected)
 
 
+@attending("xla")
 def test_diffusion_gemma_export_reads_only_the_requested_decoder_tensor(system):
     """A resident model's export can name and plan its tensors without transferring values back
     to the host. Looking up a tensor later yields the stored source's values."""
@@ -178,6 +182,7 @@ def test_diffusion_gemma_export_reads_only_the_requested_decoder_tensor(system):
     np.testing.assert_array_equal(result[name], original[name])
 
 
+@attending("xla")
 def test_diffusion_gemma_writes_back_its_releases_generation_config_and_self_conditioning(system):
     """The release's generation config reads into a process that writes back every field it stated, and its
     self-conditioning tensors export under the names and with the values the release stores: one
@@ -196,6 +201,7 @@ def test_diffusion_gemma_writes_back_its_releases_generation_config_and_self_con
         np.testing.assert_array_equal(exported[name], original[name], err_msg=name)
 
 
+@attending("xla")
 def test_native_shared_model_forward_matches_reference(system):
     """Bare and self-conditioned canvas logits after drawn prompts of five
     tokens, held to transformers' own (`assert_canvas_logits`). Five prompt
@@ -223,6 +229,7 @@ def _laid(model, layout):
     return model.clone(text=model.text.with_kv_cache(layout))
 
 
+@attending("xla")
 @pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
 def test_a_canvas_reads_its_cache_alike_paged_or_dense(system, quantized):
     """A canvas whose encoder prefix sits in a paged cache, full precision or quantized (int8's keys stored
@@ -239,6 +246,7 @@ def test_a_canvas_reads_its_cache_alike_paged_or_dense(system, quantized):
     np.testing.assert_array_equal(logits(KVCache(quantized=quantized, page_size=4)),
                                   logits(KVCache(quantized=quantized)))
 
+@attending("xla")
 def test_multi_canvas_generation_matches_full_reference_loop(system):
     model, variables, process, reference, _ = system
     inputs = ModelInputs(jnp.asarray(reference["prompt"]))
@@ -251,6 +259,7 @@ def test_multi_canvas_generation_matches_full_reference_loop(system):
     assert not bool(result.terminated.any())
 
 
+@attending("xla")
 def test_canvas_continuations_refine_the_shared_prefill_without_moving_the_first_one(system):
     """Several continuations per prompt refine the encoded prompt again, each
     over the original prompt rows: continuation zero is the reference loop's
@@ -286,6 +295,7 @@ def test_canvas_continuations_refine_the_shared_prefill_without_moving_the_first
         draw(0)
 
 
+@attending("xla")
 @pytest.mark.parametrize("budget", [0, 3, 7])
 def test_canvas_generation_can_resume_at_committed_boundaries(system, budget):
     from dew.diffusion.block import CanvasPlan, _advance, _begin, _materialize
@@ -308,6 +318,7 @@ def test_canvas_generation_can_resume_at_committed_boundaries(system, budget):
     np.testing.assert_array_equal(result.decoder_steps, expected.decoder_steps)
 
 
+@attending("xla")
 def test_refinements_return_the_last_prediction_without_an_extra_call(system):
     """Raw final-step error below 1e-4 on the complete reference trajectory."""
     model, variables, process, reference, _ = system
@@ -320,6 +331,7 @@ def test_refinements_return_the_last_prediction_without_an_extra_call(system):
     np.testing.assert_array_equal(state.argmax, reference["tokens"][:, 5:9])
 
 
+@attending("xla")
 def test_adaptive_stopping_resets_for_each_canvas(system):
     model, variables, process, reference, _ = system
     quick = replace(process, stability_threshold=0, confidence_threshold=10.0)
@@ -330,6 +342,7 @@ def test_adaptive_stopping_resets_for_each_canvas(system):
     np.testing.assert_array_equal(result.lengths, [7, 7])
 
 
+@attending("xla")
 def test_eos_finishes_rows_independently_and_padding_is_not_a_token(system):
     model, variables, process, reference, _ = system
     eos = int(reference["eos_id"])
@@ -342,6 +355,7 @@ def test_eos_finishes_rows_independently_and_padding_is_not_a_token(system):
     np.testing.assert_array_equal(result.terminated, [True, False])
 
 
+@attending("xla")
 def test_checkpoint_export_keeps_updated_weights_and_generation(system):
     model, variables, process, reference, config = system
     changed = jax.tree.map(lambda value: value + jnp.asarray(0.001, value.dtype), variables)
@@ -359,6 +373,7 @@ def test_checkpoint_export_keeps_updated_weights_and_generation(system):
     np.testing.assert_array_equal(actual.tokens, wanted.tokens)
 
 
+@attending("xla")
 def test_zero_tokens_does_not_prefill_and_capacity_uses_whole_canvases(system):
     model, variables, process, reference, _ = system
     inputs = ModelInputs(jnp.asarray(reference["prompt"]))
@@ -376,11 +391,12 @@ def released_fixture(name: str, canvas_length: int):
     directory = FIXTURES / name
     config = {"model_type": "diffusion_gemma", "canvas_length": canvas_length,
               "text_config": json.loads((directory / "config.json").read_text())}
-    model = adapter.build(config, dtype="float32", attention_impl="xla")
+    model = adapter.build(config, dtype="float32")
     variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
     return directory, model, variables, transformers_model(directory, canvas_length)
 
 
+@attending("xla")
 def test_the_released_layout_denoiser_matches_the_reference():
     """tools/hf_reference.py's diffusion-gemma-denoise-tiny: the released
     checkpoint layout (text weights under both the encoder and the decoder
@@ -395,6 +411,7 @@ def test_the_released_layout_denoiser_matches_the_reference():
                              "released conditioned" if previous else "released bare")
 
 
+@attending("xla")
 def test_a_sliding_denoiser_reads_its_whole_canvas_past_its_window():
     """tools/hf_reference.py's diffusion-gemma-window-tiny: a sliding layer
     of window 4 under prompts of 6 and canvases of 6. The decoder's sliding
@@ -407,6 +424,7 @@ def test_a_sliding_denoiser_reads_its_whole_canvas_past_its_window():
         seeds=WINDOW_SEEDS)
 
 
+@attending("xla")
 def test_media_prefill_and_canvas_generation_match_reference(system):
     """The complete image-conditioned forward over drawn pixels and canvases,
     the vision tower included, held to transformers' own
@@ -424,6 +442,7 @@ def test_media_prefill_and_canvas_generation_match_reference(system):
     np.testing.assert_array_equal(generated.decoder_steps, reference["image_steps"])
 
 
+@attending("xla")
 def test_canvases_continue_the_prompts_logical_positions(system):
     """Each canvas is refined and committed on from its prompt's logical
     positions (`CanvasDecodeState.positions`), so a prompt whose positions
@@ -439,6 +458,7 @@ def test_canvases_continue_the_prompts_logical_positions(system):
     np.testing.assert_array_equal(result.decoder_steps, reference["steps"])
 
 
+@attending("xla")
 def test_padded_prefill_keeps_each_rows_logical_cache_position(system):
     model, variables, _, reference, _ = system
     tokens = jnp.array([[0, 0, 2, 3, 4], [2, 5, 7, 9, 11]], jnp.int32)
@@ -455,6 +475,7 @@ def test_padded_prefill_keeps_each_rows_logical_cache_position(system):
         np.testing.assert_allclose(batched[row:row + 1], np.asarray(expected), atol=1e-5, rtol=0)
 
 
+@attending("xla")
 def test_canvas_generation_rejects_lossy_token_coercion_and_batched_keys(system):
     model, variables, process, reference, _ = system
     with pytest.raises(ValueError):
@@ -492,6 +513,7 @@ def test_the_tempered_logits_divide_by_the_reference_temperature_at_every_step()
     assert_as_exact(tempered, reference, draw, "tempered logits", seeds=TEMPER_SEEDS)
 
 
+@attending("xla")
 def test_a_canvas_whose_model_scores_nothing_refuses_rather_than_draw_a_token(system):
     """A canvas refinement draws each unfinished position from the model's scores; scores of NaN
     hold no distribution, so generation raises instead of committing arbitrary tokens."""

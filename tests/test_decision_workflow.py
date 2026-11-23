@@ -17,6 +17,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from model_support import attending
 from real_tokenizers import backbone_reading
 from reference_error import assert_fp32_reduction_bound
 from run_kinds import cli_settings, saved_record, scalars
@@ -214,6 +215,7 @@ def answered(cell: Mapping, run: str) -> np.ndarray:
     return np.asarray(answer["intent"].probabilities)
 
 
+@attending("xla")
 @pytest.mark.parametrize("cell", CELLS, ids=lambda cell: cell.name)
 def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, tmp_path):
     run, _ = recorded(cell, backbone, tmp_path).trained()
@@ -302,7 +304,7 @@ def assert_released_as_its_bundle(task: Decide, directory: Path, requests: list,
     bundle it releases (`Decide.of`), its weights on the host: every weight and its answers to `requests`
     bit for bit."""
     task.save_pretrained(directory)
-    reloaded = Decide.from_pretrained(directory, attention_impl="xla")
+    reloaded = Decide.from_pretrained(directory)
     host = dataclasses.replace(task, variables=jax.tree.map(np.asarray, task.variables))
     bundled = Decide.of(PretrainedDecision.of(host))
     # Every weight by its path: a head of no weights (a letter readout's) holds an empty collection or none.

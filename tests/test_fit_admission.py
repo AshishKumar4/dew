@@ -14,6 +14,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Replaying
+from model_support import attending
 from objective_cases import IMAGES
 
 from dew.batch import VALID_ROWS
@@ -39,13 +40,14 @@ class Built(JepaRunConfig):
         return objective
 
 
+@attending("xla")
 def test_a_jepa_predictor_takes_the_width_its_encoder_was_built_at(tmp_path):
     """An encoder whose width its record pins as a default (a run recorded at another class default)
     is built at that width, and the predictor it feeds takes the same width: before, the predictor
     read the stated fields alone and took its class's 384 (AT-06)."""
     rows = TFDS("dew_images", path=str(IMAGES), split="all").pipe(presets.images, 16, batch=8)
     encoder = ModelConfig("jepa_encoder", {"patch_size": 2, "num_layers": 1, "num_heads": 2, "mlp_ratio": 2,
-                                           "dtype": "float32", "attention_impl": "xla"},
+                                           "dtype": "float32"},
                           defaults={"emb_features": 16})
     run = Built(model=encoder, predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
                 data=rows.read("memory").loading(Loading(workers=0)),
@@ -134,6 +136,7 @@ def test_a_validation_split_of_undeclared_inputs_is_refused_before_the_run_train
     assert stepped.values == []
 
 
+@attending("reference")
 @pytest.mark.parametrize("metric", ["mean", "own"])
 @pytest.mark.parametrize("eval_every", [None, 2], ids=["at-the-end", "midway"])
 def test_a_validation_split_holding_no_field_its_metric_reads_is_refused_before_the_run_trains(eval_every,
@@ -152,7 +155,7 @@ def test_a_validation_split_holding_no_field_its_metric_reads_is_refused_before_
     tokens = np.tile(np.asarray([[0, 1, 2, 3, 0]], np.int32), (8, 1))
     rows = Memory({"text": tokens}).read("memory").loading(Loading(workers=0, threads=1, read_buffer=1))
     model = CausalTransformer(vocab_size=4, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
-                              max_seq_len=4, attention_impl="reference")
+                              max_seq_len=4)
     class Captions:
         """A metric of a user's own, no `Mean`, that reads the captions beside its scores (`Metric`'s
         `fields`), as FID reads its reference images: the captions it was handed, counted."""

@@ -30,6 +30,7 @@ from interop_support import (
     fixture_arrays,
     scaled_gap,
 )
+from model_support import attending
 from safetensors.numpy import load_file, save_file
 
 from dew.interop.autoencoders.dc_ae import load_dc_ae
@@ -165,6 +166,7 @@ def test_a_run_trains_behind_the_dc_ae_its_checkpoint_names(source, tmp_path):
     np.testing.assert_array_equal(np.asarray(rebound.encode(rebound.params, image)), expected)
 
 
+@attending("reference")
 def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     """A diffusion run places the DC-AE's variables beside the model's and
     trains the model alone. Placement reads a leaf's axes from its module's
@@ -187,7 +189,7 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
         model=ModelConfig(
             "simple_dit",
             {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1,
-             "dtype": "float32", "attention_impl": "reference"},
+             "dtype": "float32"},
         ),
         data=images_of("tfds://oxford_flowers102", 16, batch=8),
         trainer=TrainerConfig(steps=2),

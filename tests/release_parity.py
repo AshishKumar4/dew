@@ -42,8 +42,9 @@ class ReleaseParity:
     """Each recorded `gradient.<name>`'s head parameter, by its path in the head's tree."""
     blocks: bool = False
     """Whether the release reads its rows in blocks, whose numbering its engine recorded (`blocks`)."""
-    attention_impl: str = "reference"
-    """The attention the release is loaded with, as its own tests load it."""
+    attention: str = "reference"
+    """The attention kernel the release runs on (`generation.chosen(attention=...)`), as its own tests run
+    it."""
     every_slot: bool = False
     """Whether the recording states its scores at every option slot `[R, Q, O]`, 0 past the real options,
     rather than at the real ones alone."""
@@ -61,8 +62,7 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
     from dew.interop import Pretrained
 
     # A release of an engine outside Dew states no task of Dew's: its bundle's (`Decide.of`).
-    task = Decide.of(Pretrained.load(parity.release(scratch), dtype="float32",
-                                     attention_impl=parity.attention_impl))
+    task = Decide.of(Pretrained.load(parity.release(scratch), dtype="float32"))
     seeds = declared_seeds(parity.recording)[parity.site]
     draw, reference, truth = indexed_recording(recording(parity.recording), parity.site, seeds)
     requests = json.loads(parity.requests.read_text())

@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 from lane_environment import outside_suite
 from diffusion_stubs import RES, TOKENS, StubText
+from model_support import attending
 from PIL import Image
 from process_support import dew_train, logged_losses, raised
 from test_inference import make_run
@@ -84,6 +85,7 @@ def test_readme_demo_resumes_updates_its_policy_freezes_the_reference_and_draws_
                                   np.concatenate(list(uint8_pixels(preview)), axis=1))
 
 
+@attending("reference")
 def test_text_to_image_example_records_requested_seeds_and_their_real_pixels(tmp_path, monkeypatch):
     """A trained local DiT and real tiny CLIP render the manifest's prompts and keys."""
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")

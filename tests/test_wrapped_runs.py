@@ -12,6 +12,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Replaying
+from model_support import attending
 
 import dew
 from dew.config import TrainerConfig
@@ -66,9 +67,10 @@ def logits(model, variables):
 
 def decoder() -> CausalTransformer:
     return CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                             mlp_features=32, max_seq_len=16, attention_impl="reference")
+                             mlp_features=32, max_seq_len=16)
 
 
+@attending("reference")
 @pytest.mark.parametrize("order", ["lora, then the trainer's quantization", "quantization, then lora"])
 def test_a_run_reloads_its_lora_and_quantization_in_the_order_it_trained_them(tmp_path, order):
     """A LoRA run the trainer quantizes holds the adapter inside the
@@ -98,6 +100,7 @@ def test_a_run_reloads_its_lora_and_quantization_in_the_order_it_trained_them(tm
     assert float(np.max(np.abs(logits(unquantized, task.variables) - logits(task.model, task.variables)))) > 0
 
 
+@attending("reference")
 def test_a_quantized_run_trains_on_from_its_own_record(tmp_path):
     """`--trainer.quantization` is the trainer's: the run's own run.json
     builds the model unwrapped and the trainer wraps it once more, so a run
@@ -108,7 +111,7 @@ def test_a_quantized_run_trains_on_from_its_own_record(tmp_path):
 
     def run(directory, steps, config=None):
         fields = {"vocab_size": 64, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
-                  "mlp_features": 32, "max_seq_len": 16, "attention_impl": "reference"}
+                  "mlp_features": 32, "max_seq_len": 16}
         config = config or LMRunConfig(
             model=ModelConfig("causal_transformer", fields),
             trainer=TrainerConfig(checkpoint_dir=str(directory), steps=steps,
@@ -131,6 +134,7 @@ def test_a_quantized_run_trains_on_from_its_own_record(tmp_path):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
+@attending("reference")
 @pytest.mark.parametrize("fixture", ["modelopt/mixed", "modelopt/tiny", "nvfp4_qdq/e4m3"],
                          ids=["modelopt fp8 and nvfp4", "modelopt nvfp4", "compressed-tensors nvfp4"])
 def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantization(tmp_path, fixture):
@@ -140,7 +144,7 @@ def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantizat
     reloads computing the run's logits bit for bit, which the same weights
     without the scheme do not."""
     pytest.importorskip("qwix")
-    source = Pretrained.load(FIXTURES / "codecs" / fixture, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURES / "codecs" / fixture, dtype="float32")
     objective = LMObjective(source.model, SEQ, variables=source.variables)
     state, task = trained_run(tmp_path, objective, 90)
 
@@ -153,6 +157,7 @@ def test_a_run_of_an_input_quantized_checkpoint_reloads_with_its_input_quantizat
     assert float(np.max(np.abs(logits(plain, task.variables) - logits(task.model, task.variables)))) > 0
 
 
+@attending("reference")
 def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_end(tmp_path):
     """A run of an input-quantized checkpoint resumed from its own record
     rebuilds the model with no source at hand: its `init` declares the scales
@@ -161,8 +166,7 @@ def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_en
     steps end, scales and weights bit for bit."""
     from dew.config import RunConfig
 
-    source = Pretrained.load(FIXTURES / "codecs" / "nvfp4_qdq" / "e4m3", dtype="float32",
-                             attention_impl="reference")
+    source = Pretrained.load(FIXTURES / "codecs" / "nvfp4_qdq" / "e4m3", dtype="float32")
 
     def run(directory, steps, record=None):
         config = record or LMRunConfig(model=ModelConfig.from_model(source.model),
@@ -190,6 +194,7 @@ def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_en
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
+@attending("xla")
 def test_a_block_run_the_trainer_quantizes_reloads_quantized(tmp_path):
     """The trainer quantizes the block objective's training view; the model
     its record and task read is wrapped the same way at its serving
@@ -203,7 +208,7 @@ def test_a_block_run_the_trainer_quantizes_reloads_quantized(tmp_path):
     from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     bundle = Pretrained.load(str(FIXTURES / "hf" / "diffusion-gemma-workflow"), dtype="float32",
-                             attention_impl="xla", max_seq_len=32)
+                             max_seq_len=32)
     objective = BlockDiffusionObjective(bundle.model, prompt_length=3, variables=bundle.variables,
                                         processor=RunProcessor(tokenizer_for("byte")))
     serving = objective.model.text.max_seq_len

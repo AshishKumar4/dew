@@ -201,10 +201,10 @@ class DiffusionRunConfig(RunConfig):
                              f"{self.objective.name} trains on its data")
 
         if self.pretrained is not None:
-            # The pipeline's own denoiser trains; the model flags it reads are
-            # its compute dtype and attention kernel.
+            # The pipeline's own denoiser trains; the model flag it reads is its compute dtype (its
+            # attention kernel the run's, `diagnostics.kernels`).
             scratch = ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG))
-            reads = ("dtype", "attention_impl")
+            reads = ("dtype",)
             chosen = [name for name, named in (
                 ("model", self.model.name != scratch.name or any(
                     self.model.fields.get(key) != scratch.fields.get(key)
@@ -492,7 +492,7 @@ class DiffusionRunConfig(RunConfig):
         return load_diffusion_source(
             reference.name, revision=reference.revision,
             dtype=dtype_name(jax.numpy.dtype(self.compute_dtype())), param_dtype=keywords["param_dtype"],
-            attention_impl=self.source_attention(), size=self.sample_field().shape[:-1],
+            size=self.sample_field().shape[:-1],
             variables=variables, mesh=keywords.get("mesh"), layout=keywords.get("layout"),
             weights=keywords.get("weights", True), **self.source.keywords())
 

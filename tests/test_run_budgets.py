@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from data_support import Fanned, Questioned, Twice, jittered
+from model_support import attending
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 from test_barren_reads import Untouched
@@ -908,6 +909,7 @@ def test_an_examples_budget_over_a_mixture_counts_each_corpus_examples_whatever_
     assert read[3] + read[2] // 3 == EXAMPLES
 
 
+@attending("xla")
 @pytest.mark.parametrize("shuffled", [True, False], ids=["shuffled", "in-order"])
 def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_rows_each_makes(shuffled):
     """A decision objective lays an example out as a row a question: an examples budget over examples

@@ -29,6 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import respelled
+from model_support import attending
 from safetensors.numpy import load_file
 
 from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_weights
@@ -37,6 +38,7 @@ from dew.registry import projectors, towers
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 
+@attending("reference")
 @pytest.mark.parametrize("family", ["gemma3-tiny-mm", "gemma4-tiny-mm"])
 def test_a_gemma_wrapper_keeps_image_and_source_block_visibility_together(tmp_path, family):
 
@@ -44,7 +46,7 @@ def test_a_gemma_wrapper_keeps_image_and_source_block_visibility_together(tmp_pa
 
     directory = respelled(FIXTURES / family, tmp_path / "source", lambda config: {
         **config, "modeling_overrides": {"attention": {"sliding_attention": "block_bidirectional"}}})
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     tokens = jnp.asarray([[10, 11, 12, 13]], jnp.int32)
     altered = tokens.at[0, 1].set(14)
     groups = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
@@ -57,6 +59,7 @@ def test_a_gemma_wrapper_keeps_image_and_source_block_visibility_together(tmp_pa
         assert np.any(first(tokens, **{field: groups}) != first(altered, **{field: groups})), field
 
 
+@attending("reference")
 def test_an_explicit_causal_source_override_exports_through_the_native_decoder(tmp_path):
 
     from dew.interop import Pretrained
@@ -64,22 +67,23 @@ def test_an_explicit_causal_source_override_exports_through_the_native_decoder(t
 
     directory = respelled(FIXTURES / "llama-tiny", tmp_path / "source", lambda config: {
         **config, "modeling_overrides": {"attention": {"full_attention": "causal"}}})
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     exported = tmp_path / "derived"
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(exported)
-    restored = Pretrained.load(exported, dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(exported, dtype="float32")
     tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     np.testing.assert_array_equal(restored.model.apply(restored.variables, tokens),
                                   loaded.model.apply(loaded.variables, tokens))
 
 
+@attending("reference")
 def test_a_wrapper_dtype_change_reaches_the_decoder_that_computes_its_logits():
     """Changing the multimodal model's run dtype changes its native text decoder too, while the
     fp32 master variables remain reusable by the original model."""
     from dew.interop import Pretrained
     from dew.registry import ModelConfig
 
-    loaded = Pretrained.load(FIXTURES / "qwen35-tiny-mm", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURES / "qwen35-tiny-mm", dtype="float32")
     changed = ModelConfig.from_model(loaded.model).with_dtype("bfloat16").build()
     ids = jnp.asarray([[1, 2, 3]], jnp.int32)
     original = loaded.model.apply(loaded.variables, ids)
@@ -91,6 +95,7 @@ def test_a_wrapper_dtype_change_reaches_the_decoder_that_computes_its_logits():
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids), original)
 
 
+@attending("reference")
 def test_released_block_attention_matches_transformers_against_float64():
     """The release's own mask adapter over independent block layouts, including causal-only
     rows, judged against the paired fp32 and float64 transformers recordings."""
@@ -100,7 +105,7 @@ def test_released_block_attention_matches_transformers_against_float64():
     from dew.interop import Pretrained
 
     directory = FIXTURES / "qwen35-blocks-tiny"
-    source = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(directory, dtype="float32")
     path = directory / "reference.npz"
     seeds = declared_seeds(path)["blocks"]
     draw, reference, truth = indexed_recording(recording(path), "blocks", seeds)
@@ -114,6 +119,7 @@ def test_released_block_attention_matches_transformers_against_float64():
                     seeds=seeds, truth_fn=truth)
 
 
+@attending("reference")
 def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mate(tmp_path):
     """A source declaring block attention changes visibility only where runtime block IDs admit
     it. A future block mate can affect the earlier token, and source export preserves that rule."""
@@ -123,7 +129,7 @@ def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mat
     directory = respelled(FIXTURES / "qwen35-tiny-mm", tmp_path / "source", lambda config: {
         **config, "modeling_overrides": {"attention": {"full_attention": "block_bidirectional",
                                                        "linear_attention": "causal"}}})
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     altered = ids.at[0, 1].set(7)
     blocked = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
@@ -134,11 +140,12 @@ def test_wrapper_block_overrides_survive_export_and_admit_their_future_block_mat
     np.testing.assert_array_equal(first(loaded, ids), first(loaded, altered))
     assert np.any(first(loaded, ids, blocked) != first(loaded, altered, blocked))
     loaded.save(tmp_path / "export")
-    restored = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path / "export", dtype="float32")
     np.testing.assert_array_equal(first(restored, ids, blocked), first(loaded, ids, blocked))
     np.testing.assert_array_equal(first(restored, ids), first(loaded, ids))
 
 
+@attending("xla")
 def test_a_wrapper_whose_parts_compute_in_a_dtype_of_their_own_exports_and_reloads_alike(tmp_path):
     """A wrapper whose parts state a dtype of their own (a run's model, its projection in float32) is the
     computation its family writes, as the wrapper computes its parts in its own numerics
@@ -149,11 +156,11 @@ def test_a_wrapper_whose_parts_compute_in_a_dtype_of_their_own_exports_and_reloa
 
     from dew.interop import Pretrained, PretrainedDecoder
 
-    loaded = Pretrained.load(FIXTURES / "qwen38-dense-tiny", dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(FIXTURES / "qwen38-dense-tiny", dtype="float32")
     model = loaded.model.clone(projection=dataclasses.replace(loaded.model.projection, dtype="float32"))
     bundle = PretrainedDecoder.from_model(model, loaded.variables)
     bundle.save(tmp_path / "export")
-    restored = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="xla")
+    restored = Pretrained.load(tmp_path / "export", dtype="float32")
     assert (restored.model.dtype, restored.model.precision) == (model.dtype, model.precision)
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)),
@@ -201,6 +208,7 @@ def test_wrapper_tower_and_projector_match_the_reference():
             - projector_ref)) < tolerance
 
 
+@attending("reference")
 def test_every_stored_spelling_of_a_media_tensor_writes_back_from_its_one_leaf(tmp_path):
     """A checkpoint may store a vision tensor under two names that load to one leaf; a trained
     leaf writes back under both, so the export reloads as the trained model, neither name kept
@@ -221,13 +229,13 @@ def test_every_stored_spelling_of_a_media_tensor_writes_back_from_its_one_leaf(t
     spelled = "model.vision_tower.embeddings.patch_embedding.bias"
     tensors[spelled.removeprefix("model.")] = tensors[spelled]
     save_file(tensors, source / "model.safetensors")
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32")
     trained = dataclasses.replace(loaded, variables=jax.tree.map(lambda leaf: leaf + 0.25, loaded.variables))
     trained.save(tmp_path / "export")
     written = load_file(tmp_path / "export" / "model.safetensors")
     np.testing.assert_array_equal(written[spelled], tensors[spelled] + 0.25)
     np.testing.assert_array_equal(written[spelled.removeprefix("model.")], written[spelled])
-    Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    Pretrained.load(tmp_path / "export", dtype="float32")
 
 
 def _without(source: Path, target: Path, dropped) -> Path:
@@ -243,6 +251,7 @@ def _without(source: Path, target: Path, dropped) -> Path:
     return target
 
 
+@attending("reference")
 def test_a_text_only_load_is_the_wrappers_language_model_as_its_text_checkpoint(tmp_path):
     """`text_only` loads Qwen3.5's language model alone: a checkpoint without its vision tower loads as
     a decoder holding no media part, it computes the wrapper's text logits bit for bit, and it saves as
@@ -252,8 +261,8 @@ def test_a_text_only_load_is_the_wrappers_language_model_as_its_text_checkpoint(
 
     source = FIXTURES / "qwen35-native-tiny"
     blind = _without(source, tmp_path / "blind", lambda name: name.startswith("model.visual."))
-    text = Pretrained.load(blind, dtype="float32", attention_impl="reference", text_only=True)
-    wrapper = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    text = Pretrained.load(blind, dtype="float32", text_only=True)
+    wrapper = Pretrained.load(source, dtype="float32")
     assert isinstance(text, PretrainedDecoder) and isinstance(text.model, CausalTransformer)
     ids = jnp.asarray(np.load(source / "input_ids.npy"))
     ids = jnp.where(ids < text.model.vocab_size, ids, 0)
@@ -265,7 +274,7 @@ def test_a_text_only_load_is_the_wrappers_language_model_as_its_text_checkpoint(
     assert (config["model_type"], config["architectures"]) == ("qwen3_5_text", ["Qwen3_5ForCausalLM"])
     assert not any(name.startswith(("model.visual.", "visual.")) for name in load_file(
         tmp_path / "export" / "model.safetensors"))
-    reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(tmp_path / "export", dtype="float32")
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), logits)
 
 
@@ -293,6 +302,7 @@ def test_the_pipeline_selects_what_a_source_loads(tmp_path):
         pipeline(str(tmp_path / "run"), options=SourceOptions(text_only=True))
 
 
+@attending("reference")
 def test_a_text_only_load_takes_a_checkpoint_without_its_prediction_depth():
     """A Qwen3.5 release whose config names one prediction depth but whose checkpoint holds the trunk
     alone (re-saved by transformers, which builds no depth) loads text-only as that trunk."""
@@ -300,7 +310,7 @@ def test_a_text_only_load_takes_a_checkpoint_without_its_prediction_depth():
 
     config = json.loads((FIXTURES / "qwen35-blocks-tiny" / "config.json").read_text())
     assert config["text_config"]["mtp_num_hidden_layers"] == 1
-    text = Pretrained.load(FIXTURES / "qwen35-blocks-tiny", dtype="float32", attention_impl="reference",
+    text = Pretrained.load(FIXTURES / "qwen35-blocks-tiny", dtype="float32",
                            text_only=True)
     assert text.model.num_nextn_predict_layers == 0
     assert not any(str(name).startswith("mtp_") for name in text.variables["params"])
@@ -321,6 +331,7 @@ def _misshapen_depths(source: Path, target: Path, depth: str) -> Path:
     return target
 
 
+@attending("reference")
 @pytest.mark.parametrize(("fixture", "depth", "text_only"), [("glm4-moe-tiny", "model.layers.2.", False),
                                                              ("qwen38-dense-tiny", "mtp.", True),
                                                              ("qwen38-dense-tiny", "mtp.", False)],
@@ -333,7 +344,7 @@ def test_a_load_builds_and_reads_only_the_prediction_depths_it_keeps(tmp_path, f
     from dew.interop import Pretrained
 
     def load(directory, **options):
-        return Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=text_only,
+        return Pretrained.load(directory, dtype="float32", text_only=text_only,
                                **options)
 
     def decoder(loaded):
@@ -361,6 +372,7 @@ def test_a_load_builds_and_reads_only_the_prediction_depths_it_keeps(tmp_path, f
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
 
 
+@attending("reference")
 @pytest.mark.parametrize("text_only", [False, True], ids=["wrapper", "text"])
 def test_a_wrappers_nested_prediction_layer_is_the_depth_a_load_drops(tmp_path, text_only):
     """Qwen3.5's prediction layer stored under the wrapper's `model.language_model.mtp.*`, a spelling
@@ -373,7 +385,7 @@ def test_a_wrappers_nested_prediction_layer_is_the_depth_a_load_drops(tmp_path, 
     from dew.interop import Pretrained
 
     def load(directory, **options):
-        return Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=text_only,
+        return Pretrained.load(directory, dtype="float32", text_only=text_only,
                                **options)
 
     source = FIXTURES / "qwen38-dense-tiny"
@@ -392,6 +404,7 @@ def test_a_wrappers_nested_prediction_layer_is_the_depth_a_load_drops(tmp_path, 
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(other))
 
 
+@attending("reference")
 @pytest.mark.parametrize("text_only", [False, True], ids=["wrapper", "text"])
 def test_a_discarded_depths_conflicting_spellings_are_never_compared(tmp_path, text_only):
     """A depth `prediction_depths=0` drops is read by none, its spellings neither: a copy of Qwen3.5
@@ -405,7 +418,7 @@ def test_a_discarded_depths_conflicting_spellings_are_never_compared(tmp_path, t
     from dew.interop import Pretrained
 
     def load(directory, **options):
-        return Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=text_only,
+        return Pretrained.load(directory, dtype="float32", text_only=text_only,
                                **options)
 
     source = FIXTURES / "qwen38-dense-tiny"
@@ -426,6 +439,7 @@ def test_a_discarded_depths_conflicting_spellings_are_never_compared(tmp_path, t
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(other))
 
 
+@attending("reference")
 @pytest.mark.parametrize("fixture", ["deepseek-v4-dspark-tiny", "deepseek-v41-tiny"])
 def test_a_drafter_is_kept_whole_or_not_at_all(tmp_path, fixture):
     """A DSpark drafter's stages draft as one, its heads on its last: a count of all its stages keeps
@@ -434,7 +448,7 @@ def test_a_drafter_is_kept_whole_or_not_at_all(tmp_path, fixture):
     from dew.interop import Pretrained
 
     def load(directory, **options):
-        return Pretrained.load(directory, dtype="float32", attention_impl="reference", **options)
+        return Pretrained.load(directory, dtype="float32", **options)
 
     def drafted(loaded) -> int:
         dspark = loaded.model.dspark
@@ -460,6 +474,7 @@ def test_a_prediction_depth_count_below_zero_is_refused(depths):
         Pretrained.load(FIXTURES / "glm4-moe-tiny", dtype="float32", prediction_depths=depths)
 
 
+@attending("reference")
 def test_a_text_only_load_keeps_what_the_wrapper_declares_for_its_language_model(tmp_path):
     """What a wrapper declares at its own scope governs its language model alone: block reading its
     modeling overrides turn on still admits a future block mate, and its end-of-text id still ends
@@ -480,8 +495,8 @@ def test_a_text_only_load_keeps_what_the_wrapper_declares_for_its_language_model
     tensors[spelled.removeprefix("model.")] = tensors[spelled] + 1
     save_file(tensors, directory / "model.safetensors", metadata={"format": "pt"})
     with pytest.raises(ValueError):
-        Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    text = Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=True)
+        Pretrained.load(directory, dtype="float32")
+    text = Pretrained.load(directory, dtype="float32", text_only=True)
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     altered, blocked = ids.at[0, 1].set(7), jnp.asarray([[0, 0, -1, -1]], jnp.int32)
 
@@ -493,6 +508,7 @@ def test_a_text_only_load_keeps_what_the_wrapper_declares_for_its_language_model
     assert eos_ids(text.config, text.generation_config) == (3,)
 
 
+@attending("reference")
 @pytest.mark.parametrize(("fixture", "dropped"), [
     ("qwen35-native-tiny", "model.visual.patch_embed.proj.weight"),
     ("qwen35-native-tiny", "model.visual.merger.linear_fc1.weight"),
@@ -514,7 +530,7 @@ def test_a_wrapper_missing_a_tensor_of_a_component_it_builds_is_refused(tmp_path
     kept = {name: array for name, array in tensors.items() if name != dropped}
     save_file(kept, target / "model.safetensors", metadata={"format": "pt"})
     with pytest.raises(ValueError):
-        Pretrained.load(target, dtype="float32", attention_impl="reference")
+        Pretrained.load(target, dtype="float32")
 
 
 def quantized_fp8(directory, prefix: str, modules_to_not_convert: list[str]):
@@ -541,6 +557,7 @@ def quantized_fp8(directory, prefix: str, modules_to_not_convert: list[str]):
     return directory
 
 
+@attending("reference")
 def test_a_quantized_wrapper_loads_text_only_as_its_quantized_text_checkpoint(tmp_path):
     """A Qwen3.5 wrapper whose language model is stored in FP8 blocks, one projection and the tower left
     unconverted by name, loads `text_only` as the quantized text checkpoint does: its module selection
@@ -553,11 +570,11 @@ def test_a_quantized_wrapper_loads_text_only_as_its_quantized_text_checkpoint(tm
     kept = "model.language_model.layers.0.mlp.down_proj"
     wrapper = quantized_fp8(Path(shutil.copytree(source, tmp_path / "wrapper")), "model.language_model.",
                             [kept, "model.visual"])
-    plain = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True)
+    plain = Pretrained.load(source, dtype="float32", text_only=True)
     plain.save(tmp_path / "text")
     text = quantized_fp8(tmp_path / "text", "model.", ["model.layers.0.mlp.down_proj"])
-    taken = Pretrained.load(wrapper, dtype="float32", attention_impl="reference", text_only=True)
-    expected = Pretrained.load(text, dtype="float32", attention_impl="reference")
+    taken = Pretrained.load(wrapper, dtype="float32", text_only=True)
+    expected = Pretrained.load(text, dtype="float32")
     assert taken.model == expected.model
     jax.tree.map(np.testing.assert_array_equal, taken.variables, expected.variables)
 
@@ -594,6 +611,7 @@ TEXT_FP8 = ["model.language_model.layers.0.mlp.down_proj", "lm_head"]
 """The wrapper's language-model modules the ModelOpt scenarios store in FP8."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("table", ["modules", "container", "nested head", "nested", "tower alone"])
 def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_and_all(table, tmp_path):
     """A Qwen3.5 wrapper whose ModelOpt per-layer table puts a projection, the head and a tower's layer in
@@ -626,11 +644,11 @@ def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_an
         stored, _ = read_file(wrapper / "model.safetensors")
         write_file({f"model.language_model.{name}" if name.startswith("lm_head.") else name: value
                     for name, value in stored.items()}, wrapper / "model.safetensors", {"format": "pt"})
-    plain = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True)
+    plain = Pretrained.load(source, dtype="float32", text_only=True)
     plain.save(tmp_path / "text")
     renamed = [module.replace("model.language_model.", "model.") for module in texts]
     text = modelopt_fp8(tmp_path / "text", renamed) if renamed else tmp_path / "text"
-    load = {"dtype": "float32", "attention_impl": "reference"}
+    load = {"dtype": "float32"}
     taken, expected = Pretrained.load(wrapper, text_only=True, **load), Pretrained.load(text, **load)
     # Each load binds its input quantization in a class of its own, so the two compute alike, not one class.
     jax.tree.map(np.testing.assert_array_equal, taken.variables, expected.variables)
@@ -708,6 +726,7 @@ VLM_TEXT_SEEDS = 8
 """Their text logits' declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("model_type", sorted(VLM_TEXT))
 def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type):
     """Qwen2.5-VL's and Qwen3-VL-MoE's text decoders, which transformers builds no causal LM for, load
@@ -737,7 +756,7 @@ def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type
     model = built(torch.float32)
     scatter_weights(model)
     model.save_pretrained(tmp_path / "saved")
-    loaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="reference", text_only=True)
+    loaded = Pretrained.load(tmp_path / "saved", dtype="float32", text_only=True)
     forward = jax.jit(loaded.model.apply)
     wide = float64_twin(model, lambda: built(torch.float64)).eval()
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
@@ -752,6 +771,6 @@ def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type
                        if key not in ("model_type", "tie_word_embeddings")}, **restated}
     shutil.copytree(tmp_path / "saved", tmp_path / "restated")
     (tmp_path / "restated" / "config.json").write_text(json.dumps(restated))
-    again = Pretrained.load(tmp_path / "restated", dtype="float32", attention_impl="reference",
+    again = Pretrained.load(tmp_path / "restated", dtype="float32",
                             text_only=True)
     jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)

@@ -12,6 +12,7 @@ import optax
 import pytest
 from lane_environment import per_test_settings
 from interop_support import extract_fixture
+from model_support import attending
 
 from dew.nn.attention import forward_mode_attention, scaled_dot_product_attention
 from dew.objectives.diffusion.consistency import (
@@ -130,6 +131,7 @@ def test_forward_mode_attention_leaves_a_jvp_capable_kernel_as_it_is():
     np.testing.assert_allclose(np.asarray(tangent), np.asarray(reference_tangent), rtol=1e-5, atol=1e-6)
 
 
+@attending("xla")
 @pytest.mark.parametrize("time_scale", [.001, 16.])
 def test_continuous_consistency_trains_a_teacher_with_its_own_time_scale(time_scale):
     """The student differentiates the loaded Fourier table and takes a finite sCM update."""
@@ -142,7 +144,7 @@ def test_continuous_consistency_trains_a_teacher_with_its_own_time_scale(time_sc
     from dew.training import Trainer
 
     model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2,
-                       time_scale=time_scale, attention_impl="xla")
+                       time_scale=time_scale)
     inputs = InputSpec(Field("image", (4, 4, 3)))
     teacher = DiffusionObjective(model, Flow(), inputs, guidance=None, solver=Euler(), ema_decay=None)
     weights = teacher.init(jax.random.key(1))
@@ -173,6 +175,7 @@ class _Teacher(NamedTuple):
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def saved_teacher(tmp_path_factory) -> _Teacher:
     """A flow run trained one step and saved as its run saves it, its task's record beside its weights,
     shared by the module's distillations of it, made under settings of its own as a test's are
@@ -197,7 +200,7 @@ def _saved_teacher(root: Path) -> _Teacher:
 
     teacher_run = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
-                                         "time_scale": 0.002, "dtype": "float32", "attention_impl": "xla"}),
+                                         "time_scale": 0.002, "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
@@ -225,6 +228,7 @@ ALTERNATING = {"teacher_guidance": 2.0, "tangent_warmup": 1, "student_update_fre
 """The run's rCM fields: guidance past one, a warmup of one step, the student every other step."""
 
 
+@attending("xla")
 def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_critic(saved_teacher):
     """The teacher is a saved run; the student and fake score start from it, reading its Fourier table
     whatever scale the model record names. Past the warmup one step in two trains the student and the
@@ -267,6 +271,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     assert size({k: v for k, v in critic.items() if k != FAKE_SCORE}) == 0 and size(critic[FAKE_SCORE]) > 0
 
 
+@attending("xla")
 def test_a_lora_student_distills_the_saved_teacher_without_its_adapter(saved_teacher):
     """A LoRA student distills the same teacher, whose model and the fake score's are the run's without
     the adapter: it starts as the run that has none, up to its branch's rounding, and its training step
@@ -300,6 +305,7 @@ def test_a_lora_student_distills_the_saved_teacher_without_its_adapter(saved_tea
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(tuned.variables[FROZEN]))
 
 
+@attending("xla")
 def test_a_saved_student_samples_as_its_objective_and_holds_its_teacher(saved_teacher, tmp_path):
     """The saved student's task samples as the objective's own; a saved student, which holds its
     teacher, loads without its teacher's run."""
@@ -325,6 +331,7 @@ def test_a_saved_student_samples_as_its_objective_and_holds_its_teacher(saved_te
                                   expected)
 
 
+@attending("xla")
 def test_an_accumulated_distillation_alternates_its_networks_update_by_update(saved_teacher):
     """An update of rCM takes two microbatches (`accumulation=2`), each of its update's phase: the
     loss reads the committed updates (`Step.updates`), so a critic update's second microbatch leaves
@@ -360,6 +367,7 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(sa
                for leaf in jax.tree.leaves(tree))
 
 
+@attending("xla")
 def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_path):
     """`--pretrained <pipeline> --objective rcm` with no teacher run: the
     teacher is the model the run loads, its weights bitwise the source's,
@@ -388,7 +396,7 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
                                    data=images_of("tfds://oxford_flowers102", 16),
                                        val_metrics=(),
                                    objective=ObjectiveConfig("rcm", {"ema_decay": None})).build()
-    source = load_diffusion_source(pipeline, dtype="float32", attention_impl="xla", size=(16, 16))
+    source = load_diffusion_source(pipeline, dtype="float32", size=(16, 16))
     direct = ConsistencyDistillationObjective(source, objective.process, None, ema_decay=None)
     assert (to_record(objective.task_settings(), ImageSettings)
             == to_record(direct.task_settings(), ImageSettings))

@@ -36,7 +36,7 @@ tools/deepseek_v41_numerics.py's, not this one."""
 def _translated(name):
     """A fixture's decoder config, leaving compute settings to the caller."""
     config = translate_config(json.loads((FIXTURES / name / "config.json").read_text()))
-    return {key: value for key, value in config.items() if key not in ("dtype", "attention_impl")}
+    return {key: value for key, value in config.items() if key != "dtype"}
 
 
 DECODERS = ({case.name: case.config for case in ARCHITECTURE_CASES

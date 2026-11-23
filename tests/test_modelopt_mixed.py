@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import stored_codec
+from model_support import attending
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
@@ -43,6 +44,7 @@ def test_static_fp8_inputs_match_modelopts_own_fake_quantizer(reference, dtype):
                                       expected.view(np.uint32))
 
 
+@attending("reference")
 def test_a_dense_head_copy_beside_the_mixed_table_is_checked_before_narrowing(tmp_path):
     """The mixed table quantizes the projections alone, so a tied source's
     dense lm_head.weight is read as stored and checked against the
@@ -53,23 +55,22 @@ def test_a_dense_head_copy_beside_the_mixed_table_is_checked_before_narrowing(tm
     tensors = read_weights(FIXTURE)
     config = json.loads((FIXTURE / 'config.json').read_text())
     embedding = tensors['model.embed_tokens.weight']
-    without = Pretrained.load(FIXTURE, dtype='float32', param_dtype='bfloat16', attention_impl='reference')
+    without = Pretrained.load(FIXTURE, dtype='float32', param_dtype='bfloat16')
 
     for name, head in (('equal', embedding.copy()), ('unequal', embedding + 1)):
         directory = tmp_path / name
         save_hf_layout({**tensors, 'lm_head.weight': head}, config, directory)
         (directory / 'hf_quant_config.json').write_text((FIXTURE / 'hf_quant_config.json').read_text())
-    copied = Pretrained.load(tmp_path / 'equal', dtype='float32', param_dtype='bfloat16',
-                             attention_impl='reference')
+    copied = Pretrained.load(tmp_path / 'equal', dtype='float32', param_dtype='bfloat16')
     assert jax.tree.structure(copied.variables) == jax.tree.structure(without.variables)
     for ours, theirs in zip(jax.tree.leaves(copied.variables), jax.tree.leaves(without.variables),
                             strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
     with pytest.raises(ValueError):
-        Pretrained.load(tmp_path / 'unequal', dtype='float32', param_dtype='bfloat16',
-                        attention_impl='reference')
+        Pretrained.load(tmp_path / 'unequal', dtype='float32', param_dtype='bfloat16')
 
 
+@attending("reference")
 @pytest.mark.parametrize('uniform', ['FP8', 'W4A16_NVFP4'])
 def test_a_checkpoint_of_one_modelopt_algorithm_loads_as_that_algorithms_layers_in_a_mixed_one(
         tmp_path, uniform):
@@ -95,7 +96,7 @@ def test_a_checkpoint_of_one_modelopt_algorithm_loads_as_that_algorithms_layers_
                                                                  'quant_method': 'modelopt'}}, tmp_path)
     (tmp_path / 'hf_quant_config.json').write_text(json.dumps({'producer': producer,
                                                                'quantization': quantization}))
-    load = {'dtype': 'float32', 'param_dtype': 'bfloat16', 'attention_impl': 'reference'}
+    load = {'dtype': 'float32', 'param_dtype': 'bfloat16'}
     single, mixed = Pretrained.load(tmp_path, **load), Pretrained.load(FIXTURE, **load)
     params = (jax.tree.leaves(single.variables['params']), jax.tree.leaves(mixed.variables['params']))
     for ours, theirs in zip(*params, strict=True):
@@ -124,6 +125,7 @@ def nvfp4(name: str, weight: np.ndarray) -> dict[str, np.ndarray]:
     return codec.encode(name, weight)
 
 
+@attending("reference")
 @pytest.mark.parametrize('quantized', ['attention', 'experts'])
 def test_a_modelopt_nvfp4_model_with_experts_is_read_by_its_stored_layers(tmp_path, quantized):
     """ModelOpt may quantize a model's attention and leave its experts dense: written as one
@@ -153,7 +155,7 @@ def test_a_modelopt_nvfp4_model_with_experts_is_read_by_its_stored_layers(tmp_pa
 
     uniform = written(tmp_path / 'uniform', {'quant_algo': 'NVFP4', 'group_size': 16})
     mixed = written(tmp_path / 'mixed', {'quant_algo': 'MIXED_PRECISION', 'quantized_layers': layers})
-    load = {'dtype': 'float32', 'attention_impl': 'reference'}
+    load = {'dtype': 'float32'}
     if quantized == 'experts':
         for directory in (uniform, mixed):
             with pytest.raises(ValueError):
@@ -191,6 +193,7 @@ def fp8(name: str, weight: np.ndarray, input_scale: float, weight_scale: float |
     return codec.encode(name, weight)
 
 
+@attending("reference")
 def test_a_modelopt_fp8_model_with_fused_projections_quantizes_every_member_input(tmp_path):
     """Phi-3 stores its query, key and value as one `qkv_proj`, and its gate and up as one
     `gate_up_proj`. Written as ModelOpt FP8, each fused weight's one input scale quantizes the one
@@ -223,7 +226,7 @@ def test_a_modelopt_fp8_model_with_fused_projections_quantizes_every_member_inpu
         decoded[name] = codec.decode(tensors, name)
     save_hf_layout(decoded, config, tmp_path / 'decoded')
 
-    load = {'dtype': 'float32', 'attention_impl': 'reference'}
+    load = {'dtype': 'float32'}
     quantized = Pretrained.load(tmp_path / 'fp8', **load)
     dense = Pretrained.load(tmp_path / 'decoded', **load)
     members = {'q_proj': 'qkv_proj', 'k_proj': 'qkv_proj', 'v_proj': 'qkv_proj', 'o_proj': 'o_proj',
@@ -255,6 +258,7 @@ def test_a_modelopt_fp8_model_with_fused_projections_quantizes_every_member_inpu
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), logits)
 
 
+@attending("reference")
 def test_a_fused_and_a_stored_member_with_unequal_input_scales_are_refused(tmp_path):
     """A fused tensor beside an equal member stored apart binds that member's Linear twice: with
     unequal input scales, one calibration would be dropped, so the load is refused."""
@@ -279,4 +283,4 @@ def test_a_fused_and_a_stored_member_with_unequal_input_scales_are_refused(tmp_p
     (tmp_path / 'hf_quant_config.json').write_text(json.dumps(
         {'producer': producer, 'quantization': {'quant_algo': 'FP8', 'kv_cache_quant_algo': None}}))
     with pytest.raises(ValueError):
-        Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
+        Pretrained.load(tmp_path, dtype='float32')

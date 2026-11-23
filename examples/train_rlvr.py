@@ -70,10 +70,11 @@ from dew.inference import (
     NativeRolloutServer,
     OpenAICompletion,
     OpenAIRolloutServer,
-    SafetensorsReload,
+    PagedKV,
     Server,
     TextGeneration,
 )
+from dew.inference.rollouts import SafetensorsReload
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop import PretrainedDecoder
 from dew.nn.backbones.decoder_block import remat_policy
@@ -499,7 +500,7 @@ def native_server(source, sampling: Sampling, *, slots: int, capacity: int) -> N
             slots=slots,
             capacity=capacity,
             # A group's samples repeat their prompt: its pages are prefilled once.
-            kv_cache="shared",
+            cache=PagedKV(shared=True),
         )
     )
 

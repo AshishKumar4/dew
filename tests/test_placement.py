@@ -16,6 +16,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding
+from model_support import attending
 from placement_cases import LAYOUT, MIN_SHARD, TRAINED, cases, declared
 
 from dew.batch import unboxed
@@ -94,6 +95,7 @@ def placed_case(name: str):
     return mesh, module, args, variables, Layout(min_shard=MIN_SHARD).shardings(mesh, variables)
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("name", sorted(cases()))
 def test_each_parameter_is_placed_by_its_declared_axes(name):
@@ -153,6 +155,7 @@ PARITY_SEEDS = {"causal_transformer": 32, "causal_transformer+moe": 64}
 """Each trained case's seeds, as `seeds_for` sized them on its paired arms."""
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("name", TRAINED)
 def test_a_step_placed_by_the_layout_trains_on_par_with_one_device(name):
@@ -182,6 +185,7 @@ def pipeline_placed(name: str, source):
     return placed
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=8)
 def test_a_pipelines_state_and_load_are_placed_by_their_declared_axes_and_load_alike(tmp_path):
     """The tiny Flux pipeline's training state, its frozen CLIP and T5 encoders by their own tables beside
@@ -196,9 +200,9 @@ def test_a_pipelines_state_and_load_are_placed_by_their_declared_axes_and_load_a
 
     source = extract_fixture(Path(__file__).with_name("fixtures") / "flux_source.tar.xz", tmp_path)
     placed = pipeline_placed("flux", source)
-    on_mesh = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla", mesh=LAYOUT,
+    on_mesh = Pretrained.load(str(source / "pipeline"), dtype="float32", mesh=LAYOUT,
                               layout=Layout(min_shard=MIN_SHARD))
-    alone = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    alone = Pretrained.load(str(source / "pipeline"), dtype="float32")
     trained = {jax.tree_util.keystr(path): sharding
                for path, sharding in jax.tree_util.tree_leaves_with_path(placed.variables)}
     loaded = jax.tree_util.tree_leaves_with_path(on_mesh.variables)
@@ -209,6 +213,7 @@ def test_a_pipelines_state_and_load_are_placed_by_their_declared_axes_and_load_a
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(whole), err_msg=key)
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=8)
 def test_a_pipelines_frozen_language_tower_is_split_as_its_draw_declares(tmp_path):
     """Qwen-Image's frozen language tower, held under its encoder's `text_encoder`, is placed by the axes
@@ -228,6 +233,7 @@ def test_a_pipelines_frozen_language_tower_is_split_as_its_draw_declares(tmp_pat
     assert tower and any(TENSOR_AXIS in mesh_axes(entry) for sharding in tower for entry in sharding.spec)
 
 
+@attending("xla")
 def test_a_fresh_starts_program_for_a_gpu_draws_through_rolled_loops():
     """A fresh run's start program compiled for a GPU (`start_compiled`, as a run compiled ahead and a run
     starting compile it) draws through threefry's rounds as loops (`dew.training.distributed.drawing`), a

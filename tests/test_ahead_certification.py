@@ -22,12 +22,16 @@ from dew.nn.kernels.templates import report
 from dew.training import MeshSpec
 from dew.training.ahead import _targeted
 
-target = MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30))
-trainer = fine_tune(target, xla=True, split=2, dtype="bfloat16")
-batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-with _targeted(trainer, batch, what="test", platforms=(frozenset({"gpu"}),)):
-    ops = [c.op for c in report.certifications()]
-print(json.dumps({"ops": ops}))
+from dew.nn.kernels.generation import chosen
+
+# The fine-tune's attention XLA's (`chosen`), as `fine_tune(xla=True)` named it before row 11938.
+with chosen(attention="xla"):
+    target = MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30))
+    trainer = fine_tune(target, split=2, dtype="bfloat16")
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    with _targeted(trainer, batch, what="test", platforms=(frozenset({"gpu"}),)):
+        ops = [c.op for c in report.certifications()]
+    print(json.dumps({"ops": ops}))
 """
     result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
                    variables={"CUDA_VISIBLE_DEVICES": ""})

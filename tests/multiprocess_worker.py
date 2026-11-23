@@ -1447,7 +1447,7 @@ def mode_replicated_rollout(args) -> dict:
     rank, processes = jax.process_index(), jax.process_count()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla")
+                              dtype="float32")
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     drawn = np.random.default_rng(rank)
     scored = []
@@ -1500,8 +1500,8 @@ def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank, o
         key = jax.random.split(jax.random.key(23), 2) if fault == "key" and rank == 1 else jax.random.key(23)
         try:
             if fault == "component":
-                generate(model, state.variables, inputs_for(local), 4, key=key, sampling=sampling,
-                         logits=(jax.tree_util.Partial(rewrite),))
+                generate(model, state.variables, inputs_for(local), 4, key=key,
+                         sampling=dataclasses.replace(sampling, logits=(jax.tree_util.Partial(rewrite),)))
             else:
                 rollout(state, broken, key, objective=objective)
         except (ValueError, RuntimeError) as error:
@@ -1660,8 +1660,6 @@ def mode_inference_pipeline(args) -> dict:
     np.testing.assert_allclose(default_images, drawn.host().images, atol=2e-5, rtol=2e-5)
     rejected = []
     if args.processes > 1:
-        from dataclasses import replace
-
         from jax.experimental import multihost_utils
 
         prepared = images.prepare(prompts, steps=3, key=5)
@@ -1672,11 +1670,13 @@ def mode_inference_pipeline(args) -> dict:
             "steps": lambda: images(prompts, steps=0 if rank == 1 else 3, key=5),
             "row_count": lambda: images.prepare(prompts[:1] if rank == 1 else prompts, steps=3, key=5),
             "prepared": lambda: images(
-                replace(prepared, noise=prepared.noise[:, :-1]) if rank == 1 else prepared, steps=3, key=5
+                dataclasses.replace(prepared,
+                                    noise=prepared.noise[:, :-1]) if rank == 1 else prepared, steps=3, key=5
             ),
-            "prepared_rows": lambda: images(replace(padded_one, rows=rank + 1), steps=3, key=5),
+            "prepared_rows": lambda: images(dataclasses.replace(padded_one, rows=rank + 1), steps=3, key=5),
             "request_kind": lambda: images(prepared if rank == 1 else prompts, steps=3, key=5),
-            "budget": lambda: replace(text, max_new_tokens=None if rank == 1 else 4)(requests, key=5),
+            "budget": lambda: dataclasses.replace(text, max_new_tokens=None if rank == 1 else 4)(requests,
+                                                                                                 key=5),
         }
         for name, call in calls.items():
             try:
@@ -1736,7 +1736,7 @@ def mode_continuations(args) -> dict:
     rank, processes = jax.process_index(), jax.process_count()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla")
+                              dtype="float32")
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
     prompts, lengths = continuation_prompts()
@@ -1766,7 +1766,7 @@ def mode_continuations(args) -> dict:
             raise AssertionError("a rank did not return from the rejected request")
     from dew.interop import Pretrained
     source = Pretrained.load(Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow",
-                             dtype="float32", attention_impl="xla", max_seq_len=32)
+                             dtype="float32", max_seq_len=32)
     canvas_prompts = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"] * 2
     canvas_rows = len(canvas_prompts) // processes
     canvas_prompts = canvas_prompts[rank * canvas_rows:(rank + 1) * canvas_rows]
@@ -1950,7 +1950,6 @@ def mode_decoding_components(args) -> dict:
     """
     import jax
     import jax.numpy as jnp
-    from jax.experimental import multihost_utils
 
     from dew.inference import TextGeneration
     from dew.inference.loading import place
@@ -1962,7 +1961,7 @@ def mode_decoding_components(args) -> dict:
     rank, processes = jax.process_index(), jax.process_count()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla",
+                              dtype="float32",
                               num_nextn_predict_layers=1)
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
@@ -1977,13 +1976,15 @@ def mode_decoding_components(args) -> dict:
 
     chain = (decoding.RepetitionPenalty(1.3), jax.tree_util.Partial(raise_last),
              decoding.Temperature(0.8), decoding.TopK(5))
-    task = TextGeneration(model, placed, sampling=Sampling(temperature=0.8, top_k=5, pad_token_id=12),
-                          logits=chain, stopping=(decoding.MaxNewTokens(3),))
+    task = TextGeneration(model, placed,
+                          sampling=Sampling(temperature=0.8, top_k=5, pad_token_id=12, logits=chain,
+                                            stopping=(decoding.MaxNewTokens(3),)))
     result = task(request, 4, key=7).host()
     # An explicit chain replaces these sampling filters. Their rank-local
     # values are not part of the executed policy or its agreement identity.
-    equivalent = task(request, 4, key=7, logits=chain,
-                      sampling=Sampling(temperature=0.3 + rank, top_k=2 + rank, pad_token_id=12)).host()
+    equivalent = task(request, 4, key=7,
+                      sampling=Sampling(temperature=0.3 + rank, top_k=2 + rank, pad_token_id=12,
+                                        logits=chain)).host()
     for name in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
         if not np.array_equal(getattr(result, name), getattr(equivalent, name)):
             raise AssertionError(f"unused sampling filters changed {name}")
@@ -1992,44 +1993,14 @@ def mode_decoding_components(args) -> dict:
                    for asking in ((0, 1) if processes == 1 else (rank,))}
     refused, undefined = [], None
     if processes > 1:
-        divergences = {
-            "criterion payload": (
-                chain,
-                (decoding.EndOfSequence(jnp.asarray([3 if rank == 1 else 5], jnp.int32)),),
-            ),
-            "transform identity": (
-                (
-                    *chain[:1],
-                    jax.tree_util.Partial(
-                        (lambda state, scores: scores.at[:, 0].add(4.0)) if rank == 1 else raise_last
-                    ),
-                    *chain[2:],
-                ),
-                (),
-            ),
-            "transform payload": (
-                (
-                    decoding.RepetitionPenalty(1.3),
-                    decoding.SuppressTokens(jnp.asarray([2 if rank == 1 else 6], jnp.int32)),
-                ),
-                (),
-            ),
-        }
-        for name, (logits, stopping) in divergences.items():
-            try:
-                task(request, 4, key=7, logits=logits, stopping=stopping)
-            except (ValueError, RuntimeError, AssertionError) as failure:
-                refused.append(name)
-                del failure
-            else:
-                raise AssertionError(f"a peer's different {name} was accepted")
-            # A rank stranded in a collective never reaches this rendezvous.
-            arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
-            if arrivals.tolist() != list(range(processes)):
-                raise AssertionError("a rank did not return from the rejected request")
+        from decoding_divergences import refused_divergences
+
+        refused = refused_divergences(task, request, chain, raise_last)
         undefined = _undefined_draw(task, request, rank, processes)
-        agreed = task(request, 4, key=7, logits=chain,
-                      stopping=(decoding.EndOfSequence(jnp.asarray([5], jnp.int32)),)).host()
+        agreed = task(request, 4, key=7,
+                      sampling=dataclasses.replace(task.sampling, logits=chain,
+                                                   stopping=(decoding.EndOfSequence(jnp.asarray([5],
+                                                                                                jnp.int32)),))).host()
         if int(agreed.lengths.sum()) < 1:
             raise AssertionError("the agreed request emitted nothing")
     searched, drafted = _ragged_decoding_checks(model, params, prompts, placed, request)
@@ -2081,7 +2052,9 @@ def _undefined_draw(task, request, rank: int, processes: int) -> str:
         return jnp.where(rows >= scores.shape[0] * (processes - 1) // processes, -jnp.inf, scores)
 
     try:
-        task(request, 4, key=7, logits=(jax.tree_util.Partial(undefined_where_the_last_process_reads),))
+        task(request, 4, key=7,
+             sampling=dataclasses.replace(task.sampling,
+                                          logits=(jax.tree_util.Partial(undefined_where_the_last_process_reads),)))
     except ValueError as failure:
         undefined = str(failure)
     else:
@@ -2109,14 +2082,17 @@ def _ragged_decoding_checks(model, params, prompts, placed, request):
         step = jnp.argmax(model.apply(params, walked)[:, -1], axis=-1)[:, None].astype(jnp.int32)
         walked = jnp.concatenate([walked, step], axis=1)
     early = (decoding.EndOfSequence(jnp.asarray([int(walked[0, -1])], jnp.int32)),)
-    searched = TextGeneration(model, placed, sampling=Sampling(pad_token_id=12), stopping=early,
-                              strategy=Beam(width=3, length_penalty=0.7), n=2)(
+    searched = TextGeneration(model, placed,
+                              sampling=Sampling(pad_token_id=12, stopping=early,
+                                                strategy=Beam(width=3, length_penalty=0.7)), n=2)(
                                   request, 4, key=7).host()
-    drafted = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_token_id=12),
-                             stopping=early, strategy=Speculative(block=3))(
+    drafted = TextGeneration(model, placed,
+                             sampling=Sampling(temperature=0, pad_token_id=12, stopping=early,
+                                               strategy=Speculative(block=3)))(
                                  request, 5, key=7).host()
-    plain = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_token_id=12),
-                           stopping=early)(request, 5, key=7).host()
+    plain = TextGeneration(model, placed,
+                           sampling=Sampling(temperature=0, pad_token_id=12, stopping=early))(request, 5,
+                                                                                              key=7).host()
     if not np.array_equal(drafted.tokens, plain.tokens):
         raise AssertionError("speculation and sampling disagreed on a greedy pool run")
     return searched, drafted
@@ -2135,7 +2111,7 @@ def mode_masked_generation(args) -> dict:
 
     rank, processes = jax.process_index(), jax.process_count()
     source = Pretrained.load(Path(__file__).parent / "fixtures/hf/llada-tiny",
-                             dtype="float32", attention_impl="xla")
+                             dtype="float32")
     prompts = np.asarray([[120, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12],
                           [0, 0, 120, 5], [0, 6, 7, 8], [0, 0, 0, 9]], np.int32)
     valid = np.asarray([[1, 1, 1, 1]] * 3 + [[0, 0, 1, 1], [0, 1, 1, 1], [0, 0, 0, 1]], bool)
@@ -2362,7 +2338,7 @@ def mode_decision_publish(args) -> dict:
     from dew.training import Layout, MeshSpec
 
     mesh = MeshSpec(fsdp=jax.device_count()).build()
-    placed = Pretrained.load(args.release, dtype="float32", attention_impl="xla", mesh=mesh,
+    placed = Pretrained.load(args.release, dtype="float32", mesh=mesh,
                              layout=Layout(min_shard=1, tolerance=1.0))
     written = rollouts.SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32")
     written.write(placed.variables)

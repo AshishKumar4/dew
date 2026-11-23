@@ -315,10 +315,8 @@ def pairs_dense_kernel_gradient_holds_check_1_on_blackwell(out_dtype, k_major):
     product, shapes = _pair_gradient(out_dtype, k_major=k_major)
 
     def draw(seed):
-        keys = jax.random.split(jax.random.key(seed), 2)
-        return tuple(jax.random.normal(key, shape.shape).astype(shape.dtype)
-                     for key, shape in zip(keys, shapes, strict=True))
-
+        rng = np.random.default_rng(seed)
+        return tuple(rng.normal(size=shape.shape).astype(shape.dtype) for shape in shapes)
     def plain(lhs, rhs, wide=jnp.float32):
         lhs, rhs = (lhs.T, rhs.T) if k_major else (lhs, rhs)
         return jnp.dot(lhs.T.astype(wide), rhs.astype(wide),
@@ -419,9 +417,8 @@ def a_pairs_partial_extents_hold_check_1_on_blackwell(rows, depth, width, transp
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
-                jnp.asarray(rng.normal(size=matrix) / np.sqrt(depth), jnp.bfloat16))
-
+        return (rng.normal(size=(rows, depth)).astype(jnp.bfloat16),
+                (rng.normal(size=matrix) / np.sqrt(depth)).astype(jnp.bfloat16))
     def plain(*, truth: bool = False):
         def run(x, w):
             wide = jnp.promote_types(x.dtype, jnp.float32)

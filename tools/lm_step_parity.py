@@ -49,7 +49,7 @@ class Record:
 
 def run(config: dict[str, object], batch: int, seq: int, steps: int,
         precision: str | None = None) -> Record:
-    fields = {**config, "dtype": "bfloat16", "attention_impl": "reference"}
+    fields = {**config, "dtype": "bfloat16"}
     if precision is not None:
         fields["precision"] = precision
     model = models.build("causal_transformer", **fields)
@@ -90,4 +90,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from dew.nn.kernels import generation
+
+    with generation.chosen(attention="reference"):
+        main()

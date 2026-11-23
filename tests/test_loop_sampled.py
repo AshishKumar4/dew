@@ -12,7 +12,7 @@ import numpy as np
 import optax
 import pytest
 from generation_support import lowers
-from model_support import float64_twin
+from model_support import attending, float64_twin
 from reference_error import assert_as_exact, dew_path
 from scipy import integrate, optimize, special, stats
 from test_pass_weights import PASS_SEEDS, drawn, looped, phased_trainer
@@ -540,10 +540,11 @@ def unnormed() -> CausalTransformer:
     """A tiny decoder whose middle layer a loop of `CAP` passes runs, its queries and keys un-normed, whose
     scale QK-Clip bounds."""
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
-                             max_seq_len=128, attention_impl="xla", qk_norm=False,
+                             max_seq_len=128, qk_norm=False,
                              loop=Loop(CAP, layers=(1, 2)))
 
 
+@attending("xla")
 def test_a_sampled_run_under_qk_clip_pools_its_counts_logit_maxima_in_one_window():
     """A sampled run under QK-Clip, two microbatches an update, whose looped layer's attention a microbatch
     calls as many times as its count: its window holds each layer's maxima as one call, their largest
@@ -562,6 +563,7 @@ def test_a_sampled_run_under_qk_clip_pools_its_counts_logit_maxima_in_one_window
     assert int(trainer.fit(phased_loader(tokens), steps=4, log_every=100).step) == 4
 
 
+@attending("xla")
 @pytest.mark.parametrize("sampled_first", [False, True], ids=["fixed-first", "sampled-first"])
 def test_a_fixed_and_a_sampled_run_of_one_config_each_trace_their_own_window(sampled_first):
     """Two trainers of one optimizer config under QK-Clip (muonclip) in one process, one at the loop's own

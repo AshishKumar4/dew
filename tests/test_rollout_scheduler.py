@@ -25,7 +25,7 @@ from recording import bits
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader, replayed, tapped
 from dew.inference import NativeRolloutServer, TextGeneration
-from dew.inference.serving import Server
+from dew.inference.serving import DenseKV, PagedKV, Server, named_cache
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kv_cache import KVCache
 from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, Observation
@@ -423,8 +423,8 @@ def test_stragglers_failures_and_a_resume_leave_each_batch_its_first_complete_gr
 
 
 def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
-    """A server whose caller says its requests repeat prompts (`Server.from_task`'s `kv_cache='shared'`), as a
-    served rollout's group of samples does, pages its cache wherever a server over pages keeps a prefix
+    """A server whose caller says its requests repeat prompts (`Server.from_task`'s `PagedKV(shared=True)`),
+    as a served rollout's group of samples does, pages its cache wherever a server over pages keeps a prefix
     cache, so a group's samples of one prompt prefill it once (row 5375); one that names no layout keeps the
     model's own whole rows, which serve prompts no two of which share faster (M-IG-12); a model whose
     LongRoPE rebuilds a crossing request, one whose loop shares a cache its later passes rewrite, which
@@ -438,7 +438,7 @@ def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
 
     task = serving_task(capacity=2 * PAGE_SIZE)
     assert not isinstance(Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE).rows, PagedRows)
-    server = Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE, kv_cache="shared")
+    server = Server.from_task(task, slots=2, capacity=2 * PAGE_SIZE, cache=PagedKV(shared=True))
     assert server.reuses_prefixes
     prompt = [1 + index % 11 for index in range(PAGE_SIZE + 6)]
     server([prompt, prompt], 2, key=0)
@@ -450,10 +450,37 @@ def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
     looped = task.model.clone(loop=Loop(steps=2, shared_cache=True))
     for model in (task.model.clone(rope_scaling=scaling), looped):
         whole = Server.from_task(dataclasses.replace(task, model=model), slots=2, capacity=2 * PAGE_SIZE,
-                                 kv_cache="shared")
+                                 cache=PagedKV(shared=True))
         assert not isinstance(whole.rows, PagedRows) and not whole.reuses_prefixes
-    short = Server.from_task(serving_task(capacity=12), slots=2, capacity=8, kv_cache="shared")
+    short = Server.from_task(serving_task(capacity=12), slots=2, capacity=8, cache=PagedKV(shared=True))
     assert not isinstance(short.rows, PagedRows)
+
+
+def test_shared_pages_over_a_model_that_pages_keep_the_pages_and_format_they_name():
+    """Shared pages over a model whose own layout pages lay its rows in the pages, pool and format they name
+    (`PagedKV(shared=True, layout=KVCache(page_size=..., pages=..., quantized=...))`), as pages that are not
+    shared do (the review of API02b: the model's own layout was kept, each named one dropped); and shared
+    pages that keep no prefix cache, which share nothing, are refused."""
+    from model_support import serving_task
+
+    from dew.inference.serving import PAGE_SIZE, PagedRows
+
+    task = serving_task(capacity=2 * PAGE_SIZE)
+    paged = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
+    server = Server.from_task(paged, slots=2, capacity=2 * PAGE_SIZE,
+                              cache=PagedKV(shared=True,
+                                            layout=KVCache(page_size=32, pages=64, quantized="int8")))
+    layout = server.model.kv_cache
+    assert isinstance(server.rows, PagedRows)
+    assert (layout.page_size, layout.pages, layout.quantized) == (32, 64, "int8")
+    with pytest.raises(ValueError):
+        PagedKV(shared=True, prefix_cache=False)
+    # A pool a server names is split among its own row groups, not those of a saved model's layout (the
+    # review of API02b: an odd pool for one group was refused as split among the model's two).
+    split = KVCache(page_size=8, pages=64, groups=2)
+    grouped = dataclasses.replace(task, model=task.model.with_kv_cache(split))
+    odd = Server.from_task(grouped, slots=2, capacity=2 * PAGE_SIZE, cache=PagedKV(page_size=8, pages=63))
+    assert (odd.model.kv_cache.pages, odd.model.kv_cache.groups) == (63, 1)
 
 
 def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
@@ -472,10 +499,11 @@ def test_a_served_rollout_named_whole_keeps_each_rows_cache_whole(tmp_path):
     served = config.rollout.served
     assert served is not None and served.page_size == "whole"
     task = serving_task(capacity=64)
-    assert not Server.from_task(task, slots=4, capacity=64, kv_cache=served.page_size).reuses_prefixes
+    assert not Server.from_task(task, slots=4, capacity=64,
+                                cache=named_cache(served.page_size)).reuses_prefixes
     # A model that declares pages of its own is served whole all the same.
     paged = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
-    assert Server.from_task(paged, slots=4, capacity=64, kv_cache="shared").reuses_prefixes
-    assert not Server.from_task(paged, slots=4, capacity=64, kv_cache="whole").reuses_prefixes
+    assert Server.from_task(paged, slots=4, capacity=64, cache=PagedKV(shared=True)).reuses_prefixes
+    assert not Server.from_task(paged, slots=4, capacity=64, cache=DenseKV()).reuses_prefixes
     config.save(str(tmp_path / "whole"))
     assert LMRunConfig.load(str(tmp_path / "whole")).rollout == config.rollout

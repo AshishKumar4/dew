@@ -41,8 +41,8 @@ never waits for it; a row's exit reaches the host a step late, and its slot
 is refilled the step after. Submitting a request with an integer seed
 launches nothing on the device: the admission's program makes its key.
 
-Over a paged cache (`kv_cache=KVCache(page_size=...)`, a page size, or
-'shared', wherever pages serve requests that repeat prompts, `Server.from_task`)
+Over a paged cache (`cache=PagedKV(...)`, its pages wherever they serve
+requests that repeat prompts under `shared`, `Server.from_task`)
 the rows share one page pool whose ledger is `dew.inference.pages.Pages`, and a prompt runs over
 the pool through its row's page table from the row's cursor. A prompt can
 then prefill in pieces while the other rows draw (`chunk`, which a dense
@@ -87,6 +87,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
+from dew import _cache
 from dew._coordination import agreed_reads, collective_host, pinned_get
 from dew._hashing import array_fingerprint
 from dew._records import JSON
@@ -169,7 +170,6 @@ from dew.sampling.text import (
     decoded_rows,
     rebuild_position,
     refuse_closed_holes,
-    resolve,
 )
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
@@ -625,25 +625,100 @@ config, 256- and 512-token prompts at 32 to 128 slots, pages of 64 drew 13 to 21
 second than whole rows (M-IG-12), so a server pages only where its caller says its prompts repeat."""
 
 
+@dataclass(frozen=True)
+class DenseKV:
+    """A server's cache each row holds whole, unpaged (`Server.from_task`'s `cache`): the model's own
+    layout unpaged, its format and its offload, or the `layout` named, exactly."""
+
+    layout: KVCache | None = None
+    """The rows' layout (`dew.nn.kv_cache.KVCache`) as it states it, its format among it (`quantized`, None
+    unquantized: Train 1209's review F2, a format a server could not ask for) and its offload; None, the
+    model's own unpaged."""
+
+    def __post_init__(self) -> None:
+        if self.layout is not None and self.layout.page_size is not None:
+            raise ValueError("a dense cache holds each row whole; its layout names no page_size "
+                             "(PagedKV pages one)")
+
+
+@dataclass(frozen=True)
+class PagedKV:
+    """A server's cache in a pool of pages every row draws from (`Server.from_task`'s `cache`), so short
+    requests fit more rows than `pages * page_size / capacity`, and what the server keeps of the prompts'
+    prefixes it computed: a prefix cache (`prefix_cache`), the states a row keeps beside its pages at its
+    prefixes (`prefix_states`, `prefix_state_every`) and the pages a host tier holds (`host_pages`), a
+    paged cache's alone."""
+
+    page_size: int | None = None
+    """The slots a page holds over the model's own layout; None, its own layout's, else `PAGE_SIZE`."""
+    pages: int | None = None
+    """The pool's pages over the model's own layout; None, a row's capacity of pages for every slot."""
+    layout: KVCache | None = None
+    """The pool's layout (`dew.nn.kv_cache.KVCache`) as it states it in place of the model's: its format
+    (`quantized`, None unquantized: Train 1209's review F2), its offload, its page size (None,
+    `PAGE_SIZE`) and its pool; None, the model's own, paged at `page_size` (Train 1208's review F3: the
+    layout's fields were mirrored here under other None meanings)."""
+    prefix_cache: bool | None = None
+    """Whether a request reuses the pages of a prompt prefix an earlier request computed, its prompt's or
+    the whole history a finished one drew (`PagedRows.finished`); None, wherever the server can reuse a
+    prefix (`_reuses_prefixes`)."""
+    prefix_states: int | None = None
+    """The states a group keeps at its prompts' prefixes where the model keeps a row's state beside its
+    pages (`dew.inference.pages.States`); None, one a slot."""
+    prefix_state_every: int | None = None
+    """The pages between the states kept below a prompt's deepest shareable page boundary."""
+    host_pages: int = 0
+    """The prefix pages a host tier holds beside the device's, split over the groups
+    (`dew.inference.pages`)."""
+    shared: bool = False
+    """Pages only where they pay: where a server over them keeps a prefix cache, its caller's requests
+    repeating prompts (a group's samples of one, a session's turns), and the model's max_seq_len holds a
+    row in whole pages (`_holds`); the model's own layout elsewhere (rows 5374, 5375, `PAGE_SIZE`)."""
+
+    def __post_init__(self) -> None:
+        if self.layout is not None and (self.page_size is not None or self.pages is not None):
+            raise ValueError("a paged cache's layout states its page_size and pages; name them on it, or "
+                             "name them here over the model's own layout")
+        if self.shared and self.prefix_cache is False:
+            raise ValueError("shared pages are laid where a prefix cache over them pays; a cache that keeps "
+                             "no prefix cache shares nothing: name its page_size without shared")
+        for name in ("page_size", "pages", "prefix_states", "prefix_state_every"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+        if type(self.host_pages) is not int or self.host_pages < 0:
+            raise ValueError(f"host_pages must be a non-negative integer, got {self.host_pages!r}")
+
+
+type ServedCache = DenseKV | PagedKV
+"""How a server lays its rows' cache (`Server.from_task`'s `cache`)."""
+
 type PageSize = int | Literal["whole", "shared"] | None
-"""A page size a caller names for a server's cache (`Server.from_task`'s `kv_cache`): pages of that many
-slots; each row's cache whole ('whole'); pages wherever a server over them keeps a prefix cache, where the
-caller's requests repeat prompts, a group's samples of one or a session's turns ('shared'); or None, the
-model's own layout."""
+"""A page size a run names for its served rollout's cache (`dew.config.lm.ServedRollout.page_size`): pages
+of that many slots, each row's cache whole ('whole'), or pages where requests repeat prompts ('shared',
+and None); `named_cache` reads it."""
 
 
-def served_layout(task: TextGeneration, capacity: int, kv_cache: KVCache | PageSize = None) -> KVCache | None:
-    """The cache layout `Server.from_task` lays `task`'s rows of `capacity` slots in for its `kv_cache`
-    (`_laid`), None for a model of no layout, whose rows are whole; and for 'shared', that layout only where
-    a server over it keeps a prefix cache (`_reuses_prefixes`) and the model's max_seq_len holds a row of
-    `capacity` in its whole pages (`_holds`), None where not: what a caller serving the task only where its
-    server shares prompts' pages reads, as an episode cohort does
-    (`dew.objectives.rl.RolloutScheduler.episodes`)."""
-    *_, strategy = resolve(*task.controls(), task.strategy)
-    layout = _laid(task.model, kv_cache, capacity, strategy, None)
+def named_cache(page_size: PageSize) -> ServedCache:
+    """The cache a run's named `page_size` serves its rollouts over: whole rows for 'whole', pages of that
+    many slots for an int, and pages where requests repeat prompts otherwise (`PagedKV.shared`)."""
+    if page_size == "whole":
+        return DenseKV()
+    return PagedKV(shared=True) if page_size in (None, "shared") else PagedKV(page_size=page_size)
+
+
+def served_layout(task: TextGeneration, capacity: int, cache: ServedCache | None = None) -> KVCache | None:
+    """The cache layout `Server.from_task` lays `task`'s rows of `capacity` slots in for its `cache`
+    (`_laid`), None for a model of no layout, whose rows are whole; and for pages where they pay
+    (`PagedKV.shared`), that layout only where a server over it keeps a prefix cache (`_reuses_prefixes`)
+    and the model's max_seq_len holds a row of `capacity` in its whole pages (`_holds`), None where not:
+    what a caller serving the task only where its server shares prompts' pages reads, as an episode cohort
+    does (`dew.objectives.rl.RolloutScheduler.episodes`)."""
+    *_, strategy = task.controls().components()
+    layout = _laid(task.model, cache, capacity, strategy, None)
     shares = (layout is not None and _reuses_prefixes(task.model, layout, strategy, None)
               and _holds(task.model, capacity, layout.page_size))
-    return None if kv_cache == "shared" and not shares else layout
+    return None if isinstance(cache, PagedKV) and cache.shared and not shares else layout
 
 
 def _served_mesh(task: TextGeneration) -> Mesh | None:
@@ -723,8 +798,9 @@ class Server:
         # The run's progress a model that reads one draws at (`dew.nn.progress`), an input of every step
         # like the weights, which `reload` moves to each version it serves without a compile.
         self.progress = progress
-        # The PRNG implementation its rows' keys are of: the default one as its rows were made.
-        self.decode_steps, self.steps, self.prng = decode_steps, 0, rows.placement.prng
+        # Its rows' keys' PRNG implementation, and the trace states it was made under (`_context`).
+        self.decode_steps, self.steps, self.prng, self._made_under = (decode_steps, 0, rows.placement.prng,
+                                                                      _cache.carried())
         self._waiting: Waiting[_Row] = Waiting("the server stopped after a device check failed")
         """The requests waiting for a slot."""
         self.arrived: Callable[[], None] = _nothing
@@ -874,11 +950,14 @@ class Server:
         projection mapped per shard takes a launch on each device's rows (off a mesh none, so its programs
         are its task's own calls'), under the numerics its task's run trained in, with its rows' PRNG
         implementation the default, so a key a layer draws (a stochastic rounding stream) is of the
-        implementation its cache was opened with, whatever thread serves it. The model
+        implementation its cache was opened with, whatever thread serves it, and the kernel choices it was
+        made under (a banked stack's scan, `generation.chosen(layer_scan=...)`), which hold per thread. The
+        model
         runs its stack and sequences whole (`whole`): on a mesh with a stage or sequence axis the training
         forward pipelines the stack or splits a sequence's positions, which one token a step leaves nothing
         to do."""
-        with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh), whole(),
+        with (self._made_under(), contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
+              whole(),
               placing(None if self.mesh is None else FORWARD),
               contextlib.nullcontext() if self.precision is None
               else generation.run_precision(self.precision),
@@ -887,9 +966,7 @@ class Server:
 
     @classmethod
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
-                  admission: int | None = None, kv_cache: KVCache | PageSize = None, chunk: int | None = None,
-                  prefix_cache: bool | None = None, prefix_states: int | None = None,
-                  prefix_state_every: int | None = None, host_pages: int = 0,
+                  admission: int | None = None, cache: ServedCache | None = None, chunk: int | None = None,
                   decode_steps: int = 1, prefill_mesh: Mesh | None = None) -> Server:
         """Build a server over the task's model, weights, processor and policy.
 
@@ -900,34 +977,35 @@ class Server:
         verifies and emits a block in every row, which draws as the row-wise
         sampler draws, over a dense cache whose prompts prefill whole.
 
-        `kv_cache` replaces the model's cache layout (`dew.nn.kv_cache`), a
-        page size pages the model's own, 'whole' keeps each row's whole and
-        'shared' pages it where requests repeat prompts (`_laid`); None keeps
-        the model's own. A paged layout pools the pages of every row, so short
-        requests fit more rows than `pages * page_size / capacity`. `chunk` prefills a prompt in
-        pieces of at most that many tokens, one piece a step, so a long prompt
-        does not stall the rows beside it. It also works over a dense cache
-        where the admitting step is mixed. `prefix_cache` lets a request reuse
-        the pages of a prompt prefix an earlier request computed, its prompt's
-        or the whole history a finished one drew (`PagedRows.finished`), and
-        needs a paged cache; None, the default, keeps it wherever the layout
-        pages and the server can reuse a prefix (the rows sample a token a
-        step, prefill on the server's own mesh, and the model computes a prompt
-        split as it computes it whole, `Serving.split_prefill_refusal`), a
-        request drawing what it draws without it. Where the model keeps a row's own state beside its pages
+        `cache` lays the rows' cache (`_laid`): whole rows (`DenseKV`), or a
+        pool of pages every row draws from (`PagedKV`), so short requests fit
+        more rows than `pages * page_size / capacity`, with what the server
+        keeps of the prompts' prefixes; None keeps the model's own layout, its
+        prefix cache kept wherever it pages and the server can reuse a prefix.
+        `chunk` prefills a prompt in pieces of at most that many tokens, one
+        piece a step, so a long prompt does not stall the rows beside it. It
+        also works over a dense cache where the admitting step is mixed.
+
+        A paged cache's prefix cache (`PagedKV.prefix_cache`) lets a request
+        reuse the pages of a prompt prefix an earlier request computed; by
+        default it is kept wherever the layout pages and the server can reuse
+        a prefix (the rows sample a token a step, prefill on the server's own
+        mesh, and the model computes a prompt split as it computes it whole,
+        `Serving.split_prefill_refusal`), a request drawing what it draws
+        without it. Where the model keeps a row's own state beside its pages
         (a recurrent mixer's memory, latent attention's index keys), a reused
         prefix is read with the state its prompt left at its end: each group
-        keeps `prefix_states` of them (one a slot by default), taken at a
-        prompt's deepest shareable page boundary and every
-        `prefix_state_every` pages below it, a piece cut to end there, and a
-        request reuses pages as deep as a state is kept
-        (`dew.inference.pages.States`). `host_pages` keeps that many more
+        keeps `prefix_states` of them, taken at a prompt's deepest shareable
+        page boundary and every `prefix_state_every` pages below it, a piece
+        cut to end there, and a request reuses pages as deep as a state is
+        kept (`dew.inference.pages.States`). `host_pages` keeps that many more
         prefix pages in host memory, split over the groups: a cached page the
-        pool reclaims goes to the host first, and a prompt that shares it reads
-        it back into a fresh page before its prefill (`dew.inference.pages`), so
-        a prefix cache holds more than the device's pages. Where rows keep a
-        state beside their pages, a state giving way goes to the host too, as
-        many states as the bytes of `host_pages` pages hold.
+        pool reclaims goes to the host first, and a prompt that shares it
+        reads it back into a fresh page before its prefill
+        (`dew.inference.pages`), so a prefix cache holds more than the
+        device's pages. Where rows keep a state beside their pages, a state
+        giving way goes to the host too, as many states as the bytes of
+        `host_pages` pages hold.
 
         `prefill_mesh` prefills the admitted prompts on a mesh of their own,
         as MaxEngine's and vLLM's disaggregated serving does: the server keeps
@@ -963,49 +1041,48 @@ class Server:
         run's, and `reload` moves it to the version it serves.
         """
         mesh = _served_mesh(task)
-        policy, chain, criteria = task.controls()
-        transforms, stopping, strategy = resolve(policy, chain, criteria, task.strategy)
-        layout = _laid(task.model, kv_cache, capacity, strategy, prefill_mesh)
-        if prefix_cache is None:
-            prefix_cache = _reuses_prefixes(task.model, layout, strategy, prefill_mesh)
+        policy = task.controls()
+        transforms, stopping, strategy = policy.components()
+        layout = _laid(task.model, cache, capacity, strategy, prefill_mesh)
+        # What the server keeps of its prompts' prefixes: a paged cache's, as it names it.
+        kept = cache if isinstance(cache, PagedKV) else PagedKV()
+        prefix_cache = (_reuses_prefixes(task.model, layout, strategy, prefill_mesh)
+                        if kept.prefix_cache is None else kept.prefix_cache)
         plan = _served_plan(strategy, mesh, chunk, prefix_cache)
         if chunk is not None and (type(chunk) is not int or chunk < 1):
             raise ValueError("chunk must be a positive number of prompt tokens per piece")
-        for name, value in (("prefix_states", prefix_states), ("prefix_state_every", prefix_state_every)):
-            if value is not None and (type(value) is not int or value < 1):
-                raise ValueError(f"{name} must be a positive integer")
         model, layout, rounded = _served_layout(task.model, layout, capacity)
         groups = row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
-                                  prefix_cache, prefix_states, prefix_state_every, host_pages)
+                                  prefix_cache, kept.prefix_states, kept.prefix_state_every, kept.host_pages)
         if plan is not None:
             if isinstance(rows, PagedRows):
                 raise ValueError("speculative rows rewind a block's rejected keys from the cache saved "
                                  "before it, which a dense cache holds per row; serve without page_size")
             rows.placement = dataclasses.replace(rows.placement, plan=plan)
-        return cls(
-            model,
-            task.placed,
-            task.processor,
-            # The policy keeps the stop strings `stopping` compiled, so a server's draws are read
-            # against what ends them (`dew.inference.rollouts.check_ending`).
-            sampling=dataclasses.replace(policy, stop=task.sampling.stop),
-            transforms=transforms,
-            stopping=stopping,
-            grammar=strategy.grammar if isinstance(strategy, Sample) else None,
-            rows=rows,
-            slots=slots,
-            capacity=rounded,
-            admission=(
-                max(groups, min(slots, 8 * decode_steps) // groups * groups)
-                if admission is None
-                else admission
-            ),
-            default_budget=task.max_new_tokens,
-            max_length=task.max_length,
-            decode_steps=decode_steps, prefix=task.prefix, precision=task.precision, progress=task.progress,
-            prefill_mesh=prefill_mesh, n=task.n,
-        )
+        with task.pinned():  # Its run's kernel pins, which every step it serves traces under (`_context`).
+            return cls(
+                model,
+                task.placed,
+                task.processor,
+                # The caller's policy as the task holds it, its stop strings uncompiled and its criteria its
+                # own, so a server's draws are read against what ends them
+                # (`dew.inference.rollouts.check_ending`) and a caller reuses it whole; what it compiles to
+                # is the server's `transforms` and `stopping`.
+                sampling=dataclasses.replace(task.sampling, pad_token_id=policy.pad_token_id),
+                transforms=transforms,
+                stopping=stopping,
+                grammar=strategy.grammar if isinstance(strategy, Sample) else None,
+                rows=rows,
+                slots=slots,
+                capacity=rounded,
+                admission=(max(groups, min(slots, 8 * decode_steps) // groups * groups) if admission is None
+                           else admission),
+                default_budget=task.max_new_tokens,
+                max_length=task.max_length,
+                decode_steps=decode_steps, prefix=task.prefix, precision=task.precision,
+                progress=task.progress, prefill_mesh=prefill_mesh, n=task.n,
+            )
 
     @property
     def cache(self) -> Variables:
@@ -1819,28 +1896,40 @@ def _reuses_prefixes(model: nn.Module, kv_cache: KVCache | None, strategy: Strat
             and prefill_mesh is None and _unserved_modes(model, paged=True, prefix=True) is None)
 
 
-def _laid(model: nn.Module, kv_cache: KVCache | PageSize, capacity: int, strategy: Strategy,
+def _laid(model: nn.Module, cache: ServedCache | None, capacity: int, strategy: Strategy,
           prefill_mesh: Mesh | None) -> KVCache | None:
-    """The layout a server lays its rows' cache in for `from_task`'s `kv_cache`, None for a model of no
-    layout, whose rows are whole: a `KVCache` as given; for a page size, the model's own layout, its format
-    kept, in pages of that many slots, or unpaged, each row's cache whole, for 'whole'; for None the
-    model's own; and for 'shared' the model's own, in pages of `PAGE_SIZE` where it names no page size and
-    a server over them keeps a prefix cache (`_reuses_prefixes`) whose rows' `capacity` its max_seq_len
-    holds in whole pages (`_holds`), so requests over one prompt prefill it once (rows 5374, 5375)."""
-    if isinstance(kv_cache, KVCache):
-        return kv_cache
+    """The layout a server lays its rows' cache in for `from_task`'s `cache`, None for a model of no
+    layout, whose rows are whole: for None the model's own; for `DenseKV` the model's own unpaged, each
+    row's cache whole; for `PagedKV` the model's own in pages of its `page_size` (the model's own, else
+    `PAGE_SIZE`), its pool of `pages` (the model's own where its pages are the model's); and for
+    `PagedKV.shared` over a model that pages none, those pages only where they pay: where a server over them
+    keeps a prefix cache (`_reuses_prefixes`) and the model's max_seq_len holds a row of `capacity` in whole
+    pages (`_holds`), so requests over one prompt prefill it once (rows 5374, 5375), the model's own unpaged
+    elsewhere. A layout either names (`layout`) is laid in place of the model's, exactly: its format, its
+    offload, a paged one's page size (`PAGE_SIZE` where it names none) and pool."""
     own = model.kv_cache if isinstance(model, Layered) else None
-    if kv_cache == "whole":
-        return None if own is None else unpaged(own)
-    if kv_cache is None:
+    if cache is None:
         return own
-    if kv_cache != "shared":
-        return dataclasses.replace(KVCache() if own is None else own, page_size=kv_cache)
-    if own is None or own.page_size is not None:
-        return own
-    paged = dataclasses.replace(own, page_size=PAGE_SIZE)
-    return paged if _holds(model, capacity, PAGE_SIZE) and _reuses_prefixes(model, paged, strategy,
-                                                                             prefill_mesh) else own
+    if isinstance(cache, DenseKV):
+        laid = own if cache.layout is None else cache.layout
+        return None if laid is None else unpaged(laid)
+    if cache.layout is None:
+        if own is None and cache.shared:
+            return None
+        base = KVCache() if own is None else own
+        size = cache.page_size or base.page_size or PAGE_SIZE
+        pages = cache.pages if cache.pages is not None else base.pages if size == base.page_size else None
+    else:
+        base = cache.layout
+        size, pages = base.page_size or PAGE_SIZE, base.pages
+    # Its pool split among the server's row groups where the server lays its rows (`_cache_rows`), not the
+    # groups a saved model's layout was split among (the review of API02b: an odd pool named for one group
+    # was refused as split among a saved model's two).
+    paged = dataclasses.replace(base, page_size=size, pages=pages, groups=1)
+    if not cache.shared or base.page_size is not None:
+        return paged
+    pays = _holds(model, capacity, size) and _reuses_prefixes(model, paged, strategy, prefill_mesh)
+    return paged if pays else unpaged(base)
 
 
 def _holds(model: nn.Module, capacity: int, page_size: int | None) -> bool:
@@ -1940,13 +2029,13 @@ def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, gr
     """The model over its cache's layout, its pages pooled for `slots` rows of `capacity` slots in `groups`
     where it pages, and the rows' host side (`Server.from_task`'s arguments)."""
     if host and not prefix_cache:
-        raise ValueError("a host tier keeps a prefix cache's pages; serve with prefix_cache=True")
+        raise ValueError("a host tier keeps a prefix cache's pages; serve with "
+                         "cache=PagedKV(prefix_cache=True)")
     if host % groups:
         raise ValueError(f"host_pages ({host}) split over the {groups} groups the mesh splits rows into")
     if layout.page_size is None:
         if prefix_cache:
-            raise ValueError("prefix caching runs over a paged cache; "
-                             "serve with kv_cache=KVCache(page_size=...)")
+            raise ValueError("prefix caching runs over a paged cache; serve with cache=PagedKV()")
         return model, DenseRows(groups, chunk)
     count = slots * (capacity // layout.page_size) if layout.pages is None else layout.pages
     # Only a model that declares its layout has a paged one; the default pages nothing.

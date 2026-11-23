@@ -106,13 +106,17 @@ from token_support import token_rows
 from dew.training import Inspection, MeshSpec
 from dew.training.ahead import AheadOfTime
 
-run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True, split=2,
-                inspection=Inspection(every=2), dtype="bfloat16")
-try:
-    run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=1, log_every=1)
-except ValueError:
-    sys.exit(0)
-sys.exit("the step loaded in a process whose XLA computes otherwise")
+from dew.nn.kernels.generation import chosen
+
+# The fine-tune's attention XLA's (`chosen`), as `fine_tune(xla=True)` named it before row 11938.
+with chosen(attention="xla"):
+    run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), split=2,
+                    inspection=Inspection(every=2), dtype="bfloat16")
+    try:
+        run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=1, log_every=1)
+    except ValueError:
+        sys.exit(0)
+    sys.exit("the step loaded in a process whose XLA computes otherwise")
 """
 """A fresh process whose trainer trains a step from the step at argv[1] (`QUIET_BUILD`'s), which its loader
 must refuse as it loads it: a trainer handed a step loads it at its first step's compile, not as it is
@@ -129,14 +133,18 @@ from dew.nn.kernels.generation import compile_only_gpus
 from dew.training.ahead import compile_ahead
 
 generation, path, multiprocessors, memory = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-# Planned at the loading run's share (argv[5]), which its pool takes of the GPU's memory.
-target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors,
-                                            share=float(sys.argv[5])))
-trainer = fine_tune(target, xla=True, split=2, inspection=Inspection(every=2), dtype="bfloat16")
-batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
-fit = {"steps": 6, "log_every": 5, "eval_every": 3, "validation": validation}
-compile_ahead(trainer, batch, fit=fit).save(path)
+from dew.nn.kernels.generation import chosen
+
+# The fine-tune's attention XLA's (`chosen`), as `fine_tune(xla=True)` named it before row 11938.
+with chosen(attention="xla"):
+    # Planned at the loading run's share (argv[5]), which its pool takes of the GPU's memory.
+    target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors,
+                                                share=float(sys.argv[5])))
+    trainer = fine_tune(target, split=2, inspection=Inspection(every=2), dtype="bfloat16")
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
+    fit = {"steps": 6, "log_every": 5, "eval_every": 3, "validation": validation}
+    compile_ahead(trainer, batch, fit=fit).save(path)
 """
 """A step of two microbatches, sampled every second step, compiled ahead for the GPU argv[1] names, with
 argv[3] multiprocessors and argv[4] bytes of memory, with the programs of its fit's evaluations, and saved
@@ -205,15 +213,19 @@ from dew.telemetry.compiles import Compiles
 from dew.training import Inspection, MeshSpec
 from dew.training.ahead import AheadOfTime
 
-run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True, split=2,
-                inspection=Inspection(every=2), dtype="bfloat16")
-validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
-with Compiles(None) as compiles:
-    state = run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=6, log_every=5, eval_every=3,
-                    validation=validation)
-assert int(state.step) == 6 and run.plan["narrow"]
-compiled = [(program.name, program.where) for program in compiles.programs if program.kind == "compiled"]
-assert not compiled, compiled
+from dew.nn.kernels.generation import chosen
+
+# The fine-tune's attention XLA's (`chosen`), as `fine_tune(xla=True)` named it before row 11938.
+with chosen(attention="xla"):
+    run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), split=2,
+                    inspection=Inspection(every=2), dtype="bfloat16")
+    validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
+    with Compiles(None) as compiles:
+        state = run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=6, log_every=5, eval_every=3,
+                        validation=validation)
+    assert int(state.step) == 6 and run.plan["narrow"]
+    compiled = [(program.name, program.where) for program in compiles.programs if program.kind == "compiled"]
+    assert not compiled, compiled
 """
 """A fresh process training six steps of two microbatches from the step at argv[1], sampled every second
 step, two samples to a log, evaluated every third step, compiling nothing on its GPU: its bf16 step's plan

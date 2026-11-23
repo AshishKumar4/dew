@@ -117,9 +117,9 @@ def _tree_generated(model, params, prompts, budget: int, sampling, shape: TreeSh
     `DecodeOps.draft_tree`), as `generate` runs a strategy: the prompt's prefill, then the strategy's loop."""
     from dew.sampling import TreeSpeculative, decoding
     from dew.sampling.decoding import StepState
-    from dew.sampling.text import resolve
 
-    transforms, stopping, strategy = resolve(sampling, None, None, TreeSpeculative(shape))
+    searched = dataclasses.replace(sampling, strategy=TreeSpeculative(shape))
+    transforms, stopping, strategy = searched.components()
     ops = decode_ops(model, params, 0, 0)
     ops = dataclasses.replace(ops, draft_tree=drafting(ops))
 
@@ -181,11 +181,11 @@ def test_tree_speculation_draws_as_greedy_decoding_does(kind, stop):
     params = jax.jit(model.init)(jax.random.key(0), jnp.asarray(prompts))
     sampling = Sampling(temperature=0)
     if stop == "eos":
-        walked = generate(model, params, jnp.asarray(prompts), 8, key=jax.random.key(1), sampling=sampling,
-                          strategy=Sample())
+        walked = generate(model, params, jnp.asarray(prompts), 8, key=jax.random.key(1),
+                          sampling=dataclasses.replace(sampling, strategy=Sample()))
         sampling = Sampling(temperature=0, eos_token_ids=int(np.asarray(walked.tokens)[0, 5]), pad_token_id=0)
-    plain = generate(model, params, jnp.asarray(prompts), 8, key=jax.random.key(1), sampling=sampling,
-                     strategy=Sample())
+    plain = generate(model, params, jnp.asarray(prompts), 8, key=jax.random.key(1),
+                     sampling=dataclasses.replace(sampling, strategy=Sample()))
     drawn = _tree_generated(model, params, prompts, 8, sampling, SHAPE, _ranked([(1, 0), (1, 0), (1,)]),
                             jax.random.key(1))
     tokens = np.where(np.asarray(drawn.valid), np.asarray(drawn.tokens), 0)
@@ -208,8 +208,8 @@ def test_a_tree_past_its_rows_cache_walks_as_greedy_decoding_does():
     prompts = np.asarray([[*range(1, 13), 1], [*range(12, 0, -1), 2]], np.int32)
     params = jax.jit(model.init)(jax.random.key(0), jnp.asarray(prompts))
     sampling = Sampling(temperature=0)
-    plain = generate(model, params, jnp.asarray(prompts), 3, key=jax.random.key(1), sampling=sampling,
-                     strategy=Sample())
+    plain = generate(model, params, jnp.asarray(prompts), 3, key=jax.random.key(1),
+                     sampling=dataclasses.replace(sampling, strategy=Sample()))
     drawn = _tree_generated(model, params, prompts, 3, sampling, TreeShape.widths(4, 1),
                             _ranked([(1, 2, 3, 0), (0,)]), jax.random.key(1))
     np.testing.assert_array_equal(np.asarray(drawn.tokens), np.asarray(plain.tokens)[:, 13:])
@@ -224,8 +224,8 @@ def test_generate_refuses_a_tree_for_a_model_without_a_tree_drafter():
     prompts = jnp.asarray([[1, 2, 3]], jnp.int32)
     params = jax.jit(model.init)(jax.random.key(0), prompts)
     with pytest.raises(ValueError):
-        generate(model, params, prompts, 4, key=jax.random.key(1), sampling=Sampling(temperature=0),
-                 strategy=TreeSpeculative(SHAPE))
+        generate(model, params, prompts, 4, key=jax.random.key(1),
+                 sampling=Sampling(temperature=0, strategy=TreeSpeculative(SHAPE)))
 
 
 def _sampled(sharpness: float):
@@ -294,7 +294,6 @@ def test_a_tree_block_carries_the_targets_state_at_each_rows_last_token(case):
     `past-the-cache`: the cache holds no room for the tree and the row walks its one token."""
     from dew.sampling import Sampling, TreeSpeculative, decoding
     from dew.sampling.decoding import StepState
-    from dew.sampling.text import resolve
 
     capacity, width = (40, 3) if case == "rejected" else (16, 13)
     model = _model("attention", capacity)
@@ -302,7 +301,7 @@ def test_a_tree_block_carries_the_targets_state_at_each_rows_last_token(case):
     emitted = 4 if case == "rejected" else 1
 
     def stepped(model, params):
-        transforms, stopping, plan = resolve(Sampling(temperature=0), None, None, TreeSpeculative(SHAPE))
+        transforms, stopping, plan = Sampling(temperature=0, strategy=TreeSpeculative(SHAPE)).components()
         ops = decode_ops(model, params, 0, 0)
         ops = dataclasses.replace(ops, draft_tree=_ranked([(1, 0), (1, 0), (1,)])(ops))
 

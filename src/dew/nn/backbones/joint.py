@@ -20,7 +20,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import silu
-from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_blocks import projected_heads, projected_output
 from dew.nn.blocks import Modulation
 from dew.nn.dropout import Dropout
@@ -158,7 +158,6 @@ class JointAttention(nn.Module):
     families' adjacent pairs, or the rotate-half halves of Dew's own MM-DiT."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
     force_fp32_for_softmax: bool = True
 
     @property
@@ -200,7 +199,7 @@ class JointAttention(nn.Module):
 
     def attend(self, query, key, value, lengths):
         """Return one softmax attention over the joined sequence, masking each row's keys past `lengths`."""
-        return scaled_dot_product_attention(query, key, value, implementation=self.attention_impl,
+        return scaled_dot_product_attention(query, key, value,
                                             precision=self.precision, key_value_seq_lengths=lengths,
                                             force_fp32_for_softmax=self.force_fp32_for_softmax)
 
@@ -279,7 +278,6 @@ class DoubleStreamBlock(nn.Module):
     dropout_rate: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
     force_fp32_for_softmax: bool = True
 
     @nn.nowrap
@@ -330,7 +328,6 @@ class DoubleStreamBlock(nn.Module):
                               epsilon=self.epsilon if self.qk_epsilon is None else self.qk_epsilon,
                               context_first=self.context_first, context_out=context_out,
                               rotary_pairs=self.rotary_pairs, dtype=self.dtype, precision=self.precision,
-                              attention_impl=self.attention_impl,
                               force_fp32_for_softmax=self.force_fp32_for_softmax, name=name)
 
     @nn.compact

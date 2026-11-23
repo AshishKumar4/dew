@@ -138,7 +138,6 @@ def main(config: Config) -> Path:
     run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
     source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
-                                    attention_impl="xla" if config.smoke else "auto",
                                     max_seq_len=config.sequence_length + run.max_new_tokens,
                                     on_host=True)  # the trainer places it over its fsdp mesh
     words = HFTokenizer(tokenizer)
@@ -151,8 +150,11 @@ def main(config: Config) -> Path:
                         sampling=run.sampling, decode=words.decode))
 
     # run.json records the model as loaded, so `dew.pipeline` and the export
-    # rebuild the checkpoint's own architecture at the precision it trained in.
-    run = replace(run, model=ModelConfig.from_model(source.model))
+    # rebuild the checkpoint's own architecture at the precision it trained in; a smoke run's attention
+    # XLA's, every other the selector's.
+    run = replace(run, model=ModelConfig.from_model(source.model), diagnostics=replace(
+        run.diagnostics, kernels={**run.diagnostics.kernels, "attention": "xla"} if config.smoke
+        else run.diagnostics.kernels))
 
     name = config.out.name
     state: TrainState = run.train(objective, run.data, validation=run.validation, name=name,

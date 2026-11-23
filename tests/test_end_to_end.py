@@ -17,6 +17,7 @@ import pytest
 from diffusion_stubs import label_table
 from flax import linen as nn
 from interop_support import extract_fixture
+from model_support import attending
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -667,6 +668,7 @@ def test_end_to_end_needs_alignment_and_a_kl_autoencoder():
                            alignment=task.alignment, end_to_end=EndToEnd(**L1_KL))
 
 
+@attending("xla")
 def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_one(tmp_path):
     """REPA-E through `DiffusionRunConfig` on the committed tiny DINOv2 and
     SD VAE: a saved run's task restores the tuned autoencoder and its
@@ -685,7 +687,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
         extract_fixture(FIXTURES / f"{name}.tar.xz", tmp_path / name)
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
-                                         "mlp_ratio": 1, "dtype": "float32", "attention_impl": "xla"}),
+                                         "mlp_ratio": 1, "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", 32), preset=presets.Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),

@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from merging_tokenizer import Merging
+from model_support import attending
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 from test_decision_context import windows_of
 from test_decision_letters_context import LABELS, STATES
@@ -154,6 +155,7 @@ def test_a_question_with_siblings_reads_the_questions_before_it_in_its_row_whole
         dataclasses.replace(OWN, shared_state=None, siblings=True)
 
 
+@attending("reference")
 def test_sibling_questions_packed_a_window_read_each_their_own_requests_context():
     """Requests' rows with siblings, two a window, each lay one tree of documents, its shared part and its
     questions chained after it (`Forks.trees`), numbered as the window numbers its rows: what a token's
@@ -224,6 +226,7 @@ def scorer(objective, windows):
     return scored
 
 
+@attending("reference")
 def test_a_row_over_one_state_decides_each_question_as_its_own_row_does():
     """Rows of a request's questions over one state, two requests a window, decide each question's options as
     its own row does in a window of its own, through the unmodified objective (check 1, over drawn
@@ -283,6 +286,7 @@ def input_terms(objective, windows, variables, requests: list[list[str]]) -> tup
     return totals, int(mass)
 
 
+@attending("reference")
 def test_rows_over_one_state_score_the_input_term_each_questions_own_row_scores():
     """With `input_lm`, rows asking a request's questions over one state score the term the same questions'
     own rows score: each question's tokens from the shared part and its own part before them, never

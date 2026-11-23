@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import attending
 from reference_error import assert_as_exact
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -22,9 +23,10 @@ LABEL_SEEDS = 8
 
 def backbone() -> CausalTransformer:
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                             max_seq_len=32, attention_impl="xla", final_logit_softcap=3.0)
+                             max_seq_len=32, final_logit_softcap=3.0)
 
 
+@attending("xla")
 def test_a_verbalizers_label_logits_are_the_backbones_full_head_at_its_labels_tokens():
     """Each row's last state read as its labels' tokens' logits is the backbone's softcapped head
     there, the labels' columns taken: `[B, 1, 2, 2]` for two classes of two tokens each."""

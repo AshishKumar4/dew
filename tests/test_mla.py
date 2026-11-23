@@ -38,7 +38,7 @@ import torch
 from flax import linen as nn
 from interop_support import fixture_arrays, fixture_ids, transformers_arms, transformers_model
 from jax.sharding import PartitionSpec as P
-from model_support import as_stepped, decode_through, kept_by_slot
+from model_support import as_stepped, attending, decode_through, kept_by_slot
 from quantized_basis import dequantized_in_own_basis
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
@@ -50,7 +50,7 @@ from dew.data.dataset import Loader
 from dew.interop.decoder_parts import yarn_record
 from dew.interop.hf_decoders import translate_weights
 from dew.interop.weights import decoding_storage
-from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention import chosen_attention, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -108,7 +108,7 @@ def yarn_of(settings: dict) -> YarnScaling:
 
 
 def mla_module(settings: dict, max_seq_len: int = 64,
-               attention_impl: str = "reference", kv_cache: KVCache | None = None
+               kv_cache: KVCache | None = None
                ) -> MultiHeadLatentAttention:
     """The fixture's reference config as a dew mixer."""
     return MultiHeadLatentAttention(
@@ -128,7 +128,6 @@ def mla_module(settings: dict, max_seq_len: int = 64,
         index_topk=settings.get("index_topk"),
         index_n_heads=settings.get("index_n_heads"),
         index_head_dim=settings.get("index_head_dim"),
-        attention_impl=attention_impl,
         kv_cache=KVCache() if kv_cache is None else kv_cache)
 
 
@@ -201,9 +200,9 @@ def reference_walk(name: str, wide: bool = False):
     return torch_with_gradients(forward)
 
 
-def dew_walk(name: str, settings: dict, attention_impl: str = "reference"):
+def dew_walk(name: str, settings: dict):
     """Dew's block on the fixture's weights as a function of a draw: what `reference_walk` returns."""
-    module = mla_module(settings, attention_impl=attention_impl)
+    module = mla_module(settings)
     variables = block_variables(fixture(name))
     run = jax.jit(with_gradients(lambda states: module.apply(variables, states)))
     return lambda hidden, cotangent: run(jnp.asarray(hidden), jnp.asarray(cotangent))
@@ -339,6 +338,7 @@ def decode_loop(module, variables, tokens):
 SETTINGS = {"mla_v3": "v3", "mla_v3n": "v3n", "mla_v32": "v32"}
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n", "mla_v32"])
 def test_decode_matches_prefill(name):
     """Prefill plus one-token steps on par with the block's parallel passes, each step's at the width it
@@ -357,6 +357,7 @@ def test_decode_matches_prefill(name):
                     seeds=SEEDS["decode"], truth_fn=jax.jit(module.apply))
 
 
+@attending("reference")
 @pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
 def test_a_paged_latent_cache_decodes_what_the_compact_cache_decodes(name, quantized):
@@ -442,12 +443,13 @@ def uncached_dequantized_steps(module, variables, hidden, quantized: str):
             first, second = (jnp.where(written, part, 0) for part in held)
             key, value = (first, second) if m.sparse else m._expand(first, second)
             outputs.append(m._attend(query[:, step:step + 1], key, value, gating[:, step:step + 1],
-                                     visible[:, None, step:step + 1], m.attention_impl))
+                                     visible[:, None, step:step + 1], chosen_attention()))
         return jnp.concatenate(outputs, axis=1)
 
     return module.apply(variables, hidden, method=lambda m, x: steps(m, x))
 
 
+@attending("reference")
 @pytest.mark.parametrize("quantized", ["int8", "float8_e4m3fn"])
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
 def test_a_quantized_latent_cache_decodes_what_dequantizing_in_the_own_basis_computes(name, quantized):
@@ -478,6 +480,7 @@ def test_a_quantized_latent_cache_decodes_what_dequantizing_in_the_own_basis_com
                                                                        quantized))
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n"])
 def test_mla_reproduces_the_v3_block(name):
     """DeepseekV3Attention, with the query LoRA and without (the plain-q_proj variant no released
@@ -488,6 +491,7 @@ def test_mla_reproduces_the_v3_block(name):
                     truth_fn=reference_walk(name, wide=True))
 
 
+@attending("reference")
 def test_mla_reproduces_the_v32_block():
     """DeepseekV32Attention: biased projections, the indexer's top-k folded into the mask. The output
     and the hidden states' gradient on par with the reference's (check 1), and the selection matters:
@@ -519,8 +523,8 @@ def walked(module):
 
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n", "mla_v32"])
 def test_auto_takes_the_unequal_query_and_value_head_widths(name):
-    """`attention_impl='auto'` computes the block on the shape it used to refuse, on par with the
-    reference path, its output and every gradient, the parameters' among them, from the reference
+    """The attention selector's own pick ('auto') computes the block on the shape it used to refuse, on par
+    with the reference path, its output and every gradient, the parameters' among them, from the reference
     path's float64 run (check 1); a crop that kept the padded columns instead of the value's own moves
     them by their own size.
 
@@ -533,7 +537,8 @@ def test_auto_takes_the_unequal_query_and_value_head_widths(name):
     """
     settings = CONFIG[SETTINGS[name]]
     variables, draw = block_variables(fixture(name)), block_draw(name)
-    assert_as_exact(walked(mla_module(settings, attention_impl="auto")), walked(mla_module(settings)),
+    module = mla_module(settings)
+    assert_as_exact(walked(module), attending("reference")(walked(module)),
                     lambda seed: (variables, *draw(seed)), f"{name} auto", seeds=SEEDS["auto"])
 
 
@@ -601,10 +606,11 @@ def mla_model(settings: dict, **overrides) -> CausalTransformer:
                                     int(settings["max_position_embeddings"])),
         "norm_eps": float(settings["rms_norm_eps"]), "qk_norm": False,
         "attention_bias": bool(settings["attention_bias"]),
-        "mixer": mla_record(settings), "attention_impl": "reference"}
+        "mixer": mla_record(settings)}
     return CausalTransformer(**{**fields, **overrides})
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
 def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
     """The kind lands the block at layers_0/self_attn with the translated
@@ -634,6 +640,7 @@ def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
     assert logits.shape == (2, 7, 37)
 
 
+@attending("reference")
 @pytest.mark.parametrize("scaling", [
     RopeScaling(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=4),
     LongRopeScaling(short_factor=(1.0, 1.5, 2.0, 2.5), long_factor=(3.0, 4.0, 5.0, 6.0),
@@ -663,6 +670,7 @@ LLAMA3_SCALED_SEEDS = 8
 sized by `seeds_for` paired with Dew's logits on the CPU."""
 
 
+@attending("reference")
 def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by_it(tmp_path):
     """A DeepSeek V3 checkpoint whose config scales its rope by Llama 3.1's ramp loads through the
     shared rope codec, and its latent attention rotates by the ramp: Dew's logits on par with
@@ -679,7 +687,7 @@ def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by
     config["rope_scaling"] = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
                               "high_freq_factor": 4.0, "original_max_position_embeddings": 4}
     (tmp_path / "config.json").write_text(json.dumps(config))
-    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path, dtype="float32")
     # The eager experts, which run in float64 too: the grouped kernel takes float32 or narrower.
     reference, truth = transformers_arms(transformers_model(tmp_path),
                                          lambda model, ids: model(input_ids=ids).logits)
@@ -818,6 +826,7 @@ def assert_masks_as_the_reference(dew, rule, label: str, positions: np.ndarray |
                     seeds=SEEDS["visibility"], truth_fn=truth)
 
 
+@attending("reference")
 def test_dense_mla_reads_a_pairwise_mask_as_the_reference_masks():
     """A call's pairwise mask, both halves of the row read whole, replaces the layer's causality:
     on par with transformers' block under the same mask from it in float64 (check 1)."""
@@ -828,6 +837,7 @@ def test_dense_mla_reads_a_pairwise_mask_as_the_reference_masks():
     assert_masks_as_the_reference(lambda v, h: module.apply(v, h, call), rule, "mla pairwise mask")
 
 
+@attending("reference")
 def test_a_call_s_own_mask_replaces_its_rows_validity():
     """A call's own mask replaces its rows' validity as it replaces their causality, as the shared core
     reads it: a real query may read a key the rows mark padding where the mask keeps it, on par with
@@ -845,6 +855,7 @@ def test_a_call_s_own_mask_replaces_its_rows_validity():
                                   positions=places)
 
 
+@attending("reference")
 def test_dense_mla_reads_its_window_as_the_reference_masks():
     """A windowed layer computes what transformers' block computes under an explicit mask of the
     window's keys written out by hand: on par with it from it in float64 (check 1)."""
@@ -854,6 +865,7 @@ def test_dense_mla_reads_its_window_as_the_reference_masks():
     assert_masks_as_the_reference(lambda v, h: windowed.apply(v, h), rule, "mla window")
 
 
+@attending("reference")
 def test_dense_mla_windows_its_tokens_by_their_count_not_their_rotary_places():
     """Places with gaps (0, 10, 20, ...) rotate the tokens, and the window counts the tokens: a window
     of two keeps each query and the token before it, on par with transformers' block rotating at the
@@ -868,6 +880,7 @@ def test_dense_mla_windows_its_tokens_by_their_count_not_their_rotary_places():
                                   positions=places)
 
 
+@attending("reference")
 @pytest.mark.parametrize("both_sides", [False, True], ids=["whole row", "two-sided window"])
 def test_a_bidirectional_dense_mla_windows_only_where_its_kind_keeps_both_sides(both_sides):
     """A non-causal windowed layer reads its whole row, unless its kind keeps the window on both sides
@@ -879,6 +892,7 @@ def test_a_bidirectional_dense_mla_windows_only_where_its_kind_keeps_both_sides(
     assert_masks_as_the_reference(lambda v, h: module.apply(v, h), rule, "mla bidirectional window")
 
 
+@attending("reference")
 def test_dense_mla_reads_its_chunk_as_the_reference_masks():
     """A chunked layer computes what transformers' block computes under an explicit mask of the
     chunk rule, on par with it from it in float64 (check 1)."""
@@ -888,6 +902,7 @@ def test_dense_mla_reads_its_chunk_as_the_reference_masks():
     assert_masks_as_the_reference(lambda v, h: chunked.apply(v, h), rule, "mla chunk")
 
 
+@attending("reference")
 @pytest.mark.parametrize("kind", [LayerKind(window=3), LayerKind(chunk=4)], ids=["window", "chunk"])
 def test_the_mla_kind_takes_its_layers_window_and_chunk(kind):
     """A decoder's mla layer of a windowed or chunked kind computes what the block with that window or
@@ -921,6 +936,7 @@ def whole_group_rule(groups: np.ndarray) -> np.ndarray:
     ("bidirectional_blocks", np.asarray(prefix_groups(
         jnp.ones((2, VIS_LENGTH), jnp.int32), jnp.ones((2, VIS_LENGTH), bool), 5))),
 ], ids=["blocks", "images", "prefix"])
+@attending("reference")
 def test_dense_mla_reads_its_groups_whole_as_the_reference_masks(field, groups):
     """A causal block that reads its block, image or prefix groups whole computes what transformers'
     block computes under an explicit mask of the whole-group rule, on par with it (check 1). The rule
@@ -934,6 +950,7 @@ def test_dense_mla_reads_its_groups_whole_as_the_reference_masks(field, groups):
                                   f"mla {field}")
 
 
+@attending("reference")
 def test_dense_mla_reads_key_runs_as_the_reference_masks():
     """A call's key runs, two keys either side of each query, compute what transformers' block
     computes under an explicit mask of their union, on par with it (check 1)."""
@@ -946,6 +963,7 @@ def test_dense_mla_reads_key_runs_as_the_reference_masks():
     assert_masks_as_the_reference(lambda v, h: module.apply(v, h, call), rule, "mla key runs")
 
 
+@attending("reference")
 def test_dense_mla_windows_its_key_runs_over_their_positions():
     """Key runs over the whole row, windowed by a windowed layer over the keys' given positions, its
     queries read at them too (runs of three places, then a gap), compute what transformers' block
@@ -961,6 +979,7 @@ def test_dense_mla_windows_its_key_runs_over_their_positions():
                                   "mla windowed key runs")
 
 
+@attending("reference")
 def test_dense_mla_reads_a_position_bias_as_the_reference_masks():
     """A position bias that forbids the odd keys but a query's own computes what transformers' block
     computes under an explicit mask of the same keys, on par with it (check 1): the bias's -inf is the
@@ -973,6 +992,7 @@ def test_dense_mla_reads_a_position_bias_as_the_reference_masks():
     assert_masks_as_the_reference(lambda v, h: module.apply(v, h, call), rule, "mla position bias")
 
 
+@attending("reference")
 def test_dense_mla_reads_packed_documents_under_a_window_as_the_split_calls_do():
     """Packed documents under the layer's window compute what the same windowed block computes
     over each document as its own call, on par with the split calls from them in float64
@@ -998,6 +1018,7 @@ def test_dense_mla_reads_packed_documents_under_a_window_as_the_split_calls_do()
                     "mla documents under a window", seeds=SEEDS["visibility"])
 
 
+@attending("reference")
 def test_dense_mla_reads_a_padded_row_under_a_window_as_its_unpadded_twin():
     """A row with padding among its tokens, under the layer's window, computes at its real
     tokens what the same windowed block computes over those tokens alone, on par with the twin
@@ -1022,6 +1043,7 @@ def test_dense_mla_reads_a_padded_row_under_a_window_as_its_unpadded_twin():
                     "mla padded row under a window", seeds=SEEDS["visibility"])
 
 
+@attending("reference")
 def test_a_windowed_dense_mla_decodes_as_it_prefills():
     """A windowed block's one-token decode steps compute what its passes compute, each step's at the
     width it reads (`as_stepped`), on par with them from them in float64 (check 1): the decode mask keeps
@@ -1034,6 +1056,7 @@ def test_a_windowed_dense_mla_decodes_as_it_prefills():
                     seeds=SEEDS["visibility"], truth_fn=jax.jit(windowed.apply))
 
 
+@attending("reference")
 def test_a_mla_model_reads_key_runs_as_their_pairwise_mask():
     """Through a decoder, whose block refuses a call field its mixer does not read, an mla model's
     logits under key runs are its logits under a pairwise mask of their union, bit for bit, and with its
@@ -1068,6 +1091,7 @@ def masked_losses(model, variables, tokens, keep, counted):
     return lost, jnp.asarray(counted, lost.dtype)
 
 
+@attending("reference")
 def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
     """A prefix run needs a layer that reads its blocks whole (`MixerBase.reads_blocks`): a decoder on
     the mla kind that reads them takes one, and its trained per-token losses are on par with its losses
@@ -1104,6 +1128,7 @@ def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
                     truth_fn=masked(wide))
 
 
+@attending("reference")
 def test_a_latent_attention_source_reads_its_blocks_whole_through_its_config_and_export(tmp_path):
     """A DeepSeek-V3 source whose config states its attention block-bidirectional
     (`modeling_overrides`) loads its latent attention reading blocks whole: a block group lets the
@@ -1116,7 +1141,7 @@ def test_a_latent_attention_source_reads_its_blocks_whole_through_its_config_and
     override = {"modeling_overrides": {"attention": {"full_attention": "block_bidirectional"}}}
     source = respelled(Path(__file__).resolve().parent / "fixtures" / "hf" / "deepseek-v3-tiny",
                        tmp_path / "source", lambda config: {**config, **override})
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32")
     tokens = jnp.asarray([[10, 11, 12, 13]], jnp.int32)
     altered = tokens.at[0, 1].set(14)
     groups = jnp.asarray([[0, 0, -1, -1]], jnp.int32)
@@ -1127,12 +1152,13 @@ def test_a_latent_attention_source_reads_its_blocks_whole_through_its_config_and
     np.testing.assert_array_equal(first(loaded, tokens), first(loaded, altered))
     assert np.any(first(loaded, tokens, block_groups=groups) != first(loaded, altered, block_groups=groups))
     loaded.save(tmp_path / "exported")
-    again = Pretrained.load(tmp_path / "exported", dtype="float32", attention_impl="reference")
+    again = Pretrained.load(tmp_path / "exported", dtype="float32")
     np.testing.assert_array_equal(
         np.asarray(again.model.apply(again.variables, tokens, block_groups=groups)),
         np.asarray(loaded.model.apply(loaded.variables, tokens, block_groups=groups)))
 
 
+@attending("reference")
 def test_a_recorded_prefix_run_trains_a_windowed_latent_attention_reading_its_prefix_whole(tmp_path):
     """Row 41 through a recorded run (`LMRunConfig`, `dew train`'s): a decoder whose layer kind windows a
     latent attention that reads blocks whole trains with an lm prefix over token files, and the model the
@@ -1160,7 +1186,7 @@ def test_a_recorded_prefix_run_trains_a_windowed_latent_attention_reading_its_pr
     fields = {"emb_features": settings["hidden_size"], "num_layers": 1,
               "num_heads": settings["num_attention_heads"],
               "head_dim": settings["qk_nope_head_dim"] + settings["qk_rope_head_dim"], "mlp_features": 48,
-              "qk_norm": False, "mixer": mixer, "attention_impl": "reference", "dtype": "float32",
+              "qk_norm": False, "mixer": mixer, "dtype": "float32",
               "layer_types": ["local"], "kinds": {"local": {"window": window}}}
     chain = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=seq, batch=8, pack=None)
     default = LMRunConfig(data=chain.loading(Loading(workers=0)),

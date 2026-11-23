@@ -178,7 +178,7 @@ def pooled_rollout() -> tuple:
     rank, processes = jax.process_index(), jax.process_count()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla")
+                              dtype="float32")
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     batch = rollout_prompts()
     rows = len(batch["prompt"]) // processes

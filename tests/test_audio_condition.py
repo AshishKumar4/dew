@@ -17,6 +17,7 @@ import pytest
 import torch
 from diffusion_support import images_of
 from learning_gate import assert_learns
+from model_support import attending
 
 from dew.config import ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
@@ -181,6 +182,7 @@ def _clip(path, hertz, frames=20, side=16):
                     "-c:v", "ffv1", "-c:a", "pcm_s16le", str(path)], check=True)
 
 
+@attending("reference")
 def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tmp_path):
     """A run config selects the audio condition over a video dataset's clips:
     the clips' audio reaches the model through the dataset's own `audio`
@@ -203,7 +205,7 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     seconds = data.facts()["audio_seconds"]
     config = DiffusionRunConfig(
         model=ModelConfig("video_dit", {"patch_size": 4, "emb_features": 32, "num_layers": 1,
-                                        "num_heads": 2, "dtype": "float32", "attention_impl": "reference"}),
+                                        "num_heads": 2, "dtype": "float32"}),
         data=data, text=None, audio=AudioCondition(checkpoint=str(towers / "wav2vec2")), val_metrics=(),
         objective=ObjectiveConfig("diffusion", {"steps": 4, "guidance": CFG(2.0), "ema_decay": None}))
     objective = config.build()

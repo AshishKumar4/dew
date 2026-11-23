@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 
     from dew.data.text import PinnedTokenizer
     from dew.distributed.placement import Layout, MeshSpec
-    from dew.nn.attention import AttentionImpl
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -201,7 +200,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     @classmethod
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
-                        attention_impl: AttentionImpl = "auto", params: Variables | None = None,
+                        params: Variables | None = None,
                         mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                         height: int | None = None, width: int | None = None):
         """The pipeline's conditioning; `height` and `width` replace the image size its
@@ -209,7 +208,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         from dew.interop.pipeline_assembly import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
-                                          revision=revision, attention_impl=attention_impl, params=params,
+                                          revision=revision, params=params,
                                           mesh=mesh, layout=layout,
                                           size=None if height is None or width is None else (height, width))
 
@@ -421,13 +420,13 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
     @classmethod
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
                         param_dtype: str = "float32", revision: str | None = None,
-                        attention_impl: AttentionImpl = "auto", tokens: int = 512,
+                        tokens: int = 512,
                         params: Variables | None = None, mesh: MeshSpec | Mesh | None = None,
                         layout: Layout | None = None):
         from dew.interop.pipeline_assembly import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
-                                          revision=revision, attention_impl=attention_impl,
+                                          revision=revision,
                                           tokens=tokens, params=params, mesh=mesh, layout=layout)
 
     def captions(self, tokens):

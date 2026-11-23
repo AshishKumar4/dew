@@ -14,6 +14,7 @@ import typing
 from pathlib import Path
 
 import pytest
+from model_support import attending
 from run_kinds import KINDS, cli_settings, saved_record, scalars, set_record, trained_record
 
 from dew.checkpoints import Checkpoints
@@ -96,6 +97,7 @@ def recorded(run: Path, kind: str) -> list[dict]:
     return [row["value"] for row in rows if row["type"] == kind]
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_pauses_splits_and_ranks_as_set(kind, tmp_path):
     """Four steps paused halfway (`stop`), each batch stepped as two microbatches (`split`), a
@@ -114,6 +116,7 @@ def test_a_kinds_run_pauses_splits_and_ranks_as_set(kind, tmp_path):
     assert Checkpoints(str(run)).resolve("best") == max(losses, key=losses.__getitem__)
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_cools_down_and_skips_its_final_save_as_set(kind, tmp_path):
     """Four steps with a cooldown branched at the second (`cooldowns`) and no checkpoint, the final
@@ -126,6 +129,7 @@ def test_a_kinds_run_cools_down_and_skips_its_final_save_as_set(kind, tmp_path):
     assert saved(run) == []
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_is_as_long_as_its_epochs_and_examples(kind, tmp_path):
     """A run of two epochs ends at twice the step one epoch ends at (`epochs`), where the kind's data
@@ -146,6 +150,7 @@ def test_a_kinds_run_is_as_long_as_its_epochs_and_examples(kind, tmp_path):
                          **{"trainer.examples": 2 * EXAMPLES[kind]}))[-1] == 2 * few
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_token_budget_ends_its_run_or_is_refused(kind, tmp_path):
     """A budget of one token ends a run of a kind that counts tokens at its first step (`tokens`); a
@@ -157,6 +162,7 @@ def test_a_kinds_token_budget_ends_its_run_or_is_refused(kind, tmp_path):
             trained(kind, tmp_path, "budget", **{"trainer.tokens": 1})
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_batch_ramp_compiles_a_step_for_each_batch_it_reads(kind, tmp_path):
     """A batch ramp from four rows to the batch's eight over the first eight examples (`batch_ramp`)
@@ -171,6 +177,7 @@ def test_a_kinds_batch_ramp_compiles_a_step_for_each_batch_it_reads(kind, tmp_pa
     assert len(recorded(run, "StepCompiled")) == 2
 
 
+@attending("xla")
 def test_a_ramped_run_accumulating_two_microbatches_resumes_at_a_stage_its_updates_moved(tmp_path):
     """A batch ramp from four rows to the batch's eight after four examples, its updates two microbatches
     each (`trainer.accumulation`), begins its next stage where an update does, record 8 not 4
@@ -187,6 +194,7 @@ def test_a_ramped_run_accumulating_two_microbatches_resumes_at_a_stage_its_updat
     assert saved(run)[-1] > first
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_lowered_for_a_gpu_lowers_its_step_and_trains_nothing(kind, tmp_path):
     """Lowered for an A100 (`dew lower ... target:check`), a kind's run lowers its first step for that GPU
@@ -198,6 +206,7 @@ def test_a_kinds_run_lowered_for_a_gpu_lowers_its_step_and_trains_nothing(kind, 
     assert not any(path.name.isdigit() for path in (tmp_path / "runs" / "lowered").iterdir())
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_handed_a_step_compiled_ahead_for_other_devices_refuses_it(kind, tmp_path):
     """A kind's run compiled ahead for eight 80 GB A100s it lacks (`dew lower ... target:ahead`) writes its
@@ -219,6 +228,7 @@ def test_a_kinds_run_handed_a_step_compiled_ahead_for_other_devices_refuses_it(k
     assert not any(path.name.isdigit() for path in (tmp_path / "runs" / "handed").iterdir())
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 @pytest.mark.parametrize("option", ["update_tokens"])
 def test_an_option_a_kinds_data_cannot_take_is_refused(kind, option, tmp_path):
@@ -227,6 +237,7 @@ def test_an_option_a_kinds_data_cannot_take_is_refused(kind, option, tmp_path):
         trained(kind, tmp_path, option, **{"trainer.steps": 2, f"trainer.{option}": 64})
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_is_tracked_on_wandb_offline_and_publishes_only_there(kind, tmp_path, monkeypatch):
     """A run tracked on W&B offline (`wandb`) writes its W&B run where W&B is told to keep it; publishing
@@ -246,6 +257,7 @@ def test_a_kinds_run_is_tracked_on_wandb_offline_and_publishes_only_there(kind, 
                                                   "trainer.wandb": {"project": "dew-tests", "publish": True}})
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_stops_on_a_plateau_of_its_training_loss(kind, tmp_path):
     """A plateau of one evaluation of the training loss that nothing improves past (`stop`) stops a run of
@@ -257,6 +269,7 @@ def test_a_kinds_run_stops_on_a_plateau_of_its_training_loss(kind, tmp_path):
     assert saved(run)[-1] == 2
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_is_profiled_and_trains_quantized_as_set(kind, tmp_path):
     """A profiler window of a step after one of warmup (`profile`) writes a trace of the run's step where
@@ -273,6 +286,7 @@ def test_a_kinds_run_is_profiled_and_trains_quantized_as_set(kind, tmp_path):
     assert scalars(quantized)[2]["train/loss"] != scalars(profiled)[2]["train/loss"]
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_feeds_its_microbatches_through_its_stages_or_is_refused(kind, tmp_path):
     """Over a mesh of two pipeline stages and two tensor shards, each data shard four rows, four
@@ -291,6 +305,7 @@ def test_a_kinds_run_feeds_its_microbatches_through_its_stages_or_is_refused(kin
     assert temps[4]["memory"]["analysis"]["temp"] < temps[2]["memory"]["analysis"]["temp"]
 
 
+@attending("xla")
 def test_an_lm_run_over_token_batches_accumulates_its_update_token_budget(tmp_path):
     """An LM run over windows batched by their tokens (`Dataset.batch(tokens=)`) and an update's token
     budget of two such batches (`update_tokens`) commits an update every second step, which its
@@ -314,6 +329,7 @@ def test_an_lm_run_over_token_batches_accumulates_its_update_token_budget(tmp_pa
     assert sorted(step for step, row in logged.items() if "train/grad_norm" in row) == [2, 4]
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_trains(kind, tmp_path,
                                                                                        monkeypatch):
@@ -328,7 +344,7 @@ def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_t
 
 
 def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
-    """An LM run whose attention takes Dew's attention template (`model.attention_impl="template"`,
+    """An LM run whose attention takes Dew's attention template (`diagnostics.kernels`' attention,
     `AttentionLaunch`), a launch of configs to measure, that measures its step's launches on this GPU
     (`tune_kernels`) adds what it picked to the picks of this GPU's kind beside the compilation cache
     (`dew._cache.kernel_picks_path`), where a later run reads them: the tuner measures Dew's own launches
@@ -362,14 +378,14 @@ def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
                    "XLA_FLAGS": measuring}
     record, settings = train_record("lm", tmp_path, "tuned", **{
         "trainer.steps": 1, "diagnostics.tune_kernels": "True", "trainer.mesh": {},
-        "trainer.compilation_cache_dir": str(compiled), "model.attention_impl": "template",
+        "trainer.compilation_cache_dir": str(compiled), "diagnostics.kernels": {"attention": "template"},
         "model.head_dim": 16})
     dew_train(tmp_path, environment, str(set_record(record, settings) / "run.json"))
     assert json.loads(picks.read_text())["data"]
 
 
 def an_lm_run_whose_launches_are_tokamaxs_refuses_to_tune(tmp_path):
-    """An LM run whose attention takes tokamax's Triton kernel (`model.attention_impl="triton"`), no launch
+    """An LM run whose attention takes tokamax's Triton kernel (`diagnostics.kernels`' attention), no launch
     of Dew's in its step, that asks to measure its launches (`tune_kernels`) is refused before it trains,
     naming the kernels it cannot measure (`tuning.Untunable`): the tuner measures Dew's own launches alone
     (row 2661), and a run that asked for measured configs gets none silently no longer."""
@@ -384,7 +400,7 @@ def an_lm_run_whose_launches_are_tokamaxs_refuses_to_tune(tmp_path):
                    "XLA_FLAGS": without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))}
     record, settings = train_record("lm", tmp_path, "untuned", **{
         "trainer.steps": 1, "diagnostics.tune_kernels": "True", "trainer.mesh": {},
-        "model.attention_impl": "triton", "model.head_dim": 16})
+        "diagnostics.kernels": {"attention": "triton"}, "model.head_dim": 16})
     arguments = [str(set_record(record, settings) / "run.json")]
     done = subprocess.run([sys.executable, "-m", "dew._cli.main", "train", *arguments], cwd=tmp_path,
                           env=environment, capture_output=True, text=True, timeout=900)
@@ -392,6 +408,7 @@ def an_lm_run_whose_launches_are_tokamaxs_refuses_to_tune(tmp_path):
     assert any(error.endswith("Untunable") for error in raised(done)), done.stderr[-2000:]
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_spreads_its_split_axis_by_the_link_it_states(kind, tmp_path):
     """A run that states its tensor axis's link (`links`) traces its step with that link as stated, not

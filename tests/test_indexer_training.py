@@ -22,6 +22,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from model_support import attending
 from recording import RecordingTracker
 from reference_error import (
     as_given,
@@ -149,6 +150,7 @@ def v32_block(**overrides):
     return module, block_variables(tensors), jnp.asarray(tensors["hidden"])
 
 
+@attending("reference")
 def test_an_indexer_without_a_top_k_leaves_the_attention_dense():
     """The warm-up's layer: the indexer's weights in the tree and its KL
     sown, the output the dense block's to the bit."""
@@ -161,6 +163,7 @@ def test_an_indexer_without_a_top_k_leaves_the_attention_dense():
     assert sown["indexer"]["kl"][0].shape == hidden.shape[:2]
 
 
+@attending("reference")
 def test_a_top_k_covering_the_keys_selects_the_dense_mask():
     """With the sequence inside the top-k the sparse layer attends every
     causal key, so its output and its KL are on par with the dense-indexed

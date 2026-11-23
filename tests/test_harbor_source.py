@@ -766,6 +766,33 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
         assert not lingering, "a child of the interrupted trainer's trial outlived it"
 
 
+def test_a_killed_trainer_takes_its_running_trial_and_its_childs_group_with_it(tmp_path, harbor):
+    """A trainer SIGKILLed mid-trial runs no exit hook: its trial's group outlives it no longer, its
+    lifeline ending the group (`dew._cleanup.start`), Harbor and the child it left in its group alike, where a
+    detached session ran on without its trainer (the audit's row 12172)."""
+    task = "lingering-waits"
+    (tmp_path / task).mkdir()
+    script = tmp_path / "trainer.py"
+    script.write_text(TRAINER.format(src=str(Path(__file__).resolve().parents[1] / "src"),
+                                     tests=str(Path(__file__).parent), root=str(tmp_path), task=task,
+                                     ready="*/child.json").replace(
+        "raise KeyboardInterrupt  # the trainer is interrupted mid-trial and never calls close()",
+        "import os, signal; os.kill(os.getpid(), signal.SIGKILL)  # killed mid-trial: no hook runs"))
+    trainer = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                             env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert trainer.returncode == -signal.SIGKILL, trainer.stderr[-2000:]
+    (seen,) = (tmp_path / "trials").glob("*/seen.json")
+    (child,) = (tmp_path / "trials").glob("*/child.json")
+    pids = [json.loads(seen.read_text())["pid"], json.loads(child.read_text())]
+    deadline = time.monotonic() + 10
+    while any(running(pid) for pid in pids) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    alive = [pid for pid in pids if running(pid)]
+    for pid in alive:
+        os.kill(pid, signal.SIGKILL)
+    assert not alive, "the killed trainer's trial or its child outlived it"
+
+
 AGENT = """\
 import json, os, sys, time
 task, directory = sys.argv[1], os.getcwd()

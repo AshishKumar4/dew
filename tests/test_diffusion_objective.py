@@ -24,6 +24,7 @@ from diffusion_support import (
     objective_gradient,
 )
 from flax import linen as nn
+from model_support import attending
 from reference_error import as_given
 
 from dew.data import Memory, Phase, Steps
@@ -331,11 +332,12 @@ def test_validation_samples_follow_the_step_key():
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def conditional_mmdit():
     encoder = CharTable.from_pretrained(tokens=3, features=6, vocab=16)
     inputs = InputSpec(Field("image", (4, 4, 1)), {"textcontext": Condition(encoder)})
     model = SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
-                               num_layers=1, num_heads=2, mlp_ratio=2, attention_impl="xla")
+                               num_layers=1, num_heads=2, mlp_ratio=2)
     preset = presets.EDM(sigma_max=1.0, regime="pixel")
     objective = DiffusionObjective(model, preset, inputs, steps=3, solver=Euler(), guidance=CFG(2.0))
     variables = objective.init(jax.random.key(0))
@@ -361,6 +363,7 @@ NULL_DROPOUT_ROWS = 32
 """The rows of each null-dropout draw: each weight's gradient sums over all of them."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("probability", [0.5, 1.0])
 def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_mmdit, probability):
     """An objective that drops a row's condition, which its step records, trains as one given that
@@ -458,6 +461,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
                     seeds=NULL_DROPOUT_SEEDS[probability], truth_fn=truth)
 
 
+@attending("xla")
 def test_a_dropped_row_is_conditioned_on_the_steps_own_towers(conditional_mmdit):
     """A fully dropped batch reads the blank its step's towers encode: move the towers in the step's
     variables and the loss moves with them, as a resumed tree's would."""
@@ -472,6 +476,7 @@ def test_a_dropped_row_is_conditioned_on_the_steps_own_towers(conditional_mmdit)
     assert float(dropped.scalar_loss(moved, batch, step)[0]) != pytest.approx(before)
 
 
+@attending("xla")
 def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mmdit):
     objective, variables, batch, step = conditional_mmdit
     condition = objective.inputs.conditions["textcontext"]
@@ -484,6 +489,7 @@ def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mm
     np.testing.assert_array_equal(actual, expected)
 
 
+@attending("xla")
 def test_an_image_task_walks_under_cfg_plus_plus_and_a_brownian_solver(conditional_mmdit):
     """An image task built from the objective walks under CFG++ guidance and an SDE solver with a seed,
     each a struct whose data leaf a lowered program describes (`jax.stages.ArgInfo`), which their checks
@@ -695,6 +701,7 @@ def test_a_validation_set_beside_phases_that_batch_their_own_is_read_in_their_ba
     assert all("input_ids" in batch["text"] and "caption" not in batch for batch in batches)
 
 
+@attending("xla")
 def test_an_objectives_trace_key_is_its_encoders_kind_and_record_not_their_weights(conditional_mmdit):
     """Two objectives over one encoder's kind and record but other weights key their step alike: the
     weights are the step's arguments (the state's `encoders`), never read off the encoder object, so no

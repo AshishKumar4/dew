@@ -44,6 +44,7 @@ import numpy as np
 import tyro
 
 import dew
+from dew import kernels
 from dew.artifacts import uint8_pixels
 from dew.config import TrainerConfig
 from dew.config.lm import LMRunConfig
@@ -118,8 +119,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
     loading = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
     model = CausalTransformer(emb_features=16, num_layers=1, num_heads=2, head_dim=8, mlp_features=32,
-                              vocab_size=256, max_seq_len=48, dtype=jnp.float32,
-                              attention_impl="reference")
+                              vocab_size=256, max_seq_len=48, dtype=jnp.float32)
     run = LMRunConfig(
         model=ModelConfig.from_model(model),
         data=Memory([{"text": play[:6000]}]).repeat().pipe(
@@ -287,4 +287,5 @@ def main(config: Config) -> Path:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Config))
+    with kernels.use(attention="reference"):
+        main(tyro.cli(Config))

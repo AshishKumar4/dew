@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from model_support import attending
 from run_kinds import stated
 
 from dew.config import RunConfig
@@ -788,6 +789,7 @@ def answered(run: Path) -> Decide:
     return task
 
 
+@attending("xla")
 def test_a_decision_release_compiles_its_step_under_the_layer_recomputation_its_run_asks(tmp_path):
     """`--remat` chooses a decision release's backbone layer policy as a fresh backbone's: the release
     declares another, and a run over it asking 'full' compiles its step at that rung (its `StepCompiled`
@@ -797,7 +799,7 @@ def test_a_decision_release_compiles_its_step_under_the_layer_recomputation_its_
 
     from dew.nn.backbones.decoder_block import remat_policy
 
-    assert Decide.from_pretrained(TINY, attention_impl="xla").model.backbone.remat != remat_policy("full")
+    assert Decide.from_pretrained(TINY).model.backbone.remat != remat_policy("full")
     run = trained_by_cli(dataclasses.replace(decision(tmp_path, drawn=False), remat="full"), tmp_path,
                          "remat", {})
     assert [compiled["remat"] for compiled in recorded(run, "StepCompiled")] == [["full", None]]

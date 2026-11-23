@@ -27,7 +27,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import LogicalAxes
 from dew.nn.activations import logistic
-from dew.nn.attention import AttentionImpl, kernel_for_materialized_mask, scaled_dot_product_attention
+from dew.nn.attention import chosen_attention, kernel_for_materialized_mask, scaled_dot_product_attention
 from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits, visibility_mask
 from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
@@ -396,7 +396,6 @@ class MultiHeadLatentAttention(LinearProducts):
     kv_store_key: str | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
     kv_cache: KVCache = dataclasses.field(default_factory=KVCache)
     """The decode cache's storage layout (`dew.nn.kv_cache`), paged or quantized, over the latents
     or, under the sparse layout, the expanded keys."""
@@ -694,7 +693,7 @@ class MultiHeadLatentAttention(LinearProducts):
         # A row without context reads its first slot, so its softmax stays finite (`CausalSelfAttention`).
         attention = checkpoint_name(scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax, implementation=self.attention_impl,
+            force_fp32_for_softmax=self.force_fp32_for_softmax,
             key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
             max_segments=max_segments), Residual.CONTEXT)
         return self._output(attention, gate)
@@ -739,7 +738,7 @@ class MultiHeadLatentAttention(LinearProducts):
         decode, attention_metadata = call.decode, call.metadata
         causal, mask, objective = self.causal, None, None
         unselected = None
-        implementation = self.attention_impl
+        implementation = chosen_attention()
         tokens = coordinates_of(attention_metadata, batch, length)
         # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
         positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
@@ -1233,7 +1232,6 @@ class MLAMixer(MixerBase):
             kv_store_key=ctx.kv_store_key,
             dtype=ctx.dtype,
             precision=ctx.precision,
-            attention_impl=ctx.attention_impl,
             rotary=not self.mla_use_nope,
             output_gate=self.mla_use_output_gate,
             query_gate=self.attn_gate_fused,

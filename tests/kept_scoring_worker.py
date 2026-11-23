@@ -20,7 +20,7 @@ REQUEST = json.loads((FIXTURES / "cases.json").read_text())["quickstart"]
 BODIES = [REQUEST, {**REQUEST, "state": REQUEST["state"] * 4},
           {**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}]
 # One row a pass, so a window count at each of the layout's lengths.
-task = replace(Decide.from_pretrained(FIXTURES / "tiny", attention_impl="xla"),
+task = replace(Decide.from_pretrained(FIXTURES / "tiny"),
                budget=Budget(options=16, rows=1))
 
 

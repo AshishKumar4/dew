@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, attending, scanning, unrolled
 from reference_error import as_given, assert_as_exact, widened
 
 import dew.nn.dex
@@ -135,8 +135,8 @@ def loads(trains: str = "all", dtype: str = "float32"):
     """The source and the source with DEX on layer 0's heads 1 and 3 (`HEADS`), each loaded computing
     and storing in `dtype`."""
     extension = DifferentialExtension(((0, HEADS),), anneal_steps=10, trains=trains)
-    return (Pretrained.load(LLAMA, dtype=dtype, param_dtype=dtype, attention_impl="reference"),
-            Pretrained.load(LLAMA, dtype=dtype, param_dtype=dtype, attention_impl="reference", dex=extension))
+    return (Pretrained.load(LLAMA, dtype=dtype, param_dtype=dtype),
+            Pretrained.load(LLAMA, dtype=dtype, param_dtype=dtype, dex=extension))
 
 
 def moved_draw(variables, value_dim: int):
@@ -159,6 +159,7 @@ def moved_draw(variables, value_dim: int):
     return draw
 
 
+@attending("reference")
 def test_a_loaded_source_takes_dex_by_the_papers_recipe():
     """A source loaded with DEX adds its chosen heads' projections and a lambda alone, and by the
     paper's recipe trains them and every softmax attention layer's key, value and output projections,
@@ -195,7 +196,7 @@ def exported_site(directory: Path, dtype: str):
     @as_given
     def reloaded(variables, ids, _):
         loaded.save(directory, variables=variables)
-        back = Pretrained.load(directory, dtype=dtype, param_dtype=dtype, attention_impl="reference")
+        back = Pretrained.load(directory, dtype=dtype, param_dtype=dtype)
         return np.asarray(back.model.apply(back.variables, ids), np.float32)
 
     wide = loaded.model.clone(dtype=jnp.float64)
@@ -205,6 +206,7 @@ def exported_site(directory: Path, dtype: str):
             jax.jit(lambda variables, ids, _: wide.apply(variables, ids)))
 
 
+@attending("reference")
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def test_an_export_writes_dex_folded_into_its_output_projections(tmp_path, dtype):
     """The source's format holds no extension, so an export writes each layer's differential at its
@@ -261,6 +263,7 @@ def test_a_folded_kernel_rounds_once_to_the_dtype_its_read_asks_for():
     assert np.float32(np.float16(wide)) != np.float32(wide)
 
 
+@attending("reference")
 def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():
     """Passed a run's step's progress (`dew.nn.progress`), the layer reads lambda annealed over the run's
     updates: at update 0 the extended decoder computes its source's logits whatever its extension holds,
@@ -287,6 +290,7 @@ def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():
                         seeds=SEEDS["dex through the decoder"], truth_fn=wide_through)
 
 
+@attending("reference")
 def test_dex_trains_through_the_decoder_as_its_folded_output_projection():
     """Gradients through the loaded decoder: of the logits under a cotangent, with respect to DEX's
     projections and lambda and layer 0's key, value and output projections, on par with the same
@@ -326,7 +330,7 @@ EVERY_LAYER = DifferentialExtension(((0, (0, 1)), (1, (1, 3)), (2, (2, 0)), (3, 
 
 def every_layer(**fields) -> CausalTransformer:
     return CausalTransformer(**{"vocab_size": 64, **TINY_DECODER, "num_layers": 4, "dtype": jnp.float32,
-                                "attention_impl": "reference", "dex": EVERY_LAYER, **fields})
+                                "dex": EVERY_LAYER, **fields})
 
 
 def mid_anneal(model):
@@ -342,7 +346,7 @@ def scanned_site():
     draw of their variables with each layer's lambda and projections moved off their start, and the
     plain decoder's float64 as truth."""
     plain = every_layer()
-    start = nn.unbox(plain.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32)))
+    start = nn.unbox(unrolled(plain.init)(jax.random.key(0), jnp.zeros((2, 7), jnp.int32)))
 
     def draw(seed):
         rng = np.random.default_rng([0xD5, seed])
@@ -354,10 +358,11 @@ def scanned_site():
         return {**start, "params": unflatten_dict(flat)}, tokens
 
     wide = mid_anneal(plain.clone(dtype=jnp.float64))
-    return (mid_anneal(every_layer(scan_layers=True)), mid_anneal(plain), draw,
-            jax.jit(lambda variables, tokens: wide(variables, tokens)))
+    return (scanning(mid_anneal(plain)), unrolled(mid_anneal(plain)), draw,
+            unrolled(jax.jit(lambda variables, tokens: wide(variables, tokens))))
 
 
+@attending("reference")
 def test_layers_that_choose_their_own_heads_scan_and_pipeline_as_one_run():
     """Each layer's chosen heads and lambda_init are its own variables, so layers that choose as many
     heads share one spec (ledger 2476): the four scan as one run and split over two pipeline stages,
@@ -366,10 +371,11 @@ def test_layers_that_choose_their_own_heads_scan_and_pipeline_as_one_run():
     assert every_layer().stage_split(2).per_stage == 2
     scanned, plain, draw, truth = scanned_site()
     variables, _ = draw(0)
-    assert every_layer(scan_layers=True).apply(variables, method=lambda module: module.groups) == ((0, 4),)
+    assert scanning(every_layer().apply)(variables, method=lambda module: module.groups) == ((0, 4),)
     assert_as_exact(scanned, plain, draw, "dex scanned", seeds=SEEDS["dex scanned"], truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.mesh
 def test_a_pipelined_run_reads_its_rows_progress():
     """A run's progress rides the call's metadata one row's apiece (`AttentionMetadata.progress`), which
@@ -391,11 +397,12 @@ def test_a_pipelined_run_reads_its_rows_progress():
     def staged(variables, tokens):
         with jax.set_mesh(mesh), pipeline_microbatches(2):
             laid = jax.device_put(variables, Layout(min_shard=16).shardings(mesh, variables))
-            return jax.device_get(mid_anneal(every_layer())(laid, shard_batch(mesh, tokens)))
+            return jax.device_get(unrolled(mid_anneal(every_layer()))(laid, shard_batch(mesh, tokens)))
 
     assert_as_exact(staged, plain, rows, "dex pipelined", seeds=SEEDS["dex pipelined"], truth_fn=truth)
 
 
+@attending("reference")
 def test_a_run_names_dex_on_the_command_line_and_its_record_rebuilds_it():
     """`--source.dex` takes the extension's record as JSON, every run kind's (`SourceOptions.dex`), which
     its source's load reads (`RunConfig.source_keywords`) and its run record writes and reads back; the
@@ -410,7 +417,7 @@ def test_a_run_names_dex_on_the_command_line_and_its_record_rebuilds_it():
     assert run.source.dex == extension
     assert run.source_keywords(frozen=False)["dex"] == extension
     assert LMRunConfig.from_dict(run.to_dict()).source == run.source
-    loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference",
+    loaded = Pretrained.load(LLAMA, dtype="float32",
                              **run.source.keywords())
     model = loaded.model
     assert isinstance(model, CausalTransformer) and model.dex == extension

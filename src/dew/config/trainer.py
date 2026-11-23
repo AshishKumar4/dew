@@ -111,7 +111,7 @@ class Diagnostics:
     Only a process with the GPU to itself measures, and the picks persist beside
     the compilation cache for every later run that sets it too, each pick read for
     its own launch alone. It measures each of Dew's own launches that declares
-    variants to time (the kernel templates, `attention_impl="template"`, the norms,
+    variants to time (the kernel templates, `kernels={"attention": "template"}`, the norms,
     SwiGLU and decode attention); tokamax's flash kernel (`"triton"`) runs at
     tokamax's heuristic config, unmeasured.
     Unset, nothing is measured or read: every launch takes the config it derives

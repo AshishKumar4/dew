@@ -29,6 +29,7 @@ from interop_support import (
     token_table,
     torch_logits,
 )
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from _dew_torch.precision import float64
@@ -183,6 +184,7 @@ def _reference(directory: Path):
     return model.eval(), float64_twin(model, lambda: built(torch.float64)).eval()
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", sorted(set(YARN_SEEDS) - {SHARDED_YARN}))
 def test_a_yarn_record_extends_every_family_whose_source_builds_it(name, tmp_path):
     """The family's reader takes a YaRN record onto its rotated layers, and its logits over drawn ids
@@ -190,6 +192,7 @@ def test_a_yarn_record_extends_every_family_whose_source_builds_it(name, tmp_pat
     assert_yarn_extends(name, tmp_path)
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=512, per_task=256)
 def test_a_yarn_record_extends_gemma3n_as_its_source_does(tmp_path):
     """`test_a_yarn_record_extends_every_family_whose_source_builds_it` over Gemma 3n (`SHARDED_YARN`)."""
@@ -203,7 +206,7 @@ def assert_yarn_extends(name, tmp_path):
 
     config = _fixture_config(name)
     directory = _source(name, tmp_path / name, **_yarned(config))
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     model = loaded.model
     assert any(isinstance(scaling, YarnScaling) for scaling in
                (model.rope_scaling, *(kind.rope_scaling for kind in (model.kinds or {}).values())))
@@ -287,6 +290,7 @@ def _untrained(gradient) -> list[int]:
     return np.flatnonzero(~np.asarray(gradient).any(axis=-1)).tolist()
 
 
+@attending("reference")
 @pytest.mark.parametrize("case", ("stated", "omitted", "null"))
 @pytest.mark.parametrize("name", sorted(PADDED | UNPADDED))
 def test_the_pad_row_takes_the_gradient_its_source_gives_it(name, case, tmp_path):
@@ -305,8 +309,11 @@ def test_the_pad_row_takes_the_gradient_its_source_gives_it(name, case, tmp_path
     directory = tmp_path / name
     config, recorded = _padding_case(name, case, directory)
     model = models.build("causal_transformer",
-                         {**translate_config(config), "dtype": "float32", "attention_impl": "reference"})
-    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32)))
+                         {**translate_config(config), "dtype": "float32"})
+    # The lookup's variables alone, which every read below takes (`method="token_embeddings"`): a whole
+    # decoder's draw of a mixture of experts' layers took most of a case's 135 s (row 11917).
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32),
+                                    method="token_embeddings"))
     table = token_table(variables)[1]
     rows = jnp.arange(table.shape[0])[None]
     placeholders = [config[field] for field in PLACEHOLDERS.get(name, ())]
@@ -347,6 +354,7 @@ KIND_RAMP_SEEDS = {"gemma3-tiny": 8, "mimo-v2-flash-tiny": 8}
 """Each fixture's declared check-1 seeds for its per-kind ramps' logits, sized by `seeds_for` on armada."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", sorted(KIND_RAMPS))
 def test_each_layer_kind_rotates_by_its_own_record(name, tmp_path):
     """A config whose layer kinds state their own rope records loads each kind's ramp as the source's
@@ -357,7 +365,7 @@ def test_each_layer_kind_rotates_by_its_own_record(name, tmp_path):
     rope = {kind: {"rope_theta": record["rope_theta"], **KIND_RAMPS[name].get(kind, {})}
             for kind, record in config["rope_parameters"].items()}
     directory = _source(name, tmp_path / name, rope_parameters=rope, max_position_embeddings=CONTEXT)
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     reference, wide = _reference(directory)
     forward = jax.jit(loaded.model.apply)
 
@@ -376,6 +384,7 @@ reference (`seeds_for(dew_fn=...)`): the reference alone, heavy-tailed across dr
 delta net's float32 recurrence, resolves within no 512."""
 
 
+@attending("reference")
 def test_a_qwen35_wrapper_turns_its_three_axis_rotary_by_a_yarn_record(tmp_path):
     """Qwen 3.5's wrapper turns each rotated pair of an image token by its temporal, height or width id
     (`mrope_section`) at the frequencies its record builds through `ROPE_INIT_FUNCTIONS`, and scales
@@ -390,7 +399,7 @@ def test_a_qwen35_wrapper_turns_its_three_axis_rotary_by_a_yarn_record(tmp_path)
     directory = respelled(FIXTURES / WRAPPER, tmp_path / WRAPPER, lambda config: {
         **config, "text_config": {**config["text_config"], "max_position_embeddings": CONTEXT,
                                   "rope_parameters": {**config["text_config"]["rope_parameters"], **YARN}}})
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     assert loaded.processor is not None
 
     def built(dtype):
@@ -432,6 +441,7 @@ def test_a_qwen35_wrapper_turns_its_three_axis_rotary_by_a_yarn_record(tmp_path)
                     truth_fn=theirs(wide, float64))
 
 
+@attending("reference")
 def test_a_phi3_record_spelled_yarn_is_the_longrope_its_source_reads(tmp_path):
     """Phi3Config reads rope_type 'yarn' as LongRoPE's older spelling (configuration_phi3.py:101-104) and
     refuses any other ramp (:122-123), so Phi-3's rotary builds no YaRN: a Phi-3 record spelled 'yarn'
@@ -442,7 +452,7 @@ def test_a_phi3_record_spelled_yarn_is_the_longrope_its_source_reads(tmp_path):
     # The source writes its config back as it reads it, LongRoPE by name; the release's spelling is put back.
     saved = json.loads((directory / "config.json").read_text())
     (directory / "config.json").write_text(json.dumps({**saved, "rope_parameters": rope}))
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     reference, wide = _reference(directory)
     forward = jax.jit(loaded.model.apply)
     draw = token_draw(0x15943, config["vocab_size"], (ROWS, config["max_position_embeddings"]))

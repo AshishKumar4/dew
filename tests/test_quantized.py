@@ -23,7 +23,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from interop_support import fetch, respelled
-from model_support import float64_twin
+from model_support import attending, float64_twin
 from reference_error import assert_as_exact, widened
 
 from dew.interop import Pretrained
@@ -165,6 +165,7 @@ def expanded(scale_inv, shape, block):
     return grid[:shape[0], :shape[1]]
 
 
+@attending("reference")
 @pytest.mark.parametrize("block", [(16, 16), (1, 16), (8, 16)], ids=["square", "row", "rectangle"])
 def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path, block):
     """The tiny DeepSeek fixture re-shipped the way the real one is: the
@@ -187,8 +188,7 @@ def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path, block):
         assert not np.array_equal(expected[name], tensors[name]), "quantization changed nothing"
     write_safetensors(directory / "model.safetensors", shipped)
 
-    variables = Pretrained.load(str(directory), dtype="float32",
-                                attention_impl="reference").variables
+    variables = Pretrained.load(str(directory), dtype="float32").variables
 
     params = variables["params"]
     up = params["layers_0"]["mlp"]["up_proj"]["kernel"]
@@ -199,6 +199,7 @@ def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path, block):
                           tensors["model.layers.0.mlp.gate_proj.weight"].T)
 
 
+@attending("reference")
 def test_an_fp8_checkpoint_loads_and_saves_without_the_prediction_depths_it_drops(tmp_path):
     """GLM's tiny fixture shipped as fp8 in its trunk and its prediction depth: `prediction_depths=0`
     leaves the depth's quantized weights and scales unread, so the load binds the trunk's scales alone,
@@ -212,11 +213,11 @@ def test_an_fp8_checkpoint_loads_and_saves_without_the_prediction_depths_it_drop
         shipped[name], shipped[name + SCALE_SUFFIX] = quantize_fp8_blocks(tensors[name], (16, 16))
     write_safetensors(directory / "model.safetensors", shipped)
 
-    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference",
+    loaded = Pretrained.load(str(directory), dtype="float32",
                              prediction_depths=0)
     assert loaded.model.num_nextn_predict_layers == 0
     loaded.save(tmp_path / "saved")
-    reloaded = Pretrained.load(str(tmp_path / "saved"), dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(str(tmp_path / "saved"), dtype="float32")
     assert reloaded.model.num_nextn_predict_layers == 0
     ids = jnp.arange(8, dtype=jnp.int32)[None] % loaded.model.vocab_size
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
@@ -326,6 +327,7 @@ def one_training_step(variables):
 
 
 @pytest.fixture(scope="module", params=[False, True], ids=["float32-scales", "ue8m0-scales"])
+@attending("reference")
 def reexport(request, tmp_path_factory):
     """The tiny DeepSeek fixture shipped the way the real checkpoints are,
     loaded, trained, and written back out in its own format.
@@ -352,12 +354,12 @@ def reexport(request, tmp_path_factory):
     write_safetensors(directory / "model.safetensors", shipped)
 
     names = scaled_names(load_shards(directory))
-    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(directory), dtype="float32")
     values = one_training_step(loaded.variables)
     dense = source_tensors(loaded, values)
     loaded.save(destination, variables=values)
     written = dict(read_file(destination / "model.safetensors")[0])
-    reloaded = Pretrained.load(str(destination), dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(str(destination), dtype="float32")
     dense_dir = respelled(FIXTURE, root / "expected_dense",
                           lambda cfg: {k: v for k, v in cfg.items() if k != "quantization_config"})
     expected_tensors = {
@@ -367,12 +369,13 @@ def reexport(request, tmp_path_factory):
            for name in names},
     }
     write_safetensors(dense_dir / "model.safetensors", expected_tensors)
-    expected_dense = Pretrained.load(str(dense_dir), dtype="float32", attention_impl="reference")
+    expected_dense = Pretrained.load(str(dense_dir), dtype="float32")
     return {"ue8m0": ue8m0, "names": names, "dense": dense, "written": written,
             "loaded": loaded, "values": values, "reloaded": reloaded,
             "expected_dense": expected_dense, "destination": destination}
 
 
+@attending("reference")
 def test_a_trained_source_writes_the_cast_of_its_trained_weights(reexport):
     """Every byte of every re-encoded tensor is the cast of the trained fp32
     weight the layouts assembled, and every scale the same float32: the
@@ -386,6 +389,7 @@ def test_a_trained_source_writes_the_cast_of_its_trained_weights(reexport):
                               scales.view(np.uint32)), name
 
 
+@attending("reference")
 def test_the_written_file_decodes_through_a_reader_that_shares_no_code(reexport):
     """The bytes on disk rather than the arrays in memory: the header names
     F8_E4M3 and F32, decoding the payload by E4M3FN's bit fields gives the
@@ -407,6 +411,7 @@ def test_the_written_file_decodes_through_a_reader_that_shares_no_code(reexport)
                                        REEXPORT_BLOCK))), name
 
 
+@attending("reference")
 def test_reloading_the_re_export_recovers_the_blocks_it_wrote(reexport):
     """The loader over the export: each re-encoded tensor comes back as
     exactly the dequantization of the pair on disk, and each untouched one
@@ -426,6 +431,7 @@ def test_reloading_the_re_export_recovers_the_blocks_it_wrote(reexport):
             assert recovered[name].tobytes() == value.tobytes(), name
 
 
+@attending("reference")
 def test_the_re_export_loses_only_what_the_format_rounds(reexport):
     """The lossy claim, kept apart from the exact ones above. A trained fp32
     weight and the weight the export gives back differ by nearest-even into
@@ -449,6 +455,7 @@ REEXPORT_FORWARD_SEEDS = 8
 """Check 1's declared seeds for the reloaded FP8 model against an independent dequantized-weight forward."""
 
 
+@attending("reference")
 def test_the_re_exported_model_computes_the_dequantized_blocks_forward(reexport):
     """The reloaded FP8 model evaluates its recovered weights on par with an independent unquantized
     float32 build over independently quantized-then-dequantized trained weights from its float64 twin

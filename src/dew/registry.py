@@ -143,7 +143,12 @@ def import_path(member: Importable) -> str:
 
     A lambda, a function defined inside another, or anything defined in
     `__main__` has no path another process can import, so it is refused here,
-    where the record is written, rather than when it is read."""
+    where the record is written, rather than when it is read; as is a method
+    bound to an instance, whose receiver a path does not name (a reload would
+    import its unbound function: the API02 review)."""
+    if isinstance(member, types.MethodType) and not isinstance(member.__self__, type):
+        raise Unrecordable(f"{member!r} is bound to an instance its path cannot name; record a function, a "
+                           "class or a dataclass that holds what it reads")
     function = member.__func__ if isinstance(member, types.MethodType) else member
     module, name = function.__module__, function.__qualname__
     if not module or module == "__main__" or "<" in name:
@@ -483,12 +488,13 @@ def resolve_alias(annotation: Annotation) -> Annotation:
 
 
 def _union_members(annotation: Annotation) -> tuple[Annotation, ...]:
+    """A union's members, aliases within it expanded and each member once, by identity, however many of
+    its aliases name it (`Stops | Pause` where `Stops` holds `Pause`)."""
     annotation = resolve_alias(annotation)
     if typing.get_origin(annotation) in (Union, types.UnionType):
-        # Each once: one class a union names under several subcommands (a run's numerics' presets) is that
-        # class alone.
-        return tuple(dict.fromkeys(inner for member in typing.get_args(annotation)
-                                   for inner in _union_members(member)))
+        expanded = [inner for member in typing.get_args(annotation) for inner in _union_members(member)]
+        return tuple(member for index, member in enumerate(expanded)
+                     if not any(member is earlier for earlier in expanded[:index]))
     if typing.get_origin(annotation) is typing.Annotated:
         return _union_members(typing.get_args(annotation)[0])
     return (annotation,)
@@ -728,6 +734,67 @@ def _admits_function(annotation: Annotation) -> bool:
     return True
 
 
+def _unnamed(annotation: Annotation, classes: tuple[type, ...], value: Mapping, *,
+             dtypes: bool) -> Configured:
+    """A mapping naming no class (`class_record`) for a field of a union declaring no mapping (`_rebuilt`):
+    the record of the one dataclass of the union that reads it as its record (`_holds_record`: its keys
+    fields the class records, its required fields among them) and builds from it, its own checks passing
+    (a scaling's `rope_type`), as a field of the class reads it (row 11980: `TrainerConfig.stop`, a Pause
+    or a Plateau, given `{"fraction": 0.5}` held a dict, and the run never paused; a saved decoder's
+    `rope_scaling={"rope_type": "yarn", "factor": 4.0}` is a `YarnScaling`); refused where several
+    classes build from it, as nothing says which it is, or none does. A mapping no class reads as its
+    record stays as written, a source's own record its field reads."""
+    fitting = [member for member in classes if member is not object and _holds_record(member, value)]
+    if not fitting:
+        return configured(value)
+    built = []
+    shared = _READING.get()
+    # Each trial from the shared modules as they stood before any (`before`), its own kept beside what it
+    # built: the read keeps the one trial that builds, no other trial's, a refused or an ambiguous one's
+    # neither (the API02 review: a trial read the shared modules another had built).
+    before = None if shared is None else (dict(shared.built), dict(shared.sources))
+    for member in fitting:
+        # A class whose own check refuses the record (a scaling's `rope_type` another's) is not its class.
+        if shared is not None and before is not None:
+            shared.built, shared.sources = dict(before[0]), dict(before[1])
+        try:
+            made = _construct(member, value, dtypes=dtypes)
+        except ValueError:
+            if len(fitting) == 1:
+                raise
+            continue
+        built.append((made, None if shared is None else (shared.built, shared.sources)))
+    if shared is not None and before is not None:
+        kept = built[0][1] if len(built) == 1 else None
+        shared.built, shared.sources = kept if kept is not None else before
+    if len(built) == 1:
+        return built[0][0]
+    names = ", ".join(f"{member.__module__}:{member.__qualname__}" for member in fitting)
+    if not built:
+        raise ValueError(f"{annotation} declares {names}, each refusing {value!r} as its record")
+    raise ValueError(f"{annotation} declares {names}, each of whose fields hold {sorted(value)}: write the "
+                     f"class record {{'class': ..., 'fields': {{...}}}} that names one")
+
+
+def _holds_record(member: type, value: Mapping) -> bool:
+    """Whether the dataclass `member` reads `value` as its record (`_declared`): its every key a field the
+    class records, its every required field among them."""
+    if not dataclasses.is_dataclass(member):
+        return False
+    names, required = _record_fields(member)
+    return set(value) <= set(names) and set(required) <= set(value)
+
+
+def _record_fields(member: type) -> tuple[list[str], list[str]]:
+    """The fields the dataclass `member`'s record holds, and those of them it must (no default): a field
+    marked `metadata={"record": False}` is a binding the value picks up at runtime, not something a record
+    carries."""
+    declared = [field for field in dataclasses.fields(member) if _recorded(field)]
+    required = [field.name for field in declared
+                if field.default is dataclasses.MISSING and field.default_factory is dataclasses.MISSING]
+    return sorted(field.name for field in declared), required
+
+
 def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str = "") -> Configured:
     """Return `value` as its annotation asks for it: a record becomes the value it
     describes, and anything already built is left alone.
@@ -789,6 +856,8 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
         if isinstance(value, list) and len(sequences) == 1:
             # A record's list is the union's one sequence member (`Files.url: str | tuple[str, ...]`).
             return _rebuilt(sequences[0], value, dtypes=dtypes)
+        if isinstance(value, Mapping) and not mappings:
+            return _unnamed(annotation, classes, value, dtypes=dtypes)
         return configured(value)
     if isinstance(value, Mapping):
         if typing.get_origin(annotation) is Callable or annotation is Callable:
@@ -1001,7 +1070,7 @@ def _shared(annotation: Annotation, value: Mapping[str, object], *, dtypes: bool
     if "share" in value:
         source = value
     elif number in shared.built:
-        return shared.built[number]
+        return _declared_as(annotation, shared.built[number], number)
     else:
         found = shared.candidates.get(number, [])
         if len(found) != 1:
@@ -1011,12 +1080,30 @@ def _shared(annotation: Annotation, value: Mapping[str, object], *, dtypes: bool
     if number in shared.built:
         if shared.sources[number] != source:
             raise ValueError(f"the record defines its shared module {number} twice")
-        return shared.built[number]
+        return _declared_as(annotation, shared.built[number], number)
     shared.sources[number] = source
     shared.built[number] = _rebuilt(annotation, {str(key): entry for key, entry in source.items()
                                                  if key != "share"}, dtypes=dtypes)
     return shared.built[number]
 
+
+def _declared_as(annotation: Annotation, built: Configured, number: int) -> Configured:
+    """`built`, the shared module `number` read before, where the field reading it again declares it
+    (`annotation`'s class, or one of its union's); refused where it declares only classes it is none of, so
+    a union's trial whose field declares another kind refuses the record as a module built for it would
+    (the API02 review: a module built for one field read as another's, and two trials built)."""
+    members = (_union_members(annotation) if typing.get_origin(annotation) in (Union, types.UnionType)
+               else (resolve_alias(annotation),))
+    declared = [member for member in members if member is not type(None)]
+    if any(member is typing.Any or member is object for member in declared):
+        return built
+    # A parameterized class (`Sequence[Module]`) by its class (`typing.get_origin`), as `isinstance` reads it.
+    nominal = [typing.get_origin(member) or member for member in declared]
+    classes = tuple(member for member in nominal if isinstance(member, type) and not is_protocol(member))
+    if declared and len(classes) == len(declared) and not isinstance(built, classes):
+        raise ValueError(f"the shared module {number} is a {type(built).__qualname__}, which the field "
+                         f"reading it again ({annotation}) does not declare")
+    return built
 
 def component[Base](base: type[Base], record: Mapping[str, object]
                     ) -> tuple[type[Base], Mapping[str, object]]:
@@ -1165,11 +1252,9 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> Ma
     field `member` does not declare, or a required one the record lacks,
     raises. A field marked `metadata={"record": False}` is a binding the
     value picks up at runtime, not something a record carries."""
-    declared = [f for f in dataclasses.fields(member) if _recorded(f)]
-    names = sorted(f.name for f in declared)
+    names, required = _record_fields(member)
     unknown = sorted(set(fields) - set(names))
-    missing = [f.name for f in declared if f.name not in fields
-               and f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING]
+    missing = [name for name in required if name not in fields]
     if unknown or missing:
         raise ValueError(f"{member.__name__} does not match the record: unknown fields {unknown}, "
                          f"missing fields {missing}; its fields are {names}")
@@ -1911,8 +1996,9 @@ class ModelConfig(Registered):
     """A model's class and the fields the run gives it.
 
     `name` is an alias or an import path, held as the path. `fields` are the
-    class's own fields, its compute and storage dtypes, attention kernel and
-    matmul precision included, which the command line sets one flag each
+    class's own fields, its compute and storage dtypes and matmul precision
+    included (its attention kernel is the run's, `Diagnostics.kernels`, since
+    row 11938), which the command line sets one flag each
     (`RunConfig.cli`); a recipe fills the ones it derives from its data in
     `build`. `defaults` holds every other field the class defaults, as it
     defaulted them when the run was first recorded, so the record builds the

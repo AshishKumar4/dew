@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from jax.extend import core as jaxpr_core
+from model_support import attending
 from recording import RecordingTracker
 
 from dew.batch import CONSUMED_COUNT, VALID_ROWS, ConsumedCount
@@ -356,6 +357,7 @@ def test_dense_mlp_gate_and_active_experts_are_counted():
         routed.clone(capacity_factor=0.5).model_flops(LENGTHS)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_backbone_composes_layers_loop_passes_and_a_separate_lm_head():
     model = decoder()
     assert isinstance(model, Counted) and isinstance(model, CountedLogits)
@@ -363,7 +365,7 @@ def test_backbone_composes_layers_loop_passes_and_a_separate_lm_head():
     assert model.model_flops(LENGTHS) == 3 * layer
     assert model.logits_flops(LENGTHS) == 2 * 8 * 64 * 7
     assert model.clone(loop=Loop(3, layers=(1, 3))).model_flops(LENGTHS) == 7 * layer
-    assert model.clone(scan_layers=True, remat=RematPolicy()).model_flops(LENGTHS) == 3 * layer
+    assert model.clone(remat=RematPolicy()).model_flops(LENGTHS) == 3 * layer
     assert model.clone(tie_embeddings=False).logits_flops(LENGTHS) == model.logits_flops(LENGTHS)
 
 
@@ -782,6 +784,7 @@ def convolution_tap(equation, producers):
 GATED_NORM_SITES = (NormSite.EMBEDDING, NormSite.FINAL, NormSite.INPUT, NormSite.POST_ATTENTION)
 
 
+@attending("reference")
 @pytest.mark.parametrize("fields", [
     {"embedding_norm": True, "embedding_norm_reads": "lookup", "embedding_features": 4},
     {"loop": Loop(3, reinject=True)},
@@ -809,7 +812,7 @@ def test_gated_norms_count_each_run_at_its_width(fields):
         return (model.model_flops(lengths) + model.logits_flops(lengths),
                 forward_products(model.apply, variables, *operands))
 
-    base = {"causal": False, "attention_impl": "reference", **fields}
+    base = {"causal": False, **fields}
     plain = counted_and_traced(decoder(**base))
     gated = counted_and_traced(decoder(**base, norms=dict.fromkeys(GATED_NORM_SITES, NormSpec(gate_rank=2))))
     assert gated[0] - plain[0] == gated[1] - plain[1] > 0
@@ -823,6 +826,7 @@ def _counted_and_traced(model):
     return model.model_flops(lengths), forward_products(model.apply, variables, *operands)
 
 
+@attending("reference")
 @pytest.mark.parametrize("messages", [CrossPass(block_size=1, rank=2),
                                       CrossPass(block_size=2, rank=3, additive=False)],
                          ids=["a block a layer", "one block, gained alone"])
@@ -831,25 +835,27 @@ def test_a_loop_passing_messages_counts_each_later_passs_merges(messages):
     them, a merge at each of a layer's attention's input sites and its feed-forward's over the bank's
     blocks: as many products as the forward traces beside the plain loop's (the first pass, which reads
     no bank, merging none)."""
-    base = {"causal": False, "attention_impl": "reference"}
+    base = {"causal": False}
     plain = _counted_and_traced(decoder(**base, loop=Loop(3, step_norm=False, layers=(1, 3))))
     messaged = _counted_and_traced(decoder(**base, loop=Loop(3, step_norm=False, layers=(1, 3),
                                                              messages=messages)))
     assert messaged[0] - plain[0] == messaged[1] - plain[1] > 0
 
 
+@attending("reference")
 def test_a_norm_gated_on_the_routed_layers_counts_there_alone():
     """A layer's norm gated on the routed layers alone (`gated_layers='routed'`, A.X-K2's feed-forward
     norm) adds its gate's maps on those layers, as many products as the forward traces beside the
     ungated decoder's."""
     routed = {"mixture": Mixture(experts=4, top_k=2, layers=(1, 2), expert_features=8),
-              "causal": False, "attention_impl": "reference"}
+              "causal": False}
     gate = NormSpec(gate_rank=2, gated_layers="routed")
     plain = _counted_and_traced(decoder(**routed))
     gated = _counted_and_traced(decoder(**routed, norms={"post_attention_layernorm": gate}))
     assert gated[0] - plain[0] == gated[1] - plain[1] == 2 * 2 * 2 * 8 * 2 * 8
 
 
+@attending("reference")
 @pytest.mark.parametrize("family", ["decoder", "loop", "projected", "mlp", "attention", "dit", "jepa"])
 def test_analytical_count_equals_every_forward_dot_and_convolution(family):
     """Each model's count is every product its forward traces: a decoder's, one looping, and one whose
@@ -857,7 +863,7 @@ def test_analytical_count_equals_every_forward_dot_and_convolution(family):
     once, and so on."""
     lengths = np.array([4, 4], np.int64)
     if family in ("decoder", "loop", "projected"):
-        model = decoder(causal=False, attention_impl="reference",
+        model = decoder(causal=False,
                         loop=Loop(2) if family == "loop" else None,
                         embedding_features=4 if family == "projected" else None)
         operands = (jnp.ones((2, 4), jnp.int32),)
@@ -867,17 +873,15 @@ def test_analytical_count_equals_every_forward_dot_and_convolution(family):
         operands = (jnp.ones((2, 4, 8)),)
         count = model.model_flops(lengths)
     elif family == "attention":
-        model = CausalSelfAttention(MixerContext(8, 2, 1, 4, 16, causal=False, attention_impl="reference"))
+        model = CausalSelfAttention(MixerContext(8, 2, 1, 4, 16, causal=False))
         operands = (jnp.ones((2, 4, 8)),)
         count = model.model_flops(lengths)
     elif family == "dit":
-        model = SimpleDiT(emb_features=8, num_heads=2, num_layers=2, patch_size=2,
-                          attention_impl="reference")
+        model = SimpleDiT(emb_features=8, num_heads=2, num_layers=2, patch_size=2)
         operands = (jnp.ones((2, 4, 4, 3)), jnp.ones((2,)))
         count = model.image_flops(lengths, 3)
     else:
-        model = JepaEncoder(emb_features=8, num_heads=2, num_layers=2, patch_size=2,
-                            attention_impl="reference")
+        model = JepaEncoder(emb_features=8, num_heads=2, num_layers=2, patch_size=2)
         operands = (jnp.ones((2, 4, 4, 3)),)
         count = model.image_flops(lengths, 3)
     variables = model.init(jax.random.key(201), *operands)
@@ -918,10 +922,11 @@ def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
         assert counted == 4 * batch * length * channels * key
 
 
+@attending("reference")
 @pytest.mark.parametrize("model", [
     GatedDeltaNet(8, 2, 2, 4, 3), KimiDeltaAttention(8, 2, 4), Mamba(8, 16, state_size=3, chunk_size=1),
     Mamba2(8, 2, 4, state_size=3, chunk_size=1),
-    MultiHeadLatentAttention(8, 2, 16, 4, 3, 2, 2, 3, causal=False, attention_impl="reference"),
+    MultiHeadLatentAttention(8, 2, 16, 4, 3, 2, 2, 3, causal=False),
 ])
 def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
     """One-token recurrence has no chunk-prep products, and the convs
@@ -1048,6 +1053,7 @@ def test_s5_write_read_matches_the_native_scanned_path():
     assert module.model_flops(np.array([7, 7])) == forward_products(forward, x, operators)
 
 
+@attending("reference")
 @pytest.mark.parametrize("kind", ["laya", "joint"])
 def test_decision_heads_match_every_forward_product_including_pooling(kind):
     states = jnp.ones((1, 4, 8))
@@ -1055,9 +1061,8 @@ def test_decision_heads_match_every_forward_product_including_pooling(kind):
         kinds=jnp.zeros((1, 1), jnp.int32), questions=jnp.ones((1, 1), bool),
         spans=jnp.array([[[0, 2]]]), option_spans=jnp.array([[[[2, 3], [3, 4]]]]),
         options=jnp.ones((1, 1, 2), bool))
-    model = (DecisionHead(8, layers=1, attention_impl="reference") if kind == "laya" else
-             JointSchemaHead(8, width=8, heads=2, layers=1, routing_layers=1, feedforward=16,
-                              attention_impl="reference"))
+    model = (DecisionHead(8, layers=1) if kind == "laya" else
+             JointSchemaHead(8, width=8, heads=2, layers=1, routing_layers=1, feedforward=16))
     table = jnp.ones((16, 8)) if kind == "joint" else None
     variables = model.init(jax.random.key(205), states, inputs, table)
     count = model.decision_flops(np.array([4]), np.array([1]), np.array([2]))

@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import jax
 import numpy as np
+from model_support import attending
 from reader_support import assert_resumes_where_it_stopped
 from test_decision_objective import INTENT, LAYOUT, SPECIALS, TOKENIZER, tiny_backbone
 from test_decision_packing import alone, rows_of
@@ -67,6 +68,7 @@ def opened(passes: int):
     return data.train(DataPartition())
 
 
+@attending("xla")
 def test_a_pass_reads_every_row_of_the_slice_once():
     reader = opened(1)
     try:
@@ -76,6 +78,7 @@ def test_a_pass_reads_every_row_of_the_slice_once():
     assert Counter(read) == SLICE
 
 
+@attending("xla")
 def test_two_passes_read_every_row_twice_however_windows_straddle_them():
     """Packing fills windows across the boundary between passes, and drops or repeats nothing there."""
     reader = opened(2)
@@ -86,6 +89,7 @@ def test_two_passes_read_every_row_twice_however_windows_straddle_them():
     assert Counter(read) == Counter({tokens: 2 * count for tokens, count in SLICE.items()})
 
 
+@attending("xla")
 def test_a_reader_saved_mid_pass_resumes_on_the_rows_the_uninterrupted_one_reads():
     expected, _ = assert_resumes_where_it_stopped(
         lambda: opened(2), lambda reader, count: rows(itertools.islice(reader, count)), 2, 3)

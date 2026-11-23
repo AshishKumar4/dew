@@ -20,7 +20,7 @@ import pytest
 import sharded
 from flax import linen as nn
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, attending
 from recording import RecordingTracker
 from sharded import assert_sharded
 from token_support import repeated_token_batch, token_rows, write_token_corpus
@@ -339,6 +339,7 @@ def test_a_meshs_explicit_axes_split_rows_and_hold_no_parameter(tmp_path):
         native_trainer(explicit, layout, None).fit(data, steps=1)
 
 
+@attending("reference")
 @pytest.mark.parametrize(("length", "tensor_shards", "heads", "slow", "fast"), [
     (1, 1, 4, 60e9, 1e15),
     (13, 1, 4, 60e9, 80e9),
@@ -361,7 +362,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
     from dew.nn.sharding import measured_links
     from dew.telemetry.instrumentation import compiled_flops
 
-    model = NormalAttention(64, heads=heads, dim_head=16, attention_impl="reference")
+    model = NormalAttention(64, heads=heads, dim_head=16)
     query = jax.random.normal(jax.random.key(21), (2, 8, 64))
     context = jax.random.normal(jax.random.key(22), (2, length, 96))
     params = nn.unbox(model.init(jax.random.key(23), query, context))["params"]

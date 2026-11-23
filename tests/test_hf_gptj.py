@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from interop_support import fixture_ids, next_token_losses, transformers_arms, transformers_model
+from model_support import attending
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained
@@ -18,13 +19,14 @@ LIKELIHOOD_SEEDS = 8
 sized by `seeds_for` paired with Dew's token scores on the CPU."""
 
 
+@attending("reference")
 def test_gptj_affine_head_trains_through_the_public_objective():
     """The public objective's per-token losses through GPT-J's biased head are on par with the cross
     entropy of transformers' logits, from its float64 twin's, over drawn ids (check 1); the head's bias
     takes a gradient, and a step along it lowers the loss."""
     from dew.objectives.lm import LMObjective
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32')
     draw = fixture_ids(DIRECTORY)
     ids = jnp.asarray(draw(0)[0])
     objective = LMObjective(loaded.model, seq_len=ids.shape[1] - 1, variables=loaded.variables,

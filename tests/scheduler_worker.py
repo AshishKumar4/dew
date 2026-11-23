@@ -88,7 +88,7 @@ def main() -> None:
     process = jax.process_index()
     mixture = Mixture(experts=4, top_k=2, expert_features=16) if args.records else None
     narrow = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                               mlp_features=32, max_seq_len=12, dtype="float32", attention_impl="xla",
+                               mlp_features=32, max_seq_len=12, dtype="float32",
                                mixture=mixture)
     model = float64_twin(narrow) if args.float64 else narrow
     # The run's initial parameters: the float32 model's, widened under `--float64`.

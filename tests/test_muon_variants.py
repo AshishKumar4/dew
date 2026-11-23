@@ -8,6 +8,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from model_support import attending
 from optim_support import LR, decoder_params, drawn_tree, optax_orthogonalized
 from reference_error import as_given, assert_as_exact
 from test_optim import UPDATE_SEEDS, assert_updates_as, muon_solver, stacked_draw
@@ -72,6 +73,7 @@ def test_per_head_muonclip_clips_each_head_after_its_own_update():
                     truth_fn=paper(muon_solver(wide=True, per_head=per_head)))
 
 
+@attending("reference")
 def test_per_head_muon_orthogonalizes_each_latent_attention_head_alone():
     """Per-head Muon over multi-head latent attention's per-head projections: the query's up-projection,
     each head its `qk_nope + qk_rope` columns, and the key-value up-projection, each head its `qk_nope + v`
@@ -80,8 +82,7 @@ def test_per_head_muon_orthogonalizes_each_latent_attention_head_alone():
     from dew.nn.mla import MultiHeadLatentAttention
 
     mla = MultiHeadLatentAttention(emb_features=32, num_heads=2, max_seq_len=8, q_lora_rank=24,
-                                   kv_lora_rank=16, qk_nope_head_dim=8, qk_rope_head_dim=4, v_head_dim=8,
-                                   attention_impl="reference")
+                                   kv_lora_rank=16, qk_nope_head_dim=8, qk_rope_head_dim=4, v_head_dim=8)
     params = nn.unbox(mla.init(jax.random.key(0), jnp.ones((1, 8, 32), jnp.float32)))
     query, value = ('params', 'q_b_proj', 'kernel'), ('params', 'kv_b_proj', 'kernel')
     widths = {query: 12, value: 16}
@@ -224,6 +225,7 @@ def test_normuon_normalizes_a_half_precision_update_in_float32():
         np.asarray(large["w"], np.float64))
 
 
+@attending("xla")
 def test_a_flat_attentions_projections_are_the_matrices_muon_steps():
     """A flat attention stores each projection as one `[C, heads * head_dim]` matrix and declares it so
     where it makes it, so Muon takes each projection as one matrix, orthogonalizes it and steps (ledger
@@ -234,7 +236,7 @@ def test_a_flat_attentions_projections_are_the_matrices_muon_steps():
     from dew.optim import OptimConfig, muon_partition
 
     for flat in (True, False):
-        model = NormalAttention(query_dim=12, heads=2, dim_head=4, flat=flat, attention_impl="xla")
+        model = NormalAttention(query_dim=12, heads=2, dim_head=4, flat=flat)
         drawn = model.init(jax.random.key(0), jnp.zeros((1, 2, 12), jnp.float32))
         params = nn.unbox(drawn)["params"]
         # The run's table of the draw's axes, which a trainer holds while its optimizer steps.

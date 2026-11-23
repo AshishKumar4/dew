@@ -32,6 +32,7 @@ from interop_support import (
     source_transformer,
     torch_arms,
 )
+from model_support import attending
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.interop.autoencoders.flux2 import load_flux2_vae
@@ -77,6 +78,7 @@ def walk(name, arrays, record):
     return jnp.asarray(latent), jnp.asarray(arrays[f"{name}.times"]), condition, (rows, columns)
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", CASES)
 def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     _, params, layouts = load(source, name)
@@ -165,6 +167,7 @@ def flux2_arms(source, arrays, record, name):
     return draw, native, as_given(lambda inputs: reference_walk(narrow, inputs)), truth
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", CASES)
 def test_the_forward_and_every_gradient_match_the_source(source, arrays, record, name):
     """The forward, the latent's and the text states' gradients and every parameter's, each as near
@@ -305,10 +308,11 @@ def test_the_published_autoencoder_matches_the_source(monkeypatch):
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def klein(source):
     from dew.interop.pretrained import Pretrained
 
-    return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(source / "pipeline"), dtype="float32")
 
 
 WORDS = ("a", "red", "green", "blue", "cat", "bird", "on", "mat", "tiny", "photo", "of", "tree")
@@ -367,6 +371,7 @@ def klein_arms(pipelines, run):
                       widening=contextlib.nullcontext)
 
 
+@attending("xla")
 def test_klein_prompt_encoding_matches_the_source_pipeline(klein, klein_pipelines, record):
     """The conditioner stacks what `encode_prompt` stacks: the chat template with thinking off, every row
     padded on the right to 512 tokens, and the outputs of layers 9, 18 and 27 side by side, pads included;
@@ -396,6 +401,7 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, klein_pipeline
         encoder.tokenize(["x" * 513])
 
 
+@attending("xla")
 def test_klein_pipeline_walk_matches_the_source(klein, klein_pipelines, record):
     """`Pretrained.load().text_to_image()` reproduces the source's own call: its defaults (50 steps, two
     branches guided at 4.0 against the empty prompt), and at the recorded step count the sigmas it lays out
@@ -460,6 +466,7 @@ def assert_mistral3_reads_as_flux2_dev(directory, encoder) -> None:
                     truth_fn=truth)
 
 
+@attending("xla")
 def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source):
     """FLUX.2 [dev]'s conditioning over a tiny Mistral-3 encoder with Mistral
     Small 3.1's chat template: the system and user turns, 512 tokens padded
@@ -475,7 +482,7 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source):
     directory = source / "mistral3"
     encoder, layouts, retained, _ = _hidden_states_conditioning(
         directory, {}, jnp.float32, pipeline="flux2", tokens=512, guidance=4.0,
-        param_dtype="float32", attention_impl="xla")
+        param_dtype="float32")
     assert (encoder.template, encoder.layers) == ("mistral3", (10, 20, 30))
     condition = encoder.encode(encoder.params, encoder.tokenize(words(*prompt_draw(0))))
     np.testing.assert_array_equal(np.asarray(condition.guidance), [4.0, 4.0])
@@ -492,6 +499,7 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source):
         assert (tensor.dtype, tensor.tobytes()) == (stored.dtype, stored.tobytes()), name
 
 
+@attending("xla")
 def test_a_mistral3_encoder_whose_config_states_no_tie_ties_as_its_config_class_does(source, tmp_path):
     """A Mistral-3 text encoder whose config states no `tie_word_embeddings` ties its head as
     Mistral3Config's own default does, as transformers reads the file: its language model read by the rule
@@ -508,11 +516,12 @@ def test_a_mistral3_encoder_whose_config_states_no_tie_ties_as_its_config_class_
     stated.pop("tie_word_embeddings")
     stored.write_text(json.dumps(stated))
     encoder = _hidden_states_conditioning(directory, {}, jnp.float32, pipeline="flux2", tokens=512,
-                                          guidance=4.0, param_dtype="float32", attention_impl="xla")[0]
+                                          guidance=4.0, param_dtype="float32")[0]
     reference = AutoConfig.from_pretrained(directory / "text_encoder")
     assert encoder.tower.tie_embeddings is reference.tie_word_embeddings is True
 
 
+@attending("xla")
 def test_a_mistral3_encoder_storing_a_tensor_twice_reads_once_and_writes_both(source, record, tmp_path):
     """A checkpoint that stores its embedding under both of Mistral-3's
     spellings (transformers 4.50's `language_model.model.` and 4.52's
@@ -535,8 +544,7 @@ def test_a_mistral3_encoder_storing_a_tensor_twice_reads_once_and_writes_both(so
 
     def conditioned(where):
         encoder, layouts, *_ = _hidden_states_conditioning(
-            where, {}, jnp.float32, pipeline="flux2", tokens=512, guidance=4.0, param_dtype="float32",
-            attention_impl="xla")
+            where, {}, jnp.float32, pipeline="flux2", tokens=512, guidance=4.0, param_dtype="float32")
         return encoder, layouts
 
     (encoder, layouts), (single, _) = conditioned(directory), conditioned(source / "mistral3")

@@ -929,7 +929,6 @@ dew.interop.source_options.SourceOptions
   prediction_depths: int | None = None
   attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
   dex: Annotated[DifferentialExtension, record_argument(DifferentialExtension)] | None = None
-  scan_layers: bool = False
   packed_weights: bool = False
   param_dtype: str | None = None
   step: int | str | None = None
@@ -1161,6 +1160,9 @@ dew.sampling.text.Sampling
   min_new_tokens: int = 0
   typical_p: float = 1.0
   stop: tuple[str, ...] = ()
+  logits: tuple[LogitsTransform, ...] | None = None
+  stopping: tuple[Stopping, ...] = ()
+  strategy: Strategy | None = None
 dew.scores.Summary
   name: str
   weights: Mapping[str, float]

@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from interop_support import respelled
-from model_support import encoded_form
+from model_support import attending, encoded_form
 from safetensors.numpy import load_file, save_file
 
 from dew.interop import Pretrained, codecs
@@ -30,7 +30,7 @@ def fixture(name):
 
 
 def logits(directory):
-    loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(directory, dtype='float32')
     return loaded, np.asarray(loaded.model.apply(loaded.variables, fixture('input_ids')))
 
 
@@ -50,6 +50,7 @@ def fused(tensors, config):
     return out
 
 
+@attending("reference")
 def test_a_fused_qkv_source_loads_to_the_same_model_and_saves_back_fused(tmp_path):
     """The same weights stored fused, in runs over the key heads, load to the
     split source's model leaf for leaf, compute its logits bit for bit, and
@@ -93,6 +94,7 @@ def flash_ratio_source(directory: Path) -> Path:
     return directory
 
 
+@attending("reference")
 @pytest.mark.parametrize('source', ['tiny', 'flash-ratio'])
 def test_a_native_export_writes_mimo_v2_and_loads_back_the_same_model(tmp_path, monkeypatch, source):
     """A MiMo-V2 model Dew holds (the fixture's: sinks on its sliding layers alone, over the full layers'
@@ -117,18 +119,19 @@ def test_a_native_export_writes_mimo_v2_and_loads_back_the_same_model(tmp_path, 
             shutil.copy(reference.release_file("mimo-v2-tiny", file), snapshot / file)
     monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
     directory = TINY if source == 'tiny' else flash_ratio_source(tmp_path / 'source')
-    loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(directory, dtype='float32')
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'export')
     written = json.loads((tmp_path / 'export' / 'config.json').read_text())
     assert (written['model_type'], written['architectures']) == ('mimo_v2', ['MiMoV2ForCausalLM'])
     assert written['auto_map'] == release_pins.MIMO_V2[2]
     assert written['attention_projection_layout'] == 'split'
     assert not any('qkv_proj' in name for name in load_file(tmp_path / 'export' / 'model.safetensors'))
-    again = Pretrained.load(tmp_path / 'export', dtype='float32', attention_impl='reference')
+    again = Pretrained.load(tmp_path / 'export', dtype='float32')
     assert again.model_config == loaded.model_config
     jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)
 
 
+@attending("reference")
 @pytest.mark.parametrize('stated', ['absent', 'null'])
 def test_a_window_named_by_sliding_window_size_alone_loads_the_same_model(tmp_path, stated):
     """The author's `sliding_window_size` sizes the sliding layers' window
@@ -147,6 +150,7 @@ def test_a_window_named_by_sliding_window_size_alone_loads_the_same_model(tmp_pa
     assert json.loads((tmp_path / 'saved' / 'config.json').read_text()) == config
 
 
+@attending("reference")
 def test_the_towers_of_a_config_that_names_none_ride_along_unread(tmp_path):
     """A checkpoint's tower tensors beside a config that names no tower, which
     its text decoder never runs, leave its logits as they were and are
@@ -166,6 +170,7 @@ def test_the_towers_of_a_config_that_names_none_ride_along_unread(tmp_path):
         np.testing.assert_array_equal(written[name], tensor, err_msg=name)
 
 
+@attending("reference")
 def test_a_release_with_its_towers_loads_whole_and_saves_back_as_it_came(tmp_path):
     """MiMo-V2.6 with its towers is a bundle its family reads whole (row 357): the decoder at the config's
     root, the ViT and its merger, the audio encoder over the codes of the tokenizer the release keeps in a
@@ -177,13 +182,13 @@ def test_a_release_with_its_towers_loads_whole_and_saves_back_as_it_came(tmp_pat
 
     from dew.nn.multimodal import MultimodalTransformer
 
-    loaded = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(WHOLE, dtype='float32')
     model = loaded.model
     assert isinstance(model, MultimodalTransformer)
     assert None not in (model.vision, model.projection, model.audio)
     assert model.num_nextn_predict_layers == 1
     loaded.save(tmp_path / 'saved')
-    text = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference', text_only=True)
+    text = Pretrained.load(WHOLE, dtype='float32', text_only=True)
     # Its language model alone keeps every other tensor, the folder's among them, and writes it back.
     text.save(tmp_path / 'text')
     for folder, root in ((Path(), 'saved'), (Path('audio_tokenizer'), 'saved'), (Path(), 'text'),
@@ -196,13 +201,14 @@ def test_a_release_with_its_towers_loads_whole_and_saves_back_as_it_came(tmp_pat
         for name, tensor in read.items():
             np.testing.assert_array_equal(written[name], tensor, err_msg=name)
     for root in ('saved', 'text'):
-        again = Pretrained.load(tmp_path / root, dtype='float32', attention_impl='reference')
+        again = Pretrained.load(tmp_path / root, dtype='float32')
         jax.tree.map(np.testing.assert_array_equal, again.variables, loaded.variables)
     ids = np.load(WHOLE / 'input_ids.npy')
     np.testing.assert_array_equal(np.asarray(model.apply(loaded.variables, ids)),
                                   np.asarray(text.model.apply(text.variables, ids)))
 
 
+@attending("reference")
 def test_a_release_without_its_audio_tokenizer_is_refused_whole_and_loads_as_text(tmp_path):
     """A release whose config names its audio tower and whose folder lacks the tokenizer the tower reads
     is refused whole, before any weight is read; its language model alone still loads."""
@@ -210,11 +216,12 @@ def test_a_release_without_its_audio_tokenizer_is_refused_whole_and_loads_as_tex
     shutil.copytree(WHOLE, source)
     shutil.rmtree(source / 'audio_tokenizer')
     with pytest.raises(ValueError):
-        Pretrained.load(source, dtype='float32', attention_impl='reference')
-    text = Pretrained.load(source, dtype='float32', attention_impl='reference', text_only=True)
+        Pretrained.load(source, dtype='float32')
+    text = Pretrained.load(source, dtype='float32', text_only=True)
     assert text.model.num_nextn_predict_layers == 1
 
 
+@attending("reference")
 @pytest.mark.parametrize('emptied', [('audio_config',), ('vision_config',),
                                      ('vision_config', 'audio_config')],
                          ids=['vision alone', 'audio alone', 'text alone'])
@@ -235,8 +242,8 @@ def test_a_tower_section_that_states_nothing_builds_no_tower(tmp_path, emptied):
     source = respelled(WHOLE, tmp_path / 'release', edit)
     if 'audio_config' in emptied:
         shutil.rmtree(source / 'audio_tokenizer')
-    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
-    whole = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(source, dtype='float32')
+    whole = Pretrained.load(WHOLE, dtype='float32')
     model = loaded.model
     if len(emptied) == 2:
         assert not isinstance(model, MultimodalTransformer)
@@ -265,10 +272,10 @@ def test_a_trunk_of_full_layers_alone_builds_the_prediction_layer_its_config_sta
     fields = translate_config(config)
     assert fields['num_nextn_predict_layers'] == (stated or 0)
     if stated:
-        attending = fields['kinds'][fields['mtp_layer_type']]
+        kind = fields['kinds'][fields['mtp_layer_type']]
         assert fields['mtp_layer_type'] not in fields['layer_types']
-        assert ((attending['num_heads'], attending['head_dim'], attending['num_kv_heads'],
-                 attending['window'], attending['rope_theta'], attending['sinks'])
+        assert ((kind['num_heads'], kind['head_dim'], kind['num_kv_heads'],
+                 kind['window'], kind['rope_theta'], kind['sinks'])
                 == (2, 24, 1, config['sliding_window_size'], config['swa_rope_theta'], True))
         with pytest.raises(ValueError):
             translate_config({**config, 'swa_v_head_dim': 12})
@@ -280,6 +287,7 @@ PREDICTOR = {'swa_num_attention_heads': 2, 'swa_num_key_value_heads': 1, 'swa_he
 twice its width."""
 
 
+@attending("reference")
 def test_a_fused_prediction_layer_of_its_own_geometry_loads_and_saves_back_as_it_came(tmp_path):
     """A trunk of full layers alone, stored fused as the Pro release stores itself, beside a prediction layer
     whose fused q, k and v runs are its own geometry (`PREDICTOR`), as vLLM reads them: the layer's runs
@@ -337,6 +345,7 @@ def sliding_source(directory: Path, layout: str) -> dict:
     return tensors
 
 
+@attending("reference")
 def test_sliding_layers_of_their_own_geometry_load_split_or_fused_and_save_back_as_they_came(tmp_path):
     """A trunk whose sliding layers state query heads, key heads and a width of their own (`SLIDING_TINY`,
     MiMoV2Attention's `swa_*`) builds them in a kind of that geometry, the full layers in the model's,
@@ -371,6 +380,7 @@ PROCESSOR = WHOLE / 'processor.npz'
 """vLLM's MiMo processor over raw images, recorded by tools/mimo_reference.py --record-images."""
 
 
+@attending("reference")
 def test_a_raw_image_is_processed_as_vllms_mimo_processor_processes_it():
     """MiMo-V2.6 ships no processor, only its config's `processor_config`: Dew's own
     (`dew.interop.mimo_media`) resizes, standardizes and cuts a drawn raw image into the tower's patch
@@ -386,7 +396,7 @@ def test_a_raw_image_is_processed_as_vllms_mimo_processor_processes_it():
 
     from dew.interop.mimo_media import MiMoProcessor, smart_resize
 
-    loaded = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(WHOLE, dtype='float32')
     processor = loaded.processor._media_reference
     assert isinstance(processor, MiMoProcessor)
     with run_from('mimo_reference', 'tools') as module:
@@ -424,7 +434,7 @@ def test_a_raw_image_is_processed_as_vllms_mimo_processor_processes_it():
         processor(text='w1', audio=[np.zeros(240, np.float32)])
     # A text chat of the language model alone, which reads no media processor, runs its tokenizer's
     # template.
-    text = Pretrained.load(WHOLE, dtype='float32', attention_impl='reference', text_only=True).processor
+    text = Pretrained.load(WHOLE, dtype='float32', text_only=True).processor
     held = text.chat([{'role': 'user', 'content': [{'type': 'text', 'text': 'w1 w2'}]}],
                      add_generation_prompt=False, chat_template=template)
     np.testing.assert_array_equal(np.asarray(held.tokens)[0], text.reference.encode('w1 w2'))
@@ -435,6 +445,7 @@ STORED = {'quant_method': 'fp8', 'fmt': 'e4m3', 'weight_block_size': [128, 128],
 """The Pro release's quantization_config, its ignored_layers set per source."""
 
 
+@attending("reference")
 def test_a_store_dtype_mxfp4_source_loads_its_decoded_weights_and_saves_its_codes_back(tmp_path):
     """The tiny stored as the Pro release stores itself: the fused qkv in FP8
     blocks a run a key head, the dense MLP in FP8 blocks, the routed experts
@@ -489,6 +500,7 @@ the classes built, the loader's reports of the weights matched, and whether the 
 equal, tensor for tensor."""
 
 
+@attending("reference")
 @pytest.mark.network
 def test_a_saved_release_opens_offline_through_its_own_code_as_the_release_does(tmp_path):
     """A release whose config names its own code (`auto_map`), here the tiny checkpoint beside MiMo's code
@@ -509,7 +521,7 @@ def test_a_saved_release_opens_offline_through_its_own_code_as_the_release_does(
                        lambda config: {**config, 'auto_map': released['auto_map']})
     for file in ('configuration_mimo_v2.py', 'modeling_mimo_v2.py'):
         shutil.copy(hf_hub_download(repo, file, revision=revision), source / file)
-    Pretrained.load(source, dtype='float32', attention_impl='reference').save(tmp_path / 'saved')
+    Pretrained.load(source, dtype='float32').save(tmp_path / 'saved')
     run = subprocess.run([sys.executable, '-c', OPENED, str(tmp_path / 'saved'), str(source)], check=True,
                          capture_output=True, text=True,
                          env={**os.environ, 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',

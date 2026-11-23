@@ -14,7 +14,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import AttentionImpl
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.dropout import Dropout
 
@@ -163,7 +162,6 @@ class NormalAttention(nn.Module):
     qkv_bias: bool | None = None
     force_fp32_for_softmax: bool = True
     qk_norm: QKNorm | None = None
-    attention_impl: AttentionImpl = "auto"
     flat: bool = False
     names: tuple[str, str, str, str] = ("to_q", "to_k", "to_v", "to_out_0")
     rotary_pairs: Literal["half", "adjacent"] = "half"
@@ -265,7 +263,7 @@ class NormalAttention(nn.Module):
         hidden_states = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=self.attention_impl, mask=mask, key_value_seq_lengths=key_value_seq_lengths,
+            mask=mask, key_value_seq_lengths=key_value_seq_lengths,
             segment_ids=segment_ids, key_segment_ids=key_segment_ids, max_segments=max_segments,
         )
         proj = projected_output(constrain(hidden_states, HEADS), out_name, self.query_dim, flat=self.flat,
@@ -302,7 +300,6 @@ class BasicTransformerBlock(nn.Module):
     norm_epsilon: float = 1e-4
     dropout_rate: float = 0.0
     approximate_gelu: bool = True
-    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
@@ -329,7 +326,6 @@ class BasicTransformerBlock(nn.Module):
             qkv_bias=self.qkv_bias,
             dtype=self.dtype,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
-            attention_impl=self.attention_impl,
         )
         self.attention1 = attention(name='Attention1')
         self.attention2 = attention(name='Attention2')
@@ -382,8 +378,8 @@ class Stage:
     precision: PrecisionLike = None
 
 
-def stage_attention(stage: Stage, channels: int, attention_impl: AttentionImpl, dtype: Dtype | None,
-                    precision: PrecisionLike, name: str) -> "TransformerBlock":
+def stage_attention(stage: Stage, channels: int, dtype: Dtype | None, precision: PrecisionLike,
+                    name: str) -> "TransformerBlock":
     """Build the block a `Stage` describes, at the stage's channel count.
 
     A stage that names no dtype or precision takes the model's, and a model
@@ -392,7 +388,7 @@ def stage_attention(stage: Stage, channels: int, attention_impl: AttentionImpl, 
     return TransformerBlock(
         heads=stage.heads, dim_head=channels // stage.heads,
         dtype=stage.dtype or dtype,
-        attention_impl=attention_impl, use_projection=stage.use_projection,
+        use_projection=stage.use_projection,
         use_self_and_cross=stage.use_self_and_cross,
         precision=stage.precision or precision,
         only_pure_attention=stage.only_pure_attention,
@@ -417,7 +413,6 @@ class TransformerBlock(nn.Module):
     use_self_and_cross:bool = True
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
-    attention_impl: AttentionImpl = "auto"
     norm_inputs: bool = True
     explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-4
@@ -464,7 +459,6 @@ class TransformerBlock(nn.Module):
             first_attention="self" if self.use_self_and_cross else "none",
             only_pure_attention=self.only_pure_attention,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
-            attention_impl=self.attention_impl,
             norm_epsilon=self.norm_epsilon
         )(hidden, hidden if context is None else context)
         if self.use_projection:

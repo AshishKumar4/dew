@@ -1166,6 +1166,13 @@ class GatedDeltaNet(nn.Module):
         return 2 * self.key_features + self.value_features
 
     @property
+    def declared(self) -> dict:
+        """What the layer declares of the chunked rule's operands at every call of it (`recurrence.Hooks`):
+        its write gates a sigmoid's, at most one (`write_bound`), as `KimiDeltaAttention.declared` states
+        its own."""
+        return {"write_bound": 1.0}
+
+    @property
     def per_v(self) -> int:
         return self.num_v_heads // self.num_k_heads
 
@@ -1352,7 +1359,7 @@ class GatedDeltaNet(nn.Module):
         rows, keys, values = (self._split_heads(part, width) for part, width in
                               zip(jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1), widths, strict=True))
         # beta a sigmoid's, of the queries and keys the conv l2-normalized (`causal_conv1d`'s pieces).
-        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, write_bound=1.0)
+        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, **self.declared)
 
         def scan(convolved, *, starts, valid, held, forked=None):
             query, key, value = (self._split_heads(part, width)
@@ -1371,7 +1378,7 @@ class GatedDeltaNet(nn.Module):
                 return chunk_gated_delta_rule(
                     query, key, value, g if kept is None else jnp.where(kept, g, 0.0),
                     beta if kept is None else jnp.where(kept, beta, 0.0), state, self.chunk_size,
-                    starts=starts, max_segments=tokens.max_segments, write_bound=1.0,
+                    starts=starts, max_segments=tokens.max_segments, **self.declared,
                     firsts=tokens.firsts if forked is None else None, loads=loads, stores=stores, held=held)
             # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
@@ -1392,7 +1399,7 @@ class GatedDeltaNet(nn.Module):
         shards = sequence_split(decode, tokens)
         if shards > 1:
             rule = functools.partial(chunk_gated_delta_rule, max_segments=tokens.max_segments,
-                                     write_bound=1.0)
+                                     **self.declared)
             out = sequence_delta_rule(mixed, self.conv1d()[0], g, beta, tokens, valid, shards=shards,
                                       key_heads=self.num_k_heads, widths=widths, parts=heads,
                                       dtype=operand if ported else wide, rule=rule,

@@ -92,7 +92,7 @@ PATHS = smallest_of_each(CHECKPOINTS)
 
 @functools.cache
 def loaded(name: str, dtype: str = "float32") -> Pretrained:
-    return Pretrained.load(FIXTURES / name, dtype=dtype, attention_impl="reference")
+    return Pretrained.load(FIXTURES / name, dtype=dtype)
 
 
 class Reads(NamedTuple):

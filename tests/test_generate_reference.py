@@ -47,6 +47,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import FACTOR
 
 from dew.inference import TextGeneration
@@ -58,10 +59,13 @@ from dew.sampling import Sampling, decoding, generate
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 FAMILIES = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek-v3-tiny")
 NEW_TOKENS = 10
+
+
 @pytest.fixture(scope="module", params=FAMILIES)
+@attending("reference")
 def family(request):
     directory = FIXTURES / request.param
-    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    pretrained = Pretrained.load(str(directory), dtype="float32")
     with np.load(directory / "generate.npz") as stored:
         fixture = {name: stored[name] for name in stored.files}
     return request.param, pretrained, fixture
@@ -85,6 +89,7 @@ def float64_log_softmax(logits):
     return shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
 
 
+@attending("reference")
 def test_greedy_generation_emits_transformers_tokens(family):
     name, pretrained, fixture = family
     error = decode_error(fixture, "greedy")
@@ -108,6 +113,7 @@ def test_greedy_generation_emits_transformers_tokens(family):
     np.testing.assert_array_equal(np.asarray(again.tokens), np.asarray(result.tokens))
 
 
+@attending("reference")
 def test_source_bad_words_holding_only_eos_loads_as_an_identity_policy(tmp_path):
     """Loading an EOS-only bad-word list keeps the source's tokens, scores and termination unchanged."""
     import json
@@ -122,17 +128,18 @@ def test_source_bad_words_holding_only_eos_loads_as_an_identity_policy(tmp_path)
     config = {"do_sample": False, "eos_token_id": eos, "pad_token_id": 0, "max_new_tokens": 6}
     path = source / "generation_config.json"
     path.write_text(json.dumps(config))
-    plain = Pretrained.load(source, dtype="float32", attention_impl="reference").text_generation()
+    plain = Pretrained.load(source, dtype="float32").text_generation()
     expected = plain(prompts(fixture), key=0).host()
     assert expected.lengths[0] == 1 and expected.terminated[0]
 
     path.write_text(json.dumps({**config, "bad_words_ids": [[eos]]}))
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference").text_generation()
+    loaded = Pretrained.load(source, dtype="float32").text_generation()
     actual = loaded(prompts(fixture), key=0).host()
     for name in ("tokens", "lengths", "terminated", "raw_log_probs", "behavior_log_probs"):
         np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
 
 
+@attending("reference")
 def test_a_server_interleaving_requests_emits_each_ones_transformers_greedy_tokens(family):
     """Three requests through a two-slot server, admitted one a step and
     finishing at different budgets so rows leave and join mid-flight, each
@@ -151,10 +158,11 @@ def test_a_server_interleaving_requests_emits_each_ones_transformers_greedy_toke
         np.testing.assert_array_equal(np.asarray(generation.tokens)[0, -budget:], expected[:budget])
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["llama-tiny", "qwen3-tiny"])
 def test_rows_stop_pad_and_count_as_transformers_generate_ends_them(name):
     directory = FIXTURES / name
-    pretrained = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    pretrained = Pretrained.load(str(directory), dtype="float32")
     with np.load(directory / "generate.npz") as stored:
         fixture = {key: stored[key] for key in stored.files}
     with np.load(directory / "stopping.npz") as stored:
@@ -182,14 +190,14 @@ def test_rows_stop_pad_and_count_as_transformers_generate_ends_them(name):
 
     # generate's greedy path is causal, so its first six tokens are what
     # transformers draws with max_new_tokens 6.
-    result = ended(sampling=Sampling(temperature=0, pad_token_id=pad), stopping=(decoding.MaxNewTokens(6),))
+    result = ended(sampling=Sampling(temperature=0, pad_token_id=pad, stopping=(decoding.MaxNewTokens(6),)))
     tokens = np.asarray(result.tokens)[:, width:]
     np.testing.assert_array_equal(tokens[:, :6], fixture["greedy_tokens"][:, :6])
     assert np.all(tokens[:, 6:] == pad)
     np.testing.assert_array_equal(np.asarray(result.lengths), 6)
 
-    result = ended(sampling=Sampling(temperature=0, pad_token_id=pad),
-                   stopping=(decoding.MaxLength(int(stopping["max_length"])),))
+    result = ended(sampling=Sampling(temperature=0, pad_token_id=pad,
+                                     stopping=(decoding.MaxLength(int(stopping["max_length"])),)))
     tokens, lengths = np.asarray(result.tokens)[:, width:], np.asarray(result.lengths)
     for row in range(len(tokens)):
         want = stopping[f"max_length_tokens_{row}"]

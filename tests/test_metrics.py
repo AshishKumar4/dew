@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 
 from dew.artifacts import ImageGrid
 
@@ -35,6 +36,7 @@ def test_mean_metric_counts_uneven_batches_and_weighted_totals():
         metric(artifact, {"values": np.asarray(4.)})
 
 
+@attending("reference")
 def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
     import optax
 
@@ -48,7 +50,7 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
     rows = Memory({"text": tokens}).read("memory").loading(Loading(workers=0, threads=1, read_buffer=1))
     data, validation = rows.shuffle().repeat().batch(8), rows.batch(8)
     model = CausalTransformer(vocab_size=4, emb_features=8, num_layers=1,
-                              num_heads=2, mlp_features=16, max_seq_len=4, attention_impl="reference")
+                              num_heads=2, mlp_features=16, max_seq_len=4)
     objective = LMObjective(model, seq_len=4, ema_decay=None)
     metric = Mean(lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
                   reads=TokenScores, name="accuracy", better="higher")

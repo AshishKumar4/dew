@@ -24,7 +24,7 @@ import pytest
 from lane_environment import without_flags
 from flax import linen as nn
 from interop_support import extract_fixture, token_draw
-from model_support import parameter_loss
+from model_support import attending, compiled_apply, parameter_loss
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, dew_path, with_gradients
 from token_support import token_rows
 
@@ -72,8 +72,8 @@ def quantized_forward(spec, **overrides):
     return model, qmodel, variables, ids
 
 
-@pytest.mark.parametrize("scan_layers", [False, True])
-def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_the_wrapped_forward_matches_qwixs_own_call(stack_scan):
     """Dew's wrapping against the provider built by hand, over the layer
     loop and over the scanned stack, the hand-built one traced under its own key (`quantize_with`),
     as Dew traces every Qwix-quantized model so Qwix owns its products: identical compiled logits, and both
@@ -83,7 +83,7 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
     equal on CPU and on the RTX 4080, 1.2e-01 (CPU) and 1.3e-01 (RTX 4080)
     from fp32 on logits up to 3.9."""
     qwix = pytest.importorskip("qwix")
-    model, qmodel, variables, ids = quantized_forward(Quantization(), scan_layers=scan_layers)
+    model, qmodel, variables, ids = quantized_forward(Quantization())
     rules = [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8,
                          act_qtype=jnp.int8)]
     reference = quantize_with(model, qwix.QtProvider(rules))
@@ -640,8 +640,8 @@ def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     served, served_variables = quantize_for_serving(model, variables, spec, ids)
     dtypes = {leaf.dtype for leaf in jax.tree.leaves(served_variables["params"])}
     assert jnp.dtype(jnp.int8) in dtypes
-    logits = served.apply(served_variables, ids)
-    np.testing.assert_array_equal(logits, qmodel.apply(variables, ids))
+    logits = compiled_apply(served, served_variables, ids)
+    np.testing.assert_array_equal(logits, compiled_apply(qmodel, variables, ids))
     assert not np.array_equal(logits, model.apply(variables, ids))
 
 
@@ -729,7 +729,7 @@ def flux_source(root: Path):
     from dew.interop.pretrained import Pretrained
 
     extract_fixture(Path(__file__).parent / "fixtures/flux_source.tar.xz", root)
-    task = Pretrained.load(root / "pipeline", dtype="float32", attention_impl="xla").text_to_image()
+    task = Pretrained.load(root / "pipeline", dtype="float32").text_to_image()
     model = task.model.clone(heads=2, head_dim=32, axes_dims_rope=(8, 12, 12))
     example = task.prepare("", key=0, steps=1)
     params = nn.unbox(model.init(jax.random.key(0), example.noise, jnp.zeros(example.noise.shape[:1]),
@@ -738,10 +738,12 @@ def flux_source(root: Path):
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def flux_task(tmp_path_factory):
     return flux_source(tmp_path_factory.mktemp("flux"))
 
 
+@attending("xla")
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 @pytest.mark.parametrize("weight_only", [False, True])
 def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_task, dtype, weight_only):
@@ -988,6 +990,7 @@ def test_an_objective_over_a_quantized_packed_task_holds_the_canonical_tree():
                                   packed_only.model.apply(packed_only.variables, tokens))
 
 
+@attending("reference")
 def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
     from pathlib import Path
 
@@ -996,7 +999,7 @@ def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
 
     pytest.importorskip("qwix")
     directory = Path(__file__).parent / "fixtures/hf/gemma3-native-tiny"
-    source = Pretrained.load(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
+    source = Pretrained.load(directory, dtype="float32", max_seq_len=64)
     task = source.text_generation(sampling=Sampling(temperature=0))
     image = np.load(directory / "raw_images.npy")[0]
     prompt = "token7 <start_of_image> token9"
@@ -1471,21 +1474,38 @@ QUANTIZED_ATTENTION_SEEDS = 24
 """Check 1's declared seeds for an int8 attention block on the template against the reference path."""
 
 
-def _quantized_blocks(quantized: Callable[[nn.Module, str], nn.Module]) -> Callable[[str], nn.Module]:
+@dataclasses.dataclass(frozen=True)
+class _OnKernel:
+    """A module whose init and apply run its attention on `kernel` (`attending`), the selector's where
+    'auto'."""
+
+    module: nn.Module
+    kernel: str
+
+    def init(self, *arguments, **keywords):
+        return self._on(self.module.init)(*arguments, **keywords)
+
+    def apply(self, *arguments, **keywords):
+        return self._on(self.module.apply)(*arguments, **keywords)
+
+    def _on(self, function):
+        return function if self.kernel == "auto" else attending(self.kernel)(function)
+
+
+def _quantized_blocks(quantized: Callable[[nn.Module, str], nn.Module]) -> Callable[[str], _OnKernel]:
     """A causal attention block of 4 heads over 2 key heads 32 wide, its attention on the implementation a
-    call names, quantized by `quantized(block, implementation)`."""
+    call names (`_OnKernel`), quantized by `quantized(block, implementation)`."""
     from dew.nn.mixers import MixerContext
     from dew.nn.mixers.attention import CausalSelfAttention
 
-    def block(implementation: str) -> nn.Module:
-        context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=32, max_seq_len=64,
-                               attention_impl=implementation)
-        return quantized(CausalSelfAttention(ctx=context), implementation)
+    def block(implementation: str) -> _OnKernel:
+        context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=32, max_seq_len=64)
+        return _OnKernel(quantized(CausalSelfAttention(ctx=context), implementation), implementation)
 
     return block
 
 
-def _assert_blocks_on_par(block: Callable[[str], nn.Module], ours: str, label: str) -> None:
+def _assert_blocks_on_par(block: Callable[[str], _OnKernel], ours: str, label: str) -> None:
     """`block(ours)`'s output and gradients, its input's and each projection's (the query's, keys' and
     values' apart) under a drawn cotangent, on par (check 1) with `block("reference")`'s, the truth that
     path in float64."""
@@ -1582,7 +1602,7 @@ def test_an_int8_attention_blocks_auto_attention_is_its_rules_where_a_cell_decla
     from dew.nn.mixers.attention import CausalSelfAttention
 
     context = MixerContext(emb_features=256, num_heads=4, num_kv_heads=1, head_dim=64, max_seq_len=256,
-                           attention_impl="auto", dtype=jnp.bfloat16)
+                           dtype=jnp.bfloat16)
     x = jax.ShapeDtypeStruct((1, 256, 256), jnp.bfloat16)
     with generation.assumed(target):
         cell = attention_case(jax.ShapeDtypeStruct((1, 256, 4, 64), jnp.bfloat16),
@@ -1639,15 +1659,17 @@ def test_an_int8_models_masked_attention_runs_none_of_its_own_orders_whole_produ
     assert owned and not owned & whole, owned
 
 
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
 @pytest.mark.parametrize("step", ["decode", "mixed"])
-def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention(step):
+def test_an_int8_models_paged_steps_read_their_rows_through_the_layers_attention(step, stack_scan):
     """A paged CausalTransformer (16-slot pages, 4 query heads over 2, 64 wide, bf16) through a decode step
     and a mixed serving step (`Admitted`: rows decoding beside an admitted prompt), traced for a B200 on its
     reported routes: plain, some route takes a kernel forming its products whole, inside a launch a rule
     never sees (a paged kernel of `kv_cache.PAGED`, the template's work list); under Qwix's int8 rule, which
     owns the steps' products, no route takes one (`PagedCase.owned`, `AttentionCase.quantized`), whichever
     kernels the selectors then pick (train 802's review F1 and F2: the mixed step's work list and paged
-    read ran whole products)."""
+    read ran whole products), its stack run a layer at a time or scanned (row 12077: the scan refused the
+    interpreted launch's effect)."""
     pytest.importorskip("qwix")
     from model_support import TINY_DECODER
 
@@ -1822,6 +1844,7 @@ def served_text_flow():
     assert_computed_as_on_the_host(run, draw, "an int8 text task's log-probabilities")
 
 
+@attending("xla")
 def test_an_int8_image_task_walks_as_the_host_does():
     """`TextToImage.quantized` in int8 walks a prompt's latents as the same task does on the host,
     from the same quantized weights and encoded prompt. With Triton's GEMMs open to XLA
@@ -1884,6 +1907,7 @@ def int8_tower_flow():
     assert_computed_as_on_the_host(run, draw, "an int8 text tower's encoding")
 
 
+@attending("xla")
 def test_an_int8_guide_walks_as_the_host_does():
     """A float image task autoguided by its own denoiser quantized to int8 (`Autoguidance`) walks a
     prompt's latents as the same task does on the host: the walk compiles for the guide it runs as
@@ -1915,6 +1939,7 @@ def autoguided_image_flow():
     assert_computed_as_on_the_host(run, draw, "an int8 guide's latents")
 
 
+@attending("xla")
 def test_an_int8_decision_task_answers_as_the_host_does():
     """`Decide` over a backbone quantized to int8 gives each option of each request the probability the
     same task gives it on the host. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
@@ -1929,7 +1954,7 @@ def decision_flow():
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
-                                 max_seq_len=128, attention_impl="xla")
+                                 max_seq_len=128)
     base = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
     spec = Quantization(patterns=(".*_proj",))
 

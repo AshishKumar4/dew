@@ -27,6 +27,7 @@ import pytest
 from arm_forms import dew_path
 from flax import linen as nn
 from flax.traverse_util import unflatten_dict
+from model_support import attending
 from reference_error import as_given, assert_as_exact, widened
 from test_model_flops import forward_products
 
@@ -942,6 +943,7 @@ def test_a_full_kl_where_diloco_holds_its_axis_manual_scores_each_groups_own_tok
     assert not gathered & {(rows // 2, positions, width), (rows // 2 * positions, width)}, gathered
 
 
+@attending("xla")
 def test_a_full_kl_distillation_of_an_adapted_student_plans_on_no_head_tile(monkeypatch):
     """A full-KL distillation whose student adapts in context (`ChunkAdaptation`, which scores through more
     than its head, `predicts_by_head`), fit on devices with room for no step, walks its whole ladder without

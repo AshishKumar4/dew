@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 
 from dew.interop.streaming import SourceLeaf
 from dew.training import TrainerAdvanced
@@ -233,6 +234,7 @@ def test_a_format_placement_lands_a_source_whole_and_releases_it_whether_or_not_
     assert failing.released
 
 
+@attending("reference")
 def test_a_loaded_source_is_ready_to_run_on_the_default_device():
     """A source loaded without a mesh or layout holds its variables on JAX's default device,
     uncommitted, as a `jnp` array is held, so a jitted call reads them where they are rather than
@@ -245,7 +247,7 @@ def test_a_loaded_source_is_ready_to_run_on_the_default_device():
     from dew.interop import Pretrained
 
     fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
-    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(fixture, dtype="float32")
     leaves = jax.tree.leaves(loaded.variables)
     # Where a jnp array goes: the default device, uncommitted.
     native = jnp.zeros(())
@@ -256,7 +258,7 @@ def test_a_loaded_source_is_ready_to_run_on_the_default_device():
     spread = jax.jit(lambda leaf: leaf * 2, out_shardings=jax.sharding.NamedSharding(
         mesh, jax.sharding.PartitionSpec()))(leaves[0])
     np.testing.assert_array_equal(np.asarray(spread), 2 * np.asarray(leaves[0]))
-    host = Pretrained.load(fixture, dtype="float32", attention_impl="reference", on_host=True)
+    host = Pretrained.load(fixture, dtype="float32", on_host=True)
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(host.variables))
     for placed, held in zip(leaves, jax.tree.leaves(host.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(placed), held)
@@ -264,6 +266,7 @@ def test_a_loaded_source_is_ready_to_run_on_the_default_device():
         Pretrained.load(fixture, on_host=True, mesh=jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)))
 
 
+@attending("reference")
 @pytest.mark.parametrize("where", ["device", "host"])
 def test_a_source_trained_from_keeps_its_arrays_after_the_step_donates_the_state(where):
     """A step donates the state it is given, and a run's state holds buffers of its own: a source
@@ -281,7 +284,7 @@ def test_a_source_trained_from_keeps_its_arrays_after_the_step_donates_the_state
     from dew.training import Layout, Trainer
 
     fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
-    loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(fixture, dtype="float32")
     before = jax.device_get(loaded.variables)
     # The default layout replicates a small source's leaves, so its placed state can share their buffers.
     layout = Layout(host=("variables",)) if where == "host" else Layout()
@@ -296,6 +299,7 @@ def test_a_source_trained_from_keeps_its_arrays_after_the_step_donates_the_state
             np.testing.assert_array_equal(np.asarray(leaf), held)
 
 
+@attending("reference")
 def test_a_host_owned_state_takes_its_held_tree_over_leaf_by_leaf():
     """A state held on the host is placed from the objective's own arrays one leaf at a time, each
     handed over as it lands (`host.stream`): its step is not donated, so the state takes no copy of
@@ -310,7 +314,7 @@ def test_a_host_owned_state_takes_its_held_tree_over_leaf_by_leaf():
     from dew.training import Layout, Trainer
 
     fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
-    objective = LMObjective(Pretrained.load(fixture, dtype="float32", attention_impl="reference"), 8,
+    objective = LMObjective(Pretrained.load(fixture, dtype="float32"), 8,
                             ema_decay=None)
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5),
                       advanced=TrainerAdvanced(layout=Layout(host=("variables",))))

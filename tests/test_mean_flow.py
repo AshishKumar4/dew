@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from float64_replay import float64_replay
+from model_support import attending
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.diffusion import presets
@@ -77,6 +78,7 @@ WALK_SEEDS = 8
 """Check 1's declared seeds for the one-step walk, sized by `seeds_for`."""
 
 
+@attending("xla")
 def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp_path):
     from diffusion_stubs import batch_for
     from diffusion_support import images_of, saved_after_one_step
@@ -91,7 +93,7 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
         model=ModelConfig(
             "simple_dit",
             {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
-             "dtype": "float32", "attention_impl": "xla"},
+             "dtype": "float32"},
         ),
         data=images_of("tfds://oxford_flowers102", 4),
         preset=presets.MeanFlow(),
@@ -132,20 +134,18 @@ def meanflow_case(kernel: str):
     time moves the output by the gradient's own size: float32 determined no digit of the gradients, and
     check 1 judged no kernel (row 5469). At its initializers' scale the derivative is 1.3e5 to 2e5, a
     float32 step 0.4 to 0.8% from the truth in its worst leaf and a bf16 step 1.2 to 1.9%."""
-    def over(implementation: str, dtype: str) -> MeanFlowObjective:
-        model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1,
-                          interval=True, attention_impl=implementation, dtype=dtype)
-        inputs = InputSpec(Field("image", (16, 16, 3)),
-                           {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
-        return MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
-
-    fused, xla = over(kernel, "bfloat16"), over("xla", "bfloat16")
+    model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1, interval=True,
+                      dtype="bfloat16")
+    inputs = InputSpec(Field("image", (16, 16, 3)),
+                       {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
+    xla = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
     # Each a program of its own (row 6857): run op by op, the model's initializer, and check 1's one call
     # of each arm on a draw holding NumPy arrays (`reference_error._refuse_numpy_arms`), compiled over a
     # thousand small programs on the GPU a cell holds.
-    template = jax.jit(xla.init)(jax.random.PRNGKey(0))
+    template = attending("xla")(jax.jit(xla.init))(jax.random.PRNGKey(0))
     tokens = xla.inputs.tokenize(["a", "b", "c", "d"] * 4)
 
+    @attending("xla")
     @jax.jit
     def draw(seed):
         keys = jax.random.split(jax.random.PRNGKey(seed), 4)
@@ -170,7 +170,8 @@ def meanflow_case(kernel: str):
             return jax.value_and_grad(loss_of)(params)
         return run
 
-    return stepped(fused), stepped(xla), float64_replay(stepped(xla), compiled=True), draw
+    return (attending(kernel)(stepped(xla)), attending("xla")(stepped(xla)),
+            attending("xla")(float64_replay(stepped(xla), compiled=True)), draw)
 
 
 def agrees_with_xla(kernel: str) -> None:

@@ -91,13 +91,9 @@ def adapted_objective(config: Config) -> tuple[PretrainedBlockDecoder, BlockDiff
     source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32,
                                          on_host=True).adapt(
         LoRA(rank=config.rank, modules=tuple(config.modules), alpha=config.alpha), key=0)
-    # A host layout streams the stack one layer per scan iteration, so the
-    # decoder runs as a scan; a plain loop's fetches would all be hoisted and
-    # the whole base would land on the device this is keeping it off.
-    scanned = source.model.clone(text=source.model.text.clone(scan_layers=True))
-    # The source over the scanned model, so the objective takes its weights and end-of-sequence ids.
+    # The source, so the objective takes its weights and end-of-sequence ids; its stack runs scanned (`main`).
     return source, BlockDiffusionObjective(
-        replace(source, model=scanned), prompt_length=config.prompt_tokens, num_canvases=config.canvases,
+        source, prompt_length=config.prompt_tokens, num_canvases=config.canvases,
         pad_token_id=int(source.config["text_config"]["pad_token_id"]))
 
 
@@ -144,4 +140,8 @@ def main(config: Config) -> Path:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Config))
+    # A host layout streams the stack one layer per scan iteration, so the decoder runs as a scan
+    # (`dew.kernels.use(layer_scan="scanned")`); a plain loop's fetches would all be hoisted and the whole
+    # base would land on the device this is keeping it off.
+    with dew.kernels.use(layer_scan="scanned"):
+        main(tyro.cli(Config))

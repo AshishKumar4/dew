@@ -28,7 +28,7 @@ images[:, :, ::2, :] = 255
 batch = {"image": images}
 data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
 model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
-                  mlp_ratio=2, dtype=jnp.float32, attention_impl="xla")
+                  mlp_ratio=2, dtype=jnp.float32)
 objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (8, 8, 3))),
                                solver=Euler(), steps=4)
 trainer = Trainer(objective, OptimConfig(optimizer=Adam(), lr=0.001), key=jax.random.key(0))

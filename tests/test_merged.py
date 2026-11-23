@@ -283,8 +283,26 @@ def test_a_split_merged_with_a_subnormal_initial_mass_keeps_its_output():
     assert float(out.reshape(())) == 1.0
 
 
-@pytest.mark.parametrize("run", ["jitted", "op by op"])
-@pytest.mark.parametrize("form", sorted(SPECS))
+CHECK1_SHARDS = {
+    "test_a_padded_merge_and_its_derivatives_are_on_par[natural-op-by-op]": {"seeds": 32, "per_task": 8},
+}
+"""The cells whose draws run as CI's map tasks (`check1_shards`), by node id: the natural merge's 32 draws
+op by op, each derivative order's every operation a dispatch of its own, took 123 s in one task in train
+1191's CI, 8 a task (row 11921)."""
+
+
+def _merge_cases() -> list:
+    """Every form's merge jitted and op by op as parameters, each marked from `CHECK1_SHARDS` by its node
+    id (`form-run`, its run's spaces hyphens, as a site's id holds none)."""
+    test = "test_a_padded_merge_and_its_derivatives_are_on_par"
+    marked = {name: [pytest.mark.check1_shards(**counts)] for name, counts in CHECK1_SHARDS.items()}
+    cases = [(form, run, f"{form}-{run.replace(' ', '-')}") for form in sorted(SPECS)
+             for run in ("jitted", "op by op")]
+    return [pytest.param(form, run, id=named, marks=marked.get(f"{test}[{named}]", []))
+            for form, run, named in cases]
+
+
+@pytest.mark.parametrize(("form", "run"), _merge_cases())
 def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
     """The padded merge's finished output, its state's mass, the output's gradient and that gradient's
     derivative along a direction on par with the plain merge's (`_plain_state`, JAX's differentiation of it,

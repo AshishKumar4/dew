@@ -1006,6 +1006,67 @@ def l2_squares(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return wide, jnp.sum(jnp.square(wide), axis=-1, keepdims=True)
 
 
+def l2_normed(x: jax.Array, dtype, eps: float = L2NORM_EPS) -> jax.Array:
+    """`l2norm` of `x`'s rows rounded once to `dtype`, as `l2_unit(*l2_squares(x), dtype, eps)` computes it,
+    its derivative the unit norm's own, `r (t - y <y, t>)` for the unit row `y = x r` and its transpose
+    `r (c - y <y, c>)`: every term at the row's own scale, where JAX's derivative of `rsqrt` reads
+    `rsqrt(s) / s`, which flushes to zero at a row of length 2^55 and leaves a radial cotangent its
+    `r c` term alone, 2^-55 where the exact gradient is 0 (nGPT's join and hidden norm, row 11940's
+    review: their written transposes cancelled it)."""
+    return _unit_rows(eps, *l2_squares(x)).astype(dtype)
+
+
+def _unit_rows_value(eps: float, wide: jax.Array, squares: jax.Array) -> jax.Array:
+    """The rows `wide` over their lengths, from their sums of squares (`l2_normed`'s, in its wide dtype)."""
+    return wide * jax.lax.rsqrt(squares + eps)
+
+
+def _unit_rows_tangent(eps: float, primals, tangents):
+    wide, squares = primals
+    along, _ = tangents
+    inverse = _inverse_length(eps, wide, squares)
+    unit = wide * inverse
+
+    def projected(v: jax.Array) -> jax.Array:
+        return v - unit * jnp.sum(unit * v, axis=-1, keepdims=True)
+
+    # The sums of squares are the rows' own (`l2_squares`): their tangent is the rows' through the norm.
+    # r P(t) for P(t) = t - y <y, t>, the unit row y (`1 - eps r^2` long), written as
+    # P(r P(t)) + r eps r^2 y <y, t> (P P = P - eps r^2 y y^T, and P its own transpose): every term
+    # projected or summed before it is scaled, both forward and in the reverse JAX transposes it into, so a
+    # radial tangent or cotangent as large as float32 holds meets a short row's inverse length only as the
+    # small part the eps leaves, where either order of one projection scaled one direction's first and
+    # overflowed to inf - inf (the API02 review).
+    radial = (inverse * (eps * inverse * inverse)) * jnp.sum(unit * along, axis=-1, keepdims=True)
+    return unit, projected(inverse * projected(along)) + unit * radial
+
+
+def _inverse_length_value(eps: float, wide: jax.Array, squares: jax.Array) -> jax.Array:
+    del wide
+    return jax.lax.rsqrt(squares + eps)
+
+
+def _inverse_length_tangent(eps: float, primals, tangents):
+    wide, squares = primals
+    along, _ = tangents
+    inverse = _inverse_length(eps, wide, squares)
+    # dr = -r^3 <x, dx> = -r (r <y, dx>) for the unit row y = x r, read from the row's own tangent: every
+    # factor at the row's scale in both directions, where through its squares' tangent (2 <x, dx>, 2^56 at a
+    # row of length 2^55) a second order's reverse met r^3 first and flushed to 0 (2^-166, the API02 review).
+    return inverse, -inverse * (inverse * jnp.sum(wide * inverse * along, axis=-1, keepdims=True))
+
+
+_inverse_length = contracted("test_ngpts_join_and_normed_hidden_hold_every_order")(
+    declared_tangent(Protected(), _inverse_length_value, _inverse_length_tangent, nondiff_argnums=(0,)))
+"""The rows' inverse lengths `rsqrt(squares + eps)` from the rows `wide` and their sums of squares, its
+derivative the rows' own (`_unit_rows`')."""
+
+
+_unit_rows = contracted("test_ngpts_join_and_normed_hidden_hold_every_order")(
+    declared_tangent(Protected(), _unit_rows_value, _unit_rows_tangent, nondiff_argnums=(0,)))
+"""`_unit_rows_value` with the unit norm's own tangent, every term at the row's scale (`l2_normed`)."""
+
+
 def l2_unit(wide: jax.Array, squares: jax.Array, dtype, eps: float = L2NORM_EPS) -> jax.Array:
     """`l2norm` of the rows `wide` from their sums of squares (`l2_squares`), rounded once to `dtype`."""
     return (wide * jax.lax.rsqrt(squares + eps)).astype(dtype)
@@ -1019,6 +1080,12 @@ def float32_dot_general(lhs, rhs, dimension_numbers, precision: jax.lax.Precisio
     `BF16_BF16_F32` algorithm it is `bf16_dot_general`'s product."""
     if _bf16_algorithm(precision):
         return _held(bf16_dot_general(lhs, rhs, dimension_numbers), preferred_element_type, lhs, rhs)
+    from .sharding import contracted_alike
+
+    if kwargs.get("out_sharding") is None:
+        # A contraction Explicit axes split on both operands lands its sum where JAX asks to be told.
+        lhs, rhs, placed = contracted_alike(lhs, rhs, dimension_numbers)
+        kwargs = kwargs if placed is None else {**kwargs, "out_sharding": placed}
     return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers,
                                          precision=precision, **kwargs),
                        lhs, rhs, preferred_element_type=preferred_element_type)
@@ -2216,19 +2283,24 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
     numbers = ((tuple(lhs_contracting), tuple(rhs_contracting)), (tuple(lhs_batch), tuple(rhs_batch)))
 
     def typed(lhs, rhs, numbers):
+        from .sharding import contracted_alike
+
+        # A contraction Explicit axes split on both operands, forward and in either transpose, lands its sum
+        # where JAX asks to be told (`contracted_alike`, the confirm review of row 12225).
+        lhs, rhs, placed = contracted_alike(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), numbers)
+
         def native(lhs, rhs):
             return jax.lax.dot_general(lhs, rhs, numbers, precision=jax.lax.Precision.DEFAULT,
-                                       preferred_element_type=jnp.float32)
+                                       preferred_element_type=jnp.float32, out_sharding=placed)
 
         def widened(lhs, rhs):
             # XLA:CPU has no bf16 x bf16 = fp32 dot at every layout ("Unsupported element type for
             # DotThunk"); bf16 values multiply exactly in fp32, so the fp32 dot is the same arithmetic.
             return jax.lax.dot_general(lhs.astype(jnp.float32), rhs.astype(jnp.float32), numbers,
                                        precision=jax.lax.Precision.HIGHEST,
-                                       preferred_element_type=jnp.float32)
+                                       preferred_element_type=jnp.float32, out_sharding=placed)
 
-        return jax.lax.platform_dependent(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), cpu=widened,
-                                          default=native)
+        return jax.lax.platform_dependent(lhs, rhs, cpu=widened, default=native)
 
     def pulled(saved, operands, cotangent):
         """Each operand's cotangent: the product's transpose to it over the cotangent rounded to bf16. No
@@ -2238,10 +2310,29 @@ def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.A
         off (a stack under a bf16 head, compile-only H100: its temporaries trained are its held ones plus the
         gradient, 272 against 256 + 16 MiB), and the rule's portable reverse mode (`portable_formed`) would
         recompute the logits through their rounding's barrier, 768 MiB (train 911 F3)."""
+        from .sharding import explicit_spec, holds_sum
+
         del saved
         rounded = cotangent.astype(jnp.bfloat16)
-        return tuple(_transposed(rounded, operands, numbers, side, typed).astype(operands[side].dtype)
-                     for side in (0, 1))
+
+        def transposed(side: int) -> jax.Array:
+            if not holds_sum(operands[side]):
+                return _transposed(rounded, operands, numbers, side, typed).astype(operands[side].dtype)
+            # An operand holding a sum still to take has a cotangent of its own type (unreduced over the
+            # sum's axes), which JAX's own transpose of the product forms (the confirm review).
+            def along(operand):
+                lhs, rhs = (operand, operands[1]) if side == 0 else (operands[0], operand)
+                return typed(lhs, rhs, numbers)
+
+            return jax.vjp(along, operands[side])[1](rounded.astype(cotangent.dtype))[0]
+
+        pulled = [transposed(side) for side in (0, 1)]
+        # Each operand's cotangent placed as the operand is (a transpose formed against the other operand's
+        # own placement lands on it, the confirm review of row 12225's bilateral split).
+        # An operand holding a sum still to take keeps the cotangent JAX's rules place (`holds_sum`).
+        return tuple(part if holds_sum(operand) or (placed := explicit_spec(operand)) is None
+                     else jax.sharding.reshard(part, placed)
+                     for part, operand in zip(pulled, operands, strict=True))
 
     def forward(lhs, rhs):
         return typed(lhs, rhs, numbers)

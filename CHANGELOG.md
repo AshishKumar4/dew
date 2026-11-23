@@ -22,6 +22,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `--trainer.best.metric val/accuracy`, `--diagnostics.kernels.attention xla`. A run saved before reads as
   it trained (`dew.config.earlier.earlier_surface`).
 
+- Numerics change (rows 12024, 12025): `dew.nn.kernels.gemm.symmetric_polynomial` on its portable XLA route
+  now accumulates `c0 * I + c1 * A + c2 * (A @ A)` in `at_least_fp32` and rounds once to `out_dtype`
+  (matching native Mosaic SYRK instead of narrowing coefficients and `A @ A` to bfloat16; float32 and
+  complex64 updates stay bit-equal). `dew.newton_schulz` AOL preconditioning now scales the Gram matrix via
+  the bitwise-symmetric outer product `a * (scale[:, None] * scale[None, :])`.
 - A beam search (`Beam`, any `Regrouping`) over a paged model decodes over its pool, sized for the search,
   each beam sharing its parent's written pages; only a pool split among groups, or a model that rebuilds
   its cache past a position, decodes unpaged. A pool named smaller than the search needs is refused.

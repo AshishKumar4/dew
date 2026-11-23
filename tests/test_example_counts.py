@@ -7,6 +7,7 @@ import grain.python as pygrain
 import numpy as np
 import pytest
 from data_support import Fanned, Questioned, WideDraw
+from model_support import attending
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.data import Memory
@@ -66,6 +67,7 @@ def test_a_corpus_counts_its_source_examples_whatever_windows_a_pack_lays_their_
     assert counted(loader, "data/rejected/") == [5]
 
 
+@attending("xla")
 def test_a_decision_corpus_counts_its_source_examples():
     """A decision run's examples, two questions each, cut by a window too short for their states: the
     corpus counts every example it delivered as `data/rows`, whatever windows its rows were packed into."""
@@ -86,6 +88,7 @@ def test_a_decision_corpus_counts_its_source_examples():
     assert counted(loader) == [23]
 
 
+@attending("xla")
 def test_a_decision_corpus_counts_the_examples_it_kept_apart_from_those_its_layout_refused():
     """Ten decision examples, two of them asking a question no window holds, bound to eight examples: the
     layout refuses the two before the bound reads (a decision run fits its examples before it spreads them

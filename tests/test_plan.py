@@ -1701,12 +1701,13 @@ CENSUS = {
     "decoder": ({"seq": LONG, "width": 32, "layers": 4}, LONG_BATCH,
                 lambda need: (need(None) + need("minimal")) // 2),
     # Two scanned gated delta net layers over 256 tokens, room for what 'minimal' needs.
-    "delta-scanned": ({**HALVED, "scan_layers": True}, HALVED_BATCH, lambda need: need("minimal")),
+    "delta-scanned": ({**HALVED}, HALVED_BATCH, lambda need: need("minimal")),
 }
 """The census shapes: their decoders' fields, batches, and the room each start is given of their needs by
 remat at their own head, each read as asked (`climbed`): no other rung's need is compiled."""
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize(("shape", "target"), [
     pytest.param("decoder", "cpu", id="decoder-cpu"),
     pytest.param("decoder", "h100", id="decoder-h100"),

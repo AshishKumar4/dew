@@ -20,7 +20,7 @@ import optax
 import pytest
 from arm_arithmetic import float64_held
 from flax import linen as nn
-from model_support import flat_tree, float64_twin
+from model_support import attending, flat_tree, float64_twin
 from reference_error import assert_as_exact, widened
 
 from dew.batch import coordinates
@@ -46,10 +46,11 @@ import_module("dew.nn.backbones.causal_transformer")  # registers the backbone
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 
+@attending("reference")
 def test_biased_masked_objective_scores_the_same_affine_logits_as_its_forward():
     model = models.build('causal_transformer', vocab_size=32, emb_features=8, num_layers=1,
                          num_heads=2, mlp_features=16, max_seq_len=4, causal=False,
-                         head_bias=True, qk_norm=False, attention_impl='reference', dtype=jnp.float32)
+                         head_bias=True, qk_norm=False, dtype=jnp.float32)
     tokens = jnp.asarray([[2, 5, 7, 8], [3, 1, 4, 9]], jnp.int32)
     variables = model.init(jax.random.key(0), tokens)
     variables['params']['head_bias'] = jnp.linspace(-.123, .389, 32)
@@ -169,6 +170,7 @@ def test_an_evaluation_reads_the_run_s_end_whatever_it_reports():
     assert perplexity(5) == perplexity(0)
 
 
+@attending("reference")
 @pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
 def test_padding_that_holds_the_mask_token_scores_nothing(given):
     """A padded row whose padding slots hold the mask token, as a tokenizer padding with it writes
@@ -177,7 +179,7 @@ def test_padding_that_holds_the_mask_token_scores_nothing(given):
     marked by the attention mask, or by the coordinates' validity the decoder reads."""
     model = models.build('causal_transformer', vocab_size=32, emb_features=8, num_layers=1,
                          num_heads=2, mlp_features=16, max_seq_len=4, causal=False, qk_norm=False,
-                         attention_impl='reference', dtype=jnp.float32)
+                         dtype=jnp.float32)
     objective = MaskedDiffusionObjective(model, MDLM(mask_id=31)(), seq_len=4, head_chunks=4,
                                          ema_decay=None)
     variables = objective.init(jax.random.key(0))
@@ -206,7 +208,7 @@ def loaded(name: str):
     directory = FIXTURES / name
     config = translate_config(json.loads((directory / "config.json").read_text()))
     assert config["mask_token_id"] == 120
-    model = models.build("causal_transformer", config, dtype="float32", attention_impl="reference")
+    model = models.build("causal_transformer", config, dtype="float32")
     variables = translate_weights(load_file(str(directory / "model.safetensors")), config)
     return model, variables
 
@@ -243,6 +245,7 @@ UNMASKING_SEEDS = 8
 """An unmasking step's declared check-1 seeds, sized by `seeds_for` paired."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["llada-tiny", "dream-tiny"])
 def test_a_masked_family_unmasks_each_position_from_the_logits_its_reference_reads(name):
     """LLaDA predicts each position's token from its own logits; Dream-v0, continued from an
@@ -276,6 +279,7 @@ def test_a_masked_family_unmasks_each_position_from_the_logits_its_reference_rea
                     truth_fn=unmasking(model.clone(dtype=jnp.float64), widened(variables)))
 
 
+@attending("reference")
 def test_a_shifted_model_reads_each_document_and_padded_row_as_if_alone():
     """Dream reads position i's prediction from position i-1, but a packed document's first token,
     and a left-padded row's first real one, read their own, as the reference does a row's first: a
@@ -294,6 +298,7 @@ def test_a_shifted_model_reads_each_document_and_padded_row_as_if_alone():
     np.testing.assert_array_equal(one, scores[:, :1])
 
 
+@attending("reference")
 def test_a_dream_shaped_record_keeps_how_its_logits_line_up():
     """The alignment is a fact of the checkpoint, so the model's record carries it: a Dream config
     reads to a model that shifts, which its record rebuilds as one that shifts, and LLaDA's to one
@@ -307,6 +312,7 @@ def test_a_dream_shaped_record_keeps_how_its_logits_line_up():
         assert from_record(CausalTransformer, to_record(model, CausalTransformer)).shifted_logits is shifted
 
 
+@attending("reference")
 def test_unmask_sampler_runs_on_a_loaded_model_end_to_end():
     """Evaluation on llada-tiny unmasks the fully masked rows into vocabulary
     ids: [4, 12] int32 with no mask id left. A sampler returning its input
@@ -331,6 +337,7 @@ def test_unmask_sampler_runs_on_a_loaded_model_end_to_end():
     assert bool(np.isfinite(np.asarray(scored.losses)).all()) and float(np.asarray(scored.losses).max()) > 0
 
 
+@attending("reference")
 def test_the_trainer_builds_its_state_from_the_held_checkpoint():
     """What the seam exists for: a real `Trainer` accepts the objective and
     its initial state is the loaded checkpoint, so the run continues from
@@ -354,20 +361,22 @@ paired, on armada's CPU, every family's (mc-sizing2 at a0bc1bbfe, 11-12)."""
 
 @pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny", "llada-moe-tiny",
                                       "llada-moe-v2-tiny", "llada2-tiny", "llada22-tiny"])
+@attending("xla")
 def masked_source(request):
-    source = Pretrained.load(FIXTURES / request.param, dtype="float32", attention_impl="xla")
+    source = Pretrained.load(FIXTURES / request.param, dtype="float32")
     tokens = jnp.asarray([[0, 120, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
     fields = {"attention_mask": jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]], bool),
               "positions": jnp.asarray([[0, 3, 4, 5], [0, 1, 2, 3], [0, 0, 4, 5]])}
     return source, ModelInputs(tokens, fields)
 
 
+@attending("xla")
 def test_a_masked_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
     """An objective over a loaded source takes the source's end-of-sequence ids into its task and its
     saved run: each stops a response where the source's own task does."""
     from dew.inference.tasks import MaskedGeneration
 
-    source = Pretrained.load(FIXTURES / "llada-tiny", dtype="float32", attention_impl="xla")
+    source = Pretrained.load(FIXTURES / "llada-tiny", dtype="float32")
     tokens = jnp.asarray([[0, 120, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
     valid = jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]], bool)
     inputs = ModelInputs(tokens, {"attention_mask": valid,
@@ -395,6 +404,7 @@ def whole_response(source):
     return replace(source.text_generation(), solver=Unmask(), block=None)
 
 
+@attending("xla")
 def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
     source, inputs = masked_source
     task = whole_response(source)
@@ -419,6 +429,7 @@ def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
         np.testing.assert_array_equal(result.tokens[row], expected[0])
 
 
+@attending("xla")
 def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
     source, inputs = masked_source
     task = whole_response(source)
@@ -452,6 +463,7 @@ def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
             task(inputs, 8, key=7, **controls)
 
 
+@attending("xla")
 @pytest.mark.mesh
 def test_masked_rows_and_continuations_keep_the_mesh_contract(masked_source):
     source, inputs = masked_source
@@ -469,6 +481,7 @@ def test_masked_rows_and_continuations_keep_the_mesh_contract(masked_source):
     np.testing.assert_array_equal(np.asarray(placed.decoder_steps)[6:], 0)
 
 
+@attending("xla")
 def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path):
     source, prompt = masked_source
     model = source.model.clone(dtype=jnp.bfloat16)
@@ -528,19 +541,18 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     assert_as_exact(actual_logits, expected_logits, drawn, label, truth_fn=truth, seeds=CONVERTED_SEEDS)
 
     source.save(tmp_path / "published", variables=resumed.variables)
-    reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
+    reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16")
     # A published source generates by its family's own recipe (LLaDA2's blockwise walk), which the
     # run's task computes too under the same solver, block and steps.
     published = reloaded.text_generation()
     expected = replace(live, solver=published.solver, block=published.block, steps=published.steps)(
         prompt, 8, key=7).host().tokens
     np.testing.assert_array_equal(published(prompt, 8, key=7).host().tokens, expected)
-    # A pipeline loads its source on the automatic attention route, which the run's task is compared on
-    # too: two kernels' roundings part a near tie of sampled scores (a template's against the reference's
-    # on CPU), which check 1 qualifies across kernels, never a token (testing.md).
+    # A pipeline over the published source draws as the run's task does, both on the run's kernel: two
+    # kernels' roundings part a near tie of sampled scores (a template's against the reference's on CPU),
+    # which check 1 qualifies across kernels, never a token (testing.md).
     piped = pipeline(str(tmp_path / "published"), dtype="bfloat16")
-    routed = replace(live, model=live.model.clone(attention_impl=piped.model.attention_impl),
-                     solver=published.solver, block=published.block, steps=published.steps)
+    routed = replace(live, solver=published.solver, block=published.block, steps=published.steps)
     np.testing.assert_array_equal(piped(prompt, 8, key=7).host().tokens,
                                   routed(prompt, 8, key=7).host().tokens)
     raw = restored(["a", "bc"], 3, key=7, steps=3)
@@ -561,6 +573,7 @@ def masked_draw(model):
     return draw
 
 
+@attending("xla")
 def test_a_masked_task_packs_its_projections_as_a_decoder_does(masked_source, tmp_path):
     """A bidirectional masked model packs its projection groups at load, as a decoder does: the task
     the pipeline loads holds them packed; its denoising logits are on par with the unpacked
@@ -596,6 +609,7 @@ def test_a_masked_task_packs_its_projections_as_a_decoder_does(masked_source, tm
                                   held_apart(prompt, 8, key=7, steps=4).host().tokens)
 
 
+@attending("xla")
 def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_source):
     source, inputs = masked_source
     controls = {"repetition_penalty": 1.0, "suppress_tokens": None, "stop_strings": None,

@@ -170,7 +170,7 @@ A scanned decoder declares one bank per run of like layers, and an unscanned dec
 
 On a TPU, pinned banks keep their layer axis major-most in physical memory. A fetch keeps that axis until the copy reaches device memory and squeezes it out there, which avoids incompatible host tile bitcasts and still transfers one layer at a time. Bank sources must honor any JAX `Format` given in their placement; both built-in sources do.
 
-`dew.inference.LayerBanks` has two adapters for real use:
+`dew.inference.banks.LayerBanks` has two adapters for real use:
 
 - `CheckpointBanks` reads Dew run checkpoints bank by bank.
 - `HeldBanks` borrows an existing variables tree without donating or deleting it. The whole source stays in memory while the destination banks fill up, so it can hold two copies of the model at once.
@@ -243,9 +243,9 @@ Cached autoregressive generation decodes whole sequences: a task's call and a se
 
 ## Layer scan and pipeline
 
-`scan_layers=True` groups compatible consecutive decoder layers into a Flax scan, and the stored variables stay per layer. Scanning can cut compile time, but it adds stacking and loop overhead, and it does not promise a flat compile time or faster steps. Measure it at the model size and on the backend you plan to use.
+Under `generation.chosen(layer_scan="scanned")` a decoder groups compatible consecutive layers, and a stack's repeating period of unlike layers, into a Flax scan by its structure, and the stored variables stay per layer: a periodic stack such as Qwen3.5's (three delta nets and an attention layer, repeated) lowers its period once, not its every layer (row 4074: 112k operations unrolled). It runs every layer as its own program by default until the scanned path's open rows close and row 4074 makes the scan the default. Scanning adds stacking and loop overhead, so measure both at the model size and on the backend you plan to use.
 
-Whatever `scan_layers` says, `init` draws each run of two or more like layers under one scan, so its program has one draw per run instead of one per layer. At a given seed those layers get new values from the same distribution, and the draw depends on `bank_layers`, which splits the runs. So a run recorded with a Dew version that initialized layer by layer starts from different weights at the same seed. Init under a stage mesh or with `decode=True` still runs the plain loop.
+Either way, `init` draws each run of two or more like layers under one scan, so its program has one draw per run instead of one per layer. At a given seed those layers get new values from the same distribution, and the draw depends on `bank_layers`, which splits the runs. So a run recorded with a Dew version that initialized layer by layer starts from different weights at the same seed. Init under a stage mesh or with `decode=True` still runs the plain loop.
 
 `MeshSpec(stage=N)` turns on the GPipe-style pipeline, and `Trainer(microbatches=M)` (`--trainer.microbatches`) sets how many microbatches a step feeds through its stages, one a stage by default. The layer pattern must repeat across stages and split evenly between them. A stack of like layers is pipelined: a decoder's layer stack, a DiT's blocks (a hybrid's SSM and attention blocks where their pattern repeats every stage), a JEPA encoder's or predictor's blocks (a video's spatial and temporal pairs), and each UNet level's transformers (SDXL's levels of two and ten). Embeddings, the output head, a UNet's residual blocks and other operations outside the stacks are not split across stages; a stack the stages do not split evenly runs whole on every stage. TREAD's routes take part of the tokens through a span of the blocks, which no pipeline stage's one program runs, so a routed DiT trains on a mesh without a stage axis. The trainer refuses a stage axis on a model that runs no pipeline, such as FlaxDiff's UNet, whose levels hold one transformer each, because every stage would compute the whole step. That refusal raises `dew.mesh.LayoutRefused`, a `ValueError` that names the axis and a layout that does run. Any other error on a layout is a defect.
 

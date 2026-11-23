@@ -25,6 +25,7 @@ from deepseek_recorded import (
     held_to_the_release,
 )
 from deepseek_v41_support import TINY, training_step
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from dew.nn.inputs import ModelInputs
@@ -40,6 +41,7 @@ every position's and a cached walk's past its prompt, summarized over seeds, bes
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def recorded_rows(source):
     """The rows the recording drew (recording_rows.npz), each of whose selections Dew's plain forward clears
     `selection_margins.MARGIN` by too (`cleared_rows`)."""
@@ -55,6 +57,7 @@ in vision_rows.npz."""
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def vision_source(tmp_path_factory):
     """The tiny with its vision half, loaded as the release ships the bundle (`vision_bundle`), and the
     recording's image prompts, each of whose selections, the release's cleared when it was recorded,
@@ -63,8 +66,7 @@ def vision_source(tmp_path_factory):
     from dew.interop import Pretrained
     from tools.deepseek_v41_numerics import unquantized, vision_bundle
 
-    loaded = Pretrained.load(vision_bundle(tmp_path_factory.mktemp("bundle")), dtype="float32",
-                             attention_impl="reference")
+    loaded = Pretrained.load(vision_bundle(tmp_path_factory.mktemp("bundle")), dtype="float32")
     plain = loaded.model.clone(language_model=unquantized(loaded.model.language_model))
     with np.load(TINY / "vision.npz") as fixture:
         # The site's shape, alike for every prompt (tools/deepseek_v41_reference.py `vision_layout`).
@@ -82,6 +84,7 @@ def vision_source(tmp_path_factory):
     return loaded, prompts, shape
 
 
+@attending("reference")
 def test_an_image_prompt_is_on_par_with_the_releases(vision_source):
     """The vision half over drawn image prompts its selections clear: the span the image fills, the
     prefill's logits with it and each teacher-forced text step's after it, through Dew's cache
@@ -125,6 +128,7 @@ def test_an_image_prompt_is_on_par_with_the_releases(vision_source):
                     site, seeds=seeds, truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.shared_setup("recorded_rows")
 def test_an_interior_gap_leaves_every_window_on_its_rows_real_tokens(source, recorded_rows):
     """Uncached, three padding slots inside each row leave each real token's sliding window counting
@@ -156,6 +160,7 @@ SHIFT = 8
 rate, so a query that read entries by its given place would see SHIFT // rate windows of later tokens."""
 
 
+@attending("reference")
 @pytest.mark.shared_setup("recorded_rows")
 def test_shifted_positions_compute_the_unshifted_rows_logits(source, recorded_rows):
     """Uncached, positions given SHIFT past the tokens' indices: every rotation is relative, each
@@ -177,6 +182,7 @@ def test_shifted_positions_compute_the_unshifted_rows_logits(source, recorded_ro
                     reference, draw, "shifted positions", seeds=seeds, truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.shared_setup("recorded_rows")
 def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source, recorded_rows):
     """Cached, a prompt at positions SHIFT past its indices, then the rest of each row one token at a
@@ -211,6 +217,7 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source, recorded_row
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def quantized_rows(source):
     """The rows the recorded quantization-aware forward drew (recording_rows.npz), each of whose selections
     the release's cleared when it was recorded (`clearing_quantized_rows`), and Dew's clear
@@ -222,6 +229,7 @@ def quantized_rows(source):
                             "quantized row")
 
 
+@attending("reference")
 @pytest.mark.shared_setup("quantized_rows")
 def test_a_quantization_aware_forward_is_on_par_with_the_releases(source, quantized_rows):
     """The tiny's forward, its activations rounding through the release's quantizers, over drawn rows its
@@ -258,6 +266,7 @@ def test_a_quantization_aware_forward_is_on_par_with_the_releases(source, quanti
                     followed=Followed(truth, quantized_arms.rounds))
 
 
+@attending("reference")
 def test_a_training_steps_float64_gradients_are_the_releases(source):
     """The tiny's training step in float64, the next-token loss and its gradient in every tensor the
     release trains (the MTP layers', the DSpark stages', the routing biases' among them), by the release's
@@ -278,6 +287,7 @@ def test_a_training_steps_float64_gradients_are_the_releases(source):
     assert_truths_as_recorded(recording(TINY / "step_truths.npz"), "deepseek v41 plain step", truth)
 
 
+@attending("reference")
 def test_a_quantization_aware_training_steps_float64_gradients_are_the_releases(source):
     """The tiny's training step with its activations rounding through the release's quantizers, in float64
     following the release's recorded decisions: its loss, its gradient in every tensor the release trains
@@ -306,6 +316,7 @@ def test_a_quantization_aware_training_steps_float64_gradients_are_the_releases(
 # The recording's declared 32 seeds, a stage's 32 draws a map task: a draw takes about 4.5 s in the two arms
 # (2026-11-13, cached-cost1) beside a task's 85 s of setup, so a task of 32 draws runs within the plan's site
 # targets (v41-fit2: 226 to 233 s) where 8 a task spent half its seconds on setup (v41-fit1).
+@attending("reference")
 @pytest.mark.check1_shards(seeds=32, per_task=32)
 def test_a_cached_run_and_its_drafts_are_on_par_with_the_releases(source):
     """The release's driver through Dew's cache (`cached_leaves`): the prefill of the prompt, each

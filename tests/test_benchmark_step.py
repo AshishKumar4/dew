@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from lane_environment import outside_suite
+from model_support import attending
 from tool_support import REPO_ROOT, load
 
 from tools.benchmark_cases import cpu_smoke_cases
@@ -48,6 +49,7 @@ def test_a_case_of_a_translated_config_is_read_back_as_the_case_it_builds(name):
             == to_record(models.build(case.architecture, **case.config), object))
 
 
+@attending("xla")
 @pytest.mark.parametrize("named", ["directory", "config.json"])
 @pytest.mark.parametrize("name", ["qwen35-tiny", "qwen35-native-tiny"])
 def test_a_case_names_a_checkpoints_config_on_the_command_line(name, named):
@@ -67,9 +69,8 @@ def test_a_case_names_a_checkpoints_config_on_the_command_line(name, named):
                                               "dtype": "float32", "batch_size": 2, "seq_len": 8}]))
     translated = translate_config(decoder_config(json.loads((directory / "config.json").read_text())))
     assert translated["max_seq_len"] != 128
-    expected = models.build("causal_transformer", **{**translated, "max_seq_len": 128}, dtype="float32",
-                            attention_impl="xla")
-    built = models_module.build_objective(case, "xla").program_key()[0].module
+    expected = models.build("causal_transformer", **{**translated, "max_seq_len": 128}, dtype="float32")
+    built = models_module.build_objective(case).program_key()[0].module
     assert to_record(built, object) == to_record(expected, object)
 
 

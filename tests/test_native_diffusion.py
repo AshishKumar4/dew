@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from interop_support import extract_fixture
+from model_support import attending
 
 from tools.diffusers_scheduler_pipeline_reference import SCHEDULERS, scheduler as grid_scheduler
 
@@ -132,6 +133,7 @@ def test_multilevel_unet_geometry_and_input_gradient(tmp_path, case):
     run_check(tmp_path / case, "--model")
 
 
+@attending("xla")
 def test_an_autoencoder_the_pipeline_index_omits_exports_by_diffusers_names(saved_pipelines, tmp_path):
     """A pipeline whose model_index.json declares no vae, its vae's config naming no class (an older
     AutoencoderKL's), still loads its `vae/` (Dew reads its denoiser and autoencoder by their files), and
@@ -149,20 +151,21 @@ def test_an_autoencoder_the_pipeline_index_omits_exports_by_diffusers_names(save
     vae = json.loads((source / "vae" / "config.json").read_text())
     del vae["_class_name"]
     (source / "vae" / "config.json").write_text(json.dumps(vae))
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(source, dtype="float32")
     destination = tmp_path / "export"
     loaded.save(destination)
     assert (destination / "vae" / "diffusion_pytorch_model.safetensors").is_file()
 
 
+@attending("xla")
 def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(saved_pipelines, tmp_path):
     from dew.interop import Pretrained
 
-    source = Pretrained.load(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
+    source = Pretrained.load(saved_pipelines / "sd", dtype="float32")
     original = {layout.name: layout.export(source.variables) for layout in source.weight_layouts}
     destination = tmp_path / "export"
     source.save(destination)
-    mapped = Pretrained.load(destination, dtype="float32", attention_impl="xla")
+    mapped = Pretrained.load(destination, dtype="float32")
     assert {layout.name for layout in mapped.weight_layouts} == set(original)
     for layout in mapped.weight_layouts:
         np.testing.assert_array_equal(layout.export(mapped.variables), original[layout.name])
@@ -178,7 +181,7 @@ def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(save
     mapped.save(destination, variables=updated)
     for layout in mapped.weight_layouts:
         np.testing.assert_array_equal(layout.export(mapped.variables), original[layout.name])
-    latest = Pretrained.load(destination, dtype="float32", attention_impl="xla")
+    latest = Pretrained.load(destination, dtype="float32")
     for layout in latest.weight_layouts:
         expected = (
             original[layout.name] + np.float32(1.0) if layout.name == changed.name else original[layout.name]
@@ -186,6 +189,7 @@ def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(save
         np.testing.assert_array_equal(layout.export(latest.variables), expected)
 
 
+@attending("xla")
 def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved_pipelines, tmp_path):
     """Saved with a shard bound below its components' sizes, a pipeline writes each component's
     weights as shards and an index under the stem and shard names its library reads (the
@@ -202,7 +206,7 @@ def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved
     restore_transformers_names()
     from diffusers.pipelines.pipeline_loading_utils import variant_compatible_siblings
 
-    source = Pretrained.load(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
+    source = Pretrained.load(saved_pipelines / "sd", dtype="float32")
     destination = tmp_path / "export"
     # Saved over itself, the directory holds the latest export alone, under names no earlier index
     # held.
@@ -222,11 +226,12 @@ def test_a_diffusion_export_shards_each_component_at_the_bound_it_is_given(saved
             assert not (destination / component / f"{stem}.safetensors").exists()
             assert shards <= set(downloaded) if save == 0 else not shards & earlier
             earlier |= shards
-        reloaded = Pretrained.load(destination, dtype="float32", attention_impl="xla")
+        reloaded = Pretrained.load(destination, dtype="float32")
         for layout in reloaded.weight_layouts:
             np.testing.assert_array_equal(layout.export(reloaded.variables), layout.export(source.variables))
 
 
+@attending("xla")
 def test_a_resized_xl_conditioning_rebuilds_from_its_record_at_its_own_size(saved_pipelines):
     """An XL pipeline loaded at 64x48 instead of its own 32x32 states that size in its time ids, and
     the conditioner its run record rebuilds states the same, where it used to read the pipeline's
@@ -235,7 +240,7 @@ def test_a_resized_xl_conditioning_rebuilds_from_its_record_at_its_own_size(save
     from dew.interop.pretrained import load_diffusion_source
     from dew.registry import to_record
 
-    source = load_diffusion_source(str(saved_pipelines / "xl"), dtype="float32", attention_impl="xla",
+    source = load_diffusion_source(str(saved_pipelines / "xl"), dtype="float32",
                                    size=(64, 48))
     condition = source.inputs.conditions["conditioning"]
     assert condition.encoder.time_id_values == (64, 48, 0, 0, 64, 48)
@@ -244,6 +249,7 @@ def test_a_resized_xl_conditioning_rebuilds_from_its_record_at_its_own_size(save
     assert reloaded.encoder.time_id_values == condition.encoder.time_id_values
 
 
+@attending("xla")
 def test_a_bfloat16_safety_head_decides_as_its_checkpoint_states(saved_pipelines, tmp_path):
     """The safety head keeps its scoring state, the concept embeddings and
     thresholds, in FP32 whatever the weights are stored in, so a load at
@@ -277,12 +283,12 @@ def test_a_bfloat16_safety_head_decides_as_its_checkpoint_states(saved_pipelines
     for name, directory, expected in (("fixture", source, reference["checker_flags"]),
                                       ("concept", concept, [True])):
         for storage in ("float32", "bfloat16"):
-            loaded = Pretrained.load(str(directory), dtype="float32", param_dtype=storage,
-                                     attention_impl="xla")
+            loaded = Pretrained.load(str(directory), dtype="float32", param_dtype=storage)
             blocked = np.all(np.asarray(loaded.finish(loaded.variables, images)) == -1, axis=(1, 2, 3))
             np.testing.assert_array_equal(blocked, expected, err_msg=f"the {name} checker at {storage}")
 
 
+@attending("xla")
 @pytest.mark.parametrize("scheduler", ["shipped", "lms"])
 def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(saved_pipelines, tmp_path,
                                                                               scheduler):
@@ -316,7 +322,7 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     if scheduler == "lms":
         lms = dict(grid_scheduler("lms", saved_pipelines / "sd").config)
         (directory / "scheduler" / "scheduler_config.json").write_text(json.dumps(lms))
-    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    source = load_diffusion_source(str(directory), dtype="float32")
     size = source.inputs.sample.shape[0]
     settings = {"guidance": None, "steps": 3, "ema_decay": None}
     objective = DiffusionObjective(source, **settings)
@@ -326,8 +332,7 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     model = DiffusionRunConfig().model
     configured = DiffusionRunConfig(
         pretrained=str(directory), preset=None,
-        model=dataclasses.replace(model, fields={**model.fields, "dtype": "float32",
-                                                 "attention_impl": "xla"}),
+        model=dataclasses.replace(model, fields={**model.fields, "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", size), val_metrics=(),
         objective=ObjectiveConfig("diffusion", {**settings, "unconditional_prob": 0.0})).build()
     variables = source.variables
@@ -370,8 +375,7 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
 
     @functools.cache
     def float64_source():
-        return load_diffusion_source(str(directory), dtype="float64", param_dtype="float64",
-                                     attention_impl="xla")
+        return load_diffusion_source(str(directory), dtype="float64", param_dtype="float64")
 
     # On par with the solver's own walk from the same noise over the seeds' step keys (check 1).
     assert_as_exact(as_given(evaluation), as_given(reference), lambda seed: (np.int32(seed),),

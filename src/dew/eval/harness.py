@@ -400,7 +400,7 @@ class DewLM(TemplateLM):
                 raise ValueError("sampling at temperature 0 is refused, as Transformers' generate refuses it")
             task_ids = {"eos_token_id": self.task.sampling.eos_token_ids,
                         "pad_token_id": self.task.sampling.pad_token_id}
-            sampling, chain, strategy = source_decoding(task_ids, controls, self.task.model, 1, None)
+            sampling = source_decoding(task_ids, controls, self.task.model, 1, None)
             # The request's cache as its controls ask: offloaded to the host where they name it.
             task = dataclasses.replace(self.task, model=source_cache(task_ids, controls, self.task.model))
             if budget >= self.max_length:
@@ -410,7 +410,7 @@ class DewLM(TemplateLM):
             ids = self.tok_encode(context)[-(self.max_length - budget):]
             drawn_budget = budget if total is None else int(total) - len(ids)
             text = "" if drawn_budget < 1 else task.decode(task(
-                [ids], drawn_budget, key=seed, sampling=sampling, logits=chain, strategy=strategy))[0]
+                [ids], drawn_budget, key=seed, sampling=sampling))[0]
             answers.append(postprocess_generated_text(text, stops, None))
         return answers
 

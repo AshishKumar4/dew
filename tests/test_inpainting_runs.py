@@ -12,6 +12,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from model_support import attending
 from objective_data import IMAGES
 from run_kinds import cli_settings, saved_record, trained_record
 
@@ -66,7 +67,7 @@ def masked_images(batch: int = 8, *, rejects: bool = True, ratio: float = 1.0):
 
 def precision() -> ModelConfig:
     model = DiffusionRunConfig().model
-    return dataclasses.replace(model, fields={**model.fields, "dtype": "float32", "attention_impl": "xla"})
+    return dataclasses.replace(model, fields={**model.fields, "dtype": "float32"})
 
 
 RUNS = {
@@ -152,6 +153,7 @@ def test_a_random_mask_draws_as_diffusers_inpainting_trainer_draws(draws):
     assert facts["fields"]["mask"] == [height, width, 1]
 
 
+@attending("xla")
 @pytest.mark.parametrize("objective", list(RUNS))
 def test_dew_train_trains_an_inpainting_pipeline_through_its_masks(inpainting, objective, tmp_path):
     """`dew train` over the inpainting pipeline, its images' masks drawn by RandomMask, commits a step
@@ -173,13 +175,14 @@ def test_dew_train_trains_an_inpainting_pipeline_through_its_masks(inpainting, o
     directory = trained_record(saved_record(run, tmp_path, "inpainting"), settings)
 
     trained = Checkpoints(str(directory)).variables(ema=False)
-    published = load_diffusion_source(str(pipeline), dtype="float32", attention_impl="xla",
+    published = load_diffusion_source(str(pipeline), dtype="float32",
                                       size=(SIZE, SIZE)).variables
     moved = [not np.array_equal(np.asarray(after), np.asarray(before)) for after, before in zip(
         jax.tree.leaves(trained["params"]), jax.tree.leaves(published["params"]), strict=True)]
     assert any(moved), "the step moves the denoiser"
 
 
+@attending("xla")
 def test_an_inpainting_run_over_a_chain_without_masks_is_refused(inpainting):
     """An inpainting pipeline paints the region its mask marks: over images that carry no mask the run
     is refused as it builds."""
@@ -191,6 +194,7 @@ def test_an_inpainting_run_over_a_chain_without_masks_is_refused(inpainting):
         run.build()
 
 
+@attending("xla")
 def test_an_inpainting_run_validates_through_its_held_out_images_masks(inpainting, tmp_path):
     """An inpainting run's validation chain carries its images' masks as its training chain does
     (`RandomMask`), and `dew train` scores the held-out loss through them at each evaluation, its
