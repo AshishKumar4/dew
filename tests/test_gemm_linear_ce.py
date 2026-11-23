@@ -195,6 +195,11 @@ def test_linear_cross_entropy_mixed_dtype_matches_vjp_and_refuses_native():
         with pytest.raises(ValueError):
             linear_ce.linear_ce(jnp.zeros((64, 64), jnp.bfloat16), jnp.zeros((64, 64), jnp.float32),
                                 jnp.zeros((64,), jnp.int32), tiles=tile, multiprocessors=1, interpret=True)
+        # Public gemm.linear_cross_entropy routes mixed-dtype through selection.select -> KernelRefused.
+        from dew.nn.kernels import selection
+        with generation.chosen(grouped_matmul="mosaic"), pytest.raises(selection.KernelRefused):
+            gemm.linear_cross_entropy(jnp.zeros((64, 64), jnp.bfloat16), jnp.zeros((64, 64), jnp.float32),
+                                      jnp.zeros((64,), jnp.int32), interpret_on_cpu=True)
 
 
 def test_linear_cross_entropy_derives_on_tpu_and_clamps_shared_budget():

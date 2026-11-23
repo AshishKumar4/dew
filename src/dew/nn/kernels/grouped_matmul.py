@@ -39,6 +39,7 @@ import jax
 import jax.numpy as jnp
 
 from . import generation, selection
+from .formats import Fp8Weights, TernaryWeights
 from .generation import INHERENT
 from .grouped_cells import (
     B200_GRID,
@@ -423,7 +424,8 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         tile = self._tile(ba, target)
         if tile is None:
             return None
-        return producers.settled(self, ba, tile, target)
+        with generation.as_target(target):
+            return producers.settled(self, ba, tile, target)
 
     def _tile(self, ba, target) -> tiling.Tiles | None:
         return self._derived(ba, target)
@@ -446,7 +448,8 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         # (`producers.settled`, settled under `target` until it takes one, rows 11885, 11889).
         from .templates import report
         from .templates.gemm import producers
-        return report.refused(self, ba, producers.settled(self, ba, config, target), target)
+        with generation.as_target(target):
+            return report.refused(self, ba, producers.settled(self, ba, config, target), target)
 
     def _derived(self, ba, target, admits=None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
@@ -1483,12 +1486,15 @@ class MosaicFp8PackedGmm(MosaicPackedGmm):
     WEIGHT_BYTES: ClassVar[float] = 1.0
     DEFAULT_FMT: ClassVar[str] = 'e4m3'
     def _fmt(self, ba) -> str:
-        return getattr(ba.arguments['kernel'], 'fmt', self.DEFAULT_FMT)
+        kernel = ba.arguments['kernel']
+        return kernel.fmt if isinstance(kernel, (Fp8Weights, TernaryWeights)) else self.DEFAULT_FMT
     def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
         del trans_rhs
+        assert isinstance(kernel, (Fp8Weights, TernaryWeights))
         return kernel.words, True, {'packed_fp8': kernel.fmt}
     def _swapped_extra(self, kernel, formats: dict) -> dict:
         del formats
+        assert isinstance(kernel, (Fp8Weights, TernaryWeights))
         return {'packed_fp8': kernel.fmt}
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
         from .templates.gemm import mosaic_gpu

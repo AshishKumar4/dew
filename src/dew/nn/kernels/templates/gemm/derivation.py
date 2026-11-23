@@ -28,26 +28,19 @@ from dew.nn.kernels.templates.gemm import pricing
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 
 
-def _budgeted_launch(launch_of: Callable, target, shared_budget: int | None, programs: int) -> Callable:
-    """Wrap `launch_of` to reserve `shared_budget`'s carve-out via `Scope.addresses` through
-    `generation.shared_budget(target)` and `resources.program_shared`, clamping GPU and TPU alike."""
+def _budgeted_target(target, shared_budget: int | None):
+    """Clamp `target`'s scratch budget (`shared_limit` on GPU or `architecture.scoped_vmem` on TPU) so
+    `resources.plan` passes the clamped budget straight to `program_shared` without inflating `staged_bytes`
+    or calling `Scope` twice per ring depth (row 12099)."""
     if shared_budget is None:
-        return launch_of
+        return target
     from dew.nn.kernels import generation
 
-    block = generation.shared_budget(target)
-    real_share = resources.program_shared(block, programs)
-    clamped_share = max(0, resources.program_shared(min(block, shared_budget), programs))
-    carved = max(0, real_share - clamped_share)
-    if not carved:
-        return launch_of
-
-    def wrapped(tile):
-        built = launch_of(tile)
-        return dataclasses.replace(built, scope=lambda s, orig=built.scope: dataclasses.replace(
-            orig(s), addresses=orig(s).addresses + carved))
-
-    return wrapped
+    clamped = min(generation.shared_budget(target), shared_budget)
+    if generation.tpu(target) and target.scoped_vmem is not None and target.architecture is not None:
+        return dataclasses.replace(
+            target, architecture=dataclasses.replace(target.architecture, scoped_vmem=clamped))
+    return dataclasses.replace(target, shared_limit=clamped)
 
 
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
@@ -134,10 +127,10 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
                                    multiprocessors=multiprocessors, grouped=padded)
         price_of = functools.partial(_tile_cost, family=family, target=target, dtype=dtype, rows=rows,
                                      width=width, padded=padded)
-        active_launch = _budgeted_launch(launch_of, target, shared_budget, programs)
+        plan_target = _budgeted_target(target, shared_budget)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
-                                      candidate=candidate, launch_of=active_launch, layouts=layouts,
-                                      target=target, programs=programs, price_of=price_of)
+                                      candidate=candidate, launch_of=launch_of, layouts=layouts,
+                                      target=plan_target, programs=programs, price_of=price_of)
         # width, so a tile keeps its rows and narrows rather than shortening. mma.sync's one consumer at
         # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
         # (64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's 1.10-1.14, FSA100POST32). Where no width
@@ -153,12 +146,14 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     whole = rows >= family.role_rows if grouped else ragged or rows % (family.role_rows * most) == 0
     # balanced side, and with it each operand's reads a FLOP, at least one consumer's (CUTLASS's split, 2-7%
     # faster on every H100 scoreboard row); where no tile of theirs holds, one. Each at the most programs
-    # that hold its tile.
-    for consumers in dict.fromkeys((most if whole else 1, 1)):
-        held = [tiled(consumers, programs) for programs in range(family.programs(consumers), 0, -1)]
-        tile = next((tile for tile, balanced in held if balanced), None)
-        if tile := tile or next((tile for tile, _ in held if tile is not None), None):
-            return tile
+    from dew.nn.kernels import generation
+
+    with generation.as_target(target):
+        for consumers in dict.fromkeys((most if whole else 1, 1)):
+            held = [tiled(consumers, programs) for programs in range(family.programs(consumers), 0, -1)]
+            tile = next((tile for tile, balanced in held if balanced), None)
+            if tile := tile or next((tile for tile, _ in held if tile is not None), None):
+                return tile
     return None
 
 

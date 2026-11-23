@@ -294,9 +294,9 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         transpose_lhs: bool = False, first: jax.Array | None = None,
         scales: jax.Array | None = None, step_scales: tuple | None = None, mx_scales: tuple | None = None,
         gather: jax.Array | None = None, scatter: jax.Array | None = None, packed_rows: bool = False,
-        registers: int | None = None, shared: int | None = None,
-        balanced: bool | tail_of.Tail = True, beside: tuple = (),
-        chained: tuple = (), packed_fp8: str | None = None) -> jax.Array | tuple[jax.Array, ...]:
+        registers: int | None = None, shared: int | None = None, balanced: bool | tail_of.Tail = True,
+        beside: tuple = (), chained: tuple = (), packed_fp8: str | None = None
+        ) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or with
     `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, unrouted tail rows zeroed.
     With `dense`, one matrix multiplies every row without a grouped schedule. With `paired`, a second matrix
@@ -340,28 +340,26 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     and v's projections, row 6794). With `chained`, `(rows, matrix)` products summed with `lhs @ rhs` over
     their depths end to end, in order (`Chained`: a multi-matrix input gradient, row 8282; its overflowing
     tiles again, `guarded_walk`)."""
-    dtype = _products_dtype(lhs, {'matrix': rhs}, packed_rows)
-    block_n = tile_columns(tiles, family_of(tiles, dtype))
+    fam = family_of(tiles, dtype := _products_dtype(lhs, {'matrix': rhs}, packed_rows))
+    block_n = tile_columns(tiles, fam)
     if transpose_lhs and (not dense or prologue is not None):
         raise ValueError("a transposed lhs is a dense call's without a prologue")
     (k, rows), (matrices, k2, n) = lhs.shape if transpose_lhs else lhs.shape[::-1], rhs.shape
-    # A dense call's one matrix is its one group, its sizes unread (a TPU core's dense launch passes none).
     g = matrices if group_sizes is None else group_sizes.shape[0]
     k2, n = (n, k2) if transpose_rhs else (k2, n)
-    side_by_side = Beside.taken((rhs, *beside), tiles, family_of(tiles, dtype), transpose_rhs=transpose_rhs,
+    side_by_side = Beside.taken((rhs, *beside), tiles, fam, transpose_rhs=transpose_rhs,
                                 parts=(prologue, epilogue, paired, joined, scales, step_scales, mx_scales,
                                        gather, scatter, transpose_lhs or None, packed_rows or None))
     n = n if side_by_side is None else side_by_side.width
-    linked = Chained.taken(lhs, rhs, chained, tiles, family_of(tiles, dtype), transpose_rhs=transpose_rhs,
+    linked = Chained.taken(lhs, rhs, chained, tiles, fam, transpose_rhs=transpose_rhs,
                            parts=(prologue, epilogue, paired, joined, scales, step_scales, mx_scales, gather,
                                   scatter, transpose_lhs, packed_rows, first, exact_sums, side_by_side))
     k, k2 = packing.packed_depth(k, k2, n, rhs, tiles, packed_rows=packed_rows, scales=scales,
                                  packed_fp8=packed_fp8, transpose_rhs=transpose_rhs, prologue=prologue,
-                                 paired=paired, transpose_lhs=transpose_lhs, lhs=lhs,
-                                 family=family_of(tiles, dtype), dense=dense)
+                                 paired=paired, transpose_lhs=transpose_lhs, lhs=lhs, family=fam, dense=dense)
     if packed_fp8 is None:
-        packing.refused(lhs, rhs, scales, tiles, family_of(tiles, dtype), packed_rows=packed_rows,
-                        dense=dense, transpose_rhs=transpose_rhs, transpose_lhs=transpose_lhs,
+        packing.refused(lhs, rhs, scales, tiles, fam, packed_rows=packed_rows, dense=dense,
+                        transpose_rhs=transpose_rhs, transpose_lhs=transpose_lhs,
                         hooked=(prologue, epilogue, paired), depth=k2, width=n)
     packed_flag = scales if scales is not None else packed_fp8
     _gmm_shape_refused(lhs, rhs, tiles, (rows, k, matrices, k2, n), interpret, dtype=dtype, columns=block_n,
@@ -388,10 +386,9 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     prologue_operands = sides_extended(prologue_operands, prologue_axes, extent)
     epilogue_operands = sides_extended(epilogue_operands, epilogue_axes, extent)
     can_balance = dense and tiles.splits == 1 and not (beside or packed_fp8) and paired is scales is None
-    tail = _dense_tail(tiles, dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize),
-                       multiprocessors, balanced=balanced if can_balance else False)
+    tail = _dense_tail(tiles, dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize), multiprocessors,
+                       balanced=balanced if can_balance else False)
     walked = (-(-m // row_tile) + (0 if dense else g)) * -(-n // block_n) * tiles.cluster * tiles.splits
-    programs = launched(family_of(tiles, dtype), multiprocessors, walked, tail)
     walk = functools.partial(
         _gmm_mainloop, lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
         dtypes=dtypes if tiles.splits == 1 else (jnp.dtype(jnp.float32),), interpret=interpret, dense=dense,
@@ -400,11 +397,12 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         stored=None if scatter is None else rows, packed_rows=packed_rows, registers=registers, shared=shared,
         beside=side_by_side, beside_matrices=beside, chained=linked, packed_fp8=packed_fp8,
         chained_operands=_chained_walked(chained, tiles, dtype, transpose_lhs, dense, interpret))
-    outs = walk(multiprocessors=programs, hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
+    outs = walk(multiprocessors=launched(fam, multiprocessors, walked, tail),
+                hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
                 sides=(prologue_operands, epilogue_operands), tail=tail, flagged=linked is not None)
     if linked is not None:
         outs = guarded_walk(walk, outs, tiles, len(linked.depths),
-                            launched(family_of(tiles, dtype), multiprocessors, walked * linked.narrowed))
+                            launched(fam, multiprocessors, walked * linked.narrowed))
     outs = _gmm_outputs(outs, dtypes, rows, tiles.splits)
     return outs if out_dtypes or beside else outs[0]
 
@@ -559,14 +557,12 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             interpreted=bool(interpret), transpose_lhs=transpose_lhs, packed_rows=packed_rows,
             scale_gmems=scale_gmems, scale_per=scale_per, mx_gmems=mx_gmems, gather_gmem=gather_gmem,
             when_gmem=when_gmem, chained_gmems=chained_gmems, bounded=bounded, packed_fp8=packed_fp8)
-
         stepped_at = functools.partial(
             _gmm_stepped_at, family=family, tiles=tiles, prologue=(prologue, prologue_axes),
             matrices=matrices, transpose=(transpose_lhs, transpose_rhs), interpret=bool(interpret),
             mx=mx_scales is not None, packed_rows=packed_rows, packed_fp8=packed_fp8,
             chosen=None if when is None else chained,
             scaled=(step_scales is not None, scale_per, block_n), exact_sums=exact_sums)
-
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, decoded, *, streams):
             def issue(wg, tile, walk, *, active):
                 group, row_start, *_ = tile
@@ -581,7 +577,6 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     read_tiles=_reads(prologue_gmems, prologue_axes, read, group, g),
                     decoded=packing.decoding(decoded, tiles, wg, bool(interpret), fp8_fmt=packed_fp8))
                 return _walked_products(family, walk, step, part, accumulators, exact_sums, prefetch)
-
             def finish(wg, tile, accs, store, *, active):
                 if (tail is not None or when is not None) and not active:
                     return  # another program's tile, or one a bounded walk's flags name not (`guarded_walk`)
@@ -592,7 +587,6 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     sides=tuple(zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)),
                     partials=None if tail is None else (workspace, ready))
                 _stored(finished, tile, out, beside)
-
             walks = (tiles.splits * grid[0] * grid[1],) if tail is None else (tail.segments, pairs)
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
@@ -602,14 +596,12 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            **({'pingpong': True} if tiles.pingpong else {}),
                            **_prologue_rewrite(rewritten, family, prologue, (prologue_axes, prologue_gmems),
                                                (stepped, read, fixed), (fixed_smems, fixed_barriers), g))
-
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, tiles.sharing,
                                              multicast=multicast(tiles, family, allocations.shared),
                                              swizzles=SCALE_SWIZZLES if step_scales is not None else None,
                                              joined=operand_streams(rewritten),
                                              **_gathered(gather, tiles, lhs.dtype, interpret)))
-
     out_type = () if into is not None else (
         *_declared(lhs, rhs, gather, (m, n, stored), tiles.splits, dtypes, transpose_lhs, transpose_rhs,
                    beside, beside_matrices), *((flags_declared(grid, tiles),) if flagged else ()))
@@ -680,28 +672,29 @@ def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: 
         transpose_lhs=transpose_lhs, block_scaled=mx, packed_rows=packed_rows, packed_fp8=packed_fp8,
         block_k=tiles.block_k, scaling=_gmm_scaling(scaled[0], scaled[1], scaled[2], tile[2], rows),
         chosen=chosen, **refs)
-    scaled_step = refs.get('decoded') is not None or mx or packed_rows
     prefetching = idle is None and prefetches(
-        family, matrices=len(matrices), prologue=hook, scaled=scaled_step, chained=chosen is not None,
-        interpret=interpret, transposed=(transpose_lhs, transpose_rhs),
+        family, matrices=len(matrices), prologue=hook, scaled=refs.get('decoded') is not None or mx,
+        chained=chosen is not None, interpret=interpret,
+        transposed=(transpose_lhs or packed_rows, transpose_rhs),
         summed=exact_sums and not family.sums_in_persist)
-    return step, (_gmm_prefetch(family, matrices, rows, transpose_lhs=transpose_lhs,
-                                transpose_rhs=transpose_rhs) if prefetching else None)
+    return step, _gmm_prefetch(family, matrices, rows) if prefetching else None
 def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, chained: bool,
                interpret: bool, transposed: tuple[bool, bool], summed: bool) -> bool:
     """Dew: whether a `gmm` walk reads a step's first fragments under the previous step's last product
-    (`_gmm_prefetch`, `Transport.prefetches_fragments`, row 5271): plain, unscaled, unchained, compiled, and
-    tensor-core summed (supports untransposed forward and transposed dX/lhs)."""
-    del transposed
+    (`_gmm_prefetch`, `Transport.prefetches_fragments`): plain, unscaled, unchained, compiled, untransposed
+    (transposed-RHS prefetch regressed A100 deep-K gate_up dX by +32-34% in M-FS-53-a100 & M-NG-2-a100), and
+    tensor-core summed."""
     return (family.prefetches_fragments and matrices == 1 and prologue is None and not scaled and not chained
-            and not interpret and not summed)
+            and not interpret and not any(transposed) and not summed)
 def tgmm_prefetches(family: mosaic.Family, *, unstaged: bool, rewritten: bool, k_major: bool,
                     interpret: bool, scaled: bool, summed: bool) -> bool:
-    """Dew: whether an unstaged `tgmm` walk prefetches a step's first fragments under the previous step's
-    last product (`Transport.prefetches_fragments`): compiled, unstaged dense steps, not rewritten or
-    k-major, unscaled, and summed by the tensor cores."""
-    return (family.prefetches_fragments and unstaged and not rewritten and not k_major and not interpret
-            and not scaled and not summed)
+    """Dew: whether an unstaged `tgmm` walk prefetches a step's first fragments across steps: disabled on
+    `mma.sync` (`M-NG-45-a100` 20261123T015937Z: dW geomean 1.019x, 9/13 slower, 4B key +11.6%, confirming
+    `FS-DENSE-AB1`)."""
+    del family, unstaged, rewritten, k_major, interpret, scaled, summed
+    return False
+
+
 def _gmm_streamed(paired, scales, joined, bounded: "Chained | None" = None) -> tuple[dict, tuple, int]:
     """Dew: `_gmm_mainloop`'s matrices (its own, a paired one), each to the stream of the rows it multiplies
     (the rows', the joined rows' for a joined pair's paired matrix), the streams beyond the rows in its
@@ -1648,7 +1641,7 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
         if packed_fp8 is not None:
             words = [slots[f'words_{q}'].at[mine_rows]
                      for q in range(block_k // packing.packed_group_depth(packed_fp8))]
-            left = packing.rows_decoded_packed(words, packed_fp8, interpret, layout=rows_layout)
+            left = packing.rows_decoded(words, None, interpret, layout=rows_layout, fmt=packed_fp8)
         else:
             words = [slots[f'words_{q}'].at[mine_rows] for q in range(slots['scales'].shape[1] // 8)]
             left = packing.rows_decoded(words, slots['scales'].at[mine_rows], interpret, layout=rows_layout)
@@ -1719,17 +1712,18 @@ def _rows_of(slots, matrices: dict, mine_rows, transpose_lhs: bool) -> dict:
             for name, stream in matrices.items()}
 
 
-def _gmm_prefetch(family: mosaic.Family, matrices: dict, rows, *, transpose_lhs: bool = False,
-                  transpose_rhs: bool = False) -> Callable:
-    """Dew: the walk's prefetch of a plain `_gmm_step`'s slots (`prefetches_fragments`, row 5271)."""
+def _gmm_prefetch(family: mosaic.Family, matrices: dict, rows) -> Callable:
+    """Dew: the walk's prefetch of a plain `_gmm_step`'s slots (`prefetches_fragments`): untransposed rows
+    and matrix only (`prefetches`)."""
     (name,) = matrices
 
     def prefetch(slots):
-        rows_of = _rows_of(slots, matrices, rows, transpose_lhs=transpose_lhs)
-        oriented = _oriented(slots, matrices, transpose_rhs=transpose_rhs)
+        rows_of = _rows_of(slots, matrices, rows, transpose_lhs=False)
+        oriented = _oriented(slots, matrices, transpose_rhs=False)
         return family.first_fragments(rows_of[name], oriented[name])
 
     return prefetch
+
 def _transformed(prologue, axes_of: tuple, mine: jax.Array, tiles_of: dict, halved: str, half) -> jax.Array:
     """Dew: `mine`, this warpgroup's half of a stage read into registers, transformed by the prologue on its
     side tiles (`tiles_of`, by operand) cut to the same half along the `halved` launch axis, a side operand by

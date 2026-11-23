@@ -240,14 +240,13 @@ def stage_decoded(words, scales, out, interpret: bool, *, layout=None) -> None:
         out[:, pl.ds(nvfp4_staged_depth(group, 0, code), product_formats.NVFP4.depth)] = lane
 
 
-def rows_decoded(words, scales, interpret: bool, *, layout=None) -> jax.Array:
-    """Dew: a stage of an NVFP4 matrix's rows (`stage_decoded`'s, its columns the products' rows: a swapped
-    product's left operand, row 5387) decoded into registers, `[rows, depth]` bfloat16 in the warpgroup MMA's
-    fragment layout: each code's slice concatenated in the depths' own order, which is the staged order's
-    (`nvfp4_staged_depth`: a group's code `c` holds its depths `16c` to `16c + 15`, a word's place among
-    them), and in which a thread holds of each sixteen depths the words it loaded (a fragment's two adjacent
-    columns of each eight), so no value moves between threads."""
-    return jnp.concatenate([lane for _, _, lane in lanes(words, scales, interpret, layout=layout)], axis=1)
+def rows_decoded(words, scales, interpret: bool, *, layout=None, fmt: str | None = None) -> jax.Array:
+    """Dew: a stage of packed matrix rows (NVFP4 with `scales`, or FP8/BitNet b1.58 ternary when `fmt` is
+    set; row 5387) decoded directly into register operand A (`[rows, depth]` bfloat16 in `wgmma`'s fragment
+    layout, zero SMEM staging)."""
+    stream = (packed_lanes(words, fmt, interpret, layout=layout) if fmt is not None
+              else lanes(words, scales, interpret, layout=layout))
+    return jnp.concatenate([lane for _, _, lane in stream], axis=1)
 
 
 def lanes(words, scales, interpret: bool, *, layout=None):
@@ -329,9 +328,3 @@ def stage_decoded_ternary(words, out, interpret: bool, *, layout=None) -> None:
     for group, code, lane in packed_lanes(words, "ternary", interpret, layout=layout):
         out[:, pl.ds(ternary_staged_depth(group, 0, code), 16)] = lane
 
-
-def rows_decoded_packed(words, fmt: str, interpret: bool, *, layout=None) -> jax.Array:
-    """Decode packed FP8 or BitNet b1.58 ternary rows (`[64, 16]` uint32 per group) directly into register
-    operand A (`[64, depth]` bfloat16 in `wgmma`'s fragment layout, zero SMEM staging, row 5387)."""
-    return jnp.concatenate(
-        [lane for _, _, lane in packed_lanes(words, fmt, interpret, layout=layout)], axis=1)
