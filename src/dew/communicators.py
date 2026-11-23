@@ -663,7 +663,8 @@ def called[T](executable: jax.stages.Compiled, call: Callable[[], T]) -> T:
     (`Resident.ran`), never at its dispatch, which an asynchronous one returns before the run loads the
     program and makes its communicators (`PJRT_GPU_ENABLE_ASYNC_DISPATCH`): where it is admitted and not
     run, its outputs waited for, and what each of its GPUs lost outside XLA's pool over it, past the pool's
-    growth, measured as what loading it took. A run that fails raises here, leaving it charged as not run.
+    growth, measured as what loading it took. A run that fails raises its error here, to every caller,
+    leaving it charged as not run.
     The one boundary every executable Dew runs is called through (`dew.nn.kernels.options.OuterProgram.
     invoked`, a step's runner, `dew.training.compiler.StepCompiler.runner`)."""
     if _HELD is None or id(executable) not in _RESIDENT.pending:
@@ -681,13 +682,9 @@ def called[T](executable: jax.stages.Compiled, call: Callable[[], T]) -> T:
 
     before, pooled = read()
     outputs = call()
-    try:
-        jax.block_until_ready(outputs)
-    except jax.errors.JaxRuntimeError:
-        # A run that failed on its devices, returned as its caller would have read it: its error raised
-        # where the caller waits (a step's first run's diagnosis, `dew.training.memory.first_run`), the
-        # program charged as not run.
-        return outputs
+    # A run that fails on its devices raises here, its program charged as not run, its caller naming it
+    # (a step's first run, `dew.training.memory.first_run_failed`).
+    jax.block_until_ready(outputs)
     after, grown = read()
     _RESIDENT.ran(id(executable), before, after,
                   {gpu: grown[gpu] - pooled[gpu] for gpu in grown if gpu in pooled})

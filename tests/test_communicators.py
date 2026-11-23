@@ -649,12 +649,11 @@ def test_a_program_whose_keywords_are_named_as_its_own_call_runs(fetched):
 
 
 @pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
-def test_a_first_run_that_fails_is_left_to_its_callers_diagnosis_and_charged_as_not_run():
+def test_a_first_run_that_fails_raises_to_its_caller_and_stays_charged_as_not_run():
     """A program's first run that fails on its devices, as an asynchronous one does where its outputs are
-    awaited, is handed back to its caller as it ran (`communicators.called`), its error raised where the
-    caller waits (a step's first run's diagnosis, `dew.training.memory.first_run`'s `FirstRunFailed`), and
-    the program stays charged as not run (review of row 12131's P0: the error was raised inside the
-    admission's own wait, past that diagnosis)."""
+    awaited, raises its error to its caller (`communicators.called`), whoever calls it, never swallowed,
+    and the program stays charged as not run (review of row 12131's P0: the error was handed back as
+    outputs, a caller discarding them never told)."""
     class Refused:
         """Outputs whose run the devices refused, as a GPU reports it once they are awaited."""
 
@@ -671,8 +670,8 @@ def test_a_first_run_that_fails_is_left_to_its_callers_diagnosis_and_charged_as_
     try:
         communicators.admit(program, free=lambda gpu: 1 << 40)
         ahead = _charged(probe, gpu)
-        refused = Refused()
-        assert communicators.called(program, lambda: refused) is refused
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            communicators.called(program, Refused)
         assert _charged(probe, gpu) == ahead
     finally:
         communicators.hold(held)

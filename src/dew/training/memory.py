@@ -524,6 +524,19 @@ class FirstRunFailed(RuntimeError):
             "the kernels loaded, and a lower fraction leaves them more")
 
 
+def first_run_failed(error: jax.errors.JaxRuntimeError, step: int, fitted: JSON,
+                     mesh: Mesh) -> FirstRunFailed:
+    """A newly compiled step's first run's `error` on its devices, as the step's (`FirstRunFailed`): with
+    the record of the check that said it fits (`fitted`) and what each device holds now, wherever the step
+    raised it, at its own wait (`first_run`) or at a program's that waits on it before
+    (`dew.communicators.called`)."""
+    now: list[JSON] = [{"id": device.id, "outside": outside_pool(device),
+                        **{key: value for key, value in (device.memory_stats() or {}).items()
+                           if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
+                       for device in local_devices(mesh)]
+    return FirstRunFailed(step, error, fitted, now)
+
+
 def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str, dict[int, int]]:
     """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's
     (`FirstRunFailed`). A first run that succeeds returns, and logs, each GPU's bytes free outside XLA's
@@ -533,11 +546,7 @@ def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str,
     try:
         loss.block_until_ready()
     except jax.errors.JaxRuntimeError as error:
-        now: list[JSON] = [{"id": device.id, "outside": outside_pool(device),
-                            **{key: value for key, value in (device.memory_stats() or {}).items()
-                               if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
-                           for device in devices]
-        raise FirstRunFailed(step, error, fitted, now) from error
+        raise first_run_failed(error, step, fitted, mesh) from error
     read = () if fitted is None else listed(record(fitted, "fitted")["devices"], "devices", read=record,
                                             what="each device's memory as the fit check read it")
     checked = {integer(device["id"], "id"): outside for device in read

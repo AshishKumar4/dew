@@ -1845,6 +1845,30 @@ def test_a_step_that_fails_on_its_first_run_states_the_room_outside_xla_s_pool()
         (device.id, device.id in gpus) for device in devices]
 
 
+def test_a_fit_whose_first_step_fails_on_its_devices_raises_it_as_the_steps_first_run():
+    """A fit whose newly compiled step fails on its devices as it first runs, wherever its program raises it
+    (its own wait or an earlier one, `dew.communicators.called`), raises it as the step's first run
+    (`FirstRunFailed`), with the fit check's record and what its devices hold, never the bare runtime
+    error (review of row 12131's P0)."""
+    def refused(total):
+        raise RuntimeError("the devices refused the step")
+
+    def update(updates, state, params=None):
+        jax.debug.callback(refused, sum(jnp.sum(leaf) for leaf in jax.tree.leaves(updates)))
+        return updates, state
+
+    from affine_run import Replaying
+
+    from dew.data.dataset import Loader
+
+    refusing = optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+    trainer = Trainer(lm().objective, refusing, key=jax.random.key(0))
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    with pytest.raises(FirstRunFailed) as raised:
+        one_device(trainer).fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    assert isinstance(raised.value.__cause__, jax.errors.JaxRuntimeError), raised.value.__cause__
+
+
 @pytest.mark.parametrize("owned", [True, False], ids=["owned", "borrowed"])
 def test_trials_step_a_copy_of_the_state_and_hand_back_a_fresh_one(owned):
     """An AutoPGLE trial runs a step on a copy of the state as it stood: trials that own the state

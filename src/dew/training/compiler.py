@@ -1007,6 +1007,17 @@ class StepCompiler[L, E]:
         return dataclasses.replace(compiled, step=self.runner(stepping, kept, stepping.settings.device_mesh),
                                    planned=kept)
 
+    def abandoned(self) -> None:
+        """Release every search this compiler holds for a plan no compile will take (`_settles`, the plan
+        made before the state was placed, a provisional search's), with no winner: a layout its run turned
+        from (`dew.training.streaming.laid_start`), whose programs and admission charges are held no more."""
+        if self._unplaced is not None:
+            self._settles.append(self._unplaced.release)
+            self._unplaced = None
+        if (settle := self._provisional()) is not None:
+            self._settles.append(settle)
+        self._settled(None)
+
     def _provisional(self) -> Callable[[Planned | None], None] | None:
         """The release of the provisional search the last plan was made in (`_settle`), handed to its one
         owner and held here no more."""
