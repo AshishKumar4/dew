@@ -253,9 +253,17 @@ def test_ternary_ste_cancellation_overflow_and_subnormal_rows():
         formats.TernaryWeights.of(jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0),
                                   scale=jnp.float32(1.0)),
         scale=jnp.float32(2.0 ** 120))
+    from dew.nn.kernels.templates.gemm import ternary as ternary_mod
 
-    for kernel in ("mosaic", "xla"):
+    x_q_t, _ = ternary_mod.quantize_activations_int8(x_tiny)
+    assert np.asarray(x_tiny[0, 0]) == np.float32(2.0 ** -144), x_tiny[0, 0]
+    assert np.asarray(x_q_t[0, 0]) == np.float32(127.0), x_q_t[0, 0]
+    for kernel in ("xla", "mosaic"):
         with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
+            raw_dot = gemm.ternary_weight_product(
+                x_q_t, dataclasses.replace(w_tiny, scale=jnp.float32(1.0)), quantize_activations=False,
+                out_dtype=jnp.float32, interpret_on_cpu=True)[0, 0]
+            assert np.asarray(raw_dot) == np.float32(127.0), (kernel, raw_dot)
             y_c, (dx_c, ds_c) = jax.value_and_grad(
                 lambda a, s: gemm.ternary_weight_product(
                     a, dataclasses.replace(w_cancel, scale=s), quantize_activations=True,
