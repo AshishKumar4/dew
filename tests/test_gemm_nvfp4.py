@@ -984,3 +984,22 @@ def test_an_nvfp4_products_rescue_keeps_ieee_and_subnormal_operands():
     want = np.zeros((512,), np.float32)
     want[0], want[2] = np.inf, 2.0 ** -31
     np.testing.assert_array_equal(np.asarray(d_row)[0], want)
+
+
+def test_an_nvfp4_products_gathered_rescue_sums_across_its_bands_seam_exactly():
+    """One token routed to four experts at a factor of 2**126 each: a route's product of 2**165 just above a
+    band's seam (2**183 through 2**-18), another's of -2**165 just below it (2**182 through -2**-17), a
+    third's 2**125 below it too, and a fourth's 2**244 on input 1, past fp32's largest: input 0's gradient
+    is 2**125, every band's routes summed into the token exactly before one rounding, not each band rounded
+    apart (row 1464)."""
+    codes = jnp.zeros((4, 512, 128), jnp.float32)
+    codes = codes.at[0, 0, 0].set(0.5).at[1, 0, 0].set(-1.0).at[2, 0, 0].set(0.5).at[3, 1, 1].set(1.0)
+    scales = jnp.ones((4, 32, 128), jnp.float8_e4m3fn).at[:3, 0, 0].set(jnp.float8_e4m3fn(2.0 ** -9))
+    bank = formats.NvFp4.of(codes, scales, jnp.full((4,), 2.0 ** 118, jnp.float32))
+    token = jnp.zeros((1, 512), jnp.float32).at[0, :2].set(1.0)
+    routed = functools.partial(gemm.nvfp4_product, matrix=bank, group_sizes=jnp.ones((4,), jnp.int32),
+                               gather=jnp.zeros((4,), jnp.int32), out_dtype=jnp.float32)
+    _, pull = jax.vjp(routed, token)
+    cotangent = jnp.zeros((4, 128), jnp.float32).at[0, 0].set(2.0 ** 57).at[1, 0].set(2.0 ** 56)
+    (d_token,) = pull(cotangent.at[2, 0].set(2.0 ** 17).at[3, 1].set(2.0 ** 126))
+    np.testing.assert_array_equal(np.asarray(d_token)[0, :3], np.float32([2.0 ** 125, np.inf, 0.0]))

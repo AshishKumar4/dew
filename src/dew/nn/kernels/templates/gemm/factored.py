@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 
 import jax
@@ -31,10 +32,10 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
     factor's significands and binades, split into `FACTORED_BANDS` bands of `FACTORED_BAND` binades down
     from its row's (its token's, gathered) largest, each band moved to fp32's middle and pulled back wide
     (`wide(cotangent, *prepared(*wide_operands))`, the transpose in fp32 over the rows `run` reads, a route
-    each where gathered, its operands `prepared` once a rescue: a decoded matrix), its routes summed into
-    their tokens exactly (`aligned.aligned_segment_sum`), and the bands added at their powers, a product
-    of a cotangent or factor not finite kept as IEEE's: no product overflows or flushes, so a scale of
-    2**126 under cotangents that
+    each where gathered, its operands `prepared` once a rescue: a decoded matrix whose depth is its axis
+    -2, a chunk of it at a time), and every band's rows summed into their tokens (gathered) at their
+    powers exactly, rounded once (`aligned.aligned_segment_sum`), a product of a cotangent or factor not
+    finite kept as IEEE's: no product overflows or flushes, so a scale of 2**126 under cotangents that
     cancel pulls back their remainder, as fp32's sums would in range (ledger 1464). A checked `shard_map`'s
     devices sum a cotangent only they vary over before its pullback, and their partials after."""
     if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
@@ -123,8 +124,10 @@ class _Transpose:
 
     def moved(self, cotangent, scale, ran, routed, before, excess):
         """The banded rescue (`factored`): every product `cotangent * scale` from its significands and
-        binades, each band of it moved by its row's (token's) power to fp32's middle, pulled back wide, its
-        routes summed into their tokens exactly, and the bands added at their powers (`_added`)."""
+        binades, each band of it moved by its row's (token's) power to fp32's middle and pulled back wide, a
+        chunk of the depth at a time, and every band's rows summed into their segments (tokens, gathered;
+        each row its own, dense) at their powers, over every device, exactly and rounded once: products
+        that cancel across a band's seam or a route's leave their remainder."""
         gather, wide_operands = routed
         f = jnp.broadcast_to(scale, cotangent.shape)
         e_c, e_f = (float_bits.binade_of(v) for v in (cotangent, f))
@@ -145,30 +148,49 @@ class _Transpose:
             axes = tuple(sorted(jax.typeof(token_top).mat.varying - self.held))
             sums_top = jax.lax.pmax(token_top, axes) if axes else token_top
             rows_top = sums_top[gather]
-        prepared = self.prepared(*wide_operands)
+        matrix, *rest = self.prepared(*wide_operands)
+        segments = jnp.arange(self.shape[0], dtype=jnp.int32) if gather is None else gather
+        depth = self.shape[-1]
+        chunk = math.gcd(depth, FACTORED_CHUNK)
+        # Each band's highest binade, moved to 2**0, and its products in (2**-FACTORED_BAND, 4), formed once a
+        # chunk of the depth (no band of the whole cotangent held at once).
+        highs = rows_top - FACTORED_BAND * jnp.arange(FACTORED_BANDS, dtype=rows_top.dtype)  # [rows, bands]
+        # Each band's power as three factors each a normal float's, a row's per band, band by band.
+        powers, rest_power = [], highs
+        for _ in range(3):
+            powers.append(jnp.clip(rest_power, -126, 127))
+            rest_power = rest_power - powers[-1]
+        factors = [float_bits.exact_power2(each).T.reshape(-1, 1) for each in powers]
+        table = jnp.tile(segments, FACTORED_BANDS)
 
-        def band(index, carried):
-            # The band's highest binade, moved to 2**0: its products in (2**-FACTORED_BAND, 4).
-            value, power = carried
-            high = rows_top - FACTORED_BAND * index
-            held = (binade <= high) & (binade > high - FACTORED_BAND)
-            near = jnp.where(held, power2(significands, binade - high), 0.0)
-            near = jax.lax.psum(near, before) if before else near
-            partial = self.wide(near, *prepared).astype(jnp.float32)
-            if gather is None:
-                part = self.summed(partial, tuple(sorted(jax.typeof(partial).mat.varying - self.held)))
-            else:
-                axes = tuple(sorted(frozenset().union(
-                    *(jax.typeof(v).mat.varying for v in (partial, gather))) - self.held))
-                part = aligned_segment_sum([(partial,)], gather, self.shape[0], axes)
-            return _added(value, power, part, sums_top - FACTORED_BAND * index)
+        def pulled_chunk(at, out):
+            # Every band's pullback over this chunk of the depth, its rows and bands summed into their
+            # segments (tokens, gathered) over every device exactly and rounded once (`aligned_segment_sum`).
+            columns = jax.lax.dynamic_slice_in_dim(matrix, at * chunk, chunk, axis=-2)
 
-        # The running sum, a value and its power, typed as a band's sum is (a loop's carry keeps its type).
-        typed = jax.tree.leaves((cotangent, scale, prepared, gather))
-        start = (varying_like(jnp.zeros(self.shape, jnp.float32), *typed),
-                 varying_like(jnp.broadcast_to(sums_top, self.shape), *typed))
-        value, power = jax.lax.fori_loop(0, FACTORED_BANDS, band, start)
-        return power2(value, power)
+            def band(index, partials):
+                high = jax.lax.dynamic_index_in_dim(highs, index, axis=-1)
+                held = (binade <= high) & (binade > high - FACTORED_BAND)
+                near = jnp.where(held, power2(significands, binade - high), 0.0)
+                near = jax.lax.psum(near, before) if before else near
+                partial = self.wide(near, columns, *rest).astype(jnp.float32)
+                return jax.lax.dynamic_update_index_in_dim(partials, partial, index, axis=0)
+
+            rows = segments.shape[0]
+            partials = varying_like(jnp.zeros((FACTORED_BANDS, rows, chunk), jnp.float32),
+                                    near_typed, *jax.tree.leaves((matrix, rest)))
+            partials = jax.lax.fori_loop(0, FACTORED_BANDS, band, partials).reshape(-1, chunk)
+            axes = tuple(sorted(frozenset().union(
+                *(jax.typeof(v).mat.varying for v in (partials, table))) - self.held))
+            summed = aligned_segment_sum([(partials, *factors)], table, self.shape[0], axes)
+            return jax.lax.dynamic_update_slice_in_dim(out, varying_like(summed, out), at * chunk, axis=-1)
+
+        near_typed = jax.lax.psum(cotangent, before) if before else cotangent
+        # The rows' gradient, typed as the rows are: each chunk's sum varies over their axes at most.
+        out = jnp.zeros(self.shape, jnp.float32)
+        held = tuple(sorted(self.held))
+        out = jax.lax.pcast(out, held, to="varying") if held else out
+        return jax.lax.fori_loop(0, depth // chunk, pulled_chunk, out)
 
     def tangent(self, ran, routed, primals, tangents):
         """The plain transpose's derivative, `cotangent * scale` pulled back, every term of a perturbed
@@ -182,6 +204,10 @@ class _Transpose:
         return value, self.summed(*self.pulled(functools.reduce(jnp.add, terms), ran))
 
 
+FACTORED_CHUNK = 64
+"""The depth `factored`'s moved transpose pulls back a chunk at a time (a divisor of the rows' depth): its
+every band's partials of a chunk held at once, summed exactly, so its scratch is bands x rows x chunk."""
+
 FACTORED_BANDS = 8
 """The bands `factored`'s moved transpose splits a row's products into, `FACTORED_BAND` binades each down from
 its largest: together past a cotangent's and a factor's ranges multiplied (binades -298 to 254), so every
@@ -192,16 +218,6 @@ FACTORED_BAND = 70
 least value (an NVFP4 entry's 2**-18) none falls below fp32's least normal, and summed over any width a
 matrix holds none passes its largest."""
 
-
-
-def _added(value: jax.Array, power: jax.Array, part: jax.Array, at: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`value * 2**power + part * 2**at` as a value and a power again, each term moved to the larger one's
-    binade before they add (`precision.power2`): their sum rounds once, and neither overflows first."""
-    at = jnp.broadcast_to(at, part.shape)
-    ends = [jnp.where(term != 0, float_bits.binade_of(term) + shift, -1024)
-            for term, shift in ((value, power), (part, at))]
-    new = jnp.maximum(jnp.maximum(*ends), jnp.minimum(power, at))
-    return power2(value, power - new) + power2(part, at - new), new
 
 
 def _significand(x: jax.Array) -> jax.Array:
