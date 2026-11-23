@@ -166,3 +166,32 @@ def test_a_handed_validation_passs_short_last_batch_reads_in_its_whole_ones_shap
     batches = list(opened)
     assert [np.shape(batch["x"]) for batch in batches] == [(4, 3), (4, 3)], batches
     assert [np.asarray(batch[VALID_ROWS]).tolist() for batch in batches] == [[True] * 4, [True] * 3 + [False]]
+
+
+def test_a_split_whose_packing_the_read_cannot_see_widens_no_known_splits_bound():
+    """Packed splits whose bounds the read knows (2 and 4 documents a window) beside a split of windows
+    packed already, whose documents the read cannot count: the known splits share their tightest common
+    bound, 4, and the unknown one declares its window's length, 9, apart, never widening theirs to it, as a
+    sequence kernel's chunk grid follows the bound (row 12474's review)."""
+    from dew.data.pipeline import ObjectiveData, Pipeline
+
+    def split(windows: int, per_window: int) -> Pipeline:
+        return Pipeline(Memory(tuple({"text": np.arange(9 // per_window, dtype=np.int32)}
+                                     for _ in range(windows * per_window)))).pack(9)
+
+    ready = Pipeline(Memory(tuple({"text": np.arange(9, dtype=np.int32),
+                                   "text_segment_ids": np.asarray([1, 1, 2, 2, 3, 3, 4, 4, 0], np.int32),
+                                   "text_positions": np.asarray([0, 1, 0, 1, 0, 1, 0, 1, 0], np.int32)}
+                                  for _ in range(4))))
+    train = Pipeline(Memory(tuple({"text": np.arange(9, dtype=np.int32)} for _ in range(16)))).pack(9)
+    _, readers = fitted(train.batch(4), {"two": split(3, 2), "four": split(4, 4), "ready": ready},
+                        objective=ObjectiveData(), steps=2)
+    assert readers is not None
+    declared = {}
+    for name, reader in readers.items():
+        opened = reader(DataPartition())
+        try:
+            declared[name] = {batch["text_coordinates"].max_segments for batch in opened}
+        finally:
+            opened.close()
+    assert declared == {"two": {4}, "four": {4}, "ready": {9}}, declared

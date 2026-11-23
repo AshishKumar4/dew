@@ -2308,21 +2308,22 @@ def fitted[Entry](
 
 
 def _one_bound[Entry](readers: Mapping[str, Reader | Entry]) -> dict[str, Reader | Entry]:
-    """A run's held readers each declaring, for every packed field, the most documents a window of any of
-    them holds (`Coordinates.max_segments`, `_coordinated`'s bound over them all), so every split of one
-    shape lays its windows out to one static bound and its evaluation compiles once, where each split's
-    own most, 14 documents in one and 15 in the next, compiled a program apiece (row 12474); a split that
-    cannot see its windows' packing declares its window's length, and so does every split then. A reader
-    that is not one of `held`'s (a reader of the caller's, an evaluation suite) is passed on as it is."""
+    """A run's held readers each declaring, for every packed field whose bound it knows, the most documents a
+    window of any of them holds (`Coordinates.max_segments`), so every split of one shape lays its windows
+    out to one static bound and its evaluation compiles once, where each split's own most, 14 documents
+    in one and 15 in the next, compiled a program apiece (row 12474). A split that cannot see its windows'
+    packing declares its window's length as it does, apart, and widens no known split's bound to it: a
+    sequence kernel's work follows the bound (`dew.nn.chunked_launch`). A reader that is not one of
+    `held`'s (a reader of the caller's, an evaluation suite) is passed on as it is."""
     # Each held reader `validation` compiled (`_validation_reader`).
     compiled = {name: entry for name, entry in readers.items()
                 if isinstance(entry, functools.partial) and entry.func is _validation_reader}
-    most: dict[str, int | None] = {}
+    most: dict[str, int] = {}
     for entry in compiled.values():
         for step in _packed_steps(entry):
-            ids = step.fields[0]
-            bounds = (most.get(ids, 0), step.max_segments)
-            most[ids] = None if None in bounds else max(bounds)
+            if step.max_segments is not None:
+                ids = step.fields[0]
+                most[ids] = max(most.get(ids, 0), step.max_segments)
     return {name: _held_bounded(compiled[name], most) if name in compiled else entry
             for name, entry in readers.items()}
 
@@ -2332,10 +2333,11 @@ def _packed_steps(reader: functools.partial) -> tuple[Coordinated, ...]:
     return tuple(step for step in reader.keywords["host"] if isinstance(step, Coordinated))
 
 
-def _held_bounded(reader: functools.partial, most: Mapping[str, int | None]) -> functools.partial:
-    """`reader` with each packed field's step declaring `most`'s bound for its field."""
+def _held_bounded(reader: functools.partial, most: Mapping[str, int]) -> functools.partial:
+    """`reader` with each packed field's step whose bound it knows declaring `most`'s for its field."""
     host = tuple(Coordinated.laid(step.fields, most[step.fields[0]], step.laid_out)
-                 if isinstance(step, Coordinated) else step for step in reader.keywords["host"])
+                 if isinstance(step, Coordinated) and step.max_segments is not None else step
+                 for step in reader.keywords["host"])
     return functools.partial(reader.func, *reader.args, **{**reader.keywords, "host": host})
 
 
