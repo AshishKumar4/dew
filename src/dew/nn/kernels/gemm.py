@@ -952,11 +952,22 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
         def moved():
             binade = float_bits.binade_of(scale)
             power = jnp.where((jnp.abs(scale) > 1) & (binade < 128), binade, 0)
-            partial, excess = pulled(cotangent * power2(scale, -power), ran)
+            near = cotangent * power2(scale, -power)
+            # Each row moved so its largest term's binade is `FACTORED_RESCUE`, shared by every device of a
+            # sum: what cancels in the pullback's sum leaves a remainder its bf16 rows still hold.
+            e = float_bits.binade_of(near)
+            top = jnp.max(jnp.where((e > -1024) & (e < 128), e, -1024), axis=-1, keepdims=True,
+                          initial=-1024)
+            # The axes its partials will vary over that the rows do not, read from the types alone.
+            excess = tuple(sorted(frozenset().union(*(jax.typeof(leaf).mat.varying
+                                                      for leaf in (near, *jax.tree.leaves(ran)))) - held))
+            top = jax.lax.pmax(top, excess) if excess else top
+            lift = jnp.where(top > -1024, FACTORED_RESCUE - top, 0)
+            partial, excess = pulled(power2(near, lift), ran)
             if excess and not jax.typeof(power).mat.varying & set(excess):
-                rescued = power2(summed(partial, excess), power)
+                rescued = power2(summed(partial, excess), power - lift)
             else:
-                rescued = summed(power2(partial, power), excess)
+                rescued = summed(power2(partial, power - lift), excess)
             return jnp.where(jnp.isfinite(plain), plain, rescued)
 
         # The moved pullback where the plain one is not finite alone: each device of a sum decides alike,
@@ -983,6 +994,12 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
         return transposed(cotangent.astype(jnp.float32), scale.astype(jnp.float32), ran).astype(dtype)
 
     return generation.linear_map(apply, pullback, (factor, operands), rows)
+
+
+FACTORED_RESCUE = 100
+"""The binade `factored`'s transpose moves a row's largest term to where its plain transpose overflowed: its
+sum over any width a decoded matrix holds (an FP8 entry at most 448) within fp32, and a remainder 2**-233 of
+it still a bf16 value."""
 
 
 def ternary_weight_product(lhs: jax.Array, weights, group_sizes: jax.Array | None = None, **kw) -> jax.Array:
