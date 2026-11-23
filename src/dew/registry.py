@@ -429,7 +429,8 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         # The special form subscripted at runtime, where each member is a value rather than a
         # type expression, which a type checker reads `typing.Annotated[...]` as.
         annotated = vars(typing)["Annotated"]
-        names = sorted(self, key=lambda name: -len(self[name].__mro__))
+        names = sorted(self, key=lambda name: -len(kind.__mro__) if isinstance(kind := self[name], type)
+                       else 0)
         members = (annotated[self[name], tyro.conf.subcommand(name.replace("_", "-"))] for name in names)
         return functools.reduce(operator.or_, members)
 
@@ -1896,7 +1897,7 @@ class Registered(ABC):
         made = record_flags(type(self), self.member, self.name, named[self.name])
         own = {each.name for each in dataclasses.fields(type(self))}
         held = {name: value for name, value in self.fields.items()
-                if name in made._flags and _fits(value, made._flags[name])}
+                if name in made._flags and _fits(json_value(value, name), made._flags[name])}
         settings = {name: vars(self)[name] for name in own if name not in ("name", "fields")}
         rest = {name: value for name, value in self.fields.items() if name not in held}
         # Its flags and settings stated over the subcommand's defaults, its `fields` the rest (its
@@ -2021,7 +2022,7 @@ def record_flags(record: type[Registered], member: type | Callable[..., Configur
     reserved = {field.name for field in dataclasses.fields(record)} | set(dir(record))
     # Each flag's annotation, `make_dataclass`'s field type, and its flat part (`_flat`), which `flagged`
     # reads a value by.
-    flags: list[tuple[str, Annotation, Configured]] = []
+    flags = []
     flats: dict[str, Annotation] = {}
     stated_defaults: dict[str, Configured] = {}
     for name, declared, annotation in member_fields(member):

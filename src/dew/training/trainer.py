@@ -269,8 +269,7 @@ class TrainerAdvanced(Generic[Loss, Effects]):
     data_resume: DataResume = "relaxed"
     """How a resume treats its data: "relaxed" starts it again where its plan differs, "exact" refuses."""
     skip_nonfinite: bool = False
-    """Skip a step that is not finite, which a run otherwise takes and stops at (training.md, a step that is
-    not finite)."""
+    """Skip a step that is not finite, which a run otherwise takes and stops at (training.md)."""
     step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None
     """Replaces the built-in transaction. A custom step then owns the clocks, the scaler, the EMA and the
     mutable writes, and the compiled wrapper owns only the attempted-step counter; it passes a model that
@@ -280,8 +279,7 @@ class TrainerAdvanced(Generic[Loss, Effects]):
     profile: ProfileWindow | None = None
     """The steps a profiler traces (`ProfileWindow`)."""
     lower_for: str | None = None
-    """A CUDA generation the first step is lowered for in place of compiling it
-    (`dew.training._lowering.Lowered`)."""
+    """A CUDA generation the first step is lowered for in place of compiling it (`_lowering.Lowered`)."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run as the first step where it is that program; one
     compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is not run: the run compiles its
@@ -291,15 +289,13 @@ class TrainerAdvanced(Generic[Loss, Effects]):
     measures each of Dew's own launches that declares variants to time (`KernelOp`); tokamax's flash kernel
     runs at tokamax's heuristic config, which it does not measure."""
     record: bool = False
-    """Each step returns in its metrics what each evaluation, replays too, sampled or passed as a boundary
-    (`taken_record`)."""
+    """Each step returns in its metrics what each evaluation sampled or passed (`taken_record`)."""
     links: Mapping[str, Link] | None = None
     """An axis's `Link` by name, in place of measuring it (`_links`)."""
     inspection: Inspection | None = None
     """What the run watches at its sampled steps (`dew.training.inspection`)."""
     param_dtype: str | None = None
-    """A dtype's name the parameters the run draws fresh are stored in, as Flax's `param_dtype`
-    (`dew.state.drawn_in`); None keeps each module's own."""
+    """The dtype fresh parameters are stored in (Flax's `param_dtype`); None, each module's own."""
     diloco: DiLoCo | None = None
     """Trains the mesh's diloco groups apart, every few updates averaged (`dew.training.diloco`)."""
     phase_passes: Sequence[int] | None = None
