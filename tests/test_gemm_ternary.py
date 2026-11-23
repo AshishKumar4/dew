@@ -631,7 +631,7 @@ def test_an_fp8_products_rescue_sums_its_non_finite_products_as_ieee_does():
     """E5M2 coefficients +inf and +1 at input coordinate 0, +inf and NaN at 1, +inf and -1 at 2, under
     cotangents 1 and -inf at a unit scale: coordinate 0 sums +inf and -inf, NaN; coordinate 1 a NaN; and
     coordinate 2 +inf twice, +inf. Every non-finite product of a coordinate is read together, so no later
-    one hides an earlier (rows 1464, 12403)."""
+    one hides an earlier; a subnormal cotangent's sign is read from its bits (rows 1464, 12403)."""
     matrix = jnp.zeros((64, 64), jnp.float32).at[:3, 0].set(jnp.inf)
     matrix = matrix.at[0, 1].set(1.0).at[1, 1].set(jnp.nan).at[2, 1].set(-1.0)
     weights = formats.Fp8Weights.of(matrix.astype(jnp.float8_e5m2), fmt="e5m2", scale=jnp.float32(1.0))
@@ -640,6 +640,16 @@ def test_an_fp8_products_rescue_sums_its_non_finite_products_as_ieee_does():
     (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, :2].set(jnp.asarray([1.0, -jnp.inf])))
     row = np.array(d_rows[0])
     assert np.isnan(row[0]) and np.isnan(row[1]) and np.isposinf(row[2]), row[:3]
+
+    # A subnormal cotangent, -2**-149, at a scale of 2**126 against +inf: -inf, its sign and its nonzero
+    # read from its bits where a process flushes it to zero (not zero times an infinity's NaN).
+    infinite = jnp.zeros((64, 64), jnp.float32).at[0, 0].set(jnp.inf).astype(jnp.float8_e5m2)
+    single = formats.Fp8Weights.of(infinite, fmt="e5m2", scale=jnp.float32(1.0))
+    single = dataclasses.replace(single, scale=jnp.float32(2.0 ** 126))
+    _, pull = jax.vjp(lambda x: gemm.fp8_weight_product(x, single, out_dtype=jnp.float32),
+                      jnp.zeros((16, 64), jnp.float32))
+    (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, 0].set(jnp.float32(-(2.0 ** -149))))
+    assert np.isneginf(np.asarray(d_rows)[0, 0]), np.asarray(d_rows)[0, 0]
 
 
 @pytest.mark.mesh(devices=2)
