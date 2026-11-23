@@ -762,6 +762,10 @@ class OuterProgram:
                 return traced, made
             return algebra.program.traced_as(traced, rewritten), made
         except report.ReadingRefused as refused:
+            # Its own freeze's alone: an enclosing held jit's, which this trace's reading inherits, is that
+            # trace's to retrace past, its snapshot one this trace's retrying never moves.
+            if not frozen:
+                raise
             return refused
         finally:
             _PASSING.reset(token)
