@@ -736,8 +736,9 @@ class GpuTarget:
     @property
     def accurate_exp(self) -> bool:
         """Whether its default fp32 exp is within fp32's rounding (`Architecture.accurate_exp`): a TPU no
-        rule states takes the v5e's measured False."""
-        if tpu(self) and architecture(self.generation) is None:
+        rule states, its kind's or a generic one assumed (`assumed('tpu')`), takes the v5e's measured
+        False."""
+        if architecture(self.generation) is None and (tpu(self) or self.generation == 'tpu'):
             return False
         return self.architecture.accurate_exp
 

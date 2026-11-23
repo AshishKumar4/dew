@@ -976,6 +976,15 @@ class _Held:
     outputs: _Structure
     named: tuple
 
+    @functools.cached_property
+    def bound(self) -> Callable:
+        """One jit of the held trace, which a model's layers' calls share: its key holds its launch, so its
+        kernels' calls carry the launch they are bound for as they were traced. The trace's own, so a trace
+        its holder lets go of releases its jit with it."""
+        (outputs,) = self.outputs
+        run = jax_core.jaxpr_as_fun(self.jaxpr)
+        return owned_program(lambda *operands: jax.tree.unflatten(outputs, run(*operands)))
+
 
 LAUNCHES_HELD = 4096
 """The traces `lowered_once` holds a launch, the least recently taken dropped past it."""
@@ -1018,14 +1027,6 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
         held: collections.OrderedDict[Hashable, tuple[_Held, dict]] = collections.OrderedDict()
-
-        @functools.cache
-        def bound(found: _Held) -> Callable:
-            # One jit a held trace, which a model's layers' calls share: its key holds its launch, so its
-            # kernels' calls carry the launch they are bound for as they were traced.
-            (outputs,) = found.outputs
-            run = jax_core.jaxpr_as_fun(found.jaxpr)
-            return owned_program(lambda *operands: jax.tree.unflatten(outputs, run(*operands)))
 
         def calling(arguments: Mapping[str, object]):
             # `launch` called with `arguments` by name, as `signature.bind` gave them.
@@ -1075,7 +1076,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
                 if not made:
                     # A held trace taken: its kernels named for this launch again.
                     report.renamed(found.named)
-                return bound(found)(*leaves)
+                return found.bound(*leaves)
 
         return called
 

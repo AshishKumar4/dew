@@ -254,9 +254,10 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     """A consumer's shared-memory tile its register left operands relay through where its warps split their
     columns (`relaying`, `relay_bytes`)."""
 
-    row_bound: Any = dataclasses.field(default=None, compare=False)
+    row_bound: Any = None
     """The tile's rows its products issue before, an int32 (`bounded`): each warp's 16-row blocks at or past
-    it issue none, its accumulator's rows kept; None issues every row."""
+    it issue none, its accumulator's rows kept; None issues every row. Its identity's: a family bounded at
+    one constant is another program than at the next."""
 
     held_registers = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,

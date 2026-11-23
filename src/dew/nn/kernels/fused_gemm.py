@@ -285,9 +285,10 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
             sides, fused_work = _written(side, formed.side_bytes, xla), side.work
     # Fused, the consumers' special functions in the forms the launch compiles; in XLA's fusion, one MUFU an
     # element.
+    # Each arm's launch is the product's kernel (`product_work`'s), its epilogue and prologue within it.
     launch_fused = product + counted(region.consumers, region.forms) + prologue + cost.Work(
-        device_bytes=operands + region.captured_bytes + region.output_bytes, kernels=1.0)
-    launch_unfused = product + cost.Work(device_bytes=operands + written, kernels=1.0)
+        device_bytes=operands + region.captured_bytes + region.output_bytes)
+    launch_unfused = product + cost.Work(device_bytes=operands + written)
     fused_seconds = sides + cost.seconds(launch_fused, target)
     unfused_seconds = forming + cost.seconds(launch_unfused, target)
     fused_work, unfused_work = fused_work + launch_fused, unfused_work + launch_unfused
