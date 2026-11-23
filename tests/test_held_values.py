@@ -3,6 +3,7 @@ and one made again where it no longer holds."""
 
 import collections
 
+import jax
 import jax.numpy as jnp
 
 from dew import _cache
@@ -222,3 +223,34 @@ def test_a_held_jit_raced_at_a_new_shape_answers_a_scope_of_none_with_its_own_pr
         assert float(run(two)[0]) == 1.0
     with report.refusals():
         assert float(run(one)[0]) == 0.0 and float(run(two)[0]) == 0.0
+
+
+def test_a_held_jits_trace_that_refuses_a_launch_leaves_its_cache_its_own_refusals():
+    """A program run in a scope of no refusal, JAX's trace caches then cleared and its executables released,
+    run in another such scope whose trace records an inline refusal (a launch certified as it traces) by the
+    jit the first left, runs the program past the refusal there, and a third scope of none runs its own:
+    a held jit's trace takes no refusal of its own, ended before its cache keeps the refusal's program
+    (theme K01-e's review P0: its cache dropped, a held jit's trace read its own refusal and kept that
+    program for every call it answered)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    armed: list[bool] = []
+
+    def chosen(x):
+        if armed == [True]:
+            armed.append(True)
+            report.refuse([("a launch", 1, ("k",))])
+        return x + (1.0 if report.refusals_of("a launch") else 0.0)
+
+    run, x = owned_program(chosen), jnp.zeros((), jnp.float32)
+    with report.refusals():
+        assert float(run(x)) == 0.0
+    jax.clear_caches()
+    run.released()
+    armed.append(True)
+    with report.refusals():
+        assert float(run(x)) == 1.0
+    run.released()
+    with report.refusals():
+        assert float(run(x)) == 0.0
