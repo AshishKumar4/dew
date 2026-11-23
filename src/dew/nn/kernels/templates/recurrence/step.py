@@ -22,7 +22,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence, recurrence_algebra, short_conv, tuning
-from dew.nn.kernels.templates import mosaic, resources, scan
+from dew.nn.kernels.templates import cost, mosaic, resources, scan
 from dew.nn.precision import (
     L2NORM_EPS,
     accurate_exp,
@@ -102,7 +102,7 @@ def _plan(key_width: int, programs: int, target: generation.GpuTarget) -> tuple[
     Triton step's 17 at one row (M-JS-20)."""
     whole = key_width & (key_width - 1) == 0 and key_width >= 2 * UNROLLED
     # A GPU whose multiprocessors no fact states is held one wave of its residency.
-    wave = (target.multiprocessors or 1) * _resident(2, target)
+    wave = cost.wave(target, _resident(2, target))
     halves = 2 if whole and programs <= wave else 1
     return halves, _resident(halves, target)
 
