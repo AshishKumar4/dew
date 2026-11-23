@@ -240,11 +240,19 @@ def forget(lowered: jax.stages.Lowered) -> None:
     (`Planned.guided`), whether compiled from `lowered` or taken from its run's compiler's executables
     (`FitSearch.executables`), so no kept lowering holds the superseded executable alive beside the guided
     one (JAX keeps each executable of a lowering while it lives)."""
-    target = program_key(lowered)
+    forget_program(program_key(lowered), lowered)
+
+
+def forget_program(target: Hashable, lowered: jax.stages.Lowered | None = None) -> None:
+    """Drop every step this process keeps for a trainer built anew (`candidate_for`) whose program is
+    `target` (`program_key`), or whose lowering is `lowered`: one whose executable its run's compiler let go
+    (`dew.training.planning.HeldExecutables`), so no kept lowering holds its device code past that bound,
+    or which a guided compile supersedes (`forget`)."""
+    _, in_tree, *_ = target
     with _KEEPING:
         # Its trees first, so only a lowering of the same shapes renders its text to compare.
         for key in [key for key, kept in _CANDIDATES.items() if kept.lowered is lowered or (
-                kept.lowered.in_tree == lowered.in_tree and program_key(kept.lowered) == target)]:
+                kept.lowered.in_tree == in_tree and program_key(kept.lowered) == target)]:
             del _CANDIDATES[key]
 
 

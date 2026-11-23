@@ -712,13 +712,16 @@ class HeldExecutables(MutableMapping[Hashable, jax.stages.Compiled]):
     """The executables a run's searches hold for each other and its refits (`FitSearch.executables`), by
     key (`compiled_key`), bounded by their device code's bytes (`budget`, `CompiledMemory.generated_code`):
     each read or held marks its key as the latest used, and holding one past the budget lets the least
-    recently used go first, the shapes the run has not met for longest, never the one just held. Letting one
-    go frees it only where nothing else holds it, a plan stepping on it holding its own (`Planned`), so a
-    refit of a shape let go compiles again, or reads its program back from the persistent cache."""
+    recently used go first, the shapes the run has not met for longest, never the one just held, each one let
+    go handed to `released` (its key), which drops what else of the process holds it (the run's compiler's:
+    the traced steps it keeps of that program, `dew.training._candidates.forget_program`). Letting one go
+    frees it where nothing else holds it, a plan stepping on it holding its own (`Planned`), so a refit of a
+    shape let go compiles again, or reads its program back from the persistent cache."""
 
-    def __init__(self, budget: int = HELD_CODE_BYTES):
+    def __init__(self, budget: int = HELD_CODE_BYTES, released: Callable[[Hashable], None] | None = None):
         self.budget = budget
         self.bytes = 0
+        self._released = released
         self._held: OrderedDict[Hashable, tuple[jax.stages.Compiled, int]] = OrderedDict()
 
     def __getitem__(self, key: Hashable) -> jax.stages.Compiled:
@@ -734,6 +737,8 @@ class HeldExecutables(MutableMapping[Hashable, jax.stages.Compiled]):
         self._held[key], self.bytes = (executable, size), self.bytes + size
         while self.bytes > self.budget and (oldest := next(iter(self._held))) != key:
             del self[oldest]
+            if self._released is not None:
+                self._released(oldest)
 
     def __delitem__(self, key: Hashable) -> None:
         _, size = self._held.pop(key)

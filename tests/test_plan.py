@@ -2412,6 +2412,7 @@ def test_a_trainer_built_after_the_process_releases_its_programs_traces_its_step
     assert kept < first and kept < again, (first, kept, again)
 
 
+@pytest.mark.gpu(reason="device code's bytes, which a GPU's executables state and the CPU's do not")
 def test_a_runs_held_executables_let_the_shape_used_least_recently_go_first_past_their_budget():
     """A run's compiler holds its steps' executables by their device code's bytes (`HeldExecutables`, row
     12385): holding one past its budget lets the least recently used go first, a step read since kept
@@ -2435,21 +2436,28 @@ def test_a_runs_held_executables_let_the_shape_used_least_recently_go_first_past
     assert list(alone) == ["large"]
 
 
+@pytest.mark.gpu(reason="device code's bytes, which a GPU's executables state and the CPU's do not")
 def test_a_run_whose_held_steps_pass_their_budget_trains_on_each_shape_it_meets():
     """A run whose compiler holds no more device code than its latest step's (`HeldExecutables.budget`)
-    meets a second batch shape and lets the first's step go, holding only the step it runs, and trains on
+    meets a second batch shape and lets the first's step go, holding only the step it runs, and the traced
+    step the process kept of it (`forget_program`), so no lowering keeps its device code; and trains on
     each shape as a run that held both does (row 12385)."""
     from affine_run import dataset
 
+    from dew.nn.kernels import options
+    from dew.training import _candidates
+
     def trained(budget: int | None):
+        options.release()
         trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0))
         if budget is not None:
             trainer._compiler._executables.budget = budget
-        for rows in (8, 4):
+        for rows in (16, 8):
             state = trainer.fit(dataset(batch=rows), steps=2, log_every=100)
-        return trainer, jax.device_get(state.variables)
+        return trainer, len(_candidates._CANDIDATES), jax.device_get(state.variables)
 
-    bounded, held = trained(1)
-    unbounded, whole = trained(None)
+    bounded, kept_bounded, held = trained(1)
+    unbounded, kept_whole, whole = trained(None)
     assert len(bounded._compiler._executables) == 1 < len(unbounded._compiler._executables)
+    assert kept_bounded < kept_whole, (kept_bounded, kept_whole)
     jax.tree.map(np.testing.assert_array_equal, held, whole)
