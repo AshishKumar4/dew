@@ -1098,12 +1098,18 @@ def test_an_aside_refusal_holds_for_the_gpu_its_launch_was_queued_for_whatever_g
 
 @COMPILE_ONLY
 @lowers("sm90")
+class UncountedTwice(Uncounted):
+    """`Uncounted` as a launch of its own identity: a process certifies a launch once (`report._CERTIFIED`),
+    so one an earlier test certified would read its verdict, its retry never taken."""
+
+
 def test_a_launch_taken_in_two_recordings_of_one_aside_block_records_its_miss_in_each():
     """The same program lowered twice within one block certifying aside, each lowering within a recording of
     its own: the launch the second takes is the one the first queued, its one replay, and its miss is
     recorded in both recordings, stepped by the retry's certification past the tile (row 12007: the second
-    scope took the queued launch and its recording held no miss)."""
-    devices, lowered = _paired_step(Uncounted())
+    scope took the queued launch and its recording held no miss). Its launch its own (`UncountedTwice`): with
+    `Uncounted`'s, certified by the test before it in the file, no retry ran."""
+    devices, lowered = _paired_step(UncountedTwice())
     queued: list[report.Recorded] = []
 
     def twice():
