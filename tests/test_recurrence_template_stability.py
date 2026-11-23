@@ -95,7 +95,9 @@ FINITE_SEEDS = 2
 
 
 def assert_finite(fn, truth, operands, regime: str) -> None:
-    """`fn`'s leaves finite wherever the float64 truth's are, on `operands`."""
+    """`fn`'s leaves finite wherever the float64 truth's are, on `operands`, each jitted: one compile every
+    draw shares where its caller passes the same function (a fresh closure a draw compiled again, a seed's
+    interpreted template gradient about half of Kimi's floor cell's 143 s, train 1211's CI, row 12151)."""
     mine = jax.tree.leaves(jax.jit(fn)(*operands))
     with jax.enable_x64(new_val=True):
         exact = jax.tree.leaves(jax.jit(truth)(*widened(operands)))
@@ -411,11 +413,10 @@ def test_kimis_unit_keys_under_tiny_gates_at_the_floor_stays_finite_interpreted(
     from fla_sites import chunk_of, sites
 
     site = sites()[FLOOR_GATES]
-    mosaic = _arms('vector delta', 'the decay bound', 'forward', None)[0]
-    truth = functools.partial(token_by_token, site.hooks)
+    mosaic = with_gradients(_arms('vector delta', 'the decay bound', 'forward', None)[0])
+    truth = with_gradients(functools.partial(token_by_token, site.hooks))
     for seed in range(FINITE_SEEDS):
-        operands = chunk_of(site.arrays(seed))
-        assert_finite(with_gradients(mosaic), with_gradients(truth), operands, FLOOR_GATES)
+        assert_finite(mosaic, truth, chunk_of(site.arrays(seed)), FLOOR_GATES)
 
 
 @COMPILES_ON_CPU

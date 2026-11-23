@@ -35,7 +35,7 @@ from delta_rule_support import fla_layer_side
 from gpu_flow import cell
 from kernel_matrix import AXES
 from reference_error import FEWEST_SEEDS, assert_as_exact, indexed_recording, recording, with_gradients
-from ssd_support import mamba_side
+from ssd_support import MAMBA_SSM, mamba_side
 from test_recurrence_chunk import (
     FORMED,
     LENGTH,
@@ -106,6 +106,18 @@ interpreted cells; tools/matrix_reference.py), the same upstream at its pinned r
 
 INTERPRETERS = {"fla": "DEW_FLA_PYTHON", "mamba_ssm": "DEW_MAMBA_PYTHON"}
 """The variable naming each upstream's GPU tier reference interpreter, where a host holds one."""
+
+
+def tier_release(upstream: str) -> str:
+    """The release of `upstream` its GPU tier's reference interpreter runs, which a recording of it states
+    and is held to (`_on_par_recorded`; tools/matrix_reference.py refuses to record another): fla-core's
+    cohort pin (tools/reference_releases.py), mamba_ssm's release wheel (`ssd_support.MAMBA_SSM`), not its
+    cohort's git pin (row 12216)."""
+    from tool_support import load
+
+    if upstream == "mamba_ssm":
+        return MAMBA_SSM
+    return load("reference_releases").RELEASES[upstream][f"{upstream}-core"]
 
 UPSTREAM_SEEDS = 8 * MOST_SEEDS
 """The most of a cell's seeds its upstream runs (`_upstream`): every seed a sizing reads (`seeds_for`'s
@@ -286,23 +298,33 @@ TPU_CASES = (
 """The TPU cells' cases (`kernel_matrix.covering("recurrence_tpu")`)."""
 
 
+def upstream_block(named: dict[str, str], starts, operands: list[dict],
+                   cotangents: list[tuple]) -> list[dict]:
+    """The upstream's own computation of `named`'s cell (its form's release's, `FORM_RELEASES`,
+    `UPSTREAMS`) on a block of draws as one call, each draw's operands by name and its cotangents stacked:
+    each draw's results by name (`out`, `final`, `d_<operand>`), host arrays. The live arm's (`_upstream`)
+    and a recording's (tools/matrix_reference.py), one conversion."""
+    run = UPSTREAMS[FORM_RELEASES[named["form"]]]
+    found = run(named, {name: np.stack([each[name] for each in operands]) for name in operands[0]},
+                tuple(np.stack(parts) for parts in zip(*cotangents, strict=True)), starts)
+    return [{name: value[index] for name, value in found.items()} for index in range(len(operands))]
+
+
 def _upstream(named: dict[str, str], block: int, *, first: int = 0):
-    """The upstream's own computation of `named`'s cell at its dtype (`upstream_support.upstream_arm`): its
-    form's release's (`FORM_RELEASES`, `UPSTREAMS`) on the cell's stacked draws, read back a draw at a time,
-    the same tree as the cell's own step, up to `UPSTREAM_SEEDS` past `first`."""
-    run, starts = UPSTREAMS[FORM_RELEASES[named["form"]]], _starts(named)
+    """The upstream's own computation of `named`'s cell at its dtype (`upstream_support.upstream_arm`,
+    `upstream_block`) on the cell's draws, read back a draw at a time, the same tree as the cell's own step,
+    up to `UPSTREAM_SEEDS` past `first`."""
+    starts = _starts(named)
 
     def run_block(drawn):
         # The draw's arrays alone: a static field (`Chunk.held`) is no operand of the upstream's.
         names = [path[0].name for path, _ in jax.tree_util.tree_leaves_with_path(drawn[0][0])]
-        found = run(named, {name: np.stack([getattr(operands, name) for operands, _ in drawn])
-                            for name in names},
-                    tuple(np.stack(parts) for parts in zip(*(c for _, c in drawn), strict=True)), starts)
-        return [((jnp.asarray(found["out"][index]), jnp.asarray(found["final"][index])),
-                 dataclasses.replace(operands, **{name: jnp.asarray(found[f"d_{name}"][index],
-                                                                    getattr(operands, name).dtype)
-                                                  for name in names}))
-                for index, (operands, _) in enumerate(drawn)]
+        found = upstream_block(named, starts, [{name: getattr(operands, name) for name in names}
+                                               for operands, _ in drawn], [c for _, c in drawn])
+        return [((jnp.asarray(each["out"]), jnp.asarray(each["final"])),
+                 dataclasses.replace(operands, **{
+                     name: jnp.asarray(each[f"d_{name}"], getattr(operands, name).dtype) for name in names}))
+                for each, (operands, _) in zip(found, drawn, strict=True)]
 
     return upstream_arm(run_block, functools.partial(_drawn, named), block, most=UPSTREAM_SEEDS, first=first,
                         keyed=lambda operands, cotangents: operands)
@@ -352,15 +374,13 @@ def _on_par_recorded(named: dict[str, str], step, truth, upstream: str, seeds: i
     `indexed_recording` refuses short of), its draws drawn again on this host (`_inputs`, NumPy's) and Dew's
     float64 truth held to the recorded truth's sketch; a recording of another release than the tier's pin
     is stale, refused."""
-    from tool_support import load
-
     site = "-".join(named.values())
     # Only the recorded upstreams' cells are held here: another's is its GPU tier's alone.
     assert upstream in RECORDED, (f"{site}: no recording of {upstream}; its cells run where "
                                   f"{INTERPRETERS[upstream]} names its reference interpreter")
     stored = recording(RECORDED[upstream])
     recorded = json.loads(str(stored["provenance"]))["revision"]
-    pinned = load("reference_releases").RELEASES[upstream][f"{upstream}-core"]
+    pinned = tier_release(upstream)
     assert recorded == pinned, f"{site}: recorded on {upstream} {recorded}, the tier pins {pinned}: stale"
     drawn, reference, recorded_truth = indexed_recording(
         stored, site, seeds, inputs_of=functools.partial(_inputs, named),

@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 from arm_arithmetic import drawn_on_the_host
 from jax.sharding import Mesh, PartitionSpec
-from reference_error import assert_as_exact, equations, with_gradients
+from reference_error import as_given, assert_as_exact, equations, with_gradients
 from sharded import assert_runs_per_shard, placed_on
 from tuned import each_config
 
@@ -830,17 +830,35 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
     assert_runs_per_shard(_checked_shard_run, _checked_shard_operands, specs, mesh,
                           "per shard over an explicit mesh", seeds=SEEDS["per shard"], truth_fn=portable)
 
-    # Packed SwiGLU (`[..., 2, H]`) also runs per shard on an Explicit mesh with axes=None (splitting rows
-    # or features) and refuses splitting the pair axis `-2` (row 822).
+    # On an all-Explicit mesh, the operand's own Explicit type comes before named logical `axes` for norms,
+    # unpacked SwiGLU and packed SwiGLU alike (`_shard_spec`, row 12226): replicated norm inputs under
+    # `RESIDUAL` and feature-split SwiGLU inputs under `MLP_HIDDEN` both run per shard without `shard_map`
+    # rejecting `in_specs`.
     from dew.nn.kernels import selection
-    from dew.nn.sharding import MLP_HIDDEN
+    from dew.nn.sharding import MLP_HIDDEN, RESIDUAL
+
+    def typed_over_axes(x, branch, scale, ds, dy, gate, up, dout):
+        seam = evaluated(fused_seam(1e-5, x.dtype, offset=True, after_cast=True, axes=RESIDUAL),
+                         (x, branch, scale), (ds, dy))
+        return seam, evaluated(fused_swiglu(axes=MLP_HIDDEN), (gate, up), dout)
+
+    disagreeing = [PartitionSpec()] * 5 + [PartitionSpec(None, None, "data")] * 3
+    with jax.set_mesh(mesh):
+        disagreeing_ops = placed_on(_checked_shard_operands(), disagreeing, mesh)
+        assert sum(eq.primitive.name == "shard_map"
+                   for eq in traced(typed_over_axes, *disagreeing_ops)) >= 2
+    assert_runs_per_shard(typed_over_axes, _checked_shard_operands, disagreeing, mesh,
+                          "explicit type over logical axes", seeds=SEEDS["per shard"], truth_fn=portable)
+
+    # Packed SwiGLU (`[..., 2, H]`) also runs per shard on an Explicit mesh with axes=None or MLP_HIDDEN
+    # (splitting rows or features) and refuses splitting the pair axis `-2` (row 822).
 
     def draw_packed(draw: int = 0):
         return (jax.random.normal(drawn_key(33, draw), (4, 8, 2, 24)),
                 jax.random.normal(drawn_key(34, draw), (4, 8, 24)))
 
     def packed_run(a, d):
-        return evaluated(fused_packed(), (a,), d)
+        return evaluated(fused_packed(axes=MLP_HIDDEN), (a,), d)
 
     def packed_ref(a, d):
         return evaluated(packed_gated_product("swiglu", implementation="xla"), (a,), d)
@@ -851,6 +869,7 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
             sharded_p, sharded_d = placed_on(draw_packed(), [spec_p, out_spec], mesh)
             with generation.assumed("sm90"):
                 assert norm_swiglu.packed_swiglu_kernel("pallas", sharded_p) == "pallas"
+                assert norm_swiglu.packed_swiglu_kernel("pallas", sharded_p, axes=MLP_HIDDEN) == "pallas"
             assert any(eq.primitive.name == "shard_map"
                        for eq in traced(packed_run, sharded_p, sharded_d))
             assert not any(eq.primitive.name == "reshard"
@@ -919,6 +938,96 @@ def test_packed_gated_product_pair_reshard_preserves_other_explicit_axes():
                 np.testing.assert_array_equal(np.asarray(got_dx), np.asarray(expected_dx))
                 assert padded(got_y) == tuple(out_spec), (impl, padded(got_y), out_spec)
                 assert padded(got_dx) == tuple(in_spec), (impl, padded(got_dx), in_spec)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_packed_mlp_model_trains_on_an_explicit_data_mesh():
+    """A `Trainer` run of a packed-MLP model (`GatedMLP(..., packed=True)`, `mlp.py:264-269`) on
+    `MeshSpec(explicit=('data',))` matches one device's loss and parameter gradients against float64 truth
+    (check 1), and on `sm90` selects the fused `swiglu` kernel per shard without resharding
+    (rows 822, 12228)."""
+    import optax
+
+    from dew.data import Memory
+    from dew.distributed.batches import shard_batch
+    from dew.nn.mlp import GatedMLP
+    from dew.objectives.base import Aux, Objective, Step
+    from dew.training import Layout, MeshSpec, Trainer
+
+    class PackedMlpObjective(Objective):
+        def __init__(self):
+            self.model = GatedMLP(hidden_features=24, out_features=16, activation="swiglu",
+                                  packed=True, dtype=jnp.bfloat16)
+
+        def fresh_variables(self, key, held):
+            return self.model.init(key, jnp.ones((1, 8, 16), jnp.bfloat16))
+
+        def loss(self, variables, batch, step):
+            prediction = jnp.asarray(self.model.apply(variables, batch["x"]), jnp.float32)
+            return jnp.mean((prediction - jnp.asarray(batch["y"], jnp.float32)) ** 2), Aux({})
+
+    batch = jax.device_count()
+
+    def draw(seed: int = 0):
+        return (jax.random.normal(drawn_key(35, seed), (batch, 8, 16)),
+                jax.random.normal(drawn_key(36, seed), (batch, 8, 16)))
+
+    def make_trainer(mesh):
+        objective = PackedMlpObjective()
+        return objective, Trainer(objective, optax.sgd(1.0), key=0, mesh=mesh,
+                                  layout=Layout(min_shard=1, tolerance=1.))
+
+    x0, y0 = draw(0)
+    rows = Memory([{"x": np.asarray(x0[i]), "y": np.asarray(y0[i])}
+                   for i in range(batch)]).read("streamed").batch(batch)
+    _, fit_trainer = make_trainer(MeshSpec(explicit=("data",)))
+    fitted = fit_trainer.fit(rows, steps=1, log_every=1, checkpoint_final=False)
+    assert int(fitted.step) == 1
+    assert "gate_up_proj" in fitted.variables["params"]
+
+    _, one_trainer = make_trainer(MeshSpec().build(jax.devices()[:1]))
+    explicit_obj, explicit_trainer = make_trainer(MeshSpec(explicit=("data",)))
+    start = jax.tree.map(np.asarray, one_trainer.initial_state().variables["params"])
+    sample = {"x": x0, "y": y0}
+    one_step = one_trainer.compile(one_trainer.place()[0], shard_batch(one_trainer.device_mesh, sample))
+    explicit_step = explicit_trainer.compile(
+        explicit_trainer.place()[0], shard_batch(explicit_trainer.device_mesh, sample))
+
+    def ran(trainer, compiled, x, y):
+        state, _, _ = trainer.place()
+        updated, loss, _, finite, accepted, _ = compiled(
+            state, shard_batch(trainer.device_mesh, {"x": x, "y": y}))
+        assert bool(finite) and bool(accepted)
+        grads = jax.tree.map(lambda a, b: np.asarray(a) - np.asarray(b),
+                             start, updated.variables["params"])
+        return (np.asarray(loss), *jax.tree.leaves(grads))
+
+    truth_model = GatedMLP(hidden_features=24, out_features=16, activation="swiglu",
+                           packed=True, dtype=jnp.float64)
+
+    def truth(x, y):
+        truth_params = jax.tree.map(lambda a: jnp.asarray(a, jnp.float64), start)
+
+        def loss_f64(params):
+            pred = jnp.asarray(truth_model.apply({"params": params}, x.astype(jnp.float64)), jnp.float64)
+            return jnp.mean((pred - y.astype(jnp.float64)) ** 2)
+
+        val, grads = jax.value_and_grad(loss_f64)(truth_params)
+        return (val, *jax.tree.leaves(grads))
+
+    assert_as_exact(as_given(lambda x, y: ran(explicit_trainer, explicit_step, x, y)),
+                    as_given(lambda x, y: ran(one_trainer, one_step, x, y)), draw,
+                    "packed MLP Trainer on Explicit data mesh", seeds=SEEDS["per shard"], truth_fn=truth)
+
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
+    state0, _, _ = explicit_trainer.place()
+    with jax.set_mesh(explicit_trainer.device_mesh):
+        sharded = shard_batch(explicit_trainer.device_mesh, sample)
+        with generation.assumed("sm90"), generation.routes() as routes:
+            graph = traced(lambda v, b: explicit_obj.scalar_loss(v, b, step)[0], state0.variables, sharded)
+    assert {route.kernel for route in routes if route.choice == "swiglu"} == {"pallas"}
+    assert any(eq.primitive.name == "shard_map" for eq in graph)
+    assert not any(eq.primitive.name == "reshard" for eq in graph)
 
 
 def _checked_shard_operands(draw: int = 0):

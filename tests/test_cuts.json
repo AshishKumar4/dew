@@ -638,7 +638,7 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-float16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-bfloat16-key-bias]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-bfloat16-row-indexed]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-bfloat16-softcap]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-bfloat16-softcap-sinks-alibi]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-float16-dropout]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-OUTPUT-bfloat16-custom-vjp]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-OUTPUT-bfloat16-row-indexed]",
@@ -1034,8 +1034,8 @@
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_a_decay_a_key_dimensions_fast_backward",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_a_packed_call[inside a chunk]",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_an_unbounded_steep_column[bf16 clamped]",
-"tests/test_check2.py::test_the_recurrence_step_witness_holds_the_fast_backward[bf16 under the delta rule]",
-"tests/test_check2.py::test_the_recurrence_step_witness_holds_the_interpreted_mainloop[slow]",
+"tests/test_check2.py::test_the_recurrence_step_witness_holds_the_fast_backward[bf16 under the accurate forms]",
+"tests/test_check2.py::test_the_recurrence_step_witness_holds_the_interpreted_mainloop[decay]",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_values_passed_in_parts_and_refuses_them_rounded",
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_backward_that_read_other_gradients",
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16",
@@ -1711,9 +1711,6 @@
 "tests/test_dpo.py": [
 "tests/test_dpo.py::test_packed_pairs_train_as_each_pair_a_row[gated delta net hybrid-shared]"
 ],
-"tests/test_dream_walk.py": [
-"tests/test_dream_walk.py::test_a_dream_release_walks_its_responses_as_its_own_sampling_does[dream]"
-],
 "tests/test_dreamer.py": [
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-replay]",
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-steps]",
@@ -2206,7 +2203,6 @@
 "tests/test_kernel_configs.py::test_an_amperes_gemm_copies_its_blocks_promised_in_bounds",
 "tests/test_kernel_configs.py::test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it",
 "tests/test_kernel_configs.py::test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel[named]",
-"tests/test_kernel_configs.py::test_an_mma_sync_output_tile_stages_where_its_accumulators_stores_pass_the_banks_once[shape3-bfloat16]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-dense kernel gradient exact fp32]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-forward bf16]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-forward fp16]",
@@ -2217,6 +2213,7 @@
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-normed biased forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-normed kernel gradient]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-paired forward]",
+"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-paired swiglu forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-residual forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-scaled forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-two bf16 outputs forward]",
@@ -3083,9 +3080,6 @@
 "tests/test_quantization_sites.py::test_the_served_pipeline_quantizes_as_the_loaded_model[e4m3]",
 "tests/test_quantization_sites.py::test_the_served_pipeline_quantizes_as_the_loaded_model[unrounded]"
 ],
-"tests/test_qwen4_exp.py": [
-"tests/test_qwen4_exp.py::test_images_and_a_video_read_through_the_processor_as_transformers_reads_them"
-],
 "tests/test_qwen_image_source.py": [
 "tests/test_qwen_image_source.py::test_a_published_qwen_image_prompt_walked_alone_matches_the_source",
 "tests/test_qwen_image_source.py::test_a_trained_qwen_image_step_exports_and_reloads",
@@ -3133,23 +3127,23 @@
 "tests/test_recurrence.py::test_each_covering_hook_combination_steps_as_its_float64_form[l2norm=True]"
 ],
 "tests/test_recurrence_chunk.py": [
-"tests/test_recurrence_chunk.py::test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it[Hooks(conv=None, l2norm=False, scale=None, decay='scalar', gates=None, delta=False, write_gate=True, rated=False, skip=False, output=None, write_bound=None, unit_queries=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)]",
+"tests/test_recurrence_chunk.py::test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it[Hooks(conv=None, l2norm=False, scale=None, decay='none', gates=None, delta=False, write_gate=True, rated=False, skip=False, output=None, write_bound=None, unit_queries=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[an additive erase]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[no decay]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[the delta rule]",
-"tests/test_recurrence_chunk.py::test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact[delta-rule]",
-"tests/test_recurrence_chunk.py::test_a_forked_delta_products_documents_are_as_exact_as_each_alone[firsts]",
-"tests/test_recurrence_chunk.py::test_a_forked_erase_runs_in_a_shard_map_that_checks_varying_axes[before its decay]",
+"tests/test_recurrence_chunk.py::test_a_forked_calls_entry_writes_of_cancelling_levels_are_exact[ssd]",
 "tests/test_recurrence_chunk.py::test_a_forked_erases_documents_are_as_exact_as_each_alone[after its decay-by starts]",
-"tests/test_recurrence_chunk.py::test_a_forked_erases_documents_are_as_exact_as_each_alone[before its decay-by starts]",
-"tests/test_recurrence_chunk.py::test_a_ragged_last_chunk_keeps_its_tokens_and_document_resets[scalar decay-write-packed-3-4]",
-"tests/test_recurrence_chunk.py::test_a_transitions_decode_token_is_as_exact_as_its_formula[untied]",
+"tests/test_recurrence_chunk.py::test_a_ragged_last_chunk_keeps_its_tokens_and_document_resets[scalar decay-delta-one sequence-3-1]",
+"tests/test_recurrence_chunk.py::test_a_rated_scan_traced_for_a_jvp_on_a_tpu_gives_its_tangent",
+"tests/test_recurrence_chunk.py::test_a_turned_calls_mixed_derivative_at_zero_queries_is_as_exact_as_the_recurrence",
 "tests/test_recurrence_chunk.py::test_a_turned_forked_calls_turn_curvature_is_as_exact_as_each_document_alone",
-"tests/test_recurrence_chunk.py::test_a_turned_gradients_overflowed_term_reaches_no_later_tokens_sum",
+"tests/test_recurrence_chunk.py::test_a_turned_state_through_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[vanishing]",
 "tests/test_recurrence_chunk.py::test_a_turned_states_long_documents_under_a_short_memory_are_as_exact_as_the_recurrence[forked]",
-"tests/test_recurrence_chunk.py::test_a_turned_states_long_documents_under_a_short_memory_are_as_exact_as_the_recurrence[one sequence]",
-"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=False, scale=0.25, decay='scalar', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=OutputNorm(epsilon=1e-05, activation='sigmoid', read_in=None), write_bound=1.0, unit_queries=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-one sequence]",
-"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=True, scale=None, decay='vector', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=OutputNorm(epsilon=1e-06, activation='silu', read_in=None), write_bound=1.0, unit_queries=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-one sequence]"
+"tests/test_recurrence_chunk.py::test_an_a100s_ssd_port_cells_override_only_the_geometries_their_receipt_timed[4B of two rows]",
+"tests/test_recurrence_chunk.py::test_each_shard_enters_with_the_spans_before_it_applied_in_turn[dense-4]",
+"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=False, scale=None, decay='scalar', gates=None, delta=False, write_gate=False, rated=True, skip=True, output=OutputNorm(epsilon=1e-05, activation='silu', read_in=None), write_bound=None, unit_queries=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-packed]",
+"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=True, scale=None, decay='vector', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=OutputNorm(epsilon=1e-06, activation='silu', read_in=None), write_bound=1.0, unit_queries=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-one sequence]",
+"tests/test_recurrence_chunk.py::test_the_portable_rule_takes_forward_mode_at_its_public_seam[packed]"
 ],
 "tests/test_recurrence_mosaic.py": [
 "tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-kimi-linear-kda-True]",

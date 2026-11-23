@@ -131,8 +131,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | Fp8Weights | TernaryWeights,
     GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA elsewhere; the rows'
     cotangent is summed back into each token's (`lhs`'s, a token every slot reads). With a prologue, its
     side operands along the rows are the product's rows' (`gather`'s order, a normalized stream's scale
-    gathered with it), and the rows are gathered first, the prologue's product taking them as an ungathered
-    call's (row 5391: an expert projection over a normalized or scaled token stream).
+    gathered with it), and the prologue runs fused on the gathered rows where Mosaic GPU's launch takes
+    both (row 5391: an expert projection over a normalized or scaled token stream).
     `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at each output's
     row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
     (`stores.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
@@ -161,10 +161,6 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | Fp8Weights | TernaryWeights,
                   prologue=prologue, lhs=lhs,
                   beside=beside and (prologue, epilogue, paired, gather, scatter, applied, compute, layer,
                                      out_dtypes, *named))
-    if gather is not None and prologue is not None:
-        # The prologue's rows are the product's (its sides `gather`'s order): gathered first, its
-        # derivative summing each row's cotangent back into its token's.
-        lhs, gather = lhs[gather], None
     straight = compute is not None
     compute = jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None and layer is None
@@ -282,8 +278,9 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
     d_products, works = _worked(d_accs, narrow, compute)
     d_lhs, d_prologue, operand = None, (), None
     if wanted & set(range(3 + len(prologue_arrays))) - {1, 2}:
-        d_lhs, d_prologue, operand = _input_cotangents(tokens, d_products, matrices, group_sizes, prologue,
-                                                       prologue_arrays, prologue_axes, compute,
+        pulled_lhs = tokens if (gather is None or prologue is None) else tokens[gather]
+        d_lhs, d_prologue, operand = _input_cotangents(pulled_lhs, d_products, matrices, group_sizes,
+                                                       prologue, prologue_arrays, prologue_axes, compute,
                                                        {**held, 'gather': read})
         if gather is not None:
             d_lhs = jnp.zeros(tokens.shape, d_lhs.dtype).at[gather].add(d_lhs)
@@ -888,10 +885,9 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
     every row one group, a dense product's (`[1, depth, width]`). A value, as `gemm`'s reverse mode
     takes it. `gather`, a grouped call's table for either operand (`(lhs_table, rhs_table)`, int32
     `[rows]` or None), makes the rows that operand's rows at its entries, read where they lie (`gemm`'s
-    `gather`: the reverse pass of gathered tokens and of a scattered product's cotangent, row 1376), with
-    no prologue on gathered rows."""
-    if gather is not None and (group_sizes is None or (gather[0] is not None and prologue is not None)):
-        raise ValueError("gathered rows are a grouped call's, with no prologue on the gathered rows")
+    `gather`: the reverse pass of gathered tokens and of a scattered product's cotangent, row 1376)."""
+    if gather is not None and group_sizes is None:
+        raise ValueError("gathered rows are a grouped call's")
     prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue', group_sizes)
     return _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, out_dtype=out_dtype,
                    precision=precision, interpret_on_cpu=interpret_on_cpu, gather=gather)
@@ -1700,8 +1696,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     summed wide and rounded once (the unfused program's law: each projection's cotangent rounded, their
     products added), each summed as the gradient's own dtype sums (`_gemm`'s `summed_as`); each
     cotangent's rows read at `plain`'s `gather` where given (a scattered product's cotangent, read where its
-    rows landed). A gathered product's `lhs` is its tokens, whose dtype alone is read (no prologue rewrites
-    its rows). Where the prologue is entrywise (`_entrywise`), its VJP is the last product's epilogue
+    rows landed). Where the prologue is entrywise (`_entrywise`), its VJP is the last product's epilogue
     (`_prologue_pulled`, kernel-templates Appendix C row 17), so the operand's cotangent is never written,
     and the operand itself is written beside the cotangents for the kernel gradient: returned third, None
     where the prologue's VJP ran apart."""
@@ -1960,9 +1955,12 @@ def _kernel_gradient(lhs, d_product, matrix, group_sizes, prologue, prologue_arr
         gradient = _gemm_t(lhs.astype(compute), d_product, sizes, prologue, prologue_arrays, prologue_axes,
                            out_dtype=matrix.dtype, **options)
     else:
-        operand = (lhs.astype(compute) if prologue is None else prologue(
-            lhs.astype(compute),
-            *_rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])).astype(compute))
+        rows = lhs if prologue is None or tables[0] is None else lhs[tables[0]]
+        if prologue is not None and tables[0] is not None:
+            options = {**options, 'gather': None if tables[1] is None else (None, tables[1])}
+        operand = (rows.astype(compute) if prologue is None else prologue(
+            rows.astype(compute),
+            *_rows(prologue_arrays, prologue_axes, group_sizes, rows.shape[0])).astype(compute))
         gradient = _gemm_t(operand, d_product, sizes, None, (), (), out_dtype=matrix.dtype, **options)
     gradient = jnp.swapaxes(gradient, 1, 2) if plain['transpose_rhs'] else gradient
     if plain['first'] is None:
@@ -1977,9 +1975,7 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
     (`grouped_matmul.GROUPED`'s choice, read without reporting it: `selection.selected`), each the call
     `_gemm_t` makes of it (`grouped_matmul.tgmm_call`): where it does not (tcgen05's kernel gradient takes no
     prologue), the rows are formed by XLA and the product is the plain one's (`_kernel_gradient`), never
-    XLA's program of the whole product. Gathered rows keep the prologue (`_gemm_t` gathers them first)."""
-    if options['gather'] is not None:
-        return True
+    XLA's program of the whole product."""
     interpret = xla_products.interpreted(options['interpret_on_cpu'])
     dense = group_sizes is None
     sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
@@ -1988,14 +1984,14 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
     kernels = []
     for hooks, after in ((NO_HOOKS, ()),
                          (Hooks(prologue, axes, prologue_broadcast=broadcast), sides)):
-        call = grouped_matmul.tgmm_call(lhs, rhs.astype(lhs.dtype), sizes, after, None, out_dtype=out_dtype,
-                                        hooks=hooks, interpret=interpret, promoted=product.promoted,
-                                        dense=dense)
+        call = grouped_matmul.tgmm_call(lhs, rhs.astype(lhs.dtype), sizes, after, options['gather'],
+                                        out_dtype=out_dtype, hooks=hooks, interpret=interpret,
+                                        promoted=product.promoted, dense=dense)
         case = grouped_matmul.grouped_case(*call, product=product, whole=not automatic_axes())
         try:
             kernels.append(selection.selected(grouped_matmul.GROUPED, case).name)
         except selection.KernelRefused:
-            if not after:
+            if hooks is NO_HOOKS:
                 raise
             return False
     return kernels[0] == kernels[1]
