@@ -122,13 +122,11 @@ def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
     GEMM on the same codes a block at a time (check 1, `_gradient_cublaslt`: block-scaled FP8 on Hopper is
     held at parity with cuBLASLt), from float64; an empty group's gradient is zero. On this GPU, or
     `interpret`ed (test_gpu_gemm's cell)."""
-    reference = jax.jit(_gradient("xla"))
-    library = blockwise_matrix.cublaslt_arm(_gradient_cublaslt, _gradient_operands(0))
+    reference = blockwise_matrix.cublaslt_arm(_gradient_cublaslt, _gradient_operands(0))
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_gradient("mosaic", interpret)), reference, _gradient_operands,
                         "blockwise kernel gradient", seeds=blockwise_matrix.SEEDS,
-                        truth_fn=_gradient_truth, library_fn=library, library_row=4518,
-                        library_leaves=("",))
+                        truth_fn=_gradient_truth)
     assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 def a_blockwise_kernel_gradients_portable_arm_sums_exactly():

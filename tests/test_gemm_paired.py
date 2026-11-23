@@ -1163,3 +1163,56 @@ def test_a_chained_input_gradient_compiles_for_an_h100_within_its_resources(dens
         found = compile_mosaic_kernels([case], "sm90")
     assert found and all(len(record.get("kernels") or ()) >= 2 for record in found), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_joined_depths_walks_lora_in_place_without_concatenating_base():
+    """`low_rank.low_rank` / `gemm.joined_depths` walks the base `(x, W)` and LoRA `(t, B)` in place via
+    `mosaic_gpu.gmm`'s `chained` launch on an assumed H100 without concatenating `x` or `W`, and forward +
+    VJP hold check 1 against float64 truth (row 1304)."""
+    from dew.nn.kernels.low_rank import low_rank
+    from dew.nn.programs import equations
+
+    rows, depth, width, rank = 128, 256, 128, 16
+
+    def draw(seed):
+        rng = np.random.default_rng(1304 + seed)
+        x = jnp.asarray(rng.standard_normal((rows, depth)) / np.sqrt(depth), jnp.bfloat16)
+        w = jnp.asarray(rng.standard_normal((depth, width)) / np.sqrt(depth), jnp.bfloat16)
+        a = jnp.asarray(rng.standard_normal((depth, rank)) / np.sqrt(depth), jnp.bfloat16)
+        b = jnp.asarray(rng.standard_normal((rank, width)) / np.sqrt(rank), jnp.bfloat16)
+        cot = jnp.asarray(rng.standard_normal((rows, width)), jnp.bfloat16)
+        return x, w, a, b, cot
+
+    x0, w0, a0, b0, _ = draw(0)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        traced = jax.make_jaxpr(
+            lambda x, w, a, b: low_rank(x, w, a, b, 0.5, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+        )(x0, w0, a0, b0)
+        assert not any(
+            eqn.primitive.name == "concatenate"
+            and any(getattr(v.aval, "shape", None) in ((rows, depth), (depth, width)) for v in eqn.invars)
+            for eqn in equations(traced.jaxpr)
+        )
+
+    def dew_vjp(x, w, a, b, cot):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            out, pull = jax.vjp(
+                lambda xi, wi, ai, bi: low_rank(xi, wi, ai, bi, 0.5, out_dtype=jnp.bfloat16,
+                                                interpret_on_cpu=True),
+                x, w, a, b)
+            return out, pull(cot)
+    def ref_vjp(x, w, a, b, cot, *, dtype=jnp.float32):
+        def fwd(xi, wi, ai, bi):
+            t = (0.5 * jax.lax.dot(xi, ai, preferred_element_type=dtype)).astype(
+                jnp.bfloat16 if dtype == jnp.float32 else dtype)
+            y = (jax.lax.dot(xi, wi, preferred_element_type=dtype)
+                 + jax.lax.dot(t, bi, preferred_element_type=dtype))
+            return y.astype(jnp.bfloat16 if dtype == jnp.float32 else dtype)
+        if dtype == jnp.float64:
+            out, pull = jax.vjp(fwd, x.astype(dtype), w.astype(dtype), a.astype(dtype), b.astype(dtype))
+            return out, pull(cot.astype(dtype))
+        out, pull = jax.vjp(fwd, x, w, a, b)
+        return out, pull(cot)
+
+    assert_as_exact(dew_vjp, jax.jit(ref_vjp), draw, "zero-copy chained low_rank", seeds=8,
+                    truth_fn=functools.partial(ref_vjp, dtype=jnp.float64))

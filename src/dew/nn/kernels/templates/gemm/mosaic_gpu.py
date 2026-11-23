@@ -686,25 +686,21 @@ def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: 
         transpose_rhs=transpose_rhs, matrices=matrices, interpret=interpret, first=tile[3],
         transpose_lhs=transpose_lhs, block_scaled=mx, packed_rows=packed_rows,
         scaling=_gmm_scaling(scaled[0], scaled[1], scaled[2], tile[2], rows), chosen=chosen, **refs)
+    scaled_step = refs.get('decoded') is not None or mx or packed_rows
     prefetching = idle is None and prefetches(
-        family, matrices=len(matrices), prologue=hook, scaled=refs.get('decoded') is not None or mx,
-        chained=chosen is not None, interpret=interpret,
-        transposed=(transpose_lhs or packed_rows, transpose_rhs),
+        family, matrices=len(matrices), prologue=hook, scaled=scaled_step, chained=chosen is not None,
+        interpret=interpret, transposed=(transpose_lhs, transpose_rhs),
         summed=exact_sums and not family.sums_in_persist)
-    return step, _gmm_prefetch(family, matrices, rows) if prefetching else None
-
-
+    return step, (_gmm_prefetch(family, matrices, rows, transpose_lhs=transpose_lhs,
+                                transpose_rhs=transpose_rhs) if prefetching else None)
 def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, chained: bool,
                interpret: bool, transposed: tuple[bool, bool], summed: bool) -> bool:
-    """Dew: whether a `gmm` walk of these facts reads a step's first fragments under the step before's last
-    product (`_gmm_prefetch`, `Transport.prefetches_fragments`): a plain step's, one matrix of rows as staged
-    (no prologue), unscaled and undecoded, no chained products, compiled, its rows and its matrix read
-    untransposed, its products summed by the tensor cores (no running sum of its own), as its walk decides
-    (`_gmm_stepped_at`)."""
+    """Dew: whether a `gmm` walk reads a step's first fragments under the previous step's last product
+    (`_gmm_prefetch`, `Transport.prefetches_fragments`, row 5271): plain, unscaled, unchained, compiled, and
+    tensor-core summed (supports untransposed forward and transposed dX/lhs)."""
+    del transposed
     return (family.prefetches_fragments and matrices == 1 and prologue is None and not scaled and not chained
-            and not interpret and not any(transposed) and not summed)
-
-
+            and not interpret and not summed)
 def tgmm_prefetches(family: mosaic.Family, *, unstaged: bool, rewritten: bool, k_major: bool,
                     interpret: bool, scaled: bool, summed: bool) -> bool:
     """Dew: whether an unstaged `tgmm` walk prefetches a step's first fragments under the previous step's
@@ -1723,19 +1719,17 @@ def _rows_of(slots, matrices: dict, mine_rows, transpose_lhs: bool) -> dict:
             for name, stream in matrices.items()}
 
 
-def _gmm_prefetch(family: mosaic.Family, matrices: dict, rows) -> Callable:
-    """Dew: the walk's prefetch of a plain `_gmm_step`'s slots (`Transport.prefetches_fragments`;
-    `_gmm_stepped_at` decides which are): its one product's first fragments (`Issuer.first_fragments`) of its
-    `rows`, read under the step before's last product, its rows and its matrix read untransposed."""
+def _gmm_prefetch(family: mosaic.Family, matrices: dict, rows, *, transpose_lhs: bool = False,
+                  transpose_rhs: bool = False) -> Callable:
+    """Dew: the walk's prefetch of a plain `_gmm_step`'s slots (`prefetches_fragments`, row 5271)."""
     (name,) = matrices
 
     def prefetch(slots):
-        rows_of = _rows_of(slots, matrices, rows, transpose_lhs=False)
-        oriented = _oriented(slots, matrices, transpose_rhs=False)
+        rows_of = _rows_of(slots, matrices, rows, transpose_lhs=transpose_lhs)
+        oriented = _oriented(slots, matrices, transpose_rhs=transpose_rhs)
         return family.first_fragments(rows_of[name], oriented[name])
 
     return prefetch
-
 def _transformed(prologue, axes_of: tuple, mine: jax.Array, tiles_of: dict, halved: str, half) -> jax.Array:
     """Dew: `mine`, this warpgroup's half of a stage read into registers, transformed by the prologue on its
     side tiles (`tiles_of`, by operand) cut to the same half along the `halved` launch axis, a side operand by

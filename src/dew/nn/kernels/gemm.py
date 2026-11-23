@@ -57,8 +57,6 @@ from dew.nn.derivatives import (
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import (
-    MX_BLOCKS,
-    NVFP4_BLOCKS,
     Fp8Weights,
     MxFp8,
     NvFp4,
@@ -71,7 +69,15 @@ from dew.nn.kernels.templates import axes as side_axes_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import scattered, tiling
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
-from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
+from dew.nn.kernels.templates.product import (
+    MXFP8 as MX_BLOCKS,
+    NVFP4 as NVFP4_BLOCKS,
+    SCALE_DEPTH,
+    bf16_part_count,
+    declared,
+    formed,
+    terms,
+)
 from dew.nn.precision import (
     accumulated,
     asks_default_precision,
@@ -345,12 +351,10 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
         raise ValueError("gathered rows are a grouped call's, beside no formed operand")
     if scatter is not None and group_sizes is None:
         raise ValueError("scattered rows are a grouped call's")
-    if compute is not None and prologue is not None:
-        raise ValueError("a prologue's operand is multiplied in its own dtype, not a named `compute`")
-    if applied is not None and (prologue is None or (applied.shape, applied.dtype) != (lhs.shape, lhs.dtype)):
+    expected = jnp.dtype(lhs.dtype if compute is None else compute)
+    if applied is not None and (prologue is None or (applied.shape, applied.dtype) != (lhs.shape, expected)):
         raise ValueError(f"a formed operand is a prologue's, of the rows' shape {lhs.shape} and dtype "
-                         f"{lhs.dtype}, not {applied.shape} {applied.dtype}")
-
+                         f"{expected}, not {applied.shape} {applied.dtype}")
 
 def _nvfp4_gemm(lhs, matrix: NvFp4, group_sizes, *, epilogue, epilogue_operands: tuple, out_dtype, layer,
                 gather, scatter, interpret_on_cpu: bool, refused: tuple) -> jax.Array:
@@ -402,18 +406,24 @@ where a receipt names it; else XLA's dot as the caller wrote it."""
 def joined_depths(products: Sequence[tuple[jax.Array, jax.Array]], *, transpose_rhs: bool = False, out_dtype,
                   precision: PrecisionLike = None, interpret_on_cpu: bool = False) -> jax.Array:
     """The sum of `products`' `rows @ matrix` (`rows` `[rows, depth_i]`, `matrix` `[depth_i, width]`, or
-    `[width, depth_i]` where `transpose_rhs`), as one `gemm` over their unpadded concatenated depth in the
-    first rows' dtype, rounded to `out_dtype`: the operands joined along the depth, nothing between them (the
-    launch pads the end, `grouped_matmul.gmm_call`), its accumulation, depth split and check-1 contract
-    `gemm`'s own. The one owner of that product for LoRA's adapted product (`low_rank`; base review d0bc7dee6
-    F5). A streamed pair's two accumulators, and padding between the depths, each overflowed where this
-    product's sums stay finite (base review 3f38bf20d F1, F2)."""
+    `[width, depth_i]` where `transpose_rhs`), in the first rows' dtype, rounded to `out_dtype`: walked in
+    place via `mosaic_gpu.gmm`'s `chained` launch when Mosaic takes it (zero copy of base operands; row 1304),
+    else joined along depth into one `gemm`."""
+    from .templates.gemm import chained as chained_mod
+
     dtype = products[0][0].dtype
+    nonempty = [(rows.astype(dtype), matrix.astype(dtype)) for rows, matrix in products if rows.shape[1]]
+    if len(nonempty) >= 2:
+        out = chained_mod.joined_in_place(
+            nonempty, transpose_rhs=transpose_rhs, out_dtype=out_dtype, precision=precision,
+            interpret_on_cpu=interpret_on_cpu, launch_route=_launch_route, run_gemm=_gemm,
+            gemm_fn=gemm, gemm_t_fn=gemm_t)
+        if out is not None:
+            return out
     joined_rows = jnp.concatenate([rows.astype(dtype) for rows, _ in products], axis=1)
     joined = jnp.concatenate([matrix.astype(dtype) for _, matrix in products], axis=1 if transpose_rhs else 0)
     return gemm(joined_rows, joined, transpose_rhs=transpose_rhs, out_dtype=out_dtype, precision=precision,
                 interpret_on_cpu=interpret_on_cpu)
-
 
 def batched_product(a: jax.Array, b: jax.Array, contract: tuple[int, int], *,
                     interpret_on_cpu: bool = False) -> jax.Array:
@@ -1110,8 +1120,31 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
             out_sharding=xla_products.ragged_placement((None, (rows, 1), (columns, 1))))
         return accumulated(product, rows, columns, group_sizes, preferred_element_type=wide).astype(out_dtype)
 
-    return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays, tables)
+    from .templates.gemm import batched
 
+    call = batched.batched_gemm_t(
+        lambda *a: _dispatched(kernel, portable, interpret_on_cpu, *a),
+        lambda lf, rf, s, pa, px, *, dense: _gemm_t(lf, rf, None if dense else s, prologue, pa, px,
+                                                    out_dtype=out_dtype, precision=precision,
+                                                    interpret_on_cpu=interpret_on_cpu),
+        portable, dense=dense, prologue_axes=prologue_axes, committed_device=_committed_device)
+    return _differentiable_gemm_t(call, portable, lhs, rhs, group_sizes, prologue_arrays, tables)
+
+
+def _differentiable_gemm_t(call, portable, lhs, rhs, group_sizes, prologue_arrays, tables) -> jax.Array:
+    """Wrap `_gemm_t`'s `custom_vmap` dispatch in `linear_tangent` so reverse-mode higher orders
+    differentiate `portable` without linearizing `custom_vmap_p` (row 6104)."""
+    def forward(*operands):
+        return call(*operands), ()
+
+    def backward(saved, operands, cotangent):
+        del saved
+        _, pull = jax.vjp(portable, *operands)
+        return pull(cotangent)
+
+    differentiable = contracted("test_a_grouped_gemm_holds_every_order")(
+        generation.linear_tangent(forward, backward, portable, kind=KernelGlue()))
+    return differentiable(lhs, rhs, group_sizes, prologue_arrays, tables)
 
 NVFP4_ROW = 'ledger 3621'
 """The NVFP4 product's in-stage decode (K51)."""
@@ -1660,8 +1693,18 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
                             chained=chained)
         return scattered(outs, scatter)
 
-    return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
-                       epilogue_arrays, paired, first, gather, scatter, joined, beside, chained)
+    from .templates.gemm import batched
+
+    call = batched.batched_gemm(
+        lambda *a: _dispatched(kernel, portable, interpret_on_cpu, *a),
+        lambda lf, ri, s, pa, px, ea, ex, *, dense: _gemm(
+            lf, ri, s, prologue, pa, px, epilogue, ea, ex, dtypes, several=several,
+            transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu, precision=precision,
+            dense=dense, summed_as=summed_as, selected=selected),
+        portable, dense=dense, prologue_axes=prologue_axes, epilogue_axes=epilogue_axes,
+        committed_device=_committed_device)
+    return call(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
+                joined, beside, chained)
 
 
 def _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
@@ -1815,7 +1858,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
         last = at == len(reached) - 1
         if last and entrywise:
             pulled = _prologue_pulled(prologue, lhs, prologue_arrays, d, matrix, group_sizes, d_operand,
-                                      options)
+                                      compute, options)
             if pulled is not None:
                 return pulled
         out = wide if not last or (at and prologue is not None) else jnp.dtype(lhs.dtype)
@@ -1835,7 +1878,7 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     if prologue is None:
         return d_operand.astype(lhs.dtype), (), None
     d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes, group_sizes,
-                                             d_operand)
+                                             d_operand, compute)
     return d_lhs.astype(lhs.dtype), tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays,
                                                                                 strict=True)), None
 
@@ -1850,18 +1893,18 @@ def _entrywise(lhs, prologue, arrays: tuple, axes_of: tuple, plain: dict) -> boo
                     for array, axes in zip(arrays, axes_of, strict=True)))
 
 
-def _prologue_pulled(prologue, lhs, arrays: tuple, d, matrix, group_sizes, prior, options: dict):
+def _prologue_pulled(prologue, lhs, arrays: tuple, d, matrix, group_sizes, prior, compute, options: dict):
     """`lhs`'s and an entrywise prologue's side operands' cotangents (`_entrywise`) as the epilogue of the
     product forming the operand's (`d @ matrix`, plus a paired product's `prior` where given): each entry's
-    sum rounded to `lhs`'s dtype as the operand's cotangent, then the VJP of the prologue rounded to it,
+    sum rounded to `compute` as the operand's cotangent, then the VJP of the prologue rounded to it,
     traced by JAX on the hook's tiles of `lhs` and the sides, one output each, and the prologue's operand
     the VJP formed (the kernel gradient's rows, `_pulled`); None where that hook would move the product off
     the launch its plain product runs on (`_keeps_launch`), whose caller then pulls the cotangent back in
     XLA."""
-    dtype = jnp.dtype(lhs.dtype)
+    dtype = jnp.dtype(compute)
 
     def formed(x, *sides):
-        return prologue(x, *sides).astype(dtype)
+        return prologue(x.astype(dtype), *sides).astype(dtype)
 
     def pulled(acc, *tiles):
         if prior is not None:
@@ -1870,14 +1913,13 @@ def _prologue_pulled(prologue, lhs, arrays: tuple, d, matrix, group_sizes, prior
         return (*pull(acc.astype(dtype)), operand)
 
     sides = (*(() if prior is None else (prior,)), lhs, *arrays)
-    outs = (dtype, *(jnp.dtype(array.dtype) for array in arrays), dtype)
+    outs = (jnp.dtype(lhs.dtype), *(jnp.dtype(array.dtype) for array in arrays), dtype)
     if not _keeps_launch(d, matrix, group_sizes, pulled, sides, outs, (dtype,), options):
         return None
     d_lhs, *d_sides, operand = _gemm(d, matrix, group_sizes, None, (), (), pulled, sides,
                                      (('rows', 'columns'),) * len(sides), outs, several=True,
                                      summed_as=(dtype,), **options)
     return d_lhs, tuple(d_sides), operand
-
 
 def _added(acc, prior):
     """An accumulator plus a wide product before it (`_input_cotangents`' paired sum)."""
@@ -2038,8 +2080,8 @@ def _kernel_gradient(lhs, d_product, matrix, group_sizes, prologue, prologue_arr
                            out_dtype=matrix.dtype, **options)
     else:
         operand = (lhs.astype(compute) if prologue is None else prologue(
-            lhs, *_rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])).astype(lhs.dtype))
-        # The operand in its own dtype beside the wider cotangent, multiplied in the wider (`_gemm_t`).
+            lhs.astype(compute),
+            *_rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])).astype(compute))
         gradient = _gemm_t(operand, d_product, sizes, None, (), (), out_dtype=matrix.dtype, **options)
     gradient = jnp.swapaxes(gradient, 1, 2) if plain['transpose_rhs'] else gradient
     if plain['first'] is None:
@@ -2238,8 +2280,11 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     if compute is not None:
         # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
         wide = at_least_fp32(compute)
-        accs = tuple(xla_products.portable_projection(row, matrix, group_sizes, compute, precision, wide)
-                     for row, matrix in zip(rows, matrices, strict=True))
+        products = tuple(row if prologue is None
+                         else prologue(row.astype(compute), *prologue_arrays).astype(compute)
+                         for row in rows)
+        accs = tuple(xla_products.portable_projection(product, matrix, group_sizes, compute, precision, wide)
+                     for product, matrix in zip(products, matrices, strict=True))
     else:
         products = tuple(row if prologue is None else prologue(row, *prologue_arrays).astype(lhs.dtype)
                          for row in rows)
@@ -2275,12 +2320,13 @@ def _prologued(prologue, prologue_jvp):
         declared_tangent(KernelGlue(), prologue, _ProloguedTangent(prologue, prologue_jvp)))
 
 
-def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand):
+def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand, compute=None):
     """The cotangents of `lhs` and the prologue's side operands from the multiplied operand's: through
-    the VJP of `prologue(...)` rounded to `lhs`'s dtype. A row past the routed ones multiplied nothing,
-    so its cotangent is zero, and its inputs are taken at the first row's, a routed one's where any is,
-    so that a derivative its own inputs leave undefined (`rsqrt` of an empty row's zero mean square)
-    reaches no gradient the routed rows share."""
+    the VJP of `prologue(...)` rounded to `compute` (default `lhs.dtype`). A row past the routed ones
+    multiplied nothing, so its cotangent is zero, and its inputs are taken at the first row's, a routed
+    one's where any is, so that a derivative its own inputs leave undefined (`rsqrt` of an empty row's zero
+    mean square) reaches no gradient the routed rows share."""
+    dtype = jnp.dtype(lhs.dtype if compute is None else compute)
     routed = _routed(group_sizes, lhs.shape[0])
     nonempty = jnp.sum(group_sizes) > 0
 
@@ -2301,10 +2347,10 @@ def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand)
         sides = tuple(kept(side, axes.index(GROUPS)) if GROUPS in axes else side
                       for side, axes in zip(_rows(sides, axes_of, group_sizes, lhs.shape[0]), axes_of,
                                             strict=True))
-        return prologue(x, *sides).astype(lhs.dtype)
+        return prologue(x.astype(dtype), *sides).astype(dtype)
 
     _, pull = jax.vjp(multiplied, *inputs)
-    d_lhs, *d_sides = pull(d_operand.astype(lhs.dtype))
+    d_lhs, *d_sides = pull(d_operand.astype(dtype))
     d_lhs = jnp.where(routed[:, None] & nonempty, d_lhs, 0)
     d_sides = [d if d.dtype == jax.dtypes.float0 else jnp.where(nonempty, d, 0) for d in d_sides]
     return d_lhs, tuple(d_sides)
@@ -2453,47 +2499,5 @@ def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:
     return jnp.arange(rows) < jnp.sum(group_sizes)
 
 
-def _committed_device(operands):
-    """A process-local device of concrete `operands` when every committed leaf shares one platform
-    (including homogeneous multi-host sharding), or None if uncommitted, traced, empty, or mixed-platform."""
-    from jax.core import Tracer
-
-    devices = {
-        device
-        for leaf in jax.tree.leaves(operands)
-        if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer) and leaf.committed
-        for device in leaf.devices()
-    }
-    platforms = {device.platform for device in devices}
-    if len(platforms) != 1:
-        return None
-    local = next((device for device in devices if device.process_index == jax.process_index()), None)
-    return local if local is not None else jax.local_devices(backend=next(iter(platforms)))[0]
-
-
-def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
-    """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
-    (`xla_products._on_platform`). Evaluated eagerly, `platform_dependent` knows its platform and runs
-    its branch alone, so a CPU's would skip the selection the kernel's branch makes (its routes, a named
-    kernel's refusal): an eager call resolves committed placement before `_on_platform` so CPU-committed
-    operands with `interpret_on_cpu=True` install the interpreter branch even under a GPU default, traces
-    abstractly so every branch selects, then runs eagerly on the committed device (row 11887)."""
-    import contextlib
-
-    from jax.core import Tracer
-
-    def run():
-        branches, default = xla_products._on_platform(kernel, portable, interpret_on_cpu)
-
-        def dispatched(*args):
-            return jax.lax.platform_dependent(*args, default=default, **branches)
-
-        return dispatched
-
-    if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
-        device = _committed_device(operands)
-        with jax.default_device(device) if device is not None else contextlib.nullcontext():
-            dispatched = run()
-            jax.eval_shape(dispatched, *operands)
-            return dispatched(*operands)
-    return run()(*operands)
+_committed_device = xla_products.committed_device
+_dispatched = xla_products.dispatched

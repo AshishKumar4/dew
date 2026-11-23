@@ -47,6 +47,49 @@ def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     return branches, fallback
 
 
+def committed_device(operands):
+    """A process-local device of concrete `operands` when every committed leaf shares one platform
+    (including homogeneous multi-host sharding), or None if uncommitted, traced, empty, or mixed-platform."""
+    from jax.core import Tracer
+
+    devices = {
+        device
+        for leaf in jax.tree.leaves(operands)
+        if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer) and leaf.committed
+        for device in leaf.devices()
+    }
+    platforms = {device.platform for device in devices}
+    if len(platforms) != 1:
+        return None
+    local = next((device for device in devices if device.process_index == jax.process_index()), None)
+    return local if local is not None else jax.local_devices(backend=next(iter(platforms)))[0]
+
+
+def dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
+    """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
+    (`_on_platform`). Resolves concrete committed placement before `_on_platform`, traces abstractly so every
+    branch selects, then runs eagerly on the committed device (row 11887)."""
+    import contextlib
+
+    from jax.core import Tracer
+
+    def run():
+        branches, default = _on_platform(kernel, portable, interpret_on_cpu)
+
+        def call(*args):
+            return jax.lax.platform_dependent(*args, default=default, **branches)
+
+        return call
+
+    if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
+        device = committed_device(operands)
+        with jax.default_device(device) if device is not None else contextlib.nullcontext():
+            call = run()
+            jax.eval_shape(call, *operands)
+            return call(*operands)
+    return run()(*operands)
+
+
 def as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:
     """`tokens` and `kernel` as XLA's portable product multiplies them, and its precision (`xla_ragged_dot`,
     `xla_dot`). A precision level (`lax.Precision`) on 16-bit operands is their product's at the default,

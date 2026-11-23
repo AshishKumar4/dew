@@ -251,14 +251,13 @@ def a_gathered_ring_reads_a_strided_tables_entries() -> None:
     gather token 0's (base review 51d5c0f0a F2). On this GPU (test_gpu_gemm's Blackwell cell): its load
     warps' code runs on none other."""
     (height, width), steps, rows = STRIDED_BLOCK, 2, 128
-    table = jnp.asarray(np.concatenate([np.tile([0, 1], (height, 1)), np.tile([1, 0], (height, 1))]),
-                        jnp.int32)
+    table = np.concatenate([np.tile([0, 1], (height, 1)), np.tile([1, 0], (height, 1))]).astype(np.int32)
 
     def gathered(tokens, plain):
-        return _strided_gathers(tokens, table, plain)
+        return _strided_gathers(tokens, jnp.asarray(table, jnp.int32), plain)
 
     def first(tokens, plain):
-        return jnp.dot(plain, tokens[table[:, 0]], preferred_element_type=jnp.float32)
+        return jnp.dot(plain, tokens[jnp.asarray(table[:, 0], jnp.int32)], preferred_element_type=jnp.float32)
 
     def draw(seed):
         rng = np.random.default_rng([seed, 9])
@@ -267,8 +266,7 @@ def a_gathered_ring_reads_a_strided_tables_entries() -> None:
 
     with generation.assumed("sm100"):
         assert_as_exact(gathered, jax.jit(first), draw, "a gathered ring over a strided table", seeds=SEEDS,
-                        truth_fn=lambda tokens, plain: plain @ tokens[table[:, 0]])
-
+                        truth_fn=lambda tokens, plain: plain @ tokens[jnp.asarray(table[:, 0], jnp.int32)])
 
 def test_a_gathered_ring_over_a_strided_table_lowers_for_cuda():
     """`a_gathered_ring_reads_a_strided_tables_entries`' kernel lowered for a B200 on this CPU, its table a

@@ -293,15 +293,15 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     here = generation.gpu_target().generation
     if grouped_matmul.cutlass_built_for(here) is None:
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
-    group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
+    group_sizes = np.asarray(SIZES[sizes], np.int32)
 
     def draw(seed):
         x, w, dy, _ = operands(SIZES[sizes], jnp.bfloat16, seed)
-        return tuple(jnp.asarray(value, jnp.bfloat16) for value in (x, w, dy))
+        return tuple(np.asarray(value, jnp.bfloat16) for value in (x, w, dy))
 
     def projection(implementation, dtype=jnp.bfloat16):
-        return lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None)
-
+        return lambda x, w: expert_projection(x, w, jnp.asarray(group_sizes, jnp.int32), dtype,
+                                              implementation, None)
     # Its build's kernel pinned, as a tuned pick names it: the pin taken as legal for the wheel's one kernel
     # (`_Cutlass.legal`), where a template's shared-memory model, which CUTLASS has none of, raised.
     pinned = {grouped_matmul.CutlassGmm: grouped_matmul.cutlass_tile(grouped_matmul.cutlass_built_for(here),
@@ -380,19 +380,19 @@ def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):
     here = generation.gpu_target().generation
     if grouped_matmul.cutlass_built_for(here) is None:
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
-    group_sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
+    group_sizes = np.asarray(SIZES["ragged"], np.int32)
 
     def draw(seed):
         first, second = (operands(SIZES["ragged"], jnp.bfloat16, seed + offset)[:3]
                          for offset in (0, 1 << 16))
-        x, w, dy = (jnp.stack([jnp.asarray(a, jnp.bfloat16), jnp.asarray(b, jnp.bfloat16)])
+        x, w, dy = (np.stack([np.asarray(a, jnp.bfloat16), np.asarray(b, jnp.bfloat16)])
                     for a, b in zip(first, second, strict=True))
         return x, w[0] if shared else w, dy
 
     def mapped(implementation, dtype=jnp.bfloat16):
-        one = with_gradients(lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None))
+        one = with_gradients(lambda x, w: expert_projection(x, w, jnp.asarray(group_sizes, jnp.int32), dtype,
+                                                            implementation, None))
         return jax.vmap(one, in_axes=(0, None if shared else 0, 0))
-
     def through_cutlass(x, w, dy):
         with generation.chosen(grouped_matmul="cutlass"):
             return mapped("pallas")(x, w, dy)
@@ -1775,3 +1775,193 @@ def test_prologued_custom_jvp_is_picklable():
     primal_r, tangent_r = restored((x, y), (dx, dy))
     np.testing.assert_array_equal(np.asarray(primal_r), np.asarray(x + y))
     np.testing.assert_array_equal(np.asarray(tangent_r), np.asarray(dx + dy))
+
+
+def test_gemm_named_compute_beside_prologue_and_applied_holds_check_1():
+    """`gemm.gemm` accepts a named `compute` beside `prologue`, `applied`, and `scatter` (row 1958, unblocking
+    MoE `ExpertMLP` gated down projections over fp32 master weights): value and VJP (including full fp32 `dW`
+    precision) hold check 1 against float64 truth."""
+    from dew.nn import activations
+    from dew.nn.kernels import xla_products
+
+    hook = activations.gated_hook("swiglu", None)
+    group_sizes = jnp.asarray([40, 0, 24], jnp.int32)
+    scatter = jnp.asarray(np.random.default_rng(19580).permutation(64), jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(1958 + seed)
+        gate = jnp.asarray(rng.standard_normal((64, 32)) / np.sqrt(32), jnp.bfloat16)
+        up = jnp.asarray(rng.standard_normal((64, 32)) / np.sqrt(32), jnp.bfloat16)
+        down = jnp.asarray(rng.standard_normal((3, 32, 32)) / np.sqrt(32), jnp.float32)
+        cot = jnp.asarray(rng.standard_normal((64, 32)), jnp.bfloat16)
+        return gate, up, down, cot
+
+    def dew_fn(gate, up, down, cot):
+        def fwd(g, u, w):
+            hidden = hook(g, u).astype(jnp.bfloat16)
+            return gemm.gemm(g, w, group_sizes, prologue=hook, prologue_operands=((u, ("rows", "depth")),),
+                             applied=hidden, scatter=scatter, compute=jnp.bfloat16, out_dtype=jnp.bfloat16)
+
+        out, pull = jax.vjp(fwd, gate, up, down)
+        return out, pull(cot)
+
+    def ref_fn(gate, up, down, cot, *, dtype=jnp.float32):
+        def fwd(g, u, w):
+            act = hook(g.astype(dtype), u.astype(dtype))
+            if dtype == jnp.float32:
+                act = act.astype(jnp.bfloat16)
+            slots = xla_products.portable_projection(
+                act, w, group_sizes, jnp.bfloat16 if dtype == jnp.float32 else dtype,
+                None, jnp.bfloat16 if dtype == jnp.float32 else dtype)
+            return jnp.zeros_like(slots).at[scatter].set(slots)
+
+        if dtype == jnp.float64:
+            out, pull = jax.vjp(fwd, gate.astype(dtype), up.astype(dtype), down.astype(dtype))
+            return out, pull(cot.astype(dtype))
+        out, pull = jax.vjp(fwd, gate, up, down)
+        return out, pull(cot)
+
+    assert_as_exact(jax.jit(dew_fn), jax.jit(ref_fn), draw, "gemm compute beside prologue+applied+scatter",
+                    seeds=8, truth_fn=functools.partial(ref_fn, dtype=jnp.float64))
+    g0, u0, d0, c0 = draw(0)
+    _, (_, _, dw) = jax.jit(dew_fn)(g0, u0, d0, c0)
+    assert dw.dtype == jnp.float32
+
+
+def test_vmap_folds_batch_dimensions_into_single_gemm_launch():
+    """`jax.vmap` of `gemm.gemm` folds `[B, M, K] @ [K, N]` into one `[B*M, K] @ [K, N]` dense launch and
+    `[B, M, K] @ [B, K, N]` into one grouped launch with `group_sizes=[M]*B`; forward, `vmap(grad)`,
+    `grad(vmap)`, and nested `vmap(vmap)` hold check 1 on interpreted Mosaic GPU (row 6104)."""
+    batch, rows, depth, width = 3, 64, 64, 64
+
+    def draw_shared(seed):
+        rng = np.random.default_rng(6104 + seed)
+        xs = jnp.asarray(rng.standard_normal((batch, rows, depth)) / np.sqrt(depth), jnp.bfloat16)
+        w = jnp.asarray(rng.standard_normal((depth, width)) / np.sqrt(depth), jnp.bfloat16)
+        cot = jnp.asarray(rng.standard_normal((batch, rows, width)), jnp.bfloat16)
+        return xs, w, cot
+
+    def draw_batched_w(seed):
+        rng = np.random.default_rng(61040 + seed)
+        xs = jnp.asarray(rng.standard_normal((batch, rows, depth)) / np.sqrt(depth), jnp.bfloat16)
+        ws = jnp.asarray(rng.standard_normal((batch, depth, width)) / np.sqrt(depth), jnp.bfloat16)
+        cot = jnp.asarray(rng.standard_normal((batch, rows, width)), jnp.bfloat16)
+        return xs, ws, cot
+
+    # 1. Verify single folded launch of B*M rows (shared W) and B groups (batched W) under assumed sm90.
+    xs0, w0, _ = draw_shared(0)
+    xs1, ws1, _ = draw_batched_w(0)
+    from kernel_outputs import launched_outputs
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        found_shared = launched_outputs(
+            jax.vmap(lambda a: gemm.gemm(a, w0, out_dtype=jnp.bfloat16, interpret_on_cpu=True)), xs0)
+        assert len(found_shared) == 1
+        assert found_shared[0][1][0].shape == (batch * rows, width)
+
+        found_grouped = launched_outputs(
+            jax.vmap(lambda a, b: gemm.gemm(a, b, out_dtype=jnp.bfloat16, interpret_on_cpu=True)), xs1, ws1)
+        assert len(found_grouped) == 1
+        assert found_grouped[0][1][0].shape == (batch * rows, width)
+
+        # Nested vmap(vmap) folds [2, 3, 64, 64] -> [384, 64] in one launch.
+        xs2 = jnp.stack([xs0, xs0 * jnp.bfloat16(0.5)])
+        found_nested = launched_outputs(
+            jax.vmap(jax.vmap(lambda a: gemm.gemm(a, w0, out_dtype=jnp.bfloat16, interpret_on_cpu=True))),
+            xs2)
+        assert len(found_nested) == 1
+        assert found_nested[0][1][0].shape == (2 * batch * rows, width)
+    # 2. Check 1 on vmap-of-grad and grad-of-vmap for shared W and batched W.
+    def vmap_of_grad_shared(xs, w, cot):
+        def one_grad(a, b, c):
+            return jax.grad(lambda x, y: jnp.sum(
+                gemm.gemm(x, y, out_dtype=jnp.bfloat16, interpret_on_cpu=True).astype(jnp.float32)
+                * c.astype(jnp.float32)), argnums=(0, 1))(a, b)
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            return jax.vmap(one_grad, in_axes=(0, None, 0))(xs, w, cot)
+
+    def vmap_of_grad_shared_ref(xs, w, cot, *, dtype=jnp.float32):
+        def one_grad(a, b, c):
+            return jax.grad(lambda x, y: jnp.sum(
+                jax.lax.dot(x, y, preferred_element_type=dtype).astype(
+                    jnp.bfloat16 if dtype == jnp.float32 else dtype).astype(dtype) * c.astype(dtype)),
+                argnums=(0, 1))(a, b)
+        if dtype == jnp.float64:
+            return jax.vmap(one_grad, in_axes=(0, None, 0))(
+                xs.astype(dtype), w.astype(dtype), cot.astype(dtype))
+        return jax.vmap(one_grad, in_axes=(0, None, 0))(xs, w, cot)
+
+    assert_as_exact(vmap_of_grad_shared, jax.jit(vmap_of_grad_shared_ref), draw_shared,
+                    "vmap(grad(gemm)) shared W", seeds=8,
+                    truth_fn=functools.partial(vmap_of_grad_shared_ref, dtype=jnp.float64))
+
+    def grad_of_vmap_batched(xs, ws, cot):
+        def loss(a, b):
+            y = jax.vmap(lambda x, m: gemm.gemm(x, m, out_dtype=jnp.bfloat16,
+                                                interpret_on_cpu=True))(a, b)
+            return jnp.sum(y.astype(jnp.float32) * cot.astype(jnp.float32))
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            return jax.grad(loss, argnums=(0, 1))(xs, ws)
+
+    def grad_of_vmap_batched_ref(xs, ws, cot, *, dtype=jnp.float32):
+        def loss(a, b):
+            y = jax.vmap(lambda x, m: jax.lax.dot(x, m, preferred_element_type=dtype).astype(
+                jnp.bfloat16 if dtype == jnp.float32 else dtype))(a, b)
+            return jnp.sum(y.astype(dtype) * cot.astype(dtype))
+        if dtype == jnp.float64:
+            return jax.grad(loss, argnums=(0, 1))(xs.astype(dtype), ws.astype(dtype))
+        return jax.grad(loss, argnums=(0, 1))(xs, ws)
+
+    assert_as_exact(grad_of_vmap_batched, jax.jit(grad_of_vmap_batched_ref), draw_batched_w,
+                    "grad(vmap(gemm)) batched W", seeds=8,
+                    truth_fn=functools.partial(grad_of_vmap_batched_ref, dtype=jnp.float64))
+
+
+def test_underfilled_dense_gemm_derives_depth_split_and_holds_check_1():
+    """Underfilled multi-row-tile dense GEMMs (e.g. Qwen3.5-4B key 2048x2560->1024 on sm90 cluster=2 with
+    waves=0, or q dX 2048x8192->2560 on sm80 without balanced tail) derive `splits > 1`, while well-filled
+    dense GEMMs stay unsplit (`splits == 1`, row 10151)."""
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        key_ba = launch.bind(bf16((2048, 2560)), bf16((1, 2560, 1024)), one, out_dtype="bfloat16",
+                             trans_rhs=False, interpret=False, dense=True)
+        key_tile = launch.derived(key_ba, target)
+        assert key_tile is not None and key_tile.splits > 1, key_tile
+        full_ba = launch.bind(bf16((8192, 4096)), bf16((1, 4096, 4096)), one, out_dtype="bfloat16",
+                              trans_rhs=False, interpret=False, dense=True)
+        full_tile = launch.derived(full_ba, target)
+        assert full_tile is not None and full_tile.splits == 1, full_tile
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        dx_ba = launch.bind(bf16((2048, 8192)), bf16((1, 2560, 8192)), one, out_dtype="bfloat16",
+                            trans_rhs=True, interpret=False, dense=True)
+        dx_tile = launch.derived(dx_ba, target)
+        assert dx_tile is not None and dx_tile.splits > 1, dx_tile
+
+
+def test_sm80_transposed_dx_enables_fragment_prefetch_with_granule_registers():
+    """Ampere `CpAsync` `gmm` enables cross-step fragment prefetch for transposed `dX` (`trans_rhs=True`)
+    and prices its extra transposed rhs granule in `pricing.prefetch_registers` (row 5271)."""
+    from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        tile = tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
+        fam = pricing.family_of(tile, jnp.bfloat16, target)
+        assert mosaic_gpu.prefetches(fam, matrices=1, prologue=None, scaled=False, chained=False,
+                                     interpret=False, transposed=(False, True), summed=False)
+        fwd_ba = launch.bind(bf16((1024, 1024)), bf16((1, 1024, 1024)), one, out_dtype="bfloat16",
+                             trans_rhs=False, interpret=False, dense=True)
+        dx_ba = launch.bind(bf16((1024, 1024)), bf16((1, 1024, 1024)), one, out_dtype="bfloat16",
+                            trans_rhs=True, interpret=False, dense=True)
+        fwd_regs = pricing.prefetch_registers(fam, tile, ba=fwd_ba, staged_rows=False, unstaged=False,
+                                              rewritten=False)
+        dx_regs = pricing.prefetch_registers(fam, tile, ba=dx_ba, staged_rows=False, unstaged=False,
+                                             rewritten=False)
+        assert fwd_regs == 16 and dx_regs > fwd_regs, (fwd_regs, dx_regs)

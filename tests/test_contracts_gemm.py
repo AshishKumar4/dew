@@ -974,6 +974,38 @@ def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
                     truth_fn=plain_poly, plain_fn=plain_poly_bf, without=FORWARD_ORDERS)
 
 
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_compute_prologued_gemm_holds_every_order(edge):
+    """`gemm.gemm` with a named `compute` beside `prologue` and `applied` over an fp32 master weight
+    (row 1958): every order, under a nested jit and a scan, finite wherever float64 is a normal float32 and
+    wherever plain `portable_projection(prologue(gate, up), down)` is."""
+    from dew.nn import activations
+    from dew.nn.kernels import xla_products
+
+    hook = activations.gated_hook("swiglu", None)
+    group_sizes = jnp.asarray([5, 0, 3], jnp.int32)
+    gate, up, down = normal_draw(1958, (8, 6), (8, 6), (3, 6, 4), scale=EDGES[edge])
+    d_gate, d_up, d_down = normal_draw(1959, (8, 6), (8, 6), (3, 6, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(1960, (8, 4))
+
+    def fused(g, u, w):
+        hidden = hook(g.astype(jnp.bfloat16), u.astype(jnp.bfloat16)).astype(jnp.bfloat16)
+        return gemm.gemm(g.astype(jnp.bfloat16), w, group_sizes, prologue=hook,
+                         prologue_operands=((u.astype(jnp.bfloat16), ("rows", "depth")),),
+                         applied=hidden, compute=jnp.bfloat16, out_dtype=jnp.bfloat16)
+
+    def plain(g, u, w):
+        act = hook(g.astype(jnp.bfloat16), u.astype(jnp.bfloat16)).astype(jnp.bfloat16)
+        return xla_products.portable_projection(act, w, group_sizes, jnp.bfloat16, None, jnp.bfloat16)
+
+    def truth(g, u, w):
+        act = hook(g, u)
+        return jax.lax.ragged_dot(act, w, group_sizes)
+
+    assert_contract(fused, (gate, up, down), (d_gate, d_up, d_down), cotangent,
+                    f"compute prologued gemm {edge}", truth_fn=truth, plain_fn=plain)
+
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_linear_cross_entropy_holds_every_reverse_order(edge):
     """`gemm.linear_cross_entropy` (chunked online-softmax forward and recomputing Barron-derivative VJP):

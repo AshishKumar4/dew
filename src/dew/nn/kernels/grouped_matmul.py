@@ -1076,26 +1076,23 @@ class MosaicGmm(_Mosaic):
         return ((matrix, rows) if tile.swapped else (rows, matrix)), (None, None)
 
     def _decode_split(self, ba, tile: tiling.Tiles | None, target) -> tiling.Tiles | None:
-        """`tile`, a call's of decode-sized groups (each group's rows within one row tile: a MoE decode
-        step's experts, or a dense product's decode step run unswapped, its one group) its depth split where
-        the busiest program then walks shorter (`pricing.split_count` over each active group's one row
-        tile, its matrix's stream the walk): one wave of tiles streamed each expert's matrix at a program's
-        share of the memory rate, 1.28-1.46x Triton's time at the same DRAM bytes, 48% of the peak rate
-        against Triton's 80% (FS-3622-NCU1, FS-3622-WAVES1, row 3622); a dense decode on a GH200, unsplit,
-        ran Llama-3-8B's 4096 x 4096 at one row on 16 programs of 132, 4.3x XLA's time (M-EM-38). None,
-        exact sums (`legal`), hooks or a pair keep it unsplit."""
+        """`tile` with depth splits (`pricing.split_count`, rows 3622, 483, 10151) where a decode-sized
+        grouped call or an unbalanced dense call underfills the GPU's waves and splitting prices shorter."""
         from .templates.gemm import pricing
 
         hooks = ba.arguments['hooks']
         if (tile is None or ba.arguments['exact_sums'] or ba.arguments.get('paired') is not None
-                or hooks.prologue is not None or hooks.epilogue is not None):
+                or hooks.prologue is not None or hooks.epilogue is not None or self._scaled
+                or ba.arguments.get('beside') or ba.arguments.get('chained')):
             return tile
-        if ba.arguments['tokens'].shape[0] > ba.arguments['sizes'].shape[0] * tile.block_m:
+        dense = bool(ba.arguments.get('dense'))
+        if not dense and ba.arguments['tokens'].shape[0] > ba.arguments['sizes'].shape[0] * tile.block_m:
+            return tile
+        if dense and self.balanced(ba, tile, target):
             return tile
         splits = pricing.split_count(tile, **self._contraction(ba, tile, target))
         split = dataclasses.replace(tile, splits=splits)
         return split if splits > 1 and self.takes(ba, split, target) else tile
-
     def _left_fits(self, ba, config: tiling.Tiles, target=None) -> bool:
         """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,
         width]` is read transposed, whose stage casts to the products' layout in whole row atoms on a family
@@ -1640,8 +1637,7 @@ class MosaicTgmm(_Mosaic):
                 'stored': jnp.dtype(ba.arguments['out_dtype']).itemsize,
                 'multiprocessors': _multiprocessors(target),
                 'step_seconds': pricing.step_seconds(tile, target, itemsizes),
-                'bandwidth': target.memory_rate,
-                'launch_seconds': target.launch_seconds}
+                'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target}
 
     def _partials(self, ba):
         """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`): each slice a group
