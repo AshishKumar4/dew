@@ -427,6 +427,7 @@ def _compiled(case, generation: str, record: dict,
     # that does not compile, in every gate reading its records (`failures`, row 12144).
     if unsynced := [found for call in calls for found in unsynced_commits(call.ir)]:
         record["error"] = "its tensor-core commits pass another warp's wait: " + "; ".join(unsynced)
+        return None
     modules = report.kernel_modules(calls)
     record["modules"] = modules
     # Each kernel certification compiled alone in this process, by name and launch: its module.

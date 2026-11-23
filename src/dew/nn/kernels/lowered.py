@@ -584,6 +584,9 @@ class _Walk:
             return False
         if view.numberOfThreads is None:
             return True
+        if view.barrierId is None:
+            # Barrier 0, the block's own, of fewer threads than the block: no warpgroup's rendezvous.
+            return False
         threads, barrier = _value(view.numberOfThreads, self.thread), _value(view.barrierId, self.thread)
         group = self.thread.index // (WARPGROUP_WARPS * WARP_THREADS)
         return threads == WARPGROUP_WARPS * WARP_THREADS and barrier == group + 1
