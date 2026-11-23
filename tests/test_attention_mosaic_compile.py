@@ -2236,11 +2236,10 @@ def test_paged_forward_emitted_work_counts_table_bytes():
 
 
 def test_step_live_tiles_tracks_hooks_dropout_accuracy_and_nested_subjaxprs():
-    """`step_live_tiles` traces the emitted step at its spec (score hook, dropout, accurate form, dtype,
-    `algebra.recompute` mode, multi-run visibility) and counts nested sub-jaxpr transients via
-    `programs.live` (rows 11652, 11963, 11973, 11988, 11993, 11994, 11999)."""
+    """`step_live_tiles` traces the emitted step at its spec (score hook, dropout, accurate form, dtype)
+    and counts nested sub-jaxpr transients via `programs.live` (rows 11652, 11993, 11999)."""
     from dew.nn.kernels.templates import attention_algebra as algebra
-    from dew.nn.kernels.templates.attention_mosaic_scores import _visibility_facts, step_live_tiles
+    from dew.nn.kernels.templates.attention_mosaic_scores import step_live_tiles
 
     causal_spec = algebra.Forward("causal", 128, ids=False, scale=1.0 / 8.0)
 
@@ -2265,68 +2264,6 @@ def test_step_live_tiles_tracks_hooks_dropout_accuracy_and_nested_subjaxprs():
                                      score_types=((template.Kind.TILE, "float32"),)))
     assert acc_bwd >= plain_bwd, (acc_bwd, plain_bwd)
     assert hooked_bwd > plain_bwd, (hooked_bwd, plain_bwd)
-    # Row 11994: raw/subtracted specs carry `how.factor` through emitted `_scores`.
-    raw_spec = algebra.Forward("causal", 128, ids=False, scale=1.0 / 8.0, subtracted=True)
-    assert algebra.recompute(raw_spec).factor is not None
-    assert len(step_live_tiles(64, 64, spec=raw_spec, backward=True)) > 0
-    # Row 11963: QUERY/KEY params broadcast to full score tiles, keys_first orients (block_k, block_q),
-    # ragged full calls carry algebra.seen masking via spec, and keys_first KEY_ROWS drops HEAD/QUERY grads.
-    kf_tiles = step_live_tiles(64, 32, spec=causal_spec, backward=True, keys_first=True,
-                               score_mod=lambda s, q, k, qb, kb: s + qb + kb + (q - k).astype(jnp.float32),
-                               score_types=((template.Kind.QUERY, "float32"),
-                                            (template.Kind.KEY, "float32")))
-    assert kf_tiles and all(shape == (32, 64) for shape, _ in kf_tiles), kf_tiles
-
-    q_rag = jax.ShapeDtypeStruct((1, 100, 2, 64), jnp.bfloat16)
-    spans_full = template.spans(100, 100, 1, causal=False)
-    res_rag = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q_rag.shape))
-    bwd_rag_op, _ = attention_mosaic._backward_call(
-        q_rag, q_rag, q_rag, spans_full, None, q_rag, residuals=res_rag,
-        scale=None, natural=attention_mosaic.NATURAL, accurate=False)
-    rag_cfg = attention_mosaic.BackwardTiles(64, 64, 2, 1, family="wgmma")
-    rag_spec = bwd_rag_op._spec(100, 100, ids=False, initial=False, config=rag_cfg)
-    assert _visibility_facts(rag_spec, 64)[:5] == ("full", False, True, True, 0), rag_spec
-    aligned_spec = algebra.Forward("full", 128, ids=False, scale=1.0 / 8.0)
-    assert _visibility_facts(aligned_spec, 64)[:5] == ("full", False, False, False, 0)
-    assert len(step_live_tiles(64, 64, backward=True, spec=rag_spec)) >= len(
-        step_live_tiles(64, 64, backward=True, spec=aligned_spec))
-    # Row 11988: multi-run spans trace all `runs` visibility intervals, matching `_query_bounds`.
-    spans_spec = algebra.Forward("spans", 128, ids=True, scale=1.0 / 8.0)
-    assert _visibility_facts(spans_spec, 64, runs=1)[:5] == ("spans", True, False, False, 1)
-    assert _visibility_facts(spans_spec, 64, runs=3)[:5] == ("spans", True, False, False, 3)
-    single_run = len(step_live_tiles(64, 64, spec=spans_spec, runs=1))
-    multi_run = len(step_live_tiles(64, 64, spec=spans_spec, runs=3))
-    assert multi_run >= single_run > 0, (single_run, multi_run)
-
-    def multi_param_hook(s, _q, _k, p1, p2, p3):
-        return s + p1 * jnp.sin(s) + p2 * jnp.cos(s) + p3 * jnp.tanh(s)
-
-    dkv_head = len(step_live_tiles(64, 64, spec=causal_spec, backward=True, keys_first=True,
-                                   score_mod=multi_param_hook,
-                                   score_types=((template.Kind.HEAD, "float32"),) * 3))
-    dkv_query = len(step_live_tiles(64, 64, spec=causal_spec, backward=True, keys_first=True,
-                                    score_mod=multi_param_hook,
-                                    score_types=((template.Kind.QUERY, "float32"),) * 3))
-    dkv_tile = len(step_live_tiles(64, 64, spec=causal_spec, backward=True, keys_first=True,
-                                   score_mod=multi_param_hook,
-                                   score_types=((template.Kind.TILE, "float32"),) * 3))
-    assert dkv_tile > dkv_head and dkv_tile > dkv_query, (dkv_tile, dkv_head, dkv_query)
-    # Row 11973: unhashable FieldHook holding an array caches via tuning._held_key; genuine TypeErrors raise.
-    @dataclasses.dataclass(frozen=True)
-    class ArrayHook(tuning.FieldHook):
-        scale: jax.Array
-        calls: list[int] = dataclasses.field(default_factory=list)
-
-        def __call__(self, s, _q, _k):
-            self.calls.append(1)
-            return s * self.scale
-
-    arr_hook = ArrayHook(jnp.asarray(0.5, jnp.float32))
-    first_tiles = step_live_tiles(64, 64, spec=causal_spec, score_mod=arr_hook)
-    second_tiles = step_live_tiles(64, 64, spec=causal_spec, score_mod=arr_hook)
-    assert first_tiles == second_tiles and len(arr_hook.calls) == 1, arr_hook.calls
-    with pytest.raises(TypeError):
-        step_live_tiles(64, 64, spec=causal_spec, score_mod=lambda s, _q, _k: s + "bad")
 
 def test_wide_epilogue_chunks_tcgen05_chunks_and_prices_masked_rewalks():
     """Rows 11852, 11853: `BlockPlan.epilogue_chunk` chunks wide (>128) unmasked hookless `tcgen05.chunks`
@@ -2452,43 +2389,4 @@ def test_sm90_d256_gqa_forward_and_shared_keys_backward_compile_spill_free():
         KernelCase("sm90-d256-gqa-fwd", lambda: (fwd, (q, k, k))),
         _fast_backward_compile_case("sm90-d256-gqa-bwd", q, k, spans, res),
     ], "sm90")
-    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-
-
-@COMPILES_ON_CPU
-@pytest.mark.usefixtures("without_deterministic_ops")
-def test_sm90_roofline_forward_and_fused_backward_compile_spill_free():
-    """Row 5272: sm90 compute-bound causal forward (d64/d128 unscaled + segmented, d256 single-launch)
-    and fused dK/dV backward (overlapped scaled dP/dV WGMMAs via `product_with` + double-buffered TMA dQ
-    adds at d128) derive and compile spill-free."""
-    from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    spans = template.spans(4096, 4096, 2, causal=True)
-    cases = []
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        q256 = jax.ShapeDtypeStruct((2, 4096, 16, 256), jnp.bfloat16)
-        k256 = jax.ShapeDtypeStruct((2, 4096, 4, 256), jnp.bfloat16)
-        op256, args256 = attention_mosaic._forward_call(
-            q256, k256, k256, spans, None, scale=None, natural=attention_mosaic.NATURAL)
-        ba256 = op256.bind(*args256, residuals=template.Kept.NONE, interpret=False)
-        cfg256 = op256.derived(ba256, target)
-        assert cfg256 is not None and op256.takes(ba256, cfg256, target), cfg256
-        cases.append(KernelCase(
-            "sm90-fwd-d256",
-            lambda: (lambda query, key, value: attention_mosaic.forward(
-                query, key, value, spans, None, residuals=template.Kept.NONE), (q256, k256, k256))))
-        for width, kv_heads in ((64, 8), (128, 8)):
-            q = jax.ShapeDtypeStruct((2, 4096, 32, width), jnp.bfloat16)
-            k = jax.ShapeDtypeStruct((2, 4096, kv_heads, width), jnp.bfloat16)
-            res = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), _residuals(q.shape))
-            cases.append(KernelCase(
-                f"sm90-fwd-d{width}",
-                lambda q=q, k=k: (
-                    lambda query, key, value: attention_mosaic.forward(
-                        query, key, value, spans, None, residuals=template.Kept.NONE),
-                    (q, k, k))))
-            cases.append(_fast_backward_compile_case(f"sm90-bwd-d{width}", q, k, spans, res))
-    found = compile_mosaic_kernels(cases, "sm90")
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))

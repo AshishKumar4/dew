@@ -1,16 +1,16 @@
-"""A split walk's slices merged where its launch wrote them: one Mosaic GPU launch on NVIDIA sm80+ GPUs
-(row 9795), one Pallas Triton launch on non-NVIDIA/pre-Ampere GPUs, and the law's own path elsewhere and
-under differentiation.
+"""A split walk's slices merged where its launch wrote them: one Mosaic GPU launch on NVIDIA sm80+ CUDA GPUs
+(row 9795), one Pallas Triton launch on pre-Ampere CUDA GPUs (`platform="cuda"`), and the law's own XLA path
+elsewhere and under differentiation.
 
 A decode step's walk splits a row's keys across programs (`attention_decode`), each slice's output, maximum
 and denominator padded to its launch's tile of rows. The law merges them (`attention_algebra.merged_state`:
 `slice_state` of each, then `finished_merged`), which in XLA took the padded arrays' slices, their selects and
 the law's total and output as separate launches around it. `merged_padded` takes the launch's padded arrays as
-they are; on a GPU it lowers as one Pallas launch (Mosaic GPU on NVIDIA sm80+, Triton fallback elsewhere) that
-reads them in place and runs the law's own functions on each row (`slice_state`, `finished_merged`), elsewhere
-as the law's path on their slices (`_value`), which its derivative always is (a `jax.custom_jvp` whose rule is
-`jax.jvp` of `_value`): a step faster than main's merge at every decode cell measured, its outputs bit for bit
-the law's (M-ET-87i).
+they are; on a CUDA GPU it lowers as one Pallas launch (Mosaic GPU on sm80+, Pallas Triton on pre-Ampere CUDA
+GPUs) that reads them in place and runs the law's own functions on each row (`slice_state`,
+`finished_merged`), and on non-CUDA platforms and under differentiation as the law's path on their slices
+(`_value`), which its derivative always is (a `jax.custom_jvp` whose rule is `jax.jvp` of `_value`): a step
+faster than main's merge at every decode cell measured, its outputs bit for bit the law's (M-ET-87i).
 
 Each program merges a row's slices, a (batch, query, key head) row's, over a block of its channels
 (`_channel_block`: all of them where one block holds the row's width, else blocks of it), each forming the
@@ -308,15 +308,15 @@ def launch_work(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeSt
 
 def _uses_mosaic(target: generation.GpuTarget) -> bool:
     """Whether `target` lowers `merged_padded` on Mosaic GPU (NVIDIA sm80+ instruction families) rather than
-    the Pallas Triton fallback kept for non-NVIDIA and pre-Ampere GPUs (row 9795)."""
+    the Pallas Triton fallback kept for pre-Ampere CUDA GPUs (`platform="cuda"`, row 9795)."""
     family = generation.family(target.generation)
     return family is not None and family != "tpu"
 
 
 def _kernel(padded, stacked, *extra, units: windows.Units, queries: int, width: int,
             raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None):
-    """`_value` as one launch (`_launch_mosaic` on NVIDIA Mosaic GPU families, `_launch` Triton fallback
-    elsewhere), a program a row's block of channels (`_channel_block`)."""
+    """`_value` as one CUDA launch (`_launch_mosaic` on sm80+ Mosaic GPU families, `_launch` Triton fallback
+    on pre-Ampere CUDA GPUs), a program a row's block of channels (`_channel_block`)."""
     batch, _, _, heads, _ = padded.shape
     if batch == 0 or queries == 0 or heads == 0:
         return _value(padded, stacked, *extra, units=units, queries=queries, width=width,

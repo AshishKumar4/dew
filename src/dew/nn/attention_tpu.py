@@ -25,11 +25,13 @@ SPLASH_DENSE_MASK_CELLS = 1 << 22
 
 
 def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
-                  softcap, sinks, segment_ids, interpret: bool, spans: template.KeySpans | None = None):
+                  softcap, sinks, segment_ids, interpret: bool, spans: template.KeySpans | None = None,
+                  descriptor=None):
     """Attend on pallas: splash where its descriptor covers the call, flash
     everywhere else.
 
     Splash is block-sparse: its mask is a descriptor built with the executable,
+    or passed already built as `descriptor` when the caller resolved it once,
     so a causal or windowed sequence costs its live blocks, and packed segment
     ids are a kernel argument. It has no bias argument and needs an explicit
     mask readable on the host. Flash takes both as one additive [B, H, Q, K]
@@ -51,8 +53,7 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
     splits the heads is flash's.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
-    descriptor = None
-    if bias is None and not (q_len % SPLASH_LANES or kv_len % SPLASH_LANES):
+    if descriptor is None and bias is None and not (q_len % SPLASH_LANES or kv_len % SPLASH_LANES):
         descriptor = splash_mask_descriptor(
             q_len, kv_len, shard_heads(query), causal, sliding_window, mask, spans=spans)
     if descriptor is None and (softcap is not None or sinks is not None):
@@ -251,8 +252,9 @@ def splash_dense_mask(mask, q_len: int, kv_len: int, heads: int):
 
     None when splash cannot carry it: a traced mask (the descriptor is built
     with the executable; a decode mask over slots is one), a batch axis wider
-    than one (splash has none), or one past `SPLASH_DENSE_MASK_CELLS`, whose
-    dense blocks would cost more than the additive-bias path.
+    than one (splash has none), a shape not broadcastable to `[H or 1, Q, K]`,
+    or one whose `[H or 1, Q, K]` expansion passes `SPLASH_DENSE_MASK_CELLS`,
+    whose dense blocks would cost more than the additive-bias path.
     """
     import numpy as np
     from jax.core import Tracer
@@ -264,10 +266,13 @@ def splash_dense_mask(mask, q_len: int, kv_len: int, heads: int):
         dense = dense[0]
     if dense.ndim == 2:
         dense = dense[None]
-    if dense.ndim != 3 or dense.shape[-2:] != (q_len, kv_len):
+    if (dense.ndim != 3 or dense.shape[0] not in (1, heads)
+            or dense.shape[-2] not in (1, q_len) or dense.shape[-1] not in (1, kv_len)):
         return None
-    if dense.shape[0] not in (1, heads) or dense.size > SPLASH_DENSE_MASK_CELLS:
+    if dense.shape[0] * q_len * kv_len > SPLASH_DENSE_MASK_CELLS:
         return None
+    if dense.shape[-2:] != (q_len, kv_len):
+        dense = np.ascontiguousarray(np.broadcast_to(dense, (dense.shape[0], q_len, kv_len)))
     return [dense[head % dense.shape[0]] for head in range(heads)]
 
 

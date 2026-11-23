@@ -1421,3 +1421,35 @@ def test_common_triton_forward_lowering_isolates_scaled_op():
         runtime_names = [eq.params.get("name", "") for eq in programs.equations(runtime_jaxpr)
                          if programs.opaque(eq)]
         assert any("scaled" in name for name in runtime_names), runtime_names
+
+
+def test_triton_forward_settles_interior_and_overflow_midpoints():
+    """`attention_triton.forward` retains full single-rounding (`narrowing_settled`) on 16-bit outputs:
+    settling both finite interior BF16 midpoints (`denom = 1 + 2^-23`, `acc = 1 + 3/256 + 2^-23` ->
+    `1 + 1/128`, not double-rounded `1 + 2/128`) and BF16/FP16 overflow midpoints (`max`, not `inf`)."""
+    spans = template.spans(1, 1, 1, lengths=jnp.zeros((1,), jnp.int32))
+    denom = np.float32(1.0 + 2.0 ** -23)
+    cases = [
+        (jnp.bfloat16, np.float32(1.0 + 3.0 / 256.0 + 2.0 ** -23), np.float32(1.0 + 1.0 / 128.0)),
+        (jnp.bfloat16,
+         np.nextafter(np.float32((float(jnp.finfo(jnp.bfloat16).max)
+                                  + float(jnp.finfo(jnp.bfloat16).eps) * 2.0 ** 126) * denom),
+                      np.float32(0.0)),
+         np.float32(jnp.finfo(jnp.bfloat16).max)),
+        (jnp.float16,
+         np.nextafter(np.float32((float(jnp.finfo(jnp.float16).max)
+                                  + float(jnp.finfo(jnp.float16).eps) * 2.0 ** 14) * denom),
+                      np.float32(0.0)),
+         np.float32(jnp.finfo(jnp.float16).max)),
+    ]
+    for dtype, acc_scalar, expected in cases:
+        zeros = jnp.zeros((1, 1, 1, 16), dtype)
+        initial = template.Initial(jnp.zeros((1, 1, 1), jnp.float32),
+                                   jnp.full((1, 1, 1), denom, jnp.float32),
+                                   jnp.full((1, 1, 1, 16), acc_scalar, jnp.float32))
+        hooks = template.Hooks(initial=initial)
+        with tuning.pinned({attention_triton.TritonForward: PINNED[0]}):
+            got = attention_triton.forward(zeros, zeros, zeros, spans, hooks, interpret=not ON_GPU)
+        ref = template.reference(zeros, zeros, zeros, spans, hooks)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+        assert float(np.asarray(got, np.float32)[0, 0, 0, 0]) == float(expected), (dtype, got)

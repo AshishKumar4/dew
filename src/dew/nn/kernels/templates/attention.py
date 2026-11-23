@@ -39,7 +39,7 @@ from jax.typing import DTypeLike
 
 from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted, surrogate
-from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
+from dew.nn.float_bits import binade_of, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.precision import (
     at_least_fp32,
@@ -47,8 +47,9 @@ from dew.nn.precision import (
     exact_float32,
     float32_einsum,
     lowered_divide,
-    two_product,
+    split_bits,
     two_sum,
+    uncontracted,
 )
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
@@ -1385,16 +1386,15 @@ def _narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype
     """`narrowing_settled`'s value."""
     if out.dtype != jnp.float32:
         return out
-    divisor = jax.lax.broadcast_in_dim(divisor, acc.shape, tuple(range(divisor.ndim)))
     above = _remainder_sign(acc, out, divisor)
+    positive = jax.lax.broadcast_in_dim(divisor > 0, acc.shape, tuple(range(divisor.ndim)))
     bits = jax.lax.bitcast_convert_type(out, jnp.int32)
     # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side, its
     # side read from its sign bit (a subnormal's comparison with zero reads it as zero where the CPU treats
     # subnormal operands as zero).
     toward = jnp.where((above > 0) == (bits > 0), 1, -1).astype(jnp.int32)
     odd = jax.lax.bitcast_convert_type(bits + toward, jnp.float32)
-    nudged = (_between(bits, dtype) & (above != 0) & jnp.isfinite(out) & jnp.isfinite(acc)
-              & (divisor > 0))
+    nudged = _between(bits, dtype) & (above != 0) & jnp.isfinite(out) & jnp.isfinite(acc) & positive
     return jnp.where(nudged, odd, out)
 
 
@@ -1414,24 +1414,33 @@ do, so an exact output within their rounding of a boundary may narrow past it.""
 
 
 def _remainder_sign(acc: jax.Array, quotient: jax.Array, divisor: jax.Array) -> jax.Array:
-    """A value of the sign of `acc - quotient * divisor` (fp32, finite), exact: `quotient` and `divisor` each
-    normalized to [1, 2) from its bits (`float_bits.binade_of`, raised or lowered exactly, a subnormal's
-    too), so their product's rounding and its residual (`two_product`'s bit split) are normal, and `acc`
-    taken by the same powers of two, which leaves it near the product where the quotient is near
-    `acc / divisor`: no operand or residual passes fp32's range or flushes, at bf16's midpoint over a
-    divisor near 2^126 as at a quotient near fp32's least normal."""
-    def normalized(x):
-        binade = binade_of(x)
-        return jnp.where(binade < 0, raised_exactly(x, jnp.maximum(-binade, 0)),
-                         lowered_rounded(x, jnp.maximum(binade, 0))), binade
+    """A value of the sign of `acc - quotient * divisor` (fp32, finite) at every 16-bit narrowing tie
+    (`_between`), exact with row-hoisted divisor scaling and splitting: `divisor` is scaled once per row into
+    `[1/4, 1/2)` by two exact power-of-two factors `(s1, s2)` and split into two exact 12-bit halves
+    `(d_hi, d_lo)`. Every 16-bit tie `quotient` has at most 12 significant bits (9 for bf16, 12 for fp16), so
+    `q_scaled * d_hi` and `q_scaled * d_lo` are exact in fp32 with no per-element bit splitting or exponent
+    normalization; tiny `|quotient| < 2^-100` is scaled up by `2^52` so every intermediate stays normal down
+    to fp32's least subnormal (`2^-149`), avoiding Triton register spills across `[block_q, Dv]` (row
+    11648)."""
+    shift = jnp.clip(binade_of(divisor), -149, 127) + 2
+    first = jnp.right_shift(shift + 1, 1)
+    second = shift - first
+    s1 = jax.lax.bitcast_convert_type(jnp.left_shift(127 - first, 23).astype(jnp.int32), jnp.float32)
+    s2 = jax.lax.bitcast_convert_type(jnp.left_shift(127 - second, 23).astype(jnp.int32), jnp.float32)
+    (scaled,) = uncontracted((divisor * s1) * s2)
+    unsigned, mask, _ = split_bits(np.float32)
+    d_hi = jax.lax.bitcast_convert_type(
+        jax.lax.bitcast_convert_type(scaled, unsigned) & np.array(mask, unsigned), jnp.float32)
+    d_lo = scaled - d_hi
+    dims = tuple(range(divisor.ndim))
 
-    (quotient, at), (divisor, by) = normalized(quotient), normalized(divisor)
-    high, low = two_product(quotient, divisor, bit_split=True)
-    shift = at + by
-    taken = jnp.where(shift < 0, raised_exactly(acc, jnp.maximum(-shift, 0)),
-                      lowered_rounded(acc, jnp.maximum(shift, 0)))
-    return (taken - high) - low
+    def expand(x: jax.Array) -> jax.Array:
+        return jax.lax.broadcast_in_dim(x, acc.shape, dims)
 
+    bump = jnp.where(jnp.abs(quotient) < np.float32(2.0 ** -100), np.float32(2.0 ** 52), np.float32(1.0))
+    q_scaled = quotient * bump
+    acc_scaled = (acc * (expand(s1) * bump)) * expand(s2)
+    return (acc_scaled - q_scaled * expand(d_hi)) - q_scaled * expand(d_lo)
 
 def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
     """Whether each fp32 value of `bits` (its int32 bits) lies exactly between two neighbouring values of the

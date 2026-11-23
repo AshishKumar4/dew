@@ -29,6 +29,7 @@ from dew.nn.residuals import Residual
 from .attention_kernels import (
     ATTENTION,
     DECODE,
+    SPLASH_LANES,
     TPU_BACKEND,
     AttentionCase,
     cudnn_packs,
@@ -56,7 +57,7 @@ from .attention_parallel import (
     tensor_shards,
 )
 from .attention_sinks import sink_softmax
-from .attention_tpu import splash_mask_descriptor, splash_span_mask, tpu_attention
+from .attention_tpu import splash_mask_descriptor, tpu_attention
 from .decode_geometry import folded_attention, folds, grouped_query
 from .documents import (
     CrossDocuments,
@@ -875,7 +876,7 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                      softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None,
                      key_value_seq_starts=None, block_groups=None, image_groups=None, key_valid=None,
                      key_runs=None, places=None, query_slots=None, dropout_rate=0.0, dropout_seed=None,
-                     dropout_places=None, mask_fill=None, in_key: bool = False, tpu_spans=None):
+                     dropout_places=None, mask_fill=None, in_key: bool = False, tpu_descriptor=None):
     """Run the kernel `implementation` names, at the query's head width: the executor of what the
     attention selector chose (`resolve_implementation`, `_attention_kernel`), which held the call to
     the kernel's requirements (`attention_kernels.ATTENTION`) before it reaches here.
@@ -976,7 +977,7 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
         out = tpu_attention(query, key, value, bias, mask, causal, sliding_window,
                             softcap=softcap, sinks=sinks, segment_ids=segment_ids,
-                            interpret=generation.backend() != 'tpu', spans=tpu_spans)
+                            interpret=generation.backend() != 'tpu', descriptor=tpu_descriptor)
     return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
 
 
@@ -1170,26 +1171,32 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         # A separable bias reaches the template as its two terms alone (`template_attention`).
         bias = dense_bias(bias)
     spanned = (block_groups, image_groups, key_valid, key_runs, places, query_slots)
-    tpu_spans = None
+    tpu_descriptor = None
     aligned = isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
     if any(x is not None for x in spanned) and implementation != 'template':
         from jax.core import Tracer
 
+        q_len, kv_len = query.shape[-3], key.shape[-3]
         span_inputs = (lengths, starts, block_groups, image_groups, key_valid, key_runs, places, query_slots)
-        if (implementation == 'tpu' and not aligned
+        if (implementation == 'tpu' and bias is None and not aligned
+                and not (q_len % SPLASH_LANES or kv_len % SPLASH_LANES)
                 and (segment_ids is None or (block_groups is None and image_groups is None))
                 and not any(isinstance(x, Tracer) for x in span_inputs)):
             with jax.ensure_compile_time_eval():
-                candidate = key_spans(query.shape[-3], key.shape[-3], causal, sliding_window, None, lengths,
-                                      starts, block_groups=block_groups, image_groups=image_groups,
+                candidate = key_spans(q_len, kv_len, causal, sliding_window, None, lengths, starts,
+                                      block_groups=block_groups, image_groups=image_groups,
                                       key_valid=key_valid, key_runs=key_runs, places=places,
                                       query_slots=query_slots)
-            if splash_span_mask(candidate, shard_heads(query)) is not None:
-                tpu_spans = candidate
+            # Resolve the complete Splash descriptor once (including any broadcastable concrete `mask`).
+            tpu_descriptor = splash_mask_descriptor(
+                q_len, kv_len, shard_heads(query), causal=False, sliding_window=None, mask=mask,
+                spans=candidate)
+            if tpu_descriptor is not None:
+                mask = masked = None
                 causal, sliding_window, lengths, starts = False, None, None, None
                 block_groups = image_groups = key_valid = key_runs = places = query_slots = None
-        if tpu_spans is None:
-            mask = masked = visibility_mask(query.shape[-3], key.shape[-3], causal, sliding_window, mask,
+        if tpu_descriptor is None:
+            mask = masked = visibility_mask(q_len, kv_len, causal, sliding_window, mask,
                                             segment_ids, lengths, starts, block_groups=block_groups,
                                             image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
                                             places=places, query_slots=query_slots)
@@ -1240,7 +1247,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                 key_runs=key_runs, places=places, query_slots=query_slots,
                                 dropout_rate=dropout_rate, dropout_seed=dropout_seed,
                                 dropout_places=dropout_places, mask_fill=mask_fill, in_key=in_key,
-                                tpu_spans=tpu_spans)
+                                tpu_descriptor=tpu_descriptor)
     # A kernel whose products take no precision of their own (jax.nn's xla attention, Pallas dots: the
     # template's portable mainloop, splash and its flash fallback) multiplies at the call's stated
     # precision: a reverse-only kernel's backward, traced after the call, held at it too (`at_precision`),

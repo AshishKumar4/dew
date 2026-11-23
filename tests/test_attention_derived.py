@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import COMPILES_ON_CPU
 from reference_error import assert_as_exact
 from test_algebra_derive import shaped, walked
 
@@ -832,33 +833,191 @@ def test_tpu_scopes_read_trailing_run_axis_and_hooks_key_step_live_tiles_by_tile
 
 
 def test_staged_logits_is_skipped_when_unstaged_already_fits_shared_memory_at_same_residency():
-    """Row 11975: `MosaicBackward._staged_helps` admits `staged_logits=True` only when the un-staged config
-    exceeds shared memory or has lower residency, so refusing an un-staged config for register spills skips
-    doomed `staged_logits=True` certifications and steps straight to the next column split."""
+    """Row 11975: `MosaicBackward._staged_helps` admits `staged_logits=True` on explicit staged/unstaged
+    schedule pairs only when the un-staged config exceeds shared memory or has lower residency, so refusing
+    an un-staged config for register spills skips its doomed `staged_logits=True` twin."""
     from dew.nn.kernels.templates import attention_mosaic, report
 
     spans = template.spans(1024, 1024, 1, causal=False)
-    q = jax.ShapeDtypeStruct((1, 1024, 8, 256), jnp.float16)
-    k = jax.ShapeDtypeStruct((1, 1024, 2, 256), jnp.float16)
+    zero_row = jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32)
+    zero_idx = jax.ShapeDtypeStruct((1, 8, 1024), jnp.int32)
+
+    def backward_ba(width: int, hooks: template.Hooks | None):
+        q = jax.ShapeDtypeStruct((1, 1024, 8, width), jnp.float16)
+        k = jax.ShapeDtypeStruct((1, 1024, 2, width), jnp.float16)
+        split = template.Split(jax.ShapeDtypeStruct((1, 8, 1024, width), jnp.float32),
+                               zero_row, zero_row, zero_row)
+        op, args = attention_mosaic._backward_call(
+            q, k, k, spans, hooks, q, residuals=(zero_row, zero_row, zero_idx, split),
+            scale=None, natural=attention_mosaic.NATURAL, accurate=False)
+        return op, op.bind(*args, interpret=False)
+
     bias = jax.ShapeDtypeStruct((1, 8, 1024), jnp.float16)
     hooks = template.Hooks(
         score_mod=lambda s, _q, _k, a, b: s + a.astype(s.dtype) + 2.0 * b.astype(s.dtype),
         score_params=(template.Param(bias, template.Kind.KEY), template.Param(bias, template.Kind.KEY)))
-    zero_row = jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32)
-    zero_idx = jax.ShapeDtypeStruct((1, 8, 1024), jnp.int32)
-    split = template.Split(jax.ShapeDtypeStruct((1, 8, 1024, 256), jnp.float32),
-                           zero_row, zero_row, zero_row)
     with generation.assumed("sm80"):
-        op, args = attention_mosaic._backward_call(
-            q, k, k, spans, hooks, q, residuals=(zero_row, zero_row, zero_idx, split),
-            scale=None, natural=attention_mosaic.NATURAL, accurate=False)
-        ba = op.bind(*args, interpret=False)
         target = generation.gpu_target()
-        first = op.derived(ba, target)
-        assert first is not None and not first.staged_logits, first
+        op, ba = backward_ba(256, hooks)
+        # Negative pair: unstaged 32x32x2 at width 256 fits SMEM at the same residency, so staged_logits is
+        # rejected.
+        unstaged = attention_mosaic.BackwardTiles(
+            block_q=32, block_k=32, stages=2, consumers=1, fused=False, family="mma.sync",
+            columns=1, staged_logits=False)
+        staged = dataclasses.replace(unstaged, staged_logits=True)
+        assert op.staged_bytes(ba, unstaged, target) <= op.program_shared(unstaged, target)
+        assert op.resident(ba, staged, target) <= op.resident(ba, unstaged, target)
+        assert op._staged_helps(ba, unstaged, target)
+        assert not op._staged_helps(ba, staged, target)
         with report.refusals():
             for narrow in (False, True):
-                report.refuse_launch(op, ba, dataclasses.replace(first, narrow=narrow),
+                report.refuse_launch(op, ba, dataclasses.replace(unstaged, narrow=narrow),
                                      frozenset({"attention_dkv"}))
             stepped = op.derived(ba, target)
-        assert stepped is not None and not stepped.staged_logits and stepped.columns > first.columns, stepped
+        assert stepped is not None and op.takes(ba, stepped, target)
+        assert stepped not in (staged, dataclasses.replace(staged, narrow=True)), stepped
+
+        # Positive pair 1 (SMEM relief): unstaged 32x32x3 at width 256 exceeds SMEM while staged fits.
+        op_256, ba_256 = backward_ba(256, None)
+        over = attention_mosaic.BackwardTiles(
+            block_q=32, block_k=32, stages=3, consumers=1, fused=False, family="mma.sync",
+            columns=1, staged_logits=False)
+        fits_staged = dataclasses.replace(over, staged_logits=True)
+        assert op_256.staged_bytes(ba_256, over, target) > op_256.program_shared(over, target)
+        assert op_256.staged_bytes(ba_256, fits_staged, target) <= op_256.program_shared(fits_staged, target)
+        assert op_256._staged_helps(ba_256, fits_staged, target)
+
+        # Positive pair 2 (residency gain): unstaged 32x32x3 at width 128 fits SMEM at 1 CTA/SM, staged at 2.
+        op_128, ba_128 = backward_ba(128, None)
+        low_res = attention_mosaic.BackwardTiles(
+            block_q=32, block_k=32, stages=3, consumers=1, fused=False, family="mma.sync",
+            columns=1, staged_logits=False)
+        high_res = dataclasses.replace(low_res, staged_logits=True)
+        assert op_128.staged_bytes(ba_128, low_res, target) <= op_128.program_shared(low_res, target)
+        assert op_128.resident(ba_128, high_res, target) > op_128.resident(ba_128, low_res, target)
+        assert op_128._staged_helps(ba_128, high_res, target)
+
+
+def test_step_live_tiles_covers_keys_first_ragged_spans_and_array_field_hooks():
+    """Rows 11963, 11973, 11988, 11994: `step_live_tiles` carries `how.factor` for raw/subtracted specs,
+    orients keys-first `(block_k, block_q)` tiles, reflects ragged full visibility and multi-run spans,
+    excludes HEAD/QUERY grads from keys-first `KEY_ROWS`, and caches array-holding `FieldHook`s via
+    `tuning._held_key` while propagating genuine `TypeError`s."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.templates import attention_mosaic
+    from dew.nn.kernels.templates.attention_mosaic_scores import _visibility_facts, step_live_tiles
+
+    causal_spec = algebra.Forward("causal", 128, ids=False, scale=1.0 / 8.0)
+    raw_spec = algebra.Forward("causal", 128, ids=False, scale=1.0 / 8.0, subtracted=True)
+    assert algebra.recompute(raw_spec).factor is not None
+    assert len(step_live_tiles(64, 64, spec=raw_spec, backward=True)) > 0
+
+    kf_tiles = step_live_tiles(64, 32, spec=causal_spec, backward=True, keys_first=True,
+                               score_mod=lambda s, q, k, qb, kb: s + qb + kb + (q - k).astype(jnp.float32),
+                               score_types=((template.Kind.QUERY, "float32"),
+                                            (template.Kind.KEY, "float32")))
+    assert kf_tiles and all(shape == (32, 64) for shape, _ in kf_tiles), kf_tiles
+
+    q_rag = jax.ShapeDtypeStruct((1, 100, 2, 64), jnp.bfloat16)
+    spans_full = template.spans(100, 100, 1, causal=False)
+    zero_row = jax.ShapeDtypeStruct((1, 2, 100), jnp.float32)
+    zero_idx = jax.ShapeDtypeStruct((1, 2, 100), jnp.int32)
+    res_rag = (zero_row, zero_row, zero_idx, template.Split(
+        jax.ShapeDtypeStruct((1, 2, 100, 64), jnp.float32), zero_row, zero_row, zero_row))
+    bwd_rag_op, _ = attention_mosaic._backward_call(
+        q_rag, q_rag, q_rag, spans_full, None, q_rag, residuals=res_rag,
+        scale=None, natural=attention_mosaic.NATURAL, accurate=False)
+    rag_cfg = attention_mosaic.BackwardTiles(64, 64, 2, 1, family="wgmma")
+    rag_spec = bwd_rag_op._spec(100, 100, ids=False, initial=False, config=rag_cfg)
+    assert _visibility_facts(rag_spec, 64)[:5] == ("full", False, True, True, 0), rag_spec
+    aligned_spec = algebra.Forward("full", 128, ids=False, scale=1.0 / 8.0)
+    assert _visibility_facts(aligned_spec, 64)[:5] == ("full", False, False, False, 0)
+    assert len(step_live_tiles(64, 64, backward=True, spec=rag_spec)) >= len(
+        step_live_tiles(64, 64, backward=True, spec=aligned_spec))
+
+    spans_spec = algebra.Forward("spans", 128, ids=True, scale=1.0 / 8.0)
+    assert _visibility_facts(spans_spec, 64, runs=1)[:5] == ("spans", True, False, False, 1)
+    assert _visibility_facts(spans_spec, 64, runs=3)[:5] == ("spans", True, False, False, 3)
+    single_run = len(step_live_tiles(64, 64, spec=spans_spec, runs=1))
+    multi_run = len(step_live_tiles(64, 64, spec=spans_spec, runs=3))
+    assert multi_run >= single_run > 0, (single_run, multi_run)
+
+    def multi_param_hook(s, _q, _k, p1, p2, p3):
+        return s + p1 * jnp.sin(s) + p2 * jnp.cos(s) + p3 * jnp.tanh(s)
+
+    dkv_head = len(step_live_tiles(64, 64, spec=causal_spec, backward=True, keys_first=True,
+                                   score_mod=multi_param_hook,
+                                   score_types=((template.Kind.HEAD, "float32"),) * 3))
+    dkv_query = len(step_live_tiles(64, 64, spec=causal_spec, backward=True, keys_first=True,
+                                    score_mod=multi_param_hook,
+                                    score_types=((template.Kind.QUERY, "float32"),) * 3))
+    dkv_tile = len(step_live_tiles(64, 64, spec=causal_spec, backward=True, keys_first=True,
+                                   score_mod=multi_param_hook,
+                                   score_types=((template.Kind.TILE, "float32"),) * 3))
+    assert dkv_tile > dkv_head and dkv_tile > dkv_query, (dkv_tile, dkv_head, dkv_query)
+
+    @dataclasses.dataclass(frozen=True)
+    class ArrayHook(tuning.FieldHook):
+        scale: jax.Array
+        calls: list[int] = dataclasses.field(default_factory=list)
+
+        def __call__(self, s, _q, _k):
+            self.calls.append(1)
+            return s * self.scale
+
+    arr_hook = ArrayHook(jnp.asarray(0.5, jnp.float32))
+    first_tiles = step_live_tiles(64, 64, spec=causal_spec, score_mod=arr_hook)
+    second_tiles = step_live_tiles(64, 64, spec=causal_spec, score_mod=arr_hook)
+    assert first_tiles == second_tiles and len(arr_hook.calls) == 1, arr_hook.calls
+    with pytest.raises(TypeError):
+        step_live_tiles(64, 64, spec=causal_spec, score_mod=lambda s, _q, _k: s + "bad")
+
+
+@COMPILES_ON_CPU
+@pytest.mark.kernel
+@pytest.mark.usefixtures("without_deterministic_ops")
+def test_sm90_roofline_forward_and_fused_backward_compile_spill_free():
+    """Row 5272: sm90 compute-bound causal forward (d64/d128 unscaled + segmented, d256 single-launch)
+    and fused dK/dV backward (overlapped scaled dP/dV WGMMAs via `product_with` + double-buffered TMA dQ
+    adds at d128) derive and compile spill-free."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_mosaic
+
+    spans = template.spans(4096, 4096, 2, causal=True)
+    cases = []
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        q256 = jax.ShapeDtypeStruct((2, 4096, 16, 256), jnp.bfloat16)
+        k256 = jax.ShapeDtypeStruct((2, 4096, 4, 256), jnp.bfloat16)
+        op256, args256 = attention_mosaic._forward_call(
+            q256, k256, k256, spans, None, scale=None, natural=attention_mosaic.NATURAL)
+        ba256 = op256.bind(*args256, residuals=template.Kept.NONE, interpret=False)
+        cfg256 = op256.derived(ba256, target)
+        assert cfg256 is not None and op256.takes(ba256, cfg256, target), cfg256
+        cases.append(KernelCase(
+            "sm90-fwd-d256",
+            lambda: (lambda query, key, value: attention_mosaic.forward(
+                query, key, value, spans, None, residuals=template.Kept.NONE), (q256, k256, k256))))
+        for width, kv_heads in ((64, 8), (128, 8)):
+            q = jax.ShapeDtypeStruct((2, 4096, 32, width), jnp.bfloat16)
+            k = jax.ShapeDtypeStruct((2, 4096, kv_heads, width), jnp.bfloat16)
+            zero_row = jax.ShapeDtypeStruct((2, 32, 4096), jnp.float32)
+            zero_idx = jax.ShapeDtypeStruct((2, 32, 4096), jnp.int32)
+            res = (zero_row, zero_row, zero_idx, template.Split(
+                jax.ShapeDtypeStruct((2, 32, 4096, width), jnp.float32), zero_row, zero_row, zero_row))
+            cases.append(KernelCase(
+                f"sm90-fwd-d{width}",
+                lambda q=q, k=k: (
+                    lambda query, key, value: attention_mosaic.forward(
+                        query, key, value, spans, None, residuals=template.Kept.NONE),
+                    (q, k, k))))
+            cases.append(KernelCase(
+                f"sm90-bwd-d{width}",
+                lambda q=q, k=k, res=res: (
+                    lambda query, key, value, dout, r: attention_mosaic.backward(
+                        query, key, value, spans, None, dout, residuals=r, accurate=False),
+                    (q, k, k, q, res))))
+    found = compile_mosaic_kernels(cases, "sm90")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
