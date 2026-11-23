@@ -37,6 +37,7 @@ from dew.nn.kernels.templates import (
     across,
     after_walk,
     attention_algebra as algebra,
+    handoffs,
     mosaic,
     operands,
     outputs,
@@ -2137,7 +2138,7 @@ def _launch_body(program: _Program, layout, spec: algebra.Forward, hooks: Hooks,
         family.scheduled(consumers, _per_role(family, consumers, consumer), producer, exclusive=True,
                          static_consumers=scopes_products(family),
                          issuer=_issuer(program, streams, refs, placed),
-                         joined=_correction(program, placed, value_width, joined))
+                         joined=joined, bodies=_correction(program, placed, value_width, joined))
     return body
 
 
@@ -2271,16 +2272,18 @@ def _issuer(program: _Program, streams, refs, placed: Callable) -> Callable | No
     return issuer
 
 
-def _correction(program: _Program, placed_at: Callable, value_width: int, joined: tuple) -> tuple:
-    """Bind `Tcgen05Placed.correcting` to the planned `joined` correction role tuple (row 5368)."""
+def _correction(program: _Program, placed_at: Callable, value_width: int, joined: handoffs.Joined
+                ) -> dict[str, Callable]:
+    """The bodies of the planned `joined` correction roles (row 5368), each `Tcgen05Placed.correcting`, by
+    their names (`Family.scheduled`'s, which refuses a role left without one: row 9785)."""
     family = program.family
     if not joined or not isinstance(family, placed_mod.Tcgen05Placed):
-        return ()
+        return {}
 
     def body(_index):
         *_, (lo, hi) = placed_at()
         family.correcting(lo, hi, value_width)
-    return tuple((role, count, body) for role, count in joined)
+    return {role.name: body for role, _ in joined}
 
 
 def _written_refs(written: tuple, read: _Read) -> tuple:
