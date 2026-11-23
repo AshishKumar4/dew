@@ -43,6 +43,7 @@ from dew.nn import float_bits
 from dew.nn.derivatives import contracted
 from dew.nn.float_bits import exact_power2
 from dew.nn.precision import correctly_rounded_divide, power2, two_product, two_sum
+from dew.nn.sharding import varied_alike, varying as sharding_varying
 
 
 @dataclasses.dataclass(frozen=True)
@@ -206,13 +207,10 @@ def _alike(value: Callable) -> Callable:
     operations do before they compute, so the operations its computation binds see operands that vary
     alike, as its result type states (`varying`). Under `shard_map`, a quotient of a replicated value by
     each device's own was refused as it lowered (the merge P0's base review 8, F1: "div requires varying
-    manual axes to match"); outside one, every operand varies along none, and nothing changes."""
+    manual axes to match"); outside one, every operand varies along none, and nothing changes. The union is
+    `dew.nn.sharding`'s, as every value's that varies alike (`varied_alike`, row 10571)."""
     def computed(*operands, **params):
-        axes = frozenset().union(*(jax.typeof(operand).mat.varying for operand in operands))
-        operands = [operand if jax.typeof(operand).mat.varying == axes else jax.lax.pcast(
-            operand, tuple(sorted(axes - jax.typeof(operand).mat.varying)), to="varying")
-            for operand in operands]
-        return value(*operands, **params)
+        return value(*varied_alike(operands), **params)
     return computed
 
 
@@ -416,8 +414,7 @@ def varying(typed, *read):
     varying axis, and a scan carrying it was refused). A result typed by an operand of no mesh (a constant its
     program closes over) takes the mesh its varying operands lie on, as JAX's own operations read their
     operands' one mesh."""
-    axes = frozenset().union(*(operand.mat.varying for operand in read))
-    if not axes:
+    if not (axes := sharding_varying(*read)):
         return typed
     if typed.sharding.mesh.empty:
         mesh = next(operand.sharding.mesh for operand in read if operand.mat.varying)
