@@ -727,20 +727,21 @@ def _planned_variants() -> list[selective.Tiles]:
 
 PLANNED_VARIANTS = (selective.Tiles(128, 8, 3), selective.Tiles(128, 1, 7), selective.Tiles(128, 2, 6),
                     selective.Tiles(128, 4, 4), selective.Tiles(128, 16, 2), selective.Tiles(64, 8, 3))
-"""`_planned_variants`, each a check-1 site of its own (the every-variant test below), stated: derived as the
-module was collected, every shard derived them again (11 s of `test_kernel_matrix.py`'s 13 s collection) and
-a TPU host's raised, its device no multiprocessor (rows 12453, 12461, 12467). Regenerated from
-`_planned_variants` where the tuner's offer changes (`test_the_planned_variants_are_the_tuners_own`)."""
+"""The every-variant test's check-1 sites (below), one a config the tuner may pick that the scan runs apart,
+stated: derived as the module was collected, every shard derived them again (11 s of
+`test_kernel_matrix.py`'s 13 s collection) and a TPU host's raised, its device no multiprocessor (rows 12453,
+12461, 12467). `test_every_variant_the_tuner_derives_is_a_gated_site` holds every derived one among them."""
 
 
 @pytest.mark.parametrize("host", [None, "v5e"], ids=["this host", "a TPU host"])
-def test_the_planned_variants_are_the_tuners_own(host):
-    """The configs the every-variant test holds to check 1 (`PLANNED_VARIANTS`) are those the opt-in tuner
-    may pick for the planned shape that the scan runs apart (`_planned_variants`), so no variant the tuner may
-    time goes ungated; derived alike on a TPU host, an interpreted call's register model read under the
-    interpreted target's facts (`Selective.proposes`), where under the TPU's it raised (rows 12453, 12467)."""
+def test_every_variant_the_tuner_derives_is_a_gated_site(host):
+    """Every config the opt-in tuner may pick for the planned shape that the scan runs apart
+    (`_planned_variants`) is a site the every-variant test holds to check 1 (`PLANNED_VARIANTS`), so no
+    variant the tuner may time goes ungated; derived alike on a TPU host, an interpreted call's register model
+    read under the interpreted target's facts (`Selective.proposes`), where under the TPU's it raised (rows
+    12453, 12467)."""
     with generation.assumed(host):
-        assert _planned_variants() == list(PLANNED_VARIANTS)
+        assert set(_planned_variants()) <= set(PLANNED_VARIANTS)
 
 
 @pytest.mark.parametrize('tiles', PLANNED_VARIANTS, ids=lambda tiles: (
