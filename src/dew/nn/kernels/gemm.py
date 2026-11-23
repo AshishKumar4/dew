@@ -808,7 +808,7 @@ FP8_WEIGHT: selection.Op[Fp8WeightCase] = selection.Op(generation.Choice.GROUPED
     selection.Kernel('xla', (), generic=True),
 ))
 
-def _packed_weight_rules(launch: grouped_matmul.MosaicFp8PackedGmm, make_bank,
+def _packed_weight_rules(launch: grouped_matmul.MosaicWordPackedGmm, make_bank,
                          interpret: bool, *, dense: bool):
     """Build `(forward, backward, portable)` rules for an inline-decoding packed weight product
     (`fp8_weight_product`, `ternary_weight_product`); callers wrap `linear_tangent` with `contracted(...)`."""
