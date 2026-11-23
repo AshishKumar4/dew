@@ -850,8 +850,8 @@
 "tests/test_attention_triton.py::test_a_forward_at_its_own_config_compiles_within_an_a100s_block[SPLIT]",
 "tests/test_attention_triton.py::test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler[sm80]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-128x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-forward-64x128]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-fp16-step-32x32]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-fp32-step-128x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-temperature-forward-32x32]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-tile-step-64x64]",
@@ -1341,6 +1341,9 @@
 "tests/test_decision_objective.py::test_a_saved_vision_run_answers_image_rows[shared-source]",
 "tests/test_decision_objective.py::test_a_step_reads_its_windows_at_the_documents_its_read_declares",
 "tests/test_decision_objective.py::test_the_abstract_state_draws_a_missing_head_at_the_shapes_init_draws[False]"
+],
+"tests/test_decision_option_slots.py": [
+"tests/test_decision_option_slots.py::test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid"
 ],
 "tests/test_decision_packing.py": [
 "tests/test_decision_packing.py::test_a_decision_run_steps_one_program_over_rows_of_every_length",
@@ -1902,7 +1905,10 @@
 "tests/test_gemm_formed.py::test_a_composed_mlps_training_step_compiles_within_its_resources[sm90]"
 ],
 "tests/test_gemm_gather.py": [
-"tests/test_gemm_gather.py::test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_says[sm90-2]"
+"tests/test_gemm_gather.py::test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_says[sm90-2]",
+"tests/test_gemm_gather.py::test_a_kernel_gradient_no_launch_reads_through_its_tables_runs_a_launch_on_its_gathered_rows",
+"tests/test_gemm_gather.py::test_gathered_prologued_paired_stacked_layer_runs_fused_and_compiles[sm100]",
+"tests/test_gemm_gather.py::test_gathered_prologued_paired_stacked_layer_runs_fused_and_compiles[sm90]"
 ],
 "tests/test_gemm_nvfp4.py": [
 "tests/test_gemm_nvfp4.py::test_a_stack_of_nvfp4_banks_is_read_at_its_layer_as_that_layers_bank[xla-rows]"
