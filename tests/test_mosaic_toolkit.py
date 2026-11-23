@@ -1313,12 +1313,13 @@ def _on_the_host():
 
 @contextlib.contextmanager
 def _on_a_v5e():
-    """A TPU v5e's abstract mesh, its modules lowered from the host's CPU: a TPU module's lowering reads its
-    default device's backend, which a tier's prepare's compile-only GPU is none of."""
+    """A TPU v5e's abstract mesh and target, its modules lowered from the host's CPU: a TPU module's lowering
+    reads its default device's backend, which a tier's prepare's compile-only GPU is none of, and its
+    target, which that prepare assumes its node's GPU for."""
     from jax.sharding import AbstractDevice, AbstractMesh
 
     device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
-    with _on_the_host(), jax.sharding.use_abstract_mesh(
+    with _on_the_host(), generation.assumed("v5e"), jax.sharding.use_abstract_mesh(
             AbstractMesh((1,), ("data",), abstract_device=device)):
         yield
 
