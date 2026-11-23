@@ -1332,13 +1332,10 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     but for a form the rule's kernels do not run, which the portable math takes; `readout` whether the
     call's readout reads the state after its token's update alone (`PortCase.readout`) or after it less its
     own write (`apart`, which its call to the template carries), `turns` the key pairs its state turns
-    (`PortCase.turns`, `recurrence.Hooks.turns`; its template call bound as a turned call launches it,
-    `_turned_launch`)."""
+    (`PortCase.turns`, `recurrence.Hooks.turns`)."""
     dtype = jnp.dtype(jnp.result_type(query, key, value))
     rounded = chunk_rounding(delta, dtype) if rounded is None else rounded
     call, shards = None, (None, key, value)
-    if turns:
-        query, key, forked = _turned_launch(query, key, value, forked, turns)
     if not transition:
         # A transition of its own binds no template call: no kernel but the portable math forms it.
         call, shards = template_bind(
@@ -1679,7 +1676,10 @@ def _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, *, s
         raise ValueError("a turned call's documents add no second slot (`Chunk.adds`, row 8284): its turns' "
                          "gradient composes each document's frames from the one slot it loads "
                          "(`turned._forked_frames`)")
-    query, key, entry = _value_headed(query, key, entry, value.shape[2])
+    heads = value.shape[2]
+    query, key = (jnp.repeat(t, heads // t.shape[2], axis=2) for t in (query, key))
+    if entry is not None:
+        entry = (jnp.repeat(entry[0], heads // entry[0].shape[3], axis=3), *entry[1:])
     documents = None if forked is None else (forked.firsts, forked.loads, forked.stores)
     held = 0 if forked is None else forked.held
     # The call's arrays its launch reads, the entry write and rotation its own operands (`turned.call`'s).
@@ -1687,28 +1687,6 @@ def _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, *, s
     context = (starts, firsts, unrotated)
     return turned.call(launch, query, key, value, g, beta, state, skip, turn, starts, scale=scale,
                        group=group, documents=documents, held=held, entry=entry, context=context)
-
-
-def _value_headed(query, key, entry, heads: int) -> tuple:
-    """A turned call's queries and keys repeated to its `heads` value heads, a forked one's entry write's keys
-    so (`Forked.entry`): each value head's frames its own turns' (`_turned_or_plain`)."""
-    query, key = (jnp.repeat(t, heads // t.shape[2], axis=2) for t in (query, key))
-    if entry is not None:
-        entry = (jnp.repeat(entry[0], heads // entry[0].shape[3], axis=3), *entry[1:])
-    return query, key, entry
-
-
-def _turned_launch(query, key, value, forked: Forked | None, turns: int) -> tuple:
-    """`(query, key, forked)` as a turned call of `turns` key pairs launches them (`_turned_or_plain`), so the
-    call its selection binds is the one that runs (row 7976): its queries and keys a value head's each, and
-    a forked one's entry keys so and its documents' load rotation `(cos, sin)` `[B, D, Hv, A]`
-    (`Forked.turning`, `turned._in_last_frame`'s), which the walk reads beside its table."""
-    heads = value.shape[2]
-    query, key, entry = _value_headed(query, key, None if forked is None else forked.entry, heads)
-    if forked is not None:
-        rotation = jnp.zeros((*forked.firsts.shape, heads, turns), jnp.float32)
-        forked = dataclasses.replace(forked, entry=entry, turning=(rotation, rotation))
-    return query, key, forked
 
 
 def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, forked: Forked | None,
