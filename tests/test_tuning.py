@@ -454,12 +454,9 @@ def a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
 
 def a_pulled_launch_is_timed_with_its_backward():
     """The selective scan's launch measured on this GPU (`tuning._measured`) as a gradient calls it (its op
-    pulled, `KernelOp.moded`) and as a forward alone: its backward's tokens a thread change its backward
-    alone, so one token against the derived count sets the pulled times further apart than the forward's,
-    the one token slower pulled, the pulled pick never it (row 12340: the tuner timed the forward alone,
-    every backward variant a tie)."""
-    import numpy as np
-
+    pulled, `KernelOp.moded`) and as a forward alone: every config's timed kernels hold its backward's
+    (`selective_scan_backward`) pulled and none forward, so a pulled pick weighs the backward its tokens a
+    thread and residency set (row 12340: the tuner timed the forward alone)."""
     from dew.nn.kernels.templates import report
     from dew.nn.kernels.templates.recurrence import selective
 
@@ -471,19 +468,11 @@ def a_pulled_launch_is_timed_with_its_backward():
     with report.pulled():
         pulled = selective.SELECTIVE.moded()
     assert pulled.pulled
-    found = {}
-    for name, op in (("forward", selective.SELECTIVE), ("pulled", pulled)):
-        ba = op.keyed(op.bind(*specs))
-        derived = ba.heuristics_config
-        one = next(tiles for tiles in ba.autotuning_configs
-                   if tiles.positions == 1 and tiles.chunk == derived.chunk)
-        timings = tuning._measured(op, ba)
-        found[name] = {tiles: float(np.median(timings[tiles].evaluation_times_ms))
-                       for tiles in (derived, one)}
-        found[name]["fastest"] = timings.prune().fastest_config
-    forward, backward = (list(found[name].values())[:2] for name in ("forward", "pulled"))
-    assert backward[1] / backward[0] > forward[1] / forward[0], found
-    assert backward[1] > backward[0] and found["pulled"]["fastest"].positions != 1, found
+    for op, backward in ((selective.SELECTIVE, False), (pulled, True)):
+        timings = tuning._measured(op, op.keyed(op.bind(*specs)))
+        ran = {config: any("selective_scan_backward" in name for name in timed.metadata["kernels"])
+               for config, timed in timings.items() if not isinstance(timed, Exception)}
+        assert ran and set(ran.values()) == {backward}, (op.pulled, ran)
 
 
 TWO_CPU_MEASURE = """

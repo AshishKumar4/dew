@@ -302,7 +302,7 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
     token = _TRACING.set(_Pending(lambda: _identity(op, arguments, generation.gpu_target()),
                                   type(op).__name__, config,
                                   lambda: op.padded(arguments, config), op.emitted,
-                                  reverse=_PULLED.get() and op.CARRIES_DERIVATIVE,
+                                  reverse=_reversed(op),
                                   provenance=lambda: op_provenance(op, arguments.arguments)))
     try:
         yield
@@ -601,6 +601,14 @@ def pulling() -> bool:
     return _PULLED.get()
 
 
+def _reversed(op) -> bool:
+    """Whether `op`'s launch runs, and is certified and named, as reverse mode runs it: traced in a
+    gradient's product (`pulled`) or a pulled op (`tuning.KernelOp.pulled`, its tuner's candidates certified
+    outside a gradient's trace, `tuning._candidates`, where a spilling backward passed), of an op whose call
+    carries its derivative."""
+    return (_PULLED.get() or getattr(op, "pulled", False)) and op.CARRIES_DERIVATIVE
+
+
 @contextlib.contextmanager
 def pulled() -> Iterator[None]:
     """Within the block, a gradient's product is traced: a launch whose call carries its own derivative
@@ -893,7 +901,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
         return ()
     from dew.nn.kernels import tuning
 
-    reverse = _PULLED.get() and op.CARRIES_DERIVATIVE
+    reverse = _reversed(op)
     key = (_identity(op, arguments, generation.gpu_target()), config, device.id, device.device_kind, reverse)
     with _GUARD:
         held = _CERTIFIED.get(key)

@@ -600,10 +600,12 @@ class KernelOp(tokamax.Op):
     template's fast backward): a gradient's product certifies it as reverse mode runs it (`report.pulled`).
     Every other op's derivative is its caller's custom VJP, of launches of their own."""
     revision: int = 1
-    pulled: bool = False
+    pulled: bool = dataclasses.field(default=False, repr=False)
     """Whether the call is a gradient's product of an op that carries its derivative (`moded`): part of its
-    picks' identity, so a pick timed by the forward alone never answers a gradient's call, nor the reverse,
-    and the tuner times it as reverse mode runs it (`_measured`, `report.reversed_run`)."""
+    picks' identity (a field their JSON stores, `_launch_json`), so a pick timed by the forward alone never
+    answers a gradient's call, nor the reverse, and the tuner times and certifies it as reverse mode runs it
+    (`_measured`, `report.certified`). Out of its repr, which a launch's identity reads (`report._identity`):
+    every stored verdict of an op that never pulls keeps its key."""
 
     def moded(self) -> KernelOp:
         """This op as the call traced here runs it: pulled where a gradient's product is traced
@@ -1210,15 +1212,14 @@ def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:
     """`op` as its picks name it: without the config and the vjp a call sets, its hook
     fields by what they compute (`KernelOp.traced`, a tuning run's alone: `reading`, `seen`, `tune`, whose
     picks persist under it across checkouts), or, not `traced`, as every launch's identity reads them
-    (`KernelOp.identified`, `report._identity`), tracing nothing, and unpulled: a launch's certification
-    keys its reverse mode itself (`report.certified`), so a gradient's call and its pulled op's certify,
-    and name their kernels, as one launch."""
+    (`KernelOp.identified`, `report._identity`), tracing nothing; its `pulled` out of the repr that identity
+    reads, a launch's certification keying its reverse mode itself (`report.certified`)."""
     if not isinstance(op, KernelOp):
         return op.replace(config=None, vjp=None)
     fields = {field.name for field in dataclasses.fields(op)}
     read = op.traced if traced else op.identified
     hooks = {name: read(name, getattr(op, name)) for name in op.HOOKS if name in fields}
-    return op.replace(config=None, vjp=None, **hooks, **({} if traced else {"pulled": False}))
+    return op.replace(config=None, vjp=None, **hooks)
 
 
 def _kind(ba: tokamax.BoundArguments) -> str:
@@ -1353,8 +1354,11 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
 
 
 def _benchmarks(read: Mapping) -> dict[Hashable, tokamax.BenchmarkData]:
-    """The configs `_measured` timed, each run's time the sum of its own kernels' (`DeviceTime.behind`)."""
-    return {config: tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering, metadata={},
+    """The configs `_measured` timed, each run's time the sum of its own kernels' (`DeviceTime.behind`),
+    the kernels it ran named in its metadata (`kernels`: a pulled op's backward among them)."""
+    return {config: tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
+                                          metadata={"kernels": sorted({kernel.name for run in runs
+                                                                       for kernel in run})},
                                           evaluation_times_ms=tuple(sum(kernel.milliseconds for kernel in run)
                                                                     for run in runs))
             for config, (runs, lowering, compiling) in read.items()}
