@@ -1000,7 +1000,9 @@ def test_a_split_launchs_span_is_its_longest_slice(form, queries, keys, consumer
     split = _split_work(form, queries, keys, consumers, family, splits)
     unsplit = _split_work(form, queries, keys, consumers, family, 1)
     assert split.span == span
-    assert form != "causal" or split.integer_operations > 0
+    # Each side of a share counted at all: a launch whose work dropped a unit held 0 >= 0 (row 12012).
+    assert unsplit.flops > 0 and unsplit.exponentials > 0
+    assert form != "causal" or min(split.integer_operations, unsplit.integer_operations) > 0
     for unit in cost.ISSUED_UNITS:
         shares = getattr(split, unit) * steps[1], getattr(unsplit, unit) * steps[0]
         assert shares[0] == shares[1] if unit in ("flops", "exponentials") else shares[0] >= shares[1], unit
