@@ -183,6 +183,7 @@ value, the function its default lowering runs, and whether it returns several va
 so a lowering of a launch that runs the construct's functions (a kernel template's) holds each as it is
 made."""
 _TRITON_REGISTERED: set[core.Primitive] = set()
+_MOSAIC_GPU_REGISTERED: set[core.Primitive] = set()
 
 
 def triton_lowerings() -> None:
@@ -199,6 +200,26 @@ def triton_lowerings() -> None:
                                                                               multiple_results=several))
             _TRITON_REGISTERED.add(made)
 
+
+def mosaic_gpu_lowerings() -> None:
+    """Register Pallas Mosaic GPU warpgroup lowerings for every primitive in `MADE` not yet registered
+    (row 9795). Called lazily on Mosaic GPU launch (`dew.nn.kernels.launches.kernel`)."""
+    if len(_MOSAIC_GPU_REGISTERED) == len(MADE):
+        return
+    from jax._src.pallas.mosaic_gpu import lowering as mosaic_lowering
+    from jax.experimental.mosaic import gpu as mgpu
+
+    for made, (value, several) in MADE.items():
+        if made not in _MOSAIC_GPU_REGISTERED:
+            def _lower(ctx, *args, _value=value, _several=several, **params):
+                ir_args = tuple(mosaic_lowering._ensure_ir_value(v, a.dtype)
+                                for v, a in zip(args, ctx.avals_in, strict=True))
+                closed = jax.make_jaxpr(partial(_value, **params))(*ctx.avals_in)
+                out = mosaic_lowering.lower_jaxpr_to_mosaic_gpu(
+                    ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, ir_args, closed.consts)
+                return out if _several else out[0]
+            mosaic_lowering.register_lowering_rule(made, mgpu.LoweringSemantics.Warpgroup)(_lower)
+            _MOSAIC_GPU_REGISTERED.add(made)
 
 def _alike(value: Callable) -> Callable:
     """`value` (a primitive's computation, `primitive`'s) over its operands made to vary alike: each made to

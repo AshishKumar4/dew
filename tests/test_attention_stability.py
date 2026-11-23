@@ -1174,8 +1174,10 @@ def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edge
     # Each result check 1 draws (its second stage's too) held empty at the family's empty rows (row 9041).
     held = (None if family.empty is None
             else lambda outputs, inputs: _held_empty(family.empty, outputs, label))
-    assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth, held=held)
-    assert_merges_no_ties(differentiated, reference, truth, draw, label, seeds=seeds, rounded_fn=rounded)
+    evaluated = assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth,
+                                held=held, returns=True)
+    assert_merges_no_ties(differentiated, reference, truth, draw, label, seeds=seeds, rounded_fn=rounded,
+                          evaluated=evaluated)
 
 
 def default_is_finite(family_name: str, mainloop_name: str) -> None:

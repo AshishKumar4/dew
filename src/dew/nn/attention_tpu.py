@@ -2,6 +2,7 @@
 older pallas flash kernel behind it for the masks splash cannot carry (`tpu_attention`).
 """
 
+import functools
 import math
 
 import jax
@@ -11,6 +12,7 @@ from .attention_kernels import SPLASH_LANES
 from .attention_masks import repeat_kv_heads, structural_mask
 from .attention_parallel import four_dimensional, on_attention_shards, shard_heads
 from .documents import document_ids
+from .kernels.templates import attention as template
 from .precision import at_precision
 from .sharding import SCORES
 from .visibility import window_sides
@@ -23,7 +25,7 @@ SPLASH_DENSE_MASK_CELLS = 1 << 22
 
 
 def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
-                  softcap, sinks, segment_ids, interpret: bool):
+                  softcap, sinks, segment_ids, interpret: bool, spans: template.KeySpans | None = None):
     """Attend on pallas: splash where its descriptor covers the call, flash
     everywhere else.
 
@@ -52,7 +54,7 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
     descriptor = None
     if bias is None and not (q_len % SPLASH_LANES or kv_len % SPLASH_LANES):
         descriptor = splash_mask_descriptor(
-            q_len, kv_len, shard_heads(query), causal, sliding_window, mask)
+            q_len, kv_len, shard_heads(query), causal, sliding_window, mask, spans=spans)
     if descriptor is None and (softcap is not None or sinks is not None):
         raise ValueError(
             "attention implementation 'tpu' takes a softcap and sinks only on "
@@ -69,7 +71,13 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
 
     def attend(query, key, value, bias, sinks):
         # Splash holds the mask in its descriptor; flash takes it as an array.
-        held = None if descriptor is not None or mask is None else four_dimensional(mask)
+        if descriptor is not None:
+            held = None
+        else:
+            dense = mask if spans is None else (
+                template.dense(spans)[:, None] if mask is None
+                else jnp.logical_and(template.dense(spans)[:, None], mask))
+            held = None if dense is None else four_dimensional(dense)
         return on_attention_shards(local, query, key, value,
                           bias=(None if bias is None else four_dimensional(bias), SCORES),
                           mask=(held, SCORES), sinks=(sinks, ("activation_heads",)),
@@ -120,19 +128,24 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
 
 
 def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
-                           sliding_window: int | None, mask):
+                           sliding_window: int | None, mask, *, spans: template.KeySpans | None = None):
     """Build splash's mask for one call, or None when splash cannot describe it.
 
     CausalMask and LocalMask are comparisons the kernel evaluates per block, so
     emptied blocks leave the grid and nothing Q*K-sized is stored. Dew's window
     holds the causal flag's side already (`window_sides`), so it replaces the
-    flag. An explicit boolean mask
+    flag. When static single-row `spans` (`KeySpans`, row 956) are supplied,
+    their per-block `_SpanMask` replaces `NumpyMask`. An explicit boolean mask
     is ANDed in as dense blocks, so only a concrete, small one is taken.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 
     shape = (q_len, kv_len)
-    if sliding_window is not None:
+    if spans is not None:
+        structural = _span_structural(spans)
+        if structural is None:
+            return None
+    elif sliding_window is not None:
         structural = splash_attention_mask.LocalMask(shape, window_sides(causal, sliding_window), 0)
     elif causal:
         structural = splash_attention_mask.CausalMask(shape)
@@ -149,6 +162,89 @@ def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
     return splash_attention_mask.MultiHeadMask(
         [splash_attention_mask.LogicalAnd(structural, head) for head in dense])
 
+@functools.cache
+def _span_mask_cls():
+    """Lazy cached `splash_attention_mask.Mask` subclass evaluated block-by-block from compact `KeySpans`
+    intervals without materializing a dense `[Q, K]` `NumpyMask` (row 956)."""
+    import numpy as np
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+
+    class _SpanMask(splash_attention_mask.Mask):
+        def __init__(self, lo: np.ndarray, hi: np.ndarray, keys: int):
+            self._lo = np.array(lo, dtype=np.int32, copy=True)
+            self._hi = np.array(hi, dtype=np.int32, copy=True)
+            self._lo.setflags(write=False)
+            self._hi.setflags(write=False)
+            self._shape = (int(self._lo.shape[0]), keys)
+            self._key = (self._shape, self._lo.tobytes(), self._hi.tobytes())
+
+        @property
+        def shape(self) -> tuple[int, int]:
+            return self._shape
+
+        def __getitem__(self, slices) -> np.ndarray:
+            if len(slices) != 2:
+                raise NotImplementedError(f"Unsupported slice: {slices}")
+            q_slice, k_slice = slices
+            q_idx = (np.arange(*q_slice.indices(self._shape[0]))
+                     if isinstance(q_slice, slice) else np.asarray(q_slice))
+            k_idx = (np.arange(*k_slice.indices(self._shape[1]))
+                     if isinstance(k_slice, slice) else np.asarray(k_slice))
+            lo, hi = self._lo[q_idx], self._hi[q_idx]
+            q_ndim, k_ndim = q_idx.ndim, k_idx.ndim
+            k_axes = tuple(range(q_ndim, q_ndim + k_ndim))
+            lo_b = np.expand_dims(lo, axis=k_axes)
+            hi_b = np.expand_dims(hi, axis=k_axes)
+            if self._lo.ndim == 2:
+                k = np.expand_dims(k_idx, axis=(*range(q_ndim), -1))
+                return np.any((k >= lo_b) & (k < hi_b), axis=-1)
+            k = np.expand_dims(k_idx, axis=tuple(range(q_ndim)))
+            return (k >= lo_b) & (k < hi_b)
+
+        def __eq__(self, other) -> bool:
+            return isinstance(other, _SpanMask) and self._key == other._key
+
+        def __hash__(self) -> int:
+            return hash((type(self).__name__, self._key))
+
+    return _SpanMask
+
+
+def _span_structural(spans: template.KeySpans):
+    """Build one per-head Splash `Mask` directly from static single-row `KeySpans` without materializing a
+    dense `[Q, K]` `NumpyMask` (row 956), or None when `spans` are traced, multi-batch, or carry document
+    ids."""
+    import numpy as np
+    from jax.core import Tracer
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+
+    if (isinstance(spans.start, Tracer) or isinstance(spans.end, Tracer)
+            or spans.start.shape[0] != 1 or spans.query_ids is not None or spans.key_ids is not None):
+        return None
+    start = np.asarray(spans.start, np.int32)
+    end = np.asarray(spans.end, np.int32)
+    if spans.per_span > 1:
+        start = np.repeat(start, spans.per_span, axis=1)
+        end = np.repeat(end, spans.per_span, axis=1)
+    q_len, kv_len = int(start.shape[1]), int(spans.keys)
+    shape = (q_len, kv_len)
+    if spans.form == "full":
+        return splash_attention_mask.FullMask(shape)
+    if spans.form == "causal" and q_len == kv_len:
+        return splash_attention_mask.CausalMask(shape)
+    return _span_mask_cls()(start[0], end[0], kv_len)
+
+def splash_span_mask(spans: template.KeySpans, heads: int):
+    """Build a Splash `MultiHeadMask` directly from static single-row `KeySpans` without materializing a
+    dense `[Q, K]` `NumpyMask` (row 956): `FullMask`/`CausalMask` for those forms, else `_SpanMask` over
+    `spans`'s compact `(start, end)` intervals (single interval or multi-run). Returns None when `spans`
+    are traced, multi-batch, or carry document ids (which Splash reads separately via `SegmentIds`)."""
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+
+    structural = _span_structural(spans)
+    if structural is None:
+        return None
+    return splash_attention_mask.MultiHeadMask([structural] * heads)
 
 def splash_dense_mask(mask, q_len: int, kv_len: int, heads: int):
     """Return an explicit mask as one host [Q, K] boolean array per query head.

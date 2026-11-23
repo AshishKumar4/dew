@@ -829,3 +829,36 @@ def test_tpu_scopes_read_trailing_run_axis_and_hooks_key_step_live_tiles_by_tile
     small_tiles = step_live_tiles(64, 64, spec=causal_spec, score_mod=shape_branching_hook)
     large_tiles = step_live_tiles(128, 64, spec=causal_spec, score_mod=shape_branching_hook)
     assert len(large_tiles) > len(small_tiles), (small_tiles, large_tiles)
+
+
+def test_staged_logits_is_skipped_when_unstaged_already_fits_shared_memory_at_same_residency():
+    """Row 11975: `MosaicBackward._staged_helps` admits `staged_logits=True` only when the un-staged config
+    exceeds shared memory or has lower residency, so refusing an un-staged config for register spills skips
+    doomed `staged_logits=True` certifications and steps straight to the next column split."""
+    from dew.nn.kernels.templates import attention_mosaic, report
+
+    spans = template.spans(1024, 1024, 1, causal=False)
+    q = jax.ShapeDtypeStruct((1, 1024, 8, 256), jnp.float16)
+    k = jax.ShapeDtypeStruct((1, 1024, 2, 256), jnp.float16)
+    bias = jax.ShapeDtypeStruct((1, 8, 1024), jnp.float16)
+    hooks = template.Hooks(
+        score_mod=lambda s, _q, _k, a, b: s + a.astype(s.dtype) + 2.0 * b.astype(s.dtype),
+        score_params=(template.Param(bias, template.Kind.KEY), template.Param(bias, template.Kind.KEY)))
+    zero_row = jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32)
+    zero_idx = jax.ShapeDtypeStruct((1, 8, 1024), jnp.int32)
+    split = template.Split(jax.ShapeDtypeStruct((1, 8, 1024, 256), jnp.float32),
+                           zero_row, zero_row, zero_row)
+    with generation.assumed("sm80"):
+        op, args = attention_mosaic._backward_call(
+            q, k, k, spans, hooks, q, residuals=(zero_row, zero_row, zero_idx, split),
+            scale=None, natural=attention_mosaic.NATURAL, accurate=False)
+        ba = op.bind(*args, interpret=False)
+        target = generation.gpu_target()
+        first = op.derived(ba, target)
+        assert first is not None and not first.staged_logits, first
+        with report.refusals():
+            for narrow in (False, True):
+                report.refuse_launch(op, ba, dataclasses.replace(first, narrow=narrow),
+                                     frozenset({"attention_dkv"}))
+            stepped = op.derived(ba, target)
+        assert stepped is not None and not stepped.staged_logits and stepped.columns > first.columns, stepped

@@ -5,7 +5,7 @@ pairs it holds, and which the reference keeps apart."""
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import as_given, assert_merges_no_ties
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_merges_no_ties
 
 U = 2.0 ** -23
 """float32's ulp at one."""
@@ -52,3 +52,76 @@ def test_a_pair_a_correctly_rounded_computation_merges_is_kept_apart_by_none():
     _held([[1.0, 1.0]], [[1.0 + 0.3 * U, 1.0 + 3.7 * U]], [[1.0, 1.0 + 4 * U]], [[1.0, 1.0]])
     with pytest.raises(AssertionError):
         _held([[1.0, 1.0]], [[1.0 + 0.3 * U, 1.0 + 3.7 * U]], [[1.0, 1.0 + 4 * U]], [[1.0, 1.0 + 4 * U]])
+
+
+def test_rounded_fn_is_lazy_and_evaluated_draws_are_reused_without_recomputation():
+    """`assert_merges_no_ties` skips compiling/running `rounded_fn` on seeds with no candidate group, runs it
+    when a candidate exists (including 3-way ties where `rounded_fn` yields a non-finite entry), and reuses
+    per-seed leaves returned explicitly by `assert_as_exact(..., returns=True)` (rows 10686, 11693)."""
+    calls = {"rounded": 0}
+
+    def counted_rounded(x):
+        calls["rounded"] += 1
+        return jnp.asarray([[1.0, 1.0]], jnp.float64) + 0.0 * x
+
+    def draw(seed):
+        return (np.array([float(seed)], np.float32),)
+
+    # No candidate tie (reference spread <= plain bound): rounded_fn is never traced or called.
+    assert_merges_no_ties(
+        as_given(lambda _: np.asarray([[1.0, 1.0]], np.float32)),
+        as_given(lambda _: np.asarray([[1.0 - 0.3 * U, 1.0 + 1.8 * U]], np.float64)),
+        lambda _: jnp.asarray([[1.0, 1.0 + 1.5 * U]], jnp.float64),
+        draw, "lazy skip", seeds=2, rounded_fn=counted_rounded,
+    )
+    assert calls["rounded"] == 0
+
+    # Candidate tie present: rounded_fn runs lazily and clears the tie.
+    assert_merges_no_ties(
+        as_given(lambda _: np.asarray([[1.0, 1.0]], np.float32)),
+        as_given(lambda _: np.asarray([[1.0 + 0.3 * U, 1.0 + 3.7 * U]], np.float64)),
+        lambda _: jnp.asarray([[1.0, 1.0 + 4 * U]], jnp.float64),
+        draw, "lazy run", seeds=1, rounded_fn=counted_rounded,
+    )
+    assert calls["rounded"] == 1
+
+    # 3-way tie where one outlier makes max_err large, but rounded_fn drops that outlier as NaN:
+    # the remaining pair merges a true tie and must still be caught.
+    with pytest.raises(AssertionError):
+        _held([[1.0, 1.0, 1.0]],
+              [[1.0 + 0.1 * U, 1.0 + 4.1 * U, 1.0 + 100.0 * U]],
+              [[1.0, 1.0 + 4.0 * U, 1.0 + 4.0 * U]],
+              [[1.0, 1.0 + 4.0 * U, np.nan]])
+
+    # Explicit returns=True handoff: assert_merges_no_ties reuses leaves without calling arms/truth again.
+    def draw_vec(seed):
+        rng = np.random.default_rng(1000 + seed)
+        return (rng.standard_normal((2, 8)).astype(np.float32),)
+
+    def arm(x):
+        return x + jnp.float32(1.0)
+
+    evaluated = assert_as_exact(arm, as_given(arm), draw_vec, "explicit handoff", seeds=FEWEST_SEEDS,
+                                returns=True)
+    assert evaluated is not None and len(evaluated) == FEWEST_SEEDS
+    recalled = {"dew": 0, "ref": 0, "truth": 0, "rounded": 0}
+
+    def fail_arm(kind):
+        def fn(*args):
+            recalled[kind] += 1
+            raise AssertionError(f"{kind} should not be recomputed")
+        return fn
+
+    assert_merges_no_ties(
+        fail_arm("dew"), fail_arm("ref"), fail_arm("truth"), draw_vec, "explicit handoff",
+        seeds=FEWEST_SEEDS, rounded_fn=fail_arm("rounded"), evaluated=evaluated,
+    )
+    assert recalled == {"dew": 0, "ref": 0, "truth": 0, "rounded": 0}
+    class _RecordedArm:
+        recorded = True
+
+        def __call__(self, *args):
+            return arm(*args)
+
+    with pytest.raises(ValueError):
+        assert_as_exact(arm, _RecordedArm(), draw_vec, "recorded handoff", seeds=FEWEST_SEEDS, returns=True)

@@ -288,17 +288,16 @@ def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("cases", ["widths", "shapes"])
-@pytest.mark.parametrize("name", ["sm90", "sm100"])
+@pytest.mark.parametrize("cases", ["widths-narrow", "widths-wide", "shapes-finished", "shapes-long"])
+@pytest.mark.parametrize("name", ["sm80", "sm90", "sm100"])
 def test_a_padded_merge_compiles_as_one_launch(name, cases):
-    """The padded merge's one launch (`merged._kernel`, a GPU's lowering) compiles for a compile-only H100
-    and B200 in one process per GPU across: value widths 80, 96, 100, 128 and 192 (a row's channels one block
-    of the least power of two past the width, its loads and stores past the columns masked); a `jax.vmap`
-    batch of three splits (the batch folded into its rows, beside nothing but the one transpose that folds it,
-    every launch typed by `assembled.launched_thunks`); and long splits of 64 and 256 slices (row 8439: its
-    program a chunk of the law's at a time, `merged._chunks`). The widths and the other shapes compile apart,
-    each a group's work within its target (134 s whole in train 1156's CI)."""
+    """The padded merge's one Mosaic GPU launch (`merged._launch_mosaic`, row 9795) compiles spill-free for
+    compile-only Ampere, Hopper and Blackwell GPUs in one process per GPU across: value widths 80, 96, 100,
+    128 and 192 (predicated coalesced GMEM loads/stores); a `jax.vmap` batch of three splits (beside nothing
+    but the one transpose that folds it, every launch typed by `assembled.launched_thunks`); `merged_finished`
+    with and without `Initial`; and long splits of 64 and 256 slices (row 8439)."""
     from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     def one_case(label: str, *, slices: int, width: int) -> KernelCase:
         padded = jax.ShapeDtypeStruct((2, slices, 16, 8, width), jnp.float32)
@@ -318,26 +317,125 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
     init_t = jax.ShapeDtypeStruct((1, 8, 4), jnp.float32)
     init_acc = jax.ShapeDtypeStruct((1, 8, 4, 128), jnp.float32)
 
-    def finished_init(p, s, im, it, ia):
-        return merged.merged_finished(
-            SPECS["natural"], p, s, queries=4, width=128, out_dtype=jnp.bfloat16, out_heads=32,
-            initial=template.Initial(im, it, ia))
+    def finished_with_initial(queries: int, width: int, out_dtype, out_heads: int):
+        def _run(p, s, im, it, ia):
+            return merged.merged_finished(
+                SPECS["natural"], p, s, queries=queries, width=width, out_dtype=out_dtype,
+                out_heads=out_heads, initial=template.Initial(im, it, ia))
+        return _run
 
-    named = {"widths": [one_case(f"width-{width}", slices=16, width=width)
-                        for width in (80, 96, 100, 128, 192)],
-             "shapes": [KernelCase("batched", lambda: (batched, (batched_padded, batched_stacked))),
-                        KernelCase("finished", lambda: (finished, (finished_padded, finished_stacked))),
-                        KernelCase("finished-initial",
-                                   lambda: (finished_init, (finished_padded, finished_stacked,
-                                                            init_m, init_t, init_acc))),
-                        *(one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256))]}
+    # Row 11857 shape: 2 slices + Initial, width 16 (single chunk, sub-warp channel block).
+    small_p = jax.ShapeDtypeStruct((1, 2, 4, 1, 16), jnp.float32)
+    small_s = jax.ShapeDtypeStruct((2, 1, 1, 2, 4), jnp.float32)
+    small_m = jax.ShapeDtypeStruct((1, 1, 2), jnp.float32)
+    small_a = jax.ShapeDtypeStruct((1, 1, 2, 16), jnp.float32)
+
+    named = {
+        "widths-narrow": [one_case(f"width-{width}", slices=16, width=width) for width in (80, 96, 100)],
+        "widths-wide": [one_case(f"width-{width}", slices=16, width=width) for width in (128, 192)],
+        "shapes-finished": [
+            KernelCase("batched", lambda: (batched, (batched_padded, batched_stacked))),
+            KernelCase("finished", lambda: (finished, (finished_padded, finished_stacked))),
+            KernelCase("finished-initial",
+                       lambda: (finished_with_initial(4, 128, jnp.bfloat16, 32),
+                                (finished_padded, finished_stacked, init_m, init_t, init_acc))),
+        ],
+        "shapes-long": [
+            KernelCase("small-finished-initial",
+                       lambda: (finished_with_initial(2, 16, jnp.float32, 2),
+                                (small_p, small_s, small_m, small_m, small_a))),
+            *(one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256)),
+        ],
+    }
     with generation.assumed(name):
-        records = compile_kernels(named[cases], name)
+        records = compile_mosaic_kernels(named[cases], name)
+    assert not mosaic_failures(records), "\n".join(mosaic_failures(records))
     for record in records:
         assert "error" not in record, record
-        expected = (["merged_padded", "wrapped_transpose"] if record["name"] == "batched"
-                    else ["merged_padded"])
+        expected = (["thunk", "wrapped_transpose"] if record["name"] == "batched" else ["thunk"])
         assert sorted(record["thunks"]) == expected, record
+        kernels = record["kernels"]
+        assert len(kernels) == 1 and kernels[0]["kernel"] == "merged_padded", record
+        assert kernels[0]["spilled"] == 0 and kernels[0]["shared"] == 0, record
+
+@COMPILES_ON_CPU
+def test_padded_merge_routes_nvidia_mosaic_and_keeps_triton_fallback():
+    """Row 9795: `_uses_mosaic` selects Mosaic GPU on NVIDIA sm80+ families and keeps the Pallas Triton
+    `_launch` fallback on pre-Ampere/non-NVIDIA GPUs."""
+    from fla_gdn_support import KernelCase
+
+    for gen in ("sm80", "sm90", "sm100", "sm120"):
+        assert merged._uses_mosaic(generation.gpu_target(gen)), gen
+    assert not merged._uses_mosaic(generation.gpu_target("sm75"))
+    padded = jax.ShapeDtypeStruct((2, 16, 16, 8, 128), jnp.float32)
+    stacked = jax.ShapeDtypeStruct((2, 2, 8, 16, 16), jnp.float32)
+    triton_fn = functools.partial(
+        merged._launch, units=algebra.units_of(SPECS["natural"]), queries=4, width=128, block=128)
+    from jax._src.pallas.mosaic_gpu import core as plgpu_core, lowering as mosaic_lowering
+    from jax.extend import core as jcore
+
+    from dew.nn.kernels import launches
+
+    launches._register_mosaic_gpu_lowerings()
+    assert jcore.primitives.platform_index_p not in mosaic_lowering.mosaic_lowering_rules[
+        plgpu_core.WGxWG_SEMANTICS]
+    with generation.assumed("sm90"):
+        records = compile_kernels([KernelCase("triton-fallback", lambda: (triton_fn, (padded, stacked)))],
+                                  "sm90")
+    assert len(records) == 1 and "error" not in records[0] and sorted(records[0]["thunks"]) == [
+        "merged_padded"], records
+
+
+def test_replicated_channel_merge_matches_value_with_subnormal_initial_mass():
+    """Rows 9795, 11857: replicating row stats across `[chunk, block]` (the layout `_launch_mosaic` uses
+    for zero-SMEM Mosaic GPU lowering) matches `merged._value` bit-for-bit on regular and subnormal
+    (`2^-127`) initial-mass merges."""
+    from dew.algebra import windows
+
+    units = algebra.units_of(SPECS["natural"])
+    rng = np.random.default_rng(7)
+    slices, block, width = 6, 16, 12
+    chunk = windows.chunk_width(slices + 1)
+    chunks = -(-(slices + 1) // chunk)
+    padded = rng.standard_normal((1, slices, 1, 1, width)).astype(np.float32)
+    stacked = np.stack([rng.uniform(-4.0, 4.0, (1, 1, slices, 1)).astype(np.float32),
+                        rng.uniform(0.1, 2.0, (1, 1, slices, 1)).astype(np.float32)])
+    for label, subnormal in (("regular", False), ("subnormal-initial", True)):
+        p = np.zeros_like(padded) if subnormal else padded
+        s = np.stack([np.full((1, 1, slices, 1), -1e30, np.float32),
+                      np.zeros((1, 1, slices, 1), np.float32)]) if subnormal else stacked
+        init_m = np.full((1, 1, 1), 0.0, np.float32)
+        init_t = np.full((1, 1, 1), np.float32(2.0 ** -127 if subnormal else 0.75), np.float32)
+        init_acc = np.full((1, 1, 1, width), np.float32(2.0 ** -127 if subnormal else 1.25), np.float32)
+        ref_acc, ref_m, ref_t = merged._value(
+            jnp.asarray(p), jnp.asarray(s), jnp.asarray(init_m), jnp.asarray(init_t),
+            jnp.asarray(init_acc), units=units, queries=1, width=width)
+        raw_acc = jnp.pad(jnp.asarray(init_acc[0, 0, 0]), (0, block - width))
+        raw_m = jnp.broadcast_to(jnp.asarray(init_m[0, 0, 0]), (block,))
+        raw_t = jnp.broadcast_to(jnp.asarray(init_t[0, 0, 0]), (block,))
+        init_st = algebra.initial_state(units, algebra.Partial(raw_acc, raw_m, raw_t))
+        pad_row = jnp.pad(jnp.asarray(p[0, :, 0, 0, :]), ((0, chunks * chunk - slices), (0, block - width)))
+        m_row = jnp.pad(jnp.asarray(s[0, 0, 0, :, 0]), (0, chunks * chunk - slices))
+        t_row = jnp.pad(jnp.asarray(s[1, 0, 0, :, 0]), (0, chunks * chunk - slices))
+
+        def load(c, pad_row=pad_row, m_row=m_row, t_row=t_row, init_st=init_st):
+            start = jnp.int32(c) * chunk
+            idx = start + jax.lax.broadcasted_iota(jnp.int32, (chunk, block), 0)
+            o = jax.lax.dynamic_slice_in_dim(pad_row, start, chunk, 0)
+            mx = jnp.broadcast_to(jax.lax.dynamic_slice_in_dim(m_row, start, chunk, 0)[:, None],
+                                  (chunk, block))
+            tot = jnp.broadcast_to(jax.lax.dynamic_slice_in_dim(t_row, start, chunk, 0)[:, None],
+                                   (chunk, block))
+            is_init = idx == slices
+            return (jnp.where(is_init, init_st.acc, o), jnp.where(is_init, init_st.m, mx),
+                    jnp.where(is_init, init_st.total, tot), idx < slices + 1)
+
+        got = algebra.finished_merged_chunked(units, load, chunks)
+        np.testing.assert_array_equal(np.asarray(got.acc[:width]), np.asarray(ref_acc[0, 0, 0]), label)
+        np.testing.assert_array_equal(np.asarray(got.m[0]), np.asarray(ref_m[0, 0, 0]), label)
+        np.testing.assert_array_equal(np.asarray(got.total[0]), np.asarray(ref_t[0, 0, 0]), label)
+        if subnormal:
+            np.testing.assert_array_equal(np.asarray(got.acc[:width]), np.ones(width, np.float32))
 
 def _jaxpr_has_load(jaxpr) -> bool:
     """Whether `jaxpr` or any nested scan/while/cond executes a Pallas `get` load."""
@@ -493,13 +591,18 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
         assert work.kernels == 1.0
         assert work.span == float(3 * chunks)
         assert work.device_bytes == _traced_merge_bytes(spec, padded, stacked, queries, width, block)
+    # Padded input (`read_width=128 > width=80`): Mosaic predicates loads at `width`, while Triton reads
+    # `read_width` physical columns (row 9795).
+    pad_p = jax.ShapeDtypeStruct((2, 8, 16, 8, 128), jnp.float32)
+    pad_s = jax.ShapeDtypeStruct((2, 2, 8, 8, 16), jnp.float32)
+    mosaic_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, generation.gpu_target("sm90"))
+    triton_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, generation.gpu_target("sm75"))
+    assert mosaic_work.device_bytes < triton_work.device_bytes, (mosaic_work, triton_work)
     # The 1-row 128-wide case splits across multiple channel blocks on an H100 (row 8439), exercising the
     # single-stat-store-per-row accounting directly.
     small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
     small_s = jax.ShapeDtypeStruct((2, 1, 1, 8, 8), jnp.float32)
     assert merged._channel_block(spec, small_p, small_s, 1, 128, target) < 128
-
-
 def test_a_split_merge_with_initial_state_uses_one_merged_padded_launch():
     """A split decode merge with a sink or resumed `Initial` state (`merged.merged_split`, row 9804) lowers
     through `merged_padded_p` (one launch on GPU), matches `algebra.merged_state` on value and vmap, and

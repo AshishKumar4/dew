@@ -424,11 +424,14 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         # walk scales its rows' sums where they can pass fp32's largest (`algebra.Forward.headroom`,
         # `algebra.SCALED_WALK`).
         headroom = scaled and algebra.headroom(value.dtype)
+        # Register epilogue settles narrowed 16-bit outputs at the overflow midpoint (`midpoint_settled`,
+        # matching `attention_mosaic_forward._launch`), avoiding per-element `narrowing_settled` register
+        # spills across `[block_q, Dv]` (row 11648).
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, scale,
                                self.score_mod, self.natural, headroom, initial,
                                compensated=algebra.compensates(value.dtype), prescale=power,
                                largest=self.largest,
-                               narrowed=algebra.narrowed_of(query.dtype))
+                               narrowed=algebra.narrowed_of(query.dtype), registered=True)
         kernel = functools.partial(
             _forward_kernel, score_kinds=self.score_kinds, output_kinds=self.output_kinds, initial=initial,
             residuals=residuals, output_mod=self.output_mod, block_k=block_k, interpret=interpret)
@@ -462,11 +465,57 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
 
     GENERATES = True
 
+    def _walk_only(self, args: tuple, kwargs: dict, config):
+        """Run only `self._walk` at `self.scaled`, omitting `rare()`'s separate scaled op."""
+        residuals = _kept(kwargs.get("residuals"))
+        walk_kwargs = {k: v for k, v in kwargs.items()
+                       if k not in ("residuals", "interpret", "return_residuals")}
+        return self._walk(*args, **walk_kwargs, residuals=residuals, interpret=False, config=config,
+                          scaled=self.scaled)
+
+    def lowering(self, ba: tokamax.BoundArguments, config) -> tuple[Callable, tuple]:
+        """This launch's own walk at `config` (`report.certified`), without tracing `rare()`'s separate
+        scaled op (`scaled=True`) inside the common op's certification (row 11648)."""
+        if config is None or len(self.launched_ops(ba.arguments["value"].dtype)) == 1:
+            return super().lowering(ba, config)
+        leaves, treedef = jax.tree.flatten((ba.args, ba.kwargs))
+        held = [hasattr(leaf, "shape") and hasattr(leaf, "dtype") for leaf in leaves]
+
+        def fn(*arrays):
+            given = iter(arrays)
+            args, kwargs = jax.tree.unflatten(treedef, [next(given) if array else leaf
+                                                        for leaf, array in zip(leaves, held, strict=True)])
+            with report.launching(self, ba, config):
+                return self._walk_only(args, kwargs, config)
+
+        return fn, tuple(jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+                         for leaf, array in zip(leaves, held, strict=True) if array)
+
+    def _captured_jaxpr(self, ba: tokamax.BoundArguments, config):
+        """Trace only this op's single walk at `ba`'s own array avals (preserving shard_map/mesh info for
+        `report.capture`, row 11648)."""
+        from dew.nn import programs
+
+        arrays, fill = programs.holes((ba.args, ba.kwargs), lambda leaf: isinstance(leaf, jax.Array))
+
+        def single(*values):
+            args, kwargs = fill(values)
+            return self._walk_only(args, kwargs, config)
+
+        return jax.make_jaxpr(single)(*arrays)
+
+    def _captured(self, ba: tokamax.BoundArguments, config, awaiting: tuple):
+        """Under `report.lowered_aside`, capture only this op's single walk for certification while still
+        returning the runtime `_fwd` conditional for execution (row 11648)."""
+        if len(self.launched_ops(ba.arguments["value"].dtype)) == 1 or not isinstance(config, Tiles):
+            return super()._captured(ba, config, awaiting)
+        report.capture(awaiting, self._captured_jaxpr(ba, config))
+        return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
+
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """Its tile from the facts (`_derived`): its queries held, its keys walked."""
         return _derived(self, ba, target, lambda rows, walk, warps: Tiles(rows, walk, warps, STAGES),
                         held=ba.arguments["query"].shape[1], walked=ba.arguments["key"].shape[1])
-
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         return self.staging(ba, config, target).bytes
 

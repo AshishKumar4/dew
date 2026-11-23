@@ -1390,3 +1390,34 @@ def test_triton_kernel_dot_keeps_ieee_fp32_range_in_native_launch():
 
     assert_as_exact(jax.jit(ours), jax.jit(jnp.matmul), draw,
                     "triton kernel_dot keeps IEEE fp32 range above bfloat16.max", seeds=1)
+
+
+def test_common_triton_forward_lowering_isolates_scaled_op():
+    """Row 11648: certifying the common `TritonForward` (`lowering(ba, config)`) traces only its own
+    unscaled kernel(s), never compiling `rare()`'s separate `scaled=True` op inside the common op's
+    certification."""
+    from dew.nn import programs
+
+    spans = template.spans(256, 256, 1, causal=True)
+    q = jnp.zeros((1, 256, 2, 128), jnp.bfloat16)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        op, args, _ = attention_triton._forward_call(q, q, q, spans, None, scale=None, natural=False)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        cfg = op.derived(ba, target)
+        assert cfg is not None
+        fn, specs = op.lowering(ba, cfg)
+        traced = jax.make_jaxpr(fn)(*specs).jaxpr
+        names = [eq.params.get("name", "") for eq in programs.equations(traced) if programs.opaque(eq)]
+        assert names and all("scaled" not in name for name in names), names
+        assert any("attention_forward" in name for name in names), names
+        # Captured certification (`_captured_jaxpr`) isolates the common walk, while runtime keeps `rare()`.
+        cap_jaxpr = op._captured_jaxpr(ba, cfg).jaxpr
+        cap_names = [eq.params.get("name", "") for eq in programs.equations(cap_jaxpr) if programs.opaque(eq)]
+        assert cap_names and all("scaled" not in name for name in cap_names), cap_names
+        with tuning.pinned({attention_triton.TritonForward: cfg}):
+            runtime_jaxpr = jax.make_jaxpr(
+                lambda *xs: op(*xs, residuals=template.Kept.NONE, interpret=False))(*args).jaxpr
+        runtime_names = [eq.params.get("name", "") for eq in programs.equations(runtime_jaxpr)
+                         if programs.opaque(eq)]
+        assert any("scaled" in name for name in runtime_names), runtime_names

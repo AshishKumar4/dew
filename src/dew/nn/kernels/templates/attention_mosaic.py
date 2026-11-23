@@ -2050,6 +2050,17 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 return candidate
         return config
 
+    def _staged_helps(self, ba: tokamax.BoundArguments, config: BackwardTiles,
+                      target: generation.GpuTarget) -> bool:
+        """Whether `config.staged_logits` relieves shared memory (makes an over-budget tile fit or raises
+        residency): when the un-staged config already fit shared memory at the same residency and was
+        refused for register spills, staging logits in shared memory cannot reduce registers (row 11975)."""
+        if not config.staged_logits:
+            return True
+        unstaged = dataclasses.replace(config, staged_logits=False)
+        return (self.staged_bytes(ba, unstaged, target) > self.program_shared(unstaged, target)
+                or self.resident(ba, config, target) > self.resident(ba, unstaged, target))
+
     def _one_launch(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, family: mosaic.Family,
                     fed: list, dkv: dict) -> BackwardTiles | None:
         """`derived`'s one launch: on the fed layout with its consumers (FlashAttention 3's CTA), keys first
@@ -2057,8 +2068,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         query, key = ba.arguments["query"], ba.arguments["key"]
 
         def fits(config: BackwardTiles) -> bool:
-            return self.takes(ba, config, target)
-
+            return self._staged_helps(ba, config, target) and self.takes(ba, config, target)
         derive = functools.partial(_derived, least_held=_role_rows)
         # The one launch, legal where the form, the hooks, the widths, the registers and the mode allow
         # (`legal`), the first that holds (design §7: legality steps down, nothing is ranked). Queries first
@@ -2106,7 +2116,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         query, key = ba.arguments["query"], ba.arguments["key"]
 
         def fits(config: BackwardTiles) -> bool:
-            return self.takes(ba, config, target)
+            return self._staged_helps(ba, config, target) and self.takes(ba, config, target)
 
         derive = functools.partial(_derived, least_held=_role_rows)
 

@@ -596,7 +596,8 @@ def initial_state(spec: Forward | windows.Units, initial: Partial, *,
     held = means.holding(initial.total)
     # The law's finish (`means.finished`): a division by a broadcast total flushed past 2^126 (a total of
     # 1.5 x 2^126 left its output 0, train 931's review).
-    out = jnp.where(held[..., None], means.finished(initial.acc, initial.total), 0.0)
+    laid_held = held if initial.acc.ndim == held.ndim else held[..., None]
+    out = jnp.where(laid_held, means.finished(initial.acc, initial.total), 0.0)
     raw = spec.scale if isinstance(spec, Forward) and spec.raw else raw_scale
     maximum = raw_maximum(initial.m, raw) if raw is not None else initial.m
     return slice_state(spec, out, maximum, initial.total)
