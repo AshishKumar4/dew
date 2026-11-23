@@ -21,7 +21,10 @@ import optax
 import pytest
 from lane_environment import DETERMINISTIC_OPS
 from generation_support import lowers
+from jax._src.lib.mlir.dialects import llvm
 from jax.experimental.layout import Format, Layout
+from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend.mlir import ir
 from kernel_compile import Uncounted
 from process_support import fresh, keeping_picks
 
@@ -872,9 +875,8 @@ def test_a_programs_spilling_triton_launch_is_recorded_with_no_mosaic_kernel_bes
     assert missed == [("dew_softmax", True)]
 
 
-def _paired_step(launch):
-    """A compile-only H100's mesh, and a lowering of one paired SwiGLU step through `launch` over it, traced
-    afresh at each call (a compile's `relower`)."""
+def _paired(launch):
+    """A compile-only H100's mesh, one paired SwiGLU step through `launch`, and its operands placed on it."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.nn.kernels.generation import compile_only_gpus
@@ -883,15 +885,56 @@ def _paired_step(launch):
     operands = [jax.ShapeDtypeStruct(shape, jnp.bfloat16, sharding=NamedSharding(devices, PartitionSpec()))
                 for shape in ((ROWS, FEATURES), (EXPERTS, FEATURES, WIDTH), (EXPERTS, FEATURES, WIDTH))]
 
-    def lowered():
-        def stepped(x, gate, up):
-            sizes = jnp.full((EXPERTS,), ROWS // EXPERTS, jnp.int32)
-            return launch(x, gate, sizes, paired=up, out_dtype="bfloat16", trans_rhs=False,
-                          hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u),
-                          interpret=False)
-        return jax.jit(stepped).trace(*operands).lower()
+    def stepped(x, gate, up):
+        sizes = jnp.full((EXPERTS,), ROWS // EXPERTS, jnp.int32)
+        return launch(x, gate, sizes, paired=up, out_dtype="bfloat16", trans_rhs=False,
+                      hooks=Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u), interpret=False)
 
-    return devices, lowered
+    return devices, stepped, operands
+
+
+def _paired_step(launch):
+    """A compile-only H100's mesh, and a lowering of one paired SwiGLU step through `launch` over it, traced
+    afresh at each call (a compile's `relower`)."""
+    devices, stepped, operands = _paired(launch)
+    return devices, lambda: jax.jit(stepped).trace(*operands).lower()
+
+
+def _rejected_instruction(ctx) -> None:
+    """An instruction no PTX names, inlined: a module that lowers and that the assembler refuses."""
+    del ctx
+    llvm.inline_asm(ir.Type.parse("!llvm.void"), [], "dew.rejected.instruction;", "", has_side_effects=True)
+
+
+class AssemblerRejected(grouped_matmul.MosaicGmm):
+    """The grouped forward beside a kernel of its launch that lowers and that the assembler refuses."""
+
+    @functools.wraps(grouped_matmul.MosaicGmm._fwd)  # its binding reads its forward's signature
+    def _fwd(self, tokens, kernel, sizes, *args, **kwargs):
+        out, residuals = super()._fwd(tokens, kernel, sizes, *args, **kwargs)
+
+        def rejected(x_ref, o_ref):
+            plgpu.inline_mgpu()(_rejected_instruction)()
+            o_ref[...] = x_ref[...]
+
+        flag = plgpu.kernel(rejected, out_type=jax.ShapeDtypeStruct((128,), jnp.float32))(
+            jnp.zeros((128,), jnp.float32))
+        return out + flag[0].astype(out.dtype), residuals
+
+
+@COMPILE_ONLY
+@lowers("sm90")
+def test_a_launch_the_assembler_refuses_alone_fails_the_compile_gate_uncertified():
+    """A launch whose kernel lowers and whose PTX the assembler refuses, through the compile gate on a
+    compile-only H100: certification's own compile of it fails (`report.certified`'s refusal by XLA), it is
+    recorded uncertified (`report.uncertified`), and the gate's record names it, so the gate fails the case
+    (row 6002: the route tested on a hand-made record alone)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, failures
+
+    _, stepped, operands = _paired(AssemblerRejected())
+    [record] = compile_mosaic_kernels([KernelCase("refused", lambda: (stepped, tuple(operands)))], "sm90")
+    assert record["uncertified"] and failures([record]), record
 
 
 class TwiceUncounted(Uncounted):
