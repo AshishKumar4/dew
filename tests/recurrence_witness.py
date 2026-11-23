@@ -1522,21 +1522,42 @@ def backward_form_held(lane: Lane, form: str, heads: int = 1) -> tuple[BackRun, 
     return back, back_witnessed(back, lane)
 
 
-def assert_backward_held(held: tuple[BackRun, dict] | None) -> bool:
+DROPPED_GATE_SHARE = 0.9
+"""The least share of a values-gated backward's values' gradient records refused where its walk dropped
+their write gate (`dropped_gate_held`)."""
+
+
+def dropped_gate_held(back: BackRun, lane: Lane) -> np.ndarray:
+    """Whether each values' gradient record of a values-gated fast backward (`Run.write` 'values') whose walk
+    dropped its write gate, `du` where it stores `du beta` (each row its record over its token's gate; a
+    zero gate's row as it is), lies inside its step's enclosure (`back_witnessed`): the fault the witness of
+    that gradient's gate refuses (row 12087)."""
+    run = back.run
+    gates = run.beta.reshape(run.chunks, run.chunk, run.heads).transpose(0, 2, 1)[..., None]
+    held = back.records["dv"]
+    dropped = np.where(gates != 0, held / np.where(gates != 0, gates, 1.0), held)
+    return back_witnessed(back._replace(records={**back.records, "dv": dropped}), lane)["dv"]
+
+
+def assert_backward_held(held: tuple[BackRun, dict] | None, lane: Lane) -> bool:
     """A form's fast backward (`backward_form_held`'s) witnessed: every record each launch keeps inside its
-    step's enclosure (row 2084 (e)). Whether the template trains it, so the form was witnessed."""
+    step's enclosure (row 2084 (e)), and where it gates the values, a walk that dropped the gate refused
+    (`dropped_gate_held`, `DROPPED_GATE_SHARE`). Whether the template trains it, so the form was witnessed."""
     if held is None:
         return False
     back, inside = held
     for name, found in inside.items():
         assert np.all(found), (back.run.write, back.run.held, name, np.mean(found))
+    if back.run.write == "values":
+        refused = np.mean(~dropped_gate_held(back, lane))
+        assert refused >= DROPPED_GATE_SHARE, ("a dropped write gate", refused)
     return True
 
 
 def assert_backward_form_witnessed(lane: Lane, form: str, heads: int = 1) -> bool:
     """The step witness of the fast backward (`back_enclosures`) in one of its forms where the template
     trains it (`backward_form_held`, `assert_backward_held`); whether it does."""
-    return assert_backward_held(backward_form_held(lane, form, heads))
+    return assert_backward_held(backward_form_held(lane, form, heads), lane)
 
 
 def claimed_gradients_held(lane: Lane, heads: int = 1) -> dict:
@@ -1570,7 +1591,7 @@ def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
     held = [backward_form_held(lane, form, heads) for form in BACKWARD_FORMS]
     claimed = claimed_gradients_held(lane, heads)
     for found in held:
-        assert_backward_held(found)
+        assert_backward_held(found, lane)
     assert_claimed_refused(claimed)
 
 
