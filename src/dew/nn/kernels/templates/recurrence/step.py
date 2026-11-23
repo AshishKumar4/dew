@@ -86,7 +86,7 @@ def _resident(halves: int, target: generation.GpuTarget) -> int:
     held, registers = target.multiprocessor, step_registers()
     most = min(held.resident_blocks, held.resident_threads // (halves * scan.THREADS))
     model = resources.RegisterModel(registers, held.thread_registers, halves, most, held.register_step, 0,
-                                    file=held.registers)
+                                    target=target)
     return model.resident(registers)
 
 

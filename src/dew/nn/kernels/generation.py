@@ -186,6 +186,14 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False,
         yield
 
 
+def as_target(target: GpuTarget) -> contextlib.AbstractContextManager:
+    """Within the block, the GPU in effect is `target` (`assumed` of it, where it is not the one in effect
+    already): what a model asked for a given target reads, whatever target the call is made under (a
+    register model's, `resources.register_model`; a launch's register proposal, `templates.base.Template`,
+    rows 11987 and 12000)."""
+    return contextlib.nullcontext() if target == gpu_target() else assumed(target)
+
+
 def _cross_compiled(value: Assumption | None) -> contextlib.AbstractContextManager:
     """tokamax's kernels lowered for an assumed GPU on any host: tokamax checks the device a kernel runs on
     against this host's (its Triton attention raised "Not supported on cpu" for a step traced for a

@@ -324,6 +324,30 @@ def test_a_lazy_packages_listing_names_what_it_exports(package):
                    env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
 
 
+@pytest.mark.parametrize(("platforms", "divided"), [
+    ({"JAX_PLATFORMS": "tpu,cpu"}, False), ({"JAX_PLATFORMS": "tpu"}, False),
+    ({"JAX_FORCE_TPU_INIT": "1"}, False), ({"JAX_PLATFORMS": "cuda,cpu"}, True),
+    ({"JAX_PLATFORMS": "cpu"}, True)],
+    ids=["tpu-and-cpu", "tpu", "unnamed-on-a-tpu-vm", "cuda", "cpu-compiling-for-cuda"])
+def test_importing_dew_asks_exact_division_of_the_cuda_compiler_alone(platforms, divided):
+    """`import dew` passes XLA's backend options its GPU fp32 division (`-nvptx-prec-divf32=2`,
+    `dew._devices.divide_exactly`) where the CUDA plugin installed compiles the process's programs: a GPU's,
+    and a CPU process's compiling ahead for compile-only GPUs; never where a TPU opens (its platforms named,
+    or none named on a Cloud TPU VM), whose LLVM has no NVPTX backend and exits the process on the unknown
+    option as it compiles a host-offloaded step (row 12017: main's v5e and v6e tiers died there, no
+    traceback)."""
+    from dew._devices import cuda_plugin
+
+    assert cuda_plugin(), "the CUDA plugin must be installed for its options to be asked at all"
+    script = "import os, dew; print(os.environ.get('XLA_FLAGS', ''))"
+    environ = {name: value for name, value in os.environ.items()
+               if name not in ("JAX_PLATFORMS", "JAX_FORCE_TPU_INIT", "XLA_FLAGS")}
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120,
+                         env={**environ, **platforms, "PYTHONPATH": str(SOURCE)})
+    assert run.returncode == 0, run.stderr
+    assert ("-nvptx-prec-divf32=2" in run.stdout.splitlines()[-1]) is divided, run.stdout
+
+
 def test_the_release_version_is_read_from_a_module_import_dew_does_not_run():
     """`dew.__version__` comes from `dew._version`, imported when the version is first read, and the package
     metadata takes it from there: a release's bump then changes no module `import dew` executes, whose top
