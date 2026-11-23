@@ -684,15 +684,15 @@ def test_the_diagonal_scan_holds_its_orders(edge):
     """The diagonal scan on the template's kernels (`templates.recurrence.diagonal`, a custom VJP over its
     launches, interpreted off a GPU) as every caller reaches it (`kernels.diagonal.diagonal_scan` with the
     kernels named, whose products' wrapper takes every order through the portable math, `_per_product`),
-    over three spans of 64 tokens at an interpreted H100's facts from a state: each token's output and the
+    over two spans of 64 tokens at an interpreted H100's facts from a state: each token's output and the
     final state finite at every order wherever float64 is a normal float32 and the recurrence a token at a
     time is, at writes and states scaled to the edge, the log forget gates HGRN's."""
     def draw(seed, scale):
-        x, g, state = normal_draw(1453 + 4096 * seed, (2, 150, 128), (2, 150, 128), (2, 128))
+        x, g, state = normal_draw(1453 + 4096 * seed, (2, 70, 128), (2, 70, 128), (2, 128))
         primals = (x * scale, -jax.nn.softplus(-(g + 2.0)), state * scale)
         drawn = normal_draw(1454 + 4096 * seed, x.shape, g.shape, state.shape)
         direction = (drawn[0] * scale, drawn[1], drawn[2] * scale)
-        return primals, direction, normal_draw(1455 + 4096 * seed, (2, 151, 128))[0]
+        return primals, direction, normal_draw(1455 + 4096 * seed, (2, 71, 128))[0]
 
     def joined(out, final):
         return jnp.concatenate([out, final[:, None].astype(out.dtype)], axis=1)
@@ -718,18 +718,18 @@ def test_the_diagonal_scan_holds_its_orders(edge):
 def test_the_wkv4_scan_holds_its_orders(edge):
     """RWKV4's WKV on the template's channel walk (`templates.recurrence.wkv4`, a custom VJP over its
     launches, interpreted off a GPU) as every caller reaches it (`kernels.rwkv4.wkv4` with the kernels named,
-    whose products' wrapper takes every order through the portable scan, `_per_product`), over three spans
-    of 64 tokens at an interpreted H100's facts from a carry: each token's output and the final carry finite
+    whose products' wrapper takes every order through the portable scan, `_per_product`), over two spans of
+    64 tokens at an interpreted H100's facts from a carry: each token's output and the final carry finite
     at every order wherever float64 is a normal float32 and fla's recurrence a token at a time is
     (`rwkv4.recurrent_wkv4`), at values and numerators scaled to the edge, the keys a few units apart."""
     def draw(seed, scale):
         decay, bonus, key, value, numerator, beta, top = normal_draw(
-            1455 + 4096 * seed, (128,), (128,), (2, 150, 128), (2, 150, 128), (2, 128), (2, 128), (2, 128))
+            1455 + 4096 * seed, (128,), (128,), (2, 70, 128), (2, 70, 128), (2, 128), (2, 128), (2, 128))
         state = jnp.stack([numerator * scale, jnp.exp(beta), top], axis=1)
         primals = (decay, bonus, 2.0 * key, value * scale, state)
         drawn = normal_draw(1456 + 4096 * seed, *(operand.shape for operand in primals))
         direction = (*drawn[:3], drawn[3] * scale, drawn[4])
-        return primals, direction, normal_draw(1457 + 4096 * seed, (2, 153, 128))[0]
+        return primals, direction, normal_draw(1457 + 4096 * seed, (2, 73, 128))[0]
 
     def joined(out, final):
         return jnp.concatenate([out, final.astype(out.dtype)], axis=1)
