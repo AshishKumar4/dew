@@ -1342,6 +1342,16 @@ def test_an_adapted_products_gradient_keeps_a_wide_cotangent(grouped):
     want[0] = 64.0
     np.testing.assert_array_equal(np.asarray(d_x), want)
 
+    # And below fp16's least normal: a scale of 2**-26 against a factor of 2**14 gives the rows 2**-12, the
+    # scaled update's cotangent not flushed to fp16's zero first.
+    large_a = jnp.full(rank_a.shape, 2.0 ** 14, jnp.float16)
+    _, pull = jax.vjp(lambda rows: low_rank(rows, jnp.zeros_like(kernel), large_a, rank_b, 2.0 ** -26, sizes,
+                                            out_dtype=jnp.float16), jnp.zeros_like(x))
+    (d_x,) = pull(jnp.zeros((8, 8), jnp.float16).at[0, 0].set(1.0))
+    want = np.zeros((8, 16), np.float16)
+    want[0] = 2.0 ** -12
+    np.testing.assert_array_equal(np.asarray(d_x), want)
+
     # A bf16 cotangent of 1 through a scale of (2 - 2**-8) * 2**127, finite in fp32 but past bf16's largest,
     # and a factor of 2**-120 gives the rows 255.5, rounded to bf16's 256.
     huge = (2.0 - 2.0 ** -8) * 2.0 ** 127
