@@ -1280,8 +1280,8 @@ def _checked_decay_mask(mask: JsonDict | None, spared: bool, owner: str) -> None
     if spared:
         raise ValueError(f"{owner} spares its decay, which writes its own mask over decay_mask: set spared "
                          "False to decay where decay_mask says")
-    leaves = jax.tree.leaves(mask)
-    if not isinstance(mask, Mapping) or not leaves or not all(isinstance(leaf, bool) for leaf in leaves):
+    leaves = jax.tree.leaves(mask, is_leaf=lambda leaf: leaf is None)
+    if not isinstance(mask, Mapping) or not leaves or not all(type(leaf) is bool for leaf in leaves):
         raise ValueError(f"{owner}'s decay_mask is a tree of booleans by parameter name, got {mask!r}")
 
 
