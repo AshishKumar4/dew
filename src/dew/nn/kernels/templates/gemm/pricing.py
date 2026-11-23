@@ -245,7 +245,8 @@ def granular_tile(family: mosaic.Family, config: "Tiles", dtype, *, target,
     tensor = family.tensor_columns(tile_columns(config, family), accumulators, exact_sums)
     if tensor and stream_blocks is not None:
         tensor += family.stream_tensor_columns(stream_blocks(), config.stages)
-    return resources.tensor_memory_allocated(tensor) * config.programs <= (target.tmem_columns or 0)
+    limit = target.tmem_columns or 0
+    return tensor <= limit and resources.tensor_memory_allocated(tensor) * config.programs <= limit
 
 
 def prefetch_registers(family: mosaic.Family, config: "Tiles", *, ba) -> int:
