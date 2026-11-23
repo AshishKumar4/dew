@@ -737,6 +737,25 @@ def test_a_draw_within_a_draw_takes_the_draws_program():
     np.testing.assert_array_equal(np.asarray(warm), np.asarray(cold))
 
 
+def test_a_products_launch_decided_outside_a_draw_reports_no_route_within_one():
+    """A product's launch decided outside a draw (a decoder's apply, its routes reported) and asked again at
+    the same operands within one (`generation.drawing`: an objective's draw after a step's trace) reports no
+    route there: the held decision (`projections.launches`) is a draw's apart, where the draw replayed the
+    apply's routes, and an objective drawn after another's apply over the same decoder took a launch's route
+    (Train 1209's red main: test_kernel_spills#10/10, its draw cells in one process)."""
+    from dew.nn.kernels import projections
+    from dew.nn.kernels.generation import drawing, routes
+
+    # On this host no launch takes it, so the forward's route is reported, as XLA runs it.
+    rows, matrix = (jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((64, 128), (128, 256)))
+    with routes() as applied:
+        projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
+    with drawing(), routes() as drawn:
+        projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
+    assert applied, "the product selects no kernel, so its draw's selecting none says nothing"
+    assert not drawn, drawn
+
+
 def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
     """Each Mosaic GPU call a thunk names has its binary (`assembled.thunk_kernels`): two calls and two kernel
     protos read as two kernels, their registers and frames their cubins'; two calls and one is refused, as a

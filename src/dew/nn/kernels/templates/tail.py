@@ -25,6 +25,17 @@ class Tail:
     partitions: int
     steps: int
 
+    def bounds(self) -> np.ndarray:
+        """Each program's first step of the tail's iterations and the end, `partitions + 1` of them: its
+        contiguous ranges, as `segment` walks them, on the host."""
+        return np.arange(self.partitions + 1) * self.iterations // self.partitions
+
+    def partials(self) -> int:
+        """The partials past each tile's first that the tail's programs leave (`mosaic.Family.fixed_up`): a
+        range's end inside a tile, not at its edge, leaves one more for the tile's last program to add, so
+        they are its interior bounds off a tile's edge (row 12075; the bounds `_rounds` reads)."""
+        return int(np.count_nonzero(self.bounds()[1:-1] % self.steps))
+
     @property
     def segments(self) -> int:
         """The tiles (whole or in part) a program walks at most: its waves' and its range's."""
@@ -78,8 +89,8 @@ class Traffic:
         return self.step_seconds * -(-programs // self.multiprocessors)
 
 
-def balanced(tiles: int, steps: int, programs: int, traffic: Traffic, *,
-             handoff_steps: float = 0.0) -> Tail | None:
+def balanced(tiles: int, steps: int, programs: int, traffic: Traffic, *, handoff_steps: float,
+             scoped: bool, partial_bytes: int) -> Tail | None:
     """A dense product's tail (`Tail`) where balancing its last wave is faster than walking it, each priced
     from the tiles' traffic (`Traffic`); None elsewhere, and where the whole product is one wave. Walked,
     the last wave's `tiles` mod `programs` tiles take their `steps` together, each step reading its rows'
@@ -88,17 +99,36 @@ def balanced(tiles: int, steps: int, programs: int, traffic: Traffic, *,
     from it (`_rounds`): programs on tiles of a row or column at nearby steps share their reads, as the
     ranges' alignment with the tiles leaves them (row 3798: an H100 PCIe balanced Llama 3 8B's output
     projection's kernel gradient 3% faster, its ranges a tile's half, against Qwen3.5-4B's query-key-value
-    one 6% slower); and each tile's partials reach the program adding them through a hand-off
-    (`handoff_steps`, the part's in its steps, row 3613). Each round takes its MMA step, or its missed
-    bytes at the memory's rate where longer."""
+    one 6% slower); each tile's partials reach the program adding them through a hand-off
+    (`handoff_steps`, the part's in its steps, row 3613), and those past a tile's first are written and read
+    back through device memory (`partial_bytes` each, `Tail.partials`); and a family whose walk is scoped to
+    its block (`scoped`: mma.sync's, `mosaic.Family.walks_scoped`), launched persistent where its tail
+    balances, its whole waves' blocks drifting out of the L2 (`_drift`, rows 5363, 11945). Each round takes
+    its MMA step, or its missed bytes at the memory's rate where longer."""
     waves, tail = divmod(tiles, programs)
     if waves == 0 or tail == 0 or steps == 0:
         return None
     iterations = tail * steps
     candidate = Tail(waves, iterations, min(programs, iterations), steps)
     rows, columns = snaked(np.arange(waves * programs, tiles), traffic.grid, 1, traffic.band)
-    shared = _rounds(candidate, rows, columns, traffic) + handoff_steps * traffic.step_seconds
+    shared = (_rounds(candidate, rows, columns, traffic) + handoff_steps * traffic.step_seconds
+              + 2 * candidate.partials() * partial_bytes / traffic.bandwidth
+              + (_drift(waves, steps, programs, traffic) if scoped else 0.0))
     return candidate if shared < _walked(steps, rows, columns, traffic) else None
+
+
+def _drift(waves: int, steps: int, programs: int, traffic: Traffic) -> float:
+    """The seconds a scoped family's whole waves take more launched persistent than as blocks: each wave
+    past the first its `programs` walking `steps` with every block its own (the L2 holding fewer rounds
+    than its steps: their shared blocks drifted out) where walked as blocks they share them (`_walked`)."""
+    asked = programs * (traffic.row_bytes + traffic.column_bytes)
+    window = 0 if traffic.l2_bytes is None else traffic.l2_bytes // asked
+    if waves <= 1 or steps <= window:
+        return 0.0
+    drifted = steps * max(traffic.issued(programs), asked / traffic.bandwidth)
+    return sum(max(0.0, drifted - _walked(steps, *snaked(np.arange(wave * programs, (wave + 1) * programs),
+                                                            traffic.grid, 1, traffic.band), traffic))
+               for wave in range(1, waves))
 
 
 def snaked(index: np.ndarray, shape: tuple[int, int], minor_dim: int,
@@ -127,7 +157,7 @@ def _rounds(tail: Tail, rows: np.ndarray, columns: np.ndarray, traffic: Traffic)
     (tile `iteration // steps`, step `iteration % steps`), reading its tile's row and column blocks at that
     step; a block missed where no program read it within the rounds the L2 holds (a round asks at most
     every program's two blocks), each round its MMA step or its missed bytes, whichever longer."""
-    bounds = np.arange(tail.partitions + 1) * tail.iterations // tail.partitions
+    bounds = tail.bounds()
     program = np.repeat(np.arange(tail.partitions), np.diff(bounds))
     iteration = np.arange(tail.iterations)
     turn = iteration - bounds[program]

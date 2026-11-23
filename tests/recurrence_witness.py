@@ -1207,9 +1207,10 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
 
     - `local`: `A^T do`, `A[t, s] = scale (q_t . k_s) exp2(E_t - E_s)` (`s <= t`), its transpose's product
       `k q^T` decayed and scaled in fp32 and staged (`algebra.local_gradient`);
-    - `dv`: `du = (k grad) exp2(E_last - E) + local` (`algebra.reverse_carried`), `grad` staged; where the
-      write gate takes the keys' side (`write` "keys", the SSD's), the walk's gate on it, `du beta`, in the
-      operands' form (`algebra.gated_values_back`);
+    - `dv`: `du = (k grad) exp2(E_last - E) + local` (`algebra.reverse_carried`), `grad` staged; without the
+      delta rule (the write gate on the keys' side, `write` "keys", the SSD's, or the values', "values"), the
+      walk's gate on it, `du beta` fp32 (`algebra.gated_values_back`), stored once in the operands' form
+      (`mainloop_backward._reverse_values`, `back_witnessed`);
     - `entering`: `grad exp2(E_last) + scale q^T (do exp2(E)) - w^T du`, the memory's gradient into the
       chunk (no `w^T du` without the delta rule);
     - `ds`: `do c^T` (by each value column's write gate where the keys take it) decayed, causal and scaled
@@ -1239,7 +1240,7 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
     local = dot(scores, do, lane, parts=(held, given))
     du = fp32(add(fp32(mul(blocked(k, staged(step.grad, lane), lane, parts=(given, held)), ranged), lane),
                   point(step.local)), lane)
-    dv = fp32(mul(du, point(beta)), lane) if keyed_gate else du
+    dv = du if write == "delta" else fp32(mul(du, point(beta)), lane)
     kept = Iv(np.full(step.grad.lo.shape, raised.lo[-1]), np.full(step.grad.lo.shape, raised.hi[-1]))
     # The decayed output gradient fp32 in two bf16 parts against the queries (fla's split product,
     # `mainloop_backward._reverse`): the parts' sum as two parts hold it (`staged`'s `two_parts_reach`).
@@ -1258,7 +1259,9 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
     ds = where(lag >= 0, ds, zeros)
     if write == "delta":
         ds = staged(ds, lane)
-    narrow, scored = point(step.ds), (given if keyed_gate else held)
+    # The scores' gradient as `_query_key` reads it: the held form's under the delta rule, else the
+    # operands' (`mainloop_backward._score_grads`).
+    narrow, scored = point(step.ds), (held if write == "delta" else given)
     entered = tr(point(step.h))
     dq = fp32(add(fp32(mul(fp32(mul(blocked(do, entered, lane, parts=(given, held)), rows), lane), factor),
                        lane), dot(narrow, k, lane, parts=(scored, given))), lane)
@@ -1430,10 +1433,15 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
         """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where
         the call holds its values in parts (`Lane.held`), the parts' sum (`staged`); the queries' and keys'
         sums rounded once whatever the parts (`mainloop_backward._query_key_summed`; staged, a correctly
-        rounded bf16 sum lay outside its unrounded three parts' enclosure, row 11849)."""
+        rounded bf16 sum lay outside its unrounded three parts' enclosure, row 11849), and so without the
+        delta rule the values' gradient, the walk's gated one finished in the operands' form
+        (`mainloop_backward._reverse_values`), and the scores', a key head's in the operands' form
+        (`mainloop_backward._score_grads`): as three parts, none of a values-gated call's values' gradient
+        and 56% of its scores' lay inside (row 11873)."""
         if dtype == np.float32:
             return iv
-        once = run.held == 1 or name in ("dq", "dk")
+        once = (run.held == 1 or name in ("dq", "dk")
+                or (name in ("dv", "ds") and run.write != "delta"))
         return cast(iv, {"bfloat16": BFLOAT16, "float16": FLOAT16}[str(dtype)]) if once else staged(iv, lane)
 
     found: dict[str, list] = {}
@@ -1469,24 +1477,22 @@ the given gradients enter them."""
 
 class BackwardForm(NamedTuple):
     """A form of the fast backward the step witness takes: its draw's dtype (None its default, bf16), whether
-    the delta rule holds, its rounding (None its route's) and the records it holds (None every one)."""
+    the delta rule holds and its rounding (None its route's)."""
 
     dtype: type | None
     delta: bool
     rounded: bool | None = None
-    records: tuple[str, ...] | None = None
 
 
 BACKWARD_FORMS = {"bf16 under the delta rule": BackwardForm(None, delta=True),
                   "bf16, its keys gated": BackwardForm(None, delta=False),
-                  "bf16 under the accurate forms": BackwardForm(None, delta=False, rounded=False,
-                                                                records=("dq", "dk")),
+                  "bf16 under the accurate forms": BackwardForm(None, delta=False, rounded=False),
                   "fp32 under the delta rule": BackwardForm(np.float32, delta=True)}
 """The fast backward's forms the step witness takes (`assert_backward_form_witnessed`): a bf16 call of three
 chunks under the delta rule and without it (the SSD's, its keys taking the gate), a bf16 call without it under
-the accurate forms (its values held in three parts, its queries' and keys' sums stored once in bf16: row
-11849; its write gate on the values' side, whose other records `back_enclosures` models none of, row 11873),
-and an fp32 call under the delta rule (its values in parts)."""
+the accurate forms (its values held in three parts, its write gate on the values' side, its queries' and
+keys' sums and its values' gradient stored once in bf16: rows 11849, 11873), and an fp32 call under the delta
+rule (its values in parts)."""
 
 
 def backward_form_held(lane: Lane, form: str, heads: int = 1) -> tuple[BackRun, dict] | None:
@@ -1500,8 +1506,7 @@ def backward_form_held(lane: Lane, form: str, heads: int = 1) -> tuple[BackRun, 
     if not run.trained:
         return None
     back = recorded_backward(operands, delta=held.delta, run=run)
-    return back, {name: inside for name, inside in back_witnessed(back, lane).items()
-                  if held.records is None or name in held.records}
+    return back, back_witnessed(back, lane)
 
 
 def assert_backward_held(held: tuple[BackRun, dict] | None) -> bool:

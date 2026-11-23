@@ -451,7 +451,7 @@ def mapped_shards(lhs: jax.Array, matrices: tuple[jax.Array, ...], paths: tuple,
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
     taken, _ = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole=True,
                         target=generation.gpu_target(), choices=_cache.KERNEL_CHOICES.value,
-                        pins=_cache.KERNEL_PINS.value)
+                        pins=_cache.KERNEL_PINS.value, drawing=generation.draws())
     return (split, gathered) if taken else None
 
 
@@ -548,20 +548,21 @@ def launches(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype
     `dew.nn.gated_mlp`)."""
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
     taken, found = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole, generation.gpu_target(),
-                            _cache.KERNEL_CHOICES.value, _cache.KERNEL_PINS.value)
+                            _cache.KERNEL_CHOICES.value, _cache.KERNEL_PINS.value, generation.draws())
     generation.reported(found)
     return taken
 
 
 @functools.lru_cache(maxsize=1024)
 def _decided(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype: jnp.dtype, product,
-             whole: bool, target: generation.GpuTarget, choices: tuple, pins: tuple
+             whole: bool, target: generation.GpuTarget, choices: tuple, pins: tuple, drawing: bool
              ) -> tuple[bool, tuple[generation.Route, ...]]:
     """`launched`'s decision and the routes it found, once a key, the most recent keys kept: the operands'
-    shapes and dtypes, the product, whether each is seen whole, and the target and the kernels a block names
-    or pins, which the decision reads from its context, so they key it alone. Its routes are collected apart
+    shapes and dtypes, the product, whether each is seen whole, and the target, the kernels a block names
+    or pins and whether a model's draw traces it (`generation.drawing`, whose selectors report no route),
+    which the decision reads from its context, so they key it alone. Its routes are collected apart
     (`generation.routes`' `alone`), `launched` reporting them at every call."""
-    del target, choices, pins
+    del target, choices, pins, drawing
     with generation.routes(alone=True) as found:
         taken = _launched_once(rows, matrix, out_dtype, product, whole)
     return taken, tuple(found)
