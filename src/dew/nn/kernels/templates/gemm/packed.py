@@ -333,4 +333,5 @@ def stage_decoded_ternary(words, out, interpret: bool, *, layout=None) -> None:
 def rows_decoded_packed(words, fmt: str, interpret: bool, *, layout=None) -> jax.Array:
     """Decode packed FP8 or BitNet b1.58 ternary rows (`[64, 16]` uint32 per group) directly into register
     operand A (`[64, depth]` bfloat16 in `wgmma`'s fragment layout, zero SMEM staging, row 5387)."""
-    return jnp.concatenate([lane for _, _, lane in packed_lanes(words, fmt, interpret, layout=layout)], axis=1)
+    return jnp.concatenate(
+        [lane for _, _, lane in packed_lanes(words, fmt, interpret, layout=layout)], axis=1)
