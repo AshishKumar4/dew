@@ -1847,18 +1847,20 @@ class BlockPlan(NamedTuple):
                 or (family.places_on_role if kept is None else kept) or value_width <= 128):
             return 0
         ed = dtype if self.out_dtype is None else self.out_dtype
-        if narrow := narrow_out_stage(family, value_width, ed):
-            return narrow
-        return stores.staged_columns(value_width, (ed,))
+        swizzle = output_stage_swizzle(family, value_width, ed) or stores.STAGED_BYTES
+        return stores.staged_columns(value_width, (ed,), swizzle=swizzle)
 
 
-def narrow_out_stage(family: mosaic.Family, value_width: int, out_dtype) -> int:
-    """64B-swizzled 32-col TMA output stage width for wide (>128) 16-bit register forwards (row 5272)."""
+def output_stage_swizzle(family: mosaic.Family, value_width: int, out_dtype) -> int | None:
+    """64B swizzle width for wide (>128) 16-bit register forwards (`stores.staged_columns`, row 5272)."""
+    swizzle = swizzling.SWIZZLE_BYTES // 2
+    itemsize = jnp.dtype(out_dtype).itemsize
     if (value_width <= 128 or not family.budgets_registers or not family.adds_through_shared
-            or family.places_on_role or jnp.dtype(out_dtype).itemsize != 2):
-        return 0
-    chunk = swizzling.swizzle_columns(out_dtype, swizzling.SWIZZLE_BYTES // 2)
-    return chunk if value_width % chunk == 0 else 0
+            or family.places_on_role or itemsize != 2
+            or stores.staged_columns(value_width, (out_dtype,), swizzle=swizzle) * itemsize != swizzle):
+        return None
+    return swizzle
+
 
 def forward_block_plan(total_v: int, columns: int | None, out_dtype, *, has_output_mod: bool,
                        training: bool) -> BlockPlan:

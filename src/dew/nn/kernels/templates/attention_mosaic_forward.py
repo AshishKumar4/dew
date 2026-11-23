@@ -99,7 +99,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     issued_pairs,
     launch_scope,
     modelled,
-    narrow_out_stage,
+    output_stage_swizzle,
     param_types,
     powered_in_kernel,
     query_swizzle,
@@ -172,7 +172,7 @@ def _stores_through_query(family: mosaic.Family, width: int, value_width: int, d
     size (4) ... divisible by the tile size (8)" on an A100)."""
     return (value_width == width and out_dtype in (None, jnp.dtype(dtype))
             and query_swizzle(family) is None
-            and not narrow_out_stage(family, value_width, out_dtype or dtype))
+            and output_stage_swizzle(family, value_width, out_dtype or dtype) is None)
 
 
 def forward_products(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, *, peaks: bool = False,
@@ -270,8 +270,9 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
         stage = family.staged_memory((consumers, block_q, chunk), jnp.float32)
     elif not peaks and not _stores_through_query(family, width, value_width, dtype, out_dtype):
         out_dt = out_dtype or dtype
-        if narrow := narrow_out_stage(family, value_width, out_dt):
-            stage = family.staged_memory((consumers, block_q, narrow), out_dt, swizzling.SWIZZLE_BYTES // 2)
+        if (swizzle := output_stage_swizzle(family, value_width, out_dt)) is not None:
+            chunk = stores.staged_columns(value_width, (out_dt,), swizzle=swizzle)
+            stage = family.staged_memory((consumers, block_q, chunk), out_dt, swizzle)
         else:
             stage = family.staged_memory((consumers, block_q, value_width), out_dt)
     # Or over its rings' slots where its consumers alone read them (`Family.stages_over_rings`).
