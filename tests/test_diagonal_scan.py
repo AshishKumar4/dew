@@ -115,17 +115,18 @@ def test_a_spans_decay_below_float32s_range_carries_a_normal_state():
 
 def test_a_gates_gradient_forms_its_product_as_reverse_mode_does():
     """ReviewRecurrenceBatch's adjoint underflow: a token's gate gradient `(q_t h_{t-1}) a_t` with `q_t` near
-    2^-100, `h_{t-1}` near 2^100 and `a_t = e^-64`, normal, on par with the token recurrence's reverse mode
-    from float64 (check 1), which forms `q_t h_{t-1}` first; formed `(q_t a_t) h_{t-1}`, its first product,
-    2^-192, flushed to zero."""
+    2^-100, `h_{t-1}` near 2^100 (the first token's write, from no state) and `a_t = e^-64`, normal, on par
+    with the token recurrence's reverse mode from float64 (check 1), which forms `q_t h_{t-1}` first;
+    formed `(q_t a_t) h_{t-1}`, its first product, 2^-192, flushed to zero."""
     def draw(seed):
         rng = np.random.default_rng([1453, 2, seed])
         g = np.zeros((ROWS, 9, CHANNELS))
         g[:, 1] = -64.0 + 0.01 * rng.standard_normal((ROWS, CHANNELS))
+        x = np.zeros(g.shape)
+        x[:, 0] = 2.0 ** 100 * (1.0 + 0.1 * rng.standard_normal((ROWS, CHANNELS)))
         dy = np.zeros(g.shape)
         dy[:, 1] = 2.0 ** -100 * (1.0 + 0.1 * rng.standard_normal((ROWS, CHANNELS)))
-        state = 2.0 ** 100 * (1.0 + 0.1 * rng.standard_normal((ROWS, CHANNELS)))
-        return (np.zeros(g.shape, np.float32), g.astype(np.float32), state.astype(np.float32),
+        return (x.astype(np.float32), g.astype(np.float32), np.zeros((ROWS, CHANNELS), np.float32),
                 np.zeros((ROWS, 9), bool), (dy.astype(np.float32), np.zeros((ROWS, CHANNELS), np.float32)))
 
     assert_as_exact(jax.jit(differentiated(routed("kernels"))), jax.jit(differentiated(stepped)), draw,
