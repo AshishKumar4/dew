@@ -209,8 +209,7 @@ unresolved within 40 seeds, its extra seeds taking 784 and 934 s."""
 
 def case_hooks(case: str) -> recurrence.Hooks:
     """Case `case`'s rule: the gated delta rule with a decay a head or a key dimension (Kimi delta
-    attention's), its queries scaled by `Dk^-1/2`, its write gates and unit queries and keys declared as the
-    draws' (`draw`)."""
+    attention's), its queries scaled by `Dk^-1/2`, its write gates and unit queries declared as `draw`'s."""
     per_key = SHAPES[case].get('per_key')
     return recurrence.Hooks(decay='vector' if per_key else 'scalar', scale=SHAPES[case]['key_width'] ** -0.5,
                             write_bound=1.0, unit_queries=True)

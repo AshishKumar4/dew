@@ -311,14 +311,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # fla's simple GLA rounds as its release places it, values gated (`mainloop.Call.values_gated`).
         values_gated = simple_gla(hooks)
         transition = hooks.erase != 'tied' or hooks.value_decay
-        # Every own pair's operand at most one in size, which the template's own pairs may fold their decays
-        # against (`mainloop.Call.unit_pairs`): keys of unit norm (the op's `l2norm`, or as `write_bound`
-        # declares: `Hooks.inverse_bound`'s contract), queries so (`l2norm`, or as `unit_queries` declares),
-        # and under the delta rule each system row's write gate at most one (`write_bound`). Keys alone
-        # bounded, a query of 2^100 times a key of 2^-100 decayed by 2^-60 lost its term, the decayed key
-        # 2^-160 rounding to zero (#3703 review).
-        unit_pairs = ((hooks.l2norm or hooks.write_bound is not None) and (hooks.l2norm or hooks.unit_queries)
-                      and (not hooks.delta or (hooks.write_bound is not None and hooks.write_bound <= 1)))
+        unit_pairs = _unit_pairs(hooks)
         # The least log decay a token the layer proves, which a decay a key dimension's prefix reads
         # (`mainloop.Call.prefix_limbs`); a head's takes its compensated pair whatever it is.
         decay_bound = hooks.decay_bound if hooks.decay == 'vector' else None
@@ -1494,6 +1487,18 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
     span = algebra.Span(summary[..., columns:], summary[..., :columns])
     memory = algebra.entering(span, axis, None if state is None else state.astype(wide))
     return jnp.where(begins[:, None, None, None], 0.0, memory)
+
+
+def _unit_pairs(hooks: recurrence.Hooks) -> bool:
+    """Whether `hooks` bound every own pair's operand at most one in size, which the template's own pairs may
+    fold their decays against (`mainloop.Call.unit_pairs`): keys of unit norm (the op's `l2norm`, or as
+    `write_bound` declares: `Hooks.inverse_bound`'s contract), queries so (`l2norm`, or as `unit_queries`
+    declares), and under the delta rule each system row's write gate at most one (`write_bound`). Keys alone
+    bounded, a query of 2^100 times a key of 2^-100 decayed by 2^-60 lost its term, the decayed key 2^-160
+    rounding to zero (#3703 review)."""
+    keys = hooks.l2norm or hooks.write_bound is not None
+    gates = not hooks.delta or (hooks.write_bound is not None and hooks.write_bound <= 1)
+    return keys and (hooks.l2norm or hooks.unit_queries) and gates
 
 
 def kernel_routed(query, key, value, g, beta, *, write_bound: float | None = None,

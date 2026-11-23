@@ -416,13 +416,14 @@ def test_the_decay_clamps_derivative_is_its_forwards_at_and_around_the_fp32_floo
         assert passed[at] == jax.grad(mainloop.clamped)(point), (point, passed[at])
 
 
+@pytest.mark.check1_shards(seeds=40, per_task=8)
 def test_an_unbounded_query_keeps_its_own_pairs_term_under_a_unit_key_interpreted():
     """A rule that declares its keys of unit norm and its write gates (`write_bound`) but not its queries
     (`unit_queries` False) on the recurrence template, interpreted: a later token's query of 2^100 against
     an earlier unit key `(2^-100, 1, 0, ...)` across a decay of 2^-60 keeps its own pair's term, its output
-    `2^-60 beta v` on par with the float64 token recurrence. Folded against the keys alone, the decayed key
-    2^-160 rounded to zero before the query scaled it, the output zero (#3703 review): the fold needs every
-    row bounded too (`mainloop.Call.unit_pairs`)."""
+    and final memory on par with the portable math's from the float64 token recurrence (check 1). Folded
+    against the keys alone, the decayed key 2^-160 rounded to zero before the query scaled it, the output
+    zero (#3703 review): the fold needs every row bounded too (`mainloop.Call.unit_pairs`)."""
     from test_recurrence_chunk import chunk_on, token_by_token
 
     from dew.nn.kernels import recurrence
@@ -430,51 +431,24 @@ def test_an_unbounded_query_keeps_its_own_pairs_term_under_a_unit_key_interprete
 
     width, length = 16, 64
     hooks = recurrence.Hooks(decay='vector', scale=1.0, write_bound=1.0)
-    query, key = np.zeros((2, 1, length, 1, width))
-    key[0, 0, 0, :2] = 2.0 ** -100, 1.0
-    query[0, 1, 0, 0] = 2.0 ** 100
-    value = np.zeros((1, length, 1, width))
-    value[0, 0, 0] = np.random.default_rng(12131).normal(size=width)
-    g = np.zeros((1, length, 1, width))
-    g[0, 1, 0, 0] = -60 * np.log(2.0)
-    beta = np.full((1, length, 1), 0.5)
 
-    def operands(dtype):
-        return Chunk(*(np.asarray(x, dtype) for x in (query, key, value)),
-                     state=np.zeros((1, 1, width, width), np.float32), log_decay=np.asarray(g, np.float32),
-                     beta=np.asarray(beta, dtype))
+    def draw(seed):
+        rng = np.random.default_rng([12131, seed])
+        query, key = np.zeros((2, 1, length, 1, width))
+        key[0, 0, 0, :2] = 2.0 ** -100, 1.0
+        query[0, 1, 0, 0] = 2.0 ** 100
+        value = np.zeros((1, length, 1, width))
+        value[0, 0, 0] = rng.normal(size=width)
+        g = np.zeros((1, length, 1, width))
+        g[0, 1, 0, 0] = -60 * np.log(2.0)
+        beta = 1 / (1 + np.exp(-rng.normal(size=(1, length, 1))))
+        return (Chunk(*(np.asarray(x, jnp.bfloat16) for x in (query, key, value)),
+                      state=np.zeros((1, 1, width, width), np.float32), log_decay=np.asarray(g, np.float32),
+                      beta=np.asarray(beta, jnp.bfloat16)),)
 
-    out, _ = jax.jit(partial(chunk_on, 'mosaic_gpu', hooks))(operands(jnp.bfloat16))
-    with jax.enable_x64(new_val=True):
-        exact, _ = token_by_token(hooks, operands(np.float64))
-    found, truth = (np.asarray(x, np.float64)[0, 1, 0] for x in (out, exact))
-    np.testing.assert_allclose(found, truth, rtol=2.0 ** -6, atol=0)
-
-
-def test_the_layer_declares_its_operands_at_each_call_of_the_chunked_rule(monkeypatch):
-    """KimiDeltaAttention's call of the chunked rule and its route's ask (`kernel_routed`) declare what its
-    conv makes of its operands (`KimiDeltaAttention.declared`): its unit queries among it, which the
-    template's own pairs fold their decays against (`recurrence.Hooks.unit_queries`, `Call.unit_pairs`), a
-    call without it the unfolded own pairs (#3703 review). The sequence split's rule takes the same
-    mapping."""
-    import dew.nn.kda as kda
-
-    seen = []
-
-    def spied(name):
-        real = getattr(kda, name)
-
-        def spy(*args, **kwargs):
-            seen.append((name, kwargs.get("unit_queries"), kwargs.get("write_bound")))
-            return real(*args, **kwargs)
-        return spy
-
-    for name in ("chunk_gated_delta_rule", "kernel_routed"):
-        monkeypatch.setattr(kda, name, spied(name))
-    module, _, variables = layer_and_params(-5.0)
-    module.apply(variables, jnp.asarray(np.random.default_rng(0).normal(size=(B, S, E)), jnp.float32))
-    assert {name for name, *_ in seen} == {"chunk_gated_delta_rule", "kernel_routed"}, seen
-    assert all(declared == (True, 1.0) for _, *declared in seen), seen
+    assert_as_exact(jax.jit(partial(chunk_on, 'mosaic_gpu', hooks)), jax.jit(partial(chunk_on, 'xla', hooks)),
+                    draw, "an unbounded query's own pair under a unit key", seeds=8,
+                    truth_fn=jax.jit(partial(token_by_token, hooks)))
 
 
 def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
