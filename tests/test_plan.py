@@ -2416,24 +2416,36 @@ def test_a_trainer_built_after_the_process_releases_its_programs_traces_its_step
 def test_a_runs_held_executables_let_the_shape_used_least_recently_go_first_past_their_budget():
     """A run's compiler holds its steps' executables by their device code's bytes (`HeldExecutables`, row
     12385): holding one past its budget lets the least recently used go first, a step read since kept
-    before one held earlier and not read again, and one alone past the budget is still held."""
-    from dew.telemetry.instrumentation import compiled_memory
+    before one held earlier and not read again, and one alone past the budget is still held. The steps are
+    a run's own, one a batch shape."""
     from dew.training.planning import HeldExecutables
 
-    compiled = {name: jax.jit(lambda x: jnp.sin(x) @ x.T).lower(jnp.ones((size, size))).compile()
-                for name, size in (("small", 8), ("middle", 32), ("large", 64))}
-    sizes = {name: memory.generated_code for name, executable in compiled.items()
-             if (memory := compiled_memory(executable)) is not None}
-    assert len(sizes) == 3 and all(size > 0 for size in sizes.values()), sizes
-    budget = max(sizes["small"] + sizes["middle"], sizes["small"] + sizes["large"])
-    held = HeldExecutables(budget)
-    held["small"], held["middle"] = compiled["small"], compiled["middle"]
-    assert held.get("small") is compiled["small"]
-    held["large"] = compiled["large"]
-    assert list(held) == ["small", "large"] and held.bytes == sizes["small"] + sizes["large"] <= budget
+    trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0))
+    for rows in (16, 8, 32):
+        trainer.fit(_counted(rows), steps=1, log_every=100)
+    run = trainer._compiler._executables
+    (small, first), (middle, second), (large, third) = ((key, run[key]) for key in list(run)[:3])
+    sizes = {}
+    for key, executable in ((small, first), (middle, second), (large, third)):
+        alone = HeldExecutables(1 << 40)
+        alone[key] = executable
+        sizes[key] = alone.bytes
+    assert all(size > 0 for size in sizes.values()), sizes
+    held = HeldExecutables(max(sizes[small] + sizes[middle], sizes[small] + sizes[large]))
+    held[small], held[middle] = first, second
+    assert held.get(small) is first
+    held[large] = third
+    assert list(held) == [small, large] and held.bytes == sizes[small] + sizes[large] <= held.budget
     alone = HeldExecutables(1)
-    alone["large"] = compiled["large"]
-    assert list(alone) == ["large"]
+    alone[large] = third
+    assert list(alone) == [large]
+
+
+def _counted(rows: int):
+    """The affine run's stream, `rows` rows a batch."""
+    from affine_run import Counting, dataset
+
+    return dataset(functools.partial(Counting, rows), batch=rows)
 
 
 @pytest.mark.gpu(reason="device code's bytes, which a GPU's executables state and the CPU's do not")
@@ -2442,8 +2454,6 @@ def test_a_run_whose_held_steps_pass_their_budget_trains_on_each_shape_it_meets(
     meets a second batch shape and lets the first's step go, holding only the step it runs, and the traced
     step the process kept of it (`forget_program`), so no lowering keeps its device code; and trains on
     each shape as a run that held both does (row 12385)."""
-    from affine_run import Counting, dataset
-
     from dew.nn.kernels import options
     from dew.training import _candidates
 
@@ -2453,7 +2463,7 @@ def test_a_run_whose_held_steps_pass_their_budget_trains_on_each_shape_it_meets(
         if budget is not None:
             trainer._compiler._executables.budget = budget
         for rows in (16, 8):
-            state = trainer.fit(dataset(functools.partial(Counting, rows), batch=rows), steps=2, log_every=100)
+            state = trainer.fit(_counted(rows), steps=2, log_every=100)
         return trainer, len(_candidates._CANDIDATES), jax.device_get(state.variables)
 
     bounded, kept_bounded, held = trained(1)
