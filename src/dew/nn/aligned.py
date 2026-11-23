@@ -146,24 +146,15 @@ def _product(term: Sequence[jax.Array], ints) -> _Product:
                     jnp.broadcast_to(negative, shape), nan | (infinite & zero), infinite, zero)
 
 
-class _Reduced(NamedTuple):
-    """A term's reduction over its `axes` one at a time (Mosaic TPU x64, 8807), then `laid` (broadcast to its
-    first shape, reshaped to its second) where given: a value, so the digit loop of equal reductions is one
-    function (`_nearest_loop`)."""
+def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
+    """A term's reduction over its axes one at a time (Mosaic TPU x64, 8807) and laid, and its count."""
+    axes = axis or ()
 
-    axes: tuple[int, ...]
-    laid: tuple[tuple[int, ...], tuple[int, ...]] | None
-
-    def __call__(self, x: jax.Array, op: Callable = jnp.sum, **options) -> jax.Array:
-        for a in self.axes:
+    def reduced(x: jax.Array, op: Callable = jnp.sum, **options) -> jax.Array:
+        for a in axes:
             x = op(x, axis=a, keepdims=True, **options)
-        return x if self.laid is None else jnp.broadcast_to(x, self.laid[0]).reshape(self.laid[1])
+        return x if laid is None else jnp.broadcast_to(x, laid[0]).reshape(laid[1])
 
-
-def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[_Reduced, int]:
-    """A term's reduction (`_Reduced`) and its count."""
-    axes = tuple(axis or ())
-    reduced = _Reduced(axes, None if laid is None else (tuple(laid[0]), tuple(laid[1])))
     return reduced, math.prod(shape[a] for a in axes)
 
 
@@ -210,46 +201,22 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
     states) took Mosaic TPU an i1 vector of a splat's layout, which its widening to i8 could not relayout,
     every forked TPU scan with an entry write refused (rows 12124, 12125)."""
     ints = jnp.dtype(f"int{limits.bits}")
-    held = 2 + -(-(limits.nmant + 3) // digit)
-    zeros = functools.reduce(jnp.add, [reduced(jnp.zeros_like(product.place), jnp.sum, dtype=ints)
-                                       for product, reduced, _ in parts])
-    start = (zeros, (zeros,) * held, zeros, zeros - 1, (zeros,) * held, zeros)
-    first, last = _levels(parts, lowest, digit, levels, limits)
-    cond, body = _nearest_loop(lowest, digit, limits.dtype.name, tuple(reduced for _, reduced, _ in parts))
-    # The signs carried as integers: a bool vector a Mosaic TPU loop carries is an i1 one (rows 12124, 12125).
-    products = tuple((product.limbs, product.place, product.negative.astype(ints)) for product, _, _ in parts)
-    # A counter of the value's integers: x64 traced a 64-bit index where Mosaic's is 32 (row 8757).
-    _, _, _, states = jax.lax.while_loop(cond, body, (jnp.asarray(first, ints), jnp.asarray(last, ints),
-                                                      products, (start, start)))
-    negative = states[0][0] < 0
-    _, _, _, lead, kept, sticky = jax.tree.map(lambda p, n: jnp.where(negative, n, p), *states)
-    return _written(lead, kept, sticky, negative, lowest, digit, limits)
-
-
-@functools.lru_cache(maxsize=256)
-def _nearest_loop(lowest: int, digit: int, dtype: str,
-                  reductions: tuple[_Reduced, ...]) -> tuple[Callable, Callable]:
-    """`_nearest`'s digit loop, `(cond, body)` over `(level, last, products, states)` (each part's limbs,
-    place and sign, the sign as integers, carried as loop operands, its reduction `reductions`'), one pair
-    for equal static facts: rebuilt each call around the parts it closed over, every trace of a walk calling
-    it traced its loop again (a forked no-decay call's walk, 5 to 7 retraces a site, row 12055)."""
-    limits = jnp.finfo(dtype)
-    ints = jnp.dtype(f"int{limits.bits}")
     # A limb's bits, two of `split_bits`' low halves (`_product`).
     bits, mask, width = limits.bits, (1 << digit) - 1, 2 * split_bits(limits.dtype)[2]
+    held = 2 + -(-(limits.nmant + 3) // digit)
 
-    def digit_sums(level, products):
+    def digit_sums(level):
         low = lowest + level * digit
         sums = []
-        for (limbs, place, negative), reduced in zip(products, reductions, strict=True):
+        for product, reduced, _ in parts:
             taken = 0
-            for at, limb in enumerate(limbs):
-                shift = low - (place + at * width)
+            for at, limb in enumerate(product.limbs):
+                shift = low - (product.place + at * width)
                 right = (limb >> jnp.clip(shift, 0, bits - 1)) & mask
                 kept = limb & ((1 << jnp.clip(digit + shift, 0, bits - 1)) - 1)
                 left = kept << jnp.clip(-shift, 0, bits - 1)
                 taken = taken + jnp.where(shift >= 0, right, jnp.where(digit + shift > 0, left, 0))
-            sums.append(reduced(jnp.where(negative != 0, -taken, taken), jnp.sum, dtype=ints))
+            sums.append(reduced(jnp.where(product.negative, -taken, taken), jnp.sum, dtype=ints))
         return sums
 
     def rolled(state, sums, level):
@@ -266,16 +233,21 @@ def _nearest_loop(lowest: int, digit: int, dtype: str,
                 tuple(jnp.where(nonzero, new, old) for new, old in zip(window, kept, strict=True)),
                 jnp.where(nonzero, under, sticky))
 
-    def cond(carried):
-        return carried[0] < carried[1]
+    def step(level, states):
+        sums = digit_sums(level)
+        return rolled(states[0], sums, level), rolled(states[1], [-total for total in sums], level)
 
-    def body(carried):
-        level, last, products, states = carried
-        sums = digit_sums(level, products)
-        return (level + 1, last, products,
-                (rolled(states[0], sums, level), rolled(states[1], [-total for total in sums], level)))
-
-    return cond, body
+    zeros = functools.reduce(jnp.add, [reduced(jnp.zeros_like(product.place), jnp.sum, dtype=ints)
+                                       for product, reduced, _ in parts])
+    start = (zeros, (zeros,) * held, zeros, zeros - 1, (zeros,) * held, zeros)
+    first, last = _levels(parts, lowest, digit, levels, limits)
+    # A counter of the value's integers: x64 traced a 64-bit index where Mosaic's is 32 (row 8757).
+    _, states = jax.lax.while_loop(lambda carried: carried[0] < last,
+                                   lambda carried: (carried[0] + 1, step(carried[0], carried[1])),
+                                   (jnp.asarray(first, ints), (start, start)))
+    negative = states[0][0] < 0
+    _, _, _, lead, kept, sticky = jax.tree.map(lambda p, n: jnp.where(negative, n, p), *states)
+    return _written(lead, kept, sticky, negative, lowest, digit, limits)
 
 
 def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
