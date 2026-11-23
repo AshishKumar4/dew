@@ -428,6 +428,17 @@ def test_a_packed_products_input_gradient_differentiates_in_its_scale():
     want[0, 0] = 2.0 ** -120
     np.testing.assert_array_equal(np.asarray(d_x), want)
 
+    # Codes +1, -1 and 2**-16 under a scale of 2**126 and cotangents 4, 4 and 2**-120: the first two cancel
+    # past fp32's largest, and their remainder, 2**-10, survives the pullback's bf16 rows.
+    mixed = formats.Fp8Weights.of(jnp.zeros((256, 32), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
+                                  .at[0, 2].set(2.0 ** -16), fmt="e5m2", scale=jnp.float32(1.0))
+    mixed = dataclasses.replace(mixed, scale=jnp.float32(2.0 ** 126))
+    _, pull = jax.vjp(lambda a: gemm.fp8_weight_product(a, mixed, out_dtype=jnp.float32), x)
+    (d_x,) = pull(jnp.zeros((16, 32), jnp.float32).at[0, :2].set(4.0).at[0, 2].set(2.0 ** -120))
+    want = np.zeros((16, 256), np.float32)
+    want[0, 0] = 2.0 ** -10
+    np.testing.assert_array_equal(np.asarray(d_x), want)
+
 
 def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
     """Skinny decode products (`M=13`) for `Fp8Weights` (`e4m3`/`e5m2`) and `TernaryWeights` decode

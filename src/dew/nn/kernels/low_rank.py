@@ -163,10 +163,14 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
 
 def _kept(precision: PrecisionLike) -> PrecisionLike:
     """`precision` for a product of fp32 operands: as given (a run's configured one where it states none),
-    unless it names an algorithm of narrower operands (an F16 or BF16 preset), which would round them back
-    to those, then `HIGHEST`."""
-    narrow = any(name.startswith(("BF16", "F16", "F8", "ANY_F8"))
-                 for name in precision_names(effective_precision(precision)))
+    unless it names an algorithm of narrower operands (an F16 or BF16 preset, or a `jax.lax.DotAlgorithm`
+    whose operand types are), which would round them back to those, then `HIGHEST`."""
+    resolved = effective_precision(precision)
+    algorithms = [one for one in (resolved if isinstance(resolved, tuple) else (resolved,))
+                  if isinstance(one, jax.lax.DotAlgorithm)]
+    narrow = any(jnp.dtype(kind).itemsize < 4 for one in algorithms
+                 for kind in (one.lhs_precision_type, one.rhs_precision_type)) or any(
+        name.startswith(("BF16", "F16", "F8", "ANY_F8")) for name in precision_names(resolved))
     return jax.lax.Precision.HIGHEST if narrow else precision
 
 
