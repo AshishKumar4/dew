@@ -415,3 +415,20 @@ def test_the_low_rank_matrix_holds_on_this_gpu():
     step with its base product and update fused on par with them apart, at each case a GPU-only red seeded
     (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the CPU's."""
     run_cells(kernel_matrix.seeded_cells("low_rank"))
+
+
+def test_an_adapted_products_factor_gradients_hold_fp32_under_a_bf16_preset():
+    """An adapted product of fp32 rows under the BF16_BF16_F32 preset, which a GPU's dot takes: its factor
+    `a`'s gradient, `rowsᵀ · (scale · dy · bᵀ)`, keeps fp32's digits (`low_rank._kept`), so a row entry of
+    `1 + 2**-20`, which bf16 rounds to 1, reaches it: exactly float64's (row 12394)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    rows = jnp.zeros((8, 16), jnp.float32).at[0, 0].set(1.0 + 2.0 ** -20)
+    kernel, a = jnp.zeros((16, 8), jnp.float32), jnp.zeros((16, 4), jnp.float32)
+    b = jnp.zeros((4, 8), jnp.float32).at[0, 0].set(1.0)
+    _, pull = jax.vjp(lambda a_: low_rank(rows, kernel, a_, b, 1.0, out_dtype=jnp.float32,
+                                          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32), a)
+    (d_a,) = pull(jnp.zeros((8, 8), jnp.float32).at[0, 0].set(1.0))
+    want = np.zeros((16, 4), np.float32)
+    want[0, 0] = 1.0 + 2.0 ** -20
+    np.testing.assert_array_equal(np.asarray(d_a), want)
