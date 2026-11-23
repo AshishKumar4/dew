@@ -1407,6 +1407,10 @@ class StepCompiler[L, E]:
         except PlanRefused as refused:
             # Begun where a record or a checkpoint named, which a search of other shardings may not read.
             refused.recorded_start = recorded is not None or resumed is not None
+            if not search.provisional:
+                # A placed search that took no plan keeps none of what it compiled; a provisional one's
+                # is released by its owner (`_provisional`).
+                search.released_unplanned(None)
             raise
         # The rungs above the plan are read for their memory alone, no device ever running them: offline
         # within a prepare too, as no device run has tuned their programs (`report.read_offline`).

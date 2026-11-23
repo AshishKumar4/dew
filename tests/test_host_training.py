@@ -1615,26 +1615,6 @@ def test_a_fit_compiles_its_streamed_step_only_where_its_device_plan_is_dearer_t
     equal(trained.variables, expected.variables)
 
 
-def test_a_fit_that_streams_over_a_device_plan_that_fits_keeps_none_of_that_plan():
-    """A fresh fit whose devices hold its device plan, on a host fast enough that the streamed step is
-    chosen over it (`streaming.laid_start`), drops every program the device plan's search kept and its
-    admission charges with it (`StepCompiler.abandoned`): none outlives the layout the run turned from
-    (review of row 12131's P0: the device plan's candidates stayed pinned)."""
-    import gc
-
-    from dew.training import _candidates
-    from dew.training.ahead import stand_in_gpus
-    from dew.training.memory import host_memory_stated
-
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30), host_memory_stated(1e20):
-        trainer = streaming_decoder(dtype=jnp.bfloat16)
-        trainer.fit(streaming_data(), steps=1, log_every=100)
-    choice = trainer.layout_choice
-    assert choice is not None and choice.device is not None and choice.streams, choice
-    gc.collect()
-    assert not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
-
-
 def streamed_priced(trainer: Trainer, data):
     """The streamed step's price `trainer`'s fresh fit of one step over `data` weighs as it chooses its
     layout (`Trainer.layout_choice`), on this host's CPUs stood in for H100s whose host moves memory as fast

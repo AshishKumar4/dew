@@ -524,7 +524,7 @@ class FirstRunFailed(RuntimeError):
             "the kernels loaded, and a lower fraction leaves them more")
 
 
-def first_run_failed(error: jax.errors.JaxRuntimeError, step: int, fitted: JSON,
+def first_run_failed(error: BaseException, step: int, fitted: JSON,
                      mesh: Mesh) -> FirstRunFailed:
     """A newly compiled step's first run's `error` on its devices, as the step's (`FirstRunFailed`): with
     the record of the check that said it fits (`fitted`) and what each device holds now, wherever the step

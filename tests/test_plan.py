@@ -414,6 +414,20 @@ def free_until_placed(monkeypatch, room):
 
 
 
+def test_a_compiler_a_run_turns_from_releases_every_search_it_holds_with_no_winner():
+    """A device plan's compiler the run turns from, the streamed layout taken in its place
+    (`dew.training.streaming.laid_start`), releases every search it holds for a plan no compile will take,
+    with no winner (`StepCompiler.abandoned`): its unplaced plan's and each handed to it, none left pinning
+    programs or their admission (review of row 12131's P0: the device plan's search stayed pinned)."""
+    compiler = lm()._compiler
+    released: list[object] = []
+    compiler.settle_with(released.append)
+    compiler.settle_with(released.append)
+    compiler.abandoned()
+    compiler.abandoned()
+    assert released == [None, None], released
+
+
 def test_a_search_handed_to_a_compile_that_refuses_is_released_with_no_winner(monkeypatch):
     """A search made off the loop for the step a compile plans next (a later phase's,
     `dew.training.ahead.LaterPlans`) is handed to the compile (`StepCompiler.settle_with`): a compile whose
