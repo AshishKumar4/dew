@@ -2442,7 +2442,7 @@ def test_a_run_whose_held_steps_pass_their_budget_trains_on_each_shape_it_meets(
     meets a second batch shape and lets the first's step go, holding only the step it runs, and the traced
     step the process kept of it (`forget_program`), so no lowering keeps its device code; and trains on
     each shape as a run that held both does (row 12385)."""
-    from affine_run import dataset
+    from affine_run import Counting, dataset
 
     from dew.nn.kernels import options
     from dew.training import _candidates
@@ -2453,7 +2453,7 @@ def test_a_run_whose_held_steps_pass_their_budget_trains_on_each_shape_it_meets(
         if budget is not None:
             trainer._compiler._executables.budget = budget
         for rows in (16, 8):
-            state = trainer.fit(dataset(batch=rows), steps=2, log_every=100)
+            state = trainer.fit(dataset(functools.partial(Counting, rows), batch=rows), steps=2, log_every=100)
         return trainer, len(_candidates._CANDIDATES), jax.device_get(state.variables)
 
     bounded, kept_bounded, held = trained(1)
