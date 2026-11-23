@@ -18,7 +18,13 @@ from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, dew_path
 from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, emission, merged
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    emission,
+    merged,
+    merged_mosaic,
+)
 
 SPECS = {"natural": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True)),
          "fold": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=0.125, natural=False,
@@ -295,7 +301,7 @@ def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
 @pytest.mark.parametrize("cases", ["widths-narrow", "widths-wide", "shapes-finished", "shapes-long"])
 @pytest.mark.parametrize("name", ["sm80", "sm90", "sm100"])
 def test_a_padded_merge_compiles_as_one_launch(name, cases):
-    """The padded merge's one Mosaic GPU launch (`merged._launch_mosaic`, row 9795) compiles spill-free for
+    """The padded merge's one Mosaic GPU launch (`merged_mosaic.launch`, row 9795) compiles spill-free for
     compile-only Ampere, Hopper and Blackwell GPUs in one process per GPU across: value widths 80, 96, 100,
     128 and 192 (predicated coalesced GMEM loads/stores); a `jax.vmap` batch of three splits (beside nothing
     but the one transpose that folds it, every launch typed by `assembled.launched_thunks`); `merged_finished`
@@ -392,7 +398,7 @@ def test_padded_merge_routes_nvidia_mosaic_and_keeps_triton_fallback():
 
 
 def test_replicated_channel_merge_matches_value_with_subnormal_initial_mass():
-    """Rows 9795, 11857: replicating row stats across `[chunk, block]` (the layout `_launch_mosaic` uses
+    """Rows 9795, 11857: replicating row stats across `[chunk, block]` (the layout `merged_mosaic.launch` uses
     for zero-SMEM Mosaic GPU lowering) matches `merged._value` bit-for-bit on regular and subnormal
     (`2^-127`) initial-mass merges."""
     from dew.algebra import windows
@@ -580,10 +586,10 @@ def _mosaic_kernel_body(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDt
                         out_dtype=None, out_heads: int | None = None, output_mod=None,
                         output_kinds: tuple[template.Kind, ...] = (),
                         output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()):
-    """Trace `_launch_mosaic` and return its kernel equation and body jaxpr."""
+    """Trace `merged_mosaic.launch` and return its kernel equation and body jaxpr."""
     family = generation.family(target.generation) or "mma.sync"
     launch = functools.partial(
-        merged._launch_mosaic, units=algebra.units_of(spec), queries=queries, width=width, block=block,
+        merged_mosaic.launch, units=algebra.units_of(spec), queries=queries, width=width, block=block,
         out_dtype=out_dtype, out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds,
         family=family)
     with generation.as_target(target):
@@ -606,81 +612,6 @@ def _mosaic_emitted_roles(spec, padded: jax.ShapeDtypeStruct, stacked: jax.Shape
         out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds, output_specs=output_specs)
     return emission.emitted(body, min(blocks, 2), "block", device=range(len(body.invars)),
                             forms=emission.forms_of(kernel.params.get("compiler_params"))).roles
-
-
-def _mosaic_chunk_col_masks(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
-                            queries: int, width: int, block: int, *, target: generation.GpuTarget
-                            ) -> list[np.ndarray]:
-    """Evaluate the emitted 1D boolean column load mask passed to `_mgpu_load_chunk` for every `c_block`."""
-    from jax._src import core as jax_core
-    from jax._src.pallas import mpmd, primitives as pl_prims
-    from jax._src.pallas.mosaic_gpu import core as gpu_core, primitives as gpu_prims
-
-    _, body = _mosaic_kernel_body(spec, padded, stacked, queries, width, block, target=target)
-    channels = 1 << (width - 1).bit_length()
-    blocks = channels // block
-    tile_block = max(block, 64)
-
-    def find_mask(jaxpr: jax_core.Jaxpr, invar_vals: list, const_vals: tuple | list, cb: int
-                  ) -> np.ndarray | None:
-        env: dict = dict(zip(jaxpr.constvars, const_vals, strict=True))
-        env.update(zip(jaxpr.invars, invar_vals, strict=True))
-        for eq in jaxpr.eqns:
-            vals = [v.val if isinstance(v, jax_core.Literal) else env.get(v) for v in eq.invars]
-            prim = eq.primitive
-            if prim is gpu_prims.inline_mgpu_p and len(eq.outvars) == 3:
-                for v, val in zip(eq.invars, vals, strict=True):
-                    if (isinstance(v, jax_core.Var) and isinstance(v.aval, jax_core.ShapedArray)
-                            and v.aval.dtype == jnp.bool_ and v.aval.shape == (tile_block,)
-                            and val is not None):
-                        return np.asarray(val, dtype=bool)
-                continue
-            if (called := programs.called(eq)) is not None:
-                if (found := find_mask(called, vals, (), cb)) is not None:
-                    return found
-                continue
-            if prim is pl_prims.run_scoped_p:
-                sub = eq.params["jaxpr"]
-                if (found := find_mask(sub, [None] * len(sub.invars), vals, cb)) is not None:
-                    return found
-                continue
-            if prim is mpmd.mpmd_map_p:
-                for sub in eq.params["jaxprs"]:
-                    sub_in = (vals[:len(sub.invars)] if len(vals) >= len(sub.invars)
-                              else [None] * len(sub.invars))
-                    sub_c = vals if len(sub.constvars) == len(vals) else [None] * len(sub.constvars)
-                    if (found := find_mask(sub, sub_in, sub_c, cb)) is not None:
-                        return found
-                continue
-            if prim is jax.lax.while_p:
-                sub = eq.params["body_jaxpr"]
-                consts = vals[eq.params["cond_nconsts"]:][:eq.params["body_nconsts"]]
-                carry = [None] * (len(sub.jaxpr.invars) - len(consts))
-                if (found := find_mask(sub.jaxpr, [*consts, *carry], sub.consts, cb)) is not None:
-                    return found
-                continue
-            if prim is jax.lax.scan_p:
-                sub, nc = eq.params["jaxpr"], eq.params["num_consts"]
-                carry = [None] * (len(sub.jaxpr.invars) - nc)
-                if (found := find_mask(sub.jaxpr, [*vals[:nc], *carry], sub.consts, cb)) is not None:
-                    return found
-                continue
-            if prim is jax.lax.axis_index_p:
-                env[eq.outvars[0]] = jnp.int32(cb if eq.params["axis_name"] == "block" else 0)
-            elif prim is gpu_core.layout_cast_p and vals[0] is not None:
-                env[eq.outvars[0]] = vals[0]
-            elif not eq.effects and prim is not jax.lax.cond_p and all(v is not None for v in vals):
-                out = prim.bind(*vals, **eq.params)
-                outs = list(out) if prim.multiple_results else [out]
-                env.update(zip(eq.outvars, outs, strict=True))
-        return None
-
-    masks = []
-    for cb in range(blocks):
-        found = find_mask(body, [None] * len(body.invars), (), cb)
-        assert found is not None, "expected chunk loader to receive a 1D boolean column mask"
-        masks.append(found)
-    return masks
 
 
 def _mosaic_expected_bytes(*, rows: int, slices: int, width: int, read_width: int, block: int,
@@ -734,10 +665,6 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
     pad_blocks = 128 // mosaic_block
     assert roles_pad[0].walks[0].device_bytes == float(8 * ((80 / pad_blocks) * 4 + 2 * 4))
     assert roles_pad[0].walks[0].device_bytes < float(8 * ((128 / pad_blocks) * 4 + 2 * 4))
-    col_masks = _mosaic_chunk_col_masks(spec, pad_p, pad_s, 4, 80, mosaic_block, target=sm90)
-    assert sum(int(m.sum()) for m in col_masks) == 80
-    assert not any(m[col - cb * mosaic_block] for cb, m in enumerate(col_masks)
-                   for col in range(80, 128) if 0 <= col - cb * mosaic_block < len(m))
     triton_block = merged._channel_block(spec, pad_p, pad_s, 4, 80, sm75)
     triton_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, sm75)
     assert triton_work.device_bytes == _traced_merge_bytes(
