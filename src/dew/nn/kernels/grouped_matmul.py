@@ -2094,30 +2094,23 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
 DECLARED_ONLY = _Need('declared', lambda case: DECLARED.get(case.cell, (None,))[0] is CUTLASS,
                       "CUTLASS's launches run on the cells where they measured faster than the template "
                       "(`DECLARED`), and where a call names them", row='bible da64ae5', kind='measured')
-"""What keeps CUTLASS's launches, a vendored production route where they win (bible §6, as FA3), off every
-other cell: the template, then Triton by legality, run those."""
-
+"""Keeps CUTLASS off non-declared cells (bible §6)."""
 
 DENSE_MEASURED = _Need('dense', lambda case: not case.kind.dense,
                       "Triton's dense launches measured slower than XLA's dot on every generation timed "
                       "(DENSE1, 10 projections at 8192 tokens: A100 1.735x to 1.947x, H100 1.149x to 1.738x)",
                       row='bible da64ae5', kind='measured')
-"""What keeps Triton's launches off a dense product the template's own launches cannot run: XLA's dot runs it,
-as it measured faster than Triton's on every generation timed; a call naming Triton still runs them."""
+"""Keeps Triton off dense products where XLA dot is faster."""
 
-
-IMPLEMENTATIONS = ((MosaicGmm(), MosaicTgmm()), (Gmm(), Tgmm()),
-                   (CutlassGmm(), CutlassTgmm()))
-"""Each implementation of the grouped product, in `GROUPED`'s order: its launch of a product and its launch
-of a kernel gradient, one name for both."""
+IMPLEMENTATIONS = ((MosaicGmm(), MosaicTgmm()), (Gmm(), Tgmm()), (CutlassGmm(), CutlassTgmm()))
+"""Grouped implementations in `GROUPED` order: `(gmm, tgmm)` pairs."""
 
 _GMMS = tuple(product for product, _ in IMPLEMENTATIONS)
 _TGMMS = tuple(gradient for _, gradient in IMPLEMENTATIONS)
 
 
 def _takes_pair(name: str, case: GroupedCase) -> bool:
-    """Whether the launches `name` take the paired product `case` whole: Mosaic GPU's where a bundle takes it
-    (`MosaicGmm._takes`); every other hands it on (`APART`)."""
+    """Whether `name` takes paired product `case` whole (else `APART`)."""
     bound = case.call.bound.get(name)
     if name != MosaicGmm.name or bound is None:
         return False
@@ -2125,7 +2118,7 @@ def _takes_pair(name: str, case: GroupedCase) -> bool:
 
 
 def _takes_tables(name: str, case: GroupedCase) -> bool:
-    """Whether the launches `name` read/write rows through gather/scatter tables on `case`'s target."""
+    """Whether `name` reads/writes rows through gather/scatter tables on `case`'s target."""
     bound = case.call.bound.get(name)
     if name != MosaicGmm.name or bound is None:
         return False
@@ -2136,9 +2129,7 @@ def _takes_tables(name: str, case: GroupedCase) -> bool:
 
 
 class Apart:
-    """`launched`'s answer for a paired product no launch takes whole: its two products run apart
-    (`gemm._apart`), each through the launches that take it, as the unfused program runs
-    them."""
+    """`launched`'s sentinel for paired products no launch takes whole (`gemm._apart`)."""
 
     name = 'apart'
 

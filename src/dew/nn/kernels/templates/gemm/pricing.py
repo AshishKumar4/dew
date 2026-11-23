@@ -4,6 +4,7 @@ multiprocessor (`step_seconds`, its shared memory's bytes `step_shared_bytes`), 
 prices from them: a contraction's split (`split_count`, `split_walk`) and a dense product's balanced last
 wave (`balanced_tail`, `handoff_steps`, `fixes_up`)."""
 
+import contextlib
 import dataclasses
 import math
 from collections.abc import Callable
@@ -220,10 +221,12 @@ def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: 
     return max(hook, staged)
 
 
-def max_programs(family: mosaic.Family, consumers: int) -> int:
-    """Most resident programs/SM for `consumers` warpgroups at `family`'s scalar-register floor (shared by
-    `granular_tile`, `derivation.derived` and `MosaicGmm._tile`)."""
-    return family.programs(consumers, family.scalar_registers() if family.budgets_registers else None)
+def max_programs(family: mosaic.Family, consumers: int, target=None) -> int:
+    """Most resident programs/SM for `consumers` warpgroups at `family`'s scalar-register floor, evaluated
+    under `target` when given (shared by `granular_tile` and `MosaicGmm._tile`)."""
+    ctx = contextlib.nullcontext() if target is None else generation.as_target(target)
+    with ctx:
+        return family.programs(consumers, family.scalar_registers() if family.budgets_registers else None)
 
 
 def granular_tile(family: mosaic.Family, config: "Tiles", dtype, *, target,
@@ -236,7 +239,7 @@ def granular_tile(family: mosaic.Family, config: "Tiles", dtype, *, target,
     from dew.nn.kernels.templates.gemm.tiling import CONSUMERS
 
     if (config.warpgroups > min(family.consumers, CONSUMERS)
-            or config.programs > max_programs(family, config.warpgroups) or config.stages < 2
+            or config.programs > max_programs(family, config.warpgroups, target) or config.stages < 2
             or config.block_m % (family.role_rows * config.sharing)
             or config.block_n % family.column_unit(dtype)
             or config.block_k not in (steps or family.depths(dtype))
