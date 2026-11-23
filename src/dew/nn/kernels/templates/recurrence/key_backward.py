@@ -26,6 +26,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Operand,
     Walked,
     chunk_liveness,
+    clamped_gradient,
     column_sums,
     column_sums_scratch,
     column_tile,
@@ -584,26 +585,30 @@ class KeyKept(NamedTuple):
     dg_pairs: jax.Array
     dbeta_pairs: jax.Array
     """`own_pairs.key_pairs_own`'s queries' and keys' gradients (finished, the factored pairs' and the
-    memory's added), and its and `_key_pairs_back`'s log decay's and beta's gradients
-    through the pairs, summed."""
+    memory's added), its log decay's (finished: every launch's terms summed back over each chunk, each
+    sequence's first token's not yet taken from its memory, `_first_decays`), and its and
+    `_key_pairs_back`'s beta's gradients through the pairs, summed."""
 
 
-def _first_decays(dg, run, dh0, taken=None):
+def _first_decays(dg, run, dh0, taken=None, clamp=None):
     """`dg` `[R, HV * Dk]` with each sequence's first token's taken from the memory its decay scales
     (`algebra.first_decays`, as fla_kda's port takes it): `<h0, dh0>` for a sequence that takes its memory
     (begins its row), at its first chunk's first row. A forked call's documents each take theirs up at a
     chunk's first token (`table.Table.loads`): `<h, taken>` there, the memory the chunk took up in fp32
     (`_taken_memories`, as the walk took it, not its 16-bit copy the states launch stored) and its gradient
-    (`taken`, the reverse walk's)."""
+    (`taken`, the reverse walk's). A clamped call's `clamp`, its log decays laid, takes its clamp's
+    derivative on those tokens too (`mainloop.clamped_gradient`), as the launch that finished `dg` did."""
     call = run.call
     walked = tables.unpacked(Walked, lambda i: run.sequences[:, i])
+    passed = None if clamp is None else clamped_gradient(clamp, jnp.ones_like(clamp)) != 0
     dg = algebra.first_decays(dg, run.h0, dh0, walked.first * call.chunk, walked.row, walked.takes == 1,
-                              walked.chunks > 0)
+                              walked.chunks > 0, passed)
     if taken is None:
         return dg
     chunks = jnp.arange(call.chunks)
     took = run.table.loads >= 0
-    return algebra.first_decays(dg, _taken_memories(run), taken, chunks * call.chunk, chunks, took, took)
+    return algebra.first_decays(dg, _taken_memories(run), taken, chunks * call.chunk, chunks, took, took,
+                                passed)
 
 
 def _taken_memories(run) -> jax.Array:
@@ -634,7 +639,7 @@ def _taken_memories(run) -> jax.Array:
     return jnp.where((table.loads >= 0).repeat(slots)[:, None], memories, 0.0)
 
 
-def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
+def gradients(run, laid_do, dht, tiles, *, clamp=None) -> tuple[tuple, KeyKept]:
     """`(dq [R, H * Dk], dk [R, H * Dk], dv [R, HV * Dv], dg [R, HV * Dk], dbeta [R, HV], dh0 [B * HV * Dk,
     Dv])` fp32 of the gated delta rule under a decay a key dimension, laid as the prepared run's
     (`chunk_forward.prepared`'s, its intra launch's scores and inverse, its gated keys), fla_kda's DAG: the
@@ -666,16 +671,15 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
     # The sub-chunks' factored pairs' gradients, then their own pairs', two launches, the latter finishing
     # the queries' and keys' (`own_pairs.key_pairs_own`).
     dq_f, dk_f, dg_f, dbeta_f = _key_pairs_back(*pairs, call, scale=run.scale)
-    dq_p, dk_p, dg_o, dbeta_o = own_pairs.key_pairs_own(*pairs, (dq_f, dk_f), (dq_m, dk_m), call,
-                                                        scale=run.scale)
-    dg_p, dbeta_p = dg_f + dg_o, dbeta_f + dbeta_o
-    terms = (dg_m + dg_p).reshape(call.chunks, call.chunk, heads * width)
     # The memory decay's term on each chunk's last token, `sum(h dh) exp2(g_last)`, the reverse walk's value
-    # blocks' sums added.
+    # blocks' sums added: each suffix sum's start in the own pairs' launch, which sums the decay's gradient
+    # back over each chunk (`own_pairs.key_pairs_own`).
     last = (limb.reshape(call.chunks, call.chunk, heads * width)[:, -1] for limb in prefix)
-    terms = terms.at[:, -1].add(decayed.sum(0).reshape(call.chunks, -1) * algebra.raised(*last))
-    dg = algebra.suffix_sums(terms).reshape(rows, heads * width)
-    dg = _first_decays(dg, run, dh0, taken)
+    ending = decayed.sum(0).reshape(call.chunks, -1) * algebra.raised(*last)
+    dq_p, dk_p, dg_p, dbeta_o = own_pairs.key_pairs_own(*pairs, (dq_f, dk_f), (dq_m, dk_m), (dg_f, dg_m),
+                                                        ending, call, scale=run.scale, clamp=clamp)
+    dbeta_p = dbeta_f + dbeta_o
+    dg = _first_decays(dg_p.reshape(rows, heads * width), run, dh0, taken, clamp)
 
     def keyed(x):
         """A value head's gradient `[R, HV * Dk]` summed onto its key head's `[R, H * Dk]`."""

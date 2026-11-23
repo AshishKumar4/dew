@@ -28,7 +28,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     addressed,
     block_stored,
     chunk_liveness,
-    clamped_gradient,
     column_tile,
     diagonal,
     f32,
@@ -139,7 +138,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   family: mosaic.Family | None = None, interpret: bool = False,
                   inverse=None, kept=None, delta: bool = True,
                   rounded: bool = False, apart: int = 0, values_gated: bool = False,
-                  unit_keys: bool = False, decay_bound: float | None = None, ranged: bool = False,
+                  unit_pairs: bool = False, decay_bound: float | None = None, ranged: bool = False,
                   skip=None,
                   forked: ForkedTable | None = None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
@@ -169,19 +168,21 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
                    firsts=firsts, rounded=rounded, apart=apart, values_gated=values_gated,
-                   unit_keys=unit_keys, decay_bound=decay_bound, ranged=ranged, forked=forked,
+                   unit_pairs=unit_pairs, decay_bound=decay_bound, ranged=ranged, forked=forked,
                    skipped=skip is not None)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
     laid_do = call.given.split(run.laid(zero_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
     dht = zero_padded(zero_padded(dfinal.astype(jnp.float32), 2, width), 3, columns).reshape(-1, columns)
     if call.per_key:
-        (dq, dk, dv, dg, dbeta, dh0, taken), key_kept = key_backward.gradients(run, laid_do, dht, tiles)
+        # A clamped call's log decays laid, the clamp's derivative's (`chunk_forward.prepared`'s): summed
+        # back over its chunk, a log decay below the floor took the terms' fp32 residue where float64's is
+        # zero. Applied as the decay's gradient is finished (`key_backward.gradients`).
+        clamp = (run.laid(zero_padded(g.astype(jnp.float32), 3, width)).reshape(rows, -1) if call.clamped
+                 else None)
+        (dq, dk, dv, dg, dbeta, dh0, taken), key_kept = key_backward.gradients(run, laid_do, dht, tiles,
+                                                                               clamp=clamp)
         dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
-        if call.clamped:
-            # The clamp's derivative (`chunk_forward.prepared`'s): summed back over its chunk, a log decay
-            # below the floor took the terms' fp32 residue where float64's is zero.
-            dg = clamped_gradient(g, dg)
         grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts)
         return (*_tabled_gradients(run, grads, taken), None, _entered_gradient(run, taken)), key_kept
     local = _local_back(run.q, run.k, laid_do, *run.prefix, run.taken, call, scale=run.scale)

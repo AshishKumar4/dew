@@ -268,15 +268,15 @@ def _lightning_parts(shape: Shape, given: dict) -> tuple:
 
 
 def _gated_parts(shape: Shape, given: dict) -> tuple:
-    """A gated delta rule's or KDA's shape's (`_ssd_parts`'s): the draws' sigmoid write gates of unit keys
-    (`recurrence.Hooks.write_bound`), as layers declare."""
+    """A gated delta rule's or KDA's shape's (`_ssd_parts`'s): the draws' sigmoid write gates of unit keys and
+    queries (`recurrence.Hooks.write_bound`, `unit_queries`), as layers declare."""
     import jax.numpy as jnp
 
     from dew.nn.kernels import recurrence
     from dew.nn.kernels.recurrence_chunk import Chunk, chunk, fla_rule
 
     hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                             scale=shape.key_width ** -0.5, write_bound=1.0)
+                             scale=shape.key_width ** -0.5, write_bound=1.0, unit_queries=True)
     inputs = (*(given[key].astype(jnp.bfloat16) for key in ('q', 'k', 'v')), given['g'],
               given['beta'].astype(jnp.bfloat16))
 

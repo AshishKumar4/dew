@@ -373,7 +373,7 @@ def test_an_unbounded_steep_decay_keeps_the_mild_pairs_after_it_interpreted():
     from dew.nn.kernels.recurrence_chunk import Chunk
 
     width, length = 16, 80
-    hooks = recurrence.Hooks(decay='vector', scale=width ** -0.5, write_bound=1.0)
+    hooks = recurrence.Hooks(decay='vector', scale=width ** -0.5, write_bound=1.0, unit_queries=True)
 
     def draw(seed):
         rng = np.random.default_rng([12067, seed])
