@@ -629,17 +629,20 @@ def _ring_trips(ringed) -> tuple:
 
 @pytest.mark.parametrize("prefetched, stages", [(True, 3), (False, 1)], ids=["prefetched", "at-once"])
 def test_a_copy_into_a_rings_slot_waits_as_the_ring_hides_it(prefetched, stages):
-    """Each trip of a loop waiting on its own slot of a ring of three, the first filled before the loop: a
-    copy it issues into the next slot, a prefetch, waits as the ring's three stages hide it, where one copy
-    landing on its own barrier hides nothing (row 4123: every copy priced waited whole, its ring's depth
-    unread); a copy into its own slot, waited at once, waits whole, the ring's depth no proof of turns between
-    (row 12369: an attention consumer's copy and wait on one slot priced a third)."""
+    """Each trip of a loop waiting on its own slot of a ring of three: a copy it issues two slots ahead, the
+    ring's first two filled before the loop, a prefetch as deep as the ring, waits as its three stages hide
+    it, where one copy landing on its own barrier hides nothing (row 4123: every copy priced waited whole, its
+    ring's depth unread); a copy into its own slot, waited at once, waits whole, the ring's depth no proof of
+    turns between (row 12369: an attention consumer's copy and wait on one slot priced a third; its review:
+    the prefetch one transfer ahead of three stages, the at-once arm's slot filled twice before a wait)."""
     def ringed(out_gmem, tiles, ready):
-        plgpu.copy_gmem_to_smem(out_gmem, tiles.at[0], ready.at[0])
+        if prefetched:
+            for filled in (0, 1):
+                plgpu.copy_gmem_to_smem(out_gmem, tiles.at[filled], ready.at[filled])
 
         def trip(step):
             slot = step % 3
-            copied = (step + 1) % 3 if prefetched else slot
+            copied = (step + 2) % 3 if prefetched else slot
             plgpu.copy_gmem_to_smem(out_gmem, tiles.at[copied], ready.at[copied])
             plgpu.barrier_wait(ready.at[slot])
             return step + 1
