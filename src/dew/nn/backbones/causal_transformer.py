@@ -1220,7 +1220,7 @@ class CausalTransformer(LinearProducts):
         state them (`decoder_cache.named_caches`), tracing no forward."""
         put_opened(self, named_caches(self.mtp, batch_size))
 
-    def hidden_states(self, tokens, loop_passes=None, **kwargs):
+    def hidden_states(self, tokens, *, loop_passes=None, **kwargs):
         """Return the final normalized states, without the vocabulary projection, its loop at `loop_passes`
         passes where a call gives a count (`hidden_and_mtp_inputs`)."""
         return self.hidden_and_mtp_inputs(tokens, loop_passes=loop_passes, **kwargs)[0]
