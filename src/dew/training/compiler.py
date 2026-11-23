@@ -699,6 +699,9 @@ class StepCompiler[L, E]:
         # A provisional search's release of what it kept but the plan taken in its place, until the plan made
         # before the state was placed takes it (`Unplaced.release`); none past that, so no search outlives it.
         self._settle: Callable[[Planned | None], None] | None = None
+        # The releases of searches off the loop whose plan the next compile takes in their place
+        # (`settle_with`).
+        self._settles: list[Callable[[Planned | None], None]] = []
         # Where that search found none, its refusal, which the placed state may not cover (`refuse_unplaced`).
         self._refused: tuple[Hashable, PlanRefused] | None = None
         # The fit's interval its host steps count their misses in (`counting`), None outside a fit.
@@ -975,9 +978,20 @@ class StepCompiler[L, E]:
             keep()
         if unplaced is not None:
             unplaced.release(planned)
+        # Each search off the loop this compile's plan was made in place of (`settle_with`), released while
+        # the plan's programs are still read.
+        settles, self._settles = self._settles, []
+        for settle in settles:
+            settle(planned)
         kept = planned.released()
         return dataclasses.replace(compiled, step=self.runner(stepping, kept, settings.device_mesh),
                                    planned=kept)
+
+    def settle_with(self, release: Callable[[Planned | None], None]) -> None:
+        """Release a search made off the loop for the step the next compile plans (a later phase's,
+        `dew.training.ahead.LaterPlans.waited`) once that compile takes its plan, every program it kept but
+        the plan's dropped (`FitSearch.released_unplanned`), before the plan's own programs are let go."""
+        self._settles.append(release)
 
     def anew(self) -> StepCompiler[L, E]:
         """A compiler of this one's objective, links, step compiled ahead and pass counts, nothing planned:

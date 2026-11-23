@@ -199,7 +199,7 @@ _input_log = logging.getLogger("dew.training.input")
 if TYPE_CHECKING:
     from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
-    from dew.training.ahead import AheadOfTime, LaterPlans, Release
+    from dew.training.ahead import AheadOfTime, LaterPlans
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
@@ -2243,7 +2243,6 @@ class Trainer(Generic[Loss, Effects]):
         """
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
-        release: Release | None = None
         if signature not in compiled and self.phase_passes.begins(compiled) and (
                 not occupied(state.window)):
             # A phase of other passes begins at an update's end: its step is planned afresh, at the split
@@ -2258,7 +2257,7 @@ class Trainer(Generic[Loss, Effects]):
             if self._later is not None:
                 # The phase's plan off the loop waited for, its executables the process's (`LaterPlans`),
                 # each but those the boundary's plan takes dropped once it takes one.
-                release = self._later.waited(self.phase_passes.current)
+                self._compiler.settle_with(self._later.waited(self.phase_passes.current))
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
         if signature not in compiled:
@@ -2269,8 +2268,6 @@ class Trainer(Generic[Loss, Effects]):
             began = time.perf_counter()
             with region("compile"), run.held():
                 compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
-            if release is not None:
-                release(None if self._compiled is None else self._compiled.planned)
             seconds = time.perf_counter() - began
             settled_heap(run, compiled=True)
             links = {axis: AxisLink(link.bytes_per_second, link.spread) for axis, link in self.links.items()}
