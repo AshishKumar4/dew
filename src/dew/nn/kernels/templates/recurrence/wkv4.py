@@ -27,6 +27,8 @@ it is. Every value is fp32, `w` and `u` gradients summed compensated a program (
 and across them by XLA.
 """
 
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -70,9 +72,9 @@ def _empty(like):
     return zero, zero, zero - jnp.inf
 
 
-def _held(inside, new: tuple, old: tuple) -> tuple:
-    """`new` where the token is inside the row, else `old`, each value selected."""
-    return tuple(jnp.where(inside, one, other) for one, other in zip(new, old, strict=True))
+def _held(inside, new, old):
+    """`new` where the token is inside the row, else `old`, each value of their trees selected."""
+    return jax.tree.map(lambda one, other: jnp.where(inside, one, other), new, old)
 
 
 def _entered(program: Program, token, carry: tuple, like) -> tuple:
@@ -137,8 +139,7 @@ def summaries(k, v, w, starts, *, shape: Walk):
                 kept, added, top = _weights(cut(first, eps, zero - jnp.inf), k_t, decay)
                 stepped = (summed_on((numerator, scale), kept * numerator, added * v_t, None),
                            kept * beta + added, top)
-                inside = program.inside(t, k_t)
-                carry = jax.tree.map(lambda one, other: jnp.where(inside, one, other), stepped, carry)
+                carry = _held(program.inside(t, k_t), stepped, carry)
             return carry
 
         zero = jnp.zeros_like(decay)
@@ -224,8 +225,9 @@ def _back(program: Program, refs: tuple, shape: Walk, kept_ref, carried, emit):
 
 def _shares(k_t, aged, e):
     """The running maximum's cotangent `e` at a token's `max(aged, k_t)` as `(the key's, the aged past's)`:
-    all to the larger, half to each at a tie, as JAX's `maximum` takes it (the portable scan's and the
-    recurrence's), each selected, never a product with zero."""
+    all to the larger, half to each at a tie, as JAX's `maximum` takes it a token at a time (fla's recurrence,
+    `rwkv4.recurrent_wkv4`; the portable scan's associative grouping splits a tie of three or more tokens by
+    its own tree), each selected, never a product with zero."""
     zero, half = jnp.zeros_like(e), e * 0.5
     won, tied = k_t > aged, k_t == aged
     return jnp.where(won, e, jnp.where(tied, half, zero)), jnp.where(won, zero, jnp.where(tied, half, e))
@@ -263,8 +265,7 @@ def _reverse_step(program: Program, t, k_t, v_t, dy_t, read, terms, decay, carri
     first = program.first(t, k_t)
     before = jax.tree.map(lambda value, empty: cut(first, value, empty), before, emptied)
     inside = program.inside(t, k_t)
-    held = jax.tree.map(lambda one, other: jnp.where(inside, one, other), before, carried)
-    return held, tuple(jnp.where(inside, x, zero) for x in (dk, dv, dw, du))
+    return _held(inside, before, carried), tuple(jnp.where(inside, x, zero) for x in (dk, dv, dw, du))
 
 
 def _kept(shape: Walk):
@@ -345,6 +346,18 @@ def _spans(shape: Walk, starts, like):
     return tokens, jnp.broadcast_to(fresh[..., None], like.shape)
 
 
+class _Carry(NamedTuple):
+    """`rwkv4.SpanCarry` as the template's join holds it: a signed value (the numerator; reversed, both) an
+    extended float, a `(fraction, exponent)` pair (`walks.extended`), `rwkv4.joined` reading each field by
+    its name alike."""
+
+    numerator: jax.Array | tuple[jax.Array, jax.Array]
+    denominator: jax.Array | tuple[jax.Array, jax.Array]
+    top: jax.Array
+    tokens: jax.Array
+    fresh: jax.Array
+
+
 def _weighed(kept, earlier, added_, later):
     """Two spans' extended values (`walks.extended`) at their larger maximum, `rwkv4.joined`'s weighing."""
     return added(multiplied(earlier, extended(kept, 0)), multiplied(later, extended(added_, 0)))
@@ -370,9 +383,8 @@ def _joined(carries: tuple, given: tuple, decay, shape: Walk, starts, *, reverse
         edges = (extended(given[0][:, None], 0), given[1][:, None])
         weighing = {"numerators": _weighed}
     tokens, fresh = _spans(shape, starts, top)
-    spans = rwkv4.SpanCarry(*values, top, tokens, fresh)
-    edge = rwkv4.SpanCarry(*edges, given[2][:, None], jnp.zeros_like(tokens[:, :1]),
-                           jnp.zeros_like(fresh[:, :1]))
+    spans = _Carry(*values, top, tokens, fresh)
+    edge = _Carry(*edges, given[2][:, None], jnp.zeros_like(tokens[:, :1]), jnp.zeros_like(fresh[:, :1]))
     ordered = (spans, edge) if reverse else (edge, spans)
     joined = jax.lax.associative_scan(rwkv4.joined(decay, **weighing),
                                       jax.tree.map(lambda *parts: jnp.concatenate(parts, axis=1), *ordered),

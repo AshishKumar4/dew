@@ -8,8 +8,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, PartitionSpec as P
 from generation_support import interprets
+from jax.sharding import Mesh, PartitionSpec as P
 from reference_error import assert_as_exact
 from test_recurrence_chunk import assert_packed_on_par, hosted
 

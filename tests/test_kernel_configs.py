@@ -205,20 +205,6 @@ def _diagonal_case(*, packed: bool) -> support.KernelCase:
     return support.KernelCase("diagonal/packed" if packed else "diagonal", call)
 
 
-@COMPILES_ON_CPU
-@pytest.mark.parametrize("target", gate_generations(scoped=True))
-def test_the_diagonal_scans_kernels_compile_within_each_gpus_resources(target):
-    """The diagonal scan's training launches (`templates.recurrence.diagonal`) over whole rows and packed
-    ones, lowered as on the GPU and compiled by Mosaic for a compile-only device on this CPU through ptxas
-    (tests/kernel_compile.py): within the block's shared memory (the backward's kept states), no register
-    spilled."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
-
-    found = compile_mosaic_kernels([_diagonal_case(packed=False), _diagonal_case(packed=True)], target)
-    assert len(found) == 2
-    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-
-
 def _wkv4_case(*, packed: bool) -> support.KernelCase:
     """RWKV4's WKV's training step through its VJP (`templates.recurrence.wkv4`, its four launches: 32 spans
     a row) over bf16 keys and values at RWKV-4 1.5B's 2048 channels, eight rows of 4096 tokens, whole or
@@ -246,15 +232,16 @@ def _wkv4_case(*, packed: bool) -> support.KernelCase:
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("target", gate_generations(scoped=True))
-def test_the_wkv4_kernels_compile_within_each_gpus_resources(target):
-    """RWKV4's WKV's training launches (`templates.recurrence.wkv4`) over whole rows and packed ones, lowered
-    as on the GPU and compiled by Mosaic for a compile-only device on this CPU through ptxas
-    (tests/kernel_compile.py): within the block's shared memory (the backward's kept carries), no register
-    spilled."""
+def test_the_channel_walks_kernels_compile_within_each_gpus_resources(target):
+    """The channel walks' training launches (`templates.recurrence.walks`: the diagonal scan's and RWKV4's
+    WKV's) over whole rows and packed ones, lowered as on the GPU and compiled by Mosaic for a compile-only
+    device on this CPU through ptxas (tests/kernel_compile.py): within the block's shared memory (each
+    backward's kept states), no register spilled."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    found = compile_mosaic_kernels([_wkv4_case(packed=False), _wkv4_case(packed=True)], target)
-    assert len(found) == 2
+    cases = [case(packed=packed) for case in (_diagonal_case, _wkv4_case) for packed in (False, True)]
+    found = compile_mosaic_kernels(cases, target)
+    assert len(found) == len(cases)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
