@@ -891,7 +891,7 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
 @pytest.mark.mesh(devices=4)
 def test_packed_gated_product_pair_reshard_preserves_other_explicit_axes():
     """Resharding a pair-sharded `[..., 2, H]` input onto `None` along `-2` preserves other Explicit axes
-    splitting rows or features on both output and input-gradient shardings alongside bit equality (row 822)."""
+    splitting rows or features on output and input-gradient shardings alongside bit equality (row 822)."""
     from jax.sharding import AxisType
 
     mesh = jax.make_mesh((2, 2), ("data", "model"), axis_types=(AxisType.Explicit, AxisType.Explicit),
