@@ -5,8 +5,10 @@ Streamed-bank ownership and placement are Dew execution policies; Optax oracles 
 import contextlib
 import dataclasses
 import functools
+import gc
 import json
 import os
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -1613,6 +1615,66 @@ def test_a_fit_compiles_its_streamed_step_only_where_its_device_plan_is_dearer_t
     else:
         assert choice.streamed is not None and streamed.count > 0, (choice, streamed.programs)
     equal(trained.variables, expected.variables)
+
+
+def device_plan_watched(monkeypatch, price=None) -> list[weakref.ref]:
+    """Weak references to the device plan's executable and lowering a fresh fit's layout choice prices
+    (`streaming.priced`), filled as it prices it, which it prices `price` where given, else as it is."""
+    from dew.training import streaming
+
+    watched: list[weakref.ref] = []
+    real = streaming.priced
+
+    def priced(plan, dtype):
+        watched.extend((weakref.ref(plan.executable), weakref.ref(plan.candidate.lowered)))
+        return real(plan, dtype) if price is None else price
+
+    monkeypatch.setattr(streaming, "priced", priced)
+    return watched
+
+
+def test_a_fit_that_streams_over_a_device_plan_it_holds_keeps_none_of_that_plan(monkeypatch):
+    """A fresh fit whose devices hold both its device plan and its streamed step, the device plan priced
+    dearer (`streaming.chosen`), streams, and the device plan's search keeps none of what it compiled: its
+    executable and lowering are freed while the run that turned from them lives (`StepCompiler.abandoned`;
+    review of row 12131's P0: the device plan's programs stayed pinned)."""
+    from dew.training.ahead import stand_in_gpus
+    from dew.training.memory import StepPrice, host_memory_stated
+
+    watched = device_plan_watched(monkeypatch, StepPrice(compute=1.0))
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30), host_memory_stated(1e20):
+        trainer = streaming_decoder(dtype=jnp.bfloat16)
+        trainer.fit(streaming_data(), steps=1, log_every=100)
+    choice = trainer.layout_choice
+    assert choice is not None and choice.held and choice.fits and choice.streams, choice
+    gc.collect()
+    assert watched and not [ref for ref in watched if ref() is not None], watched
+
+
+def test_a_fit_that_fails_before_its_first_compile_keeps_none_of_its_device_plan(monkeypatch):
+    """A fresh fit that keeps its device plan (`streaming.laid_start`) and fails placing its state, before
+    its first compile takes that plan, keeps none of what the plan's search compiled: its executable and
+    lowering are freed with the fit, the trainer that ran it alive (review of row 12131's P0 r7: a start
+    whose state's placement raised left its plan on the trainer's compiler)."""
+    from dew.training.ahead import stand_in_gpus
+    from dew.training.memory import host_memory_stated
+
+    class Unplaced(Exception):
+        pass
+
+    def unplaced(self, *args, **kwargs):
+        raise Unplaced
+
+    watched = device_plan_watched(monkeypatch)
+    monkeypatch.setattr(Trainer, "_placed", unplaced)
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30), host_memory_stated(1e6):
+        trainer = streaming_decoder(dtype=jnp.bfloat16)
+        with pytest.raises(Unplaced):
+            trainer.fit(streaming_data(), steps=1, log_every=100)
+    choice = trainer.layout_choice
+    assert choice is not None and choice.held and not choice.streams, choice
+    gc.collect()
+    assert watched and not [ref for ref in watched if ref() is not None], watched
 
 
 def streamed_priced(trainer: Trainer, data):

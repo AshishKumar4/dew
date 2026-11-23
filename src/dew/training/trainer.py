@@ -1222,6 +1222,11 @@ class Trainer(Generic[Loss, Effects]):
                 if self._later is not None:
                     self._later.stopped()
                     self._later = None
+                # A plan no compile of this fit took, the fit's own until one does: the start's device plan
+                # (`streaming.laid_start`) where the run failed before its first compile took it, as placing
+                # its state, or a later phase's its run never reached; released with no winner, its programs
+                # and admission charges held no more (`StepCompiler.abandoned`).
+                self._compiler.abandoned()
                 if primary is None and error is not None:
                     raise error
         if run.preempted is not None:
