@@ -541,7 +541,8 @@ def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
             call = base.call((syrk_mod.MOSAIC_SYRK,), flat, poly_spec, transpose=transpose,
                              out_dtype=out_dtype.name, interpret=interpreting)
             admitted = (not has_poly and not interpreting
-                        and syrk_mod.measured_gram(generation.gpu_target(), flat.shape, op_dtype, transpose=transpose))
+                        and syrk_mod.measured_gram(generation.gpu_target(), flat.shape, op_dtype,
+                                                   transpose=transpose))
             case = SyrkCase(op_dtype, out_dtype, call, no_x64=not jax.config.jax_enable_x64,
                             no_auto=not automatic_axes(), precision_ok=exact_products(precision, op_dtype),
                             measured=admitted)
