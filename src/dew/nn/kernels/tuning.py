@@ -969,13 +969,25 @@ inside another (`dew.nn.kernels.options._Structure`)."""
 
 @dataclasses.dataclass(eq=False)
 class _Held:
-    """A launch's held trace (`lowered_once`): its program, its outputs' structure, the kernels it named
-    (`report.naming`) and the facts it read (`generation.recording`)."""
+    """A launch's held trace (`lowered_once`): its program, its outputs' structure and the kernels it named
+    (`report.naming`); the facts it read are its holder's (`generation.held_trace`)."""
 
     jaxpr: jax_core.Jaxpr
     outputs: _Structure
     named: tuple
-    reads: dict
+
+    @functools.cached_property
+    def bound(self) -> Callable:
+        """One jit of the held trace, which a model's layers' calls share: its key holds its launch, so its
+        kernels' calls carry the launch they are bound for as they were traced. The trace's own, so a trace
+        its holder lets go of releases its jit with it."""
+        (outputs,) = self.outputs
+        run = jax_core.jaxpr_as_fun(self.jaxpr)
+        return owned_program(lambda *operands: jax.tree.unflatten(outputs, run(*operands)))
+
+
+LAUNCHES_HELD = 4096
+"""The traces `lowered_once` holds a launch, the least recently taken dropped past it."""
 
 
 def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), at: str | None = None,
@@ -1001,9 +1013,10 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
     A launch's trace is held under all it is given and the launch tracing it: its static arguments, its
     operands' types, the trace state (`options.trace_context`, the launch apart, `report.replayed`) and
     the launch (`report.launch_metadata`), whose identity and config its kernels' names read
-    (`report.named`), taken where each fact it read answers as it did (`generation.recording`,
-    `generation.still`): a launch given the same traces once however many layers and passes call it, each
-    call binding the trace its launch made, its kernels' calls carrying that launch as they were traced
+    (`report.named`), taken where each fact it read answers as it did (`generation.held_trace`, made again
+    where one answers otherwise; `LAUNCHES_HELD` of them): a launch given the same traces once however many
+    layers and passes call it, each call binding the trace its launch made, its kernels' calls carrying
+    that launch as they were traced
     (`mosaic.compiler_params`) and named for it again (`report.renamed`). The `configured` statics are
     given narrowed to what the kernels the launch builds read of them (`kernels`, the names a launch's
     builder takes, each config's `at`): a producer's raise leaves every other launch of a config given
@@ -1013,15 +1026,7 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
     def decorate(launch: Callable) -> Callable:
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
-        held: dict[Hashable, list[_Held]] = {}
-
-        @functools.cache
-        def bound(found: _Held) -> Callable:
-            # One jit a held trace, which a model's layers' calls share: its key holds its launch, so its
-            # kernels' calls carry the launch they are bound for as they were traced.
-            (outputs,) = found.outputs
-            run = jax_core.jaxpr_as_fun(found.jaxpr)
-            return owned_program(lambda *operands: jax.tree.unflatten(outputs, run(*operands)))
+        held: collections.OrderedDict[Hashable, tuple[_Held, dict]] = collections.OrderedDict()
 
         def calling(arguments: Mapping[str, object]):
             # `launch` called with `arguments` by name, as `signature.bind` gave them.
@@ -1050,13 +1055,13 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
                 # of its config each emission reads), so a trace is held for that launch.
                 metadata = report.launch_metadata()
                 key = (tuple(statics.items()), operands, tuple(map(jax.typeof, leaves)), state, metadata)
-                entries = held.setdefault(key, [])
-                found = next((entry for entry in entries if generation.still(entry.reads)), None)
-                if found is None:
+                made = []
+
+                def making() -> _Held:
                     def traced(*values):
                         return calling({**statics, **jax.tree.unflatten(operands, values)})
 
-                    with report.naming() as named, generation.recording() as reads:
+                    with report.naming() as named:
                         program = owned_program(traced).trace(*leaves)
                     strays = {assembled.kernel_of(took)[0] for _, _, took in named if took is not None
                               and builds is not None and assembled.kernel_of(took)[0] not in builds}
@@ -1064,12 +1069,14 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
                         raise ValueError(f"{launch.__qualname__} builds {sorted(strays)}, which it does not "
                                          f"say it builds ({sorted(builds or ())}): it was given none of "
                                          "their config")
-                    found = _Held(program.jaxpr, (jax.tree.structure(program.out_info),), tuple(named), reads)
-                    entries.append(found)
-                else:
-                    generation.replay(found.reads)
+                    made.append(_Held(program.jaxpr, (jax.tree.structure(program.out_info),), tuple(named)))
+                    return made[-1]
+
+                found = generation.held_trace(held, key, making, LAUNCHES_HELD)
+                if not made:
+                    # A held trace taken: its kernels named for this launch again.
                     report.renamed(found.named)
-                return bound(found)(*leaves)
+                return found.bound(*leaves)
 
         return called
 

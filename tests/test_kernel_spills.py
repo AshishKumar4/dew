@@ -36,7 +36,11 @@ from dew.objectives.supervised import Supervised
 from dew.telemetry.compiles import Compiles
 from dew.training import Trainer
 
-ROWS, FEATURES, WIDTH, EXPERTS = 4096, 2048, 4096, 8
+ROWS, FEATURES, WIDTH, EXPERTS = 2048, 1024, 2048, 8
+"""The experts layer's step and paired product (`Experts`, `_paired_step`): its first derived tile, an H100's
+128 x 256 x 64, still spills, and its step compiled ahead needs 336 MB of a device, which a GPU tier's test
+process holds (row 8733: at 4096 x 2048 x 4096 it needed 1.88 GB of a 1.12 GiB pool, and a run handed the
+step on the H100 refused it; FS-8733-SIZES)."""
 
 
 class Experts(nn.Module):
@@ -643,54 +647,113 @@ def _thunk(calls: int, kernels: list[bytes]) -> bytes:
         _field(3, _field(5, kernel)) for kernel in kernels)
 
 
-def test_a_models_draw_of_its_variables_selects_no_kernel():
-    """A model's draw of its variables (`Objective.init`) runs its forward over a one-row batch no step runs,
-    for the variables its modules make, none of its values drawn: within it every selector takes its op's
-    generic program and reports no route (`generation.drawing`), so no launch is derived, traced or
-    certified at the draw's shapes (row 11803: an every-template decoder's ahead compile certified its
-    draw's kernels, 29% of its main thread), where the model's forward over the same variables selects and
-    reports its kernels."""
-    from dew.nn.kernels.generation import routes
+def _templated(**fields):
+    """A one-layer decoder whose attention is the template's (`attention_impl="template"`), bfloat16: its
+    forward selects and reports kernels, a draw's premise."""
+    from dew.registry import models
+
+    return models.build("causal_transformer", **{"vocab_size": 260, "emb_features": 128, "num_layers": 1,
+                                                  "num_heads": 2, "num_kv_heads": 1, "head_dim": 64,
+                                                  "mlp_features": 256, "max_seq_len": 32, "dtype": "bfloat16",
+                                                  "attention_impl": "template", **fields})
+
+
+def _drawn_objective(kind: str):
+    """An objective of `kind` over templated decoders (`_templated`), the decoder of its whose forward the
+    premise reads, and that decoder's variables out of the objective's: its own model, a decision model's
+    backbone, PPO's actor (its critic its own init), a distillation's student (its feature probe its own
+    init)."""
     from dew.objectives.lm import LMObjective
-    from dew.registry import models
 
-    model = models.build("causal_transformer", vocab_size=64, emb_features=128, num_layers=1, num_heads=2,
-                         num_kv_heads=1, head_dim=64, mlp_features=256, max_seq_len=128, dtype="bfloat16",
-                         attention_impl="template")
-    objective = LMObjective(model, 128)
-    with routes() as drawn_routes:
-        drawn = jax.eval_shape(objective.init, jax.random.key(0))
-    with routes() as applied_routes:
-        jax.eval_shape(model.apply, drawn, jax.ShapeDtypeStruct((2, 128), jnp.int32))
-    assert not drawn_routes, drawn_routes
-    assert applied_routes, "the model's forward selects no kernel, so its draw's selecting none says nothing"
+    if kind == "lm":
+        model = _templated()
+        objective = LMObjective(model, 31)
+        return objective, model, objective.model_variables
+    if kind == "decision":
+        from dew.data.text import ByteTokenizer
+        from dew.decision import DecisionObjective, Specials
+        from dew.decision.layout import SegmentLayout
+
+        model = _templated()
+        layout = SegmentLayout.state_first_row(max_len=32, head_max_len=24, option_tokens=6)
+        specials = Specials(None, 10, 0, "\x00", 255)
+        objective = DecisionObjective(model, tokenizer=ByteTokenizer(), specials=specials, layout=layout)
+        return objective, model, lambda tree: {name: part["backbone"] for name, part in tree.items()}
+    if kind == "ppo":
+        from dew.objectives.rl import PPOObjective, ValueHead
+
+        model = _templated()
+        objective = PPOObjective(model, 31, critic=ValueHead(_templated()))
+        return objective, model, objective.model_variables
+    from dew.objectives.distillation import DistillationObjective
+
+    student, teacher = _templated(), _templated(emb_features=256, mlp_features=512, head_dim=128)
+    pair = LMObjective(student, 31), LMObjective(teacher, 31)
+    objective = DistillationObjective(*pair, features=((0, 0),), beta=0.5)
+    return objective, student, objective.model_variables
 
 
-def test_a_decision_models_draw_of_the_parts_its_tree_lacks_selects_no_kernel():
-    """A decision model's draw (`DecisionObjective.init`), its backbone and its head drawn as the tree lacks
-    them (`complete_variables`, over a one-row batch no step runs), reports no route, where its backbone's
-    forward over the drawn variables reports its kernels (row 12029: the parts a tree lacked were drawn
-    outside `generation.drawing`, their kernels derived and certified at the draw's shapes)."""
-    from dew.data.text import ByteTokenizer
-    from dew.decision import DecisionObjective, Specials
-    from dew.decision.layout import SegmentLayout
+@pytest.mark.parametrize("kind", ["lm", "decision", "ppo", "distillation"])
+def test_an_objectives_draw_of_its_variables_selects_no_kernel(kind):
+    """An objective's draw of its variables (`Objective.initializer`, its `init` within `drawing`) runs
+    forwards over one-row batches no step runs, for the variables its modules make, none of their values
+    drawn: within it every selector takes its op's generic program and reports no route
+    (`generation.drawing`), so no launch is derived, traced or certified at the draw's shapes (row 11803),
+    the parts a decision model's tree lacks among them (row 12029), and an objective's own `init` whole, a
+    PPO critic's and a distillation's feature probe (Train 1205's review F2), and the draw its parameters'
+    axes read (`Objective.parameter_axes`, row 12090), where its decoder's forward over the drawn variables
+    selects and reports its kernels (row 12093)."""
     from dew.nn.kernels.generation import routes
-    from dew.registry import models
 
-    model = models.build("causal_transformer", vocab_size=260, emb_features=128, num_layers=1, num_heads=2,
-                         num_kv_heads=1, head_dim=64, mlp_features=256, max_seq_len=32, dtype="bfloat16",
-                         attention_impl="template")
-    objective = DecisionObjective(model, tokenizer=ByteTokenizer(),
-                                  specials=Specials(None, 10, 0, "\x00", 255),
-                                  layout=SegmentLayout.state_first_row(max_len=32, head_max_len=24,
-                                                                       option_tokens=6))
+    objective, model, decoders = _drawn_objective(kind)
     with routes() as drawn_routes:
-        drawn = jax.eval_shape(objective.init, jax.random.key(0))
-    tokens = jax.ShapeDtypeStruct((2, 32), jnp.int32)
+        # Its key drawn within the trace too: shapes alone, nothing computed (row 12065).
+        drawn = jax.eval_shape(lambda: objective.initializer(jax.random.key(0)))
+    with routes() as axes_routes:
+        axes = objective.parameter_axes
     with routes() as applied_routes:
-        jax.eval_shape(objective.model.backbone.apply, {"params": drawn["params"]["backbone"]}, tokens)
+        jax.eval_shape(model.apply, decoders(drawn), jax.ShapeDtypeStruct((2, 32), jnp.int32))
     assert not drawn_routes, drawn_routes
-    assert applied_routes, "the backbone selects no kernel, so its draw's selecting none says nothing"
+    assert axes and not axes_routes, axes_routes
+    assert applied_routes, "the decoder selects no kernel, so its draw's selecting none says nothing"
+
+
+def test_a_draw_within_a_draw_takes_the_draws_program():
+    """A draw traced within another (`generation.drawing` nested: `drawn.traced_draw` around an objective's
+    own draw) is that draw to JAX's trace and compile caches, which key on whether a thread draws, not how
+    deep: a probe's draw and a trainer start's of one objective take one program (row 12092)."""
+    from dew.nn.kernels.generation import drawing
+    from dew.telemetry import compiles
+
+    def drawn_scale(x):
+        return x * 2.0 + 1.0
+
+    draw = jax.jit(drawn_scale)
+    with drawing():
+        cold = draw(jnp.arange(3.0))
+    with compiles.Compiles("drawn_scale") as again, drawing(), drawing():
+        warm = draw(jnp.arange(3.0))
+    assert not again.programs, again.programs
+    np.testing.assert_array_equal(np.asarray(warm), np.asarray(cold))
+
+
+def test_a_products_launch_decided_outside_a_draw_reports_no_route_within_one():
+    """A product's launch decided outside a draw (a decoder's apply, its routes reported) and asked again at
+    the same operands within one (`generation.drawing`: an objective's draw after a step's trace) reports no
+    route there: the held decision (`projections.launches`) is a draw's apart, where the draw replayed the
+    apply's routes, and an objective drawn after another's apply over the same decoder took a launch's route
+    (Train 1209's red main: test_kernel_spills#10/10, its draw cells in one process)."""
+    from dew.nn.kernels import projections
+    from dew.nn.kernels.generation import drawing, routes
+
+    # On this host no launch takes it, so the forward's route is reported, as XLA runs it.
+    rows, matrix = (jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((64, 128), (128, 256)))
+    with routes() as applied:
+        projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
+    with drawing(), routes() as drawn:
+        projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
+    assert applied, "the product selects no kernel, so its draw's selecting none says nothing"
+    assert not drawn, drawn
 
 
 def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
@@ -919,7 +982,6 @@ def test_an_aside_refusal_stays_in_the_refusals_scope_that_queued_its_launch():
 
 
 @COMPILE_ONLY
-@COMPILE_ONLY
 @lowers("sm90")
 def test_an_aside_refusal_holds_for_the_gpu_its_launch_was_queued_for_whatever_gpu_drains_it():
     """A program whose launch spills at its first tile, lowered for an H100 within a block certifying aside,
@@ -940,6 +1002,7 @@ def test_an_aside_refusal_holds_for_the_gpu_its_launch_was_queued_for_whatever_g
     assert not again.missed, again.missed
 
 
+@COMPILE_ONLY
 @lowers("sm90")
 def test_a_launch_taken_in_two_recordings_of_one_aside_block_records_its_miss_in_each():
     """The same program lowered twice within one block certifying aside, each lowering within a recording of
@@ -1067,6 +1130,28 @@ def test_a_runs_launch_traced_outside_its_mesh_is_certified_on_the_gpu_it_target
     [certified] = [each for each in report.certifications()
                    if id(each) not in before and each.op == type(op).__name__]
     assert certified.device == devices.devices.flat[0], certified.device
+
+
+def test_a_launch_outside_any_mesh_is_certified_on_its_own_processs_device(tmp_path):
+    """In each process of a two-process run, a launch traced outside any mesh and any run's target is
+    certified on the device a plain call runs on there (JAX's default, the process's first local device),
+    never another process's: every process's first device was process 0's, which a second process cannot
+    address (rows 7211, 7224)."""
+    import sys
+    from pathlib import Path
+
+    from process_support import ProcessGroup, coordinator_port, report_of, start_process
+
+    worker = Path(__file__).with_name("certifying_device_worker.py")
+    coordinator = f"127.0.0.1:{coordinator_port()}"
+    outs = [tmp_path / f"process{rank}.json" for rank in range(2)]
+    with ProcessGroup() as pool:
+        for rank, out in enumerate(outs):
+            pool.running.append(start_process([sys.executable, str(worker), str(rank), coordinator, str(out)],
+                                              devices=1, environment={"JAX_PLATFORMS": "cpu"}))
+        reports = [report_of(process, out, timeout=300, pool=pool.running)
+                   for process, out in zip(pool.running, outs, strict=True)]
+    assert [(report["devices"], report["certifying"]) for report in reports] == [(2, 0), (2, 1)], reports
 
 
 @CERTIFIES_AT_RUN

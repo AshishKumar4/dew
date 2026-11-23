@@ -254,6 +254,11 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     """A consumer's shared-memory tile its register left operands relay through where its warps split their
     columns (`relaying`, `relay_bytes`)."""
 
+    row_bound: Any = None
+    """The tile's rows its products issue before, an int32 (`bounded`): each warp's 16-row blocks at or past
+    it issue none, its accumulator's rows kept; None issues every row. Its identity's: a family bounded at
+    one constant is another program than at the next."""
+
     held_registers = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry), a measured whole (`scalars_whole`): CUTLASS's cooperative sm90 kernel's 168
@@ -527,8 +532,13 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
             # depths are its own, its accumulator's the same.
             return self.for_dtype(lhs.dtype).products(acc, lhs, rhs)
         if interpret:
-            # mma has no rule on a CPU: its sum, in fp32.
-            return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+            # mma has no rule on a CPU: its sum, in fp32, its rows past a bound kept as `_mma` keeps them.
+            summed = acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+            if self.row_bound is None or self.dtype == jnp.float32:
+                return summed
+            starts = lax.broadcasted_iota(jnp.int32, summed.shape, 0) // self.rows * self.rows
+            issued = starts < self.row_bound
+            return jnp.where(issued, summed, acc)
         acc, last = self._all_but_last(acc, *self._fragments(lhs, rhs)[:2])
         return self._mma(acc, *last)
 
@@ -624,12 +634,18 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         return self.looped_products(self.zeros(shape), lhs, rhs)
 
+    def bounded(self, rows) -> Self:
+        # Each product it makes takes the bound: `plgpu.mma`'s `rows` (the fork's from 0.12.0.1.post125),
+        # each warp's 16-row blocks at or past it issuing none (row 7091).
+        return dataclasses.replace(self, row_bound=rows)
+
     def _mma(self, acc, left, right):
         """`acc + left @ right` by one mma.sync product of its operands' fragments: fp32's as TF32 through
         Mosaic GPU's lane-level `mma` (`inline_mgpu`; the fork's TF32 from 0.12.0.1.post42), the dialect's op
-        whose operand types jaxlib fixes naming no fp32; any other dtype's by Pallas's `mma`."""
+        whose operand types jaxlib fixes naming no fp32, every row issued; any other dtype's by Pallas's
+        `mma`, within its row bound (`bounded`)."""
         if self.dtype != jnp.float32:
-            return plgpu.mma(acc, left, right, m_warps=self.m_warps)
+            return plgpu.mma(acc, left, right, m_warps=self.m_warps, rows=self.row_bound)
         issued: Callable[..., jax.Array] = plgpu.inline_mgpu(
             arg_types=(self.layout, self.lhs, self.rhs),
             return_type=plgpu.ShapeDtypeStruct(acc.shape, jnp.dtype(jnp.float32), layout=self.layout))(

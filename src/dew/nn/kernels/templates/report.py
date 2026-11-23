@@ -14,11 +14,13 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import importlib
 import importlib.metadata
-import importlib.util
 import json
 import logging
+import os
 import re
+import subprocess
 import threading
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -484,6 +486,22 @@ def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]
         return found
 
 
+def refusals_at(op, arguments: tokamax.BoundArguments, target: "generation.GpuTarget | None"
+                ) -> frozenset[tuple[Hashable, frozenset[Refused]]]:
+    """Each config a compile of this process refused `op`'s launch of `arguments` on `target` at, with the
+    kernels refused there and their roles (`refusals_of` of its identity, its cached snapshot as is): the one
+    reading of a launch's refusals, which `refused`, `refused_at` and `spilled_in` read at a config
+    (`_refused_kernels`), and a launch none of whose configs is refused reads as empty (row 6999: a fifth
+    reader asked that alone)."""
+    return refusals_of(_identity(op, arguments, target))
+
+
+def _refused_kernels(found: frozenset[tuple[Hashable, frozenset[Refused]]], config: Hashable
+                     ) -> frozenset[Refused]:
+    """The kernels a launch's refusals (`refusals_at`) refused at `config`, none where it refused none."""
+    return next((kernels for refused_config, kernels in found if refused_config == config), frozenset())
+
+
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable,
             target: "generation.GpuTarget | None") -> bool:
     """Whether a compile of this process refused `op`'s launch of `arguments` at `config` on `target`: a
@@ -492,18 +510,12 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable,
     return bool(refused_at(op, arguments, config, target))
 
 
-def refused_any(op, arguments: tokamax.BoundArguments, target: "generation.GpuTarget | None") -> bool:
-    """Whether a compile of this process refused any config of `op`'s launch of `arguments` on `target`
-    (`refused`)."""
-    return bool(refusals_of(_identity(op, arguments, target)))
-
-
 def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable,
                target: "generation.GpuTarget | None") -> frozenset[str]:
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments` on `target`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
     recurrence's forward and backward walks) steps the one refused."""
-    return names(dict(refusals_of(_identity(op, arguments, target))).get(config, ()))
+    return names(_refused_kernels(refusals_at(op, arguments, target), config))
 
 
 def names(kernels: Iterable[Refused]) -> frozenset[str]:
@@ -517,7 +529,7 @@ def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable,
     refusal states them (`Refused`), by kernel name: what a launch's ladder steps it by (row 6744). A kernel
     whose roles its compile left unread is absent; one read and spilling none (its warpgroup MMAs serialized
     alone) states `()`."""
-    found = dict(refusals_of(_identity(op, arguments, target))).get(config, ())
+    found = _refused_kernels(refusals_at(op, arguments, target), config)
     return {kernel: roles for kernel, roles in found if roles is not None}
 
 
@@ -889,8 +901,9 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
             _progressed(key)
         return held.refused
     provenance = op_provenance(op, arguments.arguments)
-    stored = _verdict_key(_identity(op, arguments, generation.gpu_target()), config, reverse, provenance)
-    verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
+    target = verdict_target(device)
+    stored = _verdict_key(key[0], config, reverse, provenance, target)
+    verdict = None if stored is None else tuning.stored_verdict(target, stored)
     if isinstance(verdict, dict):
         return _kept_certification(key, op, config, reverse, verdict, (), device, read=True).refused
     aside = _ASIDE.get()
@@ -911,7 +924,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
     # Its verdict where its kernels' was stored however their Dew tree named it (`_lowered_verdict_key`),
     # stored by this tree's key too, so its next start reads it tracing nothing.
     lowered, modules, lowered_key = _lowered_launch(op, arguments, config, device, reverse)
-    verdict = None if lowered_key is None else tuning.stored_verdict(verdict_target(device), lowered_key)
+    verdict = None if lowered_key is None else tuning.stored_verdict(target, lowered_key)
     if isinstance(verdict, dict):
         return _kept_certification(key, op, config, reverse, verdict, (stored,), device, read=True).refused
     unstored = (stored, lowered_key)
@@ -985,23 +998,26 @@ def _lowered_verdict_key(calls) -> str | None:
     """What decides a lowered launch's certification on a GPU model, as its stored verdict's key once it has
     lowered (`tuning.stored_verdict`): each Mosaic GPU and Pallas-Triton kernel it compiles, by its name, its
     IR's digest and its config, the installed JAX, jaxlib and CUDA plugins, whose compiler assembles them (the
-    Pallas lowering cache's seal), the ptxas that assembles them (`_assemblers`, as `_verdict_key` names it:
-    another ptxas's spills and serialized products are another verdict, row 10782), and the environment a
+    Pallas lowering cache's seal), the assemblers of its kernels' kinds (`_assemblers`: another ptxas's spills
+    and serialized products are another verdict, row 10782), and the environment a
     kernel's compile reads (that cache's policy); the store's file names the GPU model. Its kernels decide its
     verdict, not the Dew tree that lowered them: a tree whose own key (`_verdict_key`) finds none, an edit's
     anywhere outside them, lowers the launch and reads its verdict, compiling nothing (row 8650: 23 of an
     edited tree's 51 seconds certifying a hybrid decoder's step ahead, FS-8650-SPLIT). None where the
-    installation has no seal, its kernels' IR read and hashed for none (row 12009)."""
-    def stated() -> tuple:
+    installation has no seal, its kernels' IR read and hashed for none (row 12009), or an assembler is
+    unknown."""
+    def stated() -> tuple | None:
         kernels = sorted((call.kind, call.name, hashlib.sha256(call.ir).hexdigest(), call.config)
                          for call in calls if call.kind in ("mosaic_gpu", "triton"))
-        return "lowered", _assemblers(), _verdict_fields(), kernels
+        if (assemblers := _assemblers({kind for kind, *_ in kernels})) is None:
+            return None
+        return "lowered", assemblers, _verdict_fields(), kernels
 
     return _sealed_key(stated)
 
 
 def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
-    """What decides a stored launch decision (`_verdict_key`, `attention_mosaic._choice_key`) for a compile
+    """What decides a stored launch decision (`attention_mosaic._choice_key`) for a compile
     target before it traces: its code (`dew._code.provenance_code`: an edit of it invalidates the stored
     entry), the installed JAX, jaxlib and CUDA plugins, whose Mosaic GPU and XLA lower and compile it (the
     Pallas lowering cache's seal of them), caller-specific `fields`, and the environment a kernel's lowering
@@ -1010,31 +1026,42 @@ def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
     return _sealed_key(lambda: (provenance_code(__name__, provenance), *fields))
 
 
-def _sealed_key(stated: Callable[[], tuple]) -> str | None:
+def _sealed_key(stated: Callable[[], tuple | None]) -> str | None:
     """A stored decision's key in the installation's sealed frame, the one owner of it (`stored_key`'s, a
-    lowered verdict's, row 11653): what `stated()` gives (its head, its code's provenance or what names its
-    kind, then its fields) beside the installed JAX, jaxlib and CUDA plugins (the Pallas lowering cache's
-    seal of them) and the environment a kernel's lowering and compile read (that cache's policy); None where
-    the installation has no seal, `stated` called only where it has one (row 12009)."""
+    verdict's, row 11653): what `stated()` gives (its head, its code's provenance or what names its kind,
+    then its fields) beside the installed JAX, jaxlib and CUDA plugins (the Pallas lowering cache's seal of
+    them) and the environment a kernel's lowering and compile read (that cache's policy); None where the
+    installation has no seal, `stated` called only where it has one (row 12009), or where `stated` gives
+    None."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
     installed = seal().digest
-    if installed is None:
+    if installed is None or (state := stated()) is None:
         return None
-    head, *fields = stated()
+    head, *fields = state
     keyed = [head, installed.hex(), *fields, _keyed_environment()]
     return hashlib.sha256(json.dumps(keyed, sort_keys=True).encode()).hexdigest()
 
 
-def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: frozenset[str] | None
-                 ) -> str | None:
-    """What decides a launch's certification for a compile target (`stored_key`, `verdict_target`,
-    `tuning.stored_verdict`) before it traces, including the ptxas that assembles it (`_assemblers`) and what
-    a stored verdict states (`_verdict_fields`)."""
+def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: frozenset[str] | None,
+                 target: str) -> str | None:
+    """What decides a launch's certification for a compile target (`verdict_target`'s `target`,
+    `tuning.stored_verdict`) before it traces: its code's provenance, as a stored decision's
+    (`stored_key`), what a stored verdict states (`_verdict_fields`), and a CUDA target's assemblers of
+    either kind of kernel its launch may compile (`_assemblers`); another target's names none, a TPU's read
+    on an install with no Mosaic GPU binding. Each is read only where the installation is sealed; None where
+    it is not or an assembler is unknown."""
     from dew.nn.kernels.tuning import encoded
 
-    return stored_key(provenance, _assemblers(), _verdict_fields(), identity, encoded(config), reverse)
+    def stated() -> tuple | None:
+        kinds = ("mosaic_gpu", "triton") if generation.capability(target) else ()
+        if (assemblers := _assemblers(kinds)) is None:
+            return None
+        return (provenance_code(__name__, provenance), assemblers, _verdict_fields(), identity,
+                encoded(config), reverse)
+
+    return _sealed_key(stated)
 
 
 def _verdict_fields() -> list[str]:
@@ -1043,17 +1070,75 @@ def _verdict_fields() -> list[str]:
     return [field.name for field in dataclasses.fields(Binary)]
 
 
+def _assemblers(kinds: Iterable[str]) -> list[tuple[str, ...]] | None:
+    """What assembles a launch's kernels of `kinds`, each kind's as its assembler is named: a Mosaic GPU
+    kernel's (`_mosaic_assembler`) and a Pallas-Triton kernel's, XLA's (`_triton_assembler`), which differ
+    where JAX gives XLA a CUDA directory Mosaic GPU does not search. A relock or a system CUDA that moves
+    either certifies again, where the seal, which holds the CUDA plugins alone, kept a verdict another
+    assembler judged (row 7309). None where one is unknown: its verdict is not stored."""
+    named = []
+    for kind in sorted(set(kinds)):
+        if (assembler := (_mosaic_assembler if kind == "mosaic_gpu" else _triton_assembler)()) is None:
+            return None
+        named.append(assembler)
+    return named
+
+
 @functools.cache
-def _assemblers() -> list[str]:
-    """The installed distributions holding the ptxas a kernel's PTX is assembled with, CUDA's nvcc wheels
-    (`nvidia-cuda-nvcc`, `nvidia-cuda-nvcc-cu12`), each as `name==version`: a relock that moves one
-    certifies again, where the seal, which holds the CUDA plugins alone, kept a verdict another ptxas
-    judged. A system CUDA's ptxas, outside every wheel, none names (row 7309: the ptxas Mosaic GPU's own
-    assembler names, `_get_assembler`, with its version, once Dew's JAX build states it)."""
+def _mosaic_assembler() -> tuple[str, ...] | None:
+    """The assembler Mosaic GPU assembles a kernel's PTX with, as it names it (`_get_assembler`, Dew's JAX
+    build from post124): its provider's kind and, where that runs a ptxas, the ptxas's build
+    (`_ptxas_build`), its path aside, which differs host to host where the build does not. Mosaic GPU finds
+    its ptxas in a CUDA directory of its own (`./cuda_sdk_lib`, `CUDA_HOME`, a system CUDA's, the nvcc
+    wheel's). Read once a process: neither moves while it runs."""
+    # JAX's own module of the extension, which loads it from whichever build provides it: its native
+    # attributes are read off the module, which no stub states.
+    extension = importlib.import_module("jax._src.lib.mosaic_gpu")._mosaic_gpu_ext
+    provider = extension._get_assembler()
+    kind = provider.split("(", 1)[0]
+    if "ptxas" not in provider:
+        return (kind,)
+    # The ptxas's path runs to the nvlink the provider names after it, or to the name's end.
+    if (ptxas := re.fullmatch(r"[^(]*\(ptxas: (.*?)(?:, nvlink: .*)?\)", provider)) is None:
+        _log.warning("certification stores no verdict: no ptxas path read in %s", provider)
+        return None
+    build = _ptxas_build(ptxas.group(1))
+    return None if build is None else (kind, build)
+
+
+@functools.cache
+def _triton_assembler() -> tuple[str, ...] | None:
+    """The assembler XLA assembles a Pallas-Triton kernel's PTX with: the ptxas in the CUDA directory JAX
+    gives each compile (`jax._src.lib.cuda_path`: `CUDA_ROOT`'s, else the nvcc wheel's), by its build
+    (`_ptxas_build`), beside the nvJitLink wheels XLA's automatic mode assembles with instead where one
+    loads. None where JAX names no directory: XLA's own search finds its ptxas, which no key states. Read
+    once a process."""
+    from jax._src.lib import cuda_path
+
+    if cuda_path is None:
+        _log.info("certification stores no Pallas-Triton kernel's verdict: JAX names XLA no CUDA directory")
+        return None
+    if (build := _ptxas_build(os.path.join(cuda_path, "bin", "ptxas"))) is None:
+        return None
     named = (((distribution.metadata.get("Name") or "").lower(), distribution)
              for distribution in importlib.metadata.distributions())
-    return sorted(f"{name}=={distribution.version}" for name, distribution in named
-                  if re.fullmatch(r"nvidia-cuda-nvcc(-cu\d+)?", name))
+    return build, *sorted(f"{name}=={distribution.version}" for name, distribution in named
+                          if re.fullmatch(r"nvidia-nvjitlink(-cu\d+)?", name))
+
+
+def _ptxas_build(ptxas: str) -> str | None:
+    """The build `ptxas` states of itself (`--version`'s last line), or None, why logged, where it states
+    none: a launch it assembles stores no verdict, its certification run as before."""
+    try:
+        ran = subprocess.run([ptxas, "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        _log.warning("certification stores no verdict: %s --version did not run: %s", ptxas, error)
+        return None
+    if ran.returncode or not (lines := ran.stdout.strip().splitlines()):
+        _log.warning("certification stores no verdict: %s --version exited %d stating no build: %s", ptxas,
+                     ran.returncode, ran.stderr.strip())
+        return None
+    return lines[-1]
 
 
 def certifications() -> tuple[Certification, ...]:
@@ -2081,9 +2166,10 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
         name = launch_name(binary.kernel, binary.launch)
         verdicts.setdefault((identity, config, launch.reverse, launch.provenance), {})[name] = (
             modules.get(name, ""), binary)
+    target = verdict_target(device)
     for (identity, config, reverse, provenance), kernels in verdicts.items():
-        if (key := _verdict_key(identity, config, reverse, provenance)) is not None:
-            tuning.store_verdict(verdict_target(device), key, kernels)
+        if (key := _verdict_key(identity, config, reverse, provenance, target)) is not None:
+            tuning.store_verdict(target, key, kernels)
 
 
 def _launches(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:

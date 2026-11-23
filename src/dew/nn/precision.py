@@ -553,15 +553,16 @@ def accurate_exp(x, *, base2: bool = False) -> jax.Array:
     """`e^x` (`2^x` where `base2`) to fp32's rounding in every form, not the run's (`Numerics.forms`): the
     recurrences' decays (a scan's, `A = -exp(A_log)`, the softplus's), where an fp32 default path must meet
     its upstream's bound. The backend's own where it is so (a GPU's and a CPU's default, a GH200's that of
-    `jax.lax.AccuracyMode.HIGHEST` bit for bit, M-JS-135); on a TPU below float64, Dew's own on the vector
-    unit's adds and multiplies (`_exp_value`): a v5e's default fp32 exp is 1.6e-6 from float64 (its exp of a
+    `jax.lax.AccuracyMode.HIGHEST` bit for bit, M-JS-135); on a device whose exp is not
+    (`GpuTarget.accurate_exp`, every TPU's) below float64, Dew's own on the vector unit's adds and
+    multiplies (`_exp_value`): a v5e's default fp32 exp is 1.6e-6 from float64 (its exp of a
     reduced argument alike), which held Mamba-2's layer cell at 5.5 times its CPU float32, and at HIGHEST
     took the cell's training step 4.5% longer in its scan's decays (11.58 to 12.10 ms, M-JS-138); Dew's own
     is 2.6e-8 there."""
-    from dew.nn.kernels.generation import backend
+    from dew.nn.kernels.generation import gpu_target
 
     x = jnp.asarray(x)
-    if backend() != "tpu" or x.dtype == jnp.float64:
+    if gpu_target().accurate_exp or x.dtype == jnp.float64:
         return jnp.exp2(x) if base2 else jnp.exp(x)
     return _exp(base2, x.astype(jnp.float32)).astype(x.dtype)
 

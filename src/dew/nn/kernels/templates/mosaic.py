@@ -1217,6 +1217,17 @@ class Issuer[Accumulator](abc.ABC):
         write states its own (`WgmmaIssuer`). The walk's ring waits and releases are its own, outside it."""
         return self.issued_when(~idle, acc, issue)
 
+    def bounded(self, rows: jax.Array) -> Self:
+        """This issuer, its products issued for a tile's rows before `rows` alone (an int32, one value across
+        the issuing warpgroup: a ragged group's rows in its last tile), the accumulator's rows kept past it,
+        where its instructions take a bound (mma.sync's, `MmaIssuer`); one whose instructions take none is
+        itself, issuing every row, those past `rows` its tile's store writes none of. A one-consumer tile's
+        products past its group's end multiplied padding (row 7091: a [64, 64] grouping at 128-row tiles
+        issued its padded half); a consumer's whole share past it is `issued_unless`'s. The bound is the
+        issuer's own, as an operand of every product it makes, however a trace nests them (row 12108)."""
+        del rows
+        return self
+
     def issued_when(self, issuing: jax.Array, acc, issue: Callable):
         """`issue()`'s accumulator, its products issued only where `issuing` (traced, one value across the
         issuing threads, the same at every step of a walk) is true: `acc` as it was elsewhere;

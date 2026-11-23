@@ -68,8 +68,10 @@ def assert_joined_as_exact(choice: str, run, draw, wide_run, label: str, *, seed
               generation.routes(alone=True)):
             return wide_run(*operands)
 
-    # Each arm's dtypes as it traces, compiling and running neither (the check-1 site compiles each once).
-    together, apart = (jax.tree.leaves(jax.eval_shape(under(joins), *draw(0))) for joins in (True, False))
+    # Each arm's dtypes as it traces, compiling and running neither, its operands' shapes alone (the check-1
+    # site compiles each once; a GPU tier's prepare computes nothing before it, row 12064).
+    operands = jax.eval_shape(draw, 0)
+    together, apart = (jax.tree.leaves(jax.eval_shape(under(joins), *operands)) for joins in (True, False))
     assert [leaf.dtype for leaf in together] == [leaf.dtype for leaf in apart]
     assert_as_exact(under(joins=True), under(joins=False), draw, label, seeds=seeds, truth_fn=truth)
 
@@ -641,6 +643,20 @@ def test_a_watched_projection_keeps_its_own_call_and_its_output_is_sown():
             stack.enter_context(context)
         _, sown = jax.eval_shape(inspected, params, x)
     assert "k_proj" in sown[INSPECTED], sown[INSPECTED].keys()
+
+
+def test_a_watch_of_another_module_leaves_the_projections_side_by_side():
+    """An attention layer traced under a watch naming none of its query, key and value projections (its
+    output's): the three still run side by side, as a watch intercepts the modules it names alone
+    (`dense.intercepting`), where any watch ran every join of a model apart (row 9772)."""
+    from dew.nn.inspection import INSPECTED, watching
+
+    layer, x, params, under = _watched_layer()
+
+    def inspected(params, x):
+        return layer.apply(params, x, mutable=[INSPECTED])
+
+    assert _qkv_routes(layer, params, x, *under(), watching(("o_proj",)), apply=inspected)[:1] == ["joined"]
 
 
 @pytest.mark.parametrize(("rows", "choice"), [((4, 3072), "joined"), ((1, 2048), "apart")],

@@ -27,7 +27,7 @@ from dew._builds import (
     newest_build,
     runs_on,
 )
-from dew._pool import answered, cuda_driver, runs_on_gpu
+from dew._pool import answered, cuda_driver, named_platforms, runs_on_gpu
 from dew._records import JSON
 
 _log = logging.getLogger(__name__)
@@ -130,28 +130,15 @@ def xla_flag(name: str) -> str | None:
     return _flag(os.environ.get('XLA_FLAGS', ''), name)
 
 
-def xla_flag_values(name: str) -> list[str]:
-    """Each value `--<name>` carries in XLA_FLAGS, in order, a bare `--<name>` 'true': a flag XLA's parser
-    reads occurrence by occurrence (a list of kinds amended by `+KIND`s and `-KIND`s,
-    `dew.telemetry.benchmark.graphs`), where `xla_flag` reads its last."""
-    return _flags(os.environ.get('XLA_FLAGS', ''), name)
-
-
-def _flags(flags: str, name: str) -> list[str]:
-    """Each value `--<name>` carries in `flags`, in order (`xla_flag_values`)."""
-    values = []
+def _flag(flags: str, name: str) -> str | None:
+    """The value `--<name>` carries in `flags`, as `xla_flag` reads it."""
+    value = None
     for token in flags.split():
         if token == f"--{name}":
-            values.append('true')
+            value = 'true'
         elif token.startswith(f"--{name}="):
-            values.append(token.split('=', 1)[1])
-    return values
-
-
-def _flag(flags: str, name: str) -> str | None:
-    """The value `--<name>` carries in `flags`, as `xla_flag` reads it: its last occurrence's."""
-    values = _flags(flags, name)
-    return values[-1] if values else None
+            value = token.split('=', 1)[1]
+    return value
 
 
 def keep_roundings() -> None:
@@ -192,13 +179,14 @@ def _gpu_default(name: str, assignment: str) -> None:
 
 
 def opens_tpu() -> bool:
-    """Whether this process's JAX backend will be a TPU's: its platforms (JAX_PLATFORMS, which JAX reads
-    as it imports, before the backend opens) name `tpu`, or name none on a Cloud TPU VM (`cloud_tpu_vm`),
-    where JAX opens the TPU. A CPU process compiling for compile-only GPUs opens none."""
+    """Whether this process's JAX backend will be a TPU's: its platforms name `tpu` (JAX's live
+    `jax_platforms` where JAX is imported, a program's update of it before the backend opens among them, row
+    12070; else JAX_PLATFORMS, which JAX reads as it imports), or name none on a Cloud TPU VM
+    (`cloud_tpu_vm`), where JAX opens the TPU. A CPU process compiling for compile-only GPUs opens none."""
     from dew.clusters import cloud_tpu_vm
 
-    platforms = os.environ.get("JAX_PLATFORMS", "")
-    named = {platform.strip() for platform in platforms.split(",") if platform.strip()}
+    jax = sys.modules.get("jax")
+    named = named_platforms(jax.config.jax_platforms if jax is not None else os.environ.get("JAX_PLATFORMS"))
     return "tpu" in named if named else cloud_tpu_vm(os.environ)
 
 
