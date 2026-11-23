@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import jax
 import jax.experimental.mosaic.gpu as mgpu
 from jax._src.lib.mlir.dialects import gpu, nvvm
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
@@ -458,12 +459,13 @@ def unsynced_commits(module: bytes) -> list[str]:
                 if len(block) != len(sizes):
                     raise ValueError(f"{name}'s block states no constant size")
                 walks = []
-                for first in range(0, math.prod(block), WARP_THREADS):
+                for first in range(0, math.prod(block), mgpu_utils.WARP_SIZE):
                     walks.append(_Walk(functions, _Thread(first, block)))
                     walks[-1].region(launch.regions[0], frozenset())
                 for warp, walk in enumerate(walks):
                     # A barrier another warp of its warpgroup waits at too, whose wait the commit may pass.
-                    group = walks[warp - warp % WARPGROUP_WARPS:][:WARPGROUP_WARPS]
+                    lead = warp - warp % mgpu_utils.WARPS_IN_WARPGROUP
+                    group = walks[lead:lead + mgpu_utils.WARPS_IN_WARPGROUP]
                     shared = set().union(*(other.waits for other in group if other is not walk))
                     found += [f"{name}, warp {warp}: a tensor-core commit arrives at barrier {barrier} after "
                               f"its wait there, which another warp of its warpgroup waits at too, with no "
@@ -473,11 +475,6 @@ def unsynced_commits(module: bytes) -> list[str]:
     return found
 
 
-WARP_THREADS = 32
-"""The threads of a warp, whose path through a kernel `unsynced_commits` follows (its first lane's)."""
-
-WARPGROUP_WARPS = 4
-"""The warps of a warpgroup, whose warps' waits a commit by one of them may pass (`unsynced_commits`)."""
 
 
 @dataclass(frozen=True)
@@ -576,7 +573,7 @@ class _Walk:
     def syncs(self, operation: ir.Operation) -> bool:
         """Whether `operation` syncs every warp of the walk's warpgroup: the block's barrier (`gpu.barrier`,
         an `nvvm.barrier` of no thread count), or the warpgroup's own (`mgpu_utils.warpgroup_barrier`: its
-        warpgroup's barrier, `WARPGROUP_WARPS` warps' threads); a barrier of fewer threads (a warp's) or
+        warpgroup's barrier, `mgpu_utils.WARPGROUP_SIZE` threads); a barrier of fewer threads (a warp's) or
         another warpgroup's syncs none of its other warps."""
         if operation.name == "gpu.barrier":
             return True
@@ -588,8 +585,8 @@ class _Walk:
             # Barrier 0, the block's own, of fewer threads than the block: no warpgroup's rendezvous.
             return False
         threads, barrier = _value(view.numberOfThreads, self.thread), _value(view.barrierId, self.thread)
-        group = self.thread.index // (WARPGROUP_WARPS * WARP_THREADS)
-        return threads == WARPGROUP_WARPS * WARP_THREADS and barrier == group + 1
+        group = self.thread.index // mgpu_utils.WARPGROUP_SIZE
+        return threads == mgpu_utils.WARPGROUP_SIZE and barrier == group + 1
 
     def taken(self, branch: ir.Operation) -> list[ir.Region]:
         """The regions of `branch` the walk's thread can take: the one its value selects where the thread's
@@ -623,7 +620,7 @@ def _value(value: ir.Value, thread: _Thread | None) -> int | None:
     """`value` where the constants and `thread`'s index and block (`gpu.thread_id`, `gpu.block_dim`) alone
     make it (a warp's or a warpgroup's index, a role's branch), through integer arithmetic and casts, and a
     lane shuffle's (`nvvm.shfl.sync`, the first lane's own value); None where anything else enters it."""
-    if (operation := _defining(value)) is None:
+    if (operation := _result_of(value)) is None:
         return None
     name = operation.name
     if name == "arith.constant":
@@ -678,7 +675,7 @@ def _barrier(value: ir.Value, arguments: dict) -> tuple[int | str, int | None]:
     gives it, 0 where it takes none, None where a run's value does (`_aliases`)."""
     slot: int | None = 0
     while True:
-        if (operation := _defining(value)) is None:
+        if (operation := _result_of(value)) is None:
             if value in arguments:
                 value = arguments[value]
                 continue
@@ -687,9 +684,9 @@ def _barrier(value: ir.Value, arguments: dict) -> tuple[int | str, int | None]:
             index = _gep_index(operation)
             slot = None if index is None or slot is None else slot + index
         if operation.name == "memref.view" and (
-                (memory := _defining(operation.operands[0])) is not None
+                (memory := _result_of(operation.operands[0])) is not None
                 and memory.name == "gpu.dynamic_shared_memory"
-                and (offset := _defining(operation.operands[1])) is not None):
+                and (offset := _result_of(operation.operands[1])) is not None):
             return ir.IntegerAttr(offset.attributes["value"]).value, slot
         if not operation.operands:
             return str(value), slot
@@ -713,9 +710,3 @@ def _aliases(one: tuple, other: tuple) -> bool:
     """Whether two barriers (`_barrier`) may be one: one array's, and one slot unless constants give
     each another."""
     return one[0] == other[0] and (one[1] is None or other[1] is None or one[1] == other[1])
-
-
-def _defining(value: ir.Value) -> ir.Operation | None:
-    """The operation that makes `value`; None for a block's argument (a loop's carry, a function's)."""
-    owner = value.owner
-    return None if isinstance(owner, ir.Block) else owner.operation

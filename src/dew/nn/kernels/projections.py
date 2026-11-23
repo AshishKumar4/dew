@@ -550,9 +550,6 @@ def launches(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype
     return taken
 
 
-DECISIONS_HELD = 1024
-"""The product launch decisions `_decided` holds, the least recently taken dropped past it."""
-
 _DECISIONS: collections.OrderedDict[Hashable, tuple[tuple[bool, tuple[generation.Route, ...]], dict]] = (
     collections.OrderedDict())
 
@@ -560,13 +557,13 @@ _DECISIONS: collections.OrderedDict[Hashable, tuple[tuple[bool, tuple[generation
 def _decided(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype: jnp.dtype, product,
              whole: bool) -> tuple[bool, tuple[generation.Route, ...]]:
     """`launched`'s decision and the routes it found, held as every held kernel decision is
-    (`generation.held_trace`, `DECISIONS_HELD` of them): by the operands' shapes and dtypes, the product and
-    whether each is seen whole, in the context a kernel is chosen in (`fusion.choice_context`: the target,
-    the kernels a block names or pins, a draw's, the refused launches), the facts it read recorded again
-    wherever it is taken (row 12134: a hand-kept subset of that context missed a draw's, Train 1209's red
-    main). Its routes are collected apart (`generation.routes`' `alone`), `launched` reporting them at every
-    call."""
-    from dew.algebra.fusion import choice_context
+    (`generation.held_trace`, `fusion.DECISIONS_HELD` of them, as the algebra's): by the operands' shapes
+    and dtypes, the product and whether each is seen whole, in the context a kernel is chosen in
+    (`fusion.choice_context`: the target, the kernels a block names or pins, a draw's, the refused launches),
+    the facts it read recorded again wherever it is taken (row 12134: a hand-kept subset of that context
+    missed a draw's, Train 1209's red main). Its routes are collected apart (`generation.routes`' `alone`),
+    `launched` reporting them at every call."""
+    from dew.algebra.fusion import DECISIONS_HELD, choice_context
 
     def made() -> tuple[bool, tuple[generation.Route, ...]]:
         with generation.routes(alone=True) as found:
