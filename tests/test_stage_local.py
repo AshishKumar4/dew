@@ -272,17 +272,18 @@ SEEDS = 8
 """Each storage cell's check-1 seeds."""
 
 
-def assert_trains_as_replicated(model, optimizer, label: str, variables=None):
+def assert_trains_as_replicated(model, optimizer, label: str, variables=None, *, mesh: MeshSpec = STAGED,
+                                devices: int = 8):
     """`STEPS` steps over the stage layout with each pipelined run stage-local and with every layer whole
     on every stage (`Layout.stage_local`) leave the variables, optimizer state and EMA a checkpoint of each
     holds on par, against one device's float64 (check 1). Bits are no contract: XLA fuses a stacked leaf's
     FP32 Nesterov direction apart from its layers', one ulp that Newton-Schulz's BF16 cast can round apart
     (row 861's MuonClip, seed 1)."""
     given = None if variables is None else variables(0)
-    assert saving(functools.partial(trainer, model, optimizer, STAGED, 8, variables=given)) > 0, \
-        "the decoder's run splits over two stages"
+    assert saving(functools.partial(trainer, model, optimizer, mesh, devices, variables=given)) > 0, \
+        "the decoder's run splits over its stages"
     initial = initials(model, optimizer, variables)
-    local, replicated = (stepped(model, optimizer, STAGED, 8, initial, variables=given, stage_local=held)
+    local, replicated = (stepped(model, optimizer, mesh, devices, initial, variables=given, stage_local=held)
                          for held in (True, False))
     truth = stepped(model, optimizer, MeshSpec(), 1, initial, variables=given, exact=True)
     assert_as_exact(local, replicated, draw, label, seeds=SEEDS, truth_fn=truth)
@@ -528,16 +529,15 @@ def mapped_beside_a_callback() -> optax.GradientTransformation:
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
 
 
-def mapped_over_none() -> optax.GradientTransformation:
-    """`mapped_by_row`'s update beside a loop over none of a stacked leaf's rows (`gradient[:0]`), whose
-    empty result it adds: a loop of no steps over a stack."""
+def called_beside() -> optax.GradientTransformation:
+    """Each leaf's update `tanh`, row by row, beside a callback handed the whole stacked leaf's sum outside
+    any loop: an update that acts beside what it returns, reading every stored layer, compared by no
+    result."""
     def update(updates, state, params=None):
-        def mapped(gradient):
-            if gradient.ndim < 3:
-                return jnp.tanh(gradient)
-            empty = jax.lax.map(jnp.tanh, gradient[:0].reshape(0, 2, *gradient.shape[1:]))
-            return jnp.tanh(gradient) + jnp.sum(empty)
-        return jax.tree.map(mapped, updates), state
+        def called(gradient):
+            jax.debug.callback(lambda total: None, jnp.sum(gradient))
+            return jnp.tanh(gradient)
+        return jax.tree.map(called, updates), state
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
 
 
@@ -577,7 +577,7 @@ WHOLE = {"lamb": lambda: optax.lamb(1e-3), "adafactor": lambda: optax.adafactor(
          "doubled-gains": doubled_gains, "spread-sums": spread_sums,
          # A loop over a stack that carries across its rows, acts beside its results, or takes no step.
          "carried-across-rows": carried_across_rows, "mapped-beside-a-callback": mapped_beside_a_callback,
-         "mapped-over-none": mapped_over_none}
+         "called-beside": called_beside}
 """Transformations whose update reads a leaf whole, or whose build reads its tree's shapes: each keeps every
 layer whole on every stage."""
 
@@ -620,23 +620,23 @@ def test_a_transform_that_may_read_a_leaf_whole_keeps_every_layer_whole_and_trai
         assert run.plan["layers_whole_for"]
 
 
+THREE_STAGED = MeshSpec(fsdp=2, stage=3)
+"""Three stages beside two fsdp shards, over six of the eight devices: a six-layer decoder's two a stage."""
+
+
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("batch_size", [1, 2], ids=["a-row-a-step", "two-rows-a-step"])
-def test_a_loop_over_a_stack_trains_stage_local_as_its_layers_whole_do(batch_size):
-    """Two stages of three layers each, a transformation's loop over each stacked leaf's rows
-    (`mapped_by_row`, a row or two a step, the two's last step a remainder JAX maps apart and concatenates)
-    keeps each run stage-local and trains its step to the same weights, bit for bit, as the same run with
-    every layer whole on every stage (`Layout.stage_local=False`)."""
-    model = decoder(num_layers=6)
-    assert saving(functools.partial(trainer, model, mapped_by_row(batch_size), STAGED, 8, ema=None)) > 0
-    # Each run's state read on its stored layers (`Trainer.stored`), the stage-local one's runs unstacked.
-    stored = []
-    for local in (True, False):
-        run = trainer(model, mapped_by_row(batch_size), STAGED, 8, ema=None, stage_local=local)
-        stored.append(on_host(run.stored(run.fit(stream(), steps=1, log_every=1)).variables))
-    assert jax.tree.structure(stored[0]) == jax.tree.structure(stored[1])
-    for local, whole in zip(*(jax.tree.leaves(variables) for variables in stored), strict=True):
-        np.testing.assert_array_equal(local, whole)
+@pytest.mark.parametrize(("batch_size", "mesh", "devices"),
+                         [(1, STAGED, 8), (2, STAGED, 8), (2, THREE_STAGED, 6)],
+                         ids=["a-row-a-step", "two-rows-a-step", "a-remainder-mapped-apart"])
+def test_a_loop_over_a_stack_trains_stage_local_as_its_layers_whole_do(batch_size, mesh, devices):
+    """A six-layer decoder's stages each holding their layers, a transformation's loop over each stacked
+    leaf's first axis (`mapped_by_row`, a stage or two a step; over three stages two a step, the last a
+    remainder JAX maps apart and concatenates, review of Train 1224) keeps each run stage-local and trains
+    on par with the same run with every layer whole on every stage (`Layout.stage_local=False`), against
+    one device's float64 (check 1)."""
+    assert_trains_as_replicated(decoder(num_layers=6), mapped_by_row(batch_size),
+                                f"a loop over a stack, {batch_size} a step over {mesh.stage} stages",
+                                mesh=mesh, devices=devices)
 
 
 @pytest.mark.mesh(devices=8)

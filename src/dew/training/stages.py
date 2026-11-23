@@ -580,9 +580,13 @@ def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[
     within one bound of the exact sum, though not to one value, so a comparison after them may decide
     otherwise at its threshold (the admission row 4036 asked for, a global-norm clip stage-local). Row
     r of a stack of n rows is read against row r of every stacked input of n rows; a stack of another
-    count is no row's."""
+    count is no row's. A program that acts beside what it returns (an effect: a callback's read of a whole
+    stack) is compared by no result, wherever it acts."""
     from dew.training.staging import flattened
 
+    if stacked.jaxpr.effects:
+        return ["it acts beside what it returns (a callback), which no result compares and a stage holding "
+                "its own layers would act on otherwise"]
     numbering = _Numbering()
     lay_equations, lay_results = flattened(layered.jaxpr, layered.jaxpr.invars, layered.consts)
     stack_equations, stack_results = flattened(stacked.jaxpr, stacked.jaxpr.invars, stacked.consts)
@@ -771,8 +775,7 @@ class _Numbering:
         scans; a branch's each program's results, one where they agree, else the branch's choice among
         them, row by row of a stack. A loop that scans a stack along its rows' first axis (`lax.map` over
         layers, `batch_size` rows a step where the rows lie over two axes) reads its next rows at each step
-        (`_step_rows`), its stacked results the rows again; a stack its rows do not divide among the steps is
-        none it reads. None for a longer loop."""
+        (`_step_rows`), its stacked results the rows again. None for a longer loop."""
         from dew.training.staging import flattened
 
         def run(closed, values: list, held: list) -> list[tuple] | None:
@@ -794,15 +797,7 @@ class _Numbering:
             # A stack scanned along its rows' first axis (`lax.map` over layers, `batch_size` rows a step
             # where its rows lie over two axes): each step its next rows, a stack of the rest of its rows'
             # axes or one row, the loop as long as that axis.
-            # A loop of no steps over a stack, or one whose steps act beside what they return (a callback's
-            # read of a whole stack), is none it reads row by row.
-            stacks = any(isinstance(value, tuple) for value in scanned)
-            if stacks and (length == 0 or equation.effects or scan_body(equation).effects):
-                return None
-            divided = all(not isinstance(value, tuple)
-                          or (len(value) == length if lead == 1 else len(value) % length == 0)
-                          for value, lead in zip(scanned, along, strict=True))
-            if length > UNROLLED or not divided:
+            if length > UNROLLED:
                 return None
             carry = list(zip(operands[consts:consts + carries], leads[consts:consts + carries], strict=True))
             steps: dict[int, list[tuple]] = {}
@@ -909,8 +904,9 @@ def _step_rows(rows: tuple, lead: int, step: int, length: int) -> tuple:
 def _moved(equation, operands: list, leads: list) -> tuple | None:
     """A stack's rows moved whole, each row as it was: a reshape that keeps every row's own shape after
     its rows' axes (merging, splitting or adding them, a value of no stack becoming a stack of one row,
-    one row its value again), a squeeze of its rows' axes of one row, a slice of rows along its one axis
-    of them, or a concatenation of stacks along it. None for any other equation."""
+    one row its value again), a squeeze of its rows' axes of one row, a slice along its first axis of rows,
+    each index of it the rows of its other axes of rows, or a concatenation of stacks alike along it (a
+    remainder `lax.map` maps apart). None for any other equation."""
     primitive, params = equation.primitive, equation.params
     if primitive not in (jax.lax.reshape_p, jax.lax.squeeze_p, jax.lax.slice_p, jax.lax.concatenate_p):
         return None
@@ -932,18 +928,20 @@ def _moved(equation, operands: list, leads: list) -> tuple | None:
             # One row, its value again.
             return (number[0], None) if isinstance(number, tuple) else None
         return ((number,) if lead is None else number), len(rows)
-    if lead != 1:
+    if lead is None:
         return None
+    # Each index of the first axis of rows holds the rows of the others, in order.
+    inner = math.prod(shape[1:lead])
     if primitive is jax.lax.slice_p:
         strides = params["strides"]
         start, limit = tuple(params["start_indices"]), tuple(params["limit_indices"])
         whole = start[1:] == (0,) * (len(shape) - 1) and limit[1:] == shape[1:]
         if (strides is not None and any(stride != 1 for stride in strides)) or not whole:
             return None
-        return number[start[0]:limit[0]], 1
+        return number[start[0] * inner:limit[0] * inner], lead
     if primitive is jax.lax.concatenate_p and params["dimension"] == 0 and all(
-            isinstance(operand, tuple) for operand in operands) and all(held == 1 for held in leads):
-        return tuple(row for operand in operands for row in operand), 1
+            isinstance(operand, tuple) for operand in operands) and all(held == lead for held in leads):
+        return tuple(row for operand in operands for row in operand), lead
     return None
 
 
