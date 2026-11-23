@@ -33,6 +33,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         gpu_target,
         triton_runs,
     )
+    from dew.nn.kernels.rwkv4 import wkv4
     from dew.nn.kernels.ssd import ssd_kernel_platform, ssd_kernel_runs
 
 _EXPORTS = {
@@ -51,6 +52,7 @@ _EXPORTS = {
     "ssd_kernel_platform": "dew.nn.kernels.ssd",
     "ssd_kernel_runs": "dew.nn.kernels.ssd",
     "diagonal_scan": "dew.nn.kernels.diagonal",
+    "wkv4": "dew.nn.kernels.rwkv4",
 }
 
 __getattr__, __dir__ = _lookup(__name__, _EXPORTS)
@@ -71,4 +73,5 @@ __all__ = [
     "ssd_kernel_platform",
     "ssd_kernel_runs",
     "triton_runs",
+    "wkv4",
 ]

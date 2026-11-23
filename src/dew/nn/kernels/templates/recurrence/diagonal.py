@@ -1,8 +1,7 @@
 """The diagonal recurrence on Mosaic GPU (`kernels.diagonal`'s kernels): `h_t = a_t h_{t-1} + x_t` a
 channel, `a_t = exp(g_t)`, each token's output its state, a packed document's first token `x_t` alone (HGRN's,
-fla's `chunk_hgrn`; RG-LRU's and MinGRU's carry). A program takes a row, a span of its tokens and a
-warpgroup's channels, each thread its channels walking the span's tokens in order, the short conv's layout
-(`conv`): each token's channels read in whole lines, no exchange between threads.
+fla's `chunk_hgrn`; RG-LRU's and MinGRU's carry), on the channel walk (`walks`): a program a row, a span of
+its tokens and a warpgroup's channels, each thread its channels walking the span's tokens in order.
 
 A call of one span walks each row from its entering state in one launch. Over more, a launch summarises each
 span as its affine map, its decay `prod a_t` and its last state from zero; XLA's scan over the spans' maps
@@ -25,135 +24,42 @@ epsilon, past the product's. A document's first token selects its own write, and
 multiplying by a zero decay: an overflowed document's infinite state times zero was NaN in the next.
 """
 
-import dataclasses
-
 import jax.numpy as jnp
 from jax import lax
-from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn import derivatives
-from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import mosaic, outputs, scan
-from dew.nn.kernels.templates.recurrence import conv
-
-TURN = conv.UNROLLED
-"""The tokens a turn of a walk reads at once, their loads issued before the first is used (`conv.UNROLLED`);
-the backward keeps a state a turn."""
+from dew.nn.kernels import tuning
+from dew.nn.kernels.templates import mosaic, scan
+from dew.nn.kernels.templates.recurrence import conv, walks
+from dew.nn.kernels.templates.recurrence.walks import (
+    TURN,
+    Program,
+    Walk,
+    cut,
+    launch,
+    per_span,
+    per_token,
+    refs_of,
+)
 
 MOST = 256
 """The most tokens a program walks: the backward keeps `MOST / TURN` states of its channels in shared
 memory, 32 KB at 256 channels a program."""
 
 
-@dataclasses.dataclass(frozen=True)
-class Walk:
-    """A call's launches' facts: its rows, tokens and channels, the tokens a program walks (`span`, whole
-    turns), the channels it takes (`lanes`), its bundle's family and whether it is interpreted."""
-
-    rows: int
-    length: int
-    channels: int
-    span: int
-    lanes: int
-    family: mosaic.Family
-    interpret: bool
-
-    @property
-    def spans(self) -> int:
-        return -(-self.length // self.span)
-
-    @property
-    def grid(self) -> tuple[int, int, int]:
-        return self.rows, self.spans, self.channels // self.lanes
-
-
 def walk(rows: int, length: int, channels: int, dtype, family: mosaic.Family, interpret: bool) -> Walk:
     """The launches' facts for a call of `rows` rows of `length` tokens and `channels` channels in `dtype`:
-    a program's channels the conv's (`conv.lanes`, whole lines a warp), its tokens as many as leave the
-    fewest programs filling the device once (`conv.span`), at most `MOST`, whole turns."""
-    lanes = conv.lanes(((channels, None),), dtype)
-    target = generation.interpreted_target() if interpret else generation.gpu_target()
-    span = min(conv.span(length, rows, channels // lanes, target), MOST)
-    return Walk(rows, length, channels, -(-span // TURN) * TURN, lanes, family, interpret)
+    a program's channels the conv's (`conv.lanes`, whole lines a warp), its tokens `walks.walk`'s, at most
+    `MOST`."""
+    return walks.walk(rows, length, channels, conv.lanes(((channels, None),), dtype), MOST, family, interpret)
 
 
-class _Program:
-    """A program's view: its row, span and channels, and its loads and stores at them."""
-
-    def __init__(self, shape: Walk, starts_ref):
-        self.shape, self.starts_ref = shape, starts_ref
-        self.row, self.block = lax.axis_index("rows"), lax.axis_index("tokens")
-        self.start = self.block * shape.span
-        self.columns = pl.ds(lax.axis_index("channels") * shape.lanes, shape.lanes)
-
-    def channels(self, ref, token):
-        """`ref`'s channels at `token`, fp32, zero outside the row."""
-        return conv.channels_at(ref, self.row, token, self.columns, self.shape.length)
-
-    def gate(self, g_ref, token):
-        """`(g_t, a_t, first)`: the log decay and its exponential (zero and one outside the row) and whether
-        `token` is a document's first, laid over the channels (None without documents)."""
-        g = self.channels(g_ref, token)
-        a = jnp.exp(g)
-        if self.starts_ref is None:
-            return g, a, None
-        length = self.shape.length
-        marked = self.starts_ref[self.row, jnp.clip(token, 0, length - 1)]
-        return g, a, mosaic.laid((token >= 0) & (token < length) & (marked != 0), a)
-
-    def summary(self, ref):
-        """`ref`'s channels at this program's span (`[B, spans, D]`)."""
-        return conv.channels_at(ref, self.row, self.block, self.columns, self.shape.spans)
-
-    def summarised(self, ref, value) -> None:
-        plgpu.store(ref.at[self.row, self.block, self.columns], value, optimized=False)
-
-    def stored(self, ref, token, value) -> None:
-        conv.stored_where(ref, (self.row, token, self.columns), value, token < self.shape.length)
-
-    def turns(self, body, carried, *, reverse: bool = False):
-        """`body(turn, tokens, carried)` over the span's turns, `turn` its index and `tokens` its `TURN`
-        in order; from the last turn where `reverse`."""
-        count = self.shape.span // TURN
-
-        def turn(i, carried):
-            at = count - 1 - i if reverse else i
-            first = self.start + at * TURN
-            return body(at, [first + u for u in range(TURN)], carried)
-
-        return lax.fori_loop(0, count, turn, carried)
-
-
-def _cut(first, value, replaced):
-    """`value`, `replaced` at a document's first token (`first`, `_Program.gate`'s), selected: never a
-    product with zero, which an overflowed state made NaN."""
-    return value if first is None else jnp.where(first, replaced, value)
-
-
-def _refs(refs, operands) -> tuple[list, list]:
-    """A launch's refs as its `operands` (None where one is absent), then its outputs' and scratch's."""
-    refs = iter(refs)
-    return [None if operand is None else next(refs) for operand in operands], list(refs)
-
-
-def _launched(entry, shape: Walk, name: str, out_type, operands, scratch=()):
-    """`entry` launched over `shape`'s grid on `operands` (an absent one None)."""
-    return mosaic.kernel(entry, out_type=out_type, grid=shape.grid, grid_names=("rows", "tokens", "channels"),
-                         warpgroups=1, interpret=shape.interpret, family=shape.family.name,
-                         compiled=mosaic.compiler_params(), name=name, scratch=scratch)(
-        *(operand for operand in operands if operand is not None))
-
-
-def _tokens_of(x, dtype) -> outputs.Output:
-    """A `[B, T, D]` output of `x`'s axes in `dtype`."""
-    return outputs.output(dtype, outputs.axis(x, 0), outputs.axis(x, 1), outputs.axis(x, 2))
-
-
-def _spans_of(x, shape: Walk) -> outputs.Output:
-    """A `[B, spans, D]` fp32 output of `x`'s rows and channels."""
-    return outputs.output(jnp.float32, outputs.axis(x, 0), outputs.axis(x, 1).ceil_div(shape.span),
-                          outputs.axis(x, 2))
+def _gate(program: Program, g_ref, token):
+    """`(a_t, first)`: `exp(g_t)` (one outside the row, where `g` reads zero) and whether `token` is a
+    document's first, laid over the channels (`Program.first`)."""
+    a = jnp.exp(program.channels(g_ref, token))
+    return a, program.first(token, a)
 
 
 LOW = 2.0 ** -64
@@ -166,7 +72,7 @@ def _decayed(decay, a_t, first):
     document's first token on, selected), raised by 2^64 where it falls below `LOW` and the exponent lowered
     by 64 with it, each exact."""
     mantissa, exponent = decay
-    mantissa = _cut(first, mantissa * a_t, jnp.zeros_like(mantissa))
+    mantissa = cut(first, mantissa * a_t, jnp.zeros_like(mantissa))
     low = mantissa < LOW
     return jnp.where(low, mantissa * 2.0 ** 64, mantissa), jnp.where(low, exponent - 64.0, exponent)
 
@@ -179,16 +85,16 @@ def summaries(x, g, starts, *, shape: Walk):
     operands = (x, g, starts)
 
     def entry(*refs):
-        (x_ref, g_ref, starts_ref), (mantissa_ref, exponent_ref, state_ref) = _refs(refs, operands)
-        program = _Program(shape, starts_ref)
+        (x_ref, g_ref, starts_ref), (mantissa_ref, exponent_ref, state_ref) = refs_of(refs, operands)
+        program = Program(shape, starts_ref)
 
         def body(_, tokens, carried):
             decay, h = carried
             xs = [program.channels(x_ref, t) for t in tokens]
-            gates = [program.gate(g_ref, t) for t in tokens]
-            for x_t, (_, a_t, first) in zip(xs, gates, strict=True):
+            gates = [_gate(program, g_ref, t) for t in tokens]
+            for x_t, (a_t, first) in zip(xs, gates, strict=True):
                 decay = _decayed(decay, a_t, first)
-                h = _cut(first, a_t * h + x_t, x_t)
+                h = cut(first, a_t * h + x_t, x_t)
             return decay, h
 
         zero = jnp.zeros((shape.lanes,), jnp.float32)
@@ -197,8 +103,8 @@ def summaries(x, g, starts, *, shape: Walk):
         program.summarised(exponent_ref, exponent)
         program.summarised(state_ref, h)
 
-    out_type = (_spans_of(x, shape), _spans_of(x, shape), _spans_of(x, shape))
-    return _launched(entry, shape, "diagonal_summaries", out_type, operands)
+    out_type = (per_span(x, shape), per_span(x, shape), per_span(x, shape))
+    return launch(entry, shape, "diagonal_summaries", out_type, operands)
 
 
 @tuning.lowered_once(("shape",))
@@ -208,20 +114,20 @@ def walked(x, g, starts, entering, *, shape: Walk):
     operands = (x, g, starts, entering)
 
     def entry(*refs):
-        (x_ref, g_ref, starts_ref, entering_ref), (out_ref, last_ref) = _refs(refs, operands)
-        program = _Program(shape, starts_ref)
+        (x_ref, g_ref, starts_ref, entering_ref), (out_ref, last_ref) = refs_of(refs, operands)
+        program = Program(shape, starts_ref)
 
         def body(_, tokens, h):
             xs = [program.channels(x_ref, t) for t in tokens]
-            gates = [program.gate(g_ref, t) for t in tokens]
-            for t, x_t, (_, a_t, first) in zip(tokens, xs, gates, strict=True):
-                h = _cut(first, a_t * h + x_t, x_t)
+            gates = [_gate(program, g_ref, t) for t in tokens]
+            for t, x_t, (a_t, first) in zip(tokens, xs, gates, strict=True):
+                h = cut(first, a_t * h + x_t, x_t)
                 program.stored(out_ref, t, h)
             return h
 
         program.summarised(last_ref, program.turns(body, program.summary(entering_ref)))
 
-    return _launched(entry, shape, "diagonal_walk", (_tokens_of(x, x.dtype), _spans_of(x, shape)), operands)
+    return launch(entry, shape, "diagonal_walk", (per_token(x, x.dtype), per_span(x, shape)), operands)
 
 
 @tuning.lowered_once(("shape",))
@@ -232,17 +138,17 @@ def reverse_summaries(g, starts, dy, *, shape: Walk):
     operands = (g, starts, dy)
 
     def entry(*refs):
-        (g_ref, starts_ref, dy_ref), (mantissa_ref, exponent_ref, carried_ref) = _refs(refs, operands)
-        program = _Program(shape, starts_ref)
+        (g_ref, starts_ref, dy_ref), (mantissa_ref, exponent_ref, carried_ref) = refs_of(refs, operands)
+        program = Program(shape, starts_ref)
         zero = jnp.zeros((shape.lanes,), jnp.float32)
 
         def body(_, tokens, carried):
             decay, c = carried
-            gates = [program.gate(g_ref, t) for t in tokens]
+            gates = [_gate(program, g_ref, t) for t in tokens]
             dys = [program.channels(dy_ref, t) for t in tokens]
-            for (_, a_t, first), dy_t in zip(reversed(gates), reversed(dys), strict=True):
+            for (a_t, first), dy_t in zip(reversed(gates), reversed(dys), strict=True):
                 decay = _decayed(decay, a_t, first)
-                c = _cut(first, a_t * (dy_t + c), zero)
+                c = cut(first, a_t * (dy_t + c), zero)
             return decay, c
 
         (mantissa, exponent), c = program.turns(body, ((zero + 1.0, zero), zero), reverse=True)
@@ -250,8 +156,8 @@ def reverse_summaries(g, starts, dy, *, shape: Walk):
         program.summarised(exponent_ref, exponent)
         program.summarised(carried_ref, c)
 
-    out_type = (_spans_of(dy, shape), _spans_of(dy, shape), _spans_of(dy, shape))
-    return _launched(entry, shape, "diagonal_summaries_backward", out_type, operands)
+    out_type = (per_span(dy, shape), per_span(dy, shape), per_span(dy, shape))
+    return launch(entry, shape, "diagonal_summaries_backward", out_type, operands)
 
 
 @tuning.lowered_once(("shape",))
@@ -265,43 +171,43 @@ def walked_back(x, g, starts, dy, entering, later, *, shape: Walk):
     kept = plgpu.SMEM((shape.span // TURN, shape.lanes), jnp.float32)
 
     def entry(*refs):
-        given, made = _refs(refs, operands)
+        given, made = refs_of(refs, operands)
         x_ref, g_ref, starts_ref, dy_ref, entering_ref, later_ref = given
         dx_ref, dg_ref, leaving_ref, kept_ref = made
-        program = _Program(shape, starts_ref)
+        program = Program(shape, starts_ref)
         layout = scan.blocked(shape.lanes)
         zero = jnp.zeros((shape.lanes,), jnp.float32)
 
         def forward(turn, tokens, h):
             plgpu.store(kept_ref.at[turn], h, optimized=False)
             xs = [program.channels(x_ref, t) for t in tokens]
-            gates = [program.gate(g_ref, t) for t in tokens]
-            for x_t, (_, a_t, first) in zip(xs, gates, strict=True):
-                h = _cut(first, a_t * h + x_t, x_t)
+            gates = [_gate(program, g_ref, t) for t in tokens]
+            for x_t, (a_t, first) in zip(xs, gates, strict=True):
+                h = cut(first, a_t * h + x_t, x_t)
             return h
 
         program.turns(forward, program.summary(entering_ref))
 
         def back(turn, tokens, c):
             xs = [program.channels(x_ref, t) for t in tokens]
-            gates = [program.gate(g_ref, t) for t in tokens]
+            gates = [_gate(program, g_ref, t) for t in tokens]
             dys = [program.channels(dy_ref, t) for t in tokens]
             h, before = plgpu.load(kept_ref.at[turn], layout=layout, optimized=False), []
-            for x_t, (_, a_t, first) in zip(xs, gates, strict=True):
+            for x_t, (a_t, first) in zip(xs, gates, strict=True):
                 before.append(h)
-                h = _cut(first, a_t * h + x_t, x_t)
+                h = cut(first, a_t * h + x_t, x_t)
             walked = list(zip(tokens, gates, dys, before, strict=True))
-            for t, (_, a_t, first), dy_t, h_t in reversed(walked):
+            for t, (a_t, first), dy_t, h_t in reversed(walked):
                 q = dy_t + c
                 program.stored(dx_ref, t, q)
-                program.stored(dg_ref, t, _cut(first, (q * h_t) * a_t, zero))
-                c = _cut(first, a_t * q, zero)
+                program.stored(dg_ref, t, cut(first, (q * h_t) * a_t, zero))
+                c = cut(first, a_t * q, zero)
             return c
 
         program.summarised(leaving_ref, program.turns(back, program.summary(later_ref), reverse=True))
 
-    out_type = (_tokens_of(x, x.dtype), _tokens_of(g, g.dtype), _spans_of(x, shape))
-    return _launched(entry, shape, "diagonal_walk_backward", out_type, operands, scratch=(kept,))
+    out_type = (per_token(x, x.dtype), per_token(g, g.dtype), per_span(x, shape))
+    return launch(entry, shape, "diagonal_walk_backward", out_type, operands, scratch=(kept,))
 
 
 def _scaled(values, decay):

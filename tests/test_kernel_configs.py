@@ -219,6 +219,45 @@ def test_the_diagonal_scans_kernels_compile_within_each_gpus_resources(target):
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+def _wkv4_case(*, packed: bool) -> support.KernelCase:
+    """RWKV4's WKV's training step through its VJP (`templates.recurrence.wkv4`, its four launches: 32 spans
+    a row) over bf16 keys and values at RWKV-4 1.5B's 2048 channels, eight rows of 4096 tokens, whole or
+    packed."""
+    from dew.nn.kernels.templates.recurrence import mainloop, wkv4
+
+    def call():
+        channel = jax.ShapeDtypeStruct((2048,), jnp.float32)
+        key = jax.ShapeDtypeStruct((8, 4096, 2048), jnp.bfloat16)
+        state = jax.ShapeDtypeStruct((8, 3, 2048), jnp.float32)
+        starts = jax.ShapeDtypeStruct(key.shape[:2], jnp.bool_) if packed else None
+
+        def grads(decay, bonus, key, value, state, starts):
+            family, _ = mainloop.issued(jnp.float32)
+
+            def loss(decay, bonus, key, value, state):
+                out, final = wkv4.wkv4(decay, bonus, key, value, state, starts, family=family,
+                                       interpret=False)
+                return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
+
+            return jax.grad(loss, argnums=(0, 1, 2, 3, 4))(decay, bonus, key, value, state)
+        return grads, (channel, channel, key, key, state, starts)
+    return support.KernelCase("wkv4/packed" if packed else "wkv4", call)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("target", gate_generations(scoped=True))
+def test_the_wkv4_kernels_compile_within_each_gpus_resources(target):
+    """RWKV4's WKV's training launches (`templates.recurrence.wkv4`) over whole rows and packed ones, lowered
+    as on the GPU and compiled by Mosaic for a compile-only device on this CPU through ptxas
+    (tests/kernel_compile.py): within the block's shared memory (the backward's kept carries), no register
+    spilled."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    found = compile_mosaic_kernels([_wkv4_case(packed=False), _wkv4_case(packed=True)], target)
+    assert len(found) == 2
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
 
 @COMPILES_ON_CPU
 @lowers("sm90")

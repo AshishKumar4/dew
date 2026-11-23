@@ -7,18 +7,29 @@ channel's past held as a numerator and a denominator scaled by a running maximum
              beta' = e^{w + eps - eps'} beta + e^{k_t - eps'}
 
 with `w = -exp(time_decay)` a channel's decay and `u` (time_first) the current token's bonus. Width one a
-channel holds no product, so it runs as a scan rather than on the recurrence template's chunked mainloop: a
-span's carry composes with the next's associatively (`_joined`), one `associative_scan` of every token's
-`(e^{k} v, e^{k}, max k, 1)` over the sequence, segmented at packed documents' first tokens."""
+channel holds no product, so its selector (`WKV4`) runs it on the recurrence template's channel walk
+(`templates.recurrence.wkv4`) where it takes the call, else on the portable math: a span's carry composes
+with the next's associatively (`joined`), one `associative_scan` of every token's `(e^{k} v, e^{k}, max k, 1)`
+over the sequence, segmented at packed documents' first tokens."""
 
 from __future__ import annotations
 
+import dataclasses
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import PartitionSpec as P
 
 from dew.nn.precision import at_least_fp32
+from dew.nn.sharding import grouped_heads, manual_map
+
+from . import generation
+from .generation import INHERENT, Choice
+from .recurrence_chunk import _VARYING, _per_product
+from .selection import Kernel, Op, Requirement, select
+from .templates import scan as block_scan
 
 EMPTY = -jnp.inf
 """An empty past's running maximum: a span that holds no token, so it never stands for a token's (a finite
@@ -39,7 +50,7 @@ class SpanCarry(NamedTuple):
     fresh: jax.Array
 
 
-def _joined(decay):
+def joined(decay):
     """The composition of a span with the span after it (`associative_scan`'s operator): the earlier one's
     past decayed by `decay` once a token of the later one, both rescaled to their larger maximum, where the
     later one begins no document."""
@@ -71,12 +82,90 @@ def _operands(time_decay, time_first, key, value, state):
             jnp.asarray(state, work), dtype)
 
 
+@dataclasses.dataclass(frozen=True)
+class WkvCase:
+    """A WKV (`wkv4`) as its selector reads it (`WKV4`): whether a shard_map that checks varying axes holds
+    its operands, its keys' and values' dtype, its channels, and its device's instruction family (None off a
+    GPU)."""
+
+    varying: bool
+    dtype: np.dtype
+    channels: int
+    family: str | None = None
+
+
+WKV4_SUPPORTS: tuple[Requirement[WkvCase], ...] = (
+    Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822'),
+    Requirement('gpu', lambda case: case.family is not None,
+                "no GPU of an instruction family the template's bundles cover: off one the template "
+                "interprets, as the CPU suite runs it where a call names it", row=INHERENT, kind='measured'),
+    Requirement('dtype', lambda case: case.dtype in (jnp.bfloat16, jnp.float16, jnp.float32),
+                lambda case: f"{case.dtype} keys and values; the kernels take 16-bit and fp32 ones",
+                row=INHERENT),
+    Requirement('channels', lambda case: case.channels % block_scan.THREADS == 0,
+                lambda case: f"{case.channels} channels, no whole number of a warpgroup's "
+                             f"{block_scan.THREADS}", row='ledger 1455'),
+)
+"""What the template's WKV (`templates.recurrence.wkv4`) needs of a call: no caller's `shard_map` that
+checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 keys and values, and whole
+warpgroups of channels."""
+
+WKV4: Op[WkvCase] = Op(Choice.WKV4, (Kernel('mosaic_gpu', WKV4_SUPPORTS), Kernel('xla', (), generic=True)))
+"""The WKV's selector: the recurrence template's channel walk (`templates.recurrence.wkv4`) where it takes
+the call, else the portable scan (`scanned`)."""
+
+
+def wkv4_kernel(key) -> str:
+    """The kernel the WKV's selector (`WKV4`) gives a call over `key` `[B, S, C]` on the target, reported as
+    its route."""
+    from .templates import bundles
+
+    on_gpu = generation.backend() == 'gpu'
+    bundled = on_gpu and bundles.of(generation.device_generation(), key.dtype) is not None
+    case = WkvCase(varying=bool(jax.typeof(key).mat.varying), dtype=jnp.dtype(key.dtype),
+                   channels=key.shape[-1], family=generation.family(generation.device_generation()) if bundled else None)
+    return select(WKV4, case).kernel
+
+
 def wkv4(time_decay, time_first, key, value, state=None, starts=None):
     """RWKV4's WKV over a sequence. `time_decay` and `time_first` `[C]` (the decay `w = -exp(time_decay)`,
     the bonus `u`), `key` and `value` `[B, S, C]`; `state` `[B, 3, C]` the carry entering (fla's alpha,
     beta and eps; an empty past where None); `starts` `[B, S]` each packed document's first token, which
     enters an empty past. Returns `(out [B, S, C] in the inputs' dtype, state [B, 3, C] in at least fp32)`,
-    as fla's `fused_recurrent_rwkv4` (its state's last token)."""
+    as fla's `fused_recurrent_rwkv4` (its state's last token), on the kernel its selector gives each product
+    (`WKV4`, `recurrence_chunk._per_product`): the recurrence template's walk, interpreted off a GPU where a
+    call names it, per shard of rows on a mesh (`manual_map`); or the portable scan (`scanned`). A call of
+    no tokens walks none: its final carry is the one entering."""
+    if key.shape[1] == 0:
+        *_, state, dtype = _operands(time_decay, time_first, key, value, state)
+        return jnp.zeros(key.shape, dtype), state
+
+    def template(decay, bonus, key, value, state, *given):
+        from .templates.recurrence import mainloop, wkv4 as launches
+
+        family, interpreted = mainloop.issued(jnp.float32)
+        return launches.wkv4(decay, bonus, key, value, state, given[0] if given else None, family=family,
+                             interpret=interpreted)
+
+    def run(kernel, time_decay, time_first, key, value, state):
+        if kernel != 'mosaic_gpu':
+            return scanned(time_decay, time_first, key, value, state, starts)
+        decay, bonus, _, _, carry, dtype = _operands(time_decay, time_first, key, value, state)
+        rows, _ = grouped_heads((*key.shape[:2], 1, key.shape[-1]), 1)
+        three, one = P(rows, None, None), P(None)
+        operands = (decay, bonus, jnp.asarray(key, dtype), jnp.asarray(value, dtype), carry,
+                    *([] if starts is None else [starts]))
+        specs = (one, one, three, three, three, P(rows, None))[:len(operands)]
+        return manual_map(template, specs, (three, three))(*operands)
+
+    # The decay and bonus (operands 0 and 1) are the call's parameters.
+    return _per_product(WKV4.bound(lambda product: wkv4_kernel(key)), run, time_decay, time_first, key, value,
+                        state, parameters=(0, 1))
+
+
+def scanned(time_decay, time_first, key, value, state=None, starts=None):
+    """`wkv4` on the portable math: one associative scan of its spans' carries (`joined`); operands and
+    results as `wkv4`'s."""
     decay, bonus, key, value, state, dtype = _operands(time_decay, time_first, key, value, state)
     batch, length, channels = key.shape
     fresh = (jnp.zeros((batch, length), bool) if starts is None else jnp.asarray(starts, bool))[..., None]
@@ -85,7 +174,7 @@ def wkv4(time_decay, time_first, key, value, state=None, starts=None):
                          jnp.zeros((batch, 1, channels), key.dtype), jnp.zeros((batch, 1, channels), bool))
     tokens = SpanCarry(value, jnp.ones_like(key), key, jnp.ones_like(key), fresh)
     spans = jax.tree.map(lambda first, rest: jnp.concatenate([first, rest], axis=1), entering, tokens)
-    carried = jax.lax.associative_scan(_joined(decay), spans, axis=1)
+    carried = jax.lax.associative_scan(joined(decay), spans, axis=1)
     # Each token reads the carry before it (an empty one at a document's first token) and itself at its
     # bonus.
     before = jax.tree.map(lambda x: x[:, :-1], carried)
