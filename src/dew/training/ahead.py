@@ -1646,10 +1646,12 @@ def _unread(step: jax.stages.Compiled, placed: TrainState, built: int) -> int:
     from dew.distributed.placement import placed_bytes
 
     (arguments, _), (shardings, _) = step.in_avals, step.input_shardings
+    # Each kept leaf beside its sharding, a dropped one beside None, by the arguments' own structure (a field
+    # the state holds none of, its window's, a node of neither).
     read = [jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=sharding)
             for tree, laid in zip(arguments[:2], shardings[:2], strict=True)
-            for aval, sharding in zip(jax.tree.leaves(tree),
-                                      jax.tree.leaves(laid, is_leaf=lambda leaf: leaf is None), strict=True)
+            for aval, sharding in zip(jax.tree.leaves(tree), jax.tree.structure(tree).flatten_up_to(laid),
+                                      strict=True)
             if sharding is not None]
     return max(0, placed_bytes(placed, memory="device") - (placed_bytes(read, memory="device") - built))
 
