@@ -13,12 +13,10 @@ from typing import ClassVar, NamedTuple
 import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
-from jax.custom_derivatives import zero_from_primal
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn import categorical
-from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
 from dew.nn.kernels import generation, grouped_launch, selection, tuning, xla_products
 from dew.nn.kernels.templates import (
     bundles,
@@ -50,9 +48,8 @@ from dew.nn.kernels.templates.gemm.pricing import (
     tile_rows,
 )
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
-from dew.nn.precision import at_least_fp32, exact_products
+from dew.nn.precision import exact_products
 from dew.nn.sharding import automatic_axes
-
 LINEAR_CE = "dew_linear_ce"
 """Kernel name for GEMM-fused linear cross-entropy launches."""
 
@@ -448,152 +445,14 @@ class MosaicLinearCE(TilesTemplate):
 MOSAIC_LINEAR_CE = MosaicLinearCE()
 """The singleton Mosaic GEMM-fused linear cross-entropy launch on `TilesTemplate`/`KernelOp`."""
 
-def _contraction_dtypes(x_dtype, w_dtype) -> tuple[jnp.dtype, jnp.dtype]:
-    """Single operand and accumulation dtype policy shared across `portable_linear_ce`,
-    `linear_ce_backward`, and native `MOSAIC_LINEAR_CE` selection (row 6103)."""
-    operand = jnp.promote_types(x_dtype, w_dtype)
-    return operand, at_least_fp32(operand)
-
-def _padded_vocab(weight: jax.Array, bias: jax.Array | None, *, transpose_rhs: bool,
-                  chunk_size: int | None) -> tuple[jax.Array, jax.Array | None, int, int, int]:
-    v = weight.shape[0] if transpose_rhs else weight.shape[1]
-    step = min(v, max(1, 4096 if chunk_size is None else int(chunk_size)))
-    n_chunks = -(-v // step)
-    v_pad = n_chunks * step
-    if v_pad != v:
-        w_pad = ((0, v_pad - v), (0, 0)) if transpose_rhs else ((0, 0), (0, v_pad - v))
-        weight = jnp.pad(weight, w_pad)
-        if bias is not None:
-            bias = jnp.pad(bias, ((0, v_pad - v),))
-    return weight, bias, v, step, n_chunks
-
-
-def _chunk_logits(x: jax.Array, w_pad: jax.Array, bias_pad: jax.Array | None, start, step: int, *,
-                  transpose_rhs: bool, precision: PrecisionLike, softcap: float | None, operand, work
-                  ) -> tuple[jax.Array, jax.Array]:
-    axis = 0 if transpose_rhs else 1
-    w_chunk = jax.lax.dynamic_slice_in_dim(w_pad, start, step, axis=axis)
-    dims = (((1,), (1 if transpose_rhs else 0,)), ((), ()))
-    raw = jax.lax.dot_general(x.astype(operand), w_chunk.astype(operand), dims, precision=precision,
-                              preferred_element_type=work)
-    if bias_pad is not None:
-        raw = raw + jax.lax.dynamic_slice_in_dim(bias_pad, start, step, axis=0).astype(work)[None, :]
-    if softcap is not None:
-        cap = jnp.asarray(softcap, work)
-        return cap * jnp.tanh(raw / cap), raw
-    return raw, raw
-
-
-def portable_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *,
-                       bias: jax.Array | None = None, softcap: float | None = None,
-                       transpose_rhs: bool = True, precision: PrecisionLike = None,
-                       chunk_size: int | None = None
-                       ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Chunked-V online softmax linear cross-entropy returning `(loss, peak, mass, rest)` in `at_least_fp32`
-    without ever materializing `[M, V]` logits (row 6103)."""
-    operand, work = _contraction_dtypes(x.dtype, weight.dtype)
-    w_pad, b_pad, v, step, n_chunks = _padded_vocab(weight, bias, transpose_rhs=transpose_rhs,
-                                                    chunk_size=chunk_size)
-    m = x.shape[0]
-    targets_i32 = targets.astype(jnp.int32)
-    init = (jnp.full((m,), -jnp.inf, work), jnp.zeros((m,), work),
-            jnp.zeros((m,), work), jnp.zeros((m,), work))
-
-    def body(chunk, carry):
-        m_acc, l_acc, t_acc, r_acc = carry
-        start = chunk * step
-        z, _ = _chunk_logits(x, w_pad, b_pad, start, step, transpose_rhs=transpose_rhs,
-                             precision=precision, softcap=softcap, operand=operand, work=work)
-        col = start + jnp.arange(step, dtype=jnp.int32)
-        in_vocab = col < v
-        z_masked = jnp.where(in_vocab[None, :], z, jnp.asarray(-jnp.inf, work))
-        m_c = jnp.max(z_masked, axis=1)
-        peak_c = jnp.where(jnp.isfinite(m_c), m_c, jnp.asarray(0.0, work))
-        exp_z = jnp.exp(z_masked - peak_c[:, None])
-        l_c = jnp.sum(exp_z, axis=1)
-        hit = in_vocab[None, :] & (col[None, :] == targets_i32[:, None])
-        t_c = jnp.sum(jnp.where(hit, z, jnp.asarray(0.0, work)), axis=1)
-        r_c = jnp.sum(jnp.where(hit, jnp.asarray(0.0, work), exp_z), axis=1)
-        merged_m = jnp.maximum(m_acc, m_c)
-        merged_peak = jnp.where(jnp.isfinite(merged_m), merged_m, jnp.asarray(0.0, work))
-        merged_l = (categorical.rescaled(m_acc, l_acc, merged_peak)
-                    + categorical.rescaled(m_c, l_c, merged_peak))
-        merged_r = (categorical.rescaled(m_acc, r_acc, merged_peak)
-                    + categorical.rescaled(m_c, r_c, merged_peak))
-        return merged_m, merged_l, t_acc + t_c, merged_r
-
-    m_all, l_all, t_all, r_all = jax.lax.fori_loop(0, n_chunks, body, init)
-    peak = jnp.where(jnp.isfinite(m_all), m_all, jnp.asarray(0.0, work))
-    return categorical.target_loss(peak, l_all, t_all), peak, l_all, r_all
-
-
-def linear_ce_backward(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None,
-                       peak: jax.Array, mass: jax.Array, rest: jax.Array, d_loss: jax.Array, *,
-                       softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
-                       chunk_size: int | None
-                       ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
-    """Recomputing chunked-V GEMM backward for linear cross-entropy with Barron et al. zero-sum label
-    derivatives (`categorical.label_entry`), never materializing `[M, V]` logits (row 6103)."""
-    operand, work = _contraction_dtypes(x.dtype, weight.dtype)
-    w_pad, b_pad, v, step, n_chunks = _padded_vocab(weight, bias, transpose_rhs=transpose_rhs,
-                                                    chunk_size=chunk_size)
-    targets_i32 = targets.astype(jnp.int32)
-    d_loss_w = d_loss.astype(work)
-    peak_w, mass_w, rest_w = peak.astype(work), mass.astype(work), rest.astype(work)
-    others_w = (rest_w / mass_w)[:, None]
-    axis = 0 if transpose_rhs else 1
-    x_w = x.astype(operand).astype(work)
-    d_x0 = jnp.zeros(x.shape, work)
-    d_w0 = jnp.zeros(w_pad.shape, work)
-    d_b0 = None if b_pad is None else jnp.zeros(b_pad.shape, work)
-
-    def body(chunk, carry):
-        d_x, d_w, d_b = carry
-        start = chunk * step
-        z, raw = _chunk_logits(x, w_pad, b_pad, start, step, transpose_rhs=transpose_rhs,
-                               precision=precision, softcap=softcap, operand=operand, work=work)
-        col = start + jnp.arange(step, dtype=jnp.int32)
-        in_vocab = col < v
-        exp_z = jnp.where(in_vocab[None, :], jnp.exp(z - peak_w[:, None]), jnp.asarray(0.0, work))
-        p = exp_z / mass_w[:, None]
-        hit = in_vocab[None, :] & (col[None, :] == targets_i32[:, None])
-        d_z = jnp.where(hit, categorical.label_entry(p, others_w), p) * d_loss_w[:, None]
-        if softcap is not None:
-            cap = jnp.asarray(softcap, work)
-            th = jnp.tanh(raw / cap)
-            d_raw = d_z * (jnp.asarray(1.0, work) - th * th)
-        else:
-            d_raw = d_z
-        w_chunk = jax.lax.dynamic_slice_in_dim(w_pad, start, step, axis=axis).astype(operand).astype(work)
-        dx_dims = (((1,), (0 if transpose_rhs else 1,)), ((), ()))
-        d_x = d_x + jax.lax.dot_general(d_raw, w_chunk, dx_dims, precision=precision,
-                                        preferred_element_type=work)
-        if transpose_rhs:
-            dw_chunk = jax.lax.dot_general(d_raw, x_w, (((0,), (0,)), ((), ())),
-                                           precision=precision, preferred_element_type=work)
-        else:
-            dw_chunk = jax.lax.dot_general(x_w, d_raw, (((0,), (0,)), ((), ())),
-                                           precision=precision, preferred_element_type=work)
-        d_w = jax.lax.dynamic_update_slice_in_dim(d_w, dw_chunk, start, axis=axis)
-        if d_b is not None:
-            d_b = jax.lax.dynamic_update_slice_in_dim(d_b, jnp.sum(d_raw, axis=0), start, axis=0)
-        return d_x, d_w, d_b
-
-    d_x, d_w_pad, d_b_pad = jax.lax.fori_loop(0, n_chunks, body, (d_x0, d_w0, d_b0))
-    d_w = d_w_pad[:v] if transpose_rhs else d_w_pad[:, :v]
-    d_b = None if (d_b_pad is None or bias is None) else d_b_pad[:v].astype(bias.dtype)
-    return d_x.astype(x.dtype), d_w.astype(weight.dtype), d_b
-
-
 LINEAR_CE_ROW = "ledger 6103"
 
 
 class LinearCECase(NamedTuple):
-    """Facts deciding whether `linear_cross_entropy` runs Mosaic GEMM-fused CE or chunked XLA."""
+    """Facts deciding whether `chunked._forward` runs Mosaic GEMM-fused CE or chunked XLA."""
     tile: Tiles | None
     whole: bool
     exact_products: bool
-    interpret: bool
     dtype_ok: bool = True
 
 
@@ -612,7 +471,7 @@ LINEAR_CE_OP: selection.Op[LinearCECase] = selection.Op(generation.Choice.GROUPE
             "precision", lambda case: case.exact_products,
             "precision does not match bf16/fp16 exact fp32 accumulation", LINEAR_CE_ROW),
         selection.Requirement(
-            "measured", lambda case: case.interpret,
+            "measured", lambda case: False,
             "no receipt yet has Mosaic linear-CE beat chunked XLA (pending M-NG-6)",
             LINEAR_CE_ROW, kind="measured"),
     )),
@@ -620,15 +479,21 @@ LINEAR_CE_OP: selection.Op[LinearCECase] = selection.Op(generation.Choice.GROUPE
 ))
 
 
-def _linear_ce_select(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None, *,
-                      transpose_rhs: bool, precision: PrecisionLike, interpret_on_cpu: bool) -> bool:
+def mosaic_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array,
+                     bias: jax.Array | None = None, *, transpose_rhs: bool = True,
+                     precision: PrecisionLike = None
+                     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None:
+    """Run `MOSAIC_LINEAR_CE` when `LINEAR_CE_OP` selects `'mosaic'` (returning `(loss, peak, mass,
+    rest)`), else `None` so `dew.objectives.lm.chunked._forward` runs its portable chunked XLA path
+    untouched (rows 6103, 12136)."""
     from dew.nn.kernels import gemm
 
     dtype_ok = supports_dtype(x.dtype) and jnp.dtype(x.dtype) == jnp.dtype(weight.dtype)
     exact = exact_products(precision, x.dtype) if dtype_ok else False
+    interpreting = xla_products.interpreted(True)
     if not dtype_ok:
         tile = None
-    elif xla_products.interpreted(interpret_on_cpu):
+    elif interpreting:
         target = generation.interpreted_target()
         tile = derive_linear_ce(
             (x.shape[0], weight.shape[0] if transpose_rhs else weight.shape[1], x.shape[1]),
@@ -638,71 +503,12 @@ def _linear_ce_select(x: jax.Array, weight: jax.Array, targets: jax.Array, bias:
             jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct(weight.shape, weight.dtype),
             jax.ShapeDtypeStruct(targets.shape, jnp.int32),
             None if bias is None else jax.ShapeDtypeStruct(bias.shape, bias.dtype),
-            transpose_rhs=transpose_rhs, softcap=None, interpret=interpret_on_cpu)
+            transpose_rhs=transpose_rhs, softcap=None, interpret=False)
         tile = gemm._planned(MOSAIC_LINEAR_CE, ba)
-    case = LinearCECase(tile, whole=not automatic_axes(), exact_products=exact,
-                        interpret=interpret_on_cpu, dtype_ok=dtype_ok)
-    return selection.select(LINEAR_CE_OP, case).kernel == "mosaic"
-
-
-def _linear_ce_run(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None, *,
-                   softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
-                   chunk_size: int | None, interpret_on_cpu: bool
-                   ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    if _linear_ce_select(x, weight, targets, bias, transpose_rhs=transpose_rhs, precision=precision,
-                         interpret_on_cpu=interpret_on_cpu):
-        ctx = (generation.assumed(generation.interpreted_target())
-               if xla_products.interpreted(interpret_on_cpu) else contextlib.nullcontext())
-        with ctx:
-            return MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs,
-                                    softcap=softcap, interpret=interpret_on_cpu)
-    return portable_linear_ce(x, weight, targets, bias=bias, softcap=softcap,
-                              transpose_rhs=transpose_rhs, precision=precision, chunk_size=chunk_size)
-
-
-def _linear_ce_value(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None,
-                     softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
-                     chunk_size: int | None, interpret_on_cpu: bool) -> jax.Array:
-    return _linear_ce_run(x, weight, targets, bias, softcap=softcap, transpose_rhs=transpose_rhs,
-                          precision=precision, chunk_size=chunk_size, interpret_on_cpu=interpret_on_cpu)[0]
-
-
-def _linear_ce_fwd(x: jax.Array, weight: jax.Array, targets: jax.Array, bias: jax.Array | None,
-                   softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
-                   chunk_size: int | None, interpret_on_cpu: bool):
-    loss, peak, mass, rest = _linear_ce_run(
-        x, weight, targets, bias, softcap=softcap, transpose_rhs=transpose_rhs,
-        precision=precision, chunk_size=chunk_size, interpret_on_cpu=interpret_on_cpu)
-    return loss, (x, weight, targets, bias, peak, mass, rest)
-
-
-def _linear_ce_bwd(softcap: float | None, transpose_rhs: bool, precision: PrecisionLike,
-                   chunk_size: int | None, interpret_on_cpu: bool, saved, d_loss: jax.Array):
-    del interpret_on_cpu
-    x, weight, targets, bias, peak, mass, rest = saved
-    d_x, d_w, d_b = linear_ce_backward(
-        x, weight, targets, bias, peak, mass, rest, d_loss, softcap=softcap,
-        transpose_rhs=transpose_rhs, precision=precision, chunk_size=chunk_size)
-    return d_x, d_w, zero_from_primal(targets), d_b
-
-
-_linear_ce_vjp = contracted("test_a_linear_cross_entropy_holds_every_reverse_order")(
-    declared_derivative(KernelGlue(), _linear_ce_value, _linear_ce_fwd, _linear_ce_bwd,
-                        nondiff_argnums=(4, 5, 6, 7, 8)))
-
-
-def linear_cross_entropy(x: jax.Array, weight: jax.Array, targets: jax.Array, *,
-                         bias: jax.Array | None = None, softcap: float | None = None,
-                         transpose_rhs: bool = True, precision: PrecisionLike = None,
-                         chunk_size: int | None = None, interpret_on_cpu: bool = False) -> jax.Array:
-    """GEMM-fused linear cross-entropy (`-log softmax(x @ W^T + bias)[targets]`, kernel-templates.md
-    Appendix C row 25, row 6103): computes per-token cross-entropy without materializing `[..., V]` logits
-    in forward or backward, using Barron et al. zero-sum label derivatives."""
-    lead = x.shape[:-1]
-    if targets.shape != lead:
-        raise ValueError(f"linear_cross_entropy targets shape {targets.shape} != x leading shape {lead}")
-    x_flat = x.reshape(-1, x.shape[-1])
-    t_flat = targets.reshape(-1)
-    loss = _linear_ce_vjp(x_flat, weight, t_flat, bias, softcap, transpose_rhs, precision,
-                          chunk_size, interpret_on_cpu)
-    return loss.reshape(lead)
+    case = LinearCECase(tile, whole=not automatic_axes(), exact_products=exact, dtype_ok=dtype_ok)
+    if selection.select(LINEAR_CE_OP, case).kernel != "mosaic":
+        return None
+    ctx = generation.assumed(generation.interpreted_target()) if interpreting else contextlib.nullcontext()
+    with ctx:
+        return MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs,
+                                softcap=None, interpret=interpreting)

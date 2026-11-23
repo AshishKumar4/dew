@@ -361,6 +361,19 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
     # Once, not per token tile: every tile multiplies the same rounded table,
     # and a conversion inside the loop reads the fp32 table once per tile.
     table = table.astype(operands)
+    if (not predict and excluded is None and temperature == 1.0 and columns.scale is None
+            and not picked and softcap is None):
+        from dew.nn.kernels.templates.gemm import linear_ce
+
+        if linear_ce.supports_dtype(operands):
+            ran = linear_ce.mosaic_linear_ce(
+                flat.astype(operands), table, labels, bias=columns.bias, precision=precision)
+            if ran is not None:
+                loss, peak, mass, rests = ran
+                log_z = peak + jnp.log(mass)
+                return ((loss.reshape(targets.shape), None, log_z.reshape(targets.shape)),
+                        (peak.reshape(targets.shape), mass.reshape(targets.shape),
+                         rests.reshape(targets.shape)))
 
     def tokens(start, outputs, size):
         states = jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands)

@@ -23,6 +23,12 @@ _EPILOGUE_LAYOUT: contextvars.ContextVar[Any] = contextvars.ContextVar("gemm_epi
 _MINIFLOAT_DTYPES = {bits.E4M3: jnp.dtype(jnp.float8_e4m3fn), bits.E5M2: jnp.dtype(jnp.float8_e5m2)}
 
 
+def minifloat_dtype(minifloat: bits.Minifloat) -> jnp.dtype:
+    """Storage float8 dtype for `minifloat` (`bits.E4M3` -> `float8_e4m3fn`, `bits.E5M2` -> `float8_e5m2`)."""
+    if minifloat not in _MINIFLOAT_DTYPES:
+        raise ValueError(f"unsupported FP8 minifloat {minifloat}")
+    return _MINIFLOAT_DTYPES[minifloat]
+
 @contextlib.contextmanager
 def epilogue_layout(layout):
     """Bind `layout` as the active compiled-epilogue register layout for `encode_tile` (row 8547)."""

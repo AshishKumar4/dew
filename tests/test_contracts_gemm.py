@@ -1006,28 +1006,6 @@ def test_a_compute_prologued_gemm_holds_every_order(edge):
     assert_contract(fused, (gate, up, down), (d_gate, d_up, d_down), cotangent,
                     f"compute prologued gemm {edge}", truth_fn=truth, plain_fn=plain)
 
-@pytest.mark.parametrize("edge", EDGES)
-def test_a_linear_cross_entropy_holds_every_reverse_order(edge):
-    """`gemm.linear_cross_entropy` (chunked online-softmax forward and recomputing Barron-derivative VJP):
-    every reverse order, under a nested jit and a scan, finite wherever float64 is a normal float32 and
-    wherever plain dense `categorical.cross_entropy` is (row 6103)."""
-    from dew.nn import categorical
-
-    targets = jnp.asarray([0, 3, 5, 2, 1, 7, 4, 6], jnp.int32)
-    x, weight, bias = normal_draw(6103, (8, 12), (10, 12), (10,), scale=EDGES[edge])
-    dx, dw, db = normal_draw(6104, (8, 12), (10, 12), (10,), scale=EDGES[edge])
-    (cotangent,) = normal_draw(6105, (8,))
-
-    def fused(rows, w, b):
-        return gemm.linear_cross_entropy(rows, w, targets, bias=b, softcap=30.0, chunk_size=4)
-
-    def plain(rows, w, b):
-        raw = rows @ w.T + b[None, :]
-        return categorical.cross_entropy(30.0 * jnp.tanh(raw / 30.0), targets)
-
-    assert_contract(fused, (x, weight, bias), (dx, dw, db), cotangent, f"linear cross-entropy {edge}",
-                    truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
-
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_an_fp8_weight_product_holds_every_order(edge):

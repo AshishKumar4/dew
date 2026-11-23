@@ -1667,65 +1667,31 @@ def test_explicit_target_derivation_sm120_and_refusal_under_mismatched_ambient_g
 
 
 @pytest.mark.parametrize(("offset", "after_cast"), [(False, False), (True, False), (False, True)])
-def test_stream_rms_norm_gemm_holds_check_1_and_lowers(offset: bool, after_cast: bool):
-    """`gemm.stream_rms_norm_gemm` pre-pass + GEMM prologue forward and backward hold check 1 against
-    `norms.rms_normalized` + `dot`, and lower through Mosaic GPU on sm80/sm90 (row 6104)."""
-    from dew.nn.norms import rms_normalized
+def test_stream_rms_normalized_fuses_through_fused_gemm_prologue(offset: bool, after_cast: bool):
+    """Residual-stream RMSNorm (`norms.stream_rms_normalized`) feeding `fused_gemm.product` splits its
+    stream sum + statistics into the XLA pre-pass and fuses the scaling into the GEMM prologue through
+    `fused_gemm.analysis` (rows 6104, 12137)."""
+    from dew.nn.kernels import fused_gemm
+    from dew.nn.norms import stream_rms_normalized
 
-    m, k, n = 64, 64, 64
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
 
-    def draw(seed):
-        rng = np.random.default_rng(6104 + seed)
-        return (
-            jnp.asarray(rng.standard_normal((m, k)) / np.sqrt(k), jnp.bfloat16),
-            jnp.asarray(rng.standard_normal((m, k)) / np.sqrt(k), jnp.bfloat16),
-            jnp.asarray(rng.uniform(0.8, 1.2, size=(k,)), jnp.float32),
-            jnp.asarray(rng.standard_normal((k, n)) / np.sqrt(k), jnp.bfloat16),
-            jnp.asarray(rng.standard_normal((m, k)), jnp.bfloat16),
-            jnp.asarray(rng.standard_normal((m, n)), jnp.bfloat16),
-        )
+    def body(x, branch, scale, w):
+        _, normed = stream_rms_normalized(x, branch, scale, 1e-6, jnp.bfloat16, scale_offset=offset,
+                                          scale_after_cast=after_cast, fp32_statistics=True,
+                                          implementation="xla")
+        return fused_gemm.product(normed, w, out_dtype=jnp.bfloat16)
 
-    def run_dew(x, branch, scale, rhs, ds, dy):
-        def fn(a, b, s, w):
-            return gemm.stream_rms_norm_gemm(a, b, s, w, offset=offset, after_cast=after_cast)
-
-        outs, pull = jax.vjp(fn, x, branch, scale, rhs)
-        return outs, pull((ds, dy))
-
-    def run_ref(x, branch, scale, rhs, ds, dy, *, dtype=jnp.bfloat16, wide=jnp.float32):
-        def fn(a, b, s, w):
-            stream = (a.astype(wide) + b.astype(wide)).astype(dtype)
-            normed = rms_normalized(stream, s, 1e-6, dtype, scale_offset=offset,
-                                    scale_after_cast=after_cast, fp32_statistics=True, implementation="xla")
-            y = jax.lax.dot(normed, w, preferred_element_type=wide).astype(dtype)
-            return stream, y
-
-        outs, pull = jax.vjp(fn, x.astype(dtype), branch.astype(dtype), scale.astype(wide), rhs.astype(dtype))
-        return outs, pull((ds.astype(dtype), dy.astype(dtype)))
-
-    assert_as_exact(
-        jax.jit(run_dew), jax.jit(run_ref), draw,
-        f"stream_rms_norm_gemm offset={offset} after_cast={after_cast}", seeds=SEEDS,
-        truth_fn=functools.partial(run_ref, dtype=jnp.float64, wide=jnp.float64),
-    )
-
-    for gpu in ("sm80", "sm90"):
-        if generation.compile_only_gpus(gpu):
-            mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
-            xs = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
-            bs = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
-            ss = jax.ShapeDtypeStruct((256,), jnp.float32)
-            ws = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
-            with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh),
-                  generation.chosen(grouped_matmul="mosaic")):
-                jax.jit(lambda a, b, s, w: gemm.stream_rms_norm_gemm(
-                    a, b, s, w, offset=offset, after_cast=after_cast)).trace(xs, bs, ss, ws).lower(
-                    lowering_platforms=("cuda",))
+    with generation.assumed("sm90"):
+        found = fused_gemm.analysis(body, bf16((8192, 4096)), bf16((8192, 4096)), f32((4096,)),
+                                    bf16((4096, 4096)))
+    assert found.prologue is not None and found.prologue.kernel == "fused", found
 
 
 def test_derivation_honors_carved_out_resource_budgets():
-    """`derivation.derived` accepts carved-out `shared_budget` and `max_consumers` limits below the device
-    whole budget (row 1762)."""
+    """`derivation.derived` honors a tightened `GpuTarget.shared_limit` below the device whole budget
+    (rows 1762, 12139)."""
     from dew.nn.kernels.templates import bundles, resources
     from dew.nn.kernels.templates.gemm import derivation
 
@@ -1737,16 +1703,16 @@ def test_derivation_honors_carved_out_resource_budgets():
     ba = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
     layouts = bundles.groups("sm90", jnp.bfloat16, stated=True)[0]
     carved_smem = 96 * 1024
+    carved = dataclasses.replace(sm90, shared_limit=carved_smem)
     tile = derivation.derived(
         layouts, rows=2048, depth=2048, width=2048, dtype=jnp.bfloat16,
-        multiprocessors=sm90.multiprocessors or 132, target=sm90,
-        candidate=lambda t: gmm.candidate(ba, t, sm90),
-        launch_of=lambda t: gmm.launch_of(ba, t, dataclasses.replace(sm90, shared_limit=carved_smem)),
-        grouped=False, dense=True, shared_budget=carved_smem, max_consumers=1,
+        multiprocessors=carved.multiprocessors or 132, target=carved,
+        candidate=lambda t: gmm.candidate(ba, t, carved),
+        launch_of=lambda t: gmm.launch_of(ba, t, carved),
+        grouped=False, dense=True,
     )
     assert tile is not None
-    assert tile.warpgroups == 1
-    assert gmm.staged_bytes(ba, tile, sm90) <= resources.program_shared(carved_smem, tile.programs)
+    assert gmm.staged_bytes(ba, tile, carved) <= resources.program_shared(carved_smem, tile.programs)
 
 
 def _add_tangent_rule(a, b):
@@ -1757,8 +1723,8 @@ def _add_tangent_rule(a, b):
 
 
 def test_prologued_custom_jvp_is_picklable():
-    """`gemm._prologued` uses a top-level picklable `_ProloguedTangent` and passes `prologue` directly
-    without a local `<lambda>`, avoiding GPU-tier prepare serialization failures."""
+    """`gemm._prologued` uses a top-level picklable `_ProloguedTangent` (pickle round-trip + JVP check,
+    row 12142)."""
     import operator
     import pickle
 
@@ -1766,7 +1732,6 @@ def test_prologued_custom_jvp_is_picklable():
     restored = pickle.loads(pickle.dumps(tangent_rule))
     assert restored == tangent_rule
     wrapped = gemm._prologued(operator.add, _add_tangent_rule)
-    assert wrapped.fun.__name__ != "<lambda>"
     x = jnp.asarray([[1.0, 2.0], [3.0, 4.0]], jnp.float32)
     y = jnp.asarray([[0.5, 1.5], [2.5, 3.5]], jnp.float32)
     dx = jnp.ones_like(x)

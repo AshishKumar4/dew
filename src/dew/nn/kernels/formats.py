@@ -55,6 +55,23 @@ staged depth order, `staged_rows(NVFP4_STAGE)`), as the bytes a matrix stores be
 (`NvFp4.form`): words packed by another encoder or staged order decode wrong by this Dew's form, so a load
 refuses them (`NvFp4.checked`; algebra.md 7.4, rows 6101, 8662)."""
 
+def _checked_form(stored, expected: np.ndarray, label: str, factory: str, *, form=None) -> None:
+    """Verify `stored` (or gathered `form`) matches `expected` across every addressable shard (row 8958)."""
+    target = stored if form is None else form
+    pieces = ([shard.data for shard in target.addressable_shards]
+              if isinstance(target, jax.Array) else [target])
+    found: set[str] = set()
+    for piece in pieces:
+        held = np.asarray(piece)
+        if held.ndim == 0 or held.shape[-1] != expected.size:
+            raise ValueError(f"{label} form digest sharded across its {expected.size} bytes "
+                             f"(shard shape {held.shape}); pass the gathered form to checked()")
+        found.update(bytes(row).hex() for row in held.reshape(-1, expected.size))
+    if found != {expected.tobytes().hex()}:
+        raise ValueError(f"{label} words packed by form version {', '.join(sorted(found))}, where this Dew "
+                         f"decodes form version {expected.tobytes().hex()}: repack them from the source "
+                         f"weights (`{factory}`)")
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -84,20 +101,7 @@ class NvFp4:
         decode, so they are repacked from the source weights, never decoded. A local host check of its
         stored bytes (every addressable shard, or the gathered `form` a collective restore hands it,
         row 8958)."""
-        target = self.form if form is None else form
-        pieces = ([shard.data for shard in target.addressable_shards]
-                  if isinstance(target, jax.Array) else [target])
-        found: set[str] = set()
-        for piece in pieces:
-            held = np.asarray(piece)
-            if held.ndim == 0 or held.shape[-1] != FORM.size:
-                raise ValueError(f"NVFP4 form digest sharded across its {FORM.size} bytes "
-                                 f"(shard shape {held.shape}); pass the gathered form to checked()")
-            found.update(bytes(row).hex() for row in held.reshape(-1, FORM.size))
-        if found != {FORM.tobytes().hex()}:
-            raise ValueError(f"NVFP4 words packed by form version {', '.join(sorted(found))}, where this Dew "
-                             f"decodes form version {FORM.tobytes().hex()}: repack them from the source "
-                             f"weights (`NvFp4.of`)")
+        _checked_form(self.form, FORM, "NVFP4", "NvFp4.of", form=form)
         return self
 
     @classmethod
@@ -406,12 +410,10 @@ class Fp8Weights(_ScaledWeights):
         *groups, width, words = self.words.shape
         return (*groups, 4 * words, width)
 
-    def checked(self) -> "Fp8Weights":
-        """Verify stored `form` version and scale shape match this Dew's checked-in encoder."""
-        expected = fp8_form_version(self.fmt)
-        stored = np.asarray(self.form, np.uint8)
-        if stored.shape[-1:] != expected.shape or not np.all(stored == expected):
-            raise ValueError(f"Fp8Weights({self.fmt}) form version mismatch; repack from source weights")
+    def checked(self, form=None) -> "Fp8Weights":
+        """Verify stored `form` version (every addressable shard) and scale shape match this Dew's encoder."""
+        _checked_form(self.form, fp8_form_version(self.fmt), f"Fp8Weights({self.fmt})", "Fp8Weights.of",
+                      form=form)
         fp8_scale_checked(jnp.shape(self.scale), self.shape)
         return self
 
@@ -552,12 +554,9 @@ class TernaryWeights(_ScaledWeights):
         *groups, width, words = self.words.shape
         return (*groups, 16 * words, width)
 
-    def checked(self) -> "TernaryWeights":
-        """Verify stored `form` version and scale shape match this Dew's BitNet b1.58 encoder."""
-        expected = ternary_form_version()
-        stored = np.asarray(self.form, np.uint8)
-        if stored.shape[-1:] != expected.shape or not np.all(stored == expected):
-            raise ValueError("TernaryWeights form version mismatch; repack from source weights")
+    def checked(self, form=None) -> "TernaryWeights":
+        """Verify stored `form` version (every addressable shard) and scale shape match this Dew's encoder."""
+        _checked_form(self.form, ternary_form_version(), "TernaryWeights", "TernaryWeights.of", form=form)
         fp8_scale_checked(jnp.shape(self.scale), self.shape)
         return self
 

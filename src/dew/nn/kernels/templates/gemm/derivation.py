@@ -28,28 +28,9 @@ from dew.nn.kernels.templates.gemm import pricing
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 
 
-def _budgeted(target, shared_budget: int | None) -> tuple:
-    """`(plan_target, tpu_cap)`: on GPUs tightens positive `target.shared_limit` so `resources.placed`
-    evaluates each ring stage once with no double-probe (never writing `0`, which `generation.shared_budget`
-    treats as unset); on TPUs (where `scoped_vmem` is a read-only property) returns the tightened VMEM cap
-    (row 12099)."""
-    if shared_budget is None:
-        return target, None
-    if shared_budget <= 0:
-        return target, 0
-    from dew.nn.kernels import generation
-
-    if shared_budget >= generation.shared_budget(target):
-        return target, None
-    if generation.tpu(target):
-        return target, shared_budget
-    return dataclasses.replace(target, shared_limit=shared_budget), None
-
-
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
-            units: tuple[int, int, int] = (1, 1, 1), dense: bool = False,
-            shared_budget: int | None = None, max_consumers: int | None = None) -> Tiles | None:
+            units: tuple[int, int, int] = (1, 1, 1), dense: bool = False) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
     in preference order, which share its facts but their loaders and registers) for a call whose output has
     `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
@@ -113,8 +94,6 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       cluster's tiles one program's.
 
     None where no tile holds."""
-    if shared_budget is not None and shared_budget <= 0:
-        return None
     # The facts the layouts share (their instruction family's); each layout's registers bound the shapes.
     family = layouts[0]
     columns = _derived_columns(family, width, dtype, units[1])
@@ -132,12 +111,9 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
                                    multiprocessors=multiprocessors, grouped=padded)
         price_of = functools.partial(_tile_cost, family=family, target=target, dtype=dtype, rows=rows,
                                      width=width, padded=padded)
-        plan_target, tpu_cap = _budgeted(target, shared_budget)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
-                                      target=plan_target, programs=programs, price_of=price_of,
-                                      tpu_cap=tpu_cap)
-        # width, so a tile keeps its rows and narrows rather than shortening. mma.sync's one consumer at
+                                      target=target, programs=programs, price_of=price_of)
         # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
         # (64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's 1.10-1.14, FSA100POST32). Where no width
         # stages busy at its balance, the widest staging busy at all, then the widest that holds.
@@ -148,7 +124,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # further consumers would compute padding alone; where groups average a role's rows, a routing's groups
     # past it keep the further consumers' rows real. Row 3622, H100 (FS-3622-AB1/AB2-h100): one consumer ran
     # 0.73 to 0.999 of the cooperative tile's time at 1 to 32 rows a group, and 1.13 to 1.26 of it at 64.
-    most = min(family.consumers, CONSUMERS if max_consumers is None else min(CONSUMERS, max_consumers))
+    most = min(family.consumers, CONSUMERS)
     whole = rows >= family.role_rows if grouped else ragged or rows % (family.role_rows * most) == 0
     # balanced side, and with it each operand's reads a FLOP, at least one consumer's (CUTLASS's split, 2-7%
     # faster on every H100 scoreboard row); where no tile of theirs holds, one. Each at the most programs
@@ -215,7 +191,7 @@ def _tile_cost(tile: Tiles, *, family: mosaic.Family, target, dtype, rows: int, 
 
 def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], shaped: Callable,
                candidate: Callable, launch_of: Callable, layouts: tuple, target, programs: int,
-               price_of: Callable, tpu_cap: int | None = None) -> tuple["Tiles | None", bool]:
+               price_of: Callable) -> tuple["Tiles | None", bool]:
     """`derived`'s tile at a width: the rows its registers or VMEM hold there (`held_rows`), shortened where
     its stages do not fit, at the first step that plans busy, taking the least-priced busy tile under the
     shared cost model (`_tile_cost`), and whether it stages deep enough to stay busy (those its family loads
@@ -228,20 +204,7 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
         for step in steps:
             def launches_of(layout, block_m=block_m, step=step):
                 shape = shaped(layout, block_m, block_n, step)
-                if not candidate(shape):
-                    return None
-                built = launch_of(shape)
-                if tpu_cap is not None:
-                    fit = built.floor - 1
-                    for stages in range(built.floor, built.most + 1):
-                        if resources.shared_bytes(layout, built.scope(stages)) <= tpu_cap:
-                            fit = stages
-                        else:
-                            break
-                    if fit < built.floor:
-                        return None
-                    built = dataclasses.replace(built, most=fit)
-                return [built]
+                return [launch_of(shape)] if candidate(shape) else None
 
             found = resources.placed(launches_of, layouts, target, programs=programs)
             if found is None:

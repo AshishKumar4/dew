@@ -58,7 +58,7 @@ from .grouped_cells import (
 from .grouped_launch import INTERPRETED, _GroupedLaunch
 from .grouped_triton import Gmm, Tgmm, _gradient_sides, _product_sides
 from .templates import base
-from .templates.gemm import packed, tiling
+from .templates.gemm import packed, pricing, tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 from .templates.product import SCALE_DEPTH, Product, eight
 
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     import tokamax
 
     from .templates import mosaic, resources
-    from .templates.gemm import mosaic_gpu, pricing
+    from .templates.gemm import mosaic_gpu
 
 def _stored_bytes(ba, rows: int, width: int) -> float:
     """The bytes a product's epilogue moves an element of its `rows` x `width` output
@@ -88,15 +88,17 @@ def _matrix_extents(ba) -> tuple[int, int]:
 _PaddedArgument = tuple[str, "jax.Array | jax.ShapeDtypeStruct | tuple", "dict | tuple"]
 """An argument `_Mosaic._aligned` pads: its name, its value (or tuple of them) and its dims (`_grown`'s)."""
 
-class _Mosaic(_GroupedLaunch[tiling.Tiles]):
+class _Mosaic(pricing.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
     """JAX's Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`) on their instruction family's bundle
     (Hopper's warpgroup MMA, Ampere's mma.sync), one 16-bit dtype, their one tile generated from the
     family's facts, the device's and the call's extents (`derivation.derived`). Each runs one warpgroup a
     multiprocessor, or two consumers beside a producer (a cooperative tile), persistent over the output
     tiles in a planar snake, so the rows a band of `grid_block_n` column tiles shares and the matrix block
     the row tiles in flight share come from the L2."""
-    name: ClassVar[str] = 'mosaic'
     config_cls: ClassVar[type[tiling.Tiles]] = tiling.Tiles
+
+    def _operand_dtype(self, ba):
+        return ba.arguments['tokens'].dtype
     GENERATES: ClassVar[bool] = True
     EXACT_SUMS: ClassVar[bool] = False
     """Whether the kernel adds each depth step's product apart (`exact_sums`); one that does not is not
@@ -118,10 +120,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
                          if name in ('tokens', 'kernel', 'cotangent'))
-        # A TPU's launch plans its VMEM against the scoped budget a measurement states
-        # (`generation.shared_budget`).
-        budgeted = not generation.tpu(target) or target.scoped_vmem is not None
-        return (first == second and budgeted and bool(self._families(ba, target))
+        return (first == second and self.tpu_budgeted(target) and bool(self._families(ba, target))
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
                 and self.derived(ba, target) is not None)
@@ -282,14 +281,6 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         out_dtypes = hooks.out_dtypes or stored
         return pricing.epilogue_registers(family, config.share, columns, out_dtypes,
                                           vectors=vectors, tile_count=tile_count, has_hook=True)
-
-    def register_budget(self, config: tiling.Tiles, target=None) -> int:
-        # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`); none on a
-        # core that budgets no registers.
-        from .templates.gemm import pricing
-
-        family = pricing.family_of(config, jnp.bfloat16, self.launch_target() if target is None else target)
-        return family.registers(config.warpgroups) if family.budgets_registers else 0
 
     def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba
@@ -760,13 +751,6 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
     def extents(cls, tile: tiling.Tiles) -> dict:
         """The block each launch axis takes at `tile`."""
         return {axis: getattr(tile, block) for axis, block in cls.BLOCKS.items()}
-
-
-    def program_shared(self, config: tiling.Tiles, target) -> int:
-        # The programs a multiprocessor runs at once share its shared memory.
-        from .templates import resources
-
-        return resources.program_shared(super().program_shared(config, target), config.programs)
 
     def _programs(self, config: tiling.Tiles, target) -> int:
         """The programs the persistent kernel's schedule spreads its tiles over: the tile's programs on each

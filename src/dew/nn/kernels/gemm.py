@@ -75,8 +75,6 @@ from dew.nn.precision import (
     asks_default_precision,
     at_least_fp32,
     exact_products,
-    rms_statistics,
-    rms_weighted,
     twice_scaled,
 )
 from dew.nn.programs import called, read_by
@@ -713,7 +711,7 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
     if minifloat in (bits.E4M3, bits.E5M2):
         assert isinstance(minifloat, bits.Minifloat)
-        out_dtype = jnp.float8_e4m3fn if minifloat == bits.E4M3 else jnp.float8_e5m2
+        out_dtype = quantized.minifloat_dtype(minifloat)
         sides = (() if tensor_scale is None else ((jnp.broadcast_to(
             jnp.asarray(tensor_scale, jnp.float32), (lhs.shape[0],)), ('rows',)),))
         out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
@@ -747,55 +745,6 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
         nibbles, block_scales = out
         return NvFp4Block(_e2m1_values(nibbles).astype(jnp.float4_e2m1fn), block_scales[..., ::16], ts)
     raise ValueError(f"gemm_quantized supports E4M3, E5M2, E2M1, MxFp8, or NvFp4Block, got {minifloat}")
-
-@dataclasses.dataclass(frozen=True)
-class _RmsPrologue:
-    """Picklable GEMM prologue applying `precision.rms_weighted` to each loaded tile of a pre-rounded
-    residual stream (`stream_rms_norm_gemm`, row 6104)."""
-    dtype: jnp.dtype
-    after_cast: bool
-    weight_first: bool
-
-    def __call__(self, tile: jax.Array, inv_rms: jax.Array, weight: jax.Array) -> jax.Array:
-        work = at_least_fp32(self.dtype)
-        rounded = (lambda v: v.astype(self.dtype).astype(work)) if self.after_cast else None
-        return rms_weighted(tile.astype(work), inv_rms[:, None], weight=weight[None, :],
-                            rounded=rounded, weight_first=self.weight_first).astype(self.dtype)
-
-
-def stream_rms_norm_gemm(x: jax.Array, branch: jax.Array, scale: jax.Array, rhs: jax.Array,
-                         group_sizes: jax.Array | None = None, *, epsilon: float = 1e-6,
-                         offset: bool = False, after_cast: bool = False, weight_first: bool = False,
-                         transpose_rhs: bool = False, out_dtype=None, precision: PrecisionLike = None,
-                         interpret_on_cpu: bool = False) -> tuple[jax.Array, jax.Array]:
-    """Residual-stream RMSNorm pre-pass fused into a GEMM prologue (kernel-templates.md Appendix C row 16,
-    row 6104): pre-pass writes rounded `stream = x + branch` and its per-row reciprocal RMS statistic, then
-    the GEMM prologue applies `precision.rms_weighted` to each loaded tile of `stream` inline."""
-    work = at_least_fp32(x.dtype)
-    stream = (x.astype(work) + branch.astype(work)).astype(x.dtype)
-    _, inv = rms_statistics(stream, epsilon, axis=-1, keepdims=False)
-    weight = (jnp.asarray(1.0, work) + scale.astype(work)) if offset else scale.astype(work)
-    out = gemm(stream, rhs, group_sizes, transpose_rhs=transpose_rhs,
-               prologue=_RmsPrologue(jnp.dtype(stream.dtype), after_cast, weight_first),
-               prologue_operands=((inv, ('rows',)), (weight, ('depth',))),
-               out_dtype=stream.dtype if out_dtype is None else out_dtype,
-               precision=precision, interpret_on_cpu=interpret_on_cpu)
-    assert isinstance(out, jax.Array)
-    return stream, out
-
-
-def linear_cross_entropy(x: jax.Array, weight: jax.Array, targets: jax.Array, *,
-                         bias: jax.Array | None = None, softcap: float | None = None,
-                         transpose_rhs: bool = True, precision: PrecisionLike = None,
-                         chunk_size: int | None = None, interpret_on_cpu: bool = False) -> jax.Array:
-    """GEMM-fused linear cross-entropy (`-log softmax(x @ W^T + bias)[targets]`, kernel-templates.md
-    Appendix C row 25, row 6103): computes per-token cross-entropy without materializing `[..., V]` logits
-    in forward or backward, using Barron et al. zero-sum label derivatives."""
-    from .templates.gemm import linear_ce as lce
-
-    return lce.linear_cross_entropy(x, weight, targets, bias=bias, softcap=softcap,
-                                    transpose_rhs=transpose_rhs, precision=precision,
-                                    chunk_size=chunk_size, interpret_on_cpu=interpret_on_cpu)
 
 
 FP8_WEIGHT_ROW = 'ledger 8548'
