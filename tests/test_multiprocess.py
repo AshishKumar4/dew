@@ -1630,6 +1630,15 @@ def test_a_local_step_on_two_meshes_is_recovered_on_each_from_a_replica(tmp_path
         assert report["recovered"] == report["expected"], report
 
 
+@pytest.mark.distributed
+def test_a_complex_leaf_a_process_lost_is_recovered_bit_for_bit_from_a_replica(tmp_path):
+    """A complex leaf the pool replicates, which the process that lost its copy receives from its replica's
+    holder, its real and imaginary parts each as their words, bit for bit (row 12177;
+    `replica_key_worker.replica_complex`)."""
+    for report in run_pool("replica_complex", tmp_path / "pool", 2, script=REPLICA_KEY):
+        assert report["bits"] == report["expected"], report
+
+
 # --------------------------------------------------------------------------
 # Validation and artifacts in a pool
 # --------------------------------------------------------------------------

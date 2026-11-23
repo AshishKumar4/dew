@@ -341,18 +341,22 @@ class _PerShare(Forwarding):
     def _grain_restores(self, written: JSON) -> None:
         """Restore the saved iterator state now, through the iterators that own it, where a Grain of another
         version wrote it (`written`, its `grain` rule): a state that Grain's iterators read otherwise
-        than this Grain's is refused, naming both, where its restore fails; one they read alike resumes."""
-        if written == GRAIN:
+        than this Grain's is refused, naming both, where its restore refuses its form; one they read alike
+        resumes. The read opened before it, its failure (a file it cannot open) is its own, never a version's
+        (row 12178)."""
+        if written == GRAIN or self._saved is None:
             return
+        read = self._open()
         try:
-            self._opened()
-        except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
-            self.close()
+            read.set_state(self._saved)
+        except (KeyError, TypeError, ValueError, IndexError) as error:
+            read.close()
             raise PlanChanged(("rules.grain",),
                               f"the saved data position's iterator state was written by grain {written}, "
                               f"which this grain {GRAIN} does not read (docs/design/data.md, the rules): "
                               f"resume with grain=={written}, or go on from the run's weights as a new run "
                               "that reads its data afresh") from error
+        self._read, self._started = read, False
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it

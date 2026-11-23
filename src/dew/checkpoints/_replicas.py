@@ -135,23 +135,36 @@ def _from_replicas(tree, grids: Sequence[Grid], holders: frozenset[int]):
         values = jax.random.key_data(leaf) if typed else leaf
         held = values.sharding
         assert isinstance(held, jax.sharding.NamedSharding), "a key's data lies where its key does"
-        words = _UNSIGNED[max(values.dtype.itemsize, 1)]
-
-        def sum_of_sources(value, source):
-            bits = (value.astype(np.uint8) if value.dtype == np.bool_
-                    else jax.lax.bitcast_convert_type(value, words))
-            return jax.lax.psum(jnp.where(source.reshape(()), bits, jnp.zeros_like(bits)), along)
-
-        summing = jax.shard_map(sum_of_sources, mesh=mesh, out_specs=held.spec,
-                                in_specs=(held.spec, jax.sharding.PartitionSpec(*mesh.axis_names)))
-        summed = owned_program(summing)(jax.device_put(values, held.with_memory_kind("device")),
-                                        masks[_placed_on(mesh), split])
-        value = (summed != 0 if values.dtype == np.bool_
-                 else jax.lax.bitcast_convert_type(summed, values.dtype))
+        mask = masks[_placed_on(mesh), split]
+        if jnp.issubdtype(values.dtype, jnp.complexfloating):
+            # A complex value's two lanes each summed as their words, its real and imaginary parts, as no
+            # word holds a complex number's bits whole (row 12177).
+            value = jax.lax.complex(_summed(jnp.real(values), mask, mesh, along),
+                                    _summed(jnp.imag(values), mask, mesh, along))
+        else:
+            value = _summed(values, mask, mesh, along)
         value = jax.device_put(value, held)
         return jax.random.wrap_key_data(value, impl=jax.random.key_impl(leaf)) if typed else value
 
     return jax.tree.map(recovered, tree)
+
+
+def _summed(values: jax.Array, mask: jax.Array, mesh: jax.sharding.Mesh, along: tuple[str, ...]) -> jax.Array:
+    """`values`' every shard as its source holds it (`mask` true on the source), summed over `along` as its
+    words: the source's bits and the others' zeros, the source's bits exactly (`_from_replicas`)."""
+    held = values.sharding
+    assert isinstance(held, jax.sharding.NamedSharding), "a covered save places by name (`Grid.each`)"
+    words = _UNSIGNED[max(values.dtype.itemsize, 1)]
+
+    def sum_of_sources(value, source):
+        bits = (value.astype(np.uint8) if value.dtype == np.bool_
+                else jax.lax.bitcast_convert_type(value, words))
+        return jax.lax.psum(jnp.where(source.reshape(()), bits, jnp.zeros_like(bits)), along)
+
+    summing = jax.shard_map(sum_of_sources, mesh=mesh, out_specs=held.spec,
+                            in_specs=(held.spec, jax.sharding.PartitionSpec(*mesh.axis_names)))
+    summed = owned_program(summing)(jax.device_put(values, held.with_memory_kind("device")), mask)
+    return summed != 0 if values.dtype == np.bool_ else jax.lax.bitcast_convert_type(summed, values.dtype)
 
 
 def _zeros(leaf):

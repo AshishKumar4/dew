@@ -220,6 +220,43 @@ def test_a_position_another_grain_wrote_resumes_where_its_iterators_read_it():
 
 
 @dataclasses.dataclass(frozen=True)
+class Unopened(Memory):
+    """A store whose records refuse to open once `refused` holds a reason (a store whose manifest a later
+    write left unreadable), an error of its own whatever position is restored."""
+
+    refused: list[str] = dataclasses.field(default_factory=list, compare=False)
+
+    def records(self, read):
+        if self.refused:
+            raise ValueError(self.refused[0])
+        return super().records(read)
+
+
+def test_a_position_another_grain_wrote_whose_read_fails_to_open_raises_that_failure():
+    """A position another Grain wrote is refused as that Grain's only where its iterators refuse its
+    state: a read that fails to open (its store's own error) raises that error, never a version's refusal
+    naming Grains that read alike (row 12178: every open's failure was refused as the other Grain's)."""
+    from dew.data.plan import PlanChanged
+
+    refused: list[str] = []
+    chain = Pipeline(Unopened({"id": np.arange(1, 25, dtype=np.int32)}, identity="ids", refused=refused)
+                     ).repeat().batch(2)
+    saved, _ = _saved(chain)
+
+    def other_grain(decoded):
+        decoded["dew_data_plan"]["rules"]["grain"] = "0.0.1"
+
+    stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    refused.append("the store's manifest is unreadable")
+    try:
+        with pytest.raises(ValueError, match="manifest is unreadable") as raised:
+            stream.set_state(_edited(saved, other_grain))
+        assert not isinstance(raised.value, PlanChanged), raised.value
+    finally:
+        stream.close()
+
+
+@dataclasses.dataclass(frozen=True)
 class Recut(Memory):
     """A store of the same content and options as `Memory`'s, cut into its shards in reverse: a store a
     later Dew cuts otherwise, read in another order."""
