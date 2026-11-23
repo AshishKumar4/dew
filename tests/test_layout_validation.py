@@ -35,7 +35,7 @@ from dew.objectives.lm import LMObjective
 from dew.optim import Adam, OptimConfig
 from dew.registry import models
 from dew.training import FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch
-from dew.training.distributed import STEP_BATCH, mesh_stages
+from dew.training.distributed import STEP_BATCH
 from dew.training.memory import step_compiler_options
 
 pytestmark = pytest.mark.mesh
@@ -73,12 +73,12 @@ CASES = {
 
 
 def fine_tune(mesh, layout, accumulation=1, optimizer=None):
-    """A tiny decoder's fine-tune over `mesh`, its step's batch read whole, or one microbatch a pipeline
-    stage where the mesh has stages (`FitPolicy.split`)."""
+    """A tiny decoder's fine-tune over `mesh`, its step's batch read whole (`FitPolicy.split`), one
+    microbatch a pipeline stage where the mesh has stages."""
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN, ema_decay=0.999), optimizer or optax.adam(1e-3),
                    key=jax.random.key(0), mesh=mesh, layout=layout, update=UpdateBatch(batches=accumulation),
-                   fit=FitPolicy(split=mesh_stages(mesh)))
+                   fit=FitPolicy(split=1))
 
 
 def step_batch():

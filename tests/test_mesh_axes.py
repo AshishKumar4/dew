@@ -544,7 +544,7 @@ def token_batches():
     return repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1)
 
 
-def run_losses(mesh, layout, steps, microbatches="auto"):
+def run_losses(mesh, layout, steps, microbatches=None):
     tracker = RecordingTracker()
     trainer = Trainer(LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                       layout=layout, fit=FitPolicy(microbatches=microbatches), tracker=tracker)

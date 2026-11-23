@@ -1061,7 +1061,7 @@ def mode_pipeline(args) -> dict:
     rows = BATCH // args.processes
     mine = token_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     # The step's split where the command names one, else the planner's.
-    trainer = pipeline_trainer(args.stage_size, args.microbatches or "auto", args.fsdp_size)
+    trainer = pipeline_trainer(args.stage_size, args.microbatches, args.fsdp_size)
     losses, state = pipeline_losses(trainer, mine, args.steps)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     return {
