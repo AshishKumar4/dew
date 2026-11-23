@@ -218,3 +218,137 @@ def flags_declared(grid: tuple, tiles: "Tiles") -> jax.ShapeDtypeStruct:
 def flag_row(entry, pair: int, member):
     """Dew: the flags' row (`flags_declared`) of a pair's `member` at its walk's table `entry`."""
     return entry * pair + member
+
+
+def step_unit(dtype, target) -> int | None:
+    """Step depth of `target`'s primary source-selecting Mosaic bundle for `dtype`, or None if unsupported."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import bundles
+
+    if generation.tpu(target):
+        return None
+    for group in bundles.groups(target.generation, dtype, stated=True, tpu=False):
+        for family in group:
+            if family.selects_sources and not family.pairs_product:
+                depths = family.depths(dtype)
+                if depths:
+                    return max(depths)
+    return None
+
+
+def padded_spec(rows, matrix, step: int, *, transpose_rhs: bool, dense: bool = True
+                ) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct]:
+    """Abstract padded `(rows, grouped_matrix)` shapes for route probing without materializing array pads."""
+    depth = rows.shape[1] + (-rows.shape[1]) % step
+    if dense:
+        m_shape = (1, matrix.shape[0], depth) if transpose_rhs else (1, depth, matrix.shape[1])
+    else:
+        m_shape = ((matrix.shape[0], matrix.shape[1], depth) if transpose_rhs
+                   else (matrix.shape[0], depth, matrix.shape[2]))
+    return (jax.ShapeDtypeStruct((rows.shape[0], depth), rows.dtype),
+            jax.ShapeDtypeStruct(m_shape, matrix.dtype))
+
+
+def padded_pair(rows: jax.Array, matrix: jax.Array, step: int, *, transpose_rhs: bool, dense: bool = True
+                ) -> tuple[jax.Array, jax.Array]:
+    """Pad `(rows, matrix)` along depth to a positive multiple of `step` (adding a leading group axis when
+    `dense`) so small LoRA/adapter terms join a base product in place via `chained` (row 1304)."""
+    pad = (-rows.shape[1]) % step
+    if pad:
+        rows = jnp.pad(rows, ((0, 0), (0, pad)))
+        if dense:
+            matrix = jnp.pad(matrix, ((0, 0), (0, pad)) if transpose_rhs else ((0, pad), (0, 0)))
+        else:
+            matrix = jnp.pad(matrix, ((0, 0), (0, 0), (0, pad)) if transpose_rhs
+                             else ((0, 0), (0, pad), (0, 0)))
+    return rows, (matrix[None] if dense else matrix)
+
+
+def joined_in_place(pairs: list[tuple[jax.Array, jax.Array]], *, group_sizes=None, transpose_rhs: bool,
+                    out_dtype, precision, interpret_on_cpu: bool, launch_route: Callable, run_gemm: Callable,
+                    gemm_fn: Callable, gemm_t_fn: Callable) -> jax.Array | None:
+    """Walk dense or grouped `pairs` in place through `mosaic_gpu.gmm`'s `chained` launch without
+    concatenating base operands, padding only small unaligned trailing adapters to `step` (row 1304)."""
+    from jax.custom_derivatives import zero_from_primal
+
+    from dew.nn.derivatives import KernelGlue, contracted
+    from dew.nn.kernels import generation, xla_products
+    from dew.nn.precision import at_least_fp32
+    from dew.nn.sharding import automatic_axes
+
+    dense = group_sizes is None
+    dtype, out_d = pairs[0][0].dtype, jnp.dtype(out_dtype)
+    target = (generation.interpreted_target()
+              if xla_products.interpreted(interpret_on_cpu) else generation.gpu_target())
+    step = step_unit(dtype, target)
+    if step is None or pairs[0][0].shape[1] % step != 0:
+        return None
+    r0, m0 = pairs[0]
+    r0_spec = jax.ShapeDtypeStruct(r0.shape, r0.dtype)
+    m0_spec = jax.ShapeDtypeStruct((1, *m0.shape) if dense else m0.shape, m0.dtype)
+    rest_spec = tuple(padded_spec(r, m, step, transpose_rhs=transpose_rhs, dense=dense)
+                      for r, m in pairs[1:])
+    sizes_spec = jax.ShapeDtypeStruct((1,) if group_sizes is None else group_sizes.shape, jnp.int32)
+    options = {'interpret_on_cpu': interpret_on_cpu, 'precision': precision, 'transpose_rhs': transpose_rhs,
+               'dense': dense, 'first': None, 'gather': None}
+    route = launch_route(r0_spec, m0_spec, {'chained': rest_spec}, sizes_spec, out_d, None, options,
+                         whole=not automatic_axes())
+    if not route:
+        return None
+    sizes_arg = (jnp.full((1,), r0.shape[0], jnp.int32) if group_sizes is None
+                 else group_sizes.astype(jnp.int32))
+    wide = at_least_fp32(dtype)
+    count = len(pairs)
+
+    def forward(*flat):
+        sizes = flat[-1]
+        terms = [(flat[2 * i], flat[2 * i + 1]) for i in range(count)]
+        padded = tuple(padded_pair(r, m, step, transpose_rhs=transpose_rhs, dense=dense)
+                       for r, m in terms[1:])
+        m0_in = terms[0][1][None] if dense else terms[0][1]
+        return run_gemm(terms[0][0], m0_in, sizes, None, (), (), None, (), (), (out_d,),
+                        several=False, transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu,
+                        precision=precision, dense=dense, chained=padded, selected=route), ()
+
+    def portable(*flat):
+        sizes = flat[-1]
+        if dense:
+            terms = [xla_products.xla_dot(flat[2 * i],
+                                          flat[2 * i + 1].T if transpose_rhs else flat[2 * i + 1],
+                                          precision=precision, preferred_element_type=wide)
+                     for i in range(count)]
+        else:
+            terms = [xla_products.xla_ragged_dot(
+                         flat[2 * i],
+                         jnp.swapaxes(flat[2 * i + 1], 1, 2) if transpose_rhs else flat[2 * i + 1],
+                         sizes, precision=precision, preferred_element_type=wide)
+                     for i in range(count)]
+        return functools.reduce(jnp.add, terms).astype(out_d)
+
+    def backward(saved, operands, cotangent, live):
+        del saved
+        g_sizes = None if dense else operands[-1]
+        work = dtype if jnp.promote_types(cotangent.dtype, dtype) == dtype else at_least_fp32(cotangent.dtype)
+        cot = cotangent.astype(work)
+        wanted = set(live)
+        leaves = []
+        for i in range(count):
+            ri, mi = operands[2 * i], operands[2 * i + 1]
+            dr = (None if 2 * i not in wanted else
+                  gemm_fn(cot, mi.astype(work), g_sizes, transpose_rhs=not transpose_rhs, out_dtype=ri.dtype,
+                          precision=precision, interpret_on_cpu=interpret_on_cpu))
+            if 2 * i + 1 not in wanted:
+                dm = None
+            else:
+                dm = gemm_t_fn(ri.astype(work), cot, g_sizes, out_dtype=mi.dtype, precision=precision,
+                               interpret_on_cpu=interpret_on_cpu)
+                dm = (dm[0].T if transpose_rhs else dm[0]) if dense else (
+                    jnp.swapaxes(dm, 1, 2) if transpose_rhs else dm)
+            leaves.extend((dr, dm))
+        leaves.append(zero_from_primal(operands[-1]))
+        return tuple(leaves[index] for index in live)
+
+    flat = (*(operand for pair in pairs for operand in pair), sizes_arg)
+    fn = contracted("test_an_adapted_product_holds_every_reverse_order")(
+        generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
+    return fn(*flat)

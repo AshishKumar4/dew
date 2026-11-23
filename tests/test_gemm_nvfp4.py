@@ -2,8 +2,10 @@
 and E4M3 block scales decoded exactly (`NvFp4.decoded`, its codes in the staged order a stage decodes), the
 deferred factor applied to the fp32 accumulator before the one rounding."""
 
+import contextlib
 import dataclasses
 import faulthandler
+import functools
 import itertools
 
 import jax
@@ -14,6 +16,7 @@ import pytest
 from generation_support import INTERPRETS, lowers
 from jax.sharding import Mesh
 from low_precision_support import nvfp4
+from reference_error import assert_as_exact
 
 from dew.algebra import bits
 from dew.nn import fake_quant
@@ -450,11 +453,11 @@ def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix(group_s
 
 @INTERPRETS
 @pytest.mark.parametrize(("minifloat", "out_dtype"),
-                         [(bits.E4M3, jnp.float8_e4m3fn), (bits.E5M2, jnp.float8_e5m2),
-                          (bits.E2M1, jnp.uint8)], ids=["e4m3", "e5m2", "e2m1"])
+                         [(bits.E4M3, jnp.float8_e4m3fn), (bits.E5M2, jnp.float8_e5m2)], ids=["e4m3", "e5m2"])
 def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
-    """`gemm.quantize_epilogue(minifloat)` encodes the GEMM accumulator via `bits.encode_form` bit-exact
-    with `bits.encoded` across E4M3, E5M2, and E2M1 (row 8547)."""
+    """`gemm.gemm_quantized` encodes the GEMM accumulator via `bits.encode_form` bit-exact with
+    `bits.encoded` across E4M3 and E5M2, dividing by `tensor_scale` on encode and returning `(codes, scale)`
+    consistent with `NvFp4Block` and `Fp8Weights` (rows 8547, 12037, 12160)."""
     rng = np.random.default_rng(17)
     lhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
     rhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
@@ -462,34 +465,291 @@ def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
     words = jax.lax.bitcast_convert_type(acc, jnp.uint32)
     expected_u8 = bits.encoded(words, minifloat).astype(jnp.uint8)
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        got = gemm.gemm(lhs, rhs, epilogue=gemm.quantize_epilogue(minifloat), out_dtype=out_dtype,
-                        interpret_on_cpu=True)
-    got_u8 = jax.lax.bitcast_convert_type(got, jnp.uint8) if out_dtype != jnp.uint8 else got
+        got, scale = gemm.gemm_quantized(lhs, rhs, minifloat=minifloat, interpret_on_cpu=True)
+        got_s, scale_s = gemm.gemm_quantized(lhs, rhs, minifloat=minifloat, tensor_scale=2.0,
+                                             interpret_on_cpu=True)
+    assert isinstance(got, jax.Array) and got.dtype == out_dtype and float(scale) == 1.0
+    got_u8 = jax.lax.bitcast_convert_type(got, jnp.uint8)
     np.testing.assert_array_equal(np.asarray(got_u8), np.asarray(expected_u8))
+    assert isinstance(got_s, jax.Array) and got_s.dtype == out_dtype and float(scale_s) == 2.0
+    scaled_u8 = bits.encoded(jax.lax.bitcast_convert_type(acc / jnp.float32(2.0), jnp.uint32),
+                             minifloat).astype(jnp.uint8)
+    np.testing.assert_array_equal(np.asarray(jax.lax.bitcast_convert_type(got_s, jnp.uint8)),
+                                  np.asarray(scaled_u8))
 
 
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])
 def test_gemm_quantize_epilogue_lowers_inline_ptx(gpu):
-    """`gemm.quantize_epilogue(bits.E4M3)` lowers through Mosaic GPU with `bits.encode_form`'s inline PTX
-    on sm80 and sm90 (row 8547)."""
+    """`gemm.gemm_quantized` lowers FP8 and MXFP8 epilogues with `bits.encode_form`'s inline PTX on sm80
+    and sm90 (rows 8547, 12037)."""
     x = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
     with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh),
           generation.chosen(grouped_matmul="mosaic")):
-        jax.jit(lambda a, b: gemm.gemm(a, b, epilogue=gemm.quantize_epilogue(bits.E4M3),
-                                       out_dtype=jnp.float8_e4m3fn)).trace(x, w).lower(
+        jax.jit(lambda a, b: gemm.gemm_quantized(a, b, minifloat=bits.E4M3)).trace(x, w).lower(
+            lowering_platforms=("cuda",))
+        jax.jit(lambda a, b: gemm.gemm_quantized(a, b, minifloat=formats.MxFp8)).trace(x, w).lower(
             lowering_platforms=("cuda",))
 
 
-def test_packed_consumer_layout_reads_and_refuses_missing_fragment():
-    """`packed.consumer_layout` resolves `mosaic_sm90.WGMMA.layout` through `bits.BitTransform.fragments`
-    and refuses a transform that omits `packed.CONSUMER` (algebra.md §7.4, rows 8676, 11984)."""
-    from dew.nn.kernels.templates import mosaic_sm90
+def test_packed_rows_supported_reads_bundle_fragment_name():
+    """`packed.rows_supported` checks `family.name` prefix in `bits.NVFP4_BFLOAT16.fragments` and
+    `hooks._epilogue_layout` reads the issuing GPU bundle's `family.layout` directly (row 12038)."""
+    from dew.nn.kernels.templates import bundles
+    from dew.nn.kernels.templates.gemm import hooks, packed
+
+    sm90_bundles = bundles.groups("sm90", jnp.bfloat16, stated=True)[0]
+    sm80_bundle = bundles.of("sm80", jnp.bfloat16)
+    assert all(packed.rows_supported(family) for family in sm90_bundles)
+    assert not packed.rows_supported(sm80_bundle)
+    assert hooks._epilogue_layout(jnp.bfloat16, generation.gpu_target("sm90")) == sm90_bundles[0].layout
+    assert hooks._epilogue_layout(jnp.bfloat16, generation.gpu_target("sm80")) == sm80_bundle.layout
+    assert hooks._epilogue_layout(jnp.bfloat16, generation.gpu_target("v5e")) is None
+
+def test_fp8_and_e8m0_bit_forms_are_exact():
+    """`E4M3_BFLOAT16_FORM`, `E5M2_BFLOAT16_FORM`, and `E8M0_SCALE_FORM` are proven bit-exact on every code
+    against `ml_dtypes` / IEEE values, and `MxFp8.decoded` handles subnormal `0x00` and `0xFF` NaN across
+    fp32 and fp64 (rows 3733, 8548, 9040)."""
+    bits.proven(bits.E4M3_BFLOAT16, bits.E4M3_BFLOAT16_FORM)
+    bits.proven(bits.E5M2_BFLOAT16, bits.E5M2_BFLOAT16_FORM)
+    for minifloat, fp8_dtype in ((bits.E4M3, jnp.float8_e4m3fn), (bits.E5M2, jnp.float8_e5m2)):
+        codes = np.arange(256, dtype=np.uint32).reshape(64, 4)
+        packed_words = bits.fp8_packed(jnp.asarray(codes), minifloat)
+        got = np.asarray(bits.fp8_codes(packed_words, minifloat, jnp.float32)).reshape(256)
+        expected = np.asarray(
+            jax.lax.bitcast_convert_type(jnp.arange(256, dtype=jnp.uint8), fp8_dtype).astype(jnp.float32))
+        nans = np.isnan(expected)
+        assert np.array_equal(np.isnan(got), nans)
+        np.testing.assert_array_equal(got[~nans], expected[~nans])
+
+    # Exhaustive check of branchless E8M0_SCALE_FORM across all 256 bytes and high-byte noise.
+    all_bytes = np.arange(256, dtype=np.uint32)
+    exp_normal = np.ldexp(np.ones(254, dtype=np.float32), np.arange(1, 255) - 127)
+    for high in (0, 0xAB00, 0xFFFF00, 0x12345600):
+        val_np = np.asarray(bits.e8m0_decoded(jnp.asarray(all_bytes | high, jnp.uint32)))
+        assert val_np[0] == np.float32(2.0 ** -127)
+        assert np.isnan(val_np[255])
+        np.testing.assert_array_equal(val_np[1:255], exp_normal)
+    # MxFp8.decoded preserves 0x00 (2^-127) without FTZ flush on normal outputs (4 * 2^-127 = 2^-125 in fp32
+    # and fp64; 1 * 2^-127 in fp64) and 0xFF (NaN).
+    raw_codes = jnp.full((1, 64), 4.0, jnp.float8_e4m3fn)
+    e8m0_scales = jnp.asarray([[0, 255]], jnp.uint8)
+    mx = formats.MxFp8(raw_codes, e8m0_scales)
+    dec32 = np.asarray(mx.decoded(jnp.float32))
+    np.testing.assert_array_equal(dec32[0, :32], np.full((32,), np.float32(4.0 * 2.0 ** -127)))
+    assert np.all(np.isnan(dec32[0, 32:]))
+    with jax.enable_x64():
+        dec64 = np.asarray(mx.decoded(jnp.float64))
+        np.testing.assert_array_equal(dec64[0, :32], np.full((32,), np.float64(4.0 * 2.0 ** -127)))
+        assert np.all(np.isnan(dec64[0, 32:]))
+        mx_one = formats.MxFp8(jnp.ones((1, 64), jnp.float8_e4m3fn), e8m0_scales)
+        np.testing.assert_array_equal(np.asarray(mx_one.decoded(jnp.float64))[0, :32],
+                                      np.full((32,), np.float64(2.0 ** -127)))
+    # Fp8Weights.checked() accepts valid form and rejects tampered form version.
+    sample = formats.Fp8Weights.of(np.zeros((64, 64), np.float32), fmt="e4m3")
+    assert sample.checked() is sample
+    bad = dataclasses.replace(sample, form=np.zeros((8,), np.uint8))
+    with pytest.raises(ValueError):
+        bad.checked()
+
+@pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
+def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
+    """`gemm.fp8_weight_product` (inline mainloop decode via `E4M3_BFLOAT16_FORM`/`E5M2_BFLOAT16_FORM`)
+    holds check 1 on both the default XLA route and interpreted Mosaic route with non-unit scalar,
+    per-column, and grouped scales, refuses invalid scale shapes, and compiles spill-free on sm80
+    (rows 3733, 8548)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+    from low_precision_support import decoded_weight_dot
+
+    def draw(seed):
+        rng = np.random.default_rng(8548 + seed)
+        x = jnp.asarray(rng.standard_normal((128, 64)) / np.sqrt(64), jnp.bfloat16)
+        w = jnp.asarray(rng.standard_normal((64, 64)) * 0.5, jnp.float32)
+        scale = jnp.asarray(rng.uniform(0.5, 2.5, size=(64,)), jnp.float32)
+        return x, formats.Fp8Weights.of(w, fmt=fmt, scale=scale)
+
+    for interpret in (False, True):
+        def dew_fn(x, weights, *, interpret=interpret):
+            ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+            with ctx:
+                return gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32, interpret_on_cpu=interpret)
+
+        assert_as_exact(jax.jit(dew_fn), jax.jit(decoded_weight_dot), draw,
+                        f"fp8_weight_product {fmt} interp={interpret}",
+                        seeds=8, truth_fn=functools.partial(decoded_weight_dot, dtype=jnp.float64))
+    # Exact single-scale check on default XLA, interpreted Mosaic, and unified gemm.gemm dispatch.
+    ones = jnp.ones((64, 64), jnp.bfloat16)
+    scaled_w = formats.Fp8Weights.of(jnp.full((64, 64), 2.0, jnp.float32), fmt=fmt, scale=2.0)
+    for interpret in (False, True):
+        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+        with ctx:
+            got = gemm.fp8_weight_product(ones, scaled_w, out_dtype=jnp.float32, interpret_on_cpu=interpret)
+        np.testing.assert_array_equal(np.asarray(got), np.full((64, 64), 128.0, np.float32))
+    np.testing.assert_array_equal(np.asarray(gemm.gemm(ones, scaled_w, out_dtype=jnp.float32)),
+                                  np.full((64, 64), 128.0, np.float32))
+    rng = np.random.default_rng(8549)
+    x_g = jnp.asarray(rng.integers(-2, 3, size=(64, 64)), jnp.bfloat16)
+    w_g = jnp.asarray(rng.integers(-2, 3, size=(2, 64, 64)), jnp.float32)
+    sizes = jnp.asarray([40, 24], jnp.int32)
+    scale_cases = [
+        jnp.asarray(2.0, jnp.float32),
+        jnp.asarray(rng.choice([0.5, 1.0, 2.0], size=(64,)), jnp.float32),
+        jnp.asarray([[[0.5]], [[2.0]]], jnp.float32),
+        jnp.asarray(rng.choice([0.5, 1.0, 2.0], size=(2, 1, 64)), jnp.float32),
+    ]
+    for scale in scale_cases:
+        bank = formats.Fp8Weights.of(w_g, fmt=fmt, scale=scale)
+        ref = jax.lax.ragged_dot(x_g.astype(jnp.float32), bank.decoded(jnp.float32), sizes,
+                                 preferred_element_type=jnp.float32)
+        for interpret in (False, True):
+            ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+            with ctx:
+                got = gemm.fp8_weight_product(x_g, bank, sizes, out_dtype=jnp.float32,
+                                              interpret_on_cpu=interpret)
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+    with pytest.raises(ValueError):
+        formats.Fp8Weights.of(w_g, fmt=fmt, scale=jnp.ones((2,), jnp.float32))
+    with pytest.raises(ValueError):
+        formats.Fp8Weights.of(w_g, fmt=fmt, scale=jnp.ones((2, 64), jnp.float32))
+
+    if generation.compile_only_gpus("sm80"):
+        x_s = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
+        w_sample = formats.Fp8Weights.of(np.zeros((128, 128), np.float32), fmt=fmt)
+        w_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype), w_sample)
+
+        def compiled_fp8(a, w):
+            with generation.chosen(grouped_matmul="mosaic"):
+                return gemm.fp8_weight_product(a, w, out_dtype=jnp.bfloat16)
+
+        with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
+            records = compile_mosaic_kernels(
+                [KernelCase(f"fp8_weight_{fmt}_sm80", lambda: (compiled_fp8, (x_s, w_spec)))], "sm80")
+        for rec in records:
+            assert not rec.get("error"), rec
+            assert rec["kernels"], rec
+            assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+@pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
+def test_stage_decoded_fp8_preserves_nonfinite_codewords(fmt: str):
+    """`packed.stage_decoded_fp8` shares `bits.fp8_restored` with `bits.fp8_codes`, preserving E4M3 NaN
+    (`0x7F`/`0xFF`) and E5M2 +/-inf/NaN (`0x7C`/`0xFC`/`0x7D`..`0x7F`) bitwise identically (row 8548)."""
     from dew.nn.kernels.templates.gemm import packed
 
-    assert packed.consumer_layout(bits.NVFP4_BFLOAT16) == mosaic_sm90.WGMMA.layout
-    missing = dataclasses.replace(bits.NVFP4_BFLOAT16, fragments={})
+    minifloat = packed.fp8_minifloat(fmt)
+    codes_1d = np.arange(256, dtype=np.uint32)
+    codes = np.broadcast_to(codes_1d[:64, None], (64, 64)).copy()
+    codes[0, 0] = 0x7F
+    codes[1, 0] = 0xFF
+    if fmt == "e5m2":
+        codes[2, 0] = 0x7C
+        codes[3, 0] = 0xFC
+        codes[4, 0] = 0x7D
+        codes[5, 0] = 0xFD
+    staged_codes = codes[formats.fp8_staged_rows(64), :]
+    packed_words = bits.fp8_packed(jnp.asarray(staged_codes.T, jnp.uint32), minifloat)
+
+    from low_precision_support import StageRef
+
+    out = StageRef(np.zeros((64, 64), dtype=jnp.bfloat16))
+    packed.stage_decoded_fp8([StageRef(packed_words)], out, fmt, interpret=True)
+    inv = np.argsort(formats.fp8_staged_rows(64))
+    expected = bits.fp8_codes(packed_words.T, minifloat, jnp.bfloat16)[inv].T
+    np.testing.assert_array_equal(
+        np.asarray(jax.lax.bitcast_convert_type(jnp.asarray(out.arr, jnp.bfloat16), jnp.uint16)),
+        np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint16)),
+    )
+    unpermuted = np.asarray(out.arr, np.float32)
+    assert np.isnan(unpermuted[0, 0]) and np.isnan(unpermuted[0, 1])
+    if fmt == "e5m2":
+        assert np.isposinf(unpermuted[0, 2]) and np.isneginf(unpermuted[0, 3])
+        assert np.isnan(unpermuted[0, 4]) and np.isnan(unpermuted[0, 5])
+    # Feed pre-encoded NaN and +-Inf through the public gemm.fp8_weight_product boundary (row 12100).
+    col_codes = np.zeros((64, 64), dtype=np.uint32)
+    col_codes[0, 0], col_codes[0, 1] = 0x7F, 0xFF
+    if fmt == "e5m2":
+        col_codes[0, 2], col_codes[0, 3] = 0x7C, 0xFC
+        col_codes[0, 4], col_codes[0, 5] = 0x7D, 0xFD
+    col_words = bits.fp8_packed(jnp.asarray(col_codes[formats.fp8_staged_rows(64), :].T, jnp.uint32),
+                                minifloat)
+    bank = formats.Fp8Weights(col_words, jnp.ones((), jnp.float32), formats.fp8_form_version(fmt), fmt=fmt)
+    sel = jnp.zeros((64, 64), jnp.bfloat16).at[:, 0].set(1.0)
+    for interpret in (False, True):
+        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+        with ctx:
+            got = np.asarray(gemm.fp8_weight_product(sel, bank, out_dtype=jnp.float32,
+                                                     interpret_on_cpu=interpret))
+        assert np.isnan(got[0, 0]) and np.isnan(got[0, 1])
+        if fmt == "e5m2":
+            assert np.isposinf(got[0, 2]) and np.isneginf(got[0, 3])
+            assert np.isnan(got[0, 4]) and np.isnan(got[0, 5])
+
+
+@pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
+                                 pytest.param("sm90", marks=lowers("sm90"))])
+def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str):
+    """`gemm.gemm_quantized` emits `formats.NvFp4Block` and `formats.MxFp8` bitwise matching
+    `formats.NvFp4Block.quantized` and `formats.MxFp8.quantized`, and lowers through Mosaic GPU on sm80/sm90
+    (rows 8547, 12037)."""
+    rng = np.random.default_rng(8547)
+    x = jnp.asarray(rng.standard_normal((64, 64)) / np.sqrt(64), jnp.bfloat16)
+    w = jnp.asarray(rng.standard_normal((64, 64)) / np.sqrt(64), jnp.bfloat16)
+    acc = jax.lax.dot(x, w, preferred_element_type=jnp.float32)
+    ref_nv = formats.NvFp4Block.quantized(acc)
+    got_nv = jax.jit(lambda a, b, s: gemm.gemm_quantized(
+        a, b, minifloat=formats.NvFp4Block, tensor_scale=s))(x, w, ref_nv.scale)
+    assert isinstance(got_nv, formats.NvFp4Block)
+    np.testing.assert_array_equal(np.asarray(got_nv.codes), np.asarray(ref_nv.codes))
+    np.testing.assert_array_equal(np.asarray(got_nv.scales), np.asarray(ref_nv.scales))
+    np.testing.assert_array_equal(np.asarray(got_nv.scale), np.asarray(ref_nv.scale))
+    np.testing.assert_array_equal(np.asarray(got_nv.decoded()), np.asarray(ref_nv.decoded()))
+
+    ref_mx = formats.MxFp8.quantized(acc)
+    got_mx = jax.jit(lambda a, b: gemm.gemm_quantized(a, b, minifloat=formats.MxFp8))(x, w)
+    assert isinstance(got_mx, formats.MxFp8)
+    np.testing.assert_array_equal(np.asarray(got_mx.codes), np.asarray(ref_mx.codes))
+    np.testing.assert_array_equal(np.asarray(got_mx.scales), np.asarray(ref_mx.scales))
+    np.testing.assert_array_equal(np.asarray(got_mx.decoded()), np.asarray(ref_mx.decoded()))
     with pytest.raises(ValueError):
-        packed.consumer_layout(missing)
+        gemm.gemm_quantized(x, jnp.ones((64, 33), jnp.bfloat16), minifloat=formats.MxFp8)
+    with pytest.raises(ValueError):
+        gemm.gemm_quantized(x, jnp.ones((64, 24), jnp.bfloat16), minifloat=formats.NvFp4Block)
+    x_s = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
+    w_s = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
+    s_s = jax.ShapeDtypeStruct((), jnp.float32)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
+    with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh),
+          generation.chosen(grouped_matmul="mosaic")):
+        jax.jit(lambda a, b, s: gemm.gemm_quantized(a, b, minifloat=bits.E2M1, tensor_scale=s)).trace(
+            x_s, w_s, s_s).lower(lowering_platforms=("cuda",))
+
+
+def test_fp8_and_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_path):
+    """Checkpoint restore (`dew.checkpoints._packed_checked`) restores matching `Fp8Weights` and
+    `TernaryWeights` banks and refuses mismatched form versions or invalid scale shapes (row 12161)."""
+    from dew.checkpoints import Checkpoints
+
+    where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+
+    def template(of):
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), of)
+
+    bad_form = np.frombuffer(bytes.fromhex("0" * 16), np.uint8).copy()
+    fp8_ok = formats.Fp8Weights.of(np.ones((64, 64), np.float32), fmt="e4m3", scale=2.0)
+    tern_ok = formats.TernaryWeights.of(np.ones((256, 64), np.float32), scale=2.0)
+    for label, good in (("fp8", fp8_ok), ("ternary", tern_ok)):
+        ok_ckpt = Checkpoints(str(tmp_path / f"{label}_ok"))
+        ok_ckpt.save(1, {"w": good})
+        ok_ckpt.wait()
+        restored = Checkpoints(str(tmp_path / f"{label}_ok")).restore(template({"w": good}))[0]["w"]
+        np.testing.assert_array_equal(np.asarray(restored.words), np.asarray(good.words))
+        for tag, bad in (("form", dataclasses.replace(good, form=bad_form)),
+                         ("scale", dataclasses.replace(good, scale=jnp.ones((3,), jnp.float32)))):
+            bad_ckpt = Checkpoints(str(tmp_path / f"{label}_{tag}"))
+            bad_ckpt.save(1, {"w": bad})
+            bad_ckpt.wait()
+            with pytest.raises(ValueError):
+                Checkpoints(str(tmp_path / f"{label}_{tag}")).restore(template({"w": bad}))

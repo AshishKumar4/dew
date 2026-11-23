@@ -827,7 +827,6 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
     return with_equations(jaxpr, equations) if changed else jaxpr
 
 
-
 WITHIN = (Surrogate, KernelGlue, Activation)
 """The marked spans' kinds (`dew.nn.derivatives.marked`) whose body the pass rewrites within its call, as it
 rewrites a body (`_holds_regions`): a surrogate's bodies, a kernel derivative's glue, and an activation's

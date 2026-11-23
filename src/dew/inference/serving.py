@@ -1413,7 +1413,7 @@ class Server:
                                   self.progress)
         rows = self._on_prefill_mesh(blank)
         with self._prefilling():
-            traced = self._prefill.jitted.trace(self.model, self._prefill_variables, self.pad_id,
+            traced = self._prefill.trace(self.model, self._prefill_variables, self.pad_id,
                                                 self.rows.placement, rows, self.progress)
         return StateTypes.of(traced.out_info[0])
 

@@ -516,13 +516,16 @@ def _calls_the_host(fn: Callable, shapes: Sequence) -> bool:
     """Whether `fn`'s program at `shapes` calls back to the host anywhere within it, by JAX's own callback
     primitives (`jax.pure_callback`'s, `jax.experimental.io_callback`'s, `jax.debug.callback`'s): each is
     lowered by the backend it runs on. Traced in the prepare's context, as its truths' shapes are
-    (tests/arm_store.py's `_shaped_truth`)."""
+    (tests/arm_store.py's `_shaped_truth`); an arm held whole (`arm_store.Whole`, a jit of its own compiler
+    options) traced as itself, which no other trace may hold (row 12062)."""
+    # The arm's holder read where a site prepares (arm_store imports this module).
+    from arm_store import Whole
     from jax._src.callback import io_callback_p, pure_callback_p
     from jax._src.debugging import debug_callback_p
 
     from dew.nn import programs
 
-    closed = jax.make_jaxpr(fn)(*shapes)
+    closed = fn.trace(*shapes).jaxpr if isinstance(fn, Whole) else jax.make_jaxpr(fn)(*shapes)
     callbacks = {pure_callback_p, io_callback_p, debug_callback_p}
     return any(equation.primitive in callbacks for equation in programs.equations(closed.jaxpr))
 

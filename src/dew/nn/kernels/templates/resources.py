@@ -85,7 +85,7 @@ class Producers(ByLaunch):
     def stepped(self, tops: Mapping[str, int], stated: Mapping[str, int] | None = None) -> "Producers | None":
         """These, with each of `tops`' launches' producers at the next rung of its ladder: from the least, its
         `stated` cap where given (where its consumers' statement leaves the producer more than the least,
-        `stated_producer`; a GEMM's gathering producer states none, `gemm.producers`), then its top (its
+        `stated_producer`), then its top (its
         program's entry share, where every role holds the same and no register moves: past it the roles'
         setmaxnreg moves invert, the producer's drop a rise, and the assembler rejects the kernel), then down
         a setmaxnreg step at a time past the stated cap, asked already, to a step above the least; None where
@@ -440,13 +440,14 @@ def raise_ceiling() -> int:
     return held.raises().below(held.thread_registers)
 
 
-Joined = tuple[tuple[float, int], ...]
-"""A program's joined raised warpgroup roles beside its consumers (`handoffs.Schedule.joined`), each its
-weight and its count of warpgroups: a correction warpgroup at half a consumer's share, `((0.5, 1),)`."""
+JoinedShares = tuple[tuple[float, int], ...]
+"""A program's joined raised warpgroup roles beside its consumers (`handoffs.Joined`, by
+`Family.joined_shares`), each its weight and its count of warpgroups: a correction warpgroup at half a
+consumer's share, `((0.5, 1),)`."""
 
 
 def raised_registers(consumers: int, programs: int = 1, producer: int | None = None,
-                     joined: Joined = ()) -> int:
+                     joined: JoinedShares = ()) -> int:
     """The registers each of `consumers` consumer warpgroups raises a thread's to beside a producer that
     lowers to `producer` a thread (`producer_floor`, a model's own where it states another,
     `RegisterModel.cap`) and the `joined` roles: `role_registers` of the consumers' equal weights beside
@@ -455,7 +456,7 @@ def raised_registers(consumers: int, programs: int = 1, producer: int | None = N
     return role_registers((*weights, 0), programs, floor=producer)[0]
 
 
-def joined_warpgroups(joined: Joined) -> int:
+def joined_warpgroups(joined: JoinedShares) -> int:
     """The warpgroups `joined`'s roles run."""
     return sum(count for _, count in joined)
 
@@ -500,7 +501,7 @@ def _role_registers(weights: tuple[float, ...], programs: int, floor: int,
 
 
 def consumer_registers(consumers: int, programs: int = 1, producer: int | None = None,
-                       joined: Joined = ()) -> int:
+                       joined: JoinedShares = ()) -> int:
     """The registers a thread of each of `consumers` consumer warpgroups holds, `programs` programs a
     multiprocessor, beside a producer lowered to `producer` (`producer_floor` where None) and the `joined`
     roles: its raise (`raised_registers`) where the GPU's compile honors it (`RAISES_HONORED`), its
@@ -510,7 +511,7 @@ def consumer_registers(consumers: int, programs: int = 1, producer: int | None =
 
 
 def producer_registers(consumers: int, programs: int = 1, producer: int | None = None,
-                       joined: Joined = ()) -> int:
+                       joined: JoinedShares = ()) -> int:
     """The registers a thread of a program's producer beside `consumers` consumer warpgroups and the `joined`
     roles holds, `programs` programs a multiprocessor: what it lowers to, `producer` (`producer_floor` where
     None), where the GPU's compile honors the program's raises, its entry's otherwise."""
@@ -650,7 +651,7 @@ class LaunchPlan:
 
 
 def _register_allocation(registers: int, consumers: int, producer: int, step: int,
-                         joined: Joined = ()) -> int:
+                         joined: JoinedShares = ()) -> int:
     """What a program allocates of a multiprocessor's registers: its consumers' `registers` a thread, each
     `joined` role's its weight's share of them (`role_registers`' rule), and its producer's, in `step`s."""
     def stepped(held: float) -> int:
@@ -715,8 +716,8 @@ class RegisterModel:
     family: "Family | None" = dataclasses.field(default=None, compare=False, repr=False)
     target: generation.GpuTarget = dataclasses.field(kw_only=True, compare=False, repr=False)
     moves: bool = dataclasses.field(default=True, kw_only=True)
-    joined: Joined = dataclasses.field(default=(), kw_only=True)
-    """Its raised roles beside its consumers (`Joined`: a correction warpgroup's weight and count), each
+    joined: JoinedShares = dataclasses.field(default=(), kw_only=True)
+    """Its raised roles beside its consumers (`JoinedShares`: a correction warpgroup's weight and count), each
     holding its weight's share of a consumer's registers."""
 
     def resident(self, registers: int, *, honored: bool = RAISES_HONORED) -> int:
