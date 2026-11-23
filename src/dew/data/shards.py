@@ -121,6 +121,15 @@ def _rows(shard: Shard | None) -> int:
     return shard.rows
 
 
+def fills(stored: ShardManifest, read: ShardManifest) -> bool:
+    """Whether a cached stream read over `read`'s shards fills the cache: where each is one of `stored`'s,
+    the store's own or its parts, which every topology's fill names alike; a cut finer than the store for
+    its readers keys its rows by cuts no other fill names, whose completions would block every later
+    fill's publication, so it reads a published generation and fills none (review of row 11948)."""
+    cuts = {shard.id for shard in read.shards}
+    return cuts <= {shard.id for shard in stored.shards} or cuts <= {shard.id for shard in stored.parts()}
+
+
 def cut(manifest: ShardManifest, *, partition: DataPartition, loading: Loading) -> ShardManifest:
     """`manifest` with the shards a stream deals its shares and their workers (`_shards`): its own, or its
     parts where too few fill them, then no further part (`subdivide`) and their rows their own, so a read

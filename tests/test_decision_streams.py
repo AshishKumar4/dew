@@ -14,6 +14,7 @@ import pytest
 from flax import linen as nn
 from map_judge import marked_seeds
 from model_support import TINY_DECODER
+from run_kinds import stated
 from test_decision_context import assert_packed_as_alone, windows_of
 from test_decision_letters_context import LABELS, QUESTIONS as LETTERED_QUESTIONS, STATES
 
@@ -250,14 +251,15 @@ def test_a_run_names_its_rows_streams_on_the_command_line_trains_and_serves_them
              json.dumps(to_record(JOINT.segments, tuple[Segment, ...])), "head:joint-shape",
              "--head.width", "16", "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
              "--head.feedforward", "32", "--trainer.name", "streams",
-             "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "1",
+             "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.horizon.steps", "1",
              "--trainer.checkpoint-every", "1", "--trainer.eval-every", "None", "--trainer.multi-host",
-             "False", "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"]
-    unread = DecisionRunConfig.cli(flags, default=DecisionRunConfig(data=rows))
+             "False", "--trainer.compilation-cache-dir", "None"]
+    default = stated(DecisionRunConfig(data=rows), model_fields={"dtype": "float32"})
+    unread = DecisionRunConfig.cli(flags, default=default)
     with pytest.raises(ValueError):
         unread.prepare()
     config = DecisionRunConfig.cli([*flags, "--reads", json.dumps(to_record(JOINT.reads, Reads))],
-                                   default=DecisionRunConfig(data=rows))
+                                   default=default)
     assert config.reads == JOINT.reads
     config.run()
     decide = Decide.from_run(str(tmp_path / "runs" / "streams"))

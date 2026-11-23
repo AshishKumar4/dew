@@ -262,11 +262,14 @@ class Cache:
         source: Source | None = None,
         transparent: bool = False,
         shard_count: int | None = None,
+        writes: bool = True,
     ) -> ShardOpener:
         """`reader`'s shards read through the cache: a published generation's records read back, or each
         shard's fill written as it is read, `source`'s generation published by the last of its shards'
         fills to seal (row 4211). A `transparent` read saves each shard's position as its reader does,
-        so a position saved with the cache resumes without it and the reverse (row 4217)."""
+        so a position saved with the cache resumes without it and the reverse (row 4217). A read that
+        `writes` nothing (shards no fill of the store names) reads a published generation where there is
+        one and computes its records where there is none, filling nothing."""
         computed = (reader if transform is None
                     else _PassthroughReader(reader, _Passthrough(transform), pool))
         if transform is not None and _volatile(transform):
@@ -281,6 +284,9 @@ class Cache:
                 return computed
             # A transparent read computes its records in the form it saves with the cache read.
             return _CachedReader(reader, self, key, transform, _Computed(), source, transparent=True)
+        if published is None and not writes:
+            return computed if not transparent else _CachedReader(reader, self, key, transform, _Computed(),
+                                                                  source, transparent=True)
         # The shards the fill is keyed by, counted once for every shard's writer (`_Writer._published`): the
         # reader's own where it states them (a positioned stream's, `stream_manifest`), else the store's.
         shards = None if source is None else (shard_count if shard_count is not None

@@ -1,17 +1,18 @@
 """The chains whose positions a main saved (`tools/positions_saved_by_main.py`, `tests/fixtures/positions`),
-each step declaring its identity or defined here, so an edit elsewhere in the tests leaves the positions
-resumable: under the plan version before this Dew's, phases on their own streams, a bounded mixture laid out
-and shuffled, a shuffled chain through a configured step taken to a bound, streamed and read into memory,
-and a seeded mix of two named corpora; before the condition encoders moved to dew.interop (row 5996), phases
-and a mix whose steps depend on one (`Conditioned`)."""
+each step declaring its identity or defined here, or in `conditioned_step` where a mix keeps its member by
+its code's file, so an edit elsewhere in the tests leaves the positions resumable: under the plan version
+before this Dew's, phases on their own streams, a bounded mixture laid out and shuffled, a shuffled chain
+through a configured step taken to a bound, streamed and read into memory, and a seeded mix of two named
+corpora; before the condition encoders moved to dew.interop (row 5996), phases and a mix whose steps depend
+on one (`Conditioned`)."""
 
 import dataclasses
-from collections.abc import Mapping
 
 import numpy as np
+from conditioned_step import Conditioned
 from test_chain_compile import Tokens
 
-from dew.data import Memory, phases
+from dew.data import Memory, Phase, Steps, phases
 from dew.data.compile import compile
 from dew.data.dataset import Loading
 from dew.data.pipeline import Pipeline, mix
@@ -37,7 +38,7 @@ def source(tag: int):
 
 def step_phases():
     """Two sources read in two phases on the step clock, the first's to step 3."""
-    return compile(phases((source(1), 3), (source(2), None)), read="indexed", loading=READ)
+    return compile(phases(Phase(source(1), Steps(3)), Phase(source(2))), read="indexed", loading=READ)
 
 
 def bounded_mixture(layout: str):
@@ -82,25 +83,10 @@ def mixture():
     return compile(mix([named("a", 1), named("b", 2)], seed=4).batch(2), read="streamed", loading=READ)
 
 
-@dataclasses.dataclass(frozen=True)
-class Conditioned:
-    """A record step whose rows depend on a condition encoder, as a diffusion run's caption step's do
-    (`dew.inputs.InputSpec.dependencies`): its identity names the encoder's class by the path the saving Dew
-    imports it from, dew.inputs.encoders before row 5996 and dew.interop.encoders since. Each row as it is."""
-
-    def dependencies(self) -> Mapping[str, object]:
-        from dew.inputs import CLIPText
-        from dew.registry import import_path
-
-        return {"encoder": {"class": import_path(CLIPText), "fields": {"checkpoint": "saved"}}}
-
-    def __call__(self, row):
-        return row
-
-
 def conditioned_phases():
     """`step_phases` with the first phase's rows through a step that depends on an encoder."""
-    return compile(phases((source(1).map(Conditioned()), 3), (source(2), None)), read="indexed", loading=READ)
+    return compile(phases(Phase(source(1).map(Conditioned()), Steps(3)), Phase(source(2))), read="indexed",
+                   loading=READ)
 
 
 def conditioned_mixture():

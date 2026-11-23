@@ -453,9 +453,13 @@ def _shard_spec(axes, first) -> jax.sharding.PartitionSpec | None:
 def _packed_specs(axes, gate_up) -> tuple[jax.sharding.PartitionSpec, jax.sharding.PartitionSpec] | None:
     """`(in_spec, out_spec)` for `packed_swiglu` (`[..., 2, H]` -> `[..., H]`) on a split mesh from
     `gate_up`'s explicit sharding or logical `axes` (`_shard_spec`), or None if unplaced, rank < 2, or an
-    explicit axis splits the pair axis `-2` (row 822)."""
+    axis splits the pair axis `-2` (row 822): a caller of the kernel's own whose pair a mesh axis splits, as
+    the gated product makes it whole before either product reads it (`dew.nn.sharding.whole_along`, row
+    12224)."""
     if gate_up.ndim < 2:
         return None
+    # The pair by the operand's own placement too, which logical axes on a mesh of Explicit and Auto axes
+    # leave unread (the head review of row 12224).
     placed = explicit_spec(gate_up)
     if placed is not None and placed.spec[-2] is not None:
         return None
@@ -464,6 +468,8 @@ def _packed_specs(axes, gate_up) -> tuple[jax.sharding.PartitionSpec, jax.shardi
     if in_spec is None:
         return None
     entries = (*in_spec, *(None,) * (gate_up.ndim - len(in_spec)))
+    if entries[-2] is not None:
+        return None
     return in_spec, jax.sharding.PartitionSpec(*entries[:-2], entries[-1])
 
 

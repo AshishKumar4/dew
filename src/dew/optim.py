@@ -27,7 +27,7 @@ import itertools
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -68,7 +68,7 @@ from dew.nn.inspection import QK
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import boxed, declared_axes, layer_norms, layers_of, parameter_path
 from dew.optim_schedules import Rates, ScheduleBase, group_named, placed_like, rates_of, scheduled_solver
-from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
+from dew.registry import Aliases, JsonDict, from_record, optimizers, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one
@@ -1218,45 +1218,15 @@ def _lamb(learning_rate, b1=0.9, b2=0.999, eps=1e-6, eps_root=0.0, weight_decay=
                        scale_by_trust_ratio(), optax.scale_by_learning_rate(learning_rate))
 
 
-Optimizer = Literal['adam', 'adamw', 'lamb', 'muon', 'muonclip', 'laprop', 'gauss_newton']
-"""The optimizers `OptimConfig.optimizer` names, each built by its `OPTIMIZER_MAP` entry."""
-
-STATE_OPTIMIZERS: dict[str, dict[Optimizer, Callable[..., optax.GradientTransformation]]] = {
-    stored: {'adam': _stored_adam(moments, coupled=True, default_decay=0.0),
-             'adamw': _stored_adam(moments, coupled=False, default_decay=1e-4)}
-    for stored, moments in (('bfloat16', bf16_moments), ('int8', int8_moments))}
-"""The optimizers each `OptimConfig.state_dtype` but float32 builds: optax.adam and optax.adamw with
-their moments stored in bf16 (`bf16_moments`) or in 8 bits (`int8_moments`), their other options kept."""
-
-
 def _rate_only(learning_rate: optax.ScalarOrSchedule) -> optax.GradientTransformation:
     """A param group's rate over a direction a solve before the groups made (`dew.gauss_newton`)."""
     return optax.scale_by_learning_rate(learning_rate)
 
 
-OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
-    'adam': _adam,
-    'adamw': _adamw,
-    'lamb': _lamb,
-    'muon': _muon_groups,
-    'muonclip': _muonclip_groups,
-    'laprop': laprop,
-    'gauss_newton': gauss_newton,
-}
-
-STACKED_OPTIMIZERS: frozenset[str] = frozenset({'adam', 'adamw', 'lamb', 'muon', 'muonclip', 'laprop'})
-"""Dew's optimizers whose every rule reads a stage-local run's stacked leaf as its stored layers
-(`layers_of`): a run of one of these keeps its pipelined runs stage-local; any other optimizer's run is
-read by its state's transforms (`dew.training.stages.whole_reading`). Gauss-Newton forms its update's
-system over every parameter on each device (`dew.gauss_newton`), which holds each layer whole on every
-device whatever the storage, so its run keeps every layer whole on every stage."""
-
-optimizers: Aliases[Callable[..., optax.GradientTransformation], optax.GradientTransformation] = Aliases(
-    "optimizer", {name: f"{make.__module__}:{make.__qualname__}" for name, make in OPTIMIZER_MAP.items()},
-    base="optax:GradientTransformation")
-"""What `OptimConfig.optimizer` names: Dew's optimizers by name (`OPTIMIZER_MAP`), or an Optax factory
-by its import path, which must be declared to return a gradient transformation before it is called,
-as every import path a record names is (`dew.registry.Aliases`)."""
+STORED_MOMENTS: dict[str, Callable[..., optax.GradientTransformation]] = {
+    "bfloat16": bf16_moments, "int8": int8_moments}
+"""The moments' storage each `Adam.state_dtype` but float32 builds: `scale_by_adam` with its moments stored in
+bf16 (`bf16_moments`) or in 8 bits (`int8_moments`), its other options kept."""
 
 
 def with_bounds(opt_state: optax.OptState, bounds: Mapping[str, tuple[float, float]]) -> optax.OptState:
@@ -1302,6 +1272,47 @@ def _keep_within(lower: float, upper: float) -> optax.GradientTransformation:
     return optax.GradientTransformation(init_fn, update_fn)
 
 
+_DECAY_MASK = tyro.constructors.PrimitiveConstructorSpec(
+    nargs=1,
+    metavar="JSON",
+    instance_from_str=lambda args: json.loads(args[0]),
+    is_instance=lambda value: isinstance(value, (dict, bool)),
+    str_from_instance=lambda value: [json.dumps(value)],
+)
+
+DecayMask = Annotated[Mapping[str, object] | bool, _DECAY_MASK]
+"""A decay's mask as Optax's decay takes it (`optax.add_decayed_weights`' `mask`): a tree of booleans by
+parameter name, a prefix of the parameters' tree, or one boolean over all of them; on the command line one
+JSON value."""
+
+
+def _checked_decay_mask(mask: DecayMask | None, spared: bool, owner: str) -> None:
+    """Refuse a decay mask (`OptimConfig.decay_mask`) beside a decay that spares, which writes its own over
+    it, or one that is neither a boolean nor a tree of them."""
+    if mask is None:
+        return
+    if spared:
+        raise ValueError(f"{owner} spares its decay, which writes its own mask over decay_mask: set spared "
+                         "False to decay where decay_mask says")
+    if type(mask) is bool:
+        return
+    leaves = jax.tree.leaves(mask, is_leaf=lambda leaf: leaf is None)
+    if not isinstance(mask, Mapping) or not leaves or not all(type(leaf) is bool for leaf in leaves):
+        raise ValueError(f"{owner}'s decay_mask is a boolean or a tree of them by parameter name, got "
+                         f"{mask!r}")
+
+
+def _decay_masked(mask: DecayMask | None, optimizer: OptimizerSpec) -> dict[str, DecayMask]:
+    """The mask the optimizer's decay takes (`decay_mask`) by its own keyword (`OptimizerSpec.masked_by`),
+    where it is given; refused for an optimizer that takes none."""
+    keyword = optimizer.masked_by()
+    if mask is None:
+        return {}
+    if keyword is None:
+        raise ValueError(f"{type(optimizer).__name__} takes no decay mask: its decay_mask is none it reads")
+    return {keyword: mask}
+
+
 @dataclasses.dataclass(frozen=True)
 class ParamGroup:
     """A group of parameters the optimizer updates with their own learning
@@ -1339,11 +1350,17 @@ class ParamGroup:
     """Whether the group claims the modules its run draws fresh beside a loaded base, ahead of its own
     `patterns` (`Objective.fresh_modules`): what `OptimConfig.with_fresh` names before a run records
     the group."""
+    decay_mask: DecayMask | None = None
+    """The parameters the group's decay applies to where it does not spare them (`spared` False): a tree of
+    booleans by parameter name, a prefix of its parameters' tree, as Optax's decay takes its mask
+    (`optax.add_decayed_weights`); None decays every parameter it claims. An earlier run's mask among its
+    optimizer's options (`dew.config.earlier`)."""
 
     def __post_init__(self):
         object.__setattr__(self, "patterns", tuple(self.patterns))
         if not self.patterns and not self.fresh:
             raise ValueError(f"param group {self.name!r} matches no pattern")
+        _checked_decay_mask(self.decay_mask, self.spared, f"param group {self.name!r}")
         if self.learning_rate_multiplier <= 0:
             raise ValueError(
                 f"param group {self.name!r} scales the learning rate by a positive "
@@ -1702,7 +1719,7 @@ class OneCycle(ScheduleBase):
 
     def warmup(self, steps: int | None) -> int:
         """The steps of its rise, to the whole step its rate peaks at (`_rise`)."""
-        return round(self._rise(self._horizon(steps, "trainer.steps")))
+        return round(self._rise(self._horizon(steps, "trainer.horizon.steps")))
 
     def run_relative(self) -> bool:
         return True
@@ -1725,7 +1742,7 @@ class OneCycle(ScheduleBase):
                          anneal(rates['peak_value'], rates['end_value'], at - rise, 1 - rise))
 
     def horizons(self, steps: int | None) -> dict[str, int | float]:
-        steps = self._horizon(self._own(steps), "trainer.steps")
+        steps = self._horizon(self._own(steps), "trainer.horizon.steps")
         rise, last = self._rise(steps), steps - 1
         if not 0 < rise < last:
             raise ValueError(f"a one-cycle schedule over {steps} steps with warmup fraction "
@@ -1849,8 +1866,235 @@ DEFAULT_RATE = 2.7e-4
 """The learning rate a config that sets none takes for a first-order optimizer
 (`OptimConfig.learning_rate`)."""
 
-OWN_RATES: dict[Callable[..., optax.GradientTransformation], float] = {gauss_newton: 1.0}
-"""An optimizer's own rate where it has one other than `DEFAULT_RATE`: Gauss-Newton's whole step."""
+def _moment_dtypes(state_dtype: str | tuple[str | None, str | None]) -> dict[str, str | None]:
+    """The first and second moments' dtypes a held `state_dtype` keeps them in, as optax's `mu_dtype` and
+    `nu_dtype` take them: both float32, both the parameters' ("params", None), or the pair as stated."""
+    if isinstance(state_dtype, str):
+        held = None if state_dtype == "params" else state_dtype
+        return {"mu_dtype": held, "nu_dtype": held}
+    first, second = state_dtype
+    return {"mu_dtype": first, "nu_dtype": second}
+
+
+@dataclasses.dataclass(frozen=True)
+class OptimizerSpec:
+    """An optimizer and its own settings, each a field of its own class (`AdamW`, `Muon`, ...), which
+    `OptimConfig` builds at its rate, schedule, param groups and clipping (`OptimConfig.build`): the
+    settings one optimizer takes are its class's, so no setting is given an optimizer that ignores it."""
+
+    OWN_RATE: ClassVar[float] = DEFAULT_RATE
+    """The rate a config that states none runs at (`OptimConfig.learning_rate`)."""
+    STACKED: ClassVar[bool] = True
+    """Whether every rule of it reads a stage-local run's stacked leaf as its stored layers (`layers_of`): a
+    run of one keeps its pipelined runs stage-local; any other's is read by its state's transforms
+    (`dew.training.stages.whole_reading`)."""
+
+    def factory(self) -> Callable[..., optax.GradientTransformation]:
+        """The function that builds it at a rate, its settings `options` (`scheduled_solver`)."""
+        raise NotImplementedError
+
+    def options(self) -> Mapping[str, object]:
+        """Its settings as its `factory` takes them."""
+        return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
+
+    def transform(self, learning_rate: optax.ScalarOrSchedule) -> optax.GradientTransformation:
+        """It alone at `learning_rate`, no schedule, group or clip of a config's around it."""
+        return self.factory()(learning_rate, **self.options())
+
+    def spares(self) -> bool:
+        """Whether its decay takes timm's split (`weight_decay_mask`) unless a run says otherwise
+        (`OptimConfig.spared`): a factory that takes a decay mask."""
+        return self.masked_by() is not None
+
+    def masked_by(self) -> str | None:
+        """The keyword its factory takes a decay mask by (`OptimConfig.decay_mask`): `mask`, Optax's, where
+        it takes one; None where it takes none."""
+        return 'mask' if 'mask' in inspect.signature(self.factory()).parameters else None
+
+
+@dataclasses.dataclass(frozen=True)
+class Adam(OptimizerSpec):
+    """optax.adam over `scale_by_adam`, its `weight_decay` torch's coupled L2 penalty, added to the gradient
+    before the moments read it; `state_dtype` the moments' storage: float32 whatever the parameters', bfloat16
+    stochastically rounded (`dew._moments.bf16_moments`), int8 blockwise (`dew._moments.int8_moments`,
+    bitsandbytes' and torchao's 8-bit Adam), a quarter of float32's, or the parameters' own ("params", a
+    float64 run's float64)."""
+
+    b1: float = 0.9
+    b2: float = 0.999
+    eps: float = 1e-8
+    eps_root: float = 0.0
+    weight_decay: float = 0.0
+    nesterov: bool = False
+    state_dtype: Literal["float32", "bfloat16", "int8", "params"] | tuple[str | None, str | None] = "float32"
+    """The moments' storage: float32, bfloat16 stochastically rounded, int8 blockwise, the parameters' own
+    ("params"), or the first and second moments' own dtypes, each None for the parameters' (a run saved with
+    them apart)."""
+
+    COUPLED: ClassVar[bool] = True
+
+    def factory(self) -> Callable[..., optax.GradientTransformation]:
+        if self.state_dtype in STORED_MOMENTS:
+            return _stored_adam(STORED_MOMENTS[self.state_dtype], coupled=self.COUPLED,
+                                default_decay=self.weight_decay)
+        return _adam if self.COUPLED else _adamw
+
+    def options(self) -> Mapping[str, object]:
+        opts = {name: value for name, value in super().options().items() if name != "state_dtype"}
+        if self.state_dtype in STORED_MOMENTS:
+            return opts
+        return {**opts, **_moment_dtypes(self.state_dtype)}
+
+
+@dataclasses.dataclass(frozen=True)
+class AdamW(Adam):
+    """optax.adamw over `scale_by_adam`: `Adam` with its decay decoupled from the gradient, 1e-4 by
+    default."""
+
+    weight_decay: float = 1e-4
+    COUPLED: ClassVar[bool] = False
+
+
+@dataclasses.dataclass(frozen=True)
+class Lamb(OptimizerSpec):
+    """optax.lamb, its trust ratio each stored layer's (`scale_by_trust_ratio`)."""
+
+    b1: float = 0.9
+    b2: float = 0.999
+    eps: float = 1e-6
+    eps_root: float = 0.0
+    weight_decay: float = 0.0
+
+    def factory(self) -> Callable[..., optax.GradientTransformation]:
+        return _lamb
+
+
+@dataclasses.dataclass(frozen=True)
+class Muon(OptimizerSpec):
+    """Muon over the matrices and AdamW over the rest, on one schedule (`_muon_groups`): Newton-Schulz's
+    coefficients `ns_coeffs` (a triple, a schedule of them or a preset's name) over `ns_steps` iterations,
+    momentum `beta`, the AdamW group's `adam_*`; it decays every parameter it updates, norms and biases
+    among them, as Moonlight does (arXiv 2502.16982, 2.2); its moments float32, or the parameters' own
+    (`state_dtype` "params", a float64 run's float64)."""
+
+    weight_decay: float = 0.0
+    adam_weight_decay: float | None = None
+    ns_coeffs: tuple[float, ...] | tuple[tuple[float, float, float], ...] | str = NEWTON_SCHULZ
+    ns_steps: int = 5
+    beta: float = 0.95
+    eps: float = 1e-8
+    nesterov: bool = True
+    adaptive: bool = False
+    preconditioning: Preconditioning = "frobenius"
+    consistent_rms: float | None = None
+    ns_precision: str | None = None
+    """A `jax.lax.DotAlgorithmPreset` by its name, the Newton-Schulz products' precision; None JAX's."""
+    per_head: Mapping[str, int] | None = None
+    neuron_beta2: float | None = None
+    adam_b1: float = 0.9
+    adam_b2: float = 0.999
+    adam_eps_root: float = 0.0
+    adam_learning_rate: float | None = None
+    ns_group: int | None = None
+    state_dtype: Literal["float32", "params"] | tuple[str | None, str | None] = "float32"
+    """The moments' dtypes: float32, the parameters' own ("params"), or the first and second moments' own,
+    each None for the parameters' (a run saved with them apart)."""
+
+    def factory(self) -> Callable[..., optax.GradientTransformation]:
+        return _muon_groups
+
+    def options(self) -> Mapping[str, object]:
+        opts = {name: value for name, value in super().options().items() if name != "state_dtype"}
+        return {**opts, **_moment_dtypes(self.state_dtype)}
+
+    def spares(self) -> bool:
+        """It decays every parameter it updates, as Moonlight does, unless a run masks its matrices' decay
+        (`masked_by`)."""
+        return False
+
+    def masked_by(self) -> str | None:
+        """Its matrices' decay takes a mask by `weight_decay_mask` (`_muon_groups`); the AdamW group decays
+        every parameter it holds."""
+        return "weight_decay_mask"
+
+    def update_flops(self, params) -> float:
+        """One update's Newton-Schulz products over each matrix it orthogonalizes (`muon_update_flops`), at
+        the iterations its coefficients hold (a schedule's rows)."""
+        table = _coefficients(self.ns_coeffs, self.ns_steps)
+        steps = self.ns_steps if table.ndim == 1 else table.shape[0]
+        return muon_update_flops(params, steps, None if self.per_head is None else dict(self.per_head))
+
+
+@dataclasses.dataclass(frozen=True)
+class MuonClip(Muon):
+    """`Muon` chained with the QK-Clip that follows its update (`scale_by_qk_clip`), Kimi K2's."""
+
+    qk_clip_threshold: float = 100.0
+
+    def factory(self) -> Callable[..., optax.GradientTransformation]:
+        return _muonclip_groups
+
+
+@dataclasses.dataclass(frozen=True)
+class LaProp(OptimizerSpec):
+    """DreamerV3's optimizer (`laprop`): the update clipped adaptively to `agc` of each parameter's norm,
+    LaProp's direction of it."""
+
+    b1: float = 0.9
+    b2: float = 0.999
+    eps: float = 1e-20
+    agc: float = 0.3
+
+    def factory(self) -> Callable[..., optax.GradientTransformation]:
+        return laprop
+
+
+@dataclasses.dataclass(frozen=True)
+class GaussNewton(OptimizerSpec):
+    """Gauss-Newton's update, damped as Levenberg-Marquardt's by `damping` (`dew.gauss_newton`), one solve
+    over every parameter, its direction capped at the config's `clip_grads`; its own rate the whole step."""
+
+    damping: float = 0.0
+    clip: float | None = None
+    """The cap of its direction's norm, None for none; a config's `clip_grads` caps it where set."""
+
+    OWN_RATE: ClassVar[float] = 1.0
+    STACKED: ClassVar[bool] = False
+
+    def factory(self) -> Callable[..., optax.GradientTransformation]:
+        return gauss_newton
+
+
+@dataclasses.dataclass(frozen=True)
+class Optax(OptimizerSpec):
+    """Any Optax optimizer factory by its import path, `optax:sgd` or `optax:adafactor`, built as
+    `factory(learning_rate, **settings)`, so an experiment on an Optax transformation records the same
+    optimizer it ran; the decay spares biases and norm scales for a factory that takes a `mask`."""
+
+    path: str = "optax:sgd"
+    settings: JsonDict = dataclasses.field(default_factory=dict)
+
+    STACKED: ClassVar[bool] = False
+
+    def factory(self) -> Callable[..., optax.GradientTransformation]:
+        return optax_factories[self.path]
+
+    def options(self) -> Mapping[str, object]:
+        return dict(self.settings)
+
+
+if TYPE_CHECKING:
+    # tyro reads the runtime annotation, the union of the aliased optimizers, as it reads `ScheduleSpec`.
+    type OptimizerSpecs = OptimizerSpec
+else:
+    OptimizerSpecs = optimizers.union
+
+
+optax_factories: Aliases[Callable[..., optax.GradientTransformation], optax.GradientTransformation] = Aliases(
+    "Optax factory", {}, base="optax:GradientTransformation")
+"""The Optax factories an `Optax` spec names by import path, each declared to return a gradient transformation
+before it is called, as every import path a record names is (`dew.registry.Aliases`)."""
+
 
 
 def _claims(modules: Sequence[str], leaves: Sequence[str]) -> tuple[str, ...]:
@@ -1859,20 +2103,36 @@ def _claims(modules: Sequence[str], leaves: Sequence[str]) -> tuple[str, ...]:
     return (*(f"{glob.escape(module)}/*" for module in modules), *map(glob.escape, leaves))
 
 
+def _optimizer_argument() -> tyro.constructors.PrimitiveConstructorSpec:
+    """The optimizer as one command-line value, the record a run holds: its name at its defaults, or its
+    record as JSON (`dew.registry.from_record`)."""
+    def read(given: list[str]) -> OptimizerSpec:
+        text = given[0]
+        built = (optimizers.build(text) if not text.lstrip().startswith("{")
+                 else from_record(OptimizerSpecs, json.loads(text), dtypes=False))
+        if not isinstance(built, OptimizerSpec):
+            raise TypeError(f"--optim.optimizer is an optimizer's name or record, not {text}")
+        return built
+
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1, metavar="NAME|JSON", instance_from_str=read,
+        is_instance=lambda given: isinstance(given, OptimizerSpec),
+        str_from_instance=lambda given: [json.dumps(to_record(given, OptimizerSpecs))])
+
+
 @dataclasses.dataclass(frozen=True)
 class OptimConfig:
     """Holds the optimizer, learning-rate schedule and gradient clipping."""
 
-    optimizer: Optimizer | str = "adamw"
-    """One of Dew's optimizers (`OPTIMIZER_MAP`), or any Optax optimizer factory by its import path,
-    `optax:sgd` or `optax:adafactor` (`optimizers`), built as `factory(learning_rate,
-    **optimizer_opts)` with `b1`, `b2` and `weight_decay` where the config sets them, so an experiment
-    on an Optax transformation records the same optimizer it ran. The decay spares biases and norm
-    scales for a factory that takes a `mask`."""
-    optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
+    optimizer: Annotated[OptimizerSpecs, _optimizer_argument()] = dataclasses.field(default_factory=AdamW)
+    """The optimizer and its own settings (`OptimizerSpec`): `AdamW(b1=0.9, b2=0.95)`, `Muon(ns_steps=5)`, or
+    any Optax factory, `Optax("optax:sgd", {"momentum": 0.9})`. On the command line it is one value: its name
+    at its defaults, `--optim.optimizer muon`, or its record, `--optim.optimizer '{"class": "adamw",
+    "fields": {"b2": 0.95}}'`."""
     learning_rate: Annotated[float | ScheduleSpec | None, _rate_argument()] = None
     """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`); unset,
-    the optimizer's own (`OWN_RATES`: Gauss-Newton's whole step, 1.0, the rest's 2.7e-4), which the config
+    the optimizer's own (`OptimizerSpec.OWN_RATE`: Gauss-Newton's whole step, 1.0, the rest's 2.7e-4), which
+    the config
     then records.
 
     The kinds are cosine, power (lm-engine's power law with an optional linear
@@ -1881,23 +2141,17 @@ class OptimConfig:
     updates. On the command line it is one value: `--optim.learning-rate 3e-4`, or a
     schedule's record, `--optim.learning-rate '{"class": "cosine", "fields": {...}}'`.
     """
-    weight_decay: float | None = None
-    """The weight decay passed to the optimizer, None keeping its own (adamw's 1e-4, the others'
-    0); for 'adam' it is torch's coupled L2 penalty, added to the gradient before the moments
-    read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
-    and vectors such as a norm's scale, timm's split for every optimizer and for an Optax factory
-    given one (`dew.optim.weight_decay_mask`, its `mask`), unless `spared` is off; Muon decays them as
-    Moonlight does, and a param group decays all it claims unless it says (`ParamGroup.spared`)."""
     spared: bool = True
     """Whether the decay spares biases and vectors such as a norm's scale (`weight_decay_mask`), where the
     optimizer takes a mask: nanoGPT's, Megatron Core's and timm's split, since decaying a norm's scale or
     a bias toward zero regularizes nothing a matrix's decay does and shifts what the layer computes.
     Optax decays every parameter (`mask=None`), which False restores. A param group decays all it claims
     unless its own `spared` says otherwise (`ParamGroup.spared`); a run's default groups follow this."""
-    b1: float | None = None
-    """First-moment decay, for adam, adamw and lamb and laprop's momentum; None keeps the optimizer's."""
-    b2: float | None = None
-    """Second-moment decay, for adam, adamw and lamb and laprop's mean square; None keeps the optimizer's."""
+    decay_mask: DecayMask | None = None
+    """The parameters the decay applies to where it does not spare them (`spared` False): a tree of
+    booleans by parameter name, a prefix of the parameters' tree, as Optax's decay takes its mask
+    (`optax.add_decayed_weights`); None decays every parameter. An earlier run's mask among its optimizer's
+    options (`dew.config.earlier`); a param group's own its group's (`ParamGroup.decay_mask`)."""
     param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
     """Per-group learning rates, momentum schedules, weight decay and bounds; the first
     matching group wins.
@@ -1905,18 +2159,6 @@ class OptimConfig:
     Empty runs one optimizer over every parameter. `ParamGroup.mup` is lm-engine's muP split.
     """
     clip_grads: float = 0.0
-    state_dtype: Literal["float32", "bfloat16", "int8"] = "float32"
-    """The dtype of Adam's moments in memory.
-
-    float32 stores adam's and adamw's two moments, and Muon's momentum, in
-    float32 whatever the parameters' dtype, so bfloat16 or float16 weights
-    train on full-precision moments. bfloat16 stores both with stochastic
-    rounding (`dew._moments.bf16_moments`), for adam and adamw only. That halves
-    the optimizer state and reduces the update's memory traffic. int8 stores
-    both blockwise in 8 bits (`dew._moments.int8_moments`, bitsandbytes' and
-    torchao's 8-bit Adam), for adam and adamw only: a quarter of float32's,
-    about 2 bytes a parameter for the two.
-    """
     forced_weight_normalization: bool = False
     """Whether to renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`) after each update.
 
@@ -1939,10 +2181,17 @@ class OptimConfig:
         return self.learning_rate
 
     def __post_init__(self):
+        _checked_decay_mask(self.decay_mask, self.spared and self.optimizer.spares(), "the optimizer")
+        if self.decay_mask is not None and self.param_groups:
+            raise ValueError("decay_mask masks an ungrouped optimizer's decay; a param group states its own "
+                             "(ParamGroup.decay_mask)")
+        capped = isinstance(self.optimizer, GaussNewton) and self.optimizer.clip is not None
+        if capped and self.clip_grads > 0:
+            raise ValueError(f"Gauss-Newton's direction is capped once: at its own clip "
+                             f"({self.optimizer}) or the config's clip_grads ({self.clip_grads}), not both")
         if self.learning_rate is None:
             # Unset, the rate is the optimizer's own, recorded as the config's.
-            own = OWN_RATES.get(optimizers[self.optimizer], DEFAULT_RATE)
-            object.__setattr__(self, 'learning_rate', own)
+            object.__setattr__(self, 'learning_rate', self.optimizer.OWN_RATE)
 
     def schedules(self) -> list[tuple[str, ScheduleBase]]:
         """The schedules its solvers run, by where the config holds them: its learning rate's, or each
@@ -1980,7 +2229,7 @@ class OptimConfig:
         """Where this optimizer's split sends each of `params` and why (`muon_partition`), for the
         optimizers that split by Muon's rule ('muon', 'muonclip'); None for one that splits none. Read
         under the axes the modules declare, as its state is initialized."""
-        return muon_partition(params) if self.optimizer in ("muon", "muonclip") else None
+        return muon_partition(params) if isinstance(self.optimizer, Muon) else None
 
     def build(self, steps: int | None, clocked: bool = False, stated: bool = False
               ) -> optax.GradientTransformation:
@@ -1999,27 +2248,13 @@ class OptimConfig:
         solvers hold no step horizons in a fresh state, which the run sets on
         every state it steps (`horizons`, `with_horizons`).
         """
-        opts = dict(self.optimizer_opts)
-        if {'b1', 'b2'} & opts.keys():
-            raise ValueError("b1 and b2 are fields of OptimConfig, not optimizer_opts")
-        given = {'b1': self.b1, 'b2': self.b2, 'weight_decay': self.weight_decay}
-        opts.update({name: value for name, value in given.items() if value is not None})
-        make = optimizers[self.optimizer]
-        if self.state_dtype != 'float32':
-            if self.optimizer not in STATE_OPTIMIZERS[self.state_dtype]:
-                raise ValueError(
-                    f"state_dtype={self.state_dtype!r} stores Adam's moments, which "
-                    f"{sorted(STATE_OPTIMIZERS[self.state_dtype])} have; {self.optimizer!r} does not")
-            make = STATE_OPTIMIZERS[self.state_dtype][self.optimizer]
-        elif self.optimizer in ('adam', 'adamw', 'muon', 'muonclip'):
-            # Muon's and MuonClip's AdamW group stores its moments as AdamW's do.
-            opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
+        make, opts = self.optimizer.factory(), dict(self.optimizer.options())
         # Gauss-Newton solves its own direction, which it caps at `clip_grads` (the gradient it is handed
         # it never reads): one solve over every parameter, each param group's rate its leaves of it.
         solved = None
-        if make is gauss_newton and self.clip_grads > 0:
+        if isinstance(self.optimizer, GaussNewton) and self.clip_grads > 0:
             opts['clip'] = self.clip_grads
-        if make is gauss_newton and self.param_groups:
+        if isinstance(self.optimizer, GaussNewton) and self.param_groups:
             damping, clip = opts.pop('damping', 0.0), opts.pop('clip', None)
             if not isinstance(damping, int | float) or not (clip is None or isinstance(clip, int | float)):
                 raise ValueError(f"Gauss-Newton's damping and clip are numbers, got {damping!r} and {clip!r}")
@@ -2037,15 +2272,18 @@ class OptimConfig:
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
                 grouped = {**opts, **decay}
-                spared = {'mask': weight_decay_mask} if group.spared and self._spares(make) else {}
+                spared = ({'mask': weight_decay_mask} if group.spared and self.optimizer.spares()
+                          else _decay_masked(group.decay_mask, self.optimizer))
                 solvers[group.name] = group.solver(make, self.rate, steps, {**grouped, **spared},
                                                    clocked=clocked, stated=stated)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
             if solved is not None:
                 solver = optax.chain(solved, solver)
         else:
-            if self.spared and self._spares(make):
+            if self.spared and self.optimizer.spares():
                 opts['mask'] = weight_decay_mask
+            else:
+                opts.update(_decay_masked(self.decay_mask, self.optimizer))
             solver = scheduled_solver(make, self.rate, steps, opts, clocked=clocked, stated=stated)
 
         if self.clip_grads > 0:
@@ -2063,19 +2301,7 @@ class OptimConfig:
         `train/update_flops` beside the model's `train/flops`: Muon's Newton-Schulz products over each matrix
         it orthogonalizes (`muon_update_flops`), at the iterations its coefficients hold (a schedule's rows);
         None for any other optimizer, whose update multiplies no matrices."""
-        if self.optimizer not in ('muon', 'muonclip'):
-            return None
-        opts = self.optimizer_opts
-        steps, per_head = opts.get('ns_steps', 5), opts.get('per_head')
-        if not isinstance(steps, int) or not (per_head is None or isinstance(per_head, Mapping)):
-            raise TypeError(f"Muon's ns_steps is a count and per_head a mapping, got {steps!r}, {per_head!r}")
-        table = _coefficients(opts.get('ns_coeffs', NEWTON_SCHULZ), steps)
-        return muon_update_flops(params, steps if table.ndim == 1 else table.shape[0], per_head)
-
-    def _spares(self, make: Callable[..., optax.GradientTransformation]) -> bool:
-        """Whether the optimizer's decay takes timm's split (`weight_decay_mask`): a factory that takes a
-        decay mask, and never Muon, which decays every parameter it updates as Moonlight does."""
-        return self.optimizer not in ('muon', 'muonclip') and 'mask' in inspect.signature(make).parameters
+        return self.optimizer.update_flops(params) if isinstance(self.optimizer, Muon) else None
 
     def fresh_groups(self) -> tuple[ParamGroup, ...]:
         """The groups a run takes that draws modules fresh beside a loaded base: its own where one claims
@@ -2097,10 +2323,13 @@ class OptimConfig:
         taken = {group.name for group in named}
         names = itertools.chain(("fresh",), (f"fresh{index}" for index in itertools.count(1)))
         name = next(name for name in names if name not in taken)
-        # The fresh group decays as the run's ungrouped optimizer would.
-        fresh = ParamGroup(name, fresh=True, learning_rate_multiplier=multiplier, spared=self.spared)
+        # The fresh group decays as the run's ungrouped optimizer would, its mask among it; an optimizer that
+        # spares nothing (Muon) spares none of a group's either.
+        spared = self.spared and self.optimizer.spares()
+        fresh = ParamGroup(name, fresh=True, learning_rate_multiplier=multiplier, spared=spared,
+                           decay_mask=self.decay_mask)
         if not named:
-            return fresh, ParamGroup("base", ("*",), spared=self.spared)
+            return fresh, ParamGroup("base", ("*",), spared=spared, decay_mask=self.decay_mask)
         at = next((index for index, group in enumerate(named) if "*" in group.patterns), len(named))
         return (*named[:at], fresh, *named[at:])
 
@@ -2116,7 +2345,9 @@ class OptimConfig:
                           for group in self.param_groups):
             return self
         groups = self.fresh_groups() if claims else self.param_groups
-        return dataclasses.replace(self, param_groups=groups).with_fresh(modules, leaves)
+        # An ungrouped decay's mask moves into the groups it is now (`fresh_groups`).
+        masked = None if claims else self.decay_mask
+        return dataclasses.replace(self, param_groups=groups, decay_mask=masked).with_fresh(modules, leaves)
 
     def with_fresh(self, modules: Sequence[str], leaves: Sequence[str] = ()) -> OptimConfig:
         """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the
@@ -2174,15 +2405,24 @@ class OptimConfig:
 
 __all__ = [
     "NEWTON_SCHULZ",
+    "Adam",
+    "AdamW",
     "BoundsState",
     "Cosine",
     "DeltaState",
     "Exponential",
+    "GaussNewton",
+    "LaProp",
+    "Lamb",
     "Linear",
     "M3GivenState",
     "M3State",
+    "Muon",
+    "MuonClip",
     "OneCycle",
+    "Optax",
     "OptimConfig",
+    "OptimizerSpec",
     "ParamGroup",
     "Power",
     "PowerProfilesState",

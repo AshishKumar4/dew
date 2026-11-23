@@ -50,11 +50,11 @@ from dew.nn.kernels import options
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
-from dew.optim import OptimConfig
+from dew.optim import Muon, Optax, OptimConfig
 from dew.registry import mixers
 from dew.state import TrainState, apart
 from dew.telemetry.compiles import Compiles
-from dew.training import Trainer
+from dew.training import FitPolicy, Trainer, UpdateBatch
 from dew.training.compiler import UNPLACED_REFUSED
 from dew.training.distributed import microbatch
 from dew.training.memory import (
@@ -286,7 +286,8 @@ def test_a_step_whose_rows_an_explicit_axis_types_is_read_whole():
                               max_seq_len=SEQ)
     spec = MeshSpec(explicit=("data",))
     with pytest.raises(ValueError):
-        Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0), split=2, mesh=spec)
+        Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+                fit=FitPolicy(split=2), mesh=spec)
     trainer = Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0), mesh=spec)
     assert splits(None, BATCH, MeshSpec().build(jax.devices()[:1]), 1, trainer._shape.split) == [1]
 
@@ -304,11 +305,15 @@ class Counted(LMObjective):
         return super().loss(variables, batch, step)
 
 
-def lm(split=None, accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, layers=1, vocab=64, **fields):
+def lm(split="auto", accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, layers=1, vocab=64,
+       policy="auto", **fields):
+    """A tiny LM's trainer on one device: its step's batch read in `split` microbatches, `accumulation`
+    steps an update, recomputing as its fit `policy` asks (`FitPolicy.remat`), its model's `fields` given."""
     model = CausalTransformer(vocab_size=vocab, emb_features=width, num_layers=layers, num_heads=2,
                               mlp_features=2 * width, max_seq_len=seq, **fields)
     return one_device(Trainer(objective(model, seq_len=seq), optax.sgd(1e-2), key=jax.random.key(0),
-                              split=split, accumulation=accumulation))
+                              update=UpdateBatch(batches=accumulation),
+                              fit=FitPolicy(split=split, remat=policy)))
 
 
 def test_a_step_whose_optimizer_state_is_a_class_made_in_its_factory_plans_and_steps():
@@ -365,7 +370,7 @@ def test_a_second_trainer_whose_step_calls_another_host_callback_runs_its_own():
 
     def run(scale: float):
         return one_device(Trainer(LMObjective(model, seq_len=SEQ), scaled_on_the_host(scale),
-                                  key=jax.random.key(0), split=1))
+                                  key=jax.random.key(0), fit=FitPolicy(split=1)))
 
     once, twice = (trained(run(scale), steps=1) for scale in (1.0, 2.0))
     # From one start over one batch: the second's step at its own rate lands elsewhere.
@@ -1087,8 +1092,9 @@ def regression_fit(x, directory, split: int, steps: int):
                    loading=Loading(workers=0, threads=1, read_buffer=1))
     # The optimizer stated as a config, which keys the step, so each seed's fits read the step the first
     # traced (`Trainer._step_key`).
-    trainer = one_device(Trainer(Regression(), OptimConfig(optimizer="optax:sgd", learning_rate=0.1),
-                                 key=jax.random.key(0), split=split, checkpoints=Checkpoints(str(directory))))
+    trainer = one_device(Trainer(Regression(), OptimConfig(optimizer=Optax('optax:sgd'), learning_rate=0.1),
+                                 key=jax.random.key(0), fit=FitPolicy(split=split),
+                                 checkpoints=Checkpoints(str(directory))))
     return trainer.fit(data, steps=steps, checkpoint_every=2).variables["params"]
 
 
@@ -1262,7 +1268,7 @@ def windowed(directory, split, remat=None, objective=LMObjective, accumulation=1
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
                               max_seq_len=8, remat=remat)
     return one_device(Trainer(objective(model, seq_len=4), optax.adam(1e-2), key=jax.random.key(0),
-                              split=split, accumulation=accumulation,
+                              update=UpdateBatch(batches=accumulation), fit=FitPolicy(split=split),
                               layout=Layout(min_shard=1, tolerance=1.0),
                               checkpoints=Checkpoints(str(directory / "run"))))
 
@@ -1276,7 +1282,7 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
     corpus = token_files(tmp_path)
     expected = windowed(tmp_path / "whole", 2).fit(windows(corpus), steps=4, checkpoint_every=2)
     windowed(tmp_path / "split", 2).fit(windows(corpus), steps=2, checkpoint_every=2)
-    resumed = windowed(tmp_path / "split", None)
+    resumed = windowed(tmp_path / "split", "auto")
     actual = resumed.fit(windows(corpus), steps=4, checkpoint_every=2)
     assert resumed.plan["split"] == 2
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
@@ -1305,7 +1311,7 @@ def test_a_resumed_run_continues_its_admitted_plan_without_timing(tmp_path, monk
     first = run(1)
     first.fit(windows(corpus), steps=2, checkpoint_every=2)
     assert first.plan["remat"] is None
-    resumed = run(None)
+    resumed = run("auto")
     resumed.fit(windows(corpus), steps=4, checkpoint_every=2)
     assert (resumed.plan["split"], resumed.plan["remat"]) == (first.plan["split"], first.plan["remat"])
 
@@ -1734,7 +1740,7 @@ def test_a_run_trains_only_its_requested_steps_without_timing_a_frontier(monkeyp
     corpus, whole = token_files(tmp_path), windowed(tmp_path / "whole", 1)
     free(monkeypatch, needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1,
                                                                   checkpoint_every=None)) - 1)
-    trainer = windowed(tmp_path / "timed", None)
+    trainer = windowed(tmp_path / "timed", "auto")
     with Compiles("step") as compiles:
         state = trainer.fit(windows(corpus), steps=3, checkpoint_every=None)
     assert compiles.count == len(trainer.plan["probes"])
@@ -1975,6 +1981,70 @@ def test_a_run_that_sets_its_remat_compiles_its_step_once(monkeypatch, tmp_path)
     assert trainer.plan["remat"] == "full" and trainer.objective.model.remat == REMAT_POLICIES["full"]
 
 
+def test_a_runs_fit_policy_sets_what_its_step_recomputes_for_every_module(monkeypatch):
+    """A run's fit policy states its remat for every module its model states none of (`FitPolicy.remat`):
+    "full" compiles one step at each module's whole recomputation, the top of its ladder; "none" one that
+    recomputes nothing; a model that states its own remat beside a policy that states one is refused as
+    its trainer is built (row 11934), and a later phase's planner over the objective its climb left, its
+    model stating the policy's remat, plans on (`dew.training.ahead`; Train 1229's review: refused, every
+    later phase compiled on the loop)."""
+    from dew.training.compiler import StepCompiler
+    from dew.training.phase_passes import PhasePasses
+
+    free(monkeypatch, LIMIT)
+    full, none = lm(split=1, policy="full"), lm(split=1, policy="none")
+    with Compiles("step") as compiles:
+        trained(full, steps=0)
+        trained(none, steps=0)
+    assert compiles.count == 2
+    assert full.plan["remat"] == "full" and full.objective.model.remat == REMAT_POLICIES["full"]
+    assert none.plan["remat"] is None and none.objective.model.remat is None
+    with pytest.raises(ValueError):
+        lm(policy="none", remat=REMAT_POLICIES["minimal"])
+    planner = StepCompiler(full.objective, None, None, PhasePasses(full.objective), "full")
+    assert planner.remat == "full"
+
+
+def test_a_run_of_one_remat_takes_no_plan_a_run_of_another_recorded(monkeypatch, tmp_path):
+    """Plans recorded beside the compilation cache are a fit policy's own (`rung_key`): a run of "auto"
+    whose devices hold too little for its step at no recomputation records a plan that recomputes, and a
+    run of "none" over the same step after it, given the room for none, plans its own at no recomputation,
+    where it read the first's and was refused it (review of row 11934)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    plain, recomputing = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=1, policy="full"))
+    assert recomputing < plain, (recomputing, plain)
+    free(monkeypatch, (plain + recomputing) // 2)
+    tight = lm(split=1)
+    trained(tight, steps=0)
+    assert tight.plan["remat"] is not None, tight.plan
+    options.unhold()
+    free(monkeypatch, LIMIT)
+    none = lm(split=1, policy="none")
+    trained(none, steps=0)
+    assert none.plan["remat"] is None and none.objective.model.remat is None
+
+
+def test_a_checkpoints_shape_rung_its_run_s_remat_policy_refuses_is_not_climbed_to(monkeypatch):
+    """A checkpoint whose run's own rung recomputes nothing and whose shape's rung climbed (a step that did
+    not fit), resumed by a run whose fit policy recomputes nothing (`FitPolicy(remat="none")`): its own rung
+    is taken and its shape's, which the policy refuses, is not, each judged against the objective as the
+    run authored it, so the step compiles recomputing nothing (review of API01: the shapes' rungs were read
+    unjudged)."""
+    plain, recomputing = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=1, policy="full"))
+    assert recomputing < plain, (recomputing, plain)
+    free(monkeypatch, (plain + recomputing) // 2)
+    tight = lm(split=1)
+    trained(tight, steps=0)
+    climbed = tight._compiler.checkpoint_rung()
+    assert tight.plan["remat"] is not None and climbed["shapes"], tight.plan
+    options.unhold()
+    free(monkeypatch, LIMIT)
+    none = lm(split=1, policy="none")
+    none._compiler.resume_rung({**none._compiler.rung(), "shapes": climbed["shapes"]})
+    trained(none, steps=0)
+    assert none.plan["remat"] is None and none.objective.model.remat is None, none.plan
+
+
 def test_a_fits_start_traces_its_loss_once_for_its_fit_check_and_its_plan(monkeypatch):
     """A fit's check of the whole state its steps keep (`Trainer._whole_validated`) and its plan's
     candidates read one trace of its loss's shapes (`StepCompiler.loss_shaped`): a CPU start traced it
@@ -1994,8 +2064,9 @@ def muon_lm(remat: str | None = None, **opts) -> Trainer:
     given."""
     model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=4, num_heads=2, mlp_features=256,
                               max_seq_len=SEQ, **({} if remat is None else {"remat": REMAT_POLICIES[remat]}))
-    config = OptimConfig(optimizer="muon", learning_rate=1e-2, optimizer_opts=opts)
-    return one_device(Trainer(LMObjective(model, seq_len=SEQ), config, key=jax.random.key(0), split=1))
+    config = OptimConfig(optimizer=Muon(**opts), learning_rate=1e-2)
+    return one_device(Trainer(LMObjective(model, seq_len=SEQ), config, key=jax.random.key(0),
+                              fit=FitPolicy(split=1)))
 
 
 def fitted_once(trainer: Trainer) -> None:

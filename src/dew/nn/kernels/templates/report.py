@@ -1655,7 +1655,7 @@ an instruction no device run has tuned yet (config_assigner.cc's NotFound, sort_
 
 class Untuned(RuntimeError):
     """A compile without a device for a device to run (`for_devices`: a job's prepare,
-    `dew.training.ahead.AheadTarget`) met an instruction no device run has tuned yet (`UNTUNED`): the
+    `dew.training.targets.AheadTarget`) met an instruction no device run has tuned yet (`UNTUNED`): the
     program (`lowered`) is not preparable until one has, and its run compiles it on the device,
     which tunes it for the next. No memory refusal: the plan's search stops at it."""
 

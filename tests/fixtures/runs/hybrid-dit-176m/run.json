@@ -36,22 +36,41 @@
       "wrappers": []
     },
     "data_seed": 0,
+    "diagnostics": {
+      "kernels": {},
+      "links": {},
+      "tune_kernels": false,
+      "xla_flags": null
+    },
+    "data_plan_version": 8,
     "source": {
       "text_only": false,
       "prediction_depths": null,
       "attention": null,
-      "dex": null
+      "dex": null,
+      "scan_layers": false,
+      "packed_weights": false,
+      "param_dtype": null,
+      "step": null,
+      "ema": null
     },
     "optim": {
-      "optimizer": "adamw",
-      "optimizer_opts": {},
+      "optimizer": {
+        "class": "dew.optim:AdamW",
+        "fields": {
+          "b1": 0.9,
+          "b2": 0.999,
+          "eps": 1e-08,
+          "eps_root": 0.0,
+          "weight_decay": 0.0001,
+          "nesterov": false,
+          "state_dtype": "float32"
+        }
+      },
       "learning_rate": 0.0001,
-      "weight_decay": null,
-      "b1": null,
-      "b2": null,
+      "spared": true,
       "param_groups": [],
       "clip_grads": 0.0,
-      "state_dtype": "float32",
       "forced_weight_normalization": false,
       "ema_profiles": []
     },
@@ -60,13 +79,17 @@
       "checkpoint_dir": "run",
       "keep": 1,
       "resume": "auto",
+      "data_resume": "relaxed",
+      "skip_nonfinite": false,
       "best": null,
-      "update_tokens": null,
       "key": 0,
-      "steps": 1350000,
-      "epochs": null,
-      "tokens": null,
-      "examples": null,
+      "horizon": {
+        "steps": 1350000,
+        "epochs": null,
+        "tokens": null,
+        "examples": null,
+        "max_tokens": null
+      },
       "stop": null,
       "restore_best": false,
       "cooldowns": null,
@@ -77,8 +100,14 @@
       "local_directory": null,
       "local_every": null,
       "scored_to": null,
-      "accumulation": 1,
-      "split": null,
+      "update": {
+        "batches": null,
+        "tokens": null
+      },
+      "fit": {
+        "split": "auto",
+        "remat": "auto"
+      },
       "batch_ramp": null,
       "precision": {
         "dtypes": {
@@ -87,7 +116,9 @@
           "output": "float32"
         },
         "matmul": "default",
-        "forms": "fast"
+        "forms": "fast",
+        "low_precision": null,
+        "loss_scaling": "auto"
       },
       "mesh": {
         "fsdp": 1,
@@ -96,169 +127,19 @@
         "sequence": 1,
         "stage": 1,
         "replicas": 1,
+        "diloco": 1,
         "explicit": []
       },
-      "microbatches": null,
-      "layout": {
-        "rules": [
-          [
-            "vocab",
-            [
-              "fsdp",
-              "tensor"
-            ]
-          ],
-          [
-            "mlp",
-            "tensor"
-          ],
-          [
-            "mlp",
-            "fsdp"
-          ],
-          [
-            "modulation",
-            "fsdp"
-          ],
-          [
-            "attention",
-            "tensor"
-          ],
-          [
-            "attention",
-            "fsdp"
-          ],
-          [
-            "linear",
-            "fsdp"
-          ],
-          [
-            "embed",
-            "fsdp"
-          ],
-          [
-            "head_dim",
-            "fsdp"
-          ],
-          [
-            "heads",
-            [
-              "fsdp",
-              "tensor"
-            ]
-          ],
-          [
-            "kv",
-            [
-              "fsdp",
-              "tensor"
-            ]
-          ],
-          [
-            "index",
-            "fsdp"
-          ],
-          [
-            "kvlora",
-            "fsdp"
-          ],
-          [
-            "qlora",
-            "fsdp"
-          ],
-          [
-            "output",
-            "fsdp"
-          ],
-          [
-            "exp",
-            "expert"
-          ],
-          [
-            "heads",
-            "tensor"
-          ],
-          [
-            "kv",
-            "tensor"
-          ],
-          [
-            "activation_batch",
-            [
-              "data",
-              "expert",
-              "fsdp"
-            ]
-          ],
-          [
-            "activation_length",
-            "sequence"
-          ],
-          [
-            "activation_spread",
-            [
-              "sequence",
-              "tensor"
-            ]
-          ],
-          [
-            "activation_spread",
-            "sequence"
-          ],
-          [
-            "activation_heads",
-            "tensor"
-          ],
-          [
-            "activation_kv",
-            "tensor"
-          ],
-          [
-            "activation_mlp",
-            "tensor"
-          ],
-          [
-            "activation_vocab",
-            "tensor"
-          ],
-          [
-            "pages",
-            [
-              "data",
-              "expert",
-              "fsdp"
-            ]
-          ],
-          [
-            "activation_batch",
-            [
-              "data",
-              "expert"
-            ]
-          ],
-          [
-            "activation_batch",
-            "data"
-          ]
-        ],
-        "min_shard": 65536,
-        "tolerance": 0.02,
-        "host": [],
-        "host_parameters": [],
-        "frozen_whole": false,
-        "data_axes": []
-      },
+      "layout": null,
       "profile": null,
+      "run_profile": null,
       "compilation_cache_dir": null,
       "wandb": null,
-      "publish": false,
       "multi_host": null,
-      "xla_flags": null,
       "quantization": null,
-      "lower_for": null,
-      "compile_ahead": null,
       "ahead": null,
-      "tune_kernels": false
+      "inspection": null,
+      "diloco": null
     },
     "objective": {
       "name": "dew.objectives.diffusion.objective:DiffusionObjective",
@@ -289,6 +170,9 @@
         "unconditional_prob": 0.12
       },
       "defaults": {
+        "autoencoder": "omitted",
+        "variables": "omitted",
+        "grid": "omitted",
         "process": null,
         "inputs": null,
         "uncertainty": null,
@@ -298,7 +182,7 @@
     },
     "lora": null,
     "val_metrics": [],
-    "val_every": {},
+    "suites": {},
     "val_summaries": [],
     "preset": {
       "class": "dew.diffusion.presets:EDM",
@@ -370,7 +254,9 @@
         "worker_buffer": 2,
         "ram_budget_mb": null,
         "max_workers": null,
-        "cache": true
+        "cache": true,
+        "host": null,
+        "warn_over": 0.01
       },
       "stages": [
         {
@@ -378,7 +264,8 @@
           "fields": {
             "seed": 0,
             "window": null,
-            "block_shards": null
+            "block_shards": null,
+            "streamed": null
           }
         },
         {
@@ -459,7 +346,9 @@
         "worker_buffer": 2,
         "ram_budget_mb": null,
         "max_workers": null,
-        "cache": true
+        "cache": true,
+        "host": null,
+        "warn_over": 0.01
       },
       "stages": [
         {
@@ -480,5 +369,7 @@
         }
       ]
     }
-  }
+  },
+  "layout_unsettable": true,
+  "additive_unsettable": true
 }

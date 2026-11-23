@@ -148,9 +148,9 @@ class DiffusionRunConfig(RunConfig):
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig(
         "diffusion", {"solver": to_record(EulerAncestral(), Solver)}))
     """The objective and its arguments: the denoising loss (`diffusion`) with its
-    EMA, condition dropout and validation sampling (`--objective.ema-decay`,
-    `--objective.guidance`, `--objective.steps`), or a loss of its own in its
-    place, as `--objective mean_flow --objective.omega 2` or `--objective rcm
+    EMA, condition dropout and validation sampling (its `ema_decay`,
+    `guidance` and `steps` fields), or a loss of its own in its
+    place, as `ObjectiveConfig("mean_flow", {"omega": 2})` or `ObjectiveConfig("rcm"
     --teacher-run runs/teacher`. Each objective refuses a preset or a
     guidance its loss cannot train or sample with.
     """
@@ -189,7 +189,7 @@ class DiffusionRunConfig(RunConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
-            raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
+            raise ValueError(f"the objective {self.objective.name} trains no diffusion model")
         from dew.objectives.rl.flow import FlowGRPOObjective
         from dew.objectives.rl.nft import DiffusionNFTObjective
 
@@ -197,7 +197,7 @@ class DiffusionRunConfig(RunConfig):
         if flow and self.rollout is None:
             object.__setattr__(self, "rollout", FlowRolloutConfig())
         if not flow and self.rollout is not None:
-            raise ValueError(f"--rollout configures a flow RL run's rollout, and --objective "
+            raise ValueError(f"--rollout configures a flow RL run's rollout, and the objective "
                              f"{self.objective.name} trains on its data")
 
         if self.pretrained is not None:

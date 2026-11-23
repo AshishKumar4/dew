@@ -12,7 +12,7 @@ import logging
 import os
 import re
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Annotated, Self
+from typing import TYPE_CHECKING, Annotated
 
 import tyro
 
@@ -32,12 +32,12 @@ from dew.nn.precision import Numerics, numerics_of
 from dew.nn.sharding import Link
 from dew.quantization import Quantization
 from dew.registry import from_record, record_argument, to_record
-from dew.training.ahead import AheadTarget
-from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
+from dew.training.budget import Horizon, Pause, Plateau, budget_tokens, run_steps
 from dew.training.cadence import Counted
 from dew.training.cooldown import Cooldowns
 from dew.training.diloco import DiLoCo
 from dew.training.inspection import Inspection
+from dew.training.policy import FitPolicy, UpdateBatch
 from dew.training.profiling import ProfileWindow, RunProfile
 from dew.training.selection import Best
 from dew.training.tracker import Wandb
@@ -139,6 +139,46 @@ def _cadence_argument(*, timed: bool = True):
 
 
 @dataclasses.dataclass(frozen=True)
+class Diagnostics:
+    """What a run pins of how its programs run, apart from what it trains and how: each op's kernel, the
+    links of its split axes, the measuring of its launches and extra XLA flags, set where a run diagnoses or
+    measures, every one derived where it states none (`RunConfig.diagnostics`, `--diagnostics.*`)."""
+
+    kernels: dict[str, str] = dataclasses.field(default_factory=dict)
+    """The kernel the run runs for each op it names (`dew.kernels.use`, ops `dew.kernels.choices`), for
+    every program it traces, its steps', evaluations' and samples' (`RunConfig.traced`):
+    `--diagnostics.kernels attention xla`. None named, each op's pick for its call (row 4649)."""
+    links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
+        default_factory=dict)
+    """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
+    measures them as they are or should not: a step spreads an axis's projections as its stated link
+    would, `--diagnostics.links '{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`.
+    Unnamed, an axis's link is measured on its devices, and on compile-only ones none is: a step
+    compiled ahead compiles with these and records them (`AheadOfTime.links`)."""
+    tune_kernels: bool = False
+    """Measure each Pallas launch of the step that has no config measured on this GPU.
+
+    Only a process with the GPU to itself measures, and the picks persist beside
+    the compilation cache for every later run that sets it too, each pick read for
+    its own launch alone. It measures each of Dew's own launches that declares
+    variants to time (the kernel templates, `attention_impl="template"`, the norms,
+    SwiGLU and decode attention); tokamax's flash kernel (`"triton"`) runs at
+    tokamax's heuristic config, unmeasured.
+    Unset, nothing is measured or read: every launch takes the config it derives
+    from the GPU's facts (row 4837).
+    """
+    xla_flags: str | None = None
+    """Extra XLA_FLAGS for this run, appended to the environment by `prepare_process`.
+
+    `dew train` sets them in XLA_FLAGS before the process loads jaxlib, so they hold
+    for every runtime XLA loads (`dew._devices.hold_xla_flags`); `prepare_process`
+    appends them before JAX opens a backend, unproven where jaxlib has loaded.
+    Library users set XLA_FLAGS before the process starts to make them certain;
+    docs/performance.md records what was measured.
+    """
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainerConfig:
     """Holds the run length, checkpointing, sharding and run tracking."""
 
@@ -159,29 +199,12 @@ class TrainerConfig:
     formed and the run stops at its next log, naming it (training.md, a step that is not finite)."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
-    update_tokens: int | None = None
-    """The optimizer update's token budget, a whole number of the data's token batches (its batch stage's
-    `TokenBudget`), which sets the run's accumulation (`RunConfig.train`)."""
     key: int = 0
     """The seed of the run key, which sets parameter init and every per-step draw."""
-    steps: int | None = None
-    epochs: int | None = None
-    """The run length as passes over the data; `steps` sets it directly instead."""
-    tokens: int | None = None
-    """Stop after the loss has scored this many targets across all microbatches, including before a
-    resume.
-
-    Counts the tokens committed updates trained on, reported as `train/committed_tokens`, without
-    padding. The final
-    microbatch may cross the budget. With `steps`, `epochs` or `examples`, the
-    first cap reached ends the run. A token-only run needs a constant learning
-    rate or a schedule with its own explicit step horizon.
-    """
-    examples: int | None = None
-    """The run length as the first this many source examples of the data, each read once with every
-    row it makes: the records the chain makes in its own order, counted before they are packed and
-    before an objective makes several rows of one (a decision layout's row a question)
-    (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
+    horizon: Horizon = dataclasses.field(default_factory=Horizon)
+    """How long the run trains, named once (`dew.training.budget.Horizon`): `--trainer.horizon.steps 2000`,
+    `--trainer.horizon.epochs 3`, `--trainer.horizon.tokens 1e9` or `--trainer.horizon.examples 50000`;
+    unnamed, as long as its data."""
     stop: (Annotated[Pause, tyro.conf.subcommand("pause")]
            | Annotated[Plateau, tyro.conf.subcommand("plateau")] | None) = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
@@ -229,16 +252,18 @@ class TrainerConfig:
     """A directory that takes every validation batch's scoring artifacts at each evaluation, a decision
     run's decisions among them, as `<scored_to>/step-<step>/<split>-<batch>.npz`, for pooling a pass's
     metrics offline (`Trainer.fit`'s `scored_to`); None writes none."""
-    accumulation: int = 1
-    """The number of steps per optimizer update."""
-    split: int | None = None
-    """The microbatches each step's batch is read in, its rows split evenly.
-
-    None lets the trainer plan it from the compiled step's memory: the
-    fewest that fit the devices before it recomputes anything, at the least
-    recomputation that fits (`Trainer.compile`). A step's tokens and the
-    update's stay as configured either way; only the microbatch shrinks.
-    """
+    update: UpdateBatch = dataclasses.field(default_factory=UpdateBatch)
+    """One optimizer update's size (`dew.training.UpdateBatch`): the steps of the data's batch it pools,
+    `--trainer.update.batches 4`, or the tokens it trains on, `--trainer.update.tokens 524288`, a whole
+    number of the data's token batches (`Dataset.batch(tokens=)`); unset, one batch."""
+    fit: FitPolicy = dataclasses.field(default_factory=FitPolicy)
+    """How the step fits the devices (`dew.training.FitPolicy`): the microbatches each step's batch is read
+    in, `--trainer.fit.split 4`, and what it recomputes, `--trainer.fit.remat selective`; each "auto", the
+    planner's choice, by default: the fewest microbatches that fit the devices before it recomputes
+    anything, at the least recomputation that fits (`Trainer.compile`); and under a mesh of pipeline stages
+    the microbatches each of those feeds through them, `--trainer.fit.microbatches 8`, a multiple of the
+    stages, one a stage unset. A step's tokens and the update's stay as configured either way; only the
+    microbatch shrinks."""
     batch_ramp: Ramp | None = None
     """A ramp that grows `batch_size` over the run's first records instead of starting there.
 
@@ -247,10 +272,6 @@ class TrainerConfig:
     way there is one optimizer update a step, and the compiled step is traced
     once per stage.
     """
-    dynamic_scale: bool | None = None
-    """Whether the run scales its loss dynamically (`flax.training.dynamic_scale.DynamicScale`): None
-    for a float16 compute's alone, which needs it (`RunConfig.built`); a run states True or False to
-    choose, as a run saved before its numerics records the one it trained under."""
     precision: Annotated[Numerics, _numerics_argument()] = dataclasses.field(default_factory=Numerics)
     """The run's numerics, set once and recorded with it (`dew.nn.precision.Numerics`; `ACCURATE` for
     scientific runs): its dtypes by Lightning's names, its products' precision by JAX's levels and its
@@ -258,13 +279,10 @@ class TrainerConfig:
     (`dew.nn.kernels.generation.run_precision`). Its compute dtype is the model's where the model's
     record states none (`RunConfig.numerics_fields`), its parameters' a loaded checkpoint's storage, and
     a float16 compute scales the loss (`RunConfig.built`). The optimizer's moments are a storage format
-    of their own (`OptimConfig.state_dtype`: float32 under any weights, bfloat16 stochastically rounded,
+    of their own (`dew.optim.Adam.state_dtype`: float32 under any weights, bfloat16 stochastically rounded,
     int8 blockwise). A dtype or precision the model states still wins, and a resumed run traces under
     the numerics it records."""
     mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
-    microbatches: int | None = None
-    """Microbatches a pipelined step feeds through the mesh's stages, a
-    multiple of `mesh.stage`; unset feeds one a stage."""
     layout: Annotated[Layout, tyro.conf.subcommand("layout")] | None = None
     """The layout the run's trainer is given (`Trainer`'s `layout`): unset, the layout chooser decides
     (`dew.training.streaming.laid_start`); stated, as `--trainer.layout.min-shard 8`, its own, the device
@@ -290,24 +308,14 @@ class TrainerConfig:
     wandb: Wandb | None = None
     """An optional W&B telemetry sink, in addition to the local tracking journal.
 
-    Scalars, records and objective previews are tracked; checkpoints are not uploaded.
+    Scalars, records and objective previews are tracked; the final checkpoint is uploaded where it says
+    so (`Wandb.publish`), and nothing else.
     """
-    publish: bool = False
-    """Publish the final checkpoint to W&B; requires `wandb`, online, and `checkpoint_final`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
 
     None tries, and continues alone only when no cluster is configured; True
     requires the pool; False never joins.
-    """
-    xla_flags: str | None = None
-    """Extra XLA_FLAGS for this run, appended to the environment by `prepare_process`.
-
-    `dew train` sets them in XLA_FLAGS before the process loads jaxlib, so they hold
-    for every runtime XLA loads (`dew._devices.hold_xla_flags`); `prepare_process`
-    appends them before JAX opens a backend, unproven where jaxlib has loaded.
-    Library users set XLA_FLAGS before the process starts to make them certain;
-    docs/performance.md records what was measured.
     """
     quantization: Quantization | None = None
     """The quantized-training spec, wrapped around the module the objective trains.
@@ -316,50 +324,14 @@ class TrainerConfig:
     the compute dtype. `dew.quantization` describes what the wrapper does
     and what it keeps.
     """
-    lower_for: str | None = None
-    """Check the run's step for a GPU on any host, a CPU too, then exit without training.
-
-    `--trainer.lower-for sm80` (or sm75, sm86, sm89, sm90, sm120) builds the run
-    as it would, traces its first step as on a GPU of that CUDA generation, with
-    every kernel choice and refusal that GPU makes, and lowers it for CUDA,
-    each of its Pallas kernels to Triton. A kernel that would fail the GPU's
-    first compile there fails here, in seconds and without the GPU; XLA's
-    compile of the whole step still needs one. The program exits with status
-    0 once the step lowers, and opens no W&B run. A TPU topology's step compiles ahead
-    (`compile_ahead`).
-    """
-    compile_ahead: Annotated[AheadTarget, tyro.conf.subcommand("ahead")] | None = None
-    """Compile the run's first step for GPUs this host lacks, save it, then exit without training.
-
-    `--trainer.compile-ahead.generation sm90 --trainer.compile-ahead.devices 8
-    --trainer.compile-ahead.path step.dew-aot` builds the run as it would over eight compile-only
-    H100s (`dew.training.ahead`), compiles its first step there with XLA's CUDA compiler, which needs
-    the CUDA plugin and no GPU, and writes it with what it costs: each device's peak bytes and the
-    step's FLOPs, read before booking the GPUs. The program exits with status 0, and writes no
-    checkpoint or tracking. A TPU topology compiles the same way on any host that holds libtpu, as
-    MaxText's train_compile does: `--trainer.compile-ahead.generation v5e:4x4
-    --trainer.compile-ahead.devices 16`, the step loading on a host of that topology alone.
-
-    `--trainer.compile-ahead.capacity-gib 80` states each GPU's memory, and the run's own fit search
-    then plans the step there as a run would, its log and the saved step naming every program it
-    compiled, each with the bytes derived for it beside XLA's, and the plan it took, with the seconds
-    planning took. A run with its remat set compiles at that remat alone, and is told of no other;
-    this is how to ask what fits beside it: compile it ahead once at each remat policy its model
-    takes (the model's `remat` field) and compare the plans.
-
-    Such a file is XLA's untuned program for those GPUs, which a run handed it does not run: it compiles
-    its own step (`AheadOfTime.runnable`). A file a run takes is compiled over the GPU host's own
-    topology, `--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY`, with that host's compilation cache
-    once a run there has tuned the step: it takes each tuned choice the run left there, or is refused.
-    """
     ahead: str | None = None
-    """Run the step `compile_ahead` saved at this path as the run's first step, in place of compiling it.
+    """Run the step `RunConfig.lower` saved at this path as the run's first step, in place of compiling it.
 
     The run lowers its first step as it would and runs the saved executable where that is the same
     program, on a host of the topology it was compiled for; another program, from another config,
     data shape, Dew or a plan recorded for another rung, is refused before the run trains. A file
     compiled without its GPU kind's tuned choices (one compiled for a generation's canonical GPUs) is
-    not run: the run compiles its own step, said once (`compile_ahead`).
+    not run: the run compiles its own step, said once (`AheadTarget`).
     """
     inspection: Annotated[Inspection, tyro.conf.subcommand("inspect")] | None = None
     """What the run watches at its sampled steps (`dew.training.inspection.Inspection`): parameter paths by
@@ -369,60 +341,22 @@ class TrainerConfig:
     """DiLoCo over the mesh's diloco groups (`--trainer.mesh.diloco`, `dew.training.diloco.DiLoCo`): every
     `--trainer.diloco.every` windows of updates the groups' copies are averaged into the outer model, by
     Nesterov SGD at `--trainer.diloco.rate` with `--trainer.diloco.momentum`; unset, one copy trains."""
-    links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
-        default_factory=dict)
-    """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
-    measures them as they are or should not: a step spreads an axis's projections as its stated link
-    would, `--set trainer.links='{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`.
-    Unnamed, an axis's link is measured on its devices, and on compile-only ones none is: a step
-    compiled ahead compiles with these and records them (`AheadOfTime.links`)."""
-    tune_kernels: bool = False
-    """Measure each Pallas launch of the step that has no config measured on this GPU.
-
-    Only a process with the GPU to itself measures, and the picks persist beside
-    the compilation cache for every later run that sets it too, each pick read for
-    its own launch alone. It measures each of Dew's own launches that declares
-    variants to time (the kernel templates, `attention_impl="template"`, the norms,
-    SwiGLU and decode attention); tokamax's flash kernel (`"triton"`) runs at
-    tokamax's heuristic config, unmeasured.
-    Unset, nothing is measured or read: every launch takes the config it derives
-    from the GPU's facts (row 4837).
-    """
-
-    def accumulating(self, dataset: Loader) -> Self:
-        """This config with the accumulation its token budget sets over `dataset`'s token batches, every
-        phase's alike (`Loader.token_batches`): `update_tokens` a whole number of them. Raises ValueError for
-        rows, no whole number, phases of other token batches or an accumulation set otherwise."""
-        if self.update_tokens is None:
-            return self
-        if len(set(dataset.token_batches)) > 1:
-            raise ValueError(f"--trainer.update-tokens sets one accumulation; the phases batch "
-                             f"{list(dataset.token_batches)} tokens: batch alike or set the accumulation")
-        if dataset.batch_tokens is None or self.update_tokens % dataset.batch_tokens:
-            raise ValueError(f"--trainer.update-tokens {self.update_tokens} is no whole number of the data's "
-                             f"token batches ({dataset.batch_tokens}); batch the data by tokens "
-                             "(Dataset.batch(tokens=)) dividing it")
-        accumulation = self.update_tokens // dataset.batch_tokens
-        if self.accumulation not in (1, accumulation):
-            raise ValueError(f"--trainer.update-tokens sets the accumulation to {accumulation}; omit "
-                             "--trainer.accumulation or match it")
-        return dataclasses.replace(self, accumulation=accumulation)
+    def accumulation(self, dataset: Loader) -> int:
+        """The steps an update pools over `dataset`: its stated batches, or its tokens over the data's token
+        batches, every phase's alike (`UpdateBatch.of_tokens`)."""
+        return self.update.of_tokens(dataset.each_token_batch)
 
     def __post_init__(self):
         # A record names its numerics as a preset's name or by their fields (`numerics_of`).
         object.__setattr__(self, "precision", numerics_of(self.precision))
-        if self.update_tokens is not None and self.update_tokens < 1:
-            raise ValueError("--trainer.update-tokens must be positive")
-        if self.update_tokens is not None and self.batch_ramp is not None:
+        if self.update.tokens is not None and self.batch_ramp is not None:
             raise ValueError("--trainer.batch-ramp grows row batches and cannot use a token budget")
-        if self.split is not None and self.split < 1:
-            raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
-        if self.publish and (self.wandb is None or not self.checkpoint_final):
-            raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
-        if self.publish and self.wandb is not None and self.wandb.offline:
-            raise ValueError("trainer.publish links the final checkpoint into W&B's registry, which an "
+        if self.wandb is not None and self.wandb.publish and not self.checkpoint_final:
+            raise ValueError("trainer.wandb.publish publishes the final checkpoint, which "
+                             "trainer.checkpoint_final keeps; keep it")
+        if self.wandb is not None and self.wandb.publish and self.wandb.offline:
+            raise ValueError("trainer.wandb.publish links the final checkpoint into W&B's registry, which an "
                              "offline W&B run cannot reach; track online to publish")
-        run_length(self.steps, self.epochs, self.tokens, self.examples, required=False)
         if isinstance(self.log_every, str) and not is_share(self.log_every):
             raise ValueError(f"--trainer.log-every is steps or a share such as 1%, not {self.log_every!r}")
         if (isinstance(self.eval_every, str) and self.eval_every not in ('epoch', PASSES)
@@ -444,7 +378,7 @@ class TrainerConfig:
                     choice = Best(choice)
                 elif isinstance(choice, Mapping):
                     choice = from_record(Best, choice, dtypes=False)
-                if not isinstance(choice, Best) or choice._source is not None:
+                if not isinstance(choice, Best) or choice.score is not None:
                     raise TypeError("a recorded best selector names metrics; callable scores are code-only")
                 rebuilt.append(choice)
             object.__setattr__(
@@ -506,30 +440,30 @@ class TrainerConfig:
             return {"on_host": True}
         return {"mesh": self.mesh, "layout": layout}
 
-    def resolved(self, dataset: Loader) -> tuple[Self, Loader, int | None]:
-        """This config and `dataset` as a run trains on them, and the run's steps: the accumulation
-        its token budget sets (`accumulating`), the dataset its batch ramp reads, and the step cap over
-        that (`total_steps`), before which the ramp goes, since it reads fewer records a step early
-        and a pass over the data is that many steps longer. Its updates are the steps over the
-        accumulation."""
-        trainer = self.accumulating(dataset)
-        dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
-        return trainer, dataset, trainer.total_steps(dataset)
+    def resolved(self, dataset: Loader) -> tuple[Loader, int | None]:
+        """`dataset` as a run of this config trains on it, and the run's steps: the dataset its batch ramp
+        reads, and the step cap over that (`total_steps`), before which the ramp goes, since it reads fewer
+        records a step early and a pass over the data is that many steps longer. Its updates are the steps
+        over the accumulation, an update of tokens read against the loader's token batches
+        (`accumulation`): the config stays as authored, which its record holds and its trainer resolves as
+        it reads the loader (`Trainer.reading`)."""
+        dataset = dataset if self.batch_ramp is None else ramped(dataset, self.batch_ramp)
+        return dataset, self.total_steps(dataset)
 
     def total_steps(self, dataset: Loader) -> int | None:
         """Return the step cap from `steps`, `epochs` or `examples`, None for a run its tokens bound
         alone, its own or where its data's schedule ends (`budget_tokens`; `run_steps`, the one policy
         a direct fit applies too, which refuses a schedule to an objective counting no tokens)."""
-        tokens = budget_tokens(dataset, self.tokens)
-        return run_steps(dataset, self.steps, self.epochs, tokens, self.accumulation, self.examples)
+        return run_steps(dataset, self.horizon, self.accumulation(dataset),
+                         budget_tokens(dataset, self.horizon.token_cap))
 
     def total_updates(self, dataset: Loader) -> int | None:
         """Return the optimizer updates the run takes over `dataset` as `RunConfig.train` finalizes it,
         its token budget's accumulation and its batch ramp applied: what an average that moves once an
         update ramps over. None for a token-only run."""
-        trainer, _, steps = self.resolved(dataset)
+        _, steps = self.resolved(dataset)
         # A window the run ends inside is never committed, as the trainer counts its updates.
-        return None if steps is None else steps // trainer.accumulation
+        return None if steps is None else steps // self.accumulation(dataset)
 
     def eval_interval(self, dataset: Loader) -> int | str | Counted | None:
         """Return the steps between validation passes over `data`, or None for never."""
@@ -567,7 +501,7 @@ class TrainerConfig:
             raise ValueError(
                 f"{option} epoch needs a dataset with a record count; this "
                 f"one streams without one, so give the interval in steps or None")
-        return dataset.epoch_steps(window=self.accumulation)
+        return dataset.epoch_steps(window=self.accumulation(dataset))
 
 
 def local_records(directory: str, name: str, kind: str) -> str:

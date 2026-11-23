@@ -39,12 +39,12 @@ from dew.data.sources.tokens import TokenFiles
 from dew.distributed.batches import DevicePrefetchIterator
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
-from dew.registry import models
+from dew.registry import models, optimizers
 from dew.training import MeshSpec, Trainer
 from dew.training.ahead import step_batch
 
 Solver = Literal["adam", "adamw", "lamb", "muon", "muon-unsplit"]
-"""The OPTIMIZER_MAP names, plus the unsplit Muon arm."""
+"""Dew's optimizers by name (`dew.registry.optimizers`), plus the unsplit Muon arm."""
 
 
 @dataclass(frozen=True)
@@ -73,8 +73,8 @@ def build_solver(config: Comparison) -> optax.GradientTransformation:
         return optax.contrib.muon(config.learning_rate,
                                   weight_decay=config.weight_decay,
                                   adam_weight_decay=config.weight_decay)
-    optim = OptimConfig(optimizer=config.optimizer, learning_rate=config.learning_rate,
-                        weight_decay=config.weight_decay)
+    optim = OptimConfig(optimizer=optimizers.build(config.optimizer, weight_decay=config.weight_decay),
+                        learning_rate=config.learning_rate)
     return optim.build(config.steps)
 
 

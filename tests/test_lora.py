@@ -40,6 +40,7 @@ from interop_support import (
 )
 from model_support import flat_tree
 from reference_error import as_given, assert_as_exact, dew_programs, indexed_recording, recording, widened
+from run_kinds import stated
 from safetensors.numpy import load_file
 from test_joined import row_joins
 from tool_support import run_from
@@ -56,7 +57,7 @@ from dew.nn.sharding import ADAPTER_RANK, boxed, boxed_axes, declared_axes, draw
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
-from dew.optim import OPTIMIZER_MAP, muon_weight_dimension_numbers
+from dew.optim import Muon, muon_weight_dimension_numbers
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -560,7 +561,7 @@ def test_muon_steps_an_adapted_head_whose_factors_it_splits_between_its_optimize
     with boxed(drawn_axes(adapter.model.init, tokens)):
         numbers = muon_weight_dimension_numbers(factors)
         assert numbers["lm_head"]["lora_A"] is not None and numbers["lm_head"]["lora_B"] is None
-        optimizer = OPTIMIZER_MAP["muon"](1e-3)
+        optimizer = Muon(state_dtype="params").transform(1e-3)
 
         def loss(moving):
             return jnp.mean(jnp.square(adapter.model.apply({**adapter.variables, "params": moving}, tokens)))
@@ -1543,11 +1544,12 @@ def test_diffusers_reads_the_adapter_dew_writes_at_dews_prediction(family, pipel
             inputs_of=functools.partial(generator.pipeline_inputs, directory, family))
         assert_as_exact(lambda index, inputs: predictions(inputs, own, merged_variables, adapter.model),
                         reference, draw, f"{family} adapted and merged", seeds=seeds, truth_fn=truth)
-def _recipe_run(tmp_path, image_size, *args):
+def _recipe_run(tmp_path, image_size, *args, model=None, model_fields=(), objective_fields=()):
     """A diffusion recipe run from argv as a user types it: two steps on the
     TFDS image fixture, with `args` ending in the run's LoRA flags
-    (`--lora.rank`, `--lora.modules`) and no subcommand. Returns the parsed
-    config and the trained state."""
+    (`--lora.rank`, `--lora.modules`) and no subcommand, its model of the class
+    `model` and its model's and objective's `*_fields` stated in Python
+    (`stated`). Returns the parsed config and the trained state."""
     from dew.config.diffusion import DiffusionRunConfig
     from dew.data import images as image_steps, presets
     from dew.data.sources.tfds import TFDS
@@ -1555,14 +1557,17 @@ def _recipe_run(tmp_path, image_size, *args):
     # Each image captioned from its row (`images.caption`), the condition the run's text tower reads.
     images = TFDS("dew_images", path=str(IMAGES), split="all").shuffle(seed=0).repeat().pipe(
         presets.images, image_size, batch=jax.device_count(), caption=image_steps.caption())
-    config = DiffusionRunConfig.cli([
-        "--model.dtype", "float32", "--model.attention-impl", "xla", "--objective.solver",
-        '{"class": "euler"}', "--objective.guidance", "None", "--objective.steps", "2",
-        "--objective.ema-decay", "None", "--val-metrics", "[]",
-        "--trainer.checkpoint-dir", str(tmp_path),
-        "--trainer.steps", "2", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2",
-        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False", "--trainer.name", "run",
-        *args], default=DiffusionRunConfig(data=images))
+    config = DiffusionRunConfig.cli(["--val-metrics", "[]", "--trainer.checkpoint-dir", str(tmp_path),
+                                     "--trainer.horizon.steps", "2", "--trainer.eval-every", "None",
+                                     "--trainer.checkpoint-every", "2", "--trainer.compilation-cache-dir",
+                                     "None", "--trainer.multi-host", "False", "--trainer.name", "run", *args],
+                                    default=stated(DiffusionRunConfig(data=images), model=model,
+                                                   model_fields={"dtype": "float32", "attention_impl": "xla",
+                                                                 **dict(model_fields)},
+                                                   objective_fields={"solver": {"class": "euler"},
+                                                                     "guidance": None, "steps": 2,
+                                                                     "ema_decay": None,
+                                                                     **dict(objective_fields)}))
     return config, config.run()
 
 
@@ -1584,9 +1589,9 @@ def test_a_pretrained_pipeline_run_from_the_command_line_trains_its_lora(pipelin
     from dew.interop.pretrained import load_diffusion_source
 
     directory = pipelines["flux"].source
-    config, state = _recipe_run(tmp_path, 16, "--pretrained", str(directory), "preset:none",
-                                "--objective.unconditional-prob", "0.0", "--lora.rank", "2", "--lora.modules",
-                                *DENOISER_MODULES)
+    config, state = _recipe_run(tmp_path, 16, "--pretrained", str(directory), "preset:none", "--lora.rank",
+                                "2", "--lora.modules", *DENOISER_MODULES,
+                                objective_fields={"unconditional_prob": 0.0})
     assert config.lora == LoRA(rank=2, modules=DENOISER_MODULES)
 
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
@@ -1660,10 +1665,9 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
     modulation frozen at zero only the output projection carries a gradient;
     it is the one target."""
     config, state = _recipe_run(
-        tmp_path, 8, "--model", "simple_dit", "--model.patch_size", "2", "--model.emb_features", "16",
-        "--model.num_layers", "1", "--model.num_heads", "2",
-        "--text.encoder", "char_table", "--text.checkpoint", "char_table", "--lora.rank", "2",
-        "--lora.modules", "final_proj")
+        tmp_path, 8, "--text.encoder", "char_table", "--text.checkpoint", "char_table", "--lora.rank", "2",
+        "--lora.modules", "final_proj", model="simple_dit",
+        model_fields={"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2})
     assert config.lora == LoRA(rank=2, modules=("final_proj",))
 
     moved = flat_tree(state.variables["params"])
@@ -1730,7 +1734,7 @@ chain = TokenFiles(tokens).pipe(presets.lm, None, seq_len=8, batch=8, pack=None)
 model = ModelConfig("causal_transformer",
                     {"emb_features": 16, "num_layers": 1, "num_heads": 2, "dtype": "float32"})
 LMRunConfig.cli([*sys.argv[4:], "--trainer.name", name, "--trainer.checkpoint-dir", root,
-                 "--trainer.steps", "1",
+                 "--trainer.horizon.steps", "1",
                  "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
                  "--trainer.eval-every", "None", "--trainer.checkpoint-every", "1", "--max-new-tokens", "0",
                  "--optim.learning-rate", "0"], default=LMRunConfig(data=chain, model=model)).run()

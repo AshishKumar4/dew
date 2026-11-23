@@ -22,6 +22,7 @@ import tyro
 from dew._cli import tpu
 from dew._cli.gcloud import emit
 from dew._cli.launch import Launch
+from dew.training.targets import AheadTarget, LowerFor
 
 if TYPE_CHECKING:
     from dew.config import RunConfig
@@ -115,10 +116,13 @@ class DataExport:
     """Parquet for records, ArrayRecord for token stores unless explicitly named."""
     rows_per_shard: int = 100_000
     branch: Literal["train", "validation"] = "train"
-    read: Literal["memory", "indexed", "streamed"] = "streamed"
+    read: Literal["memory", "indexed", "streamed"] | None = None
+    """How the export reads the chain: as it says (`Pipeline.read`), else streamed, where None."""
     provision: bool = False
     tokenizer: str | None = None
-    eos: bool = False
+    eos: bool = True
+    """End each document's tokens with the tokenizer's EOS, as `dew.data.text.export_tokens` does; `--no-eos`
+    writes them as they are."""
     trust: tuple[str, ...] = ()
     """Packages outside Dew whose modules a chain's record may import (its own steps')."""
 
@@ -205,14 +209,14 @@ def run_named(named: str, trust: tuple[str, ...]) -> RunConfig:
     return built if built.unrecorded() else RunConfig.read(built.record(), trust=(*trust, path.stem))
 
 
-def run_held(named: str, trust: tuple[str, ...], assigned: tuple[str, ...]) -> RunConfig:
-    """The run `named` names (`run_named`) with its `assigned` fields, its `trainer.xla_flags` held for every
+def run_held(named: str, trust: tuple[str, ...]) -> RunConfig:
+    """The run `named` names (`run_named`), its `diagnostics.xla_flags` held for every
     runtime XLA loads: where they do not hold, the command runs again from its start with them in XLA_FLAGS
     (`dew._devices.hold_xla_flags`), as `import dew` loads jaxlib before the run is read."""
     from dew._devices import hold_xla_flags
 
-    run = run_named(named, trust).assigned(assigned)
-    hold_xla_flags(run.trainer.xla_flags)
+    run = run_named(named, trust)
+    hold_xla_flags(run.diagnostics.xla_flags)
     return run
 
 
@@ -222,15 +226,32 @@ class Train:
 
     run: Positional[str]
     """A Python file whose `run` is a run config or a function returning one, or a `run.json`."""
-    set: Annotated[tuple[str, ...], tyro.conf.UseAppendAction] = ()
-    """`path=value`, once a field: the run's field at the dotted path, read as its
-    flag reads it (`--set trainer.steps=2000 --set model.num_layers=12`)."""
     trust: tuple[str, ...] = ()
     """Packages outside Dew whose modules a `run.json` may import."""
 
     def run_command(self) -> int:
-        run_held(self.run, self.trust, self.set).run()
+        run_held(self.run, self.trust).run()
         return 0
+
+
+@dataclasses.dataclass(frozen=True)
+class Lower:
+    """Compile or lower a run's first step for a target, training nothing (`RunConfig.lower`): its GPUs or
+    TPU topology, saved, `target:ahead --target.generation sm90 --target.devices 8 --target.path
+    step.dew-aot` (`dew.training.targets.AheadTarget`), or a CUDA generation's check on any host,
+    `target:check --target.generation sm80` (`dew.training.targets.LowerFor`). It exits with status 0 once
+    the step is compiled or lowered."""
+
+    run: Positional[str]
+    """A Python file whose `run` is a run config or a function returning one, or a `run.json`."""
+    target: Annotated[AheadTarget, tyro.conf.subcommand("ahead")] | Annotated[
+        LowerFor, tyro.conf.subcommand("check")]
+    """What the step is compiled or lowered for."""
+    trust: tuple[str, ...] = ()
+    """Packages outside Dew whose modules a `run.json` may import."""
+
+    def run_command(self) -> int:
+        run_held(self.run, self.trust).lower(self.target)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -248,8 +269,6 @@ class Profile:
     """The steps the window traces."""
     out: str | None = None
     """Where the profile goes; unset writes profiles/<the run's name>/<the time it starts>."""
-    set: Annotated[tuple[str, ...], tyro.conf.UseAppendAction] = ()
-    """`path=value`, once a field, as `dew train` reads it."""
     trust: tuple[str, ...] = ()
     """Packages outside Dew whose modules a `run.json` may import."""
     host_tracer_level: int | None = None
@@ -268,7 +287,7 @@ class Profile:
         given = {"host_tracer_level": self.host_tracer_level, "python_tracer_level": self.python_tracer_level,
                  "activity_cap": self.activity_cap}
         capture = CaptureOptions(**{name: value for name, value in given.items() if value is not None})
-        report = run_held(self.run, self.trust, self.set).profile(self.out, warmup=self.warmup,
+        report = run_held(self.run, self.trust).profile(self.out, warmup=self.warmup,
                                                                   steps=self.steps, capture=capture)
         if report is not None:
             emit(report.text())
@@ -283,17 +302,16 @@ class Inspect:
 
     run: Positional[str]
     """A Python file whose `run` is a run config or a function returning one, or a `run.json`."""
-    set: Annotated[tuple[str, ...], tyro.conf.UseAppendAction] = ()
-    """`path=value`, once a field, as `dew train` reads it: what to watch is `trainer.inspection`."""
     trust: tuple[str, ...] = ()
     """Packages outside Dew whose modules a `run.json` may import."""
 
     def run_command(self) -> int:
-        emit(json.dumps(run_held(self.run, self.trust, self.set).inspected(), sort_keys=True))
+        emit(json.dumps(run_held(self.run, self.trust).inspected(), sort_keys=True))
         return 0
 
 
-COMMANDS = {"export": Export, "inspect": Inspect, "launch": Launch, "profile": Profile, "train": Train}
+COMMANDS = {"export": Export, "inspect": Inspect, "launch": Launch, "lower": Lower, "profile": Profile,
+            "train": Train}
 DATA_COMMANDS = {"export": DataExport, "provision": DataProvision, "publish": DataPublish}
 
 

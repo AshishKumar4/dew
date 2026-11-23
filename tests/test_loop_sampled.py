@@ -3,25 +3,31 @@
 
 import dataclasses
 import math
-import threading
 import time
 
+import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import raw_leaf
+from generation_support import lowers
+from model_support import float64_twin
+from reference_error import assert_as_exact, dew_path
 from scipy import integrate, optimize, special, stats
-from test_pass_weights import looped, phased_trainer
+from test_pass_weights import PASS_SEEDS, drawn, looped, phased_trainer
 
+from dew.batch import LOOP_PASSES
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
-from dew.objectives.base import Ratio
+from dew.nn.protocols import EXITS
+from dew.objectives.base import Ratio, Step
 from dew.objectives.lm.objective import LMObjective
+from dew.optim import MuonClip
+from dew.training import FitPolicy, UpdateBatch
 from dew.training.compiler import DrawingStep
 from dew.training.interval import DISPATCHED_MICROBATCHES, Interval
-from dew.training.phase_passes import SampledPasses
+from dew.training.phase_passes import PhasePasses, SampledPasses
 
 LAWS = [SampledPasses(mean=2.0, dispersion=0.5, cap=4), SampledPasses(mean=4.0, dispersion=0.5, cap=8),
         SampledPasses(mean=3.0, dispersion=0.0, cap=6), SampledPasses(mean=32.0, dispersion=0.0, cap=3),
@@ -164,17 +170,6 @@ def test_a_sampled_pass_count_outside_its_law_is_refused(fields):
 
 
 
-@pytest.fixture(autouse=True)
-def counts_compiled_off_the_loop():
-    """A test that draws a sampled run's counts as a fit does (`DrawingStep.drawn`) ends once the counts it
-    began compiling off the loop are compiled (`dew.training.ahead.LaterCounts`, whose thread a fit waits
-    for as it ends), so none compiles on into the next test."""
-    yield
-    for thread in threading.enumerate():
-        if thread.name.startswith("dew-later-counts"):
-            thread.join()
-
-
 CAP = 3
 """The cap of the trainer cells' law, the passes their tiny looped decoder holds
 (`test_pass_weights.looped`)."""
@@ -200,48 +195,189 @@ def words(key) -> tuple[int, ...]:
     return tuple(int(word) for word in np.asarray(jax.random.key_data(key)).ravel())
 
 
-@pytest.mark.parametrize("trained", [None, 2], ids=["every-pass", "last-two"])
-def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trained):
-    """A run drawing its loop's pass count per microbatch, two microbatches an update (`accumulation` 2),
-    steps each microbatch as a run of the model at its drawn count steps it (invariant 1): from the same
-    state over the same batch, its loss, its metrics and its stepped state, an update's window pooled
-    over microbatches of other counts and committed by the second's, the same bits as that count's run's,
-    each count's program its own over the one state. A loop training through its last two passes
-    (`backprop_steps`) trains a count below them through them all. Its counts are its key's draws at the
-    microbatches' positions, and it draws more than one count."""
-    model = looped(steps=CAP).with_passes(CAP, backprop_steps=trained)
+WEIGHED = {"last": {}, "mean": {"pass_weights": "mean"}, "gated": {"exit_entropy": 0.1}}
+"""The ways a looped decoder's loss reads its passes: its last pass's output alone, the mean of every pass's
+exit, and its exit gate's distribution over them (`exit_entropy`, the model gating its exits)."""
+
+
+def weighed_model(weighing: str, trained: int | None = None) -> CausalTransformer:
+    """The trainer cells' decoder at its cap, through its last `trained` passes (every pass where None), each
+    pass exiting where `weighing` reads every pass's exit, through a gate where it is `gated`."""
+    exits = weighing != "last"
+    model = looped(steps=CAP).with_passes(CAP, backprop_steps=trained, exits=exits or None,
+                                          exit_gate=(weighing == "gated") or None)
     assert model is not None
+    return model
+
+
+def counted_gradient(objective, batch):
+    """The loss and gradient of `objective` over `batch`, one batch, run at the count the call gives its rows
+    (`LOOP_PASSES`, a traced input), or at its model's own where it gives None."""
+    def run(variables, passes=None):
+        given = batch if passes is None else {**batch, LOOP_PASSES: passes}
+
+        def loss(params):
+            return objective.scalar_loss({**variables, "params": params}, given,
+                                         Step(jnp.asarray(0), jax.random.key(0), None))[0]
+        return jax.value_and_grad(loss)(variables["params"])
+    return run
+
+
+def loss_at(model, tokens, **weighed):
+    """`counted_gradient` of `model`'s LM objective (`weighed` its passes' weighing) over `tokens`."""
+    return counted_gradient(LMObjective(model, tokens.shape[1] - 1, **weighed), {"text": tokens})
+
+
+@pytest.mark.parametrize("count", range(1, CAP + 1))
+@pytest.mark.parametrize(("weighing", "trained"),
+                         [("last", None), ("last", 2), ("mean", None), ("gated", None)],
+                         ids=["last", "last-two-trained", "mean", "gated"])
+def test_the_caps_program_at_a_drawn_count_is_that_counts_model(weighing, trained, count):
+    """The one program a sampled run steps every count by, the loop's cap's, its rows given a count
+    (`LOOP_PASSES`, traced): its loss and every parameter's gradient on par from float64 with the model
+    of that count's own (`with_passes`), through its last two passes where it trains through them, its
+    passes weighed by its last alone, their mean and its exit gate (check 1, row 11951's design)."""
+    model = weighed_model(weighing, trained)
+    fixed = model.with_passes(count, backprop_steps=trained and min(trained, count))
+    tokens = jnp.asarray(np.random.default_rng(0).integers(0, 256, (2, 17)), jnp.int32)
+    weighed = WEIGHED[weighing]
+    passes = np.full((tokens.shape[0],), count, np.int32)
+    initial = drawn(model.init, tokens[:, :-1])
+
+    def draw(seed):
+        return (*initial(seed), passes)
+
+    def own(variables, _):
+        return loss_at(fixed, tokens, **weighed)(variables)
+
+    def own_in_float64(variables, _):
+        return loss_at(float64_twin(fixed), tokens, **weighed)(variables)
+
+    # Each count's own model is Dew's (`dew_path`): an invariance claim, held against it compiled alike.
+    assert_as_exact(jax.jit(loss_at(model, tokens, **weighed)), dew_path(jax.jit(own)), draw,
+                    f"the cap's program at {count} passes ({weighing}, trained {trained})", seeds=PASS_SEEDS,
+                    truth_fn=jax.jit(own_in_float64))
+
+
+@pytest.mark.parametrize("count", range(1, CAP + 1))
+@pytest.mark.parametrize("weighing", ["mean", "gated"])
+def test_a_pass_its_drawn_count_leaves_unrun_moves_no_loss_and_no_gradient(weighing, count):
+    """The cap's program at a drawn count reads each pass the count leaves unrun nowhere: the loss's
+    cotangent on its exit's states, its exit-gate logit and its loss terms is exactly zero, where every
+    pass the count runs before its last moves the loss, its mean or its gate weighing them (row 11951's
+    design). A leaked share, however small, would move it."""
+    model = weighed_model(weighing)
+    tokens = jnp.asarray(np.random.default_rng(0).integers(0, 256, (2, 17)), jnp.int32)
+    (variables,) = drawn(model.init, tokens[:, :-1])(0)
+    passes = jnp.full((tokens.shape[0],), count, jnp.int32)
+    held: dict[str, tuple] = {}
+
+    def loss(offsets):
+        class Offset(LMObjective):
+            """The LM objective with each earlier pass's exit states, gate logits and loss terms offset by
+            `offsets`, where given, and their shapes held, as the exit objective reads them."""
+
+            def _exit_scores(self, params, gathered, targets, last, before=None):
+                exits = gathered[EXITS]
+                read = {"states": tuple(exits["states"]), "gate logit": tuple(exits.get("logits", ()))}
+                if offsets is not None:
+                    read = {name: tuple(value + offset.astype(value.dtype)
+                                        for value, offset in zip(read[name], offsets[name], strict=True))
+                            for name in read}
+                moved = {**exits, "states": read["states"]}
+                if "logits" in exits:
+                    moved["logits"] = read["gate logit"]
+                terms, logits, right, ran = super()._exit_scores(params, {**gathered, EXITS: moved},
+                                                                 targets, last, before)
+                *earlier_terms, final = terms
+                held.update({name: tuple(value.shape for value in values) for name, values in read.items()},
+                            terms=tuple(term.shape for term in earlier_terms))
+                if offsets is not None:
+                    earlier_terms = [term + offset.astype(term.dtype)
+                                     for term, offset in zip(earlier_terms, offsets["terms"], strict=True)]
+                return (*earlier_terms, final), logits, right, ran
+
+        objective = Offset(model, tokens.shape[1] - 1, **WEIGHED[weighing])
+        return objective.scalar_loss(variables, {"text": tokens, LOOP_PASSES: passes},
+                                     Step(jnp.asarray(0), jax.random.key(0), None))[0]
+
+    jax.eval_shape(loss, None)
+    assert len(held["states"]) == len(held["terms"]) == CAP - 1, held
+    offsets = {name: tuple(jnp.zeros(shape, jnp.float32) for shape in shapes)
+               for name, shapes in held.items()}
+    cotangents = jax.device_get(jax.jit(jax.grad(loss))(offsets))
+    moved = ("states", "terms") if weighing == "mean" else ("states", "gate logit", "terms")
+    for name, values in cotangents.items():
+        for index, cotangent in enumerate(values):
+            reached = bool(np.any(np.asarray(cotangent) != 0))
+            if index + 1 >= count:
+                assert not reached, f"pass {index + 1} unrun at {count}: its {name} moved the loss"
+            elif name in moved:
+                assert reached, f"pass {index + 1} of {count}: its {name} moved nothing"
+
+
+@pytest.mark.parametrize("count", range(1, CAP + 1))
+def test_a_pass_its_drawn_count_leaves_unrun_routes_no_token_to_any_expert(count):
+    """A looped mixture's routers at the cap's program, its rows given a count (`LOOP_PASSES`), count, to
+    the slot, the experts the model of that count selects (`ExpertBalance.effects`, the counts its bias
+    moves by), and their balance loss and z-loss are that model's: a pass the count leaves unrun, whose
+    routers sow a zero state's choice, credits no expert and scores no position (`ROUTER_RAN`, row 11951's
+    design). A skipped pass's choice, counted, would add its slots to the counts."""
+    from test_loop import tiny
+
+    from dew.nn.backbones.decoder_block import Mixture
+    from dew.objectives.routing import ExpertBalance
+
+    model = tiny(mixture=Mixture(experts=4, top_k=2, bias=True),
+                 loop=Loop(CAP, step_norm=False, layers=(1, 2)))
+    fixed = model.with_passes(count)
+    ids = jnp.asarray(np.random.default_rng(0).integers(0, 32, (2, 12)), jnp.int32)
+    (variables,) = drawn(model.init, ids[:, :-1])(0)
+    balance = ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.1, router_z_loss=0.01)
+    step = Step(jnp.zeros((), jnp.int32), jax.random.key(3), None)
+
+    def scored(model, batch):
+        objective = LMObjective(model, ids.shape[1] - 1, balance=balance)
+        loss, aux = objective.scalar_loss(variables, batch, step)
+        return float(loss), jax.device_get(aux.effects)
+
+    capped, capped_counts = scored(model, {"text": ids, LOOP_PASSES: np.full((2,), count, np.int32)})
+    own, own_counts = scored(fixed, {"text": ids})
+    for path, counted in jax.tree_util.tree_leaves_with_path(capped_counts):
+        np.testing.assert_array_equal(counted, own_counts_at(own_counts, path), err_msg=f"{path} at {count}")
+    # The unrun passes' terms add exact zeros, so the loss is the count's own to the bit.
+    assert capped == own, (count, capped, own)
+
+
+def own_counts_at(tree, path):
+    """`tree`'s leaf at `path` (`jax.tree_util` keys)."""
+    for key in path:
+        tree = tree[key.key]
+    return tree
+
+
+def test_each_microbatch_of_a_sampled_run_is_dealt_its_drawn_count():
+    """A run drawing its loop's pass count per microbatch, two microbatches an update (`accumulation` 2),
+    deals each microbatch its key's draw at its position, one program stepping them all at every count it
+    draws: more than one count among eight, each step's loss finite, every microbatch counted. The program
+    at each count is that count's model (`test_the_caps_program_at_a_drawn_count_is_that_counts_model`),
+    and each microbatch's work is its count's
+    (`test_a_sampled_steps_work_is_its_microbatches_at_their_counts`)."""
     batch = token_batch()
-    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, accumulation=2)
+    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED,
+                             update=UpdateBatch(batches=2))
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep)
     interval = Interval(time.time(), None, microbatches=0)
-    alone = {count: phased_trainer(model.with_passes(count, backprop_steps=trained and min(trained, count)),
-                                   0, None, accumulation=2) for count in range(1, CAP + 1)}
-    programs: dict = {}
-    drawn = []
+    drawn_counts = []
     for index in range(8):
-        step.drawn(interval, index, state)
-        (count,) = step.counts
-        drawn.append(count)
-        placement = jax.tree.map(lambda leaf: leaf.sharding, state)
-        given = jax.device_get(state)
-        state, loss, metrics, *_ = step(state, batch)
-        if count not in programs:
-            start, _, _ = alone[count].place()
-            programs[count] = alone[count].compile(start, batch)
-        own, own_loss, own_metrics, *_ = programs[count](jax.device_put(given, placement), batch)
-        np.testing.assert_array_equal(np.asarray(loss), np.asarray(own_loss), err_msg=f"microbatch {index}")
-        for name, value in jax.device_get(metrics).items():
-            np.testing.assert_array_equal(value, jax.device_get(own_metrics)[name], err_msg=f"{index} {name}")
-        ours, theirs = (jax.tree_util.tree_flatten_with_path(jax.device_get(jax.tree.map(raw_leaf, tree)))[0]
-                        for tree in (state, own))
-        unlike = [jax.tree_util.keystr(path) for (path, a), (_, b) in zip(ours, theirs, strict=True)
-                  if not np.array_equal(a, b)]
-        assert not unlike, f"microbatch {index} at {count} passes: {unlike}"
-    assert drawn == [TRAINED.count(words(sampled.key), position) for position in range(8)]
-    assert len(set(drawn)) > 1 and interval.microbatches == 8
+        step.drawn(interval, index)
+        drawn_counts.extend(step.counts)
+        state, loss, *_ = step(state, batch)
+        assert np.isfinite(float(loss)), (index, step.counts)
+    assert drawn_counts == [TRAINED.count(words(sampled.key), position) for position in range(8)]
+    assert len(set(drawn_counts)) > 1 and interval.microbatches == 8
 
 
 @pytest.mark.parametrize("cap", [2, CAP])
@@ -258,18 +394,18 @@ def test_a_sampled_run_of_an_implicit_loop_in_bf16_reads_its_caps_narrow_copies_
     batch = token_batch()
     law = dataclasses.replace(TRAINED, cap=cap)
     with chosen(narrow_copies="on"):
-        sampled = phased_trainer(model, 0, None, sampled_passes=law, accumulation=2)
+        sampled = phased_trainer(model, 0, None, sampled_passes=law, update=UpdateBatch(batches=2))
         state, _, _ = sampled.place()
         step = sampled.compile(state, batch)
         interval = Interval(time.time(), None, microbatches=0)
         drawn = []
         for index in range(8):
-            step.drawn(interval, index, state)
+            step.drawn(interval, index)
             drawn.extend(step.counts)
             state, loss, *_ = step(state, batch)
             assert np.isfinite(float(loss)), (index, step.counts)
         # The copies a run of the cap's passes alone reads, the loop's layers whole among them.
-        alone = phased_trainer(model, 0, None, accumulation=2)
+        alone = phased_trainer(model, 0, None, update=UpdateBatch(batches=2))
         start, _, _ = alone.place()
         stepped, *_ = alone.compile(start, batch)(start, batch)
 
@@ -287,66 +423,35 @@ def test_a_sampled_runs_draws_go_on_through_another_split_and_a_resume():
     to 49, not where a step and its split would place them; a checkpoint that counted none resumes at its
     step's microbatches, at the split its step reads."""
     key = jax.random.key(0)
-    flops = dict.fromkeys(range(1, CAP + 1))
-    # Every count's plan in hand, so a draw admits none (`DrawingStep.admit`): the draws alone are read.
-    four, two = (DrawingStep(dict.fromkeys(flops), flops, split, TRAINED, words(key)) for split in (4, 2))
+    four, two = (DrawingStep(split, TRAINED, words(key), None) for split in (4, 2))
     interval = Interval(time.time(), None, microbatches=0)
     drawn = []
     for index in range(10):
-        four.drawn(interval, index, None)
+        four.drawn(interval, index)
         drawn += four.counts
     control = {DISPATCHED_MICROBATCHES: interval.microbatches}
     resumed = Interval.resumed(dict(control), last_saved=10)
     for index in range(10, 15):
-        two.drawn(resumed, index, None)
+        two.drawn(resumed, index)
         drawn += two.counts
     assert drawn == [TRAINED.count(words(key), position) for position in range(50)]
     lacking = Interval.resumed({}, last_saved=7)
-    two.drawn(lacking, 7, None)
+    two.drawn(lacking, 7)
     assert two.counts == [TRAINED.count(words(key), position) for position in (14, 15)]
     assert lacking.microbatches == 16
-
-
-def test_a_sampled_step_admits_each_count_on_its_loop_as_its_draws_first_ask_it():
-    """A run that draws its pass count per microbatch builds its step with no count below its cap admitted:
-    each call admits on the loop the counts it draws that none admitted yet (`DrawingStep.plans`), while
-    from a fit's first draw every count below the cap compiles off the loop (`LaterCounts`), so a count
-    drawn once its compile there is done is admitted compiling no step program on the loop (rows 7959,
-    8067: every count compiled on the loop before the first step)."""
-    from dew.telemetry.compiles import Compiles
-
-    batch = token_batch()
-    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, accumulation=2)
-    state, _, _ = sampled.place()
-    step = sampled.compile(state, batch)
-    assert isinstance(step, DrawingStep) and set(step.plans) == {CAP}
-    interval = Interval(time.time(), None, microbatches=0)
-    step.drawn(interval, 0, state)
-    state, *_ = step(state, batch)
-    first = set(step.plans)
-    for count in range(1, CAP):
-        step.waited(count)
-    with Compiles("step") as compiles:
-        for index in range(1, 32):
-            if len(step.plans) == CAP:
-                break
-            step.drawn(interval, index, state)
-            state, *_ = step(state, batch)
-    assert first < set(step.plans) == set(range(1, CAP + 1)), (first, set(step.plans))
-    assert compiles.count == 0, compiles.programs
 
 
 def test_a_sampled_step_called_by_hand_draws_each_calls_counts_itself():
     """A sampled run's step as `Trainer.compile` returns it, called by hand with no fit drawing for it (a
     script's loop, `dew inspect`'s sampled window), draws each call's counts itself (row 8268): its first
     call's at its state's step's microbatches, each next call's past the last, the counts the run's key
-    draws there, a call a fit drew for (`drawn`) running the fit's; with no fit to wait for them as it ends,
-    it compiles no count off its loop (the review of rows 7959, 8067: by-hand calls left a thread compiling
-    every count past their caller's end)."""
+    draws there, a call a fit drew for (`drawn`) running the fit's; its calls compile nothing, every count
+    run by the one program at its cap (row 11951's design: a program a count, compiled as each was first
+    drawn)."""
     from dew.telemetry.compiles import Compiles
 
     batch = token_batch()
-    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, split=2)
+    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, fit=FitPolicy(split=2))
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep) and step.split == 2
@@ -356,11 +461,8 @@ def test_a_sampled_step_called_by_hand_draws_each_calls_counts_itself():
             state, *_ = step(state, batch)
             drawn += step.counts
     assert drawn == [TRAINED.count(words(sampled.key), position) for position in range(6)]
-    # No fit waits for counts compiling off the loop as a caller's calls end: each count drawn below the
-    # cap compiled on the loop as it was first drawn, and no other.
-    assert compiles.count == len({count for count in drawn if count < CAP}), compiles.programs
-    assert not [thread for thread in threading.enumerate() if thread.name.startswith("dew-later-counts")]
-    step.drawn(Interval(time.time(), None, microbatches=40), int(state.step), state)
+    assert len(set(drawn)) > 1 and compiles.count == 0, (drawn, compiles.programs)
+    step.drawn(Interval(time.time(), None, microbatches=40), int(state.step))
     step(state, batch)
     assert step.counts == [TRAINED.count(words(sampled.key), position) for position in (40, 41)]
 
@@ -450,8 +552,8 @@ def test_a_sampled_run_under_qk_clip_pools_its_counts_logit_maxima_in_one_window
 
     tokens, _ = phased_draw(0)
     trainer = Trainer(LMObjective(unnormed(), 16), optax.chain(scale_by_qk_clip(1.0), optax.sgd(0.1)),
-                      key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0), accumulation=2,
-                      sampled_passes=TRAINED)
+                      key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+                      update=UpdateBatch(batches=2), sampled_passes=TRAINED)
     assert int(trainer.fit(phased_loader(tokens), steps=4, log_every=100).step) == 4
 
 
@@ -465,17 +567,18 @@ def test_a_fixed_and_a_sampled_run_of_one_config_each_trace_their_own_window(sam
     from dew.optim import OptimConfig
     from dew.training import Layout, Trainer
 
-    config = OptimConfig(optimizer="muonclip", learning_rate=0.01)
+    config = OptimConfig(optimizer=MuonClip(), learning_rate=0.01)
     batch = token_batch()
 
     def stepped(**sampling) -> None:
         trainer = Trainer(LMObjective(unnormed(), 16), config, key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0), accumulation=2, **sampling)
+                          layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=2),
+                          **sampling)
         trainer.scheduled(1)
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         if isinstance(step, DrawingStep):
-            step.drawn(Interval(time.time(), None, microbatches=0), 0, state)
+            step.drawn(Interval(time.time(), None, microbatches=0), 0)
         step(state, batch)
 
     runs = [{}, {"sampled_passes": TRAINED}]
@@ -510,13 +613,13 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     """A sampled step's work (`TRAINING_FLOPS`, which train/mfu divides) is the sum of its microbatches'
     rows' work at their drawn counts (invariant 4): each count's column of the batch's counted work is the
     work a run of that count counts its rows (`prepare_counts`), and the step's metric sums its two
-    microbatches' rows of their counts' columns, exactly; its programs' FLOPs are each microbatch's count's
-    a microbatch, a run of that count's own at the same split."""
+    microbatches' rows of their counts' columns, exactly; its hardware FLOPs are the one program's at its
+    cap, reported as a bound on its counts' (`StepFlops.bound`; row 11951's design)."""
     from dew.training.model_flops import TRAINING_FLOPS, prepare_counts
 
     model = looped(steps=CAP)
     host = {"text": token_draw()}
-    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, split=2)
+    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, fit=FitPolicy(split=2))
     counted = prepare_counts(sampled.objective, host, count_model=True,
                              counts=sampled.phase_passes.counted())
     for count in range(1, CAP + 1):
@@ -528,85 +631,16 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep)
     interval = Interval(time.time(), None, microbatches=0)
-    flops = step.drawn(interval, 0, state)
+    flops = step.drawn(interval, 0)
     _, _, metrics, *_ = step(state, batch)
     work = counted[TRAINING_FLOPS]
     expected = sum(jnp.sum(jnp.asarray(work[part::2, count - 1]), dtype=jnp.float32)
                    for part, count in enumerate(step.counts))
     np.testing.assert_array_equal(np.asarray(metrics[TRAINING_FLOPS]), np.asarray(expected))
-    own = {}
-    for count in set(step.counts):
-        alone = phased_trainer(model.with_passes(count), 0, None, split=2)
-        start, _, _ = alone.place()
-        alone.compile(start, batch)
-        own[count] = alone.step_flops
-    first, second = (own[count] for count in step.counts)
-    assert flops is not None and first is not None and second is not None
-    assert flops == 0.5 * first + 0.5 * second
-
-
-def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
-    """On devices with room for the one-pass step read whole and for the cap's only in two microbatches, a
-    sampled run plans its cap's step at two (`compile`), and admits every other count's at that plan as
-    its draws first ask it (`StepCompiler.admitted_at`), the one-pass step's at two microbatches where its
-    own search plans it whole: one window, of the cap's split, over every count's step."""
-    from test_plan import LIMIT, free, free_until_placed
-
-    from dew.nn.kernels import options
-
-    batch = token_batch()
-
-    def needed(model, split):
-        free(monkeypatch, LIMIT)
-        trainer = phased_trainer(model, 0, None, split=split)
-        state, _, _ = trainer.place()
-        trainer.compile(state, batch)
-        options.unhold()
-        return LIMIT - trainer.plan["probes"][0]["headroom"]
-
-    model = looped(steps=CAP)
-    once, whole, halves = needed(model.with_passes(1), 1), needed(model, 1), needed(model, 2)
-    assert max(once, halves) < whole, (once, halves, whole)
-    free(monkeypatch, (max(once, halves) + whole) // 2)
-    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED)
-    state, _, _ = sampled.place()
-    step = sampled.compile(state, batch)
-    assert isinstance(step, DrawingStep) and step.split == 2
-    # From here the devices hold what the steps place, the window and copies the first builds among them,
-    # which an admission over the state its call steps charges once (review of rows 7959, 8067: over the
-    # state as the step was built, its fit check charged them again beside the devices that held them).
-    free_until_placed(monkeypatch, (max(once, halves) + whole) // 2)
-    # Each count admitted as its calls first draw it (`DrawingStep.admit`), until every count is.
-    interval = Interval(time.time(), None, microbatches=0)
-    for index in range(64):
-        if len(step.plans) == CAP:
-            break
-        step.drawn(interval, index, state)
-        state, *_ = step(state, batch)
-    assert {count: plan.split for count, plan in step.plans.items()} == dict.fromkeys(range(1, CAP + 1), 2)
-    free(monkeypatch, (max(once, halves) + whole) // 2)
-    alone = phased_trainer(model.with_passes(1), 0, None)
-    start, _, _ = alone.place()
-    alone.compile(start, batch)
-    assert alone.plan["split"] == 1
-
-
-def test_a_sampled_count_whose_step_returns_other_outputs_is_refused():
-    """A count whose step returns outputs other than its cap's (here a metric named by its count) cannot
-    pass the one state and pool its step's outputs with the other counts': its admission is refused."""
-    class ByCount(LMObjective):
-        def loss(self, variables, batch, step):
-            stats, aux = super().loss(variables, batch, step)
-            named = {**aux.metrics, f"passes_{self.model.loop.steps}": jnp.zeros(())}
-            return stats, dataclasses.replace(aux, metrics=named)
-
-    from dew.training import Layout, Trainer
-
-    trainer = Trainer(ByCount(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
-    state, _, _ = trainer.place()
-    with pytest.raises(ValueError):
-        trainer.compile(state, token_batch())
+    capped = sampled.step_flops
+    assert flops is not None and capped is not None
+    assert (flops.model, flops.hardware, flops.bound) == (capped.model, capped.hardware, "_upper_bound"), (
+        flops)
 
 
 class Replayed(LMObjective):
@@ -634,8 +668,8 @@ def test_a_sampled_run_whose_window_replays_its_microbatches_is_refused(grouped)
     def trainer(split):
         grouping = {"diloco": DiLoCo(every=2, rate=0.7, momentum=0.9)} if grouped else {}
         return Trainer(Replayed(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED, split=split,
-                       **grouping)
+                       layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED,
+                       fit=FitPolicy(split=split), **grouping)
 
     batch = token_batch()
     replayed = trainer(2)
@@ -676,6 +710,385 @@ class _Drawing:
         return batch
 
 
+class UncountedLM(LMObjective):
+    """A language model's loss of its own that hands its model no count of passes (a custom objective's)."""
+
+    @property
+    def reads_pass_counts(self) -> bool:
+        return False
+
+
+def test_a_pass_count_drawn_per_microbatch_for_an_objective_that_reads_none_is_refused():
+    """A run drawing its pass count per microbatch hands each microbatch its count in its batch
+    (`LOOP_PASSES`), which an objective whose loss reads no count (`Objective.reads_pass_counts`), a custom
+    one's over a looped decoder, would leave unread, running every pass at the cap whatever was drawn: such a
+    trainer is refused as it is built, and the same objective at a phase's count is not."""
+    from dew.training import Layout, Trainer
+
+    objective = UncountedLM(looped(steps=CAP), 16)
+    with pytest.raises(ValueError):
+        Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+                sampled_passes=TRAINED)
+    Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+            phase_passes=(CAP,))
+
+
+def counted_objective(name: str, at) -> tuple:
+    """The objective `name` over the trainer cells' looped decoder at its cap (`at`, each looped model it
+    reads made at a count), its one batch, and whether its step reads its frozen reference (`Step.ema`)."""
+    from dew.diffusion.discrete import MDLM
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.objectives.distillation import DistillationObjective
+    from dew.objectives.rl.preference import DPOObjective
+
+    tokens = jnp.asarray(np.random.default_rng(0).integers(0, 255, (2, 17)), jnp.int32)
+    if name == "dpo":
+        from test_dpo import WIDTH, pair_batch
+
+        return DPOObjective(at(looped(steps=CAP)), WIDTH - 1, beta=0.5), pair_batch(), True
+    if name == "masked-diffusion":
+        model = at(looped(steps=CAP).clone(causal=False))
+        return (MaskedDiffusionObjective(model, MDLM(mask_id=255)(), seq_len=16, ema_decay=None),
+                {"text": tokens[:, :16]}, False)
+    assert name == "distillation"
+    student, teacher = (LMObjective(at(looped(steps=CAP)), 16, ema_decay=None) for _ in range(2))
+    return DistillationObjective(student, teacher, alpha=0.5), {"text": tokens}, False
+
+
+@pytest.mark.parametrize("count", range(1, CAP + 1))
+@pytest.mark.parametrize("name", ["dpo", "masked-diffusion", "distillation"])
+def test_an_objectives_cap_program_at_a_drawn_count_is_that_counts_objective(name, count):
+    """Every objective a sampled run trains over a looped decoder runs its cap's one program at the count its
+    microbatch drew (`LOOP_PASSES`, traced), as a language model's does: a preference pair's policy and
+    reference, a masked diffusion's denoiser, and a distillation's student and teacher, each loss and every
+    parameter's gradient on par from float64 with the objective over the models of that count's own
+    (`with_passes`; review of row 11951: each was refused, which main trained at every count)."""
+    capped, batch, referenced = counted_objective(name, lambda model: model)
+    fixed, _, _ = counted_objective(name, lambda model: model.with_passes(count))
+    # A run drawing its count per microbatch trains it, its every count by the cap's one program.
+    PhasePasses.of(capped, None, TRAINED)
+    rows = len(next(iter(jax.tree.leaves(batch))))
+    passes = np.full((rows,), count, np.int32)
+    initial = drawn(capped.init)
+
+    def gradient(objective, given_passes=None):
+        given = batch if given_passes is None else {**batch, LOOP_PASSES: given_passes}
+
+        def run(variables):
+            # The reference a preference loss reads is the drawn variables, frozen for both sides alike.
+            step = Step(jnp.asarray(0), jax.random.key(0), variables if referenced else None)
+
+            def loss(params):
+                return objective.scalar_loss({**variables, "params": params}, given, step)[0]
+            return jax.value_and_grad(loss)(variables["params"])
+        return run
+
+    def counted(variables):
+        return gradient(capped, passes)(variables)
+
+    def own(variables):
+        return gradient(fixed)(variables)
+
+    def own_in_float64(variables):
+        twin, _, _ = counted_objective(name, lambda model: float64_twin(model.with_passes(count)))
+        return gradient(twin)(variables)
+
+    assert_as_exact(jax.jit(counted), dew_path(jax.jit(own)), initial,
+                    f"{name}'s cap program at {count} passes", seeds=PASS_SEEDS,
+                    truth_fn=jax.jit(own_in_float64))
+
+
+def decision_loss_at(model, weighed):
+    """`counted_gradient` of a decision head's objective over the looped decoder `model` (`weighed` its
+    passes' weighing), over the two-option tickets of `test_decision_objective`, its rows given `passes` (a
+    traced count, `LOOP_PASSES`), or run at the model's own count where None."""
+    from decision_support import decision_rows
+    from test_decision_objective import EXAMPLES
+
+    from dew.data import ByteTokenizer
+    from dew.data.dataset import DataPartition
+    from dew.decision import DecisionObjective, Specials
+    from dew.decision.layout import SegmentLayout
+
+    objective = DecisionObjective(model, tokenizer=ByteTokenizer(),
+                                  specials=Specials(None, 10, 0, "\x00", 255),
+                                  layout=SegmentLayout.state_first_row(max_len=32, head_max_len=24,
+                                                                       option_tokens=6), **weighed)
+    batch = next(decision_rows(EXAMPLES, 2, objective=objective.data()).train(DataPartition()))
+    return objective, batch, counted_gradient(objective, batch)
+
+
+DECIDED = {**WEIGHED, "input-lm": {"input_lm": 0.5}}
+"""A decision loss's readings of its backbone's passes (`WEIGHED`), and its last pass's beside the rows' own
+next-token term (`input_lm`), whose causal read of the rows runs the backbone again."""
+
+
+@pytest.mark.parametrize("count", range(1, CAP + 1))
+@pytest.mark.parametrize("weighing", sorted(DECIDED))
+def test_a_decision_heads_cap_program_at_a_drawn_count_is_that_counts_model(weighing, count):
+    """A decision run drawing its pass count per microbatch steps every count by its looped backbone's cap's
+    one program, its rows given the count (`LOOP_PASSES`, traced), as a language model's does: its loss and
+    every parameter's gradient on par from float64 with the decision head over the backbone of that count's
+    own (`with_passes`), its passes weighed by its last alone, their mean and its exit gate, and its rows'
+    own next-token term read at that count too (`input_lm`; check 1; row 11951's design, which a decision
+    run, row 9691's, keeps)."""
+    model = weighed_model("last" if weighing == "input-lm" else weighing)
+    fixed = model.with_passes(count)
+    weighed = DECIDED[weighing]
+    capped, batch, at_cap = decision_loss_at(model, weighed)
+    passes = np.full((len(batch["labels"]),), count, np.int32)
+    initial = capped.init
+
+    def draw(seed):
+        return initial(jax.random.key(seed)), passes
+
+    def own(variables, _):
+        return decision_loss_at(fixed, weighed)[2](variables)
+
+    def own_in_float64(variables, _):
+        return decision_loss_at(float64_twin(fixed), weighed)[2](variables)
+
+    # Each count's own model is Dew's (`dew_path`): an invariance claim, held against it compiled alike.
+    assert_as_exact(jax.jit(at_cap), dew_path(jax.jit(own)), draw,
+                    f"a decision head at {count} passes ({weighing})", seeds=PASS_SEEDS,
+                    truth_fn=jax.jit(own_in_float64))
+
+
+@pytest.mark.parametrize("count", range(1, CAP + 1))
+def test_a_decision_heads_cap_program_whose_backbone_encodes_its_context_runs_both_passes_at_the_count(count):
+    """A decision run whose backbone encodes each row's context in a pass of its own (`context_encoder=
+    "backbone"`), read by cross-attention before its first layer, drawing its pass count per microbatch:
+    the context's pass and the answering pass both run the backbone's loop at the drawn count
+    (`BackboneCall.loop_passes`), so its loss and every gradient are on par from float64 with the decision
+    over the backbone of that count's own (`with_passes`, whose both passes run its count; check 1). A
+    context encoded at the cap beside an answer at the count is another model's, which this holds apart."""
+    from decision_support import decision_rows
+    from test_decision_context import QUESTION, ROWS
+
+    from dew.data import ByteTokenizer
+    from dew.data.dataset import DataPartition
+    from dew.decision import DecisionObjective, Example, Specials
+    from dew.nn.cross_attention import CrossAttention
+
+    def objective(over):
+        return DecisionObjective(over, tokenizer=ByteTokenizer(), specials=Specials(None, 10, 0, "\x00", 255),
+                                 context_encoder="backbone")
+
+    model = looped(steps=CAP).clone(max_seq_len=512, cross_attention=CrossAttention((0,), 32))
+    fixed = model.with_passes(count)
+    capped = objective(model)
+    rows = [Example(text, QUESTION, {"pick": label}, context=note) for text, label, note in ROWS[:4]]
+    batch = next(decision_rows(rows, 2, objective=capped.data()).train(DataPartition()))
+    passes = np.full((len(batch["labels"]),), count, np.int32)
+
+    def draw(seed):
+        # Its tree unboxed, as a step holds it, which the context's pass reads leaf by leaf.
+        return flax.linen.unbox(capped.init(jax.random.key(seed))), passes
+
+    def own(variables, _):
+        return counted_gradient(objective(fixed), batch)(variables)
+
+    def own_in_float64(variables, _):
+        # The backbone in float64 as a decision's truth reads it (`test_decision_context.in_float64`).
+        return counted_gradient(objective(fixed.clone(dtype=jnp.float64)), batch)(variables)
+
+    # Each count's own model is Dew's (`dew_path`): an invariance claim, held against it compiled alike.
+    assert_as_exact(jax.jit(counted_gradient(capped, batch)), dew_path(jax.jit(own)), draw,
+                    f"a context-encoding decision at {count} passes", seeds=PASS_SEEDS,
+                    truth_fn=jax.jit(own_in_float64))
+
+
+def test_a_sampled_objective_names_its_loss_s_forward_and_a_counted_run_refuses_one_that_takes_no_count():
+    """The forward a run drawing its count per microbatch checks takes the count is the one its
+    objective's loss reads a module by (`Objective.counted_forward`, `chunked.read_method`); and an LM whose
+    adaptation steps its decoder's own layers chunk by chunk (`ChunkAdaptation.layers`) through its decode
+    cache, whose loop runs no count given per call, reads no count, so such a run is refused (row 12300)."""
+    from dew.nn.backbones.decoder_stack import Loop
+    from dew.objectives.lm.adaptation import ChunkAdaptation
+    from dew.training import Layout, Trainer
+
+    model = looped(steps=CAP)
+    assert LMObjective(model, 16).counted_forward(model) == "hidden_states"
+    adapted = LMObjective(model, 16, adaptation=ChunkAdaptation(window=4, rate=0.5, layers=(0,)))
+    assert not adapted.reads_pass_counts and isinstance(model.loop, Loop)
+    with pytest.raises(ValueError):
+        Trainer(adapted, optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+                sampled_passes=TRAINED)
+
+
+@pytest.mark.parametrize("loop", [{"shared_cache": True}, {"exit_threshold": 0.5, "exit_gate": True}],
+                         ids=["shared-cache", "exit-threshold"])
+def test_a_loop_that_chooses_its_passes_itself_is_refused_a_count_drawn_per_microbatch(loop):
+    """A loop sharing one cache across its passes, or handing each token on at an exit threshold, chooses
+    its passes itself, which the one program at its cap runs at no count given per call (`run_loop`): a run
+    drawing its count per microbatch over it is refused as it is built, and the same loop at a phase's count
+    is not (review of row 11951: admitted, it failed at its first trace)."""
+    from dew.training import Layout, Trainer
+
+    model = looped(steps=CAP).clone(loop=Loop(CAP, layers=(1, 2), **loop))
+    with pytest.raises(ValueError):
+        Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
+                layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
+    Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
+            layout=Layout(min_shard=1, tolerance=1.0), phase_passes=(CAP,))
+
+
+def test_a_counted_mean_weighs_the_passes_that_ran_in_the_terms_precision():
+    """A count given per call weighs the passes that ran alike (`PassWeights.ran`), each share `1/c` in the
+    terms' own dtype: a float64 loss's share of three passes is float64's third, not float32's rounded
+    (review of row 11951)."""
+    from dew.objectives.passes import PassWeights
+
+    weights = PassWeights.of("mean")
+    assert weights is not None
+    with jax.enable_x64(new_val=True):
+        shares = weights.ran(tuple(jnp.asarray([True, True, False])), jnp.float64)
+        assert [share.dtype for share in shares] == [jnp.dtype(jnp.float64)] * 4
+        assert [float(share) for share in shares] == [1 / 3, 1 / 3, 0.0, 1 / 3]
+
+
+def multimodal_looped():
+    """A float32 multimodal wrapper (a tiny vision tower and projector, gemma3's fusion) over the trainer
+    cells' looped decoder (`looped`), its image placeholder id 3."""
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+
+    return MultimodalTransformer(
+        looped(steps=CAP), SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                                         image_size=8, patch_size=4),
+        GemmaProjector(text_width=32, patches_per_side=2, tokens_per_side=1), family="gemma3",
+        image_token_id=3, dtype=jnp.float32)
+
+
+@pytest.mark.parametrize("count", range(1, CAP + 1))
+def test_a_multimodal_cap_program_at_a_drawn_count_is_that_counts_model_over_its_image_rows(count):
+    """A multimodal language run drawing its pass count per microbatch steps every count by its wrapper's
+    cap's one program, its rows given the count (`LOOP_PASSES`, traced), its forward handing the count to
+    its language model (`MultimodalTransformer.hidden_states`): over rows whose image fills a placeholder,
+    the vision tokens read under the count, its loss and every parameter's gradient on par from float64 with
+    the wrapper of that count's own (`with_passes`; check 1)."""
+    from test_tokens_embedded import media_rows
+
+    from dew.nn.inputs import ModelInputs
+
+    model = multimodal_looped()
+    fixed = model.with_passes(count)
+    assert fixed is not None
+    rows = np.tile(np.asarray([[2, 3, 4, 5, 6, 7, 8, 9, 10]], np.int32), (2, 1))
+    images = np.tile(np.asarray([[-1, 0, -1, -1, -1, -1, -1, -1, -1]], np.int32), (2, 1))
+    text = media_rows(rows, images)
+    assert isinstance(text, ModelInputs)
+    batch = {"text": text}
+
+    def gradient(over):
+        return counted_gradient(LMObjective(over, 8, head_chunks=1), batch)
+
+    passes = np.full((2,), count, np.int32)
+    initial = LMObjective(model, 8, head_chunks=1).init
+
+    def draw(seed):
+        return initial(jax.random.key(seed)), passes
+
+    def own(variables, _):
+        return gradient(fixed)(variables)
+
+    def own_in_float64(variables, _):
+        return gradient(float64_twin(fixed))(variables)
+
+    # Each count's own model is Dew's (`dew_path`): an invariance claim, held against it compiled alike.
+    assert_as_exact(jax.jit(gradient(model)), dew_path(jax.jit(own)), draw,
+                    f"a multimodal cap program at {count} passes", seeds=PASS_SEEDS,
+                    truth_fn=jax.jit(own_in_float64))
+
+
+def test_a_pass_count_drawn_per_microbatch_over_a_loop_whose_forward_takes_none_is_refused():
+    """A looped module whose forward its loss reads by names no count of passes a call runs (`loop_passes`),
+    an adapter's handing its keywords on, which states no count it reads, would run every pass at its cap
+    whatever a microbatch draws: a run drawing its count per microbatch over it is refused as it is built,
+    and the same module at a phase's count is not (review of row 11951: a forward taking any keyword was
+    read as taking the count where the decoder's did)."""
+    from dew.training import Layout, Trainer
+
+    class Uncounted(CausalTransformer):
+        def hidden_states(self, tokens, **kwargs):
+            return super().hidden_states(tokens, **{key: value for key, value in kwargs.items()
+                                                    if key != "loop_passes"})
+
+    base = looped(steps=CAP)
+    model = Uncounted(**{field.name: getattr(base, field.name) for field in dataclasses.fields(base)
+                         if field.init and field.name not in ("parent", "name")})
+    with pytest.raises(ValueError):
+        Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
+                layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
+    Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
+            layout=Layout(min_shard=1, tolerance=1.0), phase_passes=(CAP,))
+
+
+def test_a_sampled_run_under_autopgle_profiles_and_steps_its_counted_program():
+    """A run drawing its pass count per microbatch under JAX's AutoPGLE (`jax_enable_pgle`) profiles the
+    program it planned, its cap's counted one, on its fit's trials over the batch that program reads, each
+    microbatch's count among its rows (`StepCompiler.counted_trials`), and steps on (review of row 11951:
+    the trials held the batch read before its counts, which the profiled program refused before step 1)."""
+    from test_pass_weights import phased_draw, phased_loader
+    from test_plan import autopgle
+
+    tokens, _ = phased_draw(0)
+    with autopgle(2):
+        state = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED).fit(
+            phased_loader(tokens), steps=2, log_every=100)
+    assert int(state.step) == 2
+
+
+def test_a_sampled_run_resumes_at_the_rung_its_checkpoint_climbed_to(monkeypatch):
+    """A run drawing its pass count per microbatch, at one microbatch a step, whose devices hold its step
+    recomputing all its layers (`full`) and not at its own rung, climbs there and records that rung for its
+    batch's layout (`checkpoint_rung`); a run resuming that rung (`resume_rung`) on devices that hold either
+    compiles at the rung it holds, which the fit's compile report states (`Trainer.plan`'s first probe), not
+    its own (review of row 11951: recorded under the counted layout, the resume searched from the ladder's
+    foot)."""
+    from test_pass_weights import phased_draw, phased_loader
+    from test_plan import LIMIT, free
+
+    tokens, _ = phased_draw(0)
+
+    def fitted(model, rung=None):
+        trainer = phased_trainer(model, 0, None, sampled_passes=TRAINED, fit=FitPolicy(split=1))
+        if rung is not None:
+            trainer._compiler.resume_rung(rung)
+        trainer.fit(phased_loader(tokens), steps=1, log_every=100)
+        return trainer
+
+    def needed(model) -> int:
+        free(monkeypatch, LIMIT)
+        return LIMIT - fitted(model).plan["probes"][0]["headroom"]
+
+    own, full = needed(looped(steps=CAP)), needed(looped(steps=CAP).clone(remat="full"))
+    assert full < own, (full, own)
+    free(monkeypatch, (own + full) // 2)
+    climbed = fitted(looped(steps=CAP))
+    assert climbed.plan["remat"] is not None, climbed.plan
+    free(monkeypatch, LIMIT)
+    resumed = fitted(looped(steps=CAP), climbed._compiler.checkpoint_rung())
+    first = resumed.plan["probes"][0]
+    assert first["remat"] == climbed.plan["remat"] and first["fits"], (first, climbed.plan)
+
+
+@pytest.mark.parametrize("target", [pytest.param("sm90", marks=lowers("sm90"))])
+def test_a_sampled_step_lowered_for_a_gpu_is_its_counted_program(target):
+    """A run drawing its pass count per microbatch lowered for a GPU this host is not (`lower_for`) lowers
+    the program it steps, its cap's, reading each microbatch's count among its rows (`LOOP_PASSES`), not a
+    fixed count's (review of row 11951: lowered before its counts were laid in)."""
+    from dew.training._lowering import Lowered
+
+    trainer = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, lower_for=target)
+    state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+    with pytest.raises(Lowered) as lowered:
+        trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count() * 2, 17), jnp.int32)})
+    inputs = [jax.tree_util.keystr(path) for path, _ in
+              jax.tree_util.tree_flatten_with_path(lowered.value.lowered.args_info)[0]]
+    assert any(LOOP_PASSES in path for path in inputs), inputs
+
+
 def test_a_rollout_beside_a_pass_count_drawn_per_microbatch_is_refused():
     """A rollout samples a step's rows and behaviour log-probabilities from the one policy it holds, at the
     run's cap, while a run drawing its pass count per microbatch trains each microbatch at its own count, so
@@ -687,27 +1100,4 @@ def test_a_rollout_beside_a_pass_count_drawn_per_microbatch_is_refused():
         phased_trainer(model, 0, None, sampled_passes=TRAINED, rollout=_Drawing())
     phased_trainer(model, 0, (CAP,), rollout=_Drawing())
 
-
-def test_a_sampled_runs_step_compiled_ahead_holds_every_count(tmp_path):
-    """A run that draws its pass count per microbatch, its step compiled ahead for compile-only GPUs
-    (`compile_ahead`), holds beside its cap's step every other count's at the cap's plan, each its own program
-    (`AheadOfTime.counts`, row 7924), saved and loaded with it; a run handed it takes each count's
-    (`AheadOfTime.at_count`), a count it holds none of refused."""
-    from test_compile_ahead import gpus
-
-    from dew.training import MeshSpec
-    from dew.training.ahead import AheadOfTime, compile_ahead
-
-    trainer = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED,
-                             mesh=MeshSpec().build(gpus("sm90")))
-    ahead = compile_ahead(trainer, {"text": token_draw()})
-    assert sorted(ahead.counts) == list(range(1, CAP))
-    programs = {count: step.program for count, (step, _) in ahead.counts.items()}
-    assert len({ahead.program, *programs.values()}) == CAP
-    ahead.save(tmp_path / "step.dew-aot")
-    loaded = AheadOfTime.load(tmp_path / "step.dew-aot")
-    assert {count: step.program for count, (step, _) in loaded.counts.items()} == programs
-    assert all(loaded.at_count(count).program == program for count, program in programs.items())
-    with pytest.raises(ValueError):
-        loaded.at_count(CAP)
 

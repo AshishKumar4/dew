@@ -27,6 +27,7 @@ from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
 from dew.registry import ModelConfig
 from dew.training import Trainer
+from dew.training.budget import Horizon
 
 INPUTS = InputSpec(Field("x", (3,)))
 
@@ -178,7 +179,7 @@ def test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name():
 
 
 def supervised_run(loss) -> RunConfig:
-    return RunConfig(model=ModelConfig.from_model(Affine()), trainer=TrainerConfig(steps=1),
+    return RunConfig(model=ModelConfig.from_model(Affine()), trainer=TrainerConfig(horizon=Horizon(steps=1)),
                      objective=ObjectiveConfig("supervised", {"loss": loss, "metrics": (Accuracy(),),
                                                               "inputs": INPUTS}))
 
@@ -212,8 +213,11 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
     def losses(directory):
         return logged_losses(directory / "autoencoder_experiment")
 
-    train(str(REPO_ROOT / "tests" / "autoencoder_experiment.py"),
-          "--set", f"trainer.checkpoint_dir={tmp_path / 'first'}")
+    first = {"trainer.name": "autoencoder_experiment", "trainer.checkpoint_dir": str(tmp_path / "first")}
+    (tmp_path / "set_autoencoder.py").write_text(
+        "from autoencoder_experiment import run as built\n"
+        f"run = (built() if callable(built) else built).override({first!r})\n")
+    train(str(tmp_path / "set_autoencoder.py"))
     record = tmp_path / "first" / "autoencoder_experiment" / "run.json"
     loss = json.loads(record.read_text())["fields"]["objective"]["fields"]["loss"]
     assert loss == {"function": "autoencoder_experiment:evidence_bound"}
@@ -222,8 +226,11 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
     # (`test_the_autoencoders_evidence_bound_falls_over_independent_runs`).
     assert len(trained) == 40
 
-    train(str(record), "--trust", "autoencoder_experiment",
-          "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
+    again = {"trainer.name": "autoencoder_experiment", "trainer.checkpoint_dir": str(tmp_path / "again")}
+    (tmp_path / "again_autoencoder.py").write_text(
+        "from dew.config import RunConfig\n"
+        f"run = RunConfig.load({str(record)!r}, trust=('autoencoder_experiment',)).override({again!r})\n")
+    train(str(tmp_path / "again_autoencoder.py"), "--trust", "autoencoder_experiment")
     assert losses(tmp_path / "again") == trained
 
 
@@ -249,8 +256,9 @@ def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
 
     def drop(runs):
         return {"training halves the held-out evidence bound": cut(*held_out_measures(
-            objective, config.optim.build(config.trainer.steps), loader,
-            lambda run: points([run, 10_000], rows=256), runs=runs, steps=config.trainer.steps), margin=2)}
+            objective, config.optim.build(config.trainer.horizon.steps), loader,
+            lambda run: points([run, 10_000], rows=256), runs=runs, steps=config.trainer.horizon.steps),
+            margin=2)}
 
     assert_learns(drop, "the autoencoder experiment", units=RUNS)
 
