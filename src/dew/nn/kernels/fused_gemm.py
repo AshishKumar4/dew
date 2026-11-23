@@ -229,9 +229,10 @@ class Region:
     """Whether its launch with its hooks keeps the residency of the product's launch as its unfused path
     makes it, no hook and its declared result (`grouped_matmul.resident`)."""
     permuted_bytes: float = 0.0
-    """The bytes of the consumers' row-indexed captured arrays a scattered product's fused arm permutes to
-    its rows' order before its launch (`_indexed_rows`): an XLA gather reading and writing each once, which
-    its unfused arm, reading them where they lie after the scatter, does not run."""
+    """The device bytes a scattered product's fused arm moves permuting its consumers' row-indexed captured
+    arrays to its rows' order before its launch (`_indexed_rows`): an XLA gather reading and writing each
+    once and reading the scatter table once for each, which its unfused arm, reading them where they lie
+    after the scatter, does not run."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -305,7 +306,7 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     launch_unfused = product + cost.Work(device_bytes=operands + written)
     fused_seconds = sides + cost.seconds(launch_fused, target)
     if region.permuted_bytes:
-        permuted = cost.Work(device_bytes=2 * region.permuted_bytes, kernels=1.0)
+        permuted = cost.Work(device_bytes=region.permuted_bytes, kernels=1.0)
         fused_seconds += xla(permuted)
         fused_work = fused_work + permuted
     unfused_seconds = forming + cost.seconds(launch_unfused, target)
@@ -442,7 +443,8 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gathe
             float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
             float(sum(math.prod(out.shape) * out.dtype.itemsize for out in out_leaves)), formed, forms=forms,
             resident=resident, permuted_bytes=0.0 if scatter is None else float(sum(
-                side.size * side.dtype.itemsize for side, axes in epilogue_ops if 'rows' in axes))))
+                2 * side.size * side.dtype.itemsize + scatter.size * scatter.dtype.itemsize
+                for side, axes in epilogue_ops if 'rows' in axes))))
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))[0]
 
 
