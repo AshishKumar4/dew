@@ -219,8 +219,11 @@ _RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = _cache.untraced(conte
 _PROCESS = _Registry()
 """The process's registry, every thread's. A shared executable cache does not share these decisions:
 only an explicitly handed plan seeds them, after validating its program and target."""
-_SCOPE: contextvars.ContextVar[_Registry | None] = contextvars.ContextVar("refusals_scope", default=None)
-"""A `refusals` scope's own registry, in its context alone."""
+_SCOPE: contextvars.ContextVar[_Registry | None] = _cache.untraced(
+    contextvars.ContextVar("refusals_scope", default=None))
+"""A `refusals` scope's own registry, in its context alone: a trace reads it through its facts alone
+(`refusals_of`, `refusal_entries`, under `_GUARD`), so a held trace's key leaves it out (`_cache.untraced`),
+where its records' walk raced a compile worker filling them and a first lookup made the key stale."""
 _GUARD = threading.RLock()
 """Serializes the registries' reads and updates between threads."""
 
