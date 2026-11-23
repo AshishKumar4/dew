@@ -612,16 +612,19 @@ def test_a_warpgroup_waits_on_a_copy_its_barrier_lands_or_on_another_warpgroups_
     assert _waits(handed, plgpu.Barrier()) == ((cost.Chain(barriers=1),),)
 
 
-def test_a_copy_into_a_rings_slot_waits_as_the_ring_hides_it():
-    """A tile copy landing on one of a ring's barriers (one a slot, three of them) waits as that ring's
-    three stages hide it, two slots ahead of the step that reads it, where one copy landing on its own
-    barrier hides nothing (row 4123: every copy priced waited whole, its ring's depth unread)."""
+@pytest.mark.parametrize("copied, stages", [(2, 3), (1, 1)], ids=["prefetched", "at-once"])
+def test_a_copy_into_a_rings_slot_waits_as_the_ring_hides_it(copied, stages):
+    """A tile copy landing on one of a ring's barriers (one a slot, three of them), a step waiting on
+    another slot (the copy a prefetch for a later step's), waits as that ring's three stages hide it, where
+    one copy landing on its own barrier hides nothing (row 4123: every copy priced waited whole, its ring's
+    depth unread); waited on the slot it was copied into, at once, it waits whole, the ring's depth no proof
+    of turns between (row 12369: an attention consumer's copy and wait on one slot priced a third)."""
     def ringed(out_gmem, tiles, ready):
-        plgpu.copy_gmem_to_smem(out_gmem, tiles.at[1], ready.at[1])
+        plgpu.copy_gmem_to_smem(out_gmem, tiles.at[1], ready.at[copied])
         plgpu.barrier_wait(ready.at[1])
 
     assert _waits(ringed, plgpu.SMEM((3, 128), jnp.float32), plgpu.Barrier(num_barriers=3)) == (
-        (cost.Chain(copies=1, copy_bytes=512, stages=3),),)
+        (cost.Chain(copies=1, copy_bytes=512, stages=stages),),)
 
 
 def test_a_copy_one_warpgroup_issues_waits_in_the_warpgroup_that_reads_it():
