@@ -238,82 +238,72 @@ def test_what_a_gpu_has_spent_already_is_not_charged_to_a_program_again():
     assert resident.held == Collectives(groups=frozenset({(0, 1, 2, 3), (0, 1), (2, 3)}))
 
 
-def test_a_program_not_yet_run_is_charged_what_a_first_run_took_beside_every_other_not_yet_run():
+def test_a_program_not_yet_run_is_charged_its_load_beside_every_other_not_yet_run_and_their_communicators():
     """A program loads on its GPUs outside XLA's pool as it first runs, which what is free now counts only
-    once it has run: a program admitted is charged, beside its new communicators, what loading one took as a
-    first run measured it (`Resident.ran`, `PROGRAM_FLOOR` before any ran), and for each other program
-    admitted on its GPUs that has not run, that one's load and the communicators its admission added, which
-    no reading of free memory counts until it runs (row 12131: 24 executables left an all-reduce no room on
-    a 2xH100; review: a later admission took an earlier one's communicators as made). A first run's measure
-    is what the GPU lost over it less the communicators its admission charged and the pool's growth, never
-    those twice; a program that ran is charged nothing again, and its GPUs' others are refused only past
-    what is free."""
+    once it has run: a program admitted is charged, beside its new communicators, its load
+    (`PROGRAM_FLOOR`), and for each other program admitted on its GPUs that has not run, that one's load and
+    the communicators it makes as it runs, never those twice where both make the same (row 12131: 24
+    executables left an all-reduce no room on a 2xH100; review: a later admission took an earlier one's
+    communicators as made). A program that ran is charged nothing again, its communicators made, and its
+    GPUs' others are refused only past what is free."""
     room = dict.fromkeys(range(4), 8 * GIB)
     every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
     resident = communicators.Resident()
-    step, evaluation = communicators.Loaded((0, 1, 2, 3), 1), communicators.Loaded((0, 1), 2)
+    step, twin, evaluation = (communicators.Loaded((0, 1, 2, 3), 1), communicators.Loaded((0, 1, 2, 3), 2),
+                              communicators.Loaded((0, 1), 3))
     floor = communicators.PROGRAM_FLOOR
-    # The step's communicators (2 GiB each, `FOUR`'s every-GPU group) and its own load, the floor.
+    # The step's communicators (2 GiB each, `FOUR`'s every-GPU group) and its own load.
     with pytest.raises(CommunicatorRoom) as tight:
         resident.admit(every, FOUR, room, lambda gpu: 2 * GIB + floor - 1, step)
     assert tight.value.needed == dict.fromkeys(range(4), 2 * GIB + floor)
     resident.admit(every, FOUR, room, lambda gpu: 2 * GIB + floor, step)
-    # Admitted before the step ran: charged its own load, and the step's load and communicators, which no
-    # free reading counts yet.
+    # A second program of the same communicators before the step ran: charged them once, beside both loads.
+    with pytest.raises(CommunicatorRoom) as shared:
+        resident.admit(every, FOUR, room, lambda gpu: 0, twin)
+    assert shared.value.needed == dict.fromkeys(range(4), 2 * GIB + 2 * floor)
+    # An evaluation of none: its own load, the step's load and its communicators.
     ahead = 2 * floor + 2 * GIB
     with pytest.raises(CommunicatorRoom) as pending:
         resident.admit(Collectives(), FOUR, room, lambda gpu: ahead - 1, evaluation)
     assert pending.value.needed == {0: ahead, 1: ahead, 2: 0, 3: 0}
-    # The step's first run: the GPU lost its communicators, 96 MiB of load and 32 MiB of pool growth.
-    took = 96 << 20
-    before, after = dict.fromkeys(range(4), 6 * GIB), dict.fromkeys(range(4), 4 * GIB - took - (32 << 20))
-    resident.ran(step.key, before, after, dict.fromkeys(range(4), 32 << 20))
-    assert resident.cost == dict.fromkeys(range(4), took)
-    # The step ran, so it is charged nothing again; the evaluation, not yet run, what the step's load took.
+    resident.dispatched(step.key)
+    assert resident.held == every
+    # The step ran: charged nothing again; the evaluation its own load alone, the communicators made.
     resident.admit(every, FOUR, room, lambda gpu: 0, step)
     with pytest.raises(CommunicatorRoom):
-        resident.admit(Collectives(), FOUR, room, lambda gpu: took - 1, evaluation)
-    resident.admit(Collectives(), FOUR, room, lambda gpu: took, evaluation)
+        resident.admit(Collectives(), FOUR, room, lambda gpu: floor - 1, evaluation)
+    resident.admit(Collectives(), FOUR, room, lambda gpu: floor, evaluation)
 
 
-def test_a_pool_that_gave_regions_back_over_a_first_run_charges_the_load_it_hid():
-    """A pool that is not preallocated may give regions back over a program's first run: the GPU's free
-    bytes gained what it gave, so what the run's load took is what the GPU lost plus what the pool gave
-    back, never the loss alone (review of row 12131: a 48 MiB load beside a 32 MiB shrink was measured 16
-    MiB)."""
-    resident = communicators.Resident()
-    step = communicators.Loaded((0,), 1)
-    resident.admit(Collectives(), FOUR, {0: 8 * GIB}, lambda gpu: GIB, step)
-    resident.ran(step.key, {0: GIB}, {0: GIB - (16 << 20)}, {0: -(32 << 20)})
-    assert resident.cost == {0: 48 << 20}
-
-
-def test_a_program_released_or_run_unmeasured_is_charged_ahead_of_no_other():
+def test_a_program_released_before_it_ran_leaves_its_communicators_unmade_and_charged_to_no_other():
     """A program admitted that never runs is charged ahead of every later one only while it lives: its
     executable released (a search's passed-over rung), what it would have loaded and connected is no
-    other's charge, and its identity anyone's again; one run through Dew's compile point without a measure
-    (`Resident.dispatched`) is free memory's to read from then on (review of row 12131: both stayed charged
-    for ever)."""
+    other's charge, never taken as made, and its identity anyone's again; one run through Dew's compile
+    point (`Resident.dispatched`) is free memory's to read from then on, its communicators made (review of
+    row 12131: both stayed charged for ever, and a loser's communicators were taken as made)."""
     import gc
 
     floor = communicators.PROGRAM_FLOOR
     room = dict.fromkeys(range(4), 8 * GIB)
+    every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
     resident = communicators.Resident()
     loser = jax.jit(lambda x: x + 1).lower(jnp.ones(2)).compile()
     resident.watch(id(loser), loser)
-    resident.admit(Collectives(), FOUR, room, lambda gpu: floor, communicators.Loaded((0,), id(loser)))
+    resident.admit(every, FOUR, room, lambda gpu: 2 * GIB + floor,
+                   communicators.Loaded((0, 1, 2, 3), id(loser)))
     ran = communicators.Loaded((1,), 7)
     resident.admit(Collectives(), FOUR, room, lambda gpu: floor, ran)
     probe = communicators.Loaded((0, 1), 9)
     with pytest.raises(CommunicatorRoom) as both:
         resident.admit(Collectives(), FOUR, room, lambda gpu: 0, probe)
-    assert both.value.needed == {0: 2 * floor, 1: 2 * floor, 2: 0, 3: 0}
+    assert both.value.needed == {0: 2 * floor + 2 * GIB, 1: 3 * floor + 2 * GIB, 2: 0, 3: 0}
     del loser
     gc.collect()
     resident.dispatched(ran.key)
     with pytest.raises(CommunicatorRoom) as alone:
         resident.admit(Collectives(), FOUR, room, lambda gpu: 0, probe)
     assert alone.value.needed == {0: floor, 1: floor, 2: 0, 3: 0}
+    assert resident.held == Collectives()
 
 
 STEP = ("HloModule step\n\n%add (lhs: f32[], rhs: f32[]) -> f32[] {\n  %lhs = f32[] parameter(0)\n"
@@ -642,6 +632,10 @@ def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(
         assert len(trainer.plan["probes"]) >= 2 and trainer.plan["split"] > 1, trainer.plan["probes"]
         gc.collect()
         assert charged(probe) == alone + each, (alone, each)
+        # The step run once: its call returned, so nothing is charged ahead of a later program.
+        trained(trainer, steps=1)
+        gc.collect()
+        assert charged(probe) == alone, (alone, each)
     finally:
         communicators.hold(held)
 

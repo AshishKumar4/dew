@@ -180,6 +180,21 @@ def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, 
     return options or None
 
 
+def admitted_or_missed(take: Callable[[], jax.stages.Compiled],
+                       refusals: list[Exception]) -> jax.stages.Compiled | None:
+    """`take()`'s executable, a program compiled or loaded at a fit candidate (`compiled_if_it_fits`,
+    `dew.training.ahead.Executable.taken`), or None where its admission refuses it
+    (`dew.communicators.CommunicatorRoom`: its communicators and load have no room outside XLA's pool), the
+    refusal kept: the search asks the next candidate, as for a step that misses, and a search that finds
+    none raises naming it (row 12131's review: a losing rung's admission ended the search)."""
+    try:
+        return take()
+    except communicators.CommunicatorRoom as room:
+        _log.info("the step's communicators and load have no room outside XLA's pool: %s", room)
+        refusals.append(room)
+        return None
+
+
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                         refusals: list[Exception], *, relower: Callable[[], jax.stages.Lowered],
                         first: report.Attempt | None = None) -> jax.stages.Compiled | None:
@@ -191,18 +206,13 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
     program's temporaries against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
     returning an executable whose memory `step_fits` could read, so the refusal means the step does
     not fit. For example, on a v6e, Qwen3-0.6B at 16 x 1024
-    tokens asked for 38.47G of temporaries next to 31.24G of HBM. A program whose communicators and code
-    the room outside XLA's pool does not hold (`dew.communicators.CommunicatorRoom`, its admission) is
-    refused alike: the search asks the next candidate, as for a step that misses, and a search that finds
-    none raises naming it (row 12131's review: a losing rung's admission ended the search). Any other
-    compile error is raised. `first` is its first compile where another thread made it (`report.attempts`).
+    tokens asked for 38.47G of temporaries next to 31.24G of HBM. A program its admission refuses is a miss
+    too (`admitted_or_missed`). Any other compile error is raised. `first` is its first compile where
+    another thread made it (`report.attempts`).
     """
     try:
-        return report.compiled(program, options, relower=relower, first=first)
-    except communicators.CommunicatorRoom as room:
-        _log.info("the step's communicators and code have no room outside XLA's pool: %s", room)
-        refusals.append(room)
-        return None
+        return admitted_or_missed(lambda: report.compiled(program, options, relower=relower, first=first),
+                                  refusals)
     except jax.errors.JaxRuntimeError as error:
         if not refused_for_memory(error.error_code_string, str(error)):
             raise
@@ -514,14 +524,11 @@ class FirstRunFailed(RuntimeError):
             "the kernels loaded, and a lower fraction leaves them more")
 
 
-def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh,
-              executable: jax.stages.Compiled | None = None) -> dict[str, dict[int, int]]:
+def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str, dict[int, int]]:
     """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's
     (`FirstRunFailed`). A first run that succeeds returns, and logs, each GPU's bytes free outside XLA's
     pool as the fit check read them (`fitted`) and now: what the devices took there since, every
-    process's and a pool's growth counted, the step's collectives' communicators (NCCL) among it; what it
-    took past its communicators and the pool's growth is what loading the step's `executable` took there,
-    which every program admitted after it is charged (`dew.communicators.first_ran`)."""
+    process's and a pool's growth counted, the step's collectives' communicators (NCCL) among it."""
     devices = local_devices(mesh)
     try:
         loss.block_until_ready()
@@ -538,16 +545,6 @@ def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh,
     current = {device.id: free for device in devices
                if device.id in checked and (free := outside_pool(device)) is not None}
     observed = {"checked": {device: checked[device] for device in current}, "now": current}
-    if executable is not None and current:
-        pools = {integer(device["id"], "id"): pool for device in read
-                 if isinstance(pool := device.get("pool_bytes"), int)}
-        by_id = {device.id: device for device in devices}
-        grown = {device: (by_id[device].memory_stats() or {}).get("pool_bytes", pools[device]) - pools[device]
-                 for device in current if device in pools}
-        named = {device: communicators.ordinal(by_id[device]) for device in current}
-        communicators.first_ran(executable, {named[device]: checked[device] for device in current},
-                                {named[device]: free for device, free in current.items()},
-                                {named[device]: growth for device, growth in grown.items()})
     if current:
         _log.info("the GPUs' free bytes outside XLA's pool: %s as the step's fit check read them, %s after "
                   "its first run, which takes its collectives' communicators there", observed["checked"],

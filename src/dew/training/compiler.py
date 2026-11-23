@@ -19,6 +19,7 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
+from dew import communicators
 from dew._coordination import agreed, agreed_count, from_every_process
 from dew._records import JSON, boolean, integer, json_value, listed, record
 from dew.batch import CLOSES_WINDOW, LOOP_PASSES, Batch, Variables, at_path, placed_at
@@ -524,6 +525,9 @@ class Unplaced(NamedTuple):
     planned: Planned
     compiled: Compiled
     keep: Callable[[], None]
+    release: Callable[[Planned], None]
+    """Drop what its search kept but the plan a compile takes, its own or one searched on the placed devices
+    (`FitSearch.released_unplanned`)."""
 
     def probes(self) -> tuple[tuple[Mapping[str, object], ...], int]:
         """Its search's probes (`dew.training.planning.Probe.record`) and the index of its own: the last that
@@ -692,6 +696,8 @@ class StepCompiler[L, E]:
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
+        # The last search's release of what it kept but a plan taken in its place (`Unplaced.release`).
+        self._settle: Callable[[Planned], None] = lambda planned: None
         # Where that search found none, its refusal, which the placed state may not cover (`refuse_unplaced`).
         self._refused: tuple[Hashable, PlanRefused] | None = None
         # The fit's interval its host steps count their misses in (`counting`), None outside a fit.
@@ -906,6 +912,8 @@ class StepCompiler[L, E]:
             assert self.host_startup is not None, "a host step's compile runs its startup pass"
             return Compiled(stepping.shape.split, plan={"startup": self.host_startup.record()}, step=run)
         held, self._unplaced = self._unplaced, None
+        # Its search's programs, which whatever plan this compile takes leaves held no more but its own.
+        unplaced = held
         mesh = settings.device_mesh
         # A fresh run's first plan, made before its state was placed, judged with its narrow copies built on
         # the state its loop steps (`Building`): owned by its fit's trials, holding no copies (a start's own;
@@ -964,6 +972,8 @@ class StepCompiler[L, E]:
             # Where the devices, the state placed, hold no block for it, the plan's search runs here, on them.
             planned, compiled, keep = self._plan(stepping, state, batch, trials)
             keep()
+        if unplaced is not None:
+            unplaced.release(planned)
         kept = planned.released()
         return dataclasses.replace(compiled, step=self.runner(stepping, kept, settings.device_mesh),
                                    planned=kept)
@@ -1006,7 +1016,7 @@ class StepCompiler[L, E]:
             _log.info(UNPLACED_REFUSED, refused)
             self._unplaced, self._refused = None, (signature, refused)
             return signature
-        self._unplaced = Unplaced(signature, planned, compiled, keep)
+        self._unplaced = Unplaced(signature, planned, compiled, keep, self._settle)
         return signature
 
     def refuse_unplaced(self, signature: Hashable, freed: Callable[[], int | None], mesh: Mesh,
@@ -1236,6 +1246,8 @@ class StepCompiler[L, E]:
                 for part, executable in zip(parts, executables, strict=True):
                     moving, *output = executable(moving, frozen, batch, part)
                     outputs.append(tuple(output))
+                # Each executable a call of which returned run: its admission's charge is free memory's now.
+                communicators.dispatched(held)
                 stepped = together(moving, frozen)
                 returned[0] = stepped.window_size
                 # A split step's metrics through its whole, which pools them and reads each as its value.
@@ -1361,8 +1373,10 @@ class StepCompiler[L, E]:
                 # for a refit. An empty profile replaces nothing, and every kept lowering stays.
                 hold(asked, planned.executable)
                 forget(unguided)
-        # Every executable and traced step the search kept but the plan's dropped (row 12131).
+        # Every executable and traced step the search kept but the plan's dropped (row 12131); a provisional
+        # search's once a plan is taken in its place (`Unplaced.release`).
         search.released_unplanned(planned)
+        self._settle = functools.partial(search.released_unplanned, settled=True)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)

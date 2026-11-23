@@ -62,6 +62,7 @@ from dew.training.memory import (
     LIMIT_EXIT,
     LiveSet,
     MemoryMiss,
+    admitted_or_missed,
     compile_limit,
     compiled_if_it_fits,
     local_devices,
@@ -911,15 +912,17 @@ class FitSearch[LossT, EffectsT]:
         # (`report.targeted`).
         self.required = compiler_options() or None
 
-    def released_unplanned(self, planned: Planned) -> None:
+    def released_unplanned(self, planned: Planned, *, settled: bool = False) -> None:
         """Drop what the search kept of every program it compiled but the plan's, now it settled on
         `planned`: each executable it held but the plan's step's and its sampled step's (`unhold`), and each
         traced step it kept for a refit but the plan's (`dew.training._candidates.forget_unplanned`), every
         losing rung's and every frontier rung's (`above`, `below`) among them. A loaded executable holds its
         device code and, over several GPUs, its collectives' room outside XLA's pool for as long as it lives
         (row 12131: 24 kept beside a 4B run's step left an all-reduce no room on a 2xH100). A provisional
-        search keeps them, for the plan made on the devices as they stand to take (`provisional`)."""
-        if self.provisional:
+        search keeps them, for the plan made on the devices as they stand to take (`provisional`), until a
+        plan is taken in its place (`settled`): its own, or the one a search on the placed devices made,
+        whose programs it then keeps where it compiled them too."""
+        if self.provisional and not settled:
             return
         from dew.training._candidates import forget_unplanned
 
@@ -1089,7 +1092,8 @@ class FitSearch[LossT, EffectsT]:
             looked = self.compiled_key(candidate.lowered, options)
             kept = held(looked)
             if ahead is not None:
-                executable, self.ahead = ahead.taken(candidate.lowered), None
+                executable, self.ahead = admitted_or_missed(lambda: ahead.taken(candidate.lowered),
+                                                            self.refusals), None
             elif candidate.sampled is None and kept is not None:
                 executable, taken = kept, True
             else:
@@ -1122,7 +1126,9 @@ class FitSearch[LossT, EffectsT]:
                     # (`handed`), which its target compiles none of.
                     with handed(ahead):
                         sampled = candidate.sampled()
-                    self.sampled = SampledStep(sampled, ahead.sampled.taken(sampled, jax.devices()))
+                    loaded = admitted_or_missed(lambda: ahead.sampled.taken(sampled, jax.devices()),
+                                                self.refusals)
+                    self.sampled = None if loaded is None else SampledStep(sampled, loaded)
                 else:
                     # The one compiled beside the step's, but where the step was lowered afresh past a spill,
                     # which its sampled step is then too, as one lowered after the step's compile would be.

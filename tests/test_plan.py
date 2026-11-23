@@ -564,6 +564,37 @@ def test_a_settled_plan_keeps_no_program_its_search_passed_over(monkeypatch):
     assert len(options._HELD) == 1, list(options._HELD)
 
 
+def test_a_provisional_plans_search_keeps_no_program_once_its_plan_is_taken(monkeypatch):
+    """A fresh fit plans its step before placing its state (`Trainer._planned_unplaced`), its search keeping
+    every program it compiled for that plan to take; once its compile takes the plan, its own or one
+    searched on the placed devices, the programs it passed over are dropped, the plan's alone kept (review
+    of row 12131's P0: a provisional search's losers and frontier rungs stayed loaded)."""
+    from affine_run import Replaying
+
+    from dew.data.dataset import Loader
+    from dew.training import _candidates
+
+    whole, halves = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=2))
+    assert halves < whole, (halves, whole)
+    options.release()
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    free(monkeypatch, LIMIT)
+    roomy = lm()
+    roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    assert roomy.validation is not None
+    state = max(roomy.validation.device_bytes.values())
+    options.release()
+    gc.collect()
+    trainer = lm()
+    free_until_placed(monkeypatch, state + (whole + halves) // 2)
+    trained = trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+    plan = trainer.plan
+    assert int(trained.step) == 1 and isinstance(plan, dict) and len(plan["probes"]) >= 2, plan
+    gc.collect()
+    assert len(_candidates._CANDIDATES) == 1, list(_candidates._CANDIDATES)
+    assert len(options._HELD) == 1, list(options._HELD)
+
+
 def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(monkeypatch):
     """With room for the step at two microbatches and not at one, the plan
     reads the batch in microbatches under no recomputation, and the run

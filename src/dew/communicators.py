@@ -32,10 +32,12 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import functools
 import hashlib
 import itertools
 import json
 import logging
+import operator
 import os
 import threading
 import time
@@ -341,34 +343,33 @@ def collectives_of(program: str | jax.stages.Compiled, gpus: tuple[int, ...]) ->
 
 
 PROGRAM_FLOOR = 8 << 20
-"""The bytes outside XLA's pool a program not yet run is charged on each of its GPUs before any program's
-were measured (`Resident.loading`): the most a step of a 1.4B decoder took there past the process's first,
-6 MiB on a GH200 (row 12131's probe, its code and its first run), rounded up."""
+"""The bytes outside XLA's pool a program not yet run is charged on each of its GPUs for what loading it takes
+there (`Resident.ahead`): the most a step of a 1.4B decoder took past the process's first, 6 MiB on a GH200
+(row 12131's probe, its code and its first run), rounded up."""
 
 
 @dataclasses.dataclass(frozen=True)
 class Pending:
-    """A program admitted that has not run (`Resident.pending`): its GPUs, and on each the communicators its
-    admission added (`Needs.needed`), which its first run makes there beside what it loads."""
+    """A program admitted that has not run (`Resident.pending`): its GPUs, and the communicators it makes as
+    it first runs (`made`), which no reading of free memory counts until then."""
 
     gpus: tuple[int, ...]
-    communicators: Mapping[int, int]
+    made: Collectives
 
 
 class Resident:
-    """The communicators this process has made: XLA keeps each it creates, so every program is admitted with
-    those of the programs before it (`admit`), one program at a time, as programs of different keys compile
-    at once (`dew.nn.kernels.options.OuterProgram`). Beside them, what loading a program takes outside XLA's
-    pool on each GPU as a first run measured it (`cost`, `ran`), and, by the executable's identity while it
-    lives (`Loaded.key`), every program admitted that has not run (`pending`), whose communicators and load no
+    """The communicators this process has made: those of every program that ran (`held`), which XLA keeps,
+    each program admitted with them (`admit`), one program at a time, as programs of different keys compile
+    at once (`dew.nn.kernels.options.OuterProgram`). Beside them, by the executable's identity while it lives
+    (`Loaded.key`), every program admitted that has not run (`pending`), whose communicators and load no
     reading of free memory counts yet, and each that ran (`settled`), which loads nothing again: a program
-    that runs leaves the one for the other (`ran`, `dispatched`), one released leaves both (`released`), its
-    load and communicators never made, and an executable loaded again is charged again."""
+    that runs leaves the one for the other, its communicators made (`dispatched`), and one released leaves
+    both (`watch`), its communicators and load never made, and an executable loaded again is charged
+    again."""
 
     def __init__(self) -> None:
         self.held = Collectives()
         self.lock = threading.Lock()
-        self.cost: dict[int, int] = {}
         self.pending: dict[int, Pending] = {}
         self.settled: set[int] = set()
         self.watched: set[int] = set()
@@ -395,47 +396,29 @@ class Resident:
             self.settled.discard(key)
             self.watched.discard(key)
 
-    def ahead(self, loaded: Loaded) -> dict[int, int]:
-        """What the program `loaded` takes on each of its GPUs past what is free there now, beside its own
-        new communicators: its own load where it has not run, and every other program's admitted on the GPU
-        that has not run, its communicators and its load, which no reading of free memory counts until it
-        runs; each load the most a first run took there (`ran`), `PROGRAM_FLOOR` before any ran."""
-        own = loaded.key not in self.settled
-        others = [pending for key, pending in self.pending.items() if key != loaded.key]
-        return {gpu: own * self.cost.get(gpu, PROGRAM_FLOOR) + sum(
-                    self.cost.get(gpu, PROGRAM_FLOOR) + pending.communicators.get(gpu, 0)
-                    for pending in others if gpu in pending.gpus)
-                for gpu in loaded.gpus}
-
-    def ran(self, key: int, before: Mapping[int, int], after: Mapping[int, int], grown: Mapping[int, int]
-            ) -> None:
-        """Take the first run of the program `key` names: on each of its GPUs, the bytes free outside XLA's
-        pool `before` it and `after`, less its communicators, which its admission charges apart
-        (`Pending.communicators`), and less the pool's growth over it (`grown`: a pool that is not
-        preallocated takes regions as the run needs them, and one that gave regions back grew by less than
-        nothing, which the GPU's free bytes gained), is what loading it took, the most of which a program
-        not yet run is charged (`ahead`). A program run before takes none again."""
-        with self.lock:
-            self._forget_released()
-            pending = self.pending.pop(key, None)
-            self.settled.add(key)
-            if pending is None:
-                return
-            for gpu in pending.gpus:
-                if gpu not in before or gpu not in after:
-                    continue
-                took = before[gpu] - after[gpu] - pending.communicators.get(gpu, 0) - grown.get(gpu, 0)
-                self.cost[gpu] = max(self.cost.get(gpu, PROGRAM_FLOOR), took)
+    def ahead(self, gpus: tuple[int, ...], key: int | None) -> tuple[Collectives, dict[int, int]]:
+        """What every other program admitted on `gpus` that has not run makes as it first runs, which no
+        reading of free memory counts yet: their communicators together, and on each GPU their loads, with
+        the program `key` names's own where it has not run (none of a program of no identity); each load
+        `PROGRAM_FLOOR`."""
+        others = [pending for held, pending in self.pending.items()
+                  if held != key and set(pending.gpus) & set(gpus)]
+        made = functools.reduce(operator.or_, (pending.made for pending in others), Collectives())
+        own = key is not None and key not in self.settled
+        return made, {gpu: (own + sum(gpu in pending.gpus for pending in others)) * PROGRAM_FLOOR
+                      for gpu in gpus}
 
     def dispatched(self, key: int) -> None:
-        """Take the program `key` names as run, its load unmeasured: its communicators and load are what
-        free memory reads from here on (`dew.nn.kernels.options.running`'s dispatch)."""
+        """Take the program `key` names as run: its communicators made (`held`), its load what free memory
+        reads from here on."""
         if key not in self.pending:
             return
         with self.lock:
             self._forget_released()
-            self.pending.pop(key, None)
+            pending = self.pending.pop(key, None)
             self.settled.add(key)
+            if pending is not None:
+                self.held = self.held | pending.made
 
     def admit(self, made: Collectives, needs: Needs, room: Mapping[int, int],
               free: Callable[[int], int | None], loaded: Loaded | None = None) -> None:
@@ -457,10 +440,14 @@ class Resident:
         the program runs on any of its GPUs."""
         with self.lock:
             self._forget_released()
-            held = self.held | made
-            needed = needs.needed(held, room, runtime=True)
-            communicating = needs.needed(made, room, runtime=False, made=self.held)
-            loads = {} if loaded is None else self.ahead(loaded)
+            gpus = () if loaded is None else loaded.gpus
+            waiting, loads = self.ahead(gpus, None if loaded is None else loaded.key)
+            every = functools.reduce(operator.or_, (pending.made for pending in self.pending.values()),
+                                     self.held)
+            needed = needs.needed(every | made, room, runtime=True)
+            # Its communicators and those of every program not yet run on its GPUs that no program that ran
+            # made, each counted once, beside their loads.
+            communicating = needs.needed(waiting | made, room, runtime=False, made=self.held)
             added = {gpu: communicating.get(gpu, 0) + loads.get(gpu, 0) for gpu in {*communicating, *loads}}
             now = {gpu: answered for gpu in room if (answered := free(gpu)) is not None}
             new = made.beyond(self.held)
@@ -476,10 +463,11 @@ class Resident:
                                        "program admitted that has not run need more than its GPUs have free "
                                        "outside XLA's pool now", {gpu: added.get(gpu, 0) for gpu in now},
                                        {gpu: now[gpu] for gpu in now})
-            self.held = held
-            if loaded is not None and loaded.key not in self.settled:
-                self.pending.setdefault(loaded.key, Pending(
-                    loaded.gpus, {gpu: communicating.get(gpu, 0) for gpu in loaded.gpus}))
+            if loaded is None:
+                # A program of no identity, which no run of it is taken by, is held as made.
+                self.held = self.held | made
+            elif loaded.key not in self.settled:
+                self.pending.setdefault(loaded.key, Pending(loaded.gpus, made))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -617,41 +605,37 @@ def loaded_program(executable: jax.stages.Compiled) -> LoadedProgram | None:
 def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = gpu_free_bytes) -> None:
     """Admit a compiled or loaded program's communicators and load against the room the process's sizing left
     them and its GPUs have free outside XLA's pool now (`Resident`), refusing one that would not fit before it
-    runs on any of its GPUs. A process that holds no sizing admits every program: one of a pool of
-    processes among them (`dew.training.runtime.pooled`), whose communicators span hosts no process's
-    sizing measures. A program compiled for devices this process has not
-    (`dew.nn.kernels.generation.compile_only_gpus`) is never loaded here, so it takes none of this host's
-    room, as does a program on the host's CPU. Every program Dew compiles passes here
+    runs on any of its GPUs. A process that holds no sizing admits every program, and so does every process
+    of a pool of processes, whose communicators span hosts no process's sizing measures
+    (`dew.training.runtime.pooled` sizes none of them): its programs are admitted on every process or on
+    none, never refused on one while its peer goes on into a collective. A program compiled for devices this
+    process has not (`dew.nn.kernels.generation.compile_only_gpus`) is never loaded here, so it takes none of
+    this host's room, as does a program on the host's CPU. Every program Dew compiles passes here
     (`dew.nn.kernels.templates.report`), the RL rollouts' among them (`dew.nn.kernels.options.OuterProgram`),
-    and every executable it loads compiled ahead (`dew.training.ahead`); each is charged as not run until a
-    run of it is taken (`first_ran`, `dispatched`) or it is released (`Resident.watch`)."""
+    and every executable it loads compiled ahead (`dew.training.ahead`); each of a fingerprint is charged as
+    not run until a call of it returns (`dispatched`) or it is released (`Resident.watch`), one of none by
+    its communicators alone."""
     program = loaded_program(executable)
-    if _HELD is None or program is None:
+    if _HELD is None or program is None or jax.process_count() > 1:
         return
     devices = program.devices
     if not devices or any(device.platform != "gpu" for device in devices):
         # A program on the host's CPU makes no NCCL communicator and holds no GPU code.
         return
     gpus = assigned(devices)
-    made = (collectives_of(executable, gpus) if program.fingerprint is None
-            else collectives_kept(program.fingerprint, gpus, lambda: executable))
+    if program.fingerprint is None:
+        _RESIDENT.admit(collectives_of(executable, gpus), _HELD.needs, _HELD.room, free)
+        return
+    made = collectives_kept(program.fingerprint, gpus, lambda: executable)
     _RESIDENT.watch(id(executable), executable)
     _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, Loaded(gpus, id(executable)))
 
 
-def first_ran(executable: jax.stages.Compiled, before: Mapping[int, int], after: Mapping[int, int],
-              grown: Mapping[int, int]) -> None:
-    """Take `executable`'s first run (`Resident.ran`): each of its GPUs' bytes free outside XLA's pool
-    `before` it and `after`, and its pool's growth over it (`grown`), by GPU ordinal (`ordinal`). A process
-    that holds no sizing admits nothing, so measures nothing."""
-    if _HELD is not None:
-        _RESIDENT.ran(id(executable), before, after, grown)
-
-
 def dispatched(executable: jax.stages.Compiled) -> None:
-    """Take `executable` as run, its load unmeasured (`Resident.dispatched`): a program run through Dew's
-    compile point (`dew.nn.kernels.options.OuterProgram`), whose communicators and load free memory reads
-    from its first call on, never charged as ahead of it again."""
+    """Take a call of `executable` that returned as its run (`Resident.dispatched`): its communicators made
+    and its load what free memory reads from here on, never charged as ahead of another again. Called past
+    every dispatch of a program Dew runs: its compile point's (`dew.nn.kernels.options.OuterProgram`) and a
+    step's runner's (`dew.training.compiler.StepCompiler.runner`)."""
     if _HELD is not None:
         _RESIDENT.dispatched(id(executable))
 

@@ -420,14 +420,22 @@ def _ran(program: OuterProgram, executable: jax.stages.Compiled, args: tuple, kw
          ) -> contextlib.AbstractContextManager:
     """The contexts every enclosing `running` block runs `executable`, `program`'s for these arguments,
     inside, the outermost first, each entered here, at the call, not at the caller's `with`, which leaves
-    them; none outside any. Past them the executable runs, which its admission takes
-    (`dew.communicators.dispatched`): what it loads and connects is free memory's to read from here on."""
+    them; none outside any. Innermost, the run itself, which its admission takes once the call returns
+    (`_called`): a call that raised is no run of it."""
     stack = contextlib.ExitStack()
     with stack:
         for around in _RUNNING.get():
             stack.enter_context(around(program, executable, args, kwargs))
-        communicators.dispatched(executable)
+        stack.enter_context(_called(executable))
         return stack.pop_all()
+
+
+@contextlib.contextmanager
+def _called(executable: jax.stages.Compiled) -> Iterator[None]:
+    """Take a call of `executable` that returns as its run (`dew.communicators.dispatched`): what it loads
+    and connects is free memory's to read from there on; one that raises leaves it charged as not run."""
+    yield
+    communicators.dispatched(executable)
 
 
 @contextlib.contextmanager
