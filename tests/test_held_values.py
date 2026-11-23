@@ -409,3 +409,35 @@ def test_a_held_value_made_over_a_program_traced_again_holds_the_facts_that_trac
     assert _cache.holding(cache, "held", making, 4) == 1.0
     answer[0] = 0
     assert _cache.holding(cache, "held", making, 4) == 0.0
+
+
+@pytest.mark.parametrize("enclosed", ["jitted", "mapped"])
+def test_a_program_called_within_another_trace_reads_its_facts_at_each_call(enclosed):
+    """A program called within a plain jit of its own each time (or an eager `jax.vmap`), at one shape under a
+    fact's answer, at another under a second answer, then held made at the first shape: the value is the
+    program's under the answer as it stands, held on it (row 12296's review P0s: the program's jit held across
+    enclosing traces answered the first shape from its cached trace, made under the first answer, with the
+    facts its trace at the other shape read)."""
+    from dew.nn.kernels.options import owned_program
+
+    answer = [0]
+
+    @_facts.traced_fact
+    def flag() -> int:
+        return answer[0]
+
+    run = owned_program(lambda x: x + flag())
+
+    def within(x) -> float:
+        if enclosed == "jitted":
+            return float(jax.jit(lambda y: run(y))(x)[0])
+        return float(jax.vmap(run)(x[None])[0, 0])
+
+    one, two = jnp.zeros((1,)), jnp.zeros((2,))
+    assert within(one) == 0.0
+    answer[0] = 1
+    assert within(two) == 1.0
+    cache: collections.OrderedDict = collections.OrderedDict()
+    assert _cache.holding(cache, "held", lambda: within(one), 4) == 1.0
+    answer[0] = 0
+    assert _cache.holding(cache, "held", lambda: within(one), 4) == 0.0
