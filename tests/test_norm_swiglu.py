@@ -943,10 +943,10 @@ def test_packed_gated_product_pair_reshard_preserves_other_explicit_axes():
 @pytest.mark.mesh(devices=2)
 def test_a_packed_mlp_model_trains_on_an_explicit_data_mesh():
     """A `Trainer` run of a packed-MLP model (`GatedMLP(..., packed=True)`, `mlp.py:264-269`) on
-    `MeshSpec(explicit=('data',))` matches one device's loss and parameter gradients, and on `sm90` selects
-    the fused `swiglu` kernel per shard without resharding (rows 822, 12228)."""
+    `MeshSpec(explicit=('data',))` matches one device's loss and parameter gradients against float64 truth
+    (check 1), and on `sm90` selects the fused `swiglu` kernel per shard without resharding
+    (rows 822, 12228)."""
     import optax
-    from recording import RecordingTracker
 
     from dew.data import Memory
     from dew.distributed.batches import shard_batch
@@ -963,44 +963,66 @@ def test_a_packed_mlp_model_trains_on_an_explicit_data_mesh():
             return self.model.init(key, jnp.ones((1, 8, 16), jnp.bfloat16))
 
         def loss(self, variables, batch, step):
-            prediction = self.model.apply(variables, batch["x"]).astype(jnp.float32)
-            return jnp.mean((prediction - batch["y"].astype(jnp.float32)) ** 2), Aux({})
+            prediction = jnp.asarray(self.model.apply(variables, batch["x"]), jnp.float32)
+            return jnp.mean((prediction - jnp.asarray(batch["y"], jnp.float32)) ** 2), Aux({})
 
-    rng = np.random.default_rng(7)
-    xs = rng.normal(size=(4, 8, 16)).astype(np.float32)
-    ys = rng.normal(size=(4, 8, 16)).astype(np.float32)
-    raw = {"x": jnp.asarray(xs), "y": jnp.asarray(ys)}
+    def draw(seed: int = 0):
+        return (jax.random.normal(drawn_key(35, seed), (4, 8, 16)),
+                jax.random.normal(drawn_key(36, seed), (4, 8, 16)))
 
-    def rows():
-        return Memory([{"x": xs[i], "y": ys[i]} for i in range(4)]).read("streamed").batch(4)
-
-    def run(mesh):
+    def make_trainer(mesh):
         objective = PackedMlpObjective()
-        trainer = Trainer(objective, optax.sgd(1.0), key=0, mesh=mesh,
-                          layout=Layout(min_shard=1, tolerance=1.))
-        tracker = trainer.tracker = RecordingTracker()
-        start = jax.tree.map(np.asarray, trainer.initial_state().variables["params"])
-        state = trainer.fit(rows(), steps=1, log_every=1, checkpoint_final=False)
-        assert int(state.step) == 1
-        end = jax.tree.map(np.asarray, state.variables["params"])
-        grads = jax.tree.map(lambda a, b: a - b, start, end)
-        losses = [entry["train/loss"] for _, entry in tracker.scalars if "train/loss" in entry]
-        return trainer, objective, float(losses[-1]), grads
+        return objective, Trainer(objective, optax.sgd(1.0), key=0, mesh=mesh,
+                                  layout=Layout(min_shard=1, tolerance=1.))
 
-    _, _, one_loss, one_grads = run(MeshSpec().build(jax.devices()[:1]))
-    explicit_trainer, objective, explicit_loss, explicit_grads = run(MeshSpec(explicit=("data",)))
-    assert "gate_up_proj" in explicit_grads
-    np.testing.assert_allclose(explicit_loss, one_loss, rtol=1e-5, atol=1e-5)
-    for got, want in zip(jax.tree.leaves(explicit_grads), jax.tree.leaves(one_grads), strict=True):
-        assert np.any(np.abs(got) > 0)
-        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+    x0, y0 = draw(0)
+    rows = Memory([{"x": np.asarray(x0[i]), "y": np.asarray(y0[i])}
+                   for i in range(4)]).read("streamed").batch(4)
+    _, fit_trainer = make_trainer(MeshSpec(explicit=("data",)))
+    fitted = fit_trainer.fit(rows, steps=1, log_every=1, checkpoint_final=False)
+    assert int(fitted.step) == 1
+    assert "gate_up_proj" in fitted.variables["params"]
+
+    _, one_trainer = make_trainer(MeshSpec().build(jax.devices()[:1]))
+    explicit_obj, explicit_trainer = make_trainer(MeshSpec(explicit=("data",)))
+    start = jax.tree.map(np.asarray, one_trainer.initial_state().variables["params"])
+    sample = {"x": x0, "y": y0}
+    one_step = one_trainer.compile(one_trainer.place()[0], shard_batch(one_trainer.device_mesh, sample))
+    explicit_step = explicit_trainer.compile(
+        explicit_trainer.place()[0], shard_batch(explicit_trainer.device_mesh, sample))
+
+    def ran(trainer, compiled, x, y):
+        state, _, _ = trainer.place()
+        updated, loss, _, finite, accepted, _ = compiled(
+            state, shard_batch(trainer.device_mesh, {"x": x, "y": y}))
+        assert bool(finite) and bool(accepted)
+        grads = jax.tree.map(lambda a, b: np.asarray(a) - np.asarray(b),
+                             start, updated.variables["params"])
+        return (np.asarray(loss), *jax.tree.leaves(grads))
+
+    truth_model = GatedMLP(hidden_features=24, out_features=16, activation="swiglu",
+                           packed=True, dtype=jnp.float64)
+
+    def truth(x, y):
+        truth_params = jax.tree.map(lambda a: jnp.asarray(a, jnp.float64), start)
+
+        def loss_f64(params):
+            pred = jnp.asarray(truth_model.apply({"params": params}, x.astype(jnp.float64)), jnp.float64)
+            return jnp.mean((pred - y.astype(jnp.float64)) ** 2)
+
+        val, grads = jax.value_and_grad(loss_f64)(truth_params)
+        return (val, *jax.tree.leaves(grads))
+
+    assert_as_exact(lambda x, y: ran(explicit_trainer, explicit_step, x, y),
+                    lambda x, y: ran(one_trainer, one_step, x, y), draw,
+                    "packed MLP Trainer on Explicit data mesh", seeds=SEEDS["per shard"], truth_fn=truth)
 
     step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
     state0, _, _ = explicit_trainer.place()
     with jax.set_mesh(explicit_trainer.device_mesh):
-        sharded = shard_batch(explicit_trainer.device_mesh, raw)
+        sharded = shard_batch(explicit_trainer.device_mesh, sample)
         with generation.assumed("sm90"), generation.routes() as routes:
-            graph = traced(lambda v, b: objective.scalar_loss(v, b, step)[0], state0.variables, sharded)
+            graph = traced(lambda v, b: explicit_obj.scalar_loss(v, b, step)[0], state0.variables, sharded)
     assert {route.kernel for route in routes if route.choice == "swiglu"} == {"pallas"}
     assert any(eq.primitive.name == "shard_map" for eq in graph)
     assert not any(eq.primitive.name == "reshard" for eq in graph)
