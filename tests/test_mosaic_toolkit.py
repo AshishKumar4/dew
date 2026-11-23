@@ -536,12 +536,14 @@ def test_a_launchs_register_model_runs_the_programs_its_shared_memory_holds():
 
 def test_a_register_models_caps_are_its_targets_wherever_they_are_asked():
     """The caps an H100's register model states (`RegisterModel.cap`), asked after the model is made with
-    an A100 in effect, are those asked under the H100: its entry share and its consumers' raise its own
-    multiprocessor's (row 12028: they read the GPU in effect as they were asked)."""
+    an A100 in effect, are those asked under the H100: its entry share and its consumers' raise beside its
+    producer its own multiprocessor's (row 12028: they read the GPU in effect as they were asked, and an
+    A100's takes no setmaxnreg)."""
     from dew.nn.kernels.templates import resources
     from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
 
-    model = resources.register_model(WGMMA, 2, 168, target=generation.gpu_target("sm90"))
+    model = resources.register_model(WGMMA, 2, 168, moves=True, target=generation.gpu_target("sm90"))
+    assert model.producer and model.moves
     with generation.assumed("sm90"):
         own = [model.cap(programs, honored=honored) for programs in (1, 2) for honored in (False, True)]
     with generation.assumed("sm80"):
