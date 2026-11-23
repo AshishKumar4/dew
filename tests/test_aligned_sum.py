@@ -11,7 +11,7 @@ import pytest
 from contract_support import CANCELLING_LEVELS, MOST
 from reference_error import assert_as_exact
 
-from dew.nn.aligned import aligned_sum
+from dew.nn.aligned import aligned_segment_sum, aligned_sum
 from dew.telemetry.instrumentation import hlo_instructions
 
 ALIGNED_CASES = {
@@ -738,3 +738,39 @@ def test_an_aligned_sum_along_an_axis_sums_each_rows_terms():
     third = np.broadcast_to((2.0 ** (70 + rows)).astype(np.float32)[:, None], (6, 2))
     found = aligned_sum([(jnp.asarray(first), jnp.asarray(second), jnp.asarray(third))], axis=1)
     np.testing.assert_array_equal(np.asarray(found)[:, 0], 2.0 ** (120 + rows))
+
+
+def test_an_aligned_segment_sum_sums_each_segments_rows_exactly():
+    """`aligned_segment_sum` sums each row's product into the segment its table names, exactly, rounded
+    once: 2**240 and -2**240 beside 2**-28 in one segment give 2**-28; 2**128 (as 2**127 times 2) and
+    -2**105 give their finite difference, not inf; 256 and -255.5 times 2**-8 give 2**-9; an empty segment
+    gives 0 (row 1464)."""
+    big = jnp.float32(2.0 ** 120)
+    values = jnp.asarray([[1.0], [-1.0], [2.0 ** -28], [2.0], [-(2.0 ** -22)], [256.0], [-255.5]],
+                         jnp.float32)
+    scales = jnp.asarray([[big], [big], [1.0], [2.0 ** 127], [2.0 ** 127], [2.0 ** -8], [2.0 ** -8]],
+                         jnp.float32)
+    lifts = jnp.asarray([[2.0 ** 120], [2.0 ** 120], [1.0], [1.0], [1.0], [1.0], [1.0]], jnp.float32)
+    table = jnp.asarray([0, 0, 0, 1, 1, 2, 2], jnp.int32)
+    got = jax.jit(lambda: aligned_segment_sum([(values, scales, lifts)], table, 4))()
+    want = np.asarray([[2.0 ** -28], [np.float32(2.0 ** 128 - 2.0 ** 105)], [2.0 ** -9], [0.0]], np.float32)
+    np.testing.assert_array_equal(np.asarray(got), want)
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_aligned_segment_sum_sums_its_segments_over_a_checked_maps_devices():
+    """`aligned_segment_sum` in a `shard_map` over two CPU devices that checks the axes its values vary
+    over, each device its own rows and table: a segment's +2**140 on one device and -2**140 on the other sum
+    to 0 beside the first device's 2**-38, every device walking the same digits (row 1464)."""
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+    values = jnp.asarray([[2.0 ** 70], [2.0 ** -38], [-(2.0 ** 70)], [0.0]], jnp.float32)
+    scales = jnp.asarray([[2.0 ** 70], [1.0], [2.0 ** 70], [1.0]], jnp.float32)
+    tables = jnp.zeros((4,), jnp.int32)
+
+    def each_device(v, s, t):
+        return aligned_segment_sum([(v, s)], t, 1, ("data",))
+
+    got = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(data, data, data), out_specs=whole,
+                                check_vma=True))(values, scales, tables)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray([[2.0 ** -38]], np.float32))

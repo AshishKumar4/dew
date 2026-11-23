@@ -823,6 +823,25 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
         want[0, 0] = 2.0 ** -9
         np.testing.assert_array_equal(np.asarray(d_token), want, err_msg=kernel)
 
+    # Two routes of one token far apart: one cancelling at 2**240 on input 0, the other's products peaking
+    # at 2**97 on input 1 and giving input 0 2**-28, each summed exactly (`aligned_segment_sum`).
+    far = (jnp.zeros((2, 512, 128), jnp.float32).at[0, 0, 0].set(1.0).at[0, 0, 1].set(-1.0)
+           .at[1, 1, 2].set(1.0).at[1, 0, 3].set(1.0))
+    wide_bank = formats.NvFp4.of(far, jnp.stack([scales, scales]), jnp.asarray([2.0 ** 112, 2.0 ** -8],
+                                                                                jnp.float32))
+    pair, two = jnp.asarray([1, 1], jnp.int32), jnp.asarray([0, 0], jnp.int32)
+    tokens2 = jnp.zeros((1, 512), jnp.float32).at[0, :2].set(1.0)
+    for kernel in ("packed", "xla"):
+        with generation.assumed("sm90"), generation.chosen(nvfp4=kernel):
+            routed = functools.partial(gemm.nvfp4_product, matrix=wide_bank, group_sizes=pair, gather=two,
+                                       out_dtype=jnp.float32, interpret_on_cpu=True)
+            _, pull = jax.vjp(routed, tokens2)
+            (d_token,) = pull(jnp.zeros((2, 128), jnp.float32).at[0, :2].set(2.0 ** 120)
+                              .at[1, 2].set(2.0 ** 97).at[1, 3].set(2.0 ** -20))
+        want = np.zeros((1, 512), np.float32)
+        want[0, 0], want[0, 1] = 2.0 ** -28, 2.0 ** 89
+        np.testing.assert_array_equal(np.asarray(d_token), want, err_msg=kernel)
+
     # A gather routing no token pulls back zeros.
     none, nowhere = jnp.asarray([0, 0], jnp.int32), jnp.zeros((0,), jnp.int32)
     routed = functools.partial(gemm.nvfp4_product, matrix=bank, group_sizes=none, gather=nowhere,

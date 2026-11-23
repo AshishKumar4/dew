@@ -12,6 +12,7 @@ import jax.numpy as jnp
 from jax.custom_derivatives import SymbolicZero
 
 from dew.nn import float_bits
+from dew.nn.aligned import aligned_segment_sum
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
 from dew.nn.precision import power2
@@ -137,30 +138,25 @@ class _Transpose:
         if not routed:
             partial, excess = self.pulled(near, ran)
             return power2(self.summed(partial, excess), -lift)
-        return self.routed_moved(near, top, lift, routed)
+        return self.routed_moved(near, lift, routed)
 
-    def routed_moved(self, near, top, lift, routed):
+    def routed_moved(self, near, lift, routed):
         """A gathered product's rescue: each route pulled back wide at its own power (`lift`, so what cancels
-        within it cancels there), then summed into its token in two bands. A route whose products' largest
-        binade (`top`) is at most `FACTORED_BAND` moves back to its own scale, finite, and sums as it is; one
-        past it sums at its token's power (its band's largest on every device that routes the token,
-        `at[gather].max` and `pmax`), moved back once after the devices' sum: +-2**140 from two devices sum
-        to 0 there, while a 2**-38 route beside them sums unmoved."""
+        within it cancels there), then each moved back and summed into its token, and over the devices that
+        route it, exactly, rounded once (`aligned.aligned_segment_sum`): routes of +-2**140 from two devices
+        sum to 0 beside a 2**-38 one, and 2**128 - 2**105 to its finite value."""
         assert self.wide is not None, "a routed product's rescue pulls its routes back wide"
         gather, wide_operands = routed
         partial = self.wide(near, *wide_operands).astype(jnp.float32)
-        high = top > FACTORED_BAND
-        token_top = varying_like(jnp.full((self.shape[0], 1), -1024, top.dtype), top, gather)
-        token_top = token_top.at[gather].max(jnp.where(high, top, -1024))
-        axes = tuple(sorted(jax.typeof(token_top).mat.varying - self.held))
-        token_top = jax.lax.pmax(token_top, axes) if axes else token_top
-        token_lift = jnp.where(token_top > -1024, FACTORED_RESCUE - token_top, 0)
-        moved = jnp.where(high, power2(partial, token_lift[gather] - lift), 0.0)
-        normal = jnp.where(high, 0.0, power2(partial, -lift))
-        zeros = varying_like(jnp.zeros(self.shape, jnp.float32), partial, gather)
-        sums = [self.summed(band, tuple(sorted(jax.typeof(band).mat.varying - self.held)))
-                for band in (zeros.at[gather].add(normal), zeros.at[gather].add(moved))]
-        return sums[0] + power2(sums[1], -token_lift)
+        # The power each route moves back by, as three factors each a normal float's.
+        powers, rest = [], -lift
+        for _ in range(3):
+            part = jnp.clip(rest, -126, 127)
+            powers.append(float_bits.exact_power2(part))
+            rest = rest - part
+        axes = tuple(sorted(frozenset().union(*(jax.typeof(v).mat.varying for v in (partial, gather)))
+                            - self.held))
+        return aligned_segment_sum([(partial, *powers)], gather, self.shape[0], axes)
 
     def tangent(self, ran, routed, primals, tangents):
         """The plain transpose's derivative, `cotangent * scale` pulled back, every term of a perturbed
@@ -173,11 +169,6 @@ class _Transpose:
             return value, jnp.zeros_like(value)
         return value, self.summed(*self.pulled(functools.reduce(jnp.add, terms), ran))
 
-
-FACTORED_BAND = 96
-"""The largest binade of a route's cotangent-times-factor products whose wide pullback, moved back to its
-own scale, stays within fp32 (`_Transpose.routed_moved`): its sum over any width a decoded NVFP4 matrix
-holds (an entry at most 6 * 448 * 2**-8) gains far fewer than 31 binades."""
 
 FACTORED_RESCUE = 100
 """The binade `factored`'s transpose moves a row's largest term to where its plain transpose overflowed: its

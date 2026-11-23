@@ -40,6 +40,45 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
     return _aligned_terms(terms, ((axis, None),) * len(terms))
 
 
+def aligned_segment_sum(terms: Sequence[Sequence[jax.Array]], segments: jax.Array, count: int,
+                        axes: tuple[str, ...] = ()) -> jax.Array:
+    """`aligned_sum`'s exact sum of `terms`' products, each product's rows (its first axis) summed into the
+    row `segments` names among `count` (int32, one a row: a gather's table, its transpose summing each route
+    into its token), then over the manual axes `axes` names where its products vary over them (each
+    device's routes of a token every device holds), rounded once to nearest, ties to even: routes of +-2^140
+    from two devices sum to 0 beside a 2^-38 one, which no order of floats summed keeps. Its value alone: a
+    caller declares its derivative. Every device of `axes` walks the same digits, their bounds agreed
+    (`_levels`), as each digit's sum is a collective over them."""
+    _, factors, shape, spec = _laid_out(terms, ((None, None),) * len(terms))
+    return _exact_sum(_regrouped(shape, factors), spec, factors[0].dtype,
+                      segments=(segments, count, tuple(axes)))
+
+
+def _segmented(segments: jax.Array, count: int, axes: tuple[str, ...]) -> Callable:
+    """`_reduction`'s counterpart for `aligned_segment_sum`: a term's rows scatter-added into `count`
+    segments by `segments`, then summed over each of `axes` its sums vary over (each device's sum alone where
+    every device holds the same), and the most products one sum holds."""
+    from dew.nn.sharding import varying_like
+
+    devices = math.prod(jax.lax.axis_size(axis) for axis in axes)
+
+    def reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
+        del axis, laid
+
+        def reduced(x: jax.Array, op: Callable = jnp.sum, **options) -> jax.Array:
+            assert op is jnp.sum, "a segment's digits are summed"
+            x = jnp.asarray(x, options.get("dtype", jnp.asarray(x).dtype))
+            x = jnp.broadcast_to(x, shape)
+            zeros = varying_like(jnp.zeros((count, *shape[1:]), x.dtype), x, segments)
+            summed = zeros.at[segments].add(x)
+            over = tuple(axis for axis in axes if axis in jax.typeof(summed).mat.varying)
+            return jax.lax.psum(summed, over) if over else summed
+
+        return reduced, shape[0] * devices
+
+    return reduction
+
+
 def _aligned_terms(terms: Sequence[Sequence[jax.Array]], spec: tuple) -> jax.Array:
     """`aligned_sum` of `terms`, each product summed over its `spec` entry's axis (kept) and, where it gives
     `(held, shape)`, broadcast to `held` and reshaped to `shape` (a gradient's term in its factor's)."""
@@ -158,16 +197,20 @@ def _reduction(shape: tuple[int, ...], axis, laid) -> tuple[Callable, int]:
     return reduced, math.prod(shape[a] for a in axes)
 
 
-def _exact_sum(terms, spec, dtype) -> jax.Array:
+def _exact_sum(terms, spec, dtype, segments: tuple | None = None) -> jax.Array:
     """The sum `_aligned_terms` states, exact: every product exact (`_product`), summed as whole digits and
-    rounded once to nearest, ties to even (`_nearest`); IEEE's non-finite sums and signed zeros (row 8757)."""
+    rounded once to nearest, ties to even (`_nearest`); IEEE's non-finite sums and signed zeros (row 8757).
+    With `segments` (`aligned_segment_sum`'s table, count and axes), each product's rows summed into theirs
+    (`_segmented`)."""
+    reduction = _reduction if segments is None else _segmented(*segments)
+    axes = () if segments is None else segments[2]
     limits = jnp.finfo(dtype)
     ints = jnp.dtype(f"int{limits.bits}")
     factors = max(map(len, terms))
     parts, nan, positive, negative, live = [], False, False, False, False
     for term, (axis, laid) in zip(terms, spec, strict=True):
         product = _product(term, ints)
-        reduced, extent = _reduction(product.place.shape, axis, laid)
+        reduced, extent = reduction(product.place.shape, axis, laid)
         parts.append((product, reduced, extent))
         # Sum in `ints` (not `jnp.any`, float64 under Mosaic TPU x64, 8807); negative zeros alone stay -0.
         flags = (product.nan, product.infinite & ~product.negative, product.infinite & product.negative,
@@ -185,14 +228,14 @@ def _exact_sum(terms, spec, dtype) -> jax.Array:
     lowest = factors * (limits.minexp - 2 * limits.nmant)
     highest = factors * (limits.maxexp + 1) + count.bit_length() + 2
     levels = -(-(highest - lowest) // digit)
-    exact = _nearest(parts, lowest, digit, levels, limits)
+    exact = _nearest(parts, lowest, digit, levels, limits, axes)
     exact = jnp.where(live, exact, -jnp.zeros_like(exact))
     special = jnp.where(positive, jnp.asarray(jnp.inf, dtype), jnp.asarray(-jnp.inf, dtype))
     special = jnp.where(nan | (positive & negative), jnp.asarray(jnp.nan, dtype), special)
     return jnp.where(nan | positive | negative, special, exact).astype(dtype)
 
 
-def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
+def _nearest(parts, lowest: int, digit: int, levels: int, limits, axes: tuple[str, ...] = ()) -> jax.Array:
     """The parts' exact sum as the nearest float, ties to even: each of `levels` digits of `digit` bits from
     bit `lowest` every limb's bits there summed, carried as the number's and its negation's, the last carry
     its sign; the magnitude's highest digits and a sticky bit kept, then written as its bits (`_written`).
@@ -240,7 +283,7 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
     zeros = functools.reduce(jnp.add, [reduced(jnp.zeros_like(product.place), jnp.sum, dtype=ints)
                                        for product, reduced, _ in parts])
     start = (zeros, (zeros,) * held, zeros, zeros - 1, (zeros,) * held, zeros)
-    first, last = _levels(parts, lowest, digit, levels, limits)
+    first, last = _levels(parts, lowest, digit, levels, limits, axes)
     # A counter of the value's integers: x64 traced a 64-bit index where Mosaic's is 32 (row 8757).
     _, states = jax.lax.while_loop(lambda carried: carried[0] < last,
                                    lambda carried: (carried[0] + 1, step(carried[0], carried[1])),
@@ -250,10 +293,11 @@ def _nearest(parts, lowest: int, digit: int, levels: int, limits) -> jax.Array:
     return _written(lead, kept, sticky, negative, lowest, digit, limits)
 
 
-def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
+def _levels(parts, lowest: int, digit: int, levels: int, limits, axes: tuple[str, ...] = ()) -> tuple:
     """The digits `_nearest` walks: a kernel's every one, and every one where a limb may lie across devices
     (`_may_split`: the extrema of independent sums' limbs would be a collective across their shards, row
-    8841), else the nonzero limbs' and a carry's room."""
+    8841), else the nonzero limbs' and a carry's room, agreed over the manual `axes` its digits' sums are
+    collectives over (`aligned_segment_sum`'s), so every device walks the same digits."""
     from dew.nn.kernels.launches import interpreting
 
     if interpreting() is not None or _may_split(limb for product, _, _ in parts for limb in product.limbs):
@@ -266,6 +310,11 @@ def _levels(parts, lowest: int, digit: int, levels: int, limits) -> tuple:
             place = product.place + at * width
             least = jnp.minimum(least, jnp.min(jnp.where(limb != 0, place, least), initial=least))
             most = jnp.maximum(most, jnp.max(jnp.where(limb != 0, place + width, most), initial=most))
+    if axes:
+        # Varying over every one of `axes` first: a bound every device holds alike agrees as it is.
+        least, most = (jax.lax.pvary(bound, tuple(sorted(set(axes) - jax.typeof(bound).mat.varying)))
+                       for bound in (least, most))
+        least, most = jax.lax.pmin(least, axes), jax.lax.pmax(most, axes)
     count = sum(extent for _, _, extent in parts)
     first = jnp.clip((least - lowest) // digit, 0, levels)
     last = jnp.clip((most + count.bit_length() + 2 - lowest) // digit + 2, 0, levels)
