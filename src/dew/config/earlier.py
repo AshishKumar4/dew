@@ -314,20 +314,18 @@ MUON_GROUPS = ("muon", "muonclip")
 
 
 def _muon_masked(mask: _records.JSON, config: _Fields) -> _Fields:
-    """An earlier Muon's matrices' decay `mask` (its options' `weight_decay_mask`) as its config's decay
-    mask (`OptimConfig.decay_mask`), or each of its param groups' where it groups (`ParamGroup.decay_mask`);
-    none where it masked by none. Refused where it is no tree of booleans, which no record rebuilds."""
+    """An earlier Muon's matrices' decay `mask` (its options' `weight_decay_mask`: a boolean or a tree of
+    them) as its config's decay mask (`OptimConfig.decay_mask`), or each of its param groups' where it
+    groups (`ParamGroup.decay_mask`), each unspared, as Muon spared none of them; none where it masked by
+    none. The mask's own checks refuse any other."""
     if mask is None:
         return config
-    if not isinstance(mask, Mapping):
-        raise ValueError(f"an earlier Muon masked its matrices' decay by {mask!r}, which no record of this "
-                         "Dew states: set OptimConfig.decay_mask in its place")
     groups = config.get("param_groups") or []
     assert isinstance(groups, list), groups
     if not groups:
         return {**config, "decay_mask": mask}
-    return {**config, "param_groups": [{**group, "decay_mask": mask} if isinstance(group, Mapping) else group
-                                       for group in groups]}
+    return {**config, "param_groups": [{**group, "decay_mask": mask, "spared": False}
+                                       if isinstance(group, Mapping) else group for group in groups]}
 
 
 def _unmasked(mask: _records.JSON, settings: _Fields, config: _Fields) -> tuple[_Fields, _Fields]:
