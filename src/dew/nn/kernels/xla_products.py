@@ -20,15 +20,12 @@ from .templates.product import SCALE_DEPTH, eight
 
 
 def interpreted(interpret_on_cpu: bool) -> bool:
-    """Whether a call asking `interpret_on_cpu` (or traced under `generation.assumed(..., interpreted=True)`)
-    interprets its kernel: where the context places it on a CPU (`generation.placed_platform`), not wherever
-    this process's default backend is one. A GPU's program a CPU host compiles ahead (its default device a
-    compile-only GPU's, `dew.training.ahead`) holds no interpreted branch: the interpreter's host callbacks'
-    ordered effect, every branch's in the program, took a token parameter on its CUDA executable, which its
-    run on the GPU did not pass (row 8099)."""
-    assumed = generation.assumption()
-    return ((interpret_on_cpu or (assumed is not None and assumed.interpreted))
-            and generation.placed_platform() == 'cpu')
+    """Whether a call asking `interpret_on_cpu` interprets its kernel: where the context places it on a CPU
+    (`generation.placed_platform`), not wherever this process's default backend is one. A GPU's program a
+    CPU host compiles ahead (its default device a compile-only GPU's, `dew.training.ahead`) holds no
+    interpreted branch: the interpreter's host callbacks' ordered effect, every branch's in the program, took
+    a token parameter on its CUDA executable, which its run on the GPU did not pass (row 8099)."""
+    return interpret_on_cpu and generation.placed_platform() == 'cpu'
 
 
 @contextlib.contextmanager

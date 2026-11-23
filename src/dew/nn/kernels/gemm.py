@@ -521,29 +521,49 @@ def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: boo
                                    preferred_element_type=wide).astype(out_dtype)
     c = poly if poly.dtype == wide else poly.astype(wide)
     side = operand.shape[-1]
-    row_axis = last - 1
-    sq_dims = (((last,), (row_axis,)), (batch, batch))
 
-    def _poly_strip(start: int, stop: int) -> jax.Array:
-        whole = start == 0 and stop == side
-        strip = operand if whole else jax.lax.slice_in_dim(operand, start, stop, axis=row_axis)
-        sq = (jax.lax.dot_general(strip, operand, sq_dims, precision=precision)
-              if strip.dtype == wide
-              else jax.lax.dot_general(strip, operand, sq_dims, precision=precision,
+    def _poly_whole(block: jax.Array) -> jax.Array:
+        b_last = block.ndim - 1
+        b_batch = tuple(range(block.ndim - 2))
+        sq_dims = (((b_last,), (b_last - 1,)), (b_batch, b_batch))
+        sq = (jax.lax.dot_general(block, block, sq_dims, precision=precision)
+              if block.dtype == wide
+              else jax.lax.dot_general(block, block, sq_dims, precision=precision,
                                        preferred_element_type=wide))
-        eye = (jnp.eye(side, dtype=wide) if whole
-               else (jnp.arange(start, stop)[:, None] == jnp.arange(side)[None, :]).astype(wide))
-        op_wide = strip if strip.dtype == wide else strip.astype(wide)
+        eye = jnp.eye(side, dtype=wide)
+        op_wide = block if block.dtype == wide else block.astype(wide)
         summed = c[0] * eye + c[1] * op_wide + c[2] * sq
         return summed if out_dtype == wide else summed.astype(out_dtype)
 
+    def _poly_rows(block: jax.Array) -> jax.Array:
+        b_last = block.ndim - 1
+        b_row = b_last - 1
+        b_batch = tuple(range(block.ndim - 2))
+        sq_dims = (((b_last,), (b_row,)), (b_batch, b_batch))
+        rows = max(1, side * out_dtype.itemsize // (2 * wide.itemsize))
+        b_placed = explicit_spec(block)
+        row_sharded = b_placed is not None and b_row < len(b_placed.spec) and b_placed.spec[b_row] is not None
+        if out_dtype.itemsize >= wide.itemsize or rows >= side or row_sharded:
+            return _poly_whole(block)
+        parts = []
+        for start in range(0, side, rows):
+            stop = min(start + rows, side)
+            strip = jax.lax.slice_in_dim(block, start, stop, axis=b_row)
+            sq = jax.lax.dot_general(strip, block, sq_dims, precision=precision, preferred_element_type=wide)
+            eye = (jnp.arange(start, stop)[:, None] == jnp.arange(side)[None, :]).astype(wide)
+            summed = c[0] * eye + c[1] * strip.astype(wide) + c[2] * sq
+            parts.append(summed.astype(out_dtype))
+        return jnp.concatenate(parts, axis=b_row)
+
+    count = int(np.prod(operand.shape[:-2], dtype=np.int64)) if batch else 1
     placed = explicit_spec(operand)
-    row_sharded = placed is not None and row_axis < len(placed.spec) and placed.spec[row_axis] is not None
-    rows = max(1, side * out_dtype.itemsize // (2 * wide.itemsize))
-    if out_dtype.itemsize < wide.itemsize and rows < side and not row_sharded:
-        parts = [_poly_strip(start, min(start + rows, side)) for start in range(0, side, rows)]
-        return jnp.concatenate(parts, axis=row_axis)
-    return _poly_strip(0, side)
+    batch_sharded = placed is not None and any(entry is not None for entry in placed.spec[:len(batch)])
+    if out_dtype.itemsize < wide.itemsize and count > 1 and not batch_sharded:
+        batch_size = max(1, count * out_dtype.itemsize // (2 * wide.itemsize))
+        step_fn = _poly_rows if batch_size == 1 else _poly_whole
+        return jax.lax.map(step_fn, operand.reshape(count, side, side), batch_size=batch_size).reshape(
+            operand.shape)
+    return _poly_rows(operand)
 
 
 def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
