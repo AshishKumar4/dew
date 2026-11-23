@@ -771,7 +771,7 @@ def test_an_nvfp4_products_rescue_leaves_a_nan_block_scale_to_its_own_coordinate
                       jnp.zeros((4, 512), jnp.float32))
     (d_x,) = pull(jnp.zeros((4, 128), jnp.float32).at[0, :3].set(
         jnp.asarray([2.0 ** 126, 2.0 ** 126, 1.0], jnp.float32)))
-    got = np.asarray(d_x)
+    got = np.array(d_x)
     assert np.isnan(got[:, 16:32]).all(), got[:, 16:32]
     want = np.zeros((4, 512), np.float32)
     want[0, 0] = 4.0

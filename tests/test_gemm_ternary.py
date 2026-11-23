@@ -610,8 +610,8 @@ def test_a_packed_products_rescue_keeps_a_subnormal_remainder():
 def test_an_fp8_products_rescue_leaves_an_infinite_coefficient_to_its_own_coordinate():
     """An E5M2 bank with codes +1, -1 and +1 at input coordinate 0 and +inf at coordinate 1, a scale of 4,
     under cotangents 2**126, 2**126 and 1: coordinate 0's gradient is 4 (the infinity leaves the exact
-    sums' grid alone), coordinate 1's IEEE's, +inf where the product is 4 * 2**126 and NaN where it is 0
-    (rows 1464, 12403)."""
+    sums' grid alone) and coordinate 1's IEEE's, +inf, the product 4 * 2**126 times the infinity; every
+    other coordinate of the row is 0 (rows 1464, 12403)."""
     matrix = jnp.zeros((64, 64), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
     matrix = matrix.at[1, 0].set(jnp.inf)
     weights = dataclasses.replace(formats.Fp8Weights.of(matrix, fmt="e5m2", scale=jnp.float32(1.0)),
@@ -620,12 +620,9 @@ def test_an_fp8_products_rescue_leaves_an_infinite_coefficient_to_its_own_coordi
                       jnp.zeros((16, 64), jnp.float32))
     (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, :3].set(
         jnp.asarray([2.0 ** 126, 2.0 ** 126, 1.0], jnp.float32)))
-    got = np.asarray(d_rows)
-    assert got[0, 0] == 4.0 and np.isposinf(got[0, 1]), got[0, :2]
-    assert np.isnan(got[1:, 1]).all(), got[1:, 1]
-    rest = np.delete(got, 1, axis=1)
-    rest[0, 0] = 0.0
-    np.testing.assert_array_equal(rest, np.zeros_like(rest))
+    row = np.array(d_rows[0])
+    assert row[0] == 4.0 and np.isposinf(row[1]), row[:2]
+    np.testing.assert_array_equal(row[2:], np.zeros_like(row[2:]))
 
 
 @pytest.mark.mesh(devices=2)
