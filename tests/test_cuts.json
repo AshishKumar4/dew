@@ -851,16 +851,16 @@
 "tests/test_attention_triton.py::test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler[sm80]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-128x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-step-64x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-fp32-forward-128x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-softcap-forward-32x32]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-tile-forward-128x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-alibi-step-128x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-forward-64x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-fp32-step-32x32]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-bf16-forward-64x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp32-step-64x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[rtx5090-bf16-step-32x32]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-forward-64x128]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-fp32-forward-64x128]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-softcap-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-tile-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-forward-32x32]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-step-32x32]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-fp32-step-64x128]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp16-forward-128x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[rtx5090-bf16-forward-128x64]",
+"tests/test_attention_triton.py::test_an_fp16_weight_too_small_once_normalized_still_reaches_dv",
 "tests/test_attention_triton.py::test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block[64]",
 "tests/test_attention_triton.py::test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound[float16]",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two[192-160-portable]",
@@ -1854,9 +1854,6 @@
 "tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[memory hybrid]",
 "tests/test_forked_calls.py::test_the_per_layer_embedding_reads_each_documents_chain_over_forks[one token each]"
 ],
-"tests/test_fp8_base.py": [
-"tests/test_fp8_base.py::test_lora_packs_the_frozen_base_once_in_place_of_its_kernels_and_training_moves_neither"
-],
 "tests/test_fp8_preset.py": [
 "tests/test_fp8_preset.py::test_a_training_step_in_the_fp8_preset_is_on_par_with_a_fake_quantized_model",
 "tests/test_fp8_preset.py::test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference[experts-mxfp8]",
@@ -2075,9 +2072,6 @@
 "tests/test_hf_phi3.py::test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64_rule",
 "tests/test_hf_phi3.py::test_phi3_short_and_long_logits_match_transformers[False]"
 ],
-"tests/test_hf_qwen35_moe_wrapper.py": [
-"tests/test_hf_qwen35_moe_wrapper.py::test_qwen35_moe_text_and_images_match_the_conditional_reference"
-],
 "tests/test_hf_reference_decoders.py": [
 "tests/test_hf_reference_decoders.py::test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_reference[k2-horizon-tiny]",
 "tests/test_hf_reference_decoders.py::test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_reference[minimax-tiny]",
@@ -2223,15 +2217,15 @@
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-cast forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-dense kernel gradient]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-forward bf16]",
-"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-forward fp16]",
+"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-forward exact fp32]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-fp16 normed biased forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-input gradient fp16]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-input gradient]",
-"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-kernel gradient fp16]",
-"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-normed biased forward]",
-"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-normed kernel gradient]",
-"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-paired forward]",
+"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-kernel gradient exact fp32]",
+"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-kernel gradient]",
+"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-normed biased input gradient]",
+"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-paired forward exact fp32]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-paired swiglu forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-row scaled forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm120-scaled forward]",
@@ -3130,7 +3124,7 @@
 "tests/test_recurrence.py::test_each_covering_hook_combination_steps_as_its_float64_form[l2norm=True]"
 ],
 "tests/test_recurrence_chunk.py": [
-"tests/test_recurrence_chunk.py::test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it[Hooks(conv=None, l2norm=False, scale=None, decay='scalar', gates=None, delta=False, write_gate=True, rated=False, skip=False, output=None, write_bound=None, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)]",
+"tests/test_recurrence_chunk.py::test_a_document_start_takes_a_memory_past_the_largest_out_before_reading_it[Hooks(conv=None, l2norm=False, scale=None, decay='scalar', gates=None, delta=False, write_gate=True, rated=False, skip=False, output=None, write_bound=None, unit_queries=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[an additive erase]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[no decay]",
 "tests/test_recurrence_chunk.py::test_a_forked_call_on_an_explicit_row_axis_is_the_call_whole[the delta rule]",
@@ -3145,8 +3139,8 @@
 "tests/test_recurrence_chunk.py::test_a_turned_gradients_overflowed_term_reaches_no_later_tokens_sum",
 "tests/test_recurrence_chunk.py::test_a_turned_states_long_documents_under_a_short_memory_are_as_exact_as_the_recurrence[forked]",
 "tests/test_recurrence_chunk.py::test_a_turned_states_long_documents_under_a_short_memory_are_as_exact_as_the_recurrence[one sequence]",
-"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=False, scale=0.25, decay='scalar', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=OutputNorm(epsilon=1e-05, activation='sigmoid', read_in=None), write_bound=1.0, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-one sequence]",
-"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=True, scale=None, decay='vector', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=OutputNorm(epsilon=1e-06, activation='silu', read_in=None), write_bound=1.0, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-packed]"
+"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=False, scale=0.25, decay='scalar', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=OutputNorm(epsilon=1e-05, activation='sigmoid', read_in=None), write_bound=1.0, unit_queries=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-one sequence]",
+"tests/test_recurrence_chunk.py::test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token[Hooks(conv=None, l2norm=True, scale=None, decay='vector', gates=None, delta=True, write_gate=False, rated=False, skip=False, output=OutputNorm(epsilon=1e-06, activation='silu', read_in=None), write_bound=1.0, unit_queries=False, decay_bound=None, reads='after', own_weight=False, ranks=1, turns=0, erase='tied', value_decay=False, substeps=1)-one sequence]"
 ],
 "tests/test_recurrence_mosaic.py": [
 "tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-kimi-linear-kda-True]",
