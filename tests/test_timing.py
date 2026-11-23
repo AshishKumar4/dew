@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 from tool_support import StandInSession, git, load, run_from
 
+INSTRUMENT = Path(__file__).parents[1] / "src/dew/telemetry/benchmark.py"
+"""The timing instrument, loaded by its path into each arm's process (tools/timing.py's `INSTRUMENT`)."""
+
 TIMING = Path(__file__).resolve().parents[1] / "tools/timing.py"
 
 BUILDER = '''import jax.numpy as jnp
@@ -266,6 +269,26 @@ def test_a_failed_profile_fails_the_window_and_keeps_its_verdict(tmp_path, monke
         windowed_run(tmp_path, {"profile": {"kernel": "sin"}}, session)
     verdict = json.loads((tmp_path / "out/summary.json").read_text())
     assert verdict["cases"] and (tmp_path / "out/summary.md").read_text()
+
+
+def test_the_instrument_reads_its_flags_in_an_arm_whose_dew_states_no_reader(tmp_path):
+    """The instrument (`INSTRUMENT`, loaded by its path) answers whether a worker runs command buffers in an
+    arm's process whose Dew is another checkout's, one stating none of this checkout's flag readers (an
+    older baseline's): it imports none of the arm's Dew to read its flags (row 12063: it imported
+    `dew._devices.xla_flag_values`, which a baseline before it lacked, and raised ImportError)."""
+    arm = tmp_path / "arm" / "src" / "dew"
+    arm.mkdir(parents=True)
+    (arm / "__init__.py").write_text("")
+    (arm / "_devices.py").write_text("")
+    script = ("import importlib.util;"
+              f"spec = importlib.util.spec_from_file_location('instrument', {str(INSTRUMENT)!r});"
+              "module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module);"
+              "print(module.graphs())")
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120,
+                         env={**os.environ, "PYTHONPATH": str(arm.parent),
+                              "XLA_FLAGS": "--xla_gpu_enable_command_buffer="})
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.split() == ["False"], run.stdout
 
 
 def test_a_device_worker_runs_no_command_buffers_unless_its_arm_names_them(monkeypatch):
