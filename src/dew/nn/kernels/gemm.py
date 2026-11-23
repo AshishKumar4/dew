@@ -525,15 +525,13 @@ def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: boo
         summed = c[0] * eye + c[1] * op_wide + c[2] * sq
         return summed if out_dtype == wide else summed.astype(out_dtype)
 
-    batch_shape = operand.shape[:-2]
+    count = int(np.prod(operand.shape[:-2], dtype=np.int64)) if batch else 1
     placed = explicit_spec(operand)
-    axis0_sharded = placed is not None and bool(placed.spec) and placed.spec[0] is not None
-    if out_dtype.itemsize < wide.itemsize and batch_shape and batch_shape[0] > 1 and not axis0_sharded:
-        extent = batch_shape[0]
-        chunk = max(1, extent * out_dtype.itemsize // (2 * wide.itemsize))
-        parts = [_poly(jax.lax.slice_in_dim(operand, start, min(start + chunk, extent), axis=0))
-                 for start in range(0, extent, chunk)]
-        return jnp.concatenate(parts, axis=0)
+    batch_sharded = placed is not None and any(entry is not None for entry in placed.spec[:len(batch)])
+    if out_dtype.itemsize < wide.itemsize and count > 1 and not batch_sharded:
+        batch_size = max(1, count * out_dtype.itemsize // (2 * wide.itemsize))
+        return jax.lax.map(_poly, operand.reshape(count, side, side), batch_size=batch_size).reshape(
+            operand.shape)
     return _poly(operand)
 
 
