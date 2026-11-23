@@ -858,6 +858,15 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
         assert_runs_per_shard(packed_run, draw_packed, [spec_p, out_spec], mesh,
                               f"packed swiglu explicit mesh {tag}", seeds=SEEDS["per shard"],
                               truth_fn=packed_ref)
+    # Length-2 spec `P("data", None)` on rank-3 `[B, 2, H]` pads trailing None so axis 0 is never mistaken
+    # for pair axis `-2`.
+    with jax.set_mesh(mesh):
+        r3_p, r3_d = placed_on((jax.random.normal(drawn_key(33, 0), (8, 2, 24)),
+                                jax.random.normal(drawn_key(34, 0), (8, 24))),
+                               [PartitionSpec("data", None), PartitionSpec("data")], mesh)
+        with generation.assumed("sm90"):
+            assert norm_swiglu.packed_swiglu_kernel("pallas", r3_p) == "pallas"
+        assert not any(eq.primitive.name == "reshard" for eq in traced(packed_ref, r3_p, r3_d))
     raw_p, raw_d = draw_packed()
     for dtype in (jnp.float32, jnp.bfloat16):
         p_dt, d_dt = raw_p.astype(dtype), raw_d.astype(dtype)

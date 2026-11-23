@@ -368,11 +368,12 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
 
     def halves(gate_up: jax.Array) -> tuple[jax.Array, jax.Array]:
         placed = explicit_spec(gate_up)
-        if placed is not None and len(placed.spec) >= 2 and placed.spec[-2] is not None:
-            entries = tuple(placed.spec)
-            whole_pair = jax.sharding.NamedSharding(
-                placed.mesh, jax.sharding.PartitionSpec(*entries[:-2], None, entries[-1]))
-            gate_up = jax.sharding.reshard(gate_up, whole_pair)
+        if placed is not None:
+            entries = (*placed.spec, *(None,) * (gate_up.ndim - len(placed.spec)))
+            if entries[-2] is not None:
+                whole_pair = jax.sharding.NamedSharding(
+                    placed.mesh, jax.sharding.PartitionSpec(*entries[:-2], None, entries[-1]))
+                gate_up = jax.sharding.reshard(gate_up, whole_pair)
         return gate_up[..., 0, :], gate_up[..., 1, :]
 
     portable = _portable(_gate_function(activation, implementation), halves)

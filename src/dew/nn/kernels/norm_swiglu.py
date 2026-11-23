@@ -457,8 +457,10 @@ def _packed_specs(axes, gate_up) -> tuple[jax.sharding.PartitionSpec, jax.shardi
     `axes` or from `gate_up`'s explicit sharding, or None if unplaced or the pair axis `-2` is split
     (row 822)."""
     placed = explicit_spec(gate_up)
-    if placed is not None and len(placed.spec) >= 2 and placed.spec[-2] is not None:
-        return None
+    if placed is not None:
+        padded = (*placed.spec, *(None,) * (gate_up.ndim - len(placed.spec)))
+        if padded[-2] is not None:
+            return None
     in_spec = _shard_spec(None, gate_up)
     if in_spec is None:
         if axes is None:
