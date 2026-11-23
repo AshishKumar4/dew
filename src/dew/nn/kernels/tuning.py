@@ -605,7 +605,7 @@ class KernelOp(tokamax.Op):
     picks' identity, so a pick timed by the forward alone never answers a gradient's call, nor the reverse,
     and the tuner times it as reverse mode runs it (`_measured`, `report.reversed_run`)."""
 
-    def moded(self) -> "KernelOp":
+    def moded(self) -> KernelOp:
         """This op as the call traced here runs it: pulled where a gradient's product is traced
         (`report.pulling`) and its call carries its derivative (`CARRIES_DERIVATIVE`), else itself."""
         if self.CARRIES_DERIVATIVE and report.pulling() and not self.pulled:
