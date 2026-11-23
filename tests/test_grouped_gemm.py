@@ -2162,32 +2162,46 @@ def test_explicit_target_b200_gathered_settles_under_ambient_sm80():
 
 
 def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
-    """On `walks_scoped` A100 (`sm80`, L2=40MB), deep-K `Qwen3-32B gate_up dX` (`8192x51200->5120`) derives
-    `splits > 1` via `pricing.deep_k_splits` to keep each wave below the L2 drift cliff and compiles
-    spill-free on `sm80`, while shallower A100 shapes and Hopper `sm90` keep `splits == 1` (row 5363)."""
+    """On `walks_scoped` A100 (`sm80`, L2=40MB), `SplitWalk` prices a deep-K dense wave past the L2 drift
+    horizon (`8192x51200->5120`, `M-FS-6`, row 5363) faster split than unsplit while shallower shapes and
+    Hopper `sm90` price unsplit least; derived tiles stay legal and a pinned `splits=2` `sm80` tile compiles
+    spill-free."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
+
+    from dew.nn.kernels.templates.gemm import pricing
 
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     one = jax.ShapeDtypeStruct((1,), jnp.int32)
+
+    def walk_of(tile, target, depth_k: int, width_n: int):
+        unsplit = dataclasses.replace(tile, splits=1)
+        work = pricing.decode_contraction(
+            unsplit, target, rows=8192, groups=1, depth=depth_k, width=width_n, columns=None, held=8192,
+            operands=((2, 2), (None, None)), stored=2.0, multiprocessors=target.multiprocessors)
+        return pricing.split_walk(unsplit, **work)
+
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         deep_ba = launch.bind(bf16((8192, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
                               trans_rhs=True, interpret=False, dense=True)
         deep_tile = launch.derived(deep_ba, target)
-        assert deep_tile is not None and deep_tile.splits > 1, deep_tile
-        shallow_ba = launch.bind(bf16((8192, 4096)), bf16((1, 4096, 4096)), one, out_dtype="bfloat16",
-                                 trans_rhs=True, interpret=False, dense=True)
-        shallow_tile = launch.derived(shallow_ba, target)
-        assert shallow_tile is not None and shallow_tile.splits == 1, shallow_tile
-        mid_ba = launch.bind(bf16((8192, 24576)), bf16((1, 4096, 24576)), one, out_dtype="bfloat16",
+        assert deep_tile is not None and launch.legal(deep_ba, deep_tile, target), deep_tile
+        deep_walk = walk_of(deep_tile, target, 51200, 5120)
+        assert deep_walk is not None and deep_walk.seconds(2) < deep_walk.seconds(1), deep_walk
+        for depth_k, width_n in ((4096, 4096), (24576, 4096)):
+            ba = launch.bind(bf16((8192, depth_k)), bf16((1, width_n, depth_k)), one, out_dtype="bfloat16",
                              trans_rhs=True, interpret=False, dense=True)
-        mid_tile = launch.derived(mid_ba, target)
-        assert mid_tile is not None and mid_tile.splits == 1, mid_tile
+            tile = launch.derived(ba, target)
+            assert tile is not None and launch.legal(ba, tile, target), tile
+            walk = walk_of(tile, target, depth_k, width_n)
+            assert walk is not None and walk.seconds(1) <= walk.seconds(2), (depth_k, walk)
+        pinned = dataclasses.replace(deep_tile, splits=2)
+        assert launch.legal(deep_ba, pinned, target), pinned
         if generation.compile_only_gpus("sm80"):
             records = compile_mosaic_kernels(
-                [KernelCase("sm80_deep_k_split_dx", lambda: launch.lowering(deep_ba, deep_tile))], "sm80")
+                [KernelCase("sm80_deep_k_split_dx", lambda: launch.lowering(deep_ba, pinned))], "sm80")
             for rec in records:
                 assert not rec.get("error"), rec
                 assert rec["kernels"], rec
@@ -2197,4 +2211,6 @@ def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
         h_ba = launch.bind(bf16((8192, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
                            trans_rhs=True, interpret=False, dense=True)
         h_tile = launch.derived(h_ba, target)
-        assert h_tile is not None and h_tile.splits == 1, h_tile
+        assert h_tile is not None and launch.legal(h_ba, h_tile, target), h_tile
+        h_walk = walk_of(h_tile, target, 51200, 5120)
+        assert h_walk is not None and h_walk.seconds(1) <= h_walk.seconds(2), h_walk

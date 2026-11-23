@@ -1048,7 +1048,7 @@ class MosaicGmm(_Mosaic):
         return ((matrix, rows) if tile.swapped else (rows, matrix)), (None, None)
 
     def _decode_split(self, ba, tile: tiling.Tiles | None, target) -> tiling.Tiles | None:
-        """`tile` with depth splits (`split_count`, `deep_k_splits`, rows 3622, 483, 5363, 10151)."""
+        """`tile` with depth splits (`split_count`, rows 3622, 483, 5363, 10151)."""
         from .templates.gemm import pricing
         hooks = ba.arguments['hooks']
         if (tile is None or ba.arguments['exact_sums'] or ba.arguments.get('paired') is not None
@@ -1062,10 +1062,9 @@ class MosaicGmm(_Mosaic):
             return tile
         work = self._contraction(ba, tile, target)
         splits = pricing.split_count(tile, **work)
-        if dense and splits == 1:
-            splits = pricing.deep_k_splits(tile, **work)
         split = dataclasses.replace(tile, splits=splits)
         return split if splits > 1 and self.takes(ba, split, target) else tile
+
     def _left_fits(self, ba, config: tiling.Tiles, target=None) -> bool:
         """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,
         width]` is read transposed, whose stage casts to the products' layout in whole row atoms on a family

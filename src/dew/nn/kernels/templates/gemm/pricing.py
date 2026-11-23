@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, ClassVar
 
 import jax.numpy as jnp
+import numpy as np
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import base, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
@@ -276,13 +277,17 @@ class SplitWalk:
     passes: float
     launch: float
     stored: float
+    drift_horizon: float = 0.0
+    drift_extra: float = 0.0
 
     def walk(self, splits: int) -> float:
         """The busiest program's walk at `splits` slices a tile, in steps: its waves' share of every tile's
         slices, each step at its share of its multiprocessor's tensor rate (the programs a wave runs on each
         at once), or its multiprocessor's share of the operands' stream where that is longer: each
         multiprocessor streams at its share of the memory's rate, its programs' shares in turn, so a wave of
-        more programs than multiprocessors but not twice them streams two shares on some. Priced at a rate
+        more programs than multiprocessors but not twice them streams two shares on some. For a `walks_scoped`
+        full-wave dense walk whose K-slice passes its L2 drift horizon (`drift_horizon`, `tail.snaked`, row
+        5363), steps past the horizon add the unshared L2-miss penalty (`drift_extra`). Priced at a rate
         shared by programs instead, an A100's 2048 x 2048 decode product at 16 rows took a seven-way split
         of its 16 tiles (112 programs on 108 multiprocessors) over the six-way swapped walk (96 programs),
         which ran 0.88x its kernel time at the same DRAM bytes, 0.79x its call's (M-EM-45b-a100; the split
@@ -293,11 +298,15 @@ class SplitWalk:
         programs = self.output * splits
         waves = -(-programs // self.wave)
         sharing = -(-min(programs, self.wave) // self.multiprocessors)
-        busiest = waves * -(-self.steps // splits) * sharing
+        slice_steps = -(-self.steps // splits)
+        busiest = waves * slice_steps * sharing
         # The busiest multiprocessor's programs' shares of the operands, at its share of the memory's rate.
         rate = self.bandwidth / self.multiprocessors
         stream = waves * sharing * self.operand_bytes / programs / rate / self.step_seconds
-        return max(busiest, stream)
+        base = max(busiest, stream)
+        if self.drift_horizon > 0.0 and slice_steps > self.drift_horizon:
+            base += waves * (slice_steps - self.drift_horizon) * self.drift_extra
+        return base
 
     def seconds(self, splits: int) -> float:
         """The call's time at `splits` slices a tile: its busiest program's walk, its epilogue's store of the
@@ -324,17 +333,32 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
     each program's (a pair's CTA's its rows by the pair's columns, `tile_columns`), `step_seconds` a step at
     the multiprocessor's whole rate (`SplitWalk.walk` shares it among the programs running), its output
     stored at `stored` bytes an element (`SplitWalk.seconds`, rows 10151, 12006)."""
-    columns = tile_columns(tiles, family_of(tiles, jnp.bfloat16, target))
-    output = groups * -(-depth // tiles.block_m) * (width // columns)
+    family = family_of(tiles, jnp.bfloat16, target)
+    columns = tile_columns(tiles, family)
+    grid_m, grid_n = -(-depth // tiles.block_m), width // columns
+    output = groups * grid_m * grid_n
     steps = -(-rows // max(groups, 1) // tiles.block_k)
     if step_seconds is None or bandwidth is None or output == 0:
         return None
+    wave = multiprocessors * tiles.programs
+    drift_horizon, drift_extra = 0.0, 0.0
+    if (groups == 1 and target is not None and target.l2_bytes is not None
+            and family.walks_scoped and output >= wave):
+        row_idx, col_idx = tail_of.snaked(np.arange(wave), (grid_m, grid_n), 1, max(tiles.grid_block_n, 1))
+        row_bytes = tiles.block_m * tiles.block_k * itemsizes[0]
+        col_bytes = columns * tiles.block_k * itemsizes[1]
+        shared_step = len(np.unique(row_idx)) * row_bytes + len(np.unique(col_idx)) * col_bytes
+        unshared_step = wave * (row_bytes + col_bytes)
+        # M-FS-6 (A100 SXM, 40 MB L2): wave SMs drift past L2 reuse window after ~6x L2/shared_step steps.
+        drift_horizon = 6.0 * target.l2_bytes / max(shared_step, 1)
+        drift_extra = max(0.0, unshared_step / bandwidth / step_seconds - tiles.programs)
     held = groups * depth if partial_rows is None else partial_rows
-    return SplitWalk(output, multiprocessors * tiles.programs, steps, multiprocessors,
+    return SplitWalk(output, wave, steps, multiprocessors,
                      rows * (depth * itemsizes[0] + width * itemsizes[1]), bandwidth, step_seconds,
                      held * width * 4 / bandwidth / step_seconds,
                      0.0 if launch_seconds is None else launch_seconds / step_seconds,
-                     held * width * stored / bandwidth / step_seconds)
+                     held * width * stored / bandwidth / step_seconds,
+                     drift_horizon, drift_extra)
 
 
 def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth: int, width: int,
@@ -358,41 +382,6 @@ def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth:
     return {**shape, 'itemsizes': itemsizes, 'stored': stored, 'multiprocessors': multiprocessors,
             'step_seconds': step_seconds(unswapped, target, itemsizes, decoded),
             'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target}
-
-
-def deep_k_splits(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int,
-                  itemsizes: tuple[int, int], stored: float, multiprocessors: int,
-                  step_seconds: float | None, bandwidth: float | None, launch_seconds: float | None,
-                  partial_rows: int | None = None, target: generation.GpuTarget | None = None) -> int:
-    """Depth splits keeping a `walks_scoped` dense wave's K-footprint below the L2 drift cliff (`M-FS-6`,
-    `M-NG-45-a100`: Qwen3-32B gate_up dX at K=51200 hits 4.3x DRAM traffic vs K<=40960, row 5363)."""
-    del stored, partial_rows
-    if groups != 1 or target is None or target.l2_bytes is None or bandwidth is None or step_seconds is None:
-        return 1
-    family = family_of(tiles, jnp.bfloat16, target)
-    if not family.walks_scoped:
-        return 1
-    grid_m = -(-depth // tiles.block_m)
-    grid_n = -(-width // tile_columns(tiles, family))
-    steps = -(-rows // tiles.block_k)
-    wave = max(1, multiprocessors * tiles.programs)
-    rows_wave = min(grid_m, -(-wave // max(tiles.grid_block_n, 1)))
-    cols_wave = min(grid_n, tiles.grid_block_n)
-    step_bytes = (rows_wave * tiles.block_m * itemsizes[0]
-                  + cols_wave * tiles.block_n * itemsizes[1]) * tiles.block_k
-    wave_bytes = steps * step_bytes
-    horizon = 7 * target.l2_bytes
-    if wave_bytes <= horizon:
-        return 1
-    compute = -(-(grid_m * grid_n) // wave) * steps * step_seconds
-    for splits in (2, 4, 8):
-        if steps // splits < max(tiles.stages, 64):
-            break
-        if wave_bytes / splits > horizon:
-            continue
-        merge = 2 * splits * depth * width * 4 / bandwidth + (launch_seconds or 0.0)
-        return splits if merge <= 0.10 * compute else 1
-    return 1
 
 
 def walk_seconds(tiles: "Tiles", contraction: dict) -> float:
