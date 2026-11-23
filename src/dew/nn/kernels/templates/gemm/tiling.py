@@ -106,14 +106,15 @@ class Tiles:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
         if self.staging is not None:
-            chunk, buffers = self.staging
-            if chunk <= 0 or buffers < 1:
-                raise ValueError(f"{self}: output staging needs positive (chunk, buffers), "
-                                 f"got {self.staging}")
-            # Its chunks' columns against the tile's and its issuer's pieces, which no dtype changes; a
-            # chunk's bytes in the call's output dtypes are its launch's to judge (`staging_refusal`).
+            if self.staging[0] <= 0:
+                raise ValueError(f"{self}: output staging needs a positive chunk, got {self.staging}")
+            # Its chunks against the tile's columns and its issuer's pieces, which no dtype changes
+            # (`stores.staging_refusal` of no dtypes); a chunk's bytes in the call's output dtypes are its
+            # launch's to judge (`staging_refusal`).
             columns = self.block_n * (self.cluster if family.pairs_product else 1)
-            family.output_staging((((self.share, columns), jnp.bfloat16),), self.warpgroups, self.staging)
+            refusal = stores.staging_refusal(columns, (), self.staging, piece=family.chunk_columns(columns))
+            if refusal is not None:
+                raise ValueError(f"{self}: {refusal}")
 
     def stated(self, outputs, family) -> tuple[int, int] | None:
         """The output staging this tile states for a kernel storing `outputs` (`(shape, dtype)` each,
