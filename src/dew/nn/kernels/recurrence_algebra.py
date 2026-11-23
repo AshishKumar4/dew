@@ -1350,7 +1350,7 @@ def selective_decay(step, rate, kept=None):
     rate: a rate past float32's range times a padded token's zero step is zero, not `0 * -inf` (row 8491:
     A = -3 2^126 made `A log2(e)` -inf and a padded token's decay NaN), and the step's part is the token's
     alone, which a schedule walking the states forms once a token (an A100's backward formed
-    `(dt A) log2(e)` a token and state, two of its fifteen FMULs, M-JS-241)."""
+    `(dt A) log2(e)` a token and state, two of its thirty FMULs, M-JS-241)."""
     decay = jnp.exp2((step * LOG2_E) * rate)
     return decay if kept is None else decay * kept
 
