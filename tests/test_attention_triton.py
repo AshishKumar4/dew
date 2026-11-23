@@ -1411,8 +1411,11 @@ def test_common_triton_forward_lowering_isolates_scaled_op():
         names = [eq.params.get("name", "") for eq in programs.equations(traced) if programs.opaque(eq)]
         assert names and all("scaled" not in name for name in names), names
         assert any("attention_forward" in name for name in names), names
-        # Captured certification (`_captured_jaxpr`) isolates the common walk, while runtime keeps `rare()`.
-        cap_jaxpr = op._captured_jaxpr(ba, cfg).jaxpr
+        # The walk certification captures (`certified_walk`) is the common walk alone; the run keeps `rare()`.
+        walk = op.certified_walk(ba, cfg)
+        assert walk is not None
+        arrays, fill = programs.holes((ba.args, ba.kwargs), lambda leaf: isinstance(leaf, jax.Array))
+        cap_jaxpr = jax.make_jaxpr(lambda *values: walk(*fill(values)))(*arrays).jaxpr
         cap_names = [eq.params.get("name", "") for eq in programs.equations(cap_jaxpr) if programs.opaque(eq)]
         assert cap_names and all("scaled" not in name for name in cap_names), cap_names
         with tuning.pinned({attention_triton.TritonForward: cfg}):
