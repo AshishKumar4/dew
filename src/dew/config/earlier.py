@@ -329,16 +329,26 @@ def _unmasked(mask: _records.JSON, settings: _Fields, config: _Fields) -> tuple[
     trained. The empty state its masked decay step held, which a decay of 0 holds bare, and Adam's coupled
     decay step ahead of its moments, which a decay of 0 holds none of (`Adam.COUPLED`), a restore of a run
     whose record was this one (`unmasked_decay`) takes as they are
-    (`dew.checkpoints._state_trees.masked_decay_unsaved`). Refused where it masked by a tree, which no record
-    rebuilds."""
+    (`dew.checkpoints._state_trees.masked_decay_unsaved`). A tree of booleans is that decay's own mask where
+    it was read (`OptimConfig.decay_mask`, `ParamGroup.decay_mask`), its state as it was; any other mask is
+    refused."""
     if mask is None or mask is True:
         return settings, config
     groups, read = mask_readers(config)
     if not read:
         return settings, config
+    if isinstance(mask, Mapping):
+        # A tree of booleans, the decay's own mask where it was read (`decay_mask`): its state the masked
+        # decay step a spared decay's is, so its checkpoints restore as they were written.
+        if not groups:
+            return settings, {**config, "decay_mask": mask}
+        masked: list[_records.JSON] = [
+            {**group, "decay_mask": mask} if isinstance(group, Mapping) and group in read else group
+            for group in groups]
+        return settings, {**config, "param_groups": masked}
     if mask is not False:
         raise ValueError(f"an earlier run masked its decay by {mask!r}, which no record of this Dew states: "
-                         "set OptimConfig.spared or its param groups' (ParamGroup.spared) in its place")
+                         "set OptimConfig.decay_mask or its param groups' in its place")
     if not groups:
         return {**settings, "weight_decay": 0.0}, config
     unmasked: list[_records.JSON] = [
