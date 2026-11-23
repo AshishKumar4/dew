@@ -181,6 +181,44 @@ def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+def _diagonal_case(packed: bool) -> support.KernelCase:
+    """The diagonal scan's training step through its VJP (`templates.recurrence.diagonal`, its four launches:
+    16 spans a row) over bf16 writes at HGRN 1.3B's 2048 channels, eight rows of 4096 tokens, whole or
+    packed."""
+    from dew.nn.kernels.templates.recurrence import diagonal, mainloop
+
+    def call():
+        x = jax.ShapeDtypeStruct((8, 4096, 2048), jnp.bfloat16)
+        g = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+        state = jax.ShapeDtypeStruct((8, 2048), jnp.float32)
+        starts = jax.ShapeDtypeStruct(x.shape[:2], jnp.bool_) if packed else None
+
+        def grads(x, g, state, starts):
+            family, _ = mainloop.issued(jnp.float32)
+
+            def loss(x, g, state):
+                out, final = diagonal.diagonal_scan(x, g, state, starts, family=family, interpret=False)
+                return jnp.sum(out.astype(jnp.float32)) + jnp.sum(final)
+
+            return jax.grad(loss, argnums=(0, 1, 2))(x, g, state)
+        return grads, (x, g, state, starts)
+    return support.KernelCase("diagonal/packed" if packed else "diagonal", call)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("target", gate_generations(scoped=True))
+def test_the_diagonal_scans_kernels_compile_within_each_gpus_resources(target):
+    """The diagonal scan's training launches (`templates.recurrence.diagonal`) over whole rows and packed
+    ones, lowered as on the GPU and compiled by Mosaic for a compile-only device on this CPU through ptxas
+    (tests/kernel_compile.py): within the block's shared memory (the backward's kept states), no register
+    spilled."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    found = compile_mosaic_kernels([_diagonal_case(False), _diagonal_case(True)], target)
+    assert len(found) == 2
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
 
 @COMPILES_ON_CPU
 @lowers("sm90")

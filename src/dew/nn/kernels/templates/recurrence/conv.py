@@ -110,7 +110,7 @@ def _kept(kept, value: jax.Array) -> jax.Array:
     return jnp.where(mosaic.laid(kept, value), value, jnp.zeros_like(value))
 
 
-def _loaded(ref, row, token, columns, length: int):
+def channels_at(ref, row, token, columns, length: int):
     """`ref`'s program's channels (`columns`) at `token` of `row`, fp32, zero before the row's first and
     past its last."""
     inside = (token >= 0) & (token < length)
@@ -127,7 +127,7 @@ def _owner(documents_ref, row, token, length: int):
     return jnp.where(inside, documents_ref[row, jnp.clip(token, 0, length - 1)], -1)
 
 
-def _stored(ref, at: tuple, value, when) -> None:
+def stored_where(ref, at: tuple, value, when) -> None:
     """`value` stored at `ref[at]` in its dtype where `when` holds (a token inside the row, or its own)."""
     @pl.when(when)
     def _():
@@ -158,7 +158,7 @@ class _Piece:
             self.b_ref.at[self.columns], layout=layout, optimized=False).astype(jnp.float32))
 
     def input(self, token):
-        return _loaded(self.x_ref, self.row, token, self.columns, self.length)
+        return channels_at(self.x_ref, self.row, token, self.columns, self.length)
 
     def owner(self, token):
         return _owner(self.documents_ref, self.row, token, self.length)
@@ -239,7 +239,7 @@ def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, 
         def emit(t, out, _):
             if head is not None:
                 out = out * scan.inverse_norm(out, eps, exchanged, group=group, interpret=interpret)
-            _stored(out_ref, (piece.row, t, piece.local), _kept(piece.kept(t), out), t < length)
+            stored_where(out_ref, (piece.row, t, piece.local), _kept(piece.kept(t), out), t < length)
 
         _walked(piece, tokens=tokens, activation=activation, emit=emit)
 
@@ -291,17 +291,17 @@ def through(x, taps, bias, valid, documents, dys: tuple, *, parts: tuple, activa
             unit = out * scale
             projected = (scan.summed(unit * dy, exchanged, interpret=interpret) if group is None
                          else scan.grouped_summed(unit * dy, group, interpret=interpret))
-            _stored(out_ref, (piece.row, t, piece.columns), scale * (dy - projected * unit), t < length)
+            stored_where(out_ref, (piece.row, t, piece.columns), scale * (dy - projected * unit), t < length)
 
         _walked(piece, tokens=tokens, activation=activation, emit=emit,
-                fetch=lambda t: _loaded(dy_ref, piece.row, t, piece.local, length))
+                fetch=lambda t: channels_at(dy_ref, piece.row, t, piece.local, length))
 
     def copied(row, start, local, columns, dy_ref, out_ref):
         def turn(i, carried):
             at = [start + i * unrolled + u for u in range(unrolled)]
-            loaded = [_loaded(dy_ref, row, t, local, length) for t in at]
+            loaded = [channels_at(dy_ref, row, t, local, length) for t in at]
             for t, dy in zip(at, loaded, strict=True):
-                _stored(out_ref, (row, t, columns), dy, t < length)
+                stored_where(out_ref, (row, t, columns), dy, t < length)
             return carried
 
         lax.fori_loop(0, tokens // unrolled, turn, jnp.int32(0))
@@ -435,7 +435,7 @@ def _backward_walk(piece: _Piece, dy_ref, outs, *, activation: bool, tokens: int
         newest = last - i * unrolled
         tokens_ = [newest - u for u in range(unrolled)]
         reads = [piece.read(t - count + 1) for t in tokens_]
-        dys = [_loaded(dy_ref, piece.row, t, piece.local, length) for t in tokens_]
+        dys = [channels_at(dy_ref, piece.row, t, piece.local, length) for t in tokens_]
         for t, oldest, dy in zip(tokens_, reads, dys, strict=True):
             read = [oldest, *held]
             window = piece.window(read)
@@ -447,7 +447,7 @@ def _backward_walk(piece: _Piece, dy_ref, outs, *, activation: bool, tokens: int
             reads = zip([grad, *later], [document, *owners], strict=True)
             for shift, (value, theirs) in enumerate(reads):
                 dx = dx + _kept(theirs == document, value) * piece.taps[count - 1 - shift]
-            _stored(dx_ref, (piece.row, t, piece.columns), dx, owned)
+            stored_where(dx_ref, (piece.row, t, piece.columns), dx, owned)
             held, later, owners = read[:-1], [grad, *later[:-1]], [document, *owners[:-1]]
         return held, later, owners, sums
 
