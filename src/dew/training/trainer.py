@@ -231,7 +231,7 @@ def signature_digest(signature: Hashable) -> str:
 
 
 
-def _refuse_two_remats(objective: Objective, fit: FitPolicy) -> None:
+def _refuse_two_remats[L, E](objective: Objective[L, E], fit: FitPolicy) -> None:
     """Refuse a run's remat (`FitPolicy.remat`) beside a model that states its own, as configured, before any
     climb: one states the step's recomputation, which a later phase's planner then takes as climbed."""
     if fit.remat != "auto" and remat_stated(objective):
