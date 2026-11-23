@@ -1,5 +1,6 @@
-"""A packed matrix's product times its scales, `run(rows) * factor` (`factored`), its transpose range-safe:
-the NVFP4 and ternary products' (`gemm.nvfp4_product`, `ternary.ternary_weight_product`), ledger 1464."""
+"""A packed matrix's product times its scales, `run(rows) * factor` (`factored`), its transpose range-safe
+and exact: the packed products' (`gemm.nvfp4_product`, `ternary.ternary_weight_product`), ledger rows 1464,
+12392 and 12403."""
 
 from __future__ import annotations
 
@@ -15,7 +16,6 @@ from jax.custom_derivatives import SymbolicZero
 from dew.nn import float_bits
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
-from dew.nn.precision import power2
 from dew.nn.sharding import explicit_spec, varying_like
 
 
@@ -27,16 +27,15 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
     scales broadcast against its output (`formats.scale_factor`), one a row's or one for all (a column's,
     which the transpose sums over, is the plain product's). Its transpose is the plain one, the cotangent
     times its factor through `run`'s pullback, wherever that is finite; where it is not (a product past
-    fp32's largest), the moved one (`_Transpose.moved`): each product formed from its cotangent's and
-    factor's significands and binades, split into `FACTORED_BANDS` bands of `FACTORED_BAND` binades down
-    from its row's (its token's, gathered) largest, each band moved to fp32's middle and pulled back wide
-    (`wide(cotangent, *prepared(*wide_operands))`, the transpose in fp32 over the rows `run` reads, a route
-    each where gathered, its operands `prepared` once a rescue: a decoded matrix whose depth is its axis
-    -2, a chunk of it at a time), and every band's rows summed into their tokens (gathered) at their
-    powers exactly, rounded once (`aligned.aligned_segment_sum`), a product of a cotangent or factor not
-    finite kept as IEEE's: no product overflows or flushes, so a scale of 2**126 under cotangents that
-    cancel pulls back their remainder, as fp32's sums would in range (ledger 1464). A checked `shard_map`'s
-    devices sum a cotangent only they vary over before its pullback, and their partials after."""
+    fp32's largest), the exact one (`_Transpose.moved`): each product `cotangent * factor` and each
+    coefficient of the decoded matrix (`prepared(*wide_operands)`, its depth its axis -2) cut into integer
+    slices on grids of their own, each pair of slices multiplied by a bf16 GEMM whose fp32 sums are exact
+    integers (`wide`, the transpose over the rows `run` reads, a route each where gathered), the sums kept
+    in int32 limbs, added across routes into their tokens and across the devices that sum them, then
+    rounded once (`_rounded`). A product of a cotangent, factor or coefficient not finite is IEEE's: no
+    product overflows or flushes, so a scale of 2**126 under cotangents that cancel pulls back their
+    remainder, a subnormal one among them. A checked `shard_map`'s devices sum a cotangent only they vary
+    over before its pullback, and their partials after."""
     if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
         return run(rows.astype(jnp.bfloat16), *operands) * factor
     transpose = _Transpose(run, rows.shape, rows.dtype, frozenset(jax.typeof(rows).mat.varying),
@@ -113,18 +112,24 @@ class _Transpose:
             # vary over that the rows do not, the operands', from types alone.
             before = self.alone(ran, cotangent, scale)
             excess = tuple(sorted(self.operand_axes(ran) - self.held))
-            rescued = self.moved(cotangent, scale, ran, routed, before, excess, plain)
+            rescued = self.moved(cotangent, scale, routed, before, excess, plain)
             # A product of a cotangent or factor not finite pulled back as IEEE's, as the plain transpose's.
             special = ~jnp.isfinite(cotangent) | ~jnp.isfinite(jnp.broadcast_to(scale, cotangent.shape))
             ieee = self.summed(*self.pulled(jnp.where(special, cotangent * scale, 0.0), ran))
             rescued = jnp.where(jnp.isfinite(ieee), rescued, ieee)
+            # A coefficient not finite, which the exact sums leave out, met by each product's sign at a
+            # scale no finite coefficient's sum overflows: IEEE's infinity of the product's sign, or a NaN
+            # where one meets a zero product, a NaN or another sign, at its own input coordinate alone.
+            signs = jnp.sign(cotangent) * jnp.sign(scale) * jnp.float32(2.0 ** -126)
+            met = self.summed(*self.pulled(signs, ran))
+            rescued = jnp.where(jnp.isfinite(met), rescued, met)
             return jnp.where(jnp.isfinite(plain), plain, rescued)
 
         # The moved pullback where the plain one is not finite alone: each device of a sum decides alike,
         # the plain transpose summed over its axes.
         return jax.lax.cond(jnp.all(jnp.isfinite(plain)), lambda: plain, moved)
 
-    def moved(self, cotangent, scale, ran, routed, before, excess, plain):
+    def moved(self, cotangent, scale, routed, before, excess, plain):
         """The exact rescue (`factored`): every product `cotangent * scale` as fp32 forms it, from its
         operands' significands and binades, on a grid of `FACTORED_SLICE` bits a row (its token's, gathered,
         shared by every device that sums it), and the decoded matrix on its own; each slice pair's
@@ -149,15 +154,16 @@ class _Transpose:
         # it, rounded up to a slice's edge.
         top = jnp.max(binade, axis=-1, keepdims=True, initial=-1024)
         if gather is None:
-            grid = _shared_max(top, tuple(sorted({*before, *excess})))
+            grid = token_grid = _edge(_shared_max(top, tuple(sorted({*before, *excess}))))
         else:
             token = varying_like(jnp.full((self.shape[0], 1), -1024, top.dtype), top, gather)
             token = token.at[gather].max(top)
-            token = _shared_max(token, tuple(sorted(jax.typeof(token).mat.varying - self.held)))
-            grid = token[gather]
-        grid = _edge(grid)
+            token_grid = _edge(_shared_max(token, tuple(sorted(jax.typeof(token).mat.varying - self.held))))
+            grid = token_grid[gather]
         matrix, *rest = self.prepared(*wide_operands)
+        # The finite coefficients' grid: one not finite is IEEE's (`value`), outside the exact sums.
         held = jnp.abs(matrix.astype(jnp.float32))
+        held = jnp.where(jnp.isfinite(held), held, 0.0)
         matrix_top = jnp.max(jnp.where(held > 0, float_bits.binade_of(held), -1024), initial=-1024)
         matrix_grid = _edge(_shared_max(matrix_top, tuple(sorted(jax.typeof(matrix_top).mat.varying
                                                                    - self.held))))
@@ -178,6 +184,7 @@ class _Transpose:
                     jax.lax.dynamic_slice_in_dim(v, start, columns_a_chunk, axis=-1)
                     for v in (bits, binade, negative))
                 block = jax.lax.dynamic_slice_in_dim(columns, start, columns_a_chunk, axis=-1)
+                block = jnp.where(jnp.isfinite(block), block, jnp.zeros_like(block))
                 block_abs = jnp.abs(block.astype(jnp.float32))
                 block_binade = jnp.where(block_abs > 0, float_bits.binade_of(block_abs), -1024)
                 block_bits = (block_abs * float_bits.exact_power2(jnp.clip(7 - block_binade, -126, 127))
@@ -207,13 +214,21 @@ class _Transpose:
 
             limbs = jax.lax.fori_loop(0, width // columns_a_chunk, width_chunk, limbs)
             if gather is not None:
+                # The routes' carried digits added into their tokens `FACTORED_FAN_IN` routes at a time,
+                # carried after each, so no digit's sum passes int32.
                 tokens = varying_like(_limbs(limbs_count, plain, chunk), limbs, gather)
-                limbs = tokens.at[:, gather].add(limbs)
+                for first in range(0, gather.shape[0], FACTORED_FAN_IN):
+                    routes = slice(first, first + FACTORED_FAN_IN)
+                    tokens = _carried(tokens.at[:, gather[routes]].add(limbs[:, routes]))
+                limbs = tokens
             axes = tuple(sorted(jax.typeof(limbs).mat.varying - self.held))
-            limbs = _carried(jax.lax.psum(limbs, axes) if axes else limbs)
-            sums_grid = grid if gather is None else _edge(token)
+            if axes:
+                if (devices := math.prod(jax.lax.axis_size(axis) for axis in axes)) > FACTORED_FAN_IN:
+                    raise ValueError(f"the exact rescue sums {devices} devices' digits, past the "
+                                     f"{FACTORED_FAN_IN} whose sum int32 holds")
+                limbs = _carried(jax.lax.psum(limbs, axes))
             # The first limb's unit: 2**(grid + matrix grid - 2 slices + the headroom's slices).
-            summed = _rounded(limbs, sums_grid + matrix_grid + FACTORED_SLICE * (FACTORED_HEADROOM - 2))
+            summed = _rounded(limbs, token_grid + matrix_grid + FACTORED_SLICE * (FACTORED_HEADROOM - 2))
             return jax.lax.dynamic_update_slice_in_dim(out, varying_like(summed, out), at * chunk, axis=-1)
 
         # The rows' gradient, typed and placed as the plain transpose's is (its devices' sums taken, as each
@@ -252,6 +267,10 @@ token and every device of a mesh, each product below the two grids' tops."""
 FACTORED_ROW_SLICES = 97
 """A row's slices: its products' binades span at most a cotangent's and a factor's ranges multiplied (-298
 to 254, the largest product's grid rounded up a slice) and 24 bits of significand below them."""
+
+FACTORED_FAN_IN = 1 << 24
+"""The carried limbs (each digit below `2**FACTORED_SLICE`) the exact rescue adds into one before carrying:
+routes into a token, devices into their sum; `2**24` of them sum below int32's largest."""
 
 FACTORED_MATRIX_SLICES = 6
 """A decoded packed matrix's slices on its grid: 36 bits, past any format's span (E5M2's 31 binades and 3
@@ -306,8 +325,9 @@ def _carried(limbs: jax.Array) -> jax.Array:
 def _rounded(limbs: jax.Array, unit: jax.Array) -> jax.Array:
     """The fp32 value nearest (ties to even) `sum(limbs[t] * 2**(unit - FACTORED_SLICE * t))`, carried int32
     `limbs` (the first signed and below `2**FACTORED_SLICE`, `FACTORED_HEADROOM` deep; each other in
-    `[0, 2**FACTORED_SLICE)`): its leading 30 bits and whether any below them are set, rounded once to the
-    bits fp32 keeps at its binade (fewer where it is subnormal), then scaled (`precision.power2`)."""
+    `[0, 2**FACTORED_SLICE)`): its leading 30 bits and a sticky bit below them where any lower one is set,
+    rounded once in integers (`float_bits.rounded_float32`), so a subnormal holds where a process flushes
+    its float32 arithmetic."""
     width = FACTORED_SLICE
     negative = limbs[0] < 0
     limbs = _carried(jnp.where(negative[None], -limbs, limbs))
@@ -322,19 +342,10 @@ def _rounded(limbs: jax.Array, unit: jax.Array) -> jax.Array:
 
     mantissa = sum(jnp.left_shift(at(limbs, lead + k), width * (4 - k)) for k in range(5))
     later = jnp.cumsum(nonzero[::-1].astype(jnp.int32), axis=0)[::-1]
-    sticky = at(later, lead + 5) > 0
-    top = 31 - jax.lax.clz(jnp.maximum(mantissa, 1))
-    binade = unit - width * (lead + 4) + top
-    kept = jnp.where(binade >= -126, 24, 24 - (-126 - binade))
-    drop = jnp.clip(top + 1 - kept, 0, 30)
-    quotient = jnp.right_shift(mantissa, drop)
-    remainder = mantissa - jnp.left_shift(quotient, drop)
-    half = jnp.left_shift(1, jnp.maximum(drop - 1, 0))
-    up = (drop > 0) & ((remainder > half) | ((remainder == half) & (sticky | (quotient % 2 == 1))))
-    quotient = jnp.where(kept < 0, 0, quotient + up.astype(quotient.dtype))
-    value = power2(quotient.astype(jnp.float32), unit - width * (lead + 4) + drop)
-    value = jnp.where(jnp.any(nonzero, axis=0), value, 0.0)
-    return jnp.where(negative, -value, value)
+    sticky = (at(later, lead + 5) > 0).astype(jnp.uint32)
+    significand = jnp.left_shift(mantissa.astype(jnp.uint32), jnp.uint32(1)) | sticky
+    sign = jnp.where(negative, jnp.uint32(1 << 31), jnp.uint32(0))
+    return float_bits.rounded_float32(sign, significand, unit - width * (lead + 4) - 1)
 
 
 def _significand(x: jax.Array) -> jax.Array:
