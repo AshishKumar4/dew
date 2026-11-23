@@ -609,12 +609,12 @@ def test_an_nvfp4_products_rescue_leaves_a_nan_block_scale_to_its_own_coordinate
 
     codes = jnp.zeros((512, 128), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
     scales = jnp.ones((32, 128), jnp.float8_e4m3fn).at[1, 3].set(jnp.nan)
-    matrix = formats.NvFp4.of(codes, scales, jnp.float32(4.0 / 256.0))
+    matrix = formats.NvFp4.of(codes, scales, jnp.float32(4.0))
     _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32),
                       jnp.zeros((4, 512), jnp.float32))
     (d_x,) = pull(jnp.zeros((4, 128), jnp.float32).at[0, :3].set(
         jnp.asarray([2.0 ** 126, 2.0 ** 126, 1.0], jnp.float32)))
-    got = np.asarray(d_x)
+    got = np.array(d_x)
     assert np.isnan(got[:, 16:32]).all(), got[:, 16:32]
     want = np.zeros((4, 512), np.float32)
     want[0, 0] = 4.0
