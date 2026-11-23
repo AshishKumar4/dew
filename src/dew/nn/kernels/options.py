@@ -670,10 +670,12 @@ class OuterProgram:
                                                               tuple[bool, ...]]] = (
             collections.OrderedDict())
         # Its jits within another trace: by the reading each enclosing trace reads (`_nested`), and outside
-        # one, the refusals the latest were made under.
+        # one, the refusals the latest were made under; each with the facts its traces read (`_answered`).
         self._nested_read: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-        self._nested_jits: dict[bool, jax.stages.Wrapped] = {}
+        self._nested_jits: dict[bool, tuple[jax.stages.Wrapped, Facts]] = {}
         self._nested_refusals: tuple | None = None
+        # The facts its eager jit's traces read (`_eager`, `_answered`).
+        self._eager_reads: Facts = {}
         # The facts each executable's trace read, by the executable, read again by every call it answers with
         # no trace (row 12296's review P0: a warm call recorded none, a value made from it held past them).
         self._reads: weakref.WeakKeyDictionary[jax.stages.Compiled, Facts] = weakref.WeakKeyDictionary()
@@ -723,6 +725,13 @@ class OuterProgram:
             self._jits.move_to_end(key)
             while len(self._jits) > self.JITS_HELD:
                 self._jits.popitem(last=False)
+
+    def _retraced(self, key: Hashable, held: jax.stages.Wrapped, reads: Facts) -> None:
+        """`held`, the jit validated for `key`, traced again (JAX's caches cleared): the facts that trace read
+        (`reads`) are those its cache's trace read from here on."""
+        with self._compiling:
+            if (found := self._jits.get(key)) is not None and found[0] is held:
+                self._jits[key] = (held, reads)
 
     def _invalidated(self, key: Hashable, held: jax.stages.Wrapped) -> None:
         """`held`, the jit validated for `key`, let go where a trace by it read other refusals (JAX's trace
@@ -793,10 +802,25 @@ class OuterProgram:
     def _eager(self) -> jax.stages.Wrapped:
         """Its jit called under an eager transformation, which traces it where no trace of it can be read
         first: the function rewritten as it traces (`_rewriting`), one program as its compiles'."""
-        return jax.jit(self._rewriting, **self.arguments)
+        return jax.jit(_fresh(self._rewriting), **self.arguments)
 
-    def _nested(self, whole: bool) -> jax.stages.Wrapped:
-        """Its jit within another trace, the enclosing program's own options the ones it compiles under, as
+    def _answered[R](self, call: Callable[[], R], held: Facts) -> R:
+        """`call()`, a call of a jit it holds across calls (a nested or eager one's), its traces' facts
+        `held`: those a trace of it reads added to them, and where JAX's trace cache answered it, read again
+        (`_read_by`), so a value made within the call holds them (row 12296's review P0: a nested jit's
+        cached trace, reused by another enclosing jit, recorded none)."""
+        result, reads = _read_by(call)
+        with self._compiling:
+            if reads is not None:
+                held.update(reads)
+                return result
+            answered = dict(held)
+        _facts.replay(answered)
+        return result
+
+    def _nested(self, whole: bool) -> tuple[jax.stages.Wrapped, Facts]:
+        """Its jit within another trace and the facts its traces read (`_answered`), the enclosing program's
+        own options the ones it compiles under, as
         JAX takes compiler options on the outermost jit alone, keyed by whether the pass reads the
         enclosing program whole (`_PASSING`): as written where it does (one of these, `_traced`); rewritten
         as it traces where it does not, so a transformation outside it (`jax.grad` of it within a plain
@@ -811,10 +835,10 @@ class OuterProgram:
 
         arguments = {name: value for name, value in self.arguments.items() if name != "compiler_options"}
 
-        def made() -> dict[bool, jax.stages.Wrapped]:
+        def made() -> dict[bool, tuple[jax.stages.Wrapped, Facts]]:
             # Each of a callable of its own, which JAX's trace cache keys anew: it keys a trace on the
-            # function a jit wraps, not the jit.
-            return {mode: jax.jit(_fresh(self.function if mode else self._rewriting), **arguments)
+            # function a jit wraps, not the jit; each with the facts its traces read (`_answered`).
+            return {mode: (jax.jit(_fresh(self.function if mode else self._rewriting), **arguments), {})
                     for mode in (True, False)}
 
         read = report.current_reading()
@@ -836,9 +860,10 @@ class OuterProgram:
         # own options (`_nested`); under an eager transformation alone, or `jax.disable_jit`, its jit
         # compiles itself with its options, or runs the function as Python.
         if staged():
-            return self._nested(_PASSING.get())(*args, **kwargs)
+            nested, reads = self._nested(_PASSING.get())
+            return self._answered(lambda: nested(*args, **kwargs), reads)
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
-            return self._eager(*args, **kwargs)
+            return self._answered(lambda: self._eager(*args, **kwargs), self._eager_reads)
         if (lowering := _LOWERING.get()) is not None:
             platforms, lowerings = lowering
             traced = self.trace(*args, **kwargs)
@@ -1047,9 +1072,12 @@ class OuterProgram:
             return shapes_of(lowering.lowered.out_info)
         pending, owner = self._reserved(key)
         if not owner:
-            # Another's compile, done or not: its shapes as the call traces, none waited for.
-            return shapes_of(pending.result().out_info if pending.done() and pending.exception() is None
-                             else self.trace(*args, **kwargs).out_info)
+            # Another's compile, done or not: its shapes as the call traces, none waited for; a done one's
+            # executable's facts read again.
+            if pending.done() and pending.exception() is None:
+                _facts.replay(self._reads.get(pending.result(), {}))
+                return shapes_of(pending.result().out_info)
+            return shapes_of(self.trace(*args, **kwargs).out_info)
         try:
             traced, refused, reads = self._snapshot_trace(args, kwargs)
             lowered = traced.lower()
@@ -1148,8 +1176,11 @@ class OuterProgram:
         """The program over these arguments, compiled through the kernel templates' reports, lowered afresh
         where a kernel spills; one a block hands by its fingerprint (`taking`) runs that executable, its
         lowering what proves it the program: a caller that compiles a call itself (a server choosing its
-        state's layout) is handed it as a call is."""
-        return self._compiled_digested(*args, **kwargs)[0]
+        state's layout) is handed it as a call is; the facts its kept program's trace read read again, a
+        compile begun aside (`compiling`) tracing none here."""
+        executable, _, _, (_, _, reads) = self._compiled_digested(*args, **kwargs)
+        _facts.replay(reads)
+        return executable
 
     def _compiled_digested(self, *args, **kwargs) -> tuple[jax.stages.Compiled, str | None, tuple[bool, ...],
                                                            tuple[jax.stages.Wrapped | None, tuple, Facts]]:
@@ -1225,10 +1256,11 @@ class OuterProgram:
     def _stable_trace(self, args: tuple, kwargs: dict, *, fresh: bool
                       ) -> tuple[jax.stages.Traced, tuple, jax.stages.Wrapped, Facts]:
         """A trace whose launches read one snapshot of the refusals, the jit that made it and the facts it
-        read beside it (a held jit's trace JAX's cache answered, which reads none anew, those its validated
-        trace read, read again into every open recording, `_facts.replay`): traced
-        again where another thread refused a launch as it traced, until none did, refusals only adding of
-        finitely many; a settle's retrace's (`_traced`) its own. Its jit the one validated for this call
+        read beside it (a held jit's trace JAX's cache answered, which reads none anew, those its cached
+        trace read, read again into every open recording, `_facts.replay`; a held jit whose facts no longer
+        hold traces none, `_facts.still`): traced again where another thread refused a launch as it traced,
+        until none did, refusals only adding of finitely many; a settle's retrace's (`_traced`) its own.
+        Its jit the one validated for this call
         under the snapshot (`_held_jit`), else one of its own, which `fresh` takes always (a relowering's,
         past JAX's trace cache). A raced trace's routes are withdrawn (`withdrawn`), and a validated jit
         whose trace read other refusals let go (`_invalidated`); a held jit's trace that records a refusal
@@ -1241,10 +1273,15 @@ class OuterProgram:
             refusals = report.refusal_snapshot()
             key = None if unheld else self._held_key(args, kwargs, refusals)
             held = None if key is None else self._held_jit(key)
+            if held is not None and not _facts.still(held[1]):
+                # A fact its trace read answers otherwise (a program its trace cache keeps was made under
+                # the answer before): let go, its call traced by a jit of its own.
+                self._invalidated(key, held[0])
+                held = None
             marks = route_marks()
-            with _facts.recording() as reads:
-                outcome = self._traced((self._jitted() if held is None else held[0], refusals), args, kwargs,
-                                       frozen=held is not None)
+            outcome, reads = _read_by(functools.partial(
+                self._traced, (self._jitted() if held is None else held[0], refusals), args, kwargs,
+                frozen=held is not None))
             if isinstance(outcome, report.ReadingRefused):
                 # A held jit's trace recorded a refusal (its cached program dropped): it took nothing, and
                 # the next trace, under the refusals with it, takes a jit of its own.
@@ -1256,9 +1293,15 @@ class OuterProgram:
             if held is not None and (raced or under != refusals):
                 self._invalidated(key, held[0])
             if not raced:
-                if held is not None and made is held[0]:
-                    _facts.replay(held[1])
-                    reads = {**held[1], **reads}
+                if reads is None:
+                    # JAX's trace cache answered the held jit (a jit of its own traces always): the facts
+                    # its cached trace read.
+                    reads = {} if held is None else held[1]
+                    _facts.replay(reads)
+                elif held is not None and made is held[0]:
+                    # Traced again by the jit it holds (its cache cleared): the facts this trace read are
+                    # its cached trace's from here on.
+                    self._retraced(key, made, reads)
                 return traced, under, made, reads
             withdrawn(marks)
 
@@ -1429,11 +1472,34 @@ def program[**P, R](function: Callable[P, R], *, step: Mapping[str, Option] | No
 
 def _fresh[**P, R](function: Callable[P, R]) -> Callable[P, R]:
     """`function` as a callable of its own, which JAX's trace cache keys anew (it keys a trace on the function
-    a jit wraps): a jit of it traces afresh where one of `function` would read a trace held from before."""
+    a jit wraps): a jit of it traces afresh where one of `function` would read a trace held from before. Each
+    run of it marked where a call reads its facts (`_read_by`), so a trace run is told from one JAX's cache
+    answered."""
     @functools.wraps(function)
     def called(*args: P.args, **kwargs: P.kwargs) -> R:
+        if (ran := _RAN.get()) is not None:
+            ran.append(True)
         return function(*args, **kwargs)
     return called
+
+
+_RAN: contextvars.ContextVar[list[bool] | None] = _cache.untraced(
+    contextvars.ContextVar("outer_program_trace_ran", default=None))
+"""Where a call of one of a program's jits marks its function's run (`_fresh`, `_read_by`)."""
+
+
+def _read_by[R](call: Callable[[], R]) -> tuple[R, Facts | None]:
+    """`call()`, a call of a jit of a program's (`_fresh`), and the facts its trace read, recorded as every
+    open recording records them; None where JAX's trace cache answered it, its function run by none, whose
+    caller reads again those its cached trace read (`_facts.replay`)."""
+    ran: list[bool] = []
+    token = _RAN.set(ran)
+    try:
+        with _facts.recording() as reads:
+            result = call()
+    finally:
+        _RAN.reset(token)
+    return result, reads if ran else None
 
 
 def _weak_types(traced: jax.stages.Traced) -> tuple[bool, ...]:
