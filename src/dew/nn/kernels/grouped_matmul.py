@@ -1087,10 +1087,8 @@ class MosaicGmm(_Mosaic):
         return ((matrix, rows) if tile.swapped else (rows, matrix)), (None, None)
 
     def _decode_split(self, ba, tile: tiling.Tiles | None, target) -> tiling.Tiles | None:
-        """`tile` with depth splits (`pricing.split_count`, rows 3622, 483, 10151) where a decode-sized
-        grouped call or an unbalanced dense call underfills the GPU's waves and splitting prices shorter."""
+        """`tile` with depth splits (`split_count`, `deep_k_splits`, rows 3622, 483, 5363, 10151)."""
         from .templates.gemm import pricing
-
         hooks = ba.arguments['hooks']
         if (tile is None or ba.arguments['exact_sums'] or ba.arguments.get('paired') is not None
                 or hooks.prologue is not None or hooks.epilogue is not None or self._scaled
@@ -1101,7 +1099,10 @@ class MosaicGmm(_Mosaic):
             return tile
         if dense and self.balanced(ba, tile, target):
             return tile
-        splits = pricing.split_count(tile, **self._contraction(ba, tile, target))
+        work = self._contraction(ba, tile, target)
+        splits = pricing.split_count(tile, **work)
+        if dense and splits == 1:
+            splits = pricing.deep_k_splits(tile, **work)
         split = dataclasses.replace(tile, splits=splits)
         return split if splits > 1 and self.takes(ba, split, target) else tile
     def _left_fits(self, ba, config: tiling.Tiles, target=None) -> bool:

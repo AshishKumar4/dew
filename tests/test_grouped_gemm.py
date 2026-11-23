@@ -1997,3 +1997,42 @@ def test_explicit_target_b200_gathered_settles_under_ambient_sm80():
     with generation.assumed("sm100"):
         want = producers.settled(launch, ba, unsettled, sm100)
     assert got == want
+
+
+def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
+    """On `walks_scoped` A100 (`sm80`, L2=40MB), deep-K `Qwen3-32B gate_up dX` (`8192x51200->5120`) derives
+    `splits > 1` via `pricing.deep_k_splits` to keep each wave below the L2 drift cliff and compiles
+    spill-free on `sm80`, while shallower A100 shapes and Hopper `sm90` keep `splits == 1` (row 5363)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        deep_ba = launch.bind(bf16((8192, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
+                              trans_rhs=True, interpret=False, dense=True)
+        deep_tile = launch.derived(deep_ba, target)
+        assert deep_tile is not None and deep_tile.splits > 1, deep_tile
+        shallow_ba = launch.bind(bf16((8192, 4096)), bf16((1, 4096, 4096)), one, out_dtype="bfloat16",
+                                 trans_rhs=True, interpret=False, dense=True)
+        shallow_tile = launch.derived(shallow_ba, target)
+        assert shallow_tile is not None and shallow_tile.splits == 1, shallow_tile
+        mid_ba = launch.bind(bf16((8192, 24576)), bf16((1, 4096, 24576)), one, out_dtype="bfloat16",
+                             trans_rhs=True, interpret=False, dense=True)
+        mid_tile = launch.derived(mid_ba, target)
+        assert mid_tile is not None and mid_tile.splits == 1, mid_tile
+        if generation.compile_only_gpus("sm80"):
+            records = compile_mosaic_kernels(
+                [KernelCase("sm80_deep_k_split_dx", lambda: launch.lowering(deep_ba, deep_tile))], "sm80")
+            for rec in records:
+                assert not rec.get("error"), rec
+                assert rec["kernels"], rec
+                assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        h_ba = launch.bind(bf16((8192, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
+                           trans_rhs=True, interpret=False, dense=True)
+        h_tile = launch.derived(h_ba, target)
+        assert h_tile is not None and h_tile.splits == 1, h_tile

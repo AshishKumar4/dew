@@ -364,6 +364,43 @@ def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth:
     return {**shape, 'itemsizes': itemsizes, 'stored': stored, 'multiprocessors': multiprocessors,
             'step_seconds': step_seconds(unswapped, target, itemsizes, decoded),
             'bandwidth': target.memory_rate, 'launch_seconds': target.launch_seconds, 'target': target}
+
+
+def deep_k_splits(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int,
+                  itemsizes: tuple[int, int], stored: float, multiprocessors: int,
+                  step_seconds: float | None, bandwidth: float | None, launch_seconds: float | None,
+                  partial_rows: int | None = None, target: generation.GpuTarget | None = None) -> int:
+    """Depth splits keeping a `walks_scoped` dense wave's K-footprint below the L2 drift cliff (`M-FS-6`,
+    `M-NG-45-a100`: Qwen3-32B gate_up dX at K=51200 hits 4.3x DRAM traffic vs K<=40960, row 5363)."""
+    del stored, partial_rows
+    if groups != 1 or target is None or target.l2_bytes is None or bandwidth is None or step_seconds is None:
+        return 1
+    family = family_of(tiles, jnp.bfloat16, target)
+    if not family.walks_scoped:
+        return 1
+    grid_m = -(-depth // tiles.block_m)
+    grid_n = -(-width // tile_columns(tiles, family))
+    steps = -(-rows // tiles.block_k)
+    wave = max(1, multiprocessors * tiles.programs)
+    rows_wave = min(grid_m, -(-wave // max(tiles.grid_block_n, 1)))
+    cols_wave = min(grid_n, tiles.grid_block_n)
+    step_bytes = (rows_wave * tiles.block_m * itemsizes[0]
+                  + cols_wave * tiles.block_n * itemsizes[1]) * tiles.block_k
+    wave_bytes = steps * step_bytes
+    horizon = 7 * target.l2_bytes
+    if wave_bytes <= horizon:
+        return 1
+    compute = -(-(grid_m * grid_n) // wave) * steps * step_seconds
+    for splits in (2, 4, 8):
+        if steps // splits < max(tiles.stages, 64):
+            break
+        if wave_bytes / splits > horizon:
+            continue
+        merge = 2 * splits * depth * width * 4 / bandwidth + (launch_seconds or 0.0)
+        return splits if merge <= 0.10 * compute else 1
+    return 1
+
+
 def walk_seconds(tiles: "Tiles", contraction: dict) -> float:
     """The seconds `tiles`' walk of a `contraction` (`decode_contraction`) takes at its split, past every
     other walk's where the device states no rate (`split_walk`)."""
