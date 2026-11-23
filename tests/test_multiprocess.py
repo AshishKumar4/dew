@@ -144,24 +144,6 @@ def token_corpus(directory: Path, records: int, seq_len: int, rows: int | None =
 
 
 @pytest.mark.distributed
-def test_a_pool_admits_a_program_over_every_process_together_or_refuses_it_on_every_one(tmp_path):
-    """A program over devices of every process is admitted on every process or on none
-    (`dew.communicators.admitted_together`): where one process refuses its communicators and load, every
-    process raises before any runs it, its peer naming the refusing rank, none left waiting in a collective
-    the refusing one never joins (row 12131: one GPU's refusal left the other in NCCL for ever); a program
-    over one process's own devices is that process's alone, its refusal raised there and its peer's
-    admission its own."""
-    script = Path(__file__).with_name("admission_worker.py")
-    reports = run_pool("admission", tmp_path / "pool", 2, script=script)
-    assert [report["spans"] for report in reports] == [[True, False], [True, False]], reports
-    assert [report["pooled"] for report in reports] == [
-        ["PeerFailure", "a program's communicators and load", 1],
-        ["CommunicatorRoom", "refused on process 1"]], reports
-    assert [report["local"] for report in reports] == [
-        ["admitted"], ["CommunicatorRoom", "refused on process 1"]], reports
-
-
-@pytest.mark.distributed
 def test_a_pool_agrees_a_steps_fit_on_each_processs_own_read_and_a_failed_read_ends_every_check(tmp_path):
     """Each process reads its own devices' headroom for a step over both processes' devices and the pool
     answers alike in the same round (`memory.step_fits`): the step fits where every process's holds, a

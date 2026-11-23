@@ -1087,6 +1087,15 @@ class Trainer(Generic[Loss, Effects]):
         from is released with its plan (`Planned.released`)."""
         return None if self._compiled is None else self._compiled.executable
 
+    def _dispatched(self, sampled: bool) -> jax.stages.Compiled | None:
+        """The executable a step of the last compile ran: its sampled step's where it summarized what the run
+        inspects (`Planned.sampled`), else the plan's, whose first run is taken as its own
+        (`dew.communicators.first_ran`)."""
+        planned = None if self._compiled is None else self._compiled.planned
+        if sampled and planned is not None and planned.sampled is not None:
+            return planned.sampled.executable
+        return self.executable
+
     @property
     def step_flops(self) -> StepFlops | None:
         """The FLOPs of the last compiled step; a ramped run has one value per stage, which `fit` keeps
@@ -1356,9 +1365,9 @@ class Trainer(Generic[Loss, Effects]):
                     # its steps', its first draw's admissions (`DrawingStep.drawn`) among it.
                     interval.compiling = before + time.perf_counter() - began
                 with region("train.step"):
-                    state, loss, aux, finite, accepted, committed = train_step(
-                        state, device, sampled=self.inspection is not None and self.inspection.samples(
-                            run.current + 1, self.accumulation))
+                    state, loss, aux, finite, accepted, committed = train_step(state, device, sampled=(
+                        sampled := self.inspection is not None and self.inspection.samples(
+                            run.current + 1, self.accumulation)))
                 if not seen and self.phase_passes.counts:
                     # Once the first step is dispatched, its later phases' steps are planned off the loop.
                     from dew.training.ahead import LaterPlans
@@ -1372,7 +1381,7 @@ class Trainer(Generic[Loss, Effects]):
                     # outputs, the loss counters, so a newly compiled step's first run is awaited here,
                     # where its failure can be named.
                     self._unproven = False
-                    first_run(loss, run.current, self.memory, self.device_mesh, self.executable)
+                    first_run(loss, run.current, self.memory, self.device_mesh, self._dispatched(sampled))
                 run.loss = loss
                 assert run.train is not None
                 position = run.train.source_state if ahead is None else ahead

@@ -31,7 +31,7 @@ from jax._src.interpreters import pxla
 from jax.experimental.layout import Format
 from jax.sharding import AbstractMesh, NamedSharding, Sharding
 
-from dew import _cache, _stated, algebra
+from dew import _cache, _stated, algebra, communicators
 from dew._devices import xla_flag
 from dew._stated import Unestablished
 from dew.nn.kernels.generation import stated, traced_fact
@@ -420,13 +420,13 @@ def _ran(program: OuterProgram, executable: jax.stages.Compiled, args: tuple, kw
          ) -> contextlib.AbstractContextManager:
     """The contexts every enclosing `running` block runs `executable`, `program`'s for these arguments,
     inside, the outermost first, each entered here, at the call, not at the caller's `with`, which leaves
-    them; none outside any."""
-    if not (arounds := _RUNNING.get()):
-        return contextlib.nullcontext()
+    them; none outside any. Past them the executable runs, which its admission takes
+    (`dew.communicators.dispatched`): what it loads and connects is free memory's to read from here on."""
     stack = contextlib.ExitStack()
     with stack:
-        for around in arounds:
+        for around in _RUNNING.get():
             stack.enter_context(around(program, executable, args, kwargs))
+        communicators.dispatched(executable)
         return stack.pop_all()
 
 
