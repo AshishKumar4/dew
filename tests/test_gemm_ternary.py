@@ -367,6 +367,20 @@ def test_a_packed_products_transpose_holds_in_a_checked_map_linear_transpose_and
 
     np.testing.assert_array_equal(np.asarray(gradient(packed)), np.asarray(gradient(plain)))
 
+    # Each device's scale its own (256 and 257) and its cotangent its own (+1 and -1), the rows and codes
+    # every device's: the cotangents times their scales sum to -1 before the pullback, as the plain
+    # product's transpose sums them, not each device's pullback rounded to bf16 first (257 to 256) and
+    # summed to 0.
+    def pulled_back(product):
+        def each_device(rows, scale, dy):
+            return jax.vjp(lambda r: product(r, scale), rows)[1](dy)[0]
+
+        signs = jnp.zeros((32, 32), jnp.float32).at[0, 0].set(1.0).at[16, 0].set(-1.0)
+        return jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, data, data), out_specs=whole,
+                                     check_vma=True))(x[:16], jnp.asarray([256.0, 257.0], jnp.float32), signs)
+
+    np.testing.assert_array_equal(np.asarray(pulled_back(packed)), np.asarray(pulled_back(plain)))
+
     # The rows the same on every device, each device's codes its own (a matrix split over the map's axis), one
     # replicated scale of 2**126 and each device's cotangent +4 or -4: their partials sum to 0 before the
     # scale joins, not to inf - inf.
