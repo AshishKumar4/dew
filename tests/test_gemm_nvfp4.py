@@ -571,15 +571,14 @@ def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
             return gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32, interpret_on_cpu=interpret)
 
         assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, f"fp8_weight_product {fmt} interp={interpret}",
-                        seeds=6, truth_fn=functools.partial(plain, dtype=jnp.float64))
+                        seeds=8, truth_fn=functools.partial(plain, dtype=jnp.float64))
 
     # Exact single-scale check on default XLA and interpreted Mosaic routes (scale = 2.0 must apply once).
     ones = jnp.ones((64, 64), jnp.bfloat16)
     scaled_w = formats.Fp8Weights.of(jnp.full((64, 64), 2.0, jnp.float32), fmt=fmt, scale=2.0)
     for interpret in (False, True):
         got = gemm.fp8_weight_product(ones, scaled_w, out_dtype=jnp.float32, interpret_on_cpu=interpret)
-        np.testing.assert_allclose(np.asarray(got), np.full((64, 64), 128.0, np.float32), atol=0.0, rtol=0.0)
-
+        np.testing.assert_array_equal(np.asarray(got), np.full((64, 64), 128.0, np.float32))
     # Grouped fp8_weight_product across scalar, per-column, per-group, and per-group-per-column scales.
     rng = np.random.default_rng(8549)
     x_g = jnp.asarray(rng.integers(-2, 3, size=(64, 64)), jnp.bfloat16)
@@ -598,7 +597,7 @@ def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
         for interpret in (False, True):
             got = gemm.fp8_weight_product(x_g, bank, sizes, out_dtype=jnp.float32,
                                           interpret_on_cpu=interpret)
-            np.testing.assert_allclose(np.asarray(got), np.asarray(ref), atol=1e-4, rtol=1e-4)
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
     with pytest.raises(ValueError):
         formats.Fp8Weights.of(w_g, fmt=fmt, scale=jnp.ones((2,), jnp.float32))
     with pytest.raises(ValueError):

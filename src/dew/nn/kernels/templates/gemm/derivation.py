@@ -28,6 +28,28 @@ from dew.nn.kernels.templates.gemm import pricing
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 
 
+def _budgeted_launch(launch_of: Callable, target, shared_budget: int | None, programs: int) -> Callable:
+    """Wrap `launch_of` to reserve `shared_budget`'s carve-out via `Scope.addresses` through
+    `generation.shared_budget(target)` and `resources.program_shared`, clamping GPU and TPU alike."""
+    if shared_budget is None:
+        return launch_of
+    from dew.nn.kernels import generation
+
+    block = generation.shared_budget(target)
+    real_share = resources.program_shared(block, programs)
+    clamped_share = max(0, resources.program_shared(min(block, shared_budget), programs))
+    carved = max(0, real_share - clamped_share)
+    if not carved:
+        return launch_of
+
+    def wrapped(tile):
+        built = launch_of(tile)
+        return dataclasses.replace(built, scope=lambda s, orig=built.scope: dataclasses.replace(
+            orig(s), addresses=orig(s).addresses + carved))
+
+    return wrapped
+
+
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
             units: tuple[int, int, int] = (1, 1, 1), dense: bool = False,
@@ -95,13 +117,6 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       cluster's tiles one program's.
 
     None where no tile holds."""
-    if shared_budget is not None:
-        from dew.nn.kernels import generation
-        limit = min(generation.shared_budget(target), shared_budget)
-        if generation.tpu(target) and target.scoped_vmem is not None:
-            target = dataclasses.replace(target, scoped_vmem=limit)
-        else:
-            target = dataclasses.replace(target, shared_limit=limit)
     # The facts the layouts share (their instruction family's); each layout's registers bound the shapes.
     family = layouts[0]
     columns = _derived_columns(family, width, dtype, units[1])
@@ -119,11 +134,10 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
                                    multiprocessors=multiprocessors, grouped=padded)
         price_of = functools.partial(_tile_cost, family=family, target=target, dtype=dtype, rows=rows,
                                      width=width, padded=padded)
+        active_launch = _budgeted_launch(launch_of, target, shared_budget, programs)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
-                                      candidate=candidate, launch_of=launch_of, layouts=layouts,
+                                      candidate=candidate, launch_of=active_launch, layouts=layouts,
                                       target=target, programs=programs, price_of=price_of)
-        # rows the most its registers hold there and its stages keep busy, rows short of that balance (the
-        # width's held rows, or the balanced side where it holds more) giving way to the next narrower
         # width, so a tile keeps its rows and narrows rather than shortening. mma.sync's one consumer at
         # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
         # (64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's 1.10-1.14, FSA100POST32). Where no width
