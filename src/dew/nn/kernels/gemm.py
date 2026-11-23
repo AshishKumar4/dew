@@ -57,8 +57,6 @@ from dew.nn.derivatives import (
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import (
-    MX_BLOCKS,
-    NVFP4_BLOCKS,
     Fp8Weights,
     MxFp8,
     NvFp4,
@@ -67,7 +65,7 @@ from dew.nn.kernels.formats import (
     fp8_factor,
     fp8_scale_checked,
 )
-from dew.nn.kernels.templates import axes as side_axes_of
+from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import scattered, tiling
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
@@ -700,9 +698,9 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
         assert isinstance(out, jax.Array)
         return out
     if minifloat is MxFp8:
-        if width % MX_BLOCKS.depth != 0:
+        if width % product_of.MXFP8.depth != 0:
             raise ValueError(
-                f"gemm_quantized(MxFp8) requires width divisible by {MX_BLOCKS.depth}, got {width}")
+                f"gemm_quantized(MxFp8) requires width divisible by {product_of.MXFP8.depth}, got {width}")
         out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
                    epilogue=quantized.quantize_mxfp8_epilogue(), out_dtype=jnp.float8_e4m3fn,
                    out_dtypes=(jnp.float8_e4m3fn, jnp.float8_e8m0fnu), precision=precision,
@@ -711,9 +709,10 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
         codes, block_scales = out
         return MxFp8(codes, block_scales[..., ::32])
     if minifloat == bits.E2M1 or minifloat is NvFp4Block:
-        if width % NVFP4_BLOCKS.depth != 0:
+        if width % product_of.NVFP4.depth != 0:
             raise ValueError(
-                f"gemm_quantized(NvFp4Block) requires width divisible by {NVFP4_BLOCKS.depth}, got {width}")
+                f"gemm_quantized(NvFp4Block) requires width divisible by {product_of.NVFP4.depth}, "
+                f"got {width}")
         ts = jnp.asarray(1.0 if tensor_scale is None else tensor_scale, jnp.float32)
         out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
                    epilogue=quantized.quantize_nvfp4_epilogue(),
