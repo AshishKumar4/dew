@@ -229,12 +229,19 @@ def test_restored_blockwise_cublaslt_references_prepare_on_sm90(tmp_path, monkey
     import generation_support
     import model_flows
     import tier_wire
-    from truths_ahead import UNPREPARED, prepared
+    import pickle
+    from truths_ahead import AT_RUN, DEFERRED, HELD, SITE, UNPREPARED, prepared
 
     monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
                                                                                    gpu="sm90")))
     monkeypatch.setenv(tier_wire.PREPARE, "1")
-    with prepared(tmp_path / "store", stamp="blockwise-12062", target=generation_support.node_target()):
+    store = tmp_path / "store"
+    with prepared(store, stamp="blockwise-12062", target=generation_support.node_target()):
         blockwise_matrix.a_blockwise_fp8_product_is_on_par(blockwise_matrix.CASES[0])
         a_blockwise_kernel_gradient_is_on_par(interpret=False)
-    assert not (tmp_path / "store" / UNPREPARED).exists(), (tmp_path / "store" / UNPREPARED).read_text()
+    for record in (UNPREPARED, AT_RUN, DEFERRED):
+        assert not (store / record).exists(), (store / record).read_text()
+    arm_sites = [pickle.loads((s.parent / HELD).read_bytes()) for s in store.rglob(SITE)]
+    with_ref = [h for h in arm_sites
+                if any(k.startswith("dew ") for k in h) and any(k.startswith("reference ") for k in h)]
+    assert len(with_ref) == 2, [list(h.keys()) for h in arm_sites]

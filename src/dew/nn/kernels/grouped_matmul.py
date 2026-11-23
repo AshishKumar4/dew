@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import jax
 import jax.numpy as jnp
 
+from .formats import Fp8Weights, TernaryWeights
 from . import generation, selection
 from .formats import Fp8Weights, TernaryWeights
 from .generation import INHERENT
@@ -68,7 +69,6 @@ if TYPE_CHECKING:
     from .templates import mosaic, resources
     from .templates.gemm import mosaic_gpu, pricing
 
-
 def _stored_bytes(ba, rows: int, width: int) -> float:
     """The bytes a product's epilogue moves an element of its `rows` x `width` output
     (`pricing.split_walk`'s `stored`): each output's dtype's, and its epilogue operands' bytes over the
@@ -79,14 +79,12 @@ def _stored_bytes(ba, rows: int, width: int) -> float:
     written = sum(jnp.dtype(dtype).itemsize for dtype in hooks.out_dtypes or (ba.arguments['out_dtype'],))
     return written + cost.stored(*ba.arguments.get('epilogue_operands', ())) / max(rows * width, 1)
 
-
 def _matrix_extents(ba) -> tuple[int, int]:
     """A bound product call's depth and width as its matrix lies (`trans_rhs`'s `[width, depth]`), its width
     every matrix's side by side with the kernel's (`gmm_call`'s `beside`)."""
     kernel, transposed = ba.arguments['kernel'], ba.arguments['trans_rhs']
     depth, width = (kernel.shape[2], kernel.shape[1]) if transposed else kernel.shape[1:]
     return depth, width + sum(each.shape[1 if transposed else 2] for each in ba.arguments.get('beside') or ())
-
 
 _PaddedArgument = tuple[str, "jax.Array | jax.ShapeDtypeStruct | tuple", "dict | tuple"]
 """An argument `_Mosaic._aligned` pads: its name, its value (or tuple of them) and its dims (`_grown`'s)."""
@@ -1412,6 +1410,8 @@ class MosaicPackedGmm(MosaicGmm):
             prologue_axes=(), prologue_dtypes=(), epilogue_axes=(), epilogue_dtypes=(),
             dtypes=(ba.arguments['out_dtype'],), packed=True, packed_rows=rows)
 
+    def legal(self, ba, config: tiling.Tiles, target) -> bool:
+        return config.splits == 1 and super().legal(ba, config, target)
     def candidate(self, ba, config: tiling.Tiles, target) -> bool:
         # A swapped call's consumers each decode 64 rows of the matrix, its fragment's; the matrix's columns
         # take whole 64-column fragments otherwise (`packed.rows_taken`, `packed.taken`).
@@ -1480,23 +1480,21 @@ class MosaicPackedGmm(MosaicGmm):
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicFp8PackedGmm(MosaicPackedGmm):
-    """`MosaicPackedGmm` of free-layout FP8 weights (`formats.Fp8Weights`, rows 8548, 5387): bfloat16 rows
-    times staged uint32 FP8 words decoded inline, or swapped directly into `wgmma` registers on decode."""
-    STEPS: ClassVar[tuple[int, ...] | None] = (packed.FP8_STEP, 2 * packed.FP8_STEP)
-    WEIGHT_BYTES: ClassVar[float] = 1.0
+class MosaicWordPackedGmm(MosaicPackedGmm):
+    """Format-neutral `MosaicPackedGmm` base for inline-decoded scale-free word-packed weights (`Fp8Weights`,
+    `TernaryWeights`, rows 8548, 1464, 5387), driven by `packed.PackedWeightFormat`."""
     DEFAULT_FMT: ClassVar[str] = 'e4m3'
-    def _fmt(self, ba) -> str:
+    def _desc(self, ba) -> packed.PackedWeightFormat:
         kernel = ba.arguments['kernel']
-        return kernel.fmt if isinstance(kernel, (Fp8Weights, TernaryWeights)) else self.DEFAULT_FMT
+        return packed.weight_format(
+            kernel.fmt if isinstance(kernel, (Fp8Weights, TernaryWeights)) else self.DEFAULT_FMT)
     def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
         del trans_rhs
         assert isinstance(kernel, (Fp8Weights, TernaryWeights))
-        return kernel.words, True, {'packed_fp8': kernel.fmt}
+        return kernel.words, True, {'packed_format': kernel.fmt}
     def _swapped_extra(self, kernel, formats: dict) -> dict:
-        del formats
         assert isinstance(kernel, (Fp8Weights, TernaryWeights))
-        return {'packed_fp8': kernel.fmt}
+        return {'packed_format': kernel.fmt, **formats}
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
         from .templates.gemm import mosaic_gpu
         dtype, rows, hooks = ba.arguments['tokens'].dtype, ba.arguments['packed_rows'], ba.arguments['hooks']
@@ -1505,24 +1503,27 @@ class MosaicFp8PackedGmm(MosaicPackedGmm):
             prologue_axes=(), prologue_dtypes=(), epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
             dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
-            packed_fp8=self._fmt(ba), packed_rows=rows)
+            packed_format=self._desc(ba).name, packed_rows=rows)
     def _operand_bytes(self, ba, tile: tiling.Tiles) -> tuple[tuple[float, float], tuple]:
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
         rows_b, stage = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(kernel.dtype).itemsize
+        wb = self._desc(ba).weight_bytes
         if tile.swapped:
-            return (self.WEIGHT_BYTES, rows_b), ((0, 1), None)
+            return (wb, rows_b), ((0, 1), None)
         copies = 1 if packed.shared_decode(tile, interpret=False) else tile.warpgroups
-        return (rows_b, self.WEIGHT_BYTES), (None, (stage, copies))
-    def _decode_live(self, ba) -> int:
-        from ...algebra import bits
-        return bits.fp8_form(packed.fp8_minifloat(self._fmt(ba)))[0].live
+        return (rows_b, wb), (None, (stage, copies))
     def _registers(self, ba, config: tiling.Tiles, *, merging: bool, target) -> int | None:
         from .templates import resources
         share = config.block_m // config.warpgroups
         decoded = (2 * share * 16 + share * config.block_k // 2 if ba.arguments['packed_rows']
                    else 2 * config.block_n * 16)
         return _beside(MosaicGmm._registers(self, ba, config, merging=merging, target=target),
-                       decoded // resources.THREADS + self._decode_live(ba))
+                       decoded // resources.THREADS + self._desc(ba).decode_live)
+@dataclasses.dataclass(frozen=True)
+class MosaicFp8PackedGmm(MosaicWordPackedGmm):
+    """`MosaicWordPackedGmm` of free-layout FP8 weights (`formats.Fp8Weights`, rows 8548, 5387)."""
+    STEPS: ClassVar[tuple[int, ...] | None] = (packed.FP8_STEP, 2 * packed.FP8_STEP)
+    DEFAULT_FMT: ClassVar[str] = 'e4m3'
 
 @dataclasses.dataclass(frozen=True)
 class MosaicTgmm(_Mosaic):

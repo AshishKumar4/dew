@@ -7,6 +7,7 @@ GEMM's (`gemm`), their recipes' projections a layer's (`projections`)."""
 import dataclasses
 import functools
 import hashlib
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -404,7 +405,10 @@ class Fp8Weights(_ScaledWeights):
         minifloat, _ = _fp8_minifloat(self.fmt)
         words = jnp.asarray(self.words)
         *batches, width, wdepth = words.shape
-        flat = words.reshape(-1, width, wdepth)
+        batch = math.prod(batches)
+        if batch == 0 or width == 0 or wdepth == 0:
+            return jnp.zeros((*batches, wdepth * 4, width), dtype)
+        flat = words.reshape(batch, width, wdepth)
         inv = np.argsort(fp8_staged_rows(wdepth * 4))
         decoded = jax.vmap(lambda w: bits.fp8_codes(w.T, minifloat, jnp.float32)[inv])(flat)
         return decoded.reshape(*batches, wdepth * 4, width).astype(dtype)
@@ -470,7 +474,7 @@ def ternary_form_version() -> np.ndarray:
 
 def ternary_packed(codes: jax.Array) -> jax.Array:
     """Pack 2-bit ternary `codes` (`[..., n]` uint32, 0->0, 1->+1, 2->-1) 16 per uint32 word."""
-    grouped = codes.reshape(*codes.shape[:-1], -1, 16)
+    grouped = codes.reshape(*codes.shape[:-1], codes.shape[-1] // 16, 16)
     shifts = jnp.arange(16, dtype=jnp.uint32) * jnp.uint32(2)
     return jnp.sum((grouped & jnp.uint32(3)) << shifts, axis=-1, dtype=jnp.uint32)
 
@@ -482,7 +486,7 @@ def ternary_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
     nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
     neg = (code2 >> jnp.uint32(1)) & nz
     f32_bits = (neg << jnp.uint32(31)) | (nz * jnp.uint32(0x3F800000))
-    values = jax.lax.bitcast_convert_type(f32_bits, jnp.float32).reshape(-1, words.shape[-1])
+    values = jax.lax.bitcast_convert_type(f32_bits, jnp.float32).reshape(words.shape[0] * 16, words.shape[-1])
     return values.astype(dtype)
 
 
@@ -507,8 +511,15 @@ class TernaryWeights(_ScaledWeights):
             raise ValueError(
                 f"TernaryWeights expects 2D/3D with depth divisible by {TERNARY_STAGE}, got {source.shape}")
         if scale is None:
-            absmean = jnp.mean(jnp.abs(source), axis=(-2, -1), keepdims=(source.ndim == 3))
-            scale_arr = jnp.maximum(absmean, jnp.float32(1e-5))
+            if source.size == 0:
+                scale_shape = source.shape[:-2] + ((1, 1) if source.ndim == 3 else ())
+                scale_arr = jnp.full(scale_shape, jnp.float32(1e-5))
+            else:
+                abs_w = jnp.abs(source)
+                peak = jnp.max(abs_w, axis=(-2, -1), keepdims=(source.ndim == 3))
+                safe_peak = jnp.where(peak > 0, peak, jnp.float32(1.0))
+                absmean = peak * jnp.mean(abs_w / safe_peak, axis=(-2, -1), keepdims=(source.ndim == 3))
+                scale_arr = jnp.maximum(absmean, jnp.float32(1e-5))
         else:
             scale_arr = jnp.asarray(scale, jnp.float32)
         fp8_scale_checked(scale_arr.shape, source.shape)
@@ -542,7 +553,10 @@ class TernaryWeights(_ScaledWeights):
         """Decode packed `words` back to `[..., depth, width]` ternary `{-1, 0, +1}` in `dtype`."""
         words = jnp.asarray(self.words)
         *batches, width, wdepth = words.shape
-        flat = words.reshape(-1, width, wdepth)
+        batch = math.prod(batches)
+        if batch == 0 or width == 0 or wdepth == 0:
+            return jnp.zeros((*batches, wdepth * 16, width), dtype)
+        flat = words.reshape(batch, width, wdepth)
         inv = np.argsort(ternary_staged_rows(wdepth * 16))
         decoded = jax.vmap(lambda w: ternary_codes(w.T, jnp.float32)[inv])(flat)
         return decoded.reshape(*batches, wdepth * 16, width).astype(dtype)
