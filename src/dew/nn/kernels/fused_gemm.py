@@ -56,7 +56,7 @@ from dew import _cache, algebra
 from dew.algebra import cost as algebra_cost, program as algebra_program
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
-from dew.nn.kernels import gemm, generation, grouped_matmul, launches, tuning
+from dew.nn.kernels import gemm, generation, grouped_matmul, launches, tuning, xla_products
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost, emission
@@ -110,8 +110,8 @@ def product(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None
                                        precision=precision, preferred_element_type=declared[1])
         matrices = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
         values = lhs if gather is None else lhs[gather]
-        out = jax.lax.ragged_dot(values, matrices, group_sizes, precision=precision,
-                                 preferred_element_type=declared[1])
+        out = xla_products.placed_ragged_dot(values, matrices, group_sizes, precision=precision,
+                                             preferred_element_type=declared[1])
         return gemm.scattered(out, scatter)
     fusible = fuser.fusible(output_fusion_prefix=True)(
         functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None,
