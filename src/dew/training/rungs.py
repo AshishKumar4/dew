@@ -28,7 +28,6 @@ from jax.sharding import Mesh
 from dew import _cache
 from dew._code import whole_digest
 from dew._devices import device_memory
-from dew._files import write_atomically
 from dew._records import JSON, json_value, record
 from dew._stated import Unestablished, stated
 from dew.communicators import loaded_program
@@ -46,9 +45,10 @@ if TYPE_CHECKING:
 
 
 def rung_records() -> Path | None:
-    """Where a step's rung is recorded: DEW_RUNG_RECORDS when set, else beside
-    the persistent compilation cache, or nowhere when the process keeps none."""
-    return _cache.beside_compilation_cache('DEW_RUNG_RECORDS', 'dew-rungs')
+    """Where a step's rung is recorded: DEW_RUNG_RECORDS when set, else beside the persistent compilation
+    cache the process is configured with (`dew._cache.kept_beside`), or nowhere when it keeps none or keeps
+    a bucket's."""
+    return _cache.kept_beside('dew-rungs', variable='DEW_RUNG_RECORDS', configured=True)
 
 
 RECORD_VERSION = 3
@@ -115,9 +115,10 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     if key is None:
         return None, {}, None
     path = directory / f"{hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()}.json"
-    if not path.exists():
+    found = _cache.read_kept(path)
+    if found is None:
         return path, key, None
-    stored = record(json.loads(path.read_text()), f"rung record {path}")
+    stored = record(found, f"rung record {path}")
     if stored.get('key') != key:
         raise ValueError(f"the rung record {path} was written for another step or device "
                          f"({stored.get('key')!r}, not {key!r}); delete it to decide the rung again")
@@ -145,6 +146,6 @@ def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlo
 
 
 def keep_rung(path: Path, key: Mapping[str, JSON], rung: JSON) -> None:
-    """Record `rung` for `key` at `path`, whole or not at all."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_atomically(path, json.dumps({'key': dict(key), 'rung': rung}, sort_keys=True))
+    """Record `rung` for `key` at `path`, whole or not at all; a directory that cannot be written keeps
+    none, the miss logged (`dew._cache.keep`), and a later run decides its rung again."""
+    _cache.keep(path, {'key': dict(key), 'rung': rung}, "a step's rung")

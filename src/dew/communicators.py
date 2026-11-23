@@ -30,7 +30,6 @@ before it to the room left (`admit`), so a program that would fail to connect is
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import hashlib
 import itertools
@@ -48,7 +47,7 @@ from jaxlib.xla_client import LoadedExecutable
 
 from dew import _pool
 from dew._builds import dew_cache_dir
-from dew._cache import default_compilation_cache_dir
+from dew._cache import keep, kept_beside, read_kept
 from dew._code import code_digest
 from dew._devices import (
     backend_open,
@@ -63,7 +62,6 @@ from dew._devices import (
     pool_bound,
     write_share,
 )
-from dew._files import write_atomically
 from dew._isolated import Isolated, IsolatedFailure
 from dew.telemetry.instrumentation import compiled_memory, hlo_instructions
 from dew.telemetry.trace import collective
@@ -231,15 +229,16 @@ Dew's own code instead (`collectives_kept`)."""
 
 
 def measured(configured: Mapping, *, measure: Callable[[Mapping], Needs]) -> Needs:
-    """The measurement for `configured`, from Dew's cache, or `measure`d and kept there, in this `FORM`."""
+    """The measurement for `configured`, from Dew's cache, or `measure`d and kept there (`dew._cache.keep`),
+    in this `FORM`."""
     digest = hashlib.sha256(json.dumps(configured, sort_keys=True).encode()).hexdigest()[:24]
     path = Path(dew_cache_dir()) / "communicators" / f"form-{FORM}" / f"{digest}.json"
-    if path.exists():
-        return Needs.of(json.loads(path.read_text())["needs"])
+    found = read_kept(path)
+    if isinstance(found, dict) and isinstance(held := found.get("needs"), dict):
+        return Needs.of(held)
     needs = measure(configured)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    record = {"configuration": dict(configured), "needs": needs.to_json()}
-    write_atomically(path, json.dumps(record, indent=1))
+    keep(path, {"configuration": dict(configured), "needs": needs.to_json()},
+         "the host's measured communicators")
     _log.info("measured NCCL's communicators on this host's GPUs in %.1f s (kept in %s): %s", needs.seconds,
               path, needs.to_json())
     return needs
@@ -471,27 +470,26 @@ def held() -> Sizing | None:
 def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...],
                      program: Callable[[], str | jax.stages.Compiled]) -> Collectives:
     """The communicators an executable makes on `gpus` (`collectives_of`), read from its `program` once per
-    executable and kept beside the compilation cache it lives in (`dew._cache.default_compilation_cache_dir`)
-    under its `fingerprint` as positions in its device assignment, below the digest of the code that reads it
+    executable and kept beside the compilation cache it lives in (`dew._cache.kept_beside`) under its
+    `fingerprint` as positions in its device assignment, below the digest of the code that reads it
     (`dew._code.code_digest`), so a warm start that loads it from that cache reads no module, a process naming
     another cache reads none kept for another's programs, and those another code of it kept are read again.
-    A directory that cannot be read or written (a read-only home) keeps none, a miss logged, and a bucket's
-    (gs://) is not written to: the program's text serves the process."""
-    cache = default_compilation_cache_dir()
-    path = None if "://" in cache else (
-        Path(cache) / "dew-communicators" / code_digest(__name__) / f"{fingerprint.hex()}.json")
-    if path is not None:
-        with contextlib.suppress(OSError, ValueError):
-            return Collectives.of(json.loads(path.read_text()), gpus)
-    positions = collectives_of(program(), tuple(range(len(gpus))))
-    if path is not None:
+    Where nothing is kept (a bucket's cache, a read-only home: `dew._cache.keep`), the program's text serves
+    the process."""
+    directory = kept_beside("dew-communicators")
+    path = None if directory is None else directory / code_digest(__name__) / f"{fingerprint.hex()}.json"
+    found = None if path is None else read_kept(path)
+    if isinstance(found, dict):
+        # A record kept that does not read as positions in this assignment (a position past it or no
+        # integer, a field missing) is a miss, read again from the program.
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            write_atomically(path, json.dumps(positions.to_json()))
-        except OSError as refused:
-            _log.warning("a program's communicators are not kept (%s): a later start reads its text again",
-                         refused)
-    return Collectives.of(positions.to_json(), gpus)
+            return Collectives.of(found, gpus)
+        except (IndexError, KeyError, TypeError, ValueError) as unread:
+            _log.info("a program's kept communicators are read again from its text: %s", unread)
+    positions = collectives_of(program(), tuple(range(len(gpus)))).to_json()
+    if path is not None:
+        keep(path, positions, "a program's communicators")
+    return Collectives.of(positions, gpus)
 
 
 @dataclasses.dataclass(frozen=True)
