@@ -272,6 +272,21 @@ def prefetch_registers(family: mosaic.Family, config: "Tiles", *, ba, staged_row
     return (32 if config.block_k > 32 else 16) if active else 0
 
 
+BOUNDED_REGISTERS = 16
+"""Extra consumer registers held by `MmaIssuer.bounded` on one-consumer grouped `mma.sync` tiles
+(`mosaic_gpu._row_bound`, rows 5623, 7091): the runtime `int32` row bound and per-M-block predication
+pushed `sm80` `64x192x64` normed biased forward from 244 modeled registers to 255 with 32 bytes spilled."""
+
+
+def bounded_registers(family: mosaic.Family, config: "Tiles", dtype, *, dense: bool,
+                      staged_rows: bool) -> int:
+    """Extra consumer registers for `family.bounded(_row_bound)` on one-consumer grouped `mma.sync` tiles."""
+    if (staged_rows or dense or config.sharing != 1 or not family.operands_in_registers
+            or jnp.dtype(dtype) == jnp.float32):
+        return 0
+    return BOUNDED_REGISTERS
+
+
 @dataclasses.dataclass(frozen=True)
 class SplitWalk:
     """Dew: a contraction's walk at a tile as `split_count` prices it (`split_walk`): its `output` tiles
