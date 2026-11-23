@@ -526,7 +526,8 @@ def _traced_span(key: Hashable | None, trace: Callable, returned: dict) -> tuple
     read again wherever it is taken (`generation.held_trace`, as every held trace of Dew's), its trace's
     routes and launches reported again there (`Recorded.replay`: a held SwiGLU span's route and Pallas launch
     reach the kernel report and the tuner, row 11002); traced afresh, as it is, where no key holds it
-    (`_span_key`) or its program may not be held (`_holdable`, held as None)."""
+    (`_span_key`), and recorded afresh at each call where its program may not be held (`_holdable`, held as
+    None)."""
     if key is None:
         # Traced as it is, in the call's own collections: a recording's fresh ones are keys JAX's own caches
         # hold traces by, so a launch within it lowered again at each call (a recurrence's two layers'
@@ -545,11 +546,12 @@ def _traced_span(key: Hashable | None, trace: Callable, returned: dict) -> tuple
         return fresh["traced"] if _holdable(closed) else None
 
     entry = generation.held_trace(_SPANS.held, key, made, SPANS_HELD)
-    # A trace made here is this call's, held or not; a held one taken is its first trace's; one held as none
-    # traced as it is.
-    taken = fresh.get("traced") or entry
-    if taken is None:
-        return _traced_span(None, trace, returned)
+    # A trace made here is this call's, held or not; a held one taken is its first trace's. One held as none
+    # is recorded again as its first was: traced as it is, in this trace's collections, a jitted function
+    # within it called before is JAX's held trace, which reports its routes no more (row 12094).
+    if (taken := fresh.get("traced") or entry) is None:
+        made()
+        taken = fresh["traced"]
     taken.record.replay()
     return taken.closed, taken.structure, taken.zeros
 

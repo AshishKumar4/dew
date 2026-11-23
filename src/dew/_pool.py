@@ -35,13 +35,20 @@ def joins_pool(multi_host: bool | None, environment: ClusterEnvironment | None) 
     return multi_host is True or environment is not None or COORDINATOR in os.environ
 
 
+def named_platforms(platforms: str | None) -> frozenset[str]:
+    """The platforms a JAX_PLATFORMS value (or JAX's `jax_platforms`) names, each as JAX reads it, its
+    commas' spaces aside; none where it is unset or empty, which leaves JAX every platform it finds. The
+    one reading of it (`runs_on_gpu`, `_devices.opens_tpu`, `communicators.needs_of`, row 12083)."""
+    return frozenset(name.strip() for name in (platforms or "").split(",") if name.strip())
+
+
 def runs_on_gpu(env: Mapping[str, str]) -> bool:
     """Whether `env` leaves jax the GPUs: JAX_PLATFORMS unset or naming them,
     and CUDA_VISIBLE_DEVICES, where set, naming some (empty or -1 hides all)."""
-    platforms = env.get("JAX_PLATFORMS", "")
+    named = named_platforms(env.get("JAX_PLATFORMS"))
     visible = env.get("CUDA_VISIBLE_DEVICES")
     hidden = visible is not None and visible.strip() in ("", "-1")
-    return not hidden and (not platforms or any(name in platforms for name in ("cuda", "gpu")))
+    return not hidden and (not named or bool(named & {"cuda", "gpu"}))
 
 
 def answered(argv: Sequence[str], timeout: float = 60) -> str | None:

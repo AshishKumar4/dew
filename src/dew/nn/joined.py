@@ -31,7 +31,6 @@ from flax.core import meta
 from flax.linen.dtypes import promote_dtype
 from flax.typing import PrecisionLike
 
-from dew import _cache
 from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, _rounds_once, intercepting, observed
 from dew.nn.precision import biased, float32_dot_general
 
@@ -90,7 +89,7 @@ def projections_of(projections: Sequence[nn.Module], depth: int | None = None) -
         dense=True,
         dot_general=all(projection.dot_general in (None, float32_dot_general)
                         and projection.dot_general_cls is None for projection in projections),
-        intercepted=intercepting() or any(projection.product_owned() for projection in projections),
+        intercepted=any(intercepting(projection) or projection.product_owned() for projection in projections),
         held=leaves is not None, recipe=leaves is not None and _recipe_differs(leaves.kernels),
         observed=any(observed(projection) for projection in projections), leaves=leaves)
 
@@ -375,7 +374,7 @@ class BesideCase:
         operands = prepared(self.x, self.projections, leaves)
         paths = tuple(map(kernel_path, self.projections))
         placement = shard_placement(operands.inputs[0], operands.kernels, paths)
-        named = dict(_cache.KERNEL_CHOICES.value).get(Choice.QKV) == 'joined'
+        named = forced(Choice.QKV) == 'joined'
         return BesidePlan(operands, placement, self.projections[0].precision, named)
 
     @functools.cached_property

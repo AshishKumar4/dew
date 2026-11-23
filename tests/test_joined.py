@@ -645,6 +645,20 @@ def test_a_watched_projection_keeps_its_own_call_and_its_output_is_sown():
     assert "k_proj" in sown[INSPECTED], sown[INSPECTED].keys()
 
 
+def test_a_watch_of_another_module_leaves_the_projections_side_by_side():
+    """An attention layer traced under a watch naming none of its query, key and value projections (its
+    output's): the three still run side by side, as a watch intercepts the modules it names alone
+    (`dense.intercepting`), where any watch ran every join of a model apart (row 9772)."""
+    from dew.nn.inspection import INSPECTED, watching
+
+    layer, x, params, under = _watched_layer()
+
+    def inspected(params, x):
+        return layer.apply(params, x, mutable=[INSPECTED])
+
+    assert _qkv_routes(layer, params, x, *under(), watching(("o_proj",)), apply=inspected)[:1] == ["joined"]
+
+
 @pytest.mark.parametrize(("rows", "choice"), [((4, 3072), "joined"), ((1, 2048), "apart")],
                          ids=["4x3072", "1x2048"])
 def test_a_4b_layers_query_key_and_value_respect_named_qkv_choice(rows, choice):
