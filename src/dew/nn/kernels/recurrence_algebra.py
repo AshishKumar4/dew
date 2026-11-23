@@ -1023,15 +1023,15 @@ def key_memory_decay(entered, leaving) -> jax.Array:
 
 def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower: Tile, betas, dtype,
                     issue: Issue, summed: Callable[..., jax.Array], *,
-                    emit: Callable[[int, jax.Array], None], onto: tuple | None = None
+                    emit: Callable[[int, jax.Array], None], d_betas: jax.Array | None = None
                     ) -> tuple[jax.Array, jax.Array]:
     """The values' part of a decay a key dimension's backward (`templates.recurrence.key_backward`): through
     `u = (I + L) (v beta)`, each value block `j`'s `d(v beta) = (I + L)^T du` ('values_merge') of the
     corrected values' gradient `value_grads(j)`, its values' gradient `beta d(v beta)` `[C, BV]` fp32 to
     `emit(j, dv)`, and `(dA, dbeta)`, the inverse's gradient's part `du (v beta)^T` `[C, C]` and the write
-    gates' `sum(v d(v beta))`, fp32. A walk of a row's value blocks a few at a time adds these blocks' onto
-    the two sums its earlier steps left (`onto`)."""
-    d_betas = jnp.zeros(betas.shape, jnp.float32) if onto is None else onto[1]
+    gates' `sum(v d(v beta))`, fp32. A walk of a row's value blocks a few at a time gives the write gates'
+    sum its earlier steps left (`d_betas`) and a `summed` taking these blocks' products onto its system's."""
+    d_betas = jnp.zeros(betas.shape, jnp.float32) if d_betas is None else d_betas
     for j in range(blocks):
         value = values(j).value().astype(jnp.float32)
         d_scaled = (value_grads(j).value().astype(jnp.float32)
@@ -1044,26 +1044,25 @@ def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower:
     d_system = summed([("values_merge", value_grads(j), lambda j=j: Transposed(
         write_gated(values(j).value().astype(jnp.float32), betas).astype(dtype))) for j in range(blocks)],
         shape=(lower.shape[0],) * 2)
-    return (d_system if onto is None else onto[0] + d_system), d_betas
+    return d_system, d_betas
 
 
 def key_memory_sums(out_grads: TileLoad, corrected: TileLoad, value_grads: TileLoad, entered: TileLoad,
-                    leaving: TileLoad, blocks: int, summed: Callable[[list], jax.Array],
-                    onto: tuple = (None, None, None)) -> tuple[Callable[[], jax.Array], ...]:
+                    leaving: TileLoad, blocks: int, summed: tuple[Callable[[list], jax.Array], ...]
+                    ) -> tuple[Callable[[], jax.Array], ...]:
     """A key block's three memory products summed over value blocks `j` `[C, BK]` fp32
     (`key_memory_block`'s): `do h^T` ('memory_dq'), `v_new dh^T` ('memory_dk') and `dv h^T` ('memory_dw') of
     the output's gradient `out_grads(j)`, the corrected values `corrected(j)` and their gradient
     `value_grads(j)` against the memory entered `entered(j)` and its gradient leaving `leaving(j)` `[BK, BV]`,
-    each a callable issuing its sum into one accumulator where it is read (`summed`), so one sum is held at a
-    time; a walk of a row's value blocks a few at a time adds each onto the sum its earlier steps left
-    (`onto`)."""
-    def total(name, left, right, start):
-        found = summed([(name, left(j), right(j).T) for j in range(blocks)])
-        return found if start is None else start + found
+    each a callable issuing its sum into one accumulator where it is read (its `summed`'s), so one sum is held
+    at a time; a walk of a row's value blocks a few at a time gives `summed`s taking them onto the sums its
+    earlier steps left."""
+    def total(name, left, right, issued):
+        return issued([(name, left(j), right(j).T) for j in range(blocks)])
 
     pairs = (("memory_dq", out_grads, entered), ("memory_dk", corrected, leaving),
              ("memory_dw", value_grads, entered))
-    return tuple(functools.partial(total, *pair, start) for pair, start in zip(pairs, onto, strict=True))
+    return tuple(functools.partial(total, *pair, issued) for pair, issued in zip(pairs, summed, strict=True))
 
 
 def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tuple, lower: Tile, betas,
