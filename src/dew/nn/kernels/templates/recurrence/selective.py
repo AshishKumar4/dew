@@ -912,15 +912,17 @@ class Selective(base.Template[Tiles]):
 
     def neighbours(self, ba: tokamax.BoundArguments, config: Tiles) -> list[Tiles]:
         """The configs the opt-in tuner times beside the derived `config` (`variants`, which keeps the legal
-        ones): the backward's tokens a thread halved and doubled at their own residency (`backward_programs`),
-        and the derived tokens at one program a multiprocessor fewer, as the H100's sweep timed them (8
-        tokens at three programs 6.43 ms, at two 8.10, 16 at two 6.48, sel-sweep-sxm at f3040b154; an A100's
-        backward 14.35 ms beside mamba_ssm's 9.9, M-JS-237); and the forward's chunk halved and doubled."""
+        ones): the backward at every other token count a thread's registers hold, each at its own residency
+        (`backward_programs`), and the derived tokens at one program a multiprocessor fewer, as the H100's
+        sweep timed them (8 tokens at three programs 6.43 ms, at two 8.10, 16 at two 6.48, sel-sweep-sxm at
+        f3040b154); and the forward's chunk halved and doubled. The plan's model ties 4, 8 and 16 tokens on
+        an A100, taking 4 at five programs: its backward 14.33 ms beside mamba_ssm's 9.91, 1.6 times the
+        instructions issued at 119 registers to 168 (M-JS-240)."""
         facts = self._facts(ba, self.launch_target())
         held = facts.multiprocessor.thread_registers
+        counts = [1 << power for power in range(8) if backward_registers(1 << power) <= held]
         stepped = [Tiles(config.chunk, positions, backward_programs(backward_registers(positions), facts))
-                   for positions in (config.positions // 2, 2 * config.positions)
-                   if positions >= 1 and backward_registers(positions) <= held]
+                   for positions in counts if positions != config.positions]
         fewer = [dataclasses.replace(config, resident=config.resident - 1)] if config.resident > 1 else []
         chunks = [dataclasses.replace(config, chunk=chunk) for chunk in (config.chunk // 2, 2 * config.chunk)
                   if CHUNK <= chunk <= block_scan.THREADS]
