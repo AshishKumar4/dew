@@ -240,9 +240,9 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     """A sequence's operands for `hooks` from `seed` (`hosted`), its keys' and values' dimensions each
     permuted by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries (of unit
     norm where the hooks declare them), keys and values (`NORMED_WIDTH` wide under the norm), a log decay a
-    head or a key dimension in (-1, 0), a gate in (0, 1), a skip, a memory entering, `length` tokens over `value_heads` value heads, the values
-    `value_width` wide where given, and with
-    `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
+    head or a key dimension in (-1, 0), a gate in (0, 1), a skip, a memory entering, `length` tokens over
+    `value_heads` value heads, the values `value_width` wide where given, and with `packed` documents
+    starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
     chunk's first token."""
     rng = np.random.default_rng(seed)
     normal = np.random.default_rng([seed, 1]).standard_normal
