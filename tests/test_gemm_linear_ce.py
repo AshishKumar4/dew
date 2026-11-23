@@ -11,12 +11,11 @@ import numpy as np
 import pytest
 from fla_gdn_support import KernelCase
 from generation_support import lowers
-from kernel_compile import compile_mosaic_kernels, lowered_for
+from kernel_compile import compile_mosaic_kernels
 from reference_error import assert_as_exact
 
 from dew.nn import categorical
 from dew.nn.kernels import gemm, generation
-from dew.nn.kernels.templates import report
 from dew.nn.kernels.templates.gemm import linear_ce
 
 SEEDS = 8
@@ -138,20 +137,17 @@ def test_linear_cross_entropy_compiles_spill_free(gpu: str, with_bias: bool):
 
     def fn(a, weight, targets, *rest):
         bias = rest[0] if rest else None
-        return gemm.linear_cross_entropy(a, weight, targets, bias=bias, softcap=30.0)
+        with generation.chosen(grouped_matmul="mosaic"):
+            return gemm.linear_cross_entropy(a, weight, targets, bias=bias, softcap=30.0)
 
     args = (x, w, t, b) if with_bias else (x, w, t)
-    before = {id(c) for c in report.certifications()}
-    with (report.refusals(), report.certifying(generation.compile_only_gpus(gpu)[0]),
-          generation.chosen(grouped_matmul="mosaic")):
-        records = compile_mosaic_kernels(
-            [KernelCase(f"linear_ce_{gpu}_bias{with_bias}", lambda: lowered_for(fn, args, gpu))], gpu)
+    with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"):
+        records = compile_mosaic_kernels([KernelCase(f"linear_ce_{gpu}_bias{with_bias}",
+                                                     lambda: (fn, args))], gpu)
     for rec in records:
         assert not rec.get("error"), rec
-        assert rec["kernels"], rec
+        assert any(k["kernel"] == linear_ce.LINEAR_CE for k in rec["kernels"]), rec
         assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
-    assert any(id(c) not in before and c.op == type(linear_ce.MOSAIC_LINEAR_CE).__name__
-               for c in report.certifications())
 
 
 def test_linear_cross_entropy_derives_on_tpu():

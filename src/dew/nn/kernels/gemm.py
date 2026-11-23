@@ -923,8 +923,10 @@ def _fp8_packed(rows: jax.Array, words: jax.Array, sizes: jax.Array, fmt: str,
                 else jax.lax.ragged_dot(r, matrices, s, preferred_element_type=jnp.float32))
 
     def forward(r: jax.Array, w: jax.Array, s: jax.Array):
-        return _dispatched(kernel, portable, interpret, r, w, s), ()
-
+        ctx = (generation.assumed(generation.interpreted_target())
+               if xla_products.interpreted(interpret) else contextlib.nullcontext())
+        with ctx:
+            return _dispatched(kernel, portable, interpret, r, w, s), ()
     def backward(saved, operands, cotangent, live):
         del saved
         r, w, s = operands

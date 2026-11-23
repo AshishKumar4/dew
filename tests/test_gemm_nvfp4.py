@@ -551,7 +551,7 @@ def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
     holds check 1 interpreted on CPU (dense and grouped) and compiles spill-free on sm80 (rows 3733,
     8548)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, lowered_for
+    from kernel_compile import compile_mosaic_kernels
 
     def draw(seed):
         rng = np.random.default_rng(8548 + seed)
@@ -574,11 +574,15 @@ def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
     if generation.compile_only_gpus("sm80"):
         x_s = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
         w_sample = formats.Fp8Weights.of(np.zeros((128, 128), np.float32), fmt=fmt)
-        with generation.chosen(grouped_matmul="mosaic"):
-            records = compile_mosaic_kernels([KernelCase(
-                f"fp8_weight_{fmt}_sm80",
-                lambda: lowered_for(lambda a, w: gemm.fp8_weight_product(a, w, out_dtype=jnp.bfloat16),
-                                    (x_s, w_sample), "sm80"))], "sm80")
+        w_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype), w_sample)
+
+        def compiled_fp8(a, w):
+            with generation.chosen(grouped_matmul="mosaic"):
+                return gemm.fp8_weight_product(a, w, out_dtype=jnp.bfloat16)
+
+        with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
+            records = compile_mosaic_kernels(
+                [KernelCase(f"fp8_weight_{fmt}_sm80", lambda: (compiled_fp8, (x_s, w_spec)))], "sm80")
         for rec in records:
             assert not rec.get("error"), rec
             assert rec["kernels"], rec

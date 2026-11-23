@@ -1745,24 +1745,31 @@ def test_derivation_honors_carved_out_resource_budgets():
     assert gmm.staged_bytes(ba, tile, sm90) <= resources.program_shared(carved_smem, tile.programs)
 
 
+def _add_tangent_rule(a, b):
+    import operator
+
+    del a, b
+    return operator.add
+
+
 def test_prologued_custom_jvp_is_picklable():
     """`gemm._prologued` uses a top-level picklable `_ProloguedTangent` and passes `prologue` directly
     without a local `<lambda>`, avoiding GPU-tier prepare serialization failures."""
     import operator
     import pickle
 
-    tangent_rule = gemm._ProloguedTangent(operator.add, functools.partial(jax.jvp, operator.add))
+    tangent_rule = gemm._ProloguedTangent(operator.add, _add_tangent_rule)
     restored = pickle.loads(pickle.dumps(tangent_rule))
-    assert restored.prologue is tangent_rule.prologue
-    assert restored.prologue_jvp.func is tangent_rule.prologue_jvp.func
-    assert restored.prologue_jvp.args == tangent_rule.prologue_jvp.args
-    wrapped = gemm._prologued(operator.add, functools.partial(jax.jvp, operator.add))
+    assert restored == tangent_rule
+    wrapped = gemm._prologued(operator.add, _add_tangent_rule)
     assert wrapped.fun.__name__ != "<lambda>"
     x = jnp.asarray([[1.0, 2.0], [3.0, 4.0]], jnp.float32)
     y = jnp.asarray([[0.5, 1.5], [2.5, 3.5]], jnp.float32)
     dx = jnp.ones_like(x)
     dy = jnp.full_like(y, 2.0)
-    np.testing.assert_array_equal(np.asarray(wrapped(x, y)), np.asarray(x + y))
-    primal_out, tangent_out = restored((x, y), (dx, dy))
+    primal_out, tangent_out = jax.jvp(wrapped, (x, y), (dx, dy))
     np.testing.assert_array_equal(np.asarray(primal_out), np.asarray(x + y))
     np.testing.assert_array_equal(np.asarray(tangent_out), np.asarray(dx + dy))
+    primal_r, tangent_r = restored((x, y), (dx, dy))
+    np.testing.assert_array_equal(np.asarray(primal_r), np.asarray(x + y))
+    np.testing.assert_array_equal(np.asarray(tangent_r), np.asarray(dx + dy))
