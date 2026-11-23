@@ -1105,9 +1105,23 @@ def _saved_optimizer(tmp_path, earlier):
     return LMRunConfig.load(str(path)).optim
 
 
-def _checkpointed(directory, optimizer, steps):
-    """A tiny language run of `optimizer` fitted to `steps`, checkpointed each step in `directory`, which
-    resumes from its latest checkpoint there."""
+def _as_earlier_dews(*roots):
+    """The checkpoints under `roots` as an earlier Dew wrote them: their steps' metadata naming no optimizer
+    state of this Dew's (`TYPED_OPTIMIZER`), which a step written before each optimizer held its own spec
+    held none of."""
+    from dew.checkpoints._step_records import TYPED_OPTIMIZER
+
+    for root in roots:
+        for written in root.rglob("_CHECKPOINT_METADATA"):
+            held = json.loads(written.read_text())
+            held["custom_metadata"].pop(TYPED_OPTIMIZER)
+            written.write_text(json.dumps(held))
+
+
+def _checkpointed(directory, optimizer, steps, local=None, persistent: bool = True):
+    """A tiny language run of `optimizer` fitted to `steps`, checkpointed each step in `directory` where
+    `persistent`, and on this host in `local` where given (`local_every`), which resumes from its latest
+    checkpoint in either."""
     from dew.data.dataset import Loader, replayed
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
@@ -1115,10 +1129,12 @@ def _checkpointed(directory, optimizer, steps):
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
                               max_seq_len=8)
     batch = {"text": jnp.arange(40, dtype=jnp.int32).reshape(8, 5) % 32}
+    tiers = {} if local is None else {"local_directory": str(local), "local_every": 1}
     trainer = Trainer(LMObjective(model, seq_len=4), optimizer, key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0), checkpoints=Checkpoints(str(directory)))
+                      layout=Layout(min_shard=1, tolerance=1.0),
+                      checkpoints=Checkpoints(str(directory), **tiers))
     state = trainer.fit(Loader(train=replayed(lambda partition: iter([batch] * 4)), val=None, records=8,
-                               batch=8), steps=steps, log_every=1, checkpoint_every=1)
+                               batch=8), steps=steps, log_every=1, checkpoint_every=1 if persistent else None)
     trainer.checkpoints.wait()
     return state
 
@@ -1194,11 +1210,15 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
     if not grouped:
         built = str(jax.tree.structure(written.build(None).init(params)))
         assert built == MASKED[f"{'adamw' if optimizer == 'adamw' else 'adam-coupled'}-unspared"]["treedef"]
-    run = tmp_path / "run"
-    saved = _checkpointed(run, written, 1)
+    run, local = tmp_path / "run", tmp_path / "local"
+    # Its earlier checkpoints: a persistent step and a newer local one (`local_every`), the newest resumed.
+    _checkpointed(run, written, 1)
+    saved = _checkpointed(run, written, 2, local=local, persistent=False)
+    assert not (run / "2").exists() and list(local.rglob("2"))
+    _as_earlier_dews(run, local)
     # The earlier run's record beside its checkpoints, as that Dew wrote it.
     loaded = _saved_optimizer(run, earlier)
-    resumed = _checkpointed(run, loaded, 1)
+    resumed = _checkpointed(run, loaded, 2, local=local, persistent=False)
     assert jax.tree.structure(resumed.opt_state) != jax.tree.structure(saved.opt_state)
     for got, want in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(saved.opt_state), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
@@ -1214,8 +1234,8 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
         rest = [dataclasses.replace(group, weight_decay=0.0, spared=False) if group.name == "rest" else group
                 for group in loaded.param_groups]
         with pytest.raises(ValueError):
-            _checkpointed(run, dataclasses.replace(loaded, param_groups=tuple(rest)), 2)
-    assert int(_checkpointed(run, loaded, 2).step) == 2
+            _checkpointed(run, dataclasses.replace(loaded, param_groups=tuple(rest)), 3, local=local)
+    assert int(_checkpointed(run, loaded, 3, local=local).step) == 3
 
 
 def test_a_masked_decay_read_in_some_groups_is_read_across_in_those_groups_alone():
@@ -1241,16 +1261,16 @@ def test_a_masked_decay_read_in_some_groups_is_read_across_in_those_groups_alone
 def test_a_step_this_dew_wrote_after_an_earlier_masked_runs_is_held_to_its_template(tmp_path, optimizer):
     """An earlier masked run (`optimizer_opts={"mask": False}`, unspared) resumed under an active decay its
     config spares (`RunConfig.RESUMABLE`'s optimizer), whose state holds the same masked step, writes its
-    next step this Dew's way: that step is no step the earlier Dew wrote (`earlier_unmasked`'s steps, kept
-    in the mark as the record was rewritten), so a resume of it that drops the active decay is refused by
-    its restore, never read across as the earlier steps are (review of API01: the mark held for every step
-    of the directory)."""
+    next step this Dew's way, its metadata naming its optimizer state this Dew's (`TYPED_OPTIMIZER`): a
+    resume of it that drops the active decay is refused by its restore, never read across as the earlier
+    steps are (review of API01: the mark held for every step of the directory)."""
     from dew.config.lm import LMRunConfig
 
     spec = AdamW if optimizer == "adamw" else Adam
     active = OptimConfig(optimizer=spec(weight_decay=0.1), learning_rate=1e-2)
     run = tmp_path / "run"
     _checkpointed(run, active, 1)
+    _as_earlier_dews(run)
     earlier = {"optimizer": optimizer, "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
                "spared": False}
     undecayed = _saved_optimizer(run, earlier)
@@ -1259,7 +1279,6 @@ def test_a_step_this_dew_wrote_after_an_earlier_masked_runs_is_held_to_its_templ
     assert int(_checkpointed(run, active, 2).step) == 2
     with pytest.raises(ValueError):
         _checkpointed(run, undecayed, 3)
-    assert json.loads((run / "earlier-masked-decay.json").read_text())["steps"] == [1]
 
 
 @pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
