@@ -959,3 +959,28 @@ def test_an_nvfp4_products_dense_rescue_keeps_each_product_through_its_band():
     plus = spread.at[0, :3].set(jnp.asarray([1.0, 1.0, -1.0]))
     cotangent = (2.0 ** -85, 2.0 ** -126, 2.0 ** -126, 2.0 ** 126)
     np.testing.assert_array_equal(pulled(2.0 ** 118, cotangent, plus), np.float32([2.0 ** 33, np.inf]))
+
+
+def test_an_nvfp4_products_rescue_keeps_ieee_and_subnormal_operands():
+    """Beside a product past fp32's largest (which takes the rescue): an infinite cotangent's entries are
+    IEEE's, as float64's transpose gives them (inf through a +1 code, NaN through every 0 one); and a
+    subnormal cotangent's product, 2**-149 times a factor of 2**126 through a 2**-8 entry, is 2**-31, read
+    from its bits where a process flushes subnormal operands (row 1464)."""
+    scales = jnp.ones((32, 128), jnp.float8_e4m3fn)
+    codes = jnp.zeros((512, 128), jnp.float32).at[0, 0].set(1.0).at[1, 1].set(1.0).at[2, 2].set(1.0)
+    matrix = formats.NvFp4.of(codes, scales, jnp.float32(2.0 ** 118))
+    row = jnp.zeros((1, 512), jnp.float32).at[0, :3].set(1.0)
+    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32), row)
+    infinite = jnp.zeros((1, 128), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(jnp.inf)
+    (d_row,) = pull(infinite)
+    with np.errstate(invalid="ignore", over="ignore"):
+        products = np.asarray(infinite, np.float64) * 2.0 ** 126
+        truth = (products @ (np.asarray(codes, np.float64).T * 2.0 ** -8)).astype(np.float32)
+    np.testing.assert_array_equal(np.isnan(np.asarray(d_row)), np.isnan(truth))
+    np.testing.assert_array_equal(np.isinf(np.asarray(d_row)), np.isinf(truth))
+    subnormal = jnp.zeros((1, 128), jnp.float32).at[0, 0].set(2.0 ** 126)
+    subnormal = subnormal.at[0, 2].set(jnp.float32(2.0 ** -149))
+    (d_row,) = pull(subnormal)
+    want = np.zeros((512,), np.float32)
+    want[0], want[2] = np.inf, 2.0 ** -31
+    np.testing.assert_array_equal(np.asarray(d_row)[0], want)

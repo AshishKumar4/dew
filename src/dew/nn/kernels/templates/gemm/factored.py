@@ -20,7 +20,8 @@ from dew.nn.sharding import explicit_spec, varying_like
 
 
 def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array, *, wide: Callable,
-             wide_operands: tuple, gather: jax.Array | None = None) -> jax.Array:
+             wide_operands: tuple, prepared: Callable | None = None,
+             gather: jax.Array | None = None) -> jax.Array:
     """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows (those
     `gather` reads where given, `gemm`'s `gather`, among `operands`), and `factor` a packed matrix's fp32
     scales broadcast against its output (`formats.fp8_factor`), one a row's or one for all (a column's,
@@ -29,15 +30,17 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
     fp32's largest), the moved one (`_Transpose.moved`): each product formed from its cotangent's and
     factor's significands and binades, split into `FACTORED_BANDS` bands of `FACTORED_BAND` binades down
     from its row's (its token's, gathered) largest, each band moved to fp32's middle and pulled back wide
-    (`wide(cotangent, *wide_operands)`, the transpose in fp32 over the rows `run` reads, a route each where
-    gathered), its routes summed into their tokens exactly (`aligned.aligned_segment_sum`), and the bands
-    added at their powers: no product overflows or flushes, so a scale of 2**126 under cotangents that
+    (`wide(cotangent, *prepared(*wide_operands))`, the transpose in fp32 over the rows `run` reads, a route
+    each where gathered, its operands `prepared` once a rescue: a decoded matrix), its routes summed into
+    their tokens exactly (`aligned.aligned_segment_sum`), and the bands added at their powers, a product
+    of a cotangent or factor not finite kept as IEEE's: no product overflows or flushes, so a scale of
+    2**126 under cotangents that
     cancel pulls back their remainder, as fp32's sums would in range (ledger 1464). A checked `shard_map`'s
     devices sum a cotangent only they vary over before its pullback, and their partials after."""
     if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
         return run(rows.astype(jnp.bfloat16), *operands) * factor
     transpose = _Transpose(run, rows.shape, rows.dtype, frozenset(jax.typeof(rows).mat.varying),
-                           explicit_spec(rows), wide)
+                           explicit_spec(rows), wide, prepared or (lambda *each: each))
 
     def apply(residuals, moving):
         scale, ran, _ = residuals
@@ -61,6 +64,7 @@ class _Transpose:
     held: frozenset
     placed: jax.sharding.NamedSharding | jax.sharding.PartitionSpec | None
     wide: Callable | None = None
+    prepared: Callable | None = None
 
     @functools.cached_property
     def declared(self) -> Callable:
@@ -107,6 +111,10 @@ class _Transpose:
             before = self.alone(ran, cotangent, scale)
             excess = tuple(sorted(self.operand_axes(ran) - self.held))
             rescued = self.moved(cotangent, scale, ran, routed, before, excess)
+            # A product of a cotangent or factor not finite pulled back as IEEE's, as the plain transpose's.
+            special = ~jnp.isfinite(cotangent) | ~jnp.isfinite(jnp.broadcast_to(scale, cotangent.shape))
+            ieee = self.summed(*self.pulled(jnp.where(special, cotangent * scale, 0.0), ran))
+            rescued = jnp.where(jnp.isfinite(ieee), rescued, ieee)
             return jnp.where(jnp.isfinite(plain), plain, rescued)
 
         # The moved pullback where the plain one is not finite alone: each device of a sum decides alike,
@@ -121,39 +129,45 @@ class _Transpose:
         f = jnp.broadcast_to(scale, cotangent.shape)
         e_c, e_f = (float_bits.binade_of(v) for v in (cotangent, f))
         counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
-        e_c, e_f = jnp.where(counted, e_c, 0), jnp.where(counted, e_f, 0)
         binade = jnp.where(counted, e_c + e_f, -1024)
-        significands = power2(cotangent, -e_c) * power2(f, -e_f)
+        # Each product's significand from its operands' bits, in [1, 4): a subnormal's kept where a process
+        # flushes subnormal operands.
+        significands = jnp.where(counted, _significand(cotangent) * _significand(f), 0.0)
         top = jnp.max(binade, axis=-1, keepdims=True, initial=-1024)
         top = jax.lax.pmax(top, before) if before else top
         if gather is None:
             top = jax.lax.pmax(top, excess) if excess else top
-            rows_top = top
+            rows_top = sums_top = top
         else:
             # A token's largest, every route of it on every device: its bands' edges, shared by its routes.
             token_top = varying_like(jnp.full((self.shape[0], 1), -1024, top.dtype), top, gather)
             token_top = token_top.at[gather].max(top)
             axes = tuple(sorted(jax.typeof(token_top).mat.varying - self.held))
-            token_top = jax.lax.pmax(token_top, axes) if axes else token_top
-            rows_top = token_top[gather]
-        value, power = None, None
-        for band in range(FACTORED_BANDS):
+            sums_top = jax.lax.pmax(token_top, axes) if axes else token_top
+            rows_top = sums_top[gather]
+        prepared = self.prepared(*wide_operands)
+
+        def band(index, carried):
             # The band's highest binade, moved to 2**0: its products in (2**-FACTORED_BAND, 4).
-            high = rows_top - FACTORED_BAND * band
-            held = counted & (binade <= high) & (binade > high - FACTORED_BAND)
+            value, power = carried
+            high = rows_top - FACTORED_BAND * index
+            held = (binade <= high) & (binade > high - FACTORED_BAND)
             near = jnp.where(held, power2(significands, binade - high), 0.0)
             near = jax.lax.psum(near, before) if before else near
-            partial = self.wide(near, *wide_operands).astype(jnp.float32)
+            partial = self.wide(near, *prepared).astype(jnp.float32)
             if gather is None:
-                summed = self.summed(partial, tuple(sorted(jax.typeof(partial).mat.varying - self.held)))
-                part, at = summed, high
+                part = self.summed(partial, tuple(sorted(jax.typeof(partial).mat.varying - self.held)))
             else:
-                axes = tuple(sorted(frozenset().union(*(jax.typeof(v).mat.varying for v in (partial, gather)))
-                                    - self.held))
+                axes = tuple(sorted(frozenset().union(
+                    *(jax.typeof(v).mat.varying for v in (partial, gather))) - self.held))
                 part = aligned_segment_sum([(partial,)], gather, self.shape[0], axes)
-                at = token_top - FACTORED_BAND * band
-            value, power = (part, jnp.broadcast_to(at, part.shape)) if value is None else _added(
-                value, power, part, at)
+            return _added(value, power, part, sums_top - FACTORED_BAND * index)
+
+        # The running sum, a value and its power, typed as a band's sum is (a loop's carry keeps its type).
+        typed = jax.tree.leaves((cotangent, scale, prepared, gather))
+        start = (varying_like(jnp.zeros(self.shape, jnp.float32), *typed),
+                 varying_like(jnp.broadcast_to(sums_top, self.shape), *typed))
+        value, power = jax.lax.fori_loop(0, FACTORED_BANDS, band, start)
         return power2(value, power)
 
     def tangent(self, ran, routed, primals, tangents):
@@ -188,3 +202,11 @@ def _added(value: jax.Array, power: jax.Array, part: jax.Array, at: jax.Array) -
             for term, shift in ((value, power), (part, at))]
     new = jnp.maximum(jnp.maximum(*ends), jnp.minimum(power, at))
     return power2(value, power - new) + power2(part, at - new), new
+
+
+def _significand(x: jax.Array) -> jax.Array:
+    """A finite fp32 `x`'s significand with its sign, in [1, 2), from its bits (`float_bits`): a subnormal's
+    normalized, read where a process flushes subnormal operands; 0 for zero."""
+    sign, biased, fraction, normalized, _ = float_bits.float_bits(x.astype(jnp.float32))
+    one = sign | (127 << 23) | normalized
+    return jnp.where((biased == 0) & (fraction == 0), 0.0, jax.lax.bitcast_convert_type(one, jnp.float32))

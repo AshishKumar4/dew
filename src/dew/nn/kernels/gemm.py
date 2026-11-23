@@ -886,17 +886,16 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
         factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape,
                             dense)
         scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs,
-                          wide=functools.partial(wide_through, interpret_on_cpu=interpret_on_cpu),
-                          wide_operands=(weights, group_sizes))
+                          wide=functools.partial(wide_transpose, interpret_on_cpu=interpret_on_cpu),
+                          wide_operands=(weights, group_sizes), prepared=decoded_operands)
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
 
-def wide_through(cotangent: jax.Array, matrix, group_sizes: jax.Array | None, *,
-                 interpret_on_cpu: bool) -> jax.Array:
-    """A packed matrix's (`Fp8Weights`, `TernaryWeights`, `NvFp4`: decoded here, where a rescue asks)
-    transpose of `cotangent` in fp32 (`_wide_transpose`): `factored`'s `wide`."""
+def decoded_operands(matrix, group_sizes: jax.Array | None) -> tuple:
+    """A packed matrix (`Fp8Weights`, `TernaryWeights`, `NvFp4`) decoded to bf16, beside its group sizes:
+    `factored`'s `prepared`, decoded once a rescue, where it runs."""
     decoded = matrix.decoded() if isinstance(matrix, NvFp4) else matrix.unscaled(jnp.bfloat16)
-    return _wide_transpose(cotangent, decoded, group_sizes, interpret_on_cpu=interpret_on_cpu)
+    return decoded, group_sizes
 
 
 def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None,
@@ -1198,11 +1197,11 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     # Each row's (its group's) factor joins the sum as `factored` takes a row's: a cancelling cotangent
     # under a factor past fp32's largest pulls back its finite sum, the bank decoded only where it does.
     return factored(product, operands, factor, lhs, gather=gather,
-                    wide=functools.partial(wide_through, interpret_on_cpu=interpret_on_cpu),
-                    wide_operands=(bank, group_sizes)).astype(out_dtype)
+                    wide=functools.partial(wide_transpose, interpret_on_cpu=interpret_on_cpu),
+                    wide_operands=(bank, group_sizes), prepared=decoded_operands).astype(out_dtype)
 
 
-def _wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array | None, *,
+def wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array | None, *,
                     interpret_on_cpu: bool) -> jax.Array:
     """The rows' transpose of a product with decoded bf16 `matrices` (grouped by `sizes`, or one), in fp32:
     the cotangent as its bf16 parts (`_bf16_parts`), each part's product exact and summed in fp32, the
@@ -1263,7 +1262,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         del saved
         rows, words, scales, sizes, gather, first = operands
         matrices = decoded(words, scales, first)
-        d_rows = _wide_transpose(cotangent, matrices, None if dense else sizes, interpret_on_cpu=interpret)
+        d_rows = wide_transpose(cotangent, matrices, None if dense else sizes, interpret_on_cpu=interpret)
         if gather is not None:
             d_rows = jnp.zeros(rows.shape, d_rows.dtype).at[gather].add(d_rows)
         leaves = (d_rows.astype(rows.dtype), zero_from_primal(words), zero_from_primal(scales),
