@@ -959,7 +959,9 @@ def test_a_launch_the_assembler_refuses_alone_fails_the_compile_gate_uncertified
 
     [record] = compile_mosaic_kernels([KernelCase("refused", lambda: (discarding, tuple(operands)))], "sm90")
     assert record["uncertified"] and not refused(record), record
-    assert mosaic_failures([record]) and not mosaic_failures([{**record, "uncertified": []}]), record
+    # The failure its uncertified launch adds, what the gate reads past its program's own record.
+    added = set(mosaic_failures([record])) - set(mosaic_failures([{**record, "uncertified": []}]))
+    assert added and all("not certified" in failure for failure in added), added
 
 
 class TwiceUncounted(Uncounted):
