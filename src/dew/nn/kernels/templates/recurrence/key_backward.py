@@ -150,8 +150,8 @@ def _key_memory_back(q, k, prefix, do, corrected, dv, memory, dh, a, beta, taken
 
     A step a key block and a value row's columns (`_key_memory_tiles`): a row whole where it fits, else
     walked a few value blocks a step, the key block's three memory sums carried across its steps, each
-    step's added onto them (`algebra.key_memory_sums`), its last step's `algebra.key_memory_block` reading
-    them."""
+    step's taken onto them (`algebra.key_memory_sums`, `_carried_summed`), its last step's
+    `algebra.key_memory_block` reading them."""
     chunk = call.chunk
     from dew.nn.kernels.templates.recurrence.mainloop_backward import _value_grads
 
@@ -192,14 +192,16 @@ def _key_memory_back(q, k, prefix, do, corrected, dv, memory, dh, a, beta, taken
                                 leaving=memories.views(dh_ref, memory_row, width, 0, value_width))}
         issue = Issuer(call, {"weights_merge": list(weights)})
 
-        def sums(slots, onto) -> tuple:
-            """The step's value blocks' memory sums (`algebra.key_memory_sums`), added onto `onto`'s."""
+        def sums(slots, carried) -> tuple:
+            """The step's value blocks' memory sums (`algebra.key_memory_sums`), onto the `carried` ones
+            (`_carried_summed`)."""
             column = functools.partial(column_tile, call, slots, width=call.value_block)
             loads = {name: functools.partial(column, name, operand) for name, operand in (
                 ("out", given), ("corrected", held), ("value_grads", grads), ("entered", memories),
                 ("leaving", memories))}
             return algebra.key_memory_sums(loads["out"], loads["corrected"], loads["value_grads"],
-                                           loads["entered"], loads["leaving"], blocks, issue.summed, onto)
+                                           loads["entered"], loads["leaving"], blocks,
+                                           tuple(_carried_summed(call, issue, each) for each in carried))
 
         def finished(index, slots, carry, accumulators):
             """A key block's last step: its sums read, its gradients stored, its system's and write gates'
@@ -315,9 +317,9 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
     doubling solve's (`mainloop.solve_persistent`, row 9637).
 
     A step a value row's columns (`_key_values_walked`): the row whole where it fits, else walked a few value
-    blocks a step, the system's and the write gates' sums carried across the steps, each step's added onto
-    them (`algebra.key_values_back`'s `onto`), the last step finishing them, a segment of its own (as
-    `_key_memory_back`'s walk); a persistent tile walks one step, so such a walk takes a program a chunk."""
+    blocks a step, the system's and the write gates' sums carried across the steps (`_carried_summed`), the
+    last step finishing them, a segment of its own (as `_key_memory_back`'s walk); a persistent tile walks
+    one step, so such a walk takes a program a chunk."""
     chunk = call.chunk
     from dew.nn.kernels.templates.recurrence.mainloop_backward import _value_grads
 
@@ -349,10 +351,11 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
 
             first = h * value_width + (index * values if walked else 0)
             stored = _value_blocks(values_out, dv_out_ref, row, first, call, landing["values"], vb)
+            summed_before, d_betas = carry if walked else (None, None)
             summed, d_betas = algebra.key_values_back(
                 functools.partial(column, "value_grads", grads), functools.partial(column, "values", given),
-                blocks, lower, family.rows_of(beta_ref.at[h, span]), held.dtype, issue, issue.summed,
-                emit=stored, onto=carry if walked else None)
+                blocks, lower, family.rows_of(beta_ref.at[h, span]), held.dtype, issue,
+                _carried_summed(call, issue, summed_before), emit=stored, d_betas=d_betas)
             if not last:
                 return (summed, d_betas), accumulators
             d_system = stream_tile(slots, "system", square).value() + summed
@@ -379,6 +382,18 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
                          held=_key_values_held(call, vb, walked=walked), staging=staging, landing=landing,
                          persistent=not family.operands_in_registers and not walked)(
         dv, v, a, beta, d_system, taken)
+
+
+def _carried_summed(call: Call, issue: Issuer, carried) -> Callable[..., jax.Array]:
+    """A walk's sum onto `carried`, the sum its earlier steps left (None: a step's own, `Issuer.summed`'s):
+    its products issued into it in place where the family's accumulators are values it carries (mma.sync's,
+    `mainloop.product_results` 'fragments'), else into a fresh accumulator added onto it (a warpgroup's or
+    tensor memory's accumulator is no value a loop carries)."""
+    if carried is None:
+        return issue.summed
+    if product_results(call) == "fragments":
+        return functools.partial(issue.summed, into=carried)
+    return lambda products, **given: carried + issue.summed(products, **given)
 
 
 def _key_values_block(call: Call) -> int:
@@ -433,16 +448,19 @@ def _key_values_held(call: Call, vb: int, *, walked: bool = False) -> Held:
     chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
     carried = [f32(chunk, chunk), f32(chunk, 1)] if walked else []
+    # A walk's step's products into its carried sum where the family carries its accumulators as values
+    # (`_carried_summed`), else into a fresh one beside it.
+    squares = 1 if walked and product_results(call) == "fragments" else 0
     # In turn: the inverse (read transposed) against a value block's gradient, that gradient against the
     # gated values read transposed ('values_merge'); then the system's gradient against the inverse read
     # transposed, the inverse (read transposed) against their product ('system_merge').
     return Held(carried=carried, phases=(
-        [f32(chunk, chunk)] * 2 + [f32(chunk, vb)] * 3
+        [f32(chunk, chunk)] * (2 - squares) + [f32(chunk, vb)] * 3
         + largest_live_set(
             product_fragments(call, (held, chunk, chunk), (held, chunk, vb)),
             product_fragments(call, (held, chunk, vb), (held, vb, chunk), rhs_transposed=True,
                               rhs_staged=True)),
-        [f32(chunk, chunk)] * 3 + masks(chunk, chunk)
+        [f32(chunk, chunk)] * (3 - (1 if walked else 0)) + masks(chunk, chunk)
         + largest_live_set(
             product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_transposed=True,
                               lhs_staged=True),
@@ -458,10 +476,12 @@ def _key_memory_held(call: Call, keys: int, values: int) -> Held:
     chunk = call.chunk
     held, given, memories = dataclasses.replace(call.held, rows=call.rows), call.given, call.memories
     # The three sums, held at most beside four more `[C, keys]` tiles where the last's terms are formed;
-    # carried across a key block's steps where they walk its value row, each step's fresh sum beside them.
+    # carried across a key block's steps where they walk its value row, each step's fresh sum beside them
+    # where the family carries no accumulator as a value (`_carried_summed`).
     sums = [f32(chunk, keys)] * 3
     walked = values < call.value_width
-    apart, fresh = ([], [f32(chunk, keys)]) if walked else (sums, [])
+    apart = [] if walked else sums
+    fresh = [f32(chunk, keys)] if walked and product_results(call) != "fragments" else []
     # The system's update a second square around the merge where warpgroup accumulators hold it
     # (jsf-three-back: 208 registers against an H100's need of 240).
     merged = 2 if product_results(call) == "registers" else 1
