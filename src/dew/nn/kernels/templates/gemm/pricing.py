@@ -395,14 +395,15 @@ def decode_contraction(tiles: "Tiles", target, *, rows: int, groups: int, depth:
                        multiprocessors: int) -> dict:
     """A product's walk at `tiles` as `split_walk` and `split_count` price it (their keywords): swapped
     (`Tiles.swapped`), its matrix the rows (`width`) over its `depth`, the call's `rows` its padded `columns`;
-    multi-row-tile dense (`groups == 1` and `rows > block_m`), all `rows` over `depth` (row 10151); else each
+    multi-row-tile calls (`rows > groups * block_m`), all `rows` over `depth` (row 10151); else each
     active group's (at most `rows` of `groups`) one row tile over `depth`, its partials `held` rows."""
     itemsizes, decoded = operands
     if tiles.swapped:
         assert columns is not None, "a swapped walk's columns are the call's rows, padded"
         shape = {'groups': 1, 'rows': depth, 'depth': width, 'width': columns}
-    elif groups == 1 and rows > tiles.block_m:
-        shape = {'groups': 1, 'rows': depth, 'depth': rows, 'width': width, 'partial_rows': rows}
+    elif groups > 0 and rows > groups * tiles.block_m:
+        shape = {'groups': groups, 'rows': depth * groups, 'depth': -(-rows // groups), 'width': width,
+                 'partial_rows': rows}
     else:
         active = min(groups, rows)
         shape = {'groups': active, 'rows': depth * active, 'depth': tiles.block_m, 'width': width,

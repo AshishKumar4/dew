@@ -997,13 +997,16 @@ class MosaicGmm(_Mosaic):
         plain = self._decode_split(ba, super()._tile(ba, target), target)
         candidates = [] if plain is None else [plain]
         if plain is not None and plain.warpgroups == 1:
-            family = pricing.family_of(plain, ba.arguments['tokens'].dtype, target)
+            dtype = ba.arguments['tokens'].dtype
+            family = pricing.family_of(plain, dtype, target)
+            same = {f.name for g in self._groups(ba, target)
+                    if any(f.name == plain.family for f in g) for f in g}
             for count in range(pricing.max_programs(family, 1, target), plain.programs, -1):
-                alt_base = self._derived(ba, target, programs=count)
-                if alt_base is not None and alt_base.stages >= 1 + family.loads_ahead + family.in_flight:
-                    alt = self._decode_split(ba, alt_base, target)
-                    if alt is not None:
-                        candidates.append(alt)
+                alt = self._derived(ba, target, admits=lambda t, s=same: t.family in s, programs=count)
+                if (alt is not None and alt.stages >= 1 + (alt_fam := pricing.family_of(
+                        alt, dtype, target)).loads_ahead + alt_fam.in_flight
+                        and (split := self._decode_split(ba, alt, target)) is not None):
+                    candidates.append(split)
         swapped = self._swapped(ba, target)
         tile = None if swapped is None else self._derived(swapped, target, admits=lambda tile: (
             self._left_fits(ba, tile, target) and tile.block_m <= SWAPPED_ROWS))
@@ -1013,10 +1016,8 @@ class MosaicGmm(_Mosaic):
                 dataclasses.replace(tile, swapped=False), **self._contraction(ba, tile, target)))
             split = dataclasses.replace(tile, splits=splits)
             candidates.append(split if splits > 1 and self.takes(ba, split, target) else tile)
-        if not candidates:
-            return None
-        if len(candidates) == 1:
-            return candidates[0]
+        if len(candidates) <= 1:
+            return candidates[0] if candidates else None
         return min(candidates, key=lambda each: pricing.walk_seconds(
             each, self._contraction(ba, each, target)))
 
@@ -1027,6 +1028,9 @@ class MosaicGmm(_Mosaic):
 
         _, depth, width = self._generated_extents(ba)
         assert depth is not None, "a product's steps run over its depth"
+        if layouts := self._families(ba, target):
+            _, whole = self._whole_extents(ba, layouts[0])
+            depth, width = whole.get('depth', depth), whole.get('width', width)
         rows = ba.arguments['tokens'].shape[0]
         swapped = self._swapped(ba, target) if tile.swapped else None
         return pricing.decode_contraction(
