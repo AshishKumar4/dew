@@ -1160,13 +1160,13 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
     loaded = _saved_optimizer(tmp_path, earlier)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
                               max_seq_len=8)
-    batch = {"text": jnp.arange(10, dtype=jnp.int32).reshape(2, 5) % 32}
+    batch = {"text": jnp.arange(40, dtype=jnp.int32).reshape(8, 5) % 32}
 
     def fitted(optimizer, steps):
         trainer = Trainer(LMObjective(model, seq_len=4), optimizer, key=jax.random.key(0),
                           layout=Layout(min_shard=1, tolerance=1.0),
                           checkpoints=Checkpoints(str(tmp_path / "run")))
-        state = trainer.fit(Loader(train=lambda partition: iter([batch] * 4), val=None, records=2, batch=2),
+        state = trainer.fit(Loader(train=lambda partition: iter([batch] * 4), val=None, records=8, batch=8),
                             steps=steps, log_every=1, checkpoint_every=1)
         trainer.checkpoints.wait()
         return state

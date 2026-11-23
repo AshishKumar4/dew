@@ -418,3 +418,83 @@ def _held_apart(state_tree: dict, frozen: Mapping[str, Mapping[str, str]]) -> di
             else:
                 del state_tree[tree]
     return held
+
+
+def masked_decay_unsaved(template, metadata, optimizers: Sequence[TreePath]):
+    """A restore's `template`, a train state's, read against a checkpoint whose optimizer state holds a decay
+    step masked off whole where the template's holds it bare: an earlier Dew's `optimizer_opts={"mask":
+    False}`, its masked step's empty state (`optax.MaskedState` over `optax.EmptyState`), which the record's
+    translation trains as a decay of 0, its empty state bare (`dew.config.earlier._unmasked`). Each such
+    node of each optimizer state at `optimizers` templated as the checkpoint holds it, so the restore reads
+    the leaves alike, both nodes holding none; returned beside the template's own form, which the restored
+    state takes back (`formed_as`), or none where it templates none so. The one translation of that form at
+    the restore boundary (CONTRIBUTING), deleted at 1.0."""
+    import optax
+
+    from dew.state import TrainState
+
+    if not isinstance(template, TrainState):
+        return template, None
+    found: list[bool] = []
+
+    def masked_at(saved):
+        def masked(path, node):
+            held = _saved_at(saved, [_key_name(key) for key in path])
+            if isinstance(held, Mapping) and held.keys() == {"inner_state"} and not held["inner_state"]:
+                found.append(True)
+                return optax.MaskedState(inner_state=node)
+            return node
+        return masked
+
+    translated = template
+    for at in optimizers:
+        state = _at(translated, at)
+        if state is not None:
+            translated = _with(translated, at, jax.tree_util.tree_map_with_path(
+                masked_at(_at(metadata, at)), state, is_leaf=lambda node: isinstance(node, optax.EmptyState)))
+    return (translated, template) if found else (template, None)
+
+
+def _saved_at(saved, names: Sequence[str | int]):
+    """The part of a checkpoint's metadata `saved` at `names`, a field's or a key's name or a sequence's
+    index each, as Orbax holds a NamedTuple by its fields and a tuple as a list; None where it holds none."""
+    for name in names:
+        if isinstance(saved, Mapping):
+            saved = saved.get(name)
+        elif isinstance(saved, list | tuple) and isinstance(name, int) and name < len(saved):
+            saved = saved[name]
+        else:
+            return None
+    return saved
+
+
+def formed_as(restored: Mapping, form, optimizers: Sequence[TreePath]) -> dict:
+    """`restored`'s optimizer states at `optimizers` in `form`'s own structure (`masked_decay_unsaved`): the
+    same leaves, in the same order, each node as the template holds it."""
+    held = dict(restored)
+    for path in optimizers:
+        state, own = _at(held, path), _at(form, path)
+        if state is not None and own is not None:
+            held = _with(held, path, jax.tree.unflatten(jax.tree.structure(own), jax.tree.leaves(state)))
+    return held
+
+
+def _key_name(key) -> str | int:
+    """A pytree path entry as a checkpoint's metadata names it: a field's or a key's name, a sequence's
+    index."""
+    if isinstance(key, jax.tree_util.GetAttrKey):
+        return key.name
+    if isinstance(key, jax.tree_util.SequenceKey):
+        return key.idx
+    return key.key
+
+
+def _clip_states_unpooled(tree) -> bool:
+    """Whether a checkpoint's optimizer-state metadata `tree` holds a QK-Clip state of the form before its
+    pooled maxima: its steps and rescales with no `pooled` beside them, as Orbax names a NamedTuple's
+    fields."""
+    if isinstance(tree, Mapping):
+        if {"steps", "rescales"} <= tree.keys() and "pooled" not in tree:
+            return True
+        return any(_clip_states_unpooled(value) for value in tree.values())
+    return isinstance(tree, list | tuple) and any(_clip_states_unpooled(value) for value in tree)
