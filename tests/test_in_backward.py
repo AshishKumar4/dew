@@ -9,7 +9,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, unrolled
+from model_support import TINY_DECODER, scanning, stacked_as, unrolled
 from reference_error import assert_as_exact, dew_path, widened
 from token_support import token_rows
 
@@ -473,8 +473,8 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
         for text, label in (("charged twice", 0), ("site down", 1))
     ] * 2
 
-    def backbone(*, scan: bool, dtype: str = "float32"):
-        model = decoder(scan=scan, dtype=dtype, vocab_size=256, max_seq_len=32, num_layers=3)
+    def backbone(*, dtype: str = "float32"):
+        model = decoder(dtype=dtype, vocab_size=256, max_seq_len=32, num_layers=3)
         return model.with_cross_attention(CrossAttention(layer_ids=(0,), context_length=16)) if (
             context_backbone) else model
     # eps=1e-4 keeps AdamW from magnifying 1e-8 rounding noise on DecisionHead's shift-invariant k_proj.bias.
@@ -489,11 +489,11 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
     opts = {"tokenizer": ByteTokenizer(), "specials": Specials(None, 10, 0, "\x00", 255),
             "layout": layout, "input_lm": input_lm,
             "context_encoder": "backbone" if context_backbone else "table"}
-    seed = DecisionObjective(backbone(scan=True), **opts)
+    seed = DecisionObjective(backbone(), **opts)
     batch = next(decision_rows(examples, 2, objective=seed.data()).train(DataPartition()))
 
-    def built(*, scan: bool, exact: bool = False) -> Trainer:
-        model = backbone(scan=scan, dtype="float64" if exact else "float32")
+    def built(*, exact: bool = False) -> Trainer:
+        model = backbone(dtype="float64" if exact else "float32")
         run = Trainer(DecisionObjective(model, **opts), optimizer, key=jax.random.key(0), mesh=MeshSpec(),
                       layout=Layout(min_shard=2**30), fit=FitPolicy(split=1), checkpoints=None, tracker=None)
         run.device_mesh = MeshSpec().build(jax.devices()[:1])
@@ -501,7 +501,7 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
         return run
 
     with jax.enable_x64(new_val=False):
-        start = built(scan=False).initial_state()
+        start = unrolled(built)().initial_state()
     init, made = jax.jit(seed.init), {}
 
     def initial(drawn: int):
@@ -515,12 +515,14 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
         return made[drawn]
 
     def stepped(*, scan: bool, exact: bool = False):
+        # Its stack scanned or a layer at a time, compiled and stepped under that choice (`stacked_as`).
         compiled = []
 
         @as_given
+        @stacked_as("scanned" if scan else "plain")
         def run(drawn):
             if not compiled:
-                compiled.append(built(scan=scan, exact=exact))
+                compiled.append(built(exact=exact))
             steps = compiled[0]
             first = initial(int(drawn))
             state = steps.staged(wide(first) if exact else jax.tree.map(jnp.copy, first))
@@ -557,7 +559,7 @@ def test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the
             again, _ = super().loss(variables, batch, step)
             return jax.tree.map(lambda first, second: first + second, stats, again), aux
 
-    objective = Twice(decoder(scan=True), SEQ)
+    objective = Twice(decoder(), SEQ)
     tokens = token_rows(VOCAB, 2, SEQ + 1)
     data = Loader(train=lambda partition: iter([tokens, tokens]), val=None, records=2, batch=2)
     run = Trainer(objective, OptimConfig(optimizer=AdamW(), learning_rate=1e-2), key=jax.random.key(0),
@@ -565,4 +567,4 @@ def test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the
                   tracker=None)
     run.device_mesh = MeshSpec().build(jax.devices()[:1])
     with pytest.raises(ValueError):
-        run.fit(data, steps=1, log_every=1)
+        scanning(run.fit)(data, steps=1, log_every=1)
