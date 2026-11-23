@@ -1331,6 +1331,17 @@ def test_an_adapted_products_gradient_keeps_a_wide_cotangent(grouped):
     (d_x,) = pull(jnp.zeros((8, 8), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(1.0))
     assert np.asarray(d_x)[0, 0] == 0.0, np.asarray(d_x)[0, :2]
 
+    # An fp16 output's cotangent of 1 through a scale of 2**16 (past fp16's largest) and a factor of
+    # 2**-10 gives the rows 64: the scaled update's cotangent stays wide where fp16 would not hold it.
+    rank_a = jnp.full((*a.shape[:-1], 1), 2.0 ** -10, jnp.float16)
+    rank_b = jnp.ones((*b.shape[:-2], 1, b.shape[-1]), jnp.float16)
+    _, pull = jax.vjp(lambda rows: low_rank(rows, jnp.zeros_like(kernel), rank_a, rank_b, 2.0 ** 16, sizes,
+                                            out_dtype=jnp.float16), jnp.zeros_like(x))
+    (d_x,) = pull(jnp.zeros((8, 8), jnp.float16).at[0, 0].set(1.0))
+    want = np.zeros((8, 16), np.float16)
+    want[0] = 64.0
+    np.testing.assert_array_equal(np.asarray(d_x), want)
+
 
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("grouped", [False, True])
