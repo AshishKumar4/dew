@@ -975,9 +975,11 @@ def flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(with
     gradients on par with jax.nn's xla attention over the cache's mask over drawn inputs (check 1, the
     truth float64 attention over the mask), padding rows zero."""
 
-    positions, filled, mask = cache_call(window)
-    documents = cache_documents(positions, filled)
-    real = jnp.asarray(positions >= 0)[:, :, None, None]
+    # Formed on the host: a GPU tier part's prepare runs this cell where its device computes nothing.
+    with jax.default_device(jax.devices("cpu")[0]):
+        positions, filled, mask = cache_call(window)
+        documents = cache_documents(positions, filled)
+        real = jnp.asarray(positions >= 0)[:, :, None, None]
 
     def draw(seed):
         rng = np.random.default_rng([8, seed])

@@ -55,8 +55,10 @@ def _masked(mask: str):
     segments = (np.repeat(np.arange(DOCUMENTS, dtype=np.int32), LENGTH // DOCUMENTS)[None]
                 if mask == "documents" else None)
     causal = mask != "full"
-    spans = template.spans(LENGTH, LENGTH, 1, causal=causal,
-                           segment_ids=None if segments is None else jnp.asarray(segments))
+    # Formed on the host: a GPU tier part's prepare builds its cells where its device computes nothing.
+    with jax.default_device(jax.devices("cpu")[0]):
+        spans = template.spans(LENGTH, LENGTH, 1, causal=causal,
+                               segment_ids=None if segments is None else jnp.asarray(segments))
     return spans, kept(LENGTH, LENGTH, causal=causal, segment_ids=segments)
 
 
