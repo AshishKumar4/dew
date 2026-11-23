@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.experimental.mosaic.gpu as mgpu
-from jax._src.lib.mlir.dialects import gpu
+from jax._src.lib.mlir.dialects import gpu, nvvm
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
@@ -507,6 +507,9 @@ class _Walk:
         successor edges where it has several (a block's entry the union of its predecessors' exits), the
         union of its exits'."""
         blocks = list(body.blocks)
+        if not blocks:
+            # An absent region (an `scf.if`'s else): its exit is its entry.
+            return waited
         if len(blocks) == 1:
             return self.block(blocks[0], waited)
         entries: dict[int, frozenset] = {0: waited}
@@ -577,9 +580,8 @@ class _Walk:
         another warpgroup's syncs none of its other warps."""
         if operation.name == "gpu.barrier":
             return True
-        if operation.name != "nvvm.barrier":
+        if not isinstance(view := operation.opview, nvvm.BarrierOp):
             return False
-        view = operation.opview
         if view.numberOfThreads is None:
             return True
         threads, barrier = _value(view.numberOfThreads, self.thread), _value(view.barrierId, self.thread)
