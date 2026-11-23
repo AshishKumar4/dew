@@ -648,6 +648,36 @@ def test_a_program_whose_keywords_are_named_as_its_own_call_runs(fetched):
     assert jax.device_get(ran).tolist() == jax.device_get(x * 2.0 + 3.0 - 1.0).tolist()
 
 
+@pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
+def test_a_first_run_that_fails_is_left_to_its_callers_diagnosis_and_charged_as_not_run():
+    """A program's first run that fails on its devices, as an asynchronous one does where its outputs are
+    awaited, is handed back to its caller as it ran (`communicators.called`), its error raised where the
+    caller waits (a step's first run's diagnosis, `dew.training.memory.first_run`'s `FirstRunFailed`), and
+    the program stays charged as not run (review of row 12131's P0: the error was raised inside the
+    admission's own wait, past that diagnosis)."""
+    class Refused:
+        """Outputs whose run the devices refused, as a GPU reports it once they are awaited."""
+
+        def block_until_ready(self):
+            raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: the devices refused the run")
+
+    gpu = communicators.ordinal(jax.devices()[0])
+    roomy = communicators.Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={gpu: 0},
+                                seconds=1.0)
+    probe = jax.jit(lambda x: x * 3.0).lower(jnp.ones(2)).compile()
+    program = jax.jit(lambda x: x * 2.0).lower(jnp.ones(2)).compile()
+    held = communicators.held()
+    communicators.hold(communicators.Sizing(roomy, 0.95, 0.9, {gpu: 0}, {gpu: 1 << 40}))
+    try:
+        communicators.admit(program, free=lambda gpu: 1 << 40)
+        ahead = _charged(probe, gpu)
+        refused = Refused()
+        assert communicators.called(program, lambda: refused) is refused
+        assert _charged(probe, gpu) == ahead
+    finally:
+        communicators.hold(held)
+
+
 def _charged(program, gpu: int) -> int:
     """What admitting `program` charges on `gpu` past its free bytes, none free: the refusal's need."""
     with pytest.raises(CommunicatorRoom) as refused:
