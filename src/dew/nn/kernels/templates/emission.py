@@ -148,8 +148,9 @@ def _barrier(var: jax_core.Var) -> _Barrier | None:
     """`var` as a count holds it where it is a barrier array (`_Barrier`: a ref of a barrier type), None for
     any other operand."""
     aval = var.aval
-    if isinstance(aval, state_types.AbstractRef) and isinstance(
-            aval.inner_aval.dtype, gpu_core.BarrierType | gpu_core.ClusterBarrierType):
+    inner = aval.inner_aval if isinstance(aval, state_types.AbstractRef) else None
+    if isinstance(inner, jax_core.ShapedArray) and isinstance(
+            inner.dtype, gpu_core.BarrierType | gpu_core.ClusterBarrierType):
         return _Barrier(var)
     return None
 
