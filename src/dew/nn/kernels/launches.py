@@ -29,97 +29,14 @@ def _register_triton_lowerings() -> None:
     scaled.triton_lowerings()
 
 
-def _nextafter_f32(x, y):
-    """IEEE-754 float32 `nextafter(x, y)` from integer bit arithmetic (row 9795)."""
-    xb = jax.lax.bitcast_convert_type(x, jnp.uint32)
-    nan = jnp.isnan(x) | jnp.isnan(y)
-    same = x == y
-    zero = x == jnp.float32(0.0)
-    from_zero = jnp.where(y > jnp.float32(0.0), jnp.uint32(1), jnp.uint32(0x80000001))
-    away = ((x > jnp.float32(0.0)) & (y > x)) | ((x < jnp.float32(0.0)) & (y < x))
-    stepped = jnp.where(zero, from_zero, jnp.where(away, xb + jnp.uint32(1), xb - jnp.uint32(1)))
-    out = jax.lax.bitcast_convert_type(stepped, jnp.float32)
-    return jnp.where(nan, x + y, jnp.where(same, y, out))
-
-
-@functools.cache
-def _jax_mosaic_gpu_lowerings() -> None:
-    """Register JAX core primitives missing from Mosaic GPU warpgroup rules (`stop_gradient`,
-    `split`, `nextafter`, `call_hi_primitive`, stride-1 `slice`, partial-axis `reduce_or`) on first
-    Mosaic GPU launch (row 9795)."""
-    from jax._src import hijax
-    from jax._src.pallas.mosaic_gpu import core as plgpu_core, lowering as mosaic_lowering
-    from jax.experimental.mosaic import gpu as mgpu
-
-    rules = mosaic_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS]
-    wg = mgpu.LoweringSemantics.Warpgroup
-    if jax.lax.stop_gradient_p not in rules:
-        mosaic_lowering.register_lowering_rule(jax.lax.stop_gradient_p, wg)(
-            lambda ctx, x: mosaic_lowering._ensure_ir_value(x, ctx.avals_in[0].dtype))
-    if jax.lax.split_p not in rules:
-        @mosaic_lowering.register_lowering_rule(jax.lax.split_p, wg)
-        def _split_wg(ctx, x, *, sizes, axis):
-            def _split(value):
-                parts, offset = [], 0
-                for size in sizes:
-                    parts.append(jax.lax.slice_in_dim(value, offset, offset + size, axis=axis))
-                    offset += size
-                return tuple(parts)
-
-            ir_x = mosaic_lowering._ensure_ir_value(x, ctx.avals_in[0].dtype)
-            closed = jax.make_jaxpr(_split)(*ctx.avals_in)
-            return mosaic_lowering.lower_jaxpr_to_mosaic_gpu(
-                ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, (ir_x,), closed.consts)
-    if jax.lax.nextafter_p not in rules:
-        @mosaic_lowering.register_lowering_rule(jax.lax.nextafter_p, wg)
-        def _nextafter_wg(ctx, x, y):
-            if ctx.avals_in[0].dtype != jnp.float32:
-                raise NotImplementedError(
-                    f"Mosaic GPU nextafter supports float32, got {ctx.avals_in[0].dtype}")
-            ir_args = tuple(mosaic_lowering._ensure_ir_value(v, a.dtype)
-                            for v, a in zip((x, y), ctx.avals_in, strict=True))
-            closed = jax.make_jaxpr(_nextafter_f32)(*ctx.avals_in)
-            (out,) = mosaic_lowering.lower_jaxpr_to_mosaic_gpu(
-                ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, ir_args, closed.consts)
-            return out
-    if hijax.call_hi_primitive_p not in rules:
-        @mosaic_lowering.register_lowering_rule(hijax.call_hi_primitive_p, wg)
-        def _call_hi_wg(ctx, *in_nodes, _prim, **_params):
-            closed = jax.make_jaxpr(
-                lambda *args: hijax._call_hi_primitive_to_lojax(*args, _prim=_prim))(*ctx.avals_in)
-            ir_in = tuple(mosaic_lowering._ensure_ir_value(v, a.dtype)
-                          for v, a in zip(in_nodes, ctx.avals_in, strict=True))
-            return mosaic_lowering.lower_jaxpr_to_mosaic_gpu(
-                ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, ir_in, closed.consts)
-    orig_slice = rules.get(jax.lax.slice_p)
-    if orig_slice is not None:
-        @mosaic_lowering.register_lowering_rule(jax.lax.slice_p, wg)
-        def _slice_wg(ctx, x, limit_indices, start_indices, strides):
-            norm = None if (strides is None or all(s == 1 for s in strides)) else strides
-            return orig_slice(ctx, x, limit_indices, start_indices, norm)
-    orig_or = rules.get(jax.lax.reduce_or_p)
-    if orig_or is not None:
-        @mosaic_lowering.register_lowering_rule(jax.lax.reduce_or_p, wg)
-        def _reduce_or_wg(ctx, x, *, axes):
-            if not axes:
-                return x
-            if len(axes) == len(ctx.avals_in[0].shape):
-                return orig_or(ctx, x, axes=axes)
-            ir_x = mosaic_lowering._ensure_ir_value(x, ctx.avals_in[0].dtype)
-            closed = jax.make_jaxpr(lambda v: jax.lax.reduce_max(v.astype(jnp.int32), axes) != 0)(
-                *ctx.avals_in)
-            (out,) = mosaic_lowering.lower_jaxpr_to_mosaic_gpu(
-                ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, (ir_x,), closed.consts)
-            return out
-
 def _register_mosaic_gpu_lowerings() -> None:
     """Register Dew's primitive owners' Pallas Mosaic GPU lowerings on first `kernel` (row 9795)."""
     from dew.algebra import scaled
     from dew.nn import precision
 
-    _jax_mosaic_gpu_lowerings()
     precision.mosaic_gpu_lowerings()
     scaled.mosaic_gpu_lowerings()
+
 
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
     """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)` held per shard (`_held`), named by
