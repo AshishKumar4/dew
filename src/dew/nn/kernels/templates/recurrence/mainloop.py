@@ -1350,7 +1350,7 @@ def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], t
               streamed: Callable[[int], dict] | None = None, *, contracted: bool = False) -> int:
     """A launch's key block under a decay a key dimension, whose prefix, decays and gated keys it
     holds a block at a time in fp32: from the widest of the family's depths for 16-bit operands
-    (`Family.depths`) down to the narrowest columns a staged operand takes (`_key_blocks`: its depth's where
+    (`Family.depths`) down to the narrowest columns a staged operand takes (`key_blocks`: its depth's where
     the launch's products contract over the key block or it issues none, `contracted`), the widest that fits
     a thread's registers (`fitting_block`); where the launch walks its key blocks and
     streams a block at a time (`streamed(block)`, its walked streams there), the block a multiprocessor holds
@@ -1365,7 +1365,7 @@ def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], t
     # Where no block holds a program, the narrowest, as `fitting_block` falls back: the widest, which the
     # register-unchecked gate compiled, spilled 2784 bytes where the narrowest's need was the question
     # (row 5298, jsf-sm100-redgreen).
-    return max(_key_blocks(call, contracted=contracted),
+    return max(key_blocks(call, contracted=contracted),
                key=lambda block: (resident(block), block if resident(block) else -block))
 
 
@@ -1382,10 +1382,24 @@ def _key_unit(call: Call, *, contracted: bool) -> int:
     return max(narrowest, family.atom_columns)
 
 
-def _key_blocks(call: Call, *, contracted: bool) -> list[int]:
-    """The key blocks a walk under a decay a key dimension may take (`key_block`), each dividing the keys."""
+def key_blocks(call: Call, *, contracted: bool = False) -> list[int]:
+    """The key blocks a walk under a decay a key dimension may take (`key_block`), each dividing the keys,
+    widest first."""
     widest, unit = call.family.depths(jnp.bfloat16)[0], _key_unit(call, contracted=contracted)
     return [block for block in whole_blocks(widest, unit) if call.width % block == 0]
+
+
+def launch_fits(call: Call, held: Held, staged: tuple, blocks: dict) -> bool:
+    """Whether a launch fits its GPU one stage deep: its consumer thread's registers (`held`, beside its
+    addresses into its staging and landing tiles, `staged`) within a thread's (`Family.registers`), and its
+    streams' `blocks` one deep beside that staging and landing within a block's shared memory
+    (`generation.shared_budget`), its bytes the launch's own (`shared_allocation`, as `launch_kernel` lays
+    it)."""
+    staging, landing = staged
+    _, scope, _, _ = shared_allocation(call, blocks, staging, landing)
+    registers = held.registers(call.family, addressed(staging, landing))
+    return (resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
+            and registers <= call.family.registers(1))
 
 
 def _resident(call: Call, held: Callable[[int], Held], staged: Callable[[int], tuple],

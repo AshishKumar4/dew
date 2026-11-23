@@ -22,6 +22,7 @@ from test_recurrence_mosaic import (
     COVERED,
     DTYPES,
     INTERPRETED_GRADIENT,
+    NARROW,
     PACKED_DOCUMENTS,
     SHAPES,
     case_hooks,
@@ -247,6 +248,51 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
 
     assert_as_exact(at(128), at(64), functools.partial(drawn, dtype, **geometry(case)),
                     f'128-token chunks training on {family}, {case}', seeds=8,
+                    truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_a_value_row_walked_a_few_blocks_a_step_trains_as_whole_rows_do_interpreted():
+    """Kimi delta attention's forward and fast backward (`chunk_forward.kept_forward`,
+    `mainloop_backward.kept_backward`) at value heads 192 wide, interpreted on mma.sync's bundle at an sm86's
+    facts, whose 99 KB of shared memory a block its memory and values launches walk a value row a few blocks
+    a step in (`key_backward._key_memory_tiles`, `_key_values_walked`; row 12192), on par from float64 with
+    the same launches at an A100's facts, which take whole rows (check 1, the truth the recurrence a token at
+    a time in float64): the output, final memory and every operand's gradient in bf16."""
+    case = 'a decay a key dimension'
+    hooks, dtype = case_hooks(case), jnp.bfloat16
+    shape = {**geometry(case), 'value_width': 192}
+    bundle = bundles.of('sm86', jnp.bfloat16)
+    common = {'tiles': NARROW, 'family': bundle, 'interpret': True, 'delta': hooks.delta, 'rounded': True}
+    (sample, _) = drawn(dtype, 0, **shape)
+    bound = template_call(sample, hooks)
+
+    def memory_steps(target: str) -> int:
+        """The bytes Kimi's memory launch streams a step at `target`'s facts (`Launch.step_bytes`)."""
+        facts = generation.gpu_target(target)
+        with generation.assumed(facts):
+            launches = template.MOSAIC.launches(bound, NARROW, facts, backward=True)
+        (memory,) = (launch for launch in launches if launch.name == 'recurrence_key_memory_back')
+        return memory.step_bytes
+
+    # The sm86 arm walks its rows where the A100's takes them whole: fewer bytes a step.
+    assert memory_steps('sm86') < memory_steps('sm80')
+
+    def at(target: str):
+        def trained(given, cotangent):
+            operands = (given.query, given.key, given.value, given.log_decay, given.beta, given.state)
+            with generation.assumed(target, interpreted=True):
+                out, final, (inverse, kept) = chunk_forward.kept_forward(*operands, **common)
+                grads, _ = mainloop_backward.kept_backward(*operands, *cotangent, inverse=inverse, kept=kept,
+                                                           **common)
+            names = ('query', 'key', 'value', 'log_decay', 'beta', 'state')
+            return (out, final), dataclasses.replace(given, **{
+                name: grad.astype(operand.dtype)
+                for name, grad, operand in zip(names, grads[:len(names)], operands, strict=True)})
+        return jax.jit(trained)
+
+    assert_as_exact(at('sm86'), at('sm80'), functools.partial(drawn, dtype, **shape),
+                    f'a value row walked on an sm86, {case}', seeds=8,
                     truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
 
 

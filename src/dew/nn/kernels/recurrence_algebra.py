@@ -1023,13 +1023,16 @@ def key_memory_decay(entered, leaving) -> jax.Array:
 
 def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower: Tile, betas, dtype,
                     issue: Issue, summed: Callable[..., jax.Array], *,
-                    emit: Callable[[int, jax.Array], None]) -> tuple[jax.Array, jax.Array]:
+                    emit: Callable[[int, jax.Array], None], system=None,
+                    d_betas: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
     """The values' part of a decay a key dimension's backward (`templates.recurrence.key_backward`): through
     `u = (I + L) (v beta)`, each value block `j`'s `d(v beta) = (I + L)^T du` ('values_merge') of the
     corrected values' gradient `value_grads(j)`, its values' gradient `beta d(v beta)` `[C, BV]` fp32 to
     `emit(j, dv)`, and `(dA, dbeta)`, the inverse's gradient's part `du (v beta)^T` `[C, C]` and the write
-    gates' `sum(v d(v beta))`, fp32."""
-    d_betas = jnp.zeros(betas.shape, jnp.float32)
+    gates' `sum(v d(v beta))`, fp32. A walk of a row's value blocks a few at a time gives the sums its
+    earlier steps left, `system` (an accumulator, `summed`'s `into`) and `d_betas`, these blocks' added onto
+    them in the order one call over the row adds them."""
+    d_betas = jnp.zeros(betas.shape, jnp.float32) if d_betas is None else d_betas
     for j in range(blocks):
         value = values(j).value().astype(jnp.float32)
         d_scaled = (value_grads(j).value().astype(jnp.float32)
@@ -1041,48 +1044,66 @@ def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower:
     # launch spilled 96 bytes a thread (kda-gate6 at 306006c01).
     d_system = summed([("values_merge", value_grads(j), lambda j=j: Transposed(
         write_gated(values(j).value().astype(jnp.float32), betas).astype(dtype))) for j in range(blocks)],
-        shape=(lower.shape[0],) * 2)
+        shape=(lower.shape[0],) * 2, into=system)
     return d_system, d_betas
 
 
-def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grads: TileLoad,
-                     corrected: TileLoad, value_grads: TileLoad, entered: TileLoad, leaving: TileLoad,
-                     blocks: int, lower: Tile, betas, system, scale: float, dtype, issue: Issue,
-                     summed: Callable[[list], jax.Array], *, emit: Callable[[str, jax.Array], None],
+def key_memory_sums(out_grads: TileLoad, corrected: TileLoad, value_grads: TileLoad, entered: TileLoad,
+                    leaving: TileLoad, blocks: int, summed: Callable[[list], jax.Array],
+                    onto: tuple = (None, None, None)) -> tuple[Callable[[], jax.Array], ...]:
+    """A key block's three memory products summed over value blocks `j` `[C, BK]` fp32
+    (`key_memory_block`'s): `do h^T` ('memory_dq'), `v_new dh^T` ('memory_dk') and `dv h^T` ('memory_dw') of
+    the output's gradient `out_grads(j)`, the corrected values `corrected(j)` and their gradient
+    `value_grads(j)` against the memory entered `entered(j)` and its gradient leaving `leaving(j)` `[BK, BV]`,
+    each a callable issuing its sum into one accumulator where it is read (`summed`), so one sum is held at a
+    time; a walk of a row's value blocks a few at a time adds each onto the sum its earlier steps left
+    (`onto`)."""
+    def total(name, left, right, start):
+        found = summed([(name, left(j), right(j).T) for j in range(blocks)])
+        return found if start is None else start + found
+
+    pairs = (("memory_dq", out_grads, entered), ("memory_dk", corrected, leaving),
+             ("memory_dw", value_grads, entered))
+    return tuple(functools.partial(total, *pair, start) for pair, start in zip(pairs, onto, strict=True))
+
+
+def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tuple, lower: Tile, betas, system,
+                     scale: float, dtype, issue: Issue, *, emit: Callable[[str, jax.Array], None],
                      columns: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """One key block's part of a decay a key dimension's backward (`templates.recurrence.key_backward`), its
     queries `query` and keys `key` `[C, BK]`, their prefix from the chunk's start `gates` `[C, BK]` and the
-    chunk's last token's `last` as a row's vectors (each its limbs, `Call.prefix_limbs`), and each value block
-    `j`'s memory entered `entered(j)` and its gradient leaving `leaving(j)` `[BK, BV]`: over the value blocks
-    `dq = scale exp2(g) do h^T`, `dk = exp2(g_last - g) v_new dh^T`, the weights' `dw = -dv h^T` ('memory_dq',
-    'memory_dk', 'memory_dw'); then `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`,
-    `emit('dk', ...)` and the log decay's terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's
-    `sum(k dk)` on its last token, and `(dA, dbeta)`: the inverse's gradient over the key blocks so far
-    `system` `[C, C]` with this block's part `-dw (kg beta)^T` added as its product forms, so the part is held
-    no longer, and the write gates' `sum(kg d(kg beta))`, fp32. The last prefix's other term, the memory's
-    decay across the chunk (`key_memory_decay`), is the caller's: a key block's memory tiles' rows met the
-    keys' columns here, which Mosaic GPU's layout inference ran out of fuel laying (kda-lower5-sm90 at
-    6e03eb57e). Each sum over the value blocks issued into one accumulator (`summed`, `memory_gradients`'): a
-    list of each block's products, their accumulators at once, spilled 744 bytes a thread on an H100
-    (kda-gate3 at ee3734584). `columns`, where given, sums a tile's columns (the mainloop's,
-    `summed_pairs`')."""
+    chunk's last token's `last` as a row's vectors (each its limbs, `Call.prefix_limbs`), and its memory
+    products' sums over the value blocks (`key_memory_sums`' callables, each issued where it is read):
+    `dq = scale exp2(g) do h^T`, `dk = exp2(g_last - g) v_new dh^T`, the weights' `dw = -dv h^T`
+    ('memory_dq', 'memory_dk', 'memory_dw'); then `d(kg beta) = (I + L)^T dw` ('weights_merge'):
+    `emit('dq', ...)`, `emit('dk', ...)` and the log decay's terms `emit('dg', ...)` `[C, BK]` fp32, the
+    chunk's last prefix's `sum(k dk)` on its last token, and `(dA, dbeta)`: the inverse's gradient over the
+    key blocks so far `system` `[C, C]` with this block's part `-dw (kg beta)^T` added as its product forms,
+    so the part is held no longer, and the write gates' `sum(kg d(kg beta))`, fp32. The last prefix's other
+    term, the memory's decay across the chunk (`key_memory_decay`), is the caller's: a key block's memory
+    tiles' rows met the keys' columns here, which Mosaic GPU's layout inference ran out of fuel laying
+    (kda-lower5-sm90 at 6e03eb57e). Each sum over the value blocks issued into one accumulator
+    (`key_memory_sums`, `memory_gradients`'): a list of each block's products, their accumulators at once,
+    spilled 744 bytes a thread on an H100 (kda-gate3 at ee3734584). `columns`, where given, sums a tile's
+    columns (the mainloop's, `summed_pairs`')."""
     decays = raised(*gates)
     to_last = range_decay(tuple(limb[None, :] for limb in last), gates)
+    query_sum, key_sum, weight_sum = sums
     # Each sum in turn, the log decay's terms gathered as each one's term is formed, so one sum and its
     # terms are live at a time: the three sums at once, beside the terms every one fed, spilled 240 bytes a
     # thread on an H100 (kda-gate5 at db546905d); the weights' first, 232 (kda-gate8 at b1e1fcb9b).
-    d_query = summed([("memory_dq", out_grads(j), entered(j).T) for j in range(blocks)]) * decays * scale
+    d_query = query_sum() * decays * scale
     emit("dq", d_query)
     d_decay = query.value().astype(jnp.float32) * d_query
     keys = key.value().astype(jnp.float32)
-    d_key = summed([("memory_dk", corrected(j), leaving(j).T) for j in range(blocks)]) * to_last
+    d_key = key_sum() * to_last
     # The chunk's last prefix's term on its last token through the gated keys' `exp2(g_last - g)` every
     # token's.
     keyed = keys * d_key
     at_last = jnp.sum(keyed, axis=0) if columns is None else columns(keyed)
     rows, _ = _grid(d_key.shape)
     d_decay = d_decay - keyed + jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0)
-    d_weight = summed([("memory_dw", value_grads(j), entered(j).T) for j in range(blocks)])
+    d_weight = weight_sum()
     # `d(kg beta) = (I + L)^T dw` of `dw = -dv h^T`: cast `dw` once before both the diagonal and off-diagonal
     # terms (and `d_system`) so its narrow rounding cancels across `(I + L)^T` and between `dbeta_m` and
     # `dbeta_p` as fla's `dw = -dw.astype(dtype)` does (row 8716).
