@@ -429,8 +429,8 @@ def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
                  marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
     pytest.param(True, 0.0, False, 32, id="decision-grouped",
                  marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
-    pytest.param(False, 0.25, False, 32, id="decision-input-lm",
-                 marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
+    pytest.param(False, 0.25, False, 160, id="decision-input-lm",
+                 marks=pytest.mark.check1_shards(seeds=160, per_task=32)),
     # Its judgement resolved past 32 draws alone, within 160 (the map judge's units).
     pytest.param(False, 0.0, True, 160, id="decision-context-backbone",
                  marks=pytest.mark.check1_shards(seeds=160, per_task=32)),
@@ -520,9 +520,14 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
                 compiled.append(steps.compile(state, placed))
             for _ in range(2):
                 state, *_ = compiled[1](state, placed)
-            # The moments beside the weights: an update in the backward writes them apart.
+            # The backbone's moments beside the weights: an update in its backward writes them apart. The
+            # head's, which both arms update alike, include a shift-invariant bias's second moment, the
+            # square of rounding noise its gradient is, which no draw resolves.
             stored = steps.stored(state)
-            return jax.device_get({"params": stored.variables["params"], "opt_state": stored.opt_state})
+            moments = jax.tree_util.tree_map_with_path(
+                lambda path, leaf: leaf if "backbone" in jax.tree_util.keystr(path) else None,
+                stored.opt_state)
+            return jax.device_get({"params": stored.variables["params"], "opt_state": moments})
         return run
 
     assert_as_exact(stepped(scan=True), stepped(scan=False), lambda drawn: (np.int64(drawn),),
