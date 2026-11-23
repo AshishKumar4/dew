@@ -601,9 +601,9 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 or not self._divides(ba, config, target) or self._refused(ba, config, target)):
             return False
         hooks = ba.arguments['hooks']
-        if not self._granular(ba, config, family, target) or not config.staged_whole(
+        if not self._granular(ba, config, family, target) or config.staging_refusal(
                 hooks.out_dtypes or (ba.arguments['out_dtype'],),
-                family.specialized(config.share, pricing.tile_columns(config, family))):
+                family.specialized(config.share, pricing.tile_columns(config, family))) is not None:
             return False
         sides = (('prologue_operands', hooks.prologue_axes), ('epilogue_operands', hooks.epilogue_axes))
         vectors = {(axis, jnp.dtype(side.dtype)) for name, axes_of in sides
