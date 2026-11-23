@@ -1239,12 +1239,18 @@ def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kin
                                     interpret=True, finished=False)
 
 
+HOOKED_STEPS = [(generation_name, label) for generation_name in ("sm80", "sm90", "sm100", "sm120")
+                for label in ("single", "split")] + [("sm90", "single-head"), ("sm90", "single-query")]
+"""The hooked decode steps' compile cells, a step a cell (row 12435: an H100's four in one took 864 s)."""
+
+
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
-def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name):
+@pytest.mark.parametrize(("generation_name", "label"), HOOKED_STEPS,
+                         ids=[f"{name}-{step}" for name, step in HOOKED_STEPS])
+def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name, label):
     """Row 5385: bf16 gated decode steps (`Kind.OUTPUT` bf16 gate + sinks) compile spill-free on
     sm80/sm90/sm100/sm120 for both batched single-slice and one-row split-KV, with split-KV carrying
-    `output_mod` directly on the `merged_padded` primitive."""
+    `output_mod` directly on the `merged_padded` primitive; an H100's head and query gates too."""
     from fla_gdn_support import KernelCase
     from jax.core import ShapedArray
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
@@ -1305,8 +1311,8 @@ def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name):
             cases.append(KernelCase(label, lambda s=deferred, args=(qh, kh, kh, param_v): (s, args)))
 
     with generation.assumed(generation_name):
-        found = compile_mosaic_kernels(cases, generation_name)
-    assert not (failed := mosaic_failures(found)), "\n".join(failed)
+        found = compile_mosaic_kernels([case for case in cases if case.name == label], generation_name)
+    assert found and not (failed := mosaic_failures(found)), "\n".join(failed)
 
 
 def test_softcap_folds_into_base2_and_decode_segments_interior_tiles():
