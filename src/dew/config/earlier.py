@@ -363,6 +363,20 @@ INERT_DECAY = 1e-4
 which builds the masked decay step its checkpoints hold (`unmarked`)."""
 
 
+def typed_since(directory) -> bool:
+    """Whether the newest step a run saved in `directory` (a `dew.checkpoints` directory of numbered steps)
+    is an intermediate Dew's own, its metadata saying its optimizer state was its typed optimizer's
+    (`typed_optimizer`): one saved after that Dew resumed the run under the record it rewrote, which then
+    loads as it is, not as the earlier run trained (`unmarked`)."""
+    import orbax.checkpoint as ocp
+
+    steps = [entry for entry in directory.iterdir() if entry.name.isdigit()]
+    if not steps:
+        return False
+    custom = ocp.metadata.get_step_metadata(max(steps, key=lambda entry: int(entry.name))).custom_metadata
+    return isinstance(custom, Mapping) and custom.get("typed_optimizer") is True
+
+
 def unmarked(record: Mapping[str, object], mark: Mapping[str, object]) -> Mapping[str, object]:
     """A run record an intermediate Dew rewrote beside its `MASKED_DECAY_MARK` (`mark`), as its earlier run
     trained: each part the mark names (its optimizer config ungrouped, or each named param group) masked

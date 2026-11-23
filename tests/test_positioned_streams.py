@@ -2,7 +2,6 @@
 the store's records as the index lists them, each at its index there, in parts of whole records each stating
 its rows (`Files.positioned_manifest`, row 9051), as its indexed read numbers them."""
 
-import hashlib
 import io
 import itertools
 import json
@@ -12,7 +11,7 @@ import pytest
 
 from dew.data import Files
 from dew.data.compile import compile
-from dew.data.dataset import Closeable, DataPartition, Loading
+from dew.data.dataset import Checkpointable, Closeable, DataPartition, Loading
 from dew.data.pipeline import Pipeline
 
 
@@ -245,14 +244,16 @@ def test_a_positioned_read_cut_finer_than_its_store_fills_no_cache_another_topol
     assert log.read_text().split() == numbered
 
 
-def test_a_position_saved_under_the_first_cut_of_a_positioned_store_is_refused_where_it_resumes(tmp_path):
-    """A positioned stream's store cut finer than its ranges by the readers' count is cut by one rule
-    (`EVEN_CUT`), which its shards fact holds (`ShardManifest.cut`): a position saved when the store's
-    ranges were cut otherwise, whose fact names its shards alone, is refused where it resumes, naming the
-    fact, never read at the rows its places now hold (Train 1240's review: 130 records for 80 readers moved
-    one reader's rows from [1, 2) to [2, 4) under an unchanged fact)."""
-    from dew.data.plan import PlanChanged
-    from dew.data.sources.base import stream_manifest
+@pytest.mark.parametrize("shares", [80, 1], ids=["cut-for-its-readers", "read-whole"])
+def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_cut_dealt_resumes(
+        tmp_path, shares):
+    """A positioned store of 130 records in 65 ranges read by 80 shares is cut into 80 ranges
+    (`EVEN_CUT`), which each share's position holds: a position saved under the store's first cut, which
+    held none, is refused where it resumes (`PlanChanged`, "shards.cut"), never read at the rows its
+    places now hold; one share's read of the store whole cuts nothing and holds no cut, so a position saved
+    so, before any cut was named, resumes at its next row (review of d22: the cut was named in the store's
+    fact whatever its readers, refusing reads it never cut)."""
+    from dew._position import PlanChanged
 
     path = tmp_path / "rows.jsonl"
     path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(130)))
@@ -260,28 +261,41 @@ def test_a_position_saved_under_the_first_cut_of_a_positioned_store_is_refused_w
     files.provision()
     chain = Pipeline(files).map_with_index(lambda index, row: {**row, "at": np.int64(index)}).batch(1)
     loading = Loading(workers=0, threads=1, read_buffer=1)
-    reader = compile(chain, read="streamed", loading=loading).train(DataPartition())
-    assert isinstance(reader, Closeable)
+    partition = DataPartition(index=0, count=shares)
+
+    def opened():
+        reader = compile(chain, read="streamed", loading=loading).train(partition)
+        assert isinstance(reader, Checkpointable) and isinstance(reader, Closeable)
+        return reader
+
+    reader = opened()
     try:
-        list(itertools.islice(reader, 2))
+        first = next(iter(reader))
         saved = json.loads(reader.get_state())
+        following = next(iter(reader))
     finally:
         reader.close()
-    manifest = stream_manifest(files, positioned=True)
-    # The fact its first cut recorded: its shards' ids alone.
-    first = hashlib.sha256("\n".join(shard.id for shard in manifest.shards).encode()).hexdigest()[:16]
-    current = manifest.digest
-    assert current != first, "the cut that subdivides it is in the fact"
-    facts = saved["dew_data_plan"]["derived"]
-    named = [key for key, value in facts.items() if value == current]
-    assert named, facts
-    for key in named:
-        facts[key] = first
-    resumed = compile(chain, read="streamed", loading=loading).train(DataPartition())
-    assert isinstance(resumed, Closeable)
+    cuts = []
+
+    def uncut(node):
+        # The position as the first cut saved it: each share's rows, no cut beside them.
+        if isinstance(node, dict):
+            if set(node) == {"rows", "cut"}:
+                cuts.append(node["cut"])
+                return uncut(node["rows"])
+            return {key: uncut(value) for key, value in node.items()}
+        return [uncut(value) for value in node] if isinstance(node, list) else node
+
+    earlier = uncut(saved)
+    assert cuts == (["even"] if shares > 1 else []), cuts
+    resumed = opened()
     try:
-        with pytest.raises(PlanChanged) as refused:
-            resumed.set_state(json.dumps(saved).encode())
-        assert any(part.endswith("shards") for part in refused.value.differs), refused.value.differs
+        if shares > 1:
+            with pytest.raises(PlanChanged) as refused:
+                resumed.set_state(json.dumps(earlier).encode())
+            assert "shards.cut" in refused.value.differs, refused.value.differs
+        else:
+            resumed.set_state(json.dumps(earlier).encode())
+            assert int(next(iter(resumed))["at"][0]) == int(following["at"][0]) != int(first["at"][0])
     finally:
         resumed.close()

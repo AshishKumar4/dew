@@ -49,6 +49,7 @@ from dew.config.earlier import (
     MARKERS,
     MASKED_DECAY_MARK,
     earlier_run,
+    typed_since,
     unmarked,
 )
 from dew.config.release import Release
@@ -965,8 +966,10 @@ class RunConfig:
         path = epath.Path(directory)
         named_file = str(directory).endswith(".json")
         # A record an intermediate Dew rewrote beside its mark, as its run trained (`unmarked`).
-        mark = (path.parent if named_file else path) / MASKED_DECAY_MARK
-        marked = json.loads(mark.read_text()) if mark.exists() else None
+        directory = path.parent if named_file else path
+        mark = directory / MASKED_DECAY_MARK
+        # Its newest step that Dew's own, saved under the record it rewrote, the record read as it is.
+        marked = json.loads(mark.read_text()) if mark.exists() and not typed_since(directory) else None
         record = json.loads((path if named_file else path / RUN_FILE).read_text())
         if marked is not None:
             record = unmarked(record, marked)

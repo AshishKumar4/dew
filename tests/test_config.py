@@ -1247,6 +1247,33 @@ def test_a_run_an_intermediate_dew_rewrote_beside_its_mark_resumes_as_it_trained
     assert int(_checkpointed(run, loaded, 2).step) == 2
 
 
+def test_a_run_an_intermediate_dew_resumed_and_saved_after_its_mark_loads_its_rewritten_record(tmp_path):
+    """A run an intermediate Dew (main f124c76b5) resumed under the record it rewrote beside its mark, and
+    saved again, its newest step that Dew's own (its metadata's `typed_optimizer`), holds that record's
+    optimizer state: its record loads as written, its decay 0 unmasked, never as the earlier run trained, so
+    its newest checkpoint restores and the run steps on (review of d22: the mark was read whatever the
+    run saved after it, refusing such a run's restore)."""
+    import json as json_
+
+    from dew.config.lm import LMRunConfig
+
+    rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), learning_rate=1e-2, spared=False)
+    run = tmp_path / "run"
+    saved = _checkpointed(run, rewritten, 2)
+    newest = run / "2" / "_CHECKPOINT_METADATA"
+    metadata = json_.loads(newest.read_text())
+    metadata["custom_metadata"] = {**(metadata.get("custom_metadata") or {}), "typed_optimizer": True}
+    newest.write_text(json_.dumps(metadata))
+    LMRunConfig(optim=rewritten).save(str(run))
+    (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
+    loaded = LMRunConfig.load(str(run)).optim
+    assert (loaded.decay_mask, loaded.optimizer.weight_decay) == (None, 0.0), loaded
+    resumed = _checkpointed(run, loaded, 2)
+    for got, want in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(saved.opt_state), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert int(_checkpointed(run, loaded, 3).step) == 3
+
+
 @pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
 def test_a_checkpoint_whose_decay_its_options_masked_by_a_tree_restores_into_the_optimizer_its_record_loads(
         tmp_path, optimizer):
