@@ -564,11 +564,13 @@ def test_a_compile_begun_aside_is_taken_past_a_refusal_of_a_launch_it_read_none_
         assert begun.taken.is_set()
 
 
-def test_a_programs_executable_past_a_refusal_of_another_launch_holds_its_other_facts_still():
+@pytest.mark.parametrize("refused", [False, True], ids=["unrefused", "refused"])
+def test_a_programs_executable_holds_its_other_facts_still(refused):
     """A program run under one answer of a fact its trace reads (`_facts.traced_fact`), the fact then
-    answering otherwise and a launch its trace reads none of refused: its next call runs a program of the
-    fact's answer now, its executable judged by every fact its trace read once the refusals moved (rows
-    12311, 12328's review P0: judged by the refusals alone, the program of the first answer ran on)."""
+    answering otherwise, alone or beside a refusal of a launch its trace reads none of: its next call runs a
+    program of the fact's answer now, its executable judged by every fact its trace read (rows 12311, 12328's
+    review P0s: judged by the refusals alone where they moved, and by the snapshot alone where they did not,
+    the program of the first answer ran on)."""
     from dew.nn.kernels.options import owned_program
     from dew.nn.kernels.templates import report
 
@@ -582,5 +584,30 @@ def test_a_programs_executable_past_a_refusal_of_another_launch_holds_its_other_
     with report.refusals():
         assert float(run(x)) == 0.0
         answer[0] = 1
+        if refused:
+            report.refuse([("another launch", 1, ("k",))])
+        assert float(run(x)) == 1.0
+
+
+def test_a_compile_settled_under_a_snapshot_is_compiled_again_where_its_facts_answer_otherwise():
+    """A program compiled in a scope of no refusal, run past a refusal of a launch its trace reads none of,
+    then, a fact its trace reads answering otherwise, called in another scope of none: it runs a program of
+    the fact's answer now, the compile its first call settled under that snapshot let go (rows 12311,
+    12328's review P0: the completed reservation answered the call with the program of the first answer)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    answer = [0]
+
+    @_facts.traced_fact
+    def flag() -> int:
+        return answer[0]
+
+    run, x = owned_program(lambda x: x + flag()), jnp.zeros(())
+    with report.refusals():
+        assert float(run(x)) == 0.0
         report.refuse([("another launch", 1, ("k",))])
+        assert float(run(x)) == 0.0
+    answer[0] = 1
+    with report.refusals():
         assert float(run(x)) == 1.0
