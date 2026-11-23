@@ -625,10 +625,11 @@ def test_a_normed_projection_takes_the_template_where_a_receipt_timed_it(hidden,
     assert (("grouped_matmul", "mosaic") in found) == (gpu in taken), found
 
 
-def test_fused_product_fuses_prologue_and_epilogue_with_gather_and_scatter():
-    """`fused_gemm.product(..., gather=..., scatter=...)` fuses both a token-order RMSNorm producer into the
-    prologue (even with top-k `M_routed != M_tok`) and a post-scatter bias+residual consumer into the
-    epilogue, holding check 1 forward and VJP against float64 truth (rows 5391, 12306)."""
+def test_fused_product_fuses_its_epilogue_with_gather_and_scatter():
+    """`fused_gemm.product(..., gather=..., scatter=...)` over a token-order RMSNorm producer (top-k routes,
+    `M_routed != M_tok`) runs the producer in XLA in its tokens' order, so its derivative sums each token's
+    routes first, and fuses a post-scatter bias+residual consumer into the epilogue, holding check 1
+    forward and VJP against float64 truth (rows 5391, 12306)."""
     # 512 routed rows: the bias's gradient, a sum over them of bf16 cotangents, rounds in fp32 on most draws,
     # so its error from float64 resolves (at 64 rows it was exact on most, its ratio inconclusive).
     tokens_n, rows, depth, width, groups = 256, 512, 64, 64, 4
@@ -678,17 +679,58 @@ def test_fused_product_fuses_prologue_and_epilogue_with_gather_and_scatter():
         return out, pull(dy)
 
     def dew_vjp(x, scale, weight, bias, residual, dy):
-        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", gemm_prologue="xla",
+                                                           gemm_epilogue="fused"):
             out, pull = jax.vjp(lambda *a: fused_gemm.fused(region, *a), x, scale, weight, bias, residual)
             return out, pull(dy)
 
-    sample = draw(0)
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), generation.routes() as seen:
-        fused_gemm.fused(region, *sample[:-1])
-    choices = {r.choice: r.kernel for r in seen}
-    assert choices.get("gemm_prologue") == "fused", choices
-    assert choices.get("gemm_epilogue") == "fused", choices
     dew_fn, ref_fn = jax.jit(dew_vjp), jax.jit(plain_vjp)
     label = "fused_gemm gather+scatter+prologue+epilogue"
     assert_as_exact(dew_fn, ref_fn, draw, label, truth_fn=truth,
                     seeds=seeds_for(ref_fn, draw, label, truth_fn=truth, dew_fn=dew_fn))
+
+
+def test_a_gathered_products_producer_pulls_back_each_tokens_routes_summed():
+    """A token routed twice through a unit weight from a producer `x * 4`, its routes' cotangents 2**126 and
+    -2**126: their sum, 0, meets the producer's derivative, as the program written does, not each route's
+    4 * 2**126 (inf - inf) (row 5391)."""
+    gather, sizes = jnp.asarray([0, 0], jnp.int32), jnp.asarray([2], jnp.int32)
+    weight = jnp.eye(8, dtype=jnp.float32)[None]
+
+    def region(x, w):
+        return fused_gemm.product(x * 4, w, sizes, out_dtype=jnp.float32, gather=gather,
+                                  interpret_on_cpu=True)
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        _, pull = jax.vjp(lambda x: fused_gemm.fused(region, x, weight), jnp.ones((1, 8), jnp.float32))
+        (d_x,) = pull(jnp.zeros((2, 8), jnp.float32).at[0, 0].set(2.0 ** 126).at[1, 0].set(-(2.0 ** 126)))
+    np.testing.assert_array_equal(np.asarray(d_x), np.zeros((1, 8), np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_gathered_products_consumer_reads_it_as_varying_as_its_routing_table():
+    """A fused product in a checked `shard_map` over two CPU devices, its tokens and weight every device's
+    and its routing table and residual each device's own: its consumer reads the product varying as the
+    table does, adding the residual as the unfused program does (row 9808)."""
+    tokens = jnp.asarray(np.random.default_rng(9808).integers(-3, 4, (4, 8)), jnp.float32)
+    weight = jnp.eye(8, dtype=jnp.float32)[None]
+    tables = jnp.asarray([0, 1, 2, 3, 3, 2, 1, 0], jnp.int32)
+    residual = jnp.arange(64, dtype=jnp.float32).reshape(8, 8)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+    sizes = jnp.asarray([4], jnp.int32)
+
+    def each_device(x, w, table, side, *, fused):
+        def region(x, w, side):
+            y = (fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, gather=table, interpret_on_cpu=True)
+                 if fused else jax.lax.ragged_dot(x[table], w, sizes))
+            return y + side
+        return fused_gemm.fused(region, x, w, side) if fused else region(x, w, side)
+
+    def mapped(*, fused):
+        return jax.jit(jax.shard_map(functools.partial(each_device, fused=fused), mesh=mesh,
+                                     in_specs=(whole, whole, data, data), out_specs=data, check_vma=True))(
+            tokens, weight, tables, residual)
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        np.testing.assert_array_equal(np.asarray(mapped(fused=True)), np.asarray(mapped(fused=False)))

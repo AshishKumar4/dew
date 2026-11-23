@@ -119,33 +119,33 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | Fp8Weights | TernaryWeights,
     order differentiates (`_prologued`). `compute`, where given, is the dtype the products take, `lhs` rounded
     to it as `rhs` is, where `lhs`'s own dtype is what its cotangent takes, summed in fp32 and rounded once to
     it (an fp32 input's of a bf16 product); the rounding passes tangents through unrounded, the MoE
-    projection's law (`xla_products.portable_projection`), and there is no prologue. `layer`, where given (a
-    traced index), picks one layer of a stacked `rhs` (`[layers, *matrices]`: a layer's groups, or its one
-    matrix for a dense product), read in place: the launches take the layer's groups and read their matrices
-    where they lie in the stack, from the layer's first (`_grouped`), so no slice of the stack is made and
-    they tile, split and sum as the call over the layer's matrices alone. Its gradient is the stack's, every
-    other layer's zero. `paired`, a second matrix of `rhs`'s shape (a stack of them at the same `layer`), the
-    rows multiply into a second accumulator the epilogue takes before its side operands (`epilogue(acc,
-    paired_acc, *sides)`: a gate's and an up projection's SwiGLU), else an output. `gather`, int32 `[rows]` of
-    a grouped call (a stack's layer's too), makes the product's rows `lhs[gather]`, read where they lie: a
-    mixture of experts' tokens in their own order, the router's sort fused into the rows' loads where Mosaic
-    GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA elsewhere; the rows'
-    cotangent is summed back into each token's (`lhs`'s, a token every slot reads). With a prologue, its
-    side operands along the rows are the product's rows' (`gather`'s order, a normalized stream's scale
-    gathered with it), and the prologue runs fused on the gathered rows where Mosaic GPU's launch takes
-    both (row 5391: an expert projection over a normalized or scaled token stream).
-    `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at each output's
-    row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
+    projection's law (`xla_products.portable_projection`); a prologue forms its operand in it. `layer`, where
+    given (a traced index), picks one layer of a stacked `rhs` (`[layers, *matrices]`: a layer's groups, or
+    its one matrix for a dense product), read in place: the launches take the layer's groups and read their
+    matrices where they lie in the stack, from the layer's first (`_grouped`), so no slice of the stack is
+    made and they tile, split and sum as the call over the layer's matrices alone. Its gradient is the
+    stack's, every other layer's zero. `paired`, a second matrix of `rhs`'s shape (a stack of them at the same
+    `layer`), the rows multiply into a second accumulator the epilogue takes before its side operands
+    (`epilogue(acc, paired_acc, *sides)`: a gate's and an up projection's SwiGLU), else an output. `gather`,
+    int32 `[rows]` of a grouped call (a stack's layer's too), makes the product's rows `lhs[gather]`, read
+    where they lie: a mixture of experts' tokens in their own order, the router's sort fused into the rows'
+    loads where Mosaic GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA
+    elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every slot reads). With
+    a prologue, its side operands along the rows are the product's rows' (`gather`'s order, a normalized
+    stream's scale gathered with it), and the prologue runs fused on the gathered rows where Mosaic GPU's
+    launch takes both (row 5391: an expert projection over a normalized or scaled token stream). `scatter`,
+    int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at each output's row
+    `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
     (`stores.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
     gather. `applied`, where given, is the prologue's operand already formed, `prologue(lhs, *sides)` rounded
     to `lhs`'s dtype, which its producer wrote (a paired product's epilogue, beside `lhs` and the sides it
     read): the product multiplies it in place of forming each tile, and every derivative is the prologue's
-    (`portable`'s, which forms it), so `applied` takes no cotangent, and reverse mode forms the prologue's
-    VJP in the transposed product's epilogue (`_input_cotangents`). An NVFP4 `rhs` (`NvFp4`; a stack of banks
-    at its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen. `named`, a remat name or None an output (an
-    epilogue's output that is its accumulator rounded to its dtype, a gate's projection before its SwiGLU,
-    `fused_gemm` lifting the program's name onto it): each named output is a residual of the call's derivative
-    under its name (`checkpoint_name`), so a policy keeping the name keeps it, and the reverse pass reads the
+    (`portable`'s, which forms it), so `applied` takes no cotangent, and reverse mode forms the prologue's VJP
+    in the transposed product's epilogue (`_input_cotangents`). An NVFP4 `rhs` (`NvFp4`; a stack of banks at
+    its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen. `named`, a remat name or None an output (an epilogue's
+    output that is its accumulator rounded to its dtype, a gate's projection before its SwiGLU, `fused_gemm`
+    lifting the program's name onto it): each named output is a residual of the call's derivative under its
+    name (`checkpoint_name`), so a policy keeping the name keeps it, and the reverse pass reads the
     accumulator from it where the epilogue reads its accumulator through that rounding alone, recomputing no
     product (row 7131). `beside`, matrices of `rhs`'s groups and depth each of its own width: an output each
     (a tuple), one launch over their columns side by side where one takes them (`mosaic_gpu.gmm`'s), the input
@@ -325,9 +325,10 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
                   beside: tuple = ()) -> None:
     """`gemm`'s refusal of a call it does not take: gathered rows but a grouped call's, or beside a formed
     operand (`applied`, a producer's rows already in the product's order), scattered rows but a grouped
-    call's, a formed operand but a prologue's, of `lhs`'s shape and `compute`
-    dtype, and matrices side by side beside any of the call's parts `beside` holds (its hooks, pair, tables,
-    formed operand, named `compute`, layer, several dtypes and names, None where the call has none)."""
+    call's, a formed operand but a prologue's, of `lhs`'s shape and its products' dtype (`compute`, `lhs`'s
+    where None), and matrices side by side beside any of the call's parts `beside` holds (its hooks, pair,
+    tables, formed operand, named `compute`, layer, several dtypes and names, None where the call has
+    none)."""
     if any(part not in (None, ()) for part in beside):
         raise ValueError("matrices side by side take no hooks, pair, tables, formed operand, named compute, "
                          "layer, several dtypes or names")

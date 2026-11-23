@@ -331,22 +331,19 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gathe
     precision, out_dtype = declared
     *operand_fusions, out_fusion = fusions
     lhs_fusion, *rest_fusions = operand_fusions
-    lhs, prologue, formed = _prologue(lhs_fusion)
+    lhs, prologue, formed = _prologue(lhs_fusion, gathered=has_gather)
     rhs, *rest = (fusion() for fusion in rest_fusions)
     it = iter(rest)
     group_sizes = None if dense else next(it)
     gather = next(it) if has_gather else None
     scatter = next(it) if has_scatter else None
-    if gather is not None and prologue:
-        # Align token-order `'rows'` prologue sides to gather order and let JAX pull through `take`.
-        prologue = {**prologue, 'prologue_operands': _indexed_rows(prologue['prologue_operands'], gather)}
-        prologue.pop('prologue_jvp', None)
     rows_count = lhs.shape[0] if gather is None else gather.shape[0]
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
     # Typed as the launch's result is (`dew.nn.sharding.computed_from`, row 9808): a consumer reading it
     # beside a value each device holds its own of is traced as the program wrote it.
-    acc = computed_from(jax.ShapeDtypeStruct((rows_count, width), out_dtype), lhs, rhs, group_sizes,
-                        [side for side, _ in prologue.get('prologue_operands', ())])
+    # The routing tables too: a table each device holds its own of routes rows that vary with it.
+    acc = computed_from(jax.ShapeDtypeStruct((rows_count, width), out_dtype), lhs, rhs, group_sizes, gather,
+                        scatter, [side for side, _ in prologue.get('prologue_operands', ())])
     operand_bytes = float(rows_count * lhs.shape[-1] * lhs.dtype.itemsize + rhs.size * rhs.dtype.itemsize)
     collected = _PRICED.get()
 
@@ -480,13 +477,19 @@ PROLOGUE_AXES = ('rows', 'depth')
 """The prologue's launch axes, in a tile's order."""
 
 
-def _prologue(fusion) -> tuple[jax.Array, dict, Formed | None]:
+def _prologue(fusion, gathered: bool = False) -> tuple[jax.Array, dict, Formed | None]:
     """The left operand's base array, the template's prologue arguments that give the operand from it (the
     module's docstring) and its producer as priced (`Formed`), or the operand itself, none and None where the
-    kernels cannot take its producer, each reported ('gemm_prologue')."""
+    kernels cannot take its producer, each reported ('gemm_prologue'). A `gathered` product's producer runs
+    in XLA, in its tokens' order: its derivative then sums each token's routes' cotangents before the
+    producer's, as the program it came from does, where the gathered rows' prologue would pull each route
+    back through the producer apart (cotangents of 2**126 and -2**126 at a producer's 4, inf - inf)."""
     producer, values, prefetch = fuser.get_fusion_values(fusion)
     split = (Refusal('scalar_prefetch', "the producer reads scalar prefetch") if prefetch
              else _split(producer, values))
+    if gathered and not (isinstance(split, Refusal) and split.code == 'no_producer'):
+        split = Refusal('gathered', "a gathered product's producer runs in its tokens' order, its derivative "
+                                    "the tokens' routes summed")
     # An operand as given has no producer to fuse, and no stage to choose.
     if isinstance(split, Refusal) and split.code == 'no_producer':
         return fusion(), {}, None
