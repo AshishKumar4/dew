@@ -382,12 +382,16 @@ _COMMITTED = _cache.untraced(contextvars.ContextVar("committed", default=0))
 add to, whose differences across a walk's step are its groups (`commits`), its own value no trace's program
 reads (`dew._cache.untraced`)."""
 
-_PREDICATED = _cache.untraced(contextvars.ContextVar("predicated", default=False))
-"""Whether products are issued under a predicate a run decides (`Issuer.issued_when`)."""
+_PREDICATED = _cache.untraced(contextvars.ContextVar("predicated", default=0))
+"""How many predicates a run decides products are issued under (`Issuer.issued_when`), one within another."""
 
 _UNSURE = _cache.untraced(contextvars.ContextVar("unsure", default=0))
 """The product groups `_COMMITTED` counts that were committed under a predicate a run decides
 (`_PREDICATED`), which a run may commit none of (`sure_commits`)."""
+
+_ONCE_PREDICATED = _cache.untraced(contextvars.ContextVar("once_predicated", default=0))
+"""The product groups committed under one predicate alone, none within it (`issued_one_of`'s cases'
+own)."""
 
 
 def then_read(read: Callable, after: Callable | None) -> Callable:
@@ -403,6 +407,8 @@ def committed() -> None:
     _COMMITTED.set(_COMMITTED.get() + 1)
     if _PREDICATED.get():
         _UNSURE.set(_UNSURE.get() + 1)
+    if _PREDICATED.get() == 1:
+        _ONCE_PREDICATED.set(_ONCE_PREDICATED.get() + 1)
 
 
 def commits() -> int:
@@ -420,8 +426,9 @@ def sure_commits() -> int:
 
 
 def predicated(issue: Callable):
-    """`issue()`, its groups committed under a predicate a run decides (`sure_commits`)."""
-    token = _PREDICATED.set(True)
+    """`issue()`, its groups committed under a predicate a run decides, within any it is issued under
+    (`sure_commits`)."""
+    token = _PREDICATED.set(_PREDICATED.get() + 1)
     try:
         return issue()
     finally:
@@ -1276,17 +1283,23 @@ class Issuer[Accumulator](abc.ABC):
         `gemm.chained`). Its groups count as one case's (`commits`), each case committing as many: counted
         as every case traced, a walk's wait for a step's groups left a step of its ring in flight past its
         slot's release (base review of f86cb5b03, F2)."""
-        before, unsure, issued, groups = commits(), _UNSURE.get(), [], set()
+        before, unsure, once = commits(), _UNSURE.get(), _ONCE_PREDICATED.get()
+        issued, groups, sure = [], set(), []
         for case, acc in enumerate(accumulators):
-            began = commits()
+            began, began_once = commits(), _ONCE_PREDICATED.get()
             issued.append(self.issued_when(which == case, acc, functools.partial(issue, case, acc)))
             groups.add(commits() - began)
+            # The case's groups no predicate within it guards, which a run choosing it commits.
+            sure.append(_ONCE_PREDICATED.get() - began_once)
         if len(groups) > 1:
             raise ValueError(f"a choice among products commits one count of groups whichever it issues, not "
                              f"{sorted(groups)}")
-        # One case's groups, which every run commits, as sure as the choice's own issue is.
-        _COMMITTED.set(before + max(groups, default=0))
-        _UNSURE.set(unsure + (max(groups, default=0) if _PREDICATED.get() else 0))
+        # One case's groups, as sure as the choice's own issue is: those every case commits whatever a
+        # predicate within it decides (theme K01-e's review P0: an inner predicate's groups read as sure).
+        count = max(groups, default=0)
+        _COMMITTED.set(before + count)
+        _UNSURE.set(unsure + (count if _PREDICATED.get() else count - min(sure, default=0)))
+        _ONCE_PREDICATED.set(once)
         return tuple(issued)
 
     def added_onto(self, acc, adds: jax.Array):

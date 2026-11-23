@@ -1501,18 +1501,21 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
-             relower: Callable[[], jax.stages.Lowered], first: "Attempt | None" = None
-             ) -> jax.stages.Compiled:
+             relower: Callable[[], jax.stages.Lowered], first: "Attempt | None" = None,
+             kept_from: list[jax.stages.Lowered] | None = None) -> jax.stages.Compiled:
     """`lowered` compiled (`kept`), its communicators admitted against the room the process's pool left
     them before it runs (`dew.communicators.admit`): every program Dew compiles passes here. `first` is
-    its first compile where another thread made it (`attempts`)."""
-    executable = kept(lowered, options, relower=relower, first=first)
+    its first compile where another thread made it (`attempts`); `kept_from` given, the lowering the kept
+    executable was compiled from is appended to it (`settled`'s)."""
+    executable = kept(lowered, options, relower=relower, first=first, kept_from=kept_from)
     communicators.admit(executable)
     return executable
 
 
 def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None,
-                                             Callable[[], jax.stages.Lowered]]]) -> list[jax.stages.Compiled]:
+                                             Callable[[], jax.stages.Lowered]]],
+                     kept_from: Sequence[list[jax.stages.Lowered]] | None = None
+                     ) -> list[jax.stages.Compiled]:
     """Each of `programs`, a lowering, its options and its `relower`, compiled as `compiled` compiles it,
     their first compiles at once, each in a thread of its own (`attempted`): XLA's compile releases the
     GIL and runs one program on about one and a half cores, so two compiled at once took 1.94 times the
@@ -1522,16 +1525,17 @@ def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.Com
     and its program relowers, under this thread's contexts, so the programs kept are the ones compiled in
     turn keep: a program lowered before an earlier one's refusals committed is lowered again past them and
     compiled in turn, as it would have been lowered after them. At most `compile_threads()` compile at
-    once."""
+    once. `kept_from` given, each program's kept lowering is appended to its own list (`compiled`'s)."""
     firsts = attempts([(lowered, options) for lowered, options, _ in programs])
     held = refusal_entries()
     kept_programs = []
-    for (lowered, options, relower), first in zip(programs, firsts, strict=True):
+    lists = [None] * len(programs) if kept_from is None else kept_from
+    for (lowered, options, relower), first, keeping in zip(programs, firsts, lists, strict=True):
         # A program launching a config an earlier one's compile refused after its trace took it, each program
         # by what it launches (row 8603); refusals held before every trace, its derivations read.
         if refusal_entries() != held and refused_in(lowered):
             lowered, first = relower(), None
-        kept_programs.append(compiled(lowered, options, relower=relower, first=first))
+        kept_programs.append(compiled(lowered, options, relower=relower, first=first, kept_from=keeping))
     return kept_programs
 
 
@@ -1927,16 +1931,17 @@ def reads_binaries(lowered: jax.stages.Lowered) -> bool:
 
 def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
          relower: Callable[[], jax.stages.Lowered], first: Attempt | None = None,
-         read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None) -> jax.stages.Compiled:
+         read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None,
+         kept_from: list[jax.stages.Lowered] | None = None) -> jax.stages.Compiled:
     """`lowered` compiled and kept (`settled`), its first compile `first` or one in this thread."""
     return settled(lowered, options, relower, attempted(lowered, options) if first is None else first,
-                   read=read)
+                   read=read, kept_from=kept_from)
 
 
 def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
             relower: Callable[[], jax.stages.Lowered], first: Attempt, *,
-            read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None
-            ) -> jax.stages.Compiled:
+            read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None,
+            kept_from: list[jax.stages.Lowered] | None = None) -> jax.stages.Compiled:
     """The program kept of `lowered`'s first compile (`first`), read through its kernels' binaries
     (`read`, `binaries` where None): where a kernel of a template's launch spills, that launch's config is
     refused (`refused`), the miss recorded (`misses`, logged), and the program `relower`ed and compiled,
@@ -1954,12 +1959,14 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     cache carries its kernels' binaries as one compiled here does. A program whose block XLA refuses steps
     its asking Triton launches down (`_unblocked`). A relowering that launches every refused config again
     is the program just compiled: it is kept as compiled, its spills misses not stepped, each refusal that
-    did not take named (`_untaken`)."""
+    did not take named (`_untaken`). `kept_from` given, the lowering the kept executable was compiled from
+    is appended to it: `lowered`, or the relowering it kept (a caller keys the executable by what that one
+    traced, row 12165)."""
     if first.error is not None:
         asked = shared_asked(first.error)
         if asked is None:
             raise first.error
-        return _unblocked(lowered, options, relower, asked, first.error)
+        return _unblocked(lowered, options, relower, asked, first.error, kept_from)
     executable = first.executable
     assert executable is not None
     found, compiled_from = _misses_of(_refused_binaries(lowered, executable, read)), lowered
@@ -2000,6 +2007,8 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     # The kept program's own spills are misses alone: refused, they would have every process seeded with
     # them derive another program, not the one this compile keeps and runs.
     _recorded(found, stepped=False)
+    if kept_from is not None:
+        kept_from.append(compiled_from)
     return executable
 
 
@@ -2202,8 +2211,8 @@ def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashab
 
 
 def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-               relower: Callable[[], jax.stages.Lowered], asked: int,
-               error: Exception) -> jax.stages.Compiled:
+               relower: Callable[[], jax.stages.Lowered], asked: int, error: Exception,
+               kept_from: list[jax.stages.Lowered] | None = None) -> jax.stages.Compiled:
     """The program XLA refused for a Triton kernel asking `asked` shared bytes past a block, compiled once
     more with the configs of the Triton launches XLA refuses each compiled alone refused (`refused_alone`,
     each its next derived config, as a spill refuses one, `kept`), or every Triton launch's where none is
@@ -2211,7 +2220,7 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
     time costs a program's compile a launch (row 3584), where a kernel's call compiled alone costs its own
     (audit group 71). Each launch's miss is recorded and logged at the bytes it asked; where the relowered
     program is refused again, or a derivation finds no config left (`Exhausted`), the refusal stands, each
-    a miss not stepped."""
+    a miss not stepped. `kept_from` given, the relowering it keeps is appended to it (`settled`'s)."""
     from dew.nn.kernels.lowered import kernel_calls
 
     tried: dict[tuple[str, Hashable], tuple[str, Launch]] = {}
@@ -2225,7 +2234,8 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
     asked_by = {kernel_of(name)[0]: bytes_asked for name, bytes_asked in alone.items()}
     try:
         with _proposing([(refusal, (kernel, None)) for refusal, (kernel, _) in tried.items()]) as proposal:
-            replacement, spilling = _compiled_reported(relower(), options)
+            program = relower()
+            replacement, spilling = _compiled_reported(program, options)
     except (Exhausted, jax.errors.JaxRuntimeError) as again:
         if isinstance(again, jax.errors.JaxRuntimeError) and shared_asked(again) is None:
             raise
@@ -2237,6 +2247,8 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
         _record(refusal, None, frozenset({(kernel, None)}))
         _missed_block(kernel, launch, asked_by.get(kernel, asked), stepped=True)
     _recorded(_misses_of(spilling), stepped=False)
+    if kept_from is not None:
+        kept_from.append(program)
     return replacement
 
 
