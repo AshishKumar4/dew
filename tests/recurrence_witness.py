@@ -1150,8 +1150,12 @@ def assert_clamped_key_decays_witnessed(lane: Lane, dtype=None) -> None:
     back = recorded_key_backward(operands, run=run)
     for name, inside in key_back_witnessed(back, lane).items():
         assert np.all(inside), (name, np.mean(inside))
+    # Zero at each steep entry alone: its token's mild columns keep their terms (a mask broadcast over the
+    # token zeroed them), which test_kda's steep cell holds against the float64 recurrence (check 1).
     dg, steep = back.grads[3], operands[3] < mainloop.DECAY_FLOOR
+    beside = np.any(steep, axis=-1, keepdims=True) & ~steep
     assert np.all(np.isfinite(dg)) and np.all(dg[steep] == 0), (np.sum(~np.isfinite(dg)), dg[steep])
+    assert np.all(dg[beside] != 0), np.mean(dg[beside] == 0)
 
 
 UNGATED_SHARES = {"leaving": 0.5}
