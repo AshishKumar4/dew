@@ -82,7 +82,7 @@ def test_a_steps_planner_certifies_its_launches_beside_the_trace_that_reaches_th
     launch's own compile, a `certified_` program, runs on a certification thread (`dew-certify`), none on a
     thread that traces. Certified within the planner's trace, a 4x1024 MoE step's 16 certifications compiled
     one after another (MC-6740-POOL), and an sm90 plan certified 64 of its 82 seconds in turn (FS-P5324-MAIN,
-    row 5324)."""
+    row 5324); each launch once, on the mesh's GPU (rows 6791, 7212)."""
     script = """
 import json
 import threading
@@ -110,10 +110,18 @@ trainer = Trainer(LMObjective(model, tokens), optax.adam(1e-3), key=jax.random.k
                   mesh=MeshSpec().build(gpus("sm90")), layout=Layout(min_shard=TINY_SHARD))
 jax.monitoring.register_event_duration_secs_listener(heard)
 started = bool(compile_ahead(trainer, token_rows(VOCAB, BATCH, tokens + 1)).starts)
-print(json.dumps({"started": started, "compiled_on": compiled_on}))
+from dew.nn.kernels.templates import report
+mesh_devices = {str(device) for device in trainer.device_mesh.devices.flat}
+certified = [[each.op, repr(each.config), each.pulled, str(each.device)] for each in report.certifications()]
+print(json.dumps({"started": started, "compiled_on": compiled_on, "certified": certified,
+                  "mesh": sorted(mesh_devices)}))
 """
     result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
                    variables={"CUDA_VISIBLE_DEVICES": ""})
     certifying = [thread for thread, name in result["compiled_on"] if "certified_" in name]
     assert result["started"], result
     assert certifying and all(thread.startswith("dew-certify") for thread in certifying), result
+    # Each launch certified once, on the mesh's compile-only GPU, never the host's (row 7212).
+    launches = [tuple(each[:3]) for each in result["certified"]]
+    assert launches and len(set(launches)) == len(launches), result["certified"]
+    assert {each[3] for each in result["certified"]} <= set(result["mesh"]), result
