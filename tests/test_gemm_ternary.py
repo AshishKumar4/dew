@@ -587,3 +587,45 @@ def test_a_packed_products_rescue_keeps_an_explicit_meshs_row_placement():
             want = np.zeros((16, 256), np.float32)
             want[0, 0] = expected
             np.testing.assert_array_equal(np.asarray(d_rows), want)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_packed_products_rescue_is_exact_within_a_row_and_across_replicas():
+    """A ternary product's rescue sums its products exactly before one rounding (rows 12392, 12403): within
+    one row, codes +1, -1, +1 under cotangents 2**39, 2**39, 2**-1 at a scale of 2**126 leave 2**125 of
+    2**165 - 2**165 + 2**125; across two replicas of a checked `shard_map` (the rows and codes +1, -1 every
+    device's, each its own scale and cotangent), 2**126 under 4, 4 beside 2**100 under 1, 0 leaves 2**100,
+    and 2**126 under 4, 2**-26 beside 2**100 under -2**28, 0 leaves -2**100."""
+    rows = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(1.0)
+    three = jnp.zeros((256, 32), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
+    within = dataclasses.replace(formats.TernaryWeights.of(three, scale=jnp.float32(1.0)),
+                                 scale=jnp.float32(2.0 ** 126))
+    product = functools.partial(gemm.ternary_weight_product, weights=within, quantize_activations=False,
+                                out_dtype=jnp.float32)
+    cotangent = jnp.zeros((16, 32), jnp.float32).at[0, :3].set(jnp.asarray([2.0 ** 39, 2.0 ** 39, 0.5]))
+    (d_rows,) = jax.vjp(product, rows)[1](cotangent)
+    want = np.zeros((16, 256), np.float32)
+    want[0, 0] = 2.0 ** 125
+    np.testing.assert_array_equal(np.asarray(d_rows), want)
+
+    codes = jnp.zeros((256, 32), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
+    weights = formats.TernaryWeights.of(codes, scale=jnp.float32(1.0))
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def each_device(x, scale, dy):
+        scaled = dataclasses.replace(weights, scale=scale[0])
+        replica = functools.partial(gemm.ternary_weight_product, weights=scaled, quantize_activations=False,
+                                    out_dtype=jnp.float32)
+        return jax.vjp(replica, x)[1](dy)[0]
+
+    mapped = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, data, data), out_specs=whole,
+                                   check_vma=True))
+    scales = jnp.asarray([2.0 ** 126, 2.0 ** 100], jnp.float32)
+    for first, second, expected in (((4.0, 4.0), (1.0, 0.0), 2.0 ** 100),
+                                    ((4.0, 2.0 ** -26), (-(2.0 ** 28), 0.0), -(2.0 ** 100))):
+        dy = jnp.zeros((32, 32), jnp.float32).at[0, :2].set(jnp.asarray(first)).at[16, :2].set(
+            jnp.asarray(second))
+        want = np.zeros((16, 256), np.float32)
+        want[0, 0] = expected
+        np.testing.assert_array_equal(np.asarray(mapped(rows, scales, dy)), want)
