@@ -159,7 +159,7 @@ def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     draws = functools.partial(drawn, dtype, **geometry(case))
     # Drawn on the host: a GPU tier's prepare runs no program on its device (row 7869).
     with jax.default_device(jax.devices("cpu")[0]):
-        (sample,) = draw(dtype, 0, **geometry(case))
+        (sample,) = jax.device_get(draw(dtype, 0, **geometry(case)))
     # Judged under the forms the call runs (`on_the_mainloop`'s fast ones): an fp32 call's rounding reads the
     # product precision they set (`recurrence_chunk.fast_rounding`).
     if not formed('fast', trained)(sample, hooks):
@@ -571,7 +571,8 @@ def test_one_products_spent_ladder_leaves_the_others_launches(kernel):
             return template.MOSAIC.launches(bound, tiles.forward or tiles, target, backward=False)
 
         # Spent: past every rung of its ladder (none where its launch moves no registers), no raise answers.
-        assert template.MOSAIC._exhausted(bound, base, target) and stepped is not None, (rungs, stepped)
+        assert template.MOSAIC._exhausted(bound, base, target, training=not alone) and stepped is not None, (
+            rungs, stepped)
         # The spent product off its ladder, the other's launches as they were.
         assert launches(stepped, not alone) != launches(first, not alone), (first, stepped)
         assert launches(stepped, alone) == launches(first, alone), (first, stepped)

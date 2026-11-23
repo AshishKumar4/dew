@@ -28,16 +28,25 @@ def repository(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def change(root: Path, files: dict[str, str], message: str) -> int:
-    """`files` written and committed as `message` on the head, at WRITTEN; the gate's exit status for it, run
-    in the repository as check.sh runs it in Dew's."""
+def committed(root: Path, files: dict[str, str], message: str) -> None:
+    """`files` written and committed as `message` on the head, at WRITTEN."""
     for relative, text in files.items():
         (root / relative).parent.mkdir(parents=True, exist_ok=True)
         (root / relative).write_text(text)
     git(root, "add", "-A")
     git(root, "commit", "-qm", message, f"--date={WRITTEN}")
+
+
+def gate(root: Path) -> subprocess.CompletedProcess:
+    """The gate run in the repository as check.sh runs it in Dew's."""
     return subprocess.run([sys.executable, str(REPO / "tools/public_text.py"), "base"], cwd=root,
-                          capture_output=True, timeout=60).returncode
+                          capture_output=True, text=True, timeout=60)
+
+
+def change(root: Path, files: dict[str, str], message: str) -> int:
+    """`files` committed as `message` on the head (`committed`); the gate's exit status for it."""
+    committed(root, files, message)
+    return gate(root).returncode
 
 
 @pytest.mark.parametrize(("files", "message", "status"), [
@@ -74,3 +83,28 @@ def test_a_date_of_the_day_in_utc_as_the_commit_is_written_is_no_forecast(reposi
     git(repository, "commit", "-q", "--allow-empty", "-m", "docs: landing 2026-10-24",
         "--date=2026-10-22T23:30:00-05:00")
     assert subprocess.run(gate, cwd=repository, capture_output=True, timeout=60).returncode == 1
+
+
+HANDLE = "Review" + "JS3582"
+"""A reviewer's handle, joined here so that no line of this file names one."""
+
+
+@pytest.mark.parametrize(("commits", "refused"), [
+    ([({"src/kernel.py": f"# Reviewed: {HANDLE}'s finding F1.\n"}, "kernel: a fix")], "src/kernel.py:1"),
+    ([({"docs/guide.md": f"{GUIDE}\nA fix.\n"}, f"docs: a fix ({HANDLE} F2)")], f"a fix ({HANDLE} F2)"),
+    ([({"src/kernel.py": f"# {HANDLE}\n"}, "kernel: a note"),
+      ({"src/kernel.py": "# A note.\n"}, "kernel: a fix")], "src/kernel.py:1"),
+    ([({"src/kernel.py": "# Reviewed: the train's review, finding F1.\n"},
+       "kernel: a fix (train 1150's review)")], None),
+    ([({"tests/fixtures/run.json": f'"{HANDLE}"'}, "tests: a fixture")], None),
+], ids=["a reviewer's handle in code", "one in a commit message", "one a later commit removes",
+        "a train's review named", "data's text"])
+def test_a_change_that_names_a_reviewers_handle_fails(repository, commits, refused):
+    """A reviewer's internal handle in any line a change's commits add, though a later one removes it, or in
+    their messages fails the gate, which names where it is: no reader of Dew's history can resolve it; a
+    train's review named by its train passes, as does a fixture's data."""
+    for files, message in commits:
+        committed(repository, files, message)
+    done = gate(repository)
+    named = refused is not None and refused in done.stdout and HANDLE in done.stdout
+    assert (done.returncode, named) == ((1, True) if refused else (0, False))

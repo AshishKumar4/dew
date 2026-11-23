@@ -272,8 +272,9 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     it: a rated scan's mamba_ssm's, `recurrence_chunk.fast_rounding`, else the delta rule's alone,
     `recurrence_chunk.chunk_rounding`)."""
     heads = given.value.shape[:3]
-    g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
-    beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
+    # NumPy's: no program on the default device, which a GPU tier's prepare runs none on (row 12005).
+    g = np.zeros(heads, np.float32) if given.log_decay is None else given.log_decay
+    beta = np.ones(heads, given.value.dtype) if given.beta is None else given.beta
     # The l2 norm rounds the queries and keys back to their own dtype before the rule reads them
     # (`recurrence_chunk.chunk`, row 184).
     query, key = given.query, given.key
@@ -321,7 +322,7 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     tiles pass the device's shared memory (an fp32 call's solve on an A100's block), whose arithmetic the
     CPU interprets. Drawn on the host: a GPU tier's prepare runs no program on its device (row 7869)."""
     with jax.default_device(jax.devices("cpu")[0]):
-        (operands,) = draw(dtype, 0, **geometry(case))
+        (operands,) = jax.device_get(draw(dtype, 0, **geometry(case)))
     if formed(forms, taken)(operands, hooks):
         return formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks))
     with pytest.raises(REFUSED):
@@ -848,8 +849,9 @@ TURNED = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=Tru
 writes, and the state's first key pairs turned each token (`Hooks.turns`), two pairs unturned."""
 
 
-@pytest.mark.parametrize('packed', [pytest.param(False, id='one sequence'), pytest.param(
-    True, id='packed', marks=pytest.mark.check1_shards(seeds=32, per_task=8))])
+@pytest.mark.parametrize('packed', [
+    pytest.param(False, id='one_sequence', marks=pytest.mark.check1_shards(seeds=32, per_task=16)),
+    pytest.param(True, id='packed', marks=pytest.mark.check1_shards(seeds=32, per_task=8))])
 def test_a_turned_call_on_the_template_is_on_par_with_the_portable_math_interpreted(packed):
     """A state that turns its key pairs (`TURNED`) through the chunked op on the template, its queries and
     keys turned into their documents' frames and its turns' gradient in the crossing form
@@ -858,7 +860,8 @@ def test_a_turned_call_on_the_template_is_on_par_with_the_portable_math_interpre
     7419), its queries, keys, values and write gate in bf16 under the run's fast forms, as the template's fast
     backward trains it (`mainloop_backward.fast_backward_form`). Both arms take the turns' gradient from one
     crossing form (`turned.turn_gradient`), which the recurrence a token at a time holds
-    (test_recurrence_chunk's turned states), not this pair (row 7971); packed, four tasks (row 6745)."""
+    (test_recurrence_chunk's turned states), not this pair (row 7971); packed, four tasks (row 6745); one
+    sequence, two (125 s whole in train 1197's CI, row 11979)."""
     def on(route, operands, starts=None):
         return chunk_on(route, TURNED, dataclasses.replace(operands, starts=starts))
 
@@ -1144,19 +1147,19 @@ def test_a_launch_spilling_at_every_rung_refuses_the_tiles_that_plan_it_alike():
         bound = template.MOSAIC.bind(*operands, None, None, delta=False, rounded=True)
         tiles = template.MOSAIC.derived(bound, target)
         shallower = dataclasses.replace(tiles, stages=tiles.stages - 1)
-        assert not template.MOSAIC._refused(bound, shallower, target)
+        assert not template.MOSAIC._refused(bound, shallower, target, training=True)
         spilled, identity = {'recurrence_reverse'}, report._identity(template.MOSAIC, bound, target)
         report.refuse([(identity, tiles, spilled)])
         held, *upper, foot = template.MOSAIC.rungs(bound, tiles)
         # Its foot refused alone (a config pinned there) leaves the rungs above it unasked: nothing spent.
         report.refuse([(identity, foot, spilled)])
-        assert not template.MOSAIC._refused(bound, shallower, target)
+        assert not template.MOSAIC._refused(bound, shallower, target, training=True)
         # A rung that held the reverse walk and spilled another kernel is no evidence against the walk.
         report.refuse([(identity, held, {'recurrence_states'})])
         report.refuse([(identity, rung, spilled) for rung in upper])
-        assert not template.MOSAIC._refused(bound, shallower, target)
+        assert not template.MOSAIC._refused(bound, shallower, target, training=True)
         report.refuse([(identity, held, spilled)])
-        assert template.MOSAIC._refused(bound, shallower, target)
+        assert template.MOSAIC._refused(bound, shallower, target, training=True)
 
 
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
@@ -2431,24 +2434,21 @@ def _dealt(units: list, tasks: int, task: int) -> list:
     return [each for name in names for each in parts[int(name)]]
 
 
-IDENTITY_TASKS = {'sm90': 14, 'sm100': 13, 'sm80': 2, 'sm86': 2, 'sm89': 2, 'sm120': 1}
+IDENTITY_TASKS = {'sm90': 19, 'sm100': 20, 'sm80': 3, 'sm86': 3, 'sm89': 3, 'sm120': 2}
 """The shards a target's identity units are dealt among (`_dealt`): only how the work is split, every unit
 dealt to some shard whatever the count, and the count a function of the code alone, so a shard's units are its
 id's at one revision whatever a run's timings (row 7254: a count from the durations record moved each id's
 units, sm100's 44 to 52, where a cached task and a rerun one could cover different units). Each the target's
-identity seconds in tests/test_durations.json over 75 to 90 s a shard, under the 120 s group target with
-room, rounded up: each shard's process derives its cover's units whole (`IDENTITY_COVER`) before it deals,
-5.4 to 6.6 s on sm90 and sm100 (jsf-idcost4), so a shard more costs that setup and its process again, and
-moves which parts of a case are compared together (`_dealt`). Since the cover was read rather than derived
-(row 9697), main 84cba23c0's CI held sm90's 50 shards in 1088 s and sm100's 52 in 1033 (22 and 20 s a
-shard), where 4839 and 4682 s had held them deriving every group's reach; at these counts
-armada held sm90's 14 shards in 58 to 99 s each, 1095 s in all, and sm100's 13 in 70 to 106 s, 1056 s, all at
-once (jsf-idall). Regenerated by:
+identity seconds in tests/test_durations.json over 60 s a shard, rounded up: dealt by kernels, not seconds,
+a heaviest shard took 1.6 times its target's mean (train 1197's CI: sm90's at 128 s past the 120 s group
+target at 80 s a shard, row 11979). Each shard derives its cover's units whole (`IDENTITY_COVER`), 5.4 to
+6.6 s (jsf-idcost4), so a shard more costs that setup, and moves which parts of a case are compared
+together (`_dealt`); derived at collection, every task collecting the file pays it (row 6645). Regenerated by:
     python3 -c 'import collections, json, math; seconds = collections.Counter()
     for node, value in json.load(open("tests/test_durations.json")).items():
         if "test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[" in node:
             seconds[node.split("[", 1)[1].rsplit("-", 1)[0]] += value[0]
-    print({target: math.ceil(spent / 80) for target, spent in sorted(seconds.items())})'
+    print({target: math.ceil(spent / 60) for target, spent in sorted(seconds.items())})'
 """
 
 

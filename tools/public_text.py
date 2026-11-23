@@ -1,7 +1,9 @@
 """No forecasts in Dew's prose (the bible): the lines a change adds to its docs and prose (Markdown,
 anywhere but recorded and fixture data) and its commits' messages name no calendar date after the day they
 were written. A date work is expected by is a forecast; a measurement's timestamp, on or before its
-commit, is not.
+commit, is not. Nor does any line a change adds, in any file, or its commits' messages name one of the
+maintainers' reviewers (`REVIEWER`), an internal handle no reader of Dew's history can resolve (owner,
+2026-11-22).
 
     python tools/public_text.py BASE
 
@@ -29,22 +31,27 @@ with or without a year (22 October, the 22nd of Oct. 2026)."""
 NUMBERS = {name[:3].lower(): number for number, name in enumerate(calendar.month_name) if name}
 """Each month's number by its name's first three letters, which every spelling of it (Sept., September)
 shares."""
+REVIEWER = re.compile(r"\bReview[A-Z]{2}\d+\b")
+"""A reviewer's internal handle: the word Review, two capitals and a number, written as one word."""
 PROSE = ("*.md", "*.mdx")
 DATA = (":(exclude)site/public", ":(exclude)tests/fixtures")
 
 
 def git(*arguments: str) -> str:
-    return subprocess.run(["git", *arguments], check=True, capture_output=True, text=True).stdout
+    """Git's output, a byte its encoding cannot read replaced, as a file's text may be in any encoding."""
+    return subprocess.run(["git", *arguments], check=True, capture_output=True, text=True,
+                          errors="replace").stdout
 
 
 HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-def added(base: str) -> list[tuple[str, str]]:
-    """Each prose line HEAD adds since its merge-base with `base`: (its `path:line`, its text). A hunk's
-    lines are read by its header's counts, so an added line that begins `++ ` is not a file's header."""
+def added(changed: str, paths: tuple[str, ...] = PROSE) -> list[tuple[str, str]]:
+    """Each line the revisions `changed` (`BASE...HEAD`, a commit's own `C~1..C`) add to `paths` (prose by
+    default), recordings' and fixtures' data not read: (its `path:line`, its text). A hunk's lines are read
+    by its header's counts, so an added line that begins `++ ` is not a file's header."""
     found, path, line, old, new = [], "", 0, 0, 0
-    for text in git("diff", "-U0", "--no-color", f"{base}...HEAD", "--", *PROSE, *DATA).splitlines():
+    for text in git("diff", "-U0", "--no-color", changed, "--", *paths, *DATA).splitlines():
         if old or new:
             if text.startswith("+"):
                 found.append((f"{path}:{line}", text[1:]))
@@ -100,11 +107,20 @@ def main() -> int:
     parser.add_argument("base", help="the ref HEAD's change is read from (its merge-base with it)")
     options = parser.parse_args()
     head = written("HEAD")
-    read = [(where, text, head) for where, text in added(options.base)] + messages(options.base)
+    said = messages(options.base)
+    read = [(where, text, head) for where, text in added(f"{options.base}...HEAD")] + said
     found = [(where, text) for where, text, day in read if forecasts(text, day)]
     for where, text in found:
         print(f"public-text: a forecast: {where}: {text}")
-    return 1 if found else 0
+    # Each commit's own lines, as each is published: a handle one commit adds and a later one removes stays
+    # in the history.
+    every = [*((f"{commit[:9]} {where}", text) for commit in git("rev-list", f"{options.base}..HEAD").split()
+               for where, text in added(f"{commit}~1..{commit}", (".",))),
+             *((where, text) for where, text, _ in said)]
+    handles = [(where, text) for where, text in every if REVIEWER.search(text)]
+    for where, text in handles:
+        print(f"public-text: a reviewer's handle: {where}: {text}")
+    return 1 if found or handles else 0
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ GPUs, which a two-GPU run of the check makes; here it is the child's report, as 
 import hashlib
 import itertools
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -259,13 +260,30 @@ def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
     resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
 
 
-def test_a_programs_communicators_are_kept_under_the_digest_of_their_readers_code(tmp_path, monkeypatch):
+STEP = ("HloModule step\n\n%add (lhs: f32[], rhs: f32[]) -> f32[] {\n  %lhs = f32[] parameter(0)\n"
+        "  %rhs = f32[] parameter(1)\n  ROOT %sum = f32[] add(%lhs, %rhs)\n}\n\n"
+        "ENTRY %main (x: f32[8]) -> f32[8] {\n"
+        "  %x = f32[8] parameter(0)\n"
+        "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
+"""A program whose one collective gathers over two pairs of its four devices."""
+
+
+@pytest.fixture
+def compilation_cache(tmp_path):
+    """The process's compilation cache named at a directory of the test's own while it runs, as a process that
+    sets JAX_COMPILATION_CACHE_DIR names it; nothing compiles in it."""
+    named = jax.config.jax_compilation_cache_dir
+    jax.config.update("jax_compilation_cache_dir", str(tmp_path / "xla"))
+    yield tmp_path / "xla"
+    jax.config.update("jax_compilation_cache_dir", named)
+
+
+def test_a_programs_communicators_are_kept_under_the_digest_of_their_readers_code(compilation_cache):
     """A program's communicators are kept under the digest of the code that reads them
     (`dew._code.code_digest`): those kept under this code's digest are taken as they are kept, its text
     unread, and those kept by another code, under its digest or none, are read again from the program's
     text."""
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    kept = tmp_path / "dew" / "communicators" / "programs"
+    kept = compilation_cache / "dew-communicators"
     planted = Collectives(groups=frozenset({(0, 1, 2, 3)}))
 
     def unread() -> str:
@@ -278,25 +296,16 @@ def test_a_programs_communicators_are_kept_under_the_digest_of_their_readers_cod
     for earlier in (kept / f"{b'step'.hex()}.json", kept / ("0" * 64) / f"{b'step'.hex()}.json"):
         earlier.parent.mkdir(parents=True, exist_ok=True)
         earlier.write_text(json.dumps(planted.to_json()))
-    program = ("HloModule step\n\n%add (lhs: f32[], rhs: f32[]) -> f32[] {\n  %lhs = f32[] parameter(0)\n"
-               "  %rhs = f32[] parameter(1)\n  ROOT %sum = f32[] add(%lhs, %rhs)\n}\n\n"
-               "ENTRY %main (x: f32[8]) -> f32[8] {\n"
-               "  %x = f32[8] parameter(0)\n"
-               "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
+    program = STEP
     assert communicators.collectives_kept(b"step", (0, 1, 2, 3), lambda: program) == Collectives(
         groups=frozenset({(0, 1), (2, 3)}))
 
 
-def test_a_programs_communicators_are_read_once_per_executable(tmp_path, monkeypatch):
-    """A program's communicators are read from its text once per executable, kept in Dew's cache by its
-    fingerprint as positions in its device assignment, so a warm start that loads it from the compilation
+def test_a_programs_communicators_are_read_once_per_executable(compilation_cache):
+    """A program's communicators are read from its text once per executable, kept beside the compilation
+    cache by its fingerprint as positions in its device assignment, so a warm start that loads it from that
     cache reads no text, and the same executable over other GPUs maps them to those."""
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    program = ("HloModule step\n\n%add (lhs: f32[], rhs: f32[]) -> f32[] {\n  %lhs = f32[] parameter(0)\n"
-               "  %rhs = f32[] parameter(1)\n  ROOT %sum = f32[] add(%lhs, %rhs)\n}\n\n"
-               "ENTRY %main (x: f32[8]) -> f32[8] {\n"
-               "  %x = f32[8] parameter(0)\n"
-               "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
+    program = STEP
     read = []
 
     def text():
@@ -308,6 +317,31 @@ def test_a_programs_communicators_are_read_once_per_executable(tmp_path, monkeyp
     assert read == [1]
     assert first == Collectives(groups=frozenset({(0, 1), (2, 3)}))
     assert again == Collectives(groups=frozenset({(3, 2), (1, 0)}))
+
+
+def test_communicators_kept_beside_one_cache_are_not_anothers_and_an_unwritable_one_keeps_none(
+        compilation_cache, caplog):
+    """A process that names another compilation cache reads none of the communicators kept beside the first,
+    whose programs are not its own, and reads its program's text again (row 11757); one whose cache cannot be
+    written (a file where its directory would be) keeps none, a warning logged, and is answered from the
+    text."""
+    read = []
+
+    def text():
+        read.append(1)
+        return STEP
+    expected = Collectives(groups=frozenset({(0, 1), (2, 3)}))
+    assert communicators.collectives_kept(b"step", (0, 1, 2, 3), text) == expected
+    jax.config.update("jax_compilation_cache_dir", str(compilation_cache.parent / "other"))
+    assert communicators.collectives_kept(b"step", (0, 1, 2, 3), text) == expected
+    assert read == [1, 1]
+    (compilation_cache.parent / "file").write_text("")
+    jax.config.update("jax_compilation_cache_dir", str(compilation_cache.parent / "file" / "xla"))
+    with caplog.at_level(logging.WARNING, logger="dew.communicators"):
+        assert communicators.collectives_kept(b"step", (0, 1, 2, 3), text) == expected
+    assert read == [1, 1, 1]
+    said = [record.levelname for record in caplog.records if record.name == "dew.communicators"]
+    assert said == ["WARNING"]
 
 
 def test_programs_admitted_at_once_are_held_together():
@@ -667,7 +701,7 @@ def a_program_loaded_from_the_compilation_cache_is_admitted_from_its_kept_commun
     environment = {**os.environ, "XDG_CACHE_HOME": str(cache), "JAX_COMPILATION_CACHE_DIR": str(compiled),
                    "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
                    "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "0"}
-    kept = cache / "dew" / "communicators" / "programs" / str(code_digest("dew.communicators"))
+    kept = compiled / "dew-communicators" / str(code_digest("dew.communicators"))
 
     def ran() -> tuple[list[int], dict[str, tuple[int, int]]]:
         done = subprocess.run([sys.executable, "-c", COMPILED_ON_GPU], check=True, env=environment,
