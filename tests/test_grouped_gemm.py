@@ -1918,25 +1918,29 @@ def test_vmap_folds_batch_dimensions_into_single_gemm_launch():
 
 
 def test_underfilled_dense_gemm_derives_depth_split_and_holds_check_1():
-    """Underfilled multi-row-tile dense GEMMs (e.g. Qwen3.5-4B key 2048x2560->1024 on sm90 cluster=2 with
-    waves=0, or q dX 2048x8192->2560 on sm80 without balanced tail) derive `splits > 1`, while well-filled
-    dense GEMMs stay unsplit (`splits == 1`, row 10151)."""
+    """Deep underfilled multi-row-tile dense GEMMs (`512x16384->1024` on sm90 and sm80 without balanced
+    tail) derive `splits > 1`, while shallow-K or well-filled dense GEMMs stay unsplit (`splits == 1`,
+    row 10151)."""
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     one = jax.ShapeDtypeStruct((1,), jnp.int32)
     with generation.assumed("sm90"):
         target = generation.gpu_target()
-        key_ba = launch.bind(bf16((2048, 2560)), bf16((1, 2560, 1024)), one, out_dtype="bfloat16",
-                             trans_rhs=False, interpret=False, dense=True)
-        key_tile = launch.derived(key_ba, target)
-        assert key_tile is not None and key_tile.splits > 1, key_tile
+        deep_ba = launch.bind(bf16((512, 16384)), bf16((1, 16384, 1024)), one, out_dtype="bfloat16",
+                              trans_rhs=False, interpret=False, dense=True)
+        deep_tile = launch.derived(deep_ba, target)
+        assert deep_tile is not None and deep_tile.splits > 1, deep_tile
+        shallow_ba = launch.bind(bf16((2048, 2560)), bf16((1, 2560, 1024)), one, out_dtype="bfloat16",
+                                 trans_rhs=False, interpret=False, dense=True)
+        shallow_tile = launch.derived(shallow_ba, target)
+        assert shallow_tile is not None and shallow_tile.splits == 1, shallow_tile
         full_ba = launch.bind(bf16((8192, 4096)), bf16((1, 4096, 4096)), one, out_dtype="bfloat16",
                               trans_rhs=False, interpret=False, dense=True)
         full_tile = launch.derived(full_ba, target)
         assert full_tile is not None and full_tile.splits == 1, full_tile
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        dx_ba = launch.bind(bf16((2048, 8192)), bf16((1, 2560, 8192)), one, out_dtype="bfloat16",
+        dx_ba = launch.bind(bf16((512, 16384)), bf16((1, 1024, 16384)), one, out_dtype="bfloat16",
                             trans_rhs=True, interpret=False, dense=True)
         dx_tile = launch.derived(dx_ba, target)
         assert dx_tile is not None and dx_tile.splits > 1, dx_tile

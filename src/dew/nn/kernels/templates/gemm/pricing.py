@@ -327,20 +327,17 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
                launch_seconds: float | None, partial_rows: int | None = None,
                target: generation.GpuTarget | None = None) -> SplitWalk | None:
     """Dew: the walk `split_count` prices at `tiles` (its arguments'), None where the device states no rate
-    or the call has no whole tile: its wave every cluster unit's programs a multiprocessor runs at once, its
-    output tiles each cluster unit's (`tile_rows` x `tile_columns`), `step_seconds` a step at the
-    multiprocessor's whole rate (`SplitWalk.walk` shares it among the programs running), its output stored at
-    `stored` bytes an element (`SplitWalk.seconds`, rows 10151, 12006)."""
-    family = family_of(tiles, jnp.bfloat16, target)
-    columns = tile_columns(tiles, family)
-    row_span = tile_rows(tiles, family)
-    units = max(1, multiprocessors // tiles.cluster)
-    output = groups * -(-depth // row_span) * (width // columns)
+    or the call has no whole tile: its wave every program a multiprocessor runs at once, its output tiles
+    each program's (a pair's CTA's its rows by the pair's columns, `tile_columns`), `step_seconds` a step at
+    the multiprocessor's whole rate (`SplitWalk.walk` shares it among the programs running), its output
+    stored at `stored` bytes an element (`SplitWalk.seconds`, rows 10151, 12006)."""
+    columns = tile_columns(tiles, family_of(tiles, jnp.bfloat16, target))
+    output = groups * -(-depth // tiles.block_m) * (width // columns)
     steps = -(-rows // max(groups, 1) // tiles.block_k)
     if step_seconds is None or bandwidth is None or output == 0:
         return None
     held = groups * depth if partial_rows is None else partial_rows
-    return SplitWalk(output, units * tiles.programs, steps, units,
+    return SplitWalk(output, multiprocessors * tiles.programs, steps, multiprocessors,
                      rows * (depth * itemsizes[0] + width * itemsizes[1]), bandwidth, step_seconds,
                      held * width * 4 / bandwidth / step_seconds,
                      0.0 if launch_seconds is None else launch_seconds / step_seconds,
