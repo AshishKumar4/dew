@@ -226,10 +226,11 @@ def test_restored_blockwise_cublaslt_references_prepare_on_sm90(tmp_path, monkey
     """Both restored blockwise FP8 cells (`blockwise_matrix.a_blockwise_fp8_product_is_on_par` and
     `a_blockwise_kernel_gradient_is_on_par`) with cuBLASLt as `reference` prepare cleanly under a
     compile-only sm90 GPU-tier prepare with zero unprepared sites (row 12062)."""
+    import pickle
+
     import generation_support
     import model_flows
     import tier_wire
-    import pickle
     from truths_ahead import AT_RUN, DEFERRED, HELD, SITE, UNPREPARED, prepared
 
     monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
