@@ -1397,8 +1397,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         16 s its start traced."""
         found = self.__dict__.get("_drawn_shapes")
         if found is None:
-            found = self.__dict__.setdefault("_drawn_shapes",
-                                             _shapes_of(abstract(self.initializer, jax.random.key(0))))
+            # Its key made within the trace, nothing computed on any device (rows 12147-12150); the
+            # initializer an argument, its held tree traced as the arrays it stands for (`abstract`, 7386).
+            drawn = abstract(lambda initializer: initializer(jax.random.key(0)), self.initializer)
+            found = self.__dict__.setdefault("_drawn_shapes", _shapes_of(drawn))
         return found
 
     @functools.cached_property
@@ -1418,7 +1420,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         if held is None and (drawn_axes := self.__dict__.get("_drawn_axes")) is not None:
             return {**self.tower_axes(), **drawn_axes}
         try:
-            drawn = abstract(functools.partial(self._drawn, variables={}), jax.random.key(0))
+            # Its key made within the trace: nothing computed, on any device (rows 12147-12150).
+            drawn = abstract(lambda: self._drawn(jax.random.key(0), variables={}))
         except NotImplementedError:
             return self.tower_axes()
         if held is not None and "params" in held:

@@ -14,6 +14,7 @@ from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS, ContextReader
 from dew.inputs.condition import BackboneCall, BackboneEncoder, ConditionEncoder
 from dew.inputs.spec import Condition, encode_conditions, token_widths
+from dew.nn.backbones.looping import never_exiting
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, ModelInputs
 from dew.nn.inspection import INSPECTED, QK, component, in_parts
@@ -316,7 +317,9 @@ class DecisionModel(HeadedModel):
                                            progress=progress, opened=[*opened, EXITS])
         backbone = self.backbone
         assert isinstance(backbone, Looped), "a looped backbone's exits"
-        earlier, gates = backbone.exit_passes(sown)
+        exited = backbone.exit_passes(sown)
+        # A pass a count given per call left unrun exits at no chance (`never_exiting`).
+        earlier, gates = exited.states, never_exiting(exited.logits, exited.ran)
         # Every exit through the head, each sowing what the step opened: a QK-Clip bounds the head by the
         # largest logit any scored exit reads, each exit's call kept after the last's (`sows_appended`);
         # a watched module keeps its latest call's summary, the last pass's, as a module run more than once

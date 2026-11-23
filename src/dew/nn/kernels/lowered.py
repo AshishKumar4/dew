@@ -14,6 +14,9 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import jax
+import jax.experimental.mosaic.gpu as mgpu
+from jax._src.lib.mlir.dialects import gpu, nvvm
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
@@ -418,3 +421,331 @@ def triton_kernels(lowered: jax.stages.Lowered) -> dict[str, int]:
     """The Pallas-Triton kernels a lowered program calls (`triton_calls`), by name, with the call sites
     of each."""
     return dict(sorted(Counter(call.name for call in triton_calls(lowered)).items()))
+
+
+BARRIER_WAIT = "nvvm.mbarrier.try_wait.parity"
+"""A thread's wait at a barrier's phase in a Mosaic GPU kernel's module (`BarrierRef.wait_parity`)."""
+
+TENSOR_CORE_COMMIT = "llvm.nvvm.tcgen05.commit"
+"""The LLVM intrinsics a tensor-core commit arrives at a barrier by (`llvm.call_intrinsic`'s `intrin`):
+`.cg1` and `.cg2`, multicast or not."""
+
+
+
+def unsynced_commits(module: bytes) -> list[str]:
+    """Each tensor-core commit (`TENSOR_CORE_COMMIT`) in a Mosaic GPU kernel's `module` (`KernelCall.ir`) that
+    arrives at a barrier its thread waited at (`BARRIER_WAIT`), which another warp of its warpgroup waits at
+    too, with no warpgroup sync between (`_Walk.syncs`: the block's or the warpgroup's own, typed from the
+    fork's 0.12.0.1.post125): an elected thread commits after its own wait while its warpgroup's other warps
+    may still wait at the phase its arrival completes past (row 5671: a B200's tcgen05 chunk issuer). A warp
+    alone in its role's waits (a warp-specialized issuer's) passes no other warp's. Each warp's path is its
+    own (`_Walk`): a branch on the thread's index takes the warp's case, any other branch every case, the
+    union after; a loop to its fixed point, a for loop left past its last turn where constants make it turn,
+    a while loop past its condition; a region's blocks along their successor edges, a block's arguments what
+    each edge passes; a call through its callee, its barrier arguments its caller's. A barrier is its
+    array in shared memory and its slot (`_barrier`), slots a run's value picks maybe one (`_aliases`). Each
+    finding names its function, warp and barrier (row 12144)."""
+    kernel = mgpu.deserialized(module)
+    found: list[str] = []
+    with kernel.context:
+        functions = {ir.StringAttr(op.attributes["sym_name"]).value: op.operation
+                     for op in kernel.body.operations if op.operation.name == "func.func"}
+        if not any(map(_commits, functions.values())):
+            return []
+        for name, function in functions.items():
+            for launch in _launches(function):
+                sizes = [_value(size, None)
+                         for size in (launch.blockSizeX, launch.blockSizeY, launch.blockSizeZ)]
+                block = tuple(size for size in sizes if size is not None)
+                if len(block) != len(sizes):
+                    raise ValueError(f"{name}'s block states no constant size")
+                walks = []
+                for first in range(0, math.prod(block), mgpu_utils.WARP_SIZE):
+                    walks.append(_Walk(functions, _Thread(first, block)))
+                    walks[-1].region(launch.regions[0], frozenset())
+                for warp, walk in enumerate(walks):
+                    # A barrier another warp of its warpgroup waits at too, whose wait the commit may pass.
+                    lead = warp - warp % mgpu_utils.WARPS_IN_WARPGROUP
+                    group = walks[lead:lead + mgpu_utils.WARPS_IN_WARPGROUP]
+                    shared = set().union(*(other.waits for other in group if other is not walk))
+                    found += [f"{name}, warp {warp}: a tensor-core commit arrives at barrier {barrier} after "
+                              f"its wait there, which another warp of its warpgroup waits at too, with no "
+                              f"warpgroup sync between"
+                              for barrier in sorted(walk.unsynced, key=str)
+                              if any(_aliases(barrier, each) for each in shared)]
+    return found
+
+
+@dataclass(frozen=True)
+class _Thread:
+    """A thread of a launch: its index (`index`, along x, the block's threads numbered as Mosaic's warps and
+    warpgroups are) and the block's sizes (`block`, x, y, z)."""
+
+    index: int
+    block: tuple[int, ...]
+
+
+@dataclass
+class _Walk:
+    """One warp's walk of a kernel for `unsynced_commits`, from its first lane, `thread`: each barrier it
+    waits at (`waits`), and each it commits at after a wait at it with no sync between (`unsynced`), a
+    barrier its allocation and slot (`_barrier`); a callee's barrier arguments read as its caller's
+    (`arguments`)."""
+
+    functions: dict[str, ir.Operation]
+    thread: _Thread
+    waits: set = dataclasses.field(default_factory=set)
+    unsynced: set = dataclasses.field(default_factory=set)
+    arguments: dict = dataclasses.field(default_factory=dict)
+
+    def region(self, body: ir.Region, waited: frozenset) -> frozenset:
+        """The barriers waited at past `body` and no sync, from `waited` at its entry: along its blocks'
+        successor edges where it has several (a block's entry the union of its predecessors' exits), the
+        union of its exits'."""
+        blocks = list(body.blocks)
+        if not blocks:
+            # An absent region (an `scf.if`'s else): its exit is its entry.
+            return waited
+        if len(blocks) == 1:
+            return self.block(blocks[0], waited)
+        entries: dict[int, frozenset] = {0: waited}
+        exits = frozenset()
+        pending = [0]
+        while pending:
+            index = pending.pop()
+            left = self.block(blocks[index], entries[index])
+            terminator = blocks[index].operations[-1].operation
+            successors = list(terminator.successors)
+            if not successors:
+                exits |= left
+            for successor, passed in zip(successors, _edge_operands(terminator), strict=True):
+                at = next(place for place, each in enumerate(blocks) if each == successor)
+                # A successor's arguments are what each edge into it passes, merged at a join.
+                bound = False
+                for argument, value in zip(successor.arguments, passed, strict=True):
+                    incoming = self.arguments.setdefault(argument, set())
+                    bound |= value not in incoming
+                    incoming.add(value)
+                if at not in entries or not left <= entries[at] or bound:
+                    entries[at] = entries.get(at, frozenset()) | left
+                    pending.append(at)
+        return exits
+
+    def block(self, block: ir.Block, waited: frozenset) -> frozenset:
+        for inner in block.operations:
+            waited = self.operation(inner.operation, waited)
+        return waited
+
+    def operation(self, operation: ir.Operation, waited: frozenset) -> frozenset:
+        """The barriers waited at past `operation` and no sync, from `waited` before it."""
+        name = operation.name
+        if name == BARRIER_WAIT:
+            self.waits.add(barrier := _barrier(operation.operands[0], self.arguments))
+            return waited | {barrier}
+        if self.syncs(operation):
+            return frozenset()
+        if (name == "llvm.call_intrinsic"
+                and ir.StringAttr(operation.attributes["intrin"]).value.startswith(TENSOR_CORE_COMMIT)):
+            barrier = _barrier(operation.operands[0], self.arguments)
+            if any(_aliases(barrier, each) for each in waited):
+                self.unsynced.add(barrier)
+            return waited
+        if name == "func.call":
+            callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
+            if (called := self.functions.get(callee)) is None:
+                return waited
+            bound = {argument: {value}
+                     for argument, value in zip(called.regions[0].blocks[0].arguments, operation.operands,
+                                                strict=True)}
+            self.arguments.update(bound)
+            try:
+                return self.region(called.regions[0], waited)
+            finally:
+                for argument in bound:
+                    del self.arguments[argument]
+        if name in ("scf.for", "scf.while"):
+            # A loop's turn starts where the last left it (a while's condition, then its body): to the fixed
+            # point, none run too. A for loop leaves from its head, past its last turn where constants make
+            # it turn at least once; a while loop past its condition.
+            entry = waited
+            while True:
+                turned = entry
+                for each in operation.regions:
+                    turned = self.region(each, turned)
+                if (entry | turned) == entry:
+                    break
+                entry |= turned
+            if name == "scf.while":
+                return self.region(operation.regions[0], entry)
+            return turned if self.turns(operation) else entry
+        if name in ("scf.if", "scf.index_switch"):
+            return frozenset().union(*(self.region(each, waited) for each in self.taken(operation)))
+        return frozenset().union(waited, *(self.region(each, waited) for each in operation.regions))
+
+    def turns(self, loop: ir.Operation) -> bool:
+        """Whether an `scf.for` turns at least once: its bounds constants (`_value`), its lower below its
+        upper."""
+        lower, upper = (_value(bound, self.thread) for bound in loop.operands[:2])
+        return lower is not None and upper is not None and lower < upper
+
+    def syncs(self, operation: ir.Operation) -> bool:
+        """Whether `operation` syncs every warp of the walk's warpgroup: the block's barrier (`gpu.barrier`,
+        an `nvvm.barrier` of no thread count), or the warpgroup's own (`mgpu_utils.warpgroup_barrier`: its
+        warpgroup's barrier, `mgpu_utils.WARPGROUP_SIZE` threads); a barrier of fewer threads (a warp's) or
+        another warpgroup's syncs none of its other warps."""
+        if operation.name == "gpu.barrier":
+            return True
+        if not isinstance(view := operation.opview, nvvm.BarrierOp):
+            return False
+        if view.numberOfThreads is None:
+            return True
+        if view.barrierId is None:
+            # Barrier 0, the block's own, of fewer threads than the block: no warpgroup's rendezvous.
+            return False
+        threads, barrier = _value(view.numberOfThreads, self.thread), _value(view.barrierId, self.thread)
+        group = self.thread.index // mgpu_utils.WARPGROUP_SIZE
+        return threads == mgpu_utils.WARPGROUP_SIZE and barrier == group + 1
+
+    def taken(self, branch: ir.Operation) -> list[ir.Region]:
+        """The regions of `branch` the walk's thread can take: the one its value selects where the thread's
+        index alone decides it (`_value`), every one otherwise (an absent else among them)."""
+        selector = _value(branch.operands[0], self.thread)
+        if branch.name == "scf.if":
+            then, otherwise = branch.regions
+            return [otherwise] if selector == 0 else [then] if selector is not None else [then, otherwise]
+        default, *cases = branch.regions
+        if selector is None:
+            return [default, *cases]
+        values = list(ir.DenseI64ArrayAttr(branch.attributes["cases"]))
+        return [cases[values.index(selector)] if selector in values else default]
+
+
+_INTEGER_OPS: dict[str, Callable[[int, int], int]] = {
+    "arith.addi": lambda a, b: a + b, "arith.subi": lambda a, b: a - b, "arith.muli": lambda a, b: a * b,
+    "arith.divui": lambda a, b: a // b, "arith.divsi": lambda a, b: int(a / b),
+    "arith.remui": lambda a, b: a % b,
+    "arith.remsi": lambda a, b: int(math.fmod(a, b)), "arith.andi": lambda a, b: a & b,
+    "arith.ori": lambda a, b: a | b, "arith.xori": lambda a, b: a ^ b, "arith.shli": lambda a, b: a << b,
+    "arith.shrui": lambda a, b: a >> b, "arith.maxsi": max, "arith.minsi": min, "arith.maxui": max,
+    "arith.minui": min}
+_COMPARISONS = [lambda a, b: a == b, lambda a, b: a != b, lambda a, b: a < b, lambda a, b: a <= b,
+                lambda a, b: a > b, lambda a, b: a >= b, lambda a, b: a < b, lambda a, b: a <= b,
+                lambda a, b: a > b, lambda a, b: a >= b]
+"""`arith.cmpi`'s predicates in their order (eq, ne, slt, sle, sgt, sge, ult, ule, ugt, uge)."""
+
+
+def _value(value: ir.Value, thread: _Thread | None) -> int | None:
+    """`value` where the constants and `thread`'s index and block (`gpu.thread_id`, `gpu.block_dim`) alone
+    make it (a warp's or a warpgroup's index, a role's branch), through integer arithmetic and casts, and a
+    lane shuffle's (`nvvm.shfl.sync`, the first lane's own value); None where anything else enters it."""
+    if (operation := _result_of(value)) is None:
+        return None
+    name = operation.name
+    if name == "arith.constant":
+        constant = operation.attributes["value"]
+        return constant.value if isinstance(constant, ir.IntegerAttr) else None
+    if name in ("gpu.thread_id", "gpu.block_dim"):
+        if thread is None:
+            return None
+        along = "xyz".index(str(operation.attributes["dimension"])[-2])
+        return thread.block[along] if name == "gpu.block_dim" else thread.index if along == 0 else 0
+    if name in ("arith.index_cast", "arith.index_castui", "arith.extui", "arith.extsi", "arith.trunci"):
+        return _value(operation.operands[0], thread)
+    if name == "nvvm.shfl.sync":
+        return _value(operation.operands[1], thread)
+    if name in _INTEGER_OPS or name == "arith.cmpi":
+        a, b = (_value(operand, thread) for operand in operation.operands)
+        if a is None or b is None:
+            return None
+        if name == "arith.cmpi":
+            return int(_COMPARISONS[ir.IntegerAttr(operation.attributes["predicate"]).value](a, b))
+        return _INTEGER_OPS[name](a, b)
+    if name == "arith.select":
+        chosen = _value(operation.operands[0], thread)
+        return None if chosen is None else _value(operation.operands[1 if chosen else 2], thread)
+    return None
+
+
+def _commits(operation: ir.Operation) -> bool:
+    """Whether `operation` holds a tensor-core commit (`TENSOR_CORE_COMMIT`): a kernel with none has none
+    to walk to."""
+    return any((inner.operation.name == "llvm.call_intrinsic"
+               and ir.StringAttr(inner.operation.attributes["intrin"]).value.startswith(TENSOR_CORE_COMMIT))
+               or _commits(inner.operation)
+               for each in operation.regions for block in each.blocks for inner in block.operations)
+
+
+def _launches(operation: ir.Operation) -> Iterator[gpu.LaunchOp]:
+    """The `gpu.launch` operations within `operation`."""
+    for each in operation.regions:
+        for block in each.blocks:
+            for inner in block.operations:
+                if isinstance(inner, gpu.LaunchOp):
+                    yield inner
+                yield from _launches(inner.operation)
+
+
+def _barrier(value: ir.Value, arguments: dict, seen: frozenset = frozenset()
+             ) -> tuple[frozenset, int | None]:
+    """The barrier a barrier operand addresses: the arrays it may be one of, each the byte offset in the
+    kernel's dynamic shared memory of the view its address is computed from (each step its first operand: a
+    cast, a pointer's arithmetic, a struct's field; a block's or callee's argument each value passed to it,
+    `arguments`), else the operand's own text; and its slot in them, the index its address takes
+    (`llvm.getelementptr`'s) where constants give it alike on every path, 0 where it takes none, None where
+    a run's value does (`_aliases`)."""
+    slot: int | None = 0
+    while True:
+        if (operation := _result_of(value)) is None:
+            if value in seen:
+                # A loop's argument fed by itself: what its other edges pass, at a slot a run's value moves.
+                return frozenset(), None
+            if not (incoming := arguments.get(value)):
+                return frozenset({str(value)}), slot
+            found = [_barrier(each, arguments, seen | {value}) for each in incoming]
+            slots = {each_slot for _, each_slot in found}
+            joined = slots.pop() if len(slots) == 1 else None
+            return (frozenset().union(*(arrays for arrays, _ in found)),
+                    None if joined is None or slot is None else slot + joined)
+        if operation.name == "llvm.getelementptr":
+            index = _gep_index(operation)
+            slot = None if index is None or slot is None else slot + index
+        if operation.name == "memref.view" and (
+                (memory := _result_of(operation.operands[0])) is not None
+                and memory.name == "gpu.dynamic_shared_memory"
+                and (offset := _result_of(operation.operands[1])) is not None):
+            return frozenset({ir.IntegerAttr(offset.attributes["value"]).value}), slot
+        if not operation.operands:
+            return frozenset({str(value)}), slot
+        value = operation.operands[0]
+
+
+def _edge_operands(terminator: ir.Operation) -> list[list[ir.Value]]:
+    """What a branch passes each of its successors' arguments: its trailing operands, in its successors'
+    order, as many each as its block takes (`cf.br`, `cf.cond_br`, `llvm.br`, `llvm.cond_br`)."""
+    counts = [len(successor.arguments) for successor in terminator.successors]
+    operands = list(terminator.operands)
+    passed = operands[len(operands) - sum(counts):]
+    edges, start = [], 0
+    for count in counts:
+        edges.append(passed[start:start + count])
+        start += count
+    return edges
+
+
+DYNAMIC_INDEX = -2**31
+"""`llvm.getelementptr`'s `rawConstantIndices` entry for an index an operand gives."""
+
+
+def _gep_index(operation: ir.Operation) -> int | None:
+    """A one-index `llvm.getelementptr`'s index: its constant, or its operand's where constants make it
+    (`_value`); None for another or for a run's value."""
+    raw = list(ir.DenseI32ArrayAttr(operation.attributes["rawConstantIndices"]))
+    if len(raw) != 1:
+        return None
+    return _value(operation.operands[1], None) if raw[0] == DYNAMIC_INDEX else raw[0]
+
+
+def _aliases(one: tuple, other: tuple) -> bool:
+    """Whether two barriers (`_barrier`) may be one: an array both may be of, and one slot unless constants
+    give each another."""
+    return bool(one[0] & other[0]) and (one[1] is None or other[1] is None or one[1] == other[1])

@@ -756,6 +756,24 @@ def test_a_products_launch_decided_outside_a_draw_reports_no_route_within_one():
     assert not drawn, drawn
 
 
+def test_a_products_held_launch_decision_records_the_facts_it_read_wherever_it_is_taken():
+    """A product's launch decided once (`projections.launches`, on an assumed H100) records the facts its
+    decision read (`generation.traced_fact`: the CUTLASS build its candidates ask after) into a recording
+    around a later call that takes the held decision, as one around its making did: a trace kept by them is
+    held where each answers as it did (`generation.held_trace`, row 12134)."""
+    from dew.nn.kernels import projections
+    from dew.nn.kernels.generation import assumed, recording
+
+    rows, matrix = (jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((96, 128), (128, 384)))
+    with assumed("sm90"):
+        with recording() as made:
+            projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
+        with recording() as taken:
+            projections.launches(rows, matrix, jnp.bfloat16, None, whole=True)
+    assert made, "the decision reads no fact, so its held one's replaying none says nothing"
+    assert taken.keys() == made.keys()
+
+
 def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
     """Each Mosaic GPU call a thunk names has its binary (`assembled.thunk_kernels`): two calls and two kernel
     protos read as two kernels, their registers and frames their cubins'; two calls and one is refused, as a
@@ -1091,45 +1109,27 @@ def test_two_kernels_of_one_launch_are_two_names_each_certified_on_its_own():
 
 @CERTIFIES_AT_RUN
 @lowers("sm90")
-def test_a_launch_traced_under_a_compile_only_gpus_mesh_is_certified_on_that_gpu():
+@pytest.mark.parametrize("placed", ["its mesh", "its run's target"])
+def test_a_launch_is_certified_on_the_compile_only_gpu_its_trace_is_placed_on(placed):
     """A launch traced under a compile-only H100's mesh (`jax.set_mesh`, as a trainer traces its step's
-    programs), no device named to certify on, is certified on that mesh's GPU (`report.certified`), the one a
-    start's compile ahead certifies it on: one certification of the launch, wherever the process runs. Where
-    a host's own GPU of the generation certified it instead, a start compiling ahead on that host certified
-    each launch traced outside its certifying block twice, apart (row 6791: the GH200's recurrent step
+    programs) or outside it in a run targeting that mesh (`report.targeting`: its start's,
+    `Trainer._started`), no device named to certify on, is certified once, on that mesh's GPU
+    (`report.certified`), the one a start's compile ahead certifies it on, wherever the process runs. Where a
+    host's own GPU of the generation certified it instead, a start compiling ahead on that host certified each
+    launch traced outside its certifying block twice, apart (rows 6791, 6824: the GH200's recurrent step
     certified 5 of its 28 programs twice), and a host of no GPU certified none of them."""
-    class Meshed(TwoKernels):
-        """`TwoKernels`, a launch of its own: certified here, whatever this process certified before (row
-        10853: run after the file's other tests, `TwoKernels` was certified already and this saw none)."""
-
-    op = Meshed()
+    # `TwoKernels`, a launch of its own each placement, by its name: certified here, whatever this process
+    # certified before, the other placement's case among it (row 10853: run after the file's other tests,
+    # `TwoKernels` was certified already and this saw none; Train 1216: both placements in one process).
+    op = type(f"Placed{'OnMesh' if placed == 'its mesh' else 'ByTarget'}", (TwoKernels,), {})()
     devices, lowered = _paired_step(op)
     before = {id(each) for each in report.certifications()}
-    with generation.assumed("sm90"), jax.set_mesh(devices):
+    placing = jax.set_mesh(devices) if placed == "its mesh" else report.targeting(devices)
+    with generation.assumed("sm90"), placing:
         lowered()
     [certified] = [each for each in report.certifications()
                    if id(each) not in before and each.op == type(op).__name__]
-    assert certified.kernels, certified
-
-
-@CERTIFIES_AT_RUN
-@lowers("sm90")
-def test_a_runs_launch_traced_outside_its_mesh_is_certified_on_the_gpu_it_targets():
-    """A launch a run traces outside its mesh (its start's, `Trainer._started`) is certified on the GPU the
-    run targets (`report.targeting`, a compile-only H100's mesh) and on no other, on any host. Certified on
-    a host's own GPU, a GH200's start compiling ahead for an H100 certified five launches twice, apart, its
-    step's trace again on the mesh's (row 6824)."""
-    class Targeted(TwoKernels):
-        """`TwoKernels`, a launch of its own: certified here, whatever this process certified before."""
-
-    op = Targeted()
-    devices, lowered = _paired_step(op)
-    before = {id(each) for each in report.certifications()}
-    with generation.assumed("sm90"), report.targeting(devices):
-        lowered()
-    [certified] = [each for each in report.certifications()
-                   if id(each) not in before and each.op == type(op).__name__]
-    assert certified.device == devices.devices.flat[0], certified.device
+    assert certified.kernels and certified.device == devices.devices.flat[0], certified
 
 
 def test_a_launch_outside_any_mesh_is_certified_on_its_own_processs_device(tmp_path):

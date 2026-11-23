@@ -15,6 +15,7 @@ and inputs (check 1, tests/reference_error.py); a per-head scalar decay in
 place of the per-dimension one moves the layer by 1.06.
 """
 
+import dataclasses
 from functools import partial
 
 import jax
@@ -351,6 +352,68 @@ def test_a_decode_token_on_the_fused_step_is_the_layers_own():
 
     delta_decode_matrix.on_par(('sm90', 'kimi delta attention', 'fused', 'float32'))
 
+
+
+@pytest.mark.check1_shards(seeds=40, per_task=8)
+def test_an_unbounded_steep_decay_keeps_the_mild_pairs_after_it_interpreted():
+    """Kimi delta attention without a decay bound (`KimiDeltaAttention(lower_bound=None)`, Kimi Linear's
+    config) in bf16 on the recurrence template under the run's fast forms, interpreted, a key dimension's log
+    decay of -2^26 at a token and mild ones (about -1) after it: its output, final memory and every operand's
+    gradient, the steep token's log decay's among them (the clamp's, zero), on par from float64 (check 1)
+    with fla's on the same draw, its steep decay -200 (as zero a decay in fp32 and in float64; at -2^26
+    fla's one fp32 cumulative sum rounds the mild decays after it away). Its prefix is its rounded sum
+    alone, its decays clamped where every pair across a token decays to zero (`mainloop.LOG2_DECAY_FLOOR`).
+    Unclamped, the rounded prefix put -2^26 and a later -1 at one fp32 value, that pair's decay one where it
+    is exp(-1) (row 12067). An fp32 call keeps the compensated pair (`mainloop.prefix_limbs`), whose fast
+    forms' reference is recorded fla-core (`fla_sites`): fla's port interpreted holds IEEE fp32, 50 to 85
+    times tighter than either's TF32 (jsf-kdaplus3)."""
+    from test_recurrence_chunk import chunk_on, formed, token_by_token
+
+    from dew.nn.kernels import recurrence
+    from dew.nn.kernels.recurrence_chunk import Chunk
+
+    width, length = 16, 80
+    hooks = recurrence.Hooks(decay='vector', scale=width ** -0.5, write_bound=1.0, unit_queries=True)
+
+    def draw(seed):
+        rng = np.random.default_rng([12067, seed])
+        g = -rng.uniform(0.5, 1.5, (1, length, 1, width))
+        # The steep token inside a chunk, mild tokens after it in the same chunk and the next.
+        g[0, int(rng.integers(2, 48))] = -2.0 ** 26
+        shape = (1, length, 1, width)
+        query, key = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in rng.normal(size=(2, *shape)))
+        query, key, value = (np.asarray(x, jnp.bfloat16) for x in (query, key, rng.normal(size=shape)))
+        gate = np.asarray(1 / (1 + np.exp(-rng.normal(size=(1, length, 1)))), jnp.bfloat16)
+        operands = Chunk(query, key, value, state=np.zeros((1, 1, width, width), np.float32),
+                         log_decay=np.asarray(g, np.float32), beta=gate)
+        return operands, (np.asarray(rng.normal(size=shape), jnp.bfloat16),
+                          np.asarray(rng.normal(size=(1, 1, width, width)), np.float32))
+
+    def floored(operands):
+        return dataclasses.replace(operands, log_decay=jnp.maximum(operands.log_decay, -200.0))
+
+    mosaic = formed('fast', partial(chunk_on, 'mosaic_gpu', hooks))
+    fla = partial(chunk_on, 'fla', hooks)
+    label = "kimi delta attention's unbounded steep then mild decays"
+    assert_as_exact(jax.jit(with_gradients(mosaic)), jax.jit(with_gradients(lambda o: fla(floored(o)))), draw,
+                    label, seeds=8, truth_fn=jax.jit(with_gradients(partial(token_by_token, hooks))))
+
+
+def test_the_decay_clamps_derivative_is_its_forwards_at_and_around_the_fp32_floor():
+    """The template's log decay clamp (`mainloop.clamped`) and the derivative its backward applies
+    (`mainloop.clamped_gradient`) at fp32 values about its floor: the derivative is the forward's
+    (`jax.grad` of the clamp) at every one, the floor's among them (a decay there kept, its gradient passed),
+    and zero below, where the clamp moves the decay (row 12104)."""
+    from dew.nn.kernels.templates.recurrence import mainloop
+
+    floor = np.float32(mainloop.DECAY_FLOOR)
+    below, above = np.nextafter(floor, np.float32(-np.inf)), np.nextafter(floor, np.float32(0))
+    points = jnp.asarray([2 * floor, below, floor, above, floor / 2], jnp.float32)
+    assert np.array_equal(mainloop.clamped(points), jnp.maximum(points, floor))
+    passed = np.asarray(mainloop.clamped_gradient(points, jnp.ones_like(points)))
+    assert np.array_equal(passed, [0.0, 0.0, 1.0, 1.0, 1.0]), passed
+    for at, point in enumerate(points):
+        assert passed[at] == jax.grad(mainloop.clamped)(point), (point, passed[at])
 
 
 def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():

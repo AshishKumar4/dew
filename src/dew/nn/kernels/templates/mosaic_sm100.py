@@ -30,7 +30,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import (
     handoffs,
     mosaic,
@@ -1157,6 +1157,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
     def taken(self, shape: tuple[int, int], buffer) -> jax.Array:
         tmems, done = self._ahead(shape[1], buffer)
         plgpu.barrier_wait(done)
+        # Every warp past the wait before the next product ahead commits to it (`_waited`).
+        mosaic.synced(bool(launches.interpreting()))
         found = lax.switch(buffer, [functools.partial(_read, tmem) for tmem in tmems])
         return found if shape[1] >= PADDED else found[:, :shape[1]]
 
@@ -1295,6 +1297,9 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
                              "operand's, a value added into it, a sum read or settled): one wait for all")
         plgpu.tcgen05_commit_arrive(done)
         plgpu.barrier_wait(done)
+        # Every warp past the wait before any commits to the barrier again: a warp lagging at this phase
+        # would meet the next one completed too and wait forever (row 5671's wedge, row 5753's check).
+        mosaic.synced(bool(launches.interpreting()))
 
     def _summed(self, shape: tuple[int, int], issue, carried: jax.Array | None = None) -> jax.Array:
         """`summed`'s products issued into the building role's fresh accumulator and read, onto the sum a walk

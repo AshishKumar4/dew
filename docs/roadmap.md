@@ -36,7 +36,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5327]
 - Block-selected attention's other selections as mixers. [6301]
 - CuDNN's response to a non-finite K or V at a key a query does not see is unknown. [7190]
-- A certification verdict's key names the ptxas that assembled it by the installed nvcc wheels alone. [7309]
 - The GEMM's quantizing epilogue, algebra.md §7.3 and §7.4's encode consumer. [8547]
 - FP8 weights on sm80 decoded in the GEMM's mainloop, algebra.md §7.3 and §7.4. [8548]
 - Jax fork, Pallas Mosaic GPU lowering cache. [8721]
@@ -64,6 +63,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - Owner-approved Audit 4 API cleanup. [11933]
 - Owner-approved Audit 4 API cleanup. [11934]
 - Owner-approved Audit 4 API cleanup. [11935]
+- CI time: every test within 120 seconds. [12128]
+- A checkpoint taken after a fit's ladder climbed to recompute its layers (its model record's `remat` set by the climb) is refused on resume as 'trained another…. [12135]
+- Stage-local runs keep every layer whole on a stacked leaf whose optimizer update loops over the stack. [12266]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -90,6 +92,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 705, 5234, 5235]
 - Owner-approved (2026-11-22): retire the last two `Algebra()`-tagged custom VJPs in `src/dew/nn/ngpt.py:91` (`join`) and `src/dew/nn/ngpt.py:160`…. [11940]
+- Src/dew/algebra/program.py:823-827 (_within) rewrites a sub-jaxpr inside an equation by equation.replace(params=params) and recomputes neither equation.effects…. [12217]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
@@ -105,8 +108,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## CI and tooling
 
+- The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404, 12273]
 - Dew's CI, test cache and compile-ahead tests. [5491, 5670]
 - The perf gate's regressions since 11-07: compile time, the 4B step's stall, a DiT's peak. [10138]
-- The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
 - Tools that import their siblings by putting tools/ on sys.path at import time. [11756]

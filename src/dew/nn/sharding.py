@@ -733,9 +733,14 @@ def rows_like(x: jax.Array, like: jax.Array) -> jax.Array:
 
 
 def varying(*operands) -> frozenset[str]:
-    """The manual axes (a checked `shard_map`'s) any array among `operands` (trees; None for none) varies
-    over: what a value computed from them varies over, as JAX types an operation's result."""
-    return frozenset().union(*(jax.typeof(leaf).mat.varying for leaf in jax.tree.leaves(operands)))
+    """The manual axes (a checked `shard_map`'s) any array among `operands` (trees; None for none; an
+    abstract value, its own) varies over: what a value computed from them varies over, as JAX types an
+    operation's result. The one owner of that union: a launch's results (`computed_from`), operands made
+    to vary alike (`varied_alike`) and the algebra's primitives' result types (`dew.algebra.scaled.varying`)
+    read it (rows 10531, 10571)."""
+    typed = (leaf if isinstance(leaf, jax_core.ShapedArray) else jax.typeof(leaf)
+             for leaf in jax.tree.leaves(operands))
+    return frozenset().union(*(each.mat.varying for each in typed))
 
 
 def varying_like(x: jax.Array, *operands) -> jax.Array:
@@ -743,6 +748,22 @@ def varying_like(x: jax.Array, *operands) -> jax.Array:
     so keeps its type through steps that read them, as a step's output varies wherever an input does."""
     missing = tuple(sorted(varying(*operands) - jax.typeof(x).mat.varying))
     return jax.lax.pcast(x, missing, to="varying") if missing else x
+
+
+def varied_alike(operands: Sequence) -> list:
+    """`operands` (None where a call has none, kept) each varying over every manual axis any of them varies
+    over (their union read once, `varying`), each cast where it misses an axis alone, as JAX's own operations
+    make theirs before they compute: a kernel's or a primitive's computation then reads operands that vary
+    alike (a launch's, `norm_swiglu`; the algebra's primitives, `dew.algebra.scaled`; a chunked delta rule's
+    contraction, `dew.algebra.scan`), where a quotient of a replicated value by each device's own was refused
+    as it lowered (row 12152)."""
+    axes = varying(*operands)
+
+    def alike(operand):
+        missing = tuple(sorted(axes - jax.typeof(operand).mat.varying))
+        return jax.lax.pcast(operand, missing, to="varying") if missing else operand
+
+    return [None if operand is None else alike(operand) for operand in operands]
 
 
 def excess_axes(value: jax.Array, of: jax.Array) -> tuple[str, ...]:
@@ -773,10 +794,10 @@ def checked() -> bool:
 
 def computed_from(struct: jax.ShapeDtypeStruct, *operands) -> jax.ShapeDtypeStruct:
     """`struct` typed as a value each device computes from its own `operands` is where values are typed
-    by their manual axes (`checked`): varying over every one any of them varies over (`varying`), unless it
-    states its own (`manual_axis_type`); `struct` itself elsewhere. A launch's results (row 9808: a
-    kernel's result typed the same on every device, beside a bias each device reads its own of)."""
-    if not checked() or struct.manual_axis_type is not None:
+    by their manual axes (`checked`): varying over every one any of them varies over (`varying`); `struct`
+    itself elsewhere. A launch's results (row 9808: a kernel's result typed the same on every device, beside
+    a bias each device reads its own of), its typing the launch's alone (row 10527)."""
+    if not checked():
         return struct
     return jax.ShapeDtypeStruct(struct.shape, struct.dtype, sharding=jax_core.get_cur_mesh_sharding(),
                                 manual_axis_type=jax.sharding.ManualAxisType(varying=varying(*operands)))

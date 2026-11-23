@@ -145,6 +145,39 @@ def compensated_columns(pairs, running) -> None:
     plgpu.inline_mgpu(arg_types=(plgpu.RefType(),) * 2, return_type=())(body)(pairs, running)
 
 
+def suffix_columns(terms) -> None:
+    """Each column of `terms`, a plain fp32 shared tile `(rows + 1, columns)`, its rows' terms and then its
+    starting sum, replaced row by row by its suffix sum, row `r` the start plus rows `r` to the last
+    (`algebra.suffix_summed`'s arithmetic: each term joined to a running compensated pair,
+    `precision.renormalized_sum`, its rounded sum stored), a column a thread of the first `columns` (at most
+    `THREADS`), its loads and stores its own words, and the warpgroup met once when done. Additions alone, so
+    no multiply contracts into them."""
+    rows, columns = (terms.shape[0] - 1), terms.shape[1]
+    assert columns <= THREADS, "a column a thread"
+    # Each term read and its sum written, the start's word read, and each compensated add's fourteen
+    # additions (`compensated_columns`').
+    body = emission.stating(lambda ref: Work(operations=14 * rows * columns,
+                                             shared_bytes=4 * (2 * rows + 1) * columns))(
+        lambda ctx, ref: _suffix_columns(ref))
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(body)(terms)
+
+
+def _suffix_columns(ref) -> None:
+    """`suffix_columns` in Mosaic GPU's terms."""
+    index, i32, f32 = ir.IndexType.get(), ir.IntegerType.get_signless(32), ir.F32Type.get()
+    rows, columns = (dim - extra for dim, extra in zip(ir.MemRefType(ref.type).shape, (1, 0), strict=True))
+    thread = arith.remui(utils.thread_idx(), arith.constant(i32, THREADS))
+    column = arith.index_cast(index, thread)
+    zero = native.Word(arith.constant(f32, 0.0))
+    with utils.when(arith.cmpi(arith.CmpIPredicate.ult, thread, arith.constant(i32, columns))):
+        pair = (native.Word(memref.load(ref, [arith.constant(index, rows), column])), zero)
+        for row in reversed(range(rows)):
+            at = [arith.constant(index, row), column]
+            pair = precision.renormalized_sum(pair, (native.Word(memref.load(ref, at)), zero))
+            memref.store(pair[0].value, ref, at)
+    utils.warpgroup_barrier()
+
+
 def zeroed_columns(running) -> None:
     """Each column's running pair in `running`, a plain fp32 shared tile `(2, THREADS)`, set to zero, a column
     a thread in its own words (`compensated_columns`' starting pairs), the warpgroup met once when done."""

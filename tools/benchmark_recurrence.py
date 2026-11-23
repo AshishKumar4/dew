@@ -267,16 +267,24 @@ def _lightning_parts(shape: Shape, given: dict) -> tuple:
     return inputs, template, {}, {}, (given['do'].astype(jnp.bfloat16), given['dfinal'])
 
 
+def gated_hooks(shape: Shape):
+    """A gated delta rule's or KDA's shape's hooks: the draws' sigmoid write gates of unit keys and queries
+    (`recurrence.Hooks.write_bound`, `unit_queries`), as layers declare, so an arm runs the own pairs folded
+    as Kimi Linear's layer runs them (`recurrence_chunk._unit_pairs`); this and
+    tools/benchmark_recurrence_mosaic.py's arms alike (row 12214)."""
+    from dew.nn.kernels import recurrence
+
+    return recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
+                            scale=shape.key_width ** -0.5, write_bound=1.0, unit_queries=True)
+
+
 def _gated_parts(shape: Shape, given: dict) -> tuple:
-    """A gated delta rule's or KDA's shape's (`_ssd_parts`'s): the draws' sigmoid write gates of unit keys
-    (`recurrence.Hooks.write_bound`), as layers declare."""
+    """A gated delta rule's or KDA's shape's (`_ssd_parts`'s), under its layer's hooks (`gated_hooks`)."""
     import jax.numpy as jnp
 
-    from dew.nn.kernels import recurrence
     from dew.nn.kernels.recurrence_chunk import Chunk, chunk, fla_rule
 
-    hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                             scale=shape.key_width ** -0.5, write_bound=1.0)
+    hooks = gated_hooks(shape)
     inputs = (*(given[key].astype(jnp.bfloat16) for key in ('q', 'k', 'v')), given['g'],
               given['beta'].astype(jnp.bfloat16))
 

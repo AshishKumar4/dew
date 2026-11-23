@@ -1230,6 +1230,7 @@ class DecoderBlock(nn.Module):
         input norm where it pre-norms its attention, else as they are."""
         return self.input_layernorm(read) if self.wiring.pre_norms and self.attention_norm else read
 
+    @nn.nowrap
     def _joined(self, state: _BlockState) -> tuple[SeamNorm, _Plain] | None:
         """The MLP's pre-norm and the plain stream, where that norm adds the
         attention branch to the stream itself (`_stream_normed`): no other

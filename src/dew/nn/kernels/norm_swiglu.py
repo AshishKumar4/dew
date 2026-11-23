@@ -95,7 +95,15 @@ from ..precision import (
     two_product,
     uncontracted,
 )
-from ..sharding import automatic_axes, excess_axes, manual_map, on_shards, summed_to, varying_like
+from ..sharding import (
+    automatic_axes,
+    excess_axes,
+    explicit_spec,
+    manual_map,
+    on_shards,
+    summed_to,
+    varied_alike,
+)
 from . import generation, tuning
 from .generation import INHERENT, Choice, device_generation
 from .selection import Kernel, Op, Requirement, select
@@ -419,7 +427,7 @@ def _placed(axes, operands, *, whole_last: bool) -> bool:
     `whole_last` leave its last axis whole, or every axis splitting it is
     explicit, its type its placement (`_shard_spec`). In a `shard_map` checking varying
     axes, each shard its own, the launch states its outputs' varying type
-    (`_varying`) where a GPU compiles it; Pallas's interpreter evaluates the
+    (`sharding.varied_alike`) where a GPU compiles it; Pallas's interpreter evaluates the
     kernel's body on the shards' varying values, whose gathers by unvarying
     indices JAX refuses, so an interpreted call runs XLA's arithmetic there."""
     if not generation.triton_runs() and any(
@@ -442,6 +450,29 @@ def _shard_spec(axes, first) -> jax.sharding.PartitionSpec | None:
            for name in automatic_axes()):
         return None
     return jax.typeof(first).sharding.spec
+
+
+def _packed_specs(axes, gate_up) -> tuple[jax.sharding.PartitionSpec, jax.sharding.PartitionSpec] | None:
+    """`(in_spec, out_spec)` for `packed_swiglu` (`[..., 2, H]` -> `[..., H]`) on a split mesh from logical
+    `axes` or from `gate_up`'s explicit sharding, or None if unplaced or the pair axis `-2` is split
+    (row 822)."""
+    placed = explicit_spec(gate_up)
+    if placed is not None:
+        padded = (*placed.spec, *(None,) * (gate_up.ndim - len(placed.spec)))
+        if padded[-2] is not None:
+            return None
+    in_spec = _shard_spec(None, gate_up)
+    if in_spec is None:
+        if axes is None:
+            return None
+        shape = gate_up.shape[:-2] + gate_up.shape[-1:]
+        out_spec = logical_spec(axes, shape)
+        entries = (*out_spec, *(None,) * (len(shape) - len(out_spec)))
+        return jax.sharding.PartitionSpec(*entries[:-1], None, entries[-1]), out_spec
+    entries = (*in_spec, *(None,) * (gate_up.ndim - len(in_spec)))
+    if entries[-2] is not None:
+        return None
+    return in_spec, jax.sharding.PartitionSpec(*entries[:-2], entries[-1])
 
 
 def _per_shard(local, axes, operands, replicated):
@@ -674,10 +705,12 @@ def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
     """Resolve the SiLU product of one packed projection's `[..., 2, H]` output (`packed_swiglu`),
     through the SwiGLU selector (`SWIGLU`), whose kernel reads the halves where the projection wrote them.
     `axes` are the product's logical axes, `[..., H]`'s."""
+    varying_blocked = not generation.triton_runs() and bool(jax.typeof(gate_up).mat.varying)
+    placed = (not varying_blocked
+              and (not automatic_axes() or (gate_up.ndim >= 2 and _packed_specs(axes, gate_up) is not None)))
     case = SwigluCase(dtypes=(jnp.dtype(gate_up.dtype),), promotes=jnp.dtype(gate_up.dtype),
                       shape_fits=gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,
-                      placed=_placed(None if axes is None else (*axes[:-1], None, axes[-1]), (gate_up,),
-                                     whole_last=False))
+                      placed=placed)
     return _selected(SWIGLU, case, implementation)
 
 
@@ -960,15 +993,6 @@ def _scale_sum(partial, correction):
     return summed_total((partial, correction), (0,))
 
 
-def _varying(operands: tuple) -> tuple:
-    """`operands` (None where a call has none) each varying over every manual axis any varies over
-    (`sharding.varying_like`): `launches.pallas_call` then types every declared output from them."""
-    present = [operand for operand in operands if operand is not None]
-    if not any(jax.typeof(operand).mat.varying for operand in present):
-        return operands
-    return tuple(None if operand is None else varying_like(operand, *present) for operand in operands)
-
-
 class _Sized(NamedTuple):
     """An output axis derived from `operands[operand]`'s `axis` at static size `size` (`Dim.sized`)."""
     operand: int
@@ -1003,12 +1027,12 @@ def _realize_output(operands: tuple, spec):
 def _typed(backward, parameters: int = 0):
     """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type and
     dtype: summed over each manual axis it varies over and its operand does not (a weight replicated in a
-    checked `shard_map`, whose shards' partial gradients its varying cast's transpose sums: `_varying`),
-    then rounded to the operand's dtype (summed widened over the shards); the inputs' cotangents returned
-    only with the last `parameters` operands' gradients formed (a norm's weight,
-    `derivatives.with_gradients_formed`), each as its device forms it: a gradient no shards sum rounded to
-    its stored dtype, a per-shard partial before its sum, so an input's cotangent waits on no cross-device
-    sum, as a projection's per-shard reverse mode ties its own."""
+    checked `shard_map`, whose shards' partial gradients its varying cast's transpose sums:
+    `sharding.varied_alike`), then rounded to the operand's dtype (summed widened over the shards); the
+    inputs' cotangents returned only with the last `parameters` operands' gradients formed (a norm's weight,
+    `derivatives.with_gradients_formed`), each as its device forms it: a gradient no shards sum rounded to its
+    stored dtype, a per-shard partial before its sum, so an input's cotangent waits on no cross-device sum, as
+    a projection's per-shard reverse mode ties its own."""
     def typed(saved, operands, cotangents):
         gradients = backward(saved, operands, cotangents)
         local = tuple(gradient if gradient is None or operand is None or excess_axes(gradient, operand)
@@ -1051,7 +1075,7 @@ def _launched(*operands, kernel, name: str, outputs, grid: tuple[int, ...], warp
     warps and arithmetic static. In a `shard_map` checking varying axes, its operands are made varying over
     every axis any of them varies over and its outputs vary over them too, as an elementwise primitive's do
     (row 822)."""
-    operands = _varying(operands)
+    operands = tuple(varied_alike(operands))
     out_shape = _realize_output(operands, outputs)
     return launches.pallas_call(
         functools.partial(kernel, interpret=interpret, **dict(arithmetic)), grid=grid, out_shape=out_shape,
@@ -1492,10 +1516,9 @@ def packed_swiglu(gate_up, portable, *, axes=None):
 
     if not automatic_axes():
         return local(gate_up)
-    if axes is None:
-        raise ValueError("a mesh splits the packed SwiGLU's operands, and it places them by their logical "
-                         "axes, which the call does not name")
-    shape = gate_up.shape[:-2] + gate_up.shape[-1:]
-    spec = logical_spec(axes, shape)
-    entries = (*spec, *(None,) * (len(shape) - len(spec)))
-    return manual_map(local, (jax.sharding.PartitionSpec(*entries[:-1], None, entries[-1]),), spec)(gate_up)
+    specs = _packed_specs(axes, gate_up)
+    if specs is None:
+        raise ValueError("a mesh splits the packed SwiGLU's operands without named logical axes or an "
+                         "explicit placement leaving the pair axis whole")
+    in_spec, out_spec = specs
+    return manual_map(local, (in_spec,), out_spec)(gate_up)

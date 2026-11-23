@@ -64,3 +64,18 @@ def test_a_held_trace_made_again_past_its_bound_records_its_facts_afresh():
     assert first and [(fact, answer) for fact, (_, answer) in first.items()] == [
         (fact, answer) for fact, (_, answer) in again.items()] == [
         (fact, answer) for fact, (_, answer) in held.items()]
+
+
+def test_a_refusal_scopes_lookup_leaves_a_held_traces_key_as_it_was():
+    """Within a refusal scope (`report.refusals`), a lookup of a launch's refusals (`report.refusals_of`,
+    which fills the scope's index of them) leaves the key a held trace is kept by (`options.held_context`)
+    as it was: the scope's registry enters it by its refusals alone (`report.refusal_entries`, read under
+    its lock), not by its mutable records, where a first probe made its own key stale and a compile worker
+    filling it raced the key's walk of its dicts (row 12134's review)."""
+    from dew.nn.kernels import options
+    from dew.nn.kernels.templates import report
+
+    with report.refusals():
+        before = options.held_context()
+        report.refusals_of("a launch no compile refused")
+        assert options.held_context() == before
