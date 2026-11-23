@@ -1,6 +1,6 @@
 """The attention template as a production route (`dew.nn.attention`'s `implementation='template'`): `attend`,
-the template's forward and backward under one `jax.custom_vjp`, on the mainloops the process's calls run
-on.
+the template's forward and backward differentiated at every order (`generation.linear_tangent`), on the
+mainloops the process's calls run on.
 
 On a GPU the process places calls on, of sm80 or later (`generation.bf16_dot_runs`), the forward and the
 backward run on the Mosaic template, Mosaic GPU's mainloop, where it runs the call on the device
@@ -15,12 +15,14 @@ before it (`templates/attention.py`'s `gradients`). """
 
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import Literal, overload
 
 import jax
 import jax.numpy as jnp
+from jax.custom_derivatives import zero_from_primal
 
-from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
+from dew.nn.derivatives import KernelGlue, contracted, with_gradients_formed
 from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
@@ -34,10 +36,14 @@ from dew.nn.kernels.templates.attention import (
     Param,
     Split,
     floating_params,
+    prescaled,
     prologued,
+    prologues_taken,
+    reference,
     shared_sum,
     takes_output_residuals,
 )
+from dew.nn.precision import configured_precision
 
 
 def _plain():
@@ -88,7 +94,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
     config = _Config(scale, *run_forms(natural, accurate),
-                     None if operand_dtype is None else jnp.dtype(operand_dtype).name, in_key)
+                     None if operand_dtype is None else jnp.dtype(operand_dtype).name, in_key,
+                     jax.config.jax_default_matmul_precision)
     return _attend(config, query, key, value, spans, hooks)
 
 
@@ -112,6 +119,7 @@ class _Config:
     in_key: bool = False
     """Whether the values are the keys' leading columns (`attention_mosaic.MosaicForward.in_key`): the
     Mosaic forward reads them from the key's slot; every other mainloop takes the value array as given."""
+    precision: str | None = None
 
     def narrowed(self, query: jax.Array, key: jax.Array,
                  value: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -160,11 +168,11 @@ def _attending(config: _Config, query: jax.Array, key: jax.Array, value: jax.Arr
 
 
 def _attend_forward(config: _Config, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
-                    hooks: Hooks) -> tuple[jax.Array, tuple]:
+                    hooks: Hooks) -> tuple[jax.Array, Residuals]:
     """The forward of a differentiated call, which keeps the residuals its backward reads."""
     out, peak, total, anchors, split = _forward(*config.narrowed(query, key, value), spans, hooks, config,
                                                 residuals=True)
-    return out, (query, key, value, spans, hooks, (peak, total, anchors, split))
+    return out, (peak, total, anchors, split)
 
 
 @overload
@@ -301,11 +309,11 @@ def rounded(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     return _forward(query, key, value, spans, hooks, config, residuals=True)[0]
 
 
-def _attend_backward(config: _Config, saved: tuple, dout: jax.Array) -> tuple:
-    """The cotangents of the query, key, value and hooks, from the residuals, each in its primal's dtype;
-    the spans take none."""
-    query, key, value, spans, hooks, residuals = saved
-    grads = backward(*config.narrowed(query, key, value), spans, hooks, dout, residuals=residuals,
+def _attend_backward(config: _Config, saved: Residuals, operands: tuple, dout: jax.Array) -> tuple:
+    """The cotangents of the query, key, value, spans and hooks, from the residuals, each in its primal's
+    tangent dtype (`float0` along non-floating leaves)."""
+    query, key, value, spans, hooks = operands
+    grads = backward(*config.narrowed(query, key, value), spans, hooks, dout, residuals=saved,
                      scale=config.scale, natural=config.natural, accurate=config.accurate,
                      rounded=config.operand_dtype is None)
     # The mainloops' gradients are of the query and key under their prologues, which each takes where it
@@ -317,7 +325,7 @@ def _attend_backward(config: _Config, saved: tuple, dout: jax.Array) -> tuple:
     inputs, hooked = with_gradients_formed(
         (dquery.astype(query.dtype), dkey.astype(key.dtype), grads.value.astype(value.dtype)),
         _hooks_cotangent(hooks, grads, query_params, key_params))
-    return (*inputs, None, hooked)
+    return (*inputs, zero_from_primal(spans), hooked)
 
 
 def _pulled(operand: jax.Array, mod, params: tuple[Param, ...], cotangent: jax.Array
@@ -343,11 +351,43 @@ def _pulled(operand: jax.Array, mod, params: tuple[Param, ...], cotangent: jax.A
     return found[0], tuple(grads)
 
 
-_attend = contracted("test_a_fused_attention_kernel_holds_its_reverse_orders")(
-    declared_derivative(KernelGlue(), _attending, _attend_forward, _attend_backward,
-                        nondiff_argnums=(0,)))
-"""A template call, differentiated by its own backward: one declared derivative of a kernel's glue."""
+@functools.lru_cache(maxsize=64)
+def _route(config: _Config) -> Callable:
+    """A template call for `config`, differentiated at every order through `reference` while primal and
+    first-order reverse mode run the template's mainloops (`generation.linear_tangent`, row 2654)."""
+    def primal(query, key, value, spans, hooks):
+        with configured_precision(config.precision):
+            return _attending(config, query, key, value, spans, hooks)
 
+    def forward(query, key, value, spans, hooks):
+        with configured_precision(config.precision):
+            return _attend_forward(config, query, key, value, spans, hooks)
+
+    def backward_rule(saved, operands, dout):
+        with configured_precision(config.precision):
+            return _attend_backward(config, saved, operands, dout)
+
+    def portable(query, key, value, spans, hooks):
+        with configured_precision(config.precision):
+            nq, nk, nv = config.narrowed(query, key, value)
+            nq, nk, hooks = prologues_taken(nq, nk, hooks)
+            nq, scale, _ = prescaled(nq, config.scale)
+            wide = jnp.promote_types(nq.dtype, jnp.float32)
+            widened = tuple(
+                dataclasses.replace(p, value=p.value.astype(wide))
+                if jnp.issubdtype(p.value.dtype, jnp.floating) else p
+                for p in hooks.score_params)
+            return reference(nq, nk, nv, spans, dataclasses.replace(hooks, score_params=widened),
+                             scale=scale)
+
+    return contracted("test_a_fused_attention_kernel_holds_every_order")(
+        generation.linear_tangent(forward, backward_rule, portable, kind=KernelGlue(), primal=primal))
+
+
+def _attend(config: _Config, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+            hooks: Hooks) -> jax.Array:
+    """A template call, differentiated at every order (`_route`)."""
+    return _route(config)(query, key, value, spans, hooks)
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
              dout: jax.Array, *, residuals: Residuals, scale: float | None = None, natural: bool = NATURAL,
@@ -411,13 +451,17 @@ def _spread(hooks: Hooks, query: jax.Array) -> Hooks:
 def _hooks_cotangent(hooks: Hooks, grads: Gradients, query_params: tuple = (), key_params: tuple = ()
                      ) -> Hooks:
     """The cotangent of `hooks` in its own structure: each score and prologue parameter's gradient in its
-    `Param` (`_pulled`'s for the prologues'), and the initial state's where there is one. The callables are
-    static, and the output hook is refused."""
+    `Param` (`_pulled`'s for the prologues', `zero_from_primal` for non-floating params), the initial state's
+    where there is one, and `zero_from_primal` along non-differentiable fields (`drop`, `output_params`)."""
     def given(params: tuple[Param, ...], found) -> tuple[Param, ...]:
-        return tuple(dataclasses.replace(param, value=grad)
-                     for param, grad in zip(params, found, strict=True))
+        return tuple(
+            dataclasses.replace(param, value=grad if jnp.issubdtype(param.value.dtype, jnp.inexact)
+                                else zero_from_primal(param.value))
+            for param, grad in zip(params, found, strict=True))
 
     return Hooks(score_mod=hooks.score_mod, score_params=given(hooks.score_params, grads.score_params),
-                 initial=grads.initial, query_mod=hooks.query_mod,
+                 initial=grads.initial, output_mod=hooks.output_mod,
+                 output_params=zero_from_primal(hooks.output_params), drop=zero_from_primal(hooks.drop),
+                 rounds=hooks.rounds, query_mod=hooks.query_mod,
                  query_params=given(hooks.query_params, query_params), key_mod=hooks.key_mod,
                  key_params=given(hooks.key_params, key_params))

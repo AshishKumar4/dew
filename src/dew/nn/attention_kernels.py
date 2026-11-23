@@ -913,7 +913,7 @@ ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
     Kernel[AttentionCase]('tpu', TPU_SUPPORTS, reverse_only=True),
     XLA,
     Kernel[AttentionCase]('reference', (), generic=True),
-    Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS, reverse_only=True),
+    Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
     INFERENCE,
 ), _attention_preferred, _unlowered, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
@@ -968,7 +968,7 @@ DECODE = Op[AttentionCase](Choice.DECODE, (
     Kernel[AttentionCase]('cudnn', (*CUDNN_SUPPORTS, decode_attention.PRODUCTS), reverse_only=True),
     DECODE_XLA,
     Kernel[AttentionCase]('reference', (), generic=True),
-    Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS), reverse_only=True),
+    Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS)),
 ), _decode_preferred, _unlowered, DECODE_DECLARED)
 """The selector of a call of few query positions over key lengths (`decodes`): the decode kernel
 (`decode_attention.attend`), cuDNN and the folded xla attention (`folded_attention`), a declared cell's

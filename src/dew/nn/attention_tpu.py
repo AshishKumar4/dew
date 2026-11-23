@@ -13,7 +13,7 @@ from .attention_masks import repeat_kv_heads, structural_mask
 from .attention_parallel import four_dimensional, on_attention_shards, shard_heads
 from .documents import document_ids
 from .kernels.templates import attention as template
-from .precision import at_precision
+from .precision import asks_default_precision, at_precision
 from .sharding import SCORES
 from .visibility import window_sides
 
@@ -77,12 +77,14 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
                           mask=(held, SCORES), sinks=(sinks, ("activation_heads",)),
                           segment_ids=(segment_ids, ("activation_batch", None)))
 
-    if jnp.finfo(query.dtype).bits == 16 and not interpret:
-        # Mosaic multiplies 16-bit operands at the default precision only.
-        # Their products are exact and accumulate in fp32; splash's fp32 P·V
-        # takes one bf16 pass, as at any default-precision run
-        # (`at_precision`).
-        return at_precision('default', parameters=(3, 4))(attend)(query, key, value, bias, sinks)
+    if descriptor is None:
+        # Mosaic multiplies 16-bit operands at the default precision only; Splash holds its precision inside
+        # its own `linear_tangent` rules (row 2654), while the reverse-only Flash fallback wraps here.
+        if jnp.finfo(query.dtype).bits == 16 and not interpret:
+            return at_precision('default', parameters=(3, 4))(attend)(query, key, value, bias, sinks)
+        configured = jax.config.jax_default_matmul_precision
+        if configured is not None and not asks_default_precision(configured):
+            return at_precision(configured, parameters=(3, 4))(attend)(query, key, value, bias, sinks)
     return attend(query, key, value, bias, sinks)
 
 

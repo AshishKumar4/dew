@@ -1284,6 +1284,14 @@ def configured_precision(precision: jax.lax.PrecisionLike):
     return contextlib.nullcontext() if name in (None, 'default') else jax.default_matmul_precision(name)
 
 
+def exactly_at(precision: jax.lax.PrecisionLike):
+    """A context in which a product that takes no precision of its own multiplies at exactly `precision`,
+    `'default'` included (overriding an outer `'highest'`), through `jax.default_matmul_precision`; an unset
+    precision changes nothing. A precision no config names (`configurable_precision`) is refused."""
+    name = _configured_name(precision)
+    return contextlib.nullcontext() if name is None else jax.default_matmul_precision(name)
+
+
 def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = None) -> jax.lax.PrecisionLike:
     """The precision a product of `dtype` operands takes: the one stated, JAX's configured one where
     none is, and for bf16 operands at the default precision the algorithm that keeps a bf16 dot bf16

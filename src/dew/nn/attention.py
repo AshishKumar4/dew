@@ -1254,7 +1254,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     # and JAX's own products by the forward's scope alone, which their tangents and transposes keep, so
     # forward mode differentiates them as written. A stated default is a floor the run's configured
     # precision meets, and a kernel that states its own keeps it.
-    if reverse_only(implementation) and not asks_default_precision(precision):
+    if reverse_only(implementation) and implementation != 'tpu' and not asks_default_precision(precision):
         return at_precision(precision, parameters=(3, 4))(fused)(query, key, value, bias, sinks)
     with configured_precision(precision):
         return fused(query, key, value, bias, sinks)

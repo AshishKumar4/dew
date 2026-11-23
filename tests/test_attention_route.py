@@ -21,7 +21,7 @@ import pytest
 from attention_oracle import attention_terms, kept, traced_attention_terms
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec
-from reference_error import assert_as_exact, with_gradients
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 from sharded import MOVES, assert_runs_per_shard
 from test_attention_template import (
     DTYPES,
@@ -1351,3 +1351,96 @@ def test_backward_route_declines_and_runs_with_its_rounded_flag():
         grads = attention_route.backward(q, q, q, spans, template.Hooks(), q, residuals=residuals,
                                          rounded=False, interpret=True)
     assert grads.key.dtype == jnp.float32 and grads.value.dtype == jnp.float32
+
+
+def test_bare_attention_route_supports_jvp_and_higher_order_with_hooks():
+    """Row 2654: bare `attention_route.attend` supports `jax.jvp`, `jax.jvp(jax.grad(...))`, and
+    `jax.grad(jax.grad(...))` without `forward_mode_attention()`, including `score_mod` (with both floating
+    and integer `score_params`), `sinks`, `dropout`, and `query_mod` prologues."""
+    from dew.nn.kernels.templates import attention_route
+
+    b, q_len, k_len, h, d = 2, 16, 16, 4, 16
+    pos_i = jnp.arange(q_len, dtype=jnp.int32)[None, None, :]
+    spans = template.spans(q_len, k_len, b, causal=True)
+    drop = template.Dropout(jnp.array([11, 22], jnp.uint32), jnp.arange(b, dtype=jnp.int32),
+                            jnp.arange(h, dtype=jnp.int32), 0.1)
+
+    def score_mod(s, _qp, _kp, b_p, p_i):
+        return s + b_p + (p_i > 0).astype(s.dtype) * 0.05
+
+    def q_mod(x, _qp, s_h):
+        return x * s_h
+
+    def make_hooks(b_p, s_v, qs):
+        return template.Hooks(
+            score_mod=score_mod,
+            score_params=(template.Param(b_p, template.Kind.TILE),
+                          template.Param(pos_i, template.Kind.QUERY)),
+            initial=template.sinks(s_v, b, q_len, d),
+            drop=drop,
+            query_mod=q_mod,
+            query_params=(template.Param(qs, template.Kind.HEAD),),
+        )
+
+    def route_fn(qi, ki, vi, b_p, s_v, qs):
+        return attention_route.attend(qi, ki, vi, spans, make_hooks(b_p, s_v, qs))
+
+    def ref_fn(qi, ki, vi, b_p, s_v, qs):
+        return template.reference(qi, ki, vi, spans, make_hooks(b_p, s_v, qs))
+
+    def draw(seed: int):
+        rng = np.random.default_rng([26540, seed])
+        q = jnp.asarray(rng.standard_normal((b, q_len, h, d)), jnp.float32)
+        k = jnp.asarray(rng.standard_normal((b, k_len, h, d)), jnp.float32)
+        v = jnp.asarray(rng.standard_normal((b, k_len, h, d)), jnp.float32)
+        bias = jnp.asarray(rng.standard_normal((1, h, q_len, k_len)) * 0.25, jnp.float32)
+        sinks = jnp.asarray(rng.standard_normal((h,)) * 0.25, jnp.float32)
+        q_scale = jnp.asarray(1.0 + rng.standard_normal((h,)) * 0.1, jnp.float32)
+        primals = (q, k, v, bias, sinks, q_scale)
+        tangents = tuple(jnp.asarray(rng.standard_normal(p.shape) * 0.25, jnp.float32) for p in primals)
+        cot = jnp.asarray(rng.standard_normal((b, q_len, h, d)), jnp.float32)
+        return (*primals, *tangents, cot)
+
+    def orders_of(fn):
+        def eval_all(qi, ki, vi, b_p, s_v, qs, dqi, dki, dvi, db, ds, dqs, cot):
+            pr = (qi, ki, vi, b_p, s_v, qs)
+            tg = (dqi, dki, dvi, db, ds, dqs)
+            out, dout = jax.jvp(fn, pr, tg)
+            g, hvp = jax.jvp(
+                jax.grad(lambda *args: jnp.sum(fn(*args) * cot), argnums=(0, 1, 2, 3, 4, 5)), pr, tg)
+            return out, dout, g, hvp
+
+        return eval_all
+
+    assert_as_exact(jax.jit(orders_of(route_fn)), jax.jit(orders_of(ref_fn)), draw,
+                    "bare attention_route jvp and hvp with hooks", seeds=FEWEST_SEEDS)
+    q, k, v, bias, sink_v, q_scale, *_, cot = draw(0)
+    d2q = jax.grad(lambda qi: jnp.sum(
+        jax.grad(lambda qx: jnp.sum(route_fn(qx, k, v, bias, sink_v, q_scale) * cot))(qi) ** 2))(q)
+    assert jnp.all(jnp.isfinite(d2q))
+    # BF16-stored score parameters reach `score_mod` widened to fp32 in forward, backward, and JVP alike.
+    bf_bias = bias.astype(jnp.bfloat16)
+    db_bf = draw(1)[3].astype(jnp.bfloat16)
+    def dtype_checked_score(s, _qp, _kp, b_p):
+        return s + b_p if b_p.dtype == jnp.float32 else s
+
+    def bf_route(b_in):
+        hk = template.Hooks(score_mod=dtype_checked_score,
+                            score_params=(template.Param(b_in, template.Kind.TILE),))
+        return attention_route.attend(q, k, v, spans, hk)
+
+    def bf_ref(b_in):
+        hk = template.Hooks(score_mod=dtype_checked_score,
+                            score_params=(template.Param(b_in.astype(jnp.float32), template.Kind.TILE),))
+        return template.reference(q, k, v, spans, hk)
+
+    _, jvp_bf = jax.jvp(bf_route, (bf_bias,), (db_bf,))
+    _, ref_jvp_bf = jax.jvp(bf_ref, (bf_bias,), (db_bf,))
+    assert jnp.any(jvp_bf != 0) and jnp.all(jnp.isfinite(jvp_bf))
+    np.testing.assert_array_equal(np.asarray(jvp_bf), np.asarray(ref_jvp_bf))
+    # Explicit non-default precision stays forward-mode differentiable on the template route.
+    out_hi, dout_hi = jax.jvp(
+        lambda qi, ki, vi: attention.scaled_dot_product_attention(
+            qi, ki, vi, implementation="template", precision="highest"),
+        (q, k, v), (jnp.ones_like(q), jnp.zeros_like(k), jnp.zeros_like(v)))
+    assert jnp.all(jnp.isfinite(out_hi)) and jnp.all(jnp.isfinite(dout_hi))

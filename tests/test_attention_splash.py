@@ -503,3 +503,124 @@ def test_splash_span_mask_matches_key_spans_without_dense_numpy_mask():
     k_masked_sc = scaled_dot_product_attention(query, key, value, mask=k_mask, implementation="tpu",
                                                key_runs=runs, softcap=softcap)
     assert not np.array_equal(np.asarray(k_masked_sc), np.asarray(unmasked_sc))
+
+
+def test_bare_splash_supports_jvp_and_higher_order_with_sinks_softcap_and_segments():
+    """Row 2654: bare `splash._attention` (via `tpu_attention` without `forward_mode_attention()`) supports
+    `jax.jvp`, `jax.jvp(jax.grad(...))`, and `jax.grad(jax.grad(...))` with causal sparse `MaskInfo`,
+    `softcap`, `sinks`, and `segment_ids`."""
+    from dew.nn.attention_tpu import splash_mask_descriptor, tpu_attention
+
+    b, s, h, d = 1, 128, 8, 64
+    seg = jnp.concatenate([jnp.ones((b, 64), jnp.int32), jnp.full((b, 64), 2, jnp.int32)], axis=1)
+    desc = splash_mask_descriptor(s, s, h, causal=True, sliding_window=None, mask=None)
+
+    def call(qi, ki, vi, si):
+        return tpu_attention(qi, ki, vi, None, None, causal=True, sliding_window=None, softcap=20.0,
+                             sinks=si, segment_ids=seg, interpret=True, descriptor=desc)
+
+    def ref(qi, ki, vi, si):
+        return scaled_dot_product_attention(qi, ki, vi, causal=True, softcap=20.0, sinks=si,
+                                            segment_ids=seg, implementation="reference")
+
+    def draw(seed: int):
+        rng = np.random.default_rng([2654, seed])
+        return (
+            jnp.asarray(rng.standard_normal((b, s, h, d)), jnp.float32),
+            jnp.asarray(rng.standard_normal((b, s, h, d)), jnp.float32),
+            jnp.asarray(rng.standard_normal((b, s, h, d)), jnp.float32),
+            jnp.asarray(rng.standard_normal((h,)), jnp.float32),
+            jnp.asarray(rng.standard_normal((b, s, h, d)), jnp.float32),
+            jnp.asarray(rng.standard_normal((b, s, h, d)), jnp.float32),
+            jnp.asarray(rng.standard_normal((b, s, h, d)), jnp.float32),
+            jnp.asarray(rng.standard_normal((h,)), jnp.float32),
+            jnp.asarray(rng.standard_normal((b, s, h, d)), jnp.float32),
+        )
+
+    def jvp_and_hvp(fn):
+        def run(qi, ki, vi, si, dqi, dki, dvi, dsi, cot):
+            out, dout = jax.jvp(fn, (qi, ki, vi, si), (dqi, dki, dvi, dsi))
+            grads, hvp = jax.jvp(
+                jax.grad(lambda qx, kx, vx, sx: jnp.sum(fn(qx, kx, vx, sx) * cot), argnums=(0, 1, 2, 3)),
+                (qi, ki, vi, si), (dqi, dki, dvi, dsi))
+            return out, dout, grads, hvp
+        return run
+
+    assert_as_exact(jax.jit(jvp_and_hvp(call)), jax.jit(jvp_and_hvp(ref)), draw,
+                    "bare splash jvp and hvp with sinks softcap and segments", seeds=SPLASH_SEEDS["sinks"])
+    q, k, v, sinks, _, _, _, _, cot = draw(0)
+    d2q = jax.grad(lambda qi: jnp.sum(
+        jax.grad(lambda qx: jnp.sum(call(qx, k, v, sinks) * cot))(qi) ** 2))(q)
+    assert jnp.all(jnp.isfinite(d2q))
+
+
+def test_native_bf16_splash_lowers_jvp_and_omitted_tiles_have_zero_jvp():
+    """Row 2654: native BF16 Splash (`interpret=False` and explicit `precision='highest'`) lowers `jax.jvp`
+    for TPU without reverse-only `at_precision`, and skipped `block_mask == 0` tiles contribute exact zero
+    JVP even when `mask_value` is finite (`0.0`)."""
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+
+    from dew.nn import programs
+    from dew.nn.attention_tpu import splash_mask_descriptor, tpu_attention
+    from dew.nn.kernels import generation, splash
+
+    # Native BF16 `tpu_attention(interpret=False)` and explicit `precision='highest'` lower `jax.jvp` on v5e.
+    q_bf = jax.ShapeDtypeStruct((1, 128, 2, 64), jnp.bfloat16)
+    desc_bf = splash_mask_descriptor(128, 128, 2, causal=True, sliding_window=None, mask=None)
+    def jvp_tpu(qi, ki, vi, dqi):
+        return jax.jvp(
+            lambda x: tpu_attention(x, ki, vi, None, None, causal=True, sliding_window=None, softcap=None,
+                                    sinks=None, segment_ids=None, interpret=False, descriptor=desc_bf),
+            (qi,), (dqi,))
+
+    def jvp_hi(qi, ki, vi, dqi):
+        return jax.jvp(
+            lambda x: scaled_dot_product_attention(
+                x, ki, vi, causal=True, implementation="tpu", precision="highest"),
+            (qi,), (dqi,))
+
+    with generation.assumed("v5e"):
+        for fn in (jvp_tpu, jvp_hi):
+            traced = jax.make_jaxpr(fn)(q_bf, q_bf, q_bf, q_bf).jaxpr
+            names = [str(eq.params.get("name", "")) for eq in programs.equations(traced)
+                     if programs.opaque(eq)]
+            assert any("splash_mha_fwd" in name for name in names), names
+            jax.jit(fn).trace(q_bf, q_bf, q_bf, q_bf).lower(lowering_platforms=("tpu",))
+        with jax.default_matmul_precision("highest"):
+            jax.jit(jvp_tpu).trace(q_bf, q_bf, q_bf, q_bf).lower(lowering_platforms=("tpu",))
+
+    # Multi-tile 256x256 mask: tile 0 visible, tile 1 omitted (`block_mask == 0`, shrunken grid) with finite
+    # `mask_value=0.0`: omitted tile 1 yields exact zero JVP and native dV even with NaN poison in `v`/`dv`.
+    dense = np.zeros((256, 256), dtype=bool)
+    dense[:, :128] = True
+    m_desc = splash_attention_mask.MultiHeadMask([splash_attention_mask.NumpyMask(dense)])
+    blk = splash.BlockSizes(128, 128, 128, 128, 128, 128, 128, 128)
+    kernel = splash.make_splash_mha(m_desc, block_sizes=blk, mask_value=0.0, interpret=True)
+    assert kernel.fwd_mask_info.data_next is not None and kernel.fwd_mask_info.data_next.shape[-1] == 1
+    z = jnp.zeros((1, 256, 64), jnp.float32)
+    dv = jnp.zeros((1, 256, 64), jnp.float32).at[:, 128:, :].set(1.0)
+    _, dout = jax.jvp(lambda vi: kernel(z, z, vi), (z,), (dv,))
+    np.testing.assert_array_equal(np.asarray(dout), np.zeros((1, 256, 64), jnp.float32))
+    v_nan = z.at[:, 128:, :].set(jnp.nan)
+    dv_nan = z.at[:, 128:, :].set(jnp.nan)
+    out_nan, dout_nan = jax.jvp(lambda vi: kernel(z, z, vi), (v_nan,), (dv_nan,))
+    np.testing.assert_array_equal(np.asarray(out_nan), np.zeros((1, 256, 64), jnp.float32))
+    np.testing.assert_array_equal(np.asarray(dout_nan), np.zeros((1, 256, 64), jnp.float32))
+    dv_grad = jax.grad(lambda vi: jnp.sum(kernel(z, z, vi)))(v_nan)
+    np.testing.assert_array_equal(np.asarray(dv_grad[:, 128:, :]), np.zeros((1, 128, 64), jnp.float32))
+    # `exactly_at('default')` overrides an outer `'highest'` for 16-bit linear_tangent rules.
+    rng = np.random.default_rng(26541)
+    q16 = jnp.asarray(rng.standard_normal((1, 128, 64)), jnp.bfloat16)
+    k16 = jnp.asarray(rng.standard_normal((1, 128, 64)), jnp.bfloat16)
+    v16 = jnp.asarray(rng.standard_normal((1, 128, 64)), jnp.bfloat16)
+    dq16 = jnp.asarray(rng.standard_normal((1, 128, 64)), jnp.bfloat16)
+    d128 = splash_mask_descriptor(128, 128, 1, causal=True, sliding_window=None, mask=None)
+    k128 = splash.make_splash_mha(d128, block_sizes=blk, interpret=True)
+    op_def = splash._build_splash_op(blk, k128.call, "default")
+    args16 = (k128.fwd_mask_info, k128.dq_mask_info, k128.dkv_mask_info, q16, k16, v16, None, None)
+    with jax.default_matmul_precision("default"):
+        o_def, do_def = jax.jvp(lambda qi: op_def(*args16[:3], qi, *args16[4:]), (q16,), (dq16,))
+    with jax.default_matmul_precision("highest"):
+        o_hi, do_hi = jax.jvp(lambda qi: op_def(*args16[:3], qi, *args16[4:]), (q16,), (dq16,))
+    np.testing.assert_array_equal(np.asarray(o_hi), np.asarray(o_def))
+    np.testing.assert_array_equal(np.asarray(do_hi), np.asarray(do_def))
