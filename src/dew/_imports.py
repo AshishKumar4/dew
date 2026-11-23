@@ -44,18 +44,20 @@ class Walk:
     def parsed(self, module: str) -> ast.Module:
         """`module`'s whole tree, its TYPE_CHECKING blocks among it, parsed once a walk: what a type checker
         reads of it (tools/lint_layers.py's named imports), and what `tree` prunes."""
-        if module not in self._parsed:
-            self._parsed[module] = ast.parse(self.read(module), self.files[module])
-        return self._parsed[module]
+        parsed = self._parsed.get(module)
+        if parsed is None:
+            parsed = self._parsed[module] = ast.parse(self.read(module), self.files[module])
+        return parsed
 
     def tree(self, module: str) -> ast.Module:
         """`module`'s tree as its run executes it: `parsed`, its top-level TYPE_CHECKING blocks pruned
         (`running`)."""
-        if module not in self._trees:
+        tree = self._trees.get(module)
+        if tree is None:
             whole = self.parsed(module)
             pruned = list(running(whole, whole.body))
-            self._trees[module] = ast.Module(body=pruned, type_ignores=whole.type_ignores)
-        return self._trees[module]
+            tree = self._trees[module] = ast.Module(body=pruned, type_ignores=whole.type_ignores)
+        return tree
 
     def assigned(self, module: str, name: str) -> ast.expr | None:
         """The value `module` assigns `name` at its top level, None where it assigns none."""
@@ -77,16 +79,20 @@ class Walk:
         found = _Imports(self, module)
         # Every binding first, so a name its code reads before the statement that binds it (a function's,
         # read at its call) resolves as after it.
-        for node in ast.walk(self.tree(module)):
+        tree = self.tree(module)
+        for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 found.visit(node)
-        found.visit(self.tree(module))
+        found.visit(tree)
         self._imports[module] = frozenset(found.modules - {module}), tuple(sorted(found.sites))
         return self._imports[module]
 
     def closure(self, *roots: str) -> tuple[frozenset[str], tuple[str, ...]]:
         """The modules `roots` name and their code can import, and the dynamic import sites among them. A
-        root the tree holds no module of is refused."""
+        root the tree holds no module of is refused. The syntax trees it parsed are let go once it is done,
+        the imports and tables it read of them kept: a process's walk (`dew._code`'s) held every module's
+        tree past it (1.1M of a cold recurrent step's 4.7M live objects, its full collection 3.9 s and
+        its exit 18 s, row 8420)."""
         absent = [root for root in roots if root not in self.files]
         if absent:
             raise LookupError(f"no module of the tree is named {', '.join(absent)}")
@@ -101,6 +107,8 @@ class Walk:
             imported, found = self.imports(module)
             sites.update(found)
             pending.extend(imported - seen)
+        self._parsed.clear()
+        self._trees.clear()
         return frozenset(seen), tuple(sorted(sites))
 
 
