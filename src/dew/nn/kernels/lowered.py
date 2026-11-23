@@ -435,15 +435,17 @@ fork's 0.12.0.1.post125), or the block's."""
 
 def unsynced_commits(module: bytes) -> list[str]:
     """Each tensor-core commit (`TENSOR_CORE_COMMIT`) in a Mosaic GPU kernel's `module` (`KernelCall.ir`)
-    that arrives at a barrier its thread waited at (`BARRIER_WAIT`) with no warpgroup sync between
-    (`SYNCS`): an elected thread commits after its own wait while its warpgroup's other warps may still wait
-    at the phase its arrival completes past (row 5671: a B200's tcgen05 chunk issuer). Each warp's path is its
+    that arrives at a barrier its thread waited at (`BARRIER_WAIT`), which another warp of its warpgroup
+    waits at too, with no warpgroup sync between (`SYNCS`): an elected thread commits after its own wait
+    while its warpgroup's other warps may still wait at the phase its arrival completes past (row 5671: a
+    B200's tcgen05 chunk issuer). A warp alone in its role's waits (a warp-specialized issuer's) passes no
+    other warp's. Each warp's path is its
     own (`_Walk`): a branch on the thread's index takes the warp's case, any other branch every case, the
     union after; a loop to its fixed point; a call through its callee. A barrier is its array in shared memory
     (`_barrier`), a wait at one slot and a commit at another counted alike. Each finding names its function,
     warp and barrier."""
     kernel = mgpu.deserialized(module)
-    found: dict[str, None] = {}
+    found: list[str] = []
     with kernel.context:
         functions = {ir.StringAttr(op.attributes["sym_name"]).value: op.operation
                      for op in kernel.body.operations if op.operation.name == "func.func"}
@@ -456,15 +458,26 @@ def unsynced_commits(module: bytes) -> list[str]:
                 block = tuple(_value(size, None) for size in sizes)
                 if None in block:
                     raise ValueError(f"{name}'s block states no constant size")
+                walks = []
                 for first in range(0, math.prod(block), WARP_THREADS):
-                    where = f"{name}, warp {first // WARP_THREADS}"
-                    walk = _Walk(functions, _Thread(first, block), found, where)
-                    walk.region(launch.regions[0], frozenset())
-    return list(found)
+                    walks.append(_Walk(functions, _Thread(first, block)))
+                    walks[-1].region(launch.regions[0], frozenset())
+                for warp, walk in enumerate(walks):
+                    # A barrier another warp of its warpgroup waits at too, whose wait the commit may pass.
+                    group = walks[warp - warp % WARPGROUP_WARPS:][:WARPGROUP_WARPS]
+                    shared = set().union(*(other.waits for other in group if other is not walk))
+                    found += [f"{name}, warp {warp}: a tensor-core commit arrives at barrier {barrier} after "
+                              f"its wait there, which another warp of its warpgroup waits at too, with no "
+                              f"warpgroup sync between"
+                              for barrier in sorted(walk.unsynced & shared, key=str)]
+    return found
 
 
 WARP_THREADS = 32
 """The threads of a warp, whose path through a kernel `unsynced_commits` follows (its first lane's)."""
+
+WARPGROUP_WARPS = 4
+"""The warps of a warpgroup, whose warps' waits a commit by one of them may pass (`unsynced_commits`)."""
 
 
 @dataclass(frozen=True)
@@ -478,13 +491,13 @@ class _Thread:
 
 @dataclass
 class _Walk:
-    """One warp's walk of a kernel for `unsynced_commits`, from its first lane, `thread`, each finding in
-    `found` under `where`."""
+    """One warp's walk of a kernel for `unsynced_commits`, from its first lane, `thread`: each barrier it
+    waits at (`waits`), and each it commits at after a wait at it with no sync between (`unsynced`)."""
 
     functions: dict[str, ir.Operation]
     thread: _Thread
-    found: dict[str, None]
-    where: str
+    waits: set = dataclasses.field(default_factory=set)
+    unsynced: set = dataclasses.field(default_factory=set)
 
     def region(self, body: ir.Region, waited: frozenset) -> frozenset:
         for block in body.blocks:
@@ -496,14 +509,14 @@ class _Walk:
         """The barriers waited at past `operation` and no sync, from `waited` before it."""
         name = operation.name
         if name == BARRIER_WAIT:
-            return waited | {_barrier(operation.operands[0])}
+            self.waits.add(barrier := _barrier(operation.operands[0]))
+            return waited | {barrier}
         if name in SYNCS:
             return frozenset()
         if (name == "llvm.call_intrinsic"
                 and ir.StringAttr(operation.attributes["intrin"]).value.startswith(TENSOR_CORE_COMMIT)):
             if (barrier := _barrier(operation.operands[0])) in waited:
-                self.found[f"{self.where}: a tensor-core commit arrives at barrier {barrier} after a wait at "
-                           f"it, no warpgroup sync between"] = None
+                self.unsynced.add(barrier)
             return waited
         if name == "func.call":
             callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
@@ -556,16 +569,12 @@ def _value(value: ir.Value, thread: _Thread | None) -> int | None:
     """`value` where the constants and `thread`'s index and block (`gpu.thread_id`, `gpu.block_dim`) alone
     make it (a warp's or a warpgroup's index, a role's branch), through integer arithmetic and casts, and a
     lane shuffle's (`nvvm.shfl.sync`, the first lane's own value); None where anything else enters it."""
-    owner = value.owner
-    if not hasattr(owner, "name"):
+    if (operation := _defining(value)) is None:
         return None
-    operation = owner.operation if hasattr(owner, "operation") else owner
     name = operation.name
     if name == "arith.constant":
-        try:
-            return ir.IntegerAttr(operation.attributes["value"]).value
-        except ValueError:  # A float's constant.
-            return None
+        constant = operation.attributes["value"]
+        return ir.IntegerAttr(constant).value if ir.IntegerAttr.isinstance(constant) else None
     if name in ("gpu.thread_id", "gpu.block_dim"):
         if thread is None:
             return None
@@ -612,13 +621,17 @@ def _barrier(value: ir.Value) -> int | str:
     the view its address is computed from (each step its first operand: a cast, a pointer's arithmetic, a
     struct's field), the operand's own text where it reads none."""
     while True:
-        owner = value.owner
-        if not hasattr(owner, "name"):
+        if (operation := _defining(value)) is None or not operation.operands:
             return str(value)
-        operation = owner.operation if hasattr(owner, "operation") else owner
-        if (operation.name == "memref.view"
-                and operation.operands[0].owner.name == "gpu.dynamic_shared_memory"):
-            return ir.IntegerAttr(operation.operands[1].owner.attributes["value"]).value
-        if not operation.operands:
-            return str(value)
+        if operation.name == "memref.view" and (
+                (memory := _defining(operation.operands[0])) is not None
+                and memory.name == "gpu.dynamic_shared_memory"
+                and (offset := _defining(operation.operands[1])) is not None):
+            return ir.IntegerAttr(offset.attributes["value"]).value
         value = operation.operands[0]
+
+
+def _defining(value: ir.Value) -> ir.Operation | None:
+    """The operation that makes `value`; None for a block's argument (a loop's carry, a function's)."""
+    owner = value.owner
+    return None if isinstance(owner, ir.Block) else owner.operation
