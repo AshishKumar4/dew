@@ -2,7 +2,7 @@
 the store's records as the index lists them, each at its index there, in parts of whole records each stating
 its rows (`Files.positioned_manifest`, row 9051), as its indexed read numbers them."""
 
-import dataclasses
+import hashlib
 import io
 import itertools
 import json
@@ -268,8 +268,10 @@ def test_a_position_saved_under_the_first_cut_of_a_positioned_store_is_refused_w
     finally:
         reader.close()
     manifest = stream_manifest(files, positioned=True)
-    current, first = manifest.digest, dataclasses.replace(manifest, cut=None).digest
-    assert current != first
+    # The fact its first cut recorded: its shards' ids alone.
+    first = hashlib.sha256("\n".join(shard.id for shard in manifest.shards).encode()).hexdigest()[:16]
+    current = manifest.digest
+    assert current != first, "the cut that subdivides it is in the fact"
     facts = saved["dew_data_plan"]["derived"]
     named = [key for key, value in facts.items() if value == current]
     assert named, facts

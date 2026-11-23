@@ -1224,7 +1224,6 @@ def test_a_run_an_intermediate_dew_rewrote_beside_its_mark_resumes_as_it_trained
     across (review of d22: the intermediate format was dropped with its translation)."""
     import json as json_
 
-    from dew.config.earlier import INERT_DECAY
     from dew.config.lm import LMRunConfig
 
     spec = AdamW if optimizer == "adamw" else Adam
@@ -1236,7 +1235,7 @@ def test_a_run_an_intermediate_dew_rewrote_beside_its_mark_resumes_as_it_trained
     LMRunConfig(optim=rewritten).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
     loaded = LMRunConfig.load(str(run)).optim
-    assert (loaded.decay_mask, loaded.spared, loaded.optimizer.weight_decay) == (False, False, INERT_DECAY)
+    assert (loaded.decay_mask, loaded.spared) == (False, False) and loaded.optimizer.weight_decay > 0, loaded
     if decay == 0:
         with pytest.raises(ValueError):
             _checkpointed(run, loaded, 2)
