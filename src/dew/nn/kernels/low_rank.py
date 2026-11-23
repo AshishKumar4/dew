@@ -11,7 +11,8 @@ from jax.custom_derivatives import zero_from_primal
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
 from dew.nn.kernels import generation, selection, xla_products
 from dew.nn.kernels.gemm import gemm_t, joined_depths
-from dew.nn.precision import at_least_fp32, effective_precision, precision_names, refuse_recipe
+from dew.nn.precision import at_least_fp32, effective_precision, refuse_recipe
+from dew.nn.programs import dot_arithmetic
 from dew.nn.sharding import excess_axes, summed_to
 
 LOW_RANK_ROW = 'ledger 1304'
@@ -163,14 +164,16 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
 
 def _kept(precision: PrecisionLike) -> PrecisionLike:
     """`precision` for a product of fp32 operands: as given (a run's configured one where it states none),
-    unless it names an algorithm of narrower operands (an F16 or BF16 preset, or a `jax.lax.DotAlgorithm`
-    whose operand types are), which would round them back to those, then `HIGHEST`."""
-    resolved = effective_precision(precision)
-    algorithms = [one for one in (resolved if isinstance(resolved, tuple) else (resolved,))
-                  if isinstance(one, jax.lax.DotAlgorithm)]
-    narrow = any(jnp.dtype(kind).itemsize < 4 for one in algorithms
-                 for kind in (one.lhs_precision_type, one.rhs_precision_type)) or any(
-        name.startswith(("BF16", "F16", "F8", "ANY_F8")) for name in precision_names(resolved))
+    unless the dot algorithm it names keeps fewer of an fp32 operand's digits than fp32's
+    (`programs.dot_arithmetic`'s `digits`: an F16, BF16 or TF32 preset, or a `jax.lax.DotAlgorithm` of
+    such types), which would round them back to those, then `HIGHEST`."""
+    try:
+        arithmetic = dot_arithmetic(effective_precision(precision), jnp.float32, jnp.float32)
+        narrow = arithmetic is not None and arithmetic.digits < jnp.finfo(jnp.float32).nmant + 1
+    except ValueError:
+        # JAX's own refusal of fp32 operands for the algorithm (an FP8 preset takes FP8 operands alone), or
+        # one of products no split names (`DotArithmetic.parts`: an F8 X4's): it keeps no fp32 operand whole.
+        narrow = True
     return jax.lax.Precision.HIGHEST if narrow else precision
 
 
