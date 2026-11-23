@@ -1026,13 +1026,16 @@
 "tests/test_causal_transformer.py::test_padding_in_a_packed_row_reaches_no_query",
 "tests/test_causal_transformer.py::test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart"
 ],
+"tests/test_certified_capture.py": [
+"tests/test_certified_capture.py::test_a_templates_gradient_certified_aside_lowers_as_certified_in_turn_and_certifies_its_kernels"
+],
 "tests/test_check2.py": [
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_one_a_head[running prefix]",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_a_decay_a_key_dimensions_fast_backward",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_a_packed_call[inside a chunk]",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_an_unbounded_steep_column[bf16 clamped]",
-"tests/test_check2.py::test_the_recurrence_step_witness_holds_the_fast_backward[bf16 under the delta rule]",
-"tests/test_check2.py::test_the_recurrence_step_witness_holds_the_interpreted_mainloop[slow]",
+"tests/test_check2.py::test_the_recurrence_step_witness_holds_the_fast_backward[bf16 under the accurate forms]",
+"tests/test_check2.py::test_the_recurrence_step_witness_holds_the_interpreted_mainloop[decay]",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_values_passed_in_parts_and_refuses_them_rounded",
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_backward_that_read_other_gradients",
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16",
@@ -2203,7 +2206,6 @@
 "tests/test_kernel_configs.py::test_an_amperes_gemm_copies_its_blocks_promised_in_bounds",
 "tests/test_kernel_configs.py::test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it",
 "tests/test_kernel_configs.py::test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel[named]",
-"tests/test_kernel_configs.py::test_an_mma_sync_output_tile_stages_where_its_accumulators_stores_pass_the_banks_once[shape3-bfloat16]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-dense kernel gradient exact fp32]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-forward bf16]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-forward fp16]",
@@ -2214,6 +2216,7 @@
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-normed biased forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-normed kernel gradient]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-paired forward]",
+"tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-paired swiglu forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-residual forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-scaled forward]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-two bf16 outputs forward]",
@@ -3079,9 +3082,6 @@
 "tests/test_quantization_sites.py::test_the_scanned_stack_quantizes_each_layer_with_its_own_scales[tiny]",
 "tests/test_quantization_sites.py::test_the_served_pipeline_quantizes_as_the_loaded_model[e4m3]",
 "tests/test_quantization_sites.py::test_the_served_pipeline_quantizes_as_the_loaded_model[unrounded]"
-],
-"tests/test_qwen4_exp.py": [
-"tests/test_qwen4_exp.py::test_images_and_a_video_read_through_the_processor_as_transformers_reads_them"
 ],
 "tests/test_qwen_image_source.py": [
 "tests/test_qwen_image_source.py::test_a_published_qwen_image_prompt_walked_alone_matches_the_source",
