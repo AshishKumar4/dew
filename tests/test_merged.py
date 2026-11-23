@@ -4,7 +4,6 @@ plain merge from float64, here and on a GPU's one launch (tests/test_gpu_attenti
 import contextvars
 import dataclasses
 import functools
-import inspect
 import math
 
 import jax
@@ -19,7 +18,7 @@ from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, dew_path
 from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, merged
+from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, emission, merged
 
 SPECS = {"natural": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True)),
          "fold": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=0.125, natural=False,
@@ -576,212 +575,129 @@ def _traced_merge_bytes(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDt
                                  blocks=channels // block, slices=slices, read_width=read_width, width=width)
 
 
-def _bind_mosaic_sub(sub, outer_invars, parent_kinds: dict[int, str],
-                     parent_blocks: set[int]) -> tuple[dict[int, str], set[int]]:
-    """Map ref kinds and `block` axis vars into `sub` (`run_scoped` binds `outer_invars` to `constvars`,
-    while `scan`, `while` and `cond` bind them to `invars`)."""
-    targets = (sub.constvars if sub.constvars and len(sub.constvars) == len(outer_invars)
-               else sub.invars)
-    kinds = {id(inner): parent_kinds[id(outer)]
-             for inner, outer in zip(targets, outer_invars, strict=False) if id(outer) in parent_kinds}
-    blocks = {id(inner) for inner, outer in zip(targets, outer_invars, strict=False)
-              if id(outer) in parent_blocks}
-    return kinds, blocks
-
-
-def _jaxpr_has_inline_load(jaxpr, kinds: dict[int, str]) -> bool:
-    """Whether `jaxpr` or any nested scope/scan/while/cond executes a Mosaic chunk-load `inline_mgpu`."""
-    from jax import lax
-
-    for eq in jaxpr.eqns:
-        if (eq.primitive.name == "inline_mgpu" and len(eq.invars) >= 2
-                and kinds.get(id(eq.invars[0])) == "out" and kinds.get(id(eq.invars[1])) == "stat"):
-            return True
-        if eq.primitive is lax.scan_p:
-            sub = eq.params["jaxpr"].jaxpr
-            if _jaxpr_has_inline_load(sub, _bind_mosaic_sub(sub, eq.invars, kinds, set())[0]):
-                return True
-        elif eq.primitive is lax.while_p:
-            sub = eq.params["body_jaxpr"].jaxpr
-            body_in = eq.invars[eq.params["cond_nconsts"]:]
-            if _jaxpr_has_inline_load(sub, _bind_mosaic_sub(sub, body_in, kinds, set())[0]):
-                return True
-        elif eq.primitive is lax.cond_p:
-            if any(_jaxpr_has_inline_load(b.jaxpr, _bind_mosaic_sub(b.jaxpr, eq.invars[1:], kinds, set())[0])
-                   for b in eq.params["branches"]):
-                return True
-        elif eq.primitive.name == "run_scoped":
-            sub = eq.params["jaxpr"]
-            if _jaxpr_has_inline_load(sub, _bind_mosaic_sub(sub, eq.invars, kinds, set())[0]):
-                return True
-    return False
-
-
-def _stats_store_gated_on_block_zero(mgpu_fn) -> bool:
-    """Verify the lowered Mosaic MLIR body guards every `llvm.store` inside an `scf.if` whose condition
-    conjoins `arith.cmpi eq(c_block, 0)`."""
-    from jax.extend.mlir import ir as mgpu_ir
-    from jax.extend.mlir.dialects import arith as mgpu_arith, func as mgpu_func
-    from jax.interpreters import mlir as jax_mlir
-
-    class _Arg:
-        def __init__(self, regs: np.ndarray):
-            self.registers = regs
-
-    with jax_mlir.make_ir_context(), mgpu_ir.Location.unknown():
-        f32 = mgpu_ir.F32Type.get()
-        i32 = mgpu_ir.IntegerType.get_signless(32)
-        ref_ty = mgpu_ir.MemRefType.get((1, 1, 1), f32, mgpu_ir.StridedLayoutAttr.get(0, [1, 1, 1]))
-        vec_ty = mgpu_ir.VectorType.get((1,), f32)
-        module = mgpu_ir.Module.create()
-        with mgpu_ir.InsertionPoint(module.body):
-            fn_op = mgpu_func.FuncOp("check", ([ref_ty, ref_ty, vec_ty, vec_ty, i32, i32, i32, i32], []))
-            block = fn_op.add_entry_block()
-            args = list(block.arguments)
-            with mgpu_ir.InsertionPoint(block):
-                mgpu_fn(None, args[0], args[1], _Arg(np.array([args[2]], dtype=object)),
-                        _Arg(np.array([args[3]], dtype=object)),
-                        *(_Arg(np.array(a, dtype=object)) for a in args[4:]))
-        cb_arg = args[7]
-
-        def has_cb_eq_zero(cond) -> bool:
-            owner = cond.owner
-            if not isinstance(owner, (mgpu_ir.Operation, mgpu_ir.OpView)):
-                return False
-            op_obj = owner.operation
-            if op_obj.name == "arith.andi":
-                return any(has_cb_eq_zero(operand) for operand in op_obj.operands)
-            if op_obj.name != "arith.cmpi":
-                return False
-            pred = mgpu_ir.IntegerAttr(op_obj.attributes["predicate"]).value
-            if pred != int(mgpu_arith.CmpIPredicate.eq):
-                return False
-            lhs, rhs = op_obj.operands[0], op_obj.operands[1]
-            for candidate, other in ((lhs, rhs), (rhs, lhs)):
-                other_owner = other.owner
-                if (candidate == cb_arg
-                        and isinstance(other_owner, (mgpu_ir.Operation, mgpu_ir.OpView))
-                        and other_owner.operation.name == "arith.constant"
-                        and mgpu_ir.IntegerAttr(other_owner.operation.attributes["value"]).value == 0):
-                    return True
-            return False
-
-        guarded_stores = 0
-        for op in block.operations:
-            if op.operation.name == "llvm.store":
-                return False
-            if op.operation.name == "scf.if":
-                then_ops = list(op.operation.regions[0].blocks[0].operations)
-                stores = sum(1 for inner in then_ops if inner.operation.name == "llvm.store")
-                if stores:
-                    if not has_cb_eq_zero(op.operation.operands[0]):
-                        return False
-                    guarded_stores += stores
-        return guarded_stores >= 2
-
-
-def _emitted_mosaic_device_bytes(body, *, rows: int, blocks: int, slices: int, width: int,
-                                 output_kinds: tuple[template.Kind, ...] = ()) -> float:
-    """Device bytes transferred on the common one-window path of a traced Mosaic `merged_padded` body
-    (`kernel.params['jaxprs'][0]`), reading clipped channel bounds directly from each emitted `inline_mgpu`
-    load/store and verifying row-stat stores are gated on `axis_index('block') == 0` in the lowered MLIR."""
-    from jax import lax
-
-    chunk = windows.chunk_width(slices)
-    chunks = -(-slices // chunk)
-    channels = 1 << (width - 1).bit_length()
-    slice_frac = slices / (chunks * chunk)
-    n_params = len(output_kinds)
-    root_kinds: dict[int, str] = {id(body.invars[0]): "out", id(body.invars[1]): "stat"}
-    for idx, kind in enumerate(output_kinds):
-        root_kinds[id(body.invars[2 + idx])] = f"param:{kind.value}"
-    out_base = 2 + n_params
-    root_kinds[id(body.invars[out_base])] = "merged"
-    if len(body.invars) >= out_base + 3:
-        root_kinds[id(body.invars[out_base + 1])] = "max"
-        root_kinds[id(body.invars[out_base + 2])] = "tot"
-
-    def inline_bytes(eq, kinds: dict[int, str], live: set[int], block_vars: set[int]) -> float:
-        nonlocals = inspect.getclosurevars(eq.params["mgpu_fn"]).nonlocals
-        k0 = kinds.get(id(eq.invars[0]), "")
-        k1 = kinds.get(id(eq.invars[1]), "") if len(eq.invars) > 1 else ""
-        if k0 == "out" and k1 == "stat":
-            if not any(id(v) in live for v in eq.outvars):
-                return 0.0
-            chunk_len = eq.outvars[0].aval.shape[0]
-            return (chunk_len * nonlocals["block"] * eq.outvars[0].aval.dtype.itemsize
-                    * slice_frac * (nonlocals["read_width"] / channels)
-                    + chunk_len * 2 * eq.outvars[1].aval.dtype.itemsize * slice_frac)
-        if k0.startswith("param:"):
-            if not any(id(v) in live for v in eq.outvars):
-                return 0.0
-            item = eq.invars[0].aval.dtype.itemsize
-            if k0 == "param:output":
-                return nonlocals["block"] * item * (nonlocals["width"] / channels)
-            return float(item)
-        if k0 == "merged":
-            return nonlocals["block"] * eq.invars[0].aval.dtype.itemsize * (nonlocals["width"] / channels)
-        if k0 == "max" and k1 == "tot":
-            gated = (id(eq.invars[-1]) in block_vars
-                     and _stats_store_gated_on_block_zero(eq.params["mgpu_fn"]))
-            stat_bytes = eq.invars[0].aval.dtype.itemsize + eq.invars[1].aval.dtype.itemsize
-            return stat_bytes / (blocks if gated else 1)
-        return 0.0
-    def walk(jaxpr, kinds: dict[int, str], block_vars: set[int]) -> float:
-        live = _live_vars(jaxpr)
-        block_vars = set(block_vars)
-        total = 0.0
-        for eq in jaxpr.eqns:
-            if eq.primitive.name == "axis_index" and eq.params.get("axis_name") == "block":
-                block_vars.add(id(eq.outvars[0]))
-            elif eq.primitive.name == "inline_mgpu":
-                total += inline_bytes(eq, kinds, live, block_vars)
-            elif eq.primitive is lax.scan_p:
-                sub = eq.params["jaxpr"].jaxpr
-                total += eq.params["length"] * walk(sub, *_bind_mosaic_sub(sub, eq.invars, kinds, block_vars))
-            elif eq.primitive is lax.while_p:
-                sub = eq.params["body_jaxpr"].jaxpr
-                body_in = eq.invars[eq.params["cond_nconsts"]:]
-                total += walk(sub, *_bind_mosaic_sub(sub, body_in, kinds, block_vars))
-            elif eq.primitive is lax.cond_p:
-                b0, b1 = (walk(b.jaxpr, *_bind_mosaic_sub(b.jaxpr, eq.invars[1:], kinds, block_vars))
-                          for b in eq.params["branches"])
-                b1_loads = _jaxpr_has_inline_load(
-                    eq.params["branches"][1].jaxpr,
-                    _bind_mosaic_sub(eq.params["branches"][1].jaxpr, eq.invars[1:], kinds, set())[0])
-                total += max(b0, b1) if not b1_loads else min(b0, b1)
-            elif eq.primitive.name == "run_scoped":
-                sub = eq.params["jaxpr"]
-                total += walk(sub, *_bind_mosaic_sub(sub, eq.invars, kinds, block_vars))
-        return total
-    return walk(body, root_kinds, set()) * rows * blocks
-
-
-def _traced_mosaic_merge_bytes(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
-                               queries: int, width: int, block: int, *, target: generation.GpuTarget,
-                               out_dtype=None, out_heads: int | None = None,
-                               output_mod=None, output_kinds: tuple[template.Kind, ...] = (),
-                               output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()) -> float:
-    """Independent device-byte count for `merged._launch_mosaic` at `block` from its emitted Mosaic body."""
-    batch, slices, _, heads, _ = padded.shape
-    channels = 1 << (width - 1).bit_length()
+def _mosaic_kernel_body(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+                        queries: int, width: int, block: int, *, target: generation.GpuTarget,
+                        out_dtype=None, out_heads: int | None = None, output_mod=None,
+                        output_kinds: tuple[template.Kind, ...] = (),
+                        output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()):
+    """Trace `_launch_mosaic` and return its kernel equation and body jaxpr."""
+    family = generation.family(target.generation) or "mma.sync"
     launch = functools.partial(
         merged._launch_mosaic, units=algebra.units_of(spec), queries=queries, width=width, block=block,
         out_dtype=out_dtype, out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds,
-        family=generation.family(target.generation) or "mma.sync")
+        family=family)
     with generation.as_target(target):
         (kernel,) = (eq for eq in programs.equations(
             jax.make_jaxpr(launch)(padded, stacked, *output_specs).jaxpr) if programs.opaque(eq))
-    return _emitted_mosaic_device_bytes(kernel.params["jaxprs"][0], rows=batch * queries * heads,
-                                        blocks=channels // block, slices=slices, width=width,
-                                        output_kinds=output_kinds)
+    body = kernel.params["jaxprs"][0] if "jaxprs" in kernel.params else kernel.params["jaxpr"]
+    return kernel, body
+
+
+def _mosaic_emitted_roles(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+                          queries: int, width: int, block: int, *, target: generation.GpuTarget,
+                          out_dtype=None, out_heads: int | None = None, output_mod=None,
+                          output_kinds: tuple[template.Kind, ...] = (),
+                          output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()) -> tuple[emission.Role, ...]:
+    """Emitted Mosaic GPU roles across block indices (`c_block == 0` vs `c_block >= 1`) from `emission`."""
+    channels = 1 << (width - 1).bit_length()
+    blocks = channels // block
+    kernel, body = _mosaic_kernel_body(
+        spec, padded, stacked, queries, width, block, target=target, out_dtype=out_dtype,
+        out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds, output_specs=output_specs)
+    return emission.emitted(body, min(blocks, 2), "block", device=range(len(body.invars)),
+                            forms=emission.forms_of(kernel.params.get("compiler_params"))).roles
+
+
+def _mosaic_chunk_col_masks(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+                            queries: int, width: int, block: int, *, target: generation.GpuTarget
+                            ) -> list[np.ndarray]:
+    """Evaluate the emitted 1D boolean column load mask passed to `_mgpu_load_chunk` for every `c_block`."""
+    from jax._src import core as jax_core
+    from jax._src.pallas import mpmd, primitives as pl_prims
+    from jax._src.pallas.mosaic_gpu import core as gpu_core, primitives as gpu_prims
+
+    _, body = _mosaic_kernel_body(spec, padded, stacked, queries, width, block, target=target)
+    channels = 1 << (width - 1).bit_length()
+    blocks = channels // block
+    tile_block = max(block, 64)
+
+    def find_mask(jaxpr: jax_core.Jaxpr, invar_vals: list, const_vals: tuple | list, cb: int
+                  ) -> np.ndarray | None:
+        env: dict = dict(zip(jaxpr.constvars, const_vals, strict=True))
+        env.update(zip(jaxpr.invars, invar_vals, strict=True))
+        for eq in jaxpr.eqns:
+            vals = [v.val if isinstance(v, jax_core.Literal) else env.get(v) for v in eq.invars]
+            prim = eq.primitive
+            if prim is gpu_prims.inline_mgpu_p and len(eq.outvars) == 3:
+                for v, val in zip(eq.invars, vals, strict=True):
+                    if (isinstance(v, jax_core.Var) and isinstance(v.aval, jax_core.ShapedArray)
+                            and v.aval.dtype == jnp.bool_ and v.aval.shape == (tile_block,)
+                            and val is not None):
+                        return np.asarray(val, dtype=bool)
+                continue
+            if (called := programs.called(eq)) is not None:
+                if (found := find_mask(called, vals, (), cb)) is not None:
+                    return found
+                continue
+            if prim is pl_prims.run_scoped_p:
+                sub = eq.params["jaxpr"]
+                if (found := find_mask(sub, [None] * len(sub.invars), vals, cb)) is not None:
+                    return found
+                continue
+            if prim is mpmd.mpmd_map_p:
+                for sub in eq.params["jaxprs"]:
+                    sub_in = (vals[:len(sub.invars)] if len(vals) >= len(sub.invars)
+                              else [None] * len(sub.invars))
+                    sub_c = vals if len(sub.constvars) == len(vals) else [None] * len(sub.constvars)
+                    if (found := find_mask(sub, sub_in, sub_c, cb)) is not None:
+                        return found
+                continue
+            if prim is jax.lax.while_p:
+                sub = eq.params["body_jaxpr"]
+                consts = vals[eq.params["cond_nconsts"]:][:eq.params["body_nconsts"]]
+                carry = [None] * (len(sub.jaxpr.invars) - len(consts))
+                if (found := find_mask(sub.jaxpr, [*consts, *carry], sub.consts, cb)) is not None:
+                    return found
+                continue
+            if prim is jax.lax.scan_p:
+                sub, nc = eq.params["jaxpr"], eq.params["num_consts"]
+                carry = [None] * (len(sub.jaxpr.invars) - nc)
+                if (found := find_mask(sub.jaxpr, [*vals[:nc], *carry], sub.consts, cb)) is not None:
+                    return found
+                continue
+            if prim is jax.lax.axis_index_p:
+                env[eq.outvars[0]] = jnp.int32(cb if eq.params["axis_name"] == "block" else 0)
+            elif prim is gpu_core.layout_cast_p and vals[0] is not None:
+                env[eq.outvars[0]] = vals[0]
+            elif not eq.effects and prim is not jax.lax.cond_p and all(v is not None for v in vals):
+                out = prim.bind(*vals, **eq.params)
+                outs = list(out) if prim.multiple_results else [out]
+                env.update(zip(eq.outvars, outs, strict=True))
+        return None
+
+    masks = []
+    for cb in range(blocks):
+        found = find_mask(body, [None] * len(body.invars), (), cb)
+        assert found is not None, "expected chunk loader to receive a 1D boolean column mask"
+        masks.append(found)
+    return masks
+
+
+def _mosaic_expected_bytes(*, rows: int, slices: int, width: int, read_width: int, block: int,
+                           itemsize: int = 4) -> float:
+    """Expected valid device traffic for one Mosaic GPU `merged_padded` launch (`block` channels/program,
+    row stats written once by block 0)."""
+    channels = 1 << (width - 1).bit_length()
+    blocks = channels // block
+    read_cols = min(width, read_width)
+    return float(rows * ((3 * slices * read_cols + width) * itemsize
+                         + (blocks * 3 * slices + 1) * 2 * itemsize))
 
 
 def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
     """`merged.launch_work` prices a native `merged_padded` launch on the common one-window path (rows 8845,
-    9795, 10533): one kernel, span `3 * chunks`, and exact agreement with the emitted Mosaic GPU (`sm90`)
-    and Triton (`sm75`) launch bodies across unmasked, multi-block single-stats-writer, irregular masked
-    tail, and padded-input (`read_width > width`) shapes."""
+    9795, 10533, 12222): one kernel, span `3 * chunks`, non-zero stated arithmetic work, emitted single-stats
+    writer (`c_block == 0`), and predicated padded-column loads on Mosaic GPU vs Triton."""
     sm90 = generation.gpu_target("sm90")
     sm75 = generation.gpu_target("sm75")
     spec = SPECS["fold"]
@@ -799,38 +715,51 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
         work = merged.launch_work(spec, padded, stacked, queries, width, sm90)
         assert work.kernels == 1.0
         assert work.span == float(3 * chunks)
-        assert work.device_bytes == _traced_mosaic_merge_bytes(
-            spec, padded, stacked, queries, width, block, target=sm90)
+        assert work.operations > 0 and work.exponentials > 0
+        assert work.device_bytes == _mosaic_expected_bytes(
+            rows=batch * queries * heads, slices=slices, width=width, read_width=width, block=block)
         triton_block = merged._channel_block(spec, padded, stacked, queries, width, sm75)
         triton_work = merged.launch_work(spec, padded, stacked, queries, width, sm75)
         assert triton_work.device_bytes == _traced_merge_bytes(
             spec, padded, stacked, queries, width, triton_block)
-    # Padded input (`read_width=128 > width=80`): Mosaic predicates loads at `width`, while Triton reads
-    # `read_width` physical columns; each matches its own emitted launch body directly (row 9795).
-    pad_p = jax.ShapeDtypeStruct((2, 8, 16, 8, 128), jnp.float32)
-    pad_s = jax.ShapeDtypeStruct((2, 2, 8, 8, 16), jnp.float32)
+    # Padded input (`read_width=128 > width=80`): Mosaic predicates loads at `width`, observed both on
+    # multi-chunk emitted walk bytes and `launch_work`, while Triton reads `read_width` columns (row 9795).
+    pad_p = jax.ShapeDtypeStruct((2, 16, 16, 8, 128), jnp.float32)
+    pad_s = jax.ShapeDtypeStruct((2, 2, 8, 16, 16), jnp.float32)
     mosaic_block = merged._channel_block(spec, pad_p, pad_s, 4, 80, sm90)
     mosaic_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, sm90)
-    assert mosaic_work.device_bytes == _traced_mosaic_merge_bytes(
-        spec, pad_p, pad_s, 4, 80, mosaic_block, target=sm90)
+    assert mosaic_work.device_bytes == _mosaic_expected_bytes(
+        rows=2 * 4 * 8, slices=16, width=80, read_width=128, block=mosaic_block)
+    roles_pad = _mosaic_emitted_roles(spec, pad_p, pad_s, 4, 80, mosaic_block, target=sm90)
+    pad_blocks = 128 // mosaic_block
+    assert roles_pad[0].walks[0].device_bytes == float(8 * ((80 / pad_blocks) * 4 + 2 * 4))
+    assert roles_pad[0].walks[0].device_bytes < float(8 * ((128 / pad_blocks) * 4 + 2 * 4))
+    col_masks = _mosaic_chunk_col_masks(spec, pad_p, pad_s, 4, 80, mosaic_block, target=sm90)
+    assert sum(int(m.sum()) for m in col_masks) == 80
+    assert not any(m[col - cb * mosaic_block] for cb, m in enumerate(col_masks)
+                   for col in range(80, 128) if 0 <= col - cb * mosaic_block < len(m))
     triton_block = merged._channel_block(spec, pad_p, pad_s, 4, 80, sm75)
     triton_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, sm75)
-    assert triton_work.device_bytes == _traced_merge_bytes(spec, pad_p, pad_s, 4, 80, triton_block)
+    assert triton_work.device_bytes == _traced_merge_bytes(
+        spec, pad_p, pad_s, 4, 80, triton_block)
     assert mosaic_work.device_bytes < triton_work.device_bytes, (mosaic_work, triton_work)
     # Explicit multi-block schedule (`block=64`, 2 blocks for `width=128`) vs single-block (`block=128`):
-    # verifies single-stats-writer (`c_block == 0`) accounting directly on the emitted Mosaic MLIR body
-    # without asserting a derived block choice.
+    # emitted `c_block == 0` role writes the 8 B row stats while `c_block == 1` writes none.
     small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
     small_s = jax.ShapeDtypeStruct((2, 1, 1, 8, 8), jnp.float32)
     units = algebra.units_of(spec)
+    roles_2blk = _mosaic_emitted_roles(spec, small_p, small_s, 1, 128, 64, target=sm90)
+    assert roles_2blk[0].fixed.device_bytes - roles_2blk[1].fixed.device_bytes == float(
+        2 * small_s.dtype.itemsize)
     work_1blk, _ = merged._launch_for_block(units, small_p, small_s, 1, 128, 128, sm90, family="wgmma")
     work_2blk, _ = merged._launch_for_block(units, small_p, small_s, 1, 128, 64, sm90, family="wgmma")
-    assert work_1blk.device_bytes == _traced_mosaic_merge_bytes(spec, small_p, small_s, 1, 128, 128,
-                                                                target=sm90)
-    assert work_2blk.device_bytes == _traced_mosaic_merge_bytes(spec, small_p, small_s, 1, 128, 64,
-                                                                target=sm90)
-    # Second block adds only one extra pass of 3 * 8 * 2 * 4 stat reads (192 B), zero extra stat-store bytes.
+    assert work_1blk.device_bytes == _mosaic_expected_bytes(
+        rows=1, slices=8, width=128, read_width=128, block=128)
+    assert work_2blk.device_bytes == _mosaic_expected_bytes(
+        rows=1, slices=8, width=128, read_width=128, block=64)
     assert work_2blk.device_bytes - work_1blk.device_bytes == float(3 * 8 * 2 * 4)
+    assert work_2blk.operations > work_1blk.operations
+
 
 def test_a_split_merge_with_initial_state_uses_one_merged_padded_launch():
     """A split decode merge with a sink or resumed `Initial` state (`merged.merged_split`, row 9804) lowers
@@ -1251,10 +1180,21 @@ def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matche
         work = merged.launch_work(spec, padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
                                   out_heads=out_heads, output_mod=mod, output_kinds=kinds,
                                   output_specs=(gate, head))
+        base_work = merged.launch_work(spec, padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
+                                       out_heads=out_heads)
         block, _ = merged._planned_block(
             algebra.units_of(spec), padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
             out_heads=out_heads, output_mod=mod, output_kinds=kinds, output_specs=(gate, head))
-        emitted = _traced_mosaic_merge_bytes(
+        rows = padded.shape[0] * queries * padded.shape[3]
+        blocks = (1 << (width - 1).bit_length()) // block
+        hook_bytes = float(rows * (width * gate.dtype.itemsize + blocks * head.dtype.itemsize))
+        assert work.device_bytes - base_work.device_bytes == hook_bytes, (
+            work.device_bytes, base_work.device_bytes, hook_bytes)
+        roles_hooked = _mosaic_emitted_roles(
             spec, padded, stacked, queries, width, block, target=target, out_dtype=jnp.bfloat16,
             out_heads=out_heads, output_mod=mod, output_kinds=kinds, output_specs=(gate, head))
-        assert work.device_bytes == emitted, (work.device_bytes, emitted)
+        roles_base = _mosaic_emitted_roles(
+            spec, padded, stacked, queries, width, block, target=target, out_dtype=jnp.bfloat16,
+            out_heads=out_heads)
+        per_block_hook = float((width / blocks) * gate.dtype.itemsize + head.dtype.itemsize)
+        assert roles_hooked[0].fixed.device_bytes - roles_base[0].fixed.device_bytes == per_block_hook

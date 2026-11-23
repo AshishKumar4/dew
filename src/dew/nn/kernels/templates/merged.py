@@ -314,34 +314,57 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
             jax.make_jaxpr(launch)(padded, stacked, *extra_s, *output_specs).jaxpr)
             if programs.opaque(equation))
     body = kernel.params["jaxprs"][0] if "jaxprs" in kernel.params else kernel.params["jaxpr"]
-    (role,) = emission.emitted(body, 1, None, device=range(len(body.invars)),
-                               forms=emission.forms_of(kernel.params.get("compiler_params"))).roles
-    if len(role.walks) == 3:
-        joining_walk, mean_walk, _ = role.walks
-    elif role.walks:
-        joining_walk, mean_walk = cost.Work(), role.walks[0]
-    else:
-        joining_walk = mean_walk = cost.Work()
-    walk_work = emission.repeated(joining_walk, chunks - 1) + emission.repeated(mean_walk, 2 * chunks)
+    forms = emission.forms_of(kernel.params.get("compiler_params"))
+    block_roles = (emission.emitted(body, min(blocks, 2), "block", device=range(len(body.invars)),
+                                    forms=forms).roles
+                   if family is not None
+                   else emission.emitted(body, 1, None, device=range(len(body.invars)), forms=forms).roles)
+
+    def _role_work(role: emission.Role) -> cost.Work:
+        if len(role.walks) == 3:
+            joining_walk, mean_walk, _ = role.walks
+        elif role.walks:
+            joining_walk, mean_walk = cost.Work(), role.walks[0]
+        else:
+            joining_walk = mean_walk = cost.Work()
+        return (role.fixed + emission.repeated(joining_walk, chunks - 1)
+                + emission.repeated(mean_walk, 2 * chunks))
+
     passes = 3 * chunks
     padded_item, stacked_item = padded.dtype.itemsize, stacked.dtype.itemsize
-    read_cols = min(width, read_width) if family is not None else read_width
+    chunk_size = windows.chunk_width(total_slices)
     init_reads = int(has_initial)
     output_bytes = sum(
         rows * (width if kind is Kind.OUTPUT else blocks) * spec.dtype.itemsize
         for kind, spec in zip(output_kinds, output_specs, strict=True))
-    if out_dtype is None:
-        total_device_bytes = float(rows * ((3 * slices * read_cols + (init_reads + 1) * width) * padded_item
-                                           + (blocks * (3 * slices + init_reads) + 1) * 2 * stacked_item))
-    else:
-        out_item = jnp.dtype(out_dtype).itemsize
+    if family is not None:
+        row_work = (_role_work(block_roles[0]) + emission.repeated(_role_work(block_roles[1]), blocks - 1)
+                    if blocks > 1 else _role_work(block_roles[0]))
+        emitted_total = emission.repeated(row_work, rows)
+        slice_load = (block_roles[0].walks[0].device_bytes / chunk_size
+                      if block_roles[0].walks
+                      else (min(width, read_width) / blocks) * padded_item + 2 * stacked_item)
+        load_bytes = blocks * 3 * slices * slice_load
+        single_writer = blocks == 1 or block_roles[0].fixed.device_bytes > block_roles[1].fixed.device_bytes
+        stats_writers = 0 if out_dtype is not None else (1 if single_writer else blocks)
+        out_item = padded_item if out_dtype is None else jnp.dtype(out_dtype).itemsize
         total_device_bytes = float(
-            rows * (3 * slices * read_cols * padded_item + init_reads * width * padded_item
-                    + width * out_item + blocks * (3 * slices + init_reads) * 2 * stacked_item)
-            + output_bytes)
-    per_program = role.fixed + walk_work
-    total = dataclasses.replace(emission.repeated(per_program, launched), device_bytes=total_device_bytes,
-                                span=float(passes), kernels=1.0)
+            rows * (load_bytes + init_reads * (width * padded_item + blocks * 2 * stacked_item)
+                    + width * out_item + stats_writers * 2 * stacked_item) + output_bytes)
+    else:
+        emitted_total = emission.repeated(_role_work(block_roles[0]), launched)
+        if out_dtype is None:
+            total_device_bytes = float(
+                rows * ((3 * slices * read_width + (init_reads + 1) * width) * padded_item
+                        + (blocks * (3 * slices + init_reads) + 1) * 2 * stacked_item))
+        else:
+            out_item = jnp.dtype(out_dtype).itemsize
+            total_device_bytes = float(
+                rows * (3 * slices * read_width * padded_item + init_reads * width * padded_item
+                        + width * out_item + blocks * (3 * slices + init_reads) * 2 * stacked_item)
+                + output_bytes)
+    total = dataclasses.replace(emitted_total, device_bytes=total_device_bytes, span=float(passes),
+                                kernels=1.0)
     return total, launched
 
 
@@ -617,23 +640,25 @@ def _thread_col(block: int):
     return tid, col, unique
 
 
-def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, *, chunk: int, block: int,
-                     tile_block: int, slices: int, read_width: int, tile_layout):
-    """Predicated coalesced GMEM load of one `[chunk, tile_block]` output chunk (masked to `[0, block)` and
-    `< read_width`) and its replicated `[chunk, tile_block]` maxima and totals (row 9795)."""
+def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, col_ok, *, chunk: int,
+                     tile_block: int, slices: int, read_width: int, blocks: int = 1, tile_layout, tile_1d):
+    """Predicated coalesced GMEM load of one `[chunk, tile_block]` output chunk (gated by `col_ok` and
+    `sl < slices`) and its replicated `[chunk, tile_block]` maxima and totals (row 9795)."""
     scalar = plgpu.Layout.WG_SPLAT(())
     out_ty = plgpu.ShapeDtypeStruct((chunk, tile_block), padded_ref.dtype, layout=tile_layout)
     stat_ty = plgpu.ShapeDtypeStruct((chunk, tile_block), stacked_ref.dtype, layout=tile_layout)
 
     @emission.stating(lambda p, s, *_: cost.Work(
-        device_bytes=chunk * (block * p.dtype.itemsize + 2 * s.dtype.itemsize)))
-    def body(ctx, p_ref, s_ref, b_v, q_v, h_v, start_v, c_start_v):
+        device_bytes=chunk * ((read_width / blocks) * p.dtype.itemsize + 2 * s.dtype.itemsize)))
+    def body(ctx, p_ref, s_ref, b_v, q_v, h_v, start_v, c_start_v, col_ok_v):
         del ctx
+        pos0 = mgpu_ir.DenseI64ArrayAttr.get([0])
         i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
         b_i, q_i, h_i = (v.registers.item() for v in (b_v, q_v, h_v))
         st_i, cs_i = start_v.registers.item(), c_start_v.registers.item()
         _, tid_col, unique = _thread_col(tile_block)
         reps = tile_block // unique
+        col_ok_regs = col_ok_v.registers.reshape(reps)
 
         p_elem = mgpu_ir.MemRefType(p_ref.type).element_type
         p_strides, _ = mgpu_ir.MemRefType(p_ref.type).get_strides_and_offset()
@@ -654,7 +679,6 @@ def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, *, chunk:
         m_regs = np.empty(p_mgpu.registers_shape((chunk, tile_block)), dtype=object)
         t_regs = np.empty(p_mgpu.registers_shape((chunk, tile_block)), dtype=object)
         slices_c = mgpu_utils.c(slices, i32)
-        block_c, width_c = mgpu_utils.c(block, i32), mgpu_utils.c(read_width, i32)
         for s_idx in range(chunk):
             sl = mgpu_arith.addi(st_i, mgpu_utils.c(s_idx, i32))
             sl_ok = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, sl, slices_c)
@@ -668,10 +692,8 @@ def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, *, chunk:
             for rep in range(reps):
                 local_col = mgpu_arith.addi(tid_col, mgpu_utils.c(rep * unique, i32))
                 col = mgpu_arith.addi(cs_i, local_col)
-                in_blk = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, local_col, block_c)
-                ok = mgpu_arith.andi(
-                    mgpu_arith.andi(sl_ok, in_blk),
-                    mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.slt, col, width_c))
+                col_bit = mgpu_vector.extract(col_ok_regs[rep], dynamic_position=[], static_position=pos0)
+                ok = mgpu_arith.andi(sl_ok, col_bit)
                 col_off = mgpu_arith.muli(mgpu_arith.extsi(i64, col), mgpu_utils.c(p_strides[4], i64))
                 loaded = _predicated_load(p_base, mgpu_arith.addi(p_sl_base, col_off), ok, p_elem, p_zero)
                 p_regs[s_idx, rep, ...] = mgpu_vector.from_elements(p_vec, [loaded])
@@ -681,20 +703,20 @@ def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, *, chunk:
                 mgpu_fragments.FragmentedArray(_registers=t_regs, _layout=p_mgpu, _is_signed=None))
 
     return plgpu.inline_mgpu(
-        arg_types=(plgpu.RefType(), plgpu.RefType(), *(scalar,) * 5),
+        arg_types=(plgpu.RefType(), plgpu.RefType(), *(scalar,) * 5, tile_1d),
         return_type=(out_ty, stat_ty, stat_ty),
-    )(body)(padded_ref, stacked_ref, b, q, h, start, c_start)
+    )(body)(padded_ref, stacked_ref, b, q, h, start, c_start, col_ok)
 
 
 def _mgpu_load_initial(init_m_ref, init_t_ref, init_acc_ref, b, h, q, c_start, *, block: int,
-                       tile_block: int, width: int, tile_1d):
+                       tile_block: int, width: int, blocks: int = 1, tile_1d):
     """Predicated GMEM load of one row's `Initial` state (`[tile_block]` acc, replicated m and total)."""
     scalar = plgpu.Layout.WG_SPLAT(())
     acc_ty = plgpu.ShapeDtypeStruct((tile_block,), init_acc_ref.dtype, layout=tile_1d)
     stat_ty = plgpu.ShapeDtypeStruct((tile_block,), init_m_ref.dtype, layout=tile_1d)
 
     @emission.stating(lambda m, t, a, *_: cost.Work(
-        device_bytes=block * a.dtype.itemsize + m.dtype.itemsize + t.dtype.itemsize))
+        device_bytes=(width / blocks) * a.dtype.itemsize + m.dtype.itemsize + t.dtype.itemsize))
     def body(ctx, im_ref, it_ref, ia_ref, b_v, h_v, q_v, c_start_v):
         del ctx
         i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
@@ -744,12 +766,12 @@ def _mgpu_load_initial(init_m_ref, init_t_ref, init_acc_ref, b, h, q, c_start, *
 
 
 def _mgpu_store_finished(merged_ref, acc, b, out_t, out_h, c_start, *, block: int, tile_block: int,
-                         width: int, acc_layout):
+                         width: int, blocks: int = 1, acc_layout):
     """Predicated coalesced GMEM store of one `[block]` slice of finished output (`[tile_block]` or
     row 0 of `[2, tile_block]`, row 9795)."""
     scalar = plgpu.Layout.WG_SPLAT(())
 
-    @emission.stating(lambda ref, *_: cost.Work(device_bytes=block * ref.dtype.itemsize))
+    @emission.stating(lambda ref, *_: cost.Work(device_bytes=(width / blocks) * ref.dtype.itemsize))
     def body(ctx, dest_ref, acc_v, b_v, t_v, h_v, c_start_v):
         del ctx
         pos0 = mgpu_ir.DenseI64ArrayAttr.get([0])
@@ -783,21 +805,19 @@ def _mgpu_store_finished(merged_ref, acc, b, out_t, out_h, c_start, *, block: in
         arg_types=(plgpu.RefType(), acc_layout, *(scalar,) * 4),
     )(body)(merged_ref, acc, b, out_t, out_h, c_start)
 
-def _mgpu_store_stats(max_ref, tot_ref, maximum, total, b, q, h, c_block, *, tile_1d):
-    """Single-thread GMEM store of one row's scalar maximum and total (block 0, thread 0 only)."""
+def _mgpu_store_stats(max_ref, tot_ref, maximum, total, b, q, h, *, tile_1d):
+    """Single-thread GMEM store of one row's scalar maximum and total (thread 0; caller gates `c_block`)."""
     scalar = plgpu.Layout.WG_SPLAT(())
 
     @emission.stating(lambda m_ref, t_ref, *_: cost.Work(
         device_bytes=m_ref.dtype.itemsize + t_ref.dtype.itemsize))
-    def body(ctx, m_ref, t_ref, m_v, t_v, b_v, q_v, h_v, cb_v):
+    def body(ctx, m_ref, t_ref, m_v, t_v, b_v, q_v, h_v):
         del ctx
         pos0 = mgpu_ir.DenseI64ArrayAttr.get([0])
         i32 = mgpu_ir.IntegerType.get_signless(32)
-        b_i, q_i, h_i, cb_i = (v.registers.item() for v in (b_v, q_v, h_v, cb_v))
+        b_i, q_i, h_i = (v.registers.item() for v in (b_v, q_v, h_v))
         tid = mgpu_arith.remui(mgpu_utils.thread_idx(), mgpu_utils.c(THREADS, i32))
-        zero = mgpu_utils.c(0, i32)
-        elected = mgpu_arith.andi(mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.eq, cb_i, zero),
-                                  mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.eq, tid, zero))
+        elected = mgpu_arith.cmpi(mgpu_arith.CmpIPredicate.eq, tid, mgpu_utils.c(0, i32))
         branch = mgpu_scf.IfOp(elected)
         with mgpu_ir.InsertionPoint(branch.then_block):
             m_elem = mgpu_ir.MemRefType(m_ref.type).element_type
@@ -813,12 +833,12 @@ def _mgpu_store_stats(max_ref, tot_ref, maximum, total, b, q, h, c_block, *, til
             mgpu_scf.YieldOp([])
 
     plgpu.inline_mgpu(
-        arg_types=(plgpu.RefType(), plgpu.RefType(), tile_1d, tile_1d, *(scalar,) * 4),
-    )(body)(max_ref, tot_ref, maximum, total, b, q, h, c_block)
+        arg_types=(plgpu.RefType(), plgpu.RefType(), tile_1d, tile_1d, *(scalar,) * 3),
+    )(body)(max_ref, tot_ref, maximum, total, b, q, h)
 
 
 def _mgpu_load_output_param(param_ref, b, out_t, out_h, c_start, *, kind: Kind, block: int,
-                            tile_block: int, width: int, tile_layout):
+                            tile_block: int, width: int, blocks: int = 1, tile_layout):
     """Predicated coalesced GMEM load of one `output_mod` parameter (`Kind.HEAD` as 0D scalar, `Kind.QUERY`
     as `[2, 1]` splat, `Kind.OUTPUT` as `[2, tile_block]` `tile_layout` fragment), widening 16-bit floats to
     fp32 in registers and preserving signedness for integer and Boolean operands (row 5385)."""
@@ -835,7 +855,7 @@ def _mgpu_load_output_param(param_ref, b, out_t, out_h, c_start, *, kind: Kind, 
         out_ty = plgpu.ShapeDtypeStruct((2, 1), out_dtype, layout=plgpu.Layout.WG_SPLAT((2, 1)))
     else:
         out_ty = plgpu.ShapeDtypeStruct((2, tile_block), out_dtype, layout=tile_layout)
-    n_elems = 1 if is_scalar else block
+    n_elems = 1.0 if is_scalar else width / blocks
 
     @emission.stating(lambda p, *_: cost.Work(device_bytes=n_elems * p.dtype.itemsize))
     def body(ctx, p_ref, b_v, t_v, h_v, c_start_v):
@@ -910,6 +930,7 @@ def _launch_mosaic(padded, stacked, *extra, units: windows.Units, queries: int, 
     total_slices = slices + int(has_initial)
     chunk = max(windows.chunk_width(total_slices), 2)
     channels = 1 << (width - 1).bit_length()
+    blocks = channels // block
     tile_block = max(block, 64)
     tile_layout = _tile_layout(tile_block)
     tile_1d = _tile_1d_layout(tile_layout)
@@ -918,20 +939,20 @@ def _launch_mosaic(padded, stacked, *extra, units: windows.Units, queries: int, 
     n_params = len(output_kinds)
     def entry(padded_ref, stacked_ref, *rest):
         row = lax.axis_index("row")
-        h = lax.rem(row, heads)
-        bq = lax.div(row, heads)
-        q = lax.rem(bq, queries)
-        b = lax.div(bq, queries)
+        h, bq = lax.rem(row, heads), lax.div(row, heads)
+        q, b = lax.rem(bq, queries), lax.div(bq, queries)
         c_block = lax.axis_index("block")
         c_start = c_block * block
-        init_refs = rest[:n_init]
-        param_refs = rest[n_init:n_init + n_params]
-        out_refs = rest[n_init + n_params:]
+        local_cols = jax.lax.broadcasted_iota(jnp.int32, (tile_block,), 0)
+        read_col_ok = plgpu.layout_cast(
+            (local_cols < block) & (c_start + local_cols < min(width, read_width)), tile_1d)
+        init_refs, param_refs, out_refs = (
+            rest[:n_init], rest[n_init:n_init + n_params], rest[n_init + n_params:])
         if has_initial:
             init_m_ref, init_t_ref, init_acc_ref = init_refs
             raw_acc, raw_m, raw_t = _mgpu_load_initial(
                 init_m_ref, init_t_ref, init_acc_ref, b, h, q, c_start, block=block, tile_block=tile_block,
-                width=width, tile_1d=tile_1d)
+                width=width, blocks=blocks, tile_1d=tile_1d)
             init_state: algebra.Partial | None = algebra.initial_state(
                 units, algebra.Partial(raw_acc, raw_m, raw_t), raw_scale=raw_scale)
         else:
@@ -939,9 +960,9 @@ def _launch_mosaic(padded, stacked, *extra, units: windows.Units, queries: int, 
 
         def read(start):
             out, maximum, total = _mgpu_load_chunk(
-                padded_ref, stacked_ref, b, q, h, start, c_start, chunk=chunk, block=block,
-                tile_block=tile_block, slices=slices, read_width=min(width, read_width),
-                tile_layout=tile_layout)
+                padded_ref, stacked_ref, b, q, h, start, c_start, read_col_ok, chunk=chunk,
+                tile_block=tile_block, slices=slices, read_width=min(width, read_width), blocks=blocks,
+                tile_layout=tile_layout, tile_1d=tile_1d)
             if init_state is not None:
                 slice_pos = plgpu.layout_cast(
                     start + jax.lax.broadcasted_iota(jnp.int32, (chunk, tile_block), 0), tile_layout)
@@ -969,7 +990,8 @@ def _launch_mosaic(padded, stacked, *extra, units: windows.Units, queries: int, 
             if output_mod is not None:
                 vals = tuple(
                     _mgpu_load_output_param(ref, b, out_t, out_h, c_start, kind=kind, block=block,
-                                            tile_block=tile_block, width=width, tile_layout=tile_layout)
+                                            tile_block=tile_block, width=width, blocks=blocks,
+                                            tile_layout=tile_layout)
                     for ref, kind in zip(param_refs, output_kinds, strict=True))
                 acc = output_mod(
                     plgpu.layout_cast(lax.broadcast_in_dim(acc, (2, tile_block), (1,)), tile_layout), *vals)
@@ -978,14 +1000,15 @@ def _launch_mosaic(padded, stacked, *extra, units: windows.Units, queries: int, 
                 store_layout = tile_1d
             written = plgpu.layout_cast(acc.astype(out_dtype), store_layout)
             _mgpu_store_finished(merged_ref, written, b, out_t, out_h, c_start, block=block,
-                                 tile_block=tile_block, width=width, acc_layout=store_layout)
+                                 tile_block=tile_block, width=width, blocks=blocks, acc_layout=store_layout)
         else:
             merged_ref, maximum_ref, total_ref = out_refs
             written = plgpu.layout_cast(state.acc, tile_1d)
             _mgpu_store_finished(merged_ref, written, b, q, h, c_start, block=block, tile_block=tile_block,
-                                 width=width, acc_layout=tile_1d)
-            _mgpu_store_stats(maximum_ref, total_ref, plgpu.layout_cast(state.m, tile_1d),
-                              plgpu.layout_cast(state.total, tile_1d), b, q, h, c_block, tile_1d=tile_1d)
+                                 width=width, blocks=blocks, acc_layout=tile_1d)
+            pl.when(c_block == 0)(
+                lambda: _mgpu_store_stats(maximum_ref, total_ref, plgpu.layout_cast(state.m, tile_1d),
+                                          plgpu.layout_cast(state.total, tile_1d), b, q, h, tile_1d=tile_1d))
 
     if out_dtype is not None:
         assert out_heads is not None

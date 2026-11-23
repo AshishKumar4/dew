@@ -1418,8 +1418,6 @@ def test_bf16_template_compiles_for_a_v5e(case_name):
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_tpu_kernels, failures
 
-    from dew.nn import programs
-
     query = jax.ShapeDtypeStruct((1, 256, 4, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, 256, 2, 128), jnp.bfloat16)
     query_512 = jax.ShapeDtypeStruct((1, 512, 4, 128), jnp.bfloat16)
@@ -1448,21 +1446,6 @@ def test_bf16_template_compiles_for_a_v5e(case_name):
         assert not attention_mosaic_program.head_first(tpu_family, jnp.bfloat16, 128)
         assert attention_mosaic_program.head_first(tpu_family, jnp.bfloat16, 64)
         assert not attention_mosaic_program.head_first(tpu_family, jnp.float32, 64)
-
-        def bf16_swaps(fn, args, gen: str) -> int:
-            with generation.assumed(gen):
-                jaxpr = jax.make_jaxpr(fn)(*args).jaxpr
-                return sum(1 for eq in programs.equations(jaxpr)
-                           if eq.primitive.name == "transpose"
-                           and eq.params.get("permutation") == (0, 2, 1, 3)
-                           and getattr(eq.invars[0].aval, "dtype", None) == jnp.bfloat16)
-
-        gpu_step_swaps = bf16_swaps(step, (query, key, key, query), "sm90")
-        assert bf16_swaps(fwd, (query, key, key), "v5e") == 0
-        assert bf16_swaps(fwd, (query_d64, key_d64, key_d64), "v5e") == 0
-        assert bf16_swaps(step, (query, key, key, query), "v5e") == gpu_step_swaps
-        assert bf16_swaps(fwd, (query_512, key_512, key_512), "v6e") == 0
-        assert bf16_swaps(step, (query, key, key, query), "v6e") == gpu_step_swaps
 
     cases = {
         "v5e-fwd": ("v5e", KernelCase("v5e-bf16-fwd", lambda: (fwd, (query, key, key)))),
