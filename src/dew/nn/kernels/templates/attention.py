@@ -1346,7 +1346,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
         if hooks.initial is None or hooks.initial.valueless:
             normalized = held_mean(acc, total, value.dtype, functools.partial(
-                _scaled_mean, logits, value.astype(wide), m0, total0))
+                _scaled_mean, logits, value.astype(wide), m0, total0, acc0))
         if hooks.output_mod is None and jnp.dtype(query.dtype).itemsize == 2:
             # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
             normalized = narrowing_settled(normalized, acc, total, query.dtype)
@@ -1493,12 +1493,14 @@ def held_mean(acc: jax.Array, total: jax.Array, dtype, law) -> jax.Array:
     return saturated(out, finite, dtype) + derivative_of(law())
 
 
-def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax.Array) -> jax.Array:
-    """The mean of the values `[B, K, Hk, Dv]` at the logits `[B, H, Q, K]` beside a valueless state (its
-    maximum `m0` and mass `total0`, `[B, H, Q]`), `[B, H, Q, Dv]`: each key's mass at the row's maximum held
-    out of the graph (`m`'s, any shift's derivative cancels), the state's its mass times its own, and the
-    masses' contraction with the values over their total formed apart from their binades
-    (`scaled_contraction`), whose every order is that contraction again; zero over a total of none."""
+def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax.Array,
+                 acc0: jax.Array) -> jax.Array:
+    """The mean of the values `[B, K, Hk, Dv]` at the logits `[B, H, Q, K]` beside a state (its maximum `m0`
+    and mass `total0`, `[B, H, Q]`, and its sums `acc0`, `[B, H, Q, Dv]`, a valueless state's zero),
+    `[B, H, Q, Dv]`: each key's mass at the row's maximum held out of the graph (`m`'s, any shift's derivative
+    cancels), the state's its mass times its own, and the masses' contraction with the values and the state's
+    sums at its factor, over their total, one sum formed apart from its binades (`scaled_contraction`), whose
+    every order is that sum again; zero over a total of none."""
     batch, heads, queries, keys = logits.shape
     kv_heads, width = value.shape[2], value.shape[3]
     grouped = (batch, kv_heads, heads // kv_heads, queries)
@@ -1508,8 +1510,11 @@ def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - shift), 0)
     total = jnp.sum(masses, axis=-1) + total0 * carried
     divisor = jnp.where(total > 0, total, 1)
-    form = scaled_contraction.Form(("bhgqk", "bhgq", "bkhd"), ((1, (((0, 1), (1, -1)), ((2, 1),))),), "bhgqd")
-    mean = scaled_contraction.contract(form, masses.reshape(*grouped, keys), divisor.reshape(grouped), value)
+    form = scaled_contraction.Form(
+        ("bhgqk", "bhgq", "bkhd", "bhgqd", "bhgq"),
+        ((1, (((0, 1), (1, -1)), ((2, 1),))), (1, (((3, 1), (4, 1), (1, -1)),))), "bhgqd")
+    mean = scaled_contraction.contract(form, masses.reshape(*grouped, keys), divisor.reshape(grouped), value,
+                                       acc0.reshape(*grouped, width), carried.reshape(grouped))
     return jnp.where(total[..., None] > 0, mean.reshape(batch, heads, queries, width), 0)
 
 

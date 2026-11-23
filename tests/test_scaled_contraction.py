@@ -79,3 +79,12 @@ def test_a_quotients_second_derivatives_are_its_own():
             jax.grad(plain, argnums=(0, 1)), argnums=(0, 1))(a, d)
         for got, want in zip(jax.tree.leaves(found), jax.tree.leaves(truth), strict=True):
             np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_a_batched_sum_shares_an_unbatched_terms_operand():
+    """`x + y` (two terms) batched along `x` alone is each example's `x` plus the shared `y`."""
+    form = Form(("i", "i"), ((1, (((0, 1),),)), (1, (((1, 1),),))), "i")
+    x = jnp.arange(6.0, dtype=jnp.float32).reshape(3, 2)
+    y = jnp.asarray([0.5, -2.0], jnp.float32)
+    found = jax.vmap(lambda each: contract(form, each, y))(x)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray(x + y))

@@ -250,16 +250,27 @@ ad.primitive_transposes[scaled_contraction_p] = _transpose
 
 def _batched(arrays, dims, *, form: Form):
     """The sum of a batch: a fresh letter on each batched operand (its batch axis moved first) and on the
-    result; an unbatched operand shared along it."""
+    result; an unbatched operand shared along it, and a term that reads no batched operand taking a unit
+    operand along it, so each term spans the result's letters."""
     used = set(form.out).union(*form.subscripts)
     letter = next((each for each in string.ascii_letters if each not in used), None)
     if letter is None:
         raise ValueError("a scaled contraction batched past its letters")
+    size = next(array.shape[dim] for array, dim in zip(arrays, dims, strict=True) if dim is not None)
     operands, subscripts = [], []
     for array, dim, subscript in zip(arrays, dims, form.subscripts, strict=True):
         operands.append(array if dim is None else jnp.moveaxis(array, dim, 0))
         subscripts.append(subscript if dim is None else letter + subscript)
-    return contract(Form(tuple(subscripts), form.terms, letter + form.out), *operands), 0
+    batched = {index for index, dim in enumerate(dims) if dim is not None}
+    terms = []
+    for sign, groups in form.terms:
+        if not any(index in batched for group in groups for index, _ in group):
+            if len(operands) == len(arrays):
+                operands.append(jnp.ones((size,), _dtype(arrays)))
+                subscripts.append(letter)
+            groups = (*groups, ((len(operands) - 1, 1),))
+        terms.append((sign, groups))
+    return contract(Form(tuple(subscripts), tuple(terms), letter + form.out), *operands), 0
 
 
 batching.primitive_batchers[scaled_contraction_p] = _batched

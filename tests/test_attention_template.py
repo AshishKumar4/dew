@@ -1157,6 +1157,16 @@ def test_the_references_mean_past_the_format_differentiates_beside_any_state():
     _, moved = jax.jvp(lambda t: _state_mean(query, key[:, :1], lone, single, state, t)[..., 0], (reach,),
                        (reach,))
     np.testing.assert_array_equal(np.asarray(moved), -(2.0 ** 64))
+    # A state of mass 1 and zero sums at the key's own maximum beside one key of value 0: the output is half
+    # the state's sums, so moving them by one moves it by 1/2.
+    zero_value = jnp.zeros((1, 1, 1, 8), jnp.float32)
+
+    def beside_sums(acc):
+        hooks = template.Hooks(initial=template.Initial(state, jnp.ones_like(state), acc, valueless=True))
+        return template.reference(query, key[:, :1], zero_value, single, hooks, scale=1.0)
+
+    _, moved = jax.jvp(beside_sums, (jnp.zeros_like(zero_value),), (jnp.ones_like(zero_value),))
+    np.testing.assert_array_equal(np.asarray(moved), 0.5)
     # A call of no keys beside a state of mass 2: the output 0, its gradients finite zeros.
     none = template.spans(1, 0, 1)
     out, pull = jax.vjp(lambda t: _state_mean(query, key[:, :0], value[:, :0], none, state, t),
