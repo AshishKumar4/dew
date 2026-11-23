@@ -184,12 +184,18 @@ class ShardManifest:
     index_ordered: bool = False
     counted: Callable[[int], tuple[int, ...]] | None = None
     fixed_parts: bool = False
+    cut: str | None = None
+    """The rule its `subdivide` cuts its records by where one other than its first cut them (`EVEN_CUT`),
+    which `digest` holds: a position saved under another cut of the same shards names other rows at its
+    places, so the fact it was saved with no longer matches and a resume refuses it."""
 
     @property
     def digest(self) -> str:
-        """The shards' ids in their order as one digest: what a stream reads in turn, which a plan records
-        as its `shards` rule's fact (`dew.data.compile._derived`) and a resume compares."""
-        return hashlib.sha256("\n".join(shard.id for shard in self.shards).encode()).hexdigest()[:16]
+        """The shards' ids in their order as one digest, beside the rule that cuts them finer where it names
+        one (`cut`): what a stream reads in turn, which a plan records as its `shards` rule's fact
+        (`dew.data.compile._derived`) and a resume compares."""
+        named = [shard.id for shard in self.shards] + ([] if self.cut is None else [f"cut:{self.cut}"])
+        return hashlib.sha256("\n".join(named).encode()).hexdigest()[:16]
 
     def parts(self) -> tuple[Shard, ...]:
         """The store's finer shards its subdivision always cuts (`fixed_parts`), as a read by more readers
@@ -443,7 +449,7 @@ def _indexed_manifest(source: Source, uri: str, rows: int, reader: ShardOpener |
     count = len(source.records("indexed")) if count is None else count
     subdivide = functools.partial(_even_ranges, uri, count, lambda start, end: f"records:{start}")
     return ShardManifest(_ranges(uri, count, rows), _IndexedSlice(source) if reader is None else reader,
-                         subdivide=subdivide if subdivides else None,
+                         subdivide=subdivide if subdivides else None, cut=EVEN_CUT if subdivides else None,
                          index_ordered=True)
 
 
@@ -451,6 +457,13 @@ def _ranges(uri: str, count: int, size: int) -> tuple[Shard, ...]:
     """`count` records at `uri` in consecutive ranges of `size`, each named by the record it starts at."""
     return tuple(Shard(f"records:{start}", uri, start, min(start + size, count), min(size, count - start))
                  for start in range(0, count, size))
+
+
+EVEN_CUT = "even"
+"""The rule a positioned store's ranges are cut finer by (`_even_ranges`): exactly the readers' count of
+ranges, their sizes differing by one record at most, where its first cut ranges of `count // required`
+records, more of them than readers (Train 1240's review); `ShardManifest.cut` states it, so a position its
+first cut saved is refused, never read at other rows."""
 
 
 def _even_ranges(uri: str, count: int, name: Callable[[int, int], str], required: int) -> tuple[Shard, ...]:

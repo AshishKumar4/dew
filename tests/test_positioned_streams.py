@@ -2,6 +2,7 @@
 the store's records as the index lists them, each at its index there, in parts of whole records each stating
 its rows (`Files.positioned_manifest`, row 9051), as its indexed read numbers them."""
 
+import dataclasses
 import io
 import itertools
 import json
@@ -242,3 +243,43 @@ def test_a_positioned_read_cut_finer_than_its_store_fills_no_cache_another_topol
     numbered = log.read_text().split()
     assert first == whole() == [(index, index) for index in range(160)]
     assert log.read_text().split() == numbered
+
+
+def test_a_position_saved_under_the_first_cut_of_a_positioned_store_is_refused_where_it_resumes(tmp_path):
+    """A positioned stream's store cut finer than its ranges by the readers' count is cut by one rule
+    (`EVEN_CUT`), which its shards fact holds (`ShardManifest.cut`): a position saved when the store's
+    ranges were cut otherwise, whose fact names its shards alone, is refused where it resumes, naming the
+    fact, never read at the rows its places now hold (Train 1240's review: 130 records for 80 readers moved
+    one reader's rows from [1, 2) to [2, 4) under an unchanged fact)."""
+    from dew.data.plan import PlanChanged
+    from dew.data.sources.base import stream_manifest
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(130)))
+    files = Files(str(path))
+    files.provision()
+    chain = Pipeline(files).map_with_index(lambda index, row: {**row, "at": np.int64(index)}).batch(1)
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    reader = compile(chain, read="streamed", loading=loading).train(DataPartition())
+    assert isinstance(reader, Closeable)
+    try:
+        list(itertools.islice(reader, 2))
+        saved = json.loads(reader.get_state())
+    finally:
+        reader.close()
+    manifest = stream_manifest(files, positioned=True)
+    current, first = manifest.digest, dataclasses.replace(manifest, cut=None).digest
+    assert current != first
+    facts = saved["dew_data_plan"]["derived"]
+    named = [key for key, value in facts.items() if value == current]
+    assert named, facts
+    for key in named:
+        facts[key] = first
+    resumed = compile(chain, read="streamed", loading=loading).train(DataPartition())
+    assert isinstance(resumed, Closeable)
+    try:
+        with pytest.raises(PlanChanged) as refused:
+            resumed.set_state(json.dumps(saved).encode())
+        assert any(part.endswith("shards") for part in refused.value.differs), refused.value.differs
+    finally:
+        resumed.close()
