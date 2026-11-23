@@ -389,8 +389,9 @@ def test_a_slices_transfer_is_on_par_with_the_rule_from_the_identity(per_key):
     zero values from the identity, which `entering_memory` took before (check 1), in 16-token chunks (not
     the rule's 64) over 150 tokens, off their grid: a row whose document starts inside the slice (the
     transfer zero across it) and a row whose one document spans it, its transfer ten chunks' transitions
-    chained, about 0.3% of the identity's norm under these gates (a reset on every row made every
-    transfer zero, whatever its chunks: #3757's review). A slice of no tokens transfers the identity."""
+    chained, 0.2 to 0.7% of the identity's norm under these gates (float64, four draws); a reset on every
+    row made every transfer zero, whatever its chunks (#3757's review). A slice of no tokens transfers the
+    identity."""
     from dew.nn.kernels import generation
     from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, recurrent_delta_rule, transferred
 
