@@ -14,7 +14,6 @@ from jax._src.pallas.mosaic_gpu import (
 
 from dew.nn.derivatives import marked_call_p
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import bundles
 from dew.nn.programs import equations
 
 
@@ -100,12 +99,13 @@ def _epilogue_layout(dtype, target):
     """Accumulator register layout of `target`'s primary GPU bundle for `dtype`, or None on TPU/unbudgeted."""
     if generation.tpu(target):
         return None
+    from dew.nn.kernels.templates import bundles
+
     groups = bundles.groups(target.generation, dtype, stated=True, tpu=False)
     if not groups or not groups[0]:
         return None
     family = groups[0][0]
     return family.layout if family.budgets_registers else None
-
 
 def _lowers(hook, tiles: tuple, sides, rules, *, layout=None) -> bool:
     """Whether a Pallas lowering's `rules` hold a rule for every primitive of `hook` on its `tiles` and its

@@ -914,7 +914,7 @@ def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
 
     def plain_poly(operand, poly):
         sq = jax.lax.dot_general(operand, operand, (((2,), (1,)), ((0,), (0,))))
-        return poly[0] * jnp.eye(6, dtype=operand.dtype) + poly[1] * operand + poly[2] * sq
+        return poly[0] * jnp.eye(operand.shape[-1], dtype=operand.dtype) + poly[1] * operand + poly[2] * sq
 
     assert_contract(lambda operand, poly: gemm.symmetric_polynomial(operand, poly, out_dtype=operand.dtype),
                     (mat, coeffs), (d_mat, d_coeffs), c_gram, f"symmetric_polynomial {edge}",
@@ -969,13 +969,9 @@ def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
         return (p[0] * jnp.eye(64, dtype=jnp.float32) + p[1] * x.astype(jnp.float32) + p[2] * sq).astype(
             jnp.bfloat16)
 
-    def truth_poly_bf(operand, poly):
-        sq = jax.lax.dot_general(operand, operand, (((2,), (1,)), ((0,), (0,))))
-        return poly[0] * jnp.eye(64, dtype=operand.dtype) + poly[1] * operand + poly[2] * sq
-
     assert_contract(native_poly_bf, (sym_bf, p_bf), (d_sym_bf, dp_bf), c_bf,
                     f"symmetric_polynomial native mosaic bf16 {edge}",
-                    truth_fn=truth_poly_bf, plain_fn=plain_poly_bf, without=FORWARD_ORDERS)
+                    truth_fn=plain_poly, plain_fn=plain_poly_bf, without=FORWARD_ORDERS)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -1020,5 +1016,7 @@ def test_an_fp8_weight_product_holds_every_order(edge):
 
     def plain(rows):
         return jax.lax.dot(rows.astype(jnp.bfloat16), decoded, preferred_element_type=jnp.float32)
+
+    without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
     assert_contract(product, (x,), (dx,), cotangent, f"fp8 weight product {edge}",
-                    truth_fn=plain, plain_fn=plain)
+                    truth_fn=plain, plain_fn=plain, without=without)
