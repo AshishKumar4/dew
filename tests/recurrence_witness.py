@@ -1135,7 +1135,8 @@ def assert_clamped_key_decays_witnessed(lane: Lane, dtype=None) -> None:
     """The step witness under a decay a key dimension no bound declares (`declared_bound`), a call of three
     chunks with a steep column (`draw`'s `steep`: one key dimension of one token a chunk at -2^26, mild ones
     beside and after it): every record of its forward inside its step's enclosure, and of a 16-bit call's
-    fast backward where the template trains it (`recorded_key_backward`'s). A 16-bit call's (`dtype` None,
+    fast backward, which the template trains (`recorded_key_backward`'s), its log decays' gradient judged
+    apart: zero at each steep entry, past the clamp, and finite everywhere. A 16-bit call's (`dtype` None,
     bf16) prefix its rounded sum of its decays clamped (`Lane.clamped`); an fp32 call's the compensated pair
     (row 12067)."""
     operands = draw(0, "mild", per_key=True, dtype=dtype, steep=True)
@@ -1143,10 +1144,14 @@ def assert_clamped_key_decays_witnessed(lane: Lane, dtype=None) -> None:
     held = witness(run, lane)
     for name in RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
-    if run.trained and dtype is None:
-        back = recorded_key_backward(operands, run=run)
-        for name, inside in key_back_witnessed(back, lane).items():
-            assert np.all(inside), (name, np.mean(inside))
+    if dtype is not None:
+        return
+    assert run.trained, "the template trains a 16-bit call with a steep column"
+    back = recorded_key_backward(operands, run=run)
+    for name, inside in key_back_witnessed(back, lane).items():
+        assert np.all(inside), (name, np.mean(inside))
+    dg, steep = back.grads[3], operands[3] < mainloop.DECAY_FLOOR
+    assert np.all(np.isfinite(dg)) and np.all(dg[steep] == 0), (np.sum(~np.isfinite(dg)), dg[steep])
 
 
 UNGATED_SHARES = {"leaving": 0.5}
@@ -1354,7 +1359,8 @@ class BackRun(NamedTuple):
     """A training call's fast backward under the delta rule as its launches kept it (`recorded_backward`):
     its forward's run (`Run`), the output's and final memory's gradients `do` `[N, H, C, Dv]` and `dfinal`
     `[H, Dk, Dv]`, and each launch's records by name (`BACK_RECORDS`), `[N, H, ...]` float64 (the gradient
-    of the memory each chunk leaves `dh`, `[N, H, Dk, Dv]`, beside them), with the dtype each is stored in."""
+    of the memory each chunk leaves `dh`, `[N, H, Dk, Dv]`, beside them), with the dtype each is stored in,
+    and the step's gradients of its operands `(q, k, v, g, beta, h0)` as the training step returns them."""
 
     run: Run
     do: np.ndarray
@@ -1363,6 +1369,7 @@ class BackRun(NamedTuple):
     dh0: np.ndarray
     records: dict
     dtypes: dict
+    grads: tuple
 
     def step(self, n: int, head: int, lane: Lane) -> BackStep:
         """Chunk `n` and value head `head`'s inputs, the gradient of the memory it leaves the final memory's
@@ -1435,13 +1442,14 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
     for mine, theirs in zip(grads[:6], native, strict=True):
         assert np.array_equal(np.asarray(mine).view(np.uint8), np.asarray(theirs).view(np.uint8)), \
             "the certify build is the production program"
-    return run, do, dfinal, saved, extra
+    return run, do, dfinal, saved, extra, tuple(np.asarray(x) for x in native)
 
 
-def _back_run(run, do, dfinal, saved, named: dict, laid: int, dh: np.ndarray) -> BackRun:
+def _back_run(run, do, dfinal, saved, named: dict, laid: int, dh: np.ndarray, grads: tuple) -> BackRun:
     """A captured backward's `BackRun` (`_captured_backward`): its `named` records (each its stored array and
     width) laid a chunk and value head at a time over its `laid` chunks, beside the gradient `dh`
-    `[N, H, Dk, Dv]` of the memory each chunk leaves, each with the dtype it is stored in."""
+    `[N, H, Dk, Dv]` of the memory each chunk leaves, each with the dtype it is stored in, and the step's
+    `grads`."""
     import jax.numpy as jnp
 
     _, length, heads, value_width = do.shape
@@ -1452,7 +1460,7 @@ def _back_run(run, do, dfinal, saved, named: dict, laid: int, dh: np.ndarray) ->
     return BackRun(run, hosted_do.reshape(chunks, chunk, heads, value_width).transpose(0, 2, 1, 3),
                    np.asarray(dfinal, np.float64)[0], dh,
                    np.asarray(saved.dh0, np.float64).reshape(heads, key_width, value_width),
-                   _chunked(named, laid, chunks, chunk), dtypes)
+                   _chunked(named, laid, chunks, chunk), dtypes, grads)
 
 
 def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True,
@@ -1460,7 +1468,7 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True,
     """The fast backward of a call over one row as its launches kept it (`_captured_backward`, from the
     forward's recording `run` where taken already), each launch's outputs laid a chunk and value head at a
     time (their parts summed)."""
-    run, do, dfinal, saved, _ = _captured_backward(operands, seed, delta=delta, run=run)
+    run, do, dfinal, saved, _, grads = _captured_backward(operands, seed, delta=delta, run=run)
     _, _, heads, value_width = do.shape
     key_width, chunk = operands[1].shape[-1], run.chunk
     # The chunks the launches lay, of the memories' rows a part (`Run.held` of them stacked).
@@ -1471,7 +1479,7 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True,
         named |= {"dw": (saved.dw, key_width), "d_l": (saved.d_l, chunk),
                   "values": (saved.values, value_width), "keys": (saved.keys, key_width)}
     dh = np.asarray(saved.dh, np.float64).reshape(-1, laid, heads, key_width, value_width).sum(0)
-    return _back_run(run, do, dfinal, saved, named, laid, dh[:run.chunks])
+    return _back_run(run, do, dfinal, saved, named, laid, dh[:run.chunks], grads)
 
 
 def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
@@ -1576,7 +1584,9 @@ def dropped_gate_held(back: BackRun, lane: Lane) -> np.ndarray:
     run = back.run
     gates = run.beta.reshape(run.chunks, run.chunk, run.heads).transpose(0, 2, 1)[..., None]
     held = back.records["dv"]
+    # Stored as the gated record is, so the control's only fault is the dropped gate.
     dropped = np.where(gates != 0, held / np.where(gates != 0, gates, 1.0), held)
+    dropped = np.asarray(np.asarray(dropped, back.dtypes["dv"]), np.float64)
     return back_witnessed(back._replace(records={**back.records, "dv": dropped}), lane)["dv"]
 
 
@@ -1766,7 +1776,7 @@ def recorded_key_backward(operands: tuple, seed: int = 0, *, run: Run | None = N
     (`draw(..., per_key=True)`'s `operands`) as its launches kept it (`_captured_backward`,
     `key_backward.KeyKept`; `run` its forward's recording where taken already): its records and its
     forward's stored intra scores and gated keys, `[N, H, ...]` float64."""
-    run, do, dfinal, saved, (scores, gated_keys) = _captured_backward(
+    run, do, dfinal, saved, (scores, gated_keys), grads = _captured_backward(
         operands, seed, delta=True, extras=lambda prepared: (prepared.scores, prepared.keys),
         named=", its scores and gated keys", run=run)
     _, _, heads, value_width = do.shape
@@ -1779,7 +1789,7 @@ def recorded_key_backward(operands: tuple, seed: int = 0, *, run: Run | None = N
              "dk_pairs": (saved.dk_pairs, key_width), "scores": (scores, chunk),
              "kg": (gated_keys, key_width)}
     dh = np.asarray(saved.dh, np.float64).reshape(laid, heads, key_width, value_width)
-    return _back_run(run, do, dfinal, saved, named, laid, dh[:run.chunks])
+    return _back_run(run, do, dfinal, saved, named, laid, dh[:run.chunks], grads)
 
 
 def key_back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:

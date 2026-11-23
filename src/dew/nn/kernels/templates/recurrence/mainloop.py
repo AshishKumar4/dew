@@ -316,8 +316,10 @@ DECAY_FLOOR = LOG2_DECAY_FLOOR / algebra.LOG2_E
 
 
 def clamped(decays: jax.Array) -> jax.Array:
-    """`decays`, natural log decays, at least `DECAY_FLOOR` (`Call.clamped`'s calls)."""
-    return jnp.maximum(decays, DECAY_FLOOR)
+    """`decays`, natural log decays, at least `DECAY_FLOOR` (`Call.clamped`'s calls): a decay below it raised
+    to it, one at it kept, so the clamp's derivative at the floor is one, as `clamped_gradient` applies (a
+    maximum's splits a tie)."""
+    return jnp.where(decays < DECAY_FLOOR, DECAY_FLOOR, decays)
 
 
 def clamped_gradient(decays: jax.Array, gradient: jax.Array) -> jax.Array:
