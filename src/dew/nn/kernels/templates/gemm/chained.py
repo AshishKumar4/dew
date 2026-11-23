@@ -236,6 +236,15 @@ def step_unit(dtype, target) -> int | None:
     return None
 
 
+def padded_spec(rows, matrix, step: int, *, transpose_rhs: bool
+                ) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct]:
+    """Abstract padded `(rows, matrix[None])` shapes for route probing without materializing array pads."""
+    depth = rows.shape[1] + (-rows.shape[1]) % step
+    m_shape = (1, matrix.shape[0], depth) if transpose_rhs else (1, depth, matrix.shape[1])
+    return (jax.ShapeDtypeStruct((rows.shape[0], depth), rows.dtype),
+            jax.ShapeDtypeStruct(m_shape, matrix.dtype))
+
+
 def padded_pair(rows: jax.Array, matrix: jax.Array, step: int, *, transpose_rhs: bool
                 ) -> tuple[jax.Array, jax.Array]:
     """Pad `(rows, matrix)` along depth to a positive multiple of `step` and add a leading group axis to
@@ -264,11 +273,13 @@ def joined_in_place(pairs: list[tuple[jax.Array, jax.Array]], *, transpose_rhs: 
     if step is None or pairs[0][0].shape[1] % step != 0:
         return None
     r0, m0 = pairs[0]
-    rest_spec = tuple(padded_pair(r, m, step, transpose_rhs=transpose_rhs) for r, m in pairs[1:])
+    r0_spec = jax.ShapeDtypeStruct(r0.shape, r0.dtype)
+    m0_spec = jax.ShapeDtypeStruct((1, *m0.shape), m0.dtype)
+    rest_spec = tuple(padded_spec(r, m, step, transpose_rhs=transpose_rhs) for r, m in pairs[1:])
     options = {'interpret_on_cpu': interpret_on_cpu, 'precision': precision, 'transpose_rhs': transpose_rhs,
                'dense': True, 'first': None, 'gather': None}
-    route = launch_route(r0, m0[None], {'chained': rest_spec}, None, out_d, None, options,
-                         whole=not automatic_axes())
+    route = launch_route(r0_spec, m0_spec, {'chained': rest_spec}, jax.ShapeDtypeStruct((1,), jnp.int32),
+                         out_d, None, options, whole=not automatic_axes())
     if not route:
         return None
     sizes = jnp.full((1,), r0.shape[0], jnp.int32)

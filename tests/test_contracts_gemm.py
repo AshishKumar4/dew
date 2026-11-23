@@ -1040,9 +1040,44 @@ def test_an_fp8_weight_product_holds_every_order(edge):
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_ternary_weight_product_holds_every_order(edge):
     """`gemm.ternary_weight_product` (2-bit packed BitNet b1.58 weights decoded inline, `linear_tangent`):
-    every order in `lhs`, under a nested jit and a scan, finite wherever float64 is a normal float32 and
-    wherever the decoded product is (row 1464)."""
+    every order in `lhs`, plus interpreted packed & portable routes with `quantize_activations=True` checked
+    against independent integer-dot forward and STE activation + scale tangent oracles (row 1464)."""
+    import dataclasses
+
+    from dew.nn import precision as prec
+    from dew.nn.kernels import formats
+
     _check_packed_weight_product_contract(edge, kind="ternary")
+    if edge != "normal":
+        return
+    raw_w = normal_draw(1464, (256, 64), scale=1.0)[0]
+    weights = formats.TernaryWeights.of(raw_w, scale=jnp.float32(0.75))
+    (x,) = normal_draw(1465, (64, 256), scale=1.0)
+    (dx,) = normal_draw(1466, (64, 256), scale=1.0)
+    # Independent integer-dot forward oracle and straight-through activation + scale tangent oracle.
+    w_bf16 = weights.unscaled(jnp.bfloat16)
+    absmax = jnp.max(jnp.abs(x.astype(jnp.float32)), axis=-1)
+    act_scale = jnp.where(absmax > 0, prec.divided(absmax, jnp.float32(127.0)), jnp.float32(1.0))
+    x_int = jnp.clip(jnp.round(x.astype(jnp.float32) / act_scale[:, None]),
+                     -128.0, 127.0).astype(jnp.bfloat16)
+    fwd_oracle = prec.twice_scaled(
+        jax.lax.dot(x_int, w_bf16, preferred_element_type=jnp.float32), act_scale[:, None], weights.scale)
+    x_tan_oracle = prec.twice_scaled(
+        jax.lax.dot((dx.astype(jnp.float32) / act_scale[:, None]).astype(jnp.bfloat16), w_bf16,
+                    preferred_element_type=jnp.float32), act_scale[:, None], weights.scale)
+    s_tan_oracle = jax.lax.dot(x_int, w_bf16, preferred_element_type=jnp.float32) * act_scale[:, None]
+    for interpret in (False, True):
+        with generation.assumed("sm90"):
+            def fn(a, s, *, interp=interpret):
+                return gemm.ternary_weight_product(
+                    a, dataclasses.replace(weights, scale=s), quantize_activations=True,
+                    out_dtype=jnp.float32, interpret_on_cpu=interp)
+
+            out, dy_x = jax.jvp(lambda a: fn(a, weights.scale), (x,), (dx,))
+            _, dy_s = jax.jvp(lambda s: fn(x, s), (weights.scale,), (jnp.float32(1.0),))
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(fwd_oracle))
+        np.testing.assert_array_equal(np.asarray(dy_x), np.asarray(x_tan_oracle))
+        np.testing.assert_array_equal(np.asarray(dy_s), np.asarray(s_tan_oracle))
 
 
 def _check_packed_weight_product_contract(edge: str, *, kind: str) -> None:

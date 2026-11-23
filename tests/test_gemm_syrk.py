@@ -511,3 +511,18 @@ def test_newton_schulz_reaches_mosaic_syrk_and_honors_dot_algorithm():
             with configured_precision(preset), generation.routes() as seen:
                 lowered_for(lambda a: gemm.symmetric_gram(a), (x,), "sm90")
             assert any(r.kernel == "mosaic" for r in seen), (preset, seen)
+
+
+def test_syrk_measured_gram_gates_to_measured_bf16_cells():
+    """`syrk.measured_gram` admits only BF16 stacked Muon cells backed by real `M-NG-45` receipts on sm80
+    and sm90, refusing unmeasured generations (`sm86`/`sm89`/`sm120`), fp16, small batches, and unmeasured
+    geometries (row 11941)."""
+    sm80, sm90 = generation.gpu_target("sm80"), generation.gpu_target("sm90")
+    assert syrk.measured_gram(sm80, (28, 2560, 4096), jnp.bfloat16, transpose=False)
+    assert syrk.measured_gram(sm90, (36, 4096, 14336), jnp.bfloat16, transpose=True)
+    assert not syrk.measured_gram(sm80, (28, 2560, 4096), jnp.float16, transpose=False)
+    assert not syrk.measured_gram(sm90, (1, 4096, 4096), jnp.bfloat16, transpose=False)
+    assert not syrk.measured_gram(sm90, (28, 512, 512), jnp.bfloat16, transpose=False)
+    for gen in ("sm86", "sm89", "sm120"):
+        assert not syrk.measured_gram(generation.gpu_target(gen), (28, 2560, 4096), jnp.bfloat16,
+                                      transpose=False)

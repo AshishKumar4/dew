@@ -7,6 +7,7 @@ the left operand they take from registers, the staged order the warpgroup MMA's 
 reaches shared memory."""
 
 import dataclasses
+from collections.abc import Callable
 from typing import Any
 
 import jax
@@ -63,16 +64,6 @@ def ternary_staged_depth(group, word, code):
     return TERNARY_GROUP * group + 16 * code + word
 
 
-def packed_group_depth(fmt: str) -> int:
-    """Depth covered by one 16-word group of packed format `fmt` (`'e4m3'`, `'e5m2'`, or `'ternary'`)."""
-    return TERNARY_GROUP if fmt == "ternary" else FP8_GROUP
-
-
-def packed_codes_per_word(fmt: str) -> int:
-    """Number of weight codes packed in one uint32 word of packed format `fmt`."""
-    return 16 if fmt == "ternary" else 4
-
-
 def fp8_minifloat(fmt: str) -> bits.Minifloat:
     """Resolve `'e4m3'` / `'e5m2'` to its `bits.Minifloat` descriptor."""
     if fmt == "e4m3":
@@ -80,6 +71,64 @@ def fp8_minifloat(fmt: str) -> bits.Minifloat:
     if fmt == "e5m2":
         return bits.E5M2
     raise ValueError(f"packed FP8 format must be 'e4m3' or 'e5m2', got {fmt!r}")
+
+
+def _decode_fp8_lanes(fmt: str, loaded: jax.Array, active) -> list[jax.Array]:
+    minifloat = fp8_minifloat(fmt)
+    form, _ = bits.fp8_form(minifloat)
+    decoded = form.traced(loaded) if active is None else inline_forms.registers(form, loaded, active)
+    return [bits.fp8_restored(half, minifloat, jnp.bfloat16) for register in decoded
+            for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
+
+
+def _decode_ternary_lanes(loaded: jax.Array, active) -> list[jax.Array]:
+    del active
+    out = []
+    for code in range(16):
+        code2 = (loaded >> jnp.uint32(2 * code)) & jnp.uint32(3)
+        nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
+        neg = (code2 >> jnp.uint32(1)) & nz
+        f32_bits = (neg << jnp.uint32(31)) | (nz * jnp.uint32(0x3F800000))
+        out.append(jax.lax.bitcast_convert_type(f32_bits, jnp.float32).astype(jnp.bfloat16))
+    return out
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedWeightFormat:
+    """Format-neutral descriptor for inline-decoded scale-free packed weights (`e4m3`, `e5m2`, `ternary`,
+    rows 8548, 1464, 5387): word geometry, steps, byte cost, live-register cost, and lane decoder."""
+    name: str
+    codes_per_word: int
+    group_depth: int
+    weight_bytes: float
+    steps: tuple[int, ...]
+    decode_live: int
+    decode_lanes: Callable[[jax.Array, Any], list[jax.Array]]
+
+
+def weight_format(name: str) -> PackedWeightFormat:
+    """Resolve a scale-free packed weight format name (`'e4m3'`, `'e5m2'`, `'ternary'`) to its descriptor."""
+    if name in ("e4m3", "e5m2"):
+        form, _ = bits.fp8_form(fp8_minifloat(name))
+        return PackedWeightFormat(
+            name=name, codes_per_word=4, group_depth=FP8_GROUP, weight_bytes=1.0,
+            steps=(FP8_STEP, 2 * FP8_STEP), decode_live=form.live,
+            decode_lanes=lambda loaded, active, f=name: _decode_fp8_lanes(f, loaded, active))
+    if name == "ternary":
+        return PackedWeightFormat(
+            name="ternary", codes_per_word=16, group_depth=TERNARY_GROUP, weight_bytes=0.25,
+            steps=(TERNARY_STEP,), decode_live=4, decode_lanes=_decode_ternary_lanes)
+    raise ValueError(f"unsupported packed weight format {name!r}; expected 'e4m3', 'e5m2', or 'ternary'")
+
+
+def packed_group_depth(fmt: str) -> int:
+    """Depth covered by one 16-word group of packed format `fmt` (`'e4m3'`, `'e5m2'`, or `'ternary'`)."""
+    return weight_format(fmt).group_depth
+
+
+def packed_codes_per_word(fmt: str) -> int:
+    """Number of weight codes packed in one uint32 word of packed format `fmt`."""
+    return weight_format(fmt).codes_per_word
 def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_lhs: bool, depth: int,
           width: int) -> None:
     """Dew: refuses a packed matrix's call (`gmm`'s `scales`) its decode does not take: its words read
@@ -117,7 +166,7 @@ def fp8_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, tr
             or depth % group or tiles.block_k % group or tiles.block_n % 64
             or prologue is not None or paired is not None or transpose_lhs
             or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
-        raise ValueError(f"a packed({fmt}) matrix {rhs.shape} is read transposed in {group}-deep "
+        raise ValueError(f"a packed({fmt}) matrix {rhs.shape} is read transposed in {desc.group_depth}-deep "
                          f"steps and 64-col tiles with no prologue, pair, cluster or split, not {tiles}")
 
 def packed_depth(k: int, k2: int, n: int, rhs, tiles, *, packed_rows: bool, scales,
@@ -167,14 +216,15 @@ def rows_taken(lhs, scales, tiles, family, *, dense: bool, transpose_rhs: bool, 
                          f"split, not by {tiles}")
 
 
-def decoding(decoded: list, tiles, wg, interpret: bool, *, fp8_fmt: str | None = None) -> "Decoding | None":
+def decoding(decoded: list, tiles, wg, interpret: bool, *,
+             weight_fmt: str | None = None) -> "Decoding | None":
     """Dew: consumer `wg`'s decode of a packed matrix's stages into `decoded`'s buffers (`gmm_allocations`'),
     shared or its own (`shared_decode`); None for a matrix of no words."""
     if not decoded:
         return None
     if shared_decode(tiles, interpret=interpret):
-        return Decoding(decoded[0], wg, tiles.warpgroups, fp8_fmt=fp8_fmt)
-    return Decoding(decoded[0].at[wg], 0, 1, fp8_fmt=fp8_fmt)
+        return Decoding(decoded[0], wg, tiles.warpgroups, weight_fmt=weight_fmt)
+    return Decoding(decoded[0].at[wg], 0, 1, weight_fmt=weight_fmt)
 
 def shared_decode(tiles, *, interpret) -> bool:
     """Dew: whether a packed matrix's consumers share its decoded stages, each decoding its share of the
@@ -196,7 +246,7 @@ class Decoding:
     buffers: Any
     wg: Any
     consumers: int
-    fp8_fmt: str | None = None
+    weight_fmt: str | None = None
 
     def decode(self, index, slots, interpret: bool, *, layout=None):
         """Step `index`'s stage of words (and NVFP4 scales) (`slots`'), this consumer's share of it, decoded
@@ -208,12 +258,10 @@ class Decoding:
         buffer = self.buffers.at[index % self.buffers.shape[0]]
         columns = buffer.shape[0] // self.consumers
         mine = pl.ds(self.wg * columns, columns) if self.consumers > 1 else pl.ds(0, buffer.shape[0])
-        if self.fp8_fmt == "ternary":
-            words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // TERNARY_GROUP)]
-            stage_decoded_ternary(words, buffer.at[mine], interpret, layout=layout)
-        elif self.fp8_fmt is not None:
-            words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // FP8_GROUP)]
-            stage_decoded_fp8(words, buffer.at[mine], self.fp8_fmt, interpret, layout=layout)
+        if self.weight_fmt is not None:
+            desc = weight_format(self.weight_fmt)
+            words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // desc.group_depth)]
+            stage_decoded_words(words, buffer.at[mine], desc, interpret, layout=layout)
         else:
             words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // NVFP4_GROUP)]
             stage_decoded(words, slots['scales'].at[mine], buffer.at[mine], interpret, layout=layout)
