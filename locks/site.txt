@@ -1,5 +1,5 @@
 --index-url https://pypi.org/simple
---extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post124/8d82126ac8c95ebb/simple/
+--extra-index-url https://pypi.dewml.dev/staging/0.12.0.1.post125/3637e3d41c4ad00f/simple/
 --extra-index-url https://pypi.dewml.dev/simple
 
 absl-py==2.5.1 \
@@ -1401,8 +1401,8 @@ jaraco-functools==4.6.0 \
     # via
     #   -c locks/cpu.txt
     #   cheroot
-jax==0.12.0.1.post124 \
-    --hash=sha256:e6becc72c631e8db7dfee005b7a46a1a2bc929963e5069f7f10ba6d732ab618c
+jax==0.12.0.1.post125 \
+    --hash=sha256:a277df58f9571eac225e691ffa6225ead32735168b7ff3b9a2d02d1f0302a89c
     # via
     #   -c constraints.txt
     #   -c locks/cpu.txt
@@ -1442,13 +1442,13 @@ jaxlib==0.12.0.1 ; (os_name != 'nt' and sys_platform == 'darwin') or (platform_m
     #   optax
     #   qwix
     #   tokamax
-jaxlib==0.12.0.1.post124 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
-    --hash=sha256:0a5ac11ec7d5116480e75b80271a71043a9be069ac881f1e3d2e5b38d4cfbfd3 \
-    --hash=sha256:1675e70e6722af407d2c5642195b66b702e8739b283b5e023ae8e75282ae2ea8 \
-    --hash=sha256:3c690b7498289c38e9eef3a6ccb273535a8170ed46f844bc3fe873eddd4ca76d \
-    --hash=sha256:4f3c47a1d70bdbb86428ce904a414f340b1640b08ed70649c57a9647f1fafaf9 \
-    --hash=sha256:cdd212e8ed04936ec10d3b7890fd66c5986a5f55a6effc2a53ce26d45f728e95 \
-    --hash=sha256:d9f6a93cb025e5aeeed25ed6fad13252caffbe25f8e4c1965b238f0ac9e10ede
+jaxlib==0.12.0.1.post125 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') \
+    --hash=sha256:2d9b50fa91c4b7bbac4abe345031de69db340239eb2db9451ed5f6dbcff55cbf \
+    --hash=sha256:4ade9176c5ac8c7f1616227f129e7e4f10f2c42dcc517aa3073f69d9779725c1 \
+    --hash=sha256:a0bb42e3f16b8c0bc991132ba0f51d63f2305ec6a0300d16c48b7c8a68331183 \
+    --hash=sha256:b014ecd6b0ac2966211965e13c2779c21f5ac46a9b3838f15ed0cd4bb1fbb7d7 \
+    --hash=sha256:be38f98b48230c03015d61c63875982246b7ca3402b5c75462bfd6e74e3a26f4 \
+    --hash=sha256:e20525ec1278afdf27b34a46e1f56b65ee49eb51e78232cda7a4b69dfddf2f2a
     # via
     #   -c locks/cpu.txt
     #   dewml (pyproject.toml)
