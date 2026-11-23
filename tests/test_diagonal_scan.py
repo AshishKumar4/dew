@@ -92,7 +92,7 @@ def test_a_diagonal_scan_is_as_exact_as_its_token_recurrence(route, dtype, lengt
                     truth_fn=jax.jit(differentiated(token_by_token)))
 
 
-GATES = {"-2 over a span": [-2.0] * 64, "-44 then -64": [-44.0, -64.0]}
+GATES = {"-2 over a span": [-2.0] * 64, "-44 then -64": [-44.0, -64.0], "-0.5 then -87.25": [-0.5, -87.25]}
 """The first span's log decays of each span-underflow case: their sum below float32's normal exponents, a
 state of 2^100 through them normal."""
 
@@ -100,16 +100,16 @@ state of 2^100 through them normal."""
 @pytest.mark.parametrize('gates', list(GATES))
 def test_a_spans_decay_below_float32s_range_carries_a_normal_state(gates):
     """ReviewRecurrenceBatch's span underflows: a state of 2^100 decayed by the first span's log decays
-    (`GATES`), then held, is normal on every later span: the kernels carry the first span's decay, e^-128 or
-    e^-108, past float32's least normal 2^-126 (`diagonal._decayed`, its mantissa raised before each
-    product) and are on par with the token recurrence from float64 (check 1), where a span's decay held as
-    one float32, or raised only after a product, flushed to zero and the later spans entered from
-    nothing."""
+    (`GATES`), then held, is normal on every later span: the kernels carry the first span's decay, e^-128,
+    e^-108 or e^-87.75, past float32's least normal 2^-126 (`diagonal._decayed`, its mantissa held in `[1,
+    2)`) and are on par with the token recurrence from float64 (check 1), where a span's decay held as one
+    float32, or its mantissa raised only after a product or to `[1/2, 1]`, flushed to zero and the later spans
+    entered from nothing."""
     def draw(seed):
         rng = np.random.default_rng([1453, 1, seed])
         g = np.zeros((ROWS, 300, CHANNELS))
         decays = np.asarray(GATES[gates])
-        g[:, :decays.size] = decays[:, None] + 0.01 * rng.standard_normal((ROWS, decays.size, CHANNELS))
+        g[:, :decays.size] = decays[:, None] + 0.001 * rng.standard_normal((ROWS, decays.size, CHANNELS))
         state = 2.0 ** 100 * (1.0 + 0.1 * rng.standard_normal((ROWS, CHANNELS)))
         cotangents = (rng.standard_normal(g.shape).astype(np.float32),
                       rng.standard_normal(state.shape).astype(np.float32))
@@ -184,6 +184,21 @@ def test_a_spans_write_from_zero_past_float32s_range_carries_finite_states():
     np.testing.assert_array_equal(np.asarray(dx), later)
     before = np.concatenate([state[:, None], np.asarray(out[:, :-1], np.float32)], axis=1)
     np.testing.assert_array_equal(np.asarray(dg), later * before)
+
+
+def test_a_least_normal_state_crosses_every_span_exactly():
+    """ReviewRecurrenceBatch's lower range: a state entering at float32's least normals, every write and gate
+    zero, is every output and the final state over five spans, and a final state's cotangent at the least
+    normals is the entering state's, each exactly: the spans' maps compose in extended floats
+    (`walks.extended`), where halved through them a least normal fell below the normal range and flushed."""
+    state = (2.0 ** -126 * (1.0 + np.arange(ROWS * CHANNELS) / (ROWS * CHANNELS))).astype(np.float32)
+    state = state.reshape(ROWS, CHANNELS)
+    zeros = np.zeros((ROWS, 300, CHANNELS), np.float32)
+    (out, final), *_, dstate = jax.jit(differentiated(routed("kernels")))(
+        zeros, zeros, state, np.zeros((ROWS, 300), bool), (zeros, state))
+    np.testing.assert_array_equal(np.asarray(out), np.broadcast_to(state[:, None], zeros.shape))
+    np.testing.assert_array_equal(np.asarray(final), state)
+    np.testing.assert_array_equal(np.asarray(dstate), state)
 
 
 @pytest.mark.parametrize('route', list(ROUTES))

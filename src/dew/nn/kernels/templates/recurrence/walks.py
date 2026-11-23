@@ -141,3 +141,80 @@ def per_span(x, shape: Walk) -> outputs.Output:
     """A `[B, spans, D]` fp32 output of `x`'s rows and channels."""
     return outputs.output(jnp.float32, outputs.axis(x, 0), outputs.axis(x, 1).ceil_div(shape.span),
                           outputs.axis(x, 2))
+
+
+RAISES = (64, 32, 16, 8, 4, 2, 1)
+"""The powers of two a product's mantissa is raised by in turn where it falls below `2^(1 - power)`
+(`normalised`), which bring any normal mantissa back to `[1, 2)`."""
+
+
+def normalised(mantissa, exponent):
+    """A product's mantissa raised back to `[1, 2)` by `RAISES`' powers of two, its exponent (fp32, whole)
+    lowered with each, every step exact: a factor at most one that is normal alone then multiplies a mantissa
+    of at least one, and the product stays normal (a mantissa raised only to `[1/2, 1]` times a decay of
+    e^-87.25 fell below float32's least normal, ReviewRecurrenceBatch). Zero stays zero, its exponent lowered,
+    which `extended` reads as zero."""
+    for power in RAISES:
+        low = mantissa < 2.0 ** (1 - power)
+        mantissa = jnp.where(low, mantissa * 2.0 ** power, mantissa)
+        exponent = jnp.where(low, exponent - float(power), exponent)
+    return mantissa, exponent
+
+
+LARGE = 2.0 ** 64
+"""The magnitude past which a running sum is lowered by 2^64 (`summed_on`)."""
+
+
+def summed_on(carried, decayed, term, first):
+    """A running sum `(value, scale)`, its value `2^(64 scale)` times its `value`, walked on by one token:
+    `decayed` (its value times the token's decay, at its scale) plus `term` lowered to its scale (2^-64 a
+    step, a term so lowered below the value's precision a part it no longer holds), a document's first token
+    `term` alone at scale zero (selected), and a value past `LARGE` lowered by 2^64, its scale raised. A sum
+    from zero is a span's last value less its entering one's decayed share, at most twice float32's largest,
+    so it is held in range at two steps and none of its terms is lowered unless the sum outweighs it:
+    summed whole, two writes of 2^127 after a state of -2^127 were infinite; halved, a least normal write was
+    lost (ReviewRecurrenceBatch)."""
+    _, scale = carried
+    lowered = jnp.where(scale >= 1.0, term * 2.0 ** -64, term)
+    lowered = jnp.where(scale >= 2.0, lowered * 2.0 ** -64, lowered)
+    value = cut(first, decayed + lowered, term)
+    scale = cut(first, scale, jnp.zeros_like(scale))
+    large = jnp.abs(value) >= LARGE
+    return jnp.where(large, value * 2.0 ** -64, value), jnp.where(large, scale + 1.0, scale)
+
+
+ZERO_EXPONENT = -(2 ** 20)
+"""An extended float's exponent for zero (`extended`), far below any other's: a sum's terms aligned to the
+larger exponent leave a zero none of its own."""
+
+LEAST_EXPONENT = -1024
+"""The least exponent an extended float keeps (`extended`): any value past it is zero against every value a
+float32 sum holds."""
+
+
+def extended(mantissa, exponent):
+    """`mantissa 2^exponent` as an extended float `(fraction, exponent)`: the fraction in `[1/2, 1)` and the
+    exponent int32 (`jnp.frexp`), so a span's decays and sums compose (`multiplied`, `added`) whatever their
+    exponents, each step rounded once, where held as float32 they left its range; zero, or a value below
+    2^`LEAST_EXPONENT`, as `(0, ZERO_EXPONENT)`."""
+    fraction, shift = jnp.frexp(mantissa)
+    exponent = jnp.asarray(exponent).astype(jnp.int32) + shift
+    zero = (fraction == 0.0) | (exponent < LEAST_EXPONENT)
+    return jnp.where(zero, 0.0, fraction), jnp.where(zero, ZERO_EXPONENT, exponent)
+
+
+def multiplied(first, second):
+    """Two extended floats' product."""
+    return extended(first[0] * second[0], first[1] + second[1])
+
+
+def added(first, second):
+    """Two extended floats' sum: each fraction aligned to the larger exponent (`jnp.ldexp`), summed, rounded
+    once."""
+    top = jnp.maximum(first[1], second[1])
+    return extended(jnp.ldexp(first[0], first[1] - top) + jnp.ldexp(second[0], second[1] - top), top)
+
+
+def valued(value):
+    """An extended float as float32 (`jnp.ldexp`): zero below its least, infinite past its largest."""
+    return jnp.ldexp(value[0], value[1])

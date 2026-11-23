@@ -15,6 +15,7 @@ over the sequence, segmented at packed documents' first tokens."""
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -50,17 +51,23 @@ class SpanCarry(NamedTuple):
     fresh: jax.Array
 
 
-def joined(decay):
+def _weighed(kept, earlier, added, later):
+    """Two spans' values at their larger maximum: `kept` times the earlier's, `added` times the later's."""
+    return kept * earlier + added * later
+
+
+def joined(decay, *, numerators: Callable = _weighed, denominators: Callable = _weighed):
     """The composition of a span with the span after it (`associative_scan`'s operator): the earlier one's
     past decayed by `decay` once a token of the later one, both rescaled to their larger maximum, where the
-    later one begins no document."""
+    later one begins no document; `numerators` and `denominators` weigh each value (`_weighed`'s, or another
+    form's, the template's extended floats, `templates.recurrence.wkv4`)."""
 
     def join(before: SpanCarry, after: SpanCarry) -> SpanCarry:
         aged = before.top + after.tokens * decay
         top = jnp.maximum(aged, after.top)
         kept, added = jnp.exp(aged - top), jnp.exp(after.top - top)
-        joined = SpanCarry(kept * before.numerator + added * after.numerator,
-                           kept * before.denominator + added * after.denominator, top,
+        joined = SpanCarry(numerators(kept, before.numerator, added, after.numerator),
+                           denominators(kept, before.denominator, added, after.denominator), top,
                            before.tokens + after.tokens, before.fresh | after.fresh)
         dropped = after._replace(tokens=joined.tokens, fresh=joined.fresh)
         return jax.tree.map(lambda one, other: jnp.where(after.fresh, other, one), joined, dropped)
@@ -125,8 +132,10 @@ def wkv4_kernel(key, value) -> str:
     on_gpu = generation.backend() == 'gpu'
     bundled = on_gpu and bundles.of(generation.device_generation(), dtype) is not None
     family = generation.family(generation.device_generation()) if bundled else None
-    case = WkvCase(varying=bool(jax.typeof(key).mat.varying), dtype=dtype, channels=key.shape[-1],
-                   family=family)
+    # Either operand a checked `shard_map` varies refuses the kernels (replicated keys beside row-varying
+    # values among them, ReviewRecurrenceBatch).
+    varying = bool(jax.typeof(key).mat.varying or jax.typeof(value).mat.varying)
+    case = WkvCase(varying=varying, dtype=dtype, channels=key.shape[-1], family=family)
     return select(WKV4, case).kernel
 
 

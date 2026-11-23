@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import Mesh, PartitionSpec as P
 from generation_support import interprets
 from reference_error import assert_as_exact
 from test_recurrence_chunk import assert_packed_on_par, hosted
@@ -196,3 +197,19 @@ def test_a_tie_of_the_running_maximum_splits_its_cotangent_as_jax_does(route):
     np.testing.assert_array_equal(np.asarray(dkey[:, -1]), 0.5)
     np.testing.assert_array_equal(np.asarray(dkey[:, :-1]), 0.0)
     np.testing.assert_array_equal(np.asarray(dstate[:, 2]), 0.5)
+
+
+@pytest.mark.mesh(devices=2)
+def test_the_kernels_refuse_a_checked_shard_map_whose_values_alone_vary():
+    """ReviewRecurrenceBatch's selector variation: inside a `shard_map` that checks varying axes, keys whole
+    beside values split by row vary the call, so the kernels named refuse it (a Pallas call states no varying
+    type for its results), where a selector reading the keys' variation alone took them."""
+    channel = np.zeros((WIDE,), np.float32)
+
+    def run(key, value):
+        return routed("kernels")(channel, channel, key, value, None, None)[0]
+
+    mapped = jax.shard_map(run, mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)),
+                           in_specs=(P(), P("data")), out_specs=P("data"), check_vma=True)
+    with pytest.raises(KernelRefused):
+        jax.jit(mapped)(np.zeros((1, 9, WIDE), np.float32), np.zeros((2, 9, WIDE), np.float32))

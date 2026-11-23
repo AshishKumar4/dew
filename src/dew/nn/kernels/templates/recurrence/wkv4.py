@@ -39,11 +39,16 @@ from dew.nn.kernels.templates.recurrence.walks import (
     TURN,
     Program,
     Walk,
+    added,
     cut,
+    extended,
     launch,
+    multiplied,
     per_span,
     per_token,
     refs_of,
+    summed_on,
+    valued,
 )
 from dew.nn.precision import compensated_add, compensated_sum
 
@@ -87,13 +92,19 @@ def _read(carry: tuple, k, v, u):
     return (past * alpha + present * v) / denominator, tau, present, denominator
 
 
+def _weights(eps, k, w) -> tuple:
+    """A token's step of the running maximum: `(kept, added, top)`, the past's weight `e^(w + eps - top)`
+    and the token's `e^(k - top)` at the new maximum `top = max(w + eps, k)`."""
+    aged = w + eps
+    top = jnp.maximum(aged, k)
+    return jnp.exp(aged - top), jnp.exp(k - top), top
+
+
 def _aged(carry: tuple, k, v, w) -> tuple:
     """The carry past a token: its past decayed by `e^w` and the token's `e^k v` and `e^k` added, rescaled
     to the larger maximum."""
     alpha, beta, eps = carry
-    aged = w + eps
-    top = jnp.maximum(aged, k)
-    kept, added = jnp.exp(aged - top), jnp.exp(k - top)
+    kept, added, top = _weights(eps, k, w)
     return kept * alpha + added * v, kept * beta + added, top
 
 
@@ -106,8 +117,8 @@ def _stepped(program: Program, token, carry: tuple, k, v, w) -> tuple:
 
 @tuning.lowered_once(("shape",))
 def summaries(k, v, w, starts, *, shape: Walk):
-    """Each span's carry from an empty past, `(alpha, beta, eps)` `[B, spans, D]` fp32, its numerator of
-    halved values (`_joined`)."""
+    """Each span's carry from an empty past, `(alpha, alpha scale, beta, eps)` `[B, spans, D]` fp32, its
+    numerator a running sum (`walks.summed_on`)."""
     operands = (k, v, w, starts)
 
     def entry(*refs):
@@ -119,13 +130,23 @@ def summaries(k, v, w, starts, *, shape: Walk):
             ks = [program.channels(k_ref, t) for t in tokens]
             vs = [program.channels(v_ref, t) for t in tokens]
             for t, k_t, v_t in zip(tokens, ks, vs, strict=True):
-                carry = _stepped(program, t, carry, k_t, v_t * 0.5, decay)[1]
+                (numerator, scale), beta, eps = carry
+                first = program.first(t, k_t)
+                zero = jnp.zeros_like(k_t)
+                numerator, scale, beta = (cut(first, value, zero) for value in (numerator, scale, beta))
+                kept, added, top = _weights(cut(first, eps, zero - jnp.inf), k_t, decay)
+                stepped = (summed_on((numerator, scale), kept * numerator, added * v_t, None),
+                           kept * beta + added, top)
+                inside = program.inside(t, k_t)
+                carry = jax.tree.map(lambda one, other: jnp.where(inside, one, other), stepped, carry)
             return carry
 
-        for ref, value in zip(made, program.turns(body, _empty(decay)), strict=True):
+        zero = jnp.zeros_like(decay)
+        (numerator, scale), beta, eps = program.turns(body, ((zero, zero), zero, zero - jnp.inf))
+        for ref, value in zip(made, (numerator, scale, beta, eps), strict=True):
             program.summarised(ref, value)
 
-    return launch(entry, shape, "wkv4_summaries", tuple(per_span(k, shape) for _ in range(3)), operands)
+    return launch(entry, shape, "wkv4_summaries", tuple(per_span(k, shape) for _ in range(4)), operands)
 
 
 @tuning.lowered_once(("shape",))
@@ -210,11 +231,15 @@ def _shares(k_t, aged, e):
     return jnp.where(won, e, jnp.where(tied, half, zero)), jnp.where(won, zero, jnp.where(tied, half, e))
 
 
-def _reverse_step(program: Program, t, k_t, v_t, dy_t, read, terms, decay, carried):
+def _reverse_step(program: Program, t, k_t, v_t, dy_t, read, terms, decay, carried, *, summed: bool = False):
     """One token walked back: `(carried before it, (dk, dv, dw, du) of it)`, `carried` the reverse carry
     `(a, b, mu)` of the state after it (`A`'s and `B`'s cotangents scaled by `e^-mu`) and the cotangent `e`
-    of its running maximum; outside the row, the carry as it is and no gradient."""
+    of its running maximum; outside the row, the carry as it is and no gradient. `summed`, a span's summary
+    walked back from none: `a` and `b` each a running sum `(value, scale)` (`walks.summed_on`), the
+    gradients of none."""
     a, b, mu, e = carried
+    if summed:
+        a, b = a[0], b[0]
     alpha, beta, eps = read
     out, tau, present, denominator = terms
     c = dy_t / denominator
@@ -228,12 +253,18 @@ def _reverse_step(program: Program, t, k_t, v_t, dy_t, read, terms, decay, carri
     du = direct * (v_t - out)
     top = jnp.maximum(-tau, decay + mu)
     own, later = jnp.exp(-tau - top), jnp.exp(decay + mu - top)
-    before = (own * c + later * a, later * b - own * c * out, top, to_age)
+    if summed:
+        before = (summed_on(carried[0], later * a, own * c, None),
+                  summed_on(carried[1], later * b, -(own * c) * out, None), top, to_age)
+        emptied = ((zero, zero), (zero, zero), zero - jnp.inf, zero)
+    else:
+        before = (own * c + later * a, later * b - own * c * out, top, to_age)
+        emptied = (*_empty(k_t), zero)
     first = program.first(t, k_t)
-    emptied = (*_empty(k_t), zero)
-    before = tuple(cut(first, value, empty) for value, empty in zip(before, emptied, strict=True))
+    before = jax.tree.map(lambda value, empty: cut(first, value, empty), before, emptied)
     inside = program.inside(t, k_t)
-    return _held(inside, before, carried), tuple(jnp.where(inside, x, zero) for x in (dk, dv, dw, du))
+    held = jax.tree.map(lambda one, other: jnp.where(inside, one, other), before, carried)
+    return held, tuple(jnp.where(inside, x, zero) for x in (dk, dv, dw, du))
 
 
 def _kept(shape: Walk):
@@ -243,9 +274,9 @@ def _kept(shape: Walk):
 
 @tuning.lowered_once(("shape",))
 def reverse_summaries(k, v, w, u, starts, alpha, beta, eps, dy, *, shape: Walk):
-    """Each span's reverse carry walked back from none, `(a, b, mu)` `[B, spans, D]` fp32: half the
-    cotangents its own outputs' (`dy`) give the state entering it (`_joined`), from each span's entering
-    carry (`alpha`, `beta`, `eps`)."""
+    """Each span's reverse carry walked back from none, `(a, a scale, b, b scale, mu)` `[B, spans, D]` fp32:
+    the cotangents its own outputs' (`dy`) give the state entering it, each a running sum
+    (`walks.summed_on`), from each span's entering carry (`alpha`, `beta`, `eps`)."""
     operands = (k, v, w, u, starts, alpha, beta, eps, dy)
 
     def entry(*refs):
@@ -255,15 +286,14 @@ def reverse_summaries(k, v, w, u, starts, alpha, beta, eps, dy, *, shape: Walk):
         zero = jnp.zeros((shape.lanes,), jnp.float32)
 
         def emit(t, k_t, v_t, dy_t, read, terms, decay, carried):
-            # Halved cotangents: the carry's two values from none are halves (`_joined`).
-            return _reverse_step(program, t, k_t, v_t, dy_t * 0.5, read, terms, decay, carried)[0]
+            return _reverse_step(program, t, k_t, v_t, dy_t, read, terms, decay, carried, summed=True)[0]
 
-        carried = _back(program, (k_ref, v_ref, w_ref, u_ref, dy_ref, entering), shape, kept_ref,
-                        (*_empty(zero), zero), emit)
-        for ref, value in zip(made, carried[:3], strict=True):
+        (a, b, mu, _) = _back(program, (k_ref, v_ref, w_ref, u_ref, dy_ref, entering), shape, kept_ref,
+                              ((zero, zero), (zero, zero), zero - jnp.inf, zero), emit)
+        for ref, value in zip(made, (*a, *b, mu), strict=True):
             program.summarised(ref, value)
 
-    out_type = tuple(per_span(k, shape) for _ in range(3))
+    out_type = tuple(per_span(k, shape) for _ in range(5))
     return launch(entry, shape, "wkv4_summaries_backward", out_type, operands, scratch=(_kept(shape),))
 
 
@@ -315,29 +345,42 @@ def _spans(shape: Walk, starts, like):
     return tokens, jnp.broadcast_to(fresh[..., None], like.shape)
 
 
+def _weighed(kept, earlier, added_, later):
+    """Two spans' extended values (`walks.extended`) at their larger maximum, `rwkv4.joined`'s weighing."""
+    return added(multiplied(earlier, extended(kept, 0)), multiplied(later, extended(added_, 0)))
+
+
 def _joined(carries: tuple, given: tuple, decay, shape: Walk, starts, *, reverse: bool = False) -> tuple:
     """Each span's carry as its walk enters it, `(alpha, beta, eps)` `[B, spans, D]`: `given` (the call's
     entering carry, `[B, D]` each; `reverse`, the final carry's reverse carry, entering the last span from its
-    end) joined with the spans' (`carries`, from an empty past) by the portable scan's operator
-    (`rwkv4.joined`) over XLA's associative scan. Its signed values (the numerator; reversed, both) are
-    joined in halves, as the launches summarise them, and doubled once out: a span's from none is its last
-    less its entering one's decayed share, of two finite values' difference, so its half is finite
-    (the diagonal scan's writes of 2^127 twice after -2^127, ReviewRecurrenceBatch)."""
+    end) joined with the spans' (`carries`, from an empty past, each signed value a running sum's value and
+    scale: the numerator; reversed, both) by the portable scan's operator (`rwkv4.joined`) over XLA's
+    associative scan, the signed values in extended floats (`walks.extended`): a span's from none is its
+    last less its entering one's decayed share, past float32's largest where every value is in it."""
     from dew.nn.kernels import rwkv4
 
-    halved = (True, True, False) if reverse else (True, False, False)
-    tokens, fresh = _spans(shape, starts, carries[0])
-    spans = rwkv4.SpanCarry(*carries, tokens, fresh)
-    edge = rwkv4.SpanCarry(*(value[:, None] * 0.5 if half else value[:, None]
-                             for value, half in zip(given, halved, strict=True)),
-                           jnp.zeros_like(tokens[:, :1]), jnp.zeros_like(fresh[:, :1]))
+    if reverse:
+        a, a_scale, b, b_scale, top = carries
+        values = (extended(a, 64.0 * a_scale), extended(b, 64.0 * b_scale))
+        edges = (extended(given[0][:, None], 0), extended(given[1][:, None], 0))
+        weighing = {"numerators": _weighed, "denominators": _weighed}
+    else:
+        numerator, scale, beta, top = carries
+        values = (extended(numerator, 64.0 * scale), beta)
+        edges = (extended(given[0][:, None], 0), given[1][:, None])
+        weighing = {"numerators": _weighed}
+    tokens, fresh = _spans(shape, starts, top)
+    spans = rwkv4.SpanCarry(*values, top, tokens, fresh)
+    edge = rwkv4.SpanCarry(*edges, given[2][:, None], jnp.zeros_like(tokens[:, :1]),
+                           jnp.zeros_like(fresh[:, :1]))
     ordered = (spans, edge) if reverse else (edge, spans)
-    joined = jax.lax.associative_scan(rwkv4.joined(decay),
+    joined = jax.lax.associative_scan(rwkv4.joined(decay, **weighing),
                                       jax.tree.map(lambda *parts: jnp.concatenate(parts, axis=1), *ordered),
                                       axis=1, reverse=reverse)
     entered = jax.tree.map(lambda value: value[:, 1:] if reverse else value[:, :-1], joined)
-    values = (entered.numerator, entered.denominator, entered.top)
-    return tuple(value * 2.0 if half else value for value, half in zip(values, halved, strict=True))
+    numerator = valued(entered.numerator)
+    denominator = valued(entered.denominator) if reverse else entered.denominator
+    return numerator, denominator, entered.top
 
 
 def _forward(k, v, w, u, state, starts, shape: Walk):

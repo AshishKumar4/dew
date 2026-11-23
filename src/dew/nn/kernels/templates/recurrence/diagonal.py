@@ -17,12 +17,13 @@ kept but the operands (fla keeps each token's state in fp32, its output, fla/ops
 The arithmetic is the recurrence's, a token at a time, every state and cotangent fp32, a token's decay its own
 exponential, as the token recurrence and fla take it; `dg_t`'s product in the order reverse mode forms the
 token recurrence's, `q_t h_{t-1}` first. A span's decay is the product of its tokens' as its walk applies
-them, kept as a mantissa and an exponent (`_decayed`, each scaling exact) and applied by `ldexp` (`_scaled`):
-held as one float32 it underflowed where the states it scaled were normal (`g = -2` over 64 tokens from a
-state of 2^100, ReviewRecurrenceBatch); a log decay summed and exponentiated errs by `|sum g|` times float32's
-epsilon, past the product's. Its write from zero is carried in halves, doubled once its entering value is
-added (`_entering`). A document's first token selects its own write, and a cut selects zero, never multiplying
-by a zero decay: an overflowed document's infinite state times zero was NaN in the next.
+them, its mantissa held in `[1, 2)` and its exponent apart (`walks.normalised`, each scaling exact), and its
+state from zero a running sum held below 2^64 by exact scalings (`walks.summed_on`); XLA composes the spans'
+maps in extended floats (`walks.extended`). Held as one float32 a span's decay underflowed where the states it
+scaled were normal (`g = -2` over 64 tokens from a state of 2^100, ReviewRecurrenceBatch); a log decay summed
+and exponentiated errs by `|sum g|` times float32's epsilon, past the product's. A document's first token
+selects its own write, and a cut selects zero, never multiplying by a zero decay: an overflowed document's
+infinite state times zero was NaN in the next.
 """
 
 import jax.numpy as jnp
@@ -37,11 +38,17 @@ from dew.nn.kernels.templates.recurrence.walks import (
     TURN,
     Program,
     Walk,
+    added,
     cut,
+    extended,
     launch,
+    multiplied,
+    normalised,
     per_span,
     per_token,
     refs_of,
+    summed_on,
+    valued,
 )
 
 MOST = 256
@@ -63,35 +70,23 @@ def _gate(program: Program, g_ref, token):
     return a, program.first(token, a)
 
 
-RAISES = (64, 32, 16, 8, 4, 2, 1)
-"""The powers of two a span's decay's mantissa is raised by in turn where it falls below their inverse
-(`_decayed`), which bring any normal mantissa back to `[1/2, 1]`: a token's decay then multiplies a mantissa
-of at least a half, so the product stays normal wherever the decay alone is (raised only below 2^-64, a
-mantissa of e^-44 times a decay of e^-64 flushed to zero, ReviewRecurrenceBatch)."""
-
-
 def _decayed(decay, a_t, first):
     """A span's decay, `(mantissa, exponent)`, past one more token's `a_t`: the mantissa times it (zero from a
-    document's first token on, selected), then raised back to `[1/2, 1]` by `RAISES`' powers of two, the
-    exponent lowered with each, every step exact."""
+    document's first token on, selected), raised back to `[1, 2)` (`walks.normalised`)."""
     mantissa, exponent = decay
-    mantissa = cut(first, mantissa * a_t, jnp.zeros_like(mantissa))
-    for power in RAISES:
-        low = mantissa < 2.0 ** -power
-        mantissa = jnp.where(low, mantissa * 2.0 ** power, mantissa)
-        exponent = jnp.where(low, exponent - float(power), exponent)
-    return mantissa, exponent
+    return normalised(cut(first, mantissa * a_t, jnp.zeros_like(mantissa)), exponent)
 
 
 @tuning.lowered_once(("shape",))
 def summaries(x, g, starts, *, shape: Walk):
-    """Each span's map from its entering state to its last, `(mantissa, exponent, state)` `[B, spans, D]`
-    fp32: the product of its tokens' decays (`_decayed`, the mantissa zero where a document starts in the
-    span, which keeps none of its entering state) and half its last state from zero (`_entering`)."""
+    """Each span's map from its entering state to its last, `(mantissa, exponent, state, scale)` `[B, spans,
+    D]` fp32: the product of its tokens' decays (`_decayed`, the mantissa zero where a document starts in the
+    span, which keeps none of its entering state) and its last state from zero, a running sum
+    (`walks.summed_on`, `state 2^(64 scale)`)."""
     operands = (x, g, starts)
 
     def entry(*refs):
-        (x_ref, g_ref, starts_ref), (mantissa_ref, exponent_ref, state_ref) = refs_of(refs, operands)
+        (x_ref, g_ref, starts_ref), made = refs_of(refs, operands)
         program = Program(shape, starts_ref)
 
         def body(_, tokens, carried):
@@ -100,17 +95,15 @@ def summaries(x, g, starts, *, shape: Walk):
             gates = [_gate(program, g_ref, t) for t in tokens]
             for x_t, (a_t, first) in zip(xs, gates, strict=True):
                 decay = _decayed(decay, a_t, first)
-                half = x_t * 0.5
-                h = cut(first, a_t * h + half, half)
+                h = summed_on(h, a_t * h[0], x_t, first)
             return decay, h
 
         zero = jnp.zeros((shape.lanes,), jnp.float32)
-        (mantissa, exponent), h = program.turns(body, ((zero + 1.0, zero), zero))
-        program.summarised(mantissa_ref, mantissa)
-        program.summarised(exponent_ref, exponent)
-        program.summarised(state_ref, h)
+        decay, h = program.turns(body, ((zero + 1.0, zero), (zero, zero)))
+        for ref, value in zip(made, (*decay, *h), strict=True):
+            program.summarised(ref, value)
 
-    out_type = (per_span(x, shape), per_span(x, shape), per_span(x, shape))
+    out_type = tuple(per_span(x, shape) for _ in range(4))
     return launch(entry, shape, "diagonal_summaries", out_type, operands)
 
 
@@ -140,12 +133,12 @@ def walked(x, g, starts, entering, *, shape: Walk):
 @tuning.lowered_once(("shape",))
 def reverse_summaries(g, starts, dy, *, shape: Walk):
     """Each span's map from its last state's cotangent to its entering state's, `(mantissa, exponent,
-    cotangent)` `[B, spans, D]` fp32: the product of its tokens' decays (`_decayed`) and half the cotangent
-    its own outputs' (`dy`) give its entering state (`_entering`)."""
+    cotangent, scale)` `[B, spans, D]` fp32: the product of its tokens' decays (`_decayed`) and the cotangent
+    its own outputs' (`dy`) give its entering state, a running sum (`walks.summed_on`)."""
     operands = (g, starts, dy)
 
     def entry(*refs):
-        (g_ref, starts_ref, dy_ref), (mantissa_ref, exponent_ref, carried_ref) = refs_of(refs, operands)
+        (g_ref, starts_ref, dy_ref), made = refs_of(refs, operands)
         program = Program(shape, starts_ref)
         zero = jnp.zeros((shape.lanes,), jnp.float32)
 
@@ -155,15 +148,15 @@ def reverse_summaries(g, starts, dy, *, shape: Walk):
             dys = [program.channels(dy_ref, t) for t in tokens]
             for (a_t, first), dy_t in zip(reversed(gates), reversed(dys), strict=True):
                 decay = _decayed(decay, a_t, first)
-                c = cut(first, a_t * (dy_t * 0.5 + c), zero)
+                # The cotangent the state before a document's first token takes of it: none.
+                c = tuple(cut(first, value, zero) for value in summed_on(c, a_t * c[0], a_t * dy_t, None))
             return decay, c
 
-        (mantissa, exponent), c = program.turns(body, ((zero + 1.0, zero), zero), reverse=True)
-        program.summarised(mantissa_ref, mantissa)
-        program.summarised(exponent_ref, exponent)
-        program.summarised(carried_ref, c)
+        decay, c = program.turns(body, ((zero + 1.0, zero), (zero, zero)), reverse=True)
+        for ref, value in zip(made, (*decay, *c), strict=True):
+            program.summarised(ref, value)
 
-    out_type = (per_span(dy, shape), per_span(dy, shape), per_span(dy, shape))
+    out_type = tuple(per_span(dy, shape) for _ in range(4))
     return launch(entry, shape, "diagonal_summaries_backward", out_type, operands)
 
 
@@ -217,39 +210,26 @@ def walked_back(x, g, starts, dy, entering, later, *, shape: Walk):
     return launch(entry, shape, "diagonal_walk_backward", out_type, operands, scratch=(kept,))
 
 
-def _scaled(values, decay):
-    """`values` times a span's decay, `(mantissa, exponent)` (`_decayed`): their mantissas multiplied and
-    the exponents applied by `ldexp`, exact where the product is normal; zero at a cut (a zero mantissa),
-    selected, as an infinite value times zero is NaN."""
-    mantissa, exponent = decay
-    fraction, shift = jnp.frexp(mantissa)
-    scaled = jnp.ldexp(values * fraction, exponent.astype(jnp.int32) + shift)
-    return jnp.where(mantissa == 0.0, jnp.zeros_like(values), scaled)
-
-
 def _composed(first, then):
-    """Two spans' maps, `(decay, value)` each, as one, `first`'s applied first: their decays multiplied (each
-    mantissa's own exponent taken into the sum, `frexp`, so the product stays normal), `first`'s value scaled
-    by `then`'s decay plus `then`'s (`associative_scan`'s operator either way)."""
-    (mantissa, exponent), value = first
-    (then_mantissa, then_exponent), then_value = then
-    fraction, shift = jnp.frexp(mantissa)
-    then_fraction, then_shift = jnp.frexp(then_mantissa)
-    decay = (fraction * then_fraction, exponent + then_exponent + (shift + then_shift).astype(exponent.dtype))
-    return decay, _scaled(value, (then_mantissa, then_exponent)) + then_value
+    """Two spans' maps, `(decay, value)` each an extended float (`walks.extended`), as one, `first`'s applied
+    first: their decays multiplied, `first`'s value times `then`'s decay plus `then`'s (`associative_scan`'s
+    operator either way)."""
+    decay, value = first
+    then_decay, then_value = then
+    return multiplied(decay, then_decay), added(multiplied(value, then_decay), then_value)
 
 
-def _entering(mantissa, exponent, halves, given, *, reverse: bool = False):
+def _entering(summary: tuple, given, *, reverse: bool = False):
     """Each span's value as its walk enters it, `[B, spans, D]`: `given` `[B, D]` (the state entering the
     first span; `reverse`, the final state's cotangent entering the last) carried through the spans' maps
-    (`mantissa`, `exponent`, `halves`, as `summaries` or `reverse_summaries` give them) by XLA's associative
-    scan, in halves through it and doubled once out. A map's value from zero is its last value less its
-    entering value's decayed share, of two finite values' difference, so its half is finite: whole, writes of
-    2^127 and 2^127 after a state of -2^127 summed to infinity where every state was finite
-    (ReviewRecurrenceBatch)."""
-    through, written = lax.associative_scan(_composed, ((mantissa, exponent), halves), axis=1,
-                                            reverse=reverse)
-    after = (_scaled(given[:, None] * 0.5, through) + written) * 2.0
+    (`summary`, `(mantissa, exponent, value, scale)` as `summaries` or `reverse_summaries` give them) by XLA's
+    associative scan in extended floats (`walks.extended`), so a decay below float32's range scaling a value
+    past it, or a sum from zero past its largest, composes exactly where the value entering a span is a
+    float32's (as float32 a span's decay flushed, ReviewRecurrenceBatch; halved, a least normal state)."""
+    mantissa, exponent, value, scale = summary
+    maps = (extended(mantissa, exponent), extended(value, 64.0 * scale))
+    through, written = lax.associative_scan(_composed, maps, axis=1, reverse=reverse)
+    after = valued(added(multiplied(extended(given[:, None], 0), through), written))
     if reverse:
         return jnp.concatenate([after[:, 1:], given[:, None]], axis=1)
     return jnp.concatenate([given[:, None], after[:, :-1]], axis=1)
@@ -259,8 +239,7 @@ def _forward(x, g, state, starts, shape: Walk):
     """`(outputs, final state, each span's entering state)`."""
     entering = state[:, None]
     if shape.spans > 1:
-        mantissa, exponent, written = summaries(x, g, starts, shape=shape)
-        entering = _entering(mantissa, exponent, written, state)
+        entering = _entering(summaries(x, g, starts, shape=shape), state)
     out, last = walked(x, g, starts, entering, shape=shape)
     return out, last[:, -1], entering
 
@@ -280,8 +259,7 @@ def _backward_rule(shape: Walk, residuals, cotangents):
     dy, dfinal = dy.astype(x.dtype), dfinal.astype(jnp.float32)
     later = dfinal[:, None]
     if shape.spans > 1:
-        mantissa, exponent, carried = reverse_summaries(g, starts, dy, shape=shape)
-        later = _entering(mantissa, exponent, carried, dfinal, reverse=True)
+        later = _entering(reverse_summaries(g, starts, dy, shape=shape), dfinal, reverse=True)
     dx, dg, leaving = walked_back(x, g, starts, dy, entering, later, shape=shape)
     return dx, dg, leaving[:, 0], None
 
