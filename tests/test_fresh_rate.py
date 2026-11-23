@@ -24,11 +24,10 @@ from dew.optim import (
     param_labels,
 )
 from dew.registry import optimizers
-from dew.training.budget import Horizon
 
 RATE, MULTIPLIER = 1e-5, 30.0
-FRESH = ParamGroup("fresh", fresh=True, learning_rate_multiplier=MULTIPLIER, spared=True)
-BASE = ParamGroup("base", ("*",), spared=True)
+FRESH = ParamGroup("fresh", fresh=True, learning_rate_multiplier=MULTIPLIER, decay_norms_and_biases=False)
+BASE = ParamGroup("base", ("*",), decay_norms_and_biases=False)
 
 
 def test_a_fresh_group_claims_the_fresh_modules_ahead_of_its_own_patterns():
@@ -36,13 +35,13 @@ def test_a_fresh_group_claims_the_fresh_modules_ahead_of_its_own_patterns():
     own patterns, and leaves every other group; a config with no such group is unchanged; a group
     that claims them where none is drawn and has no pattern of its own is refused, and so is building
     one before the run names them."""
-    grouped = OptimConfig(learning_rate=RATE, param_groups=(
+    grouped = OptimConfig(lr=RATE, param_groups=(
         dataclasses.replace(FRESH, patterns=("head/*",)), BASE)).with_fresh(("layers_1/cross_attention",))
     assert grouped.param_groups == (
         dataclasses.replace(FRESH, patterns=("layers_1/cross_attention/*", "head/*"), fresh=False), BASE)
-    plain = OptimConfig(learning_rate=RATE, param_groups=(BASE,))
+    plain = OptimConfig(lr=RATE, param_groups=(BASE,))
     assert plain.with_fresh(("layers_1/cross_attention",)) == plain
-    claiming = OptimConfig(learning_rate=RATE, param_groups=(FRESH, BASE))
+    claiming = OptimConfig(lr=RATE, param_groups=(FRESH, BASE))
     with pytest.raises(ValueError):
         claiming.with_fresh(())
     with pytest.raises(ValueError):
@@ -56,7 +55,7 @@ def test_a_loaded_parameter_steps_as_ungrouped_and_a_fresh_one_at_its_groups_rat
     fresh group's rate, each on par with Optax's own optimizer stepping it alone at that rate (check 1)."""
     params = {"layers_0": {"dense": {"kernel": jnp.zeros((3, 2)), "bias": jnp.zeros((2,))}},
               "layers_1": {"cross_attention": {"q": {"kernel": jnp.zeros((2, 2))}}}}
-    solver = OptimConfig(optimizer=optimizers.build(optimizer, weight_decay=0.1), learning_rate=RATE,
+    solver = OptimConfig(optimizer=optimizers.build(optimizer, weight_decay=0.1), lr=RATE,
                          param_groups=(FRESH, BASE)).with_fresh(("layers_1/cross_attention",)).build(4)
 
     def alone(rate: float, decay: float) -> optax.GradientTransformation:
@@ -78,7 +77,7 @@ def test_under_muon_a_fresh_groups_rate_reaches_its_vector_and_its_matrix():
     params = {"layers_0": {"dense": {"kernel": jnp.zeros((6, 4)), "bias": jnp.zeros((4,))},
                            "loop_theta": jnp.zeros((4,))},
               "layers_1": {"cross_attention": {"q": {"kernel": jnp.zeros((4, 4))}}}}
-    grouped = OptimConfig(optimizer=Muon(), learning_rate=RATE, param_groups=(FRESH, BASE)).with_fresh(
+    grouped = OptimConfig(optimizer=Muon(), lr=RATE, param_groups=(FRESH, BASE)).with_fresh(
         ("layers_1/cross_attention",), ("layers_0/loop_theta",))
     # Traced under the accurate forms, whose float32 Newton-Schulz is the one held to Optax's Muon.
     solver = in_forms(grouped.build(4), "accurate")
@@ -106,7 +105,7 @@ def test_a_run_naming_no_groups_steps_its_fresh_modules_at_the_fresh_rate_on_its
     the run's; each on par with Optax's AdamW alone at that rate (check 1)."""
     params = {"layers_0": {"dense": {"kernel": jnp.zeros((3, 2))}},
               "layers_1": {"cross_attention": {"q": {"kernel": jnp.zeros((2, 2))}}}}
-    config = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=schedule)
+    config = OptimConfig(optimizer=AdamW(weight_decay=0.1), schedule=schedule)
     solver = dataclasses.replace(config, param_groups=config.fresh_groups()).with_fresh(
         ("layers_1/cross_attention",)).build(4)
     for path, rate in ((("layers_0", "dense", "kernel"), peak),
@@ -168,7 +167,7 @@ def test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_gr
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference").with_cross_attention(
         CrossAttention((0,), 8), key=0, frozen=False)
     decision = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
-    trainer = Trainer(decision, OptimConfig(optimizer=Adam(), learning_rate=RATE, param_groups=named), key=0)
+    trainer = Trainer(decision, OptimConfig(optimizer=Adam(), lr=RATE, param_groups=named), key=0)
     trainer.scheduled(4)
     params = jax.eval_shape(lambda: decision.init(jax.random.key(0)))["params"]
     labels = labelled(OptimConfig(param_groups=(FRESH, BASE)).with_fresh(
@@ -272,7 +271,7 @@ def test_a_decision_run_that_names_its_groups_resumes_in_them(tmp_path):
     assert groups(tmp_path, "named")[1] == BASE
     assert groups(tmp_path, "named")[0].learning_rate_multiplier == MULTIPLIER
     claimed(labelled(groups(tmp_path, "named"), named.variables["params"]))
-    resumed, _ = trained(run, tmp_path, "named", trainer={**SAVING, "horizon": Horizon(steps=2)})
+    resumed, _ = trained(run, tmp_path, "named", trainer={**SAVING, "steps": 2})
     assert int(resumed.step) == 2 and groups(tmp_path, "named")[0].learning_rate_multiplier == MULTIPLIER
 
 
@@ -289,18 +288,18 @@ def test_a_resumed_run_trains_in_the_groups_it_names_refused_a_changed_partition
     trained(claiming, tmp_path, "named", trainer=SAVING)
     slower = dataclasses.replace(FRESH, learning_rate_multiplier=MULTIPLIER / 4)
     resumed, _ = trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(
-        slower, BASE))), tmp_path, "named", trainer={**SAVING, "horizon": Horizon(steps=2)})
+        slower, BASE))), tmp_path, "named", trainer={**SAVING, "steps": 2})
     assert int(resumed.step) == 2
     assert groups(tmp_path, "named")[0].learning_rate_multiplier == MULTIPLIER / 4
     # The record's own groups named again, as a saved run's config names them, resume as they stand.
     recorded = groups(tmp_path, "named")
     again, _ = trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=recorded)),
-                       tmp_path, "named", trainer={**SAVING, "horizon": Horizon(steps=3)})
+                       tmp_path, "named", trainer={**SAVING, "steps": 3})
     assert int(again.step) == 3 and groups(tmp_path, "named") == recorded
-    renamed = ParamGroup("rest", ("*",), spared=True)
+    renamed = ParamGroup("rest", ("*",), decay_norms_and_biases=False)
     with pytest.raises(ValueError):
         trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(FRESH, renamed))),
-                tmp_path, "named", trainer={**SAVING, "horizon": Horizon(steps=4)})
+                tmp_path, "named", trainer={**SAVING, "steps": 4})
 
 
 @pytest.mark.mesh(devices=8)
@@ -318,7 +317,7 @@ def test_a_resumed_run_clamps_to_the_bounds_it_names_refused_bounds_its_state_la
             tmp_path, "bounded", trainer=SAVING)
     tight = dataclasses.replace(BASE, bounds=(-1e-3, 1e-3))
     resumed, _ = trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(
-        FRESH, tight))), tmp_path, "bounded", trainer={**SAVING, "horizon": Horizon(steps=2)})
+        FRESH, tight))), tmp_path, "bounded", trainer={**SAVING, "steps": 2})
     assert int(resumed.step) == 2 and groups(tmp_path, "bounded")[1].bounds == (-1e-3, 1e-3)
     params = resumed.variables["params"]
     based = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(params)
@@ -330,7 +329,7 @@ def test_a_resumed_run_clamps_to_the_bounds_it_names_refused_bounds_its_state_la
     fenced = dataclasses.replace(FRESH, bounds=(-1.0, 1.0))
     with pytest.raises(ValueError):
         trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(fenced, tight))),
-                tmp_path, "bounded", trainer={**SAVING, "horizon": Horizon(steps=3)})
+                tmp_path, "bounded", trainer={**SAVING, "steps": 3})
 
 
 @pytest.mark.mesh(devices=8)
@@ -356,7 +355,7 @@ def test_a_run_naming_groups_none_of_them_fresh_steps_its_fresh_modules_at_the_f
     labels = labelled(groups(tmp_path, "headed"), state.variables["params"])
     assert {label for path, label in labels.items() if path[0] == "head"} == {"head"}
     assert {label for path, label in labels.items() if crossing(path)} == {"fresh"}
-    resumed, _ = trained(based, tmp_path, "based", trainer={**SAVING, "horizon": Horizon(steps=2)})
+    resumed, _ = trained(based, tmp_path, "based", trainer={**SAVING, "steps": 2})
     assert int(resumed.step) == 2 and groups(tmp_path, "based") == recorded
 
 
@@ -370,7 +369,7 @@ def test_a_run_resumes_its_groups_where_its_record_holds_a_chain_only_its_python
     run = dataclasses.replace(context_run(tmp_path), lora=None)
     held = dataclasses.replace(run, validation=run.validation.map(lambda batch: batch))
     trained(held, tmp_path, "held", trainer=SAVING)
-    assert int(trained(held, tmp_path, "held", trainer={**SAVING, "horizon": Horizon(steps=2)})[0].step) == 2
+    assert int(trained(held, tmp_path, "held", trainer={**SAVING, "steps": 2})[0].step) == 2
 
 
 @pytest.mark.mesh(devices=8)

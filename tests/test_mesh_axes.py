@@ -39,7 +39,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.trace import COLLECTIVES
-from dew.training import FitPolicy, Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -85,7 +85,7 @@ def step_flops(model, mesh: MeshSpec, devices, *, layout: Layout, links=None) ->
     from dew.telemetry.instrumentation import compiled_flops
 
     trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                      layout=layout, checkpoints=None, tracker=None, links=links)
+                      advanced=TrainerAdvanced(layout=layout, links=links), checkpoints=None, tracker=None)
     trainer.device_mesh = mesh.build(devices)
     state, _, _ = trainer.place()
     trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
@@ -134,7 +134,8 @@ def stepped(mesh: MeshSpec, devices: int, **hybrid):
     batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH + 1)).astype(np.int32)}
     model = tiny(max_seq_len=LENGTH, tie_embeddings=False, **hybrid)
     trainer = Trainer(LMObjective(model, LENGTH), optax.sgd(1e-2), key=jax.random.key(0), mesh=mesh,
-                      layout=Layout(min_shard=TINY_SHARD), checkpoints=None, tracker=None)
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)), checkpoints=None,
+                      tracker=None)
     trainer.device_mesh = mesh.build(jax.devices()[:devices])
     state, _, _ = trainer.place()
     placed = shard_batch(trainer.device_mesh, batch)
@@ -257,7 +258,8 @@ NATIVE_RULES = {"embed": ("zero", "zero2"), "mlp": "zero", "heads": "zero", "kv"
 def native_trainer(mesh, layout, directory, **hybrid) -> Trainer:
     model = tiny(max_seq_len=LENGTH, tie_embeddings=False, **hybrid)
     return Trainer(LMObjective(model, LENGTH), optax.sgd(1e-2), key=jax.random.key(0), mesh=mesh,
-                   layout=layout, checkpoints=None if directory is None else Checkpoints(str(directory)),
+                   advanced=TrainerAdvanced(layout=layout),
+                   checkpoints=None if directory is None else Checkpoints(str(directory)),
                    tracker=None)
 
 
@@ -431,8 +433,9 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
             variables = (float64_held if wide else partial(jax.tree.map, np.asarray))(adapter.variables)
             trainer = Trainer(LMObjective(adapter.model, SEQ_LEN, variables=variables), optax.adam(1e-3),
                               key=jax.random.key(0), mesh=mesh, checkpoints=None, tracker=None,
-                              layout=Layout(min_shard=TINY_SHARD, frozen_whole=frozen_whole),
-                              param_dtype="float64" if wide else None)
+                              advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD,
+                                                                     frozen_whole=frozen_whole),
+                                                       param_dtype="float64" if wide else None))
             trainer.device_mesh = mesh.build(jax.devices()[:devices])
             state, shardings, _ = trainer.place()
             run = trainer.compile(state, shard_batch(trainer.device_mesh, drawn(0)))
@@ -517,8 +520,9 @@ def test_a_module_or_optimizer_group_named_frozen_keeps_its_split_under_frozen_w
             objective = Supervised(Named(), lambda outputs, rows: (outputs - rows["y"]) ** 2,
                                    inputs=InputSpec(Field("x", (32,))))
             trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=mesh, checkpoints=None,
-                              tracker=None, layout=Layout(min_shard=TINY_SHARD, frozen_whole=frozen_whole),
-                              param_dtype="float64" if wide else None)
+                              tracker=None, advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD,
+                                                                                   frozen_whole=frozen_whole),
+                                                                     param_dtype="float64" if wide else None))
             trainer.device_mesh = mesh.build(jax.devices()[:2])
             state, shardings, _ = trainer.place()
             built[frozen_whole, wide] = (trainer, shardings,
@@ -547,7 +551,7 @@ def token_batches():
 def run_losses(mesh, layout, steps, microbatches=None):
     tracker = RecordingTracker()
     trainer = Trainer(LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                      layout=layout, fit=FitPolicy(microbatches=microbatches), tracker=tracker)
+                      advanced=TrainerAdvanced(layout=layout), microbatches=microbatches, tracker=tracker)
     state = trainer.fit(Loader(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
                         steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)

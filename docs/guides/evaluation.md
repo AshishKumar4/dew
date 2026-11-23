@@ -31,7 +31,7 @@ model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
                           dtype=jnp.float32, attention_impl="xla")
 objective = LMObjective(model, seq_len=8)
-trainer = Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=0.01), key=0)
+trainer = Trainer(objective, OptimConfig(optimizer=Adam(), lr=0.01), key=0)
 state = trainer.fit(data, steps=10, log_every=5, eval_every=5,
                     metrics=(Perplexity(),))
 assert int(state.step) == 10
@@ -99,7 +99,7 @@ accuracy = Mean(
 language_model = LMObjective(model, seq_len=8, ema_decay=None)
 accuracy_train = Memory({"text": train_tokens}).repeat().batch(8)
 accuracy_val = Memory({"text": val_tokens}).batch(8)
-run = Trainer(language_model, OptimConfig(optimizer=Adam(), learning_rate=0.01), key=jax.random.key(0),
+run = Trainer(language_model, OptimConfig(optimizer=Adam(), lr=0.01), key=jax.random.key(0),
               checkpoints=Checkpoints("runs/lm-accuracy"))
 state = run.fit(
     accuracy_train, validation=accuracy_val, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
@@ -122,7 +122,7 @@ The trainer calls `Objective.preview` once per evaluation event, and only if you
 
 ## Inspecting parameters, gradients and updates
 
-`Trainer(inspection=Inspection(paths=("*attn*",), every=100))` summarizes, at every hundredth window of the run's accumulation steps (the update that commits in it: every hundredth update, unless a rejected, non-finite step shifts the windows, after which a sampled window that commits nothing skips its sample), each parameter whose path a glob selects: the parameters the update applies to, the gradient the optimizer is handed (unscaled, before its own transforms such as clipping), the optimizer's update and the parameters' actual change, each by its mean, root mean square, largest magnitude, non-finite count and zero fraction, beside each tree's L2 norm and the update-to-weight ratio. The summaries are reduced inside the step, over the global arrays, and logged under `inspect/` with the next log, off the step loop. A run that inspects nothing compiles its step unchanged; one that does compiles a second, sampled step beside it, held to the same memory check. `Inspection(modules=("*Attention*", "*MLP*"))` also summarizes each call's output of the modules a glob of their class name or of their path as the log names it (`layers_3/*`, a layer by its place in the decoder, scanned or pipelined) selects, a language model's at its real tokens alone, one summary a layer in a scanned stack and one a microbatch in a pipelined one, logged as `inspect/activations/<module path>/<statistic>`, from the forward the loss trains, and `histogram=True` adds each summary's share of magnitudes in each decade. A recorded run names it with `--trainer.inspection.paths` and `--trainer.inspection.every`, or in its record (`TrainerConfig.inspection`); `dew inspect run.json` with that setting prints one sampled update of a saved run, from its latest checkpoint or its start, over the batch its first step takes, and writes nothing; and `dew.training.inspected(trainer, batch)` gives the same view of a loaded run on one batch. With `cotangents=True` (`Inspection(modules=("*MLP",), cotangents=True)`) the sampled step also logs the loss's cotangent at each watched output over the same positions, `inspect/cotangents/<module path>/<statistic>`: its mean, standard deviation, root mean square and non-finite and zero shares, summed over every call of the module in the step (each transition of a Flow-GRPO rollout), taken from a probe whose gradient is the cotangent's sufficient statistics, so no tensor of the output's size is kept and the update is the unwatched step's. A pipelined stack's layer reports one summary over its microbatches; an objective whose model calls drop the variables' extra collections is refused as the step traces.
+`TrainerAdvanced(inspection=Inspection(paths=("*attn*",), every=100))` summarizes, at every hundredth window of the run's accumulation steps (the update that commits in it: every hundredth update, unless a rejected, non-finite step shifts the windows, after which a sampled window that commits nothing skips its sample), each parameter whose path a glob selects: the parameters the update applies to, the gradient the optimizer is handed (unscaled, before its own transforms such as clipping), the optimizer's update and the parameters' actual change, each by its mean, root mean square, largest magnitude, non-finite count and zero fraction, beside each tree's L2 norm and the update-to-weight ratio. The summaries are reduced inside the step, over the global arrays, and logged under `inspect/` with the next log, off the step loop. A run that inspects nothing compiles its step unchanged; one that does compiles a second, sampled step beside it, held to the same memory check. `Inspection(modules=("*Attention*", "*MLP*"))` also summarizes each call's output of the modules a glob of their class name or of their path as the log names it (`layers_3/*`, a layer by its place in the decoder, scanned or pipelined) selects, a language model's at its real tokens alone, one summary a layer in a scanned stack and one a microbatch in a pipelined one, logged as `inspect/activations/<module path>/<statistic>`, from the forward the loss trains, and `histogram=True` adds each summary's share of magnitudes in each decade. A recorded run names it with `--trainer.inspection.paths` and `--trainer.inspection.every`, or in its record (`TrainerConfig.inspection`); `dew inspect run.json` with that setting prints one sampled update of a saved run, from its latest checkpoint or its start, over the batch its first step takes, and writes nothing; and `dew.training.inspected(trainer, batch)` gives the same view of a loaded run on one batch. With `cotangents=True` (`Inspection(modules=("*MLP",), cotangents=True)`) the sampled step also logs the loss's cotangent at each watched output over the same positions, `inspect/cotangents/<module path>/<statistic>`: its mean, standard deviation, root mean square and non-finite and zero shares, summed over every call of the module in the step (each transition of a Flow-GRPO rollout), taken from a probe whose gradient is the cotangent's sufficient statistics, so no tensor of the output's size is kept and the update is the unwatched step's. A pipelined stack's layer reports one summary over its microbatches; an objective whose model calls drop the variables' extra collections is refused as the step traces.
 
 ## Trackers
 
@@ -194,7 +194,6 @@ The example continues the previous one and reuses `objective`, `data`, `Perplexi
 ```python
 from dew import Evaluation, LocalTracker
 from dew.config import RunConfig, TrainerConfig
-from dew.training import Horizon
 from dew.optim import Adam, OptimConfig
 from dew.registry import ModelConfig
 from dew.config.sweep import GridSearch
@@ -205,7 +204,7 @@ config = RunConfig(
     model=ModelConfig.from_model(objective.model),
     data=Memory({"text": train_tokens}).repeat().batch(8),
     optim=OptimConfig(optimizer=Adam()),
-    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", horizon=Horizon(steps=10),
+    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10,
                           eval_every=None, checkpoint_every=None),
 )
 
@@ -218,7 +217,7 @@ def trial(run: RunConfig) -> float:
 
 
 with LocalTracker("runs/sweep/tracking") as tracker:
-    trials = config.sweep({"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
+    trials = config.sweep({"optim.lr": [0.01, 0.003]}, train=trial, trials=2,
                           ledger="runs/sweep/ledger.json", tracker=tracker, search=GridSearch())
 print(min(trials, key=lambda trial: trial.value).overrides)
 ```
@@ -234,7 +233,7 @@ Local tracking: /tmp/dew-docs/docs_guides_evaluation.md/runs/sweep/lm-rate/trial
 Training CausalTransformer from step 0 to 10: 2,688 parameters, on 1 × cpu, batch 8, float32
 Trained 10 steps in 0:00:01: first step after 0.68 s, then 2683.2 step/s
 0.4% of the wall time in steps, final loss 0.6440
-{'optim.learning_rate': 0.01}
+{'optim.lr': 0.01}
 ```
 
 The two trials train under `runs/sweep/lm-rate/trial-0` and `runs/sweep/lm-rate/trial-1`, and each one's `run.json` records the learning rate it used. `sweep` returns the trials from the ledger. `trial.value` is the score the entry point returned, and `trial.overrides` is the point the trial trained. A second run of the script reads the ledger and trains nothing.

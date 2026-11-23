@@ -23,7 +23,6 @@ from dew.objectives.diffusion.consistency import (
     guided,
     trig_prediction,
 )
-from dew.training import UpdateBatch
 
 CASE = np.load(Path(__file__).resolve().parent / "fixtures" / "rcm" / "losses.npz")
 CONFIG = json.loads(str(CASE["config"]))
@@ -338,7 +337,7 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(sa
     batch = saved_teacher.batch
     task = _distilling(saved_teacher, **ALTERNATING).build()
 
-    trainer = Trainer(task, optax.sgd(1e-2), key=jax.random.PRNGKey(5), update=UpdateBatch(batches=2))
+    trainer = Trainer(task, optax.sgd(1e-2), key=jax.random.PRNGKey(5), accumulation=2)
     distilled, _, _ = trainer.place()
     step = trainer.compile(distilled, batch)
     moved = []

@@ -34,6 +34,7 @@ from dew.decision.rows import Encoding, Fit, QuestionRows, _encoded_unit, _windo
 from dew.decision.task import laid_out, whole_blocks_of
 from dew.nn import categorical
 from dew.objectives.base import Ratio, Step, Weighted
+from dew.training import TrainerAdvanced
 
 LAYOUT = SegmentLayout.joint_row(max_len=1024)
 
@@ -620,5 +621,5 @@ def test_a_decision_run_training_an_exit_gate_steps_at_one_pass_of_a_sampled_cou
     data = decision_rows(EXAMPLES, 8, objective=capped.data())
     # A law of mean 1.2 over at most three passes draws one pass at most of its steps.
     law = SampledPasses(mean=1.2, dispersion=0.5, cap=3)
-    trainer = Trainer(capped, optax.adam(1e-3), key=0, sampled_passes=law)
+    trainer = Trainer(capped, optax.adam(1e-3), key=0, advanced=TrainerAdvanced(sampled_passes=law))
     assert int(trainer.fit(data, steps=3, log_every=100).step) == 3

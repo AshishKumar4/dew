@@ -130,6 +130,7 @@ from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.registry import models
+from dew.training import TrainerAdvanced
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 # The committed byte-level BPE an export can name without a download.
@@ -1623,7 +1624,8 @@ def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tm
 
     objective = LMObjective(model, ids.shape[1] - 1, mtp_weight=0.5, variables=variables)
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0), checkpoints=None, tracker=None)
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), checkpoints=None,
+                      tracker=None)
     state, _, _ = trainer.place()
     before = jax.device_get(state.variables["params"]["mtp_0"])
     batch = {"text": jnp.asarray(np.tile(ids, (max(1, jax.device_count() // len(ids)), 1)), jnp.int32)}

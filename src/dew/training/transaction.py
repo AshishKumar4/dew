@@ -79,7 +79,7 @@ Effects = TypeVar("Effects", default=None)
 
 @dataclasses.dataclass(frozen=True)
 class PassesProgress[L, E]:
-    """A custom training step (`Trainer(step=)`) that passes the run's progress to a model that reads
+    """A custom training step (`TrainerAdvanced(step=)`) that passes the run's progress to a model that reads
     it (`dew.nn.progress`, `Progress(state.updates)`), as the objective's own loss does: `make`, its
     factory, wrapped. A custom step not so declared refuses such a model, which it would otherwise
     train at the run's end."""
@@ -97,10 +97,10 @@ def refuse_unpassed_progress[L, E](objective: Objective[L, E], *, passes: bool) 
     `PassesProgress`) over a module of `objective`'s that reads it (`Objective.progress_readers`): it
     would train the module at the run's end."""
     for module in () if passes else objective.progress_readers()[:1]:
-        raise ValueError(f"a custom training step (Trainer(step=)) passes a {type(module).__name__}, which "
-                         "reads the run's progress (dew.nn.progress), none unless it says it does: pass "
-                         "Progress(state.updates) as the model's progress= and wrap the step's factory in "
-                         "dew.training.PassesProgress, or it trains at the run's end")
+        raise ValueError(f"a custom training step (TrainerAdvanced(step=)) passes a {type(module).__name__}, "
+                         "which reads the run's progress (dew.nn.progress), none unless it says it does: "
+                         "pass Progress(state.updates) as the model's progress= and wrap the step's factory "
+                         "in dew.training.PassesProgress, or it trains at the run's end")
 
 
 @struct.dataclass
@@ -972,8 +972,8 @@ class Transaction:
         self.calls = calls
         self.resting = dict(resting or {})
         self.placed = placed
-        # Whether a step with no loss scale whose loss or gradient is not finite is skipped (the run's
-        # opt-in, `Trainer(skip_nonfinite=True)`): else it is taken as it is formed and the run stops at its
+        # Whether a step with no loss scale whose loss or gradient is not finite is skipped (the run's opt-in,
+        # `TrainerAdvanced(skip_nonfinite=True)`): else it is taken as it is formed and the run stops at its
         # next log, naming it (training.md, a step that is not finite).
         self.skip = skip
         self.record = record

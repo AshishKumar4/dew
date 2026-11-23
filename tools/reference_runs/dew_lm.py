@@ -52,7 +52,6 @@ from common import (
 from reference_source import dew_revision
 
 from dew.optim import AdamW
-from dew.training import FitPolicy
 
 if TYPE_CHECKING:
     from dew.telemetry.workload import WorkloadWork
@@ -165,12 +164,12 @@ def build(args: argparse.Namespace) -> Run:
     # and biases too.
     solver = OptimConfig(optimizer=AdamW(eps=args.eps, b1=args.b1, b2=args.b2, weight_decay=args.weight_decay,
                                          state_dtype=args.state_dtype),
-                         learning_rate=schedule, clip_grads=args.clip,
+                         schedule=schedule, clip=args.clip,
                          param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
     trainer = Trainer(objective, solver, key=jax.random.key(0), mesh=mesh, checkpoints=None, tracker=None,
-                      fit=FitPolicy(split="auto" if args.split is None else args.split))
+                      split="auto" if args.split is None else args.split)
     state, _, _ = trainer.place()
     del pretrained
     placement = batch_shardings(trainer.device_mesh, rows(np.arange(args.batch)))

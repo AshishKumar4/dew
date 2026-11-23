@@ -23,10 +23,10 @@ from dew.inference import TextToImage
 from dew.inference.tasks import SavedRun
 from dew.interop.pretrained import load_diffusion_source
 from dew.interop.saved_sources import export_run, released_run
+from dew.kernels import Kernels
 from dew.lora import LoRA
 from dew.registry import ModelConfig
 from dew.sampling.solvers import Euler
-from dew.training.budget import Horizon
 
 
 @pytest.mark.mesh(devices=8)
@@ -58,7 +58,7 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     # weights, on a host whose cache holds no release.
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "another_cache"))
     trained(recorded, tmp_path, "from_run",
-            trainer={"name": "from_run", "horizon": Horizon(steps=2), "checkpoint_final": True})
+            trainer={"name": "from_run", "steps": 2, "checkpoint_final": True})
     assert "2" in {path.name for path in (tmp_path / "runs" / "from_run").iterdir()}
     assert released_run(source, step="latest") == released_run(source)
     with pytest.raises(ValueError):
@@ -191,7 +191,7 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     # Another host, the training host's cache nowhere: the run resumes there and trains a second step.
     shutil.move(trained_on.parent.parent, tmp_path / "kept")
     resumed_on = cache("resuming_host")
-    trained(run, tmp_path, "second", trainer={"horizon": Horizon(steps=2), "checkpoint_final": True})
+    trained(run, tmp_path, "second", trainer={"steps": 2, "checkpoint_final": True})
     (later,) = SavedRun.at(second, 2).record[RELEASE_SOURCES]
     assert Path(later).parent == resumed_on
     stepped = answered(Decide.from_run(second, step=2))
@@ -451,7 +451,7 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
                                   model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)),
                                   objective=ObjectiveConfig("diffusion", {}))
     trained(command, tmp_path, "after", trainer={"name": "after", "checkpoint_final": True})
-    trained(first, tmp_path, "first", trainer={"name": "first", "horizon": Horizon(steps=2),
+    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2,
                                                "checkpoint_final": True})
     later = SavedRun.pinned(str(source)).step
     assert later != read
@@ -465,7 +465,7 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
     assert stated.resumed().pinned().source.step == later
     with pytest.raises(ValueError):
         dataclasses.replace(recorded, source=SourceOptions(step=later)).check_resume(saved)
-    trained(command, tmp_path, "after", trainer={"name": "after", "horizon": Horizon(steps=2),
+    trained(command, tmp_path, "after", trainer={"name": "after", "steps": 2,
                                                  "checkpoint_final": True})
     assert "2" in {path.name for path in (tmp_path / "runs" / "after").iterdir()}
 
@@ -483,7 +483,7 @@ def test_a_run_resumes_whether_its_decoder_scans_its_layers_or_not(tmp_path):
     for scanned, steps in ((True, 2), (False, 3)):
         run = dataclasses.replace(deeper, model=ModelConfig("causal_transformer", {
             **deeper.model.fields, "scan_layers": scanned}))
-        trained(run, tmp_path, "run", trainer={"name": "run", "horizon": Horizon(steps=steps),
+        trained(run, tmp_path, "run", trainer={"name": "run", "steps": steps,
                                                "checkpoint_final": True})
         assert str(steps) in {path.name for path in (tmp_path / "runs" / "run").iterdir()}
 
@@ -506,16 +506,16 @@ def test_a_run_resumes_under_another_kernel_choice_and_refuses_its_experts_packe
                                 vocab_size=96)
     first = dataclasses.replace(over(str(source), tmp_path, drawn=False), data=windows(corpus.train),
                                 validation=windows(corpus.val),
-                                diagnostics=Diagnostics(kernels={"attention": "reference"}))
+                                diagnostics=Diagnostics(kernels=Kernels(attention="reference")))
     trained(first, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
-    rerun = dataclasses.replace(first, diagnostics=Diagnostics(kernels={"attention": "xla"}))
+    rerun = dataclasses.replace(first, diagnostics=Diagnostics(kernels=Kernels(attention="xla")))
     again, _ = trained(rerun, tmp_path, "run",
-                       trainer={"name": "run", "horizon": Horizon(steps=2), "checkpoint_final": True})
+                       trainer={"name": "run", "steps": 2, "checkpoint_final": True})
     assert int(again.step) == 2
     record = (tmp_path / "runs" / "run" / "run.json").read_text()
     packed = dataclasses.replace(first, source=dataclasses.replace(first.source, packed_weights=True))
     with pytest.raises(ValueError):
-        trained(packed, tmp_path, "run", trainer={"name": "run", "horizon": Horizon(steps=3),
+        trained(packed, tmp_path, "run", trainer={"name": "run", "steps": 3,
                                                   "checkpoint_final": True})
     assert (tmp_path / "runs" / "run" / "run.json").read_text() == record
 
@@ -540,7 +540,7 @@ def test_a_saved_decision_runs_step_reads_the_calibration_fitted_on_it_after_a_l
     # The run as a Dew that kept no calibration by step left it: its latest alone, which the next fit
     # keeps by its own weights before it replaces it (row 3877).
     shutil.rmtree(source / "calibrations")
-    trained(first, tmp_path, "first", trainer={"name": "first", "horizon": Horizon(steps=2),
+    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2,
                                                "checkpoint_final": True})
     later = SavedRun.pinned(str(source)).step
     assert later != read

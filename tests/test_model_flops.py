@@ -73,7 +73,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import batch_text
 from dew.state import TokenCount
 from dew.telemetry.instrumentation import StepFlops
-from dew.training import MeshSpec, UpdateBatch
+from dew.training import MeshSpec
 from dew.training.interval import Interval
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, prepare_counts, step_counts
 
@@ -985,7 +985,7 @@ def test_accumulation_two_logs_the_scored_targets_of_both_microbatches():
 
     tracker = RecordingTracker()
     objective = LMObjective(decoder().clone(num_layers=1), seq_len=6, pad_id=0)
-    trainer = Trainer(objective, optax.sgd(0.01), key=0, update=UpdateBatch(batches=2), tracker=tracker)
+    trainer = Trainer(objective, optax.sgd(0.01), key=0, accumulation=2, tracker=tracker)
     trainer.fit(Loader(batches, None, batch=8, records=16), steps=2, log_every=2)
     ticks = [scalars for _, scalars in tracker.scalars if "train/tokens" in scalars]
     assert len(ticks) == 1

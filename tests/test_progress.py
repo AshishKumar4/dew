@@ -17,7 +17,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.progress import END, Progress
 from dew.objectives.base import Aux
 from dew.objectives.supervised import Supervised
-from dew.training import PassesProgress, Trainer
+from dew.training import PassesProgress, Trainer, TrainerAdvanced
 
 
 class Annealed(nn.Module):
@@ -104,7 +104,8 @@ def test_an_objective_that_passes_no_progress_refuses_a_model_that_reads_it():
         return step
 
     tracker = RecordingTracker()
-    Trainer(objective(), optax.sgd(0.0), key=0, step=PassesProgress(make_step), tracker=tracker).fit(
+    Trainer(objective(), optax.sgd(0.0), key=0, advanced=TrainerAdvanced(step=PassesProgress(make_step)),
+            tracker=tracker).fit(
         data(), steps=2, log_every=1)
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
     np.testing.assert_array_equal(losses, [0.0, 1.0])
@@ -123,10 +124,12 @@ def test_a_custom_training_step_refuses_a_module_that_reads_the_progress_it_does
         return make_step
 
     with pytest.raises(ValueError):
-        Trainer(objective(), optax.sgd(0.0), key=0, step=stepping(Annealed())).fit(data(), steps=1)
+        Trainer(objective(), optax.sgd(0.0), key=0,
+                advanced=TrainerAdvanced(step=stepping(Annealed()))).fit(data(), steps=1)
     plain = Supervised(nn.Dense(1), lambda outputs, batch: jnp.mean(outputs, axis=-1),
                        inputs=InputSpec(Field("x", (2,))))
-    trained = Trainer(plain, optax.sgd(0.0), key=0, step=stepping(nn.Dense(1))).fit(data(), steps=1)
+    trained = Trainer(plain, optax.sgd(0.0), key=0,
+                      advanced=TrainerAdvanced(step=stepping(nn.Dense(1)))).fit(data(), steps=1)
     assert int(trained.step) == 1
 
 

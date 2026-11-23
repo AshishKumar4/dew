@@ -10,7 +10,7 @@ import pytest
 from dew.data import Memory
 from dew.data.pipeline import Pipeline
 from dew.objectives.base import Aux, EMASpec, Objective
-from dew.training import FitPolicy, Trainer, UpdateBatch
+from dew.training import Trainer, TrainerAdvanced
 
 
 class ScaledObjective(Objective):
@@ -36,7 +36,7 @@ def unscaled_weights(accum: int, microsteps: int):
     dynamic scale: what a scaled run's accepted steps must equal bit for bit, its scale a power of two
     that multiplies the loss and divides the gradients exactly."""
     trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0),
-                      update=UpdateBatch(batches=accum))
+                      accumulation=accum)
     state = trainer.initial_state()
     good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
     step = trainer.compile(state, good)
@@ -49,7 +49,8 @@ def test_a_rejected_dynamic_scale_step_leaves_adams_state_as_it_was():
     """A scaled step whose loss is not finite, under Adam, leaves the parameters, their average and the
     optimizer's count and moments bit for bit as they were: the optimizer takes no step for it, not even one
     of zero gradient (row 6748, the choice read on the loss and gradient alone)."""
-    trainer = Trainer(ScaledObjective(), optax.adam(.1), key=jax.random.key(0), dynamic_scale=True)
+    trainer = Trainer(ScaledObjective(), optax.adam(.1), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(dynamic_scale=True))
     state = trainer.initial_state()
     good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
     bad = {"scale": jnp.full((jax.device_count(),), 1e35, jnp.float32)}
@@ -68,7 +69,8 @@ def test_a_dynamic_scale_step_is_accepted_on_its_gradient_finite():
     parameters, as GradScaler's `found_inf` reads the gradients alone: the choice is made before the update
     reads them, so it runs in place, holding no second state (row 6748); the run stops on the non-finite
     state at its next log. Reading the new state's finiteness rejected it."""
-    trainer = Trainer(ScaledObjective(), optax.sgd(1e30), key=jax.random.key(0), dynamic_scale=True)
+    trainer = Trainer(ScaledObjective(), optax.sgd(1e30), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(dynamic_scale=True))
     state = trainer.initial_state()
     # A gradient of 1e10, its norm finite, which a step of 1e30 carries past float32.
     huge = {"scale": jnp.full((jax.device_count(),), 5e9, jnp.float32)}
@@ -85,8 +87,9 @@ def test_a_scaled_steps_state_report_names_the_leaf_its_committed_state_holds(sp
     (row 8269)."""
     from dew.training.transaction import checked
 
-    trainer = Trainer(ScaledObjective(), optax.sgd(1e30), key=jax.random.key(0), dynamic_scale=True,
-                      fit=FitPolicy(split=split))
+    trainer = Trainer(ScaledObjective(), optax.sgd(1e30), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(dynamic_scale=True),
+                      split=split)
     state = trainer.initial_state()
     huge = {"scale": jnp.full((split * jax.device_count(),), 5e9, jnp.float32)}
     state, _, _, _, accepted, committed = trainer.compile(state, huge)(state, huge)
@@ -100,7 +103,7 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     """A dynamic scale's accepted steps are the unscaled run's, bit for bit, and a rejected one leaves
     no trace: after it, the run steps on as the unscaled run of its accepted microbatches alone."""
     trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0),
-                      update=UpdateBatch(batches=accum), dynamic_scale=True)
+                      accumulation=accum, advanced=TrainerAdvanced(dynamic_scale=True))
     state = trainer.initial_state()
     good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
     bad = {"scale": jnp.full((jax.device_count(),), 1e35, jnp.float32)}
@@ -136,7 +139,8 @@ def test_a_gradient_that_would_overflow_adams_second_moment_is_rejected_by_its_n
     average of those squares, past float32, and the moments stay finite; the step's state is kept bit for
     bit. One just under (1e19) is accepted."""
     for scale, taken in ((5e18, True), (5e19, False)):
-        trainer = Trainer(ScaledObjective(), optax.adam(1e-3), key=jax.random.key(0), dynamic_scale=True)
+        trainer = Trainer(ScaledObjective(), optax.adam(1e-3), key=jax.random.key(0),
+                          advanced=TrainerAdvanced(dynamic_scale=True))
         state = trainer.initial_state()
         batch = {"scale": jnp.full((jax.device_count(),), scale, jnp.float32)}
         before = jax.device_get(state.opt_state)
@@ -154,6 +158,7 @@ def test_a_scaled_run_whose_update_overflows_its_state_stops_at_the_next_log():
     after it, naming the leaf, rather than reading on as its scale backs off (row 6748): its committed
     state's finiteness is read after each commit."""
     rows = Pipeline(Memory({"scale": np.full(4 * jax.device_count(), 5e9, np.float32)})).repeat()
-    trainer = Trainer(ScaledObjective(), optax.sgd(1e30), key=jax.random.key(0), dynamic_scale=True)
+    trainer = Trainer(ScaledObjective(), optax.sgd(1e30), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(dynamic_scale=True))
     with pytest.raises(RuntimeError):
         trainer.fit(rows.batch(jax.device_count()), steps=4, log_every=1)

@@ -22,7 +22,7 @@ from dew.batch import unboxed
 from dew.distributed.placement import UNSPLIT_AXES, Layout
 from dew.mesh import FSDP_AXIS, SEQUENCE_AXIS, mesh_axes
 from dew.objectives.lm import LMObjective
-from dew.training import Trainer
+from dew.training import Trainer, TrainerAdvanced
 
 RULES = Layout().axis_rules
 
@@ -105,7 +105,8 @@ def test_each_parameter_is_placed_by_its_declared_axes(name):
     if name not in TRAINED:
         return
     trainer = Trainer(LMObjective(module, args[0].shape[1], ema_decay=0.9), optax.adamw(1e-3),
-                      key=jax.random.key(0), mesh=LAYOUT, layout=Layout(min_shard=MIN_SHARD), tracker=None)
+                      key=jax.random.key(0), mesh=LAYOUT,
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=MIN_SHARD)), tracker=None)
     trainer.device_mesh = mesh
     state = jax.eval_shape(trainer.initial_state)
     placed = trainer.shardings(state)
@@ -173,7 +174,7 @@ def pipeline_placed(name: str, source):
     _, objective = source_objective(source)
     mesh = LAYOUT.build(jax.devices()[:8])
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), mesh=LAYOUT,
-                      layout=Layout(min_shard=MIN_SHARD), tracker=None)
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=MIN_SHARD)), tracker=None)
     trainer.device_mesh = mesh
     state = jax.eval_shape(trainer.initial_state)
     placed = trainer.shardings(state)

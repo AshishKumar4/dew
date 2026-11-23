@@ -43,10 +43,10 @@ from run_kinds import (
 
 from dew.batch import FROZEN
 from dew.config import Diagnostics, SourceOptions, TrainerConfig
+from dew.kernels import Kernels
 from dew.lora import LoRA
 from dew.registry import ModelConfig, objectives
 from dew.scores import Summary
-from dew.training.budget import Horizon
 
 pytestmark = pytest.mark.mesh
 
@@ -63,10 +63,10 @@ def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(
     default keeps the latest two and the best, in the directory named."""
     record = saved_record(KINDS[kind](tmp_path, drawn=False), tmp_path, "set")
     run = trained_record(record, cli_settings(tmp_path, "set", {
-        "trainer.horizon.steps": "4", "trainer.update.batches": "2", "trainer.log_every": "1",
-        "trainer.eval_every": "1", "trainer.checkpoint_every": "1", "trainer.keep": "4",
+        "trainer.steps": "4", "trainer.accumulation": "2", "trainer.log_every": "1",
+        "trainer.eval_every": "1", "trainer.checkpoint_every": "1", "trainer.keep.latest": "4",
         "model.dtype": "float16",
-        "optim.learning_rate": str(RATE), "val_metrics": "[]",
+        "optim.lr": str(RATE), "val_metrics": "[]",
         "val_summaries": json.dumps([{"name": "board", "weights": {"val/loss": 1}, "better": "lower"}])}))
     logged = scalars(run)
     assert {step for step, row in logged.items() if "train/loss" in row} == {1, 2, 3, 4}
@@ -99,11 +99,12 @@ def test_a_runs_kernel_choices_reach_the_programs_it_traces_and_its_record(tmp_p
 
     run = lm(tmp_path, drawn=False)
     with pytest.raises(KernelRefused):
-        trained(dataclasses.replace(run, diagnostics=Diagnostics(kernels={"attention": "cudnn"})), tmp_path,
+        trained(dataclasses.replace(run, diagnostics=Diagnostics(kernels=Kernels(attention="cudnn"))),
+                tmp_path,
                 "refused")
-    trained(dataclasses.replace(run, diagnostics=Diagnostics(kernels={"attention": "xla"})), tmp_path,
+    trained(dataclasses.replace(run, diagnostics=Diagnostics(kernels=Kernels(attention="xla"))), tmp_path,
             "chosen")
-    assert RunConfig.load(str(tmp_path / "runs" / "chosen")).diagnostics.kernels == {"attention": "xla"}
+    assert RunConfig.load(str(tmp_path / "runs" / "chosen")).diagnostics.kernels == Kernels(attention="xla")
 
 
 @pytest.mark.mesh(devices=8)
@@ -166,7 +167,7 @@ def test_a_process_option_the_process_does_not_carry_is_refused_before_training(
     stated = {"xla_flags": "--xla_dump_hlo_pass_re=run-options-1901",
               "compilation_cache_dir": str(tmp_path / "cache"), "multi_host": True}[option]
     run = KINDS[kind](tmp_path, drawn=False)
-    trainer = TrainerConfig(**{"checkpoint_dir": str(tmp_path / "runs"), "horizon": Horizon(steps=1),
+    trainer = TrainerConfig(**{"checkpoint_dir": str(tmp_path / "runs"), "steps": 1,
                                "eval_every": None, "multi_host": False,
                                **({} if option == "xla_flags" else {option: stated})})
     diagnostics = Diagnostics(xla_flags=stated) if option == "xla_flags" else Diagnostics()

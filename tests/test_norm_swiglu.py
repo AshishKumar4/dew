@@ -28,6 +28,7 @@ from dew.nn import attention, norms
 from dew.nn.activations import gated_product, packed_gated_product
 from dew.nn.kernels import generation, norm_swiglu, tuning
 from dew.nn.norms import RMSNorm, gated_rms_normalized, rms_normalized, stream_rms_normalized
+from dew.training import TrainerAdvanced
 
 pytestmark = pytest.mark.kernel
 
@@ -996,7 +997,7 @@ def test_a_packed_mlp_model_trains_on_an_explicit_data_mesh():
     def make_trainer(mesh):
         objective = PackedMlpObjective()
         return objective, Trainer(objective, optax.sgd(1.0), key=0, mesh=mesh,
-                                  layout=Layout(min_shard=1, tolerance=1.))
+                                  advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.)))
 
     x0, y0 = draw(0)
     rows = Memory([{"x": np.asarray(x0[i]), "y": np.asarray(y0[i])}

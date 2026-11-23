@@ -159,8 +159,9 @@ def refuse_untold(opt_state: optax.OptState) -> None:
 
     def visit(node, where: str | None, routed: bool) -> None:
         if isinstance(node, optax.ApplyIfFiniteState):
-            raise refused("optax.apply_if_finite", "drop non-finite steps with Trainer(dynamic_scale=...), "
-                          "which leaves a non-finite attempt uncounted and draws its next one afresh")
+            raise refused("optax.apply_if_finite", "drop non-finite steps with "
+                          "TrainerAdvanced(dynamic_scale=...), which leaves a non-finite attempt uncounted "
+                          "and draws its next one afresh")
         if isinstance(node, optax.ConditionallyMaskState) and not routed:
             raise refused("optax.conditionally_mask", "alternate networks under dew.held_updates.phased, "
                           "which routes each update to one of them, or hold updates back with "

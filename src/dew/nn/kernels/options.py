@@ -406,7 +406,7 @@ def lowering(platforms: tuple[str, ...]) -> Iterator[list[tuple[str, jax.stages.
     mesh (the devices of a target this host is not, `generation.gpu_mesh`) lowers for `platforms`, any
     other for its own devices' backend. The list it yields holds each lowering, in the order of the calls,
     with its program's name (`OuterProgram.called`): a step lowered for another target whose programs are
-    several (a host step's, `Trainer(lower_for=)`)."""
+    several (a host step's, `TrainerAdvanced(lower_for=)`)."""
     lowered: list[tuple[str, jax.stages.Lowered]] = []
     token = _LOWERING.set((platforms, lowered))
     try:

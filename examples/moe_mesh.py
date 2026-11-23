@@ -53,6 +53,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.optim import Adam, OptimConfig
 from dew.sampling import Sampling
+from dew.training import TrainerAdvanced
 
 
 @dataclass
@@ -218,9 +219,10 @@ def main(config: Config) -> None:
         mlp_features=128, max_seq_len=64, dtype=jnp.float32, attention_impl="xla",
         mixture=mixture)
     objective = LMObjective(model, config.sequence_length, balance=ExpertBalance(aux_loss_alpha=0.01))
-    optimizer = OptimConfig(optimizer=Adam(), learning_rate=config.learning_rate).build(config.steps)
+    optimizer = OptimConfig(optimizer=Adam(), lr=config.learning_rate).build(config.steps)
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed),
-                      mesh=MeshSpec(fsdp=config.fsdp, expert=config.expert), layout=Layout(min_shard=1))
+                      mesh=MeshSpec(fsdp=config.fsdp, expert=config.expert),
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1)))
     mesh = trainer.device_mesh
     print(f"Mesh {dict(mesh.shape)} over {mesh.devices.size} {jax.devices()[0].device_kind} device(s)")
 

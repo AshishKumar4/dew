@@ -37,7 +37,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         Wandb,
         WandbTracker,
     )
-    from dew.training.trainer import Rollout, Trainer
+    from dew.training.trainer import Rollout, Trainer, TrainerAdvanced
     from dew.training.transaction import PassesProgress
 
 _EXPORTS = {
@@ -76,6 +76,7 @@ _EXPORTS = {
     "Tracker": "dew.training.tracker",
     "Trackers": "dew.training.tracker",
     "Trainer": "dew.training.trainer",
+    "TrainerAdvanced": "dew.training.trainer",
     "UpdateBatch": "dew.training.policy",
     "Wandb": "dew.training.tracker",
     "WandbTracker": "dew.training.tracker",
@@ -125,6 +126,7 @@ __all__ = [
     "Tracker",
     "Trackers",
     "Trainer",
+    "TrainerAdvanced",
     "UpdateBatch",
     "Wandb",
     "WandbTracker",

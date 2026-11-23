@@ -48,7 +48,7 @@ from dew.sampling import (
     MultiStepDPM,
     UniPC,
 )
-from dew.training import Trainer, UpdateBatch
+from dew.training import Trainer, TrainerAdvanced
 
 _DEFAULT_MAKE_OBJECTIVE_GUIDANCE = CFG(2.0)
 
@@ -581,7 +581,7 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     whole = make_batch_of(2 * rows)
     halves = [jax.tree.map(lambda value, part=part: value[part * rows:(part + 1) * rows], whole)
               for part in (0, 1)]
-    trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3), update=UpdateBatch(batches=2))
+    trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3), accumulation=2)
     initial = trainer.initial_state()
     template = jax.tree.map(jnp.copy, initial)
     run = trainer.compile(initial, halves[0])
@@ -631,7 +631,8 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
 
     def stepping(layout):
         """The layout's step of drawn weights, its update applied (`applied`), and its placed state."""
-        trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3), layout=layout)
+        trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3),
+                          advanced=TrainerAdvanced(layout=layout))
         placed, _, _ = trainer.place()
         template = jax.tree.map(jnp.copy, placed)
         run = trainer.compile(placed, batch)

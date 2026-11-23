@@ -339,7 +339,7 @@ class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, vari
   .replace(self, **updates)
   .window: property -> Accumulation | None
   .with_window(self, window: Accumulation | None) -> TrainState
-class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTransformation | OptimConfig, *, key: int | jax.Array, mesh: MeshSpec | Mesh = MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, diloco=1, explicit=()), layout: Layout | None = None, update: UpdateBatch = UpdateBatch(batches=None, tokens=None), fit: FitPolicy = FitPolicy(split='auto', remat='auto', microbatches=None), dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False, checkpoints: Checkpoints | None = None, tracker: Tracker | None = None, step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None, rollout: Rollout | None = None, profile: ProfileWindow | None = None, lower_for: str | None = None, ahead: AheadOfTime | None = None, tune_kernels: bool = False, record: bool = False, links: Mapping[str, Link] | None = None, inspection: Inspection | None = None, param_dtype: str | None = None, diloco: DiLoCo | None = None, phase_passes: Sequence[int] | None = None, sampled_passes: SampledPasses | None = None, data_resume: DataResume = 'relaxed', skip_nonfinite: bool = False)  [dew.training.trainer]
+class Trainer(objective: Objective[Loss, Effects], optimizer: OptimizerSpec | OptimConfig | optax.GradientTransformation, *, key: int | jax.Array = 0, lr: float | None = None, schedule: ScheduleBase | None = None, clip: float = 0.0, accumulation: int | None = None, update_tokens: int | None = None, split: int | Literal['auto'] = 'auto', remat: Remat = 'auto', microbatches: int | None = None, mesh: MeshSpec | Mesh = MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, diloco=1, explicit=()), checkpoints: Checkpoints | None = None, tracker: Tracker | None = None, advanced: TrainerAdvanced[Loss, Effects] | None = None)  [dew.training.trainer]
   .compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep
   .device_mesh: cached property -> Mesh
   .executable: property -> jax.stages.Compiled | None
@@ -375,8 +375,10 @@ def jit(function: Callable[P, R], **arguments: Unpack[JitArguments]) -> OuterPro
 module kernels  [dew.kernels]
   class KernelRefused(choice: str, kernel: str, first: Refusal, rest: Iterator[Refusal]) -> None  [dew.nn.kernels.selection]
     .refusals: property -> list[Refusal]
+  class Kernels(attention: Literal['cudnn', 'flash', 'inference', 'reference', 'template', 'tpu', 'triton', 'xla'] | None = None, attention_mainloop: Literal['mosaic', 'portable', 'triton'] | None = None, blockwise_fp8: Literal['mosaic', 'xla'] | None = None, decode: Literal['cudnn', 'decode', 'reference', 'template', 'xla'] | None = None, delta_decode: Literal['fused', 'step', 'xla'] | None = None, delta_gates: Literal['apart', 'joined'] | None = None, gate_up: Literal['apart', 'joined'] | None = None, gated_delta_rule: Literal['fla', 'mosaic_gpu', 'xla'] | None = None, gated_mlp: Literal['apart', 'fused'] | None = None, gemm_epilogue: Literal['fused', 'xla'] | None = None, gemm_prologue: Literal['fused', 'xla'] | None = None, grouped_matmul: Literal['apart', 'cutlass', 'mosaic', 'triton', 'xla'] | None = None, low_rank: Literal['fused', 'xla'] | None = None, mxfp8: Literal['mosaic', 'xla'] | None = None, narrow_copies: Literal['off', 'on'] | None = None, nvfp4: Literal['packed', 'xla'] | None = None, nvfp4_block: Literal['mosaic', 'xla'] | None = None, paged_decode: Literal['gathered', 'template', 'tpu', 'triton'] | None = None, qkv: Literal['apart', 'joined'] | None = None, rms_norm: Literal['pallas', 'xla'] | None = None, selective_scan: Literal['mosaic_gpu', 'xla'] | None = None, short_conv: Literal['mosaic_gpu', 'xla'] | None = None, sparse_attention: Literal['template', 'xla'] | None = None, ssd: Literal['mosaic_gpu', 'pallas', 'tpu', 'xla'] | None = None, swiglu: Literal['pallas', 'xla'] | None = None) -> None  [dew.kernels]
+    .named(self) -> dict[str, str]
   choices = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gated_delta_rule', 'gated_mlp', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'low_rank', 'mxfp8', 'narrow_copies', 'nvfp4', 'nvfp4_block', 'paged_decode', 'qkv', 'rms_norm', 'selective_scan', 'short_conv', 'sparse_attention', 'ssd', 'swiglu'})
-  def use(**kernels: str) -> Iterator[None]  [dew.nn.kernels.generation]
+  def use(kernels: dew.kernels.Kernels | None = None, /, **names: str) -> collections.abc.Iterator[None]  [dew.kernels]
 def pipeline(source: str, *, mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, dtype: DTypeLike | None = None, param_dtype: DTypeLike | Literal['auto'] | None = None, ema: bool | None = None, step: int | str | None = None, revision: str | None = None, trust: Sequence[str] = (), options: SourceOptions | None = None, precision: Numerics | str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask  [dew.inference.loading]
 def register(name: str, /) -> Callable[[M], M]  [dew.registry]
 def sample(denoise: dew.diffusion.process.Denoiser | dew.diffusion.discrete.DiscreteDenoiser, x_T: jax.Array, steps: int | None = None, *, solver: dew.sampling.solvers.common.Solver[StateT], guidance: dew.sampling.guidance.Guidance | None = None, key: int | jax.Array | dew.sampling.solvers.common.RowKeys, times: jax.Array | numpy.ndarray | numpy.bool | numpy.number | bool | int | float | complex | collections.abc.Sequence[float] | None = None, initial: StateT | None = None, final_denoise: bool = True, record: collections.abc.Callable[[jax.Array, StateT, jax.Array], RecordT] | None = None) -> jax.Array | tuple[jax.Array, RecordT]  [dew.sampling.walks]
@@ -509,8 +511,8 @@ dew.config.env.EnvRunConfig
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
-  env: Annotated[EnvConfig, tyro.conf.subcommand('env')] | None = None
-  rollout: RolloutConfig = dew.config.env.RolloutConfig()
+  env: EnvChoice | None = None
+  rollout: RolloutChoice = (lambda: RolloutConfig().flagged())()
   teacher: Annotated[TeacherConfig, tyro.conf.subcommand('teacher')] | None = None
   pretrained: str | None = None
   episodes: Annotated[Mapping[str, EpisodesConfig], record_argument(Mapping[str, EpisodesConfig])] = builtins.dict()
@@ -535,7 +537,7 @@ dew.config.jepa.JepaRunConfig
   diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
-  optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.001))()
+  optim: OptimConfig = (lambda: OptimConfig(lr=0.001))()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('jepa'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
@@ -556,7 +558,7 @@ dew.config.lm.LMRunConfig
   diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
-  optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.0006, optimizer=AdamW(weight_decay=0.1), clip_grads=1.0))()
+  optim: OptimConfig = (lambda: OptimConfig(lr=0.0006, optimizer=AdamW(weight_decay=0.1), clip=1.0))()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('lm'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
@@ -609,20 +611,24 @@ dew.config.sweep.OptunaSearch
 dew.config.sweep.RandomSearch
   seed: int = 0
 dew.config.trainer.Diagnostics
-  kernels: dict[str, str] = builtins.dict()
+  kernels: Kernels = dew.kernels.Kernels()
   links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = builtins.dict()
   tune_kernels: bool = False
   xla_flags: str | None = None
 dew.config.trainer.TrainerConfig
   name: str | None = None
   checkpoint_dir: str = './checkpoints'
-  keep: Annotated[int | Keep, _keep_argument()] = 2
+  keep: Keep = dew.checkpoints.Keep()
   resume: Resume = 'auto'
   data_resume: DataResume = 'relaxed'
   skip_nonfinite: bool = False
-  best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
+  best: Annotated[Best, tyro.conf.subcommand('best')] | None = None
   key: int = 0
-  horizon: Horizon = dew.training.budget.Horizon()
+  steps: int | None = None
+  epochs: int | None = None
+  tokens: int | None = None
+  examples: int | None = None
+  max_tokens: int | None = None
   stop: Annotated[Pause, tyro.conf.subcommand('pause')] | Annotated[Plateau, tyro.conf.subcommand('plateau')] | None = None
   restore_best: bool = False
   cooldowns: Annotated[Cooldowns, tyro.conf.subcommand('cooldowns')] | None = None
@@ -633,10 +639,13 @@ dew.config.trainer.TrainerConfig
   local_directory: str | None = None
   local_every: int | str | None = None
   scored_to: str | None = None
-  update: UpdateBatch = dew.training.policy.UpdateBatch()
-  fit: FitPolicy = dew.training.policy.FitPolicy()
+  accumulation: int | None = None
+  update_tokens: int | None = None
+  split: int | Literal['auto'] = 'auto'
+  remat: Remat = 'auto'
+  microbatches: int | None = None
   batch_ramp: Ramp | None = None
-  precision: Annotated[Numerics, _numerics_argument()] = dew.nn.precision.Numerics()
+  precision: NumericsChoices = dew.nn.precision.Numerics()
   mesh: MeshSpec = dew.distributed.placement.MeshSpec()
   layout: Annotated[Layout, tyro.conf.subcommand('layout')] | None = None
   profile: ProfileWindow | None = None
@@ -679,7 +688,7 @@ dew.decision.config.DecisionRunConfig
   diagnostics: dew.config.trainer.Diagnostics = dew.config.trainer.Diagnostics()
   data_plan_version: int | None = None
   source: dew.interop.source_options.SourceOptions = dew.interop.source_options.SourceOptions()
-  optim: OptimConfig = (lambda: OptimConfig(learning_rate=2.5e-05))()
+  optim: OptimConfig = (lambda: OptimConfig(lr=2.5e-05))()
   trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('decision'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
@@ -925,6 +934,32 @@ dew.interop.source_options.SourceOptions
   param_dtype: str | None = None
   step: int | str | None = None
   ema: bool | None = None
+dew.kernels.Kernels
+  attention: Literal['cudnn', 'flash', 'inference', 'reference', 'template', 'tpu', 'triton', 'xla'] | None = None
+  attention_mainloop: Literal['mosaic', 'portable', 'triton'] | None = None
+  blockwise_fp8: Literal['mosaic', 'xla'] | None = None
+  decode: Literal['cudnn', 'decode', 'reference', 'template', 'xla'] | None = None
+  delta_decode: Literal['fused', 'step', 'xla'] | None = None
+  delta_gates: Literal['apart', 'joined'] | None = None
+  gate_up: Literal['apart', 'joined'] | None = None
+  gated_delta_rule: Literal['fla', 'mosaic_gpu', 'xla'] | None = None
+  gated_mlp: Literal['apart', 'fused'] | None = None
+  gemm_epilogue: Literal['fused', 'xla'] | None = None
+  gemm_prologue: Literal['fused', 'xla'] | None = None
+  grouped_matmul: Literal['apart', 'cutlass', 'mosaic', 'triton', 'xla'] | None = None
+  low_rank: Literal['fused', 'xla'] | None = None
+  mxfp8: Literal['mosaic', 'xla'] | None = None
+  narrow_copies: Literal['off', 'on'] | None = None
+  nvfp4: Literal['packed', 'xla'] | None = None
+  nvfp4_block: Literal['mosaic', 'xla'] | None = None
+  paged_decode: Literal['gathered', 'template', 'tpu', 'triton'] | None = None
+  qkv: Literal['apart', 'joined'] | None = None
+  rms_norm: Literal['pallas', 'xla'] | None = None
+  selective_scan: Literal['mosaic_gpu', 'xla'] | None = None
+  short_conv: Literal['mosaic_gpu', 'xla'] | None = None
+  sparse_attention: Literal['template', 'xla'] | None = None
+  ssd: Literal['mosaic_gpu', 'pallas', 'tpu', 'xla'] | None = None
+  swiglu: Literal['pallas', 'xla'] | None = None
 dew.lora.LoRA
   rank: int
   modules: tuple[str, ...]
@@ -982,7 +1017,7 @@ dew.optim.AdamW
   state_dtype: Literal['float32', 'bfloat16', 'int8', 'params'] | tuple[str | None, str | None] = 'float32'
 dew.optim.Cosine
   every: int = 1  [keyword-only]
-  peak_value: float
+  peak_value: float | None = None  [keyword-only]
   warmup_steps: int | str
   end_value: float = 0.0
   init_value: float = 0.0
@@ -1009,7 +1044,7 @@ dew.optim.Lamb
   weight_decay: float = 0.0
 dew.optim.Linear
   every: int = 1  [keyword-only]
-  peak_value: float
+  peak_value: float | None = None  [keyword-only]
   warmup_steps: int | str = 0
   decay_start: int | None = None
   decay_steps: int | None = None
@@ -1057,7 +1092,7 @@ dew.optim.MuonClip
   qk_clip_threshold: float = 100.0
 dew.optim.OneCycle
   every: int = 1  [keyword-only]
-  peak_value: float
+  peak_value: float | None = None  [keyword-only]
   init_value: float | None = None
   end_value: float | None = None
   warmup_fraction: float | str = 0.3
@@ -1065,12 +1100,13 @@ dew.optim.Optax
   path: str = 'optax:sgd'
   settings: JsonDict = builtins.dict()
 dew.optim.OptimConfig
-  optimizer: Annotated[OptimizerSpecs, _optimizer_argument()] = dew.optim.AdamW()
-  learning_rate: Annotated[float | ScheduleSpec | None, _rate_argument()] = None
-  spared: bool = True
+  optimizer: OptimizerChoices = dew.optim.AdamW()
+  lr: float | None = None
+  schedule: ScheduleChoices | None = None
+  decay_norms_and_biases: bool = False
   decay_mask: DecayMask | None = None
   param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
-  clip_grads: float = 0.0
+  clip: float = 0.0
   forced_weight_normalization: bool = False
   ema_profiles: tuple[float, ...] = ()
 dew.optim.ParamGroup
@@ -1078,7 +1114,7 @@ dew.optim.ParamGroup
   patterns: tuple[str, ...] = ()
   learning_rate_multiplier: float = 1.0
   weight_decay: float | None = None
-  spared: bool = False
+  decay_norms_and_biases: bool = True
   schedule: ScheduleBase | None = None
   b1: ScheduleBase | None = None
   bounds: tuple[float, float] | None = None
@@ -1086,7 +1122,7 @@ dew.optim.ParamGroup
   decay_mask: DecayMask | None = None
 dew.optim.Power
   every: int = 1  [keyword-only]
-  peak_value: float
+  peak_value: float | None = None  [keyword-only]
   warmup_steps: int | str
   a: float
   b: float = -0.51
@@ -1133,12 +1169,6 @@ dew.telemetry.profile.CaptureOptions
   host_tracer_level: int = 2
   python_tracer_level: int = 0
   activity_cap: int = 2097152
-dew.training.budget.Horizon
-  steps: int | None = None
-  epochs: int | None = None
-  tokens: int | None = None
-  examples: int | None = None
-  max_tokens: int | None = None
 dew.training.budget.Pause
   fraction: float
 dew.training.budget.Plateau
@@ -1162,13 +1192,6 @@ dew.training.inspection.Inspection
   modules: tuple[str, ...] = ()
   cotangents: bool = False
   histogram: bool = False
-dew.training.policy.FitPolicy
-  split: int | Literal['auto'] = 'auto'
-  remat: Remat = 'auto'
-  microbatches: int | None = None
-dew.training.policy.UpdateBatch
-  batches: int | None = None
-  tokens: int | None = None
 dew.training.profiling.ProfileWindow
   directory: str
   steps: int

@@ -78,6 +78,7 @@ from dew.registry import (
     Registered,
     declared_type,
     from_record,
+    implied_subcommand,
     member_fields,
     metrics,
     models,
@@ -92,7 +93,7 @@ from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
 from dew.training._fit import FitArguments
 from dew.training.ahead import AheadOfTime, CompiledAhead, fit_plan
-from dew.training.budget import Horizon, Pause
+from dew.training.budget import Pause
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Split
 from dew.training.profiling import ProfileReport, ProfileWindow
@@ -323,14 +324,26 @@ def flag_subcommands(config: type, prefix: str = "") -> dict[str, str]:
                   if typing.get_origin(option) is Annotated
                   for marker in typing.get_args(option)[1:]
                   if isinstance(marker, _SUBCOMMAND) and marker.name is not None]
+        default = (field.default_factory() if callable(field.default_factory)
+                   else None if field.default is dataclasses.MISSING else field.default)
+        # A default's own subcommand, which a flag of its fields given alone implies: a chosen record's
+        # (`dew.registry.implied_subcommand`), or the one member of its own class: `--optim.optimizer.b2 0.95`
+        # sets the default AdamW's. Members of one class apart by their defaults (`trainer.precision`'s
+        # presets) imply none: the command line names one.
+        implied = implied_subcommand(default) if default is not None else None
+        own = [name for kind, name in marked if type(default) is kind]
+        if implied is None and len(own) == 1:
+            implied = own[0]
         if marked and len(marked) == len(given) < len(options):
             found[path] = marked[0][1]
             nested = [kind for kind, _ in marked]
         else:
+            if implied is not None:
+                found[path] = implied
             nested = given if len(given) == 1 else []
         for kind in nested:
             if (isinstance(kind, type) and dataclasses.is_dataclass(kind)
-                    and kind.__module__.startswith("dew.config")):
+                    and kind.__module__.startswith(("dew.config", "dew.optim"))):
                 found.update(flag_subcommands(kind, f"{path}."))
     return found
 
@@ -584,6 +597,10 @@ def _placed(config: "RunConfig", path: str) -> tuple[list[str], dict[str, JSON]]
         owner, held = held, getattr(held, group)
         if held is None and (default := _unset_default(owner, group)) is not None:
             held, unset[group] = default, registry.to_record(default, type(default))
+    if isinstance(held, Registered):
+        # A command line's subcommand (`registry.record_flags`) is the record it makes: its plain flags are
+        # that record's `fields` entries.
+        held = held.recorded()
     if isinstance(held, Registered) and field not in _names(held):
         if field not in parameters(held.member)[0]:
             raise KeyError(f"{path} names no argument of {held.name}")
@@ -697,7 +714,7 @@ class RunConfig:
     val_summaries: Annotated[tuple[Summary, ...], record_argument(tuple[Summary, ...])] = ()
     """Scalars weighed from each evaluation's split scores, a board's weighted index, each formed at a
     step that scored every split it weighs and logged as `evaluation/summary/<name>`, which
-    `--trainer.best evaluation/summary/<name>` ranks by (`dew.scores.Summary`):
+    `--trainer.best.metric evaluation/summary/<name>` ranks by (`dew.scores.Summary`):
     `--val-summaries '[{"name": "board", "weights": {"val/accuracy": 1, "test/accuracy": 2},
     "better": "higher"}]'`.
     """
@@ -931,7 +948,7 @@ class RunConfig:
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
         """Parse a run from `args`, or from the process's own command line when `args` is None: a flag for
-        each of the run's own settings, `--trainer.horizon.steps 2000` or `--optim.learning-rate 3e-4`, over
+        each of the run's own settings, `--trainer.steps 2000` or `--optim.lr 3e-4`, over
         `default` (a recipe's run) or the class's own.
 
         An optional setting such as `lora` is turned on by its own flags: `--lora.rank 16 --lora.modules
@@ -1147,10 +1164,10 @@ class RunConfig:
                                validation: Dataset | Mapping[str, Dataset | Entry] | None,
                                ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
-        stages, `data_seed` and `data_plan_version`, the training read bounded to its horizon's examples
-        where the run counts them (`trainer.horizon`), or to its epochs' passes over its source examples where
-        its read has no record count, so its length is read off the loader this returns; its loading workers
-        sized for the run's length, its horizon's steps, epochs or tokens (`dew.data.Loading.resolved`)."""
+        stages, `data_seed` and `data_plan_version`, the training read bounded to its horizon's examples where
+        the run counts them (`trainer.examples`), or to its epochs' passes over its source examples where its
+        read has no record count, so its length is read off the loader this returns; its loading workers sized
+        for the run's length, its horizon's steps, epochs or tokens (`dew.data.Loading.resolved`)."""
         # At the version `resumed` resolves (itself where `prepare` or `readied` resolved it; a run built
         # alone, `build_run`, resolves it here), which it always states.
         planned = self.resumed(("data_plan_version",)).data_plan_version
@@ -1160,8 +1177,8 @@ class RunConfig:
         trainer = self.trainer
         return fitted(dataset, validation, objective=objective, seed=self.data_seed,
                       resume=trainer.data_resume,
-                      examples=trainer.horizon.examples, epochs=trainer.horizon.epochs,
-                      steps=trainer.horizon.steps, tokens=trainer.horizon.tokens,
+                      examples=trainer.examples, epochs=trainer.epochs,
+                      steps=trainer.steps, tokens=trainer.tokens,
                       count_passes=self.reads_passes())
 
     def reads_passes(self) -> bool:
@@ -1246,7 +1263,7 @@ class RunConfig:
         name = self.trainer.name or "profile"
         warmup = max(1, -(-warmup // steps)) * steps
         trainer = dataclasses.replace(
-            self.trainer, name=name, resume="never", horizon=Horizon(steps=warmup + steps), stop=None,
+            self.trainer, name=name, resume="never", steps=warmup + steps, stop=None,
             best=None, restore_best=False, cooldowns=None, log_every=steps, eval_every=None,
             checkpoint_every=None, checkpoint_final=False, local_directory=None, local_every=None, wandb=None,
             ahead=None)
@@ -1360,7 +1377,7 @@ class RunConfig:
         `dataset` is compiled once with the objective's own stages (`dew.data.compile.fitted`), and its
         validation splits with it; the run's length, its ramp, its cadences and its recorded plan are
         read off that one compiled loader, which `fit` trains on. Its batch stage is the run's batch, and
-        an update of tokens pools `trainer.update.tokens` over its token batch.
+        an update of tokens pools `trainer.update_tokens` over its token batch.
 
         A `trainer.quantization` wraps the module `objective` trains before anything
         initializes it, so the run learns through the quantized forward pass. A
@@ -1384,7 +1401,7 @@ class RunConfig:
         # What `fit` is asked for but its resume, which a run compiled ahead compiles its evaluations from.
         fitted = FitArguments(
             # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
-            steps=steps, tokens=trainer.horizon.tokens, max_tokens=trainer.horizon.max_tokens,
+            steps=steps, tokens=trainer.tokens, max_tokens=trainer.max_tokens,
             log_every=trainer.log_every,
             examples=dataset.examples if steps is None else None,
             eval_every=trainer.eval_interval(dataset), checkpoint_every=trainer.checkpoint_interval(dataset),
@@ -1457,7 +1474,7 @@ class RunConfig:
         (`dew.kernels.use`), which JAX keys its trace caches on."""
         import dew.kernels
 
-        with generation.run_precision(self.trainer.precision), dew.kernels.use(**self.diagnostics.kernels):
+        with generation.run_precision(self.trainer.precision), dew.kernels.use(self.diagnostics.kernels):
             yield
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
@@ -1587,14 +1604,18 @@ class RunConfig:
         the training package's lazy export (`dew.training`), read where a run trains or compiles
         ahead, so a config read alone reads none of it."""
         trainer = self.trainer
+        checkpoints, tracker = resources.pop("checkpoints", None), resources.pop("tracker", None)
         return training.Trainer(
-            objective, self.optim, key=trainer.key, mesh=mesh, layout=trainer.layout, update=trainer.update,
-            fit=trainer.fit,
-            dynamic_scale=trainer.precision.scales_loss(self.compute_dtype()), rollout=rollout,
-            tune_kernels=self.diagnostics.tune_kernels, param_dtype=self.drawn_dtype(),
-            inspection=trainer.inspection,
-            diloco=trainer.diloco, data_resume=trainer.data_resume, skip_nonfinite=trainer.skip_nonfinite,
-            **{"links": self.diagnostics.links, **resources})
+            objective, self.optim, key=trainer.key, mesh=mesh, accumulation=trainer.accumulation,
+            update_tokens=trainer.update_tokens, split=trainer.split, remat=trainer.remat,
+            microbatches=trainer.microbatches, checkpoints=checkpoints, tracker=tracker,
+            advanced=training.TrainerAdvanced(
+                layout=trainer.layout, rollout=rollout, data_resume=trainer.data_resume,
+                skip_nonfinite=trainer.skip_nonfinite,
+                dynamic_scale=trainer.precision.scales_loss(self.compute_dtype()),
+                tune_kernels=self.diagnostics.tune_kernels, param_dtype=self.drawn_dtype(),
+                inspection=trainer.inspection, diloco=trainer.diloco,
+                **{"links": self.diagnostics.links, **resources}))
 
     def compute_dtype(self) -> str:
         """The dtype the run's model computes in: the one its record states, else its numerics'

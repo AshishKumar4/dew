@@ -67,8 +67,16 @@ from dew.newton_schulz import (
 from dew.nn.inspection import QK
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import boxed, declared_axes, layer_norms, layers_of, parameter_path
-from dew.optim_schedules import Rates, ScheduleBase, group_named, placed_like, rates_of, scheduled_solver
-from dew.registry import Aliases, JsonDict, from_record, optimizers, record_argument, schedules, to_record
+from dew.optim_schedules import (
+    Peaked,
+    Rates,
+    ScheduleBase,
+    group_named,
+    placed_like,
+    rates_of,
+    scheduled_solver,
+)
+from dew.registry import Aliases, JsonDict, optimizers, record_argument, schedules
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one
@@ -1292,8 +1300,8 @@ def _checked_decay_mask(mask: DecayMask | None, spared: bool, owner: str) -> Non
     if mask is None:
         return
     if spared:
-        raise ValueError(f"{owner} spares its decay, which writes its own mask over decay_mask: set spared "
-                         "False to decay where decay_mask says")
+        raise ValueError(f"{owner} spares norms and biases from its decay, which writes its own mask over "
+                         "decay_mask: set decay_norms_and_biases to decay where decay_mask says")
     if type(mask) is bool:
         return
     leaves = jax.tree.leaves(mask, is_leaf=lambda leaf: leaf is None)
@@ -1324,7 +1332,7 @@ class ParamGroup:
     `OptimConfig.param_groups` that has a pattern it matches, as in
     lm-engine, and a parameter that matches no group raises `ValueError`.
 
-    The group's learning rate is its own `schedule` (the config's `learning_rate` when
+    The group's learning rate is its own `schedule` (the config's rate, `OptimConfig.rate`, when
     None) times `learning_rate_multiplier`. `b1` schedules the first-moment
     decay of adam, adamw and lamb, as torch's `OneCycleLR(cycle_momentum=True)`
     cycles Adam's beta1; None keeps the optimizer's own. `weight_decay`
@@ -1338,11 +1346,11 @@ class ParamGroup:
     patterns: tuple[str, ...] = ()
     learning_rate_multiplier: float = 1.0
     weight_decay: float | None = None
-    spared: bool = False
-    """Whether the group's decay spares its biases and vectors (`weight_decay_mask`). A group decays
-    every parameter it claims unless it does, as a torch optimizer's parameter group does, so a run's
-    groups mirror the reference's own groups (lm_engine's, a torch recipe's); the split an ungrouped
-    optimizer takes (`OptimConfig.spared`) is the groups' only where they say so."""
+    decay_norms_and_biases: bool = True
+    """Whether the group's decay applies to its biases and vectors too (`weight_decay_mask`). A group decays
+    every parameter it claims, as a torch optimizer's parameter group does, so a run's groups mirror the
+    reference's own groups (lm_engine's, a torch recipe's); the split an ungrouped optimizer takes
+    (`OptimConfig.decay_norms_and_biases` False) is the groups' only where they say so (False)."""
     schedule: ScheduleBase | None = None
     b1: ScheduleBase | None = None
     bounds: tuple[float, float] | None = None
@@ -1351,7 +1359,7 @@ class ParamGroup:
     `patterns` (`Objective.fresh_modules`): what `OptimConfig.with_fresh` names before a run records
     the group."""
     decay_mask: DecayMask | None = None
-    """The parameters the group's decay applies to where it does not spare them (`spared` False): a tree of
+    """The parameters the group's decay applies to where it decays them (`decay_norms_and_biases`): a tree of
     booleans by parameter name, a prefix of its parameters' tree, as Optax's decay takes its mask
     (`optax.add_decayed_weights`); None decays every parameter it claims. An earlier run's mask among its
     optimizer's options (`dew.config.earlier`)."""
@@ -1360,7 +1368,7 @@ class ParamGroup:
         object.__setattr__(self, "patterns", tuple(self.patterns))
         if not self.patterns and not self.fresh:
             raise ValueError(f"param group {self.name!r} matches no pattern")
-        _checked_decay_mask(self.decay_mask, self.spared, f"param group {self.name!r}")
+        _checked_decay_mask(self.decay_mask, not self.decay_norms_and_biases, f"param group {self.name!r}")
         if self.learning_rate_multiplier <= 0:
             raise ValueError(
                 f"param group {self.name!r} scales the learning rate by a positive "
@@ -1373,7 +1381,7 @@ class ParamGroup:
                                  f"higher value, got {self.bounds}")
 
     def rate[R](self, learning_rate: R) -> R | ScheduleBase:
-        """The rate its solver runs at: its own schedule, or the config's `learning_rate` where it
+        """The rate its solver runs at: its own schedule, or the config's (`OptimConfig.rate`) where it
         names none."""
         return learning_rate if self.schedule is None else self.schedule
 
@@ -1466,7 +1474,7 @@ def _floor(rates: Rates) -> jax.typing.ArrayLike:
 
 
 @dataclasses.dataclass(frozen=True)
-class Cosine(ScheduleBase):
+class Cosine(Peaked):
     """A linear warmup from `init_value` to `peak_value`, then a cosine decay to `end_value` at
     step `decay_steps`, or at the run's end when that is None.
 
@@ -1474,7 +1482,6 @@ class Cosine(ScheduleBase):
     `warmup_steps` must be smaller than the decay horizon in schedule steps.
     """
 
-    peak_value: float = dataclasses.field(metadata={'rate': True})
     warmup_steps: int | str
     """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`): stated,
     as `optax.warmup_cosine_decay_schedule` takes it, which has no default either."""
@@ -1538,7 +1545,7 @@ class PowerTail:
 
 
 @dataclasses.dataclass(frozen=True)
-class Power(ScheduleBase):
+class Power(Peaked):
     """lm-engine's power schedule (`power_schedule`), a power law of the step after a linear warmup.
 
     After the warmup, the rate is min(peak_value, a * (step * c) ** b). With a
@@ -1547,7 +1554,6 @@ class Power(ScheduleBase):
     the tokens per step.
     """
 
-    peak_value: float = dataclasses.field(metadata={'rate': True})
     warmup_steps: int | str
     """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
     a: float = dataclasses.field(metadata={'rate': True})
@@ -1560,7 +1566,7 @@ class Power(ScheduleBase):
 
     def peak(self) -> float:
         """`peak_value`, the cap the power law climbs to."""
-        return self.peak_value
+        return self.peak_rate()
 
     def run_relative(self) -> bool:
         return isinstance(self.warmup_steps, str) or (self.tail is not None and self.tail.steps is None)
@@ -1623,7 +1629,7 @@ class Power(ScheduleBase):
 
 
 @dataclasses.dataclass(frozen=True)
-class Linear(ScheduleBase):
+class Linear(Peaked):
     """lm-engine's linear schedule (`linear_schedule`), with a warmup, a constant rate and a linear decay.
 
     The rate warms up from zero to `peak_value`, stays constant until
@@ -1631,7 +1637,6 @@ class Linear(ScheduleBase):
     `end_value` at `decay_steps` (the run's end when None).
     """
 
-    peak_value: float = dataclasses.field(metadata={'rate': True})
     warmup_steps: int | str = 0
     """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
     decay_start: int | None = None
@@ -1682,7 +1687,7 @@ class Linear(ScheduleBase):
 
 
 @dataclasses.dataclass(frozen=True)
-class OneCycle(ScheduleBase):
+class OneCycle(Peaked):
     """torch's `OneCycleLR` with its default two phases and cosine annealing.
 
     The value follows a half cosine from `init_value` to `peak_value` at step
@@ -1699,7 +1704,6 @@ class OneCycle(ScheduleBase):
     one step late and it cannot reproduce a torch run.
     """
 
-    peak_value: float = dataclasses.field(metadata={'rate': True})
     init_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
     end_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
     warmup_fraction: float | str = 0.3
@@ -1707,8 +1711,9 @@ class OneCycle(ScheduleBase):
 
     def rates(self) -> dict[str, float]:
         """The peak, and the init and end values with torch's derived defaults resolved."""
-        init = self.peak_value / 25 if self.init_value is None else self.init_value
-        return {'peak_value': self.peak_value, 'init_value': init,
+        peak = self.peak_rate()
+        init = peak / 25 if self.init_value is None else self.init_value
+        return {'peak_value': peak, 'init_value': init,
                 'end_value': init / 1e4 if self.end_value is None else self.end_value}
 
     def _rise(self, steps: int) -> float:
@@ -1719,7 +1724,7 @@ class OneCycle(ScheduleBase):
 
     def warmup(self, steps: int | None) -> int:
         """The steps of its rise, to the whole step its rate peaks at (`_rise`)."""
-        return round(self._rise(self._horizon(steps, "trainer.horizon.steps")))
+        return round(self._rise(self._horizon(steps, "trainer.steps")))
 
     def run_relative(self) -> bool:
         return True
@@ -1742,7 +1747,7 @@ class OneCycle(ScheduleBase):
                          anneal(rates['peak_value'], rates['end_value'], at - rise, 1 - rise))
 
     def horizons(self, steps: int | None) -> dict[str, int | float]:
-        steps = self._horizon(self._own(steps), "trainer.horizon.steps")
+        steps = self._horizon(self._own(steps), "trainer.steps")
         rise, last = self._rise(steps), steps - 1
         if not 0 < rise < last:
             raise ValueError(f"a one-cycle schedule over {steps} steps with warmup fraction "
@@ -1829,42 +1834,19 @@ class Exponential(ScheduleBase):
 
 
 if TYPE_CHECKING:
-    # tyro reads the runtime annotation, a Union of the aliased schedules, and a type checker cannot
-    # read a variable in a type expression. Both get what they need: the base class statically, the
-    # union at runtime, once every schedule above is defined (`dew.registry.schedules`).
+    # tyro reads the runtime annotation, a Union of the aliased schedules (a record's), or a subcommand per
+    # schedule (a command line's), and a type checker cannot read a variable in a type expression. Both get
+    # what they need: the base class statically, the union at runtime, once every schedule above is defined
+    # (`dew.registry.schedules`).
     type ScheduleSpec = ScheduleBase
+    type ScheduleChoices = ScheduleBase
 else:
     ScheduleSpec = schedules.union
-
-def _rate_argument() -> tyro.constructors.PrimitiveConstructorSpec:
-    """The learning rate as one command-line value, the record a run holds: a number, the constant
-    rate, or a schedule's record as JSON (`dew.registry.from_record`)."""
-    annotation = float | ScheduleSpec
-
-    def number(value) -> bool:
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-    def read(given: list[str]) -> float | ScheduleBase | None:
-        value = json.loads(given[0])
-        if value is None:
-            return None
-        if number(value):
-            return float(value)
-        built = from_record(annotation, value, dtypes=False)
-        if not isinstance(built, ScheduleBase):
-            raise TypeError(f"--optim.learning-rate is a number or a schedule's record, not {given[0]}")
-        return built
-
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1, metavar="RATE|JSON", instance_from_str=read,
-        is_instance=lambda given: given is None or number(given) or isinstance(given, ScheduleBase),
-        str_from_instance=lambda given: [json.dumps(
-            None if given is None else to_record(given, annotation))])
-
+    ScheduleChoices = schedules.subcommands
 
 DEFAULT_RATE = 2.7e-4
 """The learning rate a config that sets none takes for a first-order optimizer
-(`OptimConfig.learning_rate`)."""
+(`OptimConfig.lr`)."""
 
 def _moment_dtypes(state_dtype: str | tuple[str | None, str | None]) -> dict[str, str | None]:
     """The first and second moments' dtypes a held `state_dtype` keeps them in, as optax's `mu_dtype` and
@@ -1883,7 +1865,7 @@ class OptimizerSpec:
     settings one optimizer takes are its class's, so no setting is given an optimizer that ignores it."""
 
     OWN_RATE: ClassVar[float] = DEFAULT_RATE
-    """The rate a config that states none runs at (`OptimConfig.learning_rate`)."""
+    """The rate a config that states none runs at (`OptimConfig.lr`)."""
     STACKED: ClassVar[bool] = True
     """Whether every rule of it reads a stage-local run's stacked leaf as its stored layers (`layers_of`): a
     run of one keeps its pipelined runs stage-local; any other's is read by its state's transforms
@@ -1903,7 +1885,7 @@ class OptimizerSpec:
 
     def spares(self) -> bool:
         """Whether its decay takes timm's split (`weight_decay_mask`) unless a run says otherwise
-        (`OptimConfig.spared`): a factory that takes a decay mask."""
+        (`OptimConfig.decay_norms_and_biases`): a factory that takes a decay mask."""
         return self.masked_by() is not None
 
     def masked_by(self) -> str | None:
@@ -2052,11 +2034,11 @@ class LaProp(OptimizerSpec):
 @dataclasses.dataclass(frozen=True)
 class GaussNewton(OptimizerSpec):
     """Gauss-Newton's update, damped as Levenberg-Marquardt's by `damping` (`dew.gauss_newton`), one solve
-    over every parameter, its direction capped at the config's `clip_grads`; its own rate the whole step."""
+    over every parameter, its direction capped at the config's `clip`; its own rate the whole step."""
 
     damping: float = 0.0
     clip: float | None = None
-    """The cap of its direction's norm, None for none; a config's `clip_grads` caps it where set."""
+    """The cap of its direction's norm, None for none; a config's `clip` caps it where set."""
 
     OWN_RATE: ClassVar[float] = 1.0
     STACKED: ClassVar[bool] = False
@@ -2084,10 +2066,10 @@ class Optax(OptimizerSpec):
 
 
 if TYPE_CHECKING:
-    # tyro reads the runtime annotation, the union of the aliased optimizers, as it reads `ScheduleSpec`.
-    type OptimizerSpecs = OptimizerSpec
+    # tyro reads the runtime annotation, a subcommand per aliased optimizer, as it reads `ScheduleChoices`.
+    type OptimizerChoices = OptimizerSpec
 else:
-    OptimizerSpecs = optimizers.union
+    OptimizerChoices = optimizers.subcommands
 
 
 optax_factories: Aliases[Callable[..., optax.GradientTransformation], optax.GradientTransformation] = Aliases(
@@ -2103,53 +2085,32 @@ def _claims(modules: Sequence[str], leaves: Sequence[str]) -> tuple[str, ...]:
     return (*(f"{glob.escape(module)}/*" for module in modules), *map(glob.escape, leaves))
 
 
-def _optimizer_argument() -> tyro.constructors.PrimitiveConstructorSpec:
-    """The optimizer as one command-line value, the record a run holds: its name at its defaults, or its
-    record as JSON (`dew.registry.from_record`)."""
-    def read(given: list[str]) -> OptimizerSpec:
-        text = given[0]
-        built = (optimizers.build(text) if not text.lstrip().startswith("{")
-                 else from_record(OptimizerSpecs, json.loads(text), dtypes=False))
-        if not isinstance(built, OptimizerSpec):
-            raise TypeError(f"--optim.optimizer is an optimizer's name or record, not {text}")
-        return built
-
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1, metavar="NAME|JSON", instance_from_str=read,
-        is_instance=lambda given: isinstance(given, OptimizerSpec),
-        str_from_instance=lambda given: [json.dumps(to_record(given, OptimizerSpecs))])
-
-
 @dataclasses.dataclass(frozen=True)
 class OptimConfig:
     """Holds the optimizer, learning-rate schedule and gradient clipping."""
 
-    optimizer: Annotated[OptimizerSpecs, _optimizer_argument()] = dataclasses.field(default_factory=AdamW)
+    optimizer: OptimizerChoices = dataclasses.field(default_factory=AdamW)
     """The optimizer and its own settings (`OptimizerSpec`): `AdamW(b1=0.9, b2=0.95)`, `Muon(ns_steps=5)`, or
-    any Optax factory, `Optax("optax:sgd", {"momentum": 0.9})`. On the command line it is one value: its name
-    at its defaults, `--optim.optimizer muon`, or its record, `--optim.optimizer '{"class": "adamw",
-    "fields": {"b2": 0.95}}'`."""
-    learning_rate: Annotated[float | ScheduleSpec | None, _rate_argument()] = None
-    """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`); unset,
-    the optimizer's own (`OptimizerSpec.OWN_RATE`: Gauss-Newton's whole step, 1.0, the rest's 2.7e-4), which
-    the config
-    then records.
-
-    The kinds are cosine, power (lm-engine's power law with an optional linear
-    tail), linear, one_cycle (torch's `OneCycleLR`) and exponential; each record
-    holds only its own fields, and `every` steps any of them once per that many
-    updates. On the command line it is one value: `--optim.learning-rate 3e-4`, or a
-    schedule's record, `--optim.learning-rate '{"class": "cosine", "fields": {...}}'`.
-    """
-    spared: bool = True
-    """Whether the decay spares biases and vectors such as a norm's scale (`weight_decay_mask`), where the
-    optimizer takes a mask: nanoGPT's, Megatron Core's and timm's split, since decaying a norm's scale or
-    a bias toward zero regularizes nothing a matrix's decay does and shifts what the layer computes.
-    Optax decays every parameter (`mask=None`), which False restores. A param group decays all it claims
-    unless its own `spared` says otherwise (`ParamGroup.spared`); a run's default groups follow this."""
+    any Optax factory, `Optax("optax:sgd", {"momentum": 0.9})`. On the command line each is a subcommand of
+    its own flags: `optim.optimizer:muon --optim.optimizer.consistent-rms 0.2`."""
+    lr: float | None = None
+    """The learning rate: constant, or the peak of its schedule (`schedule`) where that names none; unset, the
+    schedule's peak where it names one, else the optimizer's own (`OptimizerSpec.OWN_RATE`: Gauss-Newton's
+    whole step, 1.0, the rest's 2.7e-4), which the config then records: `--optim.lr 3e-4`."""
+    schedule: ScheduleChoices | None = None
+    """How the rate moves over the run, one typed schedule per kind (`dew.optim`): cosine, power
+    (lm-engine's power law with an optional linear tail), linear, one_cycle (torch's `OneCycleLR`) and
+    exponential, each holding only its own fields and stepped once per `every` updates; its peak `lr`
+    where it names none: `optim.schedule:cosine --optim.schedule.warmup-steps 100`. None holds `lr`."""
+    decay_norms_and_biases: bool = False
+    """Whether the decay applies to biases and vectors such as a norm's scale too, where the optimizer takes a
+    mask (`weight_decay_mask`). Off, matrices alone decay: nanoGPT's, Megatron Core's and timm's split,
+    since decaying a norm's scale or a bias toward zero regularizes nothing a matrix's decay does and shifts
+    what the layer computes. On, Optax's (`mask=None`). A param group decays all it claims unless its own
+    says otherwise (`ParamGroup.decay_norms_and_biases`); a run's default groups follow this."""
     decay_mask: DecayMask | None = None
-    """The parameters the decay applies to where it does not spare them (`spared` False): a tree of
-    booleans by parameter name, a prefix of the parameters' tree, as Optax's decay takes its mask
+    """The parameters the decay applies to where it decays norms and biases (`decay_norms_and_biases`): a
+    tree of booleans by parameter name, a prefix of the parameters' tree, as Optax's decay takes its mask
     (`optax.add_decayed_weights`); None decays every parameter. An earlier run's mask among its optimizer's
     options (`dew.config.earlier`); a param group's own its group's (`ParamGroup.decay_mask`)."""
     param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
@@ -2158,7 +2119,9 @@ class OptimConfig:
 
     Empty runs one optimizer over every parameter. `ParamGroup.mup` is lm-engine's muP split.
     """
-    clip_grads: float = 0.0
+    clip: float = 0.0
+    """Clip the gradient's global norm to this before the update; 0 clips nothing (Gauss-Newton's
+    direction, which it solves itself, is capped at it instead)."""
     forced_weight_normalization: bool = False
     """Whether to renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`) after each update.
 
@@ -2176,29 +2139,49 @@ class OptimConfig:
 
     @property
     def rate(self) -> float | ScheduleBase:
-        """Its learning rate, the optimizer's own where it set none (`__post_init__`)."""
-        assert self.learning_rate is not None, "a config resolves its rate as it is made"
-        return self.learning_rate
+        """Its learning rate: its schedule, at its peak (`__post_init__`), or its constant rate."""
+        if self.schedule is not None:
+            return self.schedule
+        assert self.lr is not None, "a config resolves its rate as it is made"
+        return self.lr
 
     def __post_init__(self):
-        _checked_decay_mask(self.decay_mask, self.spared and self.optimizer.spares(), "the optimizer")
+        _checked_decay_mask(self.decay_mask, not self.decay_norms_and_biases and self.optimizer.spares(),
+                            "the optimizer")
         if self.decay_mask is not None and self.param_groups:
             raise ValueError("decay_mask masks an ungrouped optimizer's decay; a param group states its own "
                              "(ParamGroup.decay_mask)")
         capped = isinstance(self.optimizer, GaussNewton) and self.optimizer.clip is not None
-        if capped and self.clip_grads > 0:
+        if capped and self.clip > 0:
             raise ValueError(f"Gauss-Newton's direction is capped once: at its own clip "
-                             f"({self.optimizer}) or the config's clip_grads ({self.clip_grads}), not both")
-        if self.learning_rate is None:
-            # Unset, the rate is the optimizer's own, recorded as the config's.
-            object.__setattr__(self, 'learning_rate', self.optimizer.OWN_RATE)
+                             f"({self.optimizer}) or the config's clip ({self.clip}), not both")
+        named = self.schedule.peak_value if isinstance(self.schedule, Peaked) else None
+        if self.lr is not None and named is not None and named != self.lr:
+            raise ValueError(f"the rate is named twice, lr {self.lr} and its schedule's peak_value {named}: "
+                             "name one")
+        if self.schedule is not None and not isinstance(self.schedule, Peaked):
+            if self.lr is not None:
+                raise ValueError(f"{type(self.schedule).__name__} holds its rates in its own fields, which "
+                                 f"lr {self.lr} is none of")
+        else:
+            # Unset, the rate is the schedule's peak, else the optimizer's own, recorded as the config's.
+            rate = self.lr if self.lr is not None else named if named is not None else self.optimizer.OWN_RATE
+            object.__setattr__(self, 'lr', rate)
+            if self.schedule is not None:
+                object.__setattr__(self, 'schedule', dataclasses.replace(self.schedule, peak_value=rate))
+        if self.lr is not None:
+            # A group's schedule that names no peak climbs to the config's rate, which its multiplier scales.
+            object.__setattr__(self, 'param_groups', tuple(
+                dataclasses.replace(group, schedule=dataclasses.replace(group.schedule, peak_value=self.lr))
+                if isinstance(group.schedule, Peaked) and group.schedule.peak_value is None else group
+                for group in self.param_groups))
 
     def schedules(self) -> list[tuple[str, ScheduleBase]]:
         """The schedules its solvers run, by where the config holds them: its learning rate's, or each
         param group's rate (`ParamGroup.rate`, the config's own where the group names none) and b1."""
-        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.rate)]
+        held: list[tuple[str, object]] = [] if self.param_groups else [("schedule", self.rate)]
         for group in self.param_groups:
-            rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
+            rate = "schedule" if group.schedule is None else f"param_groups.{group.name}.schedule"
             held += [(rate, group.rate(self.rate)), (f"param_groups.{group.name}.b1", group.b1)]
         return [(name, schedule) for name, schedule in held if isinstance(schedule, ScheduleBase)]
 
@@ -2249,11 +2232,11 @@ class OptimConfig:
         every state it steps (`horizons`, `with_horizons`).
         """
         make, opts = self.optimizer.factory(), dict(self.optimizer.options())
-        # Gauss-Newton solves its own direction, which it caps at `clip_grads` (the gradient it is handed
+        # Gauss-Newton solves its own direction, which it caps at `clip` (the gradient it is handed
         # it never reads): one solve over every parameter, each param group's rate its leaves of it.
         solved = None
-        if isinstance(self.optimizer, GaussNewton) and self.clip_grads > 0:
-            opts['clip'] = self.clip_grads
+        if isinstance(self.optimizer, GaussNewton) and self.clip > 0:
+            opts['clip'] = self.clip
         if isinstance(self.optimizer, GaussNewton) and self.param_groups:
             damping, clip = opts.pop('damping', 0.0), opts.pop('clip', None)
             if not isinstance(damping, int | float) or not (clip is None or isinstance(clip, int | float)):
@@ -2272,22 +2255,23 @@ class OptimConfig:
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
                 grouped = {**opts, **decay}
-                spared = ({'mask': weight_decay_mask} if group.spared and self.optimizer.spares()
+                spares = not group.decay_norms_and_biases and self.optimizer.spares()
+                masked = ({'mask': weight_decay_mask} if spares
                           else _decay_masked(group.decay_mask, self.optimizer))
-                solvers[group.name] = group.solver(make, self.rate, steps, {**grouped, **spared},
+                solvers[group.name] = group.solver(make, self.rate, steps, {**grouped, **masked},
                                                    clocked=clocked, stated=stated)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
             if solved is not None:
                 solver = optax.chain(solved, solver)
         else:
-            if self.spared and self.optimizer.spares():
+            if not self.decay_norms_and_biases and self.optimizer.spares():
                 opts['mask'] = weight_decay_mask
             else:
                 opts.update(_decay_masked(self.decay_mask, self.optimizer))
             solver = scheduled_solver(make, self.rate, steps, opts, clocked=clocked, stated=stated)
 
-        if self.clip_grads > 0:
-            solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
+        if self.clip > 0:
+            solver = optax.chain(optax.clip_by_global_norm(self.clip), solver)
         if self.forced_weight_normalization:
             from dew.nn.mp import forced_weight_normalization
 
@@ -2304,16 +2288,15 @@ class OptimConfig:
         return self.optimizer.update_flops(params) if isinstance(self.optimizer, Muon) else None
 
     def fresh_groups(self) -> tuple[ParamGroup, ...]:
-        """The groups a run takes that draws modules fresh beside a loaded base: its own where one claims
-        them (`ParamGroup.fresh`); else a group of them at `FRESH_LEARNING_RATE` at the peak of this
-        config's schedule, on its shape (its rate times their quotient), or at its own where that is
-        higher, sparing what the ungrouped decay spares (`ParamGroup.spared`). Where the run names
-        none, every other parameter is a base group at its own rate; where it names some, the fresh
-        group stands ahead of its first catch-all (a pattern of `*`), so a fresh module or leaf no group
-        before that names takes the fresh rate, and one a named group claims ahead of it that group's.
-        A base fine-tunes at a rate a fresh module barely moves at: a decision run whose groups named
-        none fresh trained its cross-attention gates to 3e-4 in 1,063 steps at 5e-6, learning nothing,
-        and to 3e-2 at the fresh rate (row 5246)."""
+        """The groups a run takes that draws modules fresh beside a loaded base: its own where one claims them
+        (`ParamGroup.fresh`); else a group of them at `FRESH_LEARNING_RATE` at the peak of this config's
+        schedule, on its shape (its rate times their quotient), or at its own where that is higher, sparing
+        what the ungrouped decay spares (`ParamGroup.decay_norms_and_biases`). Where the run names none, every
+        other parameter is a base group at its own rate; where it names some, the fresh group stands ahead of
+        its first catch-all (a pattern of `*`), so a fresh module or leaf no group before that names takes the
+        fresh rate, and one a named group claims ahead of it that group's. A base fine-tunes at a rate a fresh
+        module barely moves at: a decision run whose groups named none fresh trained its cross-attention gates
+        to 3e-4 in 1,063 steps at 5e-6, learning nothing, and to 3e-2 at the fresh rate (row 5246)."""
         named = self.param_groups
         if any(group.fresh for group in named):
             return named
@@ -2325,11 +2308,12 @@ class OptimConfig:
         name = next(name for name in names if name not in taken)
         # The fresh group decays as the run's ungrouped optimizer would, its mask among it; an optimizer that
         # spares nothing (Muon) spares none of a group's either.
-        spared = self.spared and self.optimizer.spares()
-        fresh = ParamGroup(name, fresh=True, learning_rate_multiplier=multiplier, spared=spared,
-                           decay_mask=self.decay_mask)
+        decayed = self.decay_norms_and_biases or not self.optimizer.spares()
+        fresh = ParamGroup(name, fresh=True, learning_rate_multiplier=multiplier,
+                           decay_norms_and_biases=decayed, decay_mask=self.decay_mask)
         if not named:
-            return fresh, ParamGroup("base", ("*",), spared=spared, decay_mask=self.decay_mask)
+            return fresh, ParamGroup("base", ("*",), decay_norms_and_biases=decayed,
+                                     decay_mask=self.decay_mask)
         at = next((index for index, group in enumerate(named) if "*" in group.patterns), len(named))
         return (*named[:at], fresh, *named[at:])
 

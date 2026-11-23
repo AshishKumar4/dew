@@ -104,7 +104,7 @@ def solved_directions(damping: float = 0.0,
     rate's transform then scales and negates (`gauss_newton`, or a param group's own rate). An update whose
     statistics hold fewer rows than it has (a run's last, whose stream ended inside its window) solves the
     rows it holds (row 5722). Where `clip` is set, a direction longer
-    than it is scaled to that norm (`OptimConfig.clip_grads`, as a clip caps a gradient's). Its objective
+    than it is scaled to that norm (`OptimConfig.clip`, as a clip caps a gradient's). Its objective
     states the system, which `Residuals` does; any other's statistics are refused."""
     if damping < 0:
         raise ValueError(f"a Levenberg-Marquardt damping is at least zero, got {damping}")
@@ -140,7 +140,8 @@ def gauss_newton(learning_rate: optax.ScalarOrSchedule = 1.0, damping: float = 0
     """Gauss-Newton's update, damped as Levenberg-Marquardt's: the solve's direction (`solved_directions`)
     scaled by `learning_rate` (a constant, or a schedule over the updates; 1.0 the whole step) as Optax
     scales any optimizer's (`optax.scale_by_learning_rate`), its direction capped at `clip` where set, so
-    `OptimConfig` names it as it names any (`GaussNewton(damping=...)`, `clip_grads` its `clip`)."""
+    `OptimConfig` names it as it names any (`GaussNewton(damping=...)`, its own `clip` beside the
+    config's)."""
     return optax.chain(solved_directions(damping, clip), optax.scale_by_learning_rate(learning_rate))
 
 

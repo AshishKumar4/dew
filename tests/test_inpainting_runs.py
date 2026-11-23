@@ -168,7 +168,7 @@ def test_dew_train_trains_an_inpainting_pipeline_through_its_masks(inpainting, o
     assert masks.shape == (8, SIZE, SIZE, 1) and set(np.unique(masks)) <= {0.0, 1.0}
     assert len({mask.tobytes() for mask in masks}) > 1, "each image draws its own mask"
 
-    settings = cli_settings(tmp_path, "inpainting", {"trainer.log_every": "1", "optim.learning_rate": "0.05",
+    settings = cli_settings(tmp_path, "inpainting", {"trainer.log_every": "1", "optim.lr": "0.05",
                                                      "trainer.checkpoint_final": "True"})
     directory = trained_record(saved_record(run, tmp_path, "inpainting"), settings)
 
@@ -205,8 +205,8 @@ def test_an_inpainting_run_validates_through_its_held_out_images_masks(inpaintin
                                  data=masked_images(), validation=masked_images(rejects=False, ratio=ratio),
                                  val_metrics=(), **fields)
         directory = trained_record(saved_record(run, tmp_path, name), cli_settings(tmp_path, name, {
-            "trainer.horizon.steps": "2", "trainer.log_every": "1", "trainer.eval_every": "1",
-            "trainer.checkpoint_final": "False", "optim.learning_rate": "0.05"}))
+            "trainer.steps": "2", "trainer.log_every": "1", "trainer.eval_every": "1",
+            "trainer.checkpoint_final": "False", "optim.lr": "0.05"}))
         from dew.training import LocalTracker
 
         rows = [values for _, values in LocalTracker(directory / "tracking").scalars()]

@@ -32,7 +32,7 @@ model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=2,
 rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
 data = Loader(train=lambda partition: itertools.repeat({"text": rows}), val=None,
                records=16, batch=16)
-trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=jax.random.key(0),
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(lr=1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(fsdp=2, tensor=2))
 state = trainer.fit(data, steps=4, log_every=2)
 
@@ -59,7 +59,7 @@ Each `MeshSpec` field sets how many devices one axis gets, and the `data` axis g
 
 | Axis | `MeshSpec` field | Splits |
 |---|---|---|
-| `diloco` | `diloco` | DiLoCo's replica groups (`Trainer(diloco=DiLoCo(every))`): each group trains its own copy of the model on its own batch rows, and the groups average every `every` updates |
+| `diloco` | `diloco` | DiLoCo's replica groups (`TrainerAdvanced(diloco=DiLoCo(every))`): each group trains its own copy of the model on its own batch rows, and the groups average every `every` updates |
 | `data` | (the remainder) | Batch rows; parameters are replicated over it |
 | `expert` | `expert` | The expert dimension of mixture-of-experts layers, and batch rows |
 | `fsdp` | `fsdp` | Parameter dimensions the layout assigns to it, and batch rows |
@@ -88,15 +88,15 @@ print(dict(MeshSpec(fsdp=4, sequence=2).build().shape))
 `Trainer(mesh=...)`, `Checkpoints.variables(mesh=...)`, `dew.pipeline(..., mesh=...)` and `Pretrained.load(..., mesh=...)` also take a `jax.sharding.Mesh` you build yourself, with axes of any names. `Layout.rules` maps the model's logical axes onto them, and `Layout(data_axes=...)` names the axes a batch's rows split over, which the run's data shares, its batch placement and its row counts read (`dew.mesh.batch_axes` under the layout's rules, which the trainer puts in context). A rule that names an axis the mesh lacks is refused by name, except Dew's own role axes, which a mesh without them treats as size 1. The data and stage axes never hold a parameter. The expert exchange, sequence-parallel attention, the pipeline and the tensor-parallel heuristics run on the axes named `expert`, `sequence`, `stage` and `tensor`; any other axis, a second fsdp level or a context axis, holds parameters and rows as your rules place them.
 
 ```python
-from dew.training import Layout
+from dew.training import Layout, TrainerAdvanced
 
 from jax.sharding import AxisType
 
 mesh = jax.make_mesh((2, 2, 2), ("replica", "zero", "zero2"), axis_types=(AxisType.Auto,) * 3)
 layout = Layout(rules={"embed": ("zero", "zero2"), "mlp": "zero", "vocab": "zero"},
                 data_axes=("replica", "zero", "zero2"))
-trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
-                  mesh=mesh, layout=layout)
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(lr=1e-3), key=0,
+                  mesh=mesh, advanced=TrainerAdvanced(layout=layout))
 trainer.fit(data, steps=2, log_every=2)
 ```
 
@@ -247,7 +247,7 @@ Cached autoregressive generation decodes whole sequences: a task's call and a se
 
 Whatever `scan_layers` says, `init` draws each run of two or more like layers under one scan, so its program has one draw per run instead of one per layer. At a given seed those layers get new values from the same distribution, and the draw depends on `bank_layers`, which splits the runs. So a run recorded with a Dew version that initialized layer by layer starts from different weights at the same seed. Init under a stage mesh or with `decode=True` still runs the plain loop.
 
-`MeshSpec(stage=N)` turns on the GPipe-style pipeline, and `Trainer(fit=FitPolicy(microbatches=M))` (`--trainer.fit.microbatches`) sets how many microbatches a step feeds through its stages, one a stage by default. The layer pattern must repeat across stages and split evenly between them. A stack of like layers is pipelined: a decoder's layer stack, a DiT's blocks (a hybrid's SSM and attention blocks where their pattern repeats every stage), a JEPA encoder's or predictor's blocks (a video's spatial and temporal pairs), and each UNet level's transformers (SDXL's levels of two and ten). Embeddings, the output head, a UNet's residual blocks and other operations outside the stacks are not split across stages; a stack the stages do not split evenly runs whole on every stage. TREAD's routes take part of the tokens through a span of the blocks, which no pipeline stage's one program runs, so a routed DiT trains on a mesh without a stage axis. The trainer refuses a stage axis on a model that runs no pipeline, such as FlaxDiff's UNet, whose levels hold one transformer each, because every stage would compute the whole step. That refusal raises `dew.mesh.LayoutRefused`, a `ValueError` that names the axis and a layout that does run. Any other error on a layout is a defect.
+`MeshSpec(stage=N)` turns on the GPipe-style pipeline, and `Trainer(microbatches=M)` (`--trainer.microbatches`) sets how many microbatches a step feeds through its stages, one a stage by default. The layer pattern must repeat across stages and split evenly between them. A stack of like layers is pipelined: a decoder's layer stack, a DiT's blocks (a hybrid's SSM and attention blocks where their pattern repeats every stage), a JEPA encoder's or predictor's blocks (a video's spatial and temporal pairs), and each UNet level's transformers (SDXL's levels of two and ten). Embeddings, the output head, a UNet's residual blocks and other operations outside the stacks are not split across stages; a stack the stages do not split evenly runs whole on every stage. TREAD's routes take part of the tokens through a span of the blocks, which no pipeline stage's one program runs, so a routed DiT trains on a mesh without a stage axis. The trainer refuses a stage axis on a model that runs no pipeline, such as FlaxDiff's UNet, whose levels hold one transformer each, because every stage would compute the whole step. That refusal raises `dew.mesh.LayoutRefused`, a `ValueError` that names the axis and a layout that does run. Any other error on a layout is a defect.
 
 Microbatch m takes rows m, m + M, m + 2M and so on, so each microbatch keeps its rows on the batch shards that already hold them. For that to work, M must divide the number of rows each device holds. For example, a batch of 8 rows over 4 row shards gives each device 2 rows. With four microbatches, some devices would have no rows in a given microbatch and would compute another microbatch's rows again, so a stage × fsdp step would cost 1.43 times one device's matmul FLOPs, where the pipeline bubble accounts for 1.25. The pipeline refuses that schedule. It names a microbatch count that divides the rows a device holds, and a batch size that fits the count you asked for. With 16 rows the same layout costs 1.20 times.
 
@@ -275,11 +275,10 @@ Before booking the GPUs, read what the run would hold on them. On a CPU host, bu
 
 ```python
 from dew.nn.kernels import compile_only_gpus
-from dew.training import UpdateBatch
 
 h100s = MeshSpec(fsdp=8).build(compile_only_gpus("sm90", 8, 80 * 10**9))
-trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0, mesh=h100s,
-                  update=UpdateBatch(batches=4))
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(lr=1e-3), key=0, mesh=h100s,
+                  accumulation=4)
 report = trainer.validate({"text": rows}, steps=400)
 print(report.leaves["variables/params/layers_0/mlp/up_proj/kernel"])
 print(max(report.device_bytes.values()), "bytes on the fullest device")

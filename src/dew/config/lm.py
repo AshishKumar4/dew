@@ -194,8 +194,8 @@ class LMRunConfig(DecoderRunConfig):
     # GPT-3 Small's (Brown et al. 2020, table 2.1 and appendix B): peak rate 6e-4, weight decay 0.1,
     # the gradient's global norm clipped at 1.0, as nanoGPT trains its 124M model.
     optim: OptimConfig = dataclasses.field(
-        default_factory=lambda: OptimConfig(learning_rate=6e-4, optimizer=AdamW(weight_decay=0.1),
-                                            clip_grads=1.0))
+        default_factory=lambda: OptimConfig(lr=6e-4, optimizer=AdamW(weight_decay=0.1),
+                                            clip=1.0))
     tokenizer: str = "byte"
     """The tokenizer the ids were written with: 'byte', or an HF tokenizer name."""
     prompt: str = ""

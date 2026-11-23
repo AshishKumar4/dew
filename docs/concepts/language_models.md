@@ -54,7 +54,7 @@ model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
                           max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
-lm_state = Trainer(objective, OptimConfig(learning_rate=3e-3), key=jax.random.key(0)).fit(
+lm_state = Trainer(objective, OptimConfig(lr=3e-3), key=jax.random.key(0)).fit(
     data, validation=held, steps=100, log_every=50, eval_every=100, metrics=(Perplexity(),))
 continuation = generate(model, lm_state.variables, [tokenizer.encode("One day, Lily")],
                         max_new_tokens=40, key=jax.random.key(1),
@@ -108,7 +108,7 @@ The measured run changes these settings from the example:
 | Tokenizer | `HFTokenizer("gpt2")` |
 | Data | `TokenFiles("data/tinystories/train")` and `TokenFiles("data/tinystories/val")`, each through `presets.token_windows` with `seq_len=256, batch=32` |
 | Model | `emb_features=256, num_layers=4, num_heads=4, max_seq_len=256, dtype=jnp.bfloat16` |
-| Optimizer | `OptimConfig(learning_rate=1e-3)` |
+| Optimizer | `OptimConfig(lr=1e-3)` |
 | Objective | `LMObjective(model, seq_len=256, ema_decay=0.999)` |
 | Run | `steps=2000, log_every=500, eval_every=1000` |
 | Prompt | `"Once upon a time"`, 40 new tokens, `temperature=0.0` |
@@ -259,10 +259,11 @@ from dew.data import presets
 from dew.data.sources import TokenFiles
 from dew.interop import PretrainedDecoder
 
-data = TokenFiles("data/qwen3-tokens").shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=512, batch=4)
+data = TokenFiles("data/qwen3-tokens").shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=512,
+                                                                     batch=4)
 bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", max_seq_len=512)
 objective = LMObjective(bundle, seq_len=512)
-state = Trainer(objective, OptimConfig(learning_rate=1e-5), key=jax.random.key(0)).fit(data, steps=100)
+state = Trainer(objective, OptimConfig(lr=1e-5), key=jax.random.key(0)).fit(data, steps=100)
 ```
 
 This downloads the Hub weights and needs memory for the model, gradients and optimizer. The bundle supplies the model, the initial variables and its processor, so `objective.pipeline(state)` takes text prompts. Passing `variables=` or `processor=` as well overrides that part of the bundle.
@@ -275,7 +276,7 @@ from dew.lora import LoRA
 
 tuned = bundle.adapt(LoRA(rank=8, modules=("q_proj", "v_proj")), key=0)
 objective = LMObjective(tuned, seq_len=512)
-state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(data, steps=100)
+state = Trainer(objective, OptimConfig(lr=1e-4), key=0).fit(data, steps=100)
 tuned.adapter.save(state.variables, "qwen3-adapter")
 tuned.save("qwen3-merged", variables=state.variables)
 print(objective.pipeline(state)("The capital of France is", 8, key=0).text[0])
@@ -391,7 +392,7 @@ To keep training, build the bundle's objective and feed the trainer `{"text": in
 ```python
 import optax
 from dew.data.dataset import Loader
-from dew.training import Layout, MeshSpec
+from dew.training import Layout, MeshSpec, TrainerAdvanced
 
 mm_objective = LMObjective(bundle, inputs.tokens.shape[1] - 1, pad_id=0)
 rows = 2 * jax.device_count()
@@ -399,7 +400,7 @@ batch = inputs.take_rows(jax.numpy.arange(rows) % 2)
 mm_data = Loader(train=lambda partition: iter([{"text": batch}]), val=None,
                   records=rows, batch=rows)
 mm_trainer = Trainer(mm_objective, optax.sgd(1e-4), key=jax.random.key(3),
-                     mesh=MeshSpec(), layout=Layout(min_shard=2**30))
+                     mesh=MeshSpec(), advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)))
 mm_state = mm_trainer.fit(mm_data, steps=1, log_every=1)
 bundle.save("gemma3-tiny-step1", variables=mm_state.variables)
 ```

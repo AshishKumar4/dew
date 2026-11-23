@@ -50,7 +50,7 @@ masked_model = CausalTransformer(vocab_size=mask_id + 1,
                                  emb_features=64, num_layers=2, num_heads=2,
                                  mlp_features=256, max_seq_len=64, causal=False)
 masked_objective = MaskedDiffusionObjective(masked_model, process, seq_len=64)
-masked_state = Trainer(masked_objective, OptimConfig(learning_rate=3e-3), key=jax.random.key(4)).fit(
+masked_state = Trainer(masked_objective, OptimConfig(lr=3e-3), key=jax.random.key(4)).fit(
     masked_data, steps=300, log_every=150)
 drawn = process.generate(masked_model, masked_state.variables,
                          [tokenizer.encode("One day, Lily")], 24, key=jax.random.key(5))
@@ -176,7 +176,7 @@ run = LMRunConfig(
     objective=ObjectiveConfig("block_diffusion", {"prompt_length": 256}),
     pretrained="google/diffusiongemma-26B-A4B-it", tokenizer="google/diffusiongemma-26B-A4B-it",
     max_new_tokens=0)
-run = dataclasses.replace(run, optim=dataclasses.replace(run.optim, learning_rate=0.00015))
+run = dataclasses.replace(run, optim=dataclasses.replace(run.optim, lr=0.00015))
 ```
 
 ```bash

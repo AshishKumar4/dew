@@ -94,7 +94,7 @@ class Scenario:
 def settings(cell: Mapping, root: Path, more: Mapping[str, str] | None = None) -> dict[str, str]:
     """A cell's `dew train` settings (`run_kinds.cli_settings`): a short run logging every step, at the cell's
     precision over its devices' fsdp split, small leaves sharded, and `more`."""
-    return cli_settings(root, "cell", {"trainer.horizon.steps": str(STEPS), "trainer.log_every": "1",
+    return cli_settings(root, "cell", {"trainer.steps": str(STEPS), "trainer.log_every": "1",
                                        "trainer.precision": cell.get("precision", "32-true"),
                                        "trainer.mesh.fsdp": str(cell.get("devices", 1)),
                                        "trainer.layout.min_shard": "64", **(more or {})})

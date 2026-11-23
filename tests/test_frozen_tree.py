@@ -18,7 +18,7 @@ from dew.batch import FROZEN, TEXT_KEY
 from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.objectives.lm import LMObjective
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
 
@@ -141,7 +141,8 @@ def test_a_frozen_tree_an_init_moves_is_the_held_arrays_where_the_state_keeps_th
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16,
                              mesh=MeshSpec(), layout=sharded)
     objective = Moved(source.adapt(LoRA(rank=2, modules=("q_proj", "v_proj")), key=0), 8, ema_decay=None)
-    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec(), layout=sharded)
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec(),
+                      advanced=TrainerAdvanced(layout=sharded))
     state, shardings = trainer.place()[:2]
     held = objective.held_variables()
     assert held is not None
@@ -232,7 +233,7 @@ def test_an_eager_initial_state_of_a_held_tree_copies_it_by_transfer():
     weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
     objective = LMObjective(model, seq_len=4, variables=weights, ema_decay=0.999)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0), mesh=MeshSpec())
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), mesh=MeshSpec())
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     with Compiles(None) as compiles:
         state = trainer.initial_state()

@@ -37,7 +37,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.state import without_empty_window
 from dew.telemetry.instrumentation import compilation_cache_counts
-from dew.training import Trainer, UpdateBatch
+from dew.training import Trainer, TrainerAdvanced
 from dew.training.runtime import prepare_process
 from dew.training.tracker import LocalTracker
 
@@ -137,7 +137,7 @@ def run(directory: Path, mode: str) -> None:
     data = compile(train, validation=held, read="memory", seed=17, loading=Loading(workers=0, threads=1))
     trainer = Trainer(objective, optax.chain(optax.clip_by_global_norm(0.5),
                                              optax.adamw(0.003, weight_decay=0.01)), key=jax.random.key(11),
-                      update=UpdateBatch(batches=2), dynamic_scale=True, checkpoints=checkpoints,
+                      accumulation=2, advanced=TrainerAdvanced(dynamic_scale=True), checkpoints=checkpoints,
                       tracker=Interrupting(out / "metrics"))
     before, _, before_position = trainer.place()
     assert mode != "resumed" or mid_accumulation(before), "the resume lost the accumulated gradient"

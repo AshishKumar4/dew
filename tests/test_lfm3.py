@@ -117,10 +117,10 @@ def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_ca
     looped = ["--loop-layers", "1", "5", "--loop-steps", "2"] if arm == "looped" else []
     config = DecisionRunConfig.cli(["--pretrained", str(tmp_path / 'release'), "--trainer.name", arm,
                                     "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-                                    "--trainer.horizon.steps",
+                                    "--trainer.steps",
                                     "2", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None",
                                     "--trainer.log-every", "1", "--trainer.multi-host", "False",
-                                    "--trainer.compilation-cache-dir", "None", "--optim.learning-rate",
+                                    "--trainer.compilation-cache-dir", "None", "--optim.lr",
                                     "5e-06", *looped],
                                    default=stated(DecisionRunConfig(data=TICKETS, source=SourceOptions(
                                        text_only=True, prediction_depths=0,

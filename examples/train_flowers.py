@@ -28,7 +28,7 @@ from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.optim import OptimConfig
 from dew.sampling import Heun
-from dew.training import ProfileWindow
+from dew.training import ProfileWindow, TrainerAdvanced
 
 
 @dataclass
@@ -67,11 +67,11 @@ def main(config: Config, data: Dataset | Loader | None = None):
     )
     trainer = Trainer(
         objective,
-        OptimConfig(learning_rate=2e-4),
+        OptimConfig(lr=2e-4),
         key=jax.random.key(0),
         checkpoints=Checkpoints(str(config.output / "checkpoints")),
-        profile=(ProfileWindow(str(config.output / "profile"), steps=config.profile)
-                 if config.profile else None),
+        advanced=TrainerAdvanced(profile=ProfileWindow(str(config.output / "profile"), steps=config.profile)
+                                 if config.profile else None),
     )
     state = trainer.fit(
         data,

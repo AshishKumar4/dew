@@ -47,7 +47,7 @@ from dew.quantization import (
     measured_fp8_sites,
 )
 from dew.registry import models, wrapper_layers
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 
 VOCAB, SEQ, BATCH = 64, 16, 8
 FEATURES, MLP = 64, 128
@@ -380,7 +380,7 @@ def fit(adapter, steps, directory=None):
 
     mesh = MeshSpec()
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0), mesh=mesh,
-                      layout=Layout(min_shard=1, tolerance=1.0),
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
     trainer.device_mesh = mesh.build(jax.devices()[:1])
     def windows(position):

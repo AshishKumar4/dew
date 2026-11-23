@@ -81,6 +81,7 @@ class EnvConfig(Registered):
     action_repeat: int = 1
 
     _recorded: ClassVar[bool] = False
+    _aliases: ClassVar = envs
 
     @staticmethod
     def _member(name: str) -> type | Callable[..., Configured]:
@@ -104,6 +105,8 @@ class RolloutConfig(Registered):
 
     name: str = "dreamer"
 
+    _aliases: ClassVar = rollouts
+
     @staticmethod
     def _member(name: str) -> type:
         return rollouts[name]
@@ -126,6 +129,16 @@ class RolloutConfig(Registered):
                              "rollout's steps")
         given = {**read_arguments(member, self.arguments), "objective": objective, "env": env, **taught}
         return member(**given)
+
+
+EnvChoice = Annotated[EnvConfig, tyro.conf.arg(constructor_factory=envs.flag_choices(EnvConfig))]
+"""An environment as a command line chooses it: a subcommand an alias of `envs` (`env:flight`), its
+arguments plain flags (`dew.registry.record_flags`), no record written as JSON (api03)."""
+
+RolloutChoice = Annotated[RolloutConfig,
+                          tyro.conf.arg(constructor_factory=rollouts.flag_choices(RolloutConfig))]
+"""A rollout as a command line chooses it: a subcommand an alias of `rollouts` (`rollout:control`), its
+settings plain flags; what the run builds (`_BUILT`) none."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,12 +210,13 @@ class EnvRunConfig(RunConfig):
     `reads`."""
     trainer: TrainerConfig = dataclasses.field(
         default_factory=lambda: TrainerConfig(eval_every=None, checkpoint_every=None))
-    env: Annotated[EnvConfig, tyro.conf.subcommand("env")] | None = None
-    """The environment the agent acts in (`EnvConfig`): `--env.name flight --env.count 4096 --env.fields
-    '{"racing": {"hz": 60}}'`, an argument at a time `override({"env.difficulty": 0.5})`."""
-    rollout: RolloutConfig = dataclasses.field(default_factory=RolloutConfig)
-    """The rollout and its settings (`RolloutConfig`): `--rollout.name control --rollout.fields
-    '{"unroll_length": 64}'`, a setting at a time `override({"rollout.train_ratio": 128})`."""
+    env: EnvChoice | None = None
+    """The environment the agent acts in (`EnvConfig`), a subcommand an environment, its arguments plain
+    flags: `env:flight --env.count 4096 --env.difficulty 0.5`; a nested record (a race's `Racing`) an
+    argument at a time, `override({"env.racing": {...}})`."""
+    rollout: RolloutChoice = dataclasses.field(default_factory=lambda: RolloutConfig().flagged())
+    """The rollout and its settings (`RolloutConfig`), a subcommand a rollout: `rollout:control
+    --rollout.unroll-length 64`, a setting at a time `override({"rollout.train_ratio": 128})`."""
     teacher: Annotated[TeacherConfig, tyro.conf.subcommand("teacher")] | None = None
     """A privileged teacher's saved run (`TeacherConfig`), turned on by its flags: `--teacher.run runs/teacher
     --teacher.demonstrates`."""

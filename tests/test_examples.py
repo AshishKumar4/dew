@@ -245,14 +245,14 @@ def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_n
         return logged_losses(directory / "train_supervised")
 
     settings = {"trainer.name": "train_supervised", "trainer.checkpoint_dir": str(tmp_path / "first"),
-                "trainer.horizon.steps": 6, "trainer.log_every": 1, "model.hidden": 8}
+                "trainer.steps": 6, "trainer.log_every": 1, "model.hidden": 8}
     (tmp_path / "set_supervised.py").write_text(
         "from train_supervised import run as built\n"
         f"run = (built() if callable(built) else built).override({settings!r})\n")
     train(str(tmp_path / "set_supervised.py"))
     record = tmp_path / "first" / "train_supervised" / "run.json"
     written = json.loads(record.read_text())["fields"]
-    assert written["trainer"]["horizon"]["steps"] == 6 and written["model"]["fields"]["hidden"] == 8
+    assert written["trainer"]["steps"] == 6 and written["model"]["fields"]["hidden"] == 8
     assert written["objective"]["fields"]["loss"] == {"function": "train_supervised:cross_entropy"}
 
     again = {"trainer.name": "train_supervised", "trainer.checkpoint_dir": str(tmp_path / "again")}

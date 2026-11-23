@@ -51,6 +51,7 @@ from dew.objectives.rl.sessions import (
 )
 from dew.rl import k3_kl, token_log_ratio
 from dew.sampling import Sampling
+from dew.training import TrainerAdvanced
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "grpo.npz"
 VOCAB = 8
@@ -136,7 +137,8 @@ def test_a_prompt_dataset_trains_as_the_prompt_config_does():
         rollout = RolloutScheduler.sampled(objective, lambda text, record: float(len(text)), groups=2,
                                            max_new_tokens=4, sampling=Sampling(temperature=1.0))
         trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0), rollout=rollout)
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0),
+                                                   rollout=rollout))
         return trainer.fit(data, steps=1).variables
 
     identical(trained(Memory(rows).filter_map(prompts.encode(tokenizer, max_prompt_len=8)).batch(8)),
@@ -301,8 +303,9 @@ def test_a_synchronous_collection_rescores_a_ratio_read_at_another_temperature()
 
     rows = [{"prompt": "hi", "data_source": "rule", "ground_truth": "a"}] * 8
     data = Memory(rows).filter_map(prompts.encode(tokenizer, max_prompt_len=8)).batch(8)
-    Trainer(tempered, optax.sgd(0.0), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
-            rollout=rollout).fit(data, steps=2)
+    Trainer(tempered, optax.sgd(0.0), key=jax.random.key(0),
+            advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0), rollout=rollout)).fit(data,
+                                                                                                      steps=2)
     assert len(seen) == 2
     for proximal, scored in seen:
         np.testing.assert_array_equal(proximal, scored)
@@ -354,7 +357,9 @@ def asynchronously(objective: GRPOObjective, seen, steps: int = 6, *, rewarded: 
 
     data = scheduler.tasks(Loader(train=lambda partition: itertools.repeat({"task_id": tasks}), val=None,
                                   records=len(tasks), batch=len(tasks)))
-    Trainer(objective, optax.sgd(0.0), key=0, rollout=rollout).fit(data, steps=steps, log_every=100,
+    Trainer(objective, optax.sgd(0.0), key=0, advanced=TrainerAdvanced(rollout=rollout)).fit(data,
+                                                                                             steps=steps,
+                                                                                             log_every=100,
                                                                    checkpoint_every=None)
 
 
@@ -415,7 +420,7 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
     from dew.training import LocalTracker
 
     config = rl_support.recorded_grpo_config(
-        tmp_path, "--trainer.horizon.steps", "3", "--trainer.name", "served", "--rollout.served.slots", "8",
+        tmp_path, "--trainer.steps", "3", "--trainer.name", "served", "--rollout.served.slots", "8",
         "--rollout.served.sync-every", "2", "--rollout.served.max-lag", "2",
         "--rollout.served.page-size", "4", behavior_importance=2.0, prompt="hi there")
     state = config.run()
@@ -532,7 +537,8 @@ def test_a_grpo_policy_rewarded_for_its_language_learns_it():
 
     def gains(runs):
         before, after = held_out_measures(objective, optax.adam(1e-2), loader, held_out, runs=runs,
-                                          steps=COUNT_STEPS, measure=reward, rollout=rollout)
+                                          steps=COUNT_STEPS, measure=reward,
+                                          advanced=TrainerAdvanced(rollout=rollout))
         return {"training raises the held-out reward": np.log(after / before)}
 
     assert_learns(gains, "a GRPO policy learning its language", units=COUNT_RUNS)

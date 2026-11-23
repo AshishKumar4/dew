@@ -131,12 +131,12 @@ def train_and_export(root: Path) -> Path:
     windows = TokenFiles(str(tokens / "train")).shuffle(seed=0).repeat().pipe(
         presets.lm, None, seq_len=SEQ, batch=16, pack=None).loading(Loading(workers=0))
     config = LMRunConfig.cli([
-        "--tokenizer", str(TOKENIZER), "--trainer.horizon.steps", str(STEPS),
+        "--tokenizer", str(TOKENIZER), "--trainer.steps", str(STEPS),
         "--trainer.log-every", str(STEPS), "--trainer.eval-every", "None",
         "--trainer.checkpoint-every", "None", "--trainer.name", "ollama-interop",
         "--trainer.checkpoint-dir", str(root / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--max-new-tokens", "0", "--optim.learning-rate", "3e-3"],
+        "--max-new-tokens", "0", "--optim.lr", "3e-3"],
         default=LMRunConfig(data=windows,
                             model=ModelConfig("causal_transformer", {**FIELDS, "dtype": "float32"})))
     state = config.run()

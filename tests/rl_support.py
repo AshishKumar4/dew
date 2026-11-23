@@ -117,7 +117,7 @@ def recorded_grpo_config(tmp_path, *cli: str, prompt: str = "hi there " * 8, **o
                           tokenizer=tokenizer, objective=ObjectiveConfig("grpo", dict(objective_fields)),
                           rollout=rollout,
                           model=model, max_new_tokens=0)
-    return LMRunConfig.cli(["--trainer.horizon.steps", "1", "--trainer.checkpoint-dir", str(tmp_path),
+    return LMRunConfig.cli(["--trainer.steps", "1", "--trainer.checkpoint-dir", str(tmp_path),
                             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
                             "--trainer.log-every", "1", *cli], default=default)
 

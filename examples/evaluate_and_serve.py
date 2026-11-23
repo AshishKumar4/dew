@@ -56,7 +56,7 @@ from dew.objectives.lm import LMObjective, Perplexity
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig
 from dew.sampling import Sampling
-from dew.training import Evaluation, Horizon
+from dew.training import Evaluation
 
 GREEDY = Sampling(temperature=0.0)
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -126,8 +126,8 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
             presets.lm, "byte", seq_len=32, batch=4, pack=None, eos=False).loading(loading),
         validation=TokenFiles(str(held)).pipe(presets.token_windows, seq_len=32, batch=4).loading(loading),
         max_new_tokens=8,
-        optim=OptimConfig(learning_rate=1e-3),
-        trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), horizon=Horizon(steps=2), log_every=1,
+        optim=OptimConfig(lr=1e-3),
+        trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), steps=2, log_every=1,
                               eval_every=None, checkpoint_every=2, multi_host=False,
                               compilation_cache_dir=None))
     objective = LMObjective(model, 32, ema_decay=0.9, processor=RunProcessor(ByteTokenizer()))

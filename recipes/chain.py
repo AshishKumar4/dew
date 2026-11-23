@@ -46,7 +46,7 @@ from dew.objectives.rl import (
 from dew.objectives.rl.rollout import Reward
 from dew.sampling import Sampling, with_ids_of
 from dew.state import TrainState
-from dew.training import Checkpoints, Layout, Rollout, Trainer
+from dew.training import Checkpoints, Layout, Rollout, Trainer, TrainerAdvanced
 
 
 @dataclasses.dataclass(frozen=True)
@@ -160,9 +160,8 @@ class Recipe:
                 objective,
                 self.optimizer,
                 key=jax.random.fold_in(self.key, index),
-                layout=self.layout,
+                advanced=TrainerAdvanced(layout=self.layout, rollout=rollout),
                 checkpoints=Checkpoints(f"{self.directory}/{stage.name}"),
-                **({"rollout": rollout} if rollout is not None else {}),
             )
             print(f"Stage {index + 1}/{len(self.stages)}: {stage.name} "
                   f"({type(objective).__name__}, {stage.steps} steps)")

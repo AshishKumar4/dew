@@ -96,7 +96,7 @@ from test_compile_ahead import BATCH, TINY_SHARD, VOCAB, gpus
 from token_support import token_rows
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.ahead import compile_ahead
 
 compiled_on = []
@@ -110,7 +110,8 @@ model = models.build("causal_transformer", vocab_size=VOCAB,
                      **{**TINY_DECODER, "emb_features": 256, "max_seq_len": tokens}, num_kv_heads=2,
                      dtype="bfloat16")
 trainer = Trainer(LMObjective(model, tokens), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(gpus("sm90")), layout=Layout(min_shard=TINY_SHARD))
+                  mesh=MeshSpec().build(gpus("sm90")),
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)))
 jax.monitoring.register_event_duration_secs_listener(heard)
 from dew.nn.kernels.generation import assumed
 from dew.nn.kernels.templates import report

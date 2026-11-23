@@ -15,7 +15,7 @@ A launch's space, heuristic and measurement are read at its key's shapes
 time a launch takes a config pinned for its kernel (`pinned`), else its own
 shapes' heuristic, its derived config (bible §6: the tuner is off by default,
 and users tune nothing). Only within an opt-in tuning run (`tune`, which
-`Trainer(tune_kernels=True)` and tools/kernel_picks.py call) does it take the
+`TrainerAdvanced(tune_kernels=True)` and tools/kernel_picks.py call) does it take the
 pick stored for its own key on its target GPU model (Dew's picks,
 `KernelOp.get_autotuning_cache`) where the space holds it; a pick serves no
 other key. Dew resolves the config itself, so no tokamax policy measures or

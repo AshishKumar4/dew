@@ -50,7 +50,7 @@ from dew.objectives.lm import LMObjective
 from dew.registry import ModelConfig, from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
 from dew.state import TrainState
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.model_flops import prepare_counts
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -143,7 +143,7 @@ def make_trainer(case: Case, tmp_path, mesh: MeshSpec, tracker=None, devices=Non
     model = models.build(case.architecture, **case.config)
     trainer = Trainer(
         make_objective(case, model, encoder), optimizer, key=jax.random.key(0),
-        mesh=mesh, layout=Layout(min_shard=TINY_SHARD),
+        mesh=mesh, advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)),
         checkpoints=Checkpoints(str(tmp_path / f"{case.name}-fsdp{mesh.fsdp}-stage{mesh.stage}")),
         tracker=tracker)
     if devices is not None:

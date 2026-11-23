@@ -48,7 +48,7 @@ from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.training import MeshSpec, Trainer
+from dew.training import MeshSpec, Trainer, TrainerAdvanced
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
@@ -242,7 +242,7 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     batch = tokens[np.arange(rows) % ROWS]
     data = Loader(train=lambda partition: iter([{"text": batch}] * 4), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, tensor=2), layout=Layout(min_shard=1))
+                      mesh=MeshSpec(fsdp=2, tensor=2), advanced=TrainerAdvanced(layout=Layout(min_shard=1)))
     assert trainer.layout == objective.placement(Layout(min_shard=1)) != Layout(min_shard=1)
 
     state = trainer.fit(data, steps=4, log_every=1)
@@ -297,7 +297,7 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
         objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None, variables=variables)
         trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0), mesh=mesh, checkpoints=None,
                           tracker=None,
-                          layout=Layout(min_shard=1, frozen_whole=frozen_whole))
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, frozen_whole=frozen_whole)))
         trainer.device_mesh = mesh.build(jax.devices()[:4])
         state, shardings, _ = trainer.place()
         placed = shard_batch(trainer.device_mesh, batch)

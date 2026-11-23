@@ -36,8 +36,7 @@ from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED
 from dew.objectives.rl.flow import OLD_LOG_PROBS_KEY, REWARDS_KEY, FlowGRPOObjective
 from dew.registry import ModelConfig, to_record
 from dew.sampling import Euler
-from dew.training import Trainer
-from dew.training.budget import Horizon
+from dew.training import Trainer, TrainerAdvanced
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -81,7 +80,7 @@ def test_a_resumed_pipeline_run_reads_none_of_the_pipelines_weights(pipelines, t
     def trained(steps: int):
         # Named in its config, as the command line names it, so its build knows the run it resumes.
         trainer = TrainerConfig(name="resumed", checkpoint_dir=str(tmp_path / "runs"),
-                                horizon=Horizon(steps=steps), log_every=1, eval_every=None,
+                                steps=steps, log_every=1, eval_every=None,
                                 checkpoint_every=None, multi_host=False, mesh=MeshSpec())
         return dataclasses.replace(config, trainer=trainer).prepare().train("resumed")
 
@@ -643,9 +642,10 @@ def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRu
         rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3))
 
 
-def grpo_step(objective, rollout, **trainer):
+def grpo_step(objective, rollout, advanced=None, **trainer):
     """One rollout over a batch and the policy step on its transitions."""
-    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(1), rollout=rollout,
+    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(1),
+                      advanced=dataclasses.replace(advanced or TrainerAdvanced(), rollout=rollout),
                       **trainer)
     initial = trainer.initial_state()
     prepared = rollout(initial, batch_for(objective, 4), jax.random.PRNGKey(2), objective=objective)
@@ -901,7 +901,7 @@ def a_256_pixel_diffusion_run_trains_saves_resumes_and_draws(tmp_path):
             model=dataclasses.replace(config.model, fields={
                 **config.model.fields, "patch_size": 16, "emb_features": 64, "num_layers": 2, "num_heads": 4,
                 "dtype": "bfloat16"}),
-            trainer=dataclasses.replace(config.trainer, name="large", horizon=Horizon(steps=steps),
+            trainer=dataclasses.replace(config.trainer, name="large", steps=steps,
                                         checkpoint_every=2, checkpoint_final=True))
         return config.train(config.build(), data, name="large")
 

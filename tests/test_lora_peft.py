@@ -82,7 +82,7 @@ def trainer(case: str):
     objective = LMObjective(adapter.model, reference["input_ids"].shape[1] - 1, variables=adapter.variables,
                             ema_decay=None)
     params = nn.unbox(objective.init(jax.random.key(0)))
-    sgd = OptimConfig(optimizer=Optax('optax:sgd'), learning_rate=rate, clip_grads=0.0).build(2)
+    sgd = OptimConfig(optimizer=Optax('optax:sgd'), lr=rate, clip=0.0).build(2)
 
     @jax.jit
     def run(tokens, factors, masks):

@@ -42,8 +42,7 @@ from dew.nn.projections import inference_projections
 from dew.registry import ModelConfig
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun
 from dew.telemetry.compiles import Compiles
-from dew.training import Checkpoints, LocalTracker, Trainer
-from dew.training.budget import Horizon
+from dew.training import Checkpoints, Keep, LocalTracker, Trainer
 
 RES = 8
 MODEL = {"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1}
@@ -58,7 +57,7 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32", "attention_impl": "reference"}),
         data=source("tfds://oxford_flowers102").pipe(presets.images, RES, batch=8),
-        trainer=TrainerConfig(checkpoint_dir=str(directory), horizon=Horizon(steps=2), keep=1),
+        trainer=TrainerConfig(checkpoint_dir=str(directory), steps=2, keep=Keep(latest=1)),
         preset=preset, text=TextCondition(encoder=encoder, checkpoint=checkpoint),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 3}))
 
@@ -1113,7 +1112,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     config = LMRunConfig(
         model=ModelConfig("causal_transformer", {**fields,
                                                "dtype": "float32", "attention_impl": "reference"}),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=1), eval_every=None,
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, eval_every=None,
                               checkpoint_every=1, compilation_cache_dir=None, quantization=Quantization()))
     state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),
                          Loader(lambda partition: Replaying(lambda position: {"text": ids}), None, None,

@@ -32,7 +32,7 @@ from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, O
 from dew.objectives.rl.scheduler import Asynchronous, RolloutScheduler
 from dew.objectives.rl.sessions import Status, pack
 from dew.sampling import Sampling
-from dew.training import Layout, Trainer
+from dew.training import Layout, Trainer, TrainerAdvanced
 
 VOCAB = 13
 STOP = 12
@@ -152,8 +152,10 @@ def rig(environment, verifier, *, tasks, log, workers=16, scheduler=RolloutSched
     stream = dataclasses.replace(stream, train=tapped(stream.train, registered))
 
     def fit(steps, checkpoints=None):
-        trainer = Trainer(target, optax.adam(1e-2), key=jax.random.key(3), rollout=rollout,
-                          layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints)
+        trainer = Trainer(target, optax.adam(1e-2), key=jax.random.key(3),
+                          advanced=TrainerAdvanced(rollout=rollout, layout=Layout(min_shard=1,
+                                                                                  tolerance=1.0)),
+                          checkpoints=checkpoints)
         return trainer.fit(stream, steps=steps, log_every=steps,
                            checkpoint_every=None if checkpoints is None else 1)
 

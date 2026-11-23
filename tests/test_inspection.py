@@ -3,6 +3,7 @@ holds, and logged one log late; a run that watches nothing compiles its step unc
 
 import collections
 import contextlib
+import dataclasses
 import itertools
 import json
 from pathlib import Path
@@ -23,7 +24,7 @@ from dew.data.dataset import Loader
 from dew.nn.inspection import HISTOGRAM_EDGES, statistics
 from dew.optim import Adam
 from dew.telemetry.compiles import Compiles
-from dew.training import FitPolicy, Inspection, MeshSpec, Trainer, UpdateBatch, inspected
+from dew.training import Inspection, MeshSpec, Trainer, TrainerAdvanced, inspected
 
 BATCH, RATE = 8, 0.25
 FEATURES = test_run_budgets.FEATURES
@@ -62,7 +63,8 @@ def stream(rows=ROWS):
 
 
 def trainer(inspection, tracker=None):
-    return Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, inspection=inspection)
+    return Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker,
+                   advanced=TrainerAdvanced(inspection=inspection))
 
 
 def trained(inspection, steps, rows=ROWS) -> dict[int, dict[str, float]]:
@@ -112,7 +114,7 @@ def test_a_run_whose_step_calls_the_host_inspects_it():
     review, F1)."""
     tracker = Kept()
     Trainer(Printing(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker,
-            inspection=Inspection(paths=("w",), every=1)).fit(
+            advanced=TrainerAdvanced(inspection=Inspection(paths=("w",), every=1))).fit(
         Loader(lambda partition: stream(), None, batch=BATCH, records=None), steps=1, log_every=1,
         eval_every=None, checkpoint_every=None)
     assert np.isfinite(tracker.rows[1]["inspect/updates/w/rms"])
@@ -176,16 +178,16 @@ def test_an_offline_view_of_an_objective_naming_its_input_alone_declares_it_from
 
     objective = Supervised(nn.Dense(2), lambda outputs, batch: jnp.sum(outputs ** 2, axis=-1), inputs="x")
     trainer = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0),
-                      inspection=Inspection(paths=("*",), targets=("params",)))
+                      advanced=TrainerAdvanced(inspection=Inspection(paths=("*",), targets=("params",))))
     assert inspected(trainer, {"x": ROWS})["inspect/params/l2"] > 0
 
 
 def test_a_custom_step_refuses_an_inspection():
-    """A custom step (`Trainer(step=...)`) commits no update an inspection reads, so asking for one is
+    """A custom step (`TrainerAdvanced(step=...)`) commits no update an inspection reads, so asking for one is
     refused as the trainer is built, not dropped."""
     with pytest.raises(ValueError):
-        Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), inspection=Inspection(),
-                step=lambda objective, optimizer: None)
+        Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0),
+                advanced=TrainerAdvanced(inspection=Inspection(), step=lambda objective, optimizer: None))
 
 
 def test_a_non_finite_parameter_shows_in_its_summary():
@@ -196,7 +198,9 @@ def test_a_non_finite_parameter_shows_in_its_summary():
             return {"params": {"w": jnp.asarray([jnp.inf, 1.0, 2.0, 3.0])}}
 
     logged = inspected(Trainer(Infinite(), optax.sgd(RATE), key=jax.random.key(0),
-                               inspection=Inspection(paths=("w",), targets=("params",))), {"x": ROWS})
+                               advanced=TrainerAdvanced(inspection=Inspection(paths=("w",), targets=("params",
+                                                                                                     )))),
+                       {"x": ROWS})
     assert logged["inspect/params/w/non_finite"] == 0.25 and logged["inspect/params/w/abs_max"] == np.inf
 
 
@@ -207,9 +211,9 @@ def test_an_offline_view_builds_a_configured_optimizer():
     moves, where SGD's would be the gradient's quarter."""
     from dew.optim import OptimConfig
 
-    config = OptimConfig(optimizer=Adam(), learning_rate=RATE)
+    config = OptimConfig(optimizer=Adam(), lr=RATE)
     configured = Trainer(Pulled(), config, key=jax.random.key(0),
-                         inspection=Inspection(paths=("w",), targets=("updates",)))
+                         advanced=TrainerAdvanced(inspection=Inspection(paths=("w",), targets=("updates",))))
     logged = inspected(configured, {"x": QUARTERS}, steps=4)
     weight = jnp.arange(1, FEATURES + 1, dtype=jnp.float32)
     gradient = 2 * (weight - jnp.asarray(QUARTERS).mean(0)) / FEATURES
@@ -224,7 +228,7 @@ def test_a_recorded_run_inspects_what_its_command_line_names(tmp_path):
     inspection = {"class": "dew.training.inspection:Inspection",
                   "fields": {"paths": ["*q_proj*"], "every": 2}}
     run = trained_record(saved_record(lm(tmp_path, drawn=False), tmp_path, "inspected"), cli_settings(
-        tmp_path, "inspected", {"trainer.horizon.steps": "2", "trainer.log_every": "1",
+        tmp_path, "inspected", {"trainer.steps": "2", "trainer.log_every": "1",
                                 "trainer.inspection": json.dumps(inspection)}))
     logged = scalars(run)
     assert "inspect/grads/l2" in logged[2] and "inspect/grads/l2" not in logged[1]
@@ -282,7 +286,8 @@ def watched_run(model, inspection):
 
     objective = Supervised(model, lambda outputs, batch: jnp.square(outputs[:, 0]),
                            inputs=InputSpec(Field("x", (FEATURES,))))
-    return Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), inspection=inspection)
+    return Trainer(objective, optax.sgd(RATE), key=jax.random.key(0),
+                   advanced=TrainerAdvanced(inspection=inspection))
 
 
 def outputs_of(run, layers):
@@ -383,7 +388,7 @@ def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp
                   "fields": {"modules": ["*Attention*", "*Block*", "*Mlp*", "*MLP*"], "every": 2,
                              "targets": ["params"], "cotangents": True}}
     logged = scalars(trained_record(record, cli_settings(tmp_path, "watched", {
-        "trainer.horizon.steps": "2", "trainer.log_every": "1",
+        "trainer.steps": "2", "trainer.log_every": "1",
         "trainer.inspection": json.dumps(inspection)})))
     watched = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/activations/")}
     assert {"mean", "std", "abs_max", "non_finite"} <= watched
@@ -499,7 +504,8 @@ def test_a_watched_prediction_depth_summarizes_its_rows_real_positions_alone():
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
                               max_seq_len=16, qk_norm=False, num_nextn_predict_layers=2)
     trainer = Trainer(LMObjective(model, 11, mtp_weight=0.3), optax.sgd(0.), key=jax.random.key(0),
-                      inspection=Inspection(modules=("mtp_1/*",), targets=("params",)))
+                      advanced=TrainerAdvanced(inspection=Inspection(modules=("mtp_1/*",), targets=("params",
+                                                                                                    ))))
     rows = jax.device_count()
 
     # A hole of one padded token: the second depth's span from the first document's last token reaches the
@@ -539,8 +545,9 @@ def accumulating(inspection, tracker=None, checkpoints=None, split=1, accumulati
     split in two."""
     from dew.training import MeshSpec
 
-    return Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, inspection=inspection,
-                   update=UpdateBatch(batches=accumulation), fit=FitPolicy(split=split),
+    return Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker,
+                   advanced=TrainerAdvanced(inspection=inspection),
+                   accumulation=accumulation, split=split,
                    checkpoints=checkpoints, mesh=MeshSpec().build(jax.devices()[:4]))
 
 
@@ -576,8 +583,8 @@ def test_an_examples_runs_short_last_window_samples_its_commit():
 
     tracker = Kept()
     chain = Pipeline(Memory({"x": np.concatenate([ROWS] * 5)})).read("streamed").batch(BATCH)
-    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, update=UpdateBatch(batches=3),
-            inspection=Inspection(paths=("w",), targets=("params",), every=2)).fit(
+    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, accumulation=3,
+            advanced=TrainerAdvanced(inspection=Inspection(paths=("w",), targets=("params",), every=2))).fit(
         chain, examples=5 * BATCH, log_every=1, eval_every=None, checkpoint_every=None)
     sampled = [step for step, row in sorted(tracker.rows.items()) if "inspect/params/l2" in row]
     assert sampled == [5]
@@ -600,8 +607,10 @@ def test_a_rejected_step_skips_one_sample_and_the_run_samples_on():
     from flax.training.dynamic_scale import DynamicScale
 
     tracker = Kept()
-    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, update=UpdateBatch(batches=3),
-            dynamic_scale=DynamicScale(), inspection=Inspection(paths=("w",), targets=("params",), every=2)
+    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, accumulation=3,
+            advanced=TrainerAdvanced(dynamic_scale=DynamicScale(), inspection=Inspection(paths=("w",),
+                                                                                         targets=("params",),
+                                                                                         every=2))
             ).fit(Loader(rows, None, batch=BATCH, records=None), steps=12, log_every=1, eval_every=None,
                   checkpoint_every=None)
     sampled = [step for step, row in sorted(tracker.rows.items()) if "inspect/params/l2" in row]
@@ -731,10 +740,11 @@ def padding_invariant_summaries(tail, *, packed: bool = False, pipelined: bool =
              else models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                                num_kv_heads=2))
     indexer = {"indexer": IndexerTraining("warmup")} if warmup else {}
-    staged = ({"fit": FitPolicy(microbatches=2), "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
+    staged = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
               if pipelined else {})
     run = Trainer(LMObjective(model, 16, pad_id=None if packed else tail, **indexer), optax.sgd(RATE),
-                  key=jax.random.key(0), inspection=Inspection(modules=("*MLP",), targets=("params",)),
+                  key=jax.random.key(0), advanced=TrainerAdvanced(inspection=Inspection(modules=("*MLP",),
+                                                                                        targets=("params",))),
                   **staged)
     tokens = np.random.default_rng(1).integers(1, 63, size=(8, 17)).astype(np.int32)
     real = np.ones(tokens.shape, bool)
@@ -780,7 +790,7 @@ def test_a_preference_runs_watched_layers_read_each_halfs_real_tokens_alone():
     objective = DPOObjective(decoder(), 5, pairs=2)
     run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0),
                   mesh=MeshSpec().build(jax.devices()[:1]),
-                  inspection=Inspection(modules=("*MLP",), targets=("params",)))
+                  advanced=TrainerAdvanced(inspection=Inspection(modules=("*MLP",), targets=("params",))))
     ids = np.asarray(batch["input_ids"])
     padding = np.asarray(batch["real_mask"]) == 0
     # The first pair's chosen half's last real input, unmarked by its completion mask, before the window's
@@ -813,8 +823,8 @@ def test_a_pipelined_stacks_watched_layers_each_report_every_microbatch():
     model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                          num_kv_heads=2)
     run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0),
-                  fit=FitPolicy(microbatches=2), mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
-                  inspection=Inspection(modules=("*MLP",), targets=("params",)))
+                  microbatches=2, mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
+                  advanced=TrainerAdvanced(inspection=Inspection(modules=("*MLP",), targets=("params",))))
     tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
     logged = inspected(run, {"text": tokens})
     summaries = {name.rsplit("/", 1)[0]: value for name, value in logged.items()
@@ -835,9 +845,11 @@ def test_a_watched_cotangent_is_the_updates_loss_whatever_its_split():
             # A loss its objective states as one scalar, pooled by the microbatches' mean.
             objective.loss = lambda variables, batch, step, loss=objective.loss: (
                 lambda stats, aux: (stats.mean()[0], aux))(*loss(variables, batch, step))
-        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), fit=FitPolicy(split=split),
+        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), split=split,
                       mesh=MeshSpec().build(jax.devices()[:1]),
-                      inspection=Inspection(modules=("Block_1",), targets=("params",), cotangents=True))
+                      advanced=TrainerAdvanced(inspection=Inspection(modules=("Block_1",), targets=("params",
+                                                                                                    ),
+                                                                     cotangents=True)))
         # One row throughout, so any microbatch's rows are the batch's own, however the split deals them.
         rows = np.repeat(ROWS[:1], BATCH, axis=0)
         return {name: value for name, value in inspected(run, {"x": rows}).items() if "/cotangents/" in name}
@@ -862,8 +874,10 @@ def test_a_host_runs_sampled_step_summarizes_what_a_device_run_summarizes():
 
     def logged(layout, rows):
         objective = watched_run(Stacked(scanned=False), None).objective
-        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), layout=layout,
-                      inspection=Inspection(modules=("Block_1",), targets=("params",), cotangents=True))
+        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(layout=layout, inspection=Inspection(modules=("Block_1",),
+                                                                                    targets=("params",),
+                                                                                    cotangents=True)))
         found = inspected(run, {"x": rows})
         return {name: jnp.asarray(value) for name, value in sorted(found.items())}
 
@@ -887,8 +901,8 @@ def test_a_host_runs_unsampled_steps_are_the_uninspected_runs():
 
     def stepped(inspection):
         objective = watched_run(Stacked(scanned=False), None).objective
-        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), layout=Layout(host=("variables",)),
-                      inspection=inspection)
+        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(layout=Layout(host=("variables",)), inspection=inspection))
         state, _, _ = run.place()
         batch = {"x": jnp.asarray(ROWS)}
         step = run.compile(state, batch)
@@ -905,14 +919,18 @@ def test_a_watched_cotangent_is_summarized_unscaled_under_a_dynamic_loss_scale()
     """Under a dynamic loss scale, whose backward is seeded with the scale, a watched block's cotangent is
     summarized as the unscaled loss's (row 2324 review): its every statistic, the histogram's decades
     included, the unscaled run's to the bit, a power of two scaling and unscaling each entry exactly."""
-    def logged(**scaled) -> dict[str, float]:
+    def logged(advanced=None, **scaled) -> dict[str, float]:
         objective = watched_run(Stacked(scanned=False), None).objective
         run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), **scaled,
-                      inspection=Inspection(modules=("Block_1",), targets=("params",), cotangents=True,
-                                            histogram=True))
+                      advanced=dataclasses.replace(advanced or TrainerAdvanced(),
+                                                   inspection=Inspection(modules=("Block_1",),
+                                                                                   targets=("params",
+                                                                                                    ),
+                                                                     cotangents=True,
+                                            histogram=True)))
         return {name: value for name, value in inspected(run, {"x": ROWS}).items() if "/cotangents/" in name}
 
-    plain, scaled = logged(), logged(dynamic_scale=True)
+    plain, scaled = logged(), logged(advanced=TrainerAdvanced(dynamic_scale=True))
     assert any("histogram" in name for name in plain) and scaled == plain
 
 
@@ -1022,16 +1040,19 @@ def test_a_pipelined_stacks_watched_cotangents_are_each_layers_over_its_microbat
     from dew.registry import models
     from dew.training import MeshSpec
 
-    def cotangents(**placed) -> dict[str, float]:
+    def cotangents(advanced=None, **placed) -> dict[str, float]:
         model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                              num_kv_heads=2)
         run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
-                      inspection=Inspection(modules=("*MLP",), targets=("params",), cotangents=True))
+                      advanced=dataclasses.replace(advanced or TrainerAdvanced(),
+                                                   inspection=Inspection(modules=("*MLP",),
+                                                                                   targets=("params",),
+                                                                     cotangents=True)))
         tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
         return {name: value for name, value in inspected(run, {"text": tokens}).items()
                 if name.startswith("inspect/cotangents/")}
 
-    piped = cotangents(fit=FitPolicy(microbatches=2), mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]))
+    piped = cotangents(microbatches=2, mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]))
     whole = cotangents(mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
     assert set(piped) == set(whole)
     assert {f"inspect/cotangents/layers_{layer}/mlp/rms" for layer in range(4)} <= set(piped)
@@ -1117,9 +1138,10 @@ def test_a_path_glob_selects_the_layer_its_log_names(stacked):
         fields = {**TINY_DECODER, "num_layers": 4, **({"scan_layers": True} if stacked == "scanned" else {})}
         model = models.build("causal_transformer", vocab_size=64, **fields, num_kv_heads=2)
         staged = MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])
-        placed = {"fit": FitPolicy(microbatches=2), "mesh": staged} if stacked == "pipelined" else {}
+        placed = {"microbatches": 2, "mesh": staged} if stacked == "pipelined" else {}
         run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
-                      inspection=Inspection(modules=modules, targets=("params",), cotangents=True))
+                      advanced=TrainerAdvanced(inspection=Inspection(modules=modules, targets=("params",),
+                                                                     cotangents=True)))
         tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
         return {name: value for name, value in inspected(run, {"text": tokens}).items()
                 if name.startswith(("inspect/activations/", "inspect/cotangents/"))}
@@ -1153,7 +1175,8 @@ def test_a_pipeline_stage_modules_cotangent_is_refused():
     model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                          num_kv_heads=2)
     run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0),
-                  fit=FitPolicy(microbatches=2), mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
-                  inspection=Inspection(modules=("stages",), targets=("params",), cotangents=True))
+                  microbatches=2, mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
+                  advanced=TrainerAdvanced(inspection=Inspection(modules=("stages",), targets=("params",),
+                                                                 cotangents=True)))
     with pytest.raises(ValueError):
         inspected(run, {"text": np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)})

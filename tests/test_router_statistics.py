@@ -17,6 +17,7 @@ from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance, RoutedStatistics, UntrainedRouter
+from dew.training import TrainerAdvanced
 
 
 @pytest.fixture(scope="module", params=[0, 1], ids=["trunk", "mtp"])
@@ -65,7 +66,7 @@ def lowered(objective: LMObjective) -> None:
     from dew.training._lowering import Lowered
 
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), mesh=MeshSpec(),
-                      layout=Layout(min_shard=64))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=64)))
     trainer.lower_for = "sm90"
     with pytest.raises(Lowered):
         trainer.compile(trainer.initial_state(), {TEXT_KEY: jnp.zeros((8, 9), jnp.int32)})

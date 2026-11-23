@@ -70,7 +70,7 @@ from dew.nn.rope import (
 from dew.nn.sharding import down_projection
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mla"
 CONFIG = json.loads((FIXTURES / "config.json").read_text())
@@ -733,7 +733,7 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
     trainer = Trainer(
         LMObjective(model, 16, balance=ExpertBalance(balance_rate=0.01)), optax.adam(1e-3),
         key=jax.random.key(0), mesh=MeshSpec(fsdp=fsdp, expert=expert),
-        layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
+        advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)), tracker=tracker)
 
     state = trainer.fit(Loader(lambda partition: token_batches(), None, batch=8, records=None),
                         steps=2, log_every=1)
@@ -1166,7 +1166,7 @@ def test_a_recorded_prefix_run_trains_a_windowed_latent_attention_reading_its_pr
     default = LMRunConfig(data=chain.loading(Loading(workers=0)),
                           model=ModelConfig("causal_transformer", fields),
                           objective=ObjectiveConfig("lm", {"prefix": prefix}), max_new_tokens=0)
-    LMRunConfig.cli(["--trainer.horizon.steps", "2", "--trainer.name", "prefix", "--trainer.checkpoint-dir",
+    LMRunConfig.cli(["--trainer.steps", "2", "--trainer.name", "prefix", "--trainer.checkpoint-dir",
                      str(tmp_path / "runs"), "--trainer.compilation-cache-dir", "None",
                      "--trainer.multi-host", "False", "--trainer.log-every", "1", "--trainer.eval-every",
                      "None", "--trainer.checkpoint-every", "2"], default=default).run()

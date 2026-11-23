@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from dew.interop.streaming import SourceLeaf
+from dew.training import TrainerAdvanced
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
@@ -285,7 +286,7 @@ def test_a_source_trained_from_keeps_its_arrays_after_the_step_donates_the_state
     # The default layout replicates a small source's leaves, so its placed state can share their buffers.
     layout = Layout(host=("variables",)) if where == "host" else Layout()
     trainer = Trainer(LMObjective(loaded, 8, ema_decay=None), optax.sgd(0.1), key=jax.random.key(5),
-                      layout=layout)
+                      advanced=TrainerAdvanced(layout=layout))
     batch = {"text": jnp.tile(jnp.arange(1, 10, dtype=jnp.int32)[None], (jax.device_count(), 1))}
     states = [trainer.place()[0]] + ([trainer.initial_state()] if where == "device" else [])
     for state in states:
@@ -311,7 +312,8 @@ def test_a_host_owned_state_takes_its_held_tree_over_leaf_by_leaf():
     fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
     objective = LMObjective(Pretrained.load(fixture, dtype="float32", attention_impl="reference"), 8,
                             ema_decay=None)
-    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), layout=Layout(host=("variables",)))
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5),
+                      advanced=TrainerAdvanced(layout=Layout(host=("variables",))))
     state, _, _ = trainer.place()
     placed = {id(leaf) for leaf in jax.tree.leaves(state.variables)}
     held = jax.tree.leaves(objective.held_variables())
