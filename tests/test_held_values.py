@@ -129,23 +129,64 @@ def test_a_program_whose_trace_a_refusal_follows_runs_a_trace_past_it_after():
         assert float(run(x)) == 0.0
 
 
-def test_a_scope_after_another_takes_its_own_trace_again():
-    """A program traced in a scope of no refusals, then in one refusing a launch, then in one of none again,
-    traces its function once a scope's refusals: each holds its own jit, so a scope after another's takes
-    the trace it made (theme K01-e's review P0: a smaller scope's jit lost to a larger one's)."""
+def test_a_trace_a_refusal_races_leaves_no_program_for_the_refusals_it_began_under():
+    """A program whose first trace a refusal races, recorded before its launch reads the refusals (as
+    another thread's would be), runs the program past it, and a scope of no refusal after it runs a program
+    of its own: no jit its raced trace cached is held for the refusals it began under (theme K01-e's review
+    P0: a jit claimed before its trace held the refusal's program for every later call of none)."""
     from dew.nn.kernels.options import owned_program
     from dew.nn.kernels.templates import report
 
-    traced = []
+    seeded = []
 
     def chosen(x):
-        traced.append(bool(report.refusals_of("a launch")))
-        return x
+        if not seeded:
+            seeded.append(True)
+            report.refuse([("a launch", 1, ("its kernel",))])
+        return x + (1.0 if report.refusals_of("a launch") else 0.0)
 
     run, x = owned_program(chosen), jnp.zeros((), jnp.float32)
-    for refused in (False, True, False):
+    with report.refusals():
+        assert float(run(x)) == 1.0
+    with report.refusals():
+        assert float(run(x)) == 0.0
+
+
+def test_a_call_waiting_on_a_compile_kept_past_its_refusals_compiles_its_own():
+    """A call joined on another thread's compile of the same key, whose trace that thread's scope refuses a
+    launch as it traces, is not given the program its compile kept past the refusal: in a scope of none,
+    it runs a program of its own (theme K01-e's review P0: the reservation's waiters given a program of
+    refusals their scope holds none of)."""
+    import threading
+    import time
+
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    tracing, released, seeded, found = threading.Event(), threading.Event(), [], {}
+
+    def chosen(x):
+        if not seeded:
+            seeded.append(True)
+            report.refuse([("a launch", 1, ("its kernel",))])
+            tracing.set()
+            released.wait(timeout=60)
+        return x + (1.0 if report.refusals_of("a launch") else 0.0)
+
+    run, x = owned_program(chosen), jnp.zeros((), jnp.float32)
+
+    def called(name: str) -> None:
         with report.refusals():
-            if refused:
-                report.refuse([("a launch", 1, ("its kernel",))])
-            run.trace(x)
-    assert traced == [False, True], traced
+            found[name] = float(run(x))
+
+    first = threading.Thread(target=called, args=("refusing",))
+    first.start()
+    tracing.wait(timeout=60)
+    second = threading.Thread(target=called, args=("of none",))
+    second.start()
+    # The second call joined on the first's reservation before its compile settles.
+    time.sleep(1)
+    released.set()
+    first.join(timeout=120)
+    second.join(timeout=120)
+    assert found == {"refusing": 1.0, "of none": 0.0}
