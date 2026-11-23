@@ -43,6 +43,7 @@ from dew.registry import ModelConfig
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun
 from dew.telemetry.compiles import Compiles
 from dew.training import Checkpoints, LocalTracker, Trainer
+from dew.training.budget import Horizon
 
 RES = 8
 MODEL = {"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1}
@@ -57,7 +58,7 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32", "attention_impl": "reference"}),
         data=source("tfds://oxford_flowers102").pipe(presets.images, RES, batch=8),
-        trainer=TrainerConfig(checkpoint_dir=str(directory), steps=2, keep=1),
+        trainer=TrainerConfig(checkpoint_dir=str(directory), horizon=Horizon(steps=2), keep=1),
         preset=preset, text=TextCondition(encoder=encoder, checkpoint=checkpoint),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 3}))
 
@@ -260,11 +261,11 @@ def test_validation_metrics_follow_the_sample_field(tmp_path):
                                                                           fps=25, size=8, batch=2),
                                 val_metrics=(MetricConfig("psnr"),))
     held = types.SimpleNamespace(val=object())
-    (metric,) = video.suites(held, None)["val"].metrics
+    (metric,) = video.evaluation_suites(held, None)["val"].metrics
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)
     assert np.isinf(metric.finalize(metric(VideoGrid(unit_range(images)), {"video": images})))
     with pytest.raises(ValueError):
-        dataclasses.replace(video, val_metrics=(MetricConfig("clip"),)).suites(held, None)
+        dataclasses.replace(video, val_metrics=(MetricConfig("clip"),)).evaluation_suites(held, None)
 
 
 TINY_CLIP = str(Path(__file__).parent / "fixtures" / "clip" / "tiny")
@@ -291,7 +292,7 @@ def validated_run(directory, *, validates: bool, **fields):
                           checkpoints=checkpoints, tracker=tracker)
         try:
             # As `RunConfig.train` scores them: each split's named metrics, or the kind's own.
-            suites = config.suites(data, None)
+            suites = config.evaluation_suites(data, None)
             trainer.fit(data, steps=2, log_every=100, checkpoint_every=2, validation=suites,
                         metrics=config.validation_metrics(validates=data.val is not None) if suites is None
                         else ())
@@ -1112,9 +1113,8 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     config = LMRunConfig(
         model=ModelConfig("causal_transformer", {**fields,
                                                "dtype": "float32", "attention_impl": "reference"}),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1,
-                              eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
-                              quantization=Quantization()))
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=1), eval_every=None,
+                              checkpoint_every=1, compilation_cache_dir=None, quantization=Quantization()))
     state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),
                          Loader(lambda partition: Replaying(lambda position: {"text": ids}), None, None,
                                 batch), name="run")

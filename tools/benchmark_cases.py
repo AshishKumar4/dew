@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
     from dew._records import JSON
     from dew.interop.sources import SourceReference
-    from dew.optim import Optimizer
 
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
 # of the model should not spend its first minute downloading a text tower, and
@@ -106,9 +105,9 @@ class Case:
     accumulation: int = 1
     """Microbatches of `batch_size` rows the trainer pools into one optimizer
     step; a timed step is one microbatch."""
-    optimizer: "Optimizer" = "adam"
-    """The optimizer the case's trainer steps, as `dew train` builds it (`dew.optim.OptimConfig`): Adam, or
-    AdamW a full fine-tune's."""
+    optimizer: Literal["adam", "adamw"] = "adam"
+    """The optimizer the case's trainer steps by its name (`dew.registry.optimizers`): Adam, or AdamW a full
+    fine-tune's."""
     mesh: dict[str, int] = field(default_factory=dict)
     """`MeshSpec` fields, `{"fsdp": 2, "tensor": 2}`; the empty record is
     data parallelism over every device."""

@@ -250,7 +250,7 @@ command line does before it trains a run."""
 
 def test_a_command_lines_flags_hold_as_it_runs_again_with_them_set_before_jaxlib_loads():
     """`hold_xla_flags` runs the process again from its start with the flags in XLA_FLAGS where they do not
-    hold, as `dew train` does with a run's `trainer.xla_flags`: the process that goes on holds them."""
+    hold, as `dew train` does with a run's `diagnostics.xla_flags`: the process that goes on holds them."""
     env = {**os.environ, "XLA_FLAGS": "",
            "PYTHONPATH": os.pathsep.join(filter(None, (str(ROOT / "src"), os.environ.get("PYTHONPATH"))))}
     done = subprocess.run([sys.executable, "-c", HELD, STATED], capture_output=True, text=True, env=env,

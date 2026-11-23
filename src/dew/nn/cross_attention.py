@@ -120,7 +120,8 @@ over it in a pass of its own."""
 def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, lengths: jax.Array, *,
                    encoder: ContextEncoder, train: bool = False,
                    rngs: dict[str, jax.Array] | None = None, segments: jax.Array | None = None,
-                   max_segments: int = 1, progress: Progress = END) -> dict[str, jax.Array]:
+                   max_segments: int = 1, progress: Progress = END,
+                   loop_passes: jax.Array | None = None) -> dict[str, jax.Array]:
     """The conditioning a model's cross-attention layers read (`CrossAttending`) for contexts of
     token ids: `tokens` `[B, C]`, each row's first `lengths` real, as `encoder` says, and where a row
     packs the contexts of up to `max_segments` documents, each token's document, `segments` `[B, C]`
@@ -132,7 +133,8 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
     model's final states over each context alone (its `hidden_states`, or a native module's own forward:
     `dew.nn.protocols.forward_method`), its real tokens one document, with
     the weights of the model's own pass, an adapter's included, at the run's `progress` where the model
-    reads it (`dew.nn.progress`). Where the model trains nothing but its
+    reads it (`dew.nn.progress`), its loop at `loop_passes` passes where given. Where the model trains
+    nothing but its
     cross-attention blocks (`crosses_alone`), which a pass without a context runs none of, that pass
     trains nothing and its gradient is not taken. The states keep the dtype they are computed in, and
     the model casts them to its blocks' (`context_dtype`). `variables` are the model's own, whole or
@@ -157,8 +159,9 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
         documents = real.astype(jnp.int32) if segments is None else jnp.where(real, segments, 0)
         laid = coordinates(segments=documents, max_segments=max_segments if segments is not None else 1,
                            right_padded=True)
-        states = model.apply(whole, tokens, train=train, coordinates=laid, method=method, rngs=rngs,
-                             **progressed(model, progress))
+        read = functools.partial(model.apply, whole, tokens, train=train, coordinates=laid, method=method,
+                                 rngs=rngs, **progressed(model, progress))
+        states = read() if loop_passes is None else read(loop_passes=loop_passes)
         if crosses_alone(variables.get("params", {})):
             states = jax.lax.stop_gradient(states)
     else:

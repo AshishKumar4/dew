@@ -19,8 +19,8 @@ from dew.batch import under
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
 from dew.objectives import Aux, EMASpec, Objective, Ratio
-from dew.optim import OptimConfig
-from dew.training import Trainer
+from dew.optim import Adam, Optax, OptimConfig
+from dew.training import FitPolicy, Trainer, UpdateBatch
 
 
 @struct.dataclass
@@ -84,7 +84,7 @@ SHORT_SCALE = dynamic_scale_lib.DynamicScale(growth_interval=1)
 
 def trainer(composite=False, k=2, checkpoints=None):
     return Trainer(Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-                   accumulation=k, dynamic_scale=SHORT_SCALE, checkpoints=checkpoints)
+                   update=UpdateBatch(batches=k), dynamic_scale=SHORT_SCALE, checkpoints=checkpoints)
 
 
 def test_a_commit_counts_the_tokens_of_its_windows_microbatches_alone():
@@ -190,7 +190,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
                                                   aux_loss_alpha=None if auxiliary is None else .2,
                                                   seq_aux=auxiliary != "global"))
     optimizer = optax.chain(optax.clip_by_global_norm(.5), optax.sgd(.03), scale_by_qk_clip(.05))
-    train = Trainer(objective, optimizer, key=jax.random.PRNGKey(7), accumulation=2,
+    train = Trainer(objective, optimizer, key=jax.random.PRNGKey(7), update=UpdateBatch(batches=2),
                     dynamic_scale=True)
     initial = train.initial_state()
     rows = jax.device_count()
@@ -284,13 +284,14 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
                                     jnp.int32)}
     spoken = said(0)
     quiet = {"text": jnp.full((rows, 8), silent, jnp.int32)}
-    placement = {"mesh": MeshSpec(fsdp=2, stage=2), "microbatches": 2} if staged else {}
+    placement = {"mesh": MeshSpec(fsdp=2, stage=2), "fit": FitPolicy(microbatches=2)} if staged else {}
 
     def clip(threshold):
         return optax.chain(optax.sgd(0.0), scale_by_qk_clip(threshold))
 
     def trained(threshold, first, second):
-        train = Trainer(objective, clip(threshold), key=jax.random.PRNGKey(3), accumulation=2, **placement)
+        train = Trainer(objective, clip(threshold), key=jax.random.PRNGKey(3), update=UpdateBatch(batches=2),
+                        **placement)
         initial = train.initial_state()
         # The step consumes the state: what the expectation reads of it is taken first, each layer on its
         # stored layers as `stored` gives a stage-local state's.
@@ -361,7 +362,7 @@ def test_replay_preserves_half_precision_cotangents_and_integer_support():
             row = Ratio(((w + 3) ** 2).astype(jnp.float16), jnp.asarray(1))
             return Terms(prediction, row, jnp.zeros(3, jnp.float16),
                          jnp.zeros(3, jnp.int32), jnp.asarray(0)), Aux({})
-    train = Trainer(Half(), optax.sgd(.1), key=jax.random.PRNGKey(1), accumulation=2)
+    train = Trainer(Half(), optax.sgd(.1), key=jax.random.PRNGKey(1), update=UpdateBatch(batches=2))
     initial = train.initial_state()
     data = batches()[0]
     step = train.compile(initial, data)
@@ -445,7 +446,7 @@ def test_every_microbatch_of_an_accumulated_update_reads_the_updates_committed_b
                                step.updates, step.step)
             return super().loss(variables, batch, step)
 
-    state = Trainer(Clocked(), optax.sgd(0.1), key=jax.random.PRNGKey(0), accumulation=2).fit(
+    state = Trainer(Clocked(), optax.sgd(0.1), key=jax.random.PRNGKey(0), update=UpdateBatch(batches=2)).fit(
         Loader(lambda partition: batches(), None, None, 8), steps=6, log_every=100)
     assert int(state.updates) == 3
     # A debug callback's host work runs apart from the arrays it reads; the barrier waits for it.
@@ -468,7 +469,7 @@ def an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=8)
     train = Trainer(LMObjective(model, 8), OptimConfig(learning_rate=1e-3).build(10),
-                    key=jax.random.PRNGKey(0), accumulation=2)
+                    key=jax.random.PRNGKey(0), update=UpdateBatch(batches=2))
     state = train.initial_state()
     rows = jax.device_count()
     train.compile(state, {"text": np.arange(rows * 9, dtype=np.int32).reshape(rows, 9) % 64})
@@ -731,7 +732,7 @@ def test_a_skipped_steps_weights_are_kept_by_its_post_step_effects():
     clamp, the clamp's count stepping with the zero gradient's step. The clamp acted on a rejected step's
     weights (the round-3 head review's F7)."""
     from dew.optim import ParamGroup
-    clamped = OptimConfig(optimizer="adam", learning_rate=1e-3,
+    clamped = OptimConfig(optimizer=Adam(), learning_rate=1e-3,
                           param_groups=(ParamGroup("all", ("*",), bounds=(0.0, 1.0)),))
     trainer = Trainer(ClampedOutside(), clamped, key=jax.random.PRNGKey(0), skip_nonfinite=True)
     trainer.scheduled(1)
@@ -800,7 +801,7 @@ def test_a_skipping_trainer_after_a_taking_one_of_one_config_skips_by_its_own_po
     second skipping them: the first stops at its poisoned step; the second, whose fit could read the first's
     step from the process's cache of steps (`_candidates.candidate_for`), skips it, its four updates
     finite. The policy keyed no step, so the second took the first's (the rebuild's head review, F1)."""
-    config = OptimConfig(optimizer="optax:sgd", learning_rate=0.1)
+    config = OptimConfig(optimizer=Optax('optax:sgd'), learning_rate=0.1)
     with pytest.raises(RuntimeError):
         make_trainer(optimizer=config).fit(dataset(PoisonedThird), steps=5, log_every=1)
     state = make_trainer(optimizer=config, skip_nonfinite=True).fit(dataset(PoisonedThird), steps=5,

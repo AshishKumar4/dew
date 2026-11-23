@@ -39,7 +39,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.trace import COLLECTIVES
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import FitPolicy, Layout, MeshSpec, Trainer
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -546,9 +546,8 @@ def token_batches():
 
 def run_losses(mesh, layout, steps, microbatches=None):
     tracker = RecordingTracker()
-    trainer = Trainer(
-        LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-        mesh=mesh, layout=layout, microbatches=microbatches, tracker=tracker)
+    trainer = Trainer(LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
+                      layout=layout, fit=FitPolicy(microbatches=microbatches), tracker=tracker)
     state = trainer.fit(Loader(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
                         steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)

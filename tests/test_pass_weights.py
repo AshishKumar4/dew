@@ -15,6 +15,7 @@ from model_support import float64_twin
 from reference_error import assert_as_exact, dew_path
 
 from dew.batch import PHASE, VALID_ROWS, Phase
+from dew.data import Phase as DataPhase, Steps
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials
@@ -25,6 +26,7 @@ from dew.nn.protocols import EXITS
 from dew.objectives.base import Step
 from dew.objectives.lm.objective import LMObjective
 from dew.objectives.passes import PassWeights, exiting
+from dew.training import FitPolicy
 
 PASS_SEEDS = 64
 """Draws of each check-1 site here: tiny models, whose losses' errors settle well inside it."""
@@ -324,7 +326,7 @@ def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp
 
     def needed(model, split, *, startup=False):
         free(monkeypatch, LIMIT)
-        trainer = phased_trainer(model, 0, None, split=split)
+        trainer = phased_trainer(model, 0, None, fit=FitPolicy(split=split))
         state, _, _ = trainer.place()
         trainer.compile(state, {"text": jnp.asarray(tokens)})
         # Measured as in a process apart: the run below compiles nothing of it.
@@ -343,9 +345,10 @@ def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp
     assert [(probe["split"], probe["ahead"]) for probe in planned.plan["probes"]] == [(1, True), (2, True)]
     free(monkeypatch, LIMIT)
     directory = str(tmp_path / "pinned")
-    phased_params(phased_trainer(looped(), 0, split=1, checkpoints=Checkpoints(directory)), tokens, steps=2,
-                  checkpoint_every=2)
-    pinned = phased_params(phased_trainer(looped(), 0, split=2, checkpoints=Checkpoints(directory)), tokens)
+    phased_params(phased_trainer(looped(), 0, fit=FitPolicy(split=1), checkpoints=Checkpoints(directory)),
+                  tokens, steps=2, checkpoint_every=2)
+    pinned = phased_params(phased_trainer(looped(), 0, fit=FitPolicy(split=2),
+                                          checkpoints=Checkpoints(directory)), tokens)
     for mine, theirs in zip(bits(landed), bits(pinned), strict=True):
         np.testing.assert_array_equal(mine, theirs)
 
@@ -504,7 +507,7 @@ def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_p
     from dew.data.compile import compile
     from dew.training import Checkpoints, Layout, Trainer
 
-    data = compile(phases((corpus(1), 2), (corpus(2), None)), read="indexed", loading=READ)
+    data = compile(phases(DataPhase(corpus(1), Steps(2)), DataPhase(corpus(2))), read="indexed", loading=READ)
     model = looped()
 
     def trainer_of(model, directory, **phased):
@@ -555,7 +558,8 @@ def test_a_phased_runs_work_counts_each_step_at_its_phases_pass_count():
             compile(data, read="indexed", loading=READ), steps=steps, log_every=1, checkpoint_every=None)
         return flops.at
 
-    phased = counted(looped(), phases((corpus(1), 2), (corpus(2), None)), 4, phase_passes=(1, STEPS))
+    phased = counted(looped(), phases(DataPhase(corpus(1), Steps(2)), DataPhase(corpus(2))), 4,
+                     phase_passes=(1, STEPS))
     one = counted(looped().with_passes(1), corpus(1), 1)
     three = counted(looped(), corpus(2), 1)
     assert one[1] < three[1]

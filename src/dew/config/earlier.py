@@ -8,6 +8,7 @@ from collections.abc import Mapping
 
 from dew import _records, registry
 from dew._records import JSON, earlier_fields
+from dew.checkpoints._state_trees import EARLIER_OPTIMIZER_PATHS, earlier_typed, mask_readers
 from dew.data import records
 from dew.nn.precision import Numerics, numerics_of
 from dew.registry import from_record, models, objectives
@@ -49,10 +50,10 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     (ledger 1552)."""
     unsettable, additive = (record.get(key) is True for key in (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE))
     moved = _records.moved_record({key: value for key, value in record.items() if key not in MARKERS})
-    earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(
-        moved if unsettable else earlier_trainer_layout(moved)))))
+    earlier = earlier_none_of_the_above(earlier_profile(earlier_trainer(
+        moved if unsettable else earlier_trainer_layout(moved))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
-    earlier = earlier_retired(earlier_packed_experts(earlier), additive_unset=additive)
+    earlier = earlier_newton_schulz(earlier_retired(earlier_packed_experts(earlier), additive_unset=additive))
     # A decision layout recorded by one of the classes it was before (decision-inputs.md §1, row 6140).
     earlier = {name: _records.earlier_layout(_records.json_value(value, name))
                for name, value in earlier.items()}
@@ -97,27 +98,272 @@ def _retired(name: str, fields: Mapping[str, _records.JSON], root: bool,
     it names no class an imported module holds; None where nothing of it changes."""
     from dew.config import DecoderRunConfig, RunConfig
     from dew.config.trainer import TrainerConfig
+    from dew.optim import OptimConfig
 
     kind = _recorded_class(name) or (RunConfig if root else None)
     if kind is None:
         return None
+    if issubclass(kind, OptimConfig):
+        spec = _optimizer_spec(fields)
+        return None if spec is None else {"class": name, "fields": spec}
+    optim = fields.get("optim")
+    # An optimizer recorded flat, by its run's class, is read here; one by its own class as a record.
+    spec = (_optimizer_spec(optim) if issubclass(kind, RunConfig) and isinstance(optim, Mapping)
+            and _records.class_record(optim) is None else None)
     trainer = fields.get("trainer")
     # Each retirement asked of the record as it is, the record copied once where one applies (row 11892).
     exported = issubclass(kind, TrainerConfig) and "export_model" in fields
+    batched = issubclass(kind, TrainerConfig) and any(key in fields for key in EARLIER_TRAINER_FIELDS)
     flat = (issubclass(kind, RunConfig) and isinstance(trainer, Mapping) and "export_model" in trainer
             and _records.class_record(trainer) is None)
     unset = (issubclass(kind, DecoderRunConfig) and not additive_unset
              and fields.get("loop_message_additive") is True)
-    if not (exported or flat or unset):
+    # A trainer's own fields, flat or under its class record's, which the pins are taken out of.
+    tagged = _records.class_record(trainer) if isinstance(trainer, Mapping) else None
+    trainer_fields = tagged[1] if tagged is not None else trainer
+    held_pins = isinstance(trainer_fields, Mapping) and any(key in trainer_fields
+                                                            for key in EARLIER_DIAGNOSTICS)
+    pinned = issubclass(kind, RunConfig) and ("kernels" in fields or held_pins)
+    listed = fields.get("val_metrics")
+    split_metrics = isinstance(listed, list) and any(
+        isinstance(metric, Mapping) and "split" in metric for metric in listed)
+    validated = issubclass(kind, RunConfig) and ("val_every" in fields or split_metrics)
+    flat_batched = (issubclass(kind, RunConfig) and isinstance(trainer, Mapping)
+                    and _records.class_record(trainer) is None
+                    and any(key in trainer for key in EARLIER_TRAINER_FIELDS))
+    if not (exported or flat or unset or spec is not None or batched or flat_batched or pinned or validated):
         return None
     migrated = {key: value for key, value in fields.items() if not (exported and key == "export_model")}
+    if batched:
+        migrated = _update_and_fit(migrated)
+    if spec is not None:
+        migrated["optim"] = spec
     if flat:
         # A trainer recorded flat, by its run's class, is read here; one by its own class as a record.
         assert isinstance(trainer, Mapping)
         migrated["trainer"] = {key: entry for key, entry in trainer.items() if key != "export_model"}
+    if flat_batched:
+        held = migrated["trainer"]
+        assert isinstance(held, Mapping)
+        migrated["trainer"] = _update_and_fit(held)
+    if pinned:
+        held = migrated.get("trainer")
+        held = held if isinstance(held, Mapping) else {}
+        named = _records.class_record(held)
+        read = _records.json_value(named[1] if named is not None else held, "trainer")
+        inner: Mapping[str, _records.JSON] = read if isinstance(read, Mapping) else {}
+        diagnostics: dict[str, _records.JSON] = {
+            **({"kernels": migrated.pop("kernels")} if "kernels" in migrated else {}),
+            **{key: inner[key] for key in EARLIER_DIAGNOSTICS if key in inner}}
+        if "trainer" in migrated:
+            kept = {key: value for key, value in inner.items() if key not in EARLIER_DIAGNOSTICS}
+            # A trainer recorded by its class keeps its class, its fields less the pins.
+            migrated["trainer"] = {"class": named[0], "fields": kept} if named is not None else kept
+        migrated["diagnostics"] = diagnostics
+    if validated:
+        migrated = _suites(migrated)
     if unset:
         migrated["loop_message_additive"] = None
     return {"class": name, "fields": migrated}
+
+
+def _suites(fields: Mapping[str, _records.JSON]) -> dict[str, _records.JSON]:
+    """A run record's fields with its split's metrics and cadences, each earlier stated beside the others'
+    (a metric's `split`, `val_every`), as the split's suite (`dew.config.Suite`, `RunConfig.suites`, row
+    11935): a metric of no split stays the run's (`val_metrics`), and every split some metric names scores
+    those beside its own. Carried to 1.0 (ledger 1552)."""
+    kept = dict(fields)
+    metrics, every = kept.pop("val_metrics", None), kept.pop("val_every", None) or {}
+    assert isinstance(every, Mapping), every
+    suites: dict[str, _records.JSON] = {split: {"every": value} for split, value in every.items()}
+    if isinstance(metrics, list):
+        # Each metric as its config is now, the split it named or a null one (an earlier serializer's)
+        # its suite's alone.
+        shared: list[_records.JSON] = [
+            {key: value for key, value in metric.items() if key != "split"} if isinstance(metric, Mapping)
+            else metric for metric in metrics if not (isinstance(metric, Mapping) and metric.get("split"))]
+        kept["val_metrics"] = shared
+        for metric in metrics:
+            if isinstance(metric, Mapping) and isinstance(split := metric.get("split"), str):
+                suite = suites.setdefault(split, {})
+                assert isinstance(suite, dict)
+                own = suite.setdefault("metrics", list(shared))
+                assert isinstance(own, list)
+                own.append({key: value for key, value in metric.items() if key != "split"})
+    elif metrics is not None:
+        kept["val_metrics"] = metrics
+    if suites:
+        kept["suites"] = suites
+    return kept
+
+
+EARLIER_DIAGNOSTICS = ("links", "tune_kernels", "xla_flags")
+"""The fields a trainer's config held its run's pins in before the run held them apart
+(`dew.config.Diagnostics`, row 11933), beside the run's own `kernels`."""
+
+
+EARLIER_LENGTHS = ("steps", "epochs", "tokens", "examples")
+"""The fields a trainer's config held its run's length in before its horizon held it (`Horizon`, row
+11935)."""
+
+EARLIER_TRAINER_FIELDS = ("update_tokens", "accumulation", "split", "microbatches", "dynamic_scale",
+                          "lower_for", "compile_ahead", "publish", *EARLIER_LENGTHS)
+"""The fields a trainer's config held its update's size and its step's split in before it held one update
+(`dew.training.UpdateBatch`) and one fit policy (`dew.training.FitPolicy`, row 11934), its loss scaling
+before its numerics held it (`Numerics.loss_scaling`, row 11935), and a target to lower its step for in
+place of training before a run was lowered by its own call (`RunConfig.lower`, row 11933), which a saved
+record, a run that trained, never acts on."""
+
+
+def _update_and_fit(fields: Mapping[str, _records.JSON]) -> dict[str, _records.JSON]:
+    """A trainer config's fields with its earlier batching fields (`EARLIER_TRAINER_FIELDS`) as its update
+    and its fit policy: its token budget or its accumulation as the update, its split and its pipeline's
+    microbatches as the fit's (`FitPolicy.split`, `FitPolicy.microbatches`); its dynamic scale
+    stated as its numerics' loss scaling, unset as theirs, "auto"; its length as its horizon; its publishing
+    its W&B sink's; and no target to lower for. Carried to 1.0 (ledger 1552)."""
+    from dew.nn.precision import Numerics, numerics_of
+
+    kept: dict[str, _records.JSON] = {key: value for key, value in fields.items()
+                                       if key not in EARLIER_TRAINER_FIELDS}
+    scaled = fields.get("dynamic_scale")
+    if scaled is not None:
+        given = kept.get("precision", "default")
+        recorded = registry.to_record(numerics_of(given), Numerics) if isinstance(given, str) else given
+        precision = dict(recorded) if isinstance(recorded, Mapping) else {}
+        kept["precision"] = {**precision, "loss_scaling": "dynamic" if scaled else "none"}
+    tokens, batches = fields.get("update_tokens"), fields.get("accumulation", 1)
+    if tokens is not None:
+        kept["update"] = {"tokens": tokens}
+    elif batches != 1:
+        kept["update"] = {"batches": batches}
+    if fit := {key: fields[key] for key in ("split", "microbatches") if fields.get(key) is not None}:
+        kept["fit"] = fit
+    if lengths := {key: fields[key] for key in EARLIER_LENGTHS if fields.get(key) is not None}:
+        kept["horizon"] = lengths
+    wandb = kept.get("wandb")
+    if fields.get("publish") and isinstance(wandb, Mapping):
+        # Publishing is the W&B sink's (`Wandb.publish`), the final checkpoint the run's save policy keeps.
+        record, tagged = _records.json_value(wandb, "wandb"), _records.class_record(wandb)
+        held = _records.json_value(tagged[1] if tagged is not None else wandb, "wandb")
+        assert isinstance(record, dict) and isinstance(held, dict)
+        published: dict[str, _records.JSON] = {**held, "publish": True}
+        kept["wandb"] = {**record, "fields": published} if tagged is not None else published
+    return kept
+
+
+EARLIER_OPTIMIZER_FIELDS = ("optimizer_opts", "b1", "b2", "weight_decay", "state_dtype")
+"""The fields an optimizer's config held its optimizer's settings in before each optimizer held its own
+(`dew.optim.OptimizerSpec`, row 11933)."""
+
+
+MOMENTS_HELD = ("adam", "adamw", "muon", "muonclip")
+"""The optimizers whose moments a float32 `state_dtype` held in float32 before their own `state_dtype`, a
+`mu_dtype` or `nu_dtype` among their options holding a moment otherwise."""
+
+
+def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.JSON] | None:
+    """An optimizer config's fields with its optimizer named by a string and its settings in its earlier
+    fields (`EARLIER_OPTIMIZER_FIELDS`) as its optimizer's record holding them (`registry.optimizers`): one of
+    Dew's by its alias or its factory's import path (`EARLIER_OPTIMIZER_PATHS`), any other by its import
+    path as an `Optax` spec; None where it holds them so already. Its moments' dtypes, a float32
+    `state_dtype` with `mu_dtype` and `nu_dtype` among its options, are its spec's `state_dtype`: float32
+    both, the default; the parameters' own both ("params"); else the two as they were. Carried to 1.0
+    (ledger 1552)."""
+    named = fields.get("optimizer", "adamw")
+    if not isinstance(named, str) and not any(key in fields for key in EARLIER_OPTIMIZER_FIELDS):
+        return None
+    given = fields.get("optimizer_opts") or {}
+    assert isinstance(given, Mapping), given
+    opts: dict[str, _records.JSON] = dict(given)
+    assert isinstance(named, str), named
+    typed = earlier_typed(named) is not None
+    named = EARLIER_OPTIMIZER_PATHS.get(named, named)
+    # Dew's own optimizers take no mask; an Optax factory takes its options as they were given. Muon's took
+    # its matrices' decay mask by its own keyword, which is the decay's own mask now (`decay_mask`).
+    mask = opts.pop("mask", None) if typed else None
+    muon_mask = opts.pop("weight_decay_mask", None) if named in MUON_GROUPS else None
+    clipped = fields.get("clip_grads")
+    if named == "gauss_newton" and isinstance(clipped, (int, float)) and clipped > 0:
+        # Its own cap the config's clip wrote over (`OptimConfig.build`), which caps it once now.
+        opts.pop("clip", None)
+    stated = {key: fields[key] for key in ("b1", "b2", "weight_decay") if fields.get(key) is not None}
+    if fields.get("state_dtype", "float32") != "float32":
+        stated["state_dtype"] = fields["state_dtype"]
+    elif named in MOMENTS_HELD and ({"mu_dtype", "nu_dtype"} & opts.keys()):
+        moments = (opts.pop("mu_dtype", "float32"), opts.pop("nu_dtype", "float32"))
+        if moments == (None, None):
+            stated["state_dtype"] = "params"
+        elif moments != ("float32", "float32"):
+            stated["state_dtype"] = list(moments)
+    settings = {**opts, **stated}
+    kept = {key: value for key, value in fields.items() if key not in EARLIER_OPTIMIZER_FIELDS}
+    if typed:
+        settings, kept = _unmasked(mask, settings, kept)
+        kept = _muon_masked(muon_mask, kept)
+        optimizer = {"class": named, "fields": settings}
+    else:
+        optimizer = {"class": "optax", "fields": {"path": named, "settings": settings}}
+    return {**kept, "optimizer": optimizer}
+
+
+type _Fields = dict[str, _records.JSON]
+
+MUON_GROUPS = ("muon", "muonclip")
+"""The optimizers an earlier run named whose matrices' decay took its mask by `weight_decay_mask`
+(`dew.optim.Muon.masked_by`)."""
+
+
+def _muon_masked(mask: _records.JSON, config: _Fields) -> _Fields:
+    """An earlier Muon's matrices' decay `mask` (its options' `weight_decay_mask`: a boolean or a tree of
+    them) as its config's decay mask (`OptimConfig.decay_mask`), or each of its param groups' where it
+    groups (`ParamGroup.decay_mask`), each unspared, as Muon spared none of them; none where it masked by
+    none. The mask's own checks refuse any other."""
+    if mask is None:
+        return config
+    groups = config.get("param_groups") or []
+    assert isinstance(groups, list), groups
+    if not groups:
+        return {**config, "decay_mask": mask}
+    return {**config, "param_groups": [{**group, "decay_mask": mask, "spared": False}
+                                       if isinstance(group, Mapping) else group for group in groups]}
+
+
+def _unmasked(mask: _records.JSON, settings: _Fields, config: _Fields) -> tuple[_Fields, _Fields]:
+    """An earlier optimizer's `mask` among its options (`optimizer_opts`), which Dew's own optimizers take no
+    longer, as its spec's `settings` and its config's param groups (`config`'s `param_groups`), each
+    returned. Where the config spared its decay (`OptimConfig.spared`, on by default) its own mask was
+    written over it, as a group's that spared (`ParamGroup.spared`, off by default) was, every group reading
+    it alike: it changed nothing, as a mask of True or None did not. A mask of False read decayed nothing
+    there (`mask_readers`): its decay 0, the config's ungrouped, each unspared group's grouped, as it
+    trained. The empty state its masked decay step held, which a decay of 0 holds bare, and Adam's coupled
+    decay step ahead of its moments, which a decay of 0 holds none of (`Adam.COUPLED`), a restore of a run
+    whose record was this one (`unmasked_decay`) takes as they are
+    (`dew.checkpoints._state_trees.masked_decay_unsaved`). A tree of booleans is that decay's own mask where
+    it was read (`OptimConfig.decay_mask`, `ParamGroup.decay_mask`), its state as it was; any other mask is
+    refused."""
+    if mask is None or mask is True:
+        return settings, config
+    groups, read = mask_readers(config)
+    if not read:
+        return settings, config
+    if isinstance(mask, Mapping):
+        # A tree of booleans, the decay's own mask where it was read (`decay_mask`): its state the masked
+        # decay step a spared decay's is, so its checkpoints restore as they were written.
+        if not groups:
+            return settings, {**config, "decay_mask": mask}
+        masked: list[_records.JSON] = [
+            {**group, "decay_mask": mask} if isinstance(group, Mapping) and group in read else group
+            for group in groups]
+        return settings, {**config, "param_groups": masked}
+    if mask is not False:
+        raise ValueError(f"an earlier run masked its decay by {mask!r}, which no record of this Dew states: "
+                         "set OptimConfig.decay_mask or its param groups' in its place")
+    if not groups:
+        return {**settings, "weight_decay": 0.0}, config
+    unmasked: list[_records.JSON] = [
+        {**group, "weight_decay": 0.0} if isinstance(group, Mapping) and group in read else group
+        for group in groups]
+    return settings, {**config, "param_groups": unmasked}
 
 
 def _recorded_class(name: str) -> type | None:
@@ -324,24 +570,27 @@ algorithms."""
 
 
 def earlier_newton_schulz(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record whose optimizer's options name Muon's Newton-Schulz precision by an earlier
-    level's name (`EARLIER_NS_PRECISIONS`), with it named as a dot algorithm, or dropped where it was the
-    numerics' own: bfloat16 is the fast forms' own, and stated as `BF16_BF16_F32` where the run's forms
-    are accurate (`saved_forms`), whose own is float32 (row 2753). Carried to 1.0 (ledger 1552)."""
+    """A saved run's record whose optimizer (its record, `_optimizer_spec`) names Muon's Newton-Schulz
+    precision by an earlier level's name (`EARLIER_NS_PRECISIONS`), with it named as a dot algorithm, or
+    dropped where it was the numerics' own: bfloat16 is the fast forms' own, and stated as `BF16_BF16_F32`
+    where the run's forms are accurate (`saved_forms`), whose own is float32 (row 2753). Carried to 1.0
+    (ledger 1552)."""
     fields = record.get("fields")
     optim = fields.get("optim") if isinstance(fields, Mapping) else None
     inner = optim.get("fields", optim) if isinstance(optim, Mapping) else None
-    opts = inner.get("optimizer_opts") if isinstance(inner, Mapping) else None
+    spec = inner.get("optimizer") if isinstance(inner, Mapping) else None
+    opts = spec.get("fields") if isinstance(spec, Mapping) else None
     named = opts.get("ns_precision") if isinstance(opts, Mapping) else None
     if not isinstance(fields, Mapping) or not isinstance(optim, Mapping) or not isinstance(inner, Mapping) \
-            or not isinstance(opts, Mapping) or named not in EARLIER_NS_PRECISIONS:
+            or not isinstance(spec, Mapping) or not isinstance(opts, Mapping) \
+            or named not in EARLIER_NS_PRECISIONS:
         return record
     trainer = fields.get("trainer")
     accurate = isinstance(trainer, Mapping) and saved_forms(trainer) == "accurate"
     algorithm = "BF16_BF16_F32" if named == "bfloat16" and accurate else EARLIER_NS_PRECISIONS[named]
     opts = {name: value for name, value in opts.items() if name != "ns_precision"}
     opts = opts if algorithm is None else {**opts, "ns_precision": algorithm}
-    inner = {**inner, "optimizer_opts": opts}
+    inner = {**inner, "optimizer": {**spec, "fields": opts}}
     optim = {**optim, "fields": inner} if "fields" in optim else inner
     return {**record, "fields": {**fields, "optim": optim}}
 

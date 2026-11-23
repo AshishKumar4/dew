@@ -183,7 +183,7 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     config, op, ba = found
 
     def planned(config, op, ba, slices: int) -> Plan:
-        return Plan(config, slices, op.deciding(ba, config))
+        return Plan(config, slices, op.deciding(ba, config, target=target))
 
     processors = target.multiprocessors or 1
     tiles = math.ceil(query.shape[1] / (config.consumers * config.block_q))
@@ -363,8 +363,13 @@ def _planned_step(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
     def run() -> jax.Array | Initial:
         if "plain" in work:
             return walked("plain")
-        largest = _largest(value, table, sources, scales) if bounds is None else _held(bounds, table, sources)
-        may = algebra.bounded_past(largest, keys_axis=-1, initial=None if initial is None else initial.acc)
+        init_acc = None if initial is None else initial.acc
+        if bounds is None and table is None and scales is None and sources is None:
+            may = algebra.may_scale(value, keys_axis=1, initial=init_acc)
+        else:
+            largest = _largest(value, table, sources, scales) if bounds is None else _held(
+                bounds, table, sources)
+            may = algebra.bounded_past(largest, keys_axis=-1, initial=init_acc)
         return jax.lax.cond(may, lambda: walked("scaled"), lambda: walked("bounded"))
 
     return run, common

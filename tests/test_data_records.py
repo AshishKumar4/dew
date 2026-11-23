@@ -11,7 +11,7 @@ import grain.python as grain
 import numpy as np
 import pytest
 
-from dew.data import Loading, Memory, from_iter, mix, phases, presets, text
+from dew.data import Loading, Memory, Phase, Steps, from_iter, mix, phases, presets, text
 from dew.data.compile import compile, held
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Dataset
@@ -126,7 +126,7 @@ def test_a_run_recorded_while_its_iterators_identities_were_their_names_reads_it
     its `identity` (`dew.data.records.earlier_chains`, row 3031), wherever a chain holds the iterator: a mix's
     member, a concatenation's part, in its data and its validation."""
     from dew.config import RunConfig
-    from dew.data.sources import Concatenate
+    from dew.data.sources.concatenate import Concatenate
 
     mixed = mix([from_iter(_rows, identity="rows@1"), from_iter(_rows, identity="rows@2")]).batch(1)
     joined = Concatenate((from_iter(_rows, identity="rows@3"), from_iter(_rows, identity="rows@4"))).batch(1)
@@ -331,7 +331,7 @@ def _cached(tmp_path):
 
 
 def _phased():
-    phased = phases((_documents(0).map(Tagged(1)), 2), (_documents(8).map(Tagged(2)), None))
+    phased = phases(Phase(_documents(0).map(Tagged(1)), Steps(2)), Phase(_documents(8).map(Tagged(2))))
     return phased.shuffle(0).repeat().batch(2)
 
 

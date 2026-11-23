@@ -39,6 +39,7 @@ from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
     attention_mosaic_program,
+    attention_mosaic_registers,
     attention_route,
     bundles,
     report,
@@ -707,9 +708,10 @@ def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("split_cols", [False, True], ids=["whole", "split"])
 @pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
 @pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
-def test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200(rows, kept):
+def test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200(rows, kept, split_cols):
     """Qwen3.5-4B's attention (16 query heads over 4, 256 wide, 12,288 causal tokens: its step's two rows and
     the planner's one-row decision) on a compile-only B200: every config of each tcgen05 family legal for the
     call (`MosaicForward.offered`: the family's configs its derivation searches, each as it launches), pinned,
@@ -730,13 +732,12 @@ def test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200(rows, kept
                                                   natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, residuals=kept, interpret=False)
         legal = [config for family in attention_mosaic_program.layouts("sm100", jnp.bfloat16, tokens)
-                 if family.name.startswith("tcgen05") for config in op.offered(ba, family, target)]
+                 if family.name.startswith("tcgen05") for config in op.offered(ba, family, target)
+                 if (config.columns is not None) == split_cols]
         assert legal
         for config in legal:
             with tuning.pinned({attention_mosaic.MosaicForward: config}):
                 jax.jit(forward).trace(query, key, key).lower(lowering_platforms=("cuda",))
-
-
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
 @pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])
@@ -1405,14 +1406,24 @@ def test_the_launches_lower_for_a_v5e(call):
 
 @COMPILES_FOR_TPU
 @pytest.mark.usefixtures("libtpu_shared")
-def test_bf16_template_compiles_for_a_v5e():
-    """Head-first `[B, H, S, D]` TPU layout lets the template's bf16 forward and training step compile on
-    v5e through `libtpu` without Mosaic's packed-sublane head-slice error (rows 6993, 10152)."""
+@pytest.mark.parametrize("case_name", ["v5e-fwd", "v5e-step", "v5e-fwd-d64", "v5e-fwd-8192", "v5e-step-8192",
+                                       "v6e-fwd-512", "v6e-step"])
+def test_bf16_template_compiles_for_a_v5e(case_name):
+    """Sub-32-bit TPU arrays whose head width divides the TPU lane unit (`column_unit`, 128 lanes) bitcast
+    `[B, S, H, D]` to `[B, S, H * D]` (`head_flat`) with zero XLA transposes on both v5e and v6e; narrower
+    widths fall back to `head_first`, fp32 lowers in place, and every case compiles cleanly through `libtpu`
+    (rows 6993, 10152, 10683)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_tpu_kernels, failures
 
+    from dew.nn import programs
+
     query = jax.ShapeDtypeStruct((1, 256, 4, 128), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, 256, 2, 128), jnp.bfloat16)
+    query_512 = jax.ShapeDtypeStruct((1, 512, 4, 128), jnp.bfloat16)
+    key_512 = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16)
+    query_d64 = jax.ShapeDtypeStruct((1, 256, 4, 64), jnp.bfloat16)
+    key_d64 = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
     long_q = jax.ShapeDtypeStruct((1, 8192, 32, 128), jnp.bfloat16)
     long_k = jax.ShapeDtypeStruct((1, 8192, 8, 128), jnp.bfloat16)
 
@@ -1425,11 +1436,44 @@ def test_bf16_template_compiles_for_a_v5e():
             out, pull = jax.vjp(fwd, q, k, v)
             return out, *pull(dout)
 
-    cases = [KernelCase("v5e-bf16-fwd", lambda: (fwd, (query, key, key))),
-             KernelCase("v5e-bf16-step", lambda: (step, (query, key, key, query))),
-             KernelCase("v5e-bf16-fwd-8192", lambda: (fwd, (long_q, long_k, long_k))),
-             KernelCase("v5e-bf16-step-8192", lambda: (step, (long_q, long_k, long_k, long_q)))]
-    found = compile_tpu_kernels(cases, "v5e")
+    if case_name == "v5e-fwd":
+        tpu_family = attention_mosaic_program.bundle("v5e", jnp.bfloat16)
+        assert tpu_family is not None
+        assert attention_mosaic_program.head_flat(tpu_family, jnp.bfloat16, 128)
+        assert attention_mosaic_program.head_flat(tpu_family, jnp.bfloat16, 256)
+        assert not attention_mosaic_program.head_flat(tpu_family, jnp.bfloat16, 64)
+        assert not attention_mosaic_program.head_flat(tpu_family, jnp.float32, 128)
+        assert not attention_mosaic_program.head_first(tpu_family, jnp.bfloat16, 128)
+        assert attention_mosaic_program.head_first(tpu_family, jnp.bfloat16, 64)
+        assert not attention_mosaic_program.head_first(tpu_family, jnp.float32, 64)
+
+        def bf16_swaps(fn, args, gen: str) -> int:
+            with generation.assumed(gen):
+                jaxpr = jax.make_jaxpr(fn)(*args).jaxpr
+                return sum(1 for eq in programs.equations(jaxpr)
+                           if eq.primitive.name == "transpose"
+                           and eq.params.get("permutation") == (0, 2, 1, 3)
+                           and getattr(eq.invars[0].aval, "dtype", None) == jnp.bfloat16)
+
+        gpu_step_swaps = bf16_swaps(step, (query, key, key, query), "sm90")
+        assert bf16_swaps(fwd, (query, key, key), "v5e") == 0
+        assert bf16_swaps(fwd, (query_d64, key_d64, key_d64), "v5e") == 0
+        assert bf16_swaps(step, (query, key, key, query), "v5e") == gpu_step_swaps
+        assert bf16_swaps(fwd, (query_512, key_512, key_512), "v6e") == 0
+        assert bf16_swaps(step, (query, key, key, query), "v6e") == gpu_step_swaps
+
+    cases = {
+        "v5e-fwd": ("v5e", KernelCase("v5e-bf16-fwd", lambda: (fwd, (query, key, key)))),
+        "v5e-step": ("v5e", KernelCase("v5e-bf16-step", lambda: (step, (query, key, key, query)))),
+        "v5e-fwd-d64": ("v5e", KernelCase("v5e-bf16-fwd-d64", lambda: (fwd, (query_d64, key_d64, key_d64)))),
+        "v5e-fwd-8192": ("v5e", KernelCase("v5e-bf16-fwd-8192", lambda: (fwd, (long_q, long_k, long_k)))),
+        "v5e-step-8192": ("v5e", KernelCase("v5e-bf16-step-8192",
+                                            lambda: (step, (long_q, long_k, long_k, long_q)))),
+        "v6e-fwd-512": ("v6e", KernelCase("v6e-bf16-fwd-512", lambda: (fwd, (query_512, key_512, key_512)))),
+        "v6e-step": ("v6e", KernelCase("v6e-bf16-step", lambda: (step, (query, key, key, query)))),
+    }
+    gen, case = cases[case_name]
+    found = compile_tpu_kernels([case], gen)
     assert not failures(found), "\n".join(failures(found))
 
 
@@ -1670,9 +1714,9 @@ def test_fused_keys_first_register_model_counts_dq_product():
             narrow=True)
         unfused = dataclasses.replace(fused, fused=False)
         dkv_family = attention_mosaic_program.bundle_of(fused.dkv, jnp.bfloat16)
-        reg_fused = attention_mosaic_program.backward_registers(
+        reg_fused = attention_mosaic_registers.backward_registers(
             dkv_family, fused.dkv, 128, 128, jnp.bfloat16, accurate=False, dq=False, split=True)
-        reg_unfused = attention_mosaic_program.backward_registers(
+        reg_unfused = attention_mosaic_registers.backward_registers(
             dkv_family, unfused.dkv, 128, 128, jnp.bfloat16, accurate=False, dq=False, split=True)
         assert reg_fused > reg_unfused, (reg_fused, reg_unfused)
 
@@ -1741,7 +1785,19 @@ def test_fp32_forward_derives_parted_wgmma_and_consumer_choice_uses_launch_secon
         ba16 = op16.bind(*args16, residuals=template.Kept.SPLIT, interpret=False)
         cfg16 = op16.derived(ba16, target)
         assert cfg16 is not None and op16.takes(ba16, cfg16, target), cfg16
-        assert op16.takes(ba16, dataclasses.replace(cfg16, consumers=2), target), cfg16
+        # Row 12074: compare explicit 1- and 2-consumer schedule variants via pricing without prescribing
+        # which consumer count the unpinned planner picks.
+        variants = [v for c in (1, 2) if (v := op16._launchable(
+            ba16, dataclasses.replace(cfg16, consumers=c, relaunch_k=None, relaunch_consumers=None,
+                                      relaunch_columns=None), target)) is not None
+            and op16.takes(ba16, v, target)]
+        assert len(variants) == 2, variants
+        prices = [op16.price_config(ba16, v, target) for v in variants]
+        assert all(p is not None and p > 0 for p in prices), prices
+        chosen16 = op16._choose_consumers(ba16, variants, target=target)
+        assert isinstance(chosen16, attention_mosaic.Tiles) and chosen16 in variants
+        chosen_price = op16.price_config(ba16, chosen16, target)
+        assert chosen_price is not None and chosen_price == min(p for p in prices if p is not None)
         found = compile_mosaic_kernels([
             KernelCase("sm90-fp32-3part", lambda: op32.lowering(ba32, cfg32)),
         ], "sm90")
@@ -1800,36 +1856,63 @@ def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pe
                          [("infer", template.Kept.NONE), ("train", template.Kept.OUTPUT)],
                          ids=["infer", "train"])
 def test_sm90_d256_forward_fits_single_launch_without_spills(gen, label, residuals):
-    """Row 5272: chunking wide (>128) register epilogues lets d256 bf16 causal forward (inference and
-    training) derive and compile at `columns=None` (1 launch, 0 spills) on sm90 instead of spilling
-    96-112 bytes in `algebra.finish` and falling back to 2-launch `columns=128`."""
+    """Rows 5272, 11965, 11990: narrow 32-col TMA epilogue staging lets d256 bf16 causal forward
+    (inference and training) compile at whole-width `columns=None` (including 2-consumer FA3 ping-pong
+    on sm90) with 1 primary launch, 0 spills, and physical scope verified from typed emitted/certification
+    records."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    from kernel_compile import Report, compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.lowered import kernel_calls
 
     spans = template.spans(4096, 4096, 1, causal=True)
     q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
     k = jax.ShapeDtypeStruct((4, 4096, 2, 256), jnp.bfloat16)
     with generation.assumed(gen):
-        def forward(query, key, value):
-            return attention_mosaic.forward(query, key, value, spans, None, residuals=residuals)
-
+        target = generation.gpu_target()
         op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
                                                   natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, residuals=residuals, interpret=False)
-        cfg = op.derived(ba, generation.gpu_target())
-        assert cfg is not None and op.takes(ba, cfg, generation.gpu_target()), (gen, cfg)
-        if gen == "sm90":
-            assert cfg.columns is None, (gen, cfg)
+        cfg = op.derived(ba, target)
+        assert cfg is not None and op.takes(ba, cfg, target), (gen, cfg)
+        whole_cfg = (op.completed(ba, dataclasses.replace(
+            cfg, consumers=2, columns=None, relaunch_k=None, relaunch_consumers=None,
+            relaunch_columns=None, relaunch_family=None, relaunch_q=None))
+            if gen == "sm90" else None)
+        if whole_cfg is not None:
+            assert op.takes(ba, whole_cfg, target), (gen, whole_cfg)
+
+        def forward(query, key, value):
+            if whole_cfg is not None:
+                with tuning.pinned({attention_mosaic.MosaicForward: whole_cfg}):
+                    return attention_mosaic.forward(query, key, value, spans, None, residuals=residuals)
+            return attention_mosaic.forward(query, key, value, spans, None, residuals=residuals)
+
         found = compile_mosaic_kernels([KernelCase(f"{gen}-d256-{label}", lambda: (forward, (q, k, k)))],
                                        gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+        if whole_cfg is not None:
+            lowered = lowered_for(forward, (q, k, k), gen)
+            primary_calls = [call for call in kernel_calls(lowered, unrun=True)
+                             if call.kind == "mosaic_gpu" and call.name == "attention_forward"]
+            assert len(primary_calls) == 1, primary_calls
+            assert q.shape in primary_calls[0].operands and k.shape in primary_calls[0].operands, (
+                primary_calls[0].operands)
+        primary_name = ("attention_forward" if whole_cfg is not None or cfg.columns is None
+                        else f"attention_forward_columns{cfg.columns}")
         for record in found:
-            kernels = record.get("kernels", ())
-            assert kernels and all(k.get("spilled", 0) == 0 for k in kernels), record
-            if gen == "sm90":
-                assert any(k["kernel"] == "attention_forward" and k["registers"] <= 255
-                           for k in kernels), record
-
+            reports = [Report(**{k_name: v for k_name, v in item.items()
+                                 if k_name in {f.name for f in dataclasses.fields(Report)}})
+                       for item in record.get("kernels", ())]
+            assert reports and all(r.spilled == 0 and r.registers is not None and r.registers <= 255
+                                   for r in reports), record
+            primary = [r for r in reports if r.kernel == primary_name]
+            assert len(primary) == 1, (primary_name, reports)
+            main = primary[0]
+            assert main.failure(record["limit"], record["tmem_limit"]) is None, main
+            assert main.shared is not None and 0 < main.shared <= record["limit"], main
+            if isinstance(whole_cfg, attention_mosaic.Tiles):
+                assert main.threads == (whole_cfg.consumers + 1) * 128, main
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("gen", ["sm80", "sm100"])
@@ -1847,7 +1930,11 @@ def test_fused_dkv_width64_derives_and_compiles_spill_free_on_sm80_and_sm100(gen
     assert cfg is not None and cfg.fused, (gen, cfg)
     with generation.assumed(gen):
         if gen == "sm100":
-            assert op_b.takes(ba_b, dataclasses.replace(cfg, stages=3), generation.gpu_target(gen)), cfg
+            t_sm100 = generation.gpu_target(gen)
+            shallow = dataclasses.replace(cfg, stages=2)
+            deep = op_b._deepened(ba_b, shallow, t_sm100)
+            assert deep.stages > shallow.stages and cfg.stages == deep.stages, (shallow, deep, cfg)
+            assert op_b.resident(ba_b, deep, t_sm100) == op_b.resident(ba_b, shallow, t_sm100)
         case = _fast_backward_compile_case(f"{gen}-fused-d64", query, key, spans, shapes)
         found = compile_mosaic_kernels([case], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
@@ -1875,9 +1962,18 @@ def test_sm90_forward_deepens_pipeline_stages_without_losing_residency_and_compi
         ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
         cfg = op.derived(ba, target)
         assert cfg is not None and op.takes(ba, cfg, target), (label, cfg)
-        deepened = dataclasses.replace(cfg, stages=cfg.consumers + 1)
-        assert op.takes(ba, deepened, target) or op.resident(ba, deepened, target) < op.resident(
-            ba, cfg, target), (label, cfg)
+        # Row 12074: check explicit shallow/deepened schedule legality and residency without pinning
+        # the unpinned planner's stage count.
+        shallow = dataclasses.replace(cfg, stages=2)
+        assert op.takes(ba, shallow, target), (label, shallow)
+        deep = op._deepened(ba, shallow, target)
+        assert op.takes(ba, deep, target), (label, deep)
+        assert op.resident(ba, deep, target) == op.resident(ba, shallow, target), (label, shallow, deep)
+        next_stage = dataclasses.replace(shallow, stages=3)
+        if op.takes(ba, next_stage, target) and (
+                op.resident(ba, next_stage, target) == op.resident(ba, shallow, target)):
+            assert deep.stages >= next_stage.stages, (label, shallow, deep)
+
         def forward(query, key, value):
             return attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.NONE)
 
@@ -1903,6 +1999,12 @@ def test_attention_derives_product_precision_and_bf16_parts_from_algebra():
     with generation.assumed("v5e"):
         assert product.bf16_part_count(jnp.float32, accurate=True) == 3
         assert product.bf16_part_count(jnp.float32, accurate=False) == 1
+        assert (programs.mosaic_tpu_dot_precision(jnp.float32, jnp.float32, 64, 64, 64)
+                == jax.lax.Precision.HIGHEST)
+        assert (programs.mosaic_tpu_dot_precision(jnp.bfloat16, jnp.bfloat16, 64, 64, 64)
+                == jax.lax.Precision.DEFAULT)
+        assert (programs.mosaic_tpu_dot_precision(jnp.float32, jnp.bfloat16, 64, 64, 64)
+                == jax.lax.Precision.DEFAULT)
 
 
 def test_derived_one_consumer_heights_are_compared_by_choose():
@@ -1962,9 +2064,10 @@ def test_d128_fused_backward_deepens_to_3_stages_without_losing_residency(gen):
         ba = op.bind(*args, interpret=False)
         cfg = op.derived(ba, target)
         assert cfg is not None and cfg.fused and op.takes(ba, cfg, target), (gen, cfg)
-        pin3 = dataclasses.replace(cfg, stages=3)
-        assert op.takes(ba, pin3, target), (gen, pin3)
-        assert op.resident(ba, pin3, target) == op.resident(ba, dataclasses.replace(cfg, stages=2), target)
+        shallow = dataclasses.replace(cfg, stages=2)
+        deep = op._deepened(ba, shallow, target)
+        assert deep.stages > shallow.stages and cfg.stages == deep.stages, (gen, shallow, deep, cfg)
+        assert op.resident(ba, deep, target) == op.resident(ba, shallow, target)
         case = _fast_backward_compile_case(f"{gen}-fused-d128-3stage", q, k, spans, shapes)
         found = compile_mosaic_kernels([case], gen)
         assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
@@ -2196,9 +2299,12 @@ def test_paged_forward_emitted_work_counts_table_bytes():
 
 
 def test_step_live_tiles_tracks_hooks_dropout_accuracy_and_nested_subjaxprs():
-    """`step_live_tiles` traces the call's own step spec (score hook, dropout, accurate form, dtype,
-    masking) and recursively counts nested sub-jaxpr transients (row 11652)."""
+    """`step_live_tiles` traces the emitted step at its spec (score hook, dropout, accurate form, dtype)
+    and counts nested sub-jaxpr transients via `programs.live` (rows 11652, 11993, 11999)."""
+    from dew.nn.kernels.templates import attention_algebra as algebra
     from dew.nn.kernels.templates.attention_mosaic_scores import step_live_tiles
+
+    causal_spec = algebra.Forward("causal", 128, ids=False, scale=1.0 / 8.0)
 
     def nested_hook(logits, _q, _k, bias):
         def branch(x):
@@ -2208,20 +2314,19 @@ def test_step_live_tiles_tracks_hooks_dropout_accuracy_and_nested_subjaxprs():
             return (a + b) * c + bias
         return jax.lax.cond(jnp.any(logits > 0), branch, lambda x: x + bias, logits)
 
-    plain_fwd = len(step_live_tiles(64, 64))
-    hooked_fwd = len(step_live_tiles(64, 64, score_mod=nested_hook,
+    plain_fwd = len(step_live_tiles(64, 64, spec=causal_spec))
+    hooked_fwd = len(step_live_tiles(64, 64, spec=causal_spec, score_mod=nested_hook,
                                      score_types=((template.Kind.TILE, "float32"),)))
-    dropped_fwd = len(step_live_tiles(64, 64, dropped=True))
+    dropped_fwd = len(step_live_tiles(64, 64, spec=causal_spec, dropped=True))
     assert hooked_fwd > plain_fwd, (hooked_fwd, plain_fwd)
     assert dropped_fwd >= plain_fwd, (dropped_fwd, plain_fwd)
 
-    plain_bwd = len(step_live_tiles(64, 64, backward=True))
-    acc_bwd = len(step_live_tiles(64, 64, backward=True, accurate=True))
-    hooked_bwd = len(step_live_tiles(64, 64, backward=True, score_mod=nested_hook,
+    plain_bwd = len(step_live_tiles(64, 64, spec=causal_spec, backward=True))
+    acc_bwd = len(step_live_tiles(64, 64, spec=causal_spec, backward=True, accurate=True))
+    hooked_bwd = len(step_live_tiles(64, 64, spec=causal_spec, backward=True, score_mod=nested_hook,
                                      score_types=((template.Kind.TILE, "float32"),)))
     assert acc_bwd >= plain_bwd, (acc_bwd, plain_bwd)
     assert hooked_bwd > plain_bwd, (hooked_bwd, plain_bwd)
-
 
 def test_wide_epilogue_chunks_tcgen05_chunks_and_prices_masked_rewalks():
     """Rows 11852, 11853: `BlockPlan.epilogue_chunk` chunks wide (>128) unmasked hookless `tcgen05.chunks`
@@ -2240,10 +2345,10 @@ def test_wide_epilogue_chunks_tcgen05_chunks_and_prices_masked_rewalks():
 
     with generation.assumed("sm90"):
         wgmma = program.bundle_of(attention_mosaic.Tiles(64, 64, 2, 1, family="wgmma"), jnp.bfloat16)
-        unmasked = program._epilogue_registers(wgmma, [(64, 256, jnp.float32)], 64, 256, jnp.bfloat16,
-                                               residuals=False, plan=plan, masked=False)
-        masked = program._epilogue_registers(wgmma, [(64, 256, jnp.float32)], 64, 256, jnp.bfloat16,
-                                             residuals=False, plan=plan, masked=True)
+        unmasked = attention_mosaic_registers._epilogue_registers(
+            wgmma, [(64, 256, jnp.float32)], 64, 256, jnp.bfloat16, residuals=False, plan=plan, masked=False)
+        masked = attention_mosaic_registers._epilogue_registers(
+            wgmma, [(64, 256, jnp.float32)], 64, 256, jnp.bfloat16, residuals=False, plan=plan, masked=True)
         assert masked > unmasked > 0, (masked, unmasked)
         from dew.nn.kernels.templates import attention_mosaic_forward
         q = jax.ShapeDtypeStruct((4, 4096, 8, 256), jnp.bfloat16)
@@ -2270,12 +2375,16 @@ def test_wide_epilogue_chunks_tcgen05_chunks_and_prices_masked_rewalks():
         bwd_ba = bwd_op.bind(*bwd_args, interpret=False)
         bwd_cfg = bwd_op.derived(bwd_ba, target)
         assert bwd_cfg is not None and not bwd_cfg.fused and bwd_op.takes(bwd_ba, bwd_cfg, target), bwd_cfg
-        nxt_bwd = dataclasses.replace(bwd_cfg, stages=bwd_cfg.stages + 1)
-        assert (
-            not bwd_op.takes(bwd_ba, nxt_bwd, target)
-            or bwd_op.resident(bwd_ba, nxt_bwd, target) < bwd_op.resident(bwd_ba, bwd_cfg, target)
-            or bwd_cfg.stages >= max(bwd_cfg.consumers, 2) + 1), bwd_cfg
-
+        # Row 11991: pin explicit shallow/deep configs for residency comparison instead of pinning depth rule.
+        shallow_bwd = dataclasses.replace(bwd_cfg, stages=2)
+        deep_bwd = dataclasses.replace(bwd_cfg, stages=3)
+        assert bwd_op.takes(bwd_ba, shallow_bwd, target), shallow_bwd
+        deepened = bwd_op._deepened(bwd_ba, shallow_bwd, target)
+        assert bwd_op.takes(bwd_ba, deepened, target), deepened
+        assert bwd_op.resident(bwd_ba, deepened, target) == bwd_op.resident(bwd_ba, shallow_bwd, target)
+        if bwd_op.takes(bwd_ba, deep_bwd, target) and (
+                bwd_op.resident(bwd_ba, deep_bwd, target) == bwd_op.resident(bwd_ba, shallow_bwd, target)):
+            assert deepened.stages >= deep_bwd.stages, (deepened, deep_bwd)
 
 @COMPILES_ON_CPU
 @pytest.mark.usefixtures("without_deterministic_ops")

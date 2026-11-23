@@ -159,8 +159,7 @@ trainer = Trainer(
     key=jax.random.key(0),
     mesh=MeshSpec(fsdp=4, expert=1),          # data fills the rest, as build_mesh does now
     layout=Layout(rules=DEFAULT_RULES, min_shard=2**16, tolerance=0.02),
-    accumulation=4,                            # the one owner; wraps MultiSteps itself
-    dynamic_scale=False,
+    update=UpdateBatch(batches=4),             # the one owner of an update's size; wraps MultiSteps itself
     checkpoints=Checkpoints("runs/flowers", keep=2),
     tracker=WandbTracker(project="dew", name="flowers"),   # or None
 )

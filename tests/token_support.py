@@ -125,5 +125,5 @@ def export_byte_tokens(root: Path, documents: Iterable[str], *flags: str) -> Pat
     records = root / "documents.jsonl"
     records.write_text("".join(json.dumps({"text": text}) + "\n" for text in documents))
     exported = root / "tokens"
-    assert main(["data", "export", str(records), str(exported), "--tokenizer", "byte", "--eos", *flags]) == 0
+    assert main(["data", "export", str(records), str(exported), "--tokenizer", "byte", *flags]) == 0
     return exported

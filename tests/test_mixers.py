@@ -40,6 +40,7 @@ from dew.nn.mixer_base import MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.residuals import MLP_RESIDUALS
+from dew.optim import Muon
 from dew.registry import mixers, models
 
 VOCAB = 37
@@ -375,7 +376,7 @@ seventeen, the third's one."""
 @pytest.mark.parametrize("compressor", sorted(COMPRESSED))
 def test_deepseek_v4s_projections_are_matrices_muon_steps(compressor):
     """Every DeepSeek V4 projection is a matrix by its declared axes, a contracted side and an output side,
-    which Muon orthogonalizes and steps (`OptimConfig(optimizer="muon")`, its partition by the run's table of
+    which Muon orthogonalizes and steps (`OptimConfig(optimizer=Muon())`, its partition by the run's table of
     the draw's axes): its attention's and its compressor's key/value projection and the compressor's gate
     among them (row 6654), where their output side declared no axis and Muon refused the decoder."""
     from dew.batch import unboxed
@@ -390,7 +391,7 @@ def test_deepseek_v4s_projections_are_matrices_muon_steps(compressor):
     # The run's table of the draw's axes, which a trainer holds while its optimizer steps.
     with boxed(boxed_axes(draw)):
         split = muon_partition(params)
-        solver = OptimConfig(optimizer="muon", learning_rate=1e-3).build(4)
+        solver = OptimConfig(optimizer=Muon(), learning_rate=1e-3).build(4)
         gradients = jax.tree.map(lambda leaf: jnp.ones_like(leaf) / leaf.size, params)
         updates, _ = solver.update(gradients, solver.init(params), params)
     projections = {path: reason for path, reason in split.items()

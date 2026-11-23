@@ -908,6 +908,27 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
 
 
 @pytest.mark.mesh(devices=4)
+def test_the_packed_kernel_refuses_a_pair_an_explicit_axis_splits_on_a_mesh_with_an_automatic_one():
+    """On a mesh of an Explicit axis and an Auto one, a packed `[..., 2, H]` operand whose pair the Explicit
+    axis splits is refused by the packed kernel a direct caller asks for (`packed_swiglu_kernel`), its
+    logical axes naming no split of the pair, as on an all-Explicit mesh: read by its own placement, where the
+    logical axes' placement alone let it into the per-shard map (the head review of row 12224)."""
+    from jax.sharding import AxisType
+
+    from dew.nn.kernels import selection
+    from dew.nn.sharding import MLP_HIDDEN
+
+    mesh = jax.make_mesh((2, 2), ("data", "model"), axis_types=(AxisType.Auto, AxisType.Explicit),
+                         devices=jax.devices()[:4])
+    with jax.set_mesh(mesh):
+        (pair_split,) = placed_on((jax.random.normal(drawn_key(33, 0), (4, 8, 2, 24)),),
+                                  [PartitionSpec(None, None, "model", None)], mesh)
+        with generation.assumed("sm90"):
+            assert norm_swiglu.packed_swiglu_kernel("auto", pair_split, axes=MLP_HIDDEN) == "xla"
+            with generation.chosen(swiglu="pallas"), pytest.raises(selection.KernelRefused):
+                norm_swiglu.packed_swiglu_kernel("auto", pair_split, axes=MLP_HIDDEN)
+
+@pytest.mark.mesh(devices=4)
 def test_packed_gated_product_pair_reshard_preserves_other_explicit_axes():
     """Resharding a pair-sharded `[..., 2, H]` input onto `None` along `-2` preserves other Explicit axes
     splitting rows or features on output and input-gradient shardings alongside bit equality (row 822)."""

@@ -96,7 +96,8 @@ class ScheduleBase:
     def _horizon(self, steps: int | None, field: str) -> int:
         """Resolve a decay's step horizon, which a token budget cannot supply."""
         if steps is None:
-            raise ValueError(f"{type(self).__name__} needs {field} or trainer.steps as its step horizon")
+            raise ValueError(f"{type(self).__name__} needs {field} or trainer.horizon.steps as its step "
+                             "horizon")
         return steps
 
     def warmup(self, steps: int | None) -> int | None:

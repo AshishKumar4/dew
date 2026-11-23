@@ -159,14 +159,28 @@ Trained 1 steps in 0:00:15: first step after 15.06 s
 Optimizer updates: 1
 ```
 
-`recipes/lm/train.py --objective block_diffusion` runs the same objective; there is no separate recipe. It trains on complete token-window rows, and the chain's `seq_len + 1` must equal `--objective.prompt-length` plus a whole number of training canvases. `--objective.canvas-size` defaults to the checkpoint's canvas length. Packed documents are rejected, because their context boundaries differ. Block SFT logs `canvas_ce` and `encoder_ce`. It does not report autoregressive perplexity or use the autoregressive preview settings.
+The LM recipe's run with `ObjectiveConfig("block_diffusion", {"prompt_length": 256})` runs the same objective; there is no separate recipe. It trains on complete token-window rows, and the chain's `seq_len + 1` must equal the objective's `prompt_length` plus a whole number of training canvases. Its `canvas_size` defaults to the checkpoint's canvas length. Packed documents are rejected, because their context boundaries differ. Block SFT logs `canvas_ce` and `encoder_ce`. It does not report autoregressive perplexity or use the autoregressive preview settings.
+
+```python
+# block_sft.py: the recipe's run over the token windows, its objective block diffusion.
+import dataclasses
+
+from dew.config import ObjectiveConfig
+from dew.config.lm import LMRunConfig
+from dew.data import presets
+from dew.data.sources.tokens import TokenFiles
+
+run = LMRunConfig(
+    data=TokenFiles("data/diffusion-token-windows").shuffle(seed=0).repeat().pipe(
+        presets.token_windows, seq_len=511, batch=8),
+    objective=ObjectiveConfig("block_diffusion", {"prompt_length": 256}),
+    pretrained="google/diffusiongemma-26B-A4B-it", tokenizer="google/diffusiongemma-26B-A4B-it",
+    max_new_tokens=0)
+run = dataclasses.replace(run, optim=dataclasses.replace(run.optim, learning_rate=0.00015))
+```
 
 ```bash
-python recipes/lm/train.py --set data.source.url=data/diffusion-token-windows \
-    --set data.token_windows.seq_len=511 --objective block_diffusion --objective.prompt-length 256 \
-    --pretrained google/diffusiongemma-26B-A4B-it \
-    --tokenizer google/diffusiongemma-26B-A4B-it \
-    --max-new-tokens 0 --optim.learning-rate 0.00015
+dew train block_sft.py
 ```
 
 The token files must use the checkpoint's tokenizer and hold the clean prompt prefix followed by the response canvases you intend. Trainer checkpoints keep the optimizer and iterator state, and `Pretrained.save` writes a complete inference checkpoint in the source format.

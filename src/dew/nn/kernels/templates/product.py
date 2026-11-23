@@ -238,9 +238,6 @@ def parts(dtype) -> int:
     return -(-(jnp.finfo(dtype).nmant + 1) // (jnp.finfo(jnp.bfloat16).nmant + 1))
 
 
-EXACT_PARTS = parts(jnp.float32)
-"""The bf16 parts that hold an fp32 value's whole significand (`formed`): three, 8 bits each of its 24."""
-
 _BF16_PARTS: dict[tuple[str, bool], int] = {}
 
 

@@ -473,7 +473,7 @@ def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeyp
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     monkeypatch.setattr(HfApi, "dataset_info", lambda *args, **kwargs: SimpleNamespace(sha="pinned"))
     monkeypatch.setattr(HfApi, "list_repo_files", lambda *args, **kwargs: ["train.tar"])
-    chain = Hub("owner/data", revision="pinned").threads(1)
+    chain = Hub("owner/data", revision="pinned").loading(Loading(workers="auto", threads=1))
     if read is not None:
         chain = chain.read(read)
     destination = tmp_path / "snapshot"
