@@ -154,7 +154,7 @@ def _read(value):
 
 
 def _splits_scores(walk: _Backward) -> bool:
-    """Whether a backward tile's scores split into `_score_weights` (inside `product_pair`'s `between`) and
+    """Whether a backward tile's scores split into `_score_weights` (`summed_together`'s `then` of `S`) and
     `_score_cotangents` (rows 11707, 11715): undropped fast-form walks without score-hook parameters on
     overlapping shared-memory issuers (keeping synchronous issuers on `_scores`)."""
     family = walk.program.family
@@ -168,17 +168,20 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                  on_weights: Callable | None = None, after_weights: Callable | None = None
                  ) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a fast-form call whose score hook, if any, takes no parameters
-    (`_fused_step`'s, `_coop_step`'s): its `S` and `dP` products (issued through `product_pair`, overlapping
-    `_score_weights` with `dP` where `_splits_scores` and `masked is not None`), masked where `masked`, or
-    where it is None chosen at run time, unmasked where every query sees the tile `whole`. When `on_weights`
-    and `after_weights` are supplied on an overlapped step, stages narrowed `P` during `dP` and issues `dV`
-    before computing `dS`. Returns its weights narrowed for dV (`algebra.value_weights`), a dropping call's
-    dropped (`algebra.drawn`), and its score cotangents through the hook (`gradient.pulled`), one part in
-    the operands' dtype (dK's and dQ's); with `whole_operands` (fp16's, `algebra.running_parts`), both fp32:
-    the normalized weights, dropped, and the scaled cotangents."""
+    (`_fused_step`'s, `_coop_step`'s): its `S` and `dP` products (issued together, `summed_together`,
+    overlapping `_score_weights` with `dP` where `_splits_scores` and `masked is not None`), masked where
+    `masked`, or where it is None chosen at run time, unmasked where every query sees the tile `whole`. When
+    `on_weights` and `after_weights` are supplied on an overlapped step, stages narrowed `P` during `dP` and
+    issues `dV` before computing `dS`. Returns its weights narrowed for dV (`algebra.value_weights`), a
+    dropping call's dropped (`algebra.drawn`), and its score cotangents through the hook (`gradient.pulled`),
+    one part in the operands' dtype (dK's and dQ's); with `whole_operands` (fp16's, `algebra.running_parts`),
+    both fp32: the normalized weights, dropped, and the scaled cotangents."""
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held, values_t = keys.transpose((1, 0)), values.transpose((1, 0))
+    # S's products and dP's, issued together (`Issuer.summed_together`).
+    score_products = (lambda acc: family.products(acc, q_slot, held),
+                      lambda acc: family.products(acc, do_slot, values_t))
     if not family.operands_in_registers:
         rows = tuple(_read(row) for row in rows)
         coords = _read(coords)
@@ -201,10 +204,11 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
                 dp = family.product(do_slot, values_t, shape)
                 weights, slopes, seen = prepare_weights(s)
         elif stages_weights:
-            (weights, slopes, seen), dp = family.product_pair(
-                q_slot, held, do_slot, values_t, shape, between=prepare_weights)
+            # S's weights made as dP runs on (`Issuer.summed_together`'s `then`).
+            (weights, slopes, seen), dp = (read() for read in family.summed_together(
+                (shape, shape), score_products, then=(prepare_weights, None)))
         else:
-            s, dp = family.product_pair(q_slot, held, do_slot, values_t, shape)
+            s, dp = (read() for read in family.summed_together((shape, shape), score_products))
             weights, slopes, seen = prepare_weights(s)
         if after_weights is not None and not whole_operands:
             after_weights()
@@ -216,7 +220,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple,
             s = family.registers_product(by_power(family.left_of(q_slot), walk.spec.prescale), held)
             dp = family.product(do_slot, values_t, shape)
         else:
-            s, dp = family.product_pair(q_slot, held, do_slot, values_t, shape)
+            s, dp = (read() for read in family.summed_together((shape, shape), score_products))
 
         def scores(*, is_masked: bool):
             # A tile every query sees whole (`is_masked` False) takes no mask (`_dq_step`'s choice).

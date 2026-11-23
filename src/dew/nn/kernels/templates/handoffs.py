@@ -40,6 +40,13 @@ class Role:
         return 1 if self.warp else self.count
 
 
+Joined = tuple[tuple[Role, int], ...]
+"""A program's roles beside its consumers, its producer and its issuer, each with its count
+(`Schedule.joined`): the one value its launch sizes its warpgroups and registers by (`Family.kernel`,
+`Family.programs`) and its schedule runs (`Family.scheduled`), a body named for each (row 9785: stated to
+the two apart, a correction warpgroup launched beside no body ran nothing and its hand-offs waited)."""
+
+
 REDUCER = Role("reducer", warp=True, weight=0)
 """A launch's reducers: a warp of its last warpgroup a compute role, each issuing the TMA adds its role stages
 into a ring for it (`Family.scheduled`'s `reducer`), so no compute role waits on its own adds' reads, nor on

@@ -164,9 +164,10 @@ def scheduled_roles(family: mosaic.Family, consumers: int, consumer: Callable[[i
         del index
         consumer(role)
 
-    reducers = () if reducer is None else ((handoffs.REDUCER, consumers, reducer),)
+    joined = () if reducer is None else ((handoffs.REDUCER, consumers),)
+    bodies = {} if reducer is None else {handoffs.REDUCER.name: reducer}
     return walked.scheduled(consumers, functools.partial(mosaic.per_role, roles=consumers, run=compute),
-                            producer, issuer=lambda: issued(walked), joined=reducers)
+                            producer, issuer=lambda: issued(walked), joined=joined, bodies=bodies)
 
 
 def placed_scratch(family: mosaic.Family, walked: int, dtype, fused: tuple[int, ...], kept: tuple[int, ...]

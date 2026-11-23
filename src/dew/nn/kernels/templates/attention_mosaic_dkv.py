@@ -202,13 +202,17 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
             _, weights, slopes, seen = _score_weights(walk, coords, (), s, rows[0], rows[1], masked=masked)
             return weights, slopes, seen
 
-        (weights, slopes, seen), dp = family.product_pair(
-            k_smem, logits_slot.transpose((1, 0)), v_smem, do_slot.transpose((1, 0)), shape, between=between)
+        # S and dP issued together, S's weights made as dP runs on (`Issuer.summed_together`'s `then`).
+        (weights, slopes, seen), dp = (read() for read in family.summed_together(
+            (shape, shape), (lambda acc: family.products(acc, k_smem, logits_slot.transpose((1, 0))),
+                             lambda acc: family.products(acc, v_smem, do_slot.transpose((1, 0)))),
+            then=(between, None)))
         cotangents = _score_cotangents(coords, weights, dp, rows[2], rows[3], seen)
         scored = (weights, weights, cotangents, slopes, seen)
     else:
-        s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
-                                    v_smem, do_slot.transpose((1, 0)), shape)
+        s, dp = (read() for read in family.summed_together(
+            (shape, shape), (lambda acc: family.products(acc, k_smem, logits_slot.transpose((1, 0))),
+                             lambda acc: family.products(acc, v_smem, do_slot.transpose((1, 0))))))
         if logits_stage is not None:
             # Staged queries read (products waited): next step's stage may be written.
             walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)

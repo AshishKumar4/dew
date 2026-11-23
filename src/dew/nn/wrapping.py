@@ -277,15 +277,16 @@ class HeadedModel:
     def head_size(backbone: nn.Module) -> tuple[int, Dtype | None]:
         """Return the width of `backbone`'s final states, and the dtype a head over them computes in.
 
-        The backbone is traced, not run, so this costs no compute. A backbone that
-        computes in reduced precision has its head compute in it too; over
+        The backbone is traced, not run, so this costs no compute: its tokens
+        and key made within the trace too, which made outside computed on the
+        default device (row 12259: a compile-only GPU's refused it). A backbone
+        that computes in reduced precision has its head compute in it too; over
         full-precision states a head computes at its parameters' precision.
         """
-        tokens = jnp.zeros((1, 2), jnp.int32)
+        def states() -> jax.Array:
+            tokens = jnp.zeros((1, 2), jnp.int32)
+            return backbone.init_with_output(jax.random.key(0), tokens, method=_states_method(backbone))[0]
 
-        def states(key: jax.Array) -> jax.Array:
-            return backbone.init_with_output(key, tokens, method=_states_method(backbone))[0]
-
-        shape = jax.eval_shape(states, jax.random.key(0))
+        shape = jax.eval_shape(states)
         reduced = jnp.finfo(shape.dtype).bits < 32
         return shape.shape[-1], shape.dtype if reduced else None
