@@ -22,8 +22,6 @@ import os
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
-from dew import _facts
-
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
@@ -72,7 +70,7 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False,
     GPU's model alone (cuDNN's) does not lower in it. None assumes nothing. JAX keys its trace and compile
     caches on the device assumed (`dew._cache.KERNEL_ASSUMED`), so a function jitted for one traces again
     for another."""
-    from dew import _cache
+    from dew import _cache, _facts
 
     if isinstance(generation, GpuTarget):
         value = Assumption(generation.generation, generation, _facts.stated(generation), interpreted,
@@ -1926,7 +1924,23 @@ def placed_platform() -> str:
     return 'gpu' if platform in ('cuda', 'rocm') else platform
 
 
-@_facts.traced_fact
+def _fact[**Question, Answer](reader: Callable[Question, Answer]) -> Callable[Question, Answer]:
+    """`reader` declared a fact a trace reads (`dew._facts.traced_fact`), at its first read: this module
+    loads importing neither Dew nor JAX, as tools/reference_runs reads its targets (`reference_source`)."""
+    declared: list[Callable[Question, Answer]] = []
+
+    @functools.wraps(reader)
+    def read(*question: Question.args, **named: Question.kwargs) -> Answer:
+        if not declared:
+            from dew import _facts
+
+            declared.append(_facts.traced_fact(reader))
+        return declared[0](*question, **named)
+
+    return read
+
+
+@_fact
 def cutlass_built() -> dict[str, str | None]:
     """The generation of the installed dew_cutlass's kernels each CUDA GPU Dew names runs, as the wheel
     dispatches on its compute capability (`dew_cutlass.architecture`, the one statement of it), None for
@@ -1953,7 +1967,7 @@ def _cutlass_built_by(origin: str | None) -> dict[str, str | None]:
     return {name: wheel.architecture(*found) for name, found in capabilities.items()}
 
 
-@_facts.traced_fact
+@_fact
 def gpu_placed() -> bool:
     """Whether a call runs on this process's own GPU: what a CUDA library call needs, which its trace
     asks the installed plugin about and its lowering the devices, where `backend()` also takes an
@@ -1963,7 +1977,7 @@ def gpu_placed() -> bool:
     return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
 
 
-@_facts.traced_fact
+@_fact
 @functools.cache
 def host_memory_share() -> int:
     """A CPU device's share of the memory this process can hold, in bytes: the least of its host's physical
@@ -2011,7 +2025,7 @@ def cgroup_memory_limits(root: str = "/") -> list[int]:
     return limits
 
 
-@_facts.traced_fact
+@_fact
 def device_memory() -> int | None:
     """The bytes one device a call is chosen for holds: the least allocator limit of the devices this
     process places it on (`placed_devices`; `Device.memory_stats`' `bytes_limit`, what an allocation fails
