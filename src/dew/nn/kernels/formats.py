@@ -339,10 +339,23 @@ def fp8_factor(scale: jax.Array, sizes: jax.Array, count: int, weights_shape: tu
 class _ScaledWeights:
     """Shared single-scale decode for free-layout packed weight formats (`Fp8Weights`, `TernaryWeights`)."""
     if TYPE_CHECKING:
+        words: jax.Array | np.ndarray
         scale: jax.Array | np.ndarray
         @property
         def shape(self) -> tuple[int, ...]: ...
         def unscaled(self, dtype=jnp.bfloat16) -> jax.Array: ...
+
+    def _unscaled_words(self, per: int, staged_fn, decode_fn, dtype) -> jax.Array:
+        """Decode packed `[..., width, wdepth]` uint32 words to `[..., wdepth * per, width]` in `dtype`."""
+        words = jnp.asarray(self.words)
+        *batches, width, wdepth = words.shape
+        batch = math.prod(batches)
+        if batch == 0 or width == 0 or wdepth == 0:
+            return jnp.zeros((*batches, wdepth * per, width), dtype)
+        flat = words.reshape(batch, width, wdepth)
+        inv = np.argsort(staged_fn(wdepth * per))
+        decoded = jax.vmap(lambda w: decode_fn(w.T)[inv])(flat)
+        return decoded.reshape(*batches, wdepth * per, width).astype(dtype)
 
     def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
         """Decode `words` back to `[..., depth, width]` in `dtype`, scaled once in `at_least_fp32`."""
@@ -403,15 +416,8 @@ class Fp8Weights(_ScaledWeights):
     def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:
         """Decode `words` back to `[..., depth, width]` in `dtype` without applying `self.scale`."""
         minifloat, _ = _fp8_minifloat(self.fmt)
-        words = jnp.asarray(self.words)
-        *batches, width, wdepth = words.shape
-        batch = math.prod(batches)
-        if batch == 0 or width == 0 or wdepth == 0:
-            return jnp.zeros((*batches, wdepth * 4, width), dtype)
-        flat = words.reshape(batch, width, wdepth)
-        inv = np.argsort(fp8_staged_rows(wdepth * 4))
-        decoded = jax.vmap(lambda w: bits.fp8_codes(w.T, minifloat, jnp.float32)[inv])(flat)
-        return decoded.reshape(*batches, wdepth * 4, width).astype(dtype)
+        return self._unscaled_words(4, fp8_staged_rows,
+                                    lambda w: bits.fp8_codes(w, minifloat, jnp.float32), dtype)
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
     """Block-scaled codes' values in `dtype`: each code times its `block` depths' E4M3 scale, read by the one
     decode of a block scale's (`bits.scales_decoded`, row 8675), exact in float32 (an E2M1 code times an E4M3
@@ -551,12 +557,5 @@ class TernaryWeights(_ScaledWeights):
 
     def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:
         """Decode packed `words` back to `[..., depth, width]` ternary `{-1, 0, +1}` in `dtype`."""
-        words = jnp.asarray(self.words)
-        *batches, width, wdepth = words.shape
-        batch = math.prod(batches)
-        if batch == 0 or width == 0 or wdepth == 0:
-            return jnp.zeros((*batches, wdepth * 16, width), dtype)
-        flat = words.reshape(batch, width, wdepth)
-        inv = np.argsort(ternary_staged_rows(wdepth * 16))
-        decoded = jax.vmap(lambda w: ternary_codes(w.T, jnp.float32)[inv])(flat)
-        return decoded.reshape(*batches, wdepth * 16, width).astype(dtype)
+        return self._unscaled_words(16, ternary_staged_rows,
+                                    lambda w: ternary_codes(w, jnp.float32), dtype)
