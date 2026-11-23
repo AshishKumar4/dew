@@ -731,13 +731,15 @@ def test_each_tcgen05_forward_legal_for_the_4b_step_lowers_for_a_b200(rows, kept
         op, args = attention_mosaic._forward_call(query, key, key, spans, None, scale=None,
                                                   natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, residuals=kept, interpret=False)
-        legal = [config for family in attention_mosaic_program.layouts("sm100", jnp.bfloat16, tokens)
-                 if family.name.startswith("tcgen05") for config in op.offered(ba, family, target)
-                 if (config.columns is not None) == split_cols]
-        assert legal
+        all_legal = [config for family in attention_mosaic_program.layouts("sm100", jnp.bfloat16, tokens)
+                     if family.name.startswith("tcgen05") for config in op.offered(ba, family, target)]
+        assert all_legal
+        legal = [config for config in all_legal if (config.columns is not None) == split_cols]
         for config in legal:
             with tuning.pinned({attention_mosaic.MosaicForward: config}):
                 jax.jit(forward).trace(query, key, key).lower(lowering_platforms=("cuda",))
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("kept", [template.Kept.SPLIT, template.Kept.NONE], ids=["training", "inference"])
 @pytest.mark.parametrize("rows", [2, 1], ids=["step", "decision"])

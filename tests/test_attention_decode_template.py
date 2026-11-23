@@ -1154,3 +1154,152 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
             jnp.zeros(q8.shape, q8.dtype), k8, k8, template.spans(1, 4096, 8, causal=False),
             template.Hooks())
         assert work8 is not None and work8["plain"].config.stages > plan1.config.stages, (work8, plan1)
+
+
+def _query_gated(o, q_p):
+    """An output hook of a `Kind.QUERY` parameter, its tile's `[rows, 1]` query values (row 5385's shape)."""
+    assert o.ndim == 2 and q_p.ndim == 2 and q_p.shape == (o.shape[0], 1)
+    return o * jax.nn.sigmoid(q_p[:, :1])
+
+
+@INTERPRETS
+@pytest.mark.parametrize("kind", ["stateless", "head", "query", "output"])
+@pytest.mark.parametrize("mode", ["single", "split"])
+def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kind, mode):
+    """Row 5385: `attention_decode.attend` admits and fuses `output_mod` (`stateless`, `Kind.HEAD`,
+    `Kind.QUERY`, and `Kind.OUTPUT` bf16 gate) on both single-slice (`at.slices == 1`, fused in
+    `MosaicForward`) and split-KV (`at.slices > 1`, fused in `merged.merged_finished`) GQA decode steps,
+    matching `template.reference` under check 1, and rejects `finished=False` or unsupported kinds."""
+    batch, positions, heads, kv_heads, width = (2, 2, 8, 2, 64) if mode == "single" else (1, 1, 8, 2, 64)
+    keys = 256 if mode == "single" else 2048
+    lengths = jnp.asarray([200, 37] if batch == 2 else [1700], jnp.int32)
+    starts = jnp.asarray([0, 16] if batch == 2 else [0], jnp.int32)
+    spans = template.spans(positions, keys, batch, lengths=lengths, starts=starts)
+    sinks = jnp.linspace(-0.5, 0.5, heads, dtype=jnp.float32)
+    initial = template.sinks(sinks, batch, positions, width)
+
+    def draw(seed: int):
+        rng = np.random.default_rng([5385, seed])
+        q = jnp.asarray(rng.normal(size=(batch, positions, heads, width)), jnp.bfloat16)
+        k = jnp.asarray(rng.normal(size=(batch, keys, kv_heads, width)) * 0.5, jnp.bfloat16)
+        v = jnp.asarray(rng.normal(size=(batch, keys, kv_heads, width)), jnp.bfloat16)
+        if kind == "stateless":
+            return q, k, v
+        if kind == "head":
+            return q, k, v, jnp.asarray(rng.normal(size=(heads,)), jnp.float32)
+        if kind == "query":
+            return q, k, v, jnp.asarray(rng.normal(size=(batch, heads, positions)), jnp.float32)
+        return q, k, v, jnp.asarray(rng.normal(size=(batch, positions, heads, width)), jnp.bfloat16)
+
+    def hooks_of(*extra):
+        if kind == "stateless":
+            return template.Hooks(initial=initial, output_mod=lambda o: jnp.tanh(o * 0.5))
+        if kind == "head":
+            return template.Hooks(initial=initial, output_mod=lambda o, h: o * jax.nn.sigmoid(h.reshape(())),
+                                  output_params=(template.Param(extra[0], template.Kind.HEAD),))
+        if kind == "query":
+            return template.Hooks(initial=initial, output_mod=_query_gated,
+                                  output_params=(template.Param(extra[0], template.Kind.QUERY),))
+        return template.Hooks(initial=initial, output_mod=lambda o, g: o * jax.nn.sigmoid(g),
+                              output_params=(template.Param(extra[0], template.Kind.OUTPUT),))
+
+    def ours(q, k, v, *extra):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(q, k, v, spans, hooks_of(*extra), interpret=True)
+
+    def reference(q, k, v, *extra):
+        hooks = hooks_of(*extra)
+        wide = jnp.promote_types(q.dtype, jnp.float32)
+        wide_params = tuple(
+            template.Param(p.value.astype(jnp.promote_types(p.value.dtype, wide))
+                           if jnp.issubdtype(p.value.dtype, jnp.floating) else p.value, p.kind)
+            for p in hooks.output_params)
+        return template.reference(q, k, v, spans, dataclasses.replace(hooks, output_params=wide_params))
+
+    sample = draw(0)
+    assert attention_decode.packable(hooks_of(*sample[3:]))
+    with generation.assumed("sm90"):
+        work, *_ = attention_decode.planned(sample[0], sample[1], sample[2], spans, hooks_of(*sample[3:]))
+    assert work is not None
+    assert (work["plain"].slices == 1 if mode == "single" else work["plain"].slices > 1), work
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    f"template decode output hook {mode} {kind}", seeds=SEEDS)
+
+    if kind == "output" and mode == "single":
+        assert not attention_decode.packable(
+            template.Hooks(output_params=(template.Param(sample[3], template.Kind.OUTPUT),)))
+        assert not attention_decode.packable(
+            template.Hooks(output_mod=lambda o, x: o + x,
+                           output_params=(template.Param(jnp.zeros((batch, heads, keys)),
+                                                         template.Kind.KEY),)))
+        with generation.assumed("sm90"), pytest.raises(ValueError):
+            attention_decode.attend(sample[0], sample[1], sample[2], spans, hooks_of(*sample[3:]),
+                                    interpret=True, finished=False)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
+def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name):
+    """Row 5385: bf16 gated decode steps (`Kind.OUTPUT` bf16 gate + sinks) compile spill-free on
+    sm80/sm90/sm100/sm120 for both batched single-slice and one-row split-KV, with split-KV carrying
+    `output_mod` directly on the `merged_padded` primitive."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn import programs
+    from dew.nn.kernels.templates import merged
+
+    def mod(o, g):
+        return o * jax.nn.sigmoid(g)
+
+    cases = []
+    for label, batch, keys, expect_split in (("single", 32, 256, False), ("split", 1, 4096, True)):
+        q = jax.ShapeDtypeStruct((batch, 1, 8, 128), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((batch, keys, 2, 128), jnp.bfloat16)
+        g = jax.ShapeDtypeStruct((batch, 1, 8, 128), jnp.bfloat16)
+        spans = template.spans(1, keys, batch, causal=False)
+        sinks = jnp.zeros((8,), jnp.float32)
+
+        def step(q_in, k_in, v_in, g_in, *, b=batch, sp=spans, sk=sinks):
+            hooks = template.Hooks(
+                initial=template.sinks(sk, b, 1, 128), output_mod=mod,
+                output_params=(template.Param(g_in, template.Kind.OUTPUT),))
+            return attention_decode.attend(q_in, k_in, v_in, sp, hooks, interpret=False)
+
+        with generation.assumed(generation_name):
+            traced = jax.make_jaxpr(step)(q, k, k, g)
+            merge_eqns = [eq for eq in programs.equations(traced.jaxpr)
+                          if eq.primitive is merged.merged_padded_p]
+            if expect_split:
+                assert len(merge_eqns) == 1 and merge_eqns[0].params.get("output_mod") is mod, merge_eqns
+        cases.append(KernelCase(label, lambda s=step, args=(q, k, k, g): (s, args)))
+    if generation_name == "sm90":
+        qh = jax.ShapeDtypeStruct((32, 1, 8, 128), jnp.bfloat16)
+        kh = jax.ShapeDtypeStruct((32, 256, 2, 128), jnp.bfloat16)
+        hv = jax.ShapeDtypeStruct((8,), jnp.float32)
+        qv = jax.ShapeDtypeStruct((32, 8, 1), jnp.bfloat16)
+        sp_h = template.spans(1, 256, 32, causal=False)
+
+        def head_mod(o, h_p):
+            assert h_p.shape == ()
+            return o * jax.nn.sigmoid(h_p)
+
+        for label, param_v, param_kind, fn in (
+            ("single-head", hv, template.Kind.HEAD, head_mod),
+            ("single-query", qv, template.Kind.QUERY, _query_gated),
+        ):
+            def deferred(q_in, k_in, v_in, p_in, *, pk=param_kind, mod_fn=fn):
+                hooks = template.Hooks(output_mod=mod_fn, output_params=(template.Param(p_in, pk),))
+                return attention_decode.attend(q_in, k_in, v_in, sp_h, hooks, interpret=False)
+
+            with generation.assumed("sm90"):
+                traced_h = jax.make_jaxpr(deferred)(qh, kh, kh, param_v)
+                merge_h = [eq for eq in programs.equations(traced_h.jaxpr)
+                           if eq.primitive is merged.merged_padded_p]
+                assert len(merge_h) == 1 and merge_h[0].params.get("output_mod") is fn, merge_h
+                assert merge_h[0].invars[0].aval.shape[1] == 1
+            cases.append(KernelCase(label, lambda s=deferred, args=(qh, kh, kh, param_v): (s, args)))
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels(cases, generation_name)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)

@@ -861,23 +861,28 @@ class MosaicForward(_Mainloop[Tiles]):
                priced: bool = True) -> Tiles | None:
         """`derived` over the device's families but `skip` (a family whose natural rewalk runs on another,
         `_relaunched`), past the configs as they launch in `refused` (a rewalk's tiles a compile refused).
-        With `priced=False`, returns the first legal config without tracing `price_config` or deepening."""
+        Prefer whole configs and column splits that relieve SMEM/TMEM/residency (`_columns_help`) before
+        falling back to deferred same-residency splits so legal pins remain viable when whole fails
+        (rows 5535, 12210). With `priced=False`, returns the first legal config without tracing
+        `price_config` or deepening."""
         query = ba.arguments["query"]
-        for family in layouts(target.generation, query.dtype, query.shape[1]):
-            if family is skip or self.refusal(ba, family) is not None:
-                continue
+        families = [family for family in layouts(target.generation, query.dtype, query.shape[1])
+                    if family is not skip and self.refusal(ba, family) is None]
+        choose = functools.partial(self._choose_consumers, ba, target=target) if priced else None
+        residency = functools.partial(self.resident, ba, target=target) if priced else None
+        for prefer_helping in (True, False):
+            for family in families:
+                def fits(config: Tiles, *, helping=prefer_helping) -> bool:
+                    return ((not helping or self._columns_help(ba, config, target))
+                            and self._launchable(ba, config, target, priced=priced)
+                            not in (None, *refused))
 
-            def fits(config: Tiles) -> bool:
-                return (self._columns_help(ba, config, target)
-                        and self._launchable(ba, config, target, priced=priced) not in (None, *refused))
-            choose = functools.partial(self._choose_consumers, ba, target=target) if priced else None
-            residency = functools.partial(self.resident, ba, target=target) if priced else None
-            config = self._searched(ba, family, fits, choose=choose, residency=residency)
-            if config is not None:
-                launched = self._launchable(ba, config, target, priced=priced)
-                if launched is None or not priced:
-                    return launched
-                return self._deepened(ba, launched, target, refused=refused)
+                config = self._searched(ba, family, fits, choose=choose, residency=residency)
+                if config is not None:
+                    launched = self._launchable(ba, config, target, priced=priced)
+                    if launched is None or not priced:
+                        return launched
+                    return self._deepened(ba, launched, target, refused=refused)
         return None
 
     def _deepened(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget, *,
@@ -966,7 +971,7 @@ class MosaicForward(_Mainloop[Tiles]):
         """Whether splitting value columns (`config.columns is not None`) relieves shared memory, tensor
         memory, or residency on a `places_on_role` family (`tcgen05.rows`): its consumer registers hold no
         value columns (sums live in tensor memory), so when `columns=None` already fits SMEM and TMEM at the
-        same residency and was refused for register spills, splitting columns is doomed (row 5535)."""
+        same residency, splitting columns is deferred behind configs that help (rows 5535, 12210)."""
         if config.columns is None:
             return True
         family = bundle_of(config, ba.arguments["query"].dtype, target=target)
@@ -984,20 +989,22 @@ class MosaicForward(_Mainloop[Tiles]):
     def offered(self, ba: tokamax.BoundArguments, family: mosaic.Family, target: generation.GpuTarget
                 ) -> tuple[Tiles, ...]:
         """Every config of `family` its derivation searches for the call of `ba` (`_searched`) that is legal,
-        as it launches (`_launchable`), in the derivation's order; none where the family takes no such
-        call (`refusal`)."""
+        as it launches (`_launchable`), preferred configs (`_columns_help`) before deferred same-residency
+        splits so all legal pins remain visible (row 12210); none where the family takes no such call
+        (`refusal`)."""
         if self.refusal(ba, family) is not None:
             return ()
-        found: dict[Tiles, None] = {}
+        preferred: dict[Tiles, None] = {}
+        deferred: dict[Tiles, None] = {}
 
         def fits(config: Tiles) -> bool:
-            if (self._columns_help(ba, config, target)
-                    and (launched := self._launchable(ba, config, target)) is not None):
-                found[launched] = None
+            if (launched := self._launchable(ba, config, target)) is not None:
+                bucket = preferred if self._columns_help(ba, config, target) else deferred
+                bucket[launched] = None
             return False
 
         self._searched(ba, family, fits)
-        return tuple(found)
+        return tuple({**preferred, **deferred})
 
     def _searched(self, ba: tokamax.BoundArguments, family: mosaic.Family, fits: Callable[[Tiles], bool], *,
                   choose: Callable[[list[Tiles]], Tiles] | None = None,
