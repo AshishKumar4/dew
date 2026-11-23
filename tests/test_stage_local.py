@@ -542,17 +542,15 @@ def called_beside() -> optax.GradientTransformation:
 
 
 def called_on_a_layer() -> optax.GradientTransformation:
-    """`mapped_by_row`'s loop, three rows a step, over a stacked matrix, and beside a layer's own vector (a
-    bias, a norm's scale) a callback over the same `tanh`, which its stacked rows, one rank more, take
-    without: the stack's program acts on nothing, its layer's beside its result, which a stage holding its
-    own layers would drop (review of Train 1224's fixes: admitted)."""
+    """Each leaf's update `tanh`, and beside a layer's own vector (a bias, a norm's scale) a callback over
+    it, which its stacked rows, one rank more, take without: the stack's program acts on nothing, its
+    layer's beside its result, which a stage holding its own layers would drop (review of Train 1224's
+    fixes: admitted)."""
     def update(updates, state, params=None):
         def mapped(gradient):
             if gradient.ndim < 2:
                 jax.debug.callback(lambda total: None, jnp.sum(gradient))
-            if gradient.ndim < 3:
-                return jnp.tanh(gradient)
-            return jax.lax.map(jnp.tanh, gradient, batch_size=3)
+            return jnp.tanh(gradient)
         return jax.tree.map(mapped, updates), state
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
 
