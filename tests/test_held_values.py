@@ -282,7 +282,10 @@ def test_a_program_within_a_held_jits_trace_that_refuses_a_launch_leaves_it_to_i
     both released, run in another such scope where the inner one's trace records an inline refusal: the
     outer's held jit traces it, the refusal ends that trace, and the outer traces again past it (1.0), where
     the inner, its reading frozen as the outer's, retried past the outer's snapshot without end; a third
-    scope of none then runs its own (theme K01-e's review P0)."""
+    scope of none then runs its own (theme K01-e's review P0). The refused scope runs in a thread, so a call
+    that never ends fails, in its caller's context, so its call keys as the caller's (`ALGEBRA`, which the
+    suite sets per test, is a context's)."""
+    import contextvars
     import threading
 
     from dew.nn.kernels.options import owned_program
@@ -316,7 +319,7 @@ def test_a_program_within_a_held_jits_trace_that_refuses_a_launch_leaves_it_to_i
         with report.refusals():
             ran.append(float(outer(x)))
 
-    running = threading.Thread(target=refused_scope, daemon=True)
+    running = threading.Thread(target=contextvars.copy_context().run, args=(refused_scope,), daemon=True)
     running.start()
     running.join(timeout=120)
     assert ran == [1.0], "the refused scope's call did not end"
