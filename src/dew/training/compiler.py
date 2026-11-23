@@ -976,15 +976,20 @@ class StepCompiler[L, E]:
             # Where the devices, the state placed, hold no block for it, the plan's search runs here, on them.
             planned, compiled, keep = self._plan(stepping, state, batch, trials)
             keep()
+        return self._taken(stepping, planned, compiled, unplaced)
+
+    def _taken(self, stepping: Stepping[L, E], planned: Planned, compiled: Compiled,
+               unplaced: Unplaced | None) -> Compiled:
+        """`compiled` stepping by the plan `compile` took: every search it was made in place of released
+        while the plan's programs are still read (the plan made before the state was placed, `Unplaced`, and
+        each off the loop, `settle_with`), then the plan's own lowerings let go (`Planned.released`)."""
         if unplaced is not None:
             unplaced.release(planned)
-        # Each search off the loop this compile's plan was made in place of (`settle_with`), released while
-        # the plan's programs are still read.
         settles, self._settles = self._settles, []
         for settle in settles:
             settle(planned)
         kept = planned.released()
-        return dataclasses.replace(compiled, step=self.runner(stepping, kept, settings.device_mesh),
+        return dataclasses.replace(compiled, step=self.runner(stepping, kept, stepping.settings.device_mesh),
                                    planned=kept)
 
     def settle_with(self, release: Callable[[Planned | None], None]) -> None:
