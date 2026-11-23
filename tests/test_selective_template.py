@@ -735,7 +735,7 @@ def test_a_pullback_takes_each_operands_gradient_in_its_own_dtype_interpreted():
                                  interpret=INTERPRETED)
 
     def draws(seed):
-        (x, dt, *rest), _, dy = draw(jnp.float16, seed, rows, length, channels, states, False)
+        (x, dt, *rest), _, dy = draw(jnp.float16, seed, rows, length, channels, states, packed=False)
         return (x, dt.astype(jnp.float32), *rest, dy)
 
     templated = jax.jit(with_gradients(scanned(template, None)))

@@ -556,8 +556,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
     `c` `[R, N, T]`, `parameters` (`forward`'s), its blocks' entering states `entered` `[R, blocks, N, D]`
     fp32, `resets` `[R, T]` int8 and the final state's cotangent `dfinal` `[R, N, D]` fp32, `T` a whole
     number of blocks (`block_positions`). Returns `(dx, ddt [R, D, T], db, dc [R, N, T], dA [R, N, D],
-    dD [R, D], dstate [R, N, D])`, fp32 but `dx`, `ddt` in `x`'s and `dt`'s dtypes, rounded once as stored
-    (M-JS-240: an XLA convert after them took 274 us of a GH200's 8.42 ms Mamba-1 2.8B bf16 training step).
+    dD [R, D], dstate [R, N, D])`, fp32 but `dx`, `ddt` in `x`'s and `dt`'s dtypes, rounded once as stored.
 
     A program takes a row and a channel, a warpgroup's threads its block's tokens (`block_scan.blocked`), and
     walks the row's blocks from the last, each state in turn: its states through the block from the
@@ -622,9 +621,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
 
             skip = parameters_ref[states, channel]
             dx_init, dx_step, dx_inv = algebra.selective_dx_scale(skip, dys, dts)
-            # The tokens' own products, formed once a block, every state's write and B gradient reading them.
-            stepped = dts * xs
-
+            stepped = dts * xs  # every state's write and B gradient read it: formed once a block
             def state(n, sums):
                 # Rolled: unrolled, the states spilled 12 KB/thread (scanbwd-ptxas-sm90 at 5de7abaa0).
                 dx, ddt = sums
