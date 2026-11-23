@@ -445,3 +445,104 @@ class NvFp4Block:
         """Its block-scaled values, exactly, in `dtype` (`[..., depth]`, float32 or a float64 truth's): each
         code times its block's scale, the tensor's apart (`scale`)."""
         return _block_values(self.codes, self.scales, formats_of.NVFP4.depth, dtype)
+
+
+TERNARY_STAGE = packed.TERNARY_STEP
+"""Depth unit of 2-bit packed BitNet b1.58 ternary weights (`TernaryWeights`, 256 depths = 16 words)."""
+
+def ternary_staged_rows(depth: int) -> np.ndarray:
+    """Depth permutation for `TernaryWeights` (`packed.ternary_staged_depth`): word `w` (`0..15`) of each
+    256-depth group holds 16 2-bit codes at depths `16 * code + w` (row 1464)."""
+    return _staged_rows(depth, packed.TERNARY_GROUP, 2, packed.ternary_staged_depth, "ternary weight")
+
+
+def ternary_form_version() -> np.ndarray:
+    """8-byte digest identifying the BitNet b1.58 2-bit ternary staging layout (`TernaryWeights`)."""
+    return form_version(b"ternary-b158-v1\x00", ternary_staged_rows(TERNARY_STAGE))
+
+
+def ternary_packed(codes: jax.Array) -> jax.Array:
+    """Pack 2-bit ternary `codes` (`[..., n]` uint32, 0->0, 1->+1, 2->-1) 16 per uint32 word."""
+    grouped = codes.reshape(*codes.shape[:-1], -1, 16)
+    shifts = jnp.arange(16, dtype=jnp.uint32) * jnp.uint32(2)
+    return jnp.sum((grouped & jnp.uint32(3)) << shifts, axis=-1, dtype=jnp.uint32)
+
+
+def ternary_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
+    """Decode 2-bit packed ternary `words` (`[depth / 16, columns]` uint32) to `[depth, columns]`."""
+    shifts = jnp.arange(16, dtype=jnp.uint32) * jnp.uint32(2)
+    code2 = (words[:, None, :] >> shifts[None, :, None]) & jnp.uint32(3)
+    nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
+    neg = (code2 >> jnp.uint32(1)) & nz
+    f32_bits = (neg << jnp.uint32(31)) | (nz * jnp.uint32(0x3F800000))
+    values = jax.lax.bitcast_convert_type(f32_bits, jnp.float32).reshape(-1, words.shape[-1])
+    return values.astype(dtype)
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class TernaryWeights:
+    """BitNet b1.58 ternary weight matrix `[..., depth, width]` packed 16 2-bit codes per `uint32` word in
+    staged depth order (`ternary_staged_rows`, row 1464): `words` `[..., width, depth // 16]` uint32,
+    absmean/per-column/per-group `scale` fp32, and `form` digest."""
+
+    words: jax.Array | np.ndarray
+    scale: jax.Array | np.ndarray
+    form: jax.Array | np.ndarray
+    fmt: str = dataclasses.field(metadata={"static": True}, default="ternary")
+
+    @classmethod
+    def of(cls, weights: jax.Array | np.ndarray, *,
+           scale: jax.Array | np.ndarray | float | None = None) -> "TernaryWeights":
+        """Quantize `weights` (`[..., depth, width]`, `depth % 256 == 0`) to BitNet b1.58 `{-1, 0, +1}`
+        under absmean `scale` (computed automatically when None) and pack into staged `uint32` words."""
+        source = jnp.asarray(weights, jnp.float32)
+        if source.ndim not in (2, 3) or source.shape[-2] % TERNARY_STAGE != 0:
+            raise ValueError(
+                f"TernaryWeights expects 2D/3D with depth divisible by {TERNARY_STAGE}, got {source.shape}")
+        if scale is None:
+            absmean = jnp.mean(jnp.abs(source), axis=(-2, -1), keepdims=(source.ndim == 3))
+            scale_arr = jnp.maximum(absmean, jnp.float32(1e-5))
+        else:
+            scale_arr = jnp.asarray(scale, jnp.float32)
+        fp8_scale_checked(scale_arr.shape, source.shape)
+        quantized = jnp.clip(jnp.round(source / jnp.where(scale_arr > 0, scale_arr, jnp.float32(1.0))),
+                             -1.0, 1.0)
+        codes = jnp.where(quantized > 0, jnp.uint32(1),
+                          jnp.where(quantized < 0, jnp.uint32(2), jnp.uint32(0)))
+        staged = codes[..., ternary_staged_rows(source.shape[-2]), :]
+        packed_words = ternary_packed(jnp.swapaxes(staged, -1, -2))
+        return cls(packed_words, scale_arr, ternary_form_version())
+
+    @property
+    def dtype(self) -> jnp.dtype:
+        return jnp.dtype(jnp.bfloat16)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        *groups, width, words = self.words.shape
+        return (*groups, 16 * words, width)
+
+    def checked(self) -> "TernaryWeights":
+        """Verify stored `form` version and scale shape match this Dew's BitNet b1.58 encoder."""
+        expected = ternary_form_version()
+        stored = np.asarray(self.form, np.uint8)
+        if stored.shape[-1:] != expected.shape or not np.all(stored == expected):
+            raise ValueError("TernaryWeights form version mismatch; repack from source weights")
+        fp8_scale_checked(jnp.shape(self.scale), self.shape)
+        return self
+
+    def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:
+        """Decode packed `words` back to `[..., depth, width]` ternary `{-1, 0, +1}` in `dtype`."""
+        words = jnp.asarray(self.words)
+        *batches, width, wdepth = words.shape
+        flat = words.reshape(-1, width, wdepth)
+        inv = np.argsort(ternary_staged_rows(wdepth * 16))
+        decoded = jax.vmap(lambda w: ternary_codes(w.T, jnp.float32)[inv])(flat)
+        return decoded.reshape(*batches, wdepth * 16, width).astype(dtype)
+
+    def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
+        """Decode `words` back to `[..., depth, width]` in `dtype`, scaled once in `at_least_fp32`."""
+        fp8_scale_checked(jnp.shape(self.scale), self.shape)
+        wide = jnp.promote_types(dtype, jnp.float32)
+        return (self.unscaled(wide) * jnp.asarray(self.scale, wide)).astype(dtype)

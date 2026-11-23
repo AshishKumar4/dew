@@ -177,7 +177,8 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
 
     def words(across: int) -> dict:
         if packed_fp8 is not None:
-            return {f'words_{q}': ((across, 16), jnp.uint32) for q in range(block_k // packing.FP8_GROUP)}
+            group = packing.packed_group_depth(packed_fp8)
+            return {f'words_{q}': ((across, 16), jnp.uint32) for q in range(block_k // group)}
         return {**{f'words_{q}': ((across, 16), jnp.uint32) for q in range(block_k // 128)},
                 'scales': ((across, block_k // 16), jnp.float8_e4m3fn)}
 
@@ -286,8 +287,8 @@ have its models decide."""
 def _packed_depth(k: int, k2: int, n: int, rhs, tiles: Tiles, *, packed_rows: bool, scales,
                   packed_fp8: str | None, transpose_rhs: bool, prologue, paired,
                   transpose_lhs: bool) -> tuple[int, int]:
-    k, k2 = ((8 * k, k2) if packed_rows
-             else (k, 8 * k2 if scales is not None else 4 * k2 if packed_fp8 is not None else k2))
+    per = packing.packed_codes_per_word(packed_fp8) if packed_fp8 is not None else 1
+    k, k2 = (8 * k, k2) if packed_rows else (k, 8 * k2 if scales is not None else per * k2)
     if packed_fp8 is not None:
         if scales is not None or packed_rows:
             raise ValueError("packed_fp8 cannot combine with NVFP4 scales or packed_rows")
@@ -1527,7 +1528,8 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
     elif 'scales' in matrix_gmems or packed_fp8 is not None:
         # A packed matrix's words, a stream for each group of depths of a step (128 for NVFP4, 64 for FP8):
         # step j's group q, sixteen words a column at the tile's columns.
-        step_groups = tiles.block_k // (packing.FP8_GROUP if packed_fp8 is not None else 128)
+        step_groups = tiles.block_k // (packing.packed_group_depth(packed_fp8) if packed_fp8 is not None
+                                        else 128)
         words = matrices.pop('matrix')[0]
         matrices |= {f'words_{q}': (words, lambda j, q=q: (0, step_groups * (first + j) + q))
                      for q in range(step_groups)}

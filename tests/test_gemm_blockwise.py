@@ -220,3 +220,21 @@ def test_blockwise_fp8_named_mosaic_uninterpreted_dispatches_portable_on_cpu():
                                                           interpret_on_cpu=False)
     np.testing.assert_array_equal(np.asarray(got_fwd), np.asarray(ref_fwd))
     np.testing.assert_array_equal(np.asarray(got_grad), np.asarray(ref_grad))
+
+
+def test_restored_blockwise_cublaslt_references_prepare_on_sm90(tmp_path, monkeypatch):
+    """Both restored blockwise FP8 cells (`blockwise_matrix.a_blockwise_fp8_product_is_on_par` and
+    `a_blockwise_kernel_gradient_is_on_par`) with cuBLASLt as `reference` prepare cleanly under a
+    compile-only sm90 GPU-tier prepare with zero unprepared sites (row 12062)."""
+    import generation_support
+    import model_flows
+    import tier_wire
+    from truths_ahead import UNPREPARED, prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
+                                                                                   gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with prepared(tmp_path / "store", stamp="blockwise-12062", target=generation_support.node_target()):
+        blockwise_matrix.a_blockwise_fp8_product_is_on_par(("sm90", "1", "128", "bfloat16"))
+        a_blockwise_kernel_gradient_is_on_par(interpret=False)
+    assert not (tmp_path / "store" / UNPREPARED).exists(), (tmp_path / "store" / UNPREPARED).read_text()

@@ -1034,22 +1034,39 @@ def test_an_fp8_weight_product_holds_every_order(edge):
     """`gemm.fp8_weight_product` (free-layout staged FP8 weights decoded inline via
     `bits.E4M3_BFLOAT16_FORM`, `generation.linear_tangent`): every order in `lhs`, under a nested jit and a
     scan, finite wherever float64 is a normal float32 and wherever the decoded product is (row 8548)."""
+    _check_packed_weight_product_contract(edge, kind="fp8")
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_ternary_weight_product_holds_every_order(edge):
+    """`gemm.ternary_weight_product` (2-bit packed BitNet b1.58 weights decoded inline, `linear_tangent`):
+    every order in `lhs`, under a nested jit and a scan, finite wherever float64 is a normal float32 and
+    wherever the decoded product is (row 1464)."""
+    _check_packed_weight_product_contract(edge, kind="ternary")
+
+
+def _check_packed_weight_product_contract(edge: str, *, kind: str) -> None:
     from dew.nn.kernels import formats
 
-    raw_w = normal_draw(8548, (64, 64), scale=1.0)[0]
-    weights = formats.Fp8Weights.of(raw_w, fmt="e4m3", scale=jnp.float32(0.5))
+    depth = 256 if kind == "ternary" else 64
+    raw_w = normal_draw(8548 if kind == "fp8" else 1464, (depth, 64), scale=1.0)[0]
+    weights = (formats.Fp8Weights.of(raw_w, fmt="e4m3", scale=jnp.float32(0.5)) if kind == "fp8"
+               else formats.TernaryWeights.of(raw_w, scale=jnp.float32(0.5)))
     decoded = weights.decoded(jnp.bfloat16)
-    (x,) = normal_draw(8549, (64, 64), scale=EDGES[edge])
-    (dx,) = normal_draw(8550, (64, 64), scale=EDGES[edge])
+    (x,) = normal_draw(8549, (64, depth), scale=EDGES[edge])
+    (dx,) = normal_draw(8550, (64, depth), scale=EDGES[edge])
     (cotangent,) = normal_draw(8551, (64, 64))
 
     def product(rows):
-        return gemm.fp8_weight_product(rows, weights, out_dtype=jnp.float32, interpret_on_cpu=True)
+        if kind == "fp8":
+            return gemm.fp8_weight_product(rows, weights, out_dtype=jnp.float32, interpret_on_cpu=True)
+        return gemm.ternary_weight_product(rows, weights, quantize_activations=False,
+                                           out_dtype=jnp.float32, interpret_on_cpu=True)
 
     def plain(rows):
         return jax.lax.dot(rows.astype(jnp.bfloat16), decoded, preferred_element_type=jnp.float32)
 
     without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
     with generation.assumed("sm90"):
-        assert_contract(product, (x,), (dx,), cotangent, f"fp8 weight product {edge}",
+        assert_contract(product, (x,), (dx,), cotangent, f"{kind} weight product {edge}",
                         truth_fn=plain, plain_fn=plain, without=without)

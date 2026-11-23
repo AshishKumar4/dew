@@ -49,6 +49,30 @@ def fp8_staged_depth(group, word, code):
     return FP8_GROUP * group + 16 * code + word
 
 
+TERNARY_GROUP = 256
+"""Dew: the depths a BitNet b1.58 ternary weight matrix's staged order groups (`ternary_staged_depth`,
+row 1464): sixteen uint32 words a column (a 64-byte row), each word's sixteen 2-bit codes decoding into
+sixteen-depth slices."""
+
+TERNARY_STEP = 256
+"""Depth step for inline BitNet b1.58 ternary weight decode (`mosaic_gpu.gmm`'s `packed_fp8='ternary'`)."""
+
+
+def ternary_staged_depth(group, word, code):
+    """Dew: the depth `formats.ternary_staged_rows` gives word `word`'s 2-bit `code` (`0..15`) of `group`."""
+    return TERNARY_GROUP * group + 16 * code + word
+
+
+def packed_group_depth(fmt: str) -> int:
+    """Depth covered by one 16-word group of packed format `fmt` (`'e4m3'`, `'e5m2'`, or `'ternary'`)."""
+    return TERNARY_GROUP if fmt == "ternary" else FP8_GROUP
+
+
+def packed_codes_per_word(fmt: str) -> int:
+    """Number of weight codes packed in one uint32 word of packed format `fmt`."""
+    return 16 if fmt == "ternary" else 4
+
+
 def fp8_minifloat(fmt: str) -> bits.Minifloat:
     """Resolve `'e4m3'` / `'e5m2'` to its `bits.Minifloat` descriptor."""
     if fmt == "e4m3":
@@ -56,8 +80,6 @@ def fp8_minifloat(fmt: str) -> bits.Minifloat:
     if fmt == "e5m2":
         return bits.E5M2
     raise ValueError(f"packed FP8 format must be 'e4m3' or 'e5m2', got {fmt!r}")
-
-
 def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_lhs: bool, depth: int,
           width: int) -> None:
     """Dew: refuses a packed matrix's call (`gmm`'s `scales`) its decode does not take: its words read
@@ -74,17 +96,19 @@ def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_l
 
 def fp8_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, transpose_lhs: bool,
               depth: int, width: int) -> None:
-    """Refuse a free-layout FP8 packed weight call (`gmm`'s `packed_fp8`, row 8548) its decode cannot take:
-    words `[groups, width, depth // 4]` uint32 read transposed in 64-deep steps and 64-column tiles with no
-    prologue, pair, cluster, split, or swap (epilogue allowed so per-tensor/column scale fuses)."""
-    fp8_minifloat(fmt)
-    if (not transpose_rhs or rhs.dtype != jnp.uint32 or rhs.shape[1:] != (width, depth // 4)
-            or depth % FP8_GROUP or tiles.block_k % FP8_STEP or tiles.block_n % 64
+    """Refuse a packed FP8 or ternary weight call (`gmm`'s `packed_fp8`, rows 8548, 1464) its decode cannot
+    take: words `[groups, width, depth // codes_per_word]` uint32 read transposed in group-multiple steps and
+    64-column tiles with no prologue, pair, cluster, split, or swap."""
+    if fmt != "ternary":
+        fp8_minifloat(fmt)
+    per_word = packed_codes_per_word(fmt)
+    group = packed_group_depth(fmt)
+    if (not transpose_rhs or rhs.dtype != jnp.uint32 or rhs.shape[1:] != (width, depth // per_word)
+            or depth % group or tiles.block_k % group or tiles.block_n % 64
             or prologue is not None or paired is not None or transpose_lhs
             or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
-        raise ValueError(f"a packed FP8({fmt}) matrix {rhs.shape} is read transposed in {FP8_STEP}-deep "
+        raise ValueError(f"a packed({fmt}) matrix {rhs.shape} is read transposed in {group}-deep "
                          f"steps and 64-col tiles with no prologue, pair, cluster or split, not {tiles}")
-
 def rows_supported(family) -> bool:
     """Whether `family`'s products read an NVFP4 matrix decoded in registers (`rows_decoded`): its register
     family prefix is declared in `bits.NVFP4_BFLOAT16.fragments` (row 12038)."""
@@ -158,14 +182,16 @@ class Decoding:
         buffer = self.buffers.at[index % self.buffers.shape[0]]
         columns = buffer.shape[0] // self.consumers
         mine = pl.ds(self.wg * columns, columns) if self.consumers > 1 else pl.ds(0, buffer.shape[0])
-        if self.fp8_fmt is not None:
+        if self.fp8_fmt == "ternary":
+            words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // TERNARY_GROUP)]
+            stage_decoded_ternary(words, buffer.at[mine], interpret, layout=layout)
+        elif self.fp8_fmt is not None:
             words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // FP8_GROUP)]
             stage_decoded_fp8(words, buffer.at[mine], self.fp8_fmt, interpret, layout=layout)
         else:
             words = [slots[f'words_{q}'].at[mine] for q in range(buffer.shape[-1] // NVFP4_GROUP)]
             stage_decoded(words, slots['scales'].at[mine], buffer.at[mine], interpret, layout=layout)
         return buffer
-
     def met(self) -> None:
         """The consumers' meeting once each has decoded and published its share: a named barrier of all
         their threads (`DECODE_BARRIER`), none where one consumer decodes its own."""
@@ -247,3 +273,19 @@ def stage_decoded_fp8(words, out, fmt: str, interpret: bool, *, layout=None) -> 
                       for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
         for code, lane in enumerate(lanes_bf16):
             out[:, pl.ds(fp8_staged_depth(group, 0, code), 16)] = lane
+
+
+def stage_decoded_ternary(words, out, interpret: bool, *, layout=None) -> None:
+    """Decode a stage of 2-bit packed BitNet b1.58 ternary words (`[columns, 16]` uint32 per 256-depth group)
+    into `out` (`[columns, depth]` bfloat16, exact `{-1, 0, +1}`, row 1464)."""
+    active = None if interpret else layout
+    for group, group_words in enumerate(words):
+        loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
+                                                                    optimized=False)
+        for code in range(16):
+            code2 = (loaded >> jnp.uint32(2 * code)) & jnp.uint32(3)
+            nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
+            neg = (code2 >> jnp.uint32(1)) & nz
+            f32_bits = (neg << jnp.uint32(31)) | (nz * jnp.uint32(0x3F800000))
+            lane = jax.lax.bitcast_convert_type(f32_bits, jnp.float32).astype(jnp.bfloat16)
+            out[:, pl.ds(ternary_staged_depth(group, 0, code), 16)] = lane

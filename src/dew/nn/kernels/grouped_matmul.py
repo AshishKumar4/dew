@@ -353,6 +353,15 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
                 and ba.arguments['hooks'] == NO_HOOKS and ba.arguments.get('paired') is None
                 and bool(ba.arguments.get('exact_sums')))
 
+    def _tf32(self, ba, dtype, family: mosaic.Family) -> bool:
+        """Whether an fp32 TF32 call runs here (`product.declared` at DEFAULT precision, `takes_tf32`,
+        row 3428): plain unscaled unhooked call, transposed only where `family.transposes_tf32`."""
+        transposed = self._matrix_transposed(ba) or self.STAGED_ROWS
+        return (jnp.dtype(dtype) == jnp.float32 and family.takes_tf32
+                and not ba.arguments.get('exact_sums') and not self._scaled
+                and ba.arguments['hooks'] == NO_HOOKS and ba.arguments.get('paired') is None
+                and (family.transposes_tf32 or not transposed))
+
     def _families(self, ba, target) -> tuple[mosaic.Family, ...]:
         """The bundles the launch may run on `target`, in preference order: the most capable issuer's whose
         bundle takes the call (`bundles.groups`, its kernels stating their tiles' accumulators,
@@ -393,7 +402,8 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         gathered = ba.arguments.get('gather') is not None
         tabled = gathered or ba.arguments.get('scatter') is not None
         multiplied = family.operand_dtypes is None or jnp.dtype(dtype) in family.operand_dtypes
-        return (((jnp.dtype(dtype).itemsize == 2 and multiplied) or self._fp8(ba, dtype, family))
+        return (((jnp.dtype(dtype).itemsize == 2 and multiplied) or self._fp8(ba, dtype, family)
+                 or self._tf32(ba, dtype, family))
                 and (not tabled or (family.gathers_rows and family.gathers_alone))
                 and (not gathered or ba.arguments['hooks'].prologue is None)
                 and (family.issues_in_consumers or not prepared)
@@ -1508,6 +1518,7 @@ class MosaicFp8PackedGmm(MosaicGmm):
         form, _ = bits.fp8_form(packed.fp8_minifloat(ba.arguments['kernel'].fmt))
         return _beside(super()._registers(ba, config, merging=merging, target=target),
                        2 * config.block_n * 16 // resources.THREADS + form.live)
+
 
 @dataclasses.dataclass(frozen=True)
 class MosaicTgmm(_Mosaic):

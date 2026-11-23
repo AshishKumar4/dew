@@ -992,8 +992,9 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
             assert isinstance(summed, jax.Array)
     factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape, dense)
     return (summed * factor).astype(lhs.dtype if out_dtype is None else out_dtype)
-
-
+def ternary_weight_product(lhs: jax.Array, weights, group_sizes: jax.Array | None = None, **kw) -> jax.Array:
+    from .templates.gemm import ternary
+    return ternary.ternary_weight_product(lhs, weights, group_sizes, **kw)
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,
            prologue_operands: tuple = (), out_dtype, precision: PrecisionLike = None,
            interpret_on_cpu: bool = False, gather: tuple | None = None) -> jax.Array:
