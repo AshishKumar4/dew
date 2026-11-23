@@ -112,7 +112,7 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
     of them its bytes' device traffic (a Triton launch's blocks, which its loads and stores move: the decode
     merge's, `merged._channel_block`). Its special functions in `forms` where given (a Mosaic GPU kernel's,
     `forms_of`), else one MUFU an element each (`operation_work`). A wait on a barrier no landing of its own
-    answers waits for what another warpgroup or an earlier trip lands on it (a producer's copies, a
+    answers waits for what another warpgroup or an earlier trip of a loop lands on it (a producer's copies, a
     pipelined walk's next step's, `_Arrivals`), its roles counted again where a first count found any (row
     4123)."""
     values = [_DEVICE if at in device else _barrier(var) for at, var in enumerate(body.invars)]
@@ -123,7 +123,6 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
         for index in range(warpgroups):
             counting = _Counting(axis, index, forms=forms, arrivals=arrivals)
             counting.run(body, values)
-            arrivals.left(counting.landing, looped=False)
             roles.append(Role(counting.fixed, tuple(counting.walks)))
         return roles
 
@@ -156,27 +155,29 @@ def _barrier(var: jax_core.Var) -> _Barrier | None:
 
 
 class _Arrivals:
-    """What lands on each barrier a kernel allocates (`_Barrier`) that the count landing it never waits on:
-    a producer warpgroup's copies, a pipelined walk's next step's, collected as a count of the kernel's roles
-    runs (`left`), each barrier's from a loop's trips before those outside any (a prologue's prefetches, all
-    of a ring's slots at once); and read as the next count prices a wait no landing of its own answers
-    (`arriving`): its paths, each one no other outlasts (`Work.__add__`)."""
+    """What a loop's trips land on each barrier a kernel allocates (`_Barrier`) that their count never waits
+    on: a producer warpgroup's copies, a pipelined walk's next step's, collected as a count of the kernel's
+    roles runs (`left`); and read as the next count prices a wait no landing of its own answers
+    (`arriving`): its paths, each one no other outlasts (`Work.__add__`). What lands outside a loop's trip
+    arrives for none, its wait a round trip as before: a program's one load onto a barrier of one slot held a
+    walk's whole path to one stage, and a scan's trips, counted in one count, chained their copies into one
+    arrival (M-FS-65, this head's first form re-read on its own code: a gated delta net's states launch
+    priced at 1.34 of its time, KDA's weighted at 3.69)."""
 
     def __init__(self):
-        self.looped: dict[_Barrier, tuple[Chain, ...]] = {}
-        self.fixed: dict[_Barrier, tuple[Chain, ...]] = {}
+        self.landed: dict[_Barrier, tuple[Chain, ...]] = {}
         self.arrived: dict[_Barrier, tuple[Chain, ...]] = {}
 
-    def left(self, landing: Mapping, *, looped: bool) -> None:
-        """Collect a count's `landing` its count left unwaited, a loop's trip's where `looped`."""
-        held = self.looped if looped else self.fixed
+    def left(self, landing: Mapping) -> None:
+        """Collect what a loop's trip left unwaited (`landing`)."""
         for barrier, chain in landing.items():
             if isinstance(barrier, _Barrier):
-                held[barrier] = (Work(chains=held.get(barrier, ())) + Work(chains=(chain,))).chains
+                held = Work(chains=self.landed.get(barrier, ()))
+                self.landed[barrier] = (held + Work(chains=(chain,))).chains
 
     def collected(self) -> bool:
         """Take what the count left as what arrives on each barrier; whether anything does."""
-        self.arrived = {**self.fixed, **self.looped}
+        self.arrived = dict(self.landed)
         return bool(self.arrived)
 
     def arriving(self, barrier) -> tuple[Chain, ...]:
@@ -706,7 +707,7 @@ class _Counting:
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals)
             trial.run(body, inputs)
-            self.arrivals.left(trial.landing, looped=True)
+            self.arrivals.left(trial.landing)
             return trial
 
         steady, odd = trip("steady", 0), trip("steady", 1)
@@ -735,7 +736,8 @@ class _Counting:
             counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp),
                                 forms=self.forms, arrivals=self.arrivals)
             counted.run(inner, barriers)
-            self.arrivals.left(counted.landing, looped=bool(self.loops))
+            if self.loops:
+                self.arrivals.left(counted.landing)
             self.fixed = self.fixed + counted.fixed
             if counted.walks:
                 steps.append(_mean(counted.walks))
@@ -784,7 +786,8 @@ class _Counting:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals)
             trial.run(branch, operands)
-            self.arrivals.left(trial.landing, looped=bool(self.loops))
+            if self.loops:
+                self.arrivals.left(trial.landing)
             trials.append(trial)
         self.fixed = self.fixed + _envelope(trial.fixed for trial in trials)
         if any(trial.walks for trial in trials):
