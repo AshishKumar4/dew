@@ -291,8 +291,8 @@ def test_a_program_within_a_held_jits_trace_that_refuses_a_launch_leaves_it_to_i
     armed: list[bool] = []
 
     def refusing(x):
-        if armed == [True]:
-            armed.append(True)
+        # As a derivation certified inline does: its launch refused wherever its reading holds no refusal.
+        if armed and not report.refusals_of("a launch"):
             report.refuse([("a launch", 1, ("k",))])
         return x
 
@@ -320,6 +320,7 @@ def test_a_program_within_a_held_jits_trace_that_refuses_a_launch_leaves_it_to_i
     running.start()
     running.join(timeout=120)
     assert ran == [1.0], "the refused scope's call did not end"
+    armed.clear()
     outer.released()
     inner.released()
     with report.refusals():
