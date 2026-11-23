@@ -1195,8 +1195,12 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
     assert jax.tree.structure(resumed.opt_state) != jax.tree.structure(saved.opt_state)
     for got, want in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(saved.opt_state), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    # Its record rewritten in its translation, as a resumed run writes its own: its next start reads alike.
-    (run / "run.json").write_text(json.dumps({"fields": {"optim": {"optimizer": "adamw"}}}))
+    # Its record rewritten in its translation, as a resumed run writes its own (`RunConfig.save`), which
+    # marks the earlier one beside it first: its next start reads alike.
+    from dew.config.lm import LMRunConfig
+
+    LMRunConfig(optim=loaded).save(str(run))
+    assert (run / "earlier-masked-decay.json").exists()
     assert int(_checkpointed(run, loaded, 2).step) == 2
 
 

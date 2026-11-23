@@ -9,6 +9,7 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import functools
+import json
 import logging
 import threading
 import time
@@ -19,8 +20,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
+from etils import epath
 
 from dew import _records
+from dew._files import write_atomically
 from dew._records import JSON, record
 from dew.batch import Variables
 from dew.nn.kernels import options
@@ -470,32 +473,33 @@ def unmasked_decay(record: Mapping[str, JSON]) -> bool:
 
 
 def earlier_unmasked(directory: str, run_file: str) -> bool:
-    """Whether the checkpoints in `directory` are of a run whose record (`run_file`) was an earlier run's
-    whose Dew optimizer read a mask of False among its options (`unmasked_decay`): the one run whose
+    """Whether the checkpoints in `directory` are of a run whose record (`run_file`) is or was an earlier
+    run's whose Dew optimizer read a mask of False among its options (`unmasked_decay`): the one run whose
     checkpoints a restore reads across its masked decay step (`masked_decay_unsaved`), every other's held to
-    its template as Orbax holds it, an active decay's among them. Read as the checkpoints are made, before
-    the run writes its record in its translation, and kept beside them from then on (`MASKED_DECAY_MARK`),
-    so every later start of the run reads it alike."""
-    import json
-
-    from etils import epath
-
-    from dew._files import write_atomically
-
+    its template as Orbax holds it, an active decay's among them. Read alone, nothing written: the record as
+    it stands, or the mark its run kept beside it as it rewrote that record in its translation
+    (`MASKED_DECAY_MARK`, `keep_unmasked_mark`)."""
     root = epath.Path(directory)
     if (root / MASKED_DECAY_MARK).exists():
         return True
-    saved = root / run_file
+    return unmasked_decay(_record_at(root / run_file))
+
+
+def keep_unmasked_mark(path) -> None:
+    """Keep `MASKED_DECAY_MARK` beside the run record at `path` (`run.json`) where that record, about to be
+    written over in its translation, is an earlier masked run's (`unmasked_decay`), so the run's checkpoints
+    read it alike once its record no longer says so (`earlier_unmasked`); nothing where it is not."""
+    if unmasked_decay(_record_at(path)):
+        write_atomically(path.parent / MASKED_DECAY_MARK, json.dumps({"unmasked_decay": True}))
+
+
+def _record_at(path) -> Mapping[str, JSON]:
+    """The record a run's record file at `path` holds, empty where none is or it is not one."""
     try:
-        held = json.loads(saved.read_text()) if saved.exists() else None
+        held = json.loads(path.read_text()) if path.exists() else None
     except ValueError:
-        return False
-    if not (isinstance(held, Mapping) and unmasked_decay(held)):
-        return False
-    if jax.process_index() == 0:
-        root.mkdir(parents=True, exist_ok=True)
-        write_atomically(root / MASKED_DECAY_MARK, json.dumps({"unmasked_decay": True}))
-    return True
+        return {}
+    return held if isinstance(held, Mapping) else {}
 
 
 def masked_decay_unsaved(template, metadata, optimizers: Sequence[TreePath]):
