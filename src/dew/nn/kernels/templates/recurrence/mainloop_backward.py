@@ -20,7 +20,6 @@ from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
 from dew.nn.kernels.templates.recurrence.chunk_forward import ForkedTable, prepared
 from dew.nn.kernels.templates.recurrence.mainloop import (
-    LOG2_DECAY_FLOOR,
     Call,
     Held,
     Operand,
@@ -29,6 +28,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     addressed,
     block_stored,
     chunk_liveness,
+    clamped_gradient,
     column_tile,
     diagonal,
     f32,
@@ -179,10 +179,9 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
         (dq, dk, dv, dg, dbeta, dh0, taken), key_kept = key_backward.gradients(run, laid_do, dht, tiles)
         dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
         if call.clamped:
-            # The clamp's derivative (`chunk_forward.prepared`'s): a log decay below the floor takes none,
-            # every pair across it zero in fp32 as at the floor; summed back over its chunk, its gradient
-            # was the terms' fp32 residue where float64's is zero.
-            dg = jnp.where(g < LOG2_DECAY_FLOOR / algebra.LOG2_E, 0.0, dg)
+            # The clamp's derivative (`chunk_forward.prepared`'s): summed back over its chunk, a log decay
+            # below the floor took the terms' fp32 residue where float64's is zero.
+            dg = clamped_gradient(g, dg)
         grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts)
         return (*_tabled_gradients(run, grads, taken), None, _entered_gradient(run, taken)), key_kept
     local = _local_back(run.q, run.k, laid_do, *run.prefix, run.taken, call, scale=run.scale)

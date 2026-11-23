@@ -305,6 +305,28 @@ def prefix_limbs(per_key: bool, decay_bound: float | None, chunk: int, dtype) ->
     return 1 if jnp.dtype(dtype).itemsize == 2 else 2
 
 
+def clamps(per_key: bool, decay_bound: float | None, chunk: int, dtype) -> bool:
+    """Whether a call's log decays are clamped at `LOG2_DECAY_FLOOR` before their prefix is summed: a decay a
+    key dimension's rounded prefix (`prefix_limbs`) that no bound holds within `ROUNDED_PREFIX_REACH`."""
+    return prefix_limbs(per_key, decay_bound, chunk, dtype) == 1 and not bounded_prefix(decay_bound, chunk)
+
+
+DECAY_FLOOR = LOG2_DECAY_FLOOR / algebra.LOG2_E
+"""`LOG2_DECAY_FLOOR` as a natural log decay, the operands' (`clamped`)."""
+
+
+def clamped(decays: jax.Array) -> jax.Array:
+    """`decays`, natural log decays, at least `DECAY_FLOOR` (`Call.clamped`'s calls)."""
+    return jnp.maximum(decays, DECAY_FLOOR)
+
+
+def clamped_gradient(decays: jax.Array, gradient: jax.Array) -> jax.Array:
+    """`clamped`'s derivative applied to `gradient`, the log decays `decays`': none below the floor, a
+    decay there zero in fp32 at the floor too; the gradient itself at the floor and above, where the clamp
+    is the decay itself."""
+    return jnp.where(decays < DECAY_FLOOR, 0.0, gradient)
+
+
 def bounded_prefix(decay_bound: float | None, chunk: int) -> bool:
     """Whether decays bounded below by `decay_bound` a token hold a chunk of `chunk` tokens' base-2 prefix
     within `ROUNDED_PREFIX_REACH`."""
@@ -423,7 +445,7 @@ class Call:
     def clamped(self) -> bool:
         """Whether its log decays are clamped at `LOG2_DECAY_FLOOR` before their prefix is summed: a decay a
         key dimension's rounded prefix that no bound holds within `ROUNDED_PREFIX_REACH`."""
-        return self.prefix_limbs == 1 and not bounded_prefix(self.decay_bound, self.chunk)
+        return clamps(self.per_key, self.decay_bound, self.chunk, self.given.dtype)
 
     @property
     def memories(self) -> Operand:

@@ -1415,6 +1415,17 @@ def test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_o
 
 
 @INTERPRETS
+@pytest.mark.parametrize("dtype", [None, jnp.float32], ids=["bf16 clamped", "fp32 compensated"])
+def test_the_recurrence_step_witness_holds_an_unbounded_steep_column(dtype):
+    """The step witness (row 2084 (e)) under a decay a key dimension no bound declares, one key dimension of
+    one token a chunk at -2^26 beside mild ones (`rw.assert_clamped_key_decays_witnessed`): every record of a
+    call of three chunks inside its step's enclosure, its fast backward's too where the template trains it,
+    a bf16 call's decays clamped before its rounded prefix, an fp32 call's prefix the compensated pair (row
+    12067)."""
+    rw.assert_clamped_key_decays_witnessed(rw.interpreted_lane(), dtype=dtype)
+
+
+@INTERPRETS
 def test_the_recurrence_step_witness_holds_a_write_gate_on_the_keys_side_and_refuses_one_dropped():
     """The step witness (row 2084 (e)) where the write gate takes the keys' side, Mamba2's SSD under the fast
     forms (`rw.assert_keys_gated_witnessed`): every record a bf16 call of three chunks keeps inside its step's

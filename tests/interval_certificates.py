@@ -130,6 +130,9 @@ class Lane:
     rounded_prefix: bool = False
     """Whether a decay a key dimension's prefix is its rounded sum alone (`mainloop.Call.prefix_limbs`), its
     exponents half an fp32 unit further (`recurrence_witness.Exponents.of`)."""
+    clamped: bool = False
+    """Whether its log decays are clamped at its floor before their prefix is summed (`mainloop.Call.clamped`,
+    `recurrence_witness.Exponents.of`)."""
     tf32: Literal["plain", "rna", "read"] = "read"
     """How a one-part fp32 operand reaches its product (`operand`), the issuer's: 'plain', as itself (an
     interpreted product, a plain fp32 dot: mosaic_sm80.py's and mosaic_sm90.py's interpreted branches);
