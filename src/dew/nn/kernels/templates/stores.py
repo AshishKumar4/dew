@@ -41,10 +41,11 @@ OUTPUT_BUFFERS = 2
 reads it."""
 
 
-def staged_columns(columns: int, dtypes) -> int:
+def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES) -> int:
     """The columns of each chunk a consumer stages a `columns`-wide output tile in: the most that divide the
-    tile within `STAGED_BYTES` of the widest output (a 192-column tile's bf16 output in chunks of 64)."""
-    return math.gcd(columns, STAGED_BYTES // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+    tile within `swizzle` bytes of the widest output, a swizzled row's (`STAGED_BYTES` by default; a
+    192-column tile's bf16 output in chunks of 64)."""
+    return math.gcd(columns, swizzle // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
 
 
 def output_staging(columns: int, dtypes, staging: tuple[int, int] | None = None, *,
