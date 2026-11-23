@@ -394,10 +394,10 @@ _ONCE_PREDICATED = _cache.untraced(contextvars.ContextVar("once_predicated", def
 own)."""
 
 
-def refuse_staging(family, staging: tuple[int, int] | None) -> None:
-    """Refuses a `staging` (`Family.output_staging`'s) where `family` stages each output tile whole."""
-    if staging is not None:
-        raise ValueError(f"{family.name} stages each output tile whole, in no chunks: {staging}")
+def refuse_staging(family, chunks: tuple[int, int] | None) -> None:
+    """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole."""
+    if chunks is not None:
+        raise ValueError(f"{family.name} stages each output tile whole, in no chunks: {chunks}")
 
 
 def then_read(read: Callable, after: Callable | None) -> Callable:
@@ -1878,7 +1878,7 @@ class Transport[Allocated, Opened](abc.ABC):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False, staging: tuple[int, int] | None = None) -> None:
+                pingpong: bool = False, chunks: tuple[int, int] | None = None) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
@@ -1987,12 +1987,12 @@ class Transport[Allocated, Opened](abc.ABC):
         tiles' and its reads' (`schedule`)."""
         return [self.schedule(consumers), self.schedule(consumers)]
 
-    def output_staging(self, outputs: tuple, consumers: int, staging: tuple[int, int] | None = None) -> list:
+    def output_staging(self, outputs: tuple, consumers: int, chunks: tuple[int, int] | None = None) -> list:
         """The shared memory `persist` stages each of `outputs` (`(shape, dtype)`, a tile's) in, which a
         template's allocations count as its own (`resources.Scope`): the whole tile, where a family stages
-        it whole, which takes no `staging` (chunk columns and buffers, `stores.output_staging`'s)."""
+        it whole, which takes no `chunks` (chunk columns and buffers, `stores.output_staging`'s `staging`)."""
         del consumers
-        refuse_staging(self, staging)
+        refuse_staging(self, chunks)
         return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
 
     def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = (), *,

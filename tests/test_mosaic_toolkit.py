@@ -965,7 +965,7 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
 
             family.persist(streams, (PERSISTED_TILES,), schedule, issue, finish, consumers=1, axis="programs",
                            outputs=((shape, jnp.float32),), interpret=interpret, accumulators=(shape,),
-                           staging=staging)
+                           chunks=staging)
 
         family.scoped(scope, streams=family.streams(blocks, 2, 1))
 
