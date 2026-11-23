@@ -9,6 +9,7 @@ Mosaic GPU's lowering checks a kernel against the process's own device and lower
 lowering a generation's Mosaic GPU kernels runs on a CPU or on a GPU that copies as it does (`lowers_as`).
 """
 
+import contextlib
 import importlib.util
 import os
 from pathlib import Path
@@ -221,3 +222,22 @@ def production_refusals(target, group: tuple, refused: list[str]) -> list[str]:
                       f"(row {declared})")
     return failed
 
+
+def on_the_host():
+    """The host's CPU as the default device: where a cell's interpreted kernels and eager host work run, a
+    GPU tier's prepare computing on no device (its default a compile-only GPU), and an interpreter's
+    callbacks making no program its store holds (`reference_error.ahead_arm`)."""
+    return jax.default_device(jax.devices("cpu")[0])
+
+
+@contextlib.contextmanager
+def on_a_v5e():
+    """A TPU v5e's abstract mesh and target, its modules lowered from the host's CPU: a TPU module's lowering
+    reads its default device's backend, which a tier's prepare's compile-only GPU is none of, and its
+    target, which that prepare assumes its node's GPU for."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with on_the_host(), generation.assumed("v5e"), jax.sharding.use_abstract_mesh(
+            AbstractMesh((1,), ("data",), abstract_device=device)):
+        yield
