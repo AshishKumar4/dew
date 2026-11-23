@@ -127,11 +127,12 @@ from dew.nn.kernels.generation import compile_only_gpus
 from dew.training.ahead import AheadOfTime, compile_ahead
 
 nonce, refused = float(sys.argv[1]), sys.argv[3] == "refused"
+# An H100's 80 GiB, which a step is compiled ahead against (`compile_only_gpus`' memory), or the memory named.
+memory = int(sys.argv[4]) if len(sys.argv) > 4 else 80 * 2**30
 with report.refusals():
     if refused:
         report.refuse(pickle_load(sys.argv[2]))
-    # An H100's 80 GiB, which a step is compiled ahead against (`compile_only_gpus`' memory).
-    ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30)), nonce), BATCH)
+    ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1, memory)), nonce), BATCH)
     ahead.save(sys.argv[2] + (".again" if refused else ""))
     # The saved plan read back beside every field of each miss the compile made, its config by its text.
     misses = [{**{field.name: getattr(miss, field.name) for field in dataclasses.fields(miss)},
@@ -375,9 +376,16 @@ def test_a_run_handed_a_step_compiled_ahead_for_the_canonical_h100_takes_it_on_o
     multiprocessors: it derives its launches for the target the step was compiled for
     (`AheadOfTime.target`), within the step's refusals, and trains from it, its plan's first compile the
     step compiled ahead (ledger 2453). Where it counts others (an H100 PCIe's 114) the run is refused, as a
-    balanced tail's grid derived past a GPU's residency waits on a program that never starts (row 3606)."""
+    balanced tail's grid derived past a GPU's residency waits on a program that never starts (row 3606). The
+    step is compiled ahead against the memory this host's GPU states at the run's share: a GH200 shared at a
+    GPU tier's share states less than an H100's 80 GiB there, and a run is refused a plan of more memory than
+    its GPU holds (row 12193)."""
+    from dew._devices import pool_share
+
     step = str(tmp_path / "step.dew-aot")
-    spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
+    # The memory whose allocator limit at the run's share is this GPU's own, at most.
+    memory = int(jax.devices()[0].memory_stats()["bytes_limit"] / pool_share())
+    spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh", str(memory))
     canonical = generation.gpu_target("sm90").multiprocessors
     if generation.device_target(jax.devices()[0]).multiprocessors != canonical:
         from dew.training.ahead import AheadOfTime, handed
