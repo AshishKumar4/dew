@@ -38,6 +38,9 @@ one process (`gpu_flow`), each cell its own file's property:
   the CPU's, interpreted.
 - The joined projections' check-1 matrix (tests/join_matrix.py), each cell on a GPU of its generation: an
   attention layer's query, key and value side by side on a Hopper's warpgroup MMA among them.
+- The fused linear cross-entropy's check-1 matrix (tests/linear_ce_matrix.py), each cell on a GPU of its
+  generation: an LM head's loss and gradients through the template's fused kernel on par with the chunked
+  XLA program's.
 """
 
 import functools
@@ -401,6 +404,14 @@ def test_the_join_matrix_holds_on_this_gpu():
     each cell on a GPU of its generation (its pin): Hopper's side-by-side forward and chained input gradient
     on the warpgroup MMA, which the CPU only interprets (head review of 0099a4701 F6)."""
     run_cells(cells_of(kernel_matrix.check("join")))
+
+
+def test_the_linear_ce_matrix_holds_on_this_gpu():
+    """The fused linear cross-entropy's check-1 matrix (tests/kernel_matrix.py): an LM head's loss and its
+    gradients through the template's fused kernel on par with the chunked XLA program's, each cell on a GPU
+    of its generation (its pin): the fused kernel's native launch, which the CPU only interprets
+    (tests/test_gemm_linear_ce.py), on the GPU tier alone."""
+    run_cells(cells_of(kernel_matrix.check("linear_ce")))
 
 
 def test_the_blockwise_matrix_holds_on_this_gpu():

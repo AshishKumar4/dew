@@ -14,27 +14,13 @@ import pytest
 from fla_gdn_support import KernelCase
 from generation_support import lowers
 from kernel_compile import compile_mosaic_kernels
+from linear_ce_matrix import dense_truth
 from reference_error import assert_as_exact, seeds_for
 
-from dew.nn import categorical
 from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates.gemm import linear_ce
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
-
-
-def _dense_truth(x, weight, targets, bias):
-    xw, ww = x.astype(jnp.float64), weight.astype(jnp.float64)
-    logits = jax.lax.dot_general(xw, ww, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float64)
-    if bias is not None:
-        logits = logits + bias.astype(jnp.float64)[None, :]
-    peak = jnp.max(logits, axis=1)
-    exp_z = jnp.exp(logits - peak[:, None])
-    mass = jnp.sum(exp_z, axis=1)
-    hit = jnp.arange(logits.shape[1], dtype=jnp.int32)[None, :] == targets[:, None]
-    rest = jnp.sum(jnp.where(hit, jnp.float64(0.0), exp_z), axis=1)
-    loss = categorical.cross_entropy(logits, targets)
-    return loss, peak + jnp.log(mass), peak, mass, rest
 
 
 @pytest.mark.parametrize(("m", "k", "v", "with_bias"), [(64, 64, 128, False), (70, 64, 140, True)])
@@ -54,7 +40,7 @@ def test_chunked_linear_ce_mosaic_arm_holds_check_1_value_vjp_and_normalizer(
         return x, w, targets, bias, cot
 
     def _run(kernel: str, x, w, targets, bias, cot):
-        with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
+        with generation.assumed("sm90"), generation.chosen(linear_ce=kernel):
             def fwd(a, b, c):
                 loss, _, log_z = chunked.chunked_cross_entropy(
                     a, OutputTable(b, vocab_major=True, bias=c, precision=chunked.BF16), targets,
@@ -71,13 +57,13 @@ def test_chunked_linear_ce_mosaic_arm_holds_check_1_value_vjp_and_normalizer(
 
     def run_truth(x, w, targets, bias, cot):
         def fwd(a, b, c):
-            loss, log_z, *_ = _dense_truth(a, b, targets, c)
+            loss, log_z, *_ = dense_truth(a, b, targets, c)
             return loss, log_z
 
         (loss, log_z), pull = jax.vjp(fwd, x.astype(jnp.float64), w.astype(jnp.float64),
                                       None if bias is None else bias.astype(jnp.float64))
         grads = pull((cot.astype(jnp.float64), jnp.zeros_like(cot, jnp.float64)))
-        _, _, peak, mass, rest = _dense_truth(x, w, targets, bias)
+        _, _, peak, mass, rest = dense_truth(x, w, targets, bias)
         return loss, log_z, grads, peak, mass, rest
 
     dew_fn = jax.jit(functools.partial(_run, "mosaic"))
@@ -87,7 +73,7 @@ def test_chunked_linear_ce_mosaic_arm_holds_check_1_value_vjp_and_normalizer(
     assert_as_exact(dew_fn, ref_fn, draw, label, seeds=count, truth_fn=run_truth)
 
     x0, w0, t0, b0, _ = draw(0)
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+    with (generation.assumed("sm90"), generation.chosen(linear_ce="mosaic"),
           generation.routes() as seen):
         chunked.chunked_cross_entropy(x0, OutputTable(w0, vocab_major=True, bias=b0, precision=chunked.BF16),
                                       t0, chunks=2, tile=(64, 64), predict=False)
@@ -97,7 +83,7 @@ def test_chunked_linear_ce_mosaic_arm_holds_check_1_value_vjp_and_normalizer(
 def test_chunked_linear_ce_non_gated_cases_take_existing_path_untouched():
     """Cases outside `MOSAIC_LINEAR_CE`'s gate (`predict=True`, `excluded`, `temperature!=1`, scaled
     columns, `softcap`, fp32 head, or unselected default) take `chunked._forward`'s existing XLA path
-    untouched and stay bit-equal to `grouped_matmul='xla'` (row 12136)."""
+    untouched and stay bit-equal to `linear_ce='xla'` (row 12136)."""
     rng = np.random.default_rng(12136)
     x = jnp.asarray(rng.standard_normal((64, 64)) / 8.0, jnp.bfloat16)
     w = jnp.asarray(rng.standard_normal((128, 64)) / 8.0, jnp.bfloat16)
@@ -118,10 +104,10 @@ def test_chunked_linear_ce_non_gated_cases_take_existing_path_untouched():
          {"predict": False}),
     ]
     for name, hidden, head, kwargs in cases:
-        with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"):
+        with generation.assumed("sm90"), generation.chosen(linear_ce="xla"):
             ref_loss, _, ref_log_z = chunked.chunked_cross_entropy(
                 hidden, head, t, chunks=2, tile=(64, 64), **kwargs)
-        with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+        with (generation.assumed("sm90"), generation.chosen(linear_ce="mosaic"),
               generation.routes() as seen):
             got_loss, _, got_log_z = chunked.chunked_cross_entropy(
                 hidden, head, t, chunks=2, tile=(64, 64), **kwargs)
@@ -133,7 +119,7 @@ def test_chunked_linear_ce_non_gated_cases_take_existing_path_untouched():
         got_def, _, _ = chunked.chunked_cross_entropy(x, OutputTable(w, vocab_major=True), t,
                                                       chunks=2, tile=(64, 64), predict=False)
     assert not any(r.kernel == "mosaic" for r in seen), seen
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"):
+    with generation.assumed("sm90"), generation.chosen(linear_ce="xla"):
         ref_def, _, _ = chunked.chunked_cross_entropy(x, OutputTable(w, vocab_major=True), t,
                                                       chunks=2, tile=(64, 64), predict=False)
     np.testing.assert_array_equal(np.asarray(got_def), np.asarray(ref_def))
@@ -152,14 +138,14 @@ def test_linear_cross_entropy_compiles_spill_free(gpu: str, with_bias: bool):
 
     def fn(a, weight, targets, *rest):
         bias = rest[0] if rest else None
-        with generation.chosen(grouped_matmul="mosaic"):
+        with generation.chosen(linear_ce="mosaic"):
             loss, _, _ = chunked.chunked_cross_entropy(
                 a, OutputTable(weight, vocab_major=True, bias=bias, precision=chunked.BF16), targets,
                 chunks=2, tile=(256, 256), predict=False)
             return loss
 
     args = (x, w, t, b) if with_bias else (x, w, t)
-    with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"):
+    with generation.assumed(gpu), generation.chosen(linear_ce="mosaic"):
         records = compile_mosaic_kernels([KernelCase(f"linear_ce_{gpu}_bias{with_bias}",
                                                      lambda: (fn, args))], gpu)
     for rec in records:
@@ -181,7 +167,7 @@ def test_linear_cross_entropy_mixed_dtype_refuses_native():
         with pytest.raises(ValueError):
             linear_ce.linear_ce(jnp.zeros((64, 64), jnp.bfloat16), jnp.zeros((64, 64), jnp.float32),
                                 jnp.zeros((64,), jnp.int32), tiles=tile, multiprocessors=1, interpret=True)
-        with generation.chosen(grouped_matmul="mosaic"), pytest.raises(selection.KernelRefused):
+        with generation.chosen(linear_ce="mosaic"), pytest.raises(selection.KernelRefused):
             linear_ce.mosaic_linear_ce(jnp.zeros((64, 64), jnp.bfloat16), jnp.zeros((64, 64), jnp.float32),
                                        jnp.zeros((64,), jnp.int32))
 
@@ -212,8 +198,8 @@ def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_cho
     head's product does forward and backward (`chunked._tile_logits`, `bf16_product`): logits near 128,
     where bf16's places are 0.5 below and 1 above, hold check 1 on loss, log Z and gradients against
     float64 truth of the rounded logits (a softmax of the unrounded ones is 0.25 off where a target's 128.25
-    rounds to 128). Unrelated `grouped_matmul` choices (`cutlass`, `triton`) leave chunked XLA untouched,
-    bit-equal (rows 6103, 12136)."""
+    rounds to 128). Naming the grouped products' kernel (`grouped_matmul`: `mosaic`, `cutlass`, `triton`)
+    leaves chunked XLA untouched, bit-equal: the fused loss is its own choice (rows 6103, 12136, 12457)."""
     m, k, v = 64, 64, 64
 
     def draw(seed):
@@ -225,7 +211,7 @@ def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_cho
         return x.astype(jnp.bfloat16), w.astype(jnp.bfloat16), targets, cot
 
     def run(kernel: str, x, w, targets, cot):
-        with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
+        with generation.assumed("sm90"), generation.chosen(linear_ce=kernel):
             def fwd(a, b):
                 loss, _, log_z = chunked.chunked_cross_entropy(
                     a, OutputTable(b, vocab_major=True, precision=chunked.BF16), targets,
@@ -252,10 +238,10 @@ def test_linear_ce_rounds_bf16_logits_matches_head_law_and_ignores_unrelated_cho
 
     x, w, targets, _ = draw(0)
     head = OutputTable(w, vocab_major=True, precision=chunked.BF16)
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"):
+    with generation.assumed("sm90"), generation.chosen(linear_ce="xla"):
         want_loss, _, want_logz = chunked.chunked_cross_entropy(x, head, targets, chunks=1, tile=(64, 64),
                                                                 predict=False)
-    for other in ("cutlass", "triton"):
+    for other in ("mosaic", "cutlass", "triton"):
         with generation.assumed("sm90"), generation.chosen(grouped_matmul=other):
             got_loss, _, got_logz = chunked.chunked_cross_entropy(
                 x, head, targets, chunks=1, tile=(64, 64), predict=False)

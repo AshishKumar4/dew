@@ -224,6 +224,7 @@ class Choice(enum.StrEnum):
     GEMM_EPILOGUE = 'gemm_epilogue'
     GEMM_PROLOGUE = 'gemm_prologue'
     GROUPED_MATMUL = 'grouped_matmul'
+    LINEAR_CE = 'linear_ce'
     LOW_RANK = 'low_rank'
     MXFP8 = 'mxfp8'
     NARROW_COPIES = 'narrow_copies'
