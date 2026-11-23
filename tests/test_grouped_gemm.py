@@ -29,6 +29,7 @@ from dew.nn.kernels import (
     gemm,
     generation,
     grouped_cells,
+    grouped_cutlass,
     grouped_launch,
     grouped_matmul,
     grouped_triton,
@@ -278,10 +279,10 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
 
     hopper = installed((9, 0), "sm90")
     assert hopper["sm90"] == "sm90" and hopper["sm80"] is None
-    assert grouped_matmul.cutlass_built_for("sm90") == "sm90"
-    assert grouped_matmul.cutlass_built_for("sm80") is None
+    assert grouped_cutlass.cutlass_built_for("sm90") == "sm90"
+    assert grouped_cutlass.cutlass_built_for("sm80") is None
     ampere = installed((8, 0), "sm80")
-    assert ampere["sm80"] == "sm80" and grouped_matmul.cutlass_built_for("sm80") == "sm80"
+    assert ampere["sm80"] == "sm80" and grouped_cutlass.cutlass_built_for("sm80") == "sm80"
 
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
@@ -291,7 +292,7 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
     here = generation.gpu_target().generation
-    if grouped_matmul.cutlass_built_for(here) is None:
+    if grouped_cutlass.cutlass_built_for(here) is None:
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
     group_sizes = np.asarray(SIZES[sizes], np.int32)
 
@@ -304,8 +305,8 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
                                               implementation, None)
     # Its build's kernel pinned, as a tuned pick names it: the pin taken as legal for the wheel's one kernel
     # (`_Cutlass.legal`), where a template's shared-memory model, which CUTLASS has none of, raised.
-    pinned = {grouped_matmul.CutlassGmm: grouped_matmul.cutlass_tile(grouped_matmul.cutlass_built_for(here),
-                                                                     jnp.bfloat16)}
+    built = grouped_cutlass.cutlass_built_for(here)
+    pinned = {grouped_cutlass.CutlassGmm: grouped_cutlass.cutlass_tile(built, jnp.bfloat16)}
 
     def through_cutlass(x, w, dy):
         with generation.chosen(grouped_matmul="cutlass"), tuning.pinned(pinned):
@@ -378,7 +379,7 @@ def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):
     gradients through CUTLASS's launches chosen by name, each map one launch in turn (their FFI calls'
     sequential batching, row 4389), are as exact as XLA's ragged dot mapped, from float64."""
     here = generation.gpu_target().generation
-    if grouped_matmul.cutlass_built_for(here) is None:
+    if grouped_cutlass.cutlass_built_for(here) is None:
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
     group_sizes = np.asarray(SIZES["ragged"], np.int32)
 
@@ -2032,7 +2033,7 @@ def test_vmap_folds_singleton_group_sides_and_preserves_named_dispatch():
             jax.jit(jax.vmap(lambda x, w: gemm.gemm(x, w, gs, out_dtype=jnp.bfloat16,
                                                     interpret_on_cpu=True)))(xs, gw)
         assert any(r.kernel == "xla" for r in seen), seen
-        if grouped_matmul.cutlass_built_for("sm90") is None:
+        if grouped_cutlass.cutlass_built_for("sm90") is None:
             with generation.chosen(grouped_matmul="cutlass"), pytest.raises(selection.KernelRefused):
                 jax.jit(jax.vmap(lambda x, w: gemm.gemm(x, w, gs, out_dtype=jnp.bfloat16,
                                                         interpret_on_cpu=True)))(xs, gw)
