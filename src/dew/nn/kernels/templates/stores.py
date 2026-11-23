@@ -40,6 +40,11 @@ OUTPUT_BUFFERS = 2
 """The chunk buffers a consumer stages an output tile through: one written while the last one's store
 reads it."""
 
+TMA_STORE_BYTES = 16
+"""The bytes a TMA store's row is a whole number of: a tensor map's box takes an inner dimension of a
+multiple of 16 bytes (CUDA's `cuTensorMapEncodeTiled`: `boxDim[0]` times the element's size), so a staged
+chunk stores rows of whole 16-byte units in each output's dtype (8 bf16 columns, 4 fp32)."""
+
 
 def staged_columns(columns: int, dtypes, *, swizzle: int = STAGED_BYTES) -> int:
     """The columns of each chunk a consumer stages a `columns`-wide output tile in: the most that divide the
@@ -57,11 +62,19 @@ def output_staging(columns: int, dtypes, staging: tuple[int, int] | None = None,
     (its StageCountAutoCarveout). Fewer buffers or narrower chunks leave the ring a stage more where the
     block falls a stage short (an sm120 GEMM's 128 x 256 tile, row 5634, M-FS-62). A chunk divides the
     `piece` its issuer emits at once (`Issuer.chunk_columns`, the tile's width where none is given): a
-    tcgen05 tile of 128 columns emits pieces of 64, which a 128-column chunk does not hold."""
+    tcgen05 tile of 128 columns emits pieces of 64, which a 128-column chunk does not hold. A stated chunk
+    stores whole TMA rows in each of `dtypes` (`TMA_STORE_BYTES`), by each dtype's bits (a packed fp4's
+    half byte): a bf16 output's chunk of 4 columns, 8 bytes a row, is refused here rather than by the tensor
+    map it lowers to."""
     chunk, buffers = (staged_columns(columns, dtypes), OUTPUT_BUFFERS) if staging is None else staging
     if columns % chunk or (piece or columns) % chunk or buffers < 1:
         raise ValueError(f"a {columns}-column output tile emitted {piece or columns} columns at once stages "
                          f"in no {buffers} buffers of {chunk} columns")
+    row_bits = 8 * TMA_STORE_BYTES
+    if staging is not None and (partial := [jnp.dtype(dtype).name for dtype in dtypes
+                                            if chunk * jax.dtypes.itemsize_bits(dtype) % row_bits]):
+        raise ValueError(f"a stated chunk of {chunk} columns stores no whole {TMA_STORE_BYTES}-byte TMA rows "
+                         f"in {', '.join(partial)}")
     return chunk, min(columns // chunk, buffers)
 
 
