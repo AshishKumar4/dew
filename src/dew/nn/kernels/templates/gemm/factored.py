@@ -214,13 +214,7 @@ class _Transpose:
 
             limbs = jax.lax.fori_loop(0, width // columns_a_chunk, width_chunk, limbs)
             if gather is not None:
-                # The routes' carried digits added into their tokens `FACTORED_FAN_IN` routes at a time,
-                # carried after each, so no digit's sum passes int32.
-                tokens = varying_like(_limbs(limbs_count, plain, chunk), limbs, gather)
-                for first in range(0, gather.shape[0], FACTORED_FAN_IN):
-                    routes = slice(first, first + FACTORED_FAN_IN)
-                    tokens = _carried(tokens.at[:, gather[routes]].add(limbs[:, routes]))
-                limbs = tokens
+                limbs = _routed(varying_like(_limbs(limbs_count, plain, chunk), limbs, gather), gather, limbs)
             axes = tuple(sorted(jax.typeof(limbs).mat.varying - self.held))
             if axes:
                 if (devices := math.prod(jax.lax.axis_size(axis) for axis in axes)) > FACTORED_FAN_IN:
@@ -286,6 +280,16 @@ def _limbs(count: int, like: jax.Array, columns: int) -> jax.Array:
                      jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(None, rows, None)))
 
 
+def _routed(tokens: jax.Array, gather: jax.Array, limbs: jax.Array,
+            fan_in: int = FACTORED_FAN_IN) -> jax.Array:
+    """Each route's carried `limbs` added into its token's of `tokens` (`gather` its token), `fan_in` routes
+    at a time, carried after each, so no digit's sum passes int32."""
+    for first in range(0, gather.shape[0], fan_in):
+        routes = slice(first, first + fan_in)
+        tokens = _carried(tokens.at[:, gather[routes]].add(limbs[:, routes]))
+    return tokens
+
+
 def _edge(top: jax.Array) -> jax.Array:
     """A grid's top: a slice's edge above `top`'s binade (`FACTORED_SLICE`); 0 where nothing is counted."""
     return jnp.where(top > -1024, FACTORED_SLICE * (jnp.floor_divide(top, FACTORED_SLICE) + 1), 0)
@@ -340,7 +344,8 @@ def _rounded(limbs: jax.Array, unit: jax.Array) -> jax.Array:
     def at(values, index):
         return jnp.sum(jnp.where(positions == index[None], values, 0), axis=0, dtype=values.dtype)
 
-    mantissa = sum(jnp.left_shift(at(limbs, lead + k), width * (4 - k)) for k in range(5))
+    mantissa = functools.reduce(jnp.add, [jnp.left_shift(at(limbs, lead + k), width * (4 - k))
+                                          for k in range(5)])
     later = jnp.cumsum(nonzero[::-1].astype(jnp.int32), axis=0)[::-1]
     sticky = (at(later, lead + 5) > 0).astype(jnp.uint32)
     significand = jnp.left_shift(mantissa.astype(jnp.uint32), jnp.uint32(1)) | sticky

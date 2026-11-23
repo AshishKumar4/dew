@@ -756,14 +756,10 @@ def test_fp8_and_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_
 
 
 @INTERPRETS
-def test_an_nvfp4_products_rescue_leaves_a_nan_block_scale_to_its_own_coordinates(monkeypatch):
+def test_an_nvfp4_products_rescue_leaves_a_nan_block_scale_to_its_own_coordinates():
     """Codes +1, -1 and +1 at input coordinate 0 beside a NaN block scale at coordinates 16 to 31 of
     another column, a factor of 4, under cotangents 2**126, 2**126 and 1: coordinate 0's gradient is 4 and
-    the NaN block's coordinates are IEEE's NaN, every other zero; routed twice into one token with the
-    rescue's fan-in cut to one route a carry, the token's gradient is the routes' exact sum, 2**-38
-    (rows 1464, 12403)."""
-    from dew.nn.kernels.templates.gemm import factored
-
+    the NaN block's coordinates are IEEE's NaN, every other zero (rows 1464, 12403)."""
     codes = jnp.zeros((512, 128), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
     scales = jnp.ones((32, 128), jnp.float8_e4m3fn).at[1, 3].set(jnp.nan)
     matrix = formats.NvFp4.of(codes, scales, jnp.float32(4.0))
@@ -778,19 +774,26 @@ def test_an_nvfp4_products_rescue_leaves_a_nan_block_scale_to_its_own_coordinate
     got[:, 16:32] = 0.0
     np.testing.assert_array_equal(got, want)
 
-    monkeypatch.setattr(factored, "FACTORED_FAN_IN", 1)
-    one = jnp.ones((32, 128), jnp.float8_e4m3fn)
-    first = jnp.zeros((512, 128), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
-    second = jnp.zeros((512, 128), jnp.float32).at[0, 2].set(1.0)
-    bank = formats.NvFp4.of(jnp.stack([first, second]), jnp.stack([one, one]),
-                            jnp.asarray([2.0 ** 110, 2.0 ** -8], jnp.float32))
-    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, bank, jnp.asarray([1, 1], jnp.int32),
-                                                      jnp.asarray([0, 0], jnp.int32), out_dtype=jnp.float32),
-                      jnp.zeros((1, 512), jnp.float32).at[0, 0].set(1.0))
-    (d_token,) = pull(jnp.zeros((2, 128), jnp.float32).at[0, :2].set(2.0 ** 100).at[1, 2].set(2.0 ** -30))
-    want = np.zeros((1, 512), np.float32)
-    want[0, 0] = 2.0 ** -38
-    np.testing.assert_array_equal(np.asarray(d_token), want)
+
+def test_the_rescues_routes_add_into_their_tokens_alike_at_any_fan_in():
+    """Carried limbs of seven routes into three tokens (`factored._routed`), one route a carry or all at
+    once: the same carried digits, the tokens' exact sums (rows 1464, 12403)."""
+    from dew.nn.kernels.templates.gemm import factored
+
+    rng = np.random.default_rng(12403)
+    digits = rng.integers(0, 2 ** factored.FACTORED_SLICE, size=(5, 7, 4)).astype(np.int32)
+    digits[0] = rng.integers(-3, 4, size=(7, 4))
+    gather = jnp.asarray([0, 2, 0, 1, 2, 2, 0], jnp.int32)
+    tokens = jnp.zeros((5, 3, 4), jnp.int32)
+    one = np.asarray(factored._routed(tokens, gather, jnp.asarray(digits), fan_in=1))
+    whole = np.asarray(factored._routed(tokens, gather, jnp.asarray(digits)))
+    np.testing.assert_array_equal(one, whole)
+    weights = 2 ** (factored.FACTORED_SLICE * np.arange(4, -1, -1, dtype=np.int64))
+    value = np.tensordot(weights, digits.astype(np.int64), axes=1)
+    want = np.zeros((3, 4), np.int64)
+    np.add.at(want, np.asarray(gather), value)
+    np.testing.assert_array_equal(np.tensordot(weights, one.astype(np.int64), axes=1), want)
+    assert (one[1:] >= 0).all() and (one[1:] < 2 ** factored.FACTORED_SLICE).all()
 
 
 @INTERPRETS
