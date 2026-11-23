@@ -118,9 +118,10 @@ def test_linear_cross_entropy_confident_logits_and_out_of_range_targets():
     assert_as_exact(jax.jit(dew_vjp), jax.jit(ref_vjp), draw,
                     "linear_ce confident + out-of-range targets", seeds=SEEDS,
                     truth_fn=functools.partial(ref_vjp, dtype=jnp.float64))
-    # Row 0 has logit margin ~40 (p_0 == 1.0 in fp32), yet dW[0, 0] remains strictly negative and non-zero.
-    x0, w0, cot0 = draw(0)
-    _, (_, dw0) = dew_vjp(x0, w0, cot0)
+    # Row 0 has logit margin ~40 (p_0 == 1.0 in fp32), yet dW[0, 0] from row 0 alone remains strictly
+    # negative and non-zero via Barron's `categorical.label_entry`.
+    x0, w0, _ = draw(0)
+    _, (_, dw0) = dew_vjp(x0, w0, jnp.asarray([1.0, 0.0, 0.0], jnp.float32))
     assert float(dw0[0, 0]) < 0.0
 
 

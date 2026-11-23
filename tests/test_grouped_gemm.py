@@ -1753,7 +1753,7 @@ def test_prologued_custom_jvp_is_picklable():
 
     tangent_rule = gemm._ProloguedTangent(operator.add, functools.partial(jax.jvp, operator.add))
     restored = pickle.loads(pickle.dumps(tangent_rule))
-    assert restored.primal is tangent_rule.primal
+    assert restored.prologue is tangent_rule.prologue
     assert restored.prologue_jvp.func is tangent_rule.prologue_jvp.func
     assert restored.prologue_jvp.args == tangent_rule.prologue_jvp.args
     wrapped = gemm._prologued(operator.add, functools.partial(jax.jvp, operator.add))

@@ -87,9 +87,8 @@ def fp8_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, tr
 
 def rows_supported(family) -> bool:
     """Whether `family`'s products read an NVFP4 matrix decoded in registers (`rows_decoded`): its register
-    bundle name is declared in `bits.NVFP4_BFLOAT16.fragments` (row 12038)."""
-    return family.name in bits.NVFP4_BFLOAT16.fragments
-
+    family prefix is declared in `bits.NVFP4_BFLOAT16.fragments` (row 12038)."""
+    return family.name.split(".")[0] in bits.NVFP4_BFLOAT16.fragments
 def refused(lhs, rhs, scales, tiles, family, *, packed_rows: bool, dense: bool, transpose_rhs: bool,
             transpose_lhs: bool, hooked: tuple, depth: int, width: int) -> None:
     """Dew: `gmm`'s refusal of a packed call (`scales`) its decode does not take: as its matrix (`taken`), or

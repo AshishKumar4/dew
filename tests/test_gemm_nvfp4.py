@@ -486,15 +486,17 @@ def test_gemm_quantize_epilogue_lowers_inline_ptx(gpu):
 
 
 def test_packed_rows_supported_reads_bundle_fragment_name():
-    """`packed.rows_supported` checks `family.name in bits.NVFP4_BFLOAT16.fragments` and
+    """`packed.rows_supported` checks `family.name` prefix in `bits.NVFP4_BFLOAT16.fragments` and
     `hooks._epilogue_layout` reads the issuing GPU bundle's `family.layout` directly (row 12038)."""
-    from dew.nn.kernels.templates import mosaic_sm80, mosaic_sm90
+    from dew.nn.kernels.templates import bundles
     from dew.nn.kernels.templates.gemm import hooks, packed
 
-    assert packed.rows_supported(mosaic_sm90.WGMMA)
-    assert not packed.rows_supported(mosaic_sm80.MMA_SYNC)
-    assert hooks._epilogue_layout(jnp.bfloat16, generation.gpu_target("sm90")) == mosaic_sm90.WGMMA.layout
-    assert hooks._epilogue_layout(jnp.bfloat16, generation.gpu_target("sm80")) == mosaic_sm80.MMA_SYNC.layout
+    sm90_bundles = bundles.groups("sm90", jnp.bfloat16, stated=True)[0]
+    sm80_bundle = bundles.of("sm80", jnp.bfloat16)
+    assert all(packed.rows_supported(family) for family in sm90_bundles)
+    assert not packed.rows_supported(sm80_bundle)
+    assert hooks._epilogue_layout(jnp.bfloat16, generation.gpu_target("sm90")) == sm90_bundles[0].layout
+    assert hooks._epilogue_layout(jnp.bfloat16, generation.gpu_target("sm80")) == sm80_bundle.layout
     assert hooks._epilogue_layout(jnp.bfloat16, generation.gpu_target("v5e")) is None
 
 def test_fp8_and_e8m0_bit_forms_are_exact():
@@ -526,13 +528,16 @@ def test_fp8_and_e8m0_bit_forms_are_exact():
     raw_codes = jnp.full((1, 64), 4.0, jnp.float8_e4m3fn)
     e8m0_scales = jnp.asarray([[0, 255]], jnp.uint8)
     mx = formats.MxFp8(raw_codes, e8m0_scales)
-    for dtype in (jnp.float32, jnp.float64):
-        dec = np.asarray(mx.decoded(dtype))
-        np.testing.assert_array_equal(dec[0, :32], np.full((32,), dtype(4.0 * 2.0 ** -127)))
-        assert np.all(np.isnan(dec[0, 32:]))
-    mx_one = formats.MxFp8(jnp.ones((1, 64), jnp.float8_e4m3fn), e8m0_scales)
-    np.testing.assert_array_equal(np.asarray(mx_one.decoded(jnp.float64))[0, :32],
-                                  np.full((32,), np.float64(2.0 ** -127)))
+    dec32 = np.asarray(mx.decoded(jnp.float32))
+    np.testing.assert_array_equal(dec32[0, :32], np.full((32,), np.float32(4.0 * 2.0 ** -127)))
+    assert np.all(np.isnan(dec32[0, 32:]))
+    with jax.enable_x64():
+        dec64 = np.asarray(mx.decoded(jnp.float64))
+        np.testing.assert_array_equal(dec64[0, :32], np.full((32,), np.float64(4.0 * 2.0 ** -127)))
+        assert np.all(np.isnan(dec64[0, 32:]))
+        mx_one = formats.MxFp8(jnp.ones((1, 64), jnp.float8_e4m3fn), e8m0_scales)
+        np.testing.assert_array_equal(np.asarray(mx_one.decoded(jnp.float64))[0, :32],
+                                      np.full((32,), np.float64(2.0 ** -127)))
     # Fp8Weights.checked() accepts valid form and rejects tampered form version.
     sample = formats.Fp8Weights.of(np.zeros((64, 64), np.float32), fmt="e4m3")
     assert sample.checked() is sample
@@ -559,8 +564,9 @@ def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
         return gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32, interpret_on_cpu=True)
 
     def plain(x, weights, *, dtype=jnp.float32):
-        return jax.lax.dot(x.astype(dtype), weights.decoded(jnp.bfloat16).astype(dtype),
-                           preferred_element_type=dtype)
+        w_dec = (weights.decoded(jnp.float64) if dtype == jnp.float64
+                 else weights.decoded(jnp.bfloat16).astype(dtype))
+        return jax.lax.dot(x.astype(dtype), w_dec, preferred_element_type=dtype)
 
     assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, f"fp8_weight_product {fmt}", seeds=8,
                     truth_fn=functools.partial(plain, dtype=jnp.float64))

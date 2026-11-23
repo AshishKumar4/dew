@@ -280,7 +280,7 @@ def _linear_ce_mainloop(x: jax.Array, weight: jax.Array, targets: jax.Array, bia
                 del tile, active
                 mine_rows = pl.ds(tiles.share_row(wg), tiles.share)
 
-                def step(index, slots, accs, carry):
+                def step(index, slots, carry, accs):
                     del index
                     oriented = _oriented({"matrix": slots["matrix"]}, {"matrix": "rows"}, transpose_rhs)
                     lhs_ref = slots["rows"].at[mine_rows]

@@ -930,12 +930,14 @@ def _fp8_packed(rows: jax.Array, words: jax.Array, sizes: jax.Array, fmt: str,
         r, w, s = operands
         matrices = decoded(w)
         parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
-        d_rows = functools.reduce(jnp.add, [
-            gemm(part, matrices, None if dense else s, transpose_rhs=True, out_dtype=jnp.float32,
-                 precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
+        ctx = (generation.assumed(generation.interpreted_target())
+               if xla_products.interpreted(interpret) else contextlib.nullcontext())
+        with ctx:
+            d_rows = functools.reduce(jnp.add, [
+                gemm(part, matrices, None if dense else s, transpose_rhs=True, out_dtype=jnp.float32,
+                     precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
         leaves = (d_rows.astype(r.dtype), zero_from_primal(w), zero_from_primal(s))
         return tuple(leaves[index] for index in live)
-
     differentiable = contracted("test_an_fp8_weight_product_holds_every_order")(
         generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
     return differentiable(rows, words, sizes)

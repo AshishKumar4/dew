@@ -356,15 +356,18 @@ class Fp8Weights:
         return self
 
     def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
-        """Decode `words` back to `[..., depth, width]` in `dtype`, multiplied by `scale`."""
+        """Decode `words` back to `[..., depth, width]` in `dtype`, scaled in `at_least_fp32`."""
         minifloat, _ = _fp8_minifloat(self.fmt)
+        wide = jnp.promote_types(dtype, jnp.float32)
         words = jnp.asarray(self.words)
         *batches, width, wdepth = words.shape
         flat = words.reshape(-1, width, wdepth)
         inv = np.argsort(fp8_staged_rows(wdepth * 4))
         decoded = jax.vmap(lambda w: bits.fp8_codes(w.T, minifloat, jnp.float32)[inv])(flat)
-        out = decoded.reshape(*batches, wdepth * 4, width) * jnp.asarray(self.scale, jnp.float32)
+        out = decoded.reshape(*batches, wdepth * 4, width).astype(wide) * jnp.asarray(self.scale, wide)
         return out.astype(dtype)
+
+
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
     """Block-scaled codes' values in `dtype`: each code times its `block` depths' E4M3 scale, read by the one
     decode of a block scale's (`bits.scales_decoded`, row 8675), exact in float32 (an E2M1 code times an E4M3
