@@ -1252,7 +1252,7 @@ dew data publish  [dew._cli.main.DataPublish]
   data: str  [Positional]
   destination: str  [Positional]
   branch: Literal['train', 'validation'] = 'train'
-  read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
+  read: Literal['memory', 'indexed', 'streamed'] | None = None
   provision: bool = False
   trust: tuple[str, ...] = ()
 dew tpu  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
