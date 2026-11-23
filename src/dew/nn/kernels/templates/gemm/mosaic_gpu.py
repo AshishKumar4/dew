@@ -561,7 +561,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
         stepped_at = functools.partial(
             _gmm_stepped_at, family=family, tiles=tiles, prologue=(prologue, prologue_axes),
             matrices=matrices, transpose=(transpose_lhs, transpose_rhs), interpret=bool(interpret),
-            mx=mx_scales is not None, packed_rows=packed_rows, packed_format=packed_format,
+            mx=mx_scales is not None, packed_rows=packed_rows, packed_format=packed_format, dense=dense,
             chosen=None if when is None else chained,
             scaled=(step_scales is not None, scale_per, block_n), exact_sums=exact_sums)
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, decoded, *, streams):
@@ -658,17 +658,17 @@ def _chained_walked(chained: tuple, tiles: Tiles, dtype, transpose_lhs: bool, de
 
 def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: tuple, matrices: dict,
                     transpose: tuple, interpret: bool, mx: bool, packed_rows: bool, scaled: tuple,
-                    exact_sums: bool, chosen=None, packed_format: str | None = None, **refs
-                    ) -> tuple[Callable, Callable | None]:
+                    exact_sums: bool, dense: bool = False, chosen=None, packed_format: str | None = None,
+                    **refs) -> tuple[Callable, Callable | None]:
     """Dew: consumer `wg`'s step of `tile` (`_gmm_step`), `refs` its side tiles: its share of the rows, its
-    idleness and its first step the tile's, its scaling at its column tile; and the walk's prefetch of its
-    slots (`_gmm_prefetch`) where `prefetches` says its walk reads one and every consumer's products issue
-    unconditionally (no idleness), None elsewhere."""
+    idleness (`_idle`), one-consumer grouped row bound (`_row_bound`, `Family.bounded`), and prefetch."""
     rows = pl.ds(tiles.share_row(wg), tiles.share)
     (hook, hook_axes), (transpose_lhs, transpose_rhs) = prologue, transpose
     idle = _idle(tiles, tile[0], tile[1], wg)
+    within = _row_bound(tiles, tile[0], tile[1], dense)
+    step_family = family if within is None else family.bounded(within)
     step = functools.partial(
-        _gmm_step, family=family, prologue=hook, prologue_axes=hook_axes, mine_rows=rows, idle=idle,
+        _gmm_step, family=step_family, prologue=hook, prologue_axes=hook_axes, mine_rows=rows, idle=idle,
         transpose_rhs=transpose_rhs, matrices=matrices, interpret=interpret, first=tile[3],
         transpose_lhs=transpose_lhs, block_scaled=mx, packed_rows=packed_rows, packed_format=packed_format,
         block_k=tiles.block_k, scaling=_gmm_scaling(scaled[0], scaled[1], scaled[2], tile[2], rows),
@@ -678,7 +678,9 @@ def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: 
         chained=chosen is not None, interpret=interpret,
         transposed=(transpose_lhs or packed_rows, transpose_rhs),
         summed=exact_sums and not family.sums_in_persist)
-    return step, _gmm_prefetch(family, matrices, rows) if prefetching else None
+    return step, _gmm_prefetch(step_family, matrices, rows) if prefetching else None
+
+
 def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, chained: bool,
                interpret: bool, transposed: tuple[bool, bool], summed: bool) -> bool:
     """Dew: whether a `gmm` walk reads a step's first fragments under the previous step's last product
@@ -1596,6 +1598,14 @@ def _idle(tiles: Tiles, group: "row_tiles.GroupInfo", row_start, consumer) -> ja
         return None
     first = row_start + tiles.share_row(consumer)
     return (first >= group.actual_end) | (first + tiles.share <= group.actual_start)
+
+
+def _row_bound(tiles: Tiles, group: "row_tiles.GroupInfo", row_start, dense: bool) -> jax.Array | None:
+    """Live rows `[0, rows)` of a one-consumer grouped tile (`tiles.sharing == 1`) before its group's end
+    (`Issuer.bounded`, rows 5623, 7091); None on dense calls or multi-consumer tiles."""
+    if dense or tiles.sharing != 1:
+        return None
+    return jnp.clip(group.actual_end - row_start, 0, tiles.block_m).astype(jnp.int32)
 
 
 def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, prologue, prologue_axes: tuple,

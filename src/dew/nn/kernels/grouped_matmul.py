@@ -204,6 +204,8 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                         lhs_retained=ba.arguments.get('paired') is not None)
         if not self.STAGED_ROWS:
             plain += pricing.prefetch_registers(family, config, ba=ba)
+        plain += pricing.bounded_registers(family, config, dtype, dense=bool(ba.arguments.get('dense')),
+                                           staged_rows=self.STAGED_ROWS)
         accumulator = -(-config.share * columns // resources.THREADS)
         # Kernel gradient prepares its depth half of each step's rows stage (`_staged_halves`, DECIDE1/3117).
         staged = rewritten = 0

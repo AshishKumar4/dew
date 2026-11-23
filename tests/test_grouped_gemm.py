@@ -2230,3 +2230,67 @@ def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
         dw_ba = tgmm.bind(bf16((8192, 1024)), bf16((8192, 1024)), one, out_dtype="float32",
                           interpret=False, dense=True)
         assert not tgmm.legal(dw_ba, dataclasses.replace(pair_tile, splits=2), sm100)
+
+
+@INTERPRETS
+def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
+    """One-consumer `mma.sync` grouped tiles (`tiles.sharing == 1`) bind `group.actual_end - row_start` onto
+    `family.bounded` (`_row_bound`), emitting runtime `int32` row-bound operands on every native `mma` (none
+    on dense), holding check 1 on `[64, 64]` and unaligned+zero-row `[48, 0, 35, 45]` groupings, and
+    compiling spill-free on `sm80` (rows 5623, 7091)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    tile_128 = tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    with (generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"),
+          tuning.pinned({grouped_matmul.MosaicGmm: tile_128})):
+        grouped_graph = jax.make_jaxpr(
+            lambda x, w, s: gemm.gemm(x, w, s, out_dtype=jnp.bfloat16)
+        )(bf16((192, 64)), bf16((3, 64, 128)), jax.ShapeDtypeStruct((3,), jnp.int32))
+        dense_graph = jax.make_jaxpr(
+            lambda x, w: gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+        )(bf16((128, 64)), bf16((64, 128)))
+    grouped_mmas = [eq for eq in equations(grouped_graph, platform="cuda") if eq.primitive.name == "mma"]
+    dense_mmas = [eq for eq in equations(dense_graph, platform="cuda") if eq.primitive.name == "mma"]
+    assert grouped_mmas and all(
+        len(eq.invars) == 4 and eq.invars[3].aval.dtype == jnp.int32 and eq.invars[3].aval.shape == ()
+        for eq in grouped_mmas), grouped_mmas
+    assert dense_mmas and all(len(eq.invars) == 3 for eq in dense_mmas), dense_mmas
+
+    def dew_fn(x, w, sizes):
+        with (generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"),
+              tuning.pinned({grouped_matmul.MosaicGmm: tile_128})):
+            return gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+    def ref_fn(x, w, sizes, *, dtype=jnp.float32):
+        return jax.lax.ragged_dot(x.astype(dtype), w.astype(dtype), sizes,
+                                  preferred_element_type=dtype).astype(
+            jnp.float64 if dtype == jnp.float64 else jnp.bfloat16)
+
+    for tag, counts in (("[64, 64]", (64, 64)), ("[48, 0, 35, 45]", (48, 0, 35, 45))):
+        def draw(seed, counts=counts):
+            rng = np.random.default_rng(7091 + len(counts) * 100 + seed)
+            x = jnp.asarray(rng.standard_normal((128, 64)) / np.sqrt(64), jnp.bfloat16)
+            w = jnp.asarray(rng.standard_normal((len(counts), 64, 128)) / np.sqrt(64), jnp.bfloat16)
+            return x, w, jnp.asarray(counts, jnp.int32)
+
+        assert_as_exact(jax.jit(dew_fn), jax.jit(ref_fn), draw, f"sm80 bounded {tag}", seeds=8,
+                        truth_fn=functools.partial(ref_fn, dtype=jnp.float64))
+
+    if generation.compile_only_gpus("sm80"):
+        s_spec = jax.ShapeDtypeStruct((3,), jnp.int32)
+
+        def compiled(x, w, s):
+            with generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
+                    {grouped_matmul.MosaicGmm: tile_128}):
+                return gemm.gemm(x, w, s, out_dtype=jnp.bfloat16)
+
+        with generation.assumed("sm80"):
+            records = compile_mosaic_kernels(
+                [KernelCase("sm80_row_idle_grouped",
+                            lambda: (compiled, (bf16((192, 64)), bf16((3, 64, 128)), s_spec)))], "sm80")
+        for rec in records:
+            assert not rec.get("error"), rec
+            assert rec["kernels"], rec
+            assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
