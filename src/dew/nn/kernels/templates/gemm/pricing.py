@@ -130,12 +130,6 @@ def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: 
     pairs = programs // tiles.cluster
     if step is None or rate is None or pairs <= 0:
         return None
-    # On Hopper cluster=2, `fixed_up` adds ~7-10% whole-wave overhead across multi-wave persistent launches
-    # (M-NG-45b-gh200 20261123T021244Z: F/dX/dW +3.5/+5.1/+3.8% geomean, up to +10.3% on waves >= 3). Restrict
-    # cluster > 1 balanced tail to single-wave outliers with >=50% idle tail (e.g. 2048x8192x2560, 14/66).
-    waves, rem = divmod(grid[0] * grid[1], pairs)
-    if tiles.cluster > 1 and (waves > 1 or rem > pairs // 2):
-        return None
     family = family_of(tiles, dtype, target)
     left, right = itemsizes
     mp = (target.multiprocessors // tiles.cluster) if target.multiprocessors else pairs
@@ -155,6 +149,15 @@ def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: 
     family = family_of(tiles, dtype, target)
     m, n, k = extents
     grid = (-(-m // tile_rows(tiles, family)), -(-n // tile_columns(tiles, family)))
+    pairs = programs // tiles.cluster
+    if pairs <= 0:
+        return None
+    # On Hopper cluster=2, `fixed_up` adds ~7-10% whole-wave overhead across multi-wave persistent launches
+    # (M-NG-45b-gh200 20261123T021244Z: F/dX/dW +3.5/+5.1/+3.8% geomean, up to +10.3% on waves >= 3). Restrict
+    # cluster > 1 balanced tail to single-wave outliers with >=50% idle tail (e.g. 2048x8192x2560, 14/66).
+    waves, rem = divmod(grid[0] * grid[1], pairs)
+    if tiles.cluster > 1 and (waves > 1 or rem > pairs // 2):
+        return None
     return balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
 
 

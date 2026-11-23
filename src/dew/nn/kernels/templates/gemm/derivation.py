@@ -28,19 +28,29 @@ from dew.nn.kernels.templates.gemm import pricing
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 
 
-def _budgeted_target(target, shared_budget: int | None):
-    """Clamp `target`'s scratch budget (`shared_limit` on GPU or `architecture.scoped_vmem` on TPU) so
-    `resources.plan` passes the clamped budget straight to `program_shared` without inflating `staged_bytes`
-    or calling `Scope` twice per ring depth (row 12099)."""
+def _budgeted_share(target, shared_budget: int | None, programs: int) -> int | None:
+    """Per-program scratch limit (`resources.program_shared`) clamped to `shared_budget`, or None when
+    unclamped (`derived`, row 12099)."""
     if shared_budget is None:
-        return target
+        return None
     from dew.nn.kernels import generation
 
-    clamped = min(generation.shared_budget(target), shared_budget)
-    if generation.tpu(target) and target.scoped_vmem is not None and target.architecture is not None:
-        return dataclasses.replace(
-            target, architecture=dataclasses.replace(target.architecture, scoped_vmem=clamped))
-    return dataclasses.replace(target, shared_limit=clamped)
+    block = generation.shared_budget(target)
+    return None if shared_budget >= block else resources.program_shared(shared_budget, programs)
+
+
+def _clamped_launch(built: resources.Launch, layout: mosaic.Family, share: int | None
+                    ) -> resources.Launch | None:
+    """Cap `built.most` to the deepest ring whose `shared_bytes` fits within `share` (returning None if even
+    `built.floor` exceeds `share`), without mutating `Scope` or inflating `staged_bytes` (row 12099)."""
+    if share is None:
+        return built
+    if resources.shared_bytes(layout, built.scope(built.floor)) > share:
+        return None
+    deepest = built.floor
+    while deepest < built.most and resources.shared_bytes(layout, built.scope(deepest + 1)) <= share:
+        deepest += 1
+    return built if deepest == built.most else dataclasses.replace(built, most=deepest)
 
 
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
@@ -127,10 +137,10 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
                                    multiprocessors=multiprocessors, grouped=padded)
         price_of = functools.partial(_tile_cost, family=family, target=target, dtype=dtype, rows=rows,
                                      width=width, padded=padded)
-        plan_target = _budgeted_target(target, shared_budget)
+        share = _budgeted_share(target, shared_budget, programs)
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
-                                      target=plan_target, programs=programs, price_of=price_of)
+                                      target=target, programs=programs, price_of=price_of, share=share)
         # width, so a tile keeps its rows and narrows rather than shortening. mma.sync's one consumer at
         # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
         # (64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's 1.10-1.14, FSA100POST32). Where no width
@@ -209,7 +219,7 @@ def _tile_cost(tile: Tiles, *, family: mosaic.Family, target, dtype, rows: int, 
 
 def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], shaped: Callable,
                candidate: Callable, launch_of: Callable, layouts: tuple, target, programs: int,
-               price_of: Callable) -> tuple["Tiles | None", bool]:
+               price_of: Callable, share: int | None = None) -> tuple["Tiles | None", bool]:
     """`derived`'s tile at a width: the rows its registers or VMEM hold there (`held_rows`), shortened where
     its stages do not fit, at the first step that plans busy, taking the least-priced busy tile under the
     shared cost model (`_tile_cost`), and whether it stages deep enough to stay busy (those its family loads
@@ -222,7 +232,10 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
         for step in steps:
             def launches_of(layout, block_m=block_m, step=step):
                 shape = shaped(layout, block_m, block_n, step)
-                return [launch_of(shape)] if candidate(shape) else None
+                if not candidate(shape):
+                    return None
+                clamped = _clamped_launch(launch_of(shape), layout, share)
+                return None if clamped is None else [clamped]
 
             found = resources.placed(launches_of, layouts, target, programs=programs)
             if found is None:
