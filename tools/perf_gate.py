@@ -559,9 +559,11 @@ COMPILED = """
 import json, sys
 from benchmark_cases import Case
 from benchmark_models import ahead_of
+from dew import kernels
 case = Case(**json.loads(sys.argv[1]))
 generation, capacity, attention = sys.argv[2], int(sys.argv[3]), sys.argv[4]
-ahead = ahead_of(case, generation, capacity, attention)
+with kernels.use(attention=attention):
+    ahead = ahead_of(case, generation, capacity)
 print(json.dumps({"seconds": ahead.planned_seconds,
                   "parts": dict(getattr(ahead, "planned_parts", None) or {}) or None,
                   "plan": {key: (ahead.plan or {}).get(key) for key in sys.argv[5].split(",")}}))
