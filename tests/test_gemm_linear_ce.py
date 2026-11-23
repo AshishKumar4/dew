@@ -66,7 +66,7 @@ def test_chunked_linear_ce_mosaic_arm_holds_check_1_value_vjp_and_normalizer(
             _, (peak, mass, rest) = chunked._forward(
                 x, w, targets, None, 2, (64, 64), None,
                 chunked._head_product(OutputTable(w, vocab_major=True, bias=bias, precision=chunked.BF16), x),
-                False, 1.0, cols)
+                predict=False, temperature=1.0, columns=cols)
             return loss, log_z, grads, peak, mass, rest
 
     def run_truth(x, w, targets, bias, cot):

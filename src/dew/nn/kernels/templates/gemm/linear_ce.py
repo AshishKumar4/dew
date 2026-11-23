@@ -5,14 +5,12 @@ then merges column-tile summaries via `dew.nn.categorical.rescaled` and `dew.nn.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 from collections.abc import Callable
 from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from flax.typing import PrecisionLike
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -481,7 +479,7 @@ LINEAR_CE_OP: selection.Op[LinearCECase] = selection.Op(generation.Choice.GROUPE
 
 def mosaic_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array,
                      bias: jax.Array | None = None, *, transpose_rhs: bool = True,
-                     precision: PrecisionLike = None
+                     precision: jax.lax.PrecisionLike = None
                      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None:
     """Run `MOSAIC_LINEAR_CE` when `LINEAR_CE_OP` selects `'mosaic'` (returning `(loss, peak, mass,
     rest)`), else `None` so `dew.objectives.lm.chunked._forward` runs its portable chunked XLA path

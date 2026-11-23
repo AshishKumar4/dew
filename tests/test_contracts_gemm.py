@@ -3,6 +3,7 @@ products, the grouped GEMM and its portable projection, the GEMM prologue and tr
 expert primal and a router's report of its differentiation, the frozen FP8 product, the quantized
 convolution, a broadcast summing its gradient wide (ledger 2641; the harness is tests/contract_support.py)."""
 
+import contextlib
 import functools
 import itertools
 

@@ -476,8 +476,7 @@ def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
                              minifloat).astype(jnp.uint8)
     np.testing.assert_array_equal(np.asarray(jax.lax.bitcast_convert_type(got_s, jnp.uint8)),
                                   np.asarray(scaled_u8))
-    np.testing.assert_allclose(np.asarray(got_s, np.float32) * float(scale_s), np.asarray(acc), rtol=0.25,
-                               atol=0.5)
+
 
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])

@@ -5,7 +5,6 @@ estimator (STE) gradients (`fla/modules/fused_bitlinear.py`)."""
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 from typing import ClassVar, NamedTuple
 

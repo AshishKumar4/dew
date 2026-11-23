@@ -7,13 +7,14 @@ wave (`balanced_tail`, `handoff_steps`, `fixes_up`)."""
 import dataclasses
 import math
 from collections.abc import Callable
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import base, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
+from dew.nn.kernels.templates import bundles, cost as unit_cost, mosaic, resources, tail as tail_of
+from dew.nn.kernels.templates.gemm.tiling import TilesTemplate as TilesTemplate
 
 if TYPE_CHECKING:
     from dew.nn.kernels.templates.gemm.tiling import Tiles
@@ -389,57 +390,3 @@ def walk_seconds(tiles: "Tiles", contraction: dict) -> float:
     other walk's where the device states no rate (`split_walk`)."""
     walk = split_walk(dataclasses.replace(tiles, swapped=False), **contraction)
     return math.inf if walk is None else walk.seconds(tiles.splits)
-
-
-@dataclasses.dataclass(frozen=True)
-class TilesTemplate(base.Template["Tiles"]):
-    """Shared `Template[Tiles]` lifecycle for GEMM-family templates (`_Mosaic`, `MosaicSyrk`,
-    `MosaicLinearCE`, row 12141): staged bytes, register budget, shared memory per program, legality,
-    TPU budget gating, and eligibility with explicit `target` threading."""
-
-    name: ClassVar[str] = "mosaic"
-    GENERATES: ClassVar[bool] = True
-    ROWS: ClassVar[tuple[str, ...]] = ("x",)
-
-    def _operand_dtype(self, ba):
-        return ba.arguments["x"].dtype
-
-    def _supports_ba(self, ba) -> bool:
-        raise NotImplementedError
-
-    def candidate(self, ba, config: "Tiles", target) -> bool:
-        raise NotImplementedError
-
-    def launch_of(self, ba, config: "Tiles", target=None) -> resources.Launch:
-        raise NotImplementedError
-
-    @staticmethod
-    def tpu_budgeted(target) -> bool:
-        """Whether `target` states its TPU scoped VMEM budget (always True for non-TPU targets)."""
-        return not generation.tpu(target) or target.scoped_vmem is not None
-
-    def staged_bytes(self, ba, config: "Tiles", target) -> int:
-        family = family_of(config, self._operand_dtype(ba), target)
-        return resources.shared_bytes(family, self.launch_of(ba, config, target).scope(config.stages))
-
-    def register_budget(self, config: "Tiles", target: generation.GpuTarget | None = None) -> int:
-        family = family_of(config, jnp.bfloat16, self.launch_target() if target is None else target)
-        return family.registers(config.warpgroups) if family.budgets_registers else 0
-
-    def program_shared(self, config: "Tiles", target) -> int:
-        return resources.program_shared(super().program_shared(config, target), config.programs)
-
-    def legal(self, ba, config: "Tiles", target) -> bool:
-        if not self.candidate(ba, config, target):
-            return False
-        family = family_of(config, self._operand_dtype(ba), target)
-        launch = dataclasses.replace(self.launch_of(ba, config, target),
-                                     floor=config.stages, most=config.stages)
-        return resources.plan([launch], family, target, programs=config.programs) is not None
-
-    def eligible(self, ba, target) -> bool:
-        if not self._supports_ba(ba):
-            return False
-        if not self.tpu_budgeted(target) or self.derived(ba, target) is None:
-            return False
-        return target != self.launch_target() or self.holds(ba)

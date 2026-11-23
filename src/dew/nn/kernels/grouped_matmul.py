@@ -58,7 +58,7 @@ from .grouped_cells import (
 from .grouped_launch import INTERPRETED, _GroupedLaunch
 from .grouped_triton import Gmm, Tgmm, _gradient_sides, _product_sides
 from .templates import base
-from .templates.gemm import packed, pricing, tiling
+from .templates.gemm import packed, tiling
 from .templates.gemm.hooks import NO_HOOKS, Hooks
 from .templates.product import SCALE_DEPTH, Product, eight
 
@@ -88,7 +88,7 @@ def _matrix_extents(ba) -> tuple[int, int]:
 _PaddedArgument = tuple[str, "jax.Array | jax.ShapeDtypeStruct | tuple", "dict | tuple"]
 """An argument `_Mosaic._aligned` pads: its name, its value (or tuple of them) and its dims (`_grown`'s)."""
 
-class _Mosaic(pricing.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
+class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
     """JAX's Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`) on their instruction family's bundle
     (Hopper's warpgroup MMA, Ampere's mma.sync), one 16-bit dtype, their one tile generated from the
     family's facts, the device's and the call's extents (`derivation.derived`). Each runs one warpgroup a

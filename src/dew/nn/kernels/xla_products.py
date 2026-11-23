@@ -6,6 +6,7 @@ GEMM's own portable branch (`kernels.gemm`): its products as the call's precisio
 
 import contextlib
 import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
