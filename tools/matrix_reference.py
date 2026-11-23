@@ -119,17 +119,15 @@ def mamba_answers(named: dict, starts):
     """mamba_ssm's scan on a cell's draws (`recurrence_matrix.UPSTREAMS`) as `recorded`'s answer of a cell:
     the live cells' block arm (`upstream_support.UpstreamBlocks`), `BLOCK` draws a call from the draw asked,
     one block's answers held at a time, its `draw` the cell's own (`recurrence_matrix._inputs`)."""
-    import numpy as np
     import recurrence_matrix as matrix
     from upstream_support import UpstreamBlocks
 
     def run_block(drawn: list) -> list:
+        # A recording's draw is its cell's inputs, the cotangents among them (`recurrence_matrix._inputs`).
         inputs = [each for (each,) in drawn]
-        names = [name for name in inputs[0] if name not in ("d_out", "d_final")]
-        cotangents = tuple(np.stack([each[name] for each in inputs]) for name in ("d_out", "d_final"))
-        found = matrix.UPSTREAMS["mamba_ssm"](
-            named, {name: np.stack([each[name] for each in inputs]) for name in names}, cotangents, starts)
-        return [{name: value[index] for name, value in found.items()} for index in range(len(inputs))]
+        return matrix.upstream_block(
+            named, starts, [{name: value for name, value in each.items() if name not in ("d_out", "d_final")}
+                            for each in inputs], [(each["d_out"], each["d_final"]) for each in inputs])
 
     return BlockAnswers(UpstreamBlocks(run_block, lambda seed: (matrix._inputs(named, seed),), BLOCK,
                                        bounded=True))
