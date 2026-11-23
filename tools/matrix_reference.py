@@ -12,8 +12,8 @@ of draws a call), sized on the recording alone where the cell's kernel is a TPU'
 
 `<upstream>` `fla` or `mamba_ssm`, each case its axis values joined by `-`
 (`recurrence_matrix._on_par_recorded`'s site), on a GPU, `<python>` the upstream's cohort's interpreter
-(tools/reference_releases.py, `COHORTS`; mamba_ssm's its tier release, `recurrence_matrix.tier_release`,
-refused otherwise). What lands is the upstream's file (`recurrence_matrix.RECORDED`, `DESTINATIONS`), or past
+(tools/reference_releases.py, `COHORTS`), serving the tier's release (`recurrence_matrix.tier_release`),
+refused otherwise. What lands is the upstream's file (`recurrence_matrix.RECORDED`, `DESTINATIONS`), or past
 `fetched_fixtures.IN_GIT` its pin beside the store's copy (tests/fixtures/fetched/), uploaded by
 `fetched_fixtures.upload`.
 """
@@ -169,7 +169,7 @@ def main() -> None:
     from delta_rule_support import FLA_LAYER_SIDE
     from fetched_fixtures import save
     from recorded_references import provenance
-    from recurrence_matrix import RECORDED
+    from recurrence_matrix import RECORDED, tier_release
     from reference_worker import session
 
     upstream, python, *labels = sys.argv[1:]
@@ -180,14 +180,16 @@ def main() -> None:
             source.write_text(FLA_LAYER_SIDE)
             with session([python, __file__, "--serve", str(source)]) as worker:
                 version, device = worker.started.split(maxsplit=1)
+                # The release a replay holds the recording to, checked before any GPU time is spent.
+                if version != tier_release(upstream):
+                    raise SystemExit(f"{python} serves fla-core {version}; the tier's reference is "
+                                     f"{tier_release(upstream)}")
                 for label in labels:
                     began = time.perf_counter()
                     stored.update(recorded(fla_answers(worker), label))
                     print(f"{label}: recorded in {time.perf_counter() - began:.0f} s", flush=True)
         reference, license = f"fla-core-{version}", "MIT"
     elif upstream == "mamba_ssm":
-        from recurrence_matrix import tier_release
-
         os.environ["DEW_MAMBA_PYTHON"] = python
         version, device = subprocess.run([python, "-c", MAMBA_RELEASE], check=True, capture_output=True,
                                          text=True).stdout.split(maxsplit=1)
