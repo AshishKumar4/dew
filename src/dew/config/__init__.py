@@ -1060,7 +1060,8 @@ class RunConfig:
                 return self
         earlier = unmarked(self.record(), json.loads(mark.read_text()))
         fields = _records.record(earlier["fields"], "run fields")
-        return dataclasses.replace(self, optim=from_record(OptimConfig, fields["optim"]))
+        return dataclasses.replace(self, optim=from_record(OptimConfig, _records.json_value(fields["optim"],
+                                                                                           "optim")))
 
     def _defaulted_as(self, recorded: Self) -> Self:
         """This run with each class it names (`Registered`: its model, its objective) that `recorded`, the
