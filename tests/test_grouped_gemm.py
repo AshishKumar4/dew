@@ -2378,3 +2378,71 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
             assert not rec.get("error"), rec
             assert rec["kernels"], rec
             assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+@INTERPRETS
+def test_sm120_output_staging_admits_three_stage_128x256_and_compiles():
+    """Explicit `Tiles.staging` `(chunk, buffers)` lowers output SMEM from 32 KB to 16 KB on `sm120`
+    `mma.sync.fed`, admitting 3-stage `128x256x32` arms (`(64, 1)` and `(32, 2)`) where default `(64, 2)`
+    exceeds the 99 KB block, holding check 1, compiling spill-free on `sm120`, and refusing invalid or
+    non-chunked staging (row 5634, M-FS-62)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    with pytest.raises(ValueError, match="no chunks"):
+        tiling.Tiles(64, 128, 32, 3, 1, warpgroups=1, family="mma.sync", staging=(64, 1))
+    with pytest.raises(ValueError, match="positive"):
+        tiling.Tiles(128, 256, 32, 3, 1, warpgroups=2, family="mma.sync.fed", staging=(0, 1))
+    with pytest.raises(ValueError, match="stages in no"):
+        tiling.Tiles(128, 128, 64, 2, 1, warpgroups=1, family="tcgen05", staging=(128, 1))
+
+    gmm = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    base = tiling.Tiles(128, 256, 32, 3, 1, warpgroups=2, family="mma.sync.fed")
+    arm_64x1 = dataclasses.replace(base, staging=(64, 1))
+    arm_32x2 = dataclasses.replace(base, staging=(32, 2))
+    with generation.assumed("sm120"):
+        sm120 = generation.gpu_target()
+        ba = gmm.bind(bf16((256, 128)), bf16((1, 128, 256)), one, out_dtype="bfloat16",
+                      trans_rhs=False, interpret=False, dense=True)
+        assert not gmm.legal(ba, base, sm120)
+        assert gmm.legal(ba, arm_64x1, sm120)
+        assert gmm.legal(ba, arm_32x2, sm120)
+        assert gmm.staged_bytes(ba, base, sm120) - gmm.staged_bytes(ba, arm_64x1, sm120) == 16384
+        assert gmm.staged_bytes(ba, arm_64x1, sm120) == gmm.staged_bytes(ba, arm_32x2, sm120)
+
+    def ref_fn(x, w, *, dtype=jnp.float32):
+        return jax.lax.dot(x.astype(dtype), w.astype(dtype), preferred_element_type=dtype).astype(
+            jnp.float64 if dtype == jnp.float64 else jnp.bfloat16)
+
+    for tag, arm in (("64x1", arm_64x1), ("32x2", arm_32x2)):
+        def draw(seed, tag=tag):
+            rng = np.random.default_rng(5634 + (100 if tag == "32x2" else 0) + seed)
+            x = jnp.asarray(rng.standard_normal((128, 64)) / np.sqrt(64), jnp.bfloat16)
+            w = jnp.asarray(rng.standard_normal((64, 256)) / np.sqrt(64), jnp.bfloat16)
+            return x, w
+
+        def dew_fn(x, w, arm=arm):
+            with (generation.assumed("sm120"), generation.chosen(grouped_matmul="mosaic"),
+                  tuning.pinned({grouped_matmul.MosaicGmm: arm})):
+                return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+        assert_as_exact(jax.jit(dew_fn), jax.jit(ref_fn), draw, f"sm120 staging {tag}", seeds=4,
+                        truth_fn=functools.partial(ref_fn, dtype=jnp.float64))
+
+    if generation.compile_only_gpus("sm120"):
+        specs = (bf16((256, 128)), bf16((128, 256)))
+        cases = []
+        for tag, arm in (("sm120_staging_64x1", arm_64x1), ("sm120_staging_32x2", arm_32x2)):
+            def compiled(x, w, arm=arm):
+                with generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
+                        {grouped_matmul.MosaicGmm: arm}):
+                    return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+            cases.append(KernelCase(tag, lambda c=compiled: (c, specs)))
+        with generation.assumed("sm120"):
+            records = compile_mosaic_kernels(cases, "sm120")
+        for rec in records:
+            assert not rec.get("error"), rec
+            assert rec["kernels"], rec
+            assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec

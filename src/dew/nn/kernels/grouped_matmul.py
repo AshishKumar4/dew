@@ -210,7 +210,8 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         # Kernel gradient prepares its depth half of each step's rows stage (`_staged_halves`, DECIDE1/3117).
         staged = rewritten = 0
         if self.STAGED_ROWS and not family.operands_in_registers and not family.tensor_columns(columns, 1):
-            chunk = stores.staged_columns(columns, stored)
+            chunk = stores.output_staging(
+                columns, stored, config.staging, piece=family.chunk_columns(columns))[0]
             tgmm_tiles = [((1,), jnp.int32)] * 6 + [((config.share, chunk), stored[0])]
             plain += family.scalar_registers(tgmm_tiles) - family.scalar_registers()
         if self.STAGED_ROWS and not family.operands_in_registers and not self.unstaged(ba):
@@ -279,15 +280,15 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
         columns = pricing.tile_columns(config, family)
         if hooks.epilogue is None:
-            return pricing.epilogue_registers(family, config.share, columns, stored, has_hook=False)
+            return pricing.epilogue_registers(family, config.share, columns, stored, staging=config.staging)
         vectors = sum(family.column_registers(columns, side.dtype)
                       for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
                                             strict=True) if held_axes(axes) == ('columns',))
         vectors += family.column_registers(columns, jnp.float32) if hooks.accumulators > 1 else 0
         tile_count = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes)
         out_dtypes = hooks.out_dtypes or stored
-        return pricing.epilogue_registers(family, config.share, columns, out_dtypes,
-                                          vectors=vectors, tile_count=tile_count, has_hook=True)
+        return pricing.epilogue_registers(family, config.share, columns, out_dtypes, vectors=vectors,
+                                          tile_count=tile_count, has_hook=True, staging=config.staging)
 
     def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba

@@ -60,6 +60,7 @@ class Tiles:
     swapped: bool = False
     pingpong: bool = False
     producers: resources.Producers = dataclasses.field(default_factory=resources.Producers)
+    staging: tuple[int, int] | None = None
 
     @property
     def sharing(self) -> int:
@@ -103,6 +104,13 @@ class Tiles:
         if self.warpgroups == 2 and self.stages < 2:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
+        if self.staging is not None:
+            chunk, buffers = self.staging
+            if chunk <= 0 or buffers < 1:
+                raise ValueError(f"{self}: output staging needs positive (chunk, buffers), "
+                                 f"got {self.staging}")
+            columns = self.block_n * (self.cluster if family.pairs_product else 1)
+            family.output_staging((((self.share, columns), jnp.bfloat16),), self.warpgroups, self.staging)
 
 
 CONSUMERS = 2
