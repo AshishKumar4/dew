@@ -610,20 +610,7 @@ def row_pieces(smem, dest, first, stored, placed, *, swizzle: int) -> None:
     def c(value: int):
         return mgpu_utils.c(value, i32)
 
-    def staged(row, column_bytes):
-        # `swizzling.staged_address`, traced.
-        if swizzle == swizzling.UNSWIZZLED:
-            return mgpu_arith.addi(mgpu_arith.muli(row, c(row_bytes)), column_bytes)
-        tile = mgpu_arith.muli(
-            mgpu_arith.addi(mgpu_arith.muli(mgpu_arith.divui(row, c(swizzling.TILE_ROWS)),
-                                            c(row_bytes // swizzle)),
-                            mgpu_arith.divui(column_bytes, c(swizzle))),
-            c(swizzling.TILE_ROWS * swizzle))
-        in_tile = mgpu_arith.muli(mgpu_arith.remui(row, c(swizzling.TILE_ROWS)), c(swizzle))
-        within = mgpu_arith.remui(column_bytes, c(swizzle))
-        offset = mgpu_arith.addi(mgpu_arith.addi(tile, in_tile), within)
-        return mgpu_arith.xori(offset, mgpu_arith.shli(mgpu_arith.andi(
-            mgpu_arith.shrui(offset, c(7)), c(swizzle // 16 - 1)), c(4)))
+    staging = swizzling.TracedStaging(row_bytes, swizzle)
 
     mgpu_utils.warpgroup_barrier()
     end = mgpu_arith.addi(first, stored)
@@ -645,7 +632,8 @@ def row_pieces(smem, dest, first, stored, placed, *, swizzle: int) -> None:
                      else mgpu_ir.InsertionPoint(written.then_block))
             with scope:
                 column_bytes = mgpu_arith.muli(lane, c(16))
-                address = mgpu_utils.getelementptr(source, [staged(row, column_bytes)], byte)
+                address = mgpu_utils.getelementptr(
+                    source, [staging.address(staging.anchor(row, column_bytes))], byte)
                 value = mgpu_llvm.load(vector, address)
                 place = mgpu_arith.addi(
                     mgpu_arith.muli(mgpu_arith.extsi(i64, target), mgpu_utils.c(row_stride, i64)),

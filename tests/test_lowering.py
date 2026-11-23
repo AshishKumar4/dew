@@ -1311,27 +1311,36 @@ def test_a_run_over_gpus_of_two_kinds_is_refused():
         _one_kind([gpu(0, 0, h100), gpu(1, 1, a100)])
 
 
+def _named(choice: str) -> str | None:
+    """The kernel a `kernel_choices` block in effect names for `choice`, None where none does."""
+    from dew import _cache
+
+    return dict(_cache.KERNEL_CHOICES.value).get(choice)
+
+
 def test_chosen_kernels_keep_other_choices_and_restore_them_after_an_exception():
     with assumed("sm80"):
         with kernel_choices(attention="xla", ssd="pallas"):
-            assert chosen_kernel("attention", "flash") == "xla"
+            assert _named("attention") == "xla"
             with pytest.raises(RuntimeError), kernel_choices(attention="flash"):
-                assert chosen_kernel("attention", "xla") == "flash"
-                assert chosen_kernel("ssd", "xla") == "pallas"
+                assert _named("attention") == "flash"
+                assert _named("ssd") == "pallas"
                 raise RuntimeError("the comparison ended")
-            assert chosen_kernel("attention", "flash") == "xla"
-        assert chosen_kernel("attention", "flash") == "flash"
+            assert _named("attention") == "xla"
+        assert _named("attention") is None
 
 
 def test_a_function_jitted_before_a_choice_traces_again_within_it():
+    from dew.nn.kernels.generation import Choice
+
     @jax.jit
     def ported(x):
-        return x + (chosen_kernel("ssd", "xla") == "pallas")
+        return x + (chosen_kernel(Choice.NARROW_COPIES, "off") == "on")
 
     x = jnp.zeros((), jnp.int32)
-    with kernel_choices(ssd="xla"):
+    with kernel_choices(narrow_copies="off"):
         assert ported(x) == 0
-        with kernel_choices(ssd="pallas"):
+        with kernel_choices(narrow_copies="on"):
             assert ported(x) == 1
         assert ported(x) == 0
 
@@ -1648,7 +1657,7 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
 
     from dew.nn.kernels import grouped_launch, grouped_triton
     from dew.nn.kernels.lowered import KernelCall
-    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program, report
+    from dew.nn.kernels.templates import assembled, attention_mosaic, attention_mosaic_program, report
 
     def spec(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.bfloat16)
@@ -1675,7 +1684,7 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
 
     # A Triton kernel states no launch of its call; its name carries the launch that traced it.
     with report.launching(gemm, dense, tile):
-        named = report.launch_name("gmm_triton", report.launch_digest())
+        named = assembled.launch_name("gmm_triton", report.launch_digest())
     triton = KernelCall("triton", named, b"", "c", None)
     calls = ((call(gemm, dense, tile), 3.0), (call(attention, scores, tiles), 1.0),
              (call(gemm, grouped, tile), 2.0), (KernelCall("triton", "plain", b"", "c", None), 1.0),

@@ -35,7 +35,15 @@ from dew import _cache, communicators
 from dew._code import op_provenance, provenance_code
 from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates.assembled import MOSAIC_TARGET, SERIALIZED, Binary, binaries, carried, kernel_of
+from dew.nn.kernels.templates.assembled import (
+    MOSAIC_TARGET,
+    SERIALIZED,
+    Binary,
+    binaries,
+    carried,
+    kernel_of,
+    launch_name,
+)
 
 if TYPE_CHECKING:
     from dew.nn.kernels.lowered import KernelCall
@@ -369,14 +377,6 @@ def launch_metadata() -> bytes:
     return b"" if digest is None else digest.encode()
 
 
-def launch_name(kernel: str, launch: str | None, index: str | None = None) -> str:
-    """`kernel`'s name carrying the digest `launch` (`assembled.LAUNCH_SUFFIX`) and optional XLA
-    uniquification `index`, as is where None: the lossless key a kernel's evidence goes by beside its
-    launch."""
-    named = kernel if launch is None else f"{kernel}__l{launch}"
-    return named if index is None else f"{named}__{index}"
-
-
 class KernelsOfOneName(ValueError):
     """Two kernels of one name and launch (`kernel_bodies`), whose evidence would be one's."""
 
@@ -484,6 +484,22 @@ def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]
         return found
 
 
+def refusals_at(op, arguments: tokamax.BoundArguments, target: "generation.GpuTarget | None"
+                ) -> frozenset[tuple[Hashable, frozenset[Refused]]]:
+    """Each config a compile of this process refused `op`'s launch of `arguments` on `target` at, with the
+    kernels refused there and their roles (`refusals_of` of its identity, its cached snapshot as is): the one
+    reading of a launch's refusals, which `refused`, `refused_at` and `spilled_in` read at a config
+    (`_refused_kernels`), and a launch none of whose configs is refused reads as empty (row 6999: a fifth
+    reader asked that alone)."""
+    return refusals_of(_identity(op, arguments, target))
+
+
+def _refused_kernels(found: frozenset[tuple[Hashable, frozenset[Refused]]], config: Hashable
+                     ) -> frozenset[Refused]:
+    """The kernels a launch's refusals (`refusals_at`) refused at `config`, none where it refused none."""
+    return next((kernels for refused_config, kernels in found if refused_config == config), frozenset())
+
+
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable,
             target: "generation.GpuTarget | None") -> bool:
     """Whether a compile of this process refused `op`'s launch of `arguments` at `config` on `target`: a
@@ -492,18 +508,12 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable,
     return bool(refused_at(op, arguments, config, target))
 
 
-def refused_any(op, arguments: tokamax.BoundArguments, target: "generation.GpuTarget | None") -> bool:
-    """Whether a compile of this process refused any config of `op`'s launch of `arguments` on `target`
-    (`refused`)."""
-    return bool(refusals_of(_identity(op, arguments, target)))
-
-
 def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable,
                target: "generation.GpuTarget | None") -> frozenset[str]:
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments` on `target`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
     recurrence's forward and backward walks) steps the one refused."""
-    return names(dict(refusals_of(_identity(op, arguments, target))).get(config, ()))
+    return names(_refused_kernels(refusals_at(op, arguments, target), config))
 
 
 def names(kernels: Iterable[Refused]) -> frozenset[str]:
@@ -517,7 +527,7 @@ def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable,
     refusal states them (`Refused`), by kernel name: what a launch's ladder steps it by (row 6744). A kernel
     whose roles its compile left unread is absent; one read and spilling none (its warpgroup MMAs serialized
     alone) states `()`."""
-    found = dict(refusals_of(_identity(op, arguments, target))).get(config, ())
+    found = _refused_kernels(refusals_at(op, arguments, target), config)
     return {kernel: roles for kernel, roles in found if roles is not None}
 
 
@@ -528,9 +538,16 @@ def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kerne
     compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727). `spilled_in`, the
     roles each kernel's spill stood in where the compile read them (`Binary.spilled_in`), kept with it
     (`Refused`) for its ladder (`spilled_in`)."""
+    _refused_launch(_identity(op, arguments, generation.gpu_target()), config, kernels, spilled_in)
+
+
+def _refused_launch(identity: str, config: Hashable, kernels,
+                    spilled_in: Mapping[str, tuple[str, ...] | None] | None) -> None:
+    """The launch of `identity` (`_identity`: its op, arguments and target) refused at `config`, as
+    `refuse_launch` refuses it: what a settle of launches certified aside records by the identity it queued
+    each under, whatever GPU is in effect as it drains (row 12031)."""
     roles = spilled_in or {}
-    _record((_identity(op, arguments, generation.gpu_target()), config), None,
-            frozenset((kernel, roles.get(kernel)) for kernel in kernels))
+    _record((identity, config), None, frozenset((kernel, roles.get(kernel)) for kernel in kernels))
 
 
 _CERTIFYING: contextvars.ContextVar = contextvars.ContextVar("certifying_device", default=None)
@@ -638,15 +655,27 @@ _ASIDE: contextvars.ContextVar[Aside | None] = _cache.untraced(
 
 
 @contextlib.contextmanager
-def certifying_aside() -> Iterator[Aside]:
+def certifying_aside() -> Iterator[None]:
     """Within the block, a launch whose derivation has refused none of its configs is certified aside
     (`certified`): lowered as the trace reaches it, Python that holds the GIL, and compiled on
     `compile_threads` threads while the trace runs on, XLA and the GPU's assembler releasing it, its config
-    taken as holding until `settled_aside` reads its compile; the block's end waits for every compile. A
-    launch with a refusal certifies in turn, its ladder read as it climbs (`tuning.KernelOp._certified`). A
-    cold start's 47 launches certified in turn took 48 s, 18 of them compiling (M-MC-21b), and every config
-    the gates derive holds (FS-DECISION: an attention forward's 68 and a backward's 45 on sm90), so a
-    refusal's relowering is rare."""
+    taken as holding until the block's end reads its compile (`_settled_aside`), within a settle that records
+    its misses (`settling`), every compile waited for. A launch with a refusal certifies in turn, its ladder
+    read as it climbs (`tuning.KernelOp._certified`). A cold start's 47 launches certified in turn took 48 s,
+    18 of them compiling (M-MC-21b), and every config the gates derive holds (FS-DECISION: an attention
+    forward's 68 and a backward's 45 on sm90), so a refusal's relowering is rare. The one way a caller
+    certifies aside, its steps in order (row 12015); a lowering that relowers past a refusal settles wider
+    (`lowered_aside`)."""
+    with settling():
+        with _aside_block() as aside:
+            yield
+        _settled_aside(aside)
+
+
+@contextlib.contextmanager
+def _aside_block() -> Iterator[Aside]:
+    """A block certifying aside (`certifying_aside`) whose launches its caller settles (`_settled_aside`):
+    its compiles' pool, each compile waited for as it ends."""
     with ThreadPoolExecutor(compile_threads(), thread_name_prefix="dew-certify") as pool:
         aside = Aside(pool)
         token = _ASIDE.set(aside)
@@ -656,14 +685,13 @@ def certifying_aside() -> Iterator[Aside]:
             _ASIDE.reset(token)
 
 
-def settled_aside(aside: Aside) -> frozenset[tuple]:
+def _settled_aside(aside: Aside) -> frozenset[tuple]:
     """Each launch `aside` certified, kept as `certified` keeps one and dropped from the block's pending: a
     launch whose kernels the assembler refuses refused (`refuse_launch`), so a trace that took its config is
     traced afresh (`settled_trace`) and a program lowered at it lowered afresh (`refused_in`), its misses kept
-    for that retry to record (`settling`). The keys of those refused."""
+    for that retry to record (`settling`, which every caller settles within). The keys of those refused."""
     settlement = _SETTLING.get()
-    if settlement is None:
-        raise ValueError("a block certifying aside is settled within `settling`, which records its misses")
+    assert settlement is not None
     refused = set()
     for key, each in list(aside.pending.items()):
         # A launch a derivation certified (a route's eligibility) and no trace called: no program holds it.
@@ -690,9 +718,8 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
             for reporting in scopes:
                 # Refused in each scope its call was taken in, whatever scope drains it.
                 with _reported_in(reporting):
-                    refuse_launch(each.op, each.arguments, each.config,
-                                  {binary.kernel for binary in spilling},
-                                  {binary.kernel: binary.spilled_in for binary in spilling})
+                    _refused_launch(key[0], each.config, {binary.kernel for binary in spilling},
+                                    {binary.kernel: binary.spilled_in for binary in spilling})
                 # Held by the settle (`settling`) until a retry, under its own context, steps past it (row
                 # 11786).
                 settlement.deferred.append((key, Launch(key[0], type(each.op).__name__, each.config),
@@ -702,7 +729,7 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
 
 def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
     """`trace()`'s value, within a block certifying aside the launches it reached settled before it lowers
-    (`settled_aside`, within `settling`), and traced afresh (`retrace()`, past any trace cache) while they
+    (`_settled_aside`, within `settling`), and traced afresh (`retrace()`, past any trace cache) while they
     refuse a config it took: it lowers once, at the configs its certification settled (FS-ASIDE-SM100C).
     Each trace runs in the caller's context, which JAX's trace cache keys on, so a program compiled ahead is
     found by its trace (row 11766); an abandoned trace's routes are withdrawn (`generation.withdrawn`), a
@@ -715,7 +742,7 @@ def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
         marks = generation.route_marks()
         value = trace()
         seen: set = set()
-        while (refused := settled_aside(aside)) and not refused <= seen:
+        while (refused := _settled_aside(aside)) and not refused <= seen:
             seen |= refused
             generation.withdrawn(marks)
             value = retrace()
@@ -725,7 +752,7 @@ def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
 def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
                      program: Callable[[T], jax.stages.Lowered | None]) -> T:
     """`lower()`'s value, the launches its trace reaches certified aside (`certifying_aside`, settled before
-    it lowers where it traces through `settled_trace`, else as it ends: `settled_aside`), and `relower()`'s
+    it lowers where it traces through `settled_trace`, else as it ends: `_settled_aside`), and `relower()`'s
     afresh for as long as its program (`program`, None where it holds none) launches a refused config
     (`refused_in`), each refused launch's derivation stepping past its config and certifying the next in
     turn: its own certifications' refusals, or another caller's committed after its trace took the config
@@ -736,22 +763,22 @@ def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
     64 of an sm90 plan's 82 seconds (FS-P5324-MAIN, row 5324); a program's trace alone certifies aside too
     (`OuterProgram.trace`)."""
     with settling():
-        with certifying_aside() as aside:
+        with _aside_block() as aside:
             value = lower()
-        settled_aside(aside)
+        _settled_aside(aside)
         seen: set = set()
         while ((lowered := program(value)) is not None and (refused := refused_in(lowered))
                and not refused & seen):
             seen |= refused
-            with certifying_aside() as aside:
+            with _aside_block() as aside:
                 value = relower()
-            settled_aside(aside)
+            _settled_aside(aside)
     return value
 
 
 @dataclasses.dataclass
 class _Settlement:
-    """A settle's misses (`settled_aside`) by certification key and queueing scope, held until the launch
+    """A settle's misses (`_settled_aside`) by certification key and queueing scope, held until the launch
     holds at another config in that scope's registry (stepped) or the settle ends, recorded in their own
     scope either way (row 11786)."""
 
@@ -887,7 +914,7 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
         return ()
     if aside is not None and not _refused_before(op, arguments) and _traced_for(device):
         # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
-        # compiled aside (`capture`), the block's end settling it (`settled_aside`), once a block.
+        # compiled aside (`capture`), the block's end settling it (`_settled_aside`), once a block.
         aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, [reporting])
         aside.awaiting[(_launched(key[0], config, reverse), reverse)] = key
         return ()
@@ -1079,8 +1106,11 @@ def _certifying_device():
     if placed.empty:
         placed = _TARGETED.get()
     if placed is None:
+        # JAX's own default for a plain call: the device named, else this process's first of the platform
+        # named (`jax.local_devices`), never another process's (rows 7211, 7224: rank k certified on
+        # process 0's device, which it cannot address).
         default = jax.config.jax_default_device
-        devices = [default if isinstance(default, jax.Device) else jax.devices(default)[0]]
+        devices = [default] if isinstance(default, jax.Device) else jax.local_devices(backend=default)[:1]
     else:
         devices = [device for device in placed.devices.flat if device.process_index == jax.process_index()]
     # A device of another generation (a CPU's, an A100's under an assumed sm90) certifies nothing.
