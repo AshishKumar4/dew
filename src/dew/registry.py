@@ -434,13 +434,15 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         members = (annotated[self[name], tyro.conf.subcommand(name.replace("_", "-"))] for name in names)
         return functools.reduce(operator.or_, members)
 
-    def flag_choices(self, record: type[Registered]) -> Callable[[], Annotation]:
+    def flag_choices(self, record: type[Registered]) -> Callable[[], type]:
         """The members' records (`record`, this kind's `Registered` class) as a command line chooses them
         (`record_flags`): a subcommand an alias (`env:flight`), its arguments plain flags, made when a
         command line is parsed (`tyro.conf.arg(constructor_factory=...)`), one class's first alias alone,
         a subclass's before its base's (tyro reads a union's first member a default is an instance of)."""
 
-        def choices() -> Annotation:
+        def choices() -> type:
+            # A union of the subcommands' annotated records, which tyro's `constructor_factory` takes where
+            # its stubs say a type (`typing.Annotated` read by name, as tyro reads it).
             annotated = vars(typing)["Annotated"]
             named: dict[str, str] = {}
             for alias in self:
@@ -1885,7 +1887,7 @@ class Registered(ABC):
         base = type(self).__mro__[1]
         return base(**{field.name: vars(self)[field.name] for field in dataclasses.fields(base)})
 
-    def flagged(self) -> Registered:
+    def flagged(self) -> Self:
         """This record as its command line's subcommand holds it (`record_flags`, `Aliases.flag_choices`): a
         field a plain flag holds as that flag, the rest, a record's, kept as they are, its other settings as
         they are; itself where its kind names no aliases or none names its class (a command line chooses
@@ -2011,8 +2013,8 @@ def _fits(value: Configured, annotation: Annotation) -> bool:
 
 
 @functools.cache
-def record_flags(record: type[Registered], member: type | Callable[..., Configured], path: str,
-                 alias: str) -> type[Registered]:
+def record_flags[R: Registered](record: type[R], member: type | Callable[..., Configured], path: str,
+                 alias: str) -> type[R]:
     """`member`'s record (`record`, a `Registered` kind's) as a command line sets it (api03): a subclass whose
     own fields are the member's arguments a plain flag sets (`_flat`; one the run builds, an object, takes
     none), each defaulting to the member's default (None where it states none a flag holds, which leaves
@@ -2047,8 +2049,11 @@ def record_flags(record: type[Registered], member: type | Callable[..., Configur
     namespace = {"__post_init__": __post_init__, "__module__": __name__, "_alias": alias.replace("_", "-"),
                  "_flags": flats, "__doc__": (member.__doc__ or "").split("\n\n")[0]}
     title = "".join(part.title() for part in alias.split("_"))
-    return dataclasses.make_dataclass(f"{record.__name__}{title}", [*suppressed, *flags], bases=(record,),
+    made = dataclasses.make_dataclass(f"{record.__name__}{title}", [*suppressed, *flags], bases=(record,),
                                       frozen=True, namespace=namespace)
+    if not issubclass(made, record):
+        raise TypeError(f"{made.__name__} is no {record.__name__}")
+    return made
 
 
 def implied_subcommand(default: Configured) -> str | None:
