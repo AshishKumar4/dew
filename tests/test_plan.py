@@ -2410,3 +2410,46 @@ def test_a_trainer_built_after_the_process_releases_its_programs_traces_its_step
     options.release()
     again = traced()
     assert kept < first and kept < again, (first, kept, again)
+
+
+def test_a_runs_held_executables_let_the_shape_used_least_recently_go_first_past_their_budget():
+    """A run's compiler holds its steps' executables by their device code's bytes (`HeldExecutables`, row
+    12385): holding one past its budget lets the least recently used go first, a step read since kept
+    before one held earlier and not read again, and one alone past the budget is still held."""
+    from dew.telemetry.instrumentation import compiled_memory
+    from dew.training.planning import HeldExecutables
+
+    compiled = {name: jax.jit(lambda x: jnp.sin(x) @ x.T).lower(jnp.ones((size, size))).compile()
+                for name, size in (("small", 8), ("middle", 32), ("large", 64))}
+    sizes = {name: memory.generated_code for name, executable in compiled.items()
+             if (memory := compiled_memory(executable)) is not None}
+    assert len(sizes) == 3 and all(size > 0 for size in sizes.values()), sizes
+    budget = max(sizes["small"] + sizes["middle"], sizes["small"] + sizes["large"])
+    held = HeldExecutables(budget)
+    held["small"], held["middle"] = compiled["small"], compiled["middle"]
+    assert held.get("small") is compiled["small"]
+    held["large"] = compiled["large"]
+    assert list(held) == ["small", "large"] and held.bytes == sizes["small"] + sizes["large"] <= budget
+    alone = HeldExecutables(1)
+    alone["large"] = compiled["large"]
+    assert list(alone) == ["large"]
+
+
+def test_a_run_whose_held_steps_pass_their_budget_trains_on_each_shape_it_meets():
+    """A run whose compiler holds no more device code than its latest step's (`HeldExecutables.budget`)
+    meets a second batch shape and lets the first's step go, holding only the step it runs, and trains on
+    each shape as a run that held both does (row 12385)."""
+    from affine_run import dataset
+
+    def trained(budget: int | None):
+        trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0))
+        if budget is not None:
+            trainer._compiler._executables.budget = budget
+        for rows in (8, 4):
+            state = trainer.fit(dataset(batch=rows), steps=2, log_every=100)
+        return trainer, jax.device_get(state.variables)
+
+    bounded, held = trained(1)
+    unbounded, whole = trained(None)
+    assert len(bounded._compiler._executables) == 1 < len(unbounded._compiler._executables)
+    jax.tree.map(np.testing.assert_array_equal, held, whole)

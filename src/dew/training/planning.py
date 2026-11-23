@@ -20,7 +20,8 @@ import logging
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Callable, Hashable, Iterator, Mapping, MutableMapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -700,6 +701,51 @@ def compiled_key(lowered: jax.stages.Lowered, options: jax.stages.CompilerOption
     return program_key(lowered), repr(sorted((options or {}).items())), tuple(devices)
 
 
+HELD_CODE_BYTES = 1 << 30
+"""The device code a run's compiler holds for its refits at most (`HeldExecutables`): 1 GiB, a few dozen of
+a large model's steps (a 4B decoder's is 20 to 40 MiB of code on an H100), which device code past the
+allocator's pool holds as long as anything references it (row 12131), so a run meeting shape after shape
+holds no step of a shape it left long ago beyond it (row 12385)."""
+
+
+class HeldExecutables(MutableMapping[Hashable, jax.stages.Compiled]):
+    """The executables a run's searches hold for each other and its refits (`FitSearch.executables`), by
+    key (`compiled_key`), bounded by their device code's bytes (`budget`, `CompiledMemory.generated_code`):
+    each read or held marks its key as the latest used, and holding one past the budget lets the least
+    recently used go first, the shapes the run has not met for longest, never the one just held. Letting one
+    go frees it only where nothing else holds it, a plan stepping on it holding its own (`Planned`), so a
+    refit of a shape let go compiles again, or reads its program back from the persistent cache."""
+
+    def __init__(self, budget: int = HELD_CODE_BYTES):
+        self.budget = budget
+        self.bytes = 0
+        self._held: OrderedDict[Hashable, tuple[jax.stages.Compiled, int]] = OrderedDict()
+
+    def __getitem__(self, key: Hashable) -> jax.stages.Compiled:
+        executable, _ = self._held[key]
+        self._held.move_to_end(key)
+        return executable
+
+    def __setitem__(self, key: Hashable, executable: jax.stages.Compiled) -> None:
+        if key in self._held:
+            del self[key]
+        memory = compiled_memory(executable)
+        size = 0 if memory is None else memory.generated_code
+        self._held[key], self.bytes = (executable, size), self.bytes + size
+        while self.bytes > self.budget and (oldest := next(iter(self._held))) != key:
+            del self[oldest]
+
+    def __delitem__(self, key: Hashable) -> None:
+        _, size = self._held.pop(key)
+        self.bytes -= size
+
+    def __iter__(self) -> Iterator[Hashable]:
+        return iter(self._held)
+
+    def __len__(self) -> int:
+        return len(self._held)
+
+
 def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
             frontier: Sequence[Probe] | None = None,
             lighter: Sequence[Probe] | None = None) -> dict[str, JSON]:
@@ -885,7 +931,7 @@ class FitSearch[LossT, EffectsT]:
     asked: list[Rung] = dataclasses.field(default_factory=list)
     """The rungs its search asked past the one it stood on first (`searched`), which a plan made offline
     asks none of again (`below`)."""
-    executables: dict[Hashable, jax.stages.Compiled] = dataclasses.field(default_factory=dict)
+    executables: HeldExecutables = dataclasses.field(default_factory=HeldExecutables)
     """The executables its run's searches hold for each other, by key (`compiled_key`), the run's compiler's
     (`dew.training.compiler.StepCompiler`): a plan of the same program on the same devices, a provisional
     search's in a placed one's or a refit's, steps on one compiled before, and none is held past the run, a
