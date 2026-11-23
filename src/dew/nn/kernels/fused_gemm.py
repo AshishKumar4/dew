@@ -60,7 +60,7 @@ from dew.nn.kernels import gemm, generation, grouped_matmul, launches, tuning
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost, emission
-from dew.nn.sharding import computed_from
+from dew.nn.sharding import computed_from, explicit_spec
 
 FUSION_ROW = 'ledger 1295'
 """The fusion analysis's limits."""
@@ -317,10 +317,17 @@ def _written(program: algebra_cost.Seconds, written: float, xla: algebra_cost.Fu
 
 
 def _indexed_rows(operands: tuple, table: jax.Array) -> tuple:
-    """Index each `(side, axes)` side operand along its `'rows'` axis by `table` (`gather` or `scatter`)."""
-    return tuple(
-        (jnp.take(side, table, axis=axes.index('rows')) if 'rows' in axes else side, axes)
-        for side, axes in operands)
+    """Index each `(side, axes)` side operand along its `'rows'` axis by `table` (`scatter`), each placed as
+    it was where an Explicit axis splits it: a permutation of its rows, whose placement its own is."""
+    def indexed(side, axis):
+        placed = explicit_spec(side)
+        if placed is None:
+            return jnp.take(side, table, axis=axis)
+        where = (slice(None),) * axis + (table,)
+        return side.at[where].get(out_sharding=placed)
+
+    return tuple((indexed(side, axes.index('rows')) if 'rows' in axes else side, axes)
+                 for side, axes in operands)
 
 
 def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gather: bool, has_scatter: bool,

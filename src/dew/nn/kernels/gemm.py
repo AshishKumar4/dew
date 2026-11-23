@@ -1689,7 +1689,10 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     # typed the same on every device, the VJP of an epilogue adding a side each device reads its own of
     # summed the devices' cotangents into it (the add's broadcast transposed to a psum), every device's
     # gradient then their sum (row 10526).
-    operands = (lhs, *matrices, *jax.tree.leaves(prologue_arrays))
+    # Its gather table too (`plain`'s): a table each device holds its own of routes rows that vary with
+    # it, as the forward's accumulator is typed (`fused_gemm._product`'s).
+    operands = (lhs, *matrices, *jax.tree.leaves(prologue_arrays),
+                *(() if plain.get('gather') is None else (plain['gather'],)))
 
     def zero() -> jax.Array:
         return varying_like(jnp.zeros(acc_shape, at_least_fp32(compute)), *operands)
