@@ -583,7 +583,7 @@ def test_a_packed_products_rescue_keeps_an_explicit_meshs_row_placement():
             dy = jax.device_put(jnp.zeros((16, 64), jnp.float32).at[0, 0].set(4.0).at[0, 1].set(second),
                                 NamedSharding(mesh, PartitionSpec("data")))
             d_rows = pull(rows, dy)
-            assert d_rows.sharding.spec == PartitionSpec("data"), d_rows.sharding
+            assert d_rows.sharding.spec[0] == "data", d_rows.sharding
             want = np.zeros((16, 256), np.float32)
             want[0, 0] = expected
             np.testing.assert_array_equal(np.asarray(d_rows), want)

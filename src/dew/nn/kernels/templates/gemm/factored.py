@@ -64,8 +64,8 @@ class _Transpose:
     dtype: jnp.dtype
     held: frozenset
     placed: jax.sharding.NamedSharding | jax.sharding.PartitionSpec | None
-    wide: Callable | None = None
-    prepared: Callable | None = None
+    wide: Callable
+    prepared: Callable
 
     @functools.cached_property
     def declared(self) -> Callable:
