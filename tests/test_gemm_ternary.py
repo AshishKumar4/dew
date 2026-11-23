@@ -185,8 +185,7 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
             )(f32((256, 128)), f32((128, 128)))
         cuda_gemms = [
             e for e in equations(closed_high, platform="cuda")
-            if e.primitive.name in ("core_map", "pallas_call", "mosaic_gpu_v2",
-                                    "dot_general", "ragged_dot_general")
+            if e.primitive.name in ("mpmd_map", "pallas_call", "dot_general", "ragged_dot_general")
         ]
         assert cuda_gemms, "expected lowered GEMM equations in CUDA branch"
         for eqn in cuda_gemms:
@@ -243,11 +242,14 @@ def test_ternary_ste_cancellation_overflow_and_subnormal_rows():
     # Cancellation overflow witness: two entries of 2**126 against +1 and -1 with weight scale 2**10.
     x_cancel = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** 126)
     w_mat = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[1, 0].set(-1.0)
-    w_cancel = formats.TernaryWeights.of(w_mat, scale=jnp.float32(2.0 ** 10))
+    w_cancel = dataclasses.replace(formats.TernaryWeights.of(w_mat, scale=jnp.float32(1.0)),
+                                   scale=jnp.float32(2.0 ** 10))
     # Tiny subnormal row witness: 2**-144 with weight scale 2**120 -> representable result 2**-24.
     x_tiny = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** -144)
-    w_tiny = formats.TernaryWeights.of(jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0),
-                                       scale=jnp.float32(2.0 ** 120))
+    w_tiny = dataclasses.replace(
+        formats.TernaryWeights.of(jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0),
+                                  scale=jnp.float32(1.0)),
+        scale=jnp.float32(2.0 ** 120))
 
     for kernel in ("mosaic", "xla"):
         with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):

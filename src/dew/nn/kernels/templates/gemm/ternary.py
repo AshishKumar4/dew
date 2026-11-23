@@ -14,7 +14,7 @@ import jax.numpy as jnp
 from jax.core import Tracer
 
 from dew.nn import precision
-from dew.nn.derivatives import KernelGlue, contracted
+from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, fp8_factor, fp8_scale_checked
 from dew.nn.kernels.templates.gemm import tiling
@@ -133,30 +133,30 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         scaled = run_dot(lhs.astype(jnp.bfloat16)) * factor_of(scale_f32)
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
-    @jax.custom_jvp
-    def ste_scaled(a: jax.Array, s: jax.Array) -> jax.Array:
+    def ste_value(a: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
         x_q, peak = _quantize_activations_peak(a)
-        prod = run_dot(x_q) / jnp.float32(127.0)
-        return precision.twice_scaled(prod, peak[:, None], factor_of(s))
+        prod = precision.divided(run_dot(x_q), jnp.float32(127.0))
+        return precision.twice_scaled(prod, peak[:, None], factor_of(s)), prod
 
-    @ste_scaled.defjvp
-    def _ste_scaled_jvp(primals, tangents):
+    def ste_derivative(primals, tangents, value):
         a, s = primals
         d_a, d_s = tangents
+        _, prod = value
         x_q, peak = _quantize_activations_peak(a)
         peak_col = jax.lax.stop_gradient(peak)[:, None]
+        prod_held = jax.lax.stop_gradient(prod)
         # Straight-through activation derivative at the scaled product: never carries canceling `peak`
         # into the pullback (preventing `act_scale * factor -> inf` overflow on canceling rows), while
         # delegating to `run_dot`'s `linear_tangent` so VJP transposes through the GEMM backward kernel.
-        summed, d_summed = jax.jvp(run_dot, (jax.lax.stop_gradient(x_q),), (d_a.astype(jnp.bfloat16),))
-        prod = jax.lax.stop_gradient(summed) / jnp.float32(127.0)
+        _, d_summed = jax.jvp(run_dot, (jax.lax.stop_gradient(x_q),), (d_a.astype(jnp.bfloat16),))
         factor = factor_of(s)
         d_factor = factor_of(d_s)
-        y = precision.twice_scaled(prod, peak_col, factor)
-        once = prod * peak_col
-        tiny = jnp.finfo(prod.dtype).tiny
-        kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (prod == 0))
-        dy_s = jnp.where(kept, once * d_factor, (prod * d_factor) * peak_col)
-        return y, d_summed * factor + dy_s
+        once = prod_held * peak_col
+        tiny = jnp.finfo(prod_held.dtype).tiny
+        kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (prod_held == 0))
+        dy_s = jnp.where(kept, once * d_factor, (prod_held * d_factor) * peak_col)
+        return d_summed * factor + dy_s, jnp.zeros_like(prod_held)
 
-    return ste_scaled(lhs, scale_f32).astype(lhs.dtype if out_dtype is None else out_dtype)
+    ste_scaled = contracted("test_a_ternary_weight_product_holds_every_order")(
+        surrogate(ste_value, ste_derivative))
+    return ste_scaled(lhs, scale_f32)[0].astype(lhs.dtype if out_dtype is None else out_dtype)
