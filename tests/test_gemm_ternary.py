@@ -614,8 +614,10 @@ def test_an_fp8_products_rescue_leaves_an_infinite_coefficient_to_its_own_coordi
     other coordinate of the row is 0 (rows 1464, 12403)."""
     matrix = jnp.zeros((64, 64), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
     matrix = matrix.at[1, 0].set(jnp.inf)
-    weights = dataclasses.replace(formats.Fp8Weights.of(matrix, fmt="e5m2", scale=jnp.float32(1.0)),
-                                  scale=jnp.float32(4.0))
+    # E5M2 codes as given (an encode would saturate the infinity to E5M2's largest).
+    codes = formats.Fp8Weights.of(matrix.astype(jnp.float8_e5m2), fmt="e5m2", scale=jnp.float32(1.0))
+    assert np.isposinf(np.asarray(codes.decoded(jnp.float32))[1, 0])
+    weights = dataclasses.replace(codes, scale=jnp.float32(4.0))
     _, pull = jax.vjp(lambda x: gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32),
                       jnp.zeros((16, 64), jnp.float32))
     (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, :3].set(
