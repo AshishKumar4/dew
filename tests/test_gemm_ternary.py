@@ -91,7 +91,7 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
         for interpret in (False, True):
             got = gemm.ternary_weight_product(x_g, bank, sizes, quantize_activations=False,
                                               out_dtype=jnp.float32, interpret_on_cpu=interpret)
-            np.testing.assert_allclose(np.asarray(got), np.asarray(ref), atol=1e-4, rtol=1e-4)
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
     # BitNet b1.58 per-token int8 activation quantization + zero-row safety + STE gradient.
     x_bit = jnp.asarray(rng.standard_normal((32, 256)), jnp.bfloat16).at[0].set(0.0)
@@ -102,13 +102,13 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
     ref_bit = jax.lax.dot(x_q, w_bit.unscaled(jnp.float32), preferred_element_type=jnp.float32) * (
         act_scale[:, None] * w_bit.scale)
     for interpret in (False, True):
-        val, dx = jax.value_and_grad(lambda a: jnp.sum(gemm.ternary_weight_product(
+        got_bit = gemm.ternary_weight_product(x_bit, w_bit, quantize_activations=True,
+                                              out_dtype=jnp.float32, interpret_on_cpu=interpret)
+        np.testing.assert_array_equal(np.asarray(got_bit[0]), np.zeros((64,), np.float32))
+        _, dx = jax.value_and_grad(lambda a: jnp.sum(gemm.ternary_weight_product(
             a, w_bit, quantize_activations=True, out_dtype=jnp.float32, interpret_on_cpu=interpret)))(x_bit)
-        np.testing.assert_allclose(float(val), float(jnp.sum(ref_bit)), atol=1e-3, rtol=1e-4)
         assert np.all(np.isfinite(np.asarray(dx)))
-    got_zero = gemm.ternary_weight_product(x_bit, w_bit, quantize_activations=True, out_dtype=jnp.float32)
-    np.testing.assert_array_equal(np.asarray(got_zero[0]), np.zeros((64,), np.float32))
-
+        np.testing.assert_array_equal(np.asarray(got_bit), np.asarray(ref_bit))
     for gpu in ("sm80", "sm90"):
         if not generation.compile_only_gpus(gpu):
             continue
