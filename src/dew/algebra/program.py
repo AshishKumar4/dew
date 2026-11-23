@@ -971,7 +971,7 @@ class _Body:
     rewrites: tuple
 
 
-_REWRITTEN: weakref.WeakKeyDictionary[jcore.Jaxpr, dict[Hashable, _Body]] = (
+_REWRITTEN: weakref.WeakKeyDictionary[jcore.Jaxpr, collections.OrderedDict[Hashable, tuple[_Body, dict]]] = (
     weakref.WeakKeyDictionary())
 """Each body's rewrites (`_closed`) by what a rewrite read (the numerics' forms, the saturation, the
 switch's target), held while the body lives: every call site of one body, and every retrace that holds it
@@ -992,7 +992,7 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     from dew._cache import KERNEL_CHOICES
     from dew.algebra import derive
 
-    rewrites = _REWRITTEN.setdefault(closed, {})
+    rewrites = _REWRITTEN.setdefault(closed, collections.OrderedDict())
     # With kernels, the context the substitutions are decided in too (the derivation's: the mesh, the target
     # and the numerics; the kernel choices a call names; the launches the compiles refused), so a body
     # rewritten under one choice is none of another's (spec alignment, 8994). Not fusion's whole choice
@@ -1000,13 +1000,17 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
     # cache, held as long as the body is, would keep alive.
     key = (_deriving(accurate, saturation), kernels,
            (derive.context(), KERNEL_CHOICES.value, kernel_report.refusal_entries()) if kernels else None)
-    held = rewrites.get(key)
-    reused = held is not None and held.record.still()
-    if held is None or not reused:
+    fresh: list[_Body] = []
+
+    def rewrite() -> _Body:
         with kernel_report.recording() as regions:
             made, record = fusion.recorded(lambda: _rewritten(closed, accurate, saturation, kernels))
-        held = rewrites[key] = _Body(None if made is closed else made, record, tuple(regions.rewritten))
-    body = held
+        fresh.append(_Body(None if made is closed else made, record, tuple(regions.rewritten)))
+        return fresh[0]
+
+    # Held with the facts its rewrite read while each answers alike (`generation.held_trace`).
+    body = generation.held_trace(rewrites, key, rewrite, fusion.DECISIONS_HELD)
+    reused = not fresh
     # Reported where it is written, as its rewrite reported it, and on a reuse its regions' reports too, so a
     # report around the program holds the body's however often it is written (`fusion._traced`'s, a
     # region's).

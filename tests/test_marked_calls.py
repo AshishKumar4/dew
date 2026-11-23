@@ -311,6 +311,33 @@ def test_a_marked_span_called_again_in_one_state_is_traced_once(monkeypatch):
     assert kinds_of(first.jaxpr) == kinds_of(second.jaxpr) == [Protected()]
 
 
+def test_a_marked_span_with_an_effect_is_traced_at_every_call_and_runs_it(monkeypatch):
+    """A marked span whose program has an effect (a host callback), which no call may take from another's
+    trace (`derivatives._holdable`), is traced at each call, as one no key holds (`_span_key` of None), in the
+    call's own collections, and runs its effect with each call's values: its held None never reads as a
+    program to take (Train 1205's review F1, its facts held by `generation.held_trace`)."""
+    traced, seen = [], []
+    making = jax.make_jaxpr
+
+    def counted(fn, *args, **kwargs):
+        traced.append(getattr(fn, "__name__", None))
+        return making(fn, *args, **kwargs)
+
+    def logged(x, y):
+        jax.debug.callback(lambda total: seen.append(float(total)), x.sum())
+        return x * y
+
+    span = marked(Protected(), logged)
+    monkeypatch.setattr(jax, "make_jaxpr", counted)
+    first = jax.jit(lambda x, y: span(x, y))(jnp.ones(3), jnp.full(3, 2.0))
+    second = jax.jit(lambda x, y: span(x, y) + 0.0)(jnp.full(3, 3.0), jnp.full(3, 2.0))
+    jax.effects_barrier()
+    assert traced.count("span") == 2, traced
+    assert seen == [3.0, 9.0]
+    np.testing.assert_array_equal(np.asarray(first), np.full(3, 2.0, np.float32))
+    np.testing.assert_array_equal(np.asarray(second), np.full(3, 6.0, np.float32))
+
+
 SCALE = 2.0
 """A module global a marked span reads (`test_a_marked_span_reads_the_state_its_function_reads_now`)."""
 
