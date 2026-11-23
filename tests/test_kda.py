@@ -354,19 +354,19 @@ def test_a_decode_token_on_the_fused_step_is_the_layers_own():
 
 
 
-@pytest.mark.parametrize('dtype', [pytest.param(jnp.bfloat16, id='bf16'),
-                                   pytest.param(jnp.float32, id='fp32')])
 @pytest.mark.check1_shards(seeds=40, per_task=8)
-def test_an_unbounded_steep_decay_keeps_the_mild_pairs_after_it_interpreted(dtype):
+def test_an_unbounded_steep_decay_keeps_the_mild_pairs_after_it_interpreted():
     """Kimi delta attention without a decay bound (`KimiDeltaAttention(lower_bound=None)`, Kimi Linear's
-    config) on the recurrence template under the run's fast forms, interpreted, a key dimension's log decay
-    of -2^26 at a token and mild ones (about -1) after it: its output, final memory and every operand's
-    gradient, the steep token's log decay's among them, on par from float64 (check 1) with fla's on the same
-    draw, its steep decay -200 (as zero a decay in fp32 and in float64; at -2^26 fla's one fp32 cumulative
-    sum rounds the mild decays after it away). A 16-bit call's prefix is its rounded sum alone, its decays
-    clamped where every pair across a token decays to zero (`mainloop.LOG2_DECAY_FLOOR`); an fp32 call's the
-    compensated pair. Unclamped, the rounded prefix put -2^26 and a later -1 at one fp32 value, that pair's
-    decay one where it is exp(-1) (row 12067)."""
+    config) in bf16 on the recurrence template under the run's fast forms, interpreted, a key dimension's log
+    decay of -2^26 at a token and mild ones (about -1) after it: its output, final memory and every operand's
+    gradient, the steep token's log decay's among them (the clamp's, zero), on par from float64 (check 1)
+    with fla's on the same draw, its steep decay -200 (as zero a decay in fp32 and in float64; at -2^26
+    fla's one fp32 cumulative sum rounds the mild decays after it away). Its prefix is its rounded sum
+    alone, its decays clamped where every pair across a token decays to zero (`mainloop.LOG2_DECAY_FLOOR`).
+    Unclamped, the rounded prefix put -2^26 and a later -1 at one fp32 value, that pair's decay one where it
+    is exp(-1) (row 12067). An fp32 call keeps the compensated pair (`mainloop.prefix_limbs`), whose fast
+    forms' reference is recorded fla-core (`fla_sites`): fla's port interpreted holds IEEE fp32, 50 to 85
+    times tighter than either's TF32 (jsf-kdaplus3)."""
     from test_recurrence_chunk import chunk_on, formed, token_by_token
 
     from dew.nn.kernels import recurrence
@@ -382,11 +382,11 @@ def test_an_unbounded_steep_decay_keeps_the_mild_pairs_after_it_interpreted(dtyp
         g[0, int(rng.integers(2, 48))] = -2.0 ** 26
         shape = (1, length, 1, width)
         query, key = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in rng.normal(size=(2, *shape)))
-        query, key, value = (np.asarray(x, dtype) for x in (query, key, rng.normal(size=shape)))
-        gate = np.asarray(1 / (1 + np.exp(-rng.normal(size=(1, length, 1)))), dtype)
+        query, key, value = (np.asarray(x, jnp.bfloat16) for x in (query, key, rng.normal(size=shape)))
+        gate = np.asarray(1 / (1 + np.exp(-rng.normal(size=(1, length, 1)))), jnp.bfloat16)
         operands = Chunk(query, key, value, state=np.zeros((1, 1, width, width), np.float32),
                          log_decay=np.asarray(g, np.float32), beta=gate)
-        return operands, (np.asarray(rng.normal(size=shape), dtype),
+        return operands, (np.asarray(rng.normal(size=shape), jnp.bfloat16),
                           np.asarray(rng.normal(size=(1, 1, width, width)), np.float32))
 
     def floored(operands):
@@ -394,7 +394,7 @@ def test_an_unbounded_steep_decay_keeps_the_mild_pairs_after_it_interpreted(dtyp
 
     mosaic = formed('fast', partial(chunk_on, 'mosaic_gpu', hooks))
     fla = partial(chunk_on, 'fla', hooks)
-    label = f"kimi delta attention's unbounded steep then mild decays, {jnp.dtype(dtype).name}"
+    label = "kimi delta attention's unbounded steep then mild decays"
     assert_as_exact(jax.jit(with_gradients(mosaic)), jax.jit(with_gradients(lambda o: fla(floored(o)))), draw,
                     label, seeds=8, truth_fn=jax.jit(with_gradients(partial(token_by_token, hooks))))
 
