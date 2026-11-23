@@ -32,6 +32,7 @@ from test_recurrence_mosaic import (
     on_the_mainloop,
     recorded_site,
     refuses_its_gradient,
+    resource_operands,
     template_call,
 )
 
@@ -249,6 +250,20 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
     assert_as_exact(at(128), at(64), functools.partial(drawn, dtype, **geometry(case)),
                     f'128-token chunks training on {family}, {case}', seeds=8,
                     truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
+
+
+@pytest.mark.parametrize('target', ['sm86', 'sm120'])
+def test_kimis_fast_backward_holds_at_a_192_wide_value_head_on_a_99kb_gpu(target):
+    """Kimi delta attention's 16-bit training at value heads 192 wide on a GPU of 99 KB of shared memory a
+    block (an A10's, an RTX PRO 6000's) takes its fast backward (`Mosaic.trains`): its memory and values
+    launches walk a value row a few blocks a step where whole rows overran the block (row 12192: 129024 and
+    116736 bytes of its 101376, scratch jsf-v192)."""
+    q, k, v, g, beta, h0 = resource_operands('kimi-linear-kda', jnp.bfloat16, 1, 4096)
+    v, h0 = (jax.ShapeDtypeStruct((*x.shape[:-1], 192), x.dtype) for x in (v, h0))
+    bound = template.MOSAIC.bind(q, k, v, g, beta, h0, None, bound=1.0, rounded=True)
+    facts = generation.gpu_target(target)
+    with generation.assumed(facts):
+        assert template.MOSAIC.trains(bound, facts)
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=4)
@@ -593,8 +608,6 @@ def test_one_products_spent_ladder_leaves_the_others_launches(kernel):
     call's where a forward alone spent its output launch, the forward alone's where the training forward
     spent its states. Named alike, a forward alone's spill refused the training call's candidates too (row
     10559)."""
-    from test_recurrence_mosaic import resource_operands
-
     from dew.nn.kernels.templates import report
 
     operands = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)

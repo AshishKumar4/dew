@@ -481,21 +481,6 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles(dtype):
         assert all(template.MOSAIC.legal(bound, tiles, UNSEEN) for tiles in variants)
 
 
-@pytest.mark.parametrize('target', ['sm86', 'sm120'])
-def test_kimis_fast_backward_holds_at_a_192_wide_value_head_on_a_99kb_gpu(target):
-    """Kimi delta attention's 16-bit training at value heads 192 wide on a GPU of 99 KB of shared memory a
-    block (an A10's, an RTX PRO 6000's) takes its fast backward (`Mosaic.trains`): its memory and values
-    launches walk a value row a few blocks a step where whole rows overran the block (row 12192: 129024 and
-    116736 bytes of its 101376, scratch jsf-v192)."""
-    q, k, v, g, beta, h0 = resource_operands('kimi-linear-kda', jnp.bfloat16, 1, 4096)
-    v, h0 = (jax.ShapeDtypeStruct((*x.shape[:-1], 192), x.dtype) for x in (v, h0))
-    bound = template.MOSAIC.bind(q, k, v, g, beta, h0, None, bound=1.0,
-                                 **_form('kimi-linear-kda', jnp.bfloat16))
-    facts = generation.gpu_target(target)
-    with generation.assumed(facts):
-        assert template.MOSAIC.trains(bound, facts)
-
-
 @pytest.mark.check1_shards(seeds=256, per_task=32)
 def test_the_template_on_an_unseen_gpu_is_as_exact_as_its_reference():
     """The bf16 forward on the GPU no row names (`UNSEEN`) at each of its variants (`Mosaic.variants`, which

@@ -12,8 +12,8 @@ of draws a call), sized on the recording alone where the cell's kernel is a TPU'
 
 `<upstream>` `fla` or `mamba_ssm`, each case its axis values joined by `-`
 (`recurrence_matrix._on_par_recorded`'s site), on a GPU, `<python>` the upstream's cohort's interpreter
-(tools/reference_releases.py, `COHORTS`; mamba_ssm's its tier release, `recurrence_matrix.tier_release`, refused
-otherwise). What lands is the upstream's file (`recurrence_matrix.RECORDED`, `DESTINATIONS`), or past
+(tools/reference_releases.py, `COHORTS`; mamba_ssm's its tier release, `recurrence_matrix.tier_release`,
+refused otherwise). What lands is the upstream's file (`recurrence_matrix.RECORDED`, `DESTINATIONS`), or past
 `fetched_fixtures.IN_GIT` its pin beside the store's copy (tests/fixtures/fetched/), uploaded by
 `fetched_fixtures.upload`.
 """

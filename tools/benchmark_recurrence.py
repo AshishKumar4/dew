@@ -274,8 +274,8 @@ def gated_hooks(shape: Shape):
     tools/benchmark_recurrence_mosaic.py's arms alike (row 12214)."""
     from dew.nn.kernels import recurrence
 
-    return recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar', scale=shape.key_width ** -0.5,
-                            write_bound=1.0, unit_queries=True)
+    return recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
+                            scale=shape.key_width ** -0.5, write_bound=1.0, unit_queries=True)
 
 
 def _gated_parts(shape: Shape, given: dict) -> tuple:
