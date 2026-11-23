@@ -513,16 +513,41 @@ def test_newton_schulz_reaches_mosaic_syrk_and_honors_dot_algorithm():
             assert any(r.kernel == "mosaic" for r in seen), (preset, seen)
 
 
+@lowers("sm90")
 def test_syrk_measured_gram_gates_to_measured_bf16_cells():
-    """`syrk.measured_gram` admits only BF16 stacked Muon cells backed by real `M-NG-45` receipts on sm80
-    and sm90, refusing unmeasured generations (`sm86`/`sm89`/`sm120`), fp16, small batches, and unmeasured
-    geometries (row 11941)."""
+    """`syrk.measured_gram` admits only exact `(generation, shape, transpose, dtype, out_dtype)` BF16
+    stacked Muon cells backed by real `M-NG-45` receipts on sm80 and sm90, refusing unmeasured batch counts,
+    fp32 outputs, fp16 inputs, unmeasured geometries, and unmeasured generations (row 11941)."""
+    from kernel_compile import lowered_for
+
     sm80, sm90 = generation.gpu_target("sm80"), generation.gpu_target("sm90")
-    assert syrk.measured_gram(sm80, (28, 2560, 4096), jnp.bfloat16, transpose=False)
-    assert syrk.measured_gram(sm90, (36, 4096, 14336), jnp.bfloat16, transpose=True)
-    assert not syrk.measured_gram(sm80, (28, 2560, 4096), jnp.float16, transpose=False)
-    assert not syrk.measured_gram(sm90, (1, 4096, 4096), jnp.bfloat16, transpose=False)
-    assert not syrk.measured_gram(sm90, (28, 512, 512), jnp.bfloat16, transpose=False)
+    assert syrk.measured_gram(sm80, (28, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
+    assert syrk.measured_gram(sm90, (36, 4096, 14336), jnp.bfloat16, transpose=True, out_dtype=jnp.bfloat16)
+    # Exact batch count, geometry, input dtype, and output dtype all participate in the admission key.
+    assert not syrk.measured_gram(sm80, (29, 2560, 4096), jnp.bfloat16, transpose=False,
+                                  out_dtype=jnp.bfloat16)
+    assert not syrk.measured_gram(sm90, (28, 4096, 4096), jnp.bfloat16, transpose=False,
+                                  out_dtype=jnp.bfloat16)
+    assert not syrk.measured_gram(sm90, (28, 2560, 4096), jnp.bfloat16, transpose=False,
+                                  out_dtype=jnp.float32)
+    assert not syrk.measured_gram(sm80, (28, 2560, 4096), jnp.float16, transpose=False,
+                                  out_dtype=jnp.float16)
+    assert not syrk.measured_gram(sm90, (1, 4096, 4096), jnp.bfloat16, transpose=False,
+                                  out_dtype=jnp.bfloat16)
+    assert not syrk.measured_gram(sm90, (28, 512, 512), jnp.bfloat16, transpose=False,
+                                  out_dtype=jnp.bfloat16)
     for gen in ("sm86", "sm89", "sm120"):
         assert not syrk.measured_gram(generation.gpu_target(gen), (28, 2560, 4096), jnp.bfloat16,
-                                      transpose=False)
+                                      transpose=False, out_dtype=jnp.bfloat16)
+
+    # End-to-end auto selection admits measured (28, 2560, 4096) bf16->bf16 and keeps unmeasured batch/fp32
+    # outputs on XLA.
+    with generation.routes() as measured_seen:
+        lowered_for(lambda a: gemm.symmetric_gram(a), (jax.ShapeDtypeStruct((28, 2560, 4096), jnp.bfloat16),),
+                    "sm90")
+    assert any(r.kernel == "mosaic" for r in measured_seen), measured_seen
+    for shape, out_dtype in (((29, 2560, 4096), jnp.bfloat16), ((28, 2560, 4096), jnp.float32)):
+        with generation.routes() as unmeasured_seen:
+            lowered_for(lambda a, dt=out_dtype: gemm.symmetric_gram(a, out_dtype=dt),
+                        (jax.ShapeDtypeStruct(shape, jnp.bfloat16),), "sm90")
+        assert all(r.kernel != "mosaic" for r in unmeasured_seen), (shape, out_dtype, unmeasured_seen)

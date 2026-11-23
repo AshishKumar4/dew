@@ -213,8 +213,8 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         plain = resources.tile_registers(family, config.sharing, block, dtype, stored=stored,
                                         rhs_transposed=self._matrix_transposed(ba),
                                         lhs_retained=ba.arguments.get('paired') is not None)
-        plain += pricing.prefetch_registers(family, config, ba=ba, staged_rows=self.STAGED_ROWS,
-                                            unstaged=self.unstaged(ba), rewritten=self.rewritten(ba, family))
+        if not self.STAGED_ROWS:
+            plain += pricing.prefetch_registers(family, config, ba=ba)
         accumulator = -(-config.share * columns // resources.THREADS)
         # A kernel gradient's consumer prepares its depth half of each step's rows stage in registers (the
         # neighbouring groups' rows zeroed: `mosaic_gpu._staged_halves`), apart from the products, which
