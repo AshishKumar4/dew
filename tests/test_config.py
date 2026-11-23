@@ -1048,8 +1048,10 @@ def test_a_run_saved_before_its_retired_and_unsettable_fields_loads_as_it_traine
      GaussNewton(damping=1e-3)),
     ({"optimizer": "dew.optim:_muonclip_groups"}, MuonClip()),
     ({"optimizer": "optax:sgd", "optimizer_opts": {"momentum": 0.9}}, Optax("optax:sgd", {"momentum": 0.9})),
-    # Its decay masked off, unspared: it decayed nothing; spared, its own mask was written over it.
-    ({"optimizer": "adamw", "optimizer_opts": {"mask": False}, "spared": False}, AdamW(weight_decay=0.0)),
+    # Its decay masked off, unspared: its decay kept, masked off by its own mask (`OptimConfig.decay_mask`,
+    # `test_a_run_whose_decay_its_options_masked_off_resumes_its_optimizers_state_as_it_trained`); spared,
+    # its own mask was written over it.
+    ({"optimizer": "adamw", "optimizer_opts": {"mask": False}, "spared": False}, AdamW()),
     ({"optimizer": "adamw", "optimizer_opts": {"mask": False}}, AdamW()),
 ], ids=["muon-moments-apart", "adamw-params-moments", "adam-int8", "gauss-newton-path", "muonclip-path",
         "optax-path", "adamw-masked-unspared", "adamw-masked-spared"])

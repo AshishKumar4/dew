@@ -485,12 +485,12 @@ def test_a_hash_holdout_publishes_the_rows_its_stream_reads():
 
 @dataclass(frozen=True)
 class ReadsAsked(Memory):
-    """Rows held in memory that note each read a pass asks of them (`asked`)."""
+    """Rows held in memory that note each read a pass asks of them (`reads`)."""
 
-    asked: list[str] = field(default_factory=list, compare=False)
+    reads: list[str] = field(default_factory=list, compare=False)
 
     def records(self, read):
-        self.asked.append(read)
+        self.reads.append(read)
         return super().records(read)
 
 
@@ -508,9 +508,11 @@ def test_a_publication_and_an_export_read_a_chain_as_it_asks_else_as_its_sources
     chain = Pipeline(source) if stated is None else Pipeline(source).read(stated)
     want = stated or "memory"
     publish(chain.map(lambda row: {**row, "tag": row["id"] * 2}, identity="tag@1"), _cache())
-    assert set(source.asked) == {want}, source.asked
-    source.asked.clear()
-    assert len(list(passed(chain))) == 6 and set(source.asked) == {want}, source.asked
+    # The pass reads as decided, never streamed: what the decision probes (`_preferred_read`) beside it.
+    assert want in source.reads and "streamed" not in source.reads, source.reads
+    source.reads.clear()
+    assert len(list(passed(chain))) == 6, source.reads
+    assert want in source.reads and "streamed" not in source.reads, source.reads
 
 
 @pytest.mark.parametrize("changed", ["chunk overlap", "source", "fewer steps"])
