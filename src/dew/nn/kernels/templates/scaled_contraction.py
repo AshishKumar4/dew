@@ -21,7 +21,7 @@ back (the reference's mean, `attention.held_mean`).
 
 A sum whose terms cancel across more binades than the format holds (`2^127 - 2^127 + 2^-30`, a group held
 at `2^127`) loses the small part, as any float sum at one exponent does; holding it takes a banded exact sum
-(`dew.algebra.windows`), row 12442.
+(`dew.algebra.windows`), row 12452.
 """
 
 from __future__ import annotations
