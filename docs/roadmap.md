@@ -63,8 +63,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Time to first step: the compile path's re-derivations. [5556]
 - Owner-approved Audit 4 API cleanup. [11935]
-- CI time: every test within 120 seconds. [12128]
-- A checkpoint taken after a fit's ladder climbed to recompute its layers (its model record's `remat` set by the climb) is refused on resume as 'trained another…. [12135]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -84,6 +82,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Owner-approved Audit 4 API cleanup. [11939]
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
+- DeepCrossAttention (DCA, arXiv:2502.06785v2) composable depth-residual capability. [12440]
 - Dory: the release qualified and its tests' oracles. [596]
 - Serving and RL measured where users run them. [5315, 5321]
 - A served rollout's or episode cohort's server pages its cache wherever pages serve the policy as it draws (serving.served_layout, theme 15), at every prompt…. [7420]
