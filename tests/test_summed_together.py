@@ -76,11 +76,10 @@ def test_groups_summed_together_are_each_read_into_what_their_caller_makes_of_th
 
 def _groups_and_waits(module: bytes) -> list[str]:
     """A Mosaic GPU kernel's warpgroup MMA commits and waits in program order (its typed module's inline
-    assembly, `wgmma.commit_group` and `wgmma.wait_group`), each wait with the groups it leaves in flight,
-    each commit within a branch marked so."""
+    assembly, `wgmma.commit_group` and `wgmma.wait_group`), each wait with the groups it leaves in flight."""
     found: list[str] = []
 
-    def walk(operation: ir.Operation, *, branched: bool) -> None:
+    def walk(operation: ir.Operation) -> None:
         for region in operation.regions:
             for block in region.blocks:
                 for inner in block.operations:
@@ -88,14 +87,14 @@ def _groups_and_waits(module: bytes) -> list[str]:
                     if op.name == "llvm.inline_asm":
                         text = ir.StringAttr(op.attributes["asm_string"]).value
                         if text.startswith("wgmma.commit_group"):
-                            found.append("commit if" if branched else "commit")
+                            found.append("commit")
                         elif text.startswith("wgmma.wait_group.sync.aligned "):
                             found.append(f"wait {text.split()[-1].rstrip(';')}")
-                    walk(op, branched=branched or op.name == "scf.if")
+                    walk(op)
 
     typed = mgpu.deserialized(module)
     with typed.context:
-        walk(typed.operation, branched=False)
+        walk(typed.operation)
     return found
 
 
@@ -113,5 +112,4 @@ def test_a_warpgroup_mmas_groups_summed_together_are_each_read_as_their_own_comp
         run = jax.jit(lambda *operands: _together(*operands, interpret=False, predicated=predicated))
         lowered = run.trace(*shapes).lower(lowering_platforms=("cuda",))
     (call,) = [call for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
-    second, first_wait = ("commit if", "wait 0") if predicated else ("commit", "wait 1")
-    assert _groups_and_waits(call.ir) == ["commit", second, first_wait, "wait 0"]
+    assert _groups_and_waits(call.ir) == ["commit", "commit", "wait 0" if predicated else "wait 1", "wait 0"]
