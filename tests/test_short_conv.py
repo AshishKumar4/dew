@@ -177,7 +177,7 @@ def row_truth(x, weights, parts, grads, segments):
     ((1, 700), ((128, None),), 4, True, False, True),
     ((2, 19), ((128, 128), (128, 128), (256, None)), 3, True, True, False),
     ((2, 19), ((128, 128), (128, 128), (256, None)), 3, True, True, True),
-    # A plain piece between normalised ones: the backward's recompute reads the normalised ones where they lie.
+    # A plain piece between normalised ones: the recompute reads the normalised ones where they lie.
     ((2, 19), ((128, 128), (256, None), (128, 128)), 3, True, True, False),
     ((2, 9), ((128, None),), 2, True, False, False),
 ])
