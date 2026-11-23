@@ -553,10 +553,10 @@ def _masked_as_saved(node, saved, unmasked: Unmasked = True):
     every other node as it is."""
     import optax
 
-    if unmasked is not True and isinstance(node, optax.PartitionState):
+    if not isinstance(unmasked, bool) and isinstance(node, optax.PartitionState):
         held = _saved_at(saved, ["inner_states"])
         return node._replace(inner_states={
-            name: _masked_as_saved(state, _saved_at(held, [name])) if name in unmasked else state
+            name: _masked_as_saved(state, _saved_at(held, [str(name)])) if str(name) in unmasked else state
             for name, state in node.inner_states.items()})
     if isinstance(node, optax.EmptyState):
         return optax.MaskedState(inner_state=node) if _masked_empty(saved) else node
