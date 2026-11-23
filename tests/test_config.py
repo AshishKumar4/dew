@@ -1353,6 +1353,21 @@ def test_an_optax_factory_takes_the_mask_its_earlier_options_gave_it(tmp_path, m
     assert optimizer == Optax("optax:adamw", {"mask": mask})
 
 
+def test_an_earlier_muons_mask_and_gauss_newtons_cap_load_as_they_trained(tmp_path):
+    """An earlier Muon run whose options masked its matrices' decay (`weight_decay_mask`) loads that mask as
+    its decay's (`OptimConfig.decay_mask`, by Muon's own keyword); an earlier Gauss-Newton run whose options
+    capped its direction beside the config's clip, which wrote over them, loads capped by the config's
+    alone, as it trained (review of API01: both records were refused)."""
+    from dew.optim import GaussNewton, Muon
+
+    muon = _saved_optimizer(tmp_path / "muon", {"optimizer": "muon", "weight_decay": 0.1,
+                                                 "optimizer_opts": {"weight_decay_mask": {"w": False}}})
+    assert isinstance(muon.optimizer, Muon) and muon.decay_mask == {"w": False}
+    capped = _saved_optimizer(tmp_path / "gauss", {"optimizer": "gauss_newton", "clip_grads": 1.0,
+                                                   "optimizer_opts": {"clip": 0.5}})
+    assert capped.optimizer == GaussNewton() and capped.clip_grads == 1.0
+
+
 @pytest.mark.parametrize(("stage", "earlier", "fit"), [
     (2, {"split": 1, "microbatches": None}, FitPolicy(split=1)),
     (2, {"split": 1, "microbatches": 4}, FitPolicy(split=1, microbatches=4)),

@@ -60,7 +60,6 @@ from dew.training.memory import (
     memory_record,
     placed_beside,
     remat_admits,
-    remat_stated,
     remat_topmost,
     rung_record,
     step_fits,
@@ -672,12 +671,9 @@ class StepCompiler[L, E]:
     def __init__(self, objective: Objective[L, E], links: Mapping[str, Link] | None,
                  ahead: AheadOfTime | None, phase_passes: PhasePasses[L, E], remat: Remat = "auto"):
         self.objective = objective
-        # What the step may recompute (`FitPolicy.remat`), which each search climbs its ladder within: the
-        # model as it is configured, before any record climbs it, states none of its own beside it.
+        # What the step may recompute (`FitPolicy.remat`), which each search climbs its ladder within; a
+        # later phase's planner takes the objective as a climb left it (`dew.training.ahead`).
         self.remat: Remat = remat
-        if remat != "auto" and remat_stated(objective):
-            raise ValueError(f"a model that states its own remat trains at it; a run's remat {remat!r} "
-                             "states it for every module (FitPolicy.remat): state one")
         self.phase_passes = phase_passes
         self.ahead = ahead
         self._stated_links = dict(links or {})
