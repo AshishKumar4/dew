@@ -982,12 +982,15 @@ TARGETS = {target.generation: target for target in (
                         # time-weighted mean of sm__cycles_elapsed.avg.per_second over 18 GEMM launches under
                         # ncu (1.476 to 1.522; the template's, cuBLASLt's and a pair's alike; M-EM-36-gh200),
                         # against its 1.98 GHz clock locked.
-                        # A step's latencies, the slope of a chain of 256 to 4,096 waited steps
-                        # (FS-4123-LATENCIES1-gh200, two rounds: products 12.9 ns and 1.194 ns a column, their
-                        # fit within 1%; a barrier round trip 80.2 and 80.0 ns).
+                        # A step's latencies, the slope of a chain of 256 to 4,096 waited steps, its clock
+                        # locked at 1.98 GHz (1.83 GHz at its end; FS-4123-LATENCIES2-gh200, M-FS-19, two
+                        # rounds within 0.5%): products 20.6 ns and 1.156 ns a column over N 64 to 256; a
+                        # barrier round trip 85.0 ns; a tile copied from device memory past an L2 eviction
+                        # 464.5 ns and 5.17 ps a byte over 4 to 64 KiB (from L2, 203.1 ns and 5.06 ps). Its
+                        # first rounds, unlocked: products 12.9 ns and 1.194 ns a column, a barrier 80.1 ns.
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
-                                                       loaded_clock=1.496e9, product=(12.9e-9, 1.194e-9),
-                                                       barrier=80.1e-9),
+                                                       loaded_clock=1.496e9, product=(20.6e-9, 1.156e-9),
+                                                       barrier=85.0e-9, copy=(464.5e-9, 5.17e-12)),
                         'NVIDIA H200': Measured(2.81e-6, 4.617e12)},
               # PCIe Gen5 x16 (the H100 and H200 datasheets' 128 GB/s both ways, SXM, PCIe and NVL alike);
               # the GH200's NVLink-C2C to its Grace (the GH200 datasheet's 900 GB/s both ways).
