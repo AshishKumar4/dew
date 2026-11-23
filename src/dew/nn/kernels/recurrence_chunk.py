@@ -2151,28 +2151,31 @@ def fast_rounding(dtype) -> bool:
     return rounds_products()
 
 
-HGRN = recurrence.Hooks(decay='none', delta=False, value_decay=True, scale=1.0)
-"""HGRN's recurrence (`hgrn`): a key width of one, its decay along the values, no delta rule."""
+DIAGONAL = recurrence.Hooks(decay='none', delta=False, value_decay=True, scale=1.0)
+"""A diagonal recurrence's form (`diagonal_scan`): a key width of one, its decay along the values, no delta
+rule."""
 
-HGRN_WIDTH = 64
-"""The channels `hgrn` lays a head: any grouping is the same recurrence, a channel its own state."""
+DIAGONAL_WIDTH = 64
+"""The channels `diagonal_scan` lays a head: any grouping is the same recurrence, a channel its own state."""
 
 
-def hgrn(x, g, state=None, *, chunk_size: int = CHUNK_SIZE, starts=None):
-    """HGRN's recurrence (fla's `chunk_hgrn`, fla/ops/hgrn): `h_t = exp(g_t) h_{t-1} + x_t` a channel, each
-    token's output its state, `x` and `g` `[B, S, D]` (`g` the log forget gate, at most zero; the layer's
-    write `(1 - a_t) i_t` its `x`), `state` `[B, D]` the state entering, zero where None; `(output [B, S, D]
-    in `x`'s dtype, final state [B, D] in at least fp32)`. The chunked op's recurrence of a key width of one
-    with its decay along the values (`HGRN`: queries and keys one, the values `x`, `Hooks.value_decay` `g`),
-    its channels `HGRN_WIDTH` a head, on the portable math (row 1453)."""
+def diagonal_scan(x, g, state=None, *, chunk_size: int = CHUNK_SIZE, starts=None):
+    """A diagonal linear recurrence, `h_t = exp(g_t) h_{t-1} + x_t` a channel, each token's output its state:
+    HGRN's (fla's `chunk_hgrn`, fla/ops/hgrn, `x` the layer's write `(1 - a_t) i_t`, `g` its log forget gate)
+    and the carry of every recurrence whose state is a vector of channels each decaying alone (RG-LRU's,
+    MinGRU's). `x` and `g` `[B, S, D]` (`g` at most zero), `state` `[B, D]` the state entering, zero where
+    None, `starts` `[B, S]` packed documents' first tokens, each from a zero state; `(output [B, S, D] in
+    `x`'s dtype, final state [B, D] in at least fp32)`. The chunked op's recurrence of a key width of one
+    with its decay along the values (`DIAGONAL`: queries and keys one, the values `x`, `Hooks.value_decay`
+    `g`), its channels `DIAGONAL_WIDTH` a head, on the portable math (row 1453)."""
     rows, length, channels = x.shape
-    width = HGRN_WIDTH if channels % HGRN_WIDTH == 0 else channels
+    width = DIAGONAL_WIDTH if channels % DIAGONAL_WIDTH == 0 else channels
     heads = channels // width
     one = jnp.ones((rows, length, heads, 1), x.dtype)
     entered = None if state is None else state.reshape(rows, heads, 1, width)
     operands = Chunk(one, one, x.reshape(rows, length, heads, width), state=entered, starts=starts,
                      value_decay=g.reshape(rows, length, heads, width))
-    out, final = chunk(HGRN, operands, chunk_size=chunk_size)
+    out, final = chunk(DIAGONAL, operands, chunk_size=chunk_size)
     return out.reshape(rows, length, channels), final.reshape(rows, channels)
 
 
