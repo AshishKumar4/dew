@@ -242,7 +242,7 @@ class Template[Config: Hashable](tuning.KernelOp):
     def exhausted(self, ba: tokamax.BoundArguments) -> report.Exhausted:
         # A call no config fits refuses as fitting does (`unfitted`), naming what it stages; one
         # certification refused every config of, as any launch's does.
-        if report.refused_any(self, ba, self.launch_target()):
+        if report.refusals_at(self, ba, self.launch_target()):
             return super().exhausted(ba)
         return self.unfitted(ba, self.launch_target())
 
