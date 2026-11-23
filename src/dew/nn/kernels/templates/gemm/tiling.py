@@ -114,23 +114,27 @@ class Tiles:
             columns = self.block_n * (self.cluster if family.pairs_product else 1)
             family.output_staging((((self.share, columns), jnp.bfloat16),), self.warpgroups, self.staging)
 
-    def stated(self, outputs) -> tuple[int, int] | None:
+    def stated(self, outputs, family) -> tuple[int, int] | None:
         """The output staging this tile states for a kernel storing `outputs` (`(shape, dtype)` each,
-        `persist`'s `chunks`), refused where a chunk is no whole TMA store in an output's dtype
-        (`staged_whole`), as the launch's candidate refuses it: `gmm` or `tgmm` called directly at a pin."""
-        if not self.staged_whole(dtype for _, dtype in outputs):
+        `persist`'s `chunks`) on `family` (its issuer specialized for the tile), refused where a chunk is no
+        whole accumulator atom or TMA store (`staged_whole`), as the launch's candidate refuses it: `gmm` or
+        `tgmm` called directly at a pin."""
+        if not self.staged_whole((dtype for _, dtype in outputs), family):
             raise ValueError(f"{self}: a staged chunk of its outputs is no whole {TMA_STORE_BYTES}-byte TMA "
                              "store in their dtypes")
         return self.staging
 
-    def staged_whole(self, dtypes) -> bool:
+    def staged_whole(self, dtypes, family) -> bool:
         """Whether each output chunk this tile states (`staging`) slices its accumulator at whole fragments
-        (`ACCUMULATOR_COLUMNS`) and is whole TMA store quanta in every one of the call's output `dtypes`
-        by their bits (`TMA_STORE_BYTES`: a 4-bit float's 16 columns are 64 bits, no store); a tile stating
-        none stages at its family's own."""
+        (`ACCUMULATOR_COLUMNS`) and whole atoms of `family`'s issuer as the tile specializes it
+        (`mosaic.Issuer.atom_columns`: two row warps of mma.sync tile 16 columns), and is whole TMA store
+        quanta in every one of the call's output `dtypes` by their bits (`TMA_STORE_BYTES`: a 4-bit float's
+        16 columns are 64 bits, no store); a tile stating none stages at its family's own."""
         if self.staging is None:
             return True
         chunk = self.staging[0]
+        if chunk % family.atom_columns:
+            return False
         bits = (jax.dtypes.itemsize_bits(jnp.dtype(dtype)) for dtype in dtypes)
         return chunk % ACCUMULATOR_COLUMNS == 0 and all(chunk * each % (8 * TMA_STORE_BYTES) == 0
                                                          for each in bits)

@@ -592,7 +592,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         from .templates.axes import held as held_axes
-        from .templates.gemm import mosaic_gpu
+        from .templates.gemm import mosaic_gpu, pricing
         family = next((bundle for group in self._groups(ba, target) for bundle in group
                        if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
@@ -601,8 +601,9 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 or not self._divides(ba, config, target) or self._refused(ba, config, target)):
             return False
         hooks = ba.arguments['hooks']
-        if (not self._granular(ba, config, family, target)
-                or not config.staged_whole(hooks.out_dtypes or (ba.arguments['out_dtype'],))):
+        if not self._granular(ba, config, family, target) or not config.staged_whole(
+                hooks.out_dtypes or (ba.arguments['out_dtype'],),
+                family.specialized(config.share, pricing.tile_columns(config, family))):
             return False
         sides = (('prologue_operands', hooks.prologue_axes), ('epilogue_operands', hooks.epilogue_axes))
         vectors = {(axis, jnp.dtype(side.dtype)) for name, axes_of in sides
