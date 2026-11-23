@@ -66,9 +66,11 @@ def joined(decay, *, numerators: Callable = _weighed, denominators: Callable = _
         aged = before.top + after.tokens * decay
         top = jnp.maximum(aged, after.top)
         kept, added = jnp.exp(aged - top), jnp.exp(after.top - top)
-        joined = SpanCarry(numerators(kept, before.numerator, added, after.numerator),
-                           denominators(kept, before.denominator, added, after.denominator), top,
-                           before.tokens + after.tokens, before.fresh | after.fresh)
+        # The carries' own type (`SpanCarry`, or a form's holding its values otherwise), so the selection
+        # between the joined and the dropped carry meets one tree.
+        joined = after._replace(numerator=numerators(kept, before.numerator, added, after.numerator),
+                                denominator=denominators(kept, before.denominator, added, after.denominator),
+                                top=top, tokens=before.tokens + after.tokens, fresh=before.fresh | after.fresh)
         dropped = after._replace(tokens=joined.tokens, fresh=joined.fresh)
         return jax.tree.map(lambda one, other: jnp.where(after.fresh, other, one), joined, dropped)
     return join
