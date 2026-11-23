@@ -254,3 +254,24 @@ def test_a_held_jits_trace_that_refuses_a_launch_leaves_its_cache_its_own_refusa
     run.released()
     with report.refusals():
         assert float(run(x)) == 0.0
+
+
+def test_a_held_jits_trace_refusing_again_what_its_scope_refused_runs_past_it():
+    """A program whose every trace refuses one launch (a launch certified inline, refused each time), run
+    twice in one scope, JAX's caches cleared and its executables released between: the second's trace, by
+    the jit the first left, refuses again what its scope holds already, which ends nothing, and it runs the
+    program past the refusal (theme K01-e's review: a held jit's trace ended on every refusal it recorded,
+    one it held already among them, retried by that same jit without end)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    def chosen(x):
+        report.refuse([("a launch", 1, ("k",))])
+        return x + (1.0 if report.refusals_of("a launch") else 0.0)
+
+    run, x = owned_program(chosen), jnp.zeros((), jnp.float32)
+    with report.refusals():
+        assert float(run(x)) == 1.0
+        jax.clear_caches()
+        run.released()
+        assert float(run(x)) == 1.0

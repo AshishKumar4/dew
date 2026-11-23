@@ -1204,9 +1204,11 @@ class OuterProgram:
         ends taking nothing (`report.ReadingRefused`), traced again by a jit of its own."""
         from dew.nn.kernels.templates import report
 
+        # Past a held jit's trace that refused, a jit of its own each time, so its retrying ends.
+        unheld = fresh
         while True:
             refusals = report.refusal_entries()
-            key = None if fresh else self._held_key(args, kwargs, refusals)
+            key = None if unheld else self._held_key(args, kwargs, refusals)
             held = None if key is None else self._held_jit(key)
             marks = route_marks()
             try:
@@ -1216,6 +1218,7 @@ class OuterProgram:
                 # A held jit's trace recorded a refusal (its cached program dropped): it took nothing, and
                 # the next trace, under the refusals with it, takes a jit of its own.
                 withdrawn(marks)
+                unheld = True
                 continue
             raced = report.refusal_entries() != under
             if held is not None and (raced or under != refusals):

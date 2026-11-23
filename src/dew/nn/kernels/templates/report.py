@@ -262,7 +262,10 @@ _READING: contextvars.ContextVar[Reading | None] = _cache.untraced(
 def reading(entries: tuple, *, frozen: bool = False) -> Iterator[Reading]:
     """A trace's reads of the refusals (`refusals_of`, `refusal_entries`) answered from `entries` (a
     `refusal_entries` snapshot) and those it records itself within, for as long as it traces; `frozen`, none
-    of its own, a refusal recorded within it ending its trace (`ReadingRefused`)."""
+    of its own, a refusal recorded within it ending its trace (`ReadingRefused`). One within a frozen one is
+    frozen too: a trace inside a held jit's makes part of its program."""
+    outer = _READING.get()
+    frozen = frozen or (outer is not None and outer.frozen)
     held = Reading({(identity, config): kernels for identity, config, kernels in entries}, frozen)
     token = _READING.set(held)
     try:
@@ -1407,8 +1410,11 @@ def refuse(entries) -> None:
     `Refused`, or a pair a decoded record gives as a list; a kernel by its name alone states none) refused in
     this context, as a compile's spill refuses it. A handed plan seeds these inside its own `refusals` scope,
     not unioned with unrelated decisions that the receiving process already holds."""
+    refused_within = False
     for identity, config, kernels in entries:
-        _record((identity, config), None, frozenset(map(_refused, kernels)))
+        refused_within |= _recorded((identity, config), None, frozenset(map(_refused, kernels)))[1]
+    if refused_within:
+        raise ReadingRefused(tuple(entries))
 
 
 def _refused(kernel) -> Refused:
@@ -1528,14 +1534,30 @@ def _joined(kernels: frozenset[Refused]) -> frozenset[Refused]:
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
             kernels: frozenset[Refused] = frozenset()) -> bool:
+    """`_recorded`'s, its refusal ending a frozen reading's trace where it adds to the reading's refusals
+    (`ReadingRefused`); whether `miss` is new."""
+    new, refused_within = _recorded(refusal, miss, kernels)
+    if refused_within:
+        raise ReadingRefused(refusal)
+    return new
+
+
+def _recorded(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
+              kernels: frozenset[Refused] = frozenset()) -> tuple[bool, bool]:
     """`refusal` and `miss` recorded; whether `miss` is new to this context's registry. A miss is recorded
     once a holder, the registry and each `recording` open: a launch's derivation asked again (its route's
     eligibility, then its call, `tuning.KernelOp.taken`) reads its certification back and finds the same
     misses, and a recording opened since the first (a later plan's admission, `planning.admitted`) holds
-    the misses its own trace meets, those the process met before among them."""
+    the misses its own trace meets, those the process met before among them. Beside it, whether `refusal`
+    adds to a frozen reading's refusals (`reading`), which ends its trace; one it holds already does not, so
+    a held jit's trace refusing again what it read goes on."""
     registry, read = _registry(), _READING.get()
+    refused_within = False
     with _GUARD:
         if refusal is not None:
+            if read is not None and read.frozen:
+                held = read.refused.get(refusal, frozenset())
+                refused_within = _joined(held | kernels) != held
             # Into the registry, and the reading a trace here reads, which reads its own (`reading`).
             for held in (registry, None if read is None or read.frozen else read):
                 if held is not None:
@@ -1544,9 +1566,7 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
         new = miss is not None and miss not in registry.missed
         if miss is not None:
             _add(missed=(miss,))
-    if refusal is not None and read is not None and read.frozen:
-        raise ReadingRefused(refusal)
-    return new
+    return new, refused_within
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
