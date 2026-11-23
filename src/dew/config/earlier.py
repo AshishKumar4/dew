@@ -282,7 +282,8 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     # its matrices' decay mask by its own keyword, which is the decay's own mask now (`decay_mask`).
     mask = opts.pop("mask", None) if typed else None
     muon_mask = opts.pop("weight_decay_mask", None) if named in MUON_GROUPS else None
-    if named == "gauss_newton" and (fields.get("clip_grads") or 0) > 0:
+    clipped = fields.get("clip_grads")
+    if named == "gauss_newton" and isinstance(clipped, (int, float)) and clipped > 0:
         # Its own cap the config's clip wrote over (`OptimConfig.build`), which caps it once now.
         opts.pop("clip", None)
     stated = {key: fields[key] for key in ("b1", "b2", "weight_decay") if fields.get(key) is not None}

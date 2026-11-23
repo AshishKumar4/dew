@@ -231,6 +231,14 @@ def signature_digest(signature: Hashable) -> str:
 
 
 
+def _refuse_two_remats(objective: Objective, fit: FitPolicy) -> None:
+    """Refuse a run's remat (`FitPolicy.remat`) beside a model that states its own, as configured, before any
+    climb: one states the step's recomputation, which a later phase's planner then takes as climbed."""
+    if fit.remat != "auto" and remat_stated(objective):
+        raise ValueError(f"a model that states its own remat trains at it; a run's remat {fit.remat!r} "
+                         "states it for every module (FitPolicy.remat): state one")
+
+
 def _custom_step_refusal(step, record: bool, inspection, rollout: Rollout | None,
                          sampled: SampledPasses | None) -> None:
     """Refuse what a custom step cannot serve (records of its Steps, an inspection of its update), and a
@@ -345,10 +353,7 @@ class Trainer(Generic[Loss, Effects]):
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
         _custom_step_refusal(step, record, inspection, rollout, sampled_passes)
-        if fit.remat != "auto" and remat_stated(objective):
-            # The model as configured, before any climb, states none of its own beside the run's.
-            raise ValueError(f"a model that states its own remat trains at it; a run's remat {fit.remat!r} "
-                             "states it for every module (FitPolicy.remat): state one")
+        _refuse_two_remats(objective, fit)
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
