@@ -105,7 +105,7 @@ def by_thread(call: Call) -> bool:
     return not call.interpret and call.chunk % SPAN == 0
 
 
-def own_bands(queries, staged, betas, bands, *, products: tuple[str, ...], unit_keys: bool) -> None:
+def own_bands(queries, staged, betas, bands, *, products: tuple[str, ...], unit_pairs: bool) -> None:
     """Each output's sub-chunks' own pairs of one key block added into `bands`, a plain fp32 shared tile
     `[outputs, C, SUB]` (`algebra.key_diagonal_bands`' form, a row's column `e` its pair `e` tokens back, an
     entry no thread writes zero), from the outputs' rows (`products`': the scores' the queries `queries`
@@ -116,7 +116,7 @@ def own_bands(queries, staged, betas, bands, *, products: tuple[str, ...], unit_
     columns each, one loop of `SUB + 1` steps over both rows' pairs at or before them alone (`p + 1` and
     `SUB - p`, so every thread steps alike), its pair's decay the product of its tokens' own formed back from
     its own token as the token recurrence forms it, each term the row times the key, then times the decay
-    (or, `unit_keys`, the row times the key decayed once for every output, `algebra.decayed_key`), summed
+    (or, `unit_pairs`, the row times the key decayed once for every output, `algebra.decayed_key`), summed
     over its columns and then the quad's (`utils.shfl_bfly`), the warpgroup met once when done. fla_kda's
     token-parallel diagonal (chunk_kda_fwd_intra_token_parallel) walks the pairs at or before a token alone;
     the bands a tile in the accumulator's layout took every offset of every row, its shifted reads whole
@@ -124,23 +124,23 @@ def own_bands(queries, staged, betas, bands, *, products: tuple[str, ...], unit_
     issues (M-JS-145h)."""
     outputs, (chunk, keys) = len(products), staged.shape[1:]
     # Each row's pairs at or before it in its sub-chunk, each over the block's columns: its key and decay
-    # read, its decay's multiply and (`unit_keys`) the decayed key's, and each output's row read (the
-    # system's its key and write strength, and their multiply), its multiplies (one where `unit_keys`, two
+    # read, its decay's multiply and (`unit_pairs`) the decayed key's, and each output's row read (the
+    # system's its key and write strength, and their multiply), its multiplies (one where `unit_pairs`, two
     # else) and an add; then each output's sum over the quad (two shuffles and two adds) and its band's
     # entry read, added and written.
     pairs = chunk * (algebra.SUB + 1) // 2
     columns = pairs * keys
     system = "system" in products
-    work = Work(operations=columns * ((2 if unit_keys else 3) * outputs + 1 + unit_keys + system)
+    work = Work(operations=columns * ((2 if unit_pairs else 3) * outputs + 1 + unit_pairs + system)
                 + pairs * outputs * 5,
                 shared_bytes=4 * columns * (2 + outputs) + 4 * pairs * system + 8 * pairs * outputs)
     refs = tuple(ref for ref in (queries, staged, betas, bands) if ref is not None)
     body = emission.stating(lambda *refs: work)(
-        lambda ctx, *refs: _own_bands(*refs, products=products, unit_keys=unit_keys))
+        lambda ctx, *refs: _own_bands(*refs, products=products, unit_pairs=unit_pairs))
     plgpu.inline_mgpu(arg_types=(plgpu.RefType(),) * len(refs), return_type=())(body)(*refs)
 
 
-def _own_bands(*refs, products: tuple[str, ...], unit_keys: bool) -> None:
+def _own_bands(*refs, products: tuple[str, ...], unit_pairs: bool) -> None:
     """`own_bands` in Mosaic GPU's terms, a `SPAN` of rows at a time: `refs` its queries (where it forms the
     scores), the staged keys and decays, the write strengths (where it forms the system) and the bands."""
     index, i32, f32_type = ir.IndexType.get(), ir.IntegerType.get_signless(32), ir.F32Type.get()
@@ -180,12 +180,12 @@ def _own_bands(*refs, products: tuple[str, ...], unit_keys: bool) -> None:
         first_row = arith.addi(arith.muli(arith.divui(quad, const(pair_rows)), const(sub)), const(span))
         short, long = arith.addi(first_row, p), arith.subi(arith.addi(first_row, const(sub - 1)), p)
         _own_span(row_words, staged_ref, bands_ref, short, long, p, columns, leader, one, at, const,
-                  products=products, unit_keys=unit_keys, pad=pad)
+                  products=products, unit_pairs=unit_pairs, pad=pad)
     utils.warpgroup_barrier()
 
 
 def _own_span(row_words, staged_ref, bands_ref, short, long, p, columns, leader, one, at, const, *,
-              products: tuple[str, ...], unit_keys: bool, pad: int) -> None:
+              products: tuple[str, ...], unit_pairs: bool, pad: int) -> None:
     """`_own_bands`' steps over one span's rows `short` and `long` of each quad (`own_bands`'), each
     output's row's words `row_words(name, row, columns)`, `pad` the staged tile's rows before the chunk's."""
     i32, sub, run, outputs = ir.IntegerType.get_signless(32), algebra.SUB, len(columns), len(products)
@@ -222,18 +222,18 @@ def _own_span(row_words, staged_ref, bands_ref, short, long, p, columns, leader,
         ahead = read(arith.minsi(arith.addi(step, const(1)), const(sub)))
         row, e, first, _, _ = placed(step)
         key, factor = words[:run], words[run:2 * run]
-        # The pair's decay, one for every output, restarting at a row's own pair; under `unit_keys` the key
+        # The pair's decay, one for every output, restarting at a row's own pair; under `unit_pairs` the key
         # decayed by it once for every output (`algebra.decayed_key`).
         decays = [arith.select(first, one, arith.mulf(b, a)) for b, a in zip(before, factor, strict=True)]
         after = decays
-        if unit_keys:
+        if unit_pairs:
             key = [algebra.decayed_key(native.Word(k), native.Word(d)).value
                    for k, d in zip(key, decays, strict=True)]
-        pairs = [None if unit_keys else native.Word(d) for d in decays]
+        pairs = [None if unit_pairs else native.Word(d) for d in decays]
         for o in range(outputs):
             values = words[(2 + o) * run:(3 + o) * run]
             # The algebra's own term (`algebra.band_term`), emitted a word at a time.
-            terms = [algebra.band_term(native.Word(r), native.Word(k), d, unit_keys=unit_keys).value
+            terms = [algebra.band_term(native.Word(r), native.Word(k), d, unit_pairs=unit_pairs).value
                      for r, k, d in zip(values, key, pairs, strict=True)]
             total = terms[0]
             for term in terms[1:]:
@@ -293,7 +293,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
             if not by_thread(call):
                 found = algebra.key_diagonal_bands(
                     [intra_rows(call, name, operand, beta_ref.at[h, span]) for name in products], shifted,
-                    unit_keys=call.unit_keys)
+                    unit_pairs=call.unit_pairs)
                 bands = tuple(band + more for band, more in zip(bands, found, strict=True))
             else:
                 # By thread: the scores' queries and the system's write strengths staged after the keys' and
@@ -305,7 +305,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                 if betas is not None:
                     plgpu.store(betas, family.rows_of(beta_ref.at[h, span]), optimized=False)
                 mosaic.synced(call.interpret)
-                own_bands(queries, shifts, betas, summed, products=products, unit_keys=call.unit_keys)
+                own_bands(queries, shifts, betas, summed, products=products, unit_pairs=call.unit_pairs)
 
             @pl.when(index == steps - 1)
             def _():

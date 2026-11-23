@@ -154,7 +154,10 @@ def suffix_columns(terms) -> None:
     no multiply contracts into them."""
     rows, columns = (terms.shape[0] - 1), terms.shape[1]
     assert columns <= THREADS, "a column a thread"
-    body = emission.stating(lambda ref: Work(operations=6 * rows * columns, shared_bytes=8 * rows * columns))(
+    # Each term read and its sum written, the start's word read, and each compensated add's fourteen
+    # additions (`compensated_columns`').
+    body = emission.stating(lambda ref: Work(operations=14 * rows * columns,
+                                             shared_bytes=4 * (2 * rows + 1) * columns))(
         lambda ctx, ref: _suffix_columns(ref))
     plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(body)(terms)
 

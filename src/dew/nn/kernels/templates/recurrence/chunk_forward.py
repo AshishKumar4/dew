@@ -138,7 +138,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
             family: mosaic.Family | None = None, interpret: bool = False,
-            rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_keys: bool = False,
+            rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_pairs: bool = False,
             decay_bound: float | None = None,
                 ranged: bool = False, skip=None,
             forked: ForkedTable | None = None):
@@ -171,7 +171,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, keeps=False,
                                  rounded=rounded, apart=apart, values_gated=values_gated,
-                                 unit_keys=unit_keys,
+                                 unit_pairs=unit_pairs,
                                  decay_bound=decay_bound, ranged=ranged, skip=skip, forked=forked)
     return out, final
 
@@ -181,7 +181,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
                  keeps: bool = True,
-                 rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_keys: bool = False,
+                 rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_pairs: bool = False,
                  decay_bound: float | None = None,
                      ranged: bool = False,
                  skip=None, forked: ForkedTable | None = None) -> tuple[jax.Array, jax.Array, tuple]:
@@ -195,7 +195,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     A100's 8056 us training (M-JS-212)."""
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
-                   rounded=rounded, apart=apart, values_gated=values_gated, unit_keys=unit_keys,
+                   rounded=rounded, apart=apart, values_gated=values_gated, unit_pairs=unit_pairs,
                    decay_bound=decay_bound,
                        ranged=ranged, forked=forked,
                    out_dtype=jnp.float32 if wide else None, skipped=skip is not None)
@@ -301,7 +301,7 @@ def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool,
 
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None, inverse=None, kept=None, keeps: bool = True, rounded: bool = False, apart: int = 0,
-             values_gated: bool = False, unit_keys: bool = False,
+             values_gated: bool = False, unit_pairs: bool = False,
              decay_bound: float | None = None, ranged: bool = False, forked=None,
              out_dtype=None, skipped: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
@@ -355,7 +355,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     target = generation.interpreted_target() if interpret else generation.gpu_target()
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, target, tiles.chunk, ranged=ranged, apart=apart,
-                values_gated=values_gated, unit_keys=unit_keys,
+                values_gated=values_gated, unit_pairs=unit_pairs,
                 decay_bound=decay_bound, producers=tiles.producers,
                 residents=tiles.residents, alone=not keeps)
     table = None if forked is None else tabled(forked, width, columns)

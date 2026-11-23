@@ -385,7 +385,7 @@ def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     k_jk exp2(E_ik - E_jk)`, each pair's decay the product of its tokens' own (`algebra.token_decays`,
     `between` of each token against the one before), rounded a factor at a time from the row's own token
     back (`pair_e = pair_(e - 1) a_(i - e + 1)`), each term the row times the key rounded, then times its
-    decay; under `Lane.unit_keys` the key times its pair's decay rounded, then the row times it
+    decay; under `Lane.unit_pairs` the key times its pair's decay rounded, then the row times it
     (`algebra.decayed_key`, the native loop's fold, `own_pairs._own_span`); the last multiply an add may
     fuse, and the terms' sum over every
     key block within one sum's bound of them (a key block's sum and its adds into the total, at most as
@@ -408,7 +408,7 @@ def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
         chain_lo[rows_e], chain_hi[rows_e] = found.lo, found.hi
         lo[rows_e, rows_e - e], hi[rows_e, rows_e - e] = found.lo, found.hi
     chain, key = Iv(lo, hi), point(np.asarray(k)[None, :, :])
-    if lane.unit_keys:
+    if lane.unit_pairs:
         terms = fused(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), fp32(mul(chain, key), lane)), lane)
     else:
         keyed = fp32(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), key), lane)
@@ -554,8 +554,8 @@ class Run:
     trained: bool
     """Whether the template trains the call (`Mosaic.trains`): its records the training forward's, the primal
     of the route's VJP, and its fast backward the template's; else the inference forward's."""
-    unit_keys: bool
-    """Whether its own pairs fold each decay into the key before the row (`Lane.unit_keys`): a delta rule's
+    unit_pairs: bool
+    """Whether its own pairs fold each decay into the key before the row (`Lane.unit_pairs`): a delta rule's
     unit keys, as the draws' layers declare them."""
     rounded_prefix: bool
     """Whether its decay a key dimension's prefix is its rounded sum alone (`Lane.rounded_prefix`,
@@ -623,7 +623,7 @@ def _through(operands: tuple, starts, last: int) -> tuple:
 def _route_forward(route, operands: tuple, form: str, *, inference: bool = False) -> tuple:
     """The forward of `route` over `operands` as a training step runs it, the template's (`chosen`):
     `(output, final memory, tiles, trained, bound)`, `bound` the template op's bound arguments, the options
-    it took (`unit_keys`, ...). The training forward, the primal of the route's VJP, where the template
+    it took (`unit_pairs`, ...). The training forward, the primal of the route's VJP, where the template
     trains the call (`Mosaic.trains`, `trained`) and the `inference` forward is not asked; else the inference
     forward: a training step takes another kernel for a call the template does not train (an fp32 call's
     backward on an A100's registers, 264 to 328 a thread). `form` names the options `route` closes over,
@@ -652,10 +652,10 @@ def declared_bound(g) -> float | None:
 
 def witnessed_route(delta: bool, *, scale: float, rounded: bool, starts=None,
                     max_segments: int | None = None, decay_bound: float | None = None):
-    """The route a witnessed call runs: under the `delta` rule the chunked op over the draws' unit keys,
-    their sigmoid write gates bounded by 1 (`recurrence.Hooks.write_bound`) and their decays by `decay_bound`
-    (`declared_bound`) as layers declare; without it the template's op as the SSD's route calls it
-    (`recurrence_chunk.template_rule`, its output in the operands' dtype)."""
+    """The route a witnessed call runs: under the `delta` rule the chunked op over the draws' unit queries
+    and keys, their sigmoid write gates bounded by 1 (`recurrence.Hooks.write_bound`, `unit_queries`) and
+    their decays by `decay_bound` (`declared_bound`) as layers declare; without it the template's op as the
+    SSD's route calls it (`recurrence_chunk.template_rule`, its output in the operands' dtype)."""
     from dew.nn.kernels import recurrence_chunk
 
     def route(*x):
@@ -663,7 +663,8 @@ def witnessed_route(delta: bool, *, scale: float, rounded: bool, starts=None,
             return recurrence_chunk.template_rule(*x, starts, max_segments=max_segments, scale=scale,
                                                   delta=False, wide=False, rounded=rounded)
         return recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts, max_segments=max_segments,
-                                                       write_bound=1.0, decay_bound=decay_bound)
+                                                       write_bound=1.0, decay_bound=decay_bound,
+                                                       unit_queries=True)
 
     return route
 
@@ -770,7 +771,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                 f"{None if starts is None else hasher.hexdigest()[:16]}")
         o, final, tiles, trained, bound = _route_forward(route, operands, form, inference=inference)
         # Whether the call's own pairs fold each decay into the key first, as the op took it.
-        unit_keys = bound.arguments.get("unit_keys", False)
+        unit_pairs = bound.arguments.get("unit_pairs", False)
         decay_bound = bound.arguments.get("decay_bound")
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's
         # (`Tiles.forward`, the template's primal), which a call its fast backward takes narrows apart.
@@ -782,7 +783,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         program = jax.jit(lambda *x: chunk_forward.kept_forward(
             *x[:6], tiles=tiles, starts=x[6], max_segments=max_segments, scale=scale, delta=delta,
             rounded=rounded, family=mainloop.issued(jnp.result_type(*x[:3]))[0],
-            interpret=generation.backend() != "gpu", unit_keys=unit_keys, decay_bound=decay_bound))
+            interpret=generation.backend() != "gpu", unit_pairs=unit_pairs, decay_bound=decay_bound))
 
         def kept(*x, starts):
             return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}",
@@ -831,7 +832,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                write=write, held=held, rounded=bool(rounded), given=given, wide=bool(wide),
                pairing=intra.pairing_parts(held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
-               tf32=tf32_conversion(family), trained=bool(trained), unit_keys=unit_keys,
+               tf32=tf32_conversion(family), trained=bool(trained), unit_pairs=unit_pairs,
                rounded_prefix=mainloop.prefix_limbs(np.ndim(g) == 4, decay_bound, chunk, dtype) == 1,
                clamped=mainloop.clamps(np.ndim(g) == 4, decay_bound, chunk, dtype),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
@@ -893,7 +894,7 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
     enclose = writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32, unit_keys=run.unit_keys,
+                               merged=run.merged, tf32=run.tf32, unit_pairs=run.unit_pairs,
                                rounded_prefix=run.rounded_prefix, clamped=run.clamped)
     found: dict[str, list] = {}
     for n in range(run.chunks):
@@ -1422,18 +1423,18 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
                                     f"training backward of seed {seed}, delta {delta}, rounded {rounded}")
         [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
                             zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
-        unit_keys, decay_bound = bound.arguments.get("unit_keys", False), bound.arguments.get("decay_bound")
+        unit_pairs, decay_bound = bound.arguments.get("unit_pairs", False), bound.arguments.get("decay_bound")
 
         def kept(*x):
             # Its family read from its operands, a family no identity states (`launched`'s statement).
             family = mainloop.issued(jnp.result_type(*x[:3]))[0]
             _, _, (inverse, held) = chunk_forward.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
                                                          delta=delta, family=family, interpret=interpret,
-                                                         unit_keys=unit_keys, decay_bound=decay_bound)
+                                                         unit_pairs=unit_pairs, decay_bound=decay_bound)
             grads, saved = mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale,
                                                            rounded=rounded, delta=delta, family=family,
                                                            interpret=interpret, inverse=inverse, kept=held,
-                                                           unit_keys=unit_keys, decay_bound=decay_bound)
+                                                           unit_pairs=unit_pairs, decay_bound=decay_bound)
             # The prepared run stays inside the program; the witness reads its records from `Run`.
             return grads, saved._replace(run=None), extras(saved.run)
 
@@ -1488,7 +1489,7 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     it (the initial memory's, `dh0`, for the first)."""
     run = back.run
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32, unit_keys=run.unit_keys,
+                               merged=run.merged, tf32=run.tf32, unit_pairs=run.unit_pairs,
                                rounded_prefix=run.rounded_prefix, clamped=run.clamped)
 
     def stored(iv: Iv, dtype, name: str) -> Iv:

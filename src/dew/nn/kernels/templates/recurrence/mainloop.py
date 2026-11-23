@@ -361,13 +361,15 @@ class Call:
     """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
     bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges in bf16 parts
     (`_merging`)."""
-    unit_keys: bool = False
-    """Whether its keys are of unit norm (`recurrence.Hooks.l2norm`'s, or as `Hooks.write_bound` declares,
-    `Hooks.inverse_bound`'s contract): an own pair's decay may fold into its key before the row's product
+    unit_pairs: bool = False
+    """Whether every operand of its own pairs is at most one in size: its keys of unit norm
+    (`recurrence.Hooks.l2norm`'s, or as `Hooks.write_bound` declares, `Hooks.inverse_bound`'s contract), its
+    queries so (`l2norm`, or as `Hooks.unit_queries` declares) and its system's rows (write gates at most
+    one, `write_bound`). An own pair's decay may then fold into its key before the row's product
     (`recurrence_algebra.decayed_key`, `key_diagonal_bands`), all it loses below normal in the exact product
-    too, as fla's token-parallel diagonal folds it (row 7299). Other keys keep the row times the key first;
-    the backward's terms keep theirs either way, a gradient's strip unbounded against a key's decayed
-    product."""
+    too, as fla's token-parallel diagonal folds it (row 7299); a row of 2^100 against a key of 2^-100
+    across a decay of 2^-60 lost its term so (#3703 review). Else the row times the key first; the
+    backward's terms keep theirs either way, a gradient's strip unbounded against a key's decayed product."""
     decay_bound: float | None = None
     """The least log decay a token its layer proves (`recurrence.Hooks.decay_bound`), None where it proves
     none: under a decay a key dimension, whether its prefix's rounded sum alone holds (`prefix_limbs`)."""
