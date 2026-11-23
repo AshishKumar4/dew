@@ -56,12 +56,16 @@ LEAST = jnp.iinfo(jnp.int32).min // 4
 @dataclasses.dataclass(frozen=True)
 class Form:
     """A sum's shape: each operand's subscript, each term (`Term`, its factors naming operands) and the
-    result's subscript `out`. Every letter has one extent wherever it appears, and none twice in one
-    subscript."""
+    result's subscript `out`; with `divisor` terms, the sum over them (over the letters `divided`, a subset
+    of `out`'s) divides it, both formed apart from their binades and divided before they land, so a quotient
+    whose numerator and divisor pass the format lands within it (a zero divisor read as one). Every letter
+    has one extent wherever it appears, and none twice in one subscript."""
 
     subscripts: tuple[str, ...]
     terms: tuple[Term, ...]
     out: str
+    divisor: tuple[Term, ...] = ()
+    divided: str = ""
 
     def letters(self, group: tuple[Factor, ...]) -> str:
         """`group`'s letters, each once, in the order its factors' subscripts name them."""
@@ -111,29 +115,42 @@ def _dtype(arrays) -> jnp.dtype:
     return at_least_fp32(jnp.result_type(*(array.dtype for array in arrays)))
 
 
-def _value(*arrays: jax.Array, form: Form) -> jax.Array:
-    """The sum (the module's law) in its operands' format, at least float32 (`_dtype`): each term's groups
-    held apart from their binades (`_held`) and contracted, the terms joined at their exponents' largest, the
-    result landed by one power of two (`power2`)."""
-    extents = _extents(arrays, form)
-    dtype = _dtype(arrays)
-    if not form.terms:
-        return jnp.zeros([extents[letter] for letter in form.out], dtype)
+def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
+    """`terms`' signed sum over `out` unlanded: its significands' sum and the exponent it lies at, each
+    term's groups held apart from their binades (`_held`) and contracted, the terms joined at their
+    exponents' largest."""
     precision = PRECISION if dtype == jnp.float32 else jax.lax.Precision.HIGHEST
+    shaped = Form(form.subscripts, terms, out)
     parts = []
-    for sign, groups in form.terms:
-        held = [_held(form, group, arrays, dtype) for group in groups]
-        contracted = jnp.einsum(",".join(letters for letters, _, _ in held) + "->" + form.out,
+    for sign, groups in terms:
+        held = [_held(shaped, group, arrays, dtype) for group in groups]
+        contracted = jnp.einsum(",".join(letters for letters, _, _ in held) + "->" + out,
                                 *(significand for _, significand, _ in held), precision=precision,
                                 preferred_element_type=dtype)
-        scale = sum((_laid(largest, "".join(letter for letter in letters if letter in form.out), form.out)
-                     for letters, _, largest in held), jnp.zeros((1,) * len(form.out), jnp.int32))
+        scale = sum((_laid(largest, "".join(letter for letter in letters if letter in out), out)
+                     for letters, _, largest in held), jnp.zeros((1,) * len(out), jnp.int32))
         parts.append((sign * contracted, jnp.where(contracted != 0, scale, LEAST)))
     joined = parts[0][1]
     for _, scale in parts[1:]:
         joined = jnp.maximum(joined, scale)
     joined = jnp.where(joined == LEAST, 0, joined)
-    total = sum((power2(contracted, scale - joined) for contracted, scale in parts), jnp.zeros((), dtype))
+    landed = sum((power2(contracted, scale - joined) for contracted, scale in parts), jnp.zeros((), dtype))
+    return landed, joined
+
+
+def _value(*arrays: jax.Array, form: Form) -> jax.Array:
+    """The sum (the module's law) in its operands' format, at least float32 (`_dtype`), its numerator over
+    its divisor (`Form.divisor`) divided before one power of two lands it (`power2`)."""
+    extents = _extents(arrays, form)
+    dtype = _dtype(arrays)
+    if not form.terms:
+        return jnp.zeros([extents[letter] for letter in form.out], dtype)
+    total, joined = _sum(arrays, form, form.terms, form.out, dtype)
+    if form.divisor:
+        below, exponent = _sum(arrays, form, form.divisor, form.divided, dtype)
+        none = below == 0
+        total = total / _laid(jnp.where(none, 1, below), form.divided, form.out)
+        joined = joined - _laid(jnp.where(none, 0, exponent), form.divided, form.out)
     return power2(total, joined)
 
 
@@ -147,6 +164,8 @@ def _extents(arrays, form: Form) -> dict[str, int]:
         for letter, extent in zip(subscript, array.shape, strict=True):
             if extents.setdefault(letter, extent) != extent:
                 raise ValueError(f"letter {letter!r} of extents {extents[letter]} and {extent}")
+    if not set(form.divided) <= set(form.out):
+        raise ValueError(f"a divisor over {form.divided!r} beyond the result's {form.out!r}")
     return extents
 
 
@@ -174,26 +193,43 @@ def contract(form: Form, *arrays: jax.Array) -> jax.Array:
     return scaled_contraction_p.bind(*arrays, form=form)
 
 
+def _moved(terms: tuple[Term, ...], moving: dict, at: dict[int, int]) -> list[Term]:
+    """`terms`' product rule along the moving operands: along one to `+1` its tangent in its place; along
+    one to `-1`, `-dx / x^2`, its tangent to `+1` and the operand to `-1` twice."""
+    moved = []
+    for sign, groups in terms:
+        for g, group in enumerate(groups):
+            for f, (index, power) in enumerate(group):
+                if index not in moving:
+                    continue
+                factors = (((at[index], 1),) if power > 0 else ((at[index], 1), (index, -1), (index, -1)))
+                changed = (*group[:f], *factors, *group[f + 1:])
+                moved.append((sign if power > 0 else -sign, (*groups[:g], changed, *groups[g + 1:])))
+    return moved
+
+
 def _jvp(primals, tangents, *, form: Form):
-    """The sum's tangent, one sum of the product rule's terms (`ad.Zero` a still operand's), landed once:
-    along an operand to `+1` its tangent in its place; along one to `-1`, `-dx / x^2`, its tangent to `+1`
-    and the operand to `-1` twice."""
+    """The sum's tangent, one sum of the product rule's terms (`_moved`, `ad.Zero` a still operand's) landed
+    once; a quotient's `(dN - out dD) / D` over its own divisor, the result `out` an operand of the
+    divisor's moved terms, so its numerator's and divisor's parts cancel within the one sum."""
     out = contract(form, *primals)
     moving = {index: tangent for index, tangent in enumerate(tangents) if type(tangent) is not ad.Zero}
     if not moving:
         return out, ad.Zero(jax.typeof(out).to_tangent_aval())
     at = {index: len(primals) + place for place, index in enumerate(moving)}
-    terms = []
-    for sign, groups in form.terms:
-        for g, group in enumerate(groups):
-            for f, (index, power) in enumerate(group):
-                if index not in moving:
-                    continue
-                moved = (((at[index], 1),) if power > 0 else ((at[index], 1), (index, -1), (index, -1)))
-                changed = (*group[:f], *moved, *group[f + 1:])
-                terms.append((sign if power > 0 else -sign, (*groups[:g], changed, *groups[g + 1:])))
-    subscripts = (*form.subscripts, *(form.subscripts[index] for index in moving))
-    return out, contract(Form(subscripts, tuple(terms), form.out), *primals, *moving.values())
+    terms = _moved(form.terms, moving, at)
+    operands = [*primals, *moving.values()]
+    subscripts = [*form.subscripts, *(form.subscripts[index] for index in moving)]
+    if form.divisor:
+        below = _moved(form.divisor, moving, at)
+        if below:
+            operands.append(out)
+            subscripts.append(form.out)
+            terms += [(-sign, (*groups, ((len(operands) - 1, 1),))) for sign, groups in below]
+    if not terms:
+        return out, ad.Zero(jax.typeof(out).to_tangent_aval())
+    tangent = Form(tuple(subscripts), tuple(terms), form.out, form.divisor, form.divided)
+    return out, contract(tangent, *operands)
 
 
 def _transpose(cotangent, *arrays, form: Form):
@@ -204,13 +240,24 @@ def _transpose(cotangent, *arrays, form: Form):
     if type(cotangent) is ad.Zero:
         return out
     known = [index for index, array in enumerate(arrays) if not ad.is_undefined_primal(array)]
+    place = {index: at for at, index in enumerate(known)}
+    below: tuple[Factor, ...] = ()
+    shared = [arrays[index] for index in known]
+    shared_subscripts = [form.subscripts[index] for index in known]
+    if form.divisor:
+        if any(index not in place for _, groups in form.divisor for group in groups for index, _ in group):
+            raise NotImplementedError("a scaled contraction is linear in no divisor's operand")
+        divisor = tuple((sign, tuple(tuple((place[index], power) for index, power in group)
+                                     for group in groups)) for sign, groups in form.divisor)
+        total = contract(Form(tuple(shared_subscripts), divisor, form.divided), *shared)
+        shared.append(jnp.where(total == 0, jnp.ones((), total.dtype), total))
+        shared_subscripts.append(form.divided)
+        below = ((len(shared) - 1, -1),)
     for linear, array in enumerate(arrays):
         if not ad.is_undefined_primal(array):
             continue
         subscript = form.subscripts[linear]
-        operands = [arrays[index] for index in known]
-        place = {index: at for at, index in enumerate(known)}
-        subscripts = [form.subscripts[index] for index in known]
+        operands, subscripts = list(shared), list(shared_subscripts)
         operands.append(cotangent)
         subscripts.append(form.out)
         pulled = len(operands) - 1
@@ -235,7 +282,7 @@ def _transpose(cotangent, *arrays, form: Form):
                                          array.aval.dtype))
                 subscripts.append(unread)
                 extra = ((len(operands) - 1, 1),)
-            terms.append((sign, (*(group for group in rest if group), ((pulled, 1), *extra))))
+            terms.append((sign, (*(group for group in rest if group), ((pulled, 1), *below, *extra))))
         if not terms:
             # An operand no term reads (a sum's operand its own transpose carried along): no cotangent.
             continue
@@ -262,15 +309,22 @@ def _batched(arrays, dims, *, form: Form):
         operands.append(array if dim is None else jnp.moveaxis(array, dim, 0))
         subscripts.append(subscript if dim is None else letter + subscript)
     batched = {index for index, dim in enumerate(dims) if dim is not None}
-    terms = []
-    for sign, groups in form.terms:
-        if not any(index in batched for group in groups for index, _ in group):
-            if len(operands) == len(arrays):
-                operands.append(jnp.ones((size,), _dtype(arrays)))
-                subscripts.append(letter)
-            groups = (*groups, ((len(operands) - 1, 1),))
-        terms.append((sign, groups))
-    return contract(Form(tuple(subscripts), tuple(terms), letter + form.out), *operands), 0
+
+    def spanned(terms: tuple[Term, ...]) -> tuple[Term, ...]:
+        laid = []
+        for sign, groups in terms:
+            if not any(index in batched for group in groups for index, _ in group):
+                if len(operands) == len(arrays):
+                    operands.append(jnp.ones((size,), _dtype(arrays)))
+                    subscripts.append(letter)
+                groups = (*groups, ((len(arrays), 1),))
+            laid.append((sign, groups))
+        return tuple(laid)
+
+    terms = spanned(form.terms)
+    divisor = spanned(form.divisor) if form.divisor else ()
+    divided = letter + form.divided if form.divisor else ""
+    return contract(Form(tuple(subscripts), terms, letter + form.out, divisor, divided), *operands), 0
 
 
 batching.primitive_batchers[scaled_contraction_p] = _batched

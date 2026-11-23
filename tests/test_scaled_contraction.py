@@ -88,3 +88,34 @@ def test_a_batched_sum_shares_an_unbatched_terms_operand():
     y = jnp.asarray([0.5, -2.0], jnp.float32)
     found = jax.vmap(lambda each: contract(form, each, y))(x)
     np.testing.assert_array_equal(np.asarray(found), np.asarray(x + y))
+
+
+MEAN = Form(("k", "kd"), ((1, (((0, 1),), ((1, 1),))),), "d", divisor=((1, (((0, 1),),)),), divided="")
+"""`sum_k m_k v_kd / sum_k m_k`: a mean whose divisor is its own operand's sum."""
+
+
+def test_a_means_gradient_lands_its_parts_in_one_sum():
+    """The gradient of a mean's channels' sum along its masses, values near fp32's largest over eight
+    channels: each mass's part through the values (`8 v / T`, 2^130) and through the total (`-8 mean / T`)
+    cancel within one sum to `8 (v_k - mean) / T`, where formed apart they met as `inf - inf`."""
+    masses = jnp.asarray([1.0, 1.0], jnp.float32)
+    values = jnp.stack([jnp.full(8, 2.0 ** 127), jnp.full(8, 1.5 * 2.0 ** 127)]).astype(jnp.float32)
+    found = jax.grad(lambda m: jnp.sum(contract(MEAN, m, values) * 2.0 ** -127))(masses)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray([-2.0, 2.0], np.float32))
+
+
+def test_a_means_value_and_second_derivatives_are_its_own():
+    """A mean with its own divisor is `sum_k m v / sum_k m`, and its Hessian along its masses, reverse over
+    reverse and forward over reverse, the plain formula's at operands whose arithmetic is exact."""
+    masses = jnp.asarray([1.0, 3.0], jnp.float32)
+    values = jnp.asarray([[2.0, -4.0], [6.0, 8.0]], jnp.float32)
+
+    def plain(m):
+        return jnp.sum(m[:, None] * values, axis=0) / jnp.sum(m)
+
+    np.testing.assert_array_equal(np.asarray(contract(MEAN, masses, values)), np.asarray(plain(masses)))
+    for found, want in ((jax.hessian(lambda m: contract(MEAN, m, values)[0])(masses),
+                         jax.hessian(lambda m: plain(m)[0])(masses)),
+                        (jax.jacfwd(jax.grad(lambda m: contract(MEAN, m, values)[1]))(masses),
+                         jax.jacfwd(jax.grad(lambda m: plain(m)[1]))(masses))):
+        np.testing.assert_array_equal(np.asarray(found), np.asarray(want))

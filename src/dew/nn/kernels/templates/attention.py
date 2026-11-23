@@ -1512,9 +1512,11 @@ def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax
     """The mean of the values `[B, K, Hk, Dv]` at the logits `[B, H, Q, K]` beside a state (its maximum `m0`
     and mass `total0`, `[B, H, Q]`, and its sums `acc0`, `[B, H, Q, Dv]`, a valueless state's zero),
     `[B, H, Q, Dv]`: each key's mass at the row's maximum held out of the graph (`m`'s, any shift's derivative
-    cancels), the state's its mass times its own, and the masses' contraction with the values and the state's
-    sums at its factor, over their total, one sum formed apart from its binades (`scaled_contraction`), whose
-    every order is that sum again; zero over a total of none."""
+    cancels) and the state's factor at it, the masses' contraction with the values and the state's sums at
+    its factor over the masses' and the state's mass's total, one quotient formed apart from its binades
+    (`scaled_contraction`, its divisor its own sum of its operands): its every order is that quotient again,
+    so a cotangent's part through the values and its part through the total (each `2^130` at values near the
+    format's largest) cancel within one sum, where they met as `inf - inf`; zero over a total of none."""
     batch, heads, queries, keys = logits.shape
     kv_heads, width = value.shape[2], value.shape[3]
     grouped = (batch, kv_heads, heads // kv_heads, queries)
@@ -1522,14 +1524,15 @@ def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax
     shift = jax.lax.stop_gradient(jnp.where(jnp.isfinite(reached), reached, 0))
     masses = jnp.where(jnp.isfinite(logits), jnp.exp(logits - shift[..., None]), 0)
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - shift), 0)
-    total = jnp.sum(masses, axis=-1) + total0 * carried
-    divisor = jnp.where(total > 0, total, 1)
+    seen = jax.lax.stop_gradient(jnp.sum(masses, axis=-1) + total0 * carried) > 0
     form = scaled_contraction.Form(
-        ("bhgqk", "bhgq", "bkhd", "bhgqd", "bhgq"),
-        ((1, (((0, 1), (1, -1)), ((2, 1),))), (1, (((3, 1), (4, 1), (1, -1)),))), "bhgqd")
-    mean = scaled_contraction.contract(form, masses.reshape(*grouped, keys), divisor.reshape(grouped), value,
-                                       acc0.reshape(*grouped, width), carried.reshape(grouped))
-    return jnp.where(total[..., None] > 0, mean.reshape(batch, heads, queries, width), 0)
+        ("bhgqk", "bkhd", "bhgqd", "bhgq", "bhgq"),
+        ((1, (((0, 1),), ((1, 1),))), (1, (((2, 1), (3, 1)),))), "bhgqd",
+        divisor=((1, (((0, 1),),)), (1, (((3, 1), (4, 1)),))), divided="bhgq")
+    mean = scaled_contraction.contract(form, masses.reshape(*grouped, keys), value,
+                                       acc0.reshape(*grouped, width), carried.reshape(grouped),
+                                       total0.reshape(grouped))
+    return jnp.where(seen[..., None], mean.reshape(batch, heads, queries, width), 0)
 
 
 def derivative_of(out: jax.Array) -> jax.Array:
