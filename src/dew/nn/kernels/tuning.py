@@ -1669,13 +1669,9 @@ def pinned(configs: Mapping[type[KernelOp], Hashable]) -> Iterator[None]:
     and for a lab that times one."""
     # In one order whatever order `configs` names them, so equal pins are one trace context (the head
     # review of row 12169).
-    with _cache.KERNEL_PINS(tuple(sorted(configs.items(), key=lambda pin: _kind_name(pin[0])))):
+    with _cache.KERNEL_PINS(tuple(sorted(configs.items(), key=lambda pin: _named(pin[0])))):
         yield
 
-
-def _kind_name(kind: type) -> str:
-    """A kernel kind's import path, by which the pins in a block are ordered (`pinned`)."""
-    return f"{kind.__module__}.{kind.__qualname__}"
 
 @contextlib.contextmanager
 def pinned_where_taken[Op: KernelOp](op: Op, ba: tokamax.BoundArguments) -> Iterator[Op]:

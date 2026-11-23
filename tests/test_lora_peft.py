@@ -263,11 +263,16 @@ def peft_factors(adapter, factors, directory) -> dict[str, np.ndarray]:
 def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it():
     """rsLoRA: each target scales by its own alpha over the square root of its
     own rank (layer 1's v_proj at rank 2, down_proj at alpha 3). The adapted
-    logits, and one training step, are PEFT's (`assert_trains_as_peft`); the
-    base model's logits are not, check 1 deciding against them."""
+    logits, and one training step, are PEFT's (`assert_trains_as_peft`)."""
     adapter, _ = adapted("rslora")
     assert (adapter.rslora, adapter.dropout) == (True, 0.0)
     assert_trains_as_peft("rslora")
+
+
+def test_the_base_models_logits_are_not_an_rslora_adapters():
+    """The rsLoRA adapter's base model's logits are not its adapted ones (PEFT's), check 1 deciding against
+    them: the adapter moves what the site compares. A test of its own beside the adapter's, which took 130 s
+    with it (row 12374)."""
     decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
     base = jax.jit(lambda tokens: decoder.model.apply(decoder.variables, tokens))
     reference_arm = peft_trained("rslora")
