@@ -212,8 +212,8 @@ def test_linear_cross_entropy_derives_on_tpu_and_clamps_shared_budget():
         clamped = derivation.derived(
             layouts, rows=256, depth=256, width=4096, dtype=jnp.bfloat16, multiprocessors=1,
             target=target, candidate=lambda c: True,
-            launch_of=lambda c: linear_ce.linear_ce_launch_of(c, (256, 4096, 256), jnp.bfloat16,
-                                                              target=target),
+            launch_of=lambda c: linear_ce.linear_ce_launch_of(
+                c, (256, 4096, 256), jnp.bfloat16, transpose_rhs=True, has_bias=False, target=target),
             grouped=False, dense=True, shared_budget=1024)
         assert clamped is None
     with generation.assumed("sm90"):
@@ -222,7 +222,7 @@ def test_linear_cross_entropy_derives_on_tpu_and_clamps_shared_budget():
         clamped = derivation.derived(
             layouts, rows=256, depth=256, width=256, dtype=jnp.bfloat16, multiprocessors=132,
             target=target, candidate=lambda c: True,
-            launch_of=lambda c: linear_ce.linear_ce_launch_of(c, (256, 256, 256), jnp.bfloat16,
-                                                              target=target),
+            launch_of=lambda c: linear_ce.linear_ce_launch_of(
+                c, (256, 256, 256), jnp.bfloat16, transpose_rhs=True, has_bias=False, target=target),
             grouped=False, dense=True, shared_budget=1024)
         assert clamped is None
