@@ -6,17 +6,17 @@ estimator (STE) gradients (`fla/modules/fused_bitlinear.py`)."""
 from __future__ import annotations
 
 import dataclasses
-from typing import ClassVar, NamedTuple
+import functools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 from jax.core import Tracer
 
-from dew.nn import precision
+from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
-from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
+from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, fp8_factor, fp8_scale_checked
-from dew.nn.kernels.templates.gemm import tiling
 from dew.nn.sharding import automatic_axes
 
 TERNARY_WEIGHT_ROW = "ledger 1464"
@@ -29,42 +29,28 @@ class MosaicTernaryPackedGmm(grouped_matmul.MosaicWordPackedGmm):
     DEFAULT_FMT: ClassVar[str] = "ternary"
 
 
-class TernaryWeightCase(NamedTuple):
-    tile: tiling.Tiles | None
-    whole: bool
+TERNARY_WEIGHT = gemm.word_packed_op("ternary", TERNARY_WEIGHT_ROW, "M-NG-8")
 
 
-TERNARY_WEIGHT: selection.Op[TernaryWeightCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
-    selection.Kernel("mosaic", (
-        selection.Requirement(
-            "launch", lambda case: case.tile is not None,
-            "no legal Mosaic ternary-packed tile holds this shape on the target", TERNARY_WEIGHT_ROW),
-        selection.Requirement(
-            "sharding", lambda case: case.whole,
-            "automatic mesh axes keep decoded XLA outside per-shard launch", TERNARY_WEIGHT_ROW),
-        selection.Requirement(
-            "measured", lambda case: False,
-            "no receipt yet has Mosaic ternary-packed beat decoded GEMM (pending M-NG-8)",
-            TERNARY_WEIGHT_ROW, kind="measured"),
-    )),
-    selection.Kernel("xla", (), generic=True),
-))
-
-
-def _quantize_activations_peak(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Per-token absmax int8 quantization normalized by `peak` BEFORE multiplying by `127.0`, prescaling
-    subnormal rows by `2**32` and dividing via `precision.divided` so tiny subnormal nonzero rows (e.g.
-    `2**-144`) never divide by an underflowed `peak / 127.0` or overflow reciprocal `1 / peak` (row 1464)."""
+def _quantize_activations_peak(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Per-token absmax int8 codes of `x` and each row's peak, read from bits (`float_bits.binade_of`,
+    `float_bits.raised_exactly`): a row whose entries a nonzero code reads (down to `peak / 2**8`) reach
+    below fp32's least normal is raised by `2**32` first (`shift`), so a process whose float arithmetic
+    flushes subnormals (XLA's CPU) still codes a `2**-144` row (row 1464). Returns `(x_q_bf16, peak_raised,
+    shift)`, `peak = peak_raised * 2**-shift` (`0` on zero rows)."""
     if x.shape[-1] == 0:
-        return x.astype(jnp.bfloat16), jnp.zeros(x.shape[:-1], jnp.float32)
-    x_f32 = x.astype(jnp.float32)
-    peak = jnp.max(jnp.abs(x_f32), axis=-1)
-    tiny = jnp.finfo(jnp.float32).tiny
-    scale_up = jnp.where((peak > 0) & (peak < tiny), jnp.float32(2.0 ** 32), jnp.float32(1.0))
-    safe_peak = jnp.where(peak > 0, peak * scale_up, jnp.float32(1.0))
-    normalized = precision.divided(x_f32 * scale_up[:, None], safe_peak[:, None])
+        return (x.astype(jnp.bfloat16), jnp.zeros(x.shape[:-1], jnp.float32),
+                jnp.zeros(x.shape[:-1], jnp.int32))
+    x_f32 = float_bits.widened_exactly(x, jnp.float32)
+    row_exp = jnp.max(float_bits.binade_of(x_f32), axis=-1)
+    shift = jnp.where((row_exp > -1024) & (row_exp - 8 < jnp.finfo(jnp.float32).minexp), jnp.int32(32),
+                      jnp.int32(0))
+    raised = float_bits.raised_exactly(x_f32, shift[..., None])
+    peak_raised = jnp.max(jnp.abs(raised), axis=-1)
+    safe_peak = jnp.where(peak_raised > 0, peak_raised, jnp.float32(1.0))
+    normalized = precision.divided(raised, safe_peak[..., None])
     quantized = jnp.clip(jnp.round(normalized * jnp.float32(127.0)), jnp.float32(-128.0), jnp.float32(127.0))
-    return quantized.astype(jnp.bfloat16), peak
+    return quantized.astype(jnp.bfloat16), peak_raised, shift
 
 
 def quantize_activations_int8(x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -72,8 +58,9 @@ def quantize_activations_int8(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     Returns `(x_q_bf16, act_scale)` where `x_q_bf16` holds exact integers in `[-128, 127]` as bfloat16
     (every int8 integer is bit-exact in bfloat16) and `act_scale = max(|x|, axis=-1) / 127.0` (`1.0` on
     zero rows)."""
-    quantized, peak = _quantize_activations_peak(x)
-    act_scale = jnp.where(peak > 0, precision.divided(peak, jnp.float32(127.0)), jnp.float32(1.0))
+    quantized, peak_raised, shift = _quantize_activations_peak(x)
+    scaled = float_bits.lowered_rounded(precision.divided(peak_raised, jnp.float32(127.0)), shift)
+    act_scale = jnp.where(peak_raised > 0, scaled, jnp.float32(1.0))
     return quantized, act_scale
 
 
@@ -85,8 +72,6 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     decodes staged uint32 ternary words inline in the GEMM mainloop on sm80/sm90 into exact bf16
     `{-1, 0, +1}`, accumulates exact integer products in fp32, applies `(peak / 127) * weights.scale` via
     `precision.twice_scaled`, and rounds once to `out_dtype`."""
-    from dew.nn.kernels import gemm
-
     if not isinstance(weights.form, Tracer):
         weights.checked()
     else:
@@ -106,57 +91,55 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
                         None, None, None, out_dtype="float32", trans_rhs=False, interpret=interpret_on_cpu,
                         dense=dense, exact_sums=False)
     with xla_products.interpreted_context(interpret_on_cpu):
-        tile = gemm._planned(launch, bound)
-        case = TernaryWeightCase(tile, not automatic_axes())
-        use_mosaic = selection.select(TERNARY_WEIGHT, case).kernel == "mosaic"
+        case = gemm.WordPackedCase(functools.partial(gemm._planned, launch, bound), not automatic_axes())
+        mosaic = selection.select(TERNARY_WEIGHT, case).kernel == "mosaic"
+    if mosaic:
+        form_bytes, one = jnp.zeros((8,), jnp.uint8), jnp.ones((), jnp.float32)
+        rules = gemm._packed_weight_rules(launch, lambda w: TernaryWeights(w, one, form_bytes),
+                                          interpret_on_cpu, dense=dense)
+        product = contracted("test_a_ternary_weight_product_holds_every_order")(
+            generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
+        operands = (words, sizes)
+    else:
+        product = functools.partial(gemm.decoded_product, interpret_on_cpu=interpret_on_cpu)
+        operands = (weights.unscaled(jnp.bfloat16), group_sizes)
+    run = functools.partial(gemm._interpreted, product, interpret_on_cpu)
 
     def run_dot(rows_bf16: jax.Array) -> jax.Array:
-        with xla_products.interpreted_context(interpret_on_cpu):
-            if use_mosaic:
-                form_bytes = jnp.zeros((8,), jnp.uint8)
-                one = jnp.ones((), jnp.float32)
-                rules = gemm._packed_weight_rules(launch, lambda w: TernaryWeights(w, one, form_bytes),
-                                                  interpret_on_cpu, dense=dense)
-                differentiable = contracted("test_a_ternary_weight_product_holds_every_order")(
-                    generation.linear_tangent(*rules, live_cotangents=True, kind=KernelGlue()))
-                return differentiable(rows_bf16, words, sizes)
-            summed = gemm.gemm(rows_bf16, weights.unscaled(jnp.bfloat16), group_sizes,
-                               out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT,
-                               interpret_on_cpu=interpret_on_cpu)
-            assert isinstance(summed, jax.Array)
-            return summed
+        return run(rows_bf16, *operands)
 
     def factor_of(scale_arr: jax.Array) -> jax.Array:
         return fp8_factor(jnp.asarray(scale_arr, jnp.float32), sizes, lhs.shape[0], weights.shape, dense)
 
     scale_f32 = jnp.asarray(weights.scale, jnp.float32)
     if not quantize_activations:
-        scaled = run_dot(lhs.astype(jnp.bfloat16)) * factor_of(scale_f32)
+        scaled = gemm.factored(run, operands, factor_of(scale_f32), lhs)
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
     def ste_value(a: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
-        x_q, peak = _quantize_activations_peak(a)
+        x_q, peak_raised, shift = _quantize_activations_peak(a)
         prod = precision.divided(run_dot(x_q), jnp.float32(127.0))
-        return precision.twice_scaled(prod, peak[:, None], factor_of(s)), prod
+        # A raised row's output lowered back by its shift, rounded once (`lowered_rounded`), past FTZ.
+        raised = precision.twice_scaled(prod, peak_raised[:, None], factor_of(s))
+        return float_bits.lowered_rounded(raised, shift[:, None]), prod
 
     def ste_derivative(primals, tangents, value):
         a, s = primals
         d_a, d_s = tangents
         _, prod = value
-        x_q, peak = _quantize_activations_peak(a)
-        peak_col = jax.lax.stop_gradient(peak)[:, None]
+        _, peak_raised, shift = _quantize_activations_peak(a)
+        peak_col = jax.lax.stop_gradient(peak_raised)[:, None]
+        shift_scale = float_bits.exact_power2(-jax.lax.stop_gradient(shift))[:, None]
         prod_held = jax.lax.stop_gradient(prod)
-        # Straight-through activation derivative at the scaled product: never carries canceling `peak`
-        # into the pullback (preventing `act_scale * factor -> inf` overflow on canceling rows), while
-        # delegating to `run_dot`'s `linear_tangent` so VJP transposes through the GEMM backward kernel.
-        _, d_summed = jax.jvp(run_dot, (jax.lax.stop_gradient(x_q),), (d_a.astype(jnp.bfloat16),))
         factor = factor_of(s)
         d_factor = factor_of(d_s)
+        dy_a = gemm.factored(run, operands, factor, d_a)
         once = prod_held * peak_col
         tiny = jnp.finfo(prod_held.dtype).tiny
         kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (prod_held == 0))
-        dy_s = jnp.where(kept, once * d_factor, (prod_held * d_factor) * peak_col)
-        return d_summed * factor + dy_s, jnp.zeros_like(prod_held)
+        dy_s = jnp.where(kept, (once * d_factor) * shift_scale,
+                         ((prod_held * d_factor) * peak_col) * shift_scale)
+        return dy_a + dy_s, jnp.zeros_like(prod_held)
 
     ste_scaled = contracted("test_a_ternary_weight_product_holds_every_order")(
         surrogate(ste_value, ste_derivative))

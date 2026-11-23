@@ -247,23 +247,45 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
                 assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
 
 
-def test_ternary_ste_cancellation_overflow_and_subnormal_rows():
-    """STE pullback never overflows on canceling extreme rows (`2**126` with `+1/-1` and scale `2**10` ->
-    forward `0`, grad `[+1024, -1024]`), and tiny normal rows (`2**-125`, whose `peak / 127` underflows to
-    subnormal/zero under FTZ, with scale `2**101`) normalize against `peak` before scaling by `127` to
-    produce exact `2**-24` without underflow (row 1464)."""
-    # Cancellation overflow witness: two entries of 2**126 against +1 and -1 with weight scale 2**10.
+def test_packed_products_hold_extreme_scales_forward_and_backward():
+    """Packed ternary and FP8 products at scales near fp32's edges (row 1464): a ternary row of `2**126` and
+    `+1/-1` codes cancels to 0 with STE gradients of the codes times the scale; a subnormal `2**-144` row
+    codes on a process that flushes subnormals, `2**-144 * 2**120 = 2**-24`; and a cotangent of `[4, 4]`
+    against columns `[+1, -1]` at a scale of `2**126` (each cotangent times its factor past fp32's
+    largest) pulls back to exactly 0 (`[4, 2]` to `2**127`), not `inf - inf`, for a tensor or per-column
+    scale, with and without activation quantization, and for FP8 weights alike; a tiny cotangent beside a
+    huge one on another input pulls back whole."""
     x_cancel = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** 126)
     w_mat = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[1, 0].set(-1.0)
     w_cancel = dataclasses.replace(formats.TernaryWeights.of(w_mat, scale=jnp.float32(1.0)),
                                    scale=jnp.float32(2.0 ** 10))
-    # Tiny normal row witness: 2**-125 (peak / 127 < tiny = 2**-126 flushes to 0 on XLA CPU FTZ) with
-    # weight scale 2**101 -> representable result 2**-24.
-    x_tiny = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** -125)
-    w_tiny = dataclasses.replace(
+    x_sub = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(jnp.float32(2.0 ** -144))
+    w_sub = dataclasses.replace(
         formats.TernaryWeights.of(jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0),
                                   scale=jnp.float32(1.0)),
-        scale=jnp.float32(2.0 ** 101))
+        scale=jnp.float32(2.0 ** 120))
+    x_cot = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(1.0)
+    w_cot_mat = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
+    huge = jnp.float32(2.0 ** 126)
+    columns = jnp.ones((64,), jnp.float32).at[0].set(huge).at[1].set(huge)
+    ternary = formats.TernaryWeights.of(w_cot_mat, scale=jnp.float32(1.0))
+    fp8 = formats.Fp8Weights.of(w_cot_mat, scale=jnp.float32(1.0))
+    products = [
+        *((functools.partial(gemm.ternary_weight_product, weights=dataclasses.replace(ternary, scale=scale),
+                             quantize_activations=quantized), (quantized, "ternary"))
+          for scale in (huge, columns) for quantized in (True, False)),
+        *((functools.partial(gemm.fp8_weight_product, weights=dataclasses.replace(fp8, scale=scale)), "fp8")
+          for scale in (huge, columns)),
+    ]
+    eye = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[1, 1].set(1.0)
+    unit = jnp.float32(1.0)
+    separate = (
+        (functools.partial(gemm.ternary_weight_product, weights=formats.TernaryWeights.of(eye, scale=unit),
+                           quantize_activations=False), "ternary"),
+        (functools.partial(gemm.fp8_weight_product, weights=formats.Fp8Weights.of(eye, scale=unit)), "fp8"))
+    mixed = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** -100)
+    cancelling = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(4.0).at[0, 1].set(4.0)
+    apart = jnp.zeros((16, 64), jnp.float32).at[0, 0].set(4.0).at[0, 1].set(2.0)
 
     for kernel in ("mosaic", "xla"):
         with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
@@ -273,19 +295,87 @@ def test_ternary_ste_cancellation_overflow_and_subnormal_rows():
                     out_dtype=jnp.float32, interpret_on_cpu=True)[0, 0],
                 argnums=(0, 1))(x_cancel, w_cancel.scale)
             assert np.asarray(y_c) == np.float32(0.0), (kernel, y_c)
-            assert np.asarray(dx_c[0, 0]) == np.float32(1024.0), (kernel, dx_c[0, 0])
-            assert np.asarray(dx_c[0, 1]) == np.float32(-1024.0), (kernel, dx_c[0, 1])
-            assert np.all(np.isfinite(np.asarray(dx_c))), kernel
+            want = np.zeros((16, 256), np.float32)
+            want[0, 0], want[0, 1] = 1024.0, -1024.0
+            np.testing.assert_array_equal(np.asarray(dx_c), want, err_msg=kernel)
             assert np.asarray(ds_c) == np.float32(0.0), (kernel, ds_c)
 
-            y_t, (dx_t, ds_t) = jax.value_and_grad(
-                lambda a, s: gemm.ternary_weight_product(
-                    a, dataclasses.replace(w_tiny, scale=s), quantize_activations=True,
-                    out_dtype=jnp.float32, interpret_on_cpu=True)[0, 0],
-                argnums=(0, 1))(x_tiny, w_tiny.scale)
-            assert np.asarray(y_t) == np.float32(2.0 ** -24), (kernel, y_t)
-            assert np.asarray(dx_t[0, 0]) == np.float32(2.0 ** 101), (kernel, dx_t[0, 0])
-            assert np.asarray(ds_t) == np.float32(2.0 ** -125), (kernel, ds_t)
+            y_s = gemm.ternary_weight_product(x_sub, w_sub, quantize_activations=True,
+                                              out_dtype=jnp.float32, interpret_on_cpu=True)
+            assert np.asarray(y_s[0, 0]) == np.float32(2.0 ** -24), (kernel, y_s[0, 0])
+
+            for product, label in products:
+                ran = functools.partial(product, out_dtype=jnp.float32, interpret_on_cpu=True)
+                y_out, pull = jax.vjp(ran, x_cot)
+                assert np.asarray(y_out[0, 0]) == np.float32(2.0 ** 126), (kernel, label, y_out[0, 0])
+                assert np.asarray(y_out[0, 1]) == np.float32(-(2.0 ** 126)), (kernel, label, y_out[0, 1])
+                (dx_zero,) = pull(cancelling)
+                np.testing.assert_array_equal(np.asarray(dx_zero), np.zeros((16, 256), np.float32),
+                                              err_msg=f"{kernel} {label}")
+                (dx_apart,) = pull(apart)
+                want = np.zeros((16, 256), np.float32)
+                want[0, 0] = 2.0 ** 127
+                np.testing.assert_array_equal(np.asarray(dx_apart), want, err_msg=f"{kernel} {label}")
+
+            # A row's tiny cotangent beside a huge one on another input: each pulls back whole.
+            for product, label in separate:
+                ran = functools.partial(product, out_dtype=jnp.float32, interpret_on_cpu=True)
+                (dx_mixed,) = jax.vjp(ran, x_cot)[1](mixed)
+                want = np.zeros((16, 256), np.float32)
+                want[0, 0], want[0, 1] = 2.0 ** 126, 2.0 ** -100
+                np.testing.assert_array_equal(np.asarray(dx_mixed), want, err_msg=f"{kernel} {label}")
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_packed_products_transpose_holds_in_a_checked_map_linear_transpose_and_an_empty_width():
+    """A packed ternary product's input gradient in a `shard_map` over two CPU devices that checks the axes
+    its values vary over, the rows and codes the same on every device and each device its own scale, is
+    each device's partial summed, as the decoded product written plainly gives it, exactly; its transpose
+    by `jax.linear_transpose` is its VJP's; and a product of no columns pulls back zeros (row 1464)."""
+    rng = np.random.default_rng(1464)
+    codes = jnp.asarray(rng.integers(-1, 2, (256, 32)), jnp.float32)
+    weights = formats.TernaryWeights.of(codes, scale=jnp.float32(1.0))
+    x = jnp.asarray(rng.integers(-3, 4, (16, 256)), jnp.float32)
+    scales = jnp.asarray([2.0 ** 100, 2.0 ** -3], jnp.float32)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def packed(rows, scale):
+        return gemm.ternary_weight_product(rows, dataclasses.replace(weights, scale=scale[0]),
+                                           quantize_activations=False, out_dtype=jnp.float32)
+
+    def plain(rows, scale):
+        return rows.astype(jnp.bfloat16).astype(jnp.float32) @ codes * scale[0]
+
+    def gradient(product):
+        def each_device(rows, scale):
+            return jax.grad(lambda r: jnp.sum(product(r, scale)))(rows)
+
+        return jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, data), out_specs=whole,
+                                     check_vma=True))(x, scales)
+
+    np.testing.assert_array_equal(np.asarray(gradient(packed)), np.asarray(gradient(plain)))
+
+    # Each device's partial past fp32's largest (4 * 2**126 on one, -4 * 2**126 on the other) sums to 0.
+    def cancelled(rows, scale, dy):
+        return jax.vjp(lambda r: packed(r, scale), rows)[1](dy)[0]
+
+    signs = jnp.zeros((32, 32), jnp.float32).at[0, 0].set(4.0).at[16, 0].set(-4.0)
+    d_rows = jax.jit(jax.shard_map(cancelled, mesh=mesh, in_specs=(whole, data, data), out_specs=whole,
+                                   check_vma=True))(x[:16], jnp.full((2,), 2.0 ** 126, jnp.float32), signs)
+    np.testing.assert_array_equal(np.asarray(d_rows), np.zeros((16, 256), np.float32))
+
+    cotangent = jnp.asarray(rng.integers(-3, 4, (16, 32)), jnp.float32)
+    one = functools.partial(packed, scale=scales[:1])
+    (transposed,) = jax.linear_transpose(one, x)(cotangent)
+    (pulled,) = jax.vjp(one, x)[1](cotangent)
+    np.testing.assert_array_equal(np.asarray(transposed), np.asarray(pulled))
+
+    empty = formats.TernaryWeights.of(jnp.zeros((256, 0), jnp.float32), scale=jnp.float32(1.0))
+    _, pull = jax.vjp(functools.partial(gemm.ternary_weight_product, weights=empty,
+                                        quantize_activations=False, out_dtype=jnp.float32), x)
+    (nothing,) = pull(jnp.zeros((16, 0), jnp.float32))
+    np.testing.assert_array_equal(np.asarray(nothing), np.zeros((16, 256), np.float32))
 
 
 def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
