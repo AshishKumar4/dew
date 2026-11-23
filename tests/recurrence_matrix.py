@@ -102,7 +102,7 @@ its GPU tier reference interpreter."""
 
 RECORDED = {"fla": Path(__file__).resolve().parent / "fixtures" / "fla" / "matrix_seeded.npz"}
 """Each upstream's recording of the cells a host without its GPU tier reference judges (a CPU lane's
-interpreted cells; tools/fla_matrix_reference.py), the same upstream at its pinned release as a live run's."""
+interpreted cells; tools/matrix_reference.py), the same upstream at its pinned release as a live run's."""
 
 INTERPRETERS = {"fla": "DEW_FLA_PYTHON", "mamba_ssm": "DEW_MAMBA_PYTHON"}
 """The variable naming each upstream's GPU tier reference interpreter, where a host holds one."""
