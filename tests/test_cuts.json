@@ -848,7 +848,7 @@
 "tests/test_attention_triton.py::test_a_forward_at_its_own_config_compiles_within_an_a100s_block[NONE]",
 "tests/test_attention_triton.py::test_a_forward_at_its_own_config_compiles_within_an_a100s_block[OUTPUT]",
 "tests/test_attention_triton.py::test_a_forward_at_its_own_config_compiles_within_an_a100s_block[SPLIT]",
-"tests/test_attention_triton.py::test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down",
+"tests/test_attention_triton.py::test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler[sm80]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-128x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-64x128]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-step-64x64]",
@@ -1711,6 +1711,9 @@
 "tests/test_dpo.py": [
 "tests/test_dpo.py::test_packed_pairs_train_as_each_pair_a_row[gated delta net hybrid-shared]"
 ],
+"tests/test_dream_walk.py": [
+"tests/test_dream_walk.py::test_a_dream_release_walks_its_responses_as_its_own_sampling_does[dream]"
+],
 "tests/test_dreamer.py": [
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-replay]",
 "tests/test_dreamer.py::test_a_dreamer_run_resumed_from_its_checkpoint_owes_its_steps_and_with_its_replay_ends_alike[prefilled-steps]",
@@ -1872,6 +1875,9 @@
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_groups_rate[a fresh group]"
 ],
+"tests/test_gated_mlp.py": [
+"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-1.5-sm90]"
+],
 "tests/test_gemm_degenerate.py": [
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[depth no step divides-hooked]",
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[depth no step divides-paired]",
@@ -1982,6 +1988,9 @@
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[bfloat16-tile-boundaries]",
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-all-empty]",
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-tile-boundaries]"
+],
+"tests/test_grpo.py": [
+"tests/test_grpo.py::test_a_recorded_grpo_run_trains_on_the_rollout_it_records"
 ],
 "tests/test_guidance_distillation.py": [
 "tests/test_guidance_distillation.py::test_a_saved_student_samples_one_branch_at_its_conditioners_guidance[flow]",
@@ -3774,9 +3783,6 @@
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[default-chunk]",
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk]"
 ],
-"tests/test_stage_blocks.py": [
-"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[hybrid_dit-fsdp2_stage2]"
-],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
 "tests/test_stage_local.py::test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one",
@@ -4016,9 +4022,6 @@
 ],
 "tests/test_wan_vae.py": [
 "tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
-],
-"tests/test_weighed_check.py": [
-"tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",
