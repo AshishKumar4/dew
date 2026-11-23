@@ -364,9 +364,18 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
     recomputes from the packed output itself, so neither copies a half out.
     `axes` are the product's logical axes, `[..., H]`'s."""
     from .kernels import norm_swiglu
+    from .sharding import explicit_spec
 
-    portable = _portable(_gate_function(activation, implementation),
-                         lambda gate_up: (gate_up[..., 0, :], gate_up[..., 1, :]))
+    def halves(gate_up: jax.Array) -> tuple[jax.Array, jax.Array]:
+        placed = explicit_spec(gate_up)
+        if placed is not None and len(placed.spec) >= 2 and placed.spec[-2] is not None:
+            entries = tuple(placed.spec)
+            whole_pair = jax.sharding.NamedSharding(
+                placed.mesh, jax.sharding.PartitionSpec(*entries[:-2], None, entries[-1]))
+            gate_up = jax.sharding.reshard(gate_up, whole_pair)
+        return gate_up[..., 0, :], gate_up[..., 1, :]
+
+    portable = _portable(_gate_function(activation, implementation), halves)
     return _dispatched(activation, portable,
                        lambda gate_up: norm_swiglu.packed_swiglu_kernel(implementation, gate_up, axes=axes),
                        lambda gate_up, portable: norm_swiglu.packed_swiglu(gate_up, portable, axes=axes))

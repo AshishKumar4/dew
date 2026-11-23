@@ -830,6 +830,54 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
     assert_runs_per_shard(_checked_shard_run, _checked_shard_operands, specs, mesh,
                           "per shard over an explicit mesh", seeds=SEEDS["per shard"], truth_fn=portable)
 
+    # Packed SwiGLU (`[..., 2, H]`) also runs per shard on an Explicit mesh with axes=None (splitting rows
+    # or features) and refuses splitting the pair axis `-2` (row 822).
+    from dew.nn.kernels import selection
+    from dew.nn.sharding import MLP_HIDDEN
+
+    def draw_packed(draw: int = 0):
+        return (jax.random.normal(drawn_key(33, draw), (4, 8, 2, 24)),
+                jax.random.normal(drawn_key(34, draw), (4, 8, 24)))
+
+    def packed_run(a, d):
+        return evaluated(fused_packed(), (a,), d)
+
+    def packed_ref(a, d):
+        return evaluated(packed_gated_product("swiglu", implementation="xla"), (a,), d)
+    for tag, spec_p, out_spec in (
+            ("rows", PartitionSpec("data"), PartitionSpec("data")),
+            ("features", PartitionSpec(None, None, None, "data"), PartitionSpec(None, None, "data"))):
+        with jax.set_mesh(mesh):
+            sharded_p, sharded_d = placed_on(draw_packed(), [spec_p, out_spec], mesh)
+            with generation.assumed("sm90"):
+                assert norm_swiglu.packed_swiglu_kernel("pallas", sharded_p) == "pallas"
+            assert any(eq.primitive.name == "shard_map"
+                       for eq in traced(packed_run, sharded_p, sharded_d))
+            assert not any(eq.primitive.name == "reshard"
+                           for eq in traced(packed_ref, sharded_p, sharded_d))
+        assert_runs_per_shard(packed_run, draw_packed, [spec_p, out_spec], mesh,
+                              f"packed swiglu explicit mesh {tag}", seeds=SEEDS["per shard"],
+                              truth_fn=packed_ref)
+    raw_p, raw_d = draw_packed()
+    for dtype in (jnp.float32, jnp.bfloat16):
+        p_dt, d_dt = raw_p.astype(dtype), raw_d.astype(dtype)
+        expected_y, expected_dx = jax.jit(packed_ref)(p_dt, d_dt)
+        with jax.set_mesh(mesh):
+            bad_pair, bad_dy = placed_on((p_dt, d_dt), [PartitionSpec(None, None, "data", None),
+                                                        PartitionSpec()], mesh)
+            for named_axes in (None, MLP_HIDDEN):
+                if dtype == jnp.float32:
+                    with generation.assumed("sm90"):
+                        assert norm_swiglu.packed_swiglu_kernel("auto", bad_pair, axes=named_axes) == "xla"
+                        assert norm_swiglu.packed_swiglu_kernel("pallas", bad_pair, axes=named_axes) == "xla"
+                        with generation.chosen(swiglu="pallas"), pytest.raises(selection.KernelRefused):
+                            norm_swiglu.packed_swiglu_kernel("auto", bad_pair, axes=named_axes)
+                for impl in ("auto", "xla"):
+                    fn = packed_gated_product("swiglu", implementation=impl, axes=named_axes)
+                    got_y, got_dx = jax.jit(lambda a, d, f=fn: evaluated(f, (a,), d))(bad_pair, bad_dy)
+                    np.testing.assert_array_equal(np.asarray(got_y), np.asarray(expected_y))
+                    np.testing.assert_array_equal(np.asarray(got_dx), np.asarray(expected_dx))
+
 
 def _checked_shard_operands(draw: int = 0):
     """The per-shard tests' operands (`_checked_shard_run`'s): the seam's and SwiGLU's, and their

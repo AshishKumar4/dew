@@ -95,7 +95,15 @@ from ..precision import (
     two_product,
     uncontracted,
 )
-from ..sharding import automatic_axes, excess_axes, manual_map, on_shards, summed_to, varying_like
+from ..sharding import (
+    automatic_axes,
+    excess_axes,
+    explicit_spec,
+    manual_map,
+    on_shards,
+    summed_to,
+    varying_like,
+)
 from . import generation, tuning
 from .generation import INHERENT, Choice, device_generation
 from .selection import Kernel, Op, Requirement, select
@@ -444,6 +452,27 @@ def _shard_spec(axes, first) -> jax.sharding.PartitionSpec | None:
     return jax.typeof(first).sharding.spec
 
 
+def _packed_specs(axes, gate_up) -> tuple[jax.sharding.PartitionSpec, jax.sharding.PartitionSpec] | None:
+    """`(in_spec, out_spec)` for `packed_swiglu` (`[..., 2, H]` -> `[..., H]`) on a split mesh from logical
+    `axes` or from `gate_up`'s explicit sharding, or None if unplaced or the pair axis `-2` is split
+    (row 822)."""
+    placed = explicit_spec(gate_up)
+    if placed is not None and len(placed.spec) >= 2 and placed.spec[-2] is not None:
+        return None
+    in_spec = _shard_spec(None, gate_up)
+    if in_spec is None:
+        if axes is None:
+            return None
+        shape = gate_up.shape[:-2] + gate_up.shape[-1:]
+        out_spec = logical_spec(axes, shape)
+        entries = (*out_spec, *(None,) * (len(shape) - len(out_spec)))
+        return jax.sharding.PartitionSpec(*entries[:-1], None, entries[-1]), out_spec
+    entries = (*in_spec, *(None,) * (gate_up.ndim - len(in_spec)))
+    if entries[-2] is not None:
+        return None
+    return in_spec, jax.sharding.PartitionSpec(*entries[:-2], entries[-1])
+
+
 def _per_shard(local, axes, operands, replicated):
     """`local(*operands)` as it runs: whole where no mesh axis splits, else on
     each shard (`on_shards`), the operands placed as `axes` names and those
@@ -674,10 +703,12 @@ def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
     """Resolve the SiLU product of one packed projection's `[..., 2, H]` output (`packed_swiglu`),
     through the SwiGLU selector (`SWIGLU`), whose kernel reads the halves where the projection wrote them.
     `axes` are the product's logical axes, `[..., H]`'s."""
+    varying_blocked = not generation.triton_runs() and bool(jax.typeof(gate_up).mat.varying)
+    placed = (not varying_blocked
+              and (not automatic_axes() or (gate_up.ndim >= 2 and _packed_specs(axes, gate_up) is not None)))
     case = SwigluCase(dtypes=(jnp.dtype(gate_up.dtype),), promotes=jnp.dtype(gate_up.dtype),
                       shape_fits=gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,
-                      placed=_placed(None if axes is None else (*axes[:-1], None, axes[-1]), (gate_up,),
-                                     whole_last=False))
+                      placed=placed)
     return _selected(SWIGLU, case, implementation)
 
 
@@ -1492,10 +1523,9 @@ def packed_swiglu(gate_up, portable, *, axes=None):
 
     if not automatic_axes():
         return local(gate_up)
-    if axes is None:
-        raise ValueError("a mesh splits the packed SwiGLU's operands, and it places them by their logical "
-                         "axes, which the call does not name")
-    shape = gate_up.shape[:-2] + gate_up.shape[-1:]
-    spec = logical_spec(axes, shape)
-    entries = (*spec, *(None,) * (len(shape) - len(spec)))
-    return manual_map(local, (jax.sharding.PartitionSpec(*entries[:-1], None, entries[-1]),), spec)(gate_up)
+    specs = _packed_specs(axes, gate_up)
+    if specs is None:
+        raise ValueError("a mesh splits the packed SwiGLU's operands without named logical axes or an "
+                         "explicit placement leaving the pair axis whole")
+    in_spec, out_spec = specs
+    return manual_map(local, (in_spec,), out_spec)(gate_up)
