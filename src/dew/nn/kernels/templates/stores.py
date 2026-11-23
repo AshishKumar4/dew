@@ -47,13 +47,17 @@ def staged_columns(columns: int, dtypes) -> int:
     return math.gcd(columns, STAGED_BYTES // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
 
 
-def output_staging(columns: int, dtypes) -> tuple[int, int]:
+def output_staging(columns: int, dtypes, staging: tuple[int, int] | None = None) -> tuple[int, int]:
     """The columns of each chunk a consumer stages a `columns`-wide output tile in (`staged_columns`) and
-    the chunk buffers it holds (`OUTPUT_BUFFERS`, at most its chunks): the tile's output staged in two
-    chunks' shared memory rather than its whole width, CUTLASS's sub-tiled epilogue, which leaves the
-    mainloop's ring the rest of the block (its StageCountAutoCarveout)."""
-    chunk = staged_columns(columns, dtypes)
-    return chunk, min(columns // chunk, OUTPUT_BUFFERS)
+    the chunk buffers it holds (`OUTPUT_BUFFERS`, at most its chunks), or `staging`'s (chunk columns,
+    buffers) where a launch states them: the tile's output staged in its chunks' shared memory rather than
+    its whole width, CUTLASS's sub-tiled epilogue, which leaves the mainloop's ring the rest of the block
+    (its StageCountAutoCarveout). Fewer buffers or narrower chunks leave the ring a stage more where the
+    block falls a stage short (an sm120 GEMM's 128 x 256 tile, row 5634, M-FS-62)."""
+    chunk, buffers = (staged_columns(columns, dtypes), OUTPUT_BUFFERS) if staging is None else staging
+    if columns % chunk or buffers < 1:
+        raise ValueError(f"a {columns}-column output tile stages in no {buffers} buffers of {chunk} columns")
+    return chunk, min(columns // chunk, buffers)
 
 
 def written(smem, value: jax.Array) -> None:

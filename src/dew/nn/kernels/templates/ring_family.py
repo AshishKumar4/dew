@@ -173,22 +173,22 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         if again is not None:
             pl.when(again.taken())(lambda: streamed(rings, tiles, lo, hi, counted=hi - lo))
 
-    def output_staging(self, outputs: tuple, consumers: int) -> list:
-        # Each consumer's share of each output in two chunk buffers, not the whole tile (`output_staging`).
-        return [plgpu.SMEM((consumers, output_staging(shape[1], (dtype,))[1], shape[0],
-                            output_staging(shape[1], (dtype,))[0]), dtype)
-                for shape, dtype in outputs]
+    def output_staging(self, outputs: tuple, consumers: int, staging: tuple[int, int] | None = None) -> list:
+        # Each consumer's share of each output in its chunk buffers, not the whole tile (`output_staging`).
+        staged = [(shape, dtype, output_staging(shape[1], (dtype,), staging)) for shape, dtype in outputs]
+        return [plgpu.SMEM((consumers, buffers, shape[0], chunk), dtype)
+                for shape, dtype, (chunk, buffers) in staged]
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, staging: tuple[int, int] | None = None) -> None:
         del accumulators  # its consumers' walks carry their own
         self.pingponged(pingpong)
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
-        staging = self.output_staging(outputs, consumers)
+        staging = self.output_staging(outputs, consumers, staging)
         # Ping-pong's turns on the tensor cores (`persistent.consumed`'s `turns`).
         turns = [self.meeting(consumers)] if pingpong else []
 
