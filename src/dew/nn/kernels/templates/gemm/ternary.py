@@ -17,7 +17,6 @@ from dew.nn import precision
 from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, fp8_factor, fp8_scale_checked
-from dew.nn.kernels.templates import resources
 from dew.nn.kernels.templates.gemm import packed, tiling
 from dew.nn.sharding import automatic_axes
 
@@ -25,15 +24,10 @@ TERNARY_WEIGHT_ROW = "ledger 1464"
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicTernaryPackedGmm(grouped_matmul.MosaicFp8PackedGmm):
-    """`MosaicGmm` of 2-bit BitNet b1.58 ternary weights (`formats.TernaryWeights`, row 1464)."""
+class MosaicTernaryPackedGmm(grouped_matmul.MosaicWordPackedGmm):
+    """`MosaicWordPackedGmm` of 2-bit BitNet b1.58 ternary weights (`formats.TernaryWeights`, row 1464)."""
     STEPS: ClassVar[tuple[int, ...] | None] = (packed.TERNARY_STEP,)
-    WEIGHT_BYTES: ClassVar[float] = 0.25
-
-    def _registers(self, ba, config: tiling.Tiles, *, merging: bool, target) -> int | None:
-        base = super(grouped_matmul.MosaicFp8PackedGmm, self)._registers(
-            ba, config, merging=merging, target=target)
-        return None if base is None else base + 2 * config.block_n * 16 // resources.THREADS + 4
+    DEFAULT_FMT: ClassVar[str] = "ternary"
 
 class TernaryWeightCase(NamedTuple):
     """Facts deciding whether `ternary_weight_product` runs the inline-decoding Mosaic GEMM mainloop."""
@@ -64,6 +58,8 @@ def quantize_activations_int8(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     Returns `(x_q_bf16, act_scale)` where `x_q_bf16` holds exact integers in `[-128, 127]` as bfloat16
     (every int8 integer is bit-exact in bfloat16) and `act_scale = max(|x|, axis=-1) / 127.0` (`1.0` on
     zero rows so outputs stay zero with finite gradients)."""
+    if x.shape[-1] == 0:
+        return x.astype(jnp.bfloat16), jnp.ones(x.shape[:-1], jnp.float32)
     x_f32 = x.astype(jnp.float32)
     absmax = jnp.max(jnp.abs(x_f32), axis=-1)
     act_scale = jnp.where(absmax > 0, precision.divided(absmax, jnp.float32(127.0)), jnp.float32(1.0))
@@ -91,10 +87,11 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     sizes = jnp.asarray([lhs.shape[0]], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     if quantize_activations:
         x_q, act_scale = quantize_activations_int8(lhs)
-        # Straight-through estimator: forward uses exact int8-quantized bf16 rows; backward passes through.
-        scaled_lhs = lhs.astype(jnp.float32) / act_scale[:, None]
-        rows = (scaled_lhs + jax.lax.stop_gradient(x_q.astype(jnp.float32) - scaled_lhs)).astype(jnp.bfloat16)
+        # Straight-through estimator: stop `act_scale` on both sides so `d(rows * post_scale)/d(lhs) = I`
+        # everywhere (including along row maxima) while forward uses exact int8-quantized bf16 rows.
         post_scale = jax.lax.stop_gradient(act_scale)[:, None]
+        scaled_lhs = lhs.astype(jnp.float32) / post_scale
+        rows = (scaled_lhs + jax.lax.stop_gradient(x_q.astype(jnp.float32) - scaled_lhs)).astype(jnp.bfloat16)
     else:
         rows = lhs.astype(jnp.bfloat16)
         post_scale = jnp.float32(1.0)
@@ -124,4 +121,5 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
                                precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu)
             assert isinstance(summed, jax.Array)
     factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape, dense)
-    return (summed * (post_scale * factor)).astype(lhs.dtype if out_dtype is None else out_dtype)
+    scaled = precision.twice_scaled(summed, post_scale, factor) if quantize_activations else summed * factor
+    return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
