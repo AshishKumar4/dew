@@ -1247,7 +1247,8 @@ def test_a_run_an_intermediate_dew_rewrote_beside_its_mark_resumes_as_it_trained
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
     loaded = LMRunConfig.load(str(run)).resumed(()).optim
     assert type(loaded.optimizer) is spec, loaded
-    assert (loaded.decay_mask, loaded.spared) == (False, False) and loaded.optimizer.weight_decay > 0, loaded
+    assert (loaded.decay_mask, loaded.spared) == (False, False) and isinstance(loaded.optimizer, Adam), loaded
+    assert loaded.optimizer.weight_decay > 0, loaded
     if decay == 0:
         with pytest.raises(ValueError):
             _checkpointed(run, loaded, 2)
@@ -1336,15 +1337,17 @@ def test_a_marked_runs_newest_save_no_resume_reads_leaves_its_mark_to_decide(tmp
     run = tmp_path / "run"
     _checkpointed(run, rewritten, 1)
     shutil.copytree(run / "1", run / "2")
+    # Its model alone, which no resume reads (`dew.checkpoints._payloads.PROJECTED`).
+    (run / "2" / "projected.json").write_text(json_.dumps(["model"]))
     newest = run / "2" / "_CHECKPOINT_METADATA"
     metadata = json_.loads(newest.read_text())
-    metadata["custom_metadata"] = {**(metadata.get("custom_metadata") or {}), "typed_optimizer": True,
-                                   "weights_only": True}
+    metadata["custom_metadata"] = {**(metadata.get("custom_metadata") or {}), "typed_optimizer": True}
     newest.write_text(json_.dumps(metadata))
     LMRunConfig(optim=rewritten, trainer=_named(run)).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
     loaded = LMRunConfig.load(str(run)).resumed(()).optim
-    assert loaded.decay_mask is False and loaded.optimizer.weight_decay > 0, loaded
+    assert loaded.decay_mask is False and isinstance(loaded.optimizer, AdamW), loaded
+    assert loaded.optimizer.weight_decay > 0, loaded
 
 
 @pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])

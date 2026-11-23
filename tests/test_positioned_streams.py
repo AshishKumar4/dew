@@ -370,7 +370,7 @@ def test_a_single_shard_store_read_by_several_shares_holds_no_cut_and_resumes_ex
 
     rows = from_grain(grain.MapDataset.source([{"id": np.int32(index)} for index in range(40)]),
                       identity="forty-ids")
-    chain = Pipeline(rows).batch(2)
+    chain = Pipeline(rows).batch(4)
     loading = Loading(workers=0, threads=1, read_buffer=1)
     partition = DataPartition(index=0, count=4)
 

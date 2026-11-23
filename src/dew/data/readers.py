@@ -348,9 +348,12 @@ class _PerShare(Forwarding):
         its failure (a file it cannot open) is its own, never a version's (row 12178)."""
         if self._saved is None:
             return
-        read = self._open()
+        read, saved = self._open(), self._saved
+        # Refused, the reader holds no position of it: a restart (`dew.training._fit.restarted`) reads its
+        # own position afresh.
+        self._saved = None
         try:
-            read.set_state(self._saved)
+            read.set_state(saved)
         except (_position.MalformedPosition, PlanChanged):
             # A corrupt cursor of Dew's own, or a position its plan refuses (another cut of its store),
             # whatever Grain wrote beside it: refused as it is.
@@ -365,7 +368,7 @@ class _PerShare(Forwarding):
                               f"which this grain {GRAIN} does not read (docs/design/data.md, the rules): "
                               f"resume with grain=={written}, or go on from the run's weights as a new run "
                               "that reads its data afresh") from error
-        self._read, self._started = read, False
+        self._read, self._started, self._saved = read, False, saved
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it
