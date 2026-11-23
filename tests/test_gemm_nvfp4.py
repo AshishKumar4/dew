@@ -807,6 +807,22 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
     want[0, 0] = 2.0 ** -9
     np.testing.assert_array_equal(np.asarray(d_token), want)
 
+    # Beside a route whose products cancel past fp32's largest (the plain transpose not finite there), the
+    # same token's routes of 256 and -255.5 through a 2**-8 value still sum wide: 2**-9, packed or decoded.
+    mixed = formats.NvFp4.of(jnp.stack([codes, second]), jnp.stack([scales, scales]),
+                             jnp.asarray([2.0 ** 110, 2.0 ** -8], jnp.float32))
+    thrice = jnp.asarray([0, 0, 0], jnp.int32)
+    for kernel in ("packed", "xla"):
+        with generation.assumed("sm90"), generation.chosen(nvfp4=kernel):
+            _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(
+                rows, mixed, jnp.asarray([1, 2], jnp.int32), thrice, out_dtype=jnp.float32,
+                interpret_on_cpu=True), token)
+            (d_token,) = pull(jnp.zeros((3, 128), jnp.float32).at[0, :2].set(2.0 ** 100)
+                              .at[1, 2].set(256.0).at[2, 2].set(-255.5))
+        want = np.zeros((1, 512), np.float32)
+        want[0, 0] = 2.0 ** -9
+        np.testing.assert_array_equal(np.asarray(d_token), want, err_msg=kernel)
+
     # A gather routing no token pulls back zeros.
     none, nowhere = jnp.asarray([0, 0], jnp.int32), jnp.zeros((0,), jnp.int32)
     routed = functools.partial(gemm.nvfp4_product, matrix=bank, group_sizes=none, gather=nowhere,
@@ -814,3 +830,39 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
     _, pull = jax.vjp(routed, token)
     (d_none,) = pull(jnp.zeros((0, 128), jnp.float32))
     np.testing.assert_array_equal(np.asarray(d_none), np.zeros((1, 512), np.float32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_nvfp4_products_gathered_gradient_in_a_checked_map_is_the_tokens_sum():
+    """An NVFP4 bank's gathered product in a `shard_map` over two CPU devices that checks the axes its values
+    vary over, the tokens and bank every device's and each device its own routing table: the tokens'
+    gradient is each device's routes summed into their tokens and over the devices, as the product written
+    plainly over the decoded bank gives it, exactly, over small integers (row 1464)."""
+    rng = np.random.default_rng(14641)
+    codes = jnp.asarray(rng.integers(-2, 3, (2, 512, 128)), jnp.float32)
+    bank = formats.NvFp4.of(codes, jnp.ones((2, 32, 128), jnp.float8_e4m3fn),
+                            jnp.asarray([2.0 ** -8, 2.0 ** -7], jnp.float32))
+    decoded = jnp.asarray(bank.decoded(), jnp.float32)
+    tokens = jnp.asarray(rng.integers(-3, 4, (4, 512)), jnp.float32)
+    tables = jnp.asarray([0, 1, 2, 3, 3, 2, 1, 0], jnp.int32)
+    sizes = jnp.asarray([2, 2], jnp.int32)
+    weights = jnp.asarray(rng.integers(-2, 3, (8, 128)), jnp.float32)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def packed(x, table, w):
+        return jnp.sum(gemm.nvfp4_product(x, bank, sizes, table, out_dtype=jnp.float32) * w)
+
+    def plain(x, table, w):
+        experts = jnp.repeat(jnp.arange(2), sizes, total_repeat_length=table.shape[0])
+        rows = x[table].astype(jnp.bfloat16).astype(jnp.float32)
+        return jnp.sum(jnp.einsum('rd,rdw->rw', rows, decoded[experts]) * bank.factor[experts][:, None] * w)
+
+    def gradient(product):
+        def each_device(x, table, w):
+            return jax.grad(product)(x, table, w)
+
+        return jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, data, data), out_specs=whole,
+                                     check_vma=True))(tokens, tables, weights)
+
+    np.testing.assert_array_equal(np.asarray(gradient(packed)), np.asarray(gradient(plain)))

@@ -1178,19 +1178,30 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
 
         product: Callable[..., jax.Array] = packed
         operands = (words, scales, sizes, gather, first)
-        routed = (words, scales, sizes, None, first)
     else:
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
         # product's, whatever precision the program defaults to (`decoded_product`).
         product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
         operands = (bank.decoded(), group_sizes, gather)
-        routed = (operands[0], group_sizes, None)
     factor = bank.factor if group_sizes is None else jnp.repeat(
         bank.factor, sizes, total_repeat_length=count)[:, None]
     # Each row's (its group's) factor joins the sum as `factored` takes a row's: a cancelling cotangent
     # under a factor past fp32's largest pulls back its finite sum, each route at its own power.
-    return factored(product, operands, factor, lhs,
-                    routes=() if gather is None else (gather, routed)).astype(out_dtype)
+    wide = functools.partial(_wide_transpose, interpret_on_cpu=interpret_on_cpu)
+    return factored(product, operands, factor, lhs, wide=wide,
+                    routes=() if gather is None else (gather, (bank.decoded(), sizes))).astype(out_dtype)
+
+
+def _wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array | None, *,
+                    interpret_on_cpu: bool) -> jax.Array:
+    """The rows' transpose of a product with decoded bf16 `matrices` (grouped by `sizes`, or one), in fp32:
+    the cotangent as its bf16 parts (`_bf16_parts`), each part's product exact and summed in fp32, the
+    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding."""
+    parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
+    return functools.reduce(jnp.add, [
+        jnp.asarray(gemm(part, matrices, sizes, transpose_rhs=True, out_dtype=jnp.float32,
+                         precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu))
+        for part in parts])
 
 
 
@@ -1242,10 +1253,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         del saved
         rows, words, scales, sizes, gather, first = operands
         matrices = decoded(words, scales, first)
-        parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
-        d_rows = functools.reduce(jnp.add, [
-            gemm(part, matrices, None if dense else sizes, transpose_rhs=True, out_dtype=jnp.float32,
-                 precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
+        d_rows = _wide_transpose(cotangent, matrices, None if dense else sizes, interpret_on_cpu=interpret)
         if gather is not None:
             d_rows = jnp.zeros(rows.shape, d_rows.dtype).at[gather].add(d_rows)
         leaves = (d_rows.astype(rows.dtype), zero_from_primal(words), zero_from_primal(scales),
