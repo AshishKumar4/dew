@@ -330,6 +330,18 @@ def test_a_step_whose_optimizer_state_is_a_class_made_in_its_factory_plans_and_s
     assert int(state.opt_state.steps) == 2
 
 
+def test_a_dropped_trainer_holds_no_executable_of_its_step():
+    """A trainer that stepped, then dropped: no executable of its step outlives it, its device code and, over
+    several GPUs, its collectives' room freed with it (row 12131: a process-wide store of every plan's
+    executables, 4,096 deep, kept a dropped run's and left a 2xH100's all-reduce no room)."""
+    trainer = lm(split=1)
+    trained(trainer, steps=1)
+    step = weakref.ref(trainer.executable)
+    del trainer
+    gc.collect()
+    assert step() is None
+
+
 def test_a_second_trainer_of_one_step_plans_on_the_executable_the_first_compiled():
     """A second trainer of a process, its step the same program on the same devices as an earlier one's,
     plans on the executable the earlier compiled (`dew.nn.kernels.options.hold`): its plan compiles nothing
