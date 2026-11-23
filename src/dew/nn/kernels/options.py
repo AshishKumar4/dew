@@ -556,6 +556,20 @@ class _Kept:
     reads: Facts
     under: tuple
     reserved: Hashable
+    others: Facts = dataclasses.field(init=False, repr=False)
+    """The facts of `reads` but the refusals' (`_apart`), which a call under the refusals it was found
+    holding under asks again (`_holding`)."""
+
+    def __post_init__(self):
+        self.others = _apart(self.reads)[1]
+
+
+def _apart(reads: Facts) -> tuple[Facts, Facts]:
+    """`reads` as the refusals of the launches a trace read (`report.refusals_of`) and every other fact."""
+    from dew.nn.kernels.templates import report
+
+    refused = _facts.of(report.refusals_of, reads)
+    return refused, {key: fact for key, fact in reads.items() if key not in refused}
 
 
 def _holds(reads: Facts, refusals: tuple) -> bool:
@@ -569,20 +583,20 @@ def _holds(reads: Facts, refusals: tuple) -> bool:
     review's P0s: judged by the live registry, and by the refusals alone)."""
     from dew.nn.kernels.templates import report
 
-    refused = _facts.of(report.refusals_of, reads)
+    refused, others = _apart(reads)
     with report.reading(refusals):
         if not _facts.still(refused):
             return False
-    return _facts.still({key: fact for key, fact in reads.items() if key not in refused})
+    return _facts.still(others)
 
 
 def _holding(kept: Sequence[_Kept], refusals: tuple) -> jax.stages.Compiled | None:
     """The executable of `kept`, a key's, that a call under `refusals` (`report.refusal_snapshot`) runs: one
-    found to hold under them, else one its trace's facts hold under them (`_holds`), found so from here on;
-    None where none does. A key keeps one a refusal scope its calls ran in, so two scopes in turn compile
-    none again."""
+    found to hold under them whose other facts answer still (`_Kept.others`, none for most programs), else
+    one its trace's facts hold under them (`_holds`), found so from here on; None where none does. A key
+    keeps one a refusal scope its calls ran in, so two scopes in turn compile none again."""
     for each in kept:
-        if each.under == refusals:
+        if each.under == refusals and _facts.still(each.others):
             return each.executable
     for each in kept:
         if _holds(each.reads, refusals):
@@ -998,13 +1012,7 @@ class OuterProgram:
                 self._shaped.pop(unaliased)
                 continue
             reserved, _ = self._executables.popitem(last=False)
-            key = reserved[0]
-            evicted = [kept.executable for kept in self._ready.get(key, ()) if kept.reserved == reserved]
-            left = tuple(kept for kept in self._ready.get(key, ()) if kept.reserved != reserved)
-            if left:
-                self._ready[key] = left
-            else:
-                self._ready.pop(key, None)
+            evicted = self._let_go(reserved)
             running = {id(kept.executable) for kept_all in self._ready.values() for kept in kept_all}
             for executable in (executable for executable in evicted if id(executable) not in running):
                 for abstract in [abstract for abstract, held in self._shaped.items()
@@ -1017,6 +1025,18 @@ class OuterProgram:
         held = {id(kept.executable) for kept_all in self._ready.values() for kept in kept_all}
         held |= {id(entry[0]) for entry in self._shaped.values()}
         return len(held) + sum(not pending.done() for pending in self._executables.values())
+
+    def _let_go(self, reserved: tuple[Hashable, tuple]) -> list[jax.stages.Compiled]:
+        """Let go of the executables kept under the call's key that the reservation `reserved` settled
+        (`_Kept.reserved`); the ones let go. Called with `_compiling` held."""
+        key = reserved[0]
+        evicted = [kept.executable for kept in self._ready.get(key, ()) if kept.reserved == reserved]
+        left = tuple(kept for kept in self._ready.get(key, ()) if kept.reserved != reserved)
+        if left:
+            self._ready[key] = left
+        else:
+            self._ready.pop(key, None)
+        return evicted
 
     def _kept_under(self, key: Hashable, kept: _Kept) -> None:
         """Keep `kept` under the call's `key` (`_ready`), first, past any it replaces (its executable's or its
@@ -1061,11 +1081,18 @@ class OuterProgram:
             return communicators.called(executable, lambda: executable(*dynamic, **named))
 
     def _reserved(self, key: tuple[Hashable, tuple]) -> tuple[Future[jax.stages.Compiled], bool]:
-        """The compile kept under `key` and whether this caller owns it: a future its owner settles
-        (`_keep`, `_released`), reserved where none is, the bound `CACHED` held over everything it keeps
-        (`_bounded`); the map alone held, so calls of other keys compile at once."""
+        """The compile kept under `key` (a call's key and the refusals it began under) and whether this caller
+        owns it: a future its owner settles (`_keep`, `_released`), reserved where none is, or where the one
+        settled holds no longer under them (`_holds`: a fact its trace read answering otherwise), let go with
+        the executable it kept; the bound `CACHED` held over everything it keeps (`_bounded`); the map alone
+        held, so calls of other keys compile at once."""
         with self._compiling:
             pending = self._executables.get(key)
+            if (pending is not None and pending.done() and pending.exception() is None
+                    and not _holds(self._reads.get(pending.result(), {}), key[1])):
+                self._executables.pop(key)
+                self._let_go(key)
+                pending = None
             owner = pending is None
             if owner:
                 pending = self._executables[key] = Future()
@@ -1092,10 +1119,14 @@ class OuterProgram:
                 self._settle(reserved, pending, executable, settled, args, kwargs)
                 return executable
         try:
-            return pending.result()
+            executable = pending.result()
         except _Resettled:
             # Kept under other refusals than this call's (`_settle`): looked up, or compiled, under its own.
             return self._kept(key, args, kwargs, report.refusal_snapshot())
+        # Another caller's compile, settled where a fact its trace read may answer otherwise now: taken where
+        # it holds, else compiled again (`_reserved` lets it go).
+        return executable if _holds(self._reads.get(executable, {}), refusals) else self._kept(
+            key, args, kwargs, refusals)
 
     def _lowered_aside(self, args: tuple, kwargs: dict, relowered: Relowered
                        ) -> tuple[jax.stages.Lowered, tuple[bool, ...], tuple, Facts]:
