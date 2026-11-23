@@ -295,7 +295,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         family = pricing.family_of(config, jnp.bfloat16, self.launch_target() if target is None else target)
         return family.registers(config.warpgroups) if family.budgets_registers else 0
 
-    def _steps(self, ba) -> tuple[int, ...] | None:
+    def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba
         return self.STEPS
 
@@ -305,7 +305,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         from .templates.gemm import pricing
 
         return pricing.granular_tile(
-            family, config, ba.arguments['tokens'].dtype, target=target, steps=self._steps(ba),
+            family, config, ba.arguments['tokens'].dtype, target=target, steps=self._step_sizes(ba),
             accumulators=1 if ba.arguments.get('paired') is None else 2,
             exact_sums=bool(ba.arguments.get('exact_sums')),
             stream_blocks=lambda: self._allocations(ba, config, family).blocks)
@@ -438,7 +438,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
                                       candidate=lambda tile: (self.candidate(ba, tile, target)
                                                               and (admits is None or admits(tile))),
                                       launch_of=lambda tile: self.launch_of(ba, tile, target),
-                                      grouped=depth is not None, depths=self._steps(ba),
+                                      grouped=depth is not None, depths=self._step_sizes(ba),
                                       dense=bool(ba.arguments.get('dense')),
                                       ragged=self._ragged(ba, tried[0]),
                                       units=self._vector_units(ba, tried[0]))
@@ -931,7 +931,7 @@ class MosaicGmm(_Mosaic):
         return depth_partial, width_partial
 
     def _depth_unit(self, ba, family: mosaic.Family, dtype) -> int:
-        step = min(self._steps(ba) or family.depths(dtype))
+        step = min(self._step_sizes(ba) or family.depths(dtype))
         if ba.arguments['hooks'].prologue is None:
             return step
         return math.lcm(step, family.vector_unit(jnp.float32), self._vector_units(ba, family)[2])
@@ -949,7 +949,7 @@ class MosaicGmm(_Mosaic):
         # A depth run with its last step partial (`_partial_axes`) is masked too, its mask a vector of the
         # depth whose last step's load past it reads zeros.
         layouts = self._families(ba, target)
-        steps = self._steps(ba) or (layouts[0].depths(ba.arguments['tokens'].dtype) if layouts else ())
+        steps = self._step_sizes(ba) or (layouts[0].depths(ba.arguments['tokens'].dtype) if layouts else ())
         whole = depth is not None and any(depth % step == 0 for step in steps)
         # A binding aligned once keeps its mask (planning aligns the bound call again: `_ran`, `registers`).
         if hooks.prologue is None or depth is None or (depth == padded and whole) or hooks.depth_masked:
@@ -1451,7 +1451,7 @@ class MosaicWordPackedGmm(MosaicGmm):
     def _scaled(self) -> bool:
         return True
 
-    def _steps(self, ba) -> tuple[int, ...] | None:
+    def _step_sizes(self, ba) -> tuple[int, ...] | None:
         return self._desc(ba).steps
 
     def _desc(self, ba) -> packed.PackedWeightFormat:
