@@ -520,7 +520,9 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
                 compiled.append(steps.compile(state, placed))
             for _ in range(2):
                 state, *_ = compiled[1](state, placed)
-            return jax.device_get(steps.stored(state).variables["params"])
+            # The moments beside the weights: an update in the backward writes them apart.
+            stored = steps.stored(state)
+            return jax.device_get({"params": stored.variables["params"], "opt_state": stored.opt_state})
         return run
 
     assert_as_exact(stepped(scan=True), stepped(scan=False), lambda drawn: (np.int64(drawn),),

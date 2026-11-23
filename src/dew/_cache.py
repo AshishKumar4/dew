@@ -170,14 +170,16 @@ def kept_beside(name: str, *, variable: str | None = None, configured: bool = Fa
 def read_kept(path: Path) -> JSON | None:
     """The record kept at `path` (`keep`), or None where none is or it cannot be read (a home it cannot
     open, whose write the keeping then logs as its miss), or where it does not parse (another writer's
-    partial or truncated file), in which case its maker makes it again, that miss logged."""
+    partial or truncated file, or bytes no UTF-8 text holds), in which case its maker makes it again, that
+    miss logged."""
     try:
-        text = path.read_text()
+        held = path.read_bytes()
     except OSError as unopened:
         _log.debug("no record kept at %s to read (%s)", path, unopened)
         return None
     try:
-        return json.loads(text)
+        # Decoding and parsing alike: a `UnicodeDecodeError` is a `ValueError`.
+        return json.loads(held.decode())
     except ValueError as unread:
         _log.warning("the record kept at %s is unreadable (%s): it is made again", path, unread)
         return None
