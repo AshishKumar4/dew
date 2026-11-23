@@ -878,6 +878,12 @@ class Loader:
     batch, or on the token clock, whose phases begin where the run's commits reach them."""
 
     @property
+    def each_token_batch(self) -> tuple[int | None, ...]:
+        """Each phase's token batch (`token_batches`), or the one batch's (`batch_tokens`) of a read of one:
+        what an update of tokens divides (`dew.training.UpdateBatch.of_tokens`)."""
+        return self.token_batches or (self.batch_tokens,)
+
+    @property
     def steps_per_epoch(self) -> int | None:
         return None if self.records is None else self._steps(self.records)
 

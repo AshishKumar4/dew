@@ -82,24 +82,67 @@ def test_compiled_scores_follow_substituted_modules_and_head_tiles():
 def test_the_initializer_dispatches_through_the_public_init():
     """The trainer reaches an objective's initialization the way any caller
     does. An override of `init` decides what the state holds, whether it is
-    called directly or through the initializer the trainer compiles."""
+    called directly or through the initializer the trainer compiles, one
+    taking its variables by keyword alone, as the base names them, among
+    them, with a held tree and without (row 12091)."""
     from dew.objectives.lm import LMObjective
 
     class Zeroed(LMObjective):
         def init(self, key, variables=None):
             return jax.tree.map(jnp.zeros_like, LMObjective.init(self, key, variables))
 
+    class KeywordZeroed(LMObjective):
+        def init(self, key, *, variables=None):
+            return jax.tree.map(jnp.zeros_like, LMObjective.init(self, key, variables))
+
     tiny = lm_objective()
     weights = jax.jit(tiny.init)(jax.random.key(0))
-    objective = Zeroed(tiny.model, seq_len=4, variables=weights)
     key = jax.random.key(0)
 
-    for tree in (objective.init(key), objective.initializer(key),
-                 jax.jit(objective.initializer)(key),
-                 jax.jit(lambda i, k: i(k))(objective.initializer, key)):
-        nonzero = sum(int(np.count_nonzero(np.asarray(leaf)))
-                      for leaf in jax.tree.leaves(tree))
-        assert nonzero == 0, f"the override was bypassed; {nonzero} values are nonzero"
+    for override in (Zeroed, KeywordZeroed):
+        for held in (weights, None):
+            objective = override(tiny.model, seq_len=4, variables=held)
+            for tree in (objective.init(key), objective.initializer(key),
+                         jax.jit(objective.initializer)(key),
+                         jax.jit(lambda i, k: i(k))(objective.initializer, key)):
+                nonzero = sum(int(np.count_nonzero(np.asarray(leaf)))
+                              for leaf in jax.tree.leaves(tree))
+                assert nonzero == 0, f"the override was bypassed; {nonzero} values are nonzero"
+
+
+@pytest.mark.parametrize("read", ["drawn shapes", "parameter axes", "held parameter axes"])
+def test_an_objectives_drawn_shapes_and_axes_compute_nothing(read):
+    """An objective's drawn shapes (`drawn_shapes`) and its parameters' axes (`parameter_axes`: a fresh
+    objective's draw, and a held tree's, which redraws), each read alone on a compile-only GPU as the
+    default device, on which nothing computes (a GPU tier's prepare): each traces its draw for shapes alone,
+    its key made within the trace, where its key made outside raised on such a device and the tier ran the
+    test unprepared (rows 12147-12150)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    held = jax.eval_shape(lm_objective().init, jax.random.key(0)) if read.startswith("held") else None
+    objective = lm_objective(held)
+    with jax.default_device(compile_only_gpus("sm80")[0]):
+        found = objective.drawn_shapes() if read == "drawn shapes" else objective.parameter_axes
+    assert jax.tree.leaves(found) or found
+
+
+def test_an_objectives_drawn_shapes_trace_its_held_tree_as_the_arrays_it_stands_for():
+    """An objective holding a tree of shapes (`jax.ShapeDtypeStruct`s: a resumed run's base) whose `init`
+    reads its held leaves as arrays (a head's start transposing the base's vocabulary table): its drawn
+    shapes trace the held tree as the draw's arguments, the arrays it stands for, where closed over it was
+    handed to `init` as the structs themselves, which have no array's methods (row 12147's review, row
+    7386)."""
+    from dew.batch import unboxed
+    from dew.objectives.lm import LMObjective
+
+    class Transposing(LMObjective):
+        def init(self, key, variables=None):
+            return jax.tree.map(lambda leaf: leaf.T.T, LMObjective.init(self, key, variables))
+
+    tiny = lm_objective()
+    held = jax.eval_shape(tiny.init, jax.random.key(0))
+    shapes = Transposing(tiny.model, seq_len=4, variables=held).drawn_shapes()
+    assert jax.tree.map(np.shape, shapes) == jax.tree.map(np.shape, unboxed(held))
 
 
 def test_the_initializer_and_init_return_the_same_tree():

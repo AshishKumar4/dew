@@ -448,8 +448,9 @@ this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
 choice traces again within it."""
 
 DRAWING = _context(0)
-"""How many draws of a model's variables this thread traces within (`dew.nn.kernels.generation.drawing`),
-keyed on as `KERNEL_CHOICES` is: a draw selects no kernel, so its trace is never another's."""
+"""1 where this thread traces a draw of a model's variables (`dew.nn.kernels.generation.drawing`), else 0,
+keyed on as `KERNEL_CHOICES` is: a draw selects no kernel, so its trace is never another's, and one draw's
+trace within another's is that draw's (row 12092)."""
 
 NUMERICS = _context(None)
 """The run's numerics `dew.nn.kernels.generation.run_precision` holds in this thread

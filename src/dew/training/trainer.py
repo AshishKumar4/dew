@@ -495,7 +495,7 @@ class Trainer(Generic[Loss, Effects]):
         progress = self._config is not None and self._config.reads_progress()
         # An update of tokens pools as many of the loader's token batches (`UpdateBatch.of_tokens`), known
         # from here on, for every step a fit or a caller's own compile takes.
-        self.accumulation = self.update.of_tokens(loader.token_batches or (loader.batch_tokens,))
+        self.accumulation = self.update.of_tokens(loader.each_token_batch)
         self._update_read = True
         # Unstaged until its stream is read (`staged`): a ramp of a fit before is none of this one's, nor
         # its batches read whole.

@@ -559,13 +559,18 @@ def test_a_decay_mask_decays_the_parameters_its_tree_names_alone(grouped):
     ({"spared": False, "decay_mask": {"w": 0}}, "tree of booleans"),
     ({"spared": False, "decay_mask": {"w": None}}, "tree of booleans"),
     ({"spared": False, "decay_mask": {}}, "tree of booleans"),
-    ({"param_groups": (ParamGroup("all", ("*",), spared=True, decay_mask={"w": True}),)}, "spares its decay"),
-], ids=["spared", "int-leaf", "none-leaf", "empty", "spared-group"])
+    ({"group": {"spared": True, "decay_mask": {"w": True}}}, "spares its decay"),
+    ({"group": {"spared": False, "decay_mask": {"w": 1}}}, "tree of booleans"),
+], ids=["spared", "int-leaf", "none-leaf", "empty", "spared-group", "int-leaf-group"])
 def test_a_decay_mask_a_spared_decay_writes_over_or_of_other_leaves_than_booleans_is_refused(held, refusal):
     """A decay mask beside a decay that spares, whose own mask is written over it, or whose leaves are not
-    booleans, is refused as the config is built, never trained under another mask than it names."""
+    booleans, is refused as the config or its param group is made, never trained under another mask than it
+    names."""
     with pytest.raises(ValueError, match=refusal):
-        OptimConfig(optimizer=AdamW(weight_decay=0.1), **held)
+        if "group" in held:
+            ParamGroup("all", ("*",), **held["group"])
+        else:
+            OptimConfig(optimizer=AdamW(weight_decay=0.1), **held)
 
 
 def test_a_decay_mask_on_an_optimizer_that_takes_none_is_refused():

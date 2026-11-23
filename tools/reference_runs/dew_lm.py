@@ -71,7 +71,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--attention", default="auto")
     parser.add_argument("--head-chunks", type=int, default=4)
     parser.add_argument("--split", type=int, default=None,
-                        help="the microbatches a step's batch is read in (Trainer's split); unset plans it")
+                        help="the microbatches a step's batch is read in (FitPolicy.split); unset plans it")
     parser.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32",
                         help="Adam's moments in memory (dew.optim.Adam.state_dtype)")
     parser.add_argument("--remat", default=None, choices=sorted(REMAT_POLICIES),
@@ -170,7 +170,7 @@ def build(args: argparse.Namespace) -> Run:
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
     trainer = Trainer(objective, solver, key=jax.random.key(0), mesh=mesh, checkpoints=None, tracker=None,
-                      fit=FitPolicy(split=args.split))
+                      fit=FitPolicy(split="auto" if args.split is None else args.split))
     state, _, _ = trainer.place()
     del pretrained
     placement = batch_shardings(trainer.device_mesh, rows(np.arange(args.batch)))

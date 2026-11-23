@@ -27,7 +27,7 @@ from dew._builds import (
     newest_build,
     runs_on,
 )
-from dew._pool import answered, cuda_driver, runs_on_gpu
+from dew._pool import answered, cuda_driver, named_platforms, runs_on_gpu
 from dew._records import JSON
 
 _log = logging.getLogger(__name__)
@@ -186,8 +186,7 @@ def opens_tpu() -> bool:
     from dew.clusters import cloud_tpu_vm
 
     jax = sys.modules.get("jax")
-    platforms = (jax.config.jax_platforms if jax is not None else os.environ.get("JAX_PLATFORMS")) or ""
-    named = {platform.strip() for platform in platforms.split(",") if platform.strip()}
+    named = named_platforms(jax.config.jax_platforms if jax is not None else os.environ.get("JAX_PLATFORMS"))
     return "tpu" in named if named else cloud_tpu_vm(os.environ)
 
 

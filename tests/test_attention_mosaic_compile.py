@@ -9,6 +9,8 @@ score hook's lowering. The mainloop's values are tests/test_attention_mosaic.py'
 import dataclasses
 import functools
 import os
+import shlex
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -855,6 +857,35 @@ print(json.dumps([[found.op, found.stored, {name: module for name, (module, _) i
 """A start's lowering of an H100's attention forward in a process of its own, each launch certified on a
 compile-only H100: each certification's op, whether its verdict was read back, and its kernels' modules."""
 
+VERDICT_KEYS = """
+import json
+import sys
+from dew.nn.kernels.templates import report
+
+print(json.dumps({target: report._verdict_key("launch", 1, False, None, target)
+                  for target in sys.argv[1:]}))
+"""
+"""One launch's verdict key (`report._verdict_key`) for each compile target its arguments name, in a process
+of its own: what decides it read afresh."""
+
+BUILDS = ("Build cuda_12.9.r12.9/compiler.00000001_0", "Build cuda_12.9.r12.9/compiler.00000002_0")
+"""Two builds a ptxas states of itself (`_ptxas_stating`)."""
+
+
+def _ptxas_stating(directory: Path, build: str | None) -> None:
+    """A ptxas in `directory`'s bin that states `build` as its own (`--version`'s last line), its other lines
+    the installed ptxas's, and assembles as that one does; with `build` None, one whose `--version` fails."""
+    from jax._src.lib import cuda_path
+
+    assert cuda_path is not None, "no installed ptxas to assemble with"
+    installed = shlex.quote(os.path.join(cuda_path, "bin", "ptxas"))
+    stated = ("exit 1" if build is None else
+              f"{installed} --version | sed '$d'; echo {shlex.quote(build)}; exit 0")
+    ptxas = directory / "bin" / "ptxas"
+    ptxas.parent.mkdir(parents=True, exist_ok=True)
+    ptxas.write_text(f'#!/bin/sh\nif [ "$1" = --version ]; then {stated}; fi\nexec {installed} "$@"\n')
+    ptxas.chmod(0o755)
+
 
 @COMPILES_ON_CPU
 def test_a_launchs_kernels_are_named_alike_on_every_part_of_one_generation_and_size():
@@ -913,25 +944,57 @@ def test_a_launch_is_certified_once_a_machine(tmp_path):
     assert certified(warm) == certified(cold)
 
 @COMPILES_ON_CPU
-def test_a_launchs_stored_verdict_is_not_read_where_another_nvcc_wheel_is_installed(tmp_path):
-    """A launch certified by one process is certified again by the next where the installed CUDA nvcc wheels
-    differ (another wheel's metadata on its path, its kernels' IR the same): the wheels name the ptxas that
-    judges a kernel's spills and serialized products (`report._assemblers`), so neither the launch's own key
-    nor its lowered kernels' key reads a verdict judged under other wheels back (row 10782: the lowered key
-    named none). The child changes wheel metadata alone, not the ptxas binary or the provider XLA selects;
-    that a fingerprint of wheels is no whole compiler identity is row 7309's."""
-    from process_support import REPO_ROOT, fresh, keeping_picks
+def test_a_launchs_stored_verdict_is_read_where_its_ptxas_build_assembles_and_not_another(tmp_path):
+    """A launch certified by one process is certified by its stored verdict in the next where the same ptxas
+    build assembles its kernels, and again where another build does at the same path: the ptxas Mosaic GPU
+    names (`_get_assembler`, here `CUDA_HOME`'s, a path holding a parenthesis and a comma) judges a kernel's
+    spills and serialized products, so its build keys the verdict (row 10782: the lowered key named none). The
+    nvcc wheels named it before, never a system CUDA's ptxas (row 7309)."""
+    from process_support import fresh, keeping_picks
 
-    moved = tmp_path / "site"
-    (moved / "nvidia_cuda_nvcc_cu12-99.0.dist-info").mkdir(parents=True)
-    (moved / "nvidia_cuda_nvcc_cu12-99.0.dist-info" / "METADATA").write_text(
-        "Metadata-Version: 2.1\nName: nvidia-cuda-nvcc-cu12\nVersion: 99.0\n")
-    path = os.pathsep.join((str(REPO_ROOT / "src"), str(REPO_ROOT / "tests"), str(moved)))
-    cold = fresh(CERTIFIED_FORWARD, cache_dir=tmp_path, flags=keeping_picks())
-    reassembled = fresh(CERTIFIED_FORWARD, cache_dir=tmp_path, flags=keeping_picks(),
-                        variables={"PYTHONPATH": path})
+    home = tmp_path / "CUDA (13), local"
+
+    def run() -> list:
+        return fresh(CERTIFIED_FORWARD, cache_dir=tmp_path / "xla", flags=keeping_picks(),
+                     variables={"CUDA_HOME": str(home), "XDG_CACHE_HOME": str(tmp_path / "cache")})
+
+    _ptxas_stating(home, BUILDS[0])
+    cold, warm = run(), run()
+    _ptxas_stating(home, BUILDS[1])
+    reassembled = run()
     assert cold and not any(stored for _, stored, _ in cold), cold
+    assert all(stored for _, stored, _ in warm), warm
     assert reassembled and not any(stored for _, stored, _ in reassembled), reassembled
+
+
+@COMPILES_ON_CPU
+def test_a_cuda_targets_verdict_key_names_the_ptxas_jax_gives_xla_and_none_stating_no_build(tmp_path):
+    """XLA assembles a Pallas-Triton kernel with the ptxas in the CUDA directory JAX gives each compile
+    (`CUDA_ROOT`'s here), which Mosaic GPU's assembler does not search: a CUDA target's verdict key names that
+    ptxas's build, so another build at the same path keys a launch afresh, and one stating none (its
+    `--version` failing) keys it nowhere, its verdict unstored, where certifying the launch raised (row
+    7309)."""
+    from process_support import fresh
+
+    root = tmp_path / "cuda"
+
+    def key(build: str | None) -> str | None:
+        _ptxas_stating(root, build)
+        return fresh(VERDICT_KEYS, "sm90", variables={"CUDA_ROOT": str(root)})["sm90"]
+
+    first, other, again, unstated = (key(build) for build in (*BUILDS, BUILDS[0], None))
+    assert first is not None and other is not None and first == again != other
+    assert unstated is None
+
+
+def test_a_tpu_targets_verdict_key_reads_no_gpu_assembler():
+    """A TPU target's verdict key, on an install whose Mosaic GPU bindings do not import (a TPU-only one),
+    names no GPU assembler: reading Mosaic GPU's raised there for every MXU launch certified."""
+    from process_support import fresh
+
+    unbound = "import sys\nsys.modules['jax._src.lib.mosaic_gpu'] = None\n" + VERDICT_KEYS
+    assert fresh(unbound, "v5e")["v5e"] is not None
+
 
 EDITED_FORWARD = """
 import jax

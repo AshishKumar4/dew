@@ -42,7 +42,7 @@ from dew._builds import generation_builds
 from dew._devices import cuda_builds, nvidia_gpus
 from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, compile_only_gpus, gpu_target
-from dew.nn.kernels.lowered import kernel_calls, triton_kernels
+from dew.nn.kernels.lowered import kernel_calls, triton_kernels, unsynced_commits
 from dew.nn.kernels.templates import assembled, report, resources
 
 MOSAIC_REFUSED = re.compile(r"smem_bytes=(\d+) > max_smem_bytes=\d+")
@@ -423,6 +423,11 @@ def _compiled(case, generation: str, record: dict,
     # find its spills only as its whole program compiles.
     record["uncertified"] = _uncertified_since(uncertified)
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
+    # A tensor-core commit past another warp's wait wedges the launch where it runs: the case fails as one
+    # that does not compile, in every gate reading its records (`failures`, row 12144).
+    if unsynced := [found for call in calls for found in unsynced_commits(call.ir)]:
+        record["error"] = "its tensor-core commits pass another warp's wait: " + "; ".join(unsynced)
+        return None
     modules = report.kernel_modules(calls)
     record["modules"] = modules
     # Each kernel certification compiled alone in this process, by name and launch: its module.
