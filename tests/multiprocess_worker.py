@@ -1033,7 +1033,7 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
     model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
                          num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                   mesh=MeshSpec(fsdp=fsdp, stage=stage), fit=FitPolicy(split=microbatches),
+                   mesh=MeshSpec(fsdp=fsdp, stage=stage), fit=FitPolicy(microbatches=microbatches),
                    layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
 
 
@@ -1061,7 +1061,7 @@ def mode_pipeline(args) -> dict:
     rows = BATCH // args.processes
     mine = token_batch()[args.process_id * rows:(args.process_id + 1) * rows]
     # The step's split where the command names one, else the planner's.
-    trainer = pipeline_trainer(args.stage_size, args.microbatches or "auto", args.fsdp_size)
+    trainer = pipeline_trainer(args.stage_size, args.microbatches, args.fsdp_size)
     losses, state = pipeline_losses(trainer, mine, args.steps)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     return {

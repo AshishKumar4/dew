@@ -217,8 +217,8 @@ record, a run that trained, never acts on."""
 
 def _update_and_fit(fields: Mapping[str, _records.JSON]) -> dict[str, _records.JSON]:
     """A trainer config's fields with its earlier batching fields (`EARLIER_TRAINER_FIELDS`) as its update
-    and its fit policy: its token budget or its accumulation as the update, its split, or its pipeline's
-    microbatches, which it read under a mesh of stages alone, as the fit's split; its dynamic scale
+    and its fit policy: its token budget or its accumulation as the update, its split and its pipeline's
+    microbatches as the fit's (`FitPolicy.split`, `FitPolicy.microbatches`); its dynamic scale
     stated as its numerics' loss scaling, unset as theirs, "auto"; its length as its horizon; its publishing
     its W&B sink's; and no target to lower for. Carried to 1.0 (ledger 1552)."""
     from dew.nn.precision import Numerics, numerics_of
@@ -232,21 +232,12 @@ def _update_and_fit(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
         precision = dict(recorded) if isinstance(recorded, Mapping) else {}
         kept["precision"] = {**precision, "loss_scaling": "dynamic" if scaled else "none"}
     tokens, batches = fields.get("update_tokens"), fields.get("accumulation", 1)
-    # Under a mesh of stages the step's split is the microbatches its stages feed (`microbatches`), which
-    # its outer split never was; elsewhere it is the split.
-    staged = _staged(kept.get("mesh"))
-    if staged and fields.get("split") not in (None, 1):
-        raise ValueError(f"an earlier run split its pipeline's step in {fields['split']} beside the "
-                         "microbatches its stages fed, which this Dew's fit does not hold apart "
-                         "(`FitPolicy.split` is the microbatches a pipeline feeds): resume it under the Dew "
-                         "that saved it")
-    split = fields.get("microbatches") if staged else fields.get("split")
     if tokens is not None:
         kept["update"] = {"tokens": tokens}
     elif batches != 1:
         kept["update"] = {"batches": batches}
-    if split is not None:
-        kept["fit"] = {"split": split}
+    if fit := {key: fields[key] for key in ("split", "microbatches") if fields.get(key) is not None}:
+        kept["fit"] = fit
     if lengths := {key: fields[key] for key in EARLIER_LENGTHS if fields.get(key) is not None}:
         kept["horizon"] = lengths
     wandb = kept.get("wandb")
@@ -258,14 +249,6 @@ def _update_and_fit(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
         published: dict[str, _records.JSON] = {**held, "publish": True}
         kept["wandb"] = {**record, "fields": published} if tagged is not None else published
     return kept
-
-
-def _staged(mesh: _records.JSON) -> bool:
-    """Whether a trainer's recorded `mesh` (flat or by its class) holds a pipeline of two stages or more."""
-    tagged = _records.class_record(mesh) if isinstance(mesh, Mapping) else None
-    held = tagged[1] if tagged is not None else mesh
-    stage = held.get("stage", 1) if isinstance(held, Mapping) else 1
-    return isinstance(stage, int) and stage >= 2
 
 
 EARLIER_OPTIMIZER_FIELDS = ("optimizer_opts", "b1", "b2", "weight_decay", "state_dtype")
@@ -295,8 +278,14 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     assert isinstance(named, str), named
     typed = earlier_typed(named) is not None
     named = EARLIER_OPTIMIZER_PATHS.get(named, named)
-    # Dew's own optimizers take no mask; an Optax factory takes its options as they were given.
+    # Dew's own optimizers take no mask; an Optax factory takes its options as they were given. Muon's took
+    # its matrices' decay mask by its own keyword, which is the decay's own mask now (`decay_mask`).
     mask = opts.pop("mask", None) if typed else None
+    muon_mask = opts.pop("weight_decay_mask", None) if named in MUON_GROUPS else None
+    clipped = fields.get("clip_grads")
+    if named == "gauss_newton" and isinstance(clipped, (int, float)) and clipped > 0:
+        # Its own cap the config's clip wrote over (`OptimConfig.build`), which caps it once now.
+        opts.pop("clip", None)
     stated = {key: fields[key] for key in ("b1", "b2", "weight_decay") if fields.get(key) is not None}
     if fields.get("state_dtype", "float32") != "float32":
         stated["state_dtype"] = fields["state_dtype"]
@@ -310,6 +299,7 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     kept = {key: value for key, value in fields.items() if key not in EARLIER_OPTIMIZER_FIELDS}
     if typed:
         settings, kept = _unmasked(mask, settings, kept)
+        kept = _muon_masked(muon_mask, kept)
         optimizer = {"class": named, "fields": settings}
     else:
         optimizer = {"class": "optax", "fields": {"path": named, "settings": settings}}
@@ -317,6 +307,27 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
 
 
 type _Fields = dict[str, _records.JSON]
+
+MUON_GROUPS = ("muon", "muonclip")
+"""The optimizers an earlier run named whose matrices' decay took its mask by `weight_decay_mask`
+(`dew.optim.Muon.masked_by`)."""
+
+
+def _muon_masked(mask: _records.JSON, config: _Fields) -> _Fields:
+    """An earlier Muon's matrices' decay `mask` (its options' `weight_decay_mask`) as its config's decay
+    mask (`OptimConfig.decay_mask`), or each of its param groups' where it groups (`ParamGroup.decay_mask`);
+    none where it masked by none. Refused where it is no tree of booleans, which no record rebuilds."""
+    if mask is None:
+        return config
+    if not isinstance(mask, Mapping):
+        raise ValueError(f"an earlier Muon masked its matrices' decay by {mask!r}, which no record of this "
+                         "Dew states: set OptimConfig.decay_mask in its place")
+    groups = config.get("param_groups") or []
+    assert isinstance(groups, list), groups
+    if not groups:
+        return {**config, "decay_mask": mask}
+    return {**config, "param_groups": [{**group, "decay_mask": mask} if isinstance(group, Mapping) else group
+                                       for group in groups]}
 
 
 def _unmasked(mask: _records.JSON, settings: _Fields, config: _Fields) -> tuple[_Fields, _Fields]:

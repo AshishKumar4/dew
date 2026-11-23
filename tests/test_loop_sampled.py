@@ -739,7 +739,6 @@ def counted_objective(name: str, at) -> tuple:
     from dew.diffusion.discrete import MDLM
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
     from dew.objectives.distillation import DistillationObjective
-    from dew.objectives.lm.adaptation import ChunkAdaptation
     from dew.objectives.rl.preference import DPOObjective
 
     tokens = jnp.asarray(np.random.default_rng(0).integers(0, 255, (2, 17)), jnp.int32)
@@ -751,23 +750,19 @@ def counted_objective(name: str, at) -> tuple:
         model = at(looped(steps=CAP).clone(causal=False))
         return (MaskedDiffusionObjective(model, MDLM(mask_id=255)(), seq_len=16, ema_decay=None),
                 {"text": tokens[:, :16]}, False)
-    if name == "distillation":
-        student, teacher = (LMObjective(at(looped(steps=CAP)), 16, ema_decay=None) for _ in range(2))
-        return DistillationObjective(student, teacher, alpha=0.5), {"text": tokens}, False
-    assert name == "stacked-adaptation"
-    adaptation = ChunkAdaptation(window=3, rate=0.05, layers=(0,))
-    return LMObjective(at(looped(steps=CAP)), 16, adaptation=adaptation), {"text": tokens}, False
+    assert name == "distillation"
+    student, teacher = (LMObjective(at(looped(steps=CAP)), 16, ema_decay=None) for _ in range(2))
+    return DistillationObjective(student, teacher, alpha=0.5), {"text": tokens}, False
 
 
 @pytest.mark.parametrize("count", range(1, CAP + 1))
-@pytest.mark.parametrize("name", ["dpo", "masked-diffusion", "distillation", "stacked-adaptation"])
+@pytest.mark.parametrize("name", ["dpo", "masked-diffusion", "distillation"])
 def test_an_objectives_cap_program_at_a_drawn_count_is_that_counts_objective(name, count):
     """Every objective a sampled run trains over a looped decoder runs its cap's one program at the count its
     microbatch drew (`LOOP_PASSES`, traced), as a language model's does: a preference pair's policy and
-    reference, a masked diffusion's denoiser, a distillation's student and teacher, and a decoder stepping
-    its own blocks in context chunk by chunk, each loss and every parameter's gradient on par from float64
-    with the objective over the models of that count's own (`with_passes`; review of row 11951: each was
-    refused, which main trained at every count)."""
+    reference, a masked diffusion's denoiser, and a distillation's student and teacher, each loss and every
+    parameter's gradient on par from float64 with the objective over the models of that count's own
+    (`with_passes`; review of row 11951: each was refused, which main trained at every count)."""
     capped, batch, referenced = counted_objective(name, lambda model: model)
     fixed, _, _ = counted_objective(name, lambda model: model.with_passes(count))
     # A run drawing its count per microbatch trains it, its every count by the cap's one program.
@@ -903,17 +898,22 @@ def test_a_decision_heads_cap_program_whose_backbone_encodes_its_context_runs_bo
                     truth_fn=jax.jit(own_in_float64))
 
 
-def test_a_sampled_objective_names_its_loss_s_forward():
+def test_a_sampled_objective_names_its_loss_s_forward_and_a_counted_run_refuses_one_that_takes_no_count():
     """The forward a run drawing its count per microbatch checks takes the count is the one its
-    objective's loss reads a module by (`Objective.counted_forward`, `chunked.read_method`), an adaptation
-    stepping the decoder's own layers chunk by chunk among them (`ChunkAdaptation.layers`), whose trunk runs
-    at the count too (`stacked_scores`)."""
+    objective's loss reads a module by (`Objective.counted_forward`, `chunked.read_method`); and an LM whose
+    adaptation steps its decoder's own layers chunk by chunk (`ChunkAdaptation.layers`) through its decode
+    cache, whose loop runs no count given per call, reads no count, so such a run is refused (row 12300)."""
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.objectives.lm.adaptation import ChunkAdaptation
+    from dew.training import Layout, Trainer
 
     model = looped(steps=CAP)
     assert LMObjective(model, 16).counted_forward(model) == "hidden_states"
     adapted = LMObjective(model, 16, adaptation=ChunkAdaptation(window=4, rate=0.5, layers=(0,)))
-    assert adapted.reads_pass_counts and adapted.counted_forward(model) == "hidden_states"
+    assert not adapted.reads_pass_counts and isinstance(model.loop, Loop)
+    with pytest.raises(ValueError):
+        Trainer(adapted, optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+                sampled_passes=TRAINED)
 
 
 @pytest.mark.parametrize("loop", [{"shared_cache": True}, {"exit_threshold": 0.5, "exit_gate": True}],

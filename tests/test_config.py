@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 from affine_run import TimingRegression as Regression, batches
 from diffusion_support import images_of
@@ -26,7 +27,7 @@ from dew.nn.precision import Dtypes, Numerics
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.optim import Adam, AdamW, GaussNewton, Lamb, Muon, MuonClip, Optax, OptimConfig
 from dew.registry import Aliases, ModelConfig, projectors, towers
-from dew.training import Checkpoints, Layout, LocalTracker, MeshSpec, UpdateBatch, Wandb
+from dew.training import Checkpoints, FitPolicy, Layout, LocalTracker, MeshSpec, UpdateBatch, Wandb
 from dew.training.budget import Horizon
 
 
@@ -1352,19 +1353,37 @@ def test_an_optax_factory_takes_the_mask_its_earlier_options_gave_it(tmp_path, m
     assert optimizer == Optax("optax:adamw", {"mask": mask})
 
 
-@pytest.mark.parametrize(("stage", "earlier", "split"), [
-    (2, {"split": 1, "microbatches": None}, "auto"), (2, {"split": 1, "microbatches": 4}, 4),
-    (1, {"split": 2, "microbatches": None}, 2), (2, {"split": 2, "microbatches": 4}, None)],
-    ids=["staged-outer-split", "staged-feeds", "unstaged", "staged-split-refused"])
-def test_a_run_saved_with_its_split_and_its_pipelines_microbatches_loads_its_fit_by_its_mesh(
-        tmp_path, stage, earlier, split):
+def test_an_earlier_muons_mask_and_gauss_newtons_cap_load_as_they_trained(tmp_path):
+    """An earlier Muon run whose options masked its matrices' decay (`weight_decay_mask`) loads that mask as
+    its decay's (`OptimConfig.decay_mask`, by Muon's own keyword); an earlier Gauss-Newton run whose options
+    capped its direction beside the config's clip, which wrote over them, loads capped by the config's
+    alone, as it trained (review of API01: both records were refused)."""
+    from dew.optim import GaussNewton, Muon
+
+    muon = _saved_optimizer(tmp_path / "muon", {"optimizer": "muon", "weight_decay": 0.1,
+                                                 "optimizer_opts": {"weight_decay_mask": {"w": False}}})
+    assert isinstance(muon.optimizer, Muon) and muon.decay_mask == {"w": False}
+    capped = _saved_optimizer(tmp_path / "gauss", {"optimizer": "gauss_newton", "clip_grads": 1.0,
+                                                   "optimizer_opts": {"clip": 0.5}})
+    assert capped.optimizer == GaussNewton() and capped.clip_grads == 1.0
+
+
+@pytest.mark.parametrize(("stage", "earlier", "fit"), [
+    (2, {"split": 1, "microbatches": None}, FitPolicy(split=1)),
+    (2, {"split": 1, "microbatches": 4}, FitPolicy(split=1, microbatches=4)),
+    (1, {"split": 2, "microbatches": None}, FitPolicy(split=2)),
+    (2, {"split": 2, "microbatches": 4}, FitPolicy(split=2, microbatches=4)),
+    (2, {"split": None, "microbatches": None}, FitPolicy())],
+    ids=["staged-outer-split", "staged-feeds", "unstaged", "staged-split-and-feeds", "planned"])
+def test_a_run_saved_with_its_split_and_its_pipelines_microbatches_loads_both_and_trains_them(
+        tmp_path, stage, earlier, fit):
     """A run saved while its trainer held a step's split and a pipeline's microbatches apart (row 11934)
-    loads its fit's split (`FitPolicy.split`) by the mesh it saved: under a pipeline of stages the
-    microbatches its stages fed, the planner's where it named none, never its outer split; elsewhere its
-    split (review of API01: an outer split of 1 read as a pipeline's feed, which a staged trainer refuses).
-    An outer split beside a pipeline's microbatches, which this Dew's fit does not hold apart, is refused
-    rather than dropped."""
+    loads both as it trained them (`FitPolicy.split`, `FitPolicy.microbatches`), whatever its mesh: a
+    staged run's outer split beside the microbatches its stages fed among them (review of API01: refused,
+    a saved run this Dew would not resume), and its trainer holds both."""
     from dew.config.lm import LMRunConfig
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
 
     today = LMRunConfig(trainer=TrainerConfig(mesh=MeshSpec(stage=stage))).record()
     fields = today["fields"]
@@ -1372,11 +1391,13 @@ def test_a_run_saved_with_its_split_and_its_pipelines_microbatches_loads_its_fit
     trainer = {key: value for key, value in fields["trainer"].items() if key != "fit"}
     path = tmp_path / "run.json"
     path.write_text(json.dumps({**today, "fields": {**fields, "trainer": {**trainer, **earlier}}}))
-    if split is None:
-        with pytest.raises(ValueError):
-            LMRunConfig.load(str(path))
-    else:
-        assert LMRunConfig.load(str(path)).trainer.fit.split == split
+    loaded = LMRunConfig.load(str(path)).trainer
+    assert loaded.fit == fit
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
+                              max_seq_len=8)
+    run = Trainer(LMObjective(model, seq_len=4), optax.sgd(0.1), key=jax.random.key(0), fit=loaded.fit,
+                  mesh=loaded.mesh)
+    assert (run.split, run.fit_policy.microbatches) == (fit.stated_split, fit.microbatches)
 
 
 def test_a_run_saved_with_its_experts_packed_loads_with_its_weights_packed(tmp_path):

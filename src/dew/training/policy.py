@@ -62,17 +62,22 @@ class UpdateBatch:
 @dataclasses.dataclass(frozen=True)
 class FitPolicy:
     """How a run's step fits its devices: `split`, the microbatches each step's batch is read in, its rows
-    split evenly (under a mesh of pipeline stages, the microbatches the stages feed, a multiple of them), or
-    "auto", the fewest that fit before recomputing anything; and `remat`, what the step recomputes
-    (`Remat`), "auto" the least that fits. A step's tokens and its update's stay as stated either way."""
+    split evenly, or "auto", the fewest that fit before recomputing anything; `remat`, what the step
+    recomputes (`Remat`), "auto" the least that fits; and, under a mesh of pipeline stages, `microbatches`,
+    the microbatches each of those feeds through the stages, a multiple of them, None one a stage
+    (`dew.training.distributed.stage_microbatches`). A step's tokens and its update's stay as stated either
+    way."""
 
     split: int | Literal["auto"] = "auto"
     remat: Remat = "auto"
+    microbatches: int | None = None
 
     def __post_init__(self):
-        if self.split != "auto" and (not isinstance(self.split, int) or self.split < 1):
+        if self.split != "auto" and (type(self.split) is not int or self.split < 1):
             raise ValueError(f"a step's split is 'auto' or a positive count of microbatches, not "
                              f"{self.split!r}")
+        if self.microbatches is not None and (type(self.microbatches) is not int or self.microbatches < 1):
+            raise ValueError(f"a pipeline's microbatches are a positive count, not {self.microbatches!r}")
         if self.remat not in ("auto", "none", "selective", "full"):
             raise ValueError(f"a step's remat is auto, none, selective or full, not {self.remat!r}")
 

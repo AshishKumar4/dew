@@ -654,9 +654,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
     @property
     def reads_pass_counts(self) -> bool:
-        """Its loss runs its model at a microbatch's count (`token_scores`' `loop_passes`), the decoder's
-        own layers stepped chunk by chunk among them (`ChunkAdaptation.layers`, `stacked_scores`)."""
-        return True
+        """Its loss runs its model at a microbatch's count (`token_scores`' `loop_passes`), but where an
+        adaptation steps the decoder's own layers chunk by chunk (`ChunkAdaptation.layers`) through its decode
+        cache, whose loop runs no count given per call (row 12300)."""
+        return self.adaptation is None or not self.adaptation.layers
 
     def counted_forward(self, module: nn.Module) -> str | None:
         """The method its loss reads `module` by (`chunked.read_method`), which takes a call's count."""
@@ -1037,8 +1038,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             _refuse_stacked(opened, depths=depths, layers=layers, routes=routes,
                             conditioned=bool(prepared.conditioning))
             return self._stacked_scores(params, prepared, inputs, targets, roles, rows, adaptation,
-                                        predict=predict, logits=logits, train=train, rngs=rngs,
-                                        loop_passes=loop_passes)
+                                        predict=predict, logits=logits, train=train, rngs=rngs)
         with self._watched(prepared, watched):
             passes = {} if loop_passes is None else {"loop_passes": loop_passes}
             hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
@@ -1127,18 +1127,16 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return weights if rows is None else jnp.where(rows[:, None] > 0, weights, 0)
 
     def _stacked_scores(self, params, prepared, inputs, targets, roles, rows, adaptation: ChunkAdaptation, *,
-                        predict, logits: bool, train: bool, rngs, loop_passes: jax.Array | None) -> Scores:
+                        predict, logits: bool, train: bool, rngs) -> Scores:
         """`token_scores` of a decoder stepping its own feed-forward blocks in context
         (`ChunkAdaptation.layers`, `dew.objectives.lm.stacking`), which runs its trunk chunk by chunk
-        through its decode cache, its loop at `loop_passes` where given: no collection, layer's states or
-        prediction depth (`_refuse_stacked`)."""
+        through its decode cache: no collection, layer's states or prediction depth (`_refuse_stacked`)."""
         predict = self.token_accuracy if predict is None else predict
         dtype = at_least_fp32(jnp.dtype(self.model.dtype or jnp.float32))
         weights = self._target_weights(prepared, roles, dtype, rows)
         hidden, adapted = stacked_scores(self.model, params, inputs, targets, weights,
                                          _inputs(prepared).token_fields, adaptation,
-                                         predict=predict, logits=logits, train=train, rngs=rngs,
-                                         loop_passes=loop_passes)
+                                         predict=predict, logits=logits, train=train, rngs=rngs)
         losses = adapted.losses
         correct = None if adapted.predicted is None else (adapted.predicted == targets).astype(losses.dtype)
         return Scores(losses, weights.astype(losses.dtype), adapted.log_z, correct, hidden, (), None, [],

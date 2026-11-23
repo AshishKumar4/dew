@@ -158,7 +158,6 @@ from dew.training.distributed import (
     check_batch,
     check_stream,
     marked,
-    mesh_stages,
     microbatch_shapes,
     placed_start,
     ruled,
@@ -170,7 +169,7 @@ from dew.training.distributed import (
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
-from dew.training.memory import first_run, recompute_record, refuse_wide_floats, split_share
+from dew.training.memory import first_run, recompute_record, refuse_wide_floats, remat_stated, split_share
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepare_counts, uncounted
 from dew.training.observe import Observe
 from dew.training.phase_passes import PhasePasses, SampledPasses
@@ -230,6 +229,14 @@ def signature_digest(signature: Hashable) -> str:
     computed once a compile."""
     return hashlib.sha256(repr(signature).encode()).hexdigest()[:16]
 
+
+
+def _refuse_two_remats[L, E](objective: Objective[L, E], fit: FitPolicy) -> None:
+    """Refuse a run's remat (`FitPolicy.remat`) beside a model that states its own, as configured, before any
+    climb: one states the step's recomputation, which a later phase's planner then takes as climbed."""
+    if fit.remat != "auto" and remat_stated(objective):
+        raise ValueError(f"a model that states its own remat trains at it; a run's remat {fit.remat!r} "
+                         "states it for every module (FitPolicy.remat): state one")
 
 
 def _custom_step_refusal(step, record: bool, inspection, rollout: Rollout | None,
@@ -332,22 +339,21 @@ class Trainer(Generic[Loss, Effects]):
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
         self.mesh = mesh
-        # An update's steps are its batches, or one until `fit` reads its tokens' (`UpdateBatch.of_tokens`);
-        # under a mesh of stages the split is the microbatches the stages feed (`stage_microbatches`).
+        # An update's steps are its batches, or one until `fit` reads its tokens' (`UpdateBatch.of_tokens`).
         self.update, self.fit_policy, self.accumulation = update, fit, update.stated_batches
         self._update_read = update.tokens is None
-        staged = mesh_stages(mesh) > 1
-        self.split = split = None if staged else fit.stated_split
+        self.split = split = fit.stated_split
         # How a resume treats its data (`DataResume`): relaxed starts it again where its plan differs.
         self.data_resume: DataResume = data_resume
         self.skip_nonfinite = skip_nonfinite
-        self._microbatches, self._loss_scale = fit.stated_split if staged else None, loss_scale(dynamic_scale)
+        self._microbatches, self._loss_scale = fit.microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
         self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
         _custom_step_refusal(step, record, inspection, rollout, sampled_passes)
+        _refuse_two_remats(objective, fit)
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile

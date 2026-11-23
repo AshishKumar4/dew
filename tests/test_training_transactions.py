@@ -284,7 +284,7 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
                                     jnp.int32)}
     spoken = said(0)
     quiet = {"text": jnp.full((rows, 8), silent, jnp.int32)}
-    placement = {"mesh": MeshSpec(fsdp=2, stage=2), "fit": FitPolicy(split=2)} if staged else {}
+    placement = {"mesh": MeshSpec(fsdp=2, stage=2), "fit": FitPolicy(microbatches=2)} if staged else {}
 
     def clip(threshold):
         return optax.chain(optax.sgd(0.0), scale_by_qk_clip(threshold))

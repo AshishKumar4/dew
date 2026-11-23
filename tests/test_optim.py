@@ -57,6 +57,7 @@ from dew.optim import (
     AdamW,
     Cosine,
     Exponential,
+    GaussNewton,
     LaProp,
     Linear,
     Muon,
@@ -574,10 +575,38 @@ def test_a_decay_mask_a_spared_decay_writes_over_or_of_other_leaves_than_boolean
 
 
 def test_a_decay_mask_on_an_optimizer_that_takes_none_is_refused():
-    """Muon's decay takes no mask (`OptimizerSpec.spares`): a decay mask it would never read is refused as
-    its solver is built."""
+    """Gauss-Newton's solved direction takes no decay mask (`OptimizerSpec.masked_by`): a decay mask it would
+    never read is refused as its solver is built."""
     with pytest.raises(ValueError):
-        OptimConfig(optimizer=Muon(weight_decay=0.1), spared=False, decay_mask={"w": True}).build(1)
+        OptimConfig(optimizer=GaussNewton(), decay_mask={"w": True}).build(1)
+
+
+def test_muons_matrices_decay_where_its_decay_mask_says():
+    """Muon decays every matrix it orthogonalizes unless a run masks that decay (`OptimConfig.decay_mask`,
+    by Muon's own `weight_decay_mask`): on a zero gradient its update is the decay alone, moving the
+    matrix the mask names True and leaving the other (review of API01: the mask was refused, an earlier
+    Muon run's `weight_decay_mask` with it)."""
+    params = {"w": jnp.ones((4, 4)), "v": jnp.ones((4, 4))}
+    solver = OptimConfig(optimizer=Muon(weight_decay=0.1), learning_rate=LR,
+                         decay_mask={"w": False, "v": True}).build(1)
+    updates = solver.update(jax.tree.map(jnp.zeros_like, params), solver.init(params), params)[0]
+    assert not np.any(updates["w"]) and np.all(updates["v"] < 0)
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["ungrouped", "named-groups"])
+def test_a_decay_mask_reaches_the_groups_a_fresh_module_makes_and_is_refused_beside_named_groups(named):
+    """An ungrouped decay's mask is the fresh and base groups' a run that draws modules fresh trains in
+    (`OptimConfig.claiming`), never dropped as its groups are made; a mask beside named groups, which state
+    their own (`ParamGroup.decay_mask`), is refused (review of API01: it was dropped)."""
+    mask = {"w": False, "b": True}
+    if named:
+        with pytest.raises(ValueError):
+            OptimConfig(optimizer=AdamW(weight_decay=0.1), spared=False, decay_mask=mask,
+                        param_groups=(ParamGroup("all", ("*",)),))
+        return
+    claimed = OptimConfig(optimizer=AdamW(weight_decay=0.1), spared=False, decay_mask=mask).claiming(["head"])
+    assert claimed.decay_mask is None and claimed.param_groups
+    assert all(group.decay_mask == mask for group in claimed.param_groups)
 
 
 def test_muon_takes_qwen35s_hidden_matrices_and_adamw_its_filters_vectors_and_lookups():

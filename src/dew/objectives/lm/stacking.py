@@ -47,13 +47,12 @@ from dew.objectives.lm.adaptation import Adapted, ChunkAdaptation, _carried_onto
 
 def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.Array, weights: jax.Array,
                    fields: Mapping, adaptation: ChunkAdaptation, *, predict: bool,
-                   logits: bool, train: bool = False, rngs=None,
-                   loop_passes: jax.Array | None = None) -> tuple[jax.Array, Adapted]:
+                   logits: bool, train: bool = False, rngs=None) -> tuple[jax.Array, Adapted]:
     """Each target's next-token loss with the decoder's feed-forward blocks of `adaptation.layers`
     stepped in context (module docstring), over `inputs` `[B, S]` and their `targets` `[B, S]`, each
     weighted as the loss weighs it (`weights`), the rows' token `fields` (their layout, flat or as
-    `Coordinates`) read by the decoder's calls, its loop at `loop_passes` passes where given: the final
-    states the head read and the scores (`Adapted`)."""
+    `Coordinates`) read by the decoder's calls: the final states the head read and the scores
+    (`Adapted`)."""
     if not isinstance(model, SteppedFeedForward):
         raise TypeError(f"{type(model).__name__} steps no feed-forward block in context; a decoder that does "
                         "names its blocks' parameters (`SteppedFeedForward`)")
@@ -102,7 +101,7 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
     # Each chunk's call: none where no row's chunk holds a slot, else the least width its longest holds.
     calls = jnp.where(spans > 0, jnp.searchsorted(jnp.asarray(widths), spans) + 1, 0)
 
-    reads = _Reads(model, variables, view, layout, rowed, blocks, train, rngs, predict, logits, loop_passes)
+    reads = _Reads(model, variables, view, layout, rowed, blocks, train, rngs, predict, logits)
     branches = [reads.called(chunk)] if blocks is None else [reads.skipped, *map(reads.called, widths)]
 
     def chunk_call(levels, caches, block, written):
@@ -152,7 +151,7 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
 class _Reads:
     """What a chunk's call through the decoder reads (`stacked_scores`): the decoder and its `variables`,
     their store (`view`), the rows' padded `layout`, token fields (`rowed`) and `blocks` (None for none),
-    and the call's own options, its loop's pass count among them (`loop_passes`, None for every pass)."""
+    and the call's own options."""
 
     model: nn.Module
     variables: Mapping
@@ -164,7 +163,6 @@ class _Reads:
     rngs: PRNGKey | RNGSequences | None
     predict: bool
     logits: bool
-    loop_passes: jax.Array | None
 
     def row_forward(self, levels, row_cache, tokens, row_layout, row_blocks):
         """One row's chunk through the decoder at `levels`, from its cache: its final states, logits and
@@ -173,8 +171,7 @@ class _Reads:
         (states, chunk_logits), mutated = self.model.apply(
             held, tokens[None], decode=True, train=self.train, rngs=self.rngs, mutable=["cache"],
             method="states_and_logits", coordinates=row_layout,
-            block_groups=None if row_blocks is None else row_blocks[None], capture_intermediates=False,
-            **({} if self.loop_passes is None else {"loop_passes": self.loop_passes}))
+            block_groups=None if row_blocks is None else row_blocks[None])
         return states[0], chunk_logits[0], mutated["cache"]
 
     def scored(self, width: int):

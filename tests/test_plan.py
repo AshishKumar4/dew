@@ -2015,7 +2015,12 @@ def test_a_runs_fit_policy_sets_what_its_step_recomputes_for_every_module(monkey
     """A run's fit policy states its remat for every module its model states none of (`FitPolicy.remat`):
     "full" compiles one step at each module's whole recomputation, the top of its ladder; "none" one that
     recomputes nothing; a model that states its own remat beside a policy that states one is refused as
-    its trainer is built (row 11934)."""
+    its trainer is built (row 11934), and a later phase's planner over the objective its climb left, its
+    model stating the policy's remat, plans on (`dew.training.ahead`; Train 1229's review: refused, every
+    later phase compiled on the loop)."""
+    from dew.training.compiler import StepCompiler
+    from dew.training.phase_passes import PhasePasses
+
     free(monkeypatch, LIMIT)
     full, none = lm(split=1, policy="full"), lm(split=1, policy="none")
     with Compiles("step") as compiles:
@@ -2026,6 +2031,8 @@ def test_a_runs_fit_policy_sets_what_its_step_recomputes_for_every_module(monkey
     assert none.plan["remat"] is None and none.objective.model.remat is None
     with pytest.raises(ValueError):
         lm(policy="none", remat=REMAT_POLICIES["minimal"])
+    planner = StepCompiler(full.objective, None, None, PhasePasses(full.objective), "full")
+    assert planner.remat == "full"
 
 
 def test_a_run_of_one_remat_takes_no_plan_a_run_of_another_recorded(monkeypatch, tmp_path):
