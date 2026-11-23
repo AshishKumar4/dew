@@ -106,8 +106,6 @@ class Tiles:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
         if self.staging is not None:
-            if self.staging[0] <= 0:
-                raise ValueError(f"{self}: output staging needs a positive chunk, got {self.staging}")
             # A family that stages its outputs whole refuses chunks (`Family.output_staging` of no outputs);
             # its chunks against the tile's columns and its issuer's pieces, which no dtype changes
             # (`stores.staging_refusal` of no dtypes); a chunk's bytes in the call's output dtypes are its
