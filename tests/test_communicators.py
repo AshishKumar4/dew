@@ -275,6 +275,22 @@ def test_a_program_not_yet_run_is_charged_its_load_beside_every_other_not_yet_ru
     resident.admit(Collectives(), FOUR, room, lambda gpu: floor, evaluation)
 
 
+def test_a_program_of_no_identity_is_admitted_by_its_communicators_alone_and_held_as_made():
+    """A program whose runtime states no fingerprint, which no run of it is taken by (`admit`'s
+    `loaded=None`), is admitted by its communicators alone, no load charged for it, and holds them as made at
+    once: a later program of the same communicators is charged none of them, never one held pending for
+    ever (review of row 12131's P0)."""
+    room = dict.fromkeys(range(4), 8 * GIB)
+    every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+    resident = communicators.Resident()
+    with pytest.raises(CommunicatorRoom) as tight:
+        resident.admit(every, FOUR, room, lambda gpu: 2 * GIB - 1)
+    assert tight.value.needed == dict.fromkeys(range(4), 2 * GIB)
+    resident.admit(every, FOUR, room, lambda gpu: 2 * GIB)
+    assert resident.held == every and not resident.pending
+    resident.admit(every, FOUR, room, lambda gpu: 0)
+
+
 def test_a_program_released_before_it_ran_leaves_its_communicators_unmade_and_charged_to_no_other():
     """A program admitted that never runs is charged ahead of every later one only while it lives: its
     executable released (a search's passed-over rung), what it would have loaded and connected is no

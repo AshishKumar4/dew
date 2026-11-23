@@ -618,6 +618,8 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
     not run until a call of it returns (`dispatched`) or it is released (`Resident.watch`), one of none by
     its communicators alone."""
     program = loaded_program(executable)
+    # A pool of processes admits every program on every rank alike: no rank holds a sizing there, and a
+    # verdict agreed across ranks needs a round keyed by the program, not by its order (row 12351).
     if _HELD is None or program is None or jax.process_count() > 1:
         return
     devices = program.devices
