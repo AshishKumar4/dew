@@ -386,8 +386,9 @@ TRANSFER_SEEDS = 16
 def test_a_slices_transfer_is_on_par_with_the_rule_from_the_identity(per_key):
     """A sequence shard's transfer (`recurrence_chunk.transferred`: the derived forms' walk chaining each
     chunk's transition in fp32, row 1437) on par from float64 with the delta rule's fp32 final memory over
-    zero values from the identity, which `entering_memory` took before (check 1), in 16-token chunks (not
-    the rule's 64) over 150 tokens, off their grid: a row whose document starts inside the slice (the
+    zero values from the identity, which `entering_memory` took before (check 1), both in 16-token chunks
+    (not the rule's 64; the summary took the layer's chunk, as the transfer now does) over 150 tokens, off
+    their grid: a row whose document starts inside the slice (the
     transfer zero across it) and a row whose one document spans it, its transfer ten chunks' transitions
     chained, 0.2 to 0.7% of the identity's norm under these gates (float64, four draws); a reset on every
     row made every transfer zero, whatever its chunks (#3757's review). A slice of no tokens transfers the
@@ -420,7 +421,8 @@ def test_a_slices_transfer_is_on_par_with_the_rule_from_the_identity(per_key):
 
     def ruled(query, key, g, beta):
         with generation.chosen(gated_delta_rule="xla"):
-            return chunk_gated_delta_rule(query, key, unread(key), g, beta, identity(key), starts=starts)[1]
+            return chunk_gated_delta_rule(query, key, unread(key), g, beta, identity(key), starts=starts,
+                                          chunk_size=chunk)[1]
 
     @as_given
     def truth(query, key, g, beta):
