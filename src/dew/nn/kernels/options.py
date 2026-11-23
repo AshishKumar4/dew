@@ -696,6 +696,14 @@ class OuterProgram:
                 self._jits.move_to_end(key)
             return held
 
+    def _held_key(self, args: tuple, kwargs: dict, refusals: tuple) -> Hashable | None:
+        """The key a jit is held by for a call of `args` and `kwargs` under `refusals` (`abstract_of`), None
+        for a call within another trace, which holds none: its trace is the enclosing one's, whose key it
+        cannot read (its values tracers, and JAX's concrete mesh refused within it)."""
+        if not jax_core.trace_state_clean():
+            return None
+        return self.abstract_of(args, kwargs, refusals)
+
     def _validated(self, key: Hashable, made: jax.stages.Wrapped) -> None:
         """`made`, a jit whose trace of the call of `key` read its refusals alone, the one that call takes
         from here on, where none is yet; the most recent `JITS_HELD` held."""
@@ -1039,8 +1047,8 @@ class OuterProgram:
         (row 12165), and no call of the reservation's refusals runs a program traced past others (theme
         K01-e's review P0). Its jit (`settled`'s, a relowering's) traces under its refusals from here on."""
         fresh, refused = settled
-        if fresh is not None:
-            self._validated(self.abstract_of(args, kwargs, refused), fresh)
+        if fresh is not None and (held := self._held_key(args, kwargs, refused)) is not None:
+            self._validated(held, fresh)
         accepted = self.key_of(args, kwargs, refused)[0]
         kept: Future[jax.stages.Compiled] = Future()
         kept.set_result(executable)
@@ -1180,7 +1188,8 @@ class OuterProgram:
         own call's (`_held_jit`), as JAX's trace cache keys on none of them: a trace after a seeded refusal
         derives past it (row 12165)."""
         traced, refused, made = self._stable_trace(args, kwargs, fresh=False)
-        self._validated(self.abstract_of(args, kwargs, refused), made)
+        if (key := self._held_key(args, kwargs, refused)) is not None:
+            self._validated(key, made)
         return traced, refused
 
     def _stable_trace(self, args: tuple, kwargs: dict, *, fresh: bool
@@ -1195,7 +1204,7 @@ class OuterProgram:
 
         while True:
             refusals = report.refusal_entries()
-            key = None if fresh else self.abstract_of(args, kwargs, refusals)
+            key = None if fresh else self._held_key(args, kwargs, refusals)
             held = None if key is None else self._held_jit(key)
             marks = route_marks()
             traced, (made, under) = self._traced((held or self._jitted(), refusals), args, kwargs)
