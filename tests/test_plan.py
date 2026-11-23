@@ -348,9 +348,10 @@ def test_a_second_trainer_of_one_step_reads_its_step_back_from_the_persistent_ca
     """A second trainer of a process, its step the same program on the same devices as an earlier one's that
     is dropped, the process's own executables and JAX's in-process caches let go between: no executable of
     the first is held past it (row 12131: a process-wide store kept a dropped run's device code and its
-    collectives' room), and the second reads its step back from the persistent compilation cache, which
-    writes nothing new (`compilation_cache_counts`: hits, and no miss, the cache writing every compile, where
-    row 6995's store answered it from memory); it steps as the first."""
+    collectives' room), and the second's step compile reads its step back from the persistent compilation
+    cache, compiling nothing anew (`compilation_cache_counts` across the compile alone, its state placed
+    before: hits, and no miss, the cache writing every compile, where row 6995's store answered it from
+    memory; row 12417); it steps as the first."""
     from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
 
     threshold = jax.config.jax_persistent_cache_min_compile_time_secs
@@ -361,9 +362,12 @@ def test_a_second_trainer_of_one_step_reads_its_step_back_from_the_persistent_ca
         gc.collect()
         options.release()
         jax.clear_caches()
+        second = lm(split=1)
+        state, _, _ = second.place()
         before = compilation_cache_counts()
-        state = trained(lm(split=1), steps=1)
+        step = second.compile(state, BATCH)
         after = compilation_cache_counts()
+        state, *_ = step(state, BATCH)
     finally:
         jax.config.update("jax_persistent_cache_min_compile_time_secs", threshold)
     read = {name: after.get(f"train/cache_{name}", 0) - before.get(f"train/cache_{name}", 0)
