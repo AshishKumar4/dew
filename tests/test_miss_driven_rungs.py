@@ -21,12 +21,13 @@ SEQ = 512
 
 
 def _hybrid():
-    """A gated delta net's layer beside attention, its MLP wide, in bf16: what its remat rungs keep differs
-    by name (`REMAT_POLICIES`)."""
+    """Gated delta nets' layers beside attention's, their MLPs wide and their vocabulary narrow, in bf16:
+    the layers' forward values hold most of a step's peak, and what its remat rungs keep differs by name
+    (`REMAT_POLICIES`)."""
     return models.build(
-        "causal_transformer", vocab_size=1024, emb_features=512, num_layers=2, num_heads=8, num_kv_heads=2,
-        head_dim=64, mlp_features=2048, max_seq_len=SEQ, dtype="bfloat16", attention_impl="xla",
-        layer_types=("linear_attention", "attention"),
+        "causal_transformer", vocab_size=256, emb_features=512, num_layers=4, num_heads=8, num_kv_heads=2,
+        head_dim=64, mlp_features=4096, max_seq_len=SEQ, dtype="bfloat16", attention_impl="xla",
+        layer_types=("linear_attention", "attention", "linear_attention", "attention"),
         kinds={"attention": {}, "linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
             "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 64,
             "linear_value_head_dim": 64, "linear_conv_kernel_dim": 4}}}})

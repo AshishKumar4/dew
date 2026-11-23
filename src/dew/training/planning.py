@@ -1376,14 +1376,16 @@ class FitSearch[LossT, EffectsT]:
             if ns_group is None:
                 _log.warning("the step's joined Newton-Schulz stacks free nothing it needs: it keeps them "
                              "joined and climbs on")
-        for rung in self.by_shortfall(self.recomputing(start, narrow, ns_group), missed):
+        ordered, read = self.by_shortfall(self.recomputing(start, narrow, ns_group), missed)
+        for rung in ordered:
             if rung in self.asked:
                 continue
             split = ask(rung, "the step does not fit the devices; compiling it again recomputing more at %s")
             if split is not None:
                 self.said(named)
                 return split
-            self.moved(rung, missed)
+            if rung == read:
+                self.moved(rung, missed)
         if narrow and any(candidate.copies for candidate in self.lowered.values()):
             # The narrow copies, two bytes a parameter held all run for 1-2% of a step, dropped at the start's
             # rung where no recomputation fits with them.
@@ -1456,28 +1458,29 @@ class FitSearch[LossT, EffectsT]:
                  if key[0] == rung and key in self.live]
         return min(found, key=lambda pair: pair[0]) if found else None
 
-    def by_shortfall(self, rungs: list[Rung], missed: tuple[int, LiveSet] | None) -> list[Rung]:
+    def by_shortfall(self, rungs: list[Rung], missed: tuple[int, LiveSet] | None
+                     ) -> tuple[list[Rung], Rung | None]:
         """`rungs`, least recomputation first, from the first whose statement (`RecomputeStatement`) drops
         at least what the start was short by of the values its forward made at its peak (`missed`): the
         rungs before it, which drop less, after the rest, so the climb asks first the one the miss reads as
         fitting, its compile the judge (XLA schedules each rung anew). As they are where the miss read no
-        live set or a rung states nothing."""
+        live set or a rung states nothing; with the rung the miss read first, None where it read none."""
         if missed is None:
-            return rungs
+            return rungs, None
         shortfall, live = missed
         dropped = [None if (said := _stated(rung)) is None else live.forward_bytes(said.drops)
                    for rung in rungs]
         if None in dropped:
-            return rungs
+            return rungs, None
         first = next((at for at, freed in enumerate(dropped) if freed >= shortfall), None)
         if first is None:
-            return rungs
+            return rungs, None
         said = _stated(rungs[first])
         assert said is not None
         _log.info("the step's miss reads first the rung keeping %s: its forward's values it drops hold %d "
                   "bytes at the peak, the step %d short", sorted(said.save) if said.save is not None
                   else f"all but {sorted(said.recompute)}", dropped[first], shortfall)
-        return [*rungs[first:], *rungs[:first]]
+        return [*rungs[first:], *rungs[:first]], rungs[first]
 
     def moved(self, rung: Rung, missed: tuple[int, LiveSet] | None) -> None:
         """Say what the miss at `rung`, which the start's miss read as fitting (`by_shortfall`), moved: the
