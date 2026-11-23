@@ -424,22 +424,19 @@ def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
         np.testing.assert_array_equal(new, old)
 
 
-DECISION_SEEDS = 32
-"""Check 1's declared seeds for a decision step over a scanned backbone against its ordinary backward: the
-two arms share each draw's state and batch."""
-
-
-@pytest.mark.parametrize("grouped, input_lm, context_backbone", [
-    pytest.param(False, 0.0, False, id="decision", marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
-    pytest.param(True, 0.0, False, id="decision-grouped",
+@pytest.mark.parametrize("grouped, input_lm, context_backbone, seeds", [
+    pytest.param(False, 0.0, False, 32, id="decision",
                  marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
-    pytest.param(False, 0.25, False, id="decision-input-lm",
+    pytest.param(True, 0.0, False, 32, id="decision-grouped",
                  marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
-    pytest.param(False, 0.0, True, id="decision-context-backbone",
+    pytest.param(False, 0.25, False, 32, id="decision-input-lm",
                  marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
+    # Its judgement resolved past 32 draws alone, within 160 (the map judge's units).
+    pytest.param(False, 0.0, True, 160, id="decision-context-backbone",
+                 marks=pytest.mark.check1_shards(seeds=160, per_task=32)),
 ])
 def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward(grouped, input_lm,
-                                                                                   context_backbone):
+                                                                                   context_backbone, seeds):
     """A decision objective's scanned backbone, which its step updates in its backward
     (`dew.nn.in_backward`), runs inside `component('backbone')`, so its plan keys its run under
     `backbone/stages/...` (row 12076: the run's path lacked `backbone`, raising `KeyError: 'stages'`), and two
@@ -527,7 +524,7 @@ def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward
         return run
 
     assert_as_exact(stepped(scan=True), stepped(scan=False), lambda drawn: (np.int64(drawn),),
-                    "a decision step over a scanned backbone", seeds=DECISION_SEEDS,
+                    "a decision step over a scanned backbone", seeds=seeds,
                     truth_fn=stepped(scan=False, exact=True))
 
 
