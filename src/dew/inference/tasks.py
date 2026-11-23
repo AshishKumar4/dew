@@ -19,7 +19,7 @@ import functools
 import inspect
 import json
 import logging
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self, TypedDict, runtime_checkable
@@ -359,12 +359,25 @@ class SavedRun:
         recorded = self.record.get("precision")
         return None if recorded is None else from_record(Numerics, named_fields(recorded, "precision"))
 
+    @property
+    def kernels(self) -> tuple[tuple[str, str], ...]:
+        """The kernel choices the run's step pinned, by choice: a saved model's attention kernel, its field
+        until row 11938, which its declaration holds as its run's (`earlier_shapes`); none for a record that
+        names none."""
+        recorded = self.record.get("kernels")
+        if recorded is None:
+            return ()
+        return tuple(sorted((choice, named(kernel, f"kernels.{choice}"))
+                            for choice, kernel in named_fields(recorded, "kernels").items()))
+
     def formed[TaskT](self, task: TaskT) -> TaskT:
-        """`task`, built from this run (`from_saved`), under the numerics its step trained in where it
-        traces under them (`InItsForm`); a task of another class reads `precision` itself."""
-        if not isinstance(task, InItsForm) or task.precision == self.precision:
+        """`task`, built from this run (`from_saved`), under the numerics its step trained in and the kernels
+        it pinned where it traces under them (`InItsForm`); a task of another class reads `precision`
+        itself."""
+        if not isinstance(task, InItsForm) or (task.precision, task.kernels) == (self.precision,
+                                                                                  self.kernels):
             return task
-        return replace(task, precision=self.precision)
+        return replace(task, precision=self.precision, kernels=self.kernels)
 
     @classmethod
     def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = (), *,
@@ -438,7 +451,8 @@ class SavedRun:
         declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
         from dew.interop.saved_sources import RELEASE_SOURCES
 
-        stray = set(record) - {'objective', 'model', 'precision', UNREAD, RELEASE_SOURCES, *declared}
+        stray = set(record) - {'objective', 'model', 'precision', 'kernels', UNREAD, RELEASE_SOURCES,
+                               *declared}
         if stray:
             raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                              f"{sorted(stray)}")
@@ -498,12 +512,30 @@ class InItsForm:
     trained under them (`Objective.inference_record`): its products' precision and its ops' forms;
     None traces under the numerics in effect around the call."""
 
-    def traced(self) -> contextlib.AbstractContextManager[None]:
-        """The block a call of this task traces in: its run's numerics (`generation.run_precision`), which
-        JAX keys its trace and compile caches on, so another policy's task traces its own programs."""
-        if self.precision is None:
-            return contextlib.nullcontext()
-        return generation.run_precision(self.precision)
+    kernels: tuple[tuple[str, str], ...] = ()
+    """The kernel choices its run pinned (`SavedRun.kernels`: a saved model's attention kernel, a model's
+    field until row 11938), each of which its calls trace under where the caller names none of its own
+    (`dew.kernels.use`, `pinned`)."""
+
+    @contextlib.contextmanager
+    def traced(self) -> Iterator[None]:
+        """The block a call of this task traces in: its run's numerics (`generation.run_precision`) and its
+        run's kernel pins (`pinned`), which JAX keys its trace and compile caches on, so another policy's
+        task traces its own programs."""
+        with (self.pinned(), contextlib.nullcontext() if self.precision is None
+              else generation.run_precision(self.precision)):
+            yield
+
+    @contextlib.contextmanager
+    def pinned(self) -> Iterator[None]:
+        """The block its run's kernel pins hold in (`kernels`), a choice the caller names in a block of its
+        own (`dew.kernels.use`) standing over its run's: what a server made from it is made under too
+        (`dew.inference.serving.Server.from_task`)."""
+        from dew import _cache
+
+        named = dict(_cache.KERNEL_CHOICES.value)
+        with generation.chosen(**{choice: kernel for choice, kernel in self.kernels if choice not in named}):
+            yield
 
 
 def traced_in_its_form[TaskT: InItsForm, **P, R](
@@ -660,6 +692,11 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         name = named(head["name"], "head.name")
         current["head"] = {"class": name if ":" in name else f"dew.decision.head:{name}",
                            "fields": named_fields(head.get("fields", {}), "head.fields")}
+    if isinstance(current.get("head"), Mapping):
+        # The fields its head's class lost since (`REMOVED_FIELDS`: the attention kernel a head held, the
+        # run's since row 11938), left out here, where a saved step and a release are read, so the head's
+        # constructor (`Head.from_record`) reads today's fields alone (the API02 review).
+        current["head"] = earlier_fields(json_value(current["head"], "head"))
     autoencoder = record.get("autoencoder")
     if isinstance(autoencoder, Mapping) and "name" in autoencoder and "class" not in autoencoder:
         name = named(autoencoder["name"], "autoencoder.name")
@@ -721,6 +758,12 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         # The form a step trained in, which its numerics' forms hold now (ledger 2500).
         current["precision"] = {"forms": current.pop("attention_form")}
     if "model" in current:
+        # The attention kernel its model named, the run's since (row 11938), before its field goes: a loaded
+        # task traces under it (`SavedRun.kernels`), where it fell to the selector's (the API02 review).
+        model = current["model"]
+        if (isinstance(model, Mapping) and (pin := earlier_attention_pin(model)) is not None
+                and "kernels" not in current):
+            current["kernels"] = {"attention": pin}
         current = earlier_model(current)
     return current
 
@@ -820,6 +863,15 @@ def saved_decoders(part: Mapping[str, object]) -> list[Mapping[str, object]]:
     return [stated, *(decoder for field in sorted(held) if isinstance(decoder_part := stated[field], Mapping)
                       for decoder in saved_decoders(decoder_part))]
 
+
+def earlier_attention_pin(model: Mapping[str, object]) -> str | None:
+    """The attention kernel a saved model record named (`attention_impl`, a field until row 11938) but
+    'auto': its own, else a decoder's it wraps (`saved_decoders`); None where it named none. Read by a
+    run's record (`dew.config.earlier.earlier_attention_kernel`) and a step's inference declaration
+    (`earlier_shapes`) alike. Carried to 1.0 (ledger 1552)."""
+    named = [str(kernel) for decoder in saved_decoders(model)
+             if (kernel := decoder.get("attention_impl", "auto")) != "auto"]
+    return named[0] if named else None
 
 def _stated(part: Mapping[str, object]) -> Mapping[str, object]:
     """A saved part's fields as it states them: a model record's given fields over the defaults it

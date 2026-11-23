@@ -11,6 +11,7 @@ import json
 import typing
 
 import pytest
+from model_support import attending
 from option_witness import alternatives, flag, held_at, members_of, replaced
 from run_kinds import KINDS, saved_record, scalars, trained_by_cli, trained_record
 
@@ -109,6 +110,7 @@ SET = {"optim.learning_rate": 0.0123, "data_seed": 3, "trainer.key": 5}
 """Options a run trained both ways is set with, each beside its default."""
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_run_with_options_set_trains_alike_from_python_its_command_and_its_record_and_resumes_as_it_ran(

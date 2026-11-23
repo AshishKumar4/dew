@@ -40,6 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import clearing_selections, fixture_ids, transformers_arms, transformers_model
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 from selection_margins import NARROW_MARGIN
@@ -63,6 +64,7 @@ group selection: each draw's flip a heavy tail, its paired ratio 0.96 over clear
 others' check 1 resolves over every draw."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("name", DECODERS)
 def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
@@ -73,11 +75,11 @@ def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
     bfloat16's margin (`clearing_selections`, `NARROW_MARGIN`), so neither narrow run routes otherwise than
     the truth (row 4734)."""
     directory = FIXTURES / name
-    pretrained = Pretrained.load(str(directory), dtype=dtype, attention_impl="reference")
+    pretrained = Pretrained.load(str(directory), dtype=dtype)
     draw = fixture_ids(directory)
     if dtype == "bfloat16" and name in NARROW_ROUTED:
         with jax.enable_x64(new_val=True):
-            truth_model = Pretrained.load(str(directory), dtype="float64", attention_impl="reference")
+            truth_model = Pretrained.load(str(directory), dtype="float64")
         draw = clearing_selections(truth_model, draw, f"{name} {dtype}", tries=256, margin=NARROW_MARGIN)
     source = transformers_model(directory)
     narrow = source if dtype == "float32" else transformers_model(directory, dtype=dtype)
@@ -93,6 +95,7 @@ BIAS_SEEDS = {"qwen2-tiny": 64, "llama-tiny": 32}
 sized by `seeds_for` paired with Dew's gradients on the CPU."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["llama-tiny"])
 def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torch_does(name):
     """A bfloat16 model's projection biases sum their gradients over every token of the batch
@@ -100,6 +103,7 @@ def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torc
     assert_biases_sum_as_torch(name)
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=64, per_task=32)
 def test_qwen2s_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torch_does():
     """`assert_biases_sum_as_torch` over Qwen2, whose 64 declared seeds, each a batch's transformers backward
@@ -129,7 +133,7 @@ def assert_biases_sum_as_torch(name):
     narrow = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.bfloat16)
     wide = float64_twin(narrow)
     loaded = Pretrained.load(str(directory), dtype="bfloat16", param_dtype="bfloat16",
-                             attention_impl="reference", max_seq_len=128)
+                             max_seq_len=128)
     biases = [layout for layout in loaded.weight_layouts if layout.name.endswith(".bias")]
     assert biases
     shapes = {name: tuple(parameter.shape) for name, parameter in narrow.named_parameters()}
@@ -251,6 +255,7 @@ def _replayed(network, routes):
             handle.remove()
 
 
+@attending("xla")
 @pytest.mark.parametrize("forward", ["bare", "conditioned", "image_logits"])
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16(forward):
     """DiffusionGemma's shared text tree with routed experts, a sliding and a full layer, self-conditioning
@@ -269,9 +274,9 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16(forward):
     config = json.loads((directory / "config.json").read_text())
     tensors = load_file(str(directory / "model.safetensors"))
     reference = dict(np.load(directory / "reference.npz"))
-    narrow = adapter.build(config, dtype="bfloat16", attention_impl="xla")
+    narrow = adapter.build(config, dtype="bfloat16")
     variables, _ = adapter.translate_weights(tensors, config)
-    wide = adapter.build(config, dtype="float64", attention_impl="xla")
+    wide = adapter.build(config, dtype="float64")
     image = forward == "image_logits"
     drawn = block.canvas_draw(reference["image_prompt" if image else "prompt"], reference["canvas"], 64,
                               previous=forward == "conditioned",
@@ -315,6 +320,7 @@ EXPERT_SEEDS = 16
 """The expert site's declared seeds."""
 
 
+@attending("xla")
 def test_the_diffusion_denoisers_experts_are_as_exact_as_the_reference_in_bf16():
     """DiffusionGemma's routed experts' continuous math in bfloat16, on par with transformers' own
     (`DiffusionGemmaTextExperts`) over drawn inputs, both measured from its float64 twin (check 1): its first
@@ -330,7 +336,7 @@ def test_the_diffusion_denoisers_experts_are_as_exact_as_the_reference_in_bf16()
 
     directory = FIXTURES / "diffusion-gemma-workflow"
     config = json.loads((directory / "config.json").read_text())
-    model = adapter.build(config, dtype="bfloat16", attention_impl="xla")
+    model = adapter.build(config, dtype="bfloat16")
     variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
     with np.load(directory / "reference.npz") as stored:
         prompt = stored["prompt"]
@@ -387,6 +393,7 @@ MAMBA2_SEEDS = 8
 """Check 1's declared seeds for the published Mamba-2's logits, each draw a prompt of the text's tokens."""
 
 
+@attending("xla")
 @pytest.mark.network
 @pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"),
                     reason=f"DEW_NETWORK_TESTS=1 downloads {MAMBA2_130M}")
@@ -430,7 +437,7 @@ def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
         reference, truth = transformers_arms(narrow, lambda model, ids: model(ids, use_cache=False).logits,
                                              twin=twin)
         pretrained = Pretrained.load(MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype,
-                                     param_dtype=dtype, attention_impl="xla")
+                                     param_dtype=dtype)
 
         def dew(drawn, model=pretrained, accurate=dtype == "float32"):
             with generation.run_precision(ACCURATE) if accurate else contextlib.nullcontext():

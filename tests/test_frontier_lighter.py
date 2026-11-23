@@ -2,6 +2,7 @@
 that fit (`FitSearch.below`, the plan's `lighter`; row 10817), on compile-only GPUs (`compile_ahead`)."""
 
 import pytest
+from model_support import attending
 from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune, gpus, need_ahead
 from token_support import token_rows
 
@@ -9,6 +10,7 @@ from dew._records import listed, record
 from dew.training import MeshSpec
 
 
+@attending("xla")
 @pytest.mark.shared_setup("sm90_full_tiled_needs")
 def test_a_frontier_lists_each_lighter_rung_the_search_passed_over_that_fits(tmp_path, monkeypatch):
     """A step given room for itself recomputing all ('full') and for its head tiled recomputing nothing, but

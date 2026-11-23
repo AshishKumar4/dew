@@ -685,7 +685,7 @@ A run names its model as `ModelConfig(name, fields)` and its objective as `Objec
 
 `RunConfig.save` writes the run configuration. It is separate from the state checkpoint. [Recipes](../recipes.md) describes the configuration entry points and their side effects.
 
-`attention_impl` is a model field that names the attention kernel. Its names, what each runs, and the order in which `'auto'` takes them on each trace are declared once, by `AttentionImpl` in [dew/nn/attention.py](../../src/dew/nn/attention.py); each kernel's conditions are its requirements in [dew/nn/attention_kernels.py](../../src/dew/nn/attention_kernels.py), which the attention selector reads.
+A run names its attention kernel (`Diagnostics.kernels`' `attention`, `dew.kernels.use(attention=...)` in a program of your own) for every attention layer it traces; no model holds one. Its names, what each runs, and the order in which `'auto'` takes them on each trace are declared once, by `AttentionImpl` in [dew/nn/attention.py](../../src/dew/nn/attention.py); each kernel's conditions are its requirements in [dew/nn/attention_kernels.py](../../src/dew/nn/attention_kernels.py), which the attention selector reads.
 
 `'auto'` and `'xla'` both take `'reference'` for float64 inputs, because JAX's XLA attention narrows their softmax to float32, and for bf16 on a GPU older than sm80, which rejects the bf16 dot algorithm it names.
 

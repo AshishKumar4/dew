@@ -25,6 +25,7 @@ import numpy as np
 import pytest
 from deepseek_recorded import assert_cached_run_as_recorded, cleared_rows, held_to_the_release
 from flax.traverse_util import flatten_dict
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained
@@ -50,16 +51,19 @@ def fp32_matmuls():
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def source():
-    return Pretrained.load(TINY, dtype="float32", attention_impl="reference")
+    return Pretrained.load(TINY, dtype="float32")
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def recorded_rows(source):
     """The trunk's recorded rows, each of whose selections Dew's forward clears too (`cleared_rows`)."""
     return cleared_rows(source.model, source.variables, source.model_config, ROWS["rows"], "recorded row")
 
 
+@attending("reference")
 @pytest.mark.shared_setup("recorded_rows")
 @pytest.mark.parametrize("site", ["deepseek v4 dspark trunk", "deepseek v4 dspark transformers trunk"])
 def test_the_trunks_logits_are_on_par_with_each_references(source, recorded_rows, site):
@@ -74,6 +78,7 @@ def test_the_trunks_logits_are_on_par_with_each_references(source, recorded_rows
                     recorded, draw, site, seeds=seeds, truth_fn=truth)
 
 
+@attending("reference")
 def test_a_cached_run_and_its_drafts_are_on_par_with_the_releases(source):
     """The release's driver through Dew's cache: the prefill of the prompt, each teacher-forced step's
     logits after it and DSpark's draft after each, fed the step's argmax, its logits and confidence, over
@@ -83,6 +88,7 @@ def test_a_cached_run_and_its_drafts_are_on_par_with_the_releases(source):
                                   "deepseek v4 dspark cached")
 
 
+@attending("reference")
 def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(source):
     """At zero temperature every rejected draft is replaced by the target's
     own token, so Speculative decoding with the stages' blocks emits the
@@ -97,6 +103,7 @@ def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(sourc
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
 
 
+@attending("reference")
 def test_load_balancing_moves_the_routers_the_trunk_ran_and_no_other(source):
     """The drafter's stages keep balancing biases of their own, which an LM
     forward does not run; counting and moving the biases follows the routers
@@ -114,6 +121,7 @@ def test_load_balancing_moves_the_routers_the_trunk_ran_and_no_other(source):
         assert unchanged == (path[0] not in ran), path
 
 
+@attending("reference")
 @pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
 def test_a_stack_in_host_memory_writes_what_its_caller_opens_as_a_resident_one_does(source, stack_scan):
     """The layers left in host memory run one at a time in a scope of their own

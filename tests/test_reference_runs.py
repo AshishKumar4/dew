@@ -24,6 +24,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from model_support import attending
 from process_support import device_flags
 from recorded_runs import assert_arms_as_recorded
 from tool_support import REPO_ROOT, load
@@ -69,7 +70,7 @@ def _first_gradient_margin(tokens: np.ndarray) -> float:
 def _first_gradients():
     """`_first_gradient_margin`'s program over a batch of rows, qwen3-tiny loaded and compiled once."""
     with jax.enable_x64(new_val=True):
-        model = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float64", attention_impl="xla")
+        model = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float64")
 
         def loss(params, rows):
             logits = model.model.apply({**model.variables, "params": params}, rows[:, :-1])
@@ -99,7 +100,7 @@ def steps_draw(seed: int) -> dict[str, np.ndarray]:
 def _fine_tuning(rows: tuple[int, ...], dtype: str):
     """qwen3-tiny's trainer and its step compiled for a batch of `rows`' shape in `dtype`, once a process:
     each draw places a fresh state and runs this step (`fine_tuned`)."""
-    pretrained = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float32", attention_impl="xla")
+    pretrained = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float32")
     objective = LMObjective(pretrained, WIDTH - 1, ema_decay=None)
     schedule = Cosine(peak_value=OPTIONS["lr_peak"], warmup_steps=OPTIONS["warmup"],
                       end_value=OPTIONS["lr_end"], init_value=OPTIONS["lr_init"])
@@ -130,12 +131,14 @@ def pipeline_arms(_):
     return STEPS_FIXTURE, steps_draw, fine_tuned, ("loss", "grad_norm")
 
 
+@attending("xla")
 def test_lm_fine_tune_steps_are_as_exact_as_torch():
     """Eight AdamW steps of the trainer, each step's loss and gradient norm on par with torch's over drawn
     rows whose first update decides each element's sign (check 1), the truth torch's float64 run."""
     assert_arms_as_recorded(pipeline_arms(None), "lm-steps", STEPS_SEEDS, "LM fine-tune steps", host=True)
 
 
+@attending("xla")
 @pytest.mark.parametrize("family", ["qwen3-tiny", "mamba2-tiny", "mixtral-tiny", "qwen3-moe-tiny",
                                     "qwen35-tiny"])
 def test_reference_work_is_the_trainers_training_flops_at_the_same_shape(tmp_path, monkeypatch, family):
@@ -153,7 +156,7 @@ def test_reference_work_is_the_trainers_training_flops_at_the_same_shape(tmp_pat
     import json
 
     fields = translate_config(json.loads(Path(args.config).read_text()))
-    fields.update(dtype="float32", attention_impl="xla")
+    fields.update(dtype="float32")
     objective = LMObjective(fields.value, seq_len=4, ema_decay=None)
     batch = {TEXT_KEY: np.zeros((2, 5), np.int32)}
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), tracker=None, checkpoints=None)
@@ -168,6 +171,7 @@ def test_reference_work_is_the_trainers_training_flops_at_the_same_shape(tmp_pat
     assert identity["fields"]["emb_features"] == fields.value.emb_features
 
 
+@attending("xla")
 def test_packed_documents_give_every_step_the_work_counted_for_one(monkeypatch):
     """`common.documents` packs every window with the same documents, numbered
     from 1, each LOW to HIGH tokens long but the last, which the row's end
@@ -189,7 +193,7 @@ def test_packed_documents_give_every_step_the_work_counted_for_one(monkeypatch):
         common.documents((1, 4), "5:3")
 
     fields = translate_config(json.loads((FIXTURES / "hf" / "llama-tiny" / "config.json").read_text()))
-    fields.update(dtype="float32", attention_impl="xla")
+    fields.update(dtype="float32")
     objective = LMObjective(fields.value, seq_len=32, ema_decay=None)
     windows = np.random.default_rng(0).integers(0, 256, (6, 33), dtype=np.int32)
 
@@ -203,13 +207,14 @@ def test_packed_documents_give_every_step_the_work_counted_for_one(monkeypatch):
     assert counted([0, 1]) == counted([4, 5]) < counted([0, 1], packed=False)
 
 
+@attending("xla")
 def test_dit_work_includes_the_native_conditioning_geometry(monkeypatch):
     from dew.nn.backbones.dit import SimpleDiT
 
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
     runner = load("reference_runs/diffusion")
     writer = load("reference_runs/work")
-    objective = runner.counting_objective((8, 8, 3), "float32", "xla")
+    objective = runner.counting_objective((8, 8, 3), "float32")
     batch = {"image": np.zeros((2, 8, 8, 3), np.uint8)}
     work = writer.measure(objective, batch)
     assert work.training_flops_per_step == objective.training_flops(None, batch)
@@ -337,6 +342,7 @@ assert seconds > 0 and len(samples) == 1 and record["finite_losses"]
     assert done.returncode == 0, done.stderr[-3000:]
 
 
+@attending("xla")
 def test_dews_diffusion_reference_trains_dews_own_loss_on_its_batchs_draws(monkeypatch):
     """The objective Dew's side of the diffusion reference trains (`fixed_draws`) loses, on a batch
     holding its noise levels and noise, what Dew's own loss loses with those draws its step's tape: its
@@ -347,7 +353,7 @@ def test_dews_diffusion_reference_trains_dews_own_loss_on_its_batchs_draws(monke
 
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
     runner = load("reference_runs/diffusion")
-    counted = runner.counting_objective((8, 8, 3), "float32", "xla")
+    counted = runner.counting_objective((8, 8, 3), "float32")
     variables = nn.unbox(counted.init(jax.random.key(0)))
     trained = runner.fixed_draws(counted, variables, None)
     images = np.random.default_rng(0).integers(0, 255, (4, 8, 8, 3), dtype=np.uint8)

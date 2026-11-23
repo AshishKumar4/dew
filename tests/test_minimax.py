@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import token_draw
-from model_support import compiled_apply, stepped_decode, unrolled
+from model_support import attending, compiled_apply, stepped_decode, unrolled
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -29,9 +29,10 @@ def released(name: str) -> dict:
 
 
 def load() -> Pretrained:
-    return Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    return Pretrained.load(TINY, dtype='float32')
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_releases_own_config_and_its_transformers_config_read_as_one_model():
     """MiniMax-Text-01's own config (`attn_type_list`, `layernorm_*`, remote code) and the config its
@@ -44,8 +45,7 @@ def test_a_releases_own_config_and_its_transformers_config_read_as_one_model():
     narrow = {'hidden_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1, 'head_dim': 8,
               'rotary_dim': 4, 'intermediate_size': 16, 'num_local_experts': 2, 'num_experts_per_tok': 1,
               'vocab_size': 32, 'max_position_embeddings': 64}
-    model = from_record(CausalTransformer, {**translate_config({**released('minimax-text-01'), **narrow}),
-                                            'attention_impl': 'reference'})
+    model = from_record(CausalTransformer, {**translate_config({**released('minimax-text-01'), **narrow})})
     ids = jnp.zeros((1, 1), jnp.int32)
     variables = jax.eval_shape(lambda: model.init(jax.random.key(0), ids))
     cache = jax.eval_shape(lambda: model.init(jax.random.key(0), ids, decode=True))['cache']
@@ -59,6 +59,7 @@ SCAN_SEEDS = 8
 """The scanned decode's declared draws (check 1)."""
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_minimax_decodes_as_its_plain_loop():
     """A MiniMax of minimax-tiny's config over eight layers repeating three lightning layers and a softmax
@@ -66,7 +67,7 @@ def test_a_scanned_minimax_decodes_as_its_plain_loop():
     layer's rates by its place) as exactly as its plain loop (`unrolled`), both from the plain loop's
     float64 steps (check 1)."""
     config = {**released('minimax-tiny'), 'num_hidden_layers': 8, 'attn_type_list': [0, 0, 0, 1] * 2}
-    record = {**translate_config(config), 'attention_impl': 'reference'}
+    record = {**translate_config(config)}
     plain = scanned = from_record(CausalTransformer, record)
     variables = plain.init(jax.random.key(0), jnp.zeros((2, 4), jnp.int32))
 
@@ -83,6 +84,7 @@ def test_a_scanned_minimax_decodes_as_its_plain_loop():
                     'scanned MiniMax decode', seeds=SCAN_SEEDS, truth_fn=truth)
 
 
+@attending("reference")
 def test_a_record_saved_with_a_kind_for_each_lightning_layer_computes_as_it_did():
     """A run saved before the stack handed each lightning layer its place recorded a kind for each,
     `linear_attention_{index}` stating its `layer_idx` (ledger 2564); its model record, read as a saved
@@ -102,13 +104,14 @@ def test_a_record_saved_with_a_kind_for_each_lightning_layer_computes_as_it_did(
     legacy['kinds'] = {**others, **{
         name: {**lightning, 'mixer': {**lightning['mixer'], 'fields': {**fields, 'layer_idx': index}}}
         for index, name in enumerate(legacy['layer_types']) if name.startswith('linear_attention_')}}
-    saved = {'class': import_path(CausalTransformer), 'fields': {**legacy, 'attention_impl': 'reference'}}
+    saved = {'class': import_path(CausalTransformer), 'fields': {**legacy}}
     model = from_record(CausalTransformer, earlier_model({'model': saved})['model'])
     ids = np.load(TINY / 'input_ids.npy')
     np.testing.assert_array_equal(compiled_apply(model, loaded.variables, ids),
                                   compiled_apply(loaded.model, loaded.variables, ids))
 
 
+@attending("reference")
 def test_a_minimax_model_writes_no_checkpoint_another_runtime_would_misread(tmp_path):
     """No runtime outside Dew computes MiniMax as its release does (transformers' MiniMax turns every
     dimension and scales the lightning rates otherwise; the release's code does not import under

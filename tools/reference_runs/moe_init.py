@@ -73,14 +73,14 @@ def main() -> None:
 
     scaffold = Path(f"{args.out}-scaffold")
     Qwen3MoeForCausalLM(Qwen3MoeConfig.from_dict(CONFIG)).save_pretrained(scaffold, safe_serialization=True)
-    source = Pretrained.load(str(scaffold), dtype="float32", param_dtype="float32", attention_impl="xla")
+    source = Pretrained.load(str(scaffold), dtype="float32", param_dtype="float32")
     variables = source.model.init(jax.random.key(args.seed), jnp.zeros((1, 8), jnp.int32))
     if jax.tree.structure(variables) != jax.tree.structure(source.variables):
         raise ValueError("Dew's init and the scaffold's variables are different trees")
     source.save(args.out, variables=variables)
     shutil.rmtree(scaffold)
 
-    written = Pretrained.load(args.out, dtype="float32", param_dtype="float32", attention_impl="xla")
+    written = Pretrained.load(args.out, dtype="float32", param_dtype="float32")
     for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(variables),
                                     jax.tree.leaves(written.variables), strict=True):
         if not np.array_equal(np.asarray(mine), np.asarray(theirs)):
@@ -91,4 +91,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # On the xla attention, the run's kernel choice (a model's field before row 11938), Dew imported where
+    # it runs, as this tool imports it.
+    from dew.nn.kernels import generation
+
+    with generation.chosen(attention="xla"):
+        main()

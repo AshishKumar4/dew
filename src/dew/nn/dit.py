@@ -23,7 +23,6 @@ from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
 from dew._records import JSON
-from dew.nn.attention import AttentionImpl
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.nn.residuals import Residual
@@ -459,7 +458,6 @@ class _BlockOptions(TypedDict):
     precision: PrecisionLike
     force_fp32_for_softmax: bool
     norm_epsilon: float
-    attention_impl: AttentionImpl
 
 
 class _AttentionBlockOptions(_BlockOptions):
@@ -485,7 +483,6 @@ class _TransformerOptions(nn.Module, kw_only=True):
     precision: PrecisionLike = dataclasses.field(default=None, metadata={FROM_ENCODER: True})
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
-    attention_impl: AttentionImpl = 'auto'
 
     @nn.nowrap
     def condition_lengths(self, lengths: np.ndarray, spans: np.ndarray) -> np.ndarray:
@@ -495,7 +492,7 @@ class _TransformerOptions(nn.Module, kw_only=True):
     def _block_options(self) -> _BlockOptions:
         return {'mlp_ratio': self.mlp_ratio, 'dtype': self.dtype, 'precision': self.precision,
                 'force_fp32_for_softmax': self.force_fp32_for_softmax,
-                'norm_epsilon': self.norm_epsilon, 'attention_impl': self.attention_impl}
+                'norm_epsilon': self.norm_epsilon}
 
     @nn.nowrap
     def _embedding(self, patch_size: int, features: int, scan_order: str = 'raster',
@@ -595,7 +592,6 @@ class ModulatedBlock(nn.Module):
     gelu_approximate: bool = True
     qkv_bias: bool = True
     qk_norm: bool = False
-    attention_impl: AttentionImpl = "auto"
     # ssm mixer options
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True
@@ -649,7 +645,6 @@ class ModulatedBlock(nn.Module):
                 use_bias=True,
                 qkv_bias=self.qkv_bias,
                 qk_norm=QKNorm() if self.qk_norm else None,
-                attention_impl=self.attention_impl,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
             )
         else:

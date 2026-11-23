@@ -36,7 +36,7 @@ TINY = ROOT / 'mamba-tiny'
 
 
 def load():
-    return Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    return Pretrained.load(TINY, dtype='float32')
 
 
 def operands(length=11, channels=16, state=4, seed=0):

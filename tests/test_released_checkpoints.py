@@ -28,7 +28,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from model_support import flat_tree
+from model_support import attending, flat_tree
 from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained
@@ -69,14 +69,16 @@ def checkpoint(request):
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def bundle(checkpoint):
     """One released checkpoint as a native model, loaded once per checkpoint."""
     repo, revision = CHECKPOINTS[checkpoint]
-    return Pretrained.load(repo, dtype="float32", attention_impl="reference",
+    return Pretrained.load(repo, dtype="float32",
                            max_seq_len=SEQ, revision=revision)
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def batch(bundle):
     """The prompts as one right-padded batch, built without asking the
     tokenizer to pad.
@@ -102,6 +104,7 @@ def batch(bundle):
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def reference(bundle):
     """transformers over the same snapshot directory the loader resolved."""
     import torch
@@ -145,6 +148,7 @@ def reference_logits(model, ids, mask=None, positions=None, *, wide: bool = Fals
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def scoring(bundle, batch):
     """The objective the scoring and the training step share, and its rows.
 
@@ -161,6 +165,7 @@ def scoring(bundle, batch):
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def trained(scoring):
     """The state after one real `Trainer` step of plain SGD over the released
     weights."""
@@ -180,6 +185,7 @@ def trained(scoring):
         data, steps=1, log_every=1)
 
 
+@attending("reference")
 def test_the_load_hands_back_the_checkpoints_own_tokenizer(bundle, batch):
     """A text prompt becomes the ids the checkpoint was trained on, and comes
     back as its own text, without the caller naming a vocabulary."""
@@ -229,6 +235,7 @@ def assert_logits_as_exact(model, variables, reference, batch, label, salt):
         truth_fn=as_given(lambda ids: wide_logits(reference, ids, valid, positions)[valid]))
 
 
+@attending("reference")
 def test_the_released_logits_match_transformers_on_the_same_ids(
         bundle, batch, reference, checkpoint):
     """The parity claim on real weights: dew's fp32 forward over the released
@@ -238,6 +245,7 @@ def test_the_released_logits_match_transformers_on_the_same_ids(
     assert_logits_as_exact(bundle.model, bundle.variables, reference, batch, f"{checkpoint} logits", 0x5E1)
 
 
+@attending("reference")
 def test_the_objectives_token_scores_are_the_references_cross_entropy(
         batch, reference, scoring, checkpoint):
     """`LMObjective.evaluate` is the shifted cross entropy of the reference's
@@ -282,6 +290,7 @@ def test_the_objectives_token_scores_are_the_references_cross_entropy(
                     truth_fn=as_given(lambda rows: cross_entropy(wide_logits(reference, rows[:, :-1]), rows)))
 
 
+@attending("reference")
 def test_greedy_generation_draws_the_references_greedy_continuation(bundle, batch, reference):
     """Temperature zero is argmax, so the native sampler and the reference's
     greedy search read the same distribution and draw the same tokens. One
@@ -309,6 +318,7 @@ def test_greedy_generation_draws_the_references_greedy_continuation(bundle, batc
                 == [int(token) for token in expected[0][lengths[row]:]]), text
 
 
+@attending("reference")
 def test_the_trained_export_reloads_and_transformers_reads_it(
         bundle, batch, trained, checkpoint, tmp_path):
     """`Pretrained.save` writes the trained weights back into the released
@@ -328,7 +338,7 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
     bundle.save(export, variables=state.variables)
     ours = np.asarray(bundle.model.apply(state.variables, inputs.tokens, **inputs.kwargs()),
                       np.float32)
-    again = Pretrained.load(export, dtype="float32", attention_impl="reference", max_seq_len=SEQ)
+    again = Pretrained.load(export, dtype="float32", max_seq_len=SEQ)
 
     assert again.model == bundle.model, "the exported config rebuilds a different model"
     assert again.processor is not None, "the export carries no tokenizer"

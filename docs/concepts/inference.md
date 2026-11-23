@@ -172,7 +172,7 @@ from dew.sampling.text import Sampling, generate
 with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
                        cache_bytes=0, param_dtype="auto") as source:
     fields = {**translate_config(source.config), "max_seq_len": 128}
-    model = CausalTransformer(**fields, dtype=jnp.bfloat16, attention_impl="xla")
+    model = CausalTransformer(**fields, dtype=jnp.bfloat16)
     variables = source.stream(model)
     generated = jax.block_until_ready(generate(
         model, variables, [[1, 2, 3, 4]], max_new_tokens=8,

@@ -22,7 +22,7 @@ import pytest
 import selection_margins
 from arm_arithmetic import float64_held, unrewritten
 from flax import linen as nn
-from model_support import flat_tree, largest_difference, stepped_decode, steps_from, unrolled
+from model_support import attending, flat_tree, largest_difference, stepped_decode, steps_from, unrolled
 from reference_error import (
     FEWEST_SEEDS,
     GateFailure,
@@ -67,7 +67,7 @@ def fixture_pair(name, **overrides):
     """The fixture's model, which scans its stack, with the fixture's weights."""
     directory = FIXTURES / name
     pretrained = Pretrained.load(
-        str(directory), dtype="float32", attention_impl="reference", **overrides)
+        str(directory), dtype="float32", **overrides)
     return pretrained.model, pretrained.variables, directory
 
 
@@ -75,6 +75,7 @@ def paths(tree):
     return [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(tree)]
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("name", sorted(FIXTURE_NAMES))
 def test_a_scanned_fixture_scores_as_the_plain_loop(name):
@@ -96,6 +97,7 @@ def test_a_scanned_fixture_scores_as_the_plain_loop(name):
     assert float(np.max(np.abs(logits - reference))) < 1e-4
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("name", sorted(FIXTURE_NAMES))
 def test_a_scanned_fixture_decodes_through_the_cache(name):
@@ -179,8 +181,7 @@ SHAPE_CONFIGS = {"gemma4": gemma4_config, "gemma3n": gemma3n_config, "deepseek":
 def shaped(shape: str):
     """A builder of `shape`'s decoder at a dtype, its fields overridden by keyword."""
     def build(dtype=jnp.float32, **overrides):
-        return models.build("causal_transformer", SHAPE_CONFIGS[shape](**overrides), dtype=dtype,
-                            attention_impl="reference")
+        return models.build("causal_transformer", SHAPE_CONFIGS[shape](**overrides), dtype=dtype)
     return build
 
 
@@ -406,6 +407,7 @@ def scans_as_the_loop(shape: str) -> None:
                         conditioning_scale=case.weighed(site))
 
 
+@attending("reference")
 @pytest.mark.parametrize("shape", sorted(set(SHAPES) - {"gemma3n"}))
 def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     """`scans_as_the_loop` over each shape but Gemma 3n's, which CI's map tasks draw
@@ -413,6 +415,7 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     scans_as_the_loop(shape)
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=128, per_task=24, conditioning=32, conditioning_per_task=4)
 def test_gemma3ns_runs_of_like_layers_scan_as_its_loop():
     """`scans_as_the_loop` over Gemma 3n's shape, its 128 seeds and their redraws drawn by CI's map tasks
@@ -422,6 +425,7 @@ def test_gemma3ns_runs_of_like_layers_scan_as_its_loop():
     scans_as_the_loop("gemma3n")
 
 
+@attending("reference")
 def test_a_scanned_gate_at_another_sparsity_fails_check_1():
     """A Gemma 3n scanned stack whose sparse layers cut at 0.951 in place of 0.95 moves each cutoff about
     0.0035 of its row's deviation, far past the draws' margin: on the rows that clear it, it keeps other
@@ -460,6 +464,7 @@ def next_token_cross_entropy(logits, ids):
     return -jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids[:, 1:, None], axis=-1).mean()
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_a_scanned_init_is_the_plain_init(shape):
@@ -476,6 +481,7 @@ def test_a_scanned_init_is_the_plain_init(shape):
         lambda a, b: bool(jnp.array_equal(a, b)), first, second)))
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
     """The routers sow through the scanned view, so the balance loss and the
@@ -570,7 +576,7 @@ def hybrid(periods: int, **overrides):
     """A stack of `periods` repeats of three windowed layers and one full one, Qwen3.5's pattern."""
     return tiny(num_layers=4 * periods, max_seq_len=16,
                 layer_types=(("sliding_attention",) * 3 + ("full_attention",)) * periods,
-                kinds={"sliding_attention": {"window": 4}}, attention_impl="reference", **overrides)
+                kinds={"sliding_attention": {"window": 4}}, **overrides)
 
 
 def decoded(model, variables, ids):
@@ -586,6 +592,7 @@ def drawn_ids(stream: int, length: int):
     return draw
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop():
     """A decode step over resident weights scans a stack whose layers repeat one
@@ -634,6 +641,7 @@ ONE_STAGE_SEEDS = 8
 """Check 1's declared seeds for a one-stage state's stack read in place against the per-layer store."""
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_one_stage_state_holds_a_scanned_stack_as_its_scan_reads_it():
     """On one stage a scanned decoder's stage-local state (`stage_sites` at one stage, `StackView.
@@ -680,6 +688,7 @@ def test_a_one_stage_state_holds_a_scanned_stack_as_its_scan_reads_it():
     assert staged_temporaries < layered_temporaries, (staged_temporaries, layered_temporaries)
 
 
+@attending("reference")
 def test_a_stacks_layer_states_are_kept_by_the_one_layer_name_parser():
     """The capture that keeps every layer's output takes a module for a layer as the stack's one parser
     of its names does (`layer_names.group_layers`): a layer and a scanned run, and not a name that only
@@ -823,6 +832,7 @@ SOURCE_SCAN_SEEDS = 8
 """A loaded source's scanned decode's check-1 seeds, sized by `seeds_for` on armada."""
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
     """A loaded source scans its periodic stack in its decode step by itself (ledger 642, row 4074):
@@ -836,7 +846,7 @@ def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
     config.update(num_hidden_layers=8, layer_types=config["layer_types"] * 2)
     torch.manual_seed(0)
     Qwen3_5ForCausalLM(Qwen3_5TextConfig(**config)).to(torch.float32).save_pretrained(tmp_path)
-    plain = scanned = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    plain = scanned = Pretrained.load(tmp_path, dtype="float32")
     ids = np.zeros((2, 1), np.int32)
     cache = nn.unbox(scanned.model.init(jax.random.key(0), ids, decode=True))["cache"]
     graph = jax.make_jaxpr(lambda variables, cache: scanned.model.apply(
@@ -861,9 +871,10 @@ def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
 
 
 def bf16(**overrides):
-    return models.build("causal_transformer", {**TINY, **overrides}, dtype="bfloat16", attention_impl="xla")
+    return models.build("causal_transformer", {**TINY, **overrides}, dtype="bfloat16")
 
 
+@attending("xla")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_scanned_stack_under_a_bf16_policy_scores_as_the_plain_loop_does():
     """Under a bf16 compute policy the plain loop's first layer returns the
@@ -874,7 +885,7 @@ def test_a_scanned_stack_under_a_bf16_policy_scores_as_the_plain_loop_does():
     3.1e-02 between the two. The fp32 tests above hold the two paths to
     fp32 tolerance."""
     plain, scanned = bf16(), bf16()
-    exact = tiny(attention_impl="xla")
+    exact = tiny()
     ids = jax.random.randint(jax.random.key(1), (2, 12), 0, VOCAB)
     variables = nn.unbox(unrolled(plain.init)(jax.random.key(0), ids))
     logits, scanned_logits = unrolled(plain.apply)(variables, ids), scanned.apply(variables, ids)
@@ -1088,6 +1099,7 @@ def test_a_scanned_pipeline_has_the_loss_and_gradient_of_the_plain_loop():
     assert difference < 1e-5, f"max |gradient difference| {difference:.3e}"
 
 
+@attending("xla")
 @mesh_lane
 def test_a_pipeline_under_a_bf16_policy_trains_the_loss_of_the_plain_loop():
     """The stages hand the residual stream on in the dtype it settles in, so
@@ -1249,7 +1261,7 @@ def test_a_scanned_glm5_next_computes_its_unrolled_forward():
 def fetched_layer_states():
     """The host-fetched (dew) and resident (reference) layer-state functions of one scanned model's
     weights and its float64 truth, each arm compiled once (`without_ynn`)."""
-    model = tiny(attention_impl="reference")
+    model = tiny()
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     assert any(count > 1 for _, count in model.bind(variables).groups)
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
@@ -1262,6 +1274,7 @@ def fetched_layer_states():
             float64_layer_states(model, variables))
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_resident_stacks_layer_states_are_a_resident_ones():
     """A stack whose layers sit in host memory, read by a caller that keeps intermediates, binds
@@ -1273,13 +1286,14 @@ def test_a_host_resident_stacks_layer_states_are_a_resident_ones():
                     seeds=FETCHED_STATES_SEEDS, truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_resident_stack_keeps_what_its_callers_own_filter_asks_for():
     """A caller's own capture filter, every layer's input norm and nothing else, reaches the layers
     a host-resident stack fetches: it keeps the sublayer outputs the resident stack keeps, at the
     same places, and no layer output nobody asked for. A layer norm runs its own call, where the
     default RMS norm runs fused into its seam."""
-    model = tiny(attention_impl="reference", norm_type="layer")
+    model = tiny(norm_type="layer")
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
     on_host = {**variables, "params": {
@@ -1301,10 +1315,11 @@ def test_a_host_resident_stack_keeps_what_its_callers_own_filter_asks_for():
     assert kept(on_host) == resident
 
 
+@attending("reference")
 def test_a_capture_filter_can_select_only_a_later_host_resident_layer():
     """Identical layer specs need not have identical capture policies: selecting one later layer
     keeps it even when the first layer's shape probe captured nothing, a layer at a time (`unrolled`)."""
-    model = tiny(attention_impl="reference")
+    model = tiny()
     ids = jnp.ones((1, SEQ_LEN), jnp.int32)
     variables = nn.unbox(model.init(jax.random.key(0), ids))
     host = jax.sharding.SingleDeviceSharding(jax.devices()[0], memory_kind="pinned_host")
@@ -1321,6 +1336,7 @@ def test_a_capture_filter_can_select_only_a_later_host_resident_layer():
     assert jax.tree.structure(captures[1]) == jax.tree.structure(captures[0])
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_decoding():
     """A scanned stack whose later layers read the keys and values an earlier one provides, its
@@ -1355,6 +1371,7 @@ def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_dec
         assert our_paths == their_paths
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_resident_one():
@@ -1372,7 +1389,7 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
 
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=3, num_heads=2, num_kv_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
-                              attention_impl="reference",
+
                               mixture=Mixture(experts=4, top_k=2, bias=True))
     tokens = jnp.asarray([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]], jnp.int32)
     variables = nn.unbox(jax.jit(model.init)(jax.random.key(0), tokens))

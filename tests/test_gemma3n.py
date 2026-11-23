@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import fixture_arrays
+from model_support import attending
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
@@ -189,7 +190,7 @@ def clipped_gemma3n():
     from dew.interop import Pretrained
 
     directory = Path(__file__).resolve().parent / "fixtures" / "hf" / "gemma3n-tiny"
-    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(directory), dtype="float32")
     layers = [tree["altup"]["prediction_coefs"]["kernel"] for name, tree in loaded.variables["params"].items()
               if name.startswith("layers_")]
     clip = float(np.median(np.abs(np.concatenate([np.ravel(kernel) for kernel in layers]))))
@@ -226,6 +227,7 @@ def reference_decoder(directory, clip, dtype, sparsity=None):
     return wide.train()
 
 
+@attending("reference")
 @pytest.mark.parametrize("decay", [0.0, 0.1])
 def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference_does(decay):
     """A training step's update of the gemma3n-tiny decoder, with half of every layer's AltUp
@@ -322,6 +324,7 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
                     truth_fn=as_given(lambda *inputs: reference(torch.float64, *inputs)))
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_the_dense_decoders_gradient_is_the_references():
     """The gemma3n-tiny decoder's loss gradient, its AltUp coefficients past the clip and its MLPs
@@ -419,6 +422,7 @@ def test_the_dense_decoders_gradient_is_the_references():
         torch.set_num_threads(threads)
 
 
+@attending("reference")
 @pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
 @pytest.mark.parametrize("objective", ["lm", "grpo", "ppo"])
 def test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones(objective, optimizer):

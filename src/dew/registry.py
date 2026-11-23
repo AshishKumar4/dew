@@ -1932,8 +1932,9 @@ class ModelConfig(Registered):
     """A model's class and the fields the run gives it.
 
     `name` is an alias or an import path, held as the path. `fields` are the
-    class's own fields, its compute and storage dtypes, attention kernel and
-    matmul precision included, which the command line sets one flag each
+    class's own fields, its compute and storage dtypes and matmul precision
+    included (its attention kernel is the run's, `Diagnostics.kernels`, since
+    row 11938), which the command line sets one flag each
     (`RunConfig.cli`); a recipe fills the ones it derives from its data in
     `build`. `defaults` holds every other field the class defaults, as it
     defaulted them when the run was first recorded, so the record builds the

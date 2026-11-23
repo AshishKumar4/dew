@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import functools
+import json
 import math
 import re
 import typing
@@ -258,14 +259,63 @@ def set_added(value: DataclassInstance | Sequence[DataclassInstance] | Mapping[s
                or set_added(getattr(value, field.name)) for field in dataclasses.fields(value))
 
 
+ATTENTION_KERNEL_HOLDERS = (
+    "dew.decision.head:DecisionHead",
+    "dew.decision.head:JointSchemaHead",
+    "dew.nn.attention_blocks:BasicTransformerBlock",
+    "dew.nn.attention_blocks:NormalAttention",
+    "dew.nn.attention_blocks:TransformerBlock",
+    "dew.nn.backbones.dit:SimpleDiT",
+    "dew.nn.backbones.edm2:Block",
+    "dew.nn.backbones.edm2:EDM2UNet",
+    "dew.nn.backbones.flux:FluxSingleBlock",
+    "dew.nn.backbones.flux:FluxTransformer",
+    "dew.nn.backbones.flux2:Flux2SingleBlock",
+    "dew.nn.backbones.flux2:Flux2Transformer",
+    "dew.nn.backbones.jepa:FactorizedTokenStack",
+    "dew.nn.backbones.jepa:JepaEncoder",
+    "dew.nn.backbones.jepa:JepaPredictor",
+    "dew.nn.backbones.jepa:JepaVideoEncoder",
+    "dew.nn.backbones.jepa:TokenStack",
+    "dew.nn.backbones.joint:DoubleStreamBlock",
+    "dew.nn.backbones.joint:JointAttention",
+    "dew.nn.backbones.mmdit:HierarchicalMMDiT",
+    "dew.nn.backbones.mmdit:SimpleMMDiT",
+    "dew.nn.backbones.qwen_image:QwenImageTransformer",
+    "dew.nn.backbones.sd3:SD3Transformer",
+    "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
+    "dew.nn.backbones.unet:Unet",
+    "dew.nn.backbones.unet3d:UNet3D",
+    "dew.nn.backbones.unet_condition:UNet2DCondition",
+    "dew.nn.backbones.uvit:SimpleUDiT",
+    "dew.nn.backbones.uvit:UViT",
+    "dew.nn.backbones.video_dit:VideoDiT",
+    "dew.nn.backbones.wan:WanBlock",
+    "dew.nn.backbones.wan:WanTransformer",
+    "dew.nn.backbones.z_image:ZImageBlock",
+    "dew.nn.backbones.z_image:ZImageTransformer",
+    "dew.nn.cross_attention:GatedCrossAttention",
+    "dew.nn.dit:ModulatedBlock",
+    "dew.nn.dsa_kpool:KPoolSparseAttention",
+    "dew.nn.mla:MultiHeadLatentAttention",
+    "dew.nn.mobilenet:MobileAttention",
+    "dew.nn.mobilenet:MobileMultiQueryAttention",
+    "dew.nn.mobilenet:MobileNetV5Encoder",
+    "dew.nn.mobilenet:MobileStage",
+)
+"""The classes that held an attention kernel (`attention_impl`), the run's since row 11938
+(`Diagnostics.kernels`, `generation.chosen(attention=...)`), never a model's."""
+
 REMOVED_FIELDS: Mapping[str, frozenset[str]] = {
     "dew.decision.layout:OptionLines": frozenset({"stream"}),
-    "dew.nn.backbones.causal_transformer:CausalTransformer": frozenset({"scan_layers"}),
+    "dew.nn.backbones.causal_transformer:CausalTransformer": frozenset({"scan_layers", "attention_impl"}),
     "dew.interop.source_options:SourceOptions": frozenset({"scan_layers"}),
+    **{holder: frozenset({"attention_impl"}) for holder in ATTENTION_KERNEL_HOLDERS},
 }
 """The fields a configuration lost after runs were saved with them, by its class's import path: each always
 another's (a question's option lines' stream, its instructions', rows 2008 to 2450), or how a model executes
-and never what it computes (a decoder's layer scan, which its structure decides since row 4074), so a saved
+and never what it computes (a decoder's layer scan, which its structure decides since row 4074; an attention
+kernel, the run's since row 11938, which a saved run's model's moves to: `dew.config.earlier`), so a saved
 record of one means what today's, which has none, does. A saved run's records read without them
 (`earlier_fields`)."""
 
@@ -433,6 +483,58 @@ def earlier_fields(value: JSON) -> JSON:
         return {"class": name, "fields": kept}
 
     return class_records(value, without_removed)
+
+
+def earlier_described_fields(value: JSON) -> JSON:
+    """`value`, a data plan an earlier Dew saved, with each step description's fields its class lost since
+    (`REMOVED_FIELDS`) left out: a description names its class by its dotted path beside its fields
+    (`dew.data.plan.structured`), wherever it nests, a plan's step's configuration (`StepIdentity.config`,
+    an entry's of a plan's `steps`, its JSON in a string) read and written back as the plan writes one
+    (`sort_keys`). A position saved before a field was retired resumes exactly (row 11938: a decision head's
+    attention kernel). Only a plan's step's configuration is read as JSON, never a string a description
+    holds, a caption's template or a step's own `config` field among them, which stays as written, where a
+    string under any `config` read as a record and one that was no JSON raised (the API02 review)."""
+    removed = {path.replace(":", "."): fields for path, fields in REMOVED_FIELDS.items()}
+    named = {field for fields in removed.values() for field in fields}
+
+    def kept(held: Mapping) -> dict:
+        named_class = held.get("class")
+        dropped = removed.get(named_class, frozenset()) if isinstance(named_class, str) else frozenset()
+        return {key: entry for key, entry in held.items() if key not in dropped}
+
+    def described(held: JSON) -> JSON:
+        # A description, its strings as written.
+        if isinstance(held, list):
+            return [described(entry) for entry in held]
+        if isinstance(held, Mapping):
+            return {key: described(entry) for key, entry in kept(held).items()}
+        return held
+
+    def planned(held: JSON) -> JSON:
+        # The plan around its steps' identities (`StepIdentity`), each entry of a `steps` list one.
+        if isinstance(held, list):
+            return [planned(entry) for entry in held]
+        if isinstance(held, Mapping):
+            return {key: ([identity(step) for step in entry] if key == "steps" and isinstance(entry, list)
+                          else planned(entry)) for key, entry in kept(held).items()}
+        return held
+
+    def identity(step: JSON) -> JSON:
+        # A step's identity: its configuration a generated instance's description, the JSON text the plan
+        # wrote (`structured`), walked where it names a retired field; a declared identity or a name, which
+        # is no JSON, as written.
+        if not isinstance(step, Mapping):
+            return planned(step)
+        config = step.get("config")
+        # A declared identity (`StepIdentity.declared`, which a step's configuration then is too) is opaque,
+        # whatever it spells (the API02 review: an identity naming a retired field read as JSON raised).
+        if (not (isinstance(config, str) and config.startswith("{")
+                 and any(f'"{field}"' in config for field in named)) or config == step.get("declared")):
+            return planned(step)
+        return {key: json.dumps(described(json.loads(config)), sort_keys=True) if key == "config"
+                else planned(entry) for key, entry in kept(step).items()}
+
+    return planned(value)
 
 
 @overload

@@ -20,6 +20,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 import torch
+from model_support import attending
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained, sources
@@ -49,6 +50,7 @@ def logits(source) -> np.ndarray:
     return np.asarray(source.model.apply(source.variables, np.load(FIXTURE / "input_ids.npy")))
 
 
+@attending("reference")
 def test_a_pickle_checkpoint_converts_once_and_then_loads_without_torch(tmp_path, cache, monkeypatch):
     """The first load converts and reproduces the reference logits within
     the fixture's own fp32 bound (tests/test_mamba2_interop.py); the second
@@ -56,10 +58,10 @@ def test_a_pickle_checkpoint_converts_once_and_then_loads_without_torch(tmp_path
     source = pickled_fixture(tmp_path / "source")
     reference = np.load(FIXTURE / "logits.npy")
 
-    first = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    first = Pretrained.load(source, dtype="float32")
     conversions = sorted((cache / "dew" / "converted").iterdir())
     monkeypatch.setitem(sys.modules, "torch", None)
-    second = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    second = Pretrained.load(source, dtype="float32")
 
     assert float(np.max(np.abs(logits(first) - reference))) < 1e-5
     assert len(conversions) == 1 and sorted((cache / "dew" / "converted").iterdir()) == conversions

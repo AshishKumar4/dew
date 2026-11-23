@@ -15,6 +15,7 @@ from flax import linen as nn
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
 from dew.nn.inputs import DenoisingCondition
+from dew.nn.kernels import generation
 from dew.sampling.walks import sample
 
 ROWS = 256
@@ -122,7 +123,7 @@ def check_unet(directory, case):
     dropout = DROPPED.get(case)
     changed = {} if dropout is None else {"dropout": dropout}
     config = json.loads((directory / "unet/config.json").read_text()) | changed
-    model = unet_fields(config, attention_impl="xla").value
+    model = unet_fields(config).value
     params, _ = translate_unet_weights(component_tensors(directory, "unet"), model)
     training = dropout is not None
     source = UNet2DConditionModel.from_pretrained(directory / "unet", **changed).train(training)
@@ -169,8 +170,9 @@ def check(directory, case):
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
+    with generation.chosen(attention="xla"):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+        from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory")

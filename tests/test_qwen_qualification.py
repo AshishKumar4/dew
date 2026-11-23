@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import parameter_loss, stepped_outputs
+from model_support import attending, parameter_loss, stepped_outputs
 from reference_error import as_given
 
 from dew.batch import coordinates, flat_field, prefix_sum, real_slots, token_positions
@@ -40,8 +40,9 @@ def stepped_and_reloaded(loaded, inputs, expected_loss, learning_rate: float, di
     variables = {**loaded.variables, "params": jax.tree.map(
         lambda weight, grad: weight - learning_rate * grad, loaded.variables["params"], gradient)}
     loaded.save(directory, variables=variables)
-    return variables, Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    return variables, Pretrained.load(directory, dtype="float32")
 
+@attending("xla")
 def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch, tmp_path):
     import optax
     from transformers import AutoProcessor
@@ -57,7 +58,7 @@ def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch,
         pytest.fail("text-only preprocessing constructed a media processor")
 
     monkeypatch.setattr(AutoProcessor, "from_pretrained", load_media)
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(directory, dtype="float32")
     processor = loaded.processor
     from dew.interop.sources import SourceReference
 
@@ -95,12 +96,13 @@ def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch,
     loaded.save(exported, variables=state.variables)
     for name in ("preprocessor_config.json", "video_preprocessor_config.json", "chat_template.jinja"):
         assert (exported / name).read_bytes() == (directory / name).read_bytes()
-    restored = Pretrained.load(exported, dtype="float32", attention_impl="xla")
+    restored = Pretrained.load(exported, dtype="float32")
     assert restored.processor is not None
     np.testing.assert_array_equal(restored.processor(texts).tokens, inputs.tokens)
     assert restored.processor.decode(inputs.tokens) == processor.decode(inputs.tokens)
 
 
+@attending("reference")
 def test_media_requests_reuse_the_source_processor(monkeypatch):
     from transformers import AutoProcessor
 
@@ -114,7 +116,7 @@ def test_media_requests_reuse_the_source_processor(monkeypatch):
         return reference
 
     monkeypatch.setattr(AutoProcessor, "from_pretrained", load_media)
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     processor = loaded.processor
     assert processor is not None
     processor("token4")
@@ -137,11 +139,12 @@ def test_media_requests_reuse_the_source_processor(monkeypatch):
 
 
 @pytest.fixture(scope="module", params=["dense", "moe"])
+@attending("reference")
 def source(request):
     if request.param == "dense":
         pytest.importorskip("torchvision")
     directory = ROOT / f"qwen38-{request.param}-tiny"
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     assert loaded.processor is not None
     prompts = json.loads((directory / "prompts.json").read_text())
     if request.param == "dense":
@@ -151,6 +154,7 @@ def source(request):
     return loaded, inputs, np.load(directory / "reference.npz")
 
 
+@attending("reference")
 def test_source_processor_and_forward_match_reference(source):
     """fp32 max error 7.04e-6 dense / 2.19e-6 MoE; tolerance 1e-4."""
     loaded, inputs, reference = source
@@ -163,6 +167,7 @@ def test_source_processor_and_forward_match_reference(source):
     np.testing.assert_array_equal(np.asarray(result)[valid].argmax(-1), reference["logits"][valid].argmax(-1))
 
 
+@attending("reference")
 def test_source_update_exports_and_decodes_as_reference(source, tmp_path):
     """All-parameter SGD error 7.90e-6 dense / 3.46e-6 MoE; greedy ids exact.
 
@@ -278,6 +283,7 @@ def published_mtp_arms(loaded):
     return transformers_arms(built(torch.float32), predicted, twin=twin())
 
 
+@attending("reference")
 def test_shipped_prediction_weights_match_published_composition(source):
     """The prediction depth's logits over draws of the source's encoding (`encoded_draw`: its rows,
     padding and media slots, drawn tokens and pixels) on par with the published composition's over the
@@ -411,6 +417,7 @@ def uncached_steps(loaded, admitted: np.ndarray):
     return stepped
 
 
+@attending("reference")
 def test_prediction_cache_matches_reference_candidate_steps(source):
     """The prediction depth's cached steps, a token at a time over its own cache (`cached_steps`), over
     draws of its inputs from Dew's own trunk (`depth_draw`: drawn tokens and pixels in the source's
@@ -435,6 +442,7 @@ def test_prediction_cache_matches_reference_candidate_steps(source):
                     seeds=MTP_CACHE_SEEDS[loaded.source.name], truth_fn=truth)
 
 
+@attending("reference")
 def test_prediction_loss_respects_padding_and_exports_trained_depth(source, tmp_path):
     """Main+0.2*MTP CE loss error below 1e-6; post-update logits below 4.3e-6.
 
@@ -459,10 +467,11 @@ def test_prediction_loss_respects_padding_and_exports_trained_depth(source, tmp_
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def video_source():
     pytest.importorskip("torchvision")
     path = ROOT / "qwen38-dense-tiny"
-    loaded = Pretrained.load(path, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(path, dtype="float32")
     assert loaded.processor is not None
     raw = json.loads((path / "video_inputs.json").read_text())
     inputs = loaded.processor(raw["prompts"], images=[[image] for image in np.load(path / "images.npy")],
@@ -471,6 +480,7 @@ def video_source():
     return loaded, inputs, np.load(path / "video_reference.npz")
 
 
+@attending("reference")
 def test_timestamped_videos_and_images_share_the_reference_frame_order(video_source):
     """Five- and three-frame clips pad their final temporal patch; grids differ.
 
@@ -500,6 +510,7 @@ def test_timestamped_videos_and_images_share_the_reference_frame_order(video_sou
     np.testing.assert_array_equal(result.tokens[:, -3:], reference["generated"][:, -3:])
 
 
+@attending("reference")
 def test_video_prediction_training_exports_the_reference_update(video_source, tmp_path):
     """Main+MTP video update error 8.80e-6 with unchanged 1e-4 tolerance.
 
@@ -515,6 +526,7 @@ def test_video_prediction_training_exports_the_reference_update(video_source, tm
     )
 
 
+@attending("reference")
 def test_actual_checkpoint_default_nucleus_policy_reaches_the_native_draw(source):
     """Both published generation configs specify top-k 20 and top-p 0.95.
 

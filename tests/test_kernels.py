@@ -29,6 +29,7 @@ from attention_oracle import (
 )
 from contract_support import normal_drawn
 from flax import linen as nn
+from model_support import attending
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -41,6 +42,7 @@ from reference_error import (
 from dew.nn import kernels
 from dew.nn.attention import scaled_dot_product_attention, weighted_values
 from dew.nn.attention_blocks import NormalAttention
+from dew.nn.kernels import generation
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template
 from dew.nn.precision import FP32_SUMS, WIDE_CPU_ARITHMETIC, at_least_fp32
@@ -906,22 +908,23 @@ def test_a_layer_that_builds_its_mask_is_on_par_with_the_reference_path():
 
     valid = jnp.arange(300)[None] >= jnp.asarray([[0], [7]])
 
-    def model(implementation, dtype=jnp.float32):
+    def model(dtype=jnp.float32):
         return CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
-                                 max_seq_len=320, attention_impl=implementation, dtype=dtype)
+                                 max_seq_len=320, dtype=dtype)
 
     def draw(seed):
         tokens = jnp.asarray(np.random.default_rng(seed).integers(1, 64, (2, 300)), jnp.int32)
-        return nn.unbox(model('auto').init(jax.random.key(seed), tokens)), tokens
+        return nn.unbox(model().init(jax.random.key(seed), tokens)), tokens
 
-    def applied(implementation, dtype=jnp.float32):
+    def applied(dtype=jnp.float32):
         def apply(params, tokens):
-            out = model(implementation, dtype).apply(params, tokens, attention_mask=valid)
+            out = model(dtype).apply(params, tokens, attention_mask=valid)
             return jnp.where(valid[..., None], out, 0)
         return apply
 
-    assert_as_exact(jax.jit(applied('auto')), jax.jit(applied('reference')), draw,
-                    "a padded layer's built mask", seeds=8, truth_fn=applied('reference', jnp.float64))
+    assert_as_exact(jax.jit(applied()), attending('reference')(jax.jit(applied())), draw,
+                    "a padded layer's built mask", seeds=8,
+                    truth_fn=attending('reference')(applied(jnp.float64)))
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
@@ -1017,15 +1020,16 @@ def test_normal_attention_ends_each_rows_keys_at_its_length_as_a_prefix_mask_doe
     the kernel, so on a GPU, where a call this size folds its heads (8-wide
     heads, which the lengths-only decode kernel does not take), both forms run
     `folded_attention` alike."""
-    module = NormalAttention(16, heads=2, dim_head=8, attention_impl=implementation)
-    rng = np.random.default_rng(1)
-    queries = jnp.asarray(rng.normal(size=(3, 5, 16)), jnp.float32)
-    context = jnp.asarray(rng.normal(size=(3, 7, 16)), jnp.float32)
-    params = nn.unbox(module.init(jax.random.key(0), queries, context))
-    lengths = jnp.asarray([7, 4, 1])
-    prefix = (jnp.arange(7)[None, :] < lengths[:, None])[:, None, None, :]
-    np.testing.assert_array_equal(module.apply(params, queries, context, key_value_seq_lengths=lengths),
-                                  module.apply(params, queries, context, mask=prefix))
+    with generation.chosen(attention=implementation):
+        module = NormalAttention(16, heads=2, dim_head=8)
+        rng = np.random.default_rng(1)
+        queries = jnp.asarray(rng.normal(size=(3, 5, 16)), jnp.float32)
+        context = jnp.asarray(rng.normal(size=(3, 7, 16)), jnp.float32)
+        params = nn.unbox(module.init(jax.random.key(0), queries, context))
+        lengths = jnp.asarray([7, 4, 1])
+        prefix = (jnp.arange(7)[None, :] < lengths[:, None])[:, None, None, :]
+        np.testing.assert_array_equal(module.apply(params, queries, context, key_value_seq_lengths=lengths),
+                                      module.apply(params, queries, context, mask=prefix))
 
 
 ALL_TRUE_SEEDS = 8
@@ -1039,26 +1043,28 @@ def test_normal_attention_reads_only_the_keys_its_mask_keeps(implementation):
     unmasked attention, but not always bitwise: XLA:GPU fuses the masked
     softmax differently (2.4e-7 apart on an A100), so it is on par with the
     unmasked call over drawn tokens (check 1, the truth its float64 run)."""
-    module = NormalAttention(16, heads=2, dim_head=8, attention_impl=implementation)
-    rng = np.random.default_rng(0)
-    queries = jnp.asarray(rng.normal(size=(2, 5, 16)), jnp.float32)
-    context = jnp.asarray(rng.normal(size=(2, 7, 16)), jnp.float32)
-    moved = context.at[:, 3].add(10.0)
-    params = nn.unbox(module.init(jax.random.key(0), queries, context))
-    kept = jnp.ones((2, 1, 5, 7), bool)
-    dropped = kept.at[..., 3].set(False)
-    np.testing.assert_array_equal(module.apply(params, queries, context, mask=dropped),
-                                  module.apply(params, queries, moved, mask=dropped))
-    assert not np.array_equal(module.apply(params, queries, context), module.apply(params, queries, moved))
+    with generation.chosen(attention=implementation):
+        module = NormalAttention(16, heads=2, dim_head=8)
+        rng = np.random.default_rng(0)
+        queries = jnp.asarray(rng.normal(size=(2, 5, 16)), jnp.float32)
+        context = jnp.asarray(rng.normal(size=(2, 7, 16)), jnp.float32)
+        moved = context.at[:, 3].add(10.0)
+        params = nn.unbox(module.init(jax.random.key(0), queries, context))
+        kept = jnp.ones((2, 1, 5, 7), bool)
+        dropped = kept.at[..., 3].set(False)
+        np.testing.assert_array_equal(module.apply(params, queries, context, mask=dropped),
+                                      module.apply(params, queries, moved, mask=dropped))
+        assert not np.array_equal(module.apply(params, queries, context),
+                                  module.apply(params, queries, moved))
 
-    def draw(seed):
-        streams = np.random.default_rng([0x5A5, seed])
-        return tuple(jnp.asarray(streams.normal(size=(2, length, 16)), jnp.float32) for length in (5, 7))
+        def draw(seed):
+            streams = np.random.default_rng([0x5A5, seed])
+            return tuple(jnp.asarray(streams.normal(size=(2, length, 16)), jnp.float32) for length in (5, 7))
 
-    assert_as_exact(lambda queries, context: module.apply(params, queries, context, mask=kept),
-                    lambda queries, context: module.apply(params, queries, context), draw,
-                    f"{implementation} attention under an all-True mask", seeds=ALL_TRUE_SEEDS,
-                    truth_fn=lambda queries, context: module.apply(widened(params), queries, context))
+        assert_as_exact(lambda queries, context: module.apply(params, queries, context, mask=kept),
+                        lambda queries, context: module.apply(params, queries, context), draw,
+                        f"{implementation} attention under an all-True mask", seeds=ALL_TRUE_SEEDS,
+                        truth_fn=lambda queries, context: module.apply(widened(params), queries, context))
 
 
 def eligibility_cases():

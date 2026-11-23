@@ -25,7 +25,7 @@ from affine_run import Replaying
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
-from model_support import TINY_DECODER, scanning, stacked, unrolled
+from model_support import TINY_DECODER, attending, scanning, stacked, unrolled
 from process_support import READ_ONLY, fresh, keeping_picks
 from reference_error import as_given, assert_as_exact, widened, with_gradients
 
@@ -440,6 +440,7 @@ def test_a_resumed_fp8_base_run_trains_what_an_uninterrupted_one_does(tmp_path):
         np.testing.assert_array_equal(np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8))
 
 
+@attending("reference")
 def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
     """The scanned stack computes the looped one's output from the same
     variables, both jitted with the variables as arguments, as a step passes
@@ -448,7 +449,7 @@ def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
     two on par over drawn tokens (check 1), from the plain decoder in float64
     on the kernels the codes stand for (the adapter's deltas start at zero)."""
     _, fp8 = adapters()
-    exact = unrolled(jax.jit(decoder().clone(dtype=jnp.float64, attention_impl="reference").apply))
+    exact = unrolled(jax.jit(decoder().clone(dtype=jnp.float64).apply))
     # The merged tree's layout, each packed site's kernel the one its forward codes stand for in float64
     # (`exactly`), not the float32 decode `merge` stores.
     base = flatten_dict(fp8.merge(fp8.variables)["params"])

@@ -250,7 +250,7 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     sampled = samples(task.sampling, label)
     decoder, variables, vocab = task.model, task.variables, task.model.vocab_size
     held_model, held_variables = (decoder, variables) if truth is None else truth
-    wide = held_model.clone(dtype=jnp.float64, attention_impl="reference")
+    wide = held_model.clone(dtype=jnp.float64)
     width = max(request.length for request in requests)
 
     # One server for every draw, as a deployment serves request after request: its programs compile
@@ -406,7 +406,7 @@ def assert_served_through_its_cache_as_exact(task: TextGeneration, requests: Seq
             decisions.update(named(str(index), decided))
         return Rounded({"scores": tuple(scores), **rounded}, decisions)
 
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference").with_kv_cache(
+    wide = decoder.clone(dtype=jnp.float64).with_kv_cache(
         KVCache(quantized=quantized))
 
     @jax.jit

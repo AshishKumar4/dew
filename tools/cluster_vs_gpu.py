@@ -201,7 +201,7 @@ def main() -> None:
     batch_size = shape["batch"] if args.batch is None else args.batch
     data = windows(tokens, batch_size)
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
-                              dtype=getattr(jnp, dtype), attention_impl="auto")
+                              dtype=getattr(jnp, dtype))
     trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=None), optax.adamw(shape["lr"], weight_decay=0.1),
                       key=jax.random.key(0),
                       mesh=MeshSpec(diloco=world, **mesh_of(shape["mesh"], jax.local_device_count()))

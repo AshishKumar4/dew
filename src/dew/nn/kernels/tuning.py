@@ -142,7 +142,8 @@ class Untunable(ValueError):
         super().__init__(
             f"tune_kernels measures Dew's own kernel launches, and this step launches none: its Triton "
             f"kernels ({named}) are another library's, which keep their heuristic. Route its attention to "
-            "Dew's template (model.attention_impl='template') to measure it, or run without tune_kernels.")
+            "Dew's template (dew.kernels.use(attention='template'), a run's diagnostics.kernels) to "
+            "measure it, or run without tune_kernels.")
         self.kernels = kernels
 
     def __reduce__(self):

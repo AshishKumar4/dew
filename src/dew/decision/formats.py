@@ -128,7 +128,7 @@ def decision_plan(bundle: PretrainedDecision) -> ReleasePlan | Unwritable:
               or released(bundle.source).compute is not None)
     compute = computed_in(bundle.numerics, bundle.model, bundle.variables) if stated else None
     envelope = decision_envelope(backbone.envelope, layout, calibration, max_length=max_length,
-                                 numerics=bundle.numerics, compute=compute)
+                                 numerics=bundle.numerics, compute=compute, kernels=bundle.kernels)
     return ReleasePlan(placed, chosen.head(bundle), assets, envelope)
 
 

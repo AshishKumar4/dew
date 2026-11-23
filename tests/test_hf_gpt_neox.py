@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import drawn_ids, float64_logits
+from model_support import attending
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 
 from dew.interop import Pretrained
@@ -16,12 +17,13 @@ from dew.sampling import Sampling, generate
 DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'gpt-neox-tiny'
 
 
+@attending("reference")
 def test_gpt_neox_logits_and_cached_greedy_generation_match_transformers():
     """Dew's logits as exact as transformers' fp32 eager run, both from float64, over the recorded
     seeds' token grids (tools/gpt_neox_reference.py recording): the truth Dew's model run in float64,
     held at every seed to the recorded transformers truth's sketch; its cached greedy generation the
     reference's token for token; and the sequential residual another computation."""
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32')
     stored = recording(DIRECTORY / 'recorded_logits.npz')
     seeds = declared_seeds(DIRECTORY / 'recorded_logits.npz')['logits']
     vocab = json.loads((DIRECTORY / 'config.json').read_text())['vocab_size']
@@ -41,12 +43,13 @@ def test_gpt_neox_logits_and_cached_greedy_generation_match_transformers():
 
 
 
+@attending("reference")
 def test_legacy_neox_buffers_are_validated_in_their_stored_precision():
     from dew.interop.hf_decoders import translate_config, translate_weights
     from dew.interop.sources import load_shards
     from dew.nn.rope import inverse_frequencies
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32')
     config = translate_config(loaded.config)
     tensors = dict(load_shards(DIRECTORY))
     prefix = 'gpt_neox.layers.0.attention.'

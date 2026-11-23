@@ -25,6 +25,7 @@ import jax
 import numpy as np
 import pytest
 from map_judge import sharded
+from model_support import attending
 from option_witness import SETTINGS, TASK_RUNS, same, saved_with, witnessed_on
 from run_kinds import (
     ADAPTED,
@@ -52,6 +53,7 @@ pytestmark = pytest.mark.mesh
 
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(kind, tmp_path):
@@ -106,6 +108,7 @@ def test_a_runs_kernel_choices_reach_the_programs_it_traces_and_its_record(tmp_p
     assert RunConfig.load(str(tmp_path / "runs" / "chosen")).diagnostics.kernels == {"attention": "xla"}
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_key_data_seed_mesh_and_adapter_reach_what_it_trains(kind, tmp_path):
@@ -133,6 +136,7 @@ def test_a_kinds_key_data_seed_mesh_and_adapter_reach_what_it_trains(kind, tmp_p
     assert 0 < factors < sum(leaf.size for leaf in held)
 
 
+@attending("xla")
 @pytest.mark.parametrize("option", [{"text_only": True}, {"packed_weights": True}],
                          ids=["text_only", "packed_weights"])
 @pytest.mark.parametrize("kind", ["lm", "diffusion", "jepa"])
@@ -145,6 +149,7 @@ def test_a_kind_that_builds_its_model_fresh_refuses_source_options(kind, option,
         dataclasses.replace(run, source=SourceOptions(**option)).prepare()
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["lm", "decision"])
 def test_a_kind_whose_source_decides_its_model_refuses_another_model_name(kind, tmp_path):
     """A run that starts from a source takes its architecture from it, and its model's fields'
@@ -156,6 +161,7 @@ def test_a_kind_whose_source_decides_its_model_refuses_another_model_name(kind, 
         dataclasses.replace(run, model=model, **pretrained).prepare()
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 @pytest.mark.parametrize("option", ["xla_flags", "compilation_cache_dir", "multi_host"])
 def test_a_process_option_the_process_does_not_carry_is_refused_before_training(kind, option, tmp_path):
@@ -314,6 +320,7 @@ def assert_every_option_witnessed(settings: type, witnessed: list[tuple[list[str
         exports for _, _, exports in witnessed), f"no run of {settings.__name__}'s exports"
 
 
+@attending("reference")
 @pytest.mark.parametrize("release", ["dream", "diffucoder"])
 def test_a_masked_run_over_a_release_saves_and_reads_the_walk_the_release_declares(release, tmp_path):
     """A masked-diffusion run over a Dream release (dream-tiny as the release ships it, its generation
@@ -326,7 +333,7 @@ def test_a_masked_run_over_a_release_saves_and_reads_the_walk_the_release_declar
     from dew.interop import Pretrained
 
     run = dreamed(tmp_path, drawn=False, release=release)
-    source = Pretrained.load(tmp_path / release, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(tmp_path / release, dtype="float32")
     declared = source.text_generation()
     _, task = saved_with(run, tmp_path, "over", MaskedSettings, {})
     options = {name: getattr(declared, name) for name in ("process", "solver", "steps", "block")}

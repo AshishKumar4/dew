@@ -51,6 +51,8 @@ class ReleaseTask:
     dtypes: ReleaseDtypes | None = None
     rounds: Mapping[str, bool] | None = None
     max_seq_len: int | None = None
+    kernels: Mapping[str, str] | None = None
+    """The kernel choices its run pinned (`SavedRun.kernels`), which a load's tasks trace under."""
 
     def __post_init__(self) -> None:
         if self.rounds is not None:
@@ -74,15 +76,16 @@ class ReleaseTask:
         return None if self.dtypes is None else self.dtypes.compute
 
 
-def release_record(settings: TaskSettings, numerics: Numerics | None, model: nn.Module,
-                   variables: Variables) -> Release:
+def release_record(settings: TaskSettings, numerics: Numerics | None, model: nn.Module, variables: Variables,
+                   kernels: tuple[tuple[str, str], ...] = ()) -> Release:
     """The release of a run's export: its task settings, its numerics, the dtype its model computes in
-    (`computed_in`), how it rounds (`rounding`) and the cache it holds (`capacity`); the parameters' own
-    dtypes are the export's."""
+    (`computed_in`), how it rounds (`rounding`), the cache it holds (`capacity`) and the kernels its run
+    pinned (`kernels`); the parameters' own dtypes are the export's."""
     from dew.interop.release_record import Release
 
     dtypes = ReleaseDtypes(computed_in(numerics, model, variables))
-    return Release(task=ReleaseTask(settings, numerics, dtypes, rounding(model), capacity(model)).record())
+    return Release(task=ReleaseTask(settings, numerics, dtypes, rounding(model), capacity(model),
+                                    dict(kernels) or None).record())
 
 
 def capacity(model: nn.Module) -> int | None:
@@ -153,24 +156,28 @@ class LoadSettings(NamedTuple):
     max_seq_len: int | None
     """The tokens its model's cache holds: the load's, else its release's (`capacity`); None for its
     source's own."""
+    kernels: tuple[tuple[str, str], ...]
+    """The kernel choices its run pinned, as its release states them (`ReleaseTask.kernels`)."""
 
 
 def load_settings(directory: Path, numerics: Numerics | None, dtype: DTypeLike | None,
                   param_dtype: DTypeLike | Literal["auto"] | None,
                   max_seq_len: int | None = None) -> LoadSettings:
     """A load of the source in `directory`: the run's declaration an export of it carries (`released`),
-    the numerics its tasks trace under (the load's, else the run's), the compute and storage dtypes
+    the numerics its tasks trace under (the load's, else the run's) and its run's kernel pins, the compute
+    and storage dtypes
     it loads in, by name: its numerics' dtypes, else each one it states, and each it leaves unstated
     (None) its source's: the run's compute dtype over its weights as stored, or BF16 compute over FP32
     master weights; and its cache's capacity, the load's `max_seq_len`, else the run's."""
     run = released(directory)
     held = run.max_seq_len if max_seq_len is None else max_seq_len
     rounds = run.rounds or {}
+    pinned = tuple(sorted((run.kernels or {}).items()))
     if numerics is not None:
         return LoadSettings(run.settings, numerics, dtype_name(numerics.dtypes.compute),
-                            dtype_name(numerics.dtypes.params), rounds, held)
+                            dtype_name(numerics.dtypes.params), rounds, held, pinned)
     compute = dtype_name(dtype) if dtype is not None else run.compute or "bfloat16"
     params: DtypeName | Literal["auto"] = (
         AUTO if param_dtype == AUTO or (param_dtype is None and run.compute is not None)
         else "float32" if param_dtype is None else dtype_name(param_dtype))
-    return LoadSettings(run.settings, run.numerics, compute, params, rounds, held)
+    return LoadSettings(run.settings, run.numerics, compute, params, rounds, held, pinned)

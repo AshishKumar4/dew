@@ -25,7 +25,7 @@ from interop_support import (
     quantized_checkpoints,
     token_draw,
 )
-from model_support import scanning, stacked
+from model_support import attending, scanning, stacked
 from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact
 
 import dew
@@ -39,19 +39,21 @@ from dew.training import Layout, MeshSpec
 
 
 @pytest.fixture(scope="module", params=NVFP4_QDQ_CASES)
+@attending("reference")
 def case(request):
     """The checkpoint, loaded, and its reference arrays."""
     directory, reference = nvfp4_qdq_case(request.param)
-    return directory, Pretrained.load(directory, dtype="float32", attention_impl="reference"), reference
+    return directory, Pretrained.load(directory, dtype="float32"), reference
 
 
 CHECKPOINTS = quantized_checkpoints()
 
 
 @pytest.fixture(scope="module", params=CHECKPOINTS, ids=[directory.name for directory in CHECKPOINTS])
+@attending("reference")
 def stored(request):
     """A codec's checkpoint, loaded."""
-    return Pretrained.load(request.param, dtype="float32", attention_impl="reference")
+    return Pretrained.load(request.param, dtype="float32")
 
 
 VIEW_SEEDS = 8
@@ -78,6 +80,7 @@ def assert_stored_view(view, loaded, label):
     assert_view(view, loaded.model, loaded.variables, None, label, draw=draw)
 
 
+@attending("reference")
 def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case):
     """The rule detects a dropped QDQ: the same weights with no input scale fail check 1 against the
     model with them."""
@@ -89,6 +92,7 @@ def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case)
     assert not isinstance(failed.value, Inconclusive)
 
 
+@attending("reference")
 def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(stored):
     """A scanned run stacks every collection on the layer axis, the scales
     with the kernels, so each layer reads its own."""
@@ -106,6 +110,7 @@ def quantized_apart(case):
     return loaded, reference["ids"].astype(np.int32), variables
 
 
+@attending("reference")
 def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     """A checkpoint that quantizes two otherwise like layers differently, here
     one with a projection left unquantized, gives them different scale trees,
@@ -122,6 +127,7 @@ def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     assert jax.tree.structure(initialized[0]) == jax.tree.structure(initialized[1])
 
 
+@attending("reference")
 def test_layers_quantized_apart_that_one_bank_holds_are_refused(case):
     """A store that banks a run of like layers holds one array per leaf for all of them, which
     layers quantized apart cannot share: the run stays the one the store holds, and its unlike
@@ -139,6 +145,7 @@ def test_layers_quantized_apart_that_one_bank_holds_are_refused(case):
             loaded.model.apply({**variables, "params": params}, ids)
 
 
+@attending("reference")
 def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(case):
     """Four like layers, the last two quantized apart from the first two, are two runs, which a
     store places as one bank each (`HeldBanks.place`): the model reading that store runs the same
@@ -166,6 +173,7 @@ def test_a_store_that_banks_layers_quantized_apart_reads_as_the_runs_it_banks(ca
                 "banked runs quantized apart")
 
 
+@attending("reference")
 @pytest.mark.mesh(devices=2)
 def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(stored):
     """Two stages, two microbatches of one row: the stage axis stacks the scales as it stacks the
@@ -183,6 +191,7 @@ def test_the_pipeline_stages_quantize_each_layer_with_its_own_scales(stored):
     assert_stored_view(view, stored, "two stages")
 
 
+@attending("reference")
 def test_packed_projections_carry_their_members_shared_scale(case):
     """The query, key and value read one input, and the checkpoint scales it
     once for all three, so their packed product quantizes it once: the
@@ -208,6 +217,7 @@ def scaled_apart(loaded):
     return variables
 
 
+@attending("reference")
 def test_the_served_pipeline_quantizes_as_the_loaded_model(case):
     """`dew.pipeline` packs the projections once it has placed them; its task
     computes the loaded model's quantized logits."""
@@ -217,6 +227,7 @@ def test_the_served_pipeline_quantizes_as_the_loaded_model(case):
                 "pipeline")
 
 
+@attending("reference")
 def test_a_generation_over_the_loaded_tree_packs_under_its_one_scale_in_the_call(case):
     """A task over the loaded model's own tree, its query, key and value apart, packs them inside
     its compiled generation, under the one input scale `pending` finds on the loaded scales before
@@ -249,6 +260,7 @@ def test_a_generation_over_the_loaded_tree_packs_under_its_one_scale_in_the_call
     assert np.isfinite(drawn.raw_log_probs).all()
 
 
+@attending("reference")
 def test_a_server_of_the_packed_task_reloads_the_loaded_models_own_tree(case):
     """`dew.pipeline` serves the query, key and value packed under their one
     input scale. A reload takes the loaded model's own tree, each member's
@@ -268,6 +280,7 @@ def test_a_server_of_the_packed_task_reloads_the_loaded_models_own_tree(case):
         server.reload(scaled_apart(loaded))
 
 
+@attending("reference")
 def test_every_entry_method_quantizes_the_sites_it_reaches(case):
     """The quantizers run under the model's `apply`, so an entry method a
     wrapper never named, as DiffusionGemma's `encode` was, quantizes too:

@@ -7,7 +7,7 @@ cannot see builds up over thousands of decode steps.
 
 Each seed draws a prompt (`prompts`). Dew's server, as it serves (`dew.pipeline`, bf16 weights), decodes
 it greedily for `--steps` tokens at batch 1: the sequence T and each token's log-probability. The
-reference path (attention_impl="reference", and `dew.nn.kernels.generation.chosen` naming XLA for the RMS
+reference path (and `dew.nn.kernels.generation.chosen` naming XLA for the RMS
 norm, SwiGLU and the gated delta rule) scores T teacher-forced through its cached decode
 (`dew.sampling.text.prefill_state`, `decode_ops`). The truth: T scored by one float64 forward of the model
 over the prompt and T. Check 1 (`assert_as_exact`) holds the server's log-probabilities to the reference's
@@ -42,6 +42,7 @@ from dew.inference.serving import DenseKV, Server
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.categorical import token_log_probs
 from dew.nn.inputs import ModelInputs
+from dew.nn.kernels import generation
 from dew.nn.kernels.generation import chosen
 from dew.sampling import Sampling
 from dew.sampling.text import decode_ops, prefill_state
@@ -112,8 +113,7 @@ def truth(model_dir: str):
     from arm_arithmetic import widened
     from model_support import float64_twin
 
-    loaded = Pretrained.load(model_dir, dtype=jnp.float32, param_dtype=jnp.float32,
-                             attention_impl="reference")
+    loaded = Pretrained.load(model_dir, dtype=jnp.float32, param_dtype=jnp.float32)
     wide = float64_twin(loaded.model)
     variables = widened(jax.device_get(loaded.variables))
 
@@ -164,8 +164,7 @@ def main() -> int:
         parser.error(f"--steps is whole blocks of {BLOCK}")
 
     task = greedy(dew.pipeline(args.model, dtype="bfloat16", param_dtype="bfloat16"))
-    loaded = PretrainedDecoder.load(args.model, dtype="bfloat16", param_dtype="bfloat16",
-                                    attention_impl="reference")
+    loaded = PretrainedDecoder.load(args.model, dtype="bfloat16", param_dtype="bfloat16")
     reference = greedy(loaded.text_generation())
     pad = task.sampling.pad
     true = truth(args.model)
@@ -225,6 +224,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    # The tests' reference_error, as the test suite imports it.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    sys.exit(main())
+    with generation.chosen(attention="reference"):
+        # The tests' reference_error, as the test suite imports it.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+        sys.exit(main())

@@ -35,7 +35,6 @@ from dew.diffusion.discrete import MDLM
 from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.condition import ConditionEncoder
-from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer
@@ -206,12 +205,11 @@ def decoder_trunk(case: Case, trunk: nn.Module) -> CausalTransformer:
     return trunk
 
 
-def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
-                    widened: bool = False) -> Objective[Any, Any]:
+def build_objective(case: Case, *, widened: bool = False) -> Objective[Any, Any]:
     """The objective a recipe would train for this case.
 
-    The case's dtype, attention kernel and matmul precision go into the
-    model's own fields, as a recipe's model record names them; a unet's
+    The case's dtype and matmul precision go into the model's own fields, as a recipe's model record names
+    them (its attention kernel the run's, `generation.chosen(attention=...)`); a unet's
     stages compute in the model's dtype. With `widened` every model computes
     in float64 throughout under x64: layout_parity's fp64 step.
 
@@ -229,7 +227,7 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
 
     def built(architecture: str, config: Mapping[str, object]):
         declared = {field.name for field in dataclasses.fields(models[architecture])}
-        settings = {"attention_impl": attention_impl, "precision": case.matmul_precision}
+        settings = {"precision": case.matmul_precision}
         return models.build(architecture, {**config, "dtype": jnp.float64 if widened else dtype,
                                            **{key: value for key, value in settings.items()
                                               if value is not None and key in declared}})
@@ -303,8 +301,7 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     return objective
 
 
-def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
-                  optimizer: optax.GradientTransformation | None = None,
+def build_trainer(case: Case, optimizer: optax.GradientTransformation | None = None,
                   ahead: AheadOfTime | None = None) -> Trainer:
     """The trainer a recipe would build for this case, minus the tracker and the
     checkpoints, on the case's device order, stepping the optimizer `dew train`
@@ -313,7 +310,7 @@ def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
     `ahead`, its step compiled ahead (`ahead_of`), runs as its first step where it
     is that program, so the GPU compiles nothing for it."""
     fields = trainer_mesh(case.mesh)
-    trainer = Trainer(build_objective(case, attention_impl),
+    trainer = Trainer(build_objective(case),
                       optimizer or OptimConfig(optimizer=optimizers.build(case.optimizer),
                                                learning_rate=1e-4).build(None),
                       key=0, mesh=fields["mesh"], update=UpdateBatch(batches=case.accumulation),
@@ -326,12 +323,11 @@ def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
     return trainer
 
 
-def ahead_of(case: Case, generation: str, capacity: int,
-             attention_impl: AttentionImpl = 'auto') -> AheadOfTime:
+def ahead_of(case: Case, generation: str, capacity: int) -> AheadOfTime:
     """Case `case`'s step planned and compiled ahead of its run for one compile-only GPU of the CUDA
     `generation` of `capacity` bytes of memory (`dew.training.ahead.compile_ahead`), on any host: what a GPU
     node's prepare hands its run (`build_trainer`'s `ahead`), and what perf_gate's compile rows time."""
-    trainer = build_trainer(case, attention_impl)
+    trainer = build_trainer(case)
     trainer.device_mesh = trainer_mesh(case.mesh)["mesh"].build(list(compile_only_gpus(generation, 1, capacity)))
     return compile_ahead(trainer, global_batch(case))
 

@@ -85,7 +85,6 @@ from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
 from dew.mesh import batch_axes
-from dew.nn.attention import AttentionImpl
 from dew.nn.cross_attention import ContextEncoder
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiled_together, program
@@ -480,7 +479,7 @@ class Decide(SavedRunTask, InItsForm):
     @classmethod
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
-                        attention_impl: AttentionImpl = "auto", trust: Sequence[str] = ()) -> Self:
+                        trust: Sequence[str] = ()) -> Self:
         """Load a released Laya or joint-head checkpoint through `Pretrained.load` as a task.
 
         `trust` names the sources whose own code the load may run (a backbone's media processor's), as
@@ -497,7 +496,7 @@ class Decide(SavedRunTask, InItsForm):
 
         import_trusted(None, trust)
         bundle = Pretrained.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
-                                  param_dtype=param_dtype, attention_impl=attention_impl)
+                                  param_dtype=param_dtype)
         if not isinstance(bundle, PretrainedDecision):
             raise TypeError(f"{name} declares no decision task")
         # The name a caller asked for, a Hub folder included, not the cache path it resolved to.
@@ -527,8 +526,8 @@ class Decide(SavedRunTask, InItsForm):
         # A release lays its rows out as it states them, sharing a state only where it says so.
         return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
                    bundle.calibration, name=name or str(bundle.origin or bundle.source),
-                   processor=bundle.processor, precision=bundle.numerics, derives_sharing=False,
-                   named_encoder=bundle.named_encoder)
+                   processor=bundle.processor, precision=bundle.numerics, kernels=bundle.kernels,
+                   derives_sharing=False, named_encoder=bundle.named_encoder)
 
     @classmethod
     def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,

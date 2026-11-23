@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from bank_support import SelectedReads, fixture, host_layout, identical, scores, unpack
-from model_support import stacked
+from model_support import attending, stacked
 
 from dew.batch import merge
 from dew.inference.banks import CheckpointBanks, HeldBanks, at_namespace, entry_tree, in_namespace, narrowed
@@ -20,6 +20,7 @@ DEVICE = Layout(min_shard=1, tolerance=1.0)
 
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("kind", ["root", "multimodal", "shared-diffusion"])
 def test_declared_banks_preserve_canonical_values_layout_and_model_reads(kind):
@@ -117,6 +118,7 @@ class DeclaredOwners:
         return self.sites
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_shared_decoder_readers_allocate_one_canonical_owner_and_refuse_conflicts():
     model, variables, tokens, indices, media = fixture("shared-diffusion")
@@ -141,6 +143,7 @@ def first_leaf(tree):
     return tree + jnp.asarray(0.125, tree.dtype)
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("kind", ["multimodal", "shared-diffusion"])
 def test_nested_checkpoint_banks_restore_only_selected_leaves_and_partial_ema(tmp_path, kind):
@@ -167,6 +170,7 @@ def test_nested_checkpoint_banks_restore_only_selected_leaves_and_partial_ema(tm
               scores(model, resident, tokens, indices, media))
 
 
+@attending("reference")
 @pytest.mark.usefixtures("scanned_stacks")
 def test_an_unbound_decoder_plans_its_banks_from_a_store_whose_rows_differ():
     """A store whose third layer holds a leaf its neighbours lack (a checkpoint that adapts or quantizes
@@ -186,6 +190,7 @@ def test_an_unbound_decoder_plans_its_banks_from_a_store_whose_rows_differ():
     identical(scores(model, hosted, tokens, indices, media), scores(model, resident, tokens, indices, media))
 
 
+@attending("reference")
 def test_an_unscanned_decoder_banks_one_layer_at_a_time():
     """A plain loop (`unrolled`) declares singleton runs, which stream like longer ones."""
     with stacked(scanned=False):

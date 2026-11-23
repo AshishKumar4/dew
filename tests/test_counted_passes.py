@@ -19,7 +19,8 @@ from dew.training.budget import Horizon
 
 PLAIN = Path(__file__).with_name("fixtures") / "plans" / "decision-plain-main-b2d94d559.json"
 """A decision run's plan identity and batch fields, bounded in four steps with no cadence that reads its
-passes, as main compiled it at b2d94d559, before runs counted their passes."""
+passes, as main compiled it at b2d94d559, before runs counted their passes; its source's digest re-recorded
+at API02c, the head's description losing attention_impl (row 11938), the identity's one part that moved."""
 
 
 def evaluated(root: Path, name: str) -> list[int]:

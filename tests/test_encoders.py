@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import assert_as_exact
 
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
@@ -228,6 +229,7 @@ def swap_two_prompt_tokens(folder, prompt: str) -> None:
         path.write_text(json.dumps(data))
 
 
+@attending("xla")
 @pytest.mark.parametrize("family, archive, inside, tokenizer", [
     ("sd", "tiny_diffusers", "sd", "tokenizer"),
     ("sd3", "sd3_source", "pipeline", "tokenizer_3"),
@@ -250,7 +252,7 @@ def test_a_pipelines_conditioner_records_the_tokenizer_files_it_reads(tmp_path, 
     directory = tmp_path / inside
 
     def loaded():
-        source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+        source = load_diffusion_source(str(directory), dtype="float32")
         encoder = source.inputs.conditions["conditioning"].encoder
         return [np.asarray(ids) for ids in jax.tree.leaves(encoder.tokenize(["a red bird"]))], \
             encoder.dependencies()

@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.batch import unboxed
@@ -116,13 +117,13 @@ def test_a_packed_order_names_the_gate_and_up_projections():
         mlp.init(jax.random.key(0), jnp.zeros((1, 4)))
 
 
+@attending("reference")
 def test_a_transformer_with_dropout_trains_and_evaluates_without_a_dropout_key():
     """A nonzero-dropout spatial transformer trains with sampled masks and evaluates with them
     disabled. Its update reaches both attentions and the feed-forward; evaluation needs no RNG."""
     from dew.nn.attention_blocks import BasicTransformerBlock
 
-    block = BasicTransformerBlock(8, heads=2, dim_head=4, norm="layer", dropout_rate=0.1,
-                                  attention_impl="reference")
+    block = BasicTransformerBlock(8, heads=2, dim_head=4, norm="layer", dropout_rate=0.1)
     x = jax.random.normal(jax.random.key(1), (2, 4, 8))
     context = jax.random.normal(jax.random.key(2), (2, 3, 8))
     variables = block.init({"params": jax.random.key(3), "dropout": jax.random.key(4)}, x, context,

@@ -70,7 +70,6 @@ from dew.nn.inspection import QK
 from dew.nn.progress import END, Progress, progressed
 
 from .activations import GatedActivation
-from .attention import AttentionImpl
 from .attention_blocks import CROSS_KEY, CROSS_VALUE, NormalAttention, context_cache, kept_context
 from .attention_masks import max_attention_logits, visibility_mask
 from .documents import CrossDocuments, holds_keys
@@ -363,7 +362,7 @@ class CrossAttention:
             emb_features=decoder.emb_features, context_features=decoder.context_width,
             context_length=self.context_length, heads=decoder.num_heads, kv_heads=decoder.kv_heads,
             head_dim=decoder.features_per_head, dropout_rate=decoder.dropout_rate,
-            attention_impl=decoder.attention_impl, force_fp32_for_softmax=decoder.force_fp32_for_softmax,
+            force_fp32_for_softmax=decoder.force_fp32_for_softmax,
             dtype=decoder.dtype, precision=decoder.precision)
 
     def layer_key(self, decoder: CausalTransformer, index: int) -> Hashable:
@@ -462,8 +461,7 @@ class GatedCrossAttention(nn.Module):
     `ngpt` reads the stream unnormed and joins each output as nGPT's step
     (the module docstring), and `norm` is then None. The projections are
     stored flat, `[inputs, heads * head_dim]`, as the decoder's own attention
-    stores them. `attention_impl` and `force_fp32_for_softmax` are the
-    decoder's.
+    stores them. `force_fp32_for_softmax` is the decoder's.
     """
 
     reads_layer: ClassVar[bool] = False
@@ -481,7 +479,6 @@ class GatedCrossAttention(nn.Module):
     head_dim: int
     ngpt: bool = False
     dropout_rate: float = 0.0
-    attention_impl: AttentionImpl = "auto"
     force_fp32_for_softmax: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -495,7 +492,7 @@ class GatedCrossAttention(nn.Module):
         return NormalAttention(self.emb_features, self.heads, self.head_dim, dtype=self.dtype,
                                precision=self.precision, use_bias=False,
                                force_fp32_for_softmax=self.force_fp32_for_softmax,
-                               attention_impl=self.attention_impl, flat=True,
+                               flat=True,
                                names=("q_proj", "k_proj", "v_proj", "o_proj"), kv_heads=self.kv_heads,
                                cache_length=self.context_length, **parent)
 

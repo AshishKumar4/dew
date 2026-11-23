@@ -24,6 +24,7 @@ from interop_support import (
     transformers_arms,
     transformers_model,
 )
+from model_support import attending
 from reference_error import assert_as_exact
 
 from dew.data.dataset import Loader
@@ -93,6 +94,7 @@ LONGROPE_EXPORT_SEEDS = 16
 """Phi-3's export's, whose LongRoPE rows read the long factors, sized alike."""
 
 
+@attending("reference")
 @pytest.mark.parametrize('case', EXPORTS, ids=lambda case: case.label)
 def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case, tmp_path):
     """The export names its family and holds the source's tensors byte for
@@ -101,7 +103,7 @@ def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case,
     its float64 twin's, over drawn ids (check 1). Dew reads it back to the
     model, tree and logits it was saved from."""
     directory = FIXTURES / case.fixture
-    loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(directory, dtype='float32')
     exported = PretrainedDecoder.from_model(loaded.model, loaded.variables) if case.derived else loaded
     exported.save(tmp_path)
     family = case.writes or json.loads((directory / 'config.json').read_text())['model_type']
@@ -155,6 +157,7 @@ def training_rows(case: Training, loaded: Pretrained, directory: Path) -> ModelI
                             images=[[images[0]], [images[1], images[2]]])
 
 
+@attending("reference")
 @pytest.mark.parametrize('case', TRAINING, ids=lambda case: case.fixture)
 def test_a_public_training_step_lowers_the_loss_and_moves_every_module(case):
     """One SGD step through `Trainer`, on the fixture's rows repeated over the
@@ -166,7 +169,7 @@ def test_a_public_training_step_lowers_the_loss_and_moves_every_module(case):
     BLOOM's ALiBi a key bias adds one score to every key a query sees, which
     the softmax cancels, so its gradient is zero."""
     directory = FIXTURES / case.fixture
-    loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(directory, dtype='float32')
     assert set(loaded.variables) == {'params', *case.state}
     inputs = training_rows(case, loaded, directory)
     count = inputs.tokens.shape[0]

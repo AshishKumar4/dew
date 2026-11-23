@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture
+from model_support import attending
 from PIL import Image
 
 from dew.interop import Pretrained, PretrainedDecoder, PretrainedPipeline, codecs
@@ -104,6 +105,7 @@ def _shapes_and_dtypes(variables: object) -> object:
     return jax.tree.map(lambda leaf: [list(leaf.shape), str(leaf.dtype)], variables)
 
 
+@attending("xla")
 def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_no_shards(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -121,7 +123,7 @@ def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_
     sd3_root = tmp_path / "sd3"
     extract_fixture(FIXTURES / "sd3_source.tar.xz", sd3_root)
     sd3_dir = sd3_root / "pipeline"
-    expected_pipe = Pretrained.load(sd3_dir, dtype="float32", attention_impl="xla", on_host=True)
+    expected_pipe = Pretrained.load(sd3_dir, dtype="float32", on_host=True)
 
     flux_root = tmp_path / "flux"
     extract_fixture(FIXTURES / "flux_source.tar.xz", flux_root)
@@ -129,19 +131,19 @@ def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_
     dduf_repo.mkdir()
     dduf_path = dduf_repo / "pipeline.dduf"
     export_folder_as_dduf(dduf_path, flux_root / "pipeline")
-    expected_dduf = Pretrained.load(flux_root / "pipeline", dtype="float32", attention_impl="xla",
+    expected_dduf = Pretrained.load(flux_root / "pipeline", dtype="float32",
                                     on_host=True)
     local_dduf = Pretrained.load(
-        dduf_repo, dduf_file="pipeline.dduf", dtype="float32", attention_impl="xla", weights=False
+        dduf_repo, dduf_file="pipeline.dduf", dtype="float32", weights=False
     )
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(local_dduf.variables))
     assert not [p for p in (tmp_path / "xdg" / "dew" / "dduf").rglob("*") if p.suffix == ".safetensors"]
     assert _shapes_and_dtypes(local_dduf.variables) == _shapes_and_dtypes(expected_dduf.variables)
 
-    expected_joint = Pretrained.load(JOINT_TINY, dtype="float32", attention_impl="xla", on_host=True)
+    expected_joint = Pretrained.load(JOINT_TINY, dtype="float32", on_host=True)
     repos = {"acme/sd3": _files(sd3_dir), "acme/flux-dduf": _files(dduf_repo),
              "acme/joint": _files(JOINT_TINY)}
-    options = {"dtype": "float32", "attention_impl": "xla"}
+    options = {"dtype": "float32"}
     with LocalHub(repos) as hub:
         loaded_pipe = _hub_loaded(root, hub, "acme/sd3", "sd3", options=options)
         hub_dduf = _hub_loaded(root, hub, "acme/flux-dduf", "dduf",
@@ -161,19 +163,20 @@ def test_pipeline_dduf_single_file_and_composite_loads_without_weights_download_
     assert unrecorded["refused"] == "FileNotFoundError"
 
 
+@attending("xla")
 def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_shards(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     flux_root = tmp_path / "flux"
     extract_fixture(FIXTURES / "flux_source.tar.xz", flux_root)
     expected_flux = Pretrained.load(
-        flux_root / "pipeline", dtype="float32", attention_impl="xla", on_host=True
+        flux_root / "pipeline", dtype="float32", on_host=True
     )
 
     # The text encoder's position ids stored as transformers writes them (int64) and as a checkpoint may
     # (uint16): a storage dtype any torch tensor holds reads as its NumPy one (`pickles.host_dtype`).
     sd_tensors, sd_meta = read_file(SINGLE_FILE / "sd.safetensors")
-    kw = {"dtype": "float32", "attention_impl": "xla"}
+    kw = {"dtype": "float32"}
     pos_key = "cond_stage_model.transformer.text_model.embeddings.position_ids"
     for stored in (np.int64, np.uint16):
         sf_repo = tmp_path / f"sf_repo_{np.dtype(stored).name}"
@@ -273,13 +276,14 @@ def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_sh
         assert hub_sharded_sf["shapes"][part] == _shapes_and_dtypes(expected_flux.variables[part])
 
 
+@attending("xla")
 def test_flux2_metadata_only_load_preserves_latent_statistics_on_restore(
     tmp_path: Path
 ) -> None:
     flux2_root = tmp_path / "flux2"
     extract_fixture(FIXTURES / "flux2_source.tar.xz", flux2_root)
     flux2_dir = flux2_root / "pipeline"
-    expected = PretrainedPipeline.load(flux2_dir, dtype="float32", attention_impl="xla", on_host=True)
+    expected = PretrainedPipeline.load(flux2_dir, dtype="float32", on_host=True)
     assert expected.autoencoder is not None
 
     from local_hub import LocalHub
@@ -294,13 +298,13 @@ def test_flux2_metadata_only_load_preserves_latent_statistics_on_restore(
     repos = {"acme/flux2": _files(flux2_dir)}
     with LocalHub(repos) as hub:
         loaded = _hub_loaded(tmp_path / "hub", hub, "acme/flux2", "flux2", pipeline=True,
-                             options={"dtype": "float32", "attention_impl": "xla"},
+                             options={"dtype": "float32"},
                              encode={"directory": str(flux2_dir), "sample": str(tmp_path / "sample.npy")})
     _weightless(hub, "acme/flux2", repos["acme/flux2"], declared=LATENT_STATISTICS)
     assert loaded["shapes"] == _shapes_and_dtypes(expected.variables)
     np.testing.assert_array_equal(np.load(tmp_path / "hub" / "flux2" / "latent.npy"), expected_latent)
 
-    local = PretrainedPipeline.load(flux2_dir, dtype="float32", attention_impl="xla", weights=False)
+    local = PretrainedPipeline.load(flux2_dir, dtype="float32", weights=False)
     assert local.autoencoder is not None
     rebound = AutoEncoder.bound(to_record(local.autoencoder, AutoEncoder), params=vae_params)
     np.testing.assert_array_equal(np.asarray(rebound.encode_batch(vae_params, sample)), expected_latent)
@@ -322,7 +326,7 @@ def test_flux2_metadata_only_load_preserves_latent_statistics_on_restore(
         "tokenizer": ["transformers", "PreTrainedTokenizerFast"],
     }
     (m3_dir / "model_index.json").write_text(json.dumps(m3_idx))
-    kw = {"dtype": "float32", "attention_impl": "xla"}
+    kw = {"dtype": "float32"}
     expected_m3 = PretrainedPipeline.load(m3_dir, on_host=True, **kw)
     flux2_dduf_repo = tmp_path / "flux2_dduf_repo"
     flux2_dduf_repo.mkdir()
@@ -344,6 +348,7 @@ def test_flux2_metadata_only_load_preserves_latent_statistics_on_restore(
     assert _shapes_and_dtypes(reloaded_saved.variables) == _shapes_and_dtypes(expected_m3.variables)
 
 
+@attending("reference")
 def test_pack_quantized_compressed_tensors_loads_shapes_without_downloading_weights(
     tmp_path: Path
 ) -> None:
@@ -396,8 +401,8 @@ def test_pack_quantized_compressed_tensors_loads_shapes_without_downloading_weig
             packed_tensors[name] = dense
     write_file(packed_tensors, ct_dir / "model.safetensors", header_meta)
 
-    expected = Pretrained.load(ct_dir, dtype="float32", attention_impl="reference", on_host=True)
-    local_shapes = Pretrained.load(ct_dir, dtype="float32", attention_impl="reference", weights=False)
+    expected = Pretrained.load(ct_dir, dtype="float32", on_host=True)
+    local_shapes = Pretrained.load(ct_dir, dtype="float32", weights=False)
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(local_shapes.variables))
     assert _shapes_and_dtypes(local_shapes.variables) == _shapes_and_dtypes(expected.variables)
 
@@ -407,7 +412,7 @@ def test_pack_quantized_compressed_tensors_loads_shapes_without_downloading_weig
     (ct_dir / "generation_config.json").write_text(json.dumps(
         {"do_sample": True, "temperature": 0.3, "top_k": 5}))
     repos = {"acme/ct-qwen": _files(ct_dir)}
-    options = {"dtype": "float32", "attention_impl": "reference"}
+    options = {"dtype": "float32"}
     with LocalHub(repos) as hub:
         hub_shapes = _hub_loaded(tmp_path / "hub", hub, "acme/ct-qwen", "ct", options=options)
     _weightless(hub, "acme/ct-qwen", repos["acme/ct-qwen"], declared=(".weight_shape",))
@@ -452,13 +457,14 @@ def test_a_hub_autoencoder_resolves_its_release_once(tmp_path: Path) -> None:
     assert offline.get("shapes") == expected, offline
 
 
+@attending("reference")
 def test_sampling_override_governs_beam_admission(tmp_path: Path) -> None:
     stochastic_beam_dir = tmp_path / "stochastic_beam"
     shutil.copytree(QWEN_TINY, stochastic_beam_dir)
     (stochastic_beam_dir / "generation_config.json").write_text(
         json.dumps({"do_sample": True, "num_beams": 2, "top_p": 0.9, "eos_token_id": 2, "pad_token_id": 0})
     )
-    loaded = PretrainedDecoder.load(stochastic_beam_dir, dtype="float32", attention_impl="reference")
+    loaded = PretrainedDecoder.load(stochastic_beam_dir, dtype="float32")
     gen = loaded.text_generation(sampling=Sampling(temperature=0.0))
     assert isinstance(gen.sampling.strategy, Beam) and gen.sampling.strategy.width == 2
 
@@ -467,7 +473,7 @@ def test_sampling_override_governs_beam_admission(tmp_path: Path) -> None:
     (det_beam_dir / "generation_config.json").write_text(
         json.dumps({"do_sample": False, "num_beams": 2, "eos_token_id": 2, "pad_token_id": 0})
     )
-    det_loaded = PretrainedDecoder.load(det_beam_dir, dtype="float32", attention_impl="reference")
+    det_loaded = PretrainedDecoder.load(det_beam_dir, dtype="float32")
     with pytest.raises(ValueError):
         det_loaded.text_generation(sampling=Sampling(temperature=0.7))
     # A policy naming its own strategy replaces the source's beams, which nothing then judges (the review
@@ -480,18 +486,19 @@ def test_sampling_override_governs_beam_admission(tmp_path: Path) -> None:
     (contrastive_dir / "generation_config.json").write_text(
         json.dumps({"do_sample": False, "penalty_alpha": 0.6, "top_k": 4, "eos_token_id": 2,
                     "pad_token_id": 0}))
-    contrastive = PretrainedDecoder.load(contrastive_dir, dtype="float32", attention_impl="reference")
+    contrastive = PretrainedDecoder.load(contrastive_dir, dtype="float32")
     with pytest.raises(ValueError):
         contrastive.text_generation()
     replaced = contrastive.text_generation(sampling=Sampling(strategy=Sample()))
     assert isinstance(replaced.sampling.strategy, Sample)
 
 
+@attending("reference")
 def test_a_beam_search_policy_round_trips_through_generation_config() -> None:
     """A policy's beam search is written as transformers' `num_beams`, `length_penalty` and
     `early_stopping` (the review of API02b: a policy's strategy was dropped on export), which a source's
     own decoding reads back as the same search."""
-    loaded = Pretrained.load(QWEN_TINY, dtype="float32", attention_impl="reference", weights=False)
+    loaded = Pretrained.load(QWEN_TINY, dtype="float32", weights=False)
     search = Beam(width=3, length_penalty=0.5, early_stopping="never")
     native = Sampling(temperature=0, eos_token_ids=2, pad_token_id=0, no_repeat_ngram_size=2, strategy=search)
     written = generation_config_of(native)
@@ -503,6 +510,7 @@ def test_a_beam_search_policy_round_trips_through_generation_config() -> None:
     assert [type(each) for each in native.transforms()] == [type(each) for each in read.components()[0]]
 
 
+@attending("reference")
 def test_a_saved_runs_policy_loads_whole_and_a_release_of_its_unwritten_parts_is_refused() -> None:
     """A saved run's policy holding what transformers' generation config holds no field of (criteria beside
     its EOS) loads natively, its bundle's generation config the part it holds (`written_part`), and its
@@ -516,14 +524,15 @@ def test_a_saved_runs_policy_loads_whole_and_a_release_of_its_unwritten_parts_is
 
     policy = Sampling(temperature=0, eos_token_ids=2, stopping=(decoding.MaxNewTokens(3),))
     assert "max_new_tokens" not in generation_config_of(written_part(policy), None)
-    loaded = Pretrained.load(QWEN_TINY, dtype="float32", attention_impl="reference", weights=False)
+    loaded = Pretrained.load(QWEN_TINY, dtype="float32", weights=False)
     with pytest.raises(ValueError):
         replace(loaded, settings=TextSettings(seq_len=8, max_new_tokens=3, tokenizer=None, processor=None,
                                               sampling=policy)).release_plan()
 
 
+@attending("reference")
 def test_policy_controls_round_trip_through_generation_config() -> None:
-    loaded = Pretrained.load(QWEN_TINY, dtype="float32", attention_impl="reference", weights=False)
+    loaded = Pretrained.load(QWEN_TINY, dtype="float32", weights=False)
     rich = Sampling(
         temperature=0.6,
         top_k=25,
@@ -542,6 +551,7 @@ def test_policy_controls_round_trip_through_generation_config() -> None:
     assert restored == rich and exported["max_new_tokens"] == 16
 
 
+@attending("reference")
 def test_medias_processor_keeps_image_paths_and_bytes_atomic(tmp_path: Path) -> None:
     from tool_support import run_from
 
@@ -562,7 +572,7 @@ def test_medias_processor_keeps_image_paths_and_bytes_atomic(tmp_path: Path) -> 
         patch_limit_on_one_side=side,
     )
     (source / "preprocessor_config.json").write_text(json.dumps(released))
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference", trust_remote_code=True)
+    loaded = Pretrained.load(source, dtype="float32", trust_remote_code=True)
     assert loaded.processor is not None
 
     rng = np.random.default_rng(7)
@@ -603,6 +613,7 @@ def test_medias_processor_keeps_image_paths_and_bytes_atomic(tmp_path: Path) -> 
         )
 
 
+@attending("xla")
 def test_a_host_processors_images_by_url_path_and_bytes_read_as_the_arrays(tmp_path: Path) -> None:
     """A source processor of the usual kind (Gemma 3's, a `HostProcessor`) given its images by URL, by path
     (text or `Path`) or as an encoded byte buffer computes the fields it computes from the decoded arrays:
@@ -611,7 +622,7 @@ def test_a_host_processors_images_by_url_path_and_bytes_read_as_the_arrays(tmp_p
     import threading
     from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-    loaded = Pretrained.load(FIXTURES / "hf" / "gemma3-native-tiny", dtype="float32", attention_impl="xla",
+    loaded = Pretrained.load(FIXTURES / "hf" / "gemma3-native-tiny", dtype="float32",
                              max_seq_len=64)
     assert loaded.processor is not None
     pixels = (np.random.default_rng(5).random((16, 12, 3)) * 255).astype(np.uint8)

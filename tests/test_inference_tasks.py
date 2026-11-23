@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from model_support import decoder
+from model_support import attending, decoder
 from serving_support import assert_same_generation
 
 from dew.data.dataset import Loader
@@ -26,6 +26,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 SAMPLING = Sampling(temperature=0.8, top_k=5, eos_token_ids=(3, 9))
 
 
+@attending("xla")
 @pytest.mark.parametrize("family", ["llama-tiny", "diffusion-gemma-workflow"])
 def test_decoding_fp32_masters_draws_what_a_bf16_storage_load_draws(family):
     """A bf16 model over fp32 masters decodes at bf16 storage: the weights it
@@ -33,7 +34,7 @@ def test_decoding_fp32_masters_draws_what_a_bf16_storage_load_draws(family):
     draws what that load's draws, autoregressive or block by block."""
     from test_interop import assert_parameter_storage
 
-    masters, native = (Pretrained.load(FIXTURES / family, dtype="bfloat16", attention_impl="xla",
+    masters, native = (Pretrained.load(FIXTURES / family, dtype="bfloat16",
                                        max_seq_len=32, **storage)
                        for storage in ({}, {"param_dtype": "bfloat16"}))
     stored = decoding_storage(masters.model, masters.variables)
@@ -81,10 +82,11 @@ def test_a_bound_task_draws_from_the_weights_it_was_bound_to():
             decoded()
 
 
+@attending("reference")
 def test_a_loaded_source_generates_from_text_with_its_own_policy():
     """The Gemma3 source turns prompts and images into a conditioned greedy
     continuation and decodes it back through its own tokenizer."""
-    loaded = Pretrained.load(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURES / "gemma3-native-tiny", dtype="float32")
     images = np.load(FIXTURES / "gemma3-native-tiny" / "raw_images.npy")
     prompts = json.loads((FIXTURES / "gemma3-native-tiny" / "prompts.json").read_text())
     task = loaded.text_generation()
@@ -111,11 +113,12 @@ def test_a_loader_takes_a_dtype_and_records_its_name():
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
 
+@attending("xla")
 def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
     from dew import Trainer
     from dew.objectives.base import Step
 
-    source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="xla",
+    source = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32",
                              max_seq_len=8)
     options = {"ema_decay": None, "head_chunks": 1, "pad_id": 0, "z_loss": 1e-4}
     explicit = LMObjective(source.model, 4, variables=source.variables, **options)
@@ -142,8 +145,9 @@ def test_a_pretrained_bundle_fine_tunes_identically_to_explicit_wiring():
                zip(jax.tree.leaves(states[1].variables), jax.tree.leaves(source.variables), strict=True))
 
 
+@attending("xla")
 def test_a_diffusion_gemma_source_generates_canvases_without_likelihood_claims():
-    loaded = Pretrained.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
+    loaded = Pretrained.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32",
                              max_seq_len=32)
     task = loaded.block_generation()
     assert isinstance(task, BlockGeneration)
@@ -275,6 +279,7 @@ def test_a_task_moves_onto_a_mesh_with_the_variables_it_holds():
     )
 
 
+@attending("xla")
 @pytest.mark.mesh
 def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same_canvases():
     """Placed under the trainer's layout, a canvas task shards its weights,
@@ -285,7 +290,7 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
     from dew.nn.inputs import request_axes
     from dew.training import Layout, MeshSpec
 
-    loaded = Pretrained.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32", attention_impl="xla",
+    loaded = Pretrained.load(FIXTURES / "diffusion-gemma-workflow", dtype="float32",
                              max_seq_len=32)
     plain = loaded.block_generation()
     placed = plain.bind(place(loaded.variables, MeshSpec(fsdp=2), Layout(min_shard=2 ** 6)))
@@ -300,6 +305,7 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
     assert result.text == plain.decode(plain(prompts, 7, key=11))
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["dpo", "grpo", "ppo"])
 def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tmp_path):
     import dew
@@ -310,7 +316,7 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     from dew.training import Checkpoints, Trainer
 
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
-                              mlp_features=32, max_seq_len=8, dtype="float32", attention_impl="xla")
+                              mlp_features=32, max_seq_len=8, dtype="float32")
     sampling = Sampling(temperature=0)
     # One previewed token under greedy sampling: the budget and policy the run records.
     samples = Samples([1], 1, sampling=sampling)

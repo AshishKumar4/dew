@@ -20,6 +20,7 @@ import pytest
 from diffusion_stubs import PROMPTS, batch_for
 from diffusion_support import images_of
 from interop_support import allocated_bytes, extract_fixture, tiny_pipeline
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from dew.config import ObjectiveConfig, TrainerConfig
@@ -57,9 +58,10 @@ def pipelines(tmp_path_factory):
 def precision() -> ModelConfig:
     """The default model record at float32 on the XLA kernel."""
     model = DiffusionRunConfig().model
-    return dataclasses.replace(model, fields={**model.fields, "dtype": "float32", "attention_impl": "xla"})
+    return dataclasses.replace(model, fields={**model.fields, "dtype": "float32"})
 
 
+@attending("xla")
 def test_a_resumed_pipeline_run_reads_none_of_the_pipelines_weights(pipelines, tmp_path, monkeypatch):
     """A run that fine-tunes a published pipeline and resumes from its own checkpoint reads the pipeline's
     weights' shapes alone, which its restore fills (docs/design/training.md, resume; row 6148): no tensor
@@ -99,6 +101,7 @@ def test_a_resumed_pipeline_run_reads_none_of_the_pipelines_weights(pipelines, t
     assert read == [] and int(resumed.step) == 2
 
 
+@attending("xla")
 def test_a_shape_only_pipeline_load_retains_geometry_without_eager_native_copies(pipelines, tmp_path,
                                                                                monkeypatch):
     """A shape-only load preserves every component's parameter geometry and storage dtype.
@@ -108,13 +111,13 @@ def test_a_shape_only_pipeline_load_retains_geometry_without_eager_native_copies
     from dew.interop import Pretrained
 
     original = pipelines / "sd3" / "pipeline"
-    expected = Pretrained.load(original, dtype="float32", attention_impl="xla", on_host=True)
+    expected = Pretrained.load(original, dtype="float32", on_host=True)
     selected = tmp_path / "source"
     shutil.copytree(original, selected)
     _, eager_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
-        selected, dtype="float32", attention_impl="xla", on_host=True))
+        selected, dtype="float32", on_host=True))
     loaded, deferred_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
-        selected, dtype="float32", attention_impl="xla", weights=False))
+        selected, dtype="float32", weights=False))
     assert eager_bytes > 0 and deferred_bytes < eager_bytes
     shapes = jax.tree.leaves(loaded.variables)
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shapes)
@@ -132,6 +135,7 @@ def value(objective, params, batch) -> float:
     return float(loss.total / loss.mass)
 
 
+@attending("xla")
 @pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image"])
 def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
         family, pipelines, tmp_path):
@@ -174,19 +178,19 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     from dew.interop.safetensors_io import read_weights
 
     def rebound(source: Path):
-        return load_diffusion_source(str(source), dtype="float32", attention_impl="xla", size=(size, size),
+        return load_diffusion_source(str(source), dtype="float32", size=(size, size),
                                      variables=state.variables)
 
     with pytest.raises(ValueError):
         rebound(metadata).save(tmp_path / "refused")
     assert not (tmp_path / "refused").exists()
-    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla",
+    published = load_diffusion_source(str(directory), dtype="float32",
                                       size=(size, size))
     pipeline = rebound(directory)
     assert sorted(pipeline.weight_layouts, key=lambda layout: layout.name) == sorted(
         published.weight_layouts, key=lambda layout: layout.name)
     pipeline.save(tmp_path / "export")
-    again = load_diffusion_source(str(tmp_path / "export"), dtype="float32", attention_impl="xla",
+    again = load_diffusion_source(str(tmp_path / "export"), dtype="float32",
                                   size=(size, size))
     assert jax.tree.structure(again.variables) == jax.tree.structure(pipeline.variables)
     for ours, theirs in zip(jax.tree.leaves(again.variables), jax.tree.leaves(pipeline.variables),
@@ -204,8 +208,8 @@ _OFFLINE_REBIND = """
 import json, sys
 from dew.interop.pretrained import load_diffusion_source
 
-published = load_diffusion_source(sys.argv[1], dtype="float32", attention_impl="xla", size=(16, 16))
-pipeline = load_diffusion_source("dew/flux-tiny", dtype="float32", attention_impl="xla", size=(16, 16),
+published = load_diffusion_source(sys.argv[1], dtype="float32", size=(16, 16))
+pipeline = load_diffusion_source("dew/flux-tiny", dtype="float32", size=(16, 16),
                                  variables=published.variables)
 try:
     pipeline.save(sys.argv[2])
@@ -216,6 +220,7 @@ else:
 """
 
 
+@attending("xla")
 @pytest.mark.parametrize("cached", ["whole", "metadata"])
 def test_a_pipeline_rebinds_saved_variables_offline_and_exports_them_by_the_headers_it_holds(
         pipelines, tmp_path, cached):
@@ -249,8 +254,8 @@ def test_a_pipeline_rebinds_saved_variables_offline_and_exports_them_by_the_head
     if cached == "metadata":
         assert not (tmp_path / "export").exists()
         return
-    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
-    again = load_diffusion_source(str(tmp_path / "export"), dtype="float32", attention_impl="xla",
+    published = load_diffusion_source(str(directory), dtype="float32", size=(16, 16))
+    again = load_diffusion_source(str(tmp_path / "export"), dtype="float32",
                                   size=(16, 16))
     assert jax.tree.structure(again.variables) == jax.tree.structure(published.variables)
     for ours, theirs in zip(jax.tree.leaves(again.variables), jax.tree.leaves(published.variables),
@@ -258,6 +263,7 @@ def test_a_pipeline_rebinds_saved_variables_offline_and_exports_them_by_the_head
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
+@attending("xla")
 def test_a_pipeline_rebinds_over_a_sharded_copy_without_its_shards(pipelines, tmp_path):
     """A local copy of a pipeline whose transformer is sharded behind its index, with the shards
     deleted, rebinds a saved tree from its metadata alone, as it does unsharded, and its save,
@@ -272,10 +278,10 @@ def test_a_pipeline_rebinds_over_a_sharded_copy_without_its_shards(pipelines, tm
         stored.unlink()
     save_sharded(weights, copy / "transformer", "20KB", stem="diffusion_pytorch_model")
     assert len(list((copy / "transformer").glob("*.safetensors"))) > 1
-    published = load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
+    published = load_diffusion_source(str(copy), dtype="float32", size=(16, 16))
     for stored in copy.rglob("*.safetensors"):
         stored.unlink()
-    rebound = load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16),
+    rebound = load_diffusion_source(str(copy), dtype="float32", size=(16, 16),
                                     variables=published.variables)
     for ours, theirs in zip(jax.tree.leaves(rebound.variables), jax.tree.leaves(published.variables),
                             strict=True):
@@ -293,8 +299,7 @@ import jax, numpy as np
 from flax import serialization
 from dew.interop.pretrained import load_diffusion_source
 
-published = load_diffusion_source(sys.argv[1], revision=sys.argv[2], dtype="float32", attention_impl="xla",
-                                  size=(16, 16))
+published = load_diffusion_source(sys.argv[1], revision=sys.argv[2], dtype="float32", size=(16, 16))
 open(sys.argv[3], "wb").write(serialization.msgpack_serialize(jax.tree.map(np.asarray, published.variables)))
 """
 
@@ -304,13 +309,14 @@ from flax import serialization
 from dew.interop.pretrained import load_diffusion_source
 
 variables = serialization.msgpack_restore(open(sys.argv[3], "rb").read())
-pipeline = load_diffusion_source(sys.argv[1], revision=sys.argv[2], dtype="float32", attention_impl="xla",
-                                 size=(16, 16), variables=variables)
+pipeline = load_diffusion_source(sys.argv[1], revision=sys.argv[2], dtype="float32", size=(16, 16),
+                                 variables=variables)
 pipeline.save(sys.argv[4])
 print(json.dumps({"saved": True}))
 """
 
 
+@attending("xla")
 def test_a_pipeline_is_one_whatever_its_root_config_unless_that_names_a_model(pipelines, tmp_path):
     """A pipeline directory loads as its components whatever else its root holds, a config.json too,
     for a run as for a load (`_pipeline_source`); one whose config.json names a model is that model,
@@ -320,13 +326,14 @@ def test_a_pipeline_is_one_whatever_its_root_config_unless_that_names_a_model(pi
     copy = tmp_path / "pipeline"
     shutil.copytree(pipelines / "flux" / "pipeline", copy)
     (copy / "config.json").write_text("{}")
-    loaded = load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
+    loaded = load_diffusion_source(str(copy), dtype="float32", size=(16, 16))
     assert jax.tree.leaves(loaded.variables)
     (copy / "config.json").write_text(json.dumps({"model_type": "diffusion_gemma"}))
     with pytest.raises(ValueError):
-        load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
+        load_diffusion_source(str(copy), dtype="float32", size=(16, 16))
 
 
+@attending("xla")
 @pytest.mark.network
 def test_a_hub_pipeline_rebound_online_exports_offline_from_its_recorded_headers(tmp_path):
     """A saved tree rebound over a Hub pipeline whose weights it never downloads reads the
@@ -353,9 +360,9 @@ def test_a_hub_pipeline_rebound_online_exports_offline_from_its_recorded_headers
     run(_REBOUND, "metadata", tmp_path / "variables.msgpack", tmp_path / "online")
     assert not list((tmp_path / "metadata").rglob("*.safetensors"))
     run(_REBOUND, "metadata", tmp_path / "variables.msgpack", tmp_path / "offline", offline=True)
-    published = load_diffusion_source(repo, revision=revision, dtype="float32", attention_impl="xla",
+    published = load_diffusion_source(repo, revision=revision, dtype="float32",
                                       size=(16, 16))
-    again = load_diffusion_source(str(tmp_path / "offline"), dtype="float32", attention_impl="xla",
+    again = load_diffusion_source(str(tmp_path / "offline"), dtype="float32",
                                   size=(16, 16))
     assert jax.tree.structure(again.variables) == jax.tree.structure(published.variables)
     for ours, theirs in zip(jax.tree.leaves(again.variables), jax.tree.leaves(published.variables),
@@ -363,6 +370,7 @@ def test_a_hub_pipeline_rebound_online_exports_offline_from_its_recorded_headers
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
+@attending("xla")
 def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_path):
     """A recipe trains the loaded KL posterior and denoiser and publishes the tuned autoencoder,
     and the trained tree rebuilds over the pipeline's metadata alone, scoring as the run did."""
@@ -398,6 +406,7 @@ def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_
     assert value(rebuilt, trained.variables, batch) == value(objective, trained.variables, batch)
 
 
+@attending("xla")
 @pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image", "sd"])
 def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelines):
     """The wiring half of a configured run: `DiffusionRunConfig` over a
@@ -424,7 +433,7 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
                                         val_metrics=(),
                                     objective=ObjectiveConfig("diffusion", {
                                         "solver": Euler(), "steps": 2, **settings})).build()
-    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(size, size))
+    source = load_diffusion_source(str(directory), dtype="float32", size=(size, size))
     written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
     assert to_record(configured.process, Process) == to_record(written.process, Process)
@@ -464,6 +473,7 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
         np.testing.assert_array_equal(getattr(published, name), getattr(pipeline, name), err_msg=name)
 
 
+@attending("xla")
 def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
     """Flux was trained as a velocity flow; the default EDM preset is not
     that convention, and a flow preset is."""
@@ -579,6 +589,7 @@ def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(cons
     assert_as_exact(dew, diffusers, shift_times, f"{constants} noise levels", seeds=SHIFT_SEEDS)
 
 
+@attending("xla")
 def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pipelines):
     """The run's parameter dtype (`trainer.precision.dtypes.params`) is the storage the pipeline's
     denoiser loads and trains in."""
@@ -601,6 +612,7 @@ def test_a_pretrained_run_refuses_a_model_of_its_own():
                            text=TextCondition(encoder="t5"))
 
 
+@attending("xla")
 def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pipelines):
     """Flux from scratch in pixel space, conditioned by the Flux pipeline's
     CLIP and T5 towers: the conditioner's record goes in under `conditioning`,
@@ -613,7 +625,7 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
             "in_channels": 12, "out_channels": 12, "num_layers": 1, "num_single_layers": 1,
             "heads": 2, "head_dim": 12, "joint_attention_dim": 16, "pooled_projection_dim": 10,
             "guidance_embeds": True, "axes_dims_rope": [4, 4, 4],
-            "dtype": "float32", "attention_impl": "xla"}),
+            "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", 8), preset=Flow(), val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(directory)),
         objective=ObjectiveConfig("diffusion",
@@ -634,7 +646,7 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
 def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRunConfig:
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                         "num_heads": 2, "dtype": "float32", "attention_impl": "xla"}),
+                                         "num_heads": 2, "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=directory),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
@@ -655,6 +667,7 @@ def grpo_step(objective, rollout, **trainer):
     return prepared, started, state
 
 
+@attending("xla")
 def test_flow_grpo_trains_from_the_run_config_on_a_registered_reward():
     """`rl` builds the Flow-GRPO objective and its rollout: groups of SDE
     samples per prompt, scored by PSNR against the prompt's own image, and
@@ -669,6 +682,7 @@ def test_flow_grpo_trains_from_the_run_config_on_a_registered_reward():
         jax.tree.leaves(state.variables["params"]), started, strict=True))
 
 
+@attending("xla")
 def test_diffusion_nft_trains_from_the_run_config_on_a_registered_reward():
     """`rl` builds DiffusionNFT's objective and its rollout from the run's record as it builds Flow-GRPO's
     (above), the one rollout record building either: groups of the old policy's clean samples per prompt,
@@ -693,6 +707,7 @@ def test_diffusion_nft_trains_from_the_run_config_on_a_registered_reward():
         jax.tree.leaves(state.variables["params"]), started, strict=True))
 
 
+@attending("xla")
 def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
     """A Flow-GRPO run's rollout is the run's `rollout` record, which the objective's record does
     not hold: a run naming none states the default, a rollout setting on the objective is no
@@ -715,6 +730,7 @@ def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
     assert DiffusionRunConfig.from_dict(parsed.to_dict()).rollout == parsed.rollout
 
 
+@attending("xla")
 def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_path):
     """With a KL term the EMA slot holds the frozen initial model. The run's
     task restores the trained policy under `from_run`'s default `ema=None`,
@@ -739,6 +755,7 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
                for got, before in zip(restored, started, strict=True))
 
 
+@attending("xla")
 def test_a_distillation_from_a_flow_grpo_run_distills_its_policy_and_not_its_kl_reference(tmp_path):
     """A distillation whose teacher run trained under Flow-GRPO with a KL term, whose averaged weights
     are the frozen initial model, distills the trained policy the run publishes, as its task restores
@@ -766,6 +783,7 @@ def test_a_distillation_from_a_flow_grpo_run_distills_its_policy_and_not_its_kl_
                for got, before in zip(distilled, started, strict=True))
 
 
+@attending("xla")
 def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines, tmp_path):
     """Flow-GRPO built over a published pipeline, its grid left out, evaluates on the pipeline's own
     grid as the denoising objective over it does, and its published task and the task a saved run
@@ -778,7 +796,7 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
     directory = pipelines / "sd3" / "pipeline"
     settings = {"solver": Euler(), "guidance": None, "steps": 2}
     rollout = FlowRolloutConfig(reward="psnr", groups=2, steps=3)
-    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
+    source = load_diffusion_source(str(directory), dtype="float32", size=(16, 16))
     step = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
 
     def built(**grid):
@@ -858,6 +876,7 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
                                           key=7).host().images)
 
 
+@attending("xla")
 def test_diffusion_run_source_refuses_unsupported_source_transformations_before_weights(pipelines, tmp_path):
     """`DiffusionRunConfig` forwards `SourceOptions`'s `dex` and `packed_weights` to
     `load_diffusion_source`, which refuses each unsupported nondefault transformation before reading or

@@ -106,7 +106,7 @@ def measure(config: DiskConfig):
                           param_dtype=config.param_dtype, read_ahead=config.read_ahead) as source:
         record = translate_config(source.config)
         record["max_seq_len"] = config.prompt + config.tokens + 1
-        model = from_record(CausalTransformer, {**record, "dtype": config.dtype, "attention_impl": "xla",
+        model = from_record(CausalTransformer, {**record, "dtype": config.dtype,
                                                 "bank_layers": config.bank_layers})
         variables = source.stream(model, mesh=MeshSpec().build([device]),
                                    layout=Layout(min_shard=1, tolerance=1.0))
@@ -184,4 +184,7 @@ def measure(config: DiskConfig):
 
 
 if __name__ == "__main__":
-    measure(tyro.cli(DiskConfig))
+    from dew.nn.kernels import generation
+
+    with generation.chosen(attention="xla"):
+        measure(tyro.cli(DiskConfig))

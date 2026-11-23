@@ -382,7 +382,7 @@ class LMRunConfig(DecoderRunConfig):
 
         assert self.pretrained is not None
         self.sourced_model()
-        choices = ("max_seq_len", "dtype", "attention_impl")
+        choices = ("max_seq_len", "dtype")
         overridden = sorted(set(self.model.fields) - set(choices))
         if overridden:
             raise ValueError(f"the run's model sets {overridden}, which the checkpoint at {self.pretrained} "
@@ -395,7 +395,6 @@ class LMRunConfig(DecoderRunConfig):
         # The checkpoint computes in the run's compute dtype and stores its parameters as its source
         # keywords say, by whether the run trains it.
         loaded = Pretrained.load(reference.name, dtype=jnp.dtype(self.compute_dtype()),
-                                 attention_impl=self.source_attention(),
                                  max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
                                  **self.source_keywords(frozen=self.lora is not None))

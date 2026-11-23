@@ -34,6 +34,7 @@ import numpy as np
 import pytest
 from lane_environment import MESH_DEVICES
 from interop_support import assert_same_stored_tensors, written_tensors
+from model_support import attending
 from pool_records import served_image
 from process_support import (
     ProcessGroup,
@@ -372,6 +373,7 @@ def test_a_schedule_ends_its_stage_at_one_step_on_every_process(tmp_path):
                                dumped_params(tmp_path / "alone" / "process0.json"))
 
 
+@attending("xla")
 @pytest.mark.distributed
 def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_path):
     """A slot release placed over two processes, its readout partitioned across them, publishes every
@@ -385,7 +387,7 @@ def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_pa
     source, _ = slot_release(tmp_path, "head")
     reports = run_pool("decision_publish", tmp_path / "out", 2, release=source, run_dir=tmp_path / "served")
     assert [report["partitioned"] for report in reports] == [True, True]
-    host = Pretrained.load(source, dtype="float32", attention_impl="xla", on_host=True)
+    host = Pretrained.load(source, dtype="float32", on_host=True)
     host.save(tmp_path / "saved")
     assert_same_stored_tensors(written_tensors(tmp_path / "served"), written_tensors(tmp_path / "saved"))
     assert_same_stored_tensors(dumped_params(tmp_path / "out" / "process0.json"),
@@ -1858,6 +1860,7 @@ def test_a_pool_decides_its_frozen_fp8_sites_on_process_zero(tmp_path):
     assert [report["after"] for report in reports] == [True, True]
 
 
+@attending("reference")
 @pytest.mark.distributed
 def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
     """Identical user code on one device and on a two-process pool: the run's

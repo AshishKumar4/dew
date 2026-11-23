@@ -29,13 +29,13 @@ from lane_environment import without_flags
 from generation_support import COMPILES_ON_CPU
 from jax.extend import custom_call_targets, xla
 from kernel_compile import gate_generations
-from model_support import TINY_DECODER, memory_limited_to
+from model_support import TINY_DECODER, attending, memory_limited_to
 from token_support import token_rows
 
 from dew._devices import allocator_limit, device_memory
 from dew._records import listed, record
 from dew.data import Phase, Steps
-from dew.nn.kernels.generation import capability
+from dew.nn.kernels.generation import capability, chosen as attended
 from dew.nn.sharding import Link
 from dew.objectives.lm import LMObjective
 from dew.optim import AdamW, OptimConfig
@@ -87,11 +87,11 @@ def gpus(generation: str, count: int = 1, limit: int = 2**36) -> tuple:
     return compile_only_gpus(generation, count, memory_limited_to(limit))
 
 
-def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None,
-              inspection=None, tracker=None, dtype: str | None = None):
+def fine_tune(mesh, *, ahead=None, width: int | None = None, split=1, remat=None, inspection=None,
+              tracker=None, dtype: str | None = None):
+    """A tiny decoder's fine-tuning trainer on `mesh`: its attention the run's kernel (`attending`)."""
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
-              **({"attention_impl": "xla"} if xla else {}), **({} if remat is None else {"remat": remat}),
-              **({} if dtype is None else {"dtype": dtype})}
+              **({} if remat is None else {"remat": remat}), **({} if dtype is None else {"dtype": dtype})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                    layout=Layout(min_shard=TINY_SHARD), fit=FitPolicy(split=split), ahead=ahead,
@@ -479,6 +479,7 @@ def test_a_program_compiled_over_shapes_while_collecting_runs_for_arrays_alike_t
     np.testing.assert_array_equal(np.asarray(moved), np.arange(4) * 2 + 1)
 
 
+@attending("xla")
 @pytest.mark.parametrize("asked", ["midway", "at its end", "scored to"])
 def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs_its_fit_runs(
         asked, tmp_path):
@@ -513,7 +514,7 @@ def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs
         if written.exists():
             shutil.rmtree(written)
         tracker = RecordingTracker()
-        run = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True, tracker=tracker)
+        run = fine_tune(MeshSpec().build(jax.devices()[:1]), tracker=tracker)
         with taking(handed), Compiles(None) as compiles:
             state = run.fit(batch, **fit)
         # A fit asked to write what it scores writes it, handed its programs or not.
@@ -524,7 +525,7 @@ def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs
                 [np.asarray(leaf) for leaf in jax.tree.leaves(state.variables)])
 
     alone, scored, ended = compiled({})
-    ahead = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True)
+    ahead = fine_tune(MeshSpec().build(jax.devices()[:1]))
     plan = fit_plan(ahead, batch, fit)
     start = ahead._started()
     with collecting() as collected:
@@ -1330,7 +1331,7 @@ import jax
 import optax
 from token_support import token_rows
 
-from dew.nn.kernels.generation import routes
+from dew.nn.kernels.generation import chosen, routes
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
@@ -1339,7 +1340,7 @@ from dew.training.ahead import compile_ahead
 
 model = models.build(
     "causal_transformer", vocab_size=1024, emb_features=1024, num_layers=2, num_heads=8, num_kv_heads=2,
-    head_dim=128, mlp_features=8192, max_seq_len=512, dtype="bfloat16", attention_impl="template",
+    head_dim=128, mlp_features=8192, max_seq_len=512, dtype="bfloat16",
     layer_types=("linear_attention", "attention"),
     kinds={"attention": {}, "linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
         "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 64,
@@ -1348,7 +1349,7 @@ model = models.build(
 mesh = MeshSpec(fsdp=2).build(compile_only_gpus(sys.argv[1], 2, 2**36))
 trainer = Trainer(LMObjective(model, 512), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                   layout=Layout(min_shard=256))
-with routes() as taken:
+with routes() as taken, chosen(attention="template"):
     ahead = compile_ahead(trainer, token_rows(1024, 8, 513))
 print(json.dumps({"kernels": sorted({(route.choice, route.kernel) for route in taken})}))
 """
@@ -1413,14 +1414,14 @@ def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_r
     compiled its own step at run time)."""
     from dew.training.ahead import compile_ahead
 
-    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2,
-                         attention_impl=implementation)
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
     trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec().build(gpus(generation)),
                       layout=Layout(min_shard=TINY_SHARD))
     from dew.nn.kernels.generation import routes
 
-    with routes() as taken:
+    named = contextlib.nullcontext() if implementation == "auto" else attended(attention=implementation)
+    with routes() as taken, named:
         compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
     if implementation == "template":
         assert {route.kernel for route in taken if route.choice == "attention"} == {"template"}
@@ -1975,6 +1976,7 @@ def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path)
                for new, old in zip(jax.tree.leaves(moving.variables["params"]), initial, strict=True))
 
 
+@attending("xla")
 def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
     """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved and
     handed to the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
@@ -1987,13 +1989,13 @@ def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     with chosen(narrow_copies="off"):
         for name, width in (("step", None), ("wide", 48)):
-            compile_ahead(fine_tune(MeshSpec().build(this_gpus()), xla=True,
+            compile_ahead(fine_tune(MeshSpec().build(this_gpus()),
                                     width=width), batch).save(tmp_path / f"{name}.dew-aot")
         here = MeshSpec().build(jax.devices()[:1])
-        run = fine_tune(here, ahead=AheadOfTime.load(tmp_path / "step.dew-aot"), xla=True)
+        run = fine_tune(here, ahead=AheadOfTime.load(tmp_path / "step.dew-aot"))
         initial = jax.tree.leaves(run.initial_state().variables["params"])
         state = run.fit(batch, steps=2, log_every=1)
-        other = fine_tune(here, ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"), xla=True)
+        other = fine_tune(here, ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"))
         with pytest.raises(ValueError):
             other.fit(batch, steps=1, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
@@ -2079,9 +2081,9 @@ def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
 
     batch, watched = token_rows(VOCAB, BATCH, SEQ_LEN + 1), Inspection(every=1)
     with chosen(narrow_copies="off"):
-        compile_ahead(fine_tune(MeshSpec().build(this_gpus()), xla=True,
+        compile_ahead(fine_tune(MeshSpec().build(this_gpus()),
                                 inspection=watched), batch).save(tmp_path / "step.dew-aot")
-        run = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True, inspection=watched,
+        run = fine_tune(MeshSpec().build(jax.devices()[:1]), inspection=watched,
                         ahead=AheadOfTime.load(tmp_path / "step.dew-aot"))
         with Compiles("step") as compiles:
             state = run.fit(batch, steps=1, log_every=1)
@@ -2089,6 +2091,7 @@ def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
     assert int(state.step) == 1 and first["ahead"] is True and compiles.count == 0
 
 
+@attending("xla")
 @pytest.mark.tpu(reason="runs a step compiled ahead for this host's TPU topology as a run's first step")
 def test_a_run_handed_its_step_compiled_ahead_for_a_tpu_topology_trains_from_it(tmp_path):
     """A step compiled ahead for this host's one-chip TPU topology (`compile_only_tpus`), saved and handed
@@ -2099,10 +2102,9 @@ def test_a_run_handed_its_step_compiled_ahead_for_a_tpu_topology_trains_from_it(
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     chip = gpu_target(jax.devices()[0].device_kind).generation
-    compile_ahead(fine_tune(MeshSpec().build(compile_only_tpus(f"{chip}:1x1")), xla=True),
+    compile_ahead(fine_tune(MeshSpec().build(compile_only_tpus(f"{chip}:1x1"))),
                   batch).save(tmp_path / "step.dew-aot")
-    run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "step.dew-aot"),
-                    xla=True)
+    run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "step.dew-aot"))
     state = run.fit(batch, steps=2, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
     assert int(state.step) == 2 and first["ahead"] is True
@@ -2143,7 +2145,7 @@ def latent(mesh, *, ahead=None, links=None, checkpoints=None):
     (`dew.nn.sharding.down_projection`), trained over `mesh`."""
     from dew.nn.mla import MLAMixer
 
-    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, attention_impl="xla",
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER,
                          mixer=MLAMixer(q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4,
                                         qk_rope_head_dim=4, v_head_dim=4))
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
@@ -2218,11 +2220,11 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     with chosen(narrow_copies="off"):
         target = MeshSpec().build(this_gpus())
-        saved = compile_ahead(fine_tune(target, xla=True, split=2), batch)
+        saved = compile_ahead(fine_tune(target, split=2), batch)
         path = tmp_path / "split.dew-aot"
         saved.save(path)
         here = MeshSpec().build(jax.devices()[:1])
-        run = fine_tune(here, ahead=AheadOfTime.load(path), xla=True, split="auto")
+        run = fine_tune(here, ahead=AheadOfTime.load(path), split="auto")
         state = run.fit(batch, steps=1, log_every=1)
     plan = record(run.plan, "plan")
     first, *_ = listed(plan["probes"], "probes", read=record, what="probes")

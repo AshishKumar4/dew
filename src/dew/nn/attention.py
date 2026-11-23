@@ -71,7 +71,7 @@ from .documents import (
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
-from .kernels.selection import select, selected
+from .kernels.selection import forced, select, selected
 from .kernels.templates import attention as template
 from .precision import (
     asks_default_precision,
@@ -86,12 +86,13 @@ from .precision import (
 from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
 
-AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu", "template"]
+AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu", "template",
+                        "inference"]
 """Names which kernel an attention call runs.
 
-Every layer that carries the choice spells it the same way: a `ModelConfig`
-field, a module's `attention_impl`, and `scaled_dot_product_attention`'s
-`implementation`.
+A run names it once for every attention layer it traces (`generation.chosen(attention=...)`, a run's
+`Diagnostics.kernels`, `chosen_attention`); a call names its own (`scaled_dot_product_attention`'s
+`implementation`). No model holds one (row 11938).
 
 'reference' is the portable einsum and softmax, and the only path that reads
 dtype, precision and force_fp32_for_softmax. 'xla' and 'cudnn' are
@@ -105,6 +106,9 @@ calls splash's mask descriptor cannot carry.
 spans, a softcap as a score hook and sinks as the initial state, on the template's Triton or Mosaic
 mainloop on a GPU and its plain-JAX one elsewhere. 'auto' takes it on every GPU, where the call's
 declared old route does not take it (`attention_kernels._attention_preferred`, `DECLARED`).
+'inference' is the template for a call no derivative is taken of and xla's attention for one
+differentiated (`attention_kernels.INFERENCE`): every kernel the attention selector holds is named here, so
+a run naming any of them (`dew.kernels.use(attention="inference")`) traces (the API02 review).
 'auto', every module's default, resolves per trace (`resolve_implementation`),
 so a configuration logged as 'auto' runs on the next machine too: the attention selector (`ATTENTION`,
 `dew.nn.kernels.selection.select`) takes the call's declared old route where a receipt measured it faster,
@@ -125,6 +129,13 @@ def attention_implementation(name: str) -> AttentionImpl:
         if name == implementation:
             return implementation
     raise ValueError(f"Unknown attention implementation: {name}; one of {', '.join(get_args(AttentionImpl))}")
+
+
+def chosen_attention() -> AttentionImpl:
+    """The attention kernel the run's context names for every attention layer it traces
+    (`generation.chosen(attention=...)`), 'auto' where none does: what a layer resolves its calls under
+    (`resolve_implementation`), read at its trace."""
+    return attention_implementation(forced(generation.Choice.ATTENTION) or "auto")
 
 
 @jax.tree_util.register_static
@@ -187,7 +198,7 @@ def widen_value_heads(query, value):
             "fused attention runs one head width for the keys and the values, "
             f"and a value head of {v_width} is wider than the query head of "
             f"{width}: the kernel would scale the logits by the padded width. "
-            "Use the reference implementation (attention_impl 'reference').")
+            "Use the reference implementation (dew.kernels.use(attention='reference')).")
     return jnp.pad(value, ((0, 0),) * (value.ndim - 1) + ((0, width - v_width),))
 
 
@@ -1404,7 +1415,9 @@ def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, d
     """
     if implementation not in ('auto', 'cudnn', 'xla'):
         return implementation
-    return _masked_kernel(implementation, 'xla' if implementation == 'xla' else None, query, key,
+    # cuDNN aside: a call whose run chose it (`chosen_attention`) runs its built mask on xla's kernel, as the
+    # xla kernel the call names, never the cuDNN a context forces, which takes no mask.
+    return _masked_kernel(implementation, None if implementation == 'auto' else 'xla', query, key,
                           ('xla', 'reference'), dtype=dtype, precision=precision,
                           force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
 

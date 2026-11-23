@@ -14,6 +14,7 @@ import numpy as np
 import optax
 import pytest
 import test_run_budgets
+from model_support import attending
 from objective_cases import cases
 from reference_error import assert_computes_the_oracle, assert_fp32_reduction_bound
 from run_kinds import KINDS, cli_settings, lm, saved_record, scalars, set_record, trained_record
@@ -370,6 +371,7 @@ def test_watching_a_kind_no_module_is_refused():
         inspected(watched_run(Stacked(scanned=False), unmatched), {"x": ROWS})
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp_path):
     """A run of every kind watching module kinds on its command line (`trainer.inspection.modules`)
@@ -410,6 +412,7 @@ def watching_alone(kind: str, root: Path):
     return depths, ["mtp_1/*"]
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["decision", "decision-path", "lm"])
 def test_a_run_watching_a_trained_component_alone_logs_its_activations_and_cotangents(kind, tmp_path):
     """A run watching only a component its step trains beside the backbone, a decision run's head or an
@@ -638,6 +641,7 @@ returns what the watched modules sow through it; Flow-GRPO's, inside its scan, r
 (`test_flow_grpo`)."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", TRANSFORMED)
 def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
     """A sampled step of an objective whose trained forward runs inside a transform summarizes that very
@@ -963,6 +967,7 @@ def windows(tmp_path_factory):
     return corpus_windows(tmp_path_factory.mktemp("corpus"))
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", sorted(set(cases(None)) - {"flow_grpo"}))
 def test_every_objectives_watched_cotangents_reach_its_model_calls(name, windows, tmp_path):
     """Every objective's step that summarizes its watched outputs' cotangents (row 2324) carries its
@@ -1067,6 +1072,7 @@ def rcm_probes(windows, tmp_path, *, student: bool, consistency_weight: float | 
     return jax.jit(probed)(numeric)
 
 
+@attending("xla")
 def test_an_rcm_critic_updates_watched_cotangents_are_its_fake_scores(windows, tmp_path):
     """An rCM critic update past its warm-up, which trains the fake score and runs the student under no
     gradient, summarizes the loss's cotangent at the fake score's watched modules, each reached by it, and
@@ -1086,6 +1092,7 @@ def test_an_rcm_critic_updates_watched_cotangents_are_its_fake_scores(windows, t
         assert float(summary["rms"]) == 0 and float(summary["zero_fraction"]) == 1
 
 
+@attending("xla")
 def test_a_distribution_matching_student_updates_cotangent_reaches_its_trained_call(windows, tmp_path):
     """An rCM student update by distribution matching alone, whose simulation's every call but the last
     runs under no gradient, summarizes the loss's cotangent at the student's watched modules from the call

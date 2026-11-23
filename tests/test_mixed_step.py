@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, attending
 
 from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -114,6 +114,7 @@ WIDE = {"head_dim": 64, "max_seq_len": 128, "dtype": jnp.bfloat16}
 """The template's decode at head width 64 over 128 slots a row, bf16: what its Mosaic mainloop takes."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("feature", ["plain", "sinks", "window", "int8 cache"])
 @pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged"])
 @pytest.mark.parametrize("continuing", [True, False])
@@ -155,9 +156,9 @@ def test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted(conti
     def draw(seed):
         return (model.init(jax.random.key(seed), jnp.zeros((1, 4), jnp.int32)),)
 
-    assert_as_exact(jax.jit(mixed(model)), jax.jit(mixed(model.clone(attention_impl="xla"))), draw,
+    assert_as_exact(jax.jit(mixed(model)), jax.jit(mixed(model.clone())), draw,
                     f"mixed call through one work list {'paged' if paged else 'dense'}", seeds=8,
-                    truth_fn=mixed(float64_twin(model.clone(attention_impl="xla"))))
+                    truth_fn=mixed(float64_twin(model.clone())))
 
 
 

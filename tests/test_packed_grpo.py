@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from arm_arithmetic import float64_held
+from model_support import attending
 from reference_error import assert_as_exact, dew_path
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -37,9 +38,11 @@ VOCAB = 16
 WIDTH = 24
 
 
-def _model(dtype="float32", *, attention_impl="xla"):
+def _model(dtype="float32"):
+    """The policy the tests run on the xla kernel (`attending`), its float64 twin on the reference path, as
+    every float64 attention is."""
     return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2,
-                             mlp_features=32, max_seq_len=64, dtype=dtype, attention_impl=attention_impl)
+                             mlp_features=32, max_seq_len=64, dtype=dtype)
 
 
 def _rollouts(samples: int = 4):
@@ -110,6 +113,7 @@ position, and over four rollouts' the two arms' sums, rounded apart where XLA:CP
 (row 4523), spread their error ratios past what 640 seeds resolve; over sixteen both decide."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("policy_loss", ["ppo", "cispo"])
 def test_packed_grpo_computes_per_call_grpo_on_the_unmerged_chains(policy_loss):
     """Packing preserves the per-call loss and gradients: the fp32 objective over the packed rows is on
@@ -122,7 +126,7 @@ def test_packed_grpo_computes_per_call_grpo_on_the_unmerged_chains(policy_loss):
     packed[OLD_LOG_PROBS_KEY] = packed[BEHAVIOR_LOG_PROBS_KEY]
     unmerged = _per_call(rollouts)
     objective = GRPOObjective(_model(), WIDTH - 1, beta=0.1, policy_loss=policy_loss)
-    twin = GRPOObjective(_model(jnp.float64, attention_impl="reference"), WIDTH - 1, beta=0.1,
+    twin = GRPOObjective(_model(jnp.float64), WIDTH - 1, beta=0.1,
                          policy_loss=policy_loss)
 
     # One compiled initializer: an eager one compiles every initializer op anew for each seed.
@@ -141,6 +145,7 @@ def test_packed_grpo_computes_per_call_grpo_on_the_unmerged_chains(policy_loss):
                         draw, f"packed {policy_loss}", seeds=PACKED_SEEDS, truth_fn=truth)
 
 
+@attending("xla")
 def test_packed_log_probs_score_each_id_with_its_own_calls_prefix():
     rollouts = _rollouts()
     packed = pack(rollouts, WIDTH)
@@ -159,6 +164,7 @@ def test_packed_log_probs_score_each_id_with_its_own_calls_prefix():
     assert (scored[packed[RESPONSE_MASK_KEY] == 0] == 0).all()
 
 
+@attending("xla")
 def test_corrections_without_proximal_log_probs_read_the_current_policy():
     """verl's bypass mode: with behavior standing in for the old policy, the
     band and the sequence masks compare the detached current policy with
@@ -185,6 +191,7 @@ def test_corrections_without_proximal_log_probs_read_the_current_policy():
         capped.loss(params, packed, step)
 
 
+@attending("xla")
 def test_mismatch_metrics_describe_every_trainable_token_whatever_a_mask_rejects():
     """verl computes IS weights and off-policy metrics over the response mask
     and applies rejection to the loss alone."""
@@ -202,6 +209,7 @@ def test_mismatch_metrics_describe_every_trainable_token_whatever_a_mask_rejects
     assert float(open_aux.metrics["mismatch/kl"]) > 0.1
 
 
+@attending("xla")
 def test_the_loss_never_holds_the_logits_of_the_whole_batch():
     """GRPO scores through the chunked head: doubling the vocabulary adds more
     tiles to the loss and gradient's loop, never a [rows, width, vocab] tensor
@@ -212,7 +220,7 @@ def test_the_loss_never_holds_the_logits_of_the_whole_batch():
 
     def temporaries(vocab: int) -> int:
         model = CausalTransformer(vocab_size=vocab, emb_features=16, num_layers=1, num_heads=2,
-                                  mlp_features=32, max_seq_len=width, dtype="float32", attention_impl="xla")
+                                  mlp_features=32, max_seq_len=width, dtype="float32")
         objective = GRPOObjective(model, width - 1)
         params = jax.eval_shape(objective.init, jax.random.key(0))
         batch = {name: jax.ShapeDtypeStruct((rows, width), dtype) for name, dtype in (

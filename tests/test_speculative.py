@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import decoder
+from model_support import attending, decoder
 
 from dew.sampling import Sampling, Speculative, TreeShape, TreeSpeculative, decoding, generate
 
@@ -82,7 +82,7 @@ def longrope_drafter():
     from dew.nn.mixers.attention import AttentionMixer
     from dew.nn.rope import LongRopeScaling, YarnScaling
 
-    model = Pretrained.load(DSPARK, weights=False, dtype="float32", attention_impl="reference").model
+    model = Pretrained.load(DSPARK, weights=False, dtype="float32").model
     drafter = model.dspark.layer_type
     head = model.head_dim or model.emb_features // model.num_heads
     pairs = int(head * (model.partial_rotary_factor or 1.0)) // 2
@@ -138,6 +138,7 @@ LONGROPE_CASES = [(np.asarray([[1, 2, 3], [7, 8, 9]], np.int32), 6),
 with its budget."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("case", range(len(LONGROPE_CASES)))
 @pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
 def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind, case):
@@ -163,6 +164,7 @@ def longrope_speculator(kind: str):
     return model, jax.jit(model.init)(jax.random.key(0), jnp.asarray(LONGROPE_CASES[0][0]))
 
 
+@attending("reference")
 @pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
 def test_a_speculative_block_holds_a_longrope_rebuild_once(kind):
     """A block's program holds the rebuild, a whole prefill of the history, once: its candidates' verify
@@ -224,6 +226,7 @@ CROSSING_SEEDS = {"depth": 8, "drafter": 8}
 either check took, sized by `seeds_for` paired on armada."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("drafting", LONGROPE_DRAFTING)
 def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(drafting):
     """A stretch verified from before LongRoPE's change to past it answers each of its tokens as the
@@ -276,6 +279,7 @@ def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(dr
                     seeds=CROSSING_SEEDS[drafting], truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.parametrize("drafting", LONGROPE_DRAFTING)
 def test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_does(drafting):
     """A verified stretch that crosses the table change leaves the decoder state a prefill of the whole
@@ -365,6 +369,7 @@ def test_tree_speculation_reproduces_the_greedy_walk_to_the_end_of_its_cache(sha
     np.testing.assert_array_equal(np.asarray(drawn.lengths), budget)
 
 
+@attending("reference")
 @pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
 def test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     """A tree drafted by a prediction depth's picks or by a block drafter's, a pass a leaf's path

@@ -13,6 +13,7 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
+from model_support import attending
 from recording import RecordingTracker
 
 from dew.data.dataset import DataPartition
@@ -46,7 +47,7 @@ def read_in_context(length: int = 768, head=None, segments: int | None = 16, max
     """A decision over the tiny Llama with fresh cross-attention before its layers, its rows' schemas
     read as their contexts, up to `length` tokens, at most `segments` rows of `max_len` a window and
     `context_window` tokens of their contexts."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=1024)
+    source = Pretrained.load(LLAMA, dtype="float32", max_seq_len=1024)
     crossed = source.with_cross_attention(CrossAttention((0, 1), length), key=0)
     width, _ = DecisionModel.head_size(crossed.model)
     head = head or JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
@@ -86,6 +87,7 @@ def test_a_schema_read_in_context_leaves_the_row_and_its_spans_index_the_context
         '{"option_id":"a"}', '{"option_id":"b"}', '{"option_id":"c"}']
 
 
+@attending("reference")
 def test_a_run_reads_each_rows_schema_in_context_and_its_task_serves_alike():
     """Rows whose schemas are their contexts train, each logged step reporting the work of the
     context's own pass beside the row's, beyond the row's alone
@@ -115,6 +117,7 @@ def test_a_run_reads_each_rows_schema_in_context_and_its_task_serves_alike():
     assert not np.array_equal(asked[0].probabilities, asked[1].probabilities)
 
 
+@attending("reference")
 def test_the_contexts_own_pass_is_counted_once_where_it_trains_nothing():
     """The training work of a batch whose schemas are its contexts is the frozen backbone's over its
     rows, one forward of the backbone over each context, which trains nothing and takes no gradient,
@@ -140,6 +143,7 @@ def test_the_contexts_own_pass_is_counted_once_where_it_trains_nothing():
     assert objective.training_flops(None, batch) == frozen + context + 3 * (cross + head)
 
 
+@attending("reference")
 def test_a_schema_read_in_context_reads_the_context_after_it_in_the_room_it_leaves():
     """A row whose schema is its context reads its example's or request's own context after the schema, in
     the schema's stream (the backbone's own pass), the schema's spans where it laid them, and a task answers
@@ -183,6 +187,7 @@ def test_a_schema_read_in_context_reads_the_context_after_it_in_the_room_it_leav
     assert counts.cut_removed["context"] == len(examples) * (len(note) - room)
 
 
+@attending("reference")
 def test_a_schema_read_in_context_refuses_what_cannot_read_it():
     """Laya's marker head and a backbone without cross-attention layers are each refused a schema read as
     the row's context, rather than the schema left unread."""
@@ -191,7 +196,7 @@ def test_a_schema_read_in_context_refuses_what_cannot_read_it():
     marked = read_in_context(head=DecisionHead(width, layers=1))
     with pytest.raises(TypeError):
         Decide(marked.model, marked.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS)("one", QUESTION)
-    plain = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=1024)
+    plain = Pretrained.load(LLAMA, dtype="float32", max_seq_len=1024)
     bare = DecisionObjective(plain, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                              head=JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2,
                                                   feedforward=32))
@@ -217,6 +222,7 @@ def test_a_run_names_its_schema_read_in_context_on_the_command_line():
         dataclasses.replace(config, context_layers=None).prepare()
 
 
+@attending("reference")
 def test_rows_whose_schema_is_their_context_pack_several_a_window_each_reading_its_own():
     """Rows whose schemas are their contexts pack several a window, as rows of an example's context do
     (row 2008): each question's row is the one the packer placed it in (`question_rows`), its span the
@@ -258,6 +264,7 @@ them eight a task (`check1_shards`, row 3907)."""
 
 
 # PACKED_SCHEMA_SEEDS, as literal counts, which the plan reads from the source (tools/armada/ci.py `sites`).
+@attending("reference")
 @pytest.mark.check1_shards(seeds=128, per_task=8)
 def test_packed_rows_decide_each_schema_in_context_as_each_row_alone():
     """Rows whose schemas are their contexts, packed several a window, decide each row's options as the
