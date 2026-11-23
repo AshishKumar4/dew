@@ -738,10 +738,12 @@ def test_an_objectives_draw_of_its_variables_selects_no_kernel(kind):
     assert applied_routes, "the decoder selects no kernel, so its draw's selecting none says nothing"
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_draw_within_a_draw_takes_the_draws_program():
     """A draw traced within another (`generation.drawing` nested: `drawn.traced_draw` around an objective's
     own draw) is that draw to JAX's trace and compile caches, which key on whether a thread draws, not how
-    deep: a probe's draw and a trainer start's of one objective take one program (row 12092)."""
+    deep: a probe's draw and a trainer start's of one objective take one program (row 12092). A program's
+    mechanics, its run the CPU lane's (row 12256: computed on a GPU tier part, unprepared)."""
     from dew.nn.kernels.generation import drawing
     from dew.telemetry import compiles
 
