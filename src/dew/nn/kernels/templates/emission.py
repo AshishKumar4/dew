@@ -417,6 +417,13 @@ def _ring_depth(barrier: jax_core.Var) -> int:
     return max(1, math.prod(getattr(barrier.aval, "shape", ()) or (1,)))
 
 
+def _slot(leaves: Sequence) -> tuple:
+    """The slot of a barrier array a copy lands on or a wait reads, as its transforms' leaves name it: each a
+    literal's value or the variable it reads, so a copy and a wait on one slot name it alike, a step's own
+    slot (`i % S`) and the one it prefetches (`(i + 1) % S`) apart."""
+    return tuple(leaf.val if isinstance(leaf, jax_core.Literal) else leaf for leaf in leaves)
+
+
 def _copied(equation) -> int:
     """A copy's bytes between memories: its shared-memory side's, as its transforms slice it (a ring's slot,
     a tile's rows), the operands after its source and destination its barrier (`has_barrier`), then its
@@ -513,6 +520,9 @@ class _Counting:
         # barrier's allocation where the count holds it (`_Barrier`).
         self.issued: list[float] = []
         self.landing: dict[_Barrier | jax_core.Var, Chain] = {}
+        # The slots of each barrier its copies landed on, as their transforms name them (`_slot`): a wait on
+        # one of them waits for a copy it issued at once, which no stage of the ring hides (row 12369).
+        self.slots: dict[_Barrier | jax_core.Var, set[tuple]] = {}
 
     def add(self, work: Work) -> None:
         # The warpgroup's work in its order: its paths followed one by the next (`_then`).
@@ -547,8 +557,14 @@ class _Counting:
         elif primitive is gpu.copy_gmem_to_smem_p and equation.params.get("has_barrier"):
             copied = Chain(copies=1, copy_bytes=_copied(equation), stages=_ring_depth(equation.invars[2]))
             self.landing[barrier(2)] = self.landing.get(barrier(2), Chain()).then(copied)
+            leaves = equation.params["barrier_transforms_treedef"].num_leaves
+            named = _slot(equation.invars[len(equation.invars) - leaves:])
+            self.slots.setdefault(barrier(2), set()).add(named)
         elif primitive is gpu.barrier_wait_p:
             landed = self.landing.pop(barrier(0), None)
+            if landed is not None and _slot(equation.invars[1:]) in self.slots.pop(barrier(0), set()):
+                # Waited on the slot it was just copied into: no turn of the ring between, nothing hidden.
+                landed = dataclasses.replace(landed, stages=1)
             arrived = () if landed is not None else self.arrivals.arriving(barrier(0))
             self.add(Work(chains=(landed,) if landed is not None else arrived or (Chain(barriers=1),)))
 
