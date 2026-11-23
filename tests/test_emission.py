@@ -48,8 +48,9 @@ def _semantics(predicate) -> plgpu.CompilerParams:
     """The lowering a kernel holding `predicate` takes: Warpgroup's, Dew's own kernels', unless an operation
     of it states an output dtype, which Warpgroup refuses and Lane alone holds, typing it by rules of its own
     (`emission._typed_alike`)."""
+    index = jax.ShapeDtypeStruct((), jnp.int32)
     stated = any(equation.params.get("out_dtype") is not None
-                 for equation in programs.equations(jax.make_jaxpr(predicate)(jnp.int32(0)).jaxpr))
+                 for equation in programs.equations(jax.make_jaxpr(predicate)(index).jaxpr))
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Lane if stated
                                 else plgpu.LoweringSemantics.Warpgroup)
 

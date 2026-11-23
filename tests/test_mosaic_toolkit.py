@@ -12,11 +12,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import COMPILES_ON_CPU, INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS, here
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
 from kernel_compile import gate_generations, stated_outputs
+from reference_error import ahead_arm, equations
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
@@ -144,8 +145,6 @@ def test_the_ring_lowers_for_an_h100(consumers):
 def a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
     """The ring's kernel compiled and run on an H100, where the interpreter's no-op waits are real, its
     program compiled in a tier's prepare (`ahead_arm`)."""
-    from reference_error import ahead_arm
-
     x = _stream()
     summed = ahead_arm(jax.jit(functools.partial(_ring_sums, interpret=False, consumers=consumers)),
                        f"a ring's tile sums: {consumers} consumers")(x)
@@ -330,8 +329,6 @@ def test_the_fed_walk_lowers_for_an_h100(consumers):
 def consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
     """The fed walk compiled and run on an H100, where the interpreter's no-op waits are real, its program
     compiled in a tier's prepare (`ahead_arm`)."""
-    from reference_error import ahead_arm
-
     p, x = _fed_operands()
     got = ahead_arm(jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, lo=lo)),
                     f"a fed walk's products: {consumers} consumers from {lo}")(p, x)
@@ -346,32 +343,33 @@ def test_a_walk_takes_each_step_of_its_range_once_in_order_at_its_turn(stages, u
     each at its counter's slot and rotation, for every start, length and ring origin over three rotations:
     rolled, a step a trip; unrolled, the steps taken one a trip are the fewer than `stages` before the whole
     rotations and the fewer after them, and a rotation's steps know the steps before them in it are the
-    range's."""
+    range's. Its eager steps the host CPU's (a tier's prepare computes on no device)."""
     taken = []
 
     def turned(index, turn, *state, before=0):
         taken.append((index, turn.slot, turn.rotation, before))
         return state
 
-    for first in (0, 3):
-        for lo in range(first, first + 3 * stages):
-            for hi in range(lo, lo + 3 * stages + 1):
-                taken.clear()
-                singly = 0
-                for loop in mosaic.stepping(turned, lo, hi, first, stages, unrolled=unrolled):
-                    run = loop.step
-                    for trip in range(int(loop.lo), int(loop.hi)):
-                        before = len(taken)
-                        run(trip)
-                        singly += len(taken) - before == 1
-                assert [step[0] for step in taken] == list(range(lo, hi)), (first, lo, hi)
-                for index, slot, rotation, before in taken:
-                    assert (slot, rotation) == ((index - first) % stages, (index - first) // stages)
-                    assert index - before >= lo, (first, lo, hi, index)
-                if unrolled:
-                    assert singly <= 2 * (stages - 1), (first, lo, hi)
-                else:
-                    assert singly == hi - lo
+    with jax.default_device(jax.devices("cpu")[0]):
+        for first in (0, 3):
+            for lo in range(first, first + 3 * stages):
+                for hi in range(lo, lo + 3 * stages + 1):
+                    taken.clear()
+                    singly = 0
+                    for loop in mosaic.stepping(turned, lo, hi, first, stages, unrolled=unrolled):
+                        run = loop.step
+                        for trip in range(int(loop.lo), int(loop.hi)):
+                            before = len(taken)
+                            run(trip)
+                            singly += len(taken) - before == 1
+                    assert [step[0] for step in taken] == list(range(lo, hi)), (first, lo, hi)
+                    for index, slot, rotation, before in taken:
+                        assert (slot, rotation) == ((index - first) % stages, (index - first) // stages)
+                        assert index - before >= lo, (first, lo, hi, index)
+                    if unrolled:
+                        assert singly <= 2 * (stages - 1), (first, lo, hi)
+                    else:
+                        assert singly == hi - lo
 
 
 @pytest.mark.parametrize("weights", [(2, 1, 0), (1, 1, 0), (3, 1, 1, 0), (1, 0)])
@@ -504,16 +502,18 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
     split, at the indices in the pair's blocks (`viewed`'s `Split`), where a plain step is the slot's block;
     and the pair's bundle (`mosaic_sm100.PAIR`, its products over a cluster of two, each CTA a half of
     tcgen05's widest product's columns) is composed for a Blackwell launch stating its accumulators and
-    reached by a config's name, where a device without tcgen05 composes none."""
+    reached by a config's name, where a device without tcgen05 composes none. Its ref the host CPU's (a
+    tier's prepare computes on no device)."""
     from dew.nn.kernels.templates import bundles, mosaic_sm100
 
-    ref = jax.new_ref(jnp.arange(256 * 512, dtype=jnp.float32).reshape(256, 512))
-    block = (64, 128)
-    split = rings.viewed((ref, lambda step: rings.Paired((1, step), along=0)), block, 2)
-    assert isinstance(split, rings.Split) and split.along == 0 and split.ref.shape == (128, 128)
-    np.testing.assert_array_equal(np.asarray(split.ref[...]), np.asarray(ref[128:256, 256:384]))
-    plain = rings.viewed((ref, lambda step: (1, step)), block, 2)
-    np.testing.assert_array_equal(np.asarray(plain[...]), np.asarray(ref[64:128, 256:384]))
+    with jax.default_device(jax.devices("cpu")[0]):
+        ref = jax.new_ref(jnp.arange(256 * 512, dtype=jnp.float32).reshape(256, 512))
+        block = (64, 128)
+        split = rings.viewed((ref, lambda step: rings.Paired((1, step), along=0)), block, 2)
+        assert isinstance(split, rings.Split) and split.along == 0 and split.ref.shape == (128, 128)
+        np.testing.assert_array_equal(np.asarray(split.ref[...]), np.asarray(ref[128:256, 256:384]))
+        plain = rings.viewed((ref, lambda step: (1, step)), block, 2)
+        np.testing.assert_array_equal(np.asarray(plain[...]), np.asarray(ref[64:128, 256:384]))
 
     pair = mosaic_sm100.PAIR
     assert (pair.cluster, pair.pairs_product, pair.widest_product) == (2, True, 128)
@@ -924,7 +924,8 @@ def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
         launched(*refs)
         return stacked.read(refs, groups)
 
-    for index, (shape, array) in enumerate(zip(shapes, jax.jit(together)(), strict=True)):
+    for index, (shape, array) in enumerate(zip(shapes, ahead_arm(jax.jit(together), "stacked refs")(),
+                                               strict=True)):
         np.testing.assert_array_equal(array, np.full(shape, index + 1.0))
 
 
@@ -1168,12 +1169,11 @@ def _relayed_products(q, k, v, *, interpret, weighed=lambda scores, side: scores
 
 
 def _relayed_operands():
-    """Small integers, so `2 (q k) v` is exact in fp32 and its weights exact in bf16."""
-    keys = jax.random.split(jax.random.key(3), 3)
-    q = jax.random.randint(keys[0], (128, 64), -2, 3).astype(jnp.bfloat16)
-    k = jax.random.randint(keys[1], (64, 128), -2, 3).astype(jnp.bfloat16)
-    v = jax.random.randint(keys[2], (128, 64), -2, 3).astype(jnp.bfloat16)
-    return q, k, v
+    """Small integers, so `2 (q k) v` is exact in fp32 and its weights exact in bf16: NumPy's (a GPU tier's
+    prepare computes on no device)."""
+    rng = np.random.default_rng(3)
+    return tuple(rng.integers(-2, 3, shape).astype(jnp.bfloat16)
+                 for shape in ((128, 64), (64, 128), (128, 64)))
 
 
 @INTERPRETS
@@ -1205,13 +1205,11 @@ def _keys_first_products(k, q_t, statistic, do, *, interpret):
 
 
 def _keys_first_operands():
-    """Small integers, so `(k qᵀ - statistic) dO` is exact in fp32 and `Pᵀ` exact in bf16."""
-    keys = jax.random.split(jax.random.key(5), 4)
-    k = jax.random.randint(keys[0], (128, 64), -1, 2).astype(jnp.bfloat16)
-    q_t = jax.random.randint(keys[1], (64, 64), -1, 2).astype(jnp.bfloat16)
-    statistic = jax.random.randint(keys[2], (64,), -2, 3).astype(jnp.float32)
-    do = jax.random.randint(keys[3], (64, 64), -2, 3).astype(jnp.bfloat16)
-    return k, q_t, statistic, do
+    """Small integers, so `(k qᵀ - statistic) dO` is exact in fp32 and `Pᵀ` exact in bf16: NumPy's."""
+    rng = np.random.default_rng(5)
+    k, q_t = (rng.integers(-1, 2, shape).astype(jnp.bfloat16) for shape in ((128, 64), (64, 64)))
+    statistic = rng.integers(-2, 3, (64,)).astype(np.float32)
+    return k, q_t, statistic, rng.integers(-2, 3, (64, 64)).astype(jnp.bfloat16)
 
 
 @INTERPRETS
@@ -1295,25 +1293,35 @@ def test_a_tpu_core_walks_the_persistent_tiles_interpreted():
     """Interpreted on any host: the persistent walk on a TPU core's bundle (`mosaic_tpu.MXU`), each step's
     blocks DMA'd into its VMEM ring a step ahead and multiplied by the MXU, each tile's rows stored from
     VMEM, over three tiles with the middle one multiplying nothing: each tile's rows exactly its product,
-    the middle's zeros."""
+    the middle's zeros. On the host's CPU, its program compiled in a tier's prepare (`ahead_arm`)."""
     from dew.nn.kernels.templates import mosaic_tpu
     family = mosaic_tpu.MXU
     x, w = _persisted_operands(family.rows)
-    got = np.asarray(_persisted_products(x, w, family=family, interpret=True))
+    got = np.asarray(ahead_arm(jax.jit(functools.partial(_persisted_products, family=family, interpret=True)),
+                               "a TPU core's persistent walk", host=True)(x, w))
     expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
     expected[family.rows:2 * family.rows] = 0
     np.testing.assert_array_equal(got, expected)
 
 
-def test_the_tpu_persistent_walk_lowers_for_a_v5e():
-    """The persistent walk on a TPU core's bundle lowers for a TPU v5e on any host, its devices abstract."""
+@contextlib.contextmanager
+def _on_a_v5e():
+    """A TPU v5e's abstract mesh, its modules lowered from the host's CPU: a TPU module's lowering reads its
+    default device's backend, which a tier's prepare's compile-only GPU is none of."""
     from jax.sharding import AbstractDevice, AbstractMesh
 
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with jax.default_device(jax.devices("cpu")[0]), jax.sharding.use_abstract_mesh(
+            AbstractMesh((1,), ("data",), abstract_device=device)):
+        yield
+
+
+def test_the_tpu_persistent_walk_lowers_for_a_v5e():
+    """The persistent walk on a TPU core's bundle lowers for a TPU v5e on any host, its devices abstract."""
     from dew.nn.kernels.templates import mosaic_tpu
     family = mosaic_tpu.MXU
     x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
-    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
-    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+    with _on_a_v5e():
         jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(x, w).lower(
             lowering_platforms=("tpu",))
 
@@ -1343,18 +1351,15 @@ def _read_through(x, rows, index, *, interpret):
 
 def test_a_tpu_core_reads_its_hbm_operands_through_its_family():
     """A TPU core's tile, row vector and scalar read from operands left in HBM (`VmemRings.tile_of`,
-    `rows_of`, `scalar_of`, each through a copy): interpreted on any host, exactly `x * index[0] + rows`;
-    lowered for a TPU v5e."""
-    from jax.sharding import AbstractDevice, AbstractMesh
-
-    x = jnp.arange(8 * 128, dtype=jnp.float32).reshape(8, 128)
-    rows = jnp.arange(8, dtype=jnp.float32) * 1000
-    index = jnp.asarray([3], jnp.int32)
-    got = _read_through(x, rows, index, interpret=True)
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(x) * 3 + np.asarray(rows)[:, None])
-    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    `rows_of`, `scalar_of`, each through a copy): interpreted on any host, exactly `x * index[0] + rows`, on
+    the host's CPU, its program compiled in a tier's prepare (`ahead_arm`); lowered for a TPU v5e."""
+    x = np.arange(8 * 128, dtype=np.float32).reshape(8, 128)
+    rows, index = np.arange(8, dtype=np.float32) * 1000, np.asarray([3], np.int32)
+    got = ahead_arm(jax.jit(functools.partial(_read_through, interpret=True)), "a TPU core's HBM reads",
+                    host=True)(x, rows, index)
+    np.testing.assert_array_equal(np.asarray(got), x * 3 + rows[:, None])
     shapes = [jax.ShapeDtypeStruct(each.shape, each.dtype) for each in (x, rows, index)]
-    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+    with _on_a_v5e():
         jax.jit(functools.partial(_read_through, interpret=False)).trace(*shapes).lower(
             lowering_platforms=("tpu",))
 
@@ -1389,15 +1394,14 @@ def _added_in_place(x, *, interpret):
 def test_a_tpu_cores_programs_add_into_an_in_place_ref_in_turn():
     """Three programs of a TPU core adding into one ref the launch takes in place (a launch's dQ, its grouped
     dK and dV), each read-modify-write through VMEM in turn: interpreted on any host, the ref holds the three
-    adds' sum exactly, and the launch's own output each program's row; lowered for a TPU v5e."""
-    from jax.sharding import AbstractDevice, AbstractMesh
-
-    x = jnp.arange(8 * 128, dtype=jnp.float32).reshape(8, 128)
-    summed, out = jax.jit(functools.partial(_added_in_place, interpret=True))(x)
-    np.testing.assert_array_equal(np.asarray(summed), np.asarray(x) * 6)
+    adds' sum exactly, and the launch's own output each program's row, on the host's CPU, its program
+    compiled in a tier's prepare (`ahead_arm`); lowered for a TPU v5e."""
+    x = np.arange(8 * 128, dtype=np.float32).reshape(8, 128)
+    summed, out = ahead_arm(jax.jit(functools.partial(_added_in_place, interpret=True)),
+                            "a TPU core's adds in place", host=True)(x)
+    np.testing.assert_array_equal(np.asarray(summed), x * 6)
     np.testing.assert_array_equal(np.asarray(out), np.repeat(np.arange(3, dtype=np.int32)[:, None], 128, 1))
-    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
-    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+    with _on_a_v5e():
         jax.jit(functools.partial(_added_in_place, interpret=False)).trace(
             jax.ShapeDtypeStruct(x.shape, x.dtype)).lower(lowering_platforms=("tpu",))
 
@@ -1411,12 +1415,11 @@ def _gemm_on_a_tpu_core():
 
     rows, depth, width = 384, 512, 256
     tiles = tiling.Tiles(128, 128, 128, 2, 1, family="mxu")
-    keys = jax.random.split(jax.random.key(4), 4)
-    x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
-    w = jax.random.randint(keys[1], (3, depth, width), -3, 4).astype(jnp.bfloat16)
-    dy = jax.random.randint(keys[2], (rows, width), -3, 4).astype(jnp.bfloat16)
-    bias = jax.random.randint(keys[3], (width,), -3, 4).astype(jnp.float32)
-    sizes = jnp.asarray([100, 0, 250], jnp.int32)
+    rng = np.random.default_rng(4)
+    x, w, dy = (rng.integers(-3, 4, shape).astype(jnp.bfloat16)
+                for shape in ((rows, depth), (3, depth, width), (rows, width)))
+    bias = rng.integers(-3, 4, (width,)).astype(np.float32)
+    sizes = np.asarray([100, 0, 250], np.int32)
     xf, wf, dyf = (np.asarray(each, np.float32) for each in (x, w, dy))
     unrouted = np.zeros((rows - 350, width), np.float32)
     routed = np.concatenate([xf[:100] @ wf[0], xf[100:350] @ wf[2], unrouted])
@@ -1429,7 +1432,7 @@ def _gemm_on_a_tpu_core():
                        (x, w[:1], None), xf @ wf[0] + np.asarray(bias)[None, :]),
         "grouped": (functools.partial(grouped, transpose_rhs=False), (x, w, sizes), routed),
         "grouped transposed": (functools.partial(grouped, transpose_rhs=True),
-                               (x, jnp.swapaxes(w, 1, 2), sizes), routed),
+                               (x, np.swapaxes(w, 1, 2), sizes), routed),
         "kernel gradient": (functools.partial(mosaic_gpu.tgmm, tiles=tiles, out_dtype=jnp.float32,
                                               multiprocessors=2), (x, dy, sizes),
                             np.stack([xf[:100].T @ dyf[:100], np.zeros((depth, width), np.float32),
@@ -1468,14 +1471,19 @@ def test_a_tpu_launch_plans_one_program_within_its_cores_scoped_vmem():
 @pytest.mark.parametrize("case", ["dense bias", "grouped", "grouped transposed", "kernel gradient"])
 def test_the_gemms_kernel_bodies_run_on_a_tpu_core(case):
     """Interpreted on any host, each of the GEMM template's kernel bodies on a TPU core's bundle gives its
-    product exactly, and it lowers for a TPU v5e, its devices abstract."""
-    from jax.sharding import AbstractDevice, AbstractMesh
-
+    product exactly, and it lowers for a TPU v5e, its devices abstract. Interpreted on the host's CPU, its
+    program compiled in a tier's prepare (`ahead_arm`), its operands NumPy's."""
     call, operands, expected = _gemm_on_a_tpu_core()[case]
-    np.testing.assert_array_equal(np.asarray(call(*operands, interpret=True)), expected)
+
+    def interpreted(*arrays):
+        given = iter(arrays)
+        return call(*(None if each is None else next(given) for each in operands), interpret=True)
+
+    got = ahead_arm(jax.jit(interpreted), f"a TPU core's GEMM: {case}", host=True)(
+        *(each for each in operands if each is not None))
+    np.testing.assert_array_equal(np.asarray(got), expected)
     abstract = [None if each is None else jax.ShapeDtypeStruct(each.shape, each.dtype) for each in operands]
-    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
-    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+    with _on_a_v5e():
         jax.jit(call).trace(*abstract).lower(lowering_platforms=("tpu",))
 
 
@@ -1607,8 +1615,6 @@ def every_warpgroup_read_lands_its_products_on_an_h100(path: str):
     """On an H100: each read path of a warpgroup accumulator (`READS`) gives the products' value to a sign op
     on its registers, `-(a @ b)` exactly over small integers, where ptxas dropped the MMA and stored -0.0
     (row 4346); its program compiled in a tier's prepare (`ahead_arm`), its operands NumPy's."""
-    from reference_error import ahead_arm
-
     rng = np.random.default_rng(7)
     a, b = (rng.integers(-2, 3, (LANDED, LANDED)).astype(jnp.bfloat16) for _ in range(2))
     expected = -(np.asarray(a, np.float32) @ np.asarray(b, np.float32))
@@ -1630,10 +1636,10 @@ def test_every_warpgroup_read_path_gives_the_products_value(path):
 
 
 def _chained_operands(rows: int):
-    """Small integers whose chained products are exact in fp32, the first's (at most 128) in bf16."""
-    keys = jax.random.split(jax.random.key(5), 3)
-    return (jax.random.randint(keys[0], (rows, RELAYED), -2, 3).astype(jnp.bfloat16),
-            *(jax.random.randint(key, (RELAYED, RELAYED), -1, 2).astype(jnp.bfloat16) for key in keys[1:]))
+    """Small integers whose chained products are exact in fp32, the first's (at most 128) in bf16: NumPy's."""
+    rng = np.random.default_rng(5)
+    return (rng.integers(-2, 3, (rows, RELAYED)).astype(jnp.bfloat16),
+            *(rng.integers(-1, 2, (RELAYED, RELAYED)).astype(jnp.bfloat16) for _ in range(2)))
 
 
 @pytest.mark.parametrize(("rows", "m_warps"), [(16, 1), (32, 2)])
@@ -1642,10 +1648,11 @@ def test_an_accumulator_feeds_the_next_product_on_any_warp_split(rows, m_warps):
     its columns (one or two along its rows): lowered for an A100 on any host, and on a GPU exactly `(a @ b)
     @ c` (each warp's columns relayed through the bound tile, where no register cast crosses warps)."""
     a, b, c = _chained_operands(rows)
-    if jax.default_backend() == "gpu":
+    if here() != "cpu":
         f32 = [np.asarray(x, np.float32) for x in (a, b, c)]
-        np.testing.assert_array_equal(np.asarray(_chained(a, b, c, m_warps=m_warps, interpret=False)),
-                                      (f32[0] @ f32[1]) @ f32[2])
+        chained = ahead_arm(jax.jit(functools.partial(_chained, m_warps=m_warps, interpret=False)),
+                            f"chained products: {rows} rows, {m_warps} warps")(a, b, c)
+        np.testing.assert_array_equal(np.asarray(chained), (f32[0] @ f32[1]) @ f32[2])
         return
     shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (a, b, c)]
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
@@ -1687,18 +1694,23 @@ def test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it(m_war
     """mma.sync's products by a family bounded at a tile's rows (`Issuer.bounded`: a ragged group's last tile)
     issue for the 16-row blocks before the bound alone, a nonzero accumulator, each row its own, kept in the
     rest: two run-time bounds in one trace (-1 keeping every row, 65 issuing all), and a constant one a family
-    carries into one jitted helper at each bound (M-FS-56b; exact on a GPU; rows 7091, 12108, 12109)."""
+    carries into one jitted helper at each bound (M-FS-56b; exact on a GPU, its program compiled in a tier's
+    prepare, `ahead_arm`; rows 7091, 12108, 12109)."""
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16), m_warps=m_warps)
-    a, b = (jax.random.randint(key, shape, -2, 3).astype(jnp.bfloat16) for key, shape in
-            zip(jax.random.split(jax.random.key(9)), ((64, RELAYED), (RELAYED, RELAYED)), strict=True))
+    rng = np.random.default_rng(9)
+    a, b = (rng.integers(-2, 3, shape).astype(jnp.bfloat16) for shape in ((64, RELAYED), (RELAYED, RELAYED)))
     c = np.broadcast_to(np.arange(1, 65, dtype=np.float32)[:, None] * 0.5, (64, RELAYED)).copy()
     full = c + np.asarray(a, np.float32) @ np.asarray(b, np.float32)
-    starts, on_gpu = np.arange(64)[:, None] // 16 * 16, jax.default_backend() == "gpu"
+    starts, on_gpu = np.arange(64)[:, None] // 16 * 16, here() != "cpu"
     run = jax.jit(_bounded, static_argnames=("family", "interpret"))
     for bounds, constant in (((-1, 65), -1), ((0, 64), 65), ((1, 47), 16), ((16, 17), 47)):
-        with contextlib.nullcontext() if on_gpu else generation.assumed("sm80"):
-            got = run(a, b, jnp.asarray(c), jnp.array(bounds, jnp.int32), family=family.bounded(constant),
-                      interpret=False if on_gpu else INTERPRETED)
+        operands, bounded = (a, b, c, np.asarray(bounds, np.int32)), family.bounded(constant)
+        if on_gpu:
+            got = ahead_arm(jax.jit(functools.partial(_bounded, family=bounded, interpret=False)),
+                            f"bounded products: {m_warps} warps at {constant}")(*operands)
+        else:
+            with generation.assumed("sm80"):
+                got = run(*operands, family=bounded, interpret=INTERPRETED)
         expected = [np.where(starts < bound, full, c) for bound in (*bounds, constant)]
         np.testing.assert_array_equal(np.asarray(got), np.stack(expected))
     if on_gpu:
@@ -1742,12 +1754,11 @@ def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = 
 
 
 def _codes(dtype):
-    """Codes of `dtype` and per-row power-of-two scales, so each converted value is exact in bf16."""
-    keys = jax.random.split(jax.random.key(6), 2)
-    codes = jax.random.randint(keys[0], CODES, -8, 8).astype(dtype)
+    """Codes of `dtype` and per-row power-of-two scales, so each converted value is exact in bf16: NumPy's."""
+    rng = np.random.default_rng(6)
+    codes = rng.integers(-8, 8, CODES).astype(dtype)
     # ldexp is exact where a GPU's exp2 is not (0.12499999 for 2 ** -3 on an A100).
-    exponents = jax.random.randint(keys[1], (CODES[0],), -3, 4)
-    return codes, jnp.ldexp(jnp.ones((CODES[0],), jnp.float32), exponents)
+    return codes, np.ldexp(np.ones((CODES[0],), np.float32), rng.integers(-3, 4, (CODES[0],)))
 
 
 @pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
@@ -1757,10 +1768,11 @@ def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_n
     """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
     `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host;
     FP8 codes refused where the device converts none (an A100). A host neither a CPU nor a GPU of the
-    generation (a TPU, another GPU) runs none of it (row 9003)."""
-    if jax.default_backend() != "cpu" and generation.device_generation() != generation_name:
+    generation (a TPU, another GPU) runs none of it (row 9003). On a GPU its program is compiled in a tier's
+    prepare (`here`, `ahead_arm`)."""
+    if here() not in ("cpu", generation_name):
         pytest.skip(f"converts interpreted on a CPU or natively on a {generation_name} GPU, not on this "
-                    f"{generation.device_generation()}")
+                    f"{here()}")
     codes, scale = _codes(dtype)
     expected = np.asarray(codes, np.float32) * (np.asarray(scale)[:, None] if scaled else 1)
     with generation.assumed(generation_name):
@@ -1770,7 +1782,7 @@ def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_n
         with pytest.raises(ValueError), generation.assumed(generation_name):
             _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED)
         return
-    if jax.default_backend() == "cpu":
+    if here() == "cpu":
         with generation.assumed(generation_name):
             converted = _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED,
                                    scaled=scaled)
@@ -1787,7 +1799,9 @@ def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_n
         found = compile_mosaic_kernels([KernelCase("converted", lambda: (compiled, shapes))], generation_name)
         assert not mosaic_failures(found), mosaic_failures(found)
     else:
-        converted = _converted(codes, scale, generation_name=generation_name, interpret=False, scaled=scaled)
+        native = jax.jit(functools.partial(_converted, generation_name=generation_name, interpret=False,
+                                           scaled=scaled))
+        converted = ahead_arm(native, f"a {jnp.dtype(dtype).name} stage: scaled {scaled}")(codes, scale)
         np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
 
 
@@ -1945,11 +1959,8 @@ def test_groups_summed_together_on_tcgen05_issue_every_product_before_one_commit
     """Traced for a B200 (`summed_together` on tcgen05's chunks): the three groups' products are all issued
     before the role commits its tensor-core barrier once and waits on it once, no commit or wait between
     them, so no group's wait stands between another's issue and its own."""
-    from reference_error import equations
-
-    keys = jax.random.split(jax.random.key(5))
-    x = jax.random.randint(keys[0], (64, 2 * CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
-    w = jax.random.randint(keys[1], (2 * CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((64, 2 * CHUNK_DEPTH), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((2 * CHUNK_DEPTH, 128), jnp.bfloat16)
     with generation.assumed("sm100"):
         traced = jax.make_jaxpr(lambda x, w: _summed_together(x, w, interpret=False))(x, w)
     order = [equation.primitive.name for equation in equations(traced.jaxpr)
@@ -2005,10 +2016,8 @@ def test_groups_summed_together_stage_no_operand_into_a_tile_a_product_in_flight
     issue and the wait that retires it. A tcgen05 product reads its operands after it issues, until its
     commit's barrier, so a group staged while another's product is in flight overwrites that product's
     operand under it."""
-    from reference_error import equations
-
-    x = jnp.zeros((64, CHUNK_DEPTH), jnp.bfloat16)
-    w = jnp.zeros((CHUNK_DEPTH, 128), jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((64, CHUNK_DEPTH), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((CHUNK_DEPTH, 128), jnp.bfloat16)
     with generation.assumed("sm100"):
         traced = jax.make_jaxpr(lambda x, w: _staged_together(x, w, interpret=False, shared=shared))(x, w)
     order = [equation.primitive.name if equation.primitive.name != "swap" else "staged"
@@ -2049,8 +2058,8 @@ def test_a_group_summed_together_that_awaits_its_own_products_is_refused():
     """A group summed together on tcgen05 whose issue awaits its own products (a value added into its
     accumulator, `added_into`) is refused as it traces: its wait would leave the groups' one commit behind
     nothing pending (row 5671)."""
-    x = jnp.zeros((64, 2 * CHUNK_DEPTH), jnp.bfloat16)
-    w = jnp.zeros((2 * CHUNK_DEPTH, 128), jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((64, 2 * CHUNK_DEPTH), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((2 * CHUNK_DEPTH, 128), jnp.bfloat16)
     with generation.assumed("sm100"), pytest.raises(ValueError):
         jax.make_jaxpr(lambda x, w: _summed_together(x, w, interpret=False, awaiting=True))(x, w)
 
@@ -2088,12 +2097,14 @@ def test_a_register_left_product_on_tcgen05s_chunks_is_its_shared_memory_product
 @pytest.mark.parametrize("shift", [0, 5, -7])
 def test_a_row_shift_takes_each_row_from_its_groups_row_shift_up(shift):
     """A tile's rows shifted within groups of 16 (`Issuer.row_shifted`, interpreted at an H100's facts):
-    each row whose source lies in its group holds that row's values, the rest masked."""
+    each row whose source lies in its group holds that row's values, the rest masked; on the host's CPU, its
+    program compiled in a tier's prepare (`ahead_arm`)."""
     from dew.nn.kernels.templates import bundles
 
     tile = np.arange(64 * 32, dtype=np.float32).reshape(64, 32)
     family = bundles.of("sm90", jnp.bfloat16)
-    out = np.asarray(family.row_shifted(jnp.asarray(tile), jnp.int32(shift), period=16, interpret=True))
+    shifted = jax.jit(functools.partial(family.row_shifted, period=16, interpret=True))
+    out = np.asarray(ahead_arm(shifted, "a row shift", host=True)(tile, np.int32(shift)))
     rows = np.arange(64)
     kept = (rows % 16 - shift >= 0) & (rows % 16 - shift < 16)
     np.testing.assert_array_equal(out[kept], tile[rows[kept] - shift])
@@ -2138,9 +2149,10 @@ def test_a_launch_runs_a_flags_branch_and_its_negations_branch_each_alone(semant
             plgpu.copy_smem_to_gmem(staged, out_gmem.at[pl.ds(program * 128, 128)])
             plgpu.wait_smem_to_gmem(0)
 
-    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((256,), jnp.int32), grid=(2,),
-                       grid_names=("program",),
-                       compiler_params=plgpu.CompilerParams(lowering_semantics=semantics))()
+    launch = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((256,), jnp.int32), grid=(2,),
+                          grid_names=("program",),
+                          compiler_params=plgpu.CompilerParams(lowering_semantics=semantics))
+    out = ahead_arm(jax.jit(launch), f"a flag's branches: {semantics.name}")()
     np.testing.assert_array_equal(np.asarray(out), np.repeat(np.asarray([2, 1], np.int32), 128))
 
 
@@ -2204,8 +2216,6 @@ def test_a_uniform_read_gives_each_lane_its_warps_lane_zero_value(read):
         read_value = across.uniform(held) if read == "uniform" else held
         each = plgpu.ShapeDtypeStruct((128,), jnp.dtype(jnp.int32), layout=lanes)
         out_gmem[...] = plgpu.inline_mgpu(arg_types=(scalar,), return_type=each)(spread)(read_value)
-
-    from reference_error import ahead_arm
 
     kernel = jax.jit(plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((128,), jnp.int32), grid=(1,),
                                   grid_names=("programs",)))
@@ -2282,8 +2292,6 @@ def test_a_walks_prologue_loads_before_it_waits_on_its_once_streams(bundle):
     warpgroup MMA's roles and its consumer-fed bundle's: the consumer's prologue reads global memory before
     it first waits on a barrier, as a prologue's loads are in flight beside the streams' (row 6657); its once
     streams' acquire waits after them."""
-    from reference_error import equations
-
     from dew.nn.kernels.templates import mosaic_sm90
 
     family = {"wgmma": mosaic_sm90.WGMMA, "fed": mosaic_sm90.FED}[bundle]
@@ -2307,12 +2315,14 @@ def test_a_walks_once_stream_loads_once_and_every_step_reads_it(bundle):
     folding it into its walked streams (`folded`); every step reads its step-zero block with its own ringed
     block, so the walk sums that block times every step's: exactly, small integers in fp32. (tcgen05's plain
     walks' accumulators are their persist's or their launch's tensor memory, which this one scopes none of;
-    mma.sync's pipeline refuses a once stream, `test_a_cp_async_walk_refuses_a_once_stream`.)"""
+    mma.sync's pipeline refuses a once stream, `test_a_cp_async_walk_refuses_a_once_stream`.) On the host's
+    CPU (`ahead_arm`)."""
     family, target, interpret = _once_bundle(bundle)
     x, w = _persisted_operands(family.rows)
     x = x[:family.rows]
     with generation.assumed(target):
-        got = np.asarray(_walked_once(x, w, family=family, interpret=interpret))
+        walked = jax.jit(functools.partial(_walked_once, family=family, interpret=interpret))
+        got = np.asarray(ahead_arm(walked, f"a once stream: {bundle}", host=True)(x, w))
     blocks = np.asarray(w, np.float32).reshape(PERSISTED_STEPS, PERSISTED_DEPTH, -1).sum(axis=0)
     np.testing.assert_array_equal(got, np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ blocks)
 
@@ -2339,12 +2349,14 @@ def test_a_walks_prologue_value_reaches_every_step_beside_its_once_stream(bundle
 def test_a_walk_whose_every_operand_is_a_once_stream_reads_them_at_each_step(bundle):
     """Interpreted: a plain walk of two operands both once streams, no ring to rotate (a consumer-fed
     bundle's loading consumer one step deep, as a ring family's walk is): every step reads the two step-zero
-    blocks, so the walk sums their product once a step."""
+    blocks, so the walk sums their product once a step, on the host's CPU (`ahead_arm`)."""
     family, target, interpret = _once_bundle(bundle)
     x, w = _persisted_operands(family.rows)
     x = x[:family.rows]
     with generation.assumed(target):
-        got = np.asarray(_walked_once(x, w, family=family, interpret=interpret, all_once=True))
+        got = np.asarray(ahead_arm(jax.jit(functools.partial(_walked_once, family=family, interpret=interpret,
+                                                             all_once=True)), f"once streams: {bundle}",
+                                   host=True)(x, w))
     first = np.asarray(x, np.float32)[:, :PERSISTED_DEPTH] @ np.asarray(w, np.float32)[:PERSISTED_DEPTH]
     np.testing.assert_array_equal(got, PERSISTED_STEPS * first)
 
@@ -2373,8 +2385,6 @@ def test_a_values_parts_sum_back_to_it_exactly_fp32s_largest_among_them():
     """An fp32 value's three bf16 parts (`product.formed`) sum back to it exactly (`product.whole`), the
     largest finite values among them: fp32's largest, and bf16's largest past by `2^120 - 2^111`, whose
     leading two parts summed first reach `2^128`, past fp32's largest, to infinity (rows 6842, 6866)."""
-    from reference_error import ahead_arm
-
     largest = float(np.finfo(np.float32).max)
     past = 2.0**128 - 2.0**111
     x = np.asarray([largest, past, -largest, -past, 1.0 + 2.0**-23], np.float32)
@@ -2415,7 +2425,8 @@ def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loo
     flight before a tile's first chunk, whose buffer the tile before stored last, two before its second, one
     before its third) every buffer is rewritten only once its last TMA store has read it, the output the
     tiles' values; a wait allowing one group more at a tile's first chunk or its third rewrites a buffer a
-    store still reads, which the detector names (its second's buffer the first's drain already freed)."""
+    store still reads, which the detector names (its second's buffer the first's drain already freed). On
+    the host's CPU, its program compiled in a tier's prepare (`ahead_arm`)."""
     from jax._src.pallas.mosaic_gpu.interpret.interpret_pallas_call import reset_gpu_interpret_mode_state
 
     rows, width, chunks = STAGED
@@ -2423,7 +2434,8 @@ def test_a_staged_chunks_buffer_is_rewritten_once_its_last_store_has_read_it(loo
     assert waits == [0, 2, 1]
     if loosened is not None:
         waits[loosened] += 1
-    kernel = _staged_launch(tuple(waits), interpret=plgpu.InterpretGPUParams(detect_races=True))
+    kernel = ahead_arm(jax.jit(_staged_launch(tuple(waits), interpret=plgpu.InterpretGPUParams(
+        detect_races=True))), f"staged chunks: {loosened} loosened", host=True)
     if loosened is None:
         tiles = 1000.0 * np.repeat([0, 1], rows)[:, None]
         columns = np.arange(chunks * width, dtype=np.float32)
@@ -2450,12 +2462,13 @@ def test_a_share_storing_no_rows_stages_no_chunk_between_stored_tiles():
     storing no rows (`SKIPPED`), under the GPU interpreter's race detection: `stores.staged_chunks` stages
     nothing for it, no race is named and the output holds the first and third tiles' values. The race a
     zero-row share staged anyway makes is the protocol checker's, which counts store groups (the next
-    test; base review 5028c8148 F2)."""
+    test; base review 5028c8148 F2). On the host's CPU, its program compiled in a tier's prepare
+    (`ahead_arm`)."""
     rows, width, _ = STAGED
     chunks = len(SKIPPED_WAITS)
     assert SKIPPED_WAITS == (1, 1)
     kernel = _staged_launch(SKIPPED_WAITS, SKIPPED, interpret=plgpu.InterpretGPUParams(detect_races=True))
-    out = np.asarray(kernel())
+    out = np.asarray(ahead_arm(jax.jit(kernel), "a share storing no rows", host=True)())
     columns = np.broadcast_to(np.arange(chunks * width, dtype=np.float32), (rows, chunks * width))
     np.testing.assert_array_equal(out[:rows], columns)
     np.testing.assert_array_equal(out[2 * rows:], columns + 2000.0)
@@ -2472,7 +2485,8 @@ def test_a_share_storing_no_rows_issues_no_write_and_no_group(staging):
     from ring_protocol import Violation, commits_group, explore, programs
 
     chunks = len(SKIPPED_WAITS)
-    threads, arrivals = programs(_staged_launch(SKIPPED_WAITS, SKIPPED, staging), threads=1)
+    with jax.default_device(jax.devices("cpu")[0]):
+        threads, arrivals = programs(_staged_launch(SKIPPED_WAITS, SKIPPED, staging), threads=1)
     [program] = threads
     writes = sum(event.kind == "write" for event in program)
     if staging is stores.staged_chunks:
@@ -2489,8 +2503,6 @@ def test_a_staged_outputs_launch_states_its_cost():
     """The staged output's launch (`_staged_launch`, each of its chunks' copies its own store group) costed as
     the toolkit's launches are (`emission.costed`, the estimate XLA and Dew's FLOP count read): it states the
     bytes it is given and no arithmetic, a store group's commit priced as the synchronization it is."""
-    from reference_error import equations
-
     rows, width, chunks = STAGED
     stored = 2 * rows * chunks * width * 4
     launch = _staged_launch(stores.buffer_waits(chunks, 2))
