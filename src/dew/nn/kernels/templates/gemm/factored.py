@@ -161,7 +161,8 @@ class _Transpose:
         matrix_grid = _edge(_shared_max(matrix_top, tuple(sorted(jax.typeof(matrix_top).mat.varying
                                                                    - self.held))))
         depth, width = self.shape[-1], cotangent.shape[-1]
-        varying = frozenset().union(*(jax.typeof(v).mat.varying for v in (cotangent, matrix, *rest)))
+        leaves = jax.tree.leaves((cotangent, matrix, rest))
+        varying = frozenset().union(*(jax.typeof(leaf).mat.varying for leaf in leaves))
         axes = tuple(sorted(varying - self.held))
         devices = math.prod(jax.lax.axis_size(axis) for axis in axes)
         if devices > FACTORED_FAN_IN:
