@@ -389,7 +389,7 @@ def test_a_split_delta_rules_transfer_takes_its_layers_chunk(name, monkeypatch):
 
     taken, transfer = [], recurrence_chunk.transferred
 
-    def spied(*args, chunk_size, **options):
+    def spied(*args, chunk_size=recurrence_chunk.CHUNK_SIZE, **options):
         taken.append(chunk_size)
         return transfer(*args, chunk_size=chunk_size, **options)
 
