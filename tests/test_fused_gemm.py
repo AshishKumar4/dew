@@ -229,6 +229,32 @@ def test_a_regions_analysis_prices_it_fused_and_unfused_on_one_model():
     assert plain.fused_seconds is None and plain.unfused_seconds is None
 
 
+def test_a_scattered_regions_fused_price_counts_its_sides_permutation():
+    """A scattered product's fused arm permutes its consumer's row-indexed residual to the product's rows
+    before its launch, an XLA pass reading and writing it: priced so, its fused arm costs at least that round
+    trip's bytes at the H100's device memory rate more than the same region gathered, its residual read where
+    it lies; its unfused arm the same either way. Shapes only (row 12399)."""
+    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+    x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((4, 4096, 4096), jnp.bfloat16)
+    rows = jax.ShapeDtypeStruct((8192,), jnp.int32)
+    residual = jax.ShapeDtypeStruct((8192, 4096), jnp.float32)
+
+    def routed(table):
+        def region(x, w, sizes, rows, residual):
+            product = fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, **{table: rows})
+            return (product + residual).astype(jnp.bfloat16)
+        return region
+
+    with generation.assumed("sm90"):
+        scattered, gathered = (fused_gemm.analysis(routed(table), x, w, sizes, rows, residual)
+                               for table in ("scatter", "gather"))
+        rate = generation.gpu_target().memory_rate
+    assert scattered.unfused_seconds == gathered.unfused_seconds, (scattered, gathered)
+    permuted = 2 * 8192 * 4096 * 4 / rate
+    assert scattered.fused_seconds - gathered.fused_seconds >= permuted, (scattered, gathered)
+
+
 def _chained(function, wide):
     """`function` applied eight times over `wide`, in float32."""
     for _ in range(8):
