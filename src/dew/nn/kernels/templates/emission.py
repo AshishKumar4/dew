@@ -12,6 +12,7 @@ kernel emits."""
 
 import dataclasses
 import functools
+import itertools
 import math
 import weakref
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -132,14 +133,6 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
 
 _DEVICE = object()
 """A ref in device memory, as `emitted`'s walk holds it (`_Counting.equation` prices its reads and writes)."""
-
-_INVARIANT = object()
-"""A value of no data and no trip: an iota's, and what pure operations (`_PURE`) compute of such values,
-literals and concrete scalars alone (a tile's row and column indices and the masks made of them). The GPU's
-compile folds it or computes it once outside every loop, so it issues nothing a step: the recurrence solve's
-masks, priced at 6.1M integer operations a GH200 program (FS-4123-INT3, its launch integer-bound), compile
-to about a thousand integer instructions a thread a walk's trip, its moves and conversions among them
-(FS-SOLVE-SASS2), and their floor division and its truncating form to one binary (M-JS-258, row 4123)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -534,6 +527,8 @@ class _Counting:
         # The products it issued and has not waited on (each one's columns, `_columns`), and what lands on
         # each barrier it will wait on: products committed to it, copies arriving on it (`waited`), by the
         # barrier's allocation where the count holds it (`_Barrier`).
+        # The variables the program's constants alone decide (`run`, `_static`).
+        self.static: set[jax_core.Var] = set()
         self.issued: list[float] = []
         self.landing: dict[_Barrier | jax_core.Var, Chain] = {}
         # The slots of each barrier its copies landed on, as their transforms name them (`_slot`): a wait on
@@ -587,13 +582,22 @@ class _Counting:
             arrived = () if landed is not None else self.arrivals.arriving(barrier(0))
             self.add(Work(chains=(landed,) if landed is not None else arrived or (Chain(barriers=1),)))
 
-    def run(self, jaxpr: jax_core.Jaxpr, values: list, constants: Sequence = ()) -> list:
-        """Count `jaxpr` given its inputs' concrete `values` (None where unknown), and its constants'
-        (`constvars`) where its caller binds them (a scoped body's, `run_scoped`'s operands); its outputs'
-        concrete values."""
+    def run(self, jaxpr: jax_core.Jaxpr, values: list, constants: Sequence = (),
+            static: Sequence[bool] = ()) -> list:
+        """Count `jaxpr` given its inputs' concrete `values` (None where unknown) and which of them are
+        `static` (none where not given), and its constants' (`constvars`) where its caller binds them (a
+        scoped body's, `run_scoped`'s operands), a concrete one static; its outputs' concrete values. A value
+        is static where the program's own constants alone decide it (`_static`), whatever the count holds of
+        it: a trip's place the count holds concretely is none (`_Place`)."""
         held = dict(zip(jaxpr.invars, values, strict=True))
         if constants:
             held.update(zip(jaxpr.constvars, constants, strict=True))
+        # Each variable's provenance rewritten as it is bound, so a jaxpr run again (a call's, shared by its
+        # callers) holds none of an earlier run's.
+        bound = [*itertools.zip_longest(jaxpr.invars, static, fillvalue=False),
+                 *((variable, _concrete(held.get(variable))) for variable in jaxpr.constvars)]
+        for variable, given in bound:
+            (self.static.add if given else self.static.discard)(variable)
 
         def read(atom):
             if isinstance(atom, jax_core.Literal):
@@ -607,8 +611,12 @@ class _Counting:
                 for atom in atoms if isinstance(atom, jax_core.Var)}
         for equation in jaxpr.eqns:
             values = [read(atom) for atom in equation.invars]
-            outputs = self.moved(equation, values, live) or self.equation(equation, values)
+            given = [isinstance(atom, jax_core.Literal) or atom in self.static for atom in equation.invars]
+            outputs = self.moved(equation, values, live) or self.equation(equation, values, given)
             held.update(zip(equation.outvars, outputs, strict=True))
+            fixed = _static(equation, given)
+            for variable in equation.outvars:
+                (self.static.add if fixed else self.static.discard)(variable)
         return [read(atom) for atom in jaxpr.outvars]
 
     def moved(self, equation, values: list, live: set) -> list | None:
@@ -625,7 +633,7 @@ class _Counting:
         self.add(Work(device_bytes=read + written))
         return [None] * len(equation.outvars)
 
-    def equation(self, equation, values: list) -> list:
+    def equation(self, equation, values: list, given: list[bool]) -> list:
         primitive, params = equation.primitive, equation.params
         unknown = [None] * len(equation.outvars)
         self.waited(equation, values)
@@ -644,8 +652,10 @@ class _Counting:
         if (primitive is lax.select_n_p and programs.integral_scalar(values[0])
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
-        if primitive is lax.iota_p or (primitive in _PURE and values and all(map(_invariant, values))):
-            return [_INVARIANT] * len(equation.outvars)
+        if (primitive is lax.iota_p or primitive in _PURE) and _static(equation, given):
+            # Of the program's constants alone: folded by its compile or computed once outside every loop. A
+            # call of them runs on, its body's folds the values a later guard reads.
+            return unknown
         if primitive in _ARITHMETIC:
             self.add(operation_work(primitive, [variable.aval for variable in equation.invars],
                                     [variable.aval for variable in equation.outvars], params,
@@ -688,25 +698,25 @@ class _Counting:
             arguments = equation.invars[:params["pytree_args"].num_leaves]
             self.add(work(*(variable.aval for variable in arguments)))
         elif primitive is lax.cond_p:
-            return self.cond(params["branches"], values)
+            return self.cond(params["branches"], values, given)
         elif (region := _REGIONS.get(primitive)) is not None:
-            return region(self, equation, values) or unknown
+            return region(self, equation, values, given) or unknown
         elif primitive is derivatives.marked_call_p and isinstance(params["kind"], _MARKS):
-            return self.marked(params, values)
+            return self.marked(params, values, given)
         elif (expanded := _expanded(equation)) is not None:
-            return self.run(expanded[0], values, expanded[1])
+            return self.run(expanded[0], values, expanded[1], given)
         elif primitive not in _FREE:
             raise Unpriced(f"no rule prices {primitive} in a kernel's body")
         return unknown
 
-    def marked(self, params, values: list) -> list:
+    def marked(self, params, values: list, given: list[bool]) -> list:
         """A marked span a count reads by its kind: a rare span's verdict as its common value, False
         (`derivatives.Rare`), a walk's step counted by its loop and run (`derivatives.WalkStep`)."""
         if isinstance(params["kind"], derivatives.Rare):
             return [np.False_]
         if self.loops:
             self.loops[-1].marks += 1
-        return self.run(params["call_jaxpr"], values)
+        return self.run(params["call_jaxpr"], values, static=given)
 
     def place(self, name) -> int | None:
         """The concrete index along axis `name`: its warp's among its warpgroup's warps (`warp`), its
@@ -714,13 +724,14 @@ class _Counting:
         found = dict([(self.axis, self.index), *([self.warp] if self.warp is not None else [])])
         return next((index for axis, index in found.items() if name in (axis, (axis,))), None)
 
-    def scoped(self, equation, values: list) -> list:
+    def scoped(self, equation, values: list, given: list[bool]) -> list:
         """A scope (`run_scoped`): its operands its body's constants, its body's inputs the refs it
         allocates."""
+        del given
         body = equation.params["jaxpr"]
         return self.run(body, [_barrier(var) for var in body.invars], values)
 
-    def loop(self, equation, values: list) -> None:
+    def loop(self, equation, values: list, given: list[bool]) -> None:
         """A loop whose trips its data decides (a while's): the outermost such loop that runs walk steps
         (`derivatives.WalkStep` marks along the branches its warpgroup takes) a walk, its steady trip's work
         over its marks one step of it (`walks`), which the launch's statement of its steps multiplies; any
@@ -732,9 +743,9 @@ class _Counting:
                                                                                    strict=True)]
         body, consts = params["body_jaxpr"], held[params["cond_nconsts"]:][:params["body_nconsts"]]
         carry = len(body.invars) - len(consts)
-        # A range's bound held by its atom where its value is invariant alone, so a guard on it is read.
-        ranged = _ranged(params, [_Same(atom) if value is _INVARIANT else value
-                                  for atom, value in zip(equation.invars, held, strict=True)])
+        # Its constants keep their provenance in every trip; a carried value is none past the first.
+        static = [*given[params["cond_nconsts"]:][:params["body_nconsts"]], *([False] * carry)]
+        ranged = _ranged(params, held)
 
         def trip(at: str, parity: int) -> "_Counting":
             # A carried value is unknown past the first trip, but a range's counter and stop (`_ranged`).
@@ -745,7 +756,7 @@ class _Counting:
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals)
-            trial.run(body, inputs)
+            trial.run(body, inputs, static=static)
             self.arrivals.left(trial.landing)
             return trial
 
@@ -760,13 +771,13 @@ class _Counting:
                 taken = _mean([trip(at, parity).loops[-1].work for parity in (0, 1)])
                 self.fixed = self.fixed + taken + repeated(found.work, -1)
 
-    def warps(self, equation, values: list) -> None:
+    def warps(self, equation, values: list, given: list[bool]) -> None:
         """A warpgroup's warps each running its role (`plgpu.warp_map`'s `mpmd_map`: tcgen05's load and
         product warps): each warp's body counted with its warp's index concrete, so its role's branch is the
         one it takes; the warpgroup's work theirs together, a step of its walk each warp's step summed, and
         the steps its warps take together its enclosing loop's (the most any warp marks). The barriers its
         body takes are allocations every warp's count holds alike (`_Barrier`)."""
-        del values
+        del values, given
         (mesh,), (inner,) = equation.params["meshes"], equation.params["jaxprs"]
         ((name, count),) = mesh.shape.items()
         steps, marks = [], 0.0
@@ -788,16 +799,19 @@ class _Counting:
         if self.loops:
             self.loops[-1].marks += marks
 
-    def scanned(self, equation, values: list) -> list:
+    def scanned(self, equation, values: list, given: list[bool]) -> list:
         """A loop of the trips its jaxpr states (a scan's), each trip counted as it runs, its carry's
         concrete values carried to the next (a walk's step index, so a step's guard on it takes its
         branch): its work where it stands, its marks its enclosing loop's; its outputs' concrete carry."""
         params = equation.params
         body, length = params["jaxpr"], params["length"]
         consts, carried, xs = map(list, params["ft_in"].update(values).unpack())
+        # Its constants keep their provenance; its carry, which the count holds concretely trip by trip, has
+        # none.
+        static = [*given[:len(consts)], *([False] * (len(carried) + len(xs)))]
         self.loops.append(_Loop())
         for _ in range(length):
-            carried = self.run(body, [*consts, *carried, *([None] * len(xs))])[:len(carried)]
+            carried = self.run(body, [*consts, *carried, *([None] * len(xs))], static=static)[:len(carried)]
         self.ended(self.loops.pop(), walks=False)
         return [*carried, *([None] * (len(body.outvars) - len(carried)))]
 
@@ -812,19 +826,19 @@ class _Counting:
         else:
             self.fixed = self.fixed + found.work
 
-    def cond(self, branches, values: list) -> list:
+    def cond(self, branches, values: list, given: list[bool]) -> list:
         """A conditional: its branch where its index is concrete (a role's, by its warpgroup), else every
         branch's envelope, unit by unit (the most of each any branch issues, as the custom call's FLOP count
         takes a conditional), its steps' marks likewise; the walks its branches hold one walk, a step of it
         the most of each unit any branch's walks take a step (their mean, `Role.step`)."""
         index, operands = values[0], values[1:]
         if programs.integral_scalar(index):
-            return self.run(branches[int(index)], operands)
+            return self.run(branches[int(index)], operands, static=given[1:])
         trials = []
         for branch in branches:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
                               forms=self.forms, arrivals=self.arrivals)
-            trial.run(branch, operands)
+            trial.run(branch, operands, static=given[1:])
             if self.loops:
                 self.arrivals.left(trial.landing)
             trials.append(trial)
@@ -919,16 +933,30 @@ apart (`_Counting.equation`'s, a TPU core's)."""
 
 _PURE = _ARITHMETIC | frozenset({lax.broadcast_in_dim_p, lax.reshape_p, lax.squeeze_p, lax.transpose_p,
                                  lax.bitcast_convert_type_p, gpu_core.layout_cast_p, lax.slice_p,
-                                 lax.concatenate_p, lax.rev_p})
+                                 lax.concatenate_p, lax.rev_p, pallas.multiple_of_p})
 """What computes its outputs of its operands' values alone, nothing read of memory nor of a thread's place:
-elementwise arithmetic and a value's elements rearranged, which of invariant operands is invariant
-(`_INVARIANT`)."""
+elementwise arithmetic and a value's elements rearranged, which of static operands is static (`_static`)."""
 
 
-def _invariant(value) -> bool:
-    """Whether the count holds `value` as one of no data and no trip: invariant (`_INVARIANT`), or a host's
-    concrete value (a literal's, a fold's)."""
-    return value is _INVARIANT or isinstance(value, int | float | np.generic | np.ndarray)
+def _static(equation, given: Sequence[bool]) -> bool:
+    """Whether `equation`'s outputs are of the program's constants alone: an iota's (a tile's row and column
+    indices), and what a pure operation (`_PURE`) or a call of no effects computes of static operands
+    (`given`: literals, and values so computed), the masks a tile's indices make among them. The GPU's
+    compile folds such a value or computes it once outside every loop, so it issues nothing a step: the
+    recurrence solve's masks, priced at 6.1M integer operations a GH200 program (FS-4123-INT3, its launch
+    integer-bound), compile to about a thousand integer instructions a thread a walk's trip, its moves and
+    conversions among them (FS-SOLVE-SASS2), their floor division and its truncating form to one binary
+    (M-JS-258, row 4123). A value the count holds concretely of a thread's place or a trip's (a warpgroup's
+    index, a step's parity, a scan's carry) is none of them."""
+    if equation.primitive is lax.iota_p:
+        return True
+    pure = equation.primitive in _PURE or (programs.called(equation) is not None and not equation.effects)
+    return pure and bool(given) and all(given)
+
+
+def _concrete(value) -> bool:
+    """Whether the count holds `value` concretely: a host's integer, float or array."""
+    return isinstance(value, int | float | np.generic | np.ndarray)
 
 
 def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mapping,
