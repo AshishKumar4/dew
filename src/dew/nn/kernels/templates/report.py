@@ -1412,7 +1412,7 @@ def refuse(entries) -> None:
     not unioned with unrelated decisions that the receiving process already holds."""
     refused_within = False
     for identity, config, kernels in entries:
-        refused_within |= _recorded((identity, config), None, frozenset(map(_refused, kernels)))[1]
+        refused_within |= _entered((identity, config), None, frozenset(map(_refused, kernels)))[1]
     if refused_within:
         raise ReadingRefused(tuple(entries))
 
@@ -1534,16 +1534,16 @@ def _joined(kernels: frozenset[Refused]) -> frozenset[Refused]:
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
             kernels: frozenset[Refused] = frozenset()) -> bool:
-    """`_recorded`'s, its refusal ending a frozen reading's trace where it adds to the reading's refusals
+    """`_entered`'s, its refusal ending a frozen reading's trace where it adds to the reading's refusals
     (`ReadingRefused`); whether `miss` is new."""
-    new, refused_within = _recorded(refusal, miss, kernels)
+    new, refused_within = _entered(refusal, miss, kernels)
     if refused_within:
         raise ReadingRefused(refusal)
     return new
 
 
-def _recorded(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
-              kernels: frozenset[Refused] = frozenset()) -> tuple[bool, bool]:
+def _entered(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
+             kernels: frozenset[Refused] = frozenset()) -> tuple[bool, bool]:
     """`refusal` and `miss` recorded; whether `miss` is new to this context's registry. A miss is recorded
     once a holder, the registry and each `recording` open: a launch's derivation asked again (its route's
     eligibility, then its call, `tuning.KernelOp.taken`) reads its certification back and finds the same
