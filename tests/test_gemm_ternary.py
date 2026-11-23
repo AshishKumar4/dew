@@ -315,6 +315,18 @@ def test_packed_products_hold_extreme_scales_forward_and_backward():
                 want[0, 0] = 2.0 ** 127
                 np.testing.assert_array_equal(np.asarray(dx_apart), want, err_msg=f"{kernel} {label}")
 
+            # Cotangents of 2**127 against two +1 codes at scales of a quarter and of zero: 2**126 and 0,
+            # the cotangent times its scale first, as the plain transpose has it.
+            pair = formats.TernaryWeights.of(jnp.abs(w_cot_mat), scale=jnp.float32(1.0))
+            for scale, expected in ((0.25, 2.0 ** 126), (0.0, 0.0)):
+                _, pull = jax.vjp(lambda a, scale=scale, pair=pair: gemm.ternary_weight_product(
+                    a, dataclasses.replace(pair, scale=jnp.float32(scale)), quantize_activations=False,
+                    out_dtype=jnp.float32, interpret_on_cpu=True), x_cot)
+                (dx_small,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, :2].set(2.0 ** 127))
+                want = np.zeros((16, 256), np.float32)
+                want[0, 0] = expected
+                np.testing.assert_array_equal(np.asarray(dx_small), want, err_msg=f"{kernel} {scale}")
+
             # A row's tiny cotangent beside a huge one on another input, no product past fp32's largest:
             # each pulls back whole, as the plain transpose gives it.
             for product, label in separate:
@@ -354,6 +366,16 @@ def test_a_packed_products_transpose_holds_in_a_checked_map_linear_transpose_and
                                      check_vma=True))(x, scales)
 
     np.testing.assert_array_equal(np.asarray(gradient(packed)), np.asarray(gradient(plain)))
+
+    # One replicated scale of 2**126 and each device's cotangent its own, +4 and -4: their partials sum to 0
+    # before the scale joins, not to inf - inf.
+    def cancelled(rows, dy):
+        return jax.vjp(lambda r: packed(r, jnp.full((1,), 2.0 ** 126, jnp.float32)), rows)[1](dy)[0]
+
+    signs = jnp.zeros((32, 32), jnp.float32).at[0, 0].set(4.0).at[16, 0].set(-4.0)
+    d_rows = jax.jit(jax.shard_map(cancelled, mesh=mesh, in_specs=(whole, data), out_specs=whole,
+                                   check_vma=True))(x[:16], signs)
+    np.testing.assert_array_equal(np.asarray(d_rows), np.zeros((16, 256), np.float32))
 
     cotangent = jnp.asarray(rng.integers(-3, 4, (16, 32)), jnp.float32)
     one = functools.partial(packed, scale=scales[:1])
