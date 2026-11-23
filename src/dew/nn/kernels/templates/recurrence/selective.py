@@ -613,13 +613,16 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
 
             skip = parameters_ref[states, channel]
             dx_init, dx_step, dx_inv = algebra.selective_dx_scale(skip, dys, dts)
+            # The tokens' own products, formed once a block, every state's write and B gradient reading them.
+            stepped = dts * xs
+
             def state(n, sums):
                 # Rolled: unrolled, the states spilled 12 KB/thread (scanbwd-ptxas-sm90 at 5de7abaa0).
                 dx, ddt = sums
                 rate = parameters_ref[n, channel]
                 bs, cs = load(b_ref.at[row, n, span]), load(c_ref.at[row, n, span])
                 a = algebra.selective_decay(dts, rate, kept)
-                written = dts * xs * bs
+                written = stepped * bs
                 entering = entered_ref[row, k, n, channel]
                 read = cs * dys
                 before, after, carried[0, n] = (

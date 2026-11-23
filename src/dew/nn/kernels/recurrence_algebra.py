@@ -1346,10 +1346,12 @@ def selective_decay(step, rate, kept=None):
     log2(e))`, zero at a document's first token (`kept` 0, where given): the one decay form of the scan's
     every path (the template's forward and backward, the portable scan), the token and adjoint functions'
     `a` (`selective_token`, `selective_adjoint`), which the scan's schedules take a token or a block of
-    tokens at a time (`templates.recurrence.selective`). The rate is taken to base 2 after the step
-    multiplies it, so a rate past float32's range times a padded token's zero step is zero, not `0 * -inf`
-    (row 8491: A = -3 2^126 made `A log2(e)` -inf and a padded token's decay NaN)."""
-    decay = jnp.exp2((step * rate) * LOG2_E)
+    tokens at a time (`templates.recurrence.selective`). The step is taken to base 2, then multiplies the
+    rate: a rate past float32's range times a padded token's zero step is zero, not `0 * -inf` (row 8491:
+    A = -3 2^126 made `A log2(e)` -inf and a padded token's decay NaN), and the step's part is the token's
+    alone, which a schedule walking the states forms once a token (an A100's backward formed
+    `(dt A) log2(e)` a token and state, two of its fifteen FMULs, M-JS-241)."""
+    decay = jnp.exp2((step * LOG2_E) * rate)
     return decay if kept is None else decay * kept
 
 
@@ -1406,8 +1408,9 @@ def selective_adjoint(cotangent, before, decay, written, step, value, b, dy, rat
     terms and `skip * dy` stay normal across the state sum (row 8722, base review b0601005b F6)."""
     through = cotangent * before * decay
     d_written = cotangent * b
+    # `B`'s through `dt x`, the token's alone, as `written` reads it: formed once a token, not a state.
     return (d_written * (step if dx_step is None else dx_step), d_written * value + through * rate,
-            cotangent * step * value, dy * (decay * before + written), through * step)
+            cotangent * (step * value), dy * (decay * before + written), through * step)
 
 
 def gated_values_back(u_grad, values, beta) -> tuple[jax.Array, jax.Array]:
