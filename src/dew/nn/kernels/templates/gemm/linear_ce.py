@@ -40,7 +40,6 @@ from dew.nn.kernels.templates.gemm.mosaic_gpu import (
     _walked_products,
     multicast,
     pair_takes,
-    sides_extended,
 )
 from dew.nn.kernels.templates.gemm.pricing import (
     TilesTemplate,
