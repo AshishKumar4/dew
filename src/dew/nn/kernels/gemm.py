@@ -911,20 +911,17 @@ FP8_WEIGHT: selection.Op[Fp8WeightCase] = selection.Op(generation.Choice.GROUPED
     selection.Kernel('xla', (), generic=True),
 ))
 
-def _fp8_packed(rows: jax.Array, words: jax.Array, sizes: jax.Array, fmt: str,
-                launch: grouped_matmul.MosaicFp8PackedGmm, interpret: bool, *, dense: bool) -> jax.Array:
-    """Inline-decoding FP8 weight product in fp32 (`fp8_weight_product`, row 8548), differentiable at every
-    order through `generation.linear_tangent`."""
-    form = Fp8Weights(words, jnp.ones((), jnp.float32), jnp.zeros((8,), jnp.uint8), fmt=fmt)
+def _packed_weight_product(rows: jax.Array, words: jax.Array, sizes: jax.Array,
+                           launch: grouped_matmul.MosaicFp8PackedGmm, make_bank,
+                           interpret: bool, *, dense: bool, contract: str) -> jax.Array:
+    """Inline-decoding packed weight product in fp32 (`fp8_weight_product`, `ternary_weight_product`),
+    differentiable at every order through `generation.linear_tangent`."""
     def decoded(packed_words: jax.Array) -> jax.Array:
-        matrices = Fp8Weights(packed_words, jnp.ones((), jnp.float32), form.form, fmt=fmt).unscaled()
+        matrices = make_bank(packed_words).unscaled()
         return matrices[0] if dense else matrices
-
     def kernel(r: jax.Array, w: jax.Array, s: jax.Array, *, interpret: bool) -> jax.Array:
-        bank = Fp8Weights(w, jnp.ones((), jnp.float32), form.form, fmt=fmt)
-        return launch(r, bank, s, (), (), None, None, None, out_dtype='float32', trans_rhs=False,
-                      interpret=interpret, dense=dense, exact_sums=False)
-
+        return launch(r, make_bank(w), s, (), (), None, None, None, out_dtype='float32',
+                      trans_rhs=False, interpret=interpret, dense=dense, exact_sums=False)
     def portable(r: jax.Array, w: jax.Array, s: jax.Array) -> jax.Array:
         matrices = decoded(w)
         return (jax.lax.dot(r, matrices, preferred_element_type=jnp.float32) if dense
@@ -948,10 +945,9 @@ def _fp8_packed(rows: jax.Array, words: jax.Array, sizes: jax.Array, fmt: str,
                      precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
         leaves = (d_rows.astype(r.dtype), zero_from_primal(w), zero_from_primal(s))
         return tuple(leaves[index] for index in live)
-    differentiable = contracted("test_an_fp8_weight_product_holds_every_order")(
+    differentiable = contracted(contract)(
         generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
     return differentiable(rows, words, sizes)
-
 
 def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Array | None = None, *,
                        out_dtype=None, interpret_on_cpu: bool = False) -> jax.Array:
@@ -985,7 +981,10 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
         tile = _planned(launch, bound)
         case = Fp8WeightCase(tile, not automatic_axes(), interpret_on_cpu)
         if selection.select(FP8_WEIGHT, case).kernel == 'mosaic':
-            summed = _fp8_packed(rows, words, sizes, weights.fmt, launch, interpret_on_cpu, dense=dense)
+            form_b, one = jnp.zeros((8,), jnp.uint8), jnp.ones((), jnp.float32)
+            summed = _packed_weight_product(
+                rows, words, sizes, launch, lambda w: Fp8Weights(w, one, form_b, fmt=weights.fmt),
+                interpret_on_cpu, dense=dense, contract="test_an_fp8_weight_product_holds_every_order")
         else:
             summed = gemm(rows, weights.unscaled(jnp.bfloat16), group_sizes, out_dtype=jnp.float32,
                           precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu)

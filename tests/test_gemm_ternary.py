@@ -14,11 +14,12 @@ import pytest
 from fla_gdn_support import KernelCase
 from generation_support import lowers
 from kernel_compile import compile_mosaic_kernels
+from low_precision_support import StageRef, decoded_weight_dot
 from reference_error import assert_as_exact
 
+from dew.nn import precision
 from dew.nn.kernels import formats, gemm, generation, grouped_matmul
 from dew.nn.kernels.templates.gemm import packed
-
 
 def test_ternary_weights_pack_decode_and_stage_match_bitwise():
     """`formats.TernaryWeights` packs 16 2-bit codes per uint32 word (`0->0`, `1->+1`, `2->-1`, `3->0`),
@@ -31,17 +32,8 @@ def test_ternary_weights_pack_decode_and_stage_match_bitwise():
     vals = np.asarray(packed_w.unscaled(jnp.float32))
     assert set(np.unique(vals)).issubset({-1.0, 0.0, 1.0})
 
-    class _Ref:
-        def __init__(self, arr):
-            self.arr = np.asarray(arr)
-        def __getitem__(self, key):
-            return jnp.asarray(self.arr) if key is Ellipsis else jnp.asarray(self.arr[key])
-        def __setitem__(self, key, val):
-            rows, sl = key
-            self.arr[rows, sl.start:sl.start + sl.size] = np.asarray(val)
-
-    out = _Ref(np.zeros((64, 256), dtype=jnp.bfloat16))
-    packed.stage_decoded_ternary([_Ref(packed_w.words)], out, interpret=True)
+    out = StageRef(np.zeros((64, 256), dtype=jnp.bfloat16))
+    packed.stage_decoded_ternary([StageRef(packed_w.words)], out, interpret=True)
     np.testing.assert_array_equal(np.asarray(out.arr.T, np.float32), vals)
 
     # Code 3 (0b11) decodes cleanly to 0.0.
@@ -66,19 +58,14 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
         scale = jnp.asarray(rng.uniform(0.5, 2.5, size=(64,)), jnp.float32)
         return x, formats.TernaryWeights.of(w, scale=scale)
 
-    def plain(x, weights, *, dtype=jnp.float32):
-        w_dec = (weights.decoded(jnp.float64) if dtype == jnp.float64
-                 else weights.decoded(jnp.bfloat16).astype(dtype))
-        return jax.lax.dot(x.astype(dtype), w_dec, preferred_element_type=dtype)
-
     for interpret in (False, True):
         def dew_fn(x, weights, *, interpret=interpret):
             return gemm.ternary_weight_product(x, weights, quantize_activations=False,
                                                out_dtype=jnp.float32, interpret_on_cpu=interpret)
 
-        assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, f"ternary_weight interp={interpret}",
-                        seeds=8, truth_fn=functools.partial(plain, dtype=jnp.float64))
-    # Grouped ternary product across scalar, per-column, per-group, and per-group-per-column scales.
+        assert_as_exact(jax.jit(dew_fn), jax.jit(decoded_weight_dot), draw,
+                        f"ternary_weight interp={interpret}",
+                        seeds=8, truth_fn=functools.partial(decoded_weight_dot, dtype=jnp.float64))
     rng = np.random.default_rng(1465)
     x_g = jnp.asarray(rng.integers(-3, 4, size=(64, 256)), jnp.bfloat16)
     w_g = jnp.asarray(rng.standard_normal((2, 256, 64)), jnp.float32)
@@ -97,7 +84,7 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
     x_bit = jnp.asarray(rng.standard_normal((32, 256)), jnp.bfloat16).at[0].set(0.0)
     w_bit = formats.TernaryWeights.of(jnp.asarray(rng.standard_normal((256, 64)), jnp.float32))
     absmax = jnp.max(jnp.abs(x_bit.astype(jnp.float32)), axis=-1)
-    act_scale = jnp.where(absmax > 0, absmax / 127.0, 1.0)
+    act_scale = jnp.where(absmax > 0, precision.divided(absmax, jnp.float32(127.0)), jnp.float32(1.0))
     x_q = jnp.clip(jnp.round(x_bit.astype(jnp.float32) / act_scale[:, None]), -128.0, 127.0)
     ref_bit = jax.lax.dot(x_q, w_bit.unscaled(jnp.float32), preferred_element_type=jnp.float32) * (
         act_scale[:, None] * w_bit.scale)
@@ -105,7 +92,7 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
         got_bit = gemm.ternary_weight_product(x_bit, w_bit, quantize_activations=True,
                                               out_dtype=jnp.float32, interpret_on_cpu=interpret)
         np.testing.assert_array_equal(np.asarray(got_bit[0]), np.zeros((64,), np.float32))
-        _, dx = jax.value_and_grad(lambda a: jnp.sum(gemm.ternary_weight_product(
+        _, dx = jax.value_and_grad(lambda a, interpret=interpret: jnp.sum(gemm.ternary_weight_product(
             a, w_bit, quantize_activations=True, out_dtype=jnp.float32, interpret_on_cpu=interpret)))(x_bit)
         assert np.all(np.isfinite(np.asarray(dx)))
         np.testing.assert_array_equal(np.asarray(got_bit), np.asarray(ref_bit))
@@ -122,7 +109,8 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
 
         with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"):
             records = compile_mosaic_kernels(
-                [KernelCase(f"ternary_weight_{gpu}", lambda: (compiled_ternary, (x_s, w_spec)))], gpu)
+                [KernelCase(f"ternary_weight_{gpu}",
+                            lambda fn=compiled_ternary, x=x_s, w=w_spec: (fn, (x, w)))], gpu)
         for rec in records:
             assert not rec.get("error"), rec
             assert rec["kernels"], rec
@@ -176,9 +164,9 @@ def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
     x = jnp.asarray(rng.integers(-3, 4, size=(13, 256)), jnp.bfloat16)
     w_raw = jnp.asarray(rng.integers(-2, 3, size=(256, 128)), jnp.float32)
     with generation.assumed("sm90"):
+        swapped_fp8 = tiling.Tiles(128, 64, 64, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
         for fmt in ("e4m3", "e5m2"):
             fp8_w = formats.Fp8Weights.of(w_raw, fmt=fmt, scale=0.5)
-            swapped_fp8 = tiling.Tiles(128, 64, 64, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
             with tuning.pinned({grouped_matmul.MosaicFp8PackedGmm: swapped_fp8}):
                 got = gemm.fp8_weight_product(x, fp8_w, out_dtype=jnp.float32, interpret_on_cpu=True)
             want = jax.lax.dot(x.astype(jnp.float32), fp8_w.decoded(jnp.float32),

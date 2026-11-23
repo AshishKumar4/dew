@@ -276,11 +276,15 @@ def options_of(flags: str) -> dict[str, str]:
 def graphs() -> bool:
     """Whether this process's XLA:GPU may run programs as command buffers: unless its XLA_FLAGS leave it
     none, each occurrence of the flag taken in turn as XLA's parser takes it (a list of kinds replacing the
-    one before it, a list of `+KIND`s and `-KIND`s amending it), XLA's defaults where no list is given."""
-    from dew._devices import xla_flag_values
-
+    one before it, a list of `+KIND`s and `-KIND`s amending it), XLA's defaults where no list is given. Read
+    here, not through `dew._devices`: the instrument loads by its path into an arm's process, whose Dew may be
+    a checkout that states none of its own reader (row 12063: an older baseline raised ImportError)."""
+    name = UNGRAPHED_FLAG.removesuffix("=")
     kinds: set[str] | None = None
-    for value in xla_flag_values(UNGRAPHED_FLAG.removeprefix("--").removesuffix("=")):
+    for token in os.environ.get("XLA_FLAGS", "").split():
+        named, _, value = token.partition("=")
+        if named != name:
+            continue
         listed = [kind.strip().upper() for kind in value.split(",") if kind.strip()]
         if not (listed and all(kind[0] in "+-" for kind in listed)):
             kinds = set(listed)

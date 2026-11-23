@@ -424,6 +424,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         if tile is None:
             return None
         return producers.settled(self, ba, tile, target)
+
     def _tile(self, ba, target) -> tiling.Tiles | None:
         return self._derived(ba, target)
 
@@ -446,6 +447,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         from .templates import report
         from .templates.gemm import producers
         return report.refused(self, ba, producers.settled(self, ba, config, target), target)
+
     def _derived(self, ba, target, admits=None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole
@@ -1448,11 +1450,13 @@ class MosaicPackedGmm(MosaicGmm):
                                           trans_rhs=trans_rhs, interpret=interpret, hooks=hooks,
                                           exact_sums=exact_sums, dense=dense, config=config, formats=formats,
                                           target=target)
-        # The matrix's words and scales the rows, decoded in registers (`_swaps_on`).
+        # The matrix's words (and block scales when NVFP4) as rows, decoded in registers (`_swaps_on`).
         return self._swapped_launch(kernel.words[0], tokens, sizes, out_dtype=out_dtype, interpret=interpret,
                                     exact_sums=exact_sums, config=config, target=target,
-                                    scales=kernel.scales[0], packed_rows=True, **formats)
+                                    packed_rows=True, **self._swapped_extra(kernel, formats))
 
+    def _swapped_extra(self, kernel, formats: dict) -> dict:
+        return {'scales': kernel.scales[0], **formats}
     def _registers(self, ba, config: tiling.Tiles, *, merging: bool, target) -> int | None:
         # Beside the plain product's live set, a step's decode holds a 128-depth group's words, the code
         # being decoded and the stage's block scales, each a `[columns, 16]` register tile over a role's
@@ -1476,52 +1480,43 @@ class MosaicFp8PackedGmm(MosaicPackedGmm):
     """`MosaicPackedGmm` of free-layout FP8 weights (`formats.Fp8Weights`, rows 8548, 5387): bfloat16 rows
     times staged uint32 FP8 words decoded inline, or swapped directly into `wgmma` registers on decode."""
     STEPS: ClassVar[tuple[int, ...] | None] = (packed.FP8_STEP, 2 * packed.FP8_STEP)
-
+    WEIGHT_BYTES: ClassVar[float] = 1.0
+    DEFAULT_FMT: ClassVar[str] = 'e4m3'
+    def _fmt(self, ba) -> str:
+        return getattr(ba.arguments['kernel'], 'fmt', self.DEFAULT_FMT)
     def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
         del trans_rhs
         return kernel.words, True, {'packed_fp8': kernel.fmt}
-
+    def _swapped_extra(self, kernel, formats: dict) -> dict:
+        del formats
+        return {'packed_fp8': kernel.fmt}
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
         from .templates.gemm import mosaic_gpu
-        dtype, rows = ba.arguments['tokens'].dtype, ba.arguments['packed_rows']
-        hooks = ba.arguments['hooks']
-        stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
+        dtype, rows, hooks = ba.arguments['tokens'].dtype, ba.arguments['packed_rows'], ba.arguments['hooks']
         return mosaic_gpu.gmm_allocations(
             config, family, dtype=dtype, rhs_dtype=dtype if rows else jnp.uint32, transpose_rhs=True,
             prologue_axes=(), prologue_dtypes=(), epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
-            dtypes=stored, packed_fp8=ba.arguments['kernel'].fmt, packed_rows=rows)
-
+            dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
+            packed_fp8=self._fmt(ba), packed_rows=rows)
     def _operand_bytes(self, ba, tile: tiling.Tiles) -> tuple[tuple[float, float], tuple]:
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
         rows_b, stage = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(kernel.dtype).itemsize
         if tile.swapped:
-            return (1.0, rows_b), ((0, 1), None)
+            return (self.WEIGHT_BYTES, rows_b), ((0, 1), None)
         copies = 1 if packed.shared_decode(tile, interpret=False) else tile.warpgroups
-        return (rows_b, 1.0), (None, (stage, copies))
-
-    def _launched_call(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                       gather, scatter, joined=None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
-                       hooks: Hooks, exact_sums: bool, dense: bool, config: tiling.Tiles, formats: dict,
-                       target):
-        if not config.swapped:
-            return MosaicGmm._launched_call(
-                self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first, gather,
-                scatter, joined, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret, hooks=hooks,
-                exact_sums=exact_sums, dense=dense, config=config, formats=formats, target=target)
-        return self._swapped_launch(kernel.words[0], tokens, sizes, out_dtype=out_dtype, interpret=interpret,
-                                    exact_sums=exact_sums, config=config, target=target, packed_rows=True,
-                                    packed_fp8=kernel.fmt)
-
-    def _registers(self, ba, config: tiling.Tiles, *, merging: bool, target) -> int | None:
+        return (rows_b, self.WEIGHT_BYTES), (None, (stage, copies))
+    def _decode_live(self, ba) -> int:
         from ...algebra import bits
+        return bits.fp8_form(packed.fp8_minifloat(self._fmt(ba)))[0].live
+    def _registers(self, ba, config: tiling.Tiles, *, merging: bool, target) -> int | None:
         from .templates import resources
-        form, _ = bits.fp8_form(packed.fp8_minifloat(ba.arguments['kernel'].fmt))
         share = config.block_m // config.warpgroups
         decoded = (2 * share * 16 + share * config.block_k // 2 if ba.arguments['packed_rows']
                    else 2 * config.block_n * 16)
         return _beside(MosaicGmm._registers(self, ba, config, merging=merging, target=target),
-                       decoded // resources.THREADS + form.live)
+                       decoded // resources.THREADS + self._decode_live(ba))
+
 @dataclasses.dataclass(frozen=True)
 class MosaicTgmm(_Mosaic):
     """`Tgmm` through the template's mainloop (`mosaic_gpu.tgmm`) on a GPU family's bundle or a TPU core's:

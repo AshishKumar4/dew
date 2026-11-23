@@ -285,22 +285,6 @@ def _nvfp4_lanes(words: jax.Array, layout) -> list[jax.Array]:
             for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
 
 
-def stage_decoded_fp8(words, out, fmt: str, interpret: bool, *, layout=None) -> None:
-    """Decode a stage of free-layout FP8 words (`[columns, 16]` uint32 per 64-depth group) into `out`
-    (`[columns, depth]` bfloat16) via `bits.E4M3_BFLOAT16_FORM` / `bits.E5M2_BFLOAT16_FORM` (row 8548)."""
-    minifloat = fp8_minifloat(fmt)
-    form, _ = bits.fp8_form(minifloat)
-    active = None if interpret else layout
-    for group, group_words in enumerate(words):
-        loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
-                                                                    optimized=False)
-        decoded = form.traced(loaded) if active is None else inline_forms.registers(form, loaded, active)
-        lanes_bf16 = [bits.fp8_restored(half, minifloat, jnp.bfloat16) for register in decoded
-                      for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
-        for code, lane in enumerate(lanes_bf16):
-            out[:, pl.ds(fp8_staged_depth(group, 0, code), 16)] = lane
-
-
 def _ternary_lane(loaded: jax.Array, code: int) -> jax.Array:
     code2 = (loaded >> jnp.uint32(2 * code)) & jnp.uint32(3)
     nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
@@ -309,35 +293,44 @@ def _ternary_lane(loaded: jax.Array, code: int) -> jax.Array:
     return jax.lax.bitcast_convert_type(f32_bits, jnp.float32).astype(jnp.bfloat16)
 
 
-def stage_decoded_ternary(words, out, interpret: bool, *, layout=None) -> None:
-    """Decode a stage of 2-bit packed BitNet b1.58 ternary words (`[columns, 16]` uint32 per 256-depth group)
-    into `out` (`[columns, depth]` bfloat16, exact `{-1, 0, +1}`, row 1464)."""
+def packed_lanes(words, fmt: str, interpret: bool, *, layout=None):
+    """Yield `(group, code, lane)` (`[columns, 16]` bfloat16) for free-layout FP8 (`e4m3`/`e5m2`) or
+    BitNet b1.58 `ternary` words (`stage_decoded_fp8`, `stage_decoded_ternary`, `rows_decoded_packed`)."""
     active = None if interpret else layout
+    if fmt == "ternary":
+        for group, group_words in enumerate(words):
+            loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
+                                                                        optimized=False)
+            for code in range(16):
+                yield group, code, _ternary_lane(loaded, code)
+        return
+    minifloat = fp8_minifloat(fmt)
+    form, _ = bits.fp8_form(minifloat)
     for group, group_words in enumerate(words):
         loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
                                                                     optimized=False)
-        for code in range(16):
-            out[:, pl.ds(ternary_staged_depth(group, 0, code), 16)] = _ternary_lane(loaded, code)
+        decoded = form.traced(loaded) if active is None else inline_forms.registers(form, loaded, active)
+        lanes_bf16 = [bits.fp8_restored(half, minifloat, jnp.bfloat16) for register in decoded
+                      for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
+        for code, lane in enumerate(lanes_bf16):
+            yield group, code, lane
+
+
+def stage_decoded_fp8(words, out, fmt: str, interpret: bool, *, layout=None) -> None:
+    """Decode a stage of free-layout FP8 words (`[columns, 16]` uint32 per 64-depth group) into `out`
+    (`[columns, depth]` bfloat16) via `bits.E4M3_BFLOAT16_FORM` / `bits.E5M2_BFLOAT16_FORM` (row 8548)."""
+    for group, code, lane in packed_lanes(words, fmt, interpret, layout=layout):
+        out[:, pl.ds(fp8_staged_depth(group, 0, code), 16)] = lane
+
+
+def stage_decoded_ternary(words, out, interpret: bool, *, layout=None) -> None:
+    """Decode a stage of 2-bit packed BitNet b1.58 ternary words (`[columns, 16]` uint32 per 256-depth group)
+    into `out` (`[columns, depth]` bfloat16, exact `{-1, 0, +1}`, row 1464)."""
+    for group, code, lane in packed_lanes(words, "ternary", interpret, layout=layout):
+        out[:, pl.ds(ternary_staged_depth(group, 0, code), 16)] = lane
 
 
 def rows_decoded_packed(words, fmt: str, interpret: bool, *, layout=None) -> jax.Array:
     """Decode packed FP8 or BitNet b1.58 ternary rows (`[64, 16]` uint32 per group) directly into register
     operand A (`[64, depth]` bfloat16 in `wgmma`'s fragment layout, zero SMEM staging, row 5387)."""
-    active = None if interpret else layout
-    slices: list[jax.Array] = []
-    if fmt == "ternary":
-        for group_words in words:
-            loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
-                                                                        optimized=False)
-            slices.extend(_ternary_lane(loaded, code) for code in range(16))
-        return jnp.concatenate(slices, axis=1)
-    minifloat = fp8_minifloat(fmt)
-    form, _ = bits.fp8_form(minifloat)
-    for group_words in words:
-        loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
-                                                                    optimized=False)
-        decoded = form.traced(loaded) if active is None else inline_forms.registers(form, loaded, active)
-        for register in decoded:
-            for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16)):
-                slices.append(bits.fp8_restored(half, minifloat, jnp.bfloat16))
-    return jnp.concatenate(slices, axis=1)
+    return jnp.concatenate([lane for _, _, lane in packed_lanes(words, fmt, interpret, layout=layout)], axis=1)
