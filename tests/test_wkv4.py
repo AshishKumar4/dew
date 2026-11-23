@@ -14,6 +14,7 @@ from test_recurrence_chunk import assert_packed_on_par, hosted
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.rwkv4 import recurrent_wkv4, wkv4
+from dew.nn.kernels.selection import KernelRefused
 
 ROWS, LENGTH, CHANNELS = 2, 70, 16
 DOCUMENTS = ((0, 23, 40), (9, 48))
@@ -138,3 +139,60 @@ def test_a_wkv_of_no_tokens_hands_its_carry_through(route):
     assert out.shape == key.shape
     np.testing.assert_array_equal(np.asarray(final), state)
     np.testing.assert_array_equal(np.asarray(dstate), state + 1.0)
+
+
+def test_the_kernels_take_keys_and_values_in_the_dtype_they_run_them_in():
+    """ReviewRecurrenceBatch's selector dtype: bf16 keys beside fp64 values under x64 run in their common
+    dtype, fp64, which the kernels do not take: named, the call is refused, where a selector reading the keys'
+    dtype alone took the kernels and ran values of 2^200 in fp32, infinite."""
+    channel = np.zeros((WIDE,), np.float64)
+    with jax.enable_x64(new_val=True):
+        key = jnp.zeros((ROWS, 9, WIDE), jnp.bfloat16)
+        value = jnp.full((ROWS, 9, WIDE), 2.0 ** 200, jnp.float64)
+        with pytest.raises(KernelRefused):
+            routed("kernels")(channel, channel, key, value, None, None)
+
+
+def test_a_document_at_the_last_token_cuts_the_final_maximums_cotangent():
+    """ReviewRecurrenceBatch's cut: a document starting at the last token, of value 2^100, under a final
+    numerator's cotangent of 2^100: the final maximum's cotangent net of the numerator's is past float32's
+    range, and every earlier span is cut from it, so every gradient but the last key's is finite, where the
+    cut multiplying it by zero made them NaN."""
+    rng = np.random.default_rng([1455, 3])
+    channel = rng.standard_normal((WIDE,)).astype(np.float32)
+    key = rng.standard_normal((ROWS, 150, WIDE)).astype(np.float32)
+    value = rng.standard_normal((ROWS, 150, WIDE)).astype(np.float32)
+    value[:, -1] = 2.0 ** 100
+    starts = np.zeros((ROWS, 150), bool)
+    starts[:, -1] = True
+    dfinal = np.zeros((ROWS, 3, WIDE), np.float32)
+    dfinal[:, 0] = 2.0 ** 100
+    state = np.stack([np.zeros((ROWS, WIDE)), np.ones((ROWS, WIDE)), np.zeros((ROWS, WIDE))], 1)
+    state = state.astype(np.float32)
+    _, dtime_decay, dtime_first, dkey, dvalue, dstate = jax.jit(differentiated(routed("kernels")))(
+        channel, channel, key, value, state, starts, (np.ones(key.shape, np.float32), dfinal))
+    for grad in (dtime_decay, dtime_first, dkey[:, :-1], dvalue, dstate):
+        assert np.isfinite(np.asarray(grad)).all()
+
+
+@pytest.mark.parametrize('route', list(ROUTES))
+def test_a_tie_of_the_running_maximum_splits_its_cotangent_as_jax_does(route):
+    """ReviewRecurrenceBatch's tie: a carry entering at a maximum of 0, a decay of -1 a token and every key
+    -1000 but the last, which ties the entering maximum aged over the call's 130 tokens (three spans): the
+    final maximum's unit cotangent goes half to the last key and half to the entering maximum, its half
+    aging it once a token to the decay (65), as JAX's `maximum` splits a tie, on both routes."""
+    time_decay = np.zeros((WIDE,), np.float32)
+    key = np.full((ROWS, 130, WIDE), -1000.0, np.float32)
+    key[:, -1] = -130.0
+    state = np.stack([np.zeros((ROWS, WIDE)), np.ones((ROWS, WIDE)), np.zeros((ROWS, WIDE))], 1)
+    state = state.astype(np.float32)
+    dfinal = np.zeros(state.shape, np.float32)
+    dfinal[:, 2] = 1.0
+    _, dtime_decay, _, dkey, _, dstate = differentiated(routed(route))(
+        time_decay, time_decay, key, np.zeros(key.shape, np.float32), state, np.zeros((ROWS, 130), bool),
+        (np.zeros(key.shape, np.float32), dfinal))
+    # The decay is -exp(time_decay), -1: its gradient is minus the decay's.
+    np.testing.assert_array_equal(np.asarray(dtime_decay), -65.0 * ROWS)
+    np.testing.assert_array_equal(np.asarray(dkey[:, -1]), 0.5)
+    np.testing.assert_array_equal(np.asarray(dkey[:, :-1]), 0.0)
+    np.testing.assert_array_equal(np.asarray(dstate[:, 2]), 0.5)

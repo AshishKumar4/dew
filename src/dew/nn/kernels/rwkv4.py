@@ -115,15 +115,18 @@ WKV4: Op[WkvCase] = Op(Choice.WKV4, (Kernel('mosaic_gpu', WKV4_SUPPORTS), Kernel
 the call, else the portable scan (`scanned`)."""
 
 
-def wkv4_kernel(key) -> str:
-    """The kernel the WKV's selector (`WKV4`) gives a call over `key` `[B, S, C]` on the target, reported as
-    its route."""
+def wkv4_kernel(key, value) -> str:
+    """The kernel the WKV's selector (`WKV4`) gives a call over `key` and `value` `[B, S, C]` on the target,
+    reported as its route: of the dtype the kernels run them in, their common one (a call's keys alone in
+    bf16 beside fp64 values under x64 took the kernels, which ran them in fp32, ReviewRecurrenceBatch)."""
     from .templates import bundles
 
+    dtype = jnp.dtype(jnp.result_type(key, value))
     on_gpu = generation.backend() == 'gpu'
-    bundled = on_gpu and bundles.of(generation.device_generation(), key.dtype) is not None
-    case = WkvCase(varying=bool(jax.typeof(key).mat.varying), dtype=jnp.dtype(key.dtype),
-                   channels=key.shape[-1], family=generation.family(generation.device_generation()) if bundled else None)
+    bundled = on_gpu and bundles.of(generation.device_generation(), dtype) is not None
+    family = generation.family(generation.device_generation()) if bundled else None
+    case = WkvCase(varying=bool(jax.typeof(key).mat.varying), dtype=dtype, channels=key.shape[-1],
+                   family=family)
     return select(WKV4, case).kernel
 
 
@@ -159,8 +162,8 @@ def wkv4(time_decay, time_first, key, value, state=None, starts=None):
         return manual_map(template, specs, (three, three))(*operands)
 
     # The decay and bonus (operands 0 and 1) are the call's parameters.
-    return _per_product(WKV4.bound(lambda product: wkv4_kernel(key)), run, time_decay, time_first, key, value,
-                        state, parameters=(0, 1))
+    return _per_product(WKV4.bound(lambda product: wkv4_kernel(key, value)), run, time_decay, time_first, key,
+                        value, state, parameters=(0, 1))
 
 
 def scanned(time_decay, time_first, key, value, state=None, starts=None):
