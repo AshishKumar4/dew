@@ -417,6 +417,23 @@ def test_the_low_rank_matrix_holds_on_this_gpu():
     run_cells(kernel_matrix.seeded_cells("low_rank"))
 
 
+def test_an_adapted_products_factor_gradients_hold_fp32_under_a_bf16_preset():
+    """An adapted product of fp32 rows under the BF16_BF16_F32 preset, which a GPU's dot takes: its factor
+    `a`'s gradient, `rowsᵀ · (scale · dy · bᵀ)`, keeps fp32's digits (`low_rank._kept`), so a row entry of
+    `1 + 2**-20`, which bf16 rounds to 1, reaches it: exactly float64's (row 12394)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    rows = jnp.zeros((8, 16), jnp.float32).at[0, 0].set(1.0 + 2.0 ** -20)
+    kernel, a = jnp.zeros((16, 8), jnp.float32), jnp.zeros((16, 4), jnp.float32)
+    b = jnp.zeros((4, 8), jnp.float32).at[0, 0].set(1.0)
+    _, pull = jax.vjp(lambda a_: low_rank(rows, kernel, a_, b, 1.0, out_dtype=jnp.float32,
+                                          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32), a)
+    (d_a,) = pull(jnp.zeros((8, 8), jnp.float32).at[0, 0].set(1.0))
+    want = np.zeros((16, 4), np.float32)
+    want[0, 0] = 1.0 + 2.0 ** -20
+    np.testing.assert_array_equal(np.asarray(d_a), want)
+
+
 def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide():
     """An adapted product of fp16 rows under the F16_F16_F32 dot preset, which a GPU's dot takes: an fp32
     cotangent of 2**16 against a 2**-10 kernel, and an fp16 one of 1 through a scale of 2**16 and a factor of

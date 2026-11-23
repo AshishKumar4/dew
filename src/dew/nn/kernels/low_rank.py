@@ -165,15 +165,15 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
 def _kept(precision: PrecisionLike) -> PrecisionLike:
     """`precision` for a product of fp32 operands: as given (a run's configured one where it states none),
     unless the dot algorithm it names keeps fewer of an fp32 operand's digits than fp32's
-    (`programs.dot_arithmetic`'s `digits`: an F16, BF16 or TF32 preset, or a `jax.lax.DotAlgorithm` of
-    such types), which would round them back to those, then `HIGHEST`."""
+    (`programs.dot_arithmetic`'s `digits`: an F16, BF16 or TF32 preset, a `jax.lax.DotAlgorithm` of such
+    types, or one JAX refuses fp32 operands for), which would round them back to those, then `HIGHEST`."""
     try:
         arithmetic = dot_arithmetic(effective_precision(precision), jnp.float32, jnp.float32)
-        narrow = arithmetic is not None and arithmetic.digits < jnp.finfo(jnp.float32).nmant + 1
     except ValueError:
-        # JAX's own refusal of fp32 operands for the algorithm (an FP8 preset takes FP8 operands alone), or
-        # one of products no split names (`DotArithmetic.parts`: an F8 X4's): it keeps no fp32 operand whole.
-        narrow = True
+        # JAX's own refusal of fp32 operands for the algorithm (an FP8 preset takes FP8 operands alone): it
+        # keeps no fp32 operand whole.
+        return jax.lax.Precision.HIGHEST
+    narrow = arithmetic is not None and arithmetic.digits < jnp.finfo(jnp.float32).nmant + 1
     return jax.lax.Precision.HIGHEST if narrow else precision
 
 
