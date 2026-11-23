@@ -62,6 +62,7 @@ from dew.training.memory import (
     LIMIT_EXIT,
     LiveSet,
     MemoryMiss,
+    admitted_or_missed,
     compile_limit,
     compiled_if_it_fits,
     local_devices,
@@ -815,11 +816,11 @@ class FitSearch[LossT, EffectsT]:
     live set (`LiveSet`), from which the split asked next at that rung is computed (`MemoryMiss`). The plan
     is the first rung of that order that fits, at the coarsest split seen to fit there: a head's tile or
     XLA's defaults, which recompute nothing, can fit below the remat rung settled, which a run states by
-    its rung (`--trainer.remat`, a head tile) or plans offline at each (`told`). What a rung keeps orders its
-    residuals, not XLA's allocated peak (a scanned delta decoder at four microbatches needed 31.71 MB
-    recomputing all but its scans and convolutions and 32.14 MB recomputing them too, a heavier rung needing
-    more), so no rung is passed over for one above or below it on a figure; the log names every rung asked
-    with what it needed.
+    its rung (`--trainer.fit.remat`, a head tile) or plans offline at each (`told`). What a rung keeps
+    orders its residuals, not XLA's allocated peak (a scanned delta decoder at four microbatches needed
+    31.71 MB recomputing all but its scans and convolutions and 32.14 MB recomputing them too, a heavier
+    rung needing more), so no rung is passed over for one above or below it on a figure; the log names every
+    rung asked with what it needed.
     Each compile that misses names the split asked next (`after`); `resumed`, a checkpoint's rung, is
     warned of where it misses; where nothing fits it raises with the closest candidate's numbers. The
     objective is left at the plan's rung. A miss read from JAX's persistent cache states its live set as
@@ -846,7 +847,7 @@ class FitSearch[LossT, EffectsT]:
     """What the step may recompute (`FitPolicy.remat`): "auto" its whole ladder, "selective" short of each
     module's whole recomputation, "none" and "full" its start's remat alone, its head's rungs above it."""
     probes: list[Probe] = dataclasses.field(default_factory=list)
-    refusals: list[RuntimeError] = dataclasses.field(default_factory=list)
+    refusals: list[Exception] = dataclasses.field(default_factory=list)
     lowered: dict[tuple[int, str], Candidate] = dataclasses.field(default_factory=dict)
     gather: Callable[[object], list] = from_every_process
     """How every process's figure is read (`from_every_process`), so each asks the same split."""
@@ -887,6 +888,9 @@ class FitSearch[LossT, EffectsT]:
     asked: list[Rung] = dataclasses.field(default_factory=list)
     """The rungs its search asked past the one it stood on first (`searched`), which a plan made offline
     asks none of again (`below`)."""
+    holding: set[Hashable] = dataclasses.field(default_factory=set)
+    """The executables it held for the process (`dew.nn.kernels.options.hold`), by key: each a plan may
+    step on, until the search settles and drops every one but its plan's (`released_unplanned`)."""
     kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
     found spilling (`report.misses`, `spill_record`), each launch config they refused
@@ -907,6 +911,37 @@ class FitSearch[LossT, EffectsT]:
         # step's own (`options`) are made; the target's own policy is the compile point's
         # (`report.targeted`).
         self.required = compiler_options() or None
+
+    def released_unplanned(self, planned: Planned | None, *, settled: bool = False) -> None:
+        """Drop what the search kept of every program it compiled but the plan's, now it settled on
+        `planned`: each executable it held but the plan's step's and its sampled step's (`unhold`), and each
+        traced step it kept for a refit but the plan's (`dew.training._candidates.forget_unplanned`), every
+        losing rung's and every frontier rung's (`above`, `below`) among them. A loaded executable holds its
+        device code and, over several GPUs, its collectives' room outside XLA's pool for as long as it lives
+        (row 12131: 24 kept beside a 4B run's step left an all-reduce no room on a 2xH100). A provisional
+        search keeps them, for the plan made on the devices as they stand to take (`provisional`), until a
+        plan is taken in its place (`settled`): its own, or the one a search on the placed devices made,
+        whose programs it then keeps where it compiled them too; none (`planned` None), every one dropped (a
+        later phase's search its run abandoned, `dew.training.ahead.LaterPlans`)."""
+        if self.provisional and not settled:
+            return
+        from dew.training._candidates import forget_unplanned
+
+        if planned is None:
+            for key in self.holding:
+                unhold(key)
+            self.holding.clear()
+            forget_unplanned([candidate.lowered for candidate in self.lowered.values()], None)
+            return
+        sampled = planned.sampled
+        lowered = [planned.candidate.lowered, *([] if sampled is None or sampled.lowered is None
+                                                 else [sampled.lowered])]
+        stepped = {self.compiled_key(program, planned.options) for program in lowered}
+        for key in self.holding - stepped:
+            unhold(key)
+        self.holding &= stepped
+        forget_unplanned([candidate.lowered for candidate in self.lowered.values()],
+                         planned.candidate.lowered)
 
     def past_selective(self) -> bool:
         """Whether a "selective" run's climb has put a module at the top of its ladder (`remat_topped`), its
@@ -1064,7 +1099,8 @@ class FitSearch[LossT, EffectsT]:
             looked = self.compiled_key(candidate.lowered, options)
             kept = held(looked)
             if ahead is not None:
-                executable, self.ahead = ahead.taken(candidate.lowered), None
+                executable, self.ahead = admitted_or_missed(lambda: ahead.taken(candidate.lowered),
+                                                            self.refusals), None
             elif candidate.sampled is None and kept is not None:
                 executable, taken = kept, True
             else:
@@ -1087,6 +1123,7 @@ class FitSearch[LossT, EffectsT]:
                 # directly, the spill's refusal held for the process. One that misses on the devices the
                 # step runs on is no step's, its device code held for nothing.
                 hold(key, executable)
+                self.holding.add(key)
             elif kept is not None and executable is kept and not fit and not self.provisional:
                 unhold(key)
             self.sampled = None
@@ -1096,7 +1133,10 @@ class FitSearch[LossT, EffectsT]:
                     # (`handed`), which its target compiles none of.
                     with handed(ahead):
                         sampled = candidate.sampled()
-                    self.sampled = SampledStep(sampled, ahead.sampled.taken(sampled, jax.devices()))
+                    sampled_ahead = ahead.sampled
+                    loaded = admitted_or_missed(lambda: sampled_ahead.taken(sampled, jax.devices()),
+                                                self.refusals)
+                    self.sampled = None if loaded is None else SampledStep(sampled, loaded)
                 else:
                     # The one compiled beside the step's, but where the step was lowered afresh past a spill,
                     # which its sampled step is then too, as one lowered after the step's compile would be.

@@ -452,6 +452,29 @@ def a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
     assert set(alone.prune_errors()) == set(norm.autotuning_configs)
 
 
+def a_pulled_launch_is_timed_with_its_backward():
+    """The selective scan's launch measured on this GPU (`tuning._measured`) as a gradient calls it (its op
+    pulled, `KernelOp.moded`) and as a forward alone: every config's timed kernels hold its backward's
+    (`selective_scan_backward`) pulled and none forward, so a pulled pick weighs the backward its tokens a
+    thread and residency set (row 12340: the tuner timed the forward alone)."""
+    from dew.nn.kernels.templates import report
+    from dew.nn.kernels.templates.recurrence import selective
+
+    rows, length, channels, states = 2, 2048, 1024, 16
+    specs = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+    with report.pulled():
+        pulled = selective.SELECTIVE.moded()
+    assert pulled.pulled
+    for op, backward in ((selective.SELECTIVE, False), (pulled, True)):
+        timings = tuning._measured(op, op.keyed(op.bind(*specs)))
+        ran = {config: any("selective_scan_backward" in name for name in timed.metadata["kernels"])
+               for config, timed in timings.items() if not isinstance(timed, Exception)}
+        assert ran and set(ran.values()) == {backward}, (op.pulled, ran)
+
+
 TWO_CPU_MEASURE = """
 import json, os, threading, time
 os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:2])

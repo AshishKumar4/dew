@@ -483,6 +483,38 @@ def test_a_hash_holdout_publishes_the_rows_its_stream_reads():
     assert sorted(published) == [(index, index * 10) for index in part] and 0 < len(part) < 20
 
 
+@dataclass(frozen=True)
+class ReadsAsked(Memory):
+    """Rows held in memory that note each read a pass asks of them (`reads`)."""
+
+    reads: list[str] = field(default_factory=list, compare=False)
+
+    def records(self, read):
+        self.reads.append(read)
+        return super().records(read)
+
+
+@pytest.mark.parametrize("stated", [None, "indexed"])
+def test_a_publication_and_an_export_read_a_chain_as_it_asks_else_as_its_sources_choose(stated):
+    """A publication and an export of a chain that names no read take the one its chain asks
+    (`Pipeline.read`), else the one its sources choose (`held_read`, memory for rows held in memory), as a
+    run's compile does: one rule, never a publication's own `streamed` beside it (Train 1237's review: a
+    publication read every chain streamed, its `.read()` aside)."""
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+    from dew.data.sinks import passed
+
+    source = ReadsAsked([{"id": np.int32(index)} for index in range(6)])
+    chain = Pipeline(source) if stated is None else Pipeline(source).read(stated)
+    want = stated or "memory"
+    publish(chain.map(lambda row: {**row, "tag": row["id"] * 2}, identity="tag@1"), _cache())
+    # The pass reads as decided, never streamed: what the decision probes (`_preferred_read`) beside it.
+    assert want in source.reads and "streamed" not in source.reads, source.reads
+    source.reads.clear()
+    assert len(list(passed(chain))) == 6, source.reads
+    assert want in source.reads and "streamed" not in source.reads, source.reads
+
+
 @pytest.mark.parametrize("changed", ["chunk overlap", "source", "fewer steps"])
 def test_a_generation_reads_in_place_of_the_steps_it_ran_and_of_no_others(changed):
     """A published generation reads in place of the source and steps it was published from, as

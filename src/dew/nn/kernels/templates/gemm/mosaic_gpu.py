@@ -127,7 +127,7 @@ class Allocations:
         `rewritten`, its streams' slots rewritten by its family's own role (`persist`'s `prepared`), whose
         publish barriers `persist` scopes too."""
         consumers = tiles.warpgroups
-        staging = tuple(family.output_staging(self.outputs, consumers))
+        staging = tuple(family.output_staging(self.outputs, consumers, tiles.staging))
         rewrites = tuple(tiles.stages for _ in self.blocks) if rewritten else ()
         persisted, addresses = family.persist_scratch(consumers, rewrites, pingpong=tiles.pingpong)
         streams = family.streams(self.blocks, tiles.stages, tiles.sharing,
@@ -595,6 +595,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            accumulators=(part,) * accumulators, **_summed(family, tiles, exact_sums),
                            producer=tiles.producers.of(GMM),
                            **({'pingpong': True} if tiles.pingpong else {}),
+                           chunks=tiles.stated(allocations.outputs, family),
                            **_prologue_rewrite(rewritten, family, prologue, (prologue_axes, prologue_gmems),
                                                (stepped, read, fixed), (fixed_smems, fixed_barriers), g))
         family.scoped(scope, *allocations.staged,
@@ -2204,7 +2205,9 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=unrolled, accumulators=(part,),
-                           producer=tiles.producers.of(TGMM), **_summed(family, tiles, exact_sums),
+                           producer=tiles.producers.of(TGMM),
+                           chunks=tiles.stated(allocations.outputs, family),
+                           **_summed(family, tiles, exact_sums),
                            **_stage_rewrite(rewritten, family, starts_gmem, ends_gmem, block_k))
 
         family.scoped(scope, *allocations.staged,

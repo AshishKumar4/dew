@@ -1000,7 +1000,9 @@ def test_a_split_launchs_span_is_its_longest_slice(form, queries, keys, consumer
     split = _split_work(form, queries, keys, consumers, family, splits)
     unsplit = _split_work(form, queries, keys, consumers, family, 1)
     assert split.span == span
-    assert form != "causal" or split.integer_operations > 0
+    # Each side of a share counted at all: a launch whose work dropped a unit held 0 >= 0 (row 12012).
+    assert unsplit.flops > 0 and unsplit.exponentials > 0
+    assert form != "causal" or min(split.integer_operations, unsplit.integer_operations) > 0
     for unit in cost.ISSUED_UNITS:
         shares = getattr(split, unit) * steps[1], getattr(unsplit, unit) * steps[0]
         assert shares[0] == shares[1] if unit in ("flops", "exponentials") else shares[0] >= shares[1], unit
@@ -1154,3 +1156,264 @@ def test_one_row_decode_split_k_keeps_sm_utilization_and_per_slice_stage_depth()
             jnp.zeros(q8.shape, q8.dtype), k8, k8, template.spans(1, 4096, 8, causal=False),
             template.Hooks())
         assert work8 is not None and work8["plain"].config.stages > plan1.config.stages, (work8, plan1)
+
+
+def _query_gated(o, q_p):
+    """An output hook of a `Kind.QUERY` parameter, its tile's `[rows, 1]` query values (row 5385's shape)."""
+    assert o.ndim == 2 and q_p.ndim == 2 and q_p.shape == (o.shape[0], 1)
+    return o * jax.nn.sigmoid(q_p[:, :1])
+
+
+@INTERPRETS
+@pytest.mark.parametrize("kind", ["stateless", "head", "query", "output"])
+@pytest.mark.parametrize("mode", ["single", "split"])
+def test_a_decode_step_fuses_output_hooks_single_slice_and_split_interpreted(kind, mode):
+    """Row 5385: `attention_decode.attend` admits and fuses `output_mod` (`stateless`, `Kind.HEAD`,
+    `Kind.QUERY`, and `Kind.OUTPUT` bf16 gate) on both single-slice (`at.slices == 1`, fused in
+    `MosaicForward`) and split-KV (`at.slices > 1`, fused in `merged.merged_finished`) GQA decode steps,
+    matching `template.reference` under check 1, and rejects `finished=False` or unsupported kinds."""
+    batch, positions, heads, kv_heads, width = (2, 2, 8, 2, 64) if mode == "single" else (1, 1, 8, 2, 64)
+    keys = 256 if mode == "single" else 2048
+    lengths = jnp.asarray([200, 37] if batch == 2 else [1700], jnp.int32)
+    starts = jnp.asarray([0, 16] if batch == 2 else [0], jnp.int32)
+    spans = template.spans(positions, keys, batch, lengths=lengths, starts=starts)
+    sinks = jnp.linspace(-0.5, 0.5, heads, dtype=jnp.float32)
+    initial = template.sinks(sinks, batch, positions, width)
+
+    def draw(seed: int):
+        rng = np.random.default_rng([5385, seed])
+        q = jnp.asarray(rng.normal(size=(batch, positions, heads, width)), jnp.bfloat16)
+        k = jnp.asarray(rng.normal(size=(batch, keys, kv_heads, width)) * 0.5, jnp.bfloat16)
+        v = jnp.asarray(rng.normal(size=(batch, keys, kv_heads, width)), jnp.bfloat16)
+        if kind == "stateless":
+            return q, k, v
+        if kind == "head":
+            return q, k, v, jnp.asarray(rng.normal(size=(heads,)), jnp.float32)
+        if kind == "query":
+            return q, k, v, jnp.asarray(rng.normal(size=(batch, heads, positions)), jnp.float32)
+        return q, k, v, jnp.asarray(rng.normal(size=(batch, positions, heads, width)), jnp.bfloat16)
+
+    def hooks_of(*extra):
+        if kind == "stateless":
+            return template.Hooks(initial=initial, output_mod=lambda o: jnp.tanh(o * 0.5))
+        if kind == "head":
+            return template.Hooks(initial=initial, output_mod=lambda o, h: o * jax.nn.sigmoid(h.reshape(())),
+                                  output_params=(template.Param(extra[0], template.Kind.HEAD),))
+        if kind == "query":
+            return template.Hooks(initial=initial, output_mod=_query_gated,
+                                  output_params=(template.Param(extra[0], template.Kind.QUERY),))
+        return template.Hooks(initial=initial, output_mod=lambda o, g: o * jax.nn.sigmoid(g),
+                              output_params=(template.Param(extra[0], template.Kind.OUTPUT),))
+
+    def ours(q, k, v, *extra):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(q, k, v, spans, hooks_of(*extra), interpret=True)
+
+    def reference(q, k, v, *extra):
+        hooks = hooks_of(*extra)
+        wide = jnp.promote_types(q.dtype, jnp.float32)
+        wide_params = tuple(
+            template.Param(p.value.astype(jnp.promote_types(p.value.dtype, wide))
+                           if jnp.issubdtype(p.value.dtype, jnp.floating) else p.value, p.kind)
+            for p in hooks.output_params)
+        return template.reference(q, k, v, spans, dataclasses.replace(hooks, output_params=wide_params))
+
+    sample = draw(0)
+    assert attention_decode.packable(hooks_of(*sample[3:]))
+    with generation.assumed("sm90"):
+        work, *_ = attention_decode.planned(sample[0], sample[1], sample[2], spans, hooks_of(*sample[3:]))
+    assert work is not None
+    assert (work["plain"].slices == 1 if mode == "single" else work["plain"].slices > 1), work
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    f"template decode output hook {mode} {kind}", seeds=SEEDS)
+
+    if kind == "output" and mode == "single":
+        assert not attention_decode.packable(
+            template.Hooks(output_params=(template.Param(sample[3], template.Kind.OUTPUT),)))
+        assert not attention_decode.packable(
+            template.Hooks(output_mod=lambda o, x: o + x,
+                           output_params=(template.Param(jnp.zeros((batch, heads, keys)),
+                                                         template.Kind.KEY),)))
+        with generation.assumed("sm90"), pytest.raises(ValueError):
+            attention_decode.attend(sample[0], sample[1], sample[2], spans, hooks_of(*sample[3:]),
+                                    interpret=True, finished=False)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
+def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name):
+    """Row 5385: bf16 gated decode steps (`Kind.OUTPUT` bf16 gate + sinks) compile spill-free on
+    sm80/sm90/sm100/sm120 for both batched single-slice and one-row split-KV, with split-KV carrying
+    `output_mod` directly on the `merged_padded` primitive."""
+    from fla_gdn_support import KernelCase
+    from jax.core import ShapedArray
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn import programs
+    from dew.nn.kernels.templates import merged
+
+    def mod(o, g):
+        return o * jax.nn.sigmoid(g)
+
+    cases = []
+    for label, batch, keys, expect_split in (("single", 32, 256, False), ("split", 1, 4096, True)):
+        q = jax.ShapeDtypeStruct((batch, 1, 8, 128), jnp.bfloat16)
+        k = jax.ShapeDtypeStruct((batch, keys, 2, 128), jnp.bfloat16)
+        g = jax.ShapeDtypeStruct((batch, 1, 8, 128), jnp.bfloat16)
+        spans = template.spans(1, keys, batch, causal=False)
+        sinks = jnp.zeros((8,), jnp.float32)
+
+        def step(q_in, k_in, v_in, g_in, *, b=batch, sp=spans, sk=sinks):
+            hooks = template.Hooks(
+                initial=template.sinks(sk, b, 1, 128), output_mod=mod,
+                output_params=(template.Param(g_in, template.Kind.OUTPUT),))
+            return attention_decode.attend(q_in, k_in, v_in, sp, hooks, interpret=False)
+
+        with generation.assumed(generation_name):
+            traced = jax.make_jaxpr(step)(q, k, k, g)
+            merge_eqns = [eq for eq in programs.equations(traced.jaxpr)
+                          if eq.primitive is merged.merged_padded_p]
+            if expect_split:
+                assert len(merge_eqns) == 1 and merge_eqns[0].params.get("output_mod") is mod, merge_eqns
+        cases.append(KernelCase(label, lambda s=step, args=(q, k, k, g): (s, args)))
+    if generation_name == "sm90":
+        qh = jax.ShapeDtypeStruct((32, 1, 8, 128), jnp.bfloat16)
+        kh = jax.ShapeDtypeStruct((32, 256, 2, 128), jnp.bfloat16)
+        hv = jax.ShapeDtypeStruct((8,), jnp.float32)
+        qv = jax.ShapeDtypeStruct((32, 8, 1), jnp.bfloat16)
+        sp_h = template.spans(1, 256, 32, causal=False)
+
+        def head_mod(o, h_p):
+            assert h_p.shape == ()
+            return o * jax.nn.sigmoid(h_p)
+
+        for label, param_v, param_kind, fn in (
+            ("single-head", hv, template.Kind.HEAD, head_mod),
+            ("single-query", qv, template.Kind.QUERY, _query_gated),
+        ):
+            def deferred(q_in, k_in, v_in, p_in, *, pk=param_kind, mod_fn=fn):
+                hooks = template.Hooks(output_mod=mod_fn, output_params=(template.Param(p_in, pk),))
+                return attention_decode.attend(q_in, k_in, v_in, sp_h, hooks, interpret=False)
+
+            with generation.assumed("sm90"):
+                traced_h = jax.make_jaxpr(deferred)(qh, kh, kh, param_v)
+                merge_h = [eq for eq in programs.equations(traced_h.jaxpr)
+                           if eq.primitive is merged.merged_padded_p]
+                assert len(merge_h) == 1 and merge_h[0].params.get("output_mod") is fn, merge_h
+                padded_aval = merge_h[0].invars[0].aval
+                assert isinstance(padded_aval, ShapedArray) and padded_aval.shape[1] == 1
+            cases.append(KernelCase(label, lambda s=deferred, args=(qh, kh, kh, param_v): (s, args)))
+
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels(cases, generation_name)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+def test_softcap_folds_into_base2_and_decode_segments_interior_tiles():
+    """Row 4045: bounded `Capped(softcap)` folds `scale/softcap` and `softcap * LOG2E` into base-2 log2 units
+    (`spec.base2=True`, `spec.reaches=False`, using 1-op `exp2` instead of 10-op `exp`), while `natural=True`
+    or degenerate caps stay natural; `_Program.segmented` clips empty interior runs (`raw_start > raw_end`)
+    without revisiting edge tiles and splits windowed spans into `(masked, unmasked, masked)`."""
+    from dew.nn.kernels.templates import attention_mosaic_program as program
+
+    class _ShiftedCapped(template.Capped):
+        def __call__(self, s, q_pos, k_pos):
+            return super().__call__(s, q_pos, k_pos) + 1.0
+
+    cap = template.Capped(30.0)
+    spec_fold = algebra.Forward("spans", 32768, ids=False, scale=64 ** -0.5, score_mod=cap, natural=False)
+    spec_nat = algebra.Forward("spans", 32768, ids=False, scale=64 ** -0.5, score_mod=cap, natural=True)
+    spec_zero = algebra.Forward("spans", 32768, ids=False, scale=64 ** -0.5,
+                                score_mod=template.Capped(0.0), natural=False)
+    spec_sub = algebra.Forward("spans", 32768, ids=False, scale=64 ** -0.5,
+                               score_mod=_ShiftedCapped(30.0), natural=False)
+    assert spec_fold.base2 and not spec_fold.reaches and not spec_fold.raw
+    assert not spec_nat.base2 and not spec_zero.base2 and not spec_sub.base2
+    # Subclass of `Capped` keeps its overridden `__call__` instead of folding.
+    q_pos = jnp.zeros((2, 2), jnp.int32)
+    coords = algebra.Coords(q_pos, q_pos, (), None, None)
+    raw_s = jnp.ones((2, 2), jnp.float32)
+    sub_logits = algebra.logits_of(spec_sub, raw_s, coords, masked=False)[0]
+    ref_sub = _ShiftedCapped(30.0)(raw_s * float(np.float32(64 ** -0.5)), q_pos, q_pos)
+    np.testing.assert_array_equal(np.asarray(sub_logits), np.asarray(ref_sub))
+    # Native `MosaicForward` wraps `score_mod` in `tuning.Prepared`; folding must unwrap it.
+    q_s = jax.ShapeDtypeStruct((1, 1, 8, 64), jnp.bfloat16)
+    k_s = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.bfloat16)
+    sp_s = template.spans(1, 4096, 1, lengths=jnp.array([4096], jnp.int32))
+    op_cap, _ = attention_mosaic._forward_call(
+        q_s, k_s, k_s, sp_s, template.Hooks(cap), scale=64 ** -0.5, natural=False)
+    prepared_spec = algebra.Forward("spans", 4096, ids=False, scale=64 ** -0.5,
+                                    score_mod=op_cap.score_mod, natural=False)
+    assert prepared_spec.base2 and not prepared_spec.reaches and not prepared_spec.raw
+    assert attention_mosaic.MosaicForward.revision == 2
+
+    with generation.assumed("sm90"):
+        family = program.layouts("sm90", jnp.bfloat16, 4)[0]
+        tiles = attention_mosaic.Tiles(16, 64, 2, 1, family=family.name)
+        prog = program._Program(family, tiles, 64, 2, 4096, causal=False, queries=4, per_span=4)
+        # Empty interior (start=16, end=37 inside tile 0 -> full_lo=1 > full_hi=0) visits tile 0 once.
+        segs_empty = prog.segmented(lambda *a, **kw: None, (jnp.int32(1), jnp.int32(0)),
+                                    jnp.int32(0), jnp.int32(1))
+        assert [(int(s), int(e)) for _, s, e in segs_empty] == [(0, 1), (1, 1), (1, 1)]
+        # Windowed span [1000, 4096) at block_k=64: tile 15 masked, tiles [16, 64) unmasked, tail empty.
+        segs_win = prog.segmented(lambda *a, **kw: None, (jnp.int32(16), jnp.int32(64)),
+                                  jnp.int32(15), jnp.int32(64))
+        assert [(int(s), int(e)) for _, s, e in segs_win] == [(15, 16), (16, 64), (64, 64)]
+
+
+def test_a_folded_cap_and_a_state_resumed_at_it_hold_one_logit():
+    """A saturated key's folded logit under `Capped(c)` (`logits_of`, base 2) is the logit a state resumed
+    at a natural maximum `c` takes (`resumed`, `base2_maximum`), bit for bit: `Capped(32768 + 2^-10)`, whose
+    cap is 32768 in fp32, folded its base-2 cap from float64 an ulp above the state's, so a key of value 1
+    over a state of mass 1 and sum -1 at that maximum gave 0.00135 where the two cancel to 0 (the head
+    review of 7188133e84a, F3)."""
+    cap = template.Capped(32768 + 2.0 ** -10)
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, score_mod=cap, natural=False)
+    assert spec.base2
+    places = jnp.zeros((1, 1), jnp.int32)
+    saturated = algebra.logits_of(spec, jnp.full((1, 1), 2.0 ** 30, jnp.float32),
+                                  algebra.Coords(places, places, (), None, None), masked=False)[0]
+    state = algebra.resumed(spec, jnp.full((1,), 32768.0), jnp.ones((1,)), -jnp.ones((1, 1)))
+    np.testing.assert_array_equal(np.asarray(saturated)[0], np.asarray(state.m))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
+def test_softcap_and_windowed_decode_compile_spill_free(generation_name):
+    """Row 4045: base-2 folded `Capped(30.0)` and statically unmasked interior decode tiles compile
+    spill-free across sm80/sm90/sm100/sm120 on the softcap d64 (`32 x 32768`), windowed (`128 x 4096`,
+    `starts=3072`), and d256 softcap prefill (`ET-PINSOFT`) shapes."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    q_soft = jax.ShapeDtypeStruct((32, 1, 32, 64), jnp.bfloat16)
+    k_soft = jax.ShapeDtypeStruct((32, 32768, 8, 64), jnp.bfloat16)
+    sp_soft = template.spans(1, 32768, 32, lengths=jnp.full((32,), 32768, jnp.int32))
+    hk_soft = template.Hooks(template.Capped(30.0))
+
+    q_win = jax.ShapeDtypeStruct((128, 1, 32, 128), jnp.bfloat16)
+    k_win = jax.ShapeDtypeStruct((128, 4096, 8, 128), jnp.bfloat16)
+    sp_win = template.spans(1, 4096, 128, lengths=jnp.full((128,), 4096, jnp.int32),
+                            starts=jnp.full((128,), 3072, jnp.int32))
+
+    q_pre = jax.ShapeDtypeStruct((1, 1024, 16, 256), jnp.bfloat16)
+    k_pre = jax.ShapeDtypeStruct((1, 1024, 4, 256), jnp.bfloat16)
+    sp_pre = template.spans(1024, 1024, 1, causal=True)
+
+    def soft_decode(q, k, v):
+        return attention_decode.attend(q, k, v, sp_soft, hk_soft, interpret=False)
+
+    def win_decode(q, k, v):
+        return attention_decode.attend(q, k, v, sp_win, None, interpret=False)
+
+    def soft_prefill(q, k, v):
+        return attention_mosaic.forward(q, k, v, sp_pre, hk_soft, natural=False)
+
+    cases = [
+        KernelCase("softcap-d64-decode", lambda: (soft_decode, (q_soft, k_soft, k_soft))),
+        KernelCase("windowed-d128-decode", lambda: (win_decode, (q_win, k_win, k_win))),
+        KernelCase("softcap-d256-prefill", lambda: (soft_prefill, (q_pre, k_pre, k_pre))),
+    ]
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels(cases, generation_name)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)

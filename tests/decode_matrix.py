@@ -121,7 +121,7 @@ class _Paged(nn.Module):
 def _step(case: dict[str, str], *, reference: bool):
     """`case`'s step: a dense one's output and its gradients under `dout`, a paged one's output, through its
     choice's route at its kernel (`generation.chosen`) or the reference path."""
-    lengths = jnp.asarray(LENGTHS, jnp.int32)
+    lengths = np.asarray(LENGTHS, np.int32)
 
     def step(*operands):
         if reference:

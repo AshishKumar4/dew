@@ -287,14 +287,19 @@ def seen_by_every_process(directory: str) -> list[bool]:
     `directory` (made if absent): whether they all read it as one directory, on a filesystem they
     share, rather than each on a disk of its own."""
     mark = os.path.join(directory, f".dew-shared-{broadcast_from_process_zero(os.urandom(8).hex())}")
-    if jax.process_index() == 0:
-        os.makedirs(directory, exist_ok=True)
-        with open(mark, "w"):
-            pass
-    from_every_process(None)  # every process looks once the mark is written
+
+    def written() -> None:
+        if jax.process_index() == 0:
+            os.makedirs(directory, exist_ok=True)
+            with open(mark, "w"):
+                pass
+
+    # Process 0's write agreed, so a write it cannot make (a read-only or full disk) raises on every
+    # process rather than leaving them waiting for a mark that never lands (row 12176); its removal alike.
+    agreed("the shared directory's mark", written)
     seen = from_every_process(os.path.exists(mark))
-    if jax.process_index() == 0:
-        os.remove(mark)
+    agreed("the shared directory's mark removed",
+           lambda: os.remove(mark) if jax.process_index() == 0 else None)
     return seen
 
 

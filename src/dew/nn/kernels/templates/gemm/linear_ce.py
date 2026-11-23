@@ -197,6 +197,8 @@ def linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *, tiles: Til
     if x.ndim != 2 or weight.ndim != 2 or targets.ndim != 1:
         raise ValueError(f"linear_ce expects 2D x/weight and 1D targets, got "
                          f"{x.shape}, {weight.shape}, {targets.shape}")
+    if tiles.staging is not None:
+        raise ValueError(f"linear_ce stages its summaries at its family's own chunks, not {tiles.staging}")
     m, k = x.shape
     v, kw = weight.shape if transpose_rhs else (weight.shape[1], weight.shape[0])
     if kw != k or targets.shape[0] != m:
@@ -433,7 +435,7 @@ class MosaicLinearCE(TilesTemplate):
         target = generation.gpu_target()
         bound = self.bind(x, weight, targets, bias, transpose_rhs=transpose_rhs, softcap=softcap,
                           round_logits=round_logits, interpret=interpret)
-        mp = config.cluster if interpret else unit_cost.wave(target, config.programs)
+        mp = config.cluster if interpret else unit_cost.wave(target.multiprocessors, config.programs)
         regs = self.registers(bound, config, target)
         shared = regs and self.staged_bytes(bound, config, target)
         out = linear_ce(x, weight, targets, tiles=config, transpose_rhs=transpose_rhs, bias=bias,

@@ -3,8 +3,8 @@ its own, run in one process (`gpu_flow`), each cell its own file's property, eac
 own:
 
 - The tuner measures only on an explicit pass to itself, each launch once; a config failing for more than
-  its shared memory stops the measurement; a launch measured beside a profile capture keeps its heuristic
-  (test_tuning).
+  its shared memory stops the measurement; a launch measured beside a profile capture keeps its heuristic; a
+  gradient's launch is timed with its backward (test_tuning).
 - A GPU window past CUPTI's activity cap reports no device figure its kernels cannot establish
   (test_profile).
 - A fused attention counts the pairs its mask computes, with and without a window; a run prepared on a GPU
@@ -40,6 +40,8 @@ def test_a_runs_systems_read_this_gpu(tmp_path_factory):
              tuning.a_config_failing_for_more_than_its_shared_memory_stops_the_measurement),
         Cell("a launch measured beside a profile capture keeps its heuristic",
              in_own(tuning.a_launch_measured_beside_a_profile_capture_keeps_its_heuristic, "capture")),
+        Cell("a pulled launch is timed with its backward",
+             in_own(tuning.a_pulled_launch_is_timed_with_its_backward, "pulled")),
         Cell("a launch's measurement compiles its candidates in the process's compile slots",
              in_own(tuning.a_launchs_measurement_compiles_its_candidates_in_the_processs_compile_slots,
                     "slots")),

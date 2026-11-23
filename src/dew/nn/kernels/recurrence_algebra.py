@@ -1348,7 +1348,9 @@ def selective_decay(step, rate, kept=None):
     `a` (`selective_token`, `selective_adjoint`), which the scan's schedules take a token or a block of
     tokens at a time (`templates.recurrence.selective`). The rate is taken to base 2 after the step
     multiplies it, so a rate past float32's range times a padded token's zero step is zero, not `0 * -inf`
-    (row 8491: A = -3 2^126 made `A log2(e)` -inf and a padded token's decay NaN)."""
+    (row 8491: A = -3 2^126 made `A log2(e)` -inf and a padded token's decay NaN), and a step past it times
+    a small rate its decay: the step taken to base 2 first, `dt = 3 2^126` overflowed, `A = -2^-126`
+    decaying to 0 for `exp(-3)` and `A = 0` to NaN for 1 (mamba1b's review)."""
     decay = jnp.exp2((step * rate) * LOG2_E)
     return decay if kept is None else decay * kept
 
