@@ -50,6 +50,7 @@ import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
 import pytest
+import syrk_matrix
 import test_contracts_gemm as contracts_gemm
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
@@ -128,51 +129,6 @@ def a_fused_projection_trains_its_producer_and_epilogue():
                         "fused projection producer and epilogue update", seeds=8, truth_fn=reference)
 
 
-def native_syrk_holds_check_1_on_this_gpu(polynomial: bool, transpose: bool):
-    """Native Mosaic SYRK (`gemm.symmetric_gram` / `gemm.symmetric_polynomial`) holds check 1 forward and
-    backward at production widths against XLA dot_general from float64 truth (rows 11941, 5972)."""
-    from dew import newton_schulz as ns
-    from dew.nn.kernels import gemm
-
-    shape = (2, 256, 256) if polynomial else ((2, 512, 256) if transpose else (2, 256, 512))
-    coeffs_host = np.asarray(ns.NEWTON_SCHULZ, np.float32)
-
-    def draw(seed):
-        rng = np.random.default_rng(11941 + seed)
-        arr = rng.normal(size=shape) / np.sqrt(shape[-1])
-        if polynomial:
-            arr = 0.5 * (arr + np.swapaxes(arr, -1, -2))
-        return (arr.astype(jnp.bfloat16), rng.normal(size=(2, 256, 256)).astype(jnp.bfloat16))
-
-    def run_dew(x, cot):
-        def fn(a):
-            if polynomial:
-                return gemm.symmetric_polynomial(a, jnp.asarray(coeffs_host, jnp.float32))
-            return gemm.symmetric_gram(a, transpose=transpose)
-
-        with generation.chosen(grouped_matmul="mosaic"):
-            y, pull = jax.vjp(fn, x)
-            return y, pull(cot)[0]
-
-    def run_plain(x, cot, *, dtype=jnp.float32, out_dtype=jnp.bfloat16):
-        def fn(a):
-            if polynomial:
-                sq = jax.lax.dot_general(a, a, (((2,), (1,)), ((0,), (0,))), preferred_element_type=dtype)
-                c = jnp.asarray(coeffs_host, dtype)
-                return (c[0] * jnp.eye(256, dtype=dtype) + c[1] * a.astype(dtype) + c[2] * sq).astype(
-                    out_dtype)
-            axis = 1 if transpose else 2
-            return jax.lax.dot_general(a, a, (((axis,), (axis,)), ((0,), (0,))),
-                                       preferred_element_type=dtype).astype(out_dtype)
-
-        y, pull = jax.vjp(fn, x.astype(out_dtype))
-        return y, pull(cot.astype(out_dtype))[0]
-
-    assert_as_exact(jax.jit(run_dew), jax.jit(run_plain), draw,
-                    f"native syrk poly={polynomial} tr={transpose}", seeds=4,
-                    truth_fn=functools.partial(run_plain, dtype=jnp.float64, out_dtype=jnp.float64))
-
-
 def native_hopper_cluster2_balanced_tail_holds_check_1():
     """Native Hopper `cluster=2` dense forward with a verified nonempty balanced `Tail` holds check 1
     against XLA dot_general from float64 truth at Qwen3.5-4B q dX outlier shape (row 10151)."""
@@ -202,12 +158,13 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
 
 def _syrk_and_tail_cells():
     return [
-        *(Cell(f"native Mosaic SYRK holds check 1: {name} poly={poly} tr={tr}",
-               functools.partial(native_syrk_holds_check_1_on_this_gpu, poly, tr), name,
-               fault="native SYRK upper-triangle mirror store (row 11941)" if not poly and not tr else None,
-               native={"launch": "syrk", "poly": str(poly), "transpose": str(tr)})
-          for name in ("sm90", "sm80")
-          for poly, tr in ((False, False), (False, True), (True, False))),
+        *(Cell(f"native Mosaic SYRK holds check 1: {name} poly={form == 'polynomial'} "
+               f"tr={form == 'gram-transposed'}",
+               functools.partial(syrk_matrix.a_symmetric_product_is_on_par, (name, form)), name,
+               fault="native SYRK upper-triangle mirror store (row 11941)" if form == "gram" else None,
+               native={"launch": "syrk", "poly": str(form == "polynomial"),
+                       "transpose": str(form == "gram-transposed")})
+          for name, form in syrk_matrix.CASES),
         Cell("native Hopper cluster=2 balanced tail holds check 1",
              native_hopper_cluster2_balanced_tail_holds_check_1, "sm90", fault=BALANCED_TAIL,
              native={"launch": "cluster2 tail", "pass": "forward"}),

@@ -374,7 +374,7 @@ def jit(function: Callable[P, R], **arguments: Unpack[JitArguments]) -> OuterPro
 module kernels  [dew.kernels]
   class KernelRefused(choice: str, kernel: str, first: Refusal, rest: Iterator[Refusal]) -> None  [dew.nn.kernels.selection]
     .refusals: property -> list[Refusal]
-  choices = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gated_delta_rule', 'gated_mlp', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'linear_ce', 'low_rank', 'mxfp8', 'narrow_copies', 'nvfp4', 'nvfp4_block', 'paged_decode', 'qkv', 'rms_norm', 'selective_scan', 'short_conv', 'sparse_attention', 'ssd', 'swiglu'})
+  choices = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gated_delta_rule', 'gated_mlp', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'linear_ce', 'low_rank', 'mxfp8', 'narrow_copies', 'nvfp4', 'nvfp4_block', 'paged_decode', 'qkv', 'rms_norm', 'selective_scan', 'short_conv', 'sparse_attention', 'ssd', 'swiglu', 'syrk'})
   def use(**kernels: str) -> Iterator[None]  [dew.nn.kernels.generation]
 def pipeline(source: str, *, mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, dtype: DTypeLike | None = None, param_dtype: DTypeLike | Literal['auto'] | None = None, ema: bool | None = None, step: int | str | None = None, revision: str | None = None, trust: Sequence[str] = (), options: SourceOptions | None = None, precision: Numerics | str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask  [dew.inference.loading]
 def register(name: str, /) -> Callable[[M], M]  [dew.registry]

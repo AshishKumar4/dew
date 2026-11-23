@@ -238,6 +238,7 @@ class Choice(enum.StrEnum):
     SPARSE_ATTENTION = 'sparse_attention'
     SSD = 'ssd'
     SWIGLU = 'swiglu'
+    SYRK = 'syrk'
 
 
 CHOICES = frozenset(choice.value for choice in Choice)

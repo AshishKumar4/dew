@@ -453,7 +453,7 @@ class SyrkCase:
     precision_ok: bool = True
     measured: bool = False
 
-SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
+SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.SYRK, (
     selection.Kernel('mosaic', (
         selection.Requirement(
             'dtype', lambda case: case.dtype in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)),
@@ -477,8 +477,9 @@ SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
             'launch', lambda case: case.call.eligible('mosaic'),
             "no legal square super-tile holds this symmetric product on the target", SYRK_ROW))),
     selection.Kernel('xla', (), generic=True)))
-"""Symmetric Gram/polynomial selector (`symmetric_gram`, `symmetric_polynomial`): Mosaic SYRK once measured
-or when chosen by name (`generation.chosen(grouped_matmul='mosaic')`), else XLA."""
+"""Symmetric Gram/polynomial selector (`symmetric_gram`, `symmetric_polynomial`), its own choice (`syrk`, row
+12485): Mosaic SYRK once measured or when chosen by name (`generation.chosen(syrk='mosaic')`), else XLA;
+naming the grouped products' kernel (`grouped_matmul`) leaves Muon's products alone."""
 
 
 def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: bool, conjugate: bool,
