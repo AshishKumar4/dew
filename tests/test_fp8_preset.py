@@ -98,12 +98,13 @@ def test_a_projection_takes_the_recipe_for_its_role_alone(role):
     with generation.run_precision(Numerics("bf16-mixed")):
         own = layer.apply(params, x)
     [route] = [route for route in found if route.choice == "blockwise_fp8"]
+    out, own = (np.asarray(value) for value in (out, own))
     assert out.dtype == own.dtype == jnp.bfloat16
     if role in (() if FP8.low_precision is None else FP8.low_precision.roles):
-        assert route.kernel != "unquantized" and not np.array_equal(np.asarray(out), np.asarray(own))
+        assert route.kernel != "unquantized" and not np.array_equal(out, own)
     else:
         assert route.refusal is not None and route.refusal.code == "kept_role", route
-        np.testing.assert_array_equal(np.asarray(out), np.asarray(own))
+        np.testing.assert_array_equal(out, own)
 
 
 def test_a_grouped_output_projection_takes_the_recipe_group_by_group():
