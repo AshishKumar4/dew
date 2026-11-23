@@ -610,13 +610,13 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers", "loop_remat", "remat")
+    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers", "loop_remat")
     """The model and source fields, by name, that say how a model's layers execute and not what they
     compute or store: a decoder's runs under one scan or a layer at a time hold the same layers on disk
     (`layers_N`) and compute the same step, so a run resumes under either (`check_resume`), as it does
-    with a looped block's passes recomputed in its backward or held (`loop_remat`), and with its layers
-    recomputed or held (`remat`), the rung a fit's ladder climbed to where its step did not fit (a checkpoint
-    of a climbed step records it, and a resume climbs there as it compiles: memory alone). A source's
+    with a looped block's passes recomputed in its backward or held (`loop_remat`), memory alone. A model's
+    own fields that say how it runs, its recompute (`remat`) among them, are its class's to mark
+    (`dew._records.RUNS`), which a resume reads by its class (`registry.computing_fields`). A source's
     weights packed or decoded (`SourceOptions.packed_weights`) are not: packed, its banks are no trainable
     parameters and hold no optimizer moments, so a resume across them is refused by name."""
 

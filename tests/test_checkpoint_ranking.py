@@ -9,6 +9,7 @@ import math
 from collections.abc import Iterator
 from typing import ClassVar
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -20,6 +21,7 @@ from recording import RecordingTracker
 from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking, _Laid
 from dew.data.dataset import DataPartition
+from dew.nn.backbones.decoder_block import RematPolicy
 from dew.objectives.base import Aux, Objective, Shown
 from dew.scores import Summary
 from dew.telemetry.records import FitEnded
@@ -1230,6 +1232,44 @@ def test_a_resume_under_another_loss_setting_is_refused_as_a_fresh_run_beside_it
     with pytest.raises(ValueError):
         lm(tmp_path / "model").fit(lm_data(), steps=1)
     assert int(lm(tmp_path / "model", z_loss=1e-4).fit(lm_data(), steps=1).step) == 1
+
+
+class RecomputedAsItComputes(nn.Module):
+    """A model of its own whose `remat` says what it computes, which it marks no `dew._records.RUNS`."""
+
+    features: int = 2
+    remat: bool = False
+
+    @nn.compact
+    def __call__(self, inputs):
+        return nn.Dense(self.features)(inputs) * (2 if self.remat else 1)
+
+
+@pytest.mark.parametrize("before, after, refused", [
+    ({"remat": None}, {"remat": RematPolicy()}, []),
+    ({"num_layers": 1}, {"num_layers": 2}, ["model.fields.num_layers"]),
+    ({}, {}, []),
+], ids=["a-decoders-recompute", "a-decoders-depth", "alike"])
+def test_a_checkpoint_resumes_across_what_a_models_class_marks_as_how_it_runs_alone(before, after, refused):
+    """A checkpoint's model and this run's differ in what they compute only where its class says so: a
+    decoder's recompute (`remat`), which its class marks as how it runs (`dew._records.RUNS`), resumes (row
+    12135: a step a fit's ladder climbed was refused), its depth does not; and a model of its own whose field
+    of that name says what it computes is refused across it, never resumed by the field's name alone
+    (review of row 12135: every record's `remat` was dropped)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import ModelConfig, to_record
+    from dew.training.startup import differing_records
+
+    def inference(model) -> dict:
+        return {"model": to_record(ModelConfig.from_model(model), ModelConfig)}
+
+    def decoder(**fields):
+        return CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                                 mlp_features=32, max_seq_len=4, **fields)
+
+    assert differing_records(inference(decoder(**before)), inference(decoder(**after)), None, None) == refused
+    own = [inference(RecomputedAsItComputes(remat=remat)) for remat in (False, True)]
+    assert differing_records(*own, None, None) == ["model.fields.remat"]
 
 
 def test_a_rows_length_and_the_context_it_derives_are_no_computation_a_resume_holds():

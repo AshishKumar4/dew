@@ -480,7 +480,12 @@ def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...],
     path = None if directory is None else directory / code_digest(__name__) / f"{fingerprint.hex()}.json"
     found = None if path is None else read_kept(path)
     if isinstance(found, dict):
-        return Collectives.of(found, gpus)
+        # A record kept that does not read as positions in this assignment (a position past it or no
+        # integer, a field missing) is a miss, read again from the program.
+        try:
+            return Collectives.of(found, gpus)
+        except (IndexError, KeyError, TypeError, ValueError) as unread:
+            _log.info("a program's kept communicators are read again from its text: %s", unread)
     positions = collectives_of(program(), tuple(range(len(gpus)))).to_json()
     if path is not None:
         keep(path, positions, "a program's communicators")

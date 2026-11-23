@@ -301,6 +301,26 @@ def test_a_programs_communicators_are_kept_under_the_digest_of_their_readers_cod
         groups=frozenset({(0, 1), (2, 3)}))
 
 
+@pytest.mark.parametrize("written", [
+    {"groups": [[0, 7]], "exchanges": [], "permutes": []},
+    {"groups": [["first", 1]], "exchanges": [], "permutes": []},
+    {"groups": [[0, 1]], "exchanges": []},
+    {"groups": 4, "exchanges": [], "permutes": []},
+], ids=["position-past-the-assignment", "no-integer", "a-field-missing", "no-list"])
+def test_a_kept_record_that_reads_as_no_communicators_is_read_again_from_the_program(
+        compilation_cache, written):
+    """A program's communicators kept under this code's digest that do not read as positions in its device
+    assignment (a position past it, none an integer, a field missing) are a miss: read again from the
+    program's text and kept anew, never ending its admission (review of row 12018's kept records)."""
+    kept = compilation_cache / "dew-communicators" / str(code_digest("dew.communicators"))
+    kept = kept / f"{b'step'.hex()}.json"
+    kept.parent.mkdir(parents=True)
+    kept.write_text(json.dumps(written))
+    step = Collectives(groups=frozenset({(0, 1), (2, 3)}))
+    assert communicators.collectives_kept(b"step", (0, 1, 2, 3), lambda: STEP) == step
+    assert Collectives.of(json.loads(kept.read_text()), (0, 1, 2, 3)) == step
+
+
 def test_a_record_kept_beside_a_cache_it_cannot_write_is_made_again_and_its_miss_logged(
         compilation_cache, tmp_path, monkeypatch, caplog):
     """Every record Dew keeps beside its caches (`dew._cache.kept_beside`, `keep`): a program's
