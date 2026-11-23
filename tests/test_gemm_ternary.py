@@ -394,6 +394,29 @@ def test_a_packed_products_transpose_holds_in_a_checked_map_linear_transpose_and
     np.testing.assert_array_equal(np.asarray(nothing), np.zeros((16, 256), np.float32))
 
 
+def test_a_packed_products_input_gradient_differentiates_in_its_scale():
+    """A packed ternary product's input gradient, `(cotangent @ codesᵀ) * scale`, has the plain transpose's
+    derivative in its scale, `cotangent @ codesᵀ`, at a scale of 3 and at 2**126, where cotangents against
+    +1 and -1 codes cancel past fp32's largest (its value 0, its derivative the cancelling sum's, 0, where
+    they cancel, and the code sum elsewhere); a scale held still contributes no term of its own (row 1464)."""
+    rng = np.random.default_rng(14640)
+    codes = jnp.asarray(rng.integers(-1, 2, (256, 32)), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
+    weights = formats.TernaryWeights.of(codes, scale=jnp.float32(1.0))
+    x = jnp.asarray(rng.integers(-3, 4, (16, 256)), jnp.float32)
+    cotangent = jnp.asarray(rng.integers(-3, 4, (16, 32)), jnp.float32).at[0, :2].set(4.0)
+
+    def input_gradient(scale):
+        scaled = dataclasses.replace(weights, scale=scale)
+        product = functools.partial(gemm.ternary_weight_product, weights=scaled, quantize_activations=False,
+                                    out_dtype=jnp.float32)
+        return jax.vjp(product, x)[1](cotangent)[0]
+
+    want = np.asarray(cotangent, np.float64) @ np.asarray(codes, np.float64).T
+    for scale in (3.0, 2.0 ** 126):
+        _, derivative = jax.jvp(input_gradient, (jnp.float32(scale),), (jnp.float32(1.0),))
+        np.testing.assert_array_equal(np.asarray(derivative), want.astype(np.float32), err_msg=str(scale))
+
+
 def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
     """Skinny decode products (`M=13`) for `Fp8Weights` (`e4m3`/`e5m2`) and `TernaryWeights` decode
     directly into `wgmma` register operand A (`packed_rows=True`, zero SMEM staging), matching the decoded

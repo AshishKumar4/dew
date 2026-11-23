@@ -45,7 +45,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
-from jax.custom_derivatives import zero_from_primal
+from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
 from dew.algebra import bits
 from dew.nn import float_bits
@@ -940,27 +940,44 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
         partial = partial.astype(jnp.float32)
         return partial, tuple(sorted(jax.typeof(partial).mat.varying - held))
 
-    @jax.custom_jvp
-    def transposed(cotangent, scale, ran):
-        # A row's factor past 1 as its significand and its power of two (a scale of a row, `[rows, 1]`, or of
-        # all, `[1]` or `[]`, broadcasting against the rows' gradient alike); at most 1, itself and none.
-        binade = float_bits.binade_of(scale)
-        power = jnp.where((jnp.abs(scale) > 1) & (binade < 128), binade, 0)
-        partial, excess = pulled(cotangent * power2(scale, -power), ran)
-        if excess and not jax.typeof(power).mat.varying & set(excess):
-            # Every device's partial at the one power the factor shares, summed, then moved.
-            return power2(jax.lax.psum(partial, excess), power)
-        partial = power2(partial, power)
+    def summed(partial, excess):
         return jax.lax.psum(partial, excess) if excess else partial
 
-    @transposed.defjvp
-    def _transposed_tangent(primals, tangents):
-        # Its derivatives the plain transpose's, `cotangent * scale` pulled back, which a higher order reads:
-        # its moved power is the value's alone.
-        cotangent, scale, ran = primals
-        d_cotangent, d_scale, _ = tangents
-        partial, excess = pulled(d_cotangent * scale + cotangent * d_scale, ran)
-        return transposed(cotangent, scale, ran), jax.lax.psum(partial, excess) if excess else partial
+    def transposed_value(cotangent, scale, ran):
+        # The plain transpose, the cotangent times its factor pulled back; where an entry of it is past
+        # fp32's largest, the factor past 1 as its significand in the cotangent and its power of two
+        # (`precision.power2`) after the sum (a scale of a row, `[rows, 1]`, or of all, `[1]` or `[]`,
+        # broadcasting against the rows' gradient alike), after every device's sum where it is replicated.
+        plain = summed(*pulled(cotangent * scale, ran))
+
+        def moved():
+            binade = float_bits.binade_of(scale)
+            power = jnp.where((jnp.abs(scale) > 1) & (binade < 128), binade, 0)
+            partial, excess = pulled(cotangent * power2(scale, -power), ran)
+            if excess and not jax.typeof(power).mat.varying & set(excess):
+                rescued = power2(summed(partial, excess), power)
+            else:
+                rescued = summed(power2(partial, power), excess)
+            return jnp.where(jnp.isfinite(plain), plain, rescued)
+
+        # The moved pullback where the plain one is not finite alone: each device of a sum decides alike,
+        # the plain transpose summed over its axes.
+        return jax.lax.cond(jnp.all(jnp.isfinite(plain)), lambda: plain, moved)
+
+    def transposed_tangent(ran, primals, tangents):
+        # Its derivatives the plain transpose's, `cotangent * scale` pulled back, every term of a perturbed
+        # operand alone (a scale held still meets no cotangent of its own: an infinite one is no NaN).
+        (cotangent, scale), (d_cotangent, d_scale) = primals, tangents
+        terms = [*(() if isinstance(d_cotangent, SymbolicZero) else (d_cotangent * scale,)),
+                 *(() if isinstance(d_scale, SymbolicZero) else (cotangent * d_scale,))]
+        value = transposed(cotangent, scale, ran)
+        if not terms:
+            return value, jnp.zeros_like(value)
+        return value, summed(*pulled(functools.reduce(jnp.add, terms), ran))
+
+    transposed = contracted("test_a_ternary_weight_product_holds_every_order")(
+        declared_tangent(KernelGlue(), transposed_value, transposed_tangent, nondiff_argnums=(2,),
+                         symbolic_zeros=True))
 
     def pullback(residuals, cotangent):
         scale, ran = residuals
