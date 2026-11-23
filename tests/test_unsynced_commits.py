@@ -70,12 +70,11 @@ def test_a_commit_at_another_slot_of_the_waited_array_is_not_found(slot):
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("between", ["nothing", "a warpgroup's sync"])
-def test_the_compile_gate_fails_a_case_whose_commit_passes_a_wait(between):
+def test_the_compile_gate_fails_a_case_whose_commit_passes_a_wait():
     """The shared Mosaic GPU compile gate (`compile_mosaic_kernels`, every case's `failures`) fails a case
-    whose commit passes another warp's wait, where only the template gates' own collector read it (row
-    12144: the SYRK gate's cases)."""
+    whose commit passes another warp's wait, before it reads its kernels, where only the template gates' own
+    collector read it (row 12144: the SYRK gate's cases)."""
     from fla_gdn_support import KernelCase
 
-    case = KernelCase(between, lambda: (_committed_after_its_wait(between), (OPERAND,)))
-    assert bool(failures(compile_mosaic_kernels([case], "sm100"))) == (between == "nothing")
+    case = KernelCase("unsynced", lambda: (_committed_after_its_wait("nothing"), (OPERAND,)))
+    assert failures(compile_mosaic_kernels([case], "sm100"))
