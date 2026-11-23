@@ -232,6 +232,53 @@ def _registry() -> _Registry:
     return _SCOPE.get() or _PROCESS
 
 
+@dataclasses.dataclass(eq=False)
+class Reading:
+    """The refusals a trace reads (`reading`): those in effect as it began, and those it records itself
+    since (a launch it certifies inline, its derivation stepping past its own refusal), never another
+    thread's, recorded into the registry it shares as it traces (theme K01-e's review P0: a held jit's
+    trace at a new shape read another scope's refusal, which JAX's trace cache then held for its own).
+    A `frozen` one takes none of its own: a refusal recorded within it ends its trace (`ReadingRefused`)."""
+    refused: dict[tuple[str, Hashable], frozenset[Refused]]
+    frozen: bool = False
+    by_launch: dict[str, frozenset] = dataclasses.field(default_factory=dict)
+
+
+class ReadingRefused(BaseException):
+    """A refusal recorded within a frozen reading (`reading`'s `frozen`: a held jit's trace), recorded into
+    the registry: the trace ends here, before JAX's trace cache takes the program the refusal would make
+    under the refusals its jit is held for, and its caller traces afresh by a jit of its own (theme K01-e's
+    review P0: a held jit's trace, its cached program dropped, recorded an inline refusal, read it, and its
+    cache kept the refusal's program for every call it answered). Not an `Exception`: no handler on the way
+    takes it for a launch's failure."""
+
+
+_READING: contextvars.ContextVar[Reading | None] = _cache.untraced(
+    contextvars.ContextVar("refusals_read", default=None))
+"""The `reading` a trace in this context reads its refusals from, None outside one."""
+
+
+@contextlib.contextmanager
+def reading(entries: tuple, *, frozen: bool = False) -> Iterator[Reading]:
+    """A trace's reads of the refusals (`refusals_of`, `refusal_entries`) answered from `entries` (a
+    `refusal_entries` snapshot) and those it records itself within, for as long as it traces; `frozen`, none
+    of its own, a refusal recorded within it ending its trace (`ReadingRefused`). One within a frozen one is
+    frozen too: a trace inside a held jit's makes part of its program."""
+    outer = _READING.get()
+    frozen = frozen or (outer is not None and outer.frozen)
+    held = Reading({(identity, config): kernels for identity, config, kernels in entries}, frozen)
+    token = _READING.set(held)
+    try:
+        yield held
+    finally:
+        _READING.reset(token)
+
+
+def current_reading() -> Reading | None:
+    """The `reading` a trace in this context reads its refusals from, None outside one."""
+    return _READING.get()
+
+
 class Exhausted(ValueError):
     """A derivation that finds no config left for a launch (`base.Unfitted`): a relowering after a spill
     that ends so refuses the program (`compiled`), which no compile keeps spilling."""
@@ -481,7 +528,7 @@ def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]
     refusals, the one way a trace reads
     them (`traced_fact`), so a trace kept past a refusal of another launch holds."""
     with _GUARD:
-        registry = _registry()
+        registry = _READING.get() or _registry()
         if (found := registry.by_launch.get(identity)) is None:
             found = registry.by_launch[identity] = frozenset(
                 (config, kernels) for (launch, config), kernels in registry.refused.items()
@@ -852,12 +899,6 @@ def settling() -> Iterator[None]:
         settlement.ended()
 
 
-def _refused_before(op, arguments: tokamax.BoundArguments) -> bool:
-    """Whether `op`'s launch of `arguments` had a config refused in this context (`refused_launches`)."""
-    identity = _identity(op, arguments, generation.gpu_target())
-    return any(refused == identity for refused, _, _ in refused_launches())
-
-
 @contextlib.contextmanager
 def targeting(mesh: jax.sharding.Mesh) -> Iterator[None]:
     """Within the block, a trace outside any mesh certifies as one under `mesh` does (`_certifying_device`):
@@ -918,7 +959,9 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
             taken.reporting.append(reporting)
     if taken is not None:
         return ()
-    if aside is not None and not _refused_before(op, arguments) and _traced_for(device):
+    # A launch a config of which was refused here is certified now; asked of its own refusals alone, so a
+    # trace held past another launch's refusal holds (row 12167).
+    if aside is not None and not refusals_of(key[0]) and _traced_for(device):
         # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
         # compiled aside (`capture`), the block's end settling it (`_settled_aside`), once a block.
         aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, [reporting])
@@ -1351,8 +1394,9 @@ def refusal_entries() -> tuple[tuple[str, Hashable, frozenset[Refused]], ...]:
     one is another than a process without it traces (`traced_fact`): a trace's key holds them, roles and
     all (`options.held_context`)."""
     with _GUARD:
-        return tuple(sorted(((identity, config, kernels)
-                             for (identity, config), kernels in _registry().refused.items()), key=repr))
+        refused = (_READING.get() or _registry()).refused
+        return tuple(sorted(((identity, config, kernels) for (identity, config), kernels in refused.items()),
+                            key=repr))
 
 
 def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
@@ -1366,8 +1410,11 @@ def refuse(entries) -> None:
     `Refused`, or a pair a decoded record gives as a list; a kernel by its name alone states none) refused in
     this context, as a compile's spill refuses it. A handed plan seeds these inside its own `refusals` scope,
     not unioned with unrelated decisions that the receiving process already holds."""
+    refused_within = False
     for identity, config, kernels in entries:
-        _record((identity, config), None, frozenset(map(_refused, kernels)))
+        refused_within |= _entered((identity, config), None, frozenset(map(_refused, kernels)))[1]
+    if refused_within:
+        raise ReadingRefused(tuple(entries))
 
 
 def _refused(kernel) -> Refused:
@@ -1487,36 +1534,57 @@ def _joined(kernels: frozenset[Refused]) -> frozenset[Refused]:
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
             kernels: frozenset[Refused] = frozenset()) -> bool:
+    """`_entered`'s, its refusal ending a frozen reading's trace where it adds to the reading's refusals
+    (`ReadingRefused`); whether `miss` is new."""
+    new, refused_within = _entered(refusal, miss, kernels)
+    if refused_within:
+        raise ReadingRefused(refusal)
+    return new
+
+
+def _entered(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
+             kernels: frozenset[Refused] = frozenset()) -> tuple[bool, bool]:
     """`refusal` and `miss` recorded; whether `miss` is new to this context's registry. A miss is recorded
     once a holder, the registry and each `recording` open: a launch's derivation asked again (its route's
     eligibility, then its call, `tuning.KernelOp.taken`) reads its certification back and finds the same
     misses, and a recording opened since the first (a later plan's admission, `planning.admitted`) holds
-    the misses its own trace meets, those the process met before among them."""
-    registry = _registry()
+    the misses its own trace meets, those the process met before among them. Beside it, whether `refusal`
+    adds to a frozen reading's refusals (`reading`), which ends its trace; one it holds already does not, so
+    a held jit's trace refusing again what it read goes on."""
+    registry, read = _registry(), _READING.get()
+    refused_within = False
     with _GUARD:
         if refusal is not None:
-            registry.refused[refusal] = _joined(registry.refused.get(refusal, frozenset()) | kernels)
-            registry.by_launch.pop(refusal[0], None)
-        if miss is None:
-            return False
-        new = miss not in registry.missed
-        _add(missed=(miss,))
-        return new
+            if read is not None and read.frozen:
+                held = read.refused.get(refusal, frozenset())
+                refused_within = _joined(held | kernels) != held
+            # Into the registry, and the reading a trace here reads, which reads its own (`reading`).
+            for held in (registry, None if read is None or read.frozen else read):
+                if held is not None:
+                    held.refused[refusal] = _joined(held.refused.get(refusal, frozenset()) | kernels)
+                    held.by_launch.pop(refusal[0], None)
+        new = miss is not None and miss not in registry.missed
+        if miss is not None:
+            _add(missed=(miss,))
+    return new, refused_within
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
-             relower: Callable[[], jax.stages.Lowered], first: "Attempt | None" = None
-             ) -> jax.stages.Compiled:
+             relower: Callable[[], jax.stages.Lowered], first: "Attempt | None" = None,
+             kept_from: list[jax.stages.Lowered] | None = None) -> jax.stages.Compiled:
     """`lowered` compiled (`kept`), its communicators admitted against the room the process's pool left
     them before it runs (`dew.communicators.admit`): every program Dew compiles passes here. `first` is
-    its first compile where another thread made it (`attempts`)."""
-    executable = kept(lowered, options, relower=relower, first=first)
+    its first compile where another thread made it (`attempts`); `kept_from` given, the lowering the kept
+    executable was compiled from is appended to it (`settled`'s)."""
+    executable = kept(lowered, options, relower=relower, first=first, kept_from=kept_from)
     communicators.admit(executable)
     return executable
 
 
 def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None,
-                                             Callable[[], jax.stages.Lowered]]]) -> list[jax.stages.Compiled]:
+                                             Callable[[], jax.stages.Lowered]]],
+                     kept_from: Sequence[list[jax.stages.Lowered]] | None = None
+                     ) -> list[jax.stages.Compiled]:
     """Each of `programs`, a lowering, its options and its `relower`, compiled as `compiled` compiles it,
     their first compiles at once, each in a thread of its own (`attempted`): XLA's compile releases the
     GIL and runs one program on about one and a half cores, so two compiled at once took 1.94 times the
@@ -1526,16 +1594,17 @@ def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.Com
     and its program relowers, under this thread's contexts, so the programs kept are the ones compiled in
     turn keep: a program lowered before an earlier one's refusals committed is lowered again past them and
     compiled in turn, as it would have been lowered after them. At most `compile_threads()` compile at
-    once."""
+    once. `kept_from` given, each program's kept lowering is appended to its own list (`compiled`'s)."""
     firsts = attempts([(lowered, options) for lowered, options, _ in programs])
     held = refusal_entries()
     kept_programs = []
-    for (lowered, options, relower), first in zip(programs, firsts, strict=True):
+    lists = [None] * len(programs) if kept_from is None else kept_from
+    for (lowered, options, relower), first, keeping in zip(programs, firsts, lists, strict=True):
         # A program launching a config an earlier one's compile refused after its trace took it, each program
         # by what it launches (row 8603); refusals held before every trace, its derivations read.
         if refusal_entries() != held and refused_in(lowered):
             lowered, first = relower(), None
-        kept_programs.append(compiled(lowered, options, relower=relower, first=first))
+        kept_programs.append(compiled(lowered, options, relower=relower, first=first, kept_from=keeping))
     return kept_programs
 
 
@@ -1931,16 +2000,17 @@ def reads_binaries(lowered: jax.stages.Lowered) -> bool:
 
 def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
          relower: Callable[[], jax.stages.Lowered], first: Attempt | None = None,
-         read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None) -> jax.stages.Compiled:
+         read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None,
+         kept_from: list[jax.stages.Lowered] | None = None) -> jax.stages.Compiled:
     """`lowered` compiled and kept (`settled`), its first compile `first` or one in this thread."""
     return settled(lowered, options, relower, attempted(lowered, options) if first is None else first,
-                   read=read)
+                   read=read, kept_from=kept_from)
 
 
 def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
             relower: Callable[[], jax.stages.Lowered], first: Attempt, *,
-            read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None
-            ) -> jax.stages.Compiled:
+            read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None,
+            kept_from: list[jax.stages.Lowered] | None = None) -> jax.stages.Compiled:
     """The program kept of `lowered`'s first compile (`first`), read through its kernels' binaries
     (`read`, `binaries` where None): where a kernel of a template's launch spills, that launch's config is
     refused (`refused`), the miss recorded (`misses`, logged), and the program `relower`ed and compiled,
@@ -1958,12 +2028,14 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     cache carries its kernels' binaries as one compiled here does. A program whose block XLA refuses steps
     its asking Triton launches down (`_unblocked`). A relowering that launches every refused config again
     is the program just compiled: it is kept as compiled, its spills misses not stepped, each refusal that
-    did not take named (`_untaken`)."""
+    did not take named (`_untaken`). `kept_from` given, the lowering the kept executable was compiled from
+    is appended to it: `lowered`, or the relowering it kept (a caller keys the executable by what that one
+    traced, row 12165)."""
     if first.error is not None:
         asked = shared_asked(first.error)
         if asked is None:
             raise first.error
-        return _unblocked(lowered, options, relower, asked, first.error)
+        return _unblocked(lowered, options, relower, asked, first.error, kept_from)
     executable = first.executable
     assert executable is not None
     found, compiled_from = _misses_of(_refused_binaries(lowered, executable, read)), lowered
@@ -2004,6 +2076,8 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     # The kept program's own spills are misses alone: refused, they would have every process seeded with
     # them derive another program, not the one this compile keeps and runs.
     _recorded(found, stepped=False)
+    if kept_from is not None:
+        kept_from.append(compiled_from)
     return executable
 
 
@@ -2206,8 +2280,8 @@ def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashab
 
 
 def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-               relower: Callable[[], jax.stages.Lowered], asked: int,
-               error: Exception) -> jax.stages.Compiled:
+               relower: Callable[[], jax.stages.Lowered], asked: int, error: Exception,
+               kept_from: list[jax.stages.Lowered] | None = None) -> jax.stages.Compiled:
     """The program XLA refused for a Triton kernel asking `asked` shared bytes past a block, compiled once
     more with the configs of the Triton launches XLA refuses each compiled alone refused (`refused_alone`,
     each its next derived config, as a spill refuses one, `kept`), or every Triton launch's where none is
@@ -2215,7 +2289,7 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
     time costs a program's compile a launch (row 3584), where a kernel's call compiled alone costs its own
     (audit group 71). Each launch's miss is recorded and logged at the bytes it asked; where the relowered
     program is refused again, or a derivation finds no config left (`Exhausted`), the refusal stands, each
-    a miss not stepped."""
+    a miss not stepped. `kept_from` given, the relowering it keeps is appended to it (`settled`'s)."""
     from dew.nn.kernels.lowered import kernel_calls
 
     tried: dict[tuple[str, Hashable], tuple[str, Launch]] = {}
@@ -2229,7 +2303,8 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
     asked_by = {kernel_of(name)[0]: bytes_asked for name, bytes_asked in alone.items()}
     try:
         with _proposing([(refusal, (kernel, None)) for refusal, (kernel, _) in tried.items()]) as proposal:
-            replacement, spilling = _compiled_reported(relower(), options)
+            program = relower()
+            replacement, spilling = _compiled_reported(program, options)
     except (Exhausted, jax.errors.JaxRuntimeError) as again:
         if isinstance(again, jax.errors.JaxRuntimeError) and shared_asked(again) is None:
             raise
@@ -2241,6 +2316,8 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
         _record(refusal, None, frozenset({(kernel, None)}))
         _missed_block(kernel, launch, asked_by.get(kernel, asked), stepped=True)
     _recorded(_misses_of(spilling), stepped=False)
+    if kept_from is not None:
+        kept_from.append(program)
     return replacement
 
 
