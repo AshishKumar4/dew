@@ -888,6 +888,39 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
                     np.testing.assert_array_equal(np.asarray(got_dx), np.asarray(expected_dx))
 
 
+@pytest.mark.mesh(devices=4)
+def test_packed_gated_product_pair_reshard_preserves_other_explicit_axes():
+    """Resharding a pair-sharded `[..., 2, H]` input onto `None` along `-2` preserves other Explicit axes
+    splitting rows or features on both output and input-gradient shardings alongside bit equality (row 822)."""
+    from jax.sharding import AxisType
+
+    mesh = jax.make_mesh((2, 2), ("data", "model"), axis_types=(AxisType.Explicit, AxisType.Explicit),
+                         devices=jax.devices()[:4])
+    raw_p = jax.random.normal(drawn_key(33, 0), (4, 8, 2, 24))
+    raw_d = jax.random.normal(drawn_key(34, 0), (4, 8, 24))
+
+    def packed_ref(a, d):
+        return evaluated(packed_gated_product("swiglu", implementation="xla"), (a,), d)
+
+    def padded(arr) -> tuple:
+        spec = arr.sharding.spec
+        return (*spec, *(None,) * (arr.ndim - len(spec)))
+
+    expected_y, expected_dx = jax.jit(packed_ref)(raw_p, raw_d)
+    for in_spec, out_spec in (
+            (PartitionSpec("data", None, "model", None), PartitionSpec("data", None, None)),
+            (PartitionSpec(None, None, "model", "data"), PartitionSpec(None, None, "data"))):
+        with jax.set_mesh(mesh):
+            sharded_p, sharded_d = placed_on((raw_p, raw_d), [in_spec, out_spec], mesh)
+            for impl in ("auto", "xla"):
+                fn = packed_gated_product("swiglu", implementation=impl)
+                got_y, got_dx = jax.jit(lambda a, d, f=fn: evaluated(f, (a,), d))(sharded_p, sharded_d)
+                np.testing.assert_array_equal(np.asarray(got_y), np.asarray(expected_y))
+                np.testing.assert_array_equal(np.asarray(got_dx), np.asarray(expected_dx))
+                assert padded(got_y) == tuple(out_spec), (impl, padded(got_y), out_spec)
+                assert padded(got_dx) == tuple(in_spec), (impl, padded(got_dx), in_spec)
+
+
 def _checked_shard_operands(draw: int = 0):
     """The per-shard tests' operands (`_checked_shard_run`'s): the seam's and SwiGLU's, and their
     cotangents. Held per shard as the gate holds a kernel (`sharded.assert_runs_per_shard`): a shard's rows
