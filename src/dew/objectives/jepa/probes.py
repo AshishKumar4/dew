@@ -26,7 +26,7 @@ from dew.nn import categorical
 from dew.nn.kernels.options import program
 from dew.nn.precision import accumulated
 from dew.objectives.base import Objective, Shown, mean_of_totals, merge_totals
-from dew.optim import OPTIMIZER_MAP
+from dew.optim import AdamW
 
 
 class ProbeParams(NamedTuple):
@@ -58,8 +58,8 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
     fit_x, test_x = (fit_x - mean) / std, (test_x - mean) / std
 
     params = ProbeParams(jnp.zeros((embeddings.shape[-1], num_classes)), jnp.zeros((num_classes,)))
-    # Dew's AdamW, the one a run's config builds (`OPTIMIZER_MAP`), its bias corrections formed in double.
-    optimizer = OPTIMIZER_MAP["adamw"](learning_rate, weight_decay=weight_decay)
+    # Dew's AdamW, the one a run's config builds (`AdamW`), its bias corrections formed in double.
+    optimizer = AdamW(weight_decay=weight_decay, state_dtype="params").transform(learning_rate)
 
     def objective(p: ProbeParams):
         logits = accumulated(jnp.matmul, fit_x, p.w) + p.b

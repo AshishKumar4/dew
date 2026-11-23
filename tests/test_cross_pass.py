@@ -17,13 +17,14 @@ from flax import linen as nn
 from map_judge import marked_seeds
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
-from test_loop_sampled import counts_compiled_off_the_loop
 
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
 from dew.nn.cross_pass import MERGE_PREFIX, MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
+from dew.optim import AdamW
+from dew.training import FitPolicy, UpdateBatch
 
 VOCAB = 37
 
@@ -464,7 +465,6 @@ def test_a_source_written_in_its_own_bindings_refuses_its_export_once_it_passes_
     assert refused.value.args == (MESSAGES_UNWRITTEN,)
 
 
-@pytest.mark.usefixtures(counts_compiled_off_the_loop.__name__)
 def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies():
     """A bf16 decoder passing messages over a block every pass exits through (an exit gate), its passes
     recomputed and drawn per microbatch (`SampledPasses`), its parameters read through narrow copies,
@@ -482,13 +482,13 @@ def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies()
                                         remat=True, messages=CrossPass(block_size=1, rank=4)))
     batch = token_batch()
     with chosen(narrow_copies="on"):
-        trainer = phased_trainer(model, 0, None, sampled_passes=TRAINED, accumulation=2)
+        trainer = phased_trainer(model, 0, None, sampled_passes=TRAINED, update=UpdateBatch(batches=2))
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         interval = Interval(0.0, None, microbatches=0)
         drawn = []
         for index in range(6):
-            step.drawn(interval, index, state)
+            step.drawn(interval, index)
             drawn.extend(step.counts)
             state, loss, *_ = step(state, batch)
             assert np.isfinite(float(loss)), (index, step.counts)
@@ -553,10 +553,10 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
             remat=REMAT_POLICIES["full"],
             loop=Loop(steps, step_norm=False, layers=(0, 4), exit_gate=True, messages=messages))
         trainer = Trainer(LMObjective(model, MIXER_LENGTH, exit_entropy=0.1),
-                          OptimConfig(optimizer="adamw", learning_rate=1e-3).build(None),
+                          OptimConfig(optimizer=AdamW(), learning_rate=1e-3).build(None),
                           key=jax.random.key(0),
                           mesh=MeshSpec(fsdp=devices).build(compile_only_gpus("sm90", devices, 2**36)),
-                          layout=STEP_LAYOUT, split=1, inspection=inspection)
+                          layout=STEP_LAYOUT, fit=FitPolicy(split=1), inspection=inspection)
         ahead = compile_ahead(trainer, token_rows(512, MIXER_ROWS, MIXER_LENGTH + 1))
         if inspection is None:
             return ahead.live_bytes - ahead.argument_bytes

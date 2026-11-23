@@ -14,15 +14,16 @@ import optax
 import pytest
 from affine_run import FEATURES, Affine
 from test_chain_compile import Tokens
-from test_data_mixtures import READ, assert_same, checkpointed_trainer, parameters
+from test_data_mixtures import READ, Indexed, assert_same, checkpointed_trainer, ids as batch_ids, parameters
 
 from dew.batch import PHASE, VALID_ROWS, Phase
-from dew.data import Memory, mix, phases
+from dew.data import Memory, Phase as DataPhase, Steps, mix, phases
 from dew.data.compile import compile
-from dew.data.dataset import DataPartition
+from dew.data.dataset import Closeable, DataPartition
+from dew.data.pipeline import Pipeline
 from dew.mesh import LayoutRefused
 from dew.objectives.base import Aux, Objective
-from dew.training import Checkpoints, Layout, Trainer
+from dew.training import Checkpoints, Layout, Trainer, UpdateBatch
 
 
 def fits(row) -> bool:
@@ -39,7 +40,7 @@ def source(tag: int):
 
 def chain(*ends):
     """Two sources read in two phases on the step clock, the first's to `ends[0]`, the second's on."""
-    return phases((source(1), ends[0]), (source(2), None))
+    return phases(DataPhase(source(1), Steps(ends[0])), DataPhase(source(2)))
 
 
 def resumes_as_read(loader, whole, stops) -> None:
@@ -130,7 +131,7 @@ def shared_phases(elastic: bool = False):
     second = mix([SHARED, member(3, endless=True)], weights=(0.25, 0.75))
     if elastic:
         first, second = first.elastic(), second.elastic()
-    return phases((first.batch(tokens=128), 3), (second.batch(tokens=64), None))
+    return phases(DataPhase(first.batch(tokens=128), Steps(3)), DataPhase(second.batch(tokens=64)))
 
 
 def shared_ids(batches) -> tuple[list[int], list[int]]:
@@ -171,7 +172,8 @@ def test_phases_that_share_a_concat_continue_its_join_across_their_boundary(read
     kept = [1000 * tag + index for tag in (1, 4) for index in range(96) if (3 + index % 11) % 5 != 0]
     first = mix([joined, member(2, endless=True)], weights=(0.5, 0.5))
     second = mix([joined, member(3, endless=True)], weights=(0.25, 0.75))
-    loader = compile(phases((first.batch(tokens=128), 3), (second.batch(tokens=64), None)), read=read_as,
+    loader = compile(phases(DataPhase(first.batch(tokens=128), Steps(3)),
+                            DataPhase(second.batch(tokens=64))), read=read_as,
                      loading=READ)
     whole, stream = read(loader, 24)
     stream.close()
@@ -194,7 +196,8 @@ def test_three_phases_sharing_a_corpus_through_a_short_shuffled_middle_train_eac
     middle = mix([SHARED, member(2, endless=True)], weights=(0.5, 0.5)).shuffle(2, streamed=4)
     middle = middle.batch(tokens=64)
     last = mix([SHARED, member(3, endless=True)], weights=(0.25, 0.75)).batch(tokens=64)
-    loader = compile(phases((first, 3), (middle, 4), (last, None)), read="indexed", loading=READ)
+    loader = compile(phases(DataPhase(first, Steps(3)), DataPhase(middle, Steps(4)), DataPhase(last)),
+                     read="indexed", loading=READ)
     whole, stream = read(loader, 24)
     stream.close()
     passed = first_pass(whole, len(KEPT))
@@ -245,7 +248,8 @@ def test_phases_that_read_a_corpus_alone_continue_it_across_their_boundary(read_
     continues it where the run left it, each record trained once and in order, as phases reading it as the
     one member of a mix of their own do (`_alone_mixed`), where they were refused (row 5400); and a read
     stopped in either phase or at their boundary, resumed, reads what the read never stopped reads."""
-    alone = phases((SHARED.repeat().batch(tokens=128), 3), (SHARED.repeat().batch(tokens=64), None))
+    alone = phases(DataPhase(SHARED.repeat().batch(tokens=128), Steps(3)),
+                   DataPhase(SHARED.repeat().batch(tokens=64)))
     loader = compile(alone, read=read_as, loading=READ)
     whole, stream = read(loader, 24)
     stream.close()
@@ -263,16 +267,19 @@ def test_phases_that_share_a_corpus_otherwise_than_as_one_member_each_are_refuse
     left it."""
     nested = mix([mix([SHARED.repeat(), member(2, endless=True)]), member(3, endless=True)])
     with pytest.raises(ValueError):
-        compile(phases((SHARED.repeat().batch(tokens=128), 3), (nested.batch(tokens=64), None)),
+        compile(phases(DataPhase(SHARED.repeat().batch(tokens=128), Steps(3)),
+                       DataPhase(nested.batch(tokens=64))),
                 read="indexed", loading=READ)
     other = mix([SHARED.map(lambda row: row), member(3, endless=True)]).batch(tokens=64)
     with pytest.raises(ValueError):
-        compile(phases((mix([SHARED, member(2, endless=True)]).batch(tokens=128), 3), (other, None)),
+        compile(phases(DataPhase(mix([SHARED, member(2, endless=True)]).batch(tokens=128), Steps(3)),
+                       DataPhase(other)),
                 read="indexed", loading=READ)
     # Moved to another place among the unnamed, it is drawn and shuffled under another key.
     moved = mix([member(3, endless=True), SHARED]).batch(tokens=64)
     with pytest.raises(ValueError):
-        compile(phases((mix([SHARED, member(2, endless=True)]).batch(tokens=128), 3), (moved, None)),
+        compile(phases(DataPhase(mix([SHARED, member(2, endless=True)]).batch(tokens=128), Steps(3)),
+                       DataPhase(moved)),
                 read="indexed", loading=READ)
 
 
@@ -285,7 +292,8 @@ def test_phases_say_where_they_end_before_any_is_read(repeats, ends):
                 for index in range(48)]
         return Memory(rows).map(Tokens()).filter(fits, reason="too_long").repeat(repeats).batch(tokens=128)
 
-    stream = compile(phases((finite(1), 3), (finite(2), None)), read="indexed", loading=READ).train(
+    stream = compile(phases(DataPhase(finite(1), Steps(3)), DataPhase(finite(2))), read="indexed",
+                     loading=READ).train(
         DataPartition())
     assert stream.ends == ends
     stream.close()
@@ -326,10 +334,11 @@ def test_a_run_over_phases_of_other_batches_lays_each_update_out_in_its_own_phas
     update's window out in its phase's batch, the second phase beginning where an update does, and stopped
     in it and resumed lands where the run nobody stopped lands. A later phase whose batch the mesh cannot
     divide is refused before any step trains."""
-    data = compile(phases((_budget(1, 256), 2), (_budget(2, 128), None)), read="indexed", loading=READ)
+    data = compile(phases(DataPhase(_budget(1, 256), Steps(2)), DataPhase(_budget(2, 128))), read="indexed",
+                   loading=READ)
 
     def accumulating(directory):
-        return Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0), accumulation=2,
+        return Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0), update=UpdateBatch(batches=2),
                        layout=Layout(min_shard=1, tolerance=1.0),
                        checkpoints=Checkpoints(str(directory), keep=8))
 
@@ -338,7 +347,8 @@ def test_a_run_over_phases_of_other_batches_lays_each_update_out_in_its_own_phas
     resumed = accumulating(tmp_path / "resumed").fit(data, steps=6, log_every=100, checkpoint_every=2)
     assert int(resumed.step) == 6
     assert_same(parameters(whole), parameters(resumed), "the resumed phases did not land on the whole run")
-    indivisible = compile(phases((_budget(1, 128), 2), (_budget(2, 64), None)), read="indexed", loading=READ)
+    indivisible = compile(phases(DataPhase(_budget(1, 128), Steps(2)), DataPhase(_budget(2, 64))),
+                          read="indexed", loading=READ)
     with pytest.raises(LayoutRefused):
         trainer(tmp_path / "indivisible").fit(indivisible, steps=4, log_every=100, checkpoint_every=1)
     assert not (tmp_path / "indivisible").exists() or not any((tmp_path / "indivisible").iterdir())
@@ -400,7 +410,7 @@ def test_phases_of_elastic_reads_resume_on_another_share_count(saved, resumed):
     from dew import _position
 
     def loader():
-        return compile(phases((_elastic(1), 2), (_elastic(2), None)), loading=READ, seed=3)
+        return compile(phases(DataPhase(_elastic(1), Steps(2)), DataPhase(_elastic(2))), loading=READ, seed=3)
 
     shares = [loader().train(DataPartition(index, saved)) for index in range(saved)]
     for share in shares:
@@ -450,7 +460,8 @@ def test_a_profile_window_in_a_phase_that_reads_an_earlier_phases_batches_names_
     from dew.telemetry.records import ProfileTraced, StepCompiled
     from dew.training import ProfileWindow
 
-    data = compile(phases((_budget(1, 256), 2), (_budget(2, 128), 4), (_budget(3, 256), None)),
+    data = compile(phases(DataPhase(_budget(1, 256), Steps(2)), DataPhase(_budget(2, 128), Steps(4)),
+                          DataPhase(_budget(3, 256))),
                    read="indexed", loading=READ)
     tracker = RecordingTracker()
     Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
@@ -460,3 +471,67 @@ def test_a_profile_window_in_a_phase_that_reads_an_earlier_phases_batches_names_
     (window,) = [value for _, value in tracker.artifacts if isinstance(value, ProfileTraced)]
     assert len(compiled) == 2 and compiled[0].signature != compiled[1].signature
     assert window.signature == compiled[0].signature
+
+
+def _endless_ids(chain, count: int) -> list[list[int]]:
+    """The ids of the first `count` batches a run reads of `chain`, read on past its end (`fitted`)."""
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+
+    loader, _ = fitted(chain, None, objective=ObjectiveData())
+    stream = loader.train(DataPartition())
+    assert isinstance(stream, Closeable)
+    try:
+        return batch_ids(itertools.islice(stream, count))
+    finally:
+        stream.close()
+
+
+def test_a_phase_batched_inside_itself_reads_on_as_a_single_stream_does():
+    """A phase that batches its own records, read on past its end by a run, reads as the same chain read
+    alone does, its repeat before its batch: a pass that holds a batch and a half continues its last into
+    the next pass, where a repeat after the batch dropped it and read the pass again from its start."""
+    first, second = Memory(Indexed(1, 12)), Memory(Indexed(2, 12))
+    phased = phases(DataPhase(Pipeline(first).batch(8), Steps(2)), DataPhase(Pipeline(second).batch(8)))
+    expected = (_endless_ids(Pipeline(first).batch(8), 2) + _endless_ids(Pipeline(second).batch(8), 2))
+    assert _endless_ids(phased, 4) == expected
+    assert expected[1] == [1008, 1009, 1010, 1011, 1000, 1001, 1002, 1003]
+
+
+def test_a_phase_whose_pass_holds_less_than_a_batch_reads_whole_batches():
+    """A phase that batches its own records, each pass fewer than a batch, reads whole batches of its records
+    on past its end, its repeat before its batch: a repeat after it made every pass one short batch, its
+    last rows padded (and a batch that drops its short last one never yielded one, the run hanging)."""
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+
+    phased = phases(DataPhase(Pipeline(Memory(Indexed(1, 6))).batch(8, drop_remainder=False), Steps(1)),
+                    DataPhase(Pipeline(Memory(Indexed(2, 6))).batch(8, drop_remainder=False)))
+    loader, _ = fitted(phased, None, objective=ObjectiveData())
+    stream = loader.train(DataPartition())
+    assert isinstance(stream, Closeable)
+    try:
+        read = list(itertools.islice(stream, 2))
+    finally:
+        stream.close()
+    assert [int(np.sum(batch.get(VALID_ROWS, np.ones(8, bool)))) for batch in read] == [8, 8]
+    assert batch_ids(read) == [[1000, 1001, 1002, 1003, 1004, 1005, 1000, 1001],
+                               [2000, 2001, 2002, 2003, 2004, 2005, 2000, 2001]]
+
+
+def test_phases_batched_outside_themselves_read_as_they_did():
+    """Phases that batch outside themselves, one stating a repeat of its own and the chain taking from both,
+    read as a run always read them: the first phase's two passes read on to its end, and the second
+    continues the corpus past what the first read of it."""
+    corpus = Pipeline(Memory(Indexed(1, 64)))
+    shared = _endless_ids(phases(DataPhase(corpus, Steps(6)), DataPhase(corpus)).take(16).batch(4), 8)
+    assert shared[6] == [1024, 1025, 1026, 1027]
+    finite = Pipeline(Memory(Indexed(1, 8)))
+    second = Pipeline(Memory(Indexed(2, 8)))
+    repeated = _endless_ids(phases(DataPhase(finite.repeat(2), Steps(10)), DataPhase(second)).batch(8), 11)
+    assert len(repeated) == 11 and repeated[2][0] // 1000 == 1 and repeated[10][0] // 1000 == 2
+    # A chain that states its own repeat reads as it states it, its phases batched inside themselves too.
+    once = phases(DataPhase(Pipeline(Memory(Indexed(1, 16))).batch(8), Steps(1)),
+                  DataPhase(Pipeline(Memory(Indexed(2, 16))).batch(8)))
+    assert _endless_ids(once.repeat(1), 4) == [list(range(1000, 1008)), list(range(2000, 2008)),
+                                               list(range(2008, 2016))]

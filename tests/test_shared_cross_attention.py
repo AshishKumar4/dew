@@ -15,6 +15,7 @@ import pytest
 from flax import linen as nn
 from model_support import flat_tree
 from reference_error import assert_as_exact
+from run_kinds import stated
 from test_cross_attention import (
     MODEL,
     SEQ,
@@ -572,15 +573,18 @@ def test_a_decision_run_reads_its_context_through_a_deepseek_backbones_own_atten
 
     release = with_a_tokenizer(HF / fixture, tmp_path / "release")
     rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
-    config = DecisionRunConfig.cli(
-        ["--pretrained", str(release), "--segments", json.dumps(to_record(SEGMENTS, tuple[Segment, ...])),
-         "--context-layers", "0", "--context-form", "shared", "head:letters", "--head.count", "4",
-         "--head.labels.names", *(LABELS.names or ()), "--head.labels.variants", *LABELS.variants,
-         "--head.labels.cue", LABELS.cue, "--trainer.name", "shared", "--trainer.checkpoint-dir",
-         str(tmp_path / "runs"), "--trainer.steps", "2", "--trainer.checkpoint-every", "None",
-         "--trainer.eval-every", "None", "--trainer.log-every", "1", "--trainer.multi-host", "False",
-         "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
-        default=DecisionRunConfig(data=rows))
+    config = DecisionRunConfig.cli(["--pretrained", str(release), "--segments",
+                                    json.dumps(to_record(SEGMENTS, tuple[Segment, ...])), "--context-layers",
+                                    "0", "--context-form", "shared", "head:letters", "--head.count", "4",
+                                    "--head.labels.names", *(LABELS.names or ()), "--head.labels.variants",
+                                    *LABELS.variants, "--head.labels.cue", LABELS.cue, "--trainer.name",
+                                    "shared", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                                    "--trainer.horizon.steps", "2", "--trainer.checkpoint-every", "None",
+                                    "--trainer.eval-every", "None", "--trainer.log-every", "1",
+                                    "--trainer.multi-host", "False", "--trainer.compilation-cache-dir",
+                                    "None"],
+                                   default=stated(DecisionRunConfig(data=rows),
+                                                  model_fields={"dtype": "float32"}))
     state = config.run()
     gates = [np.asarray(leaf) for path, leaf in flat_tree(jax.device_get(state.variables["params"])).items()
              if "alpha_cross_attn" in path]

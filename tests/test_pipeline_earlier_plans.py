@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from saved_positions_support import named
 
-from dew.data import Memory
+from dew.data import Memory, Phase, Steps
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.pipeline import Pipeline, mix
@@ -99,7 +99,7 @@ def test_a_position_saved_under_14_resumes_and_saves_one_of_this_dews_that_resum
 
 SAVED_BEFORE_THE_MOVE = Path(__file__).with_name("fixtures") / "positions" / "main-cdc45f8f9"
 """Positions main saved at cdc45f8f9, before the condition encoders moved to dew.interop (row 5996), of
-chains whose steps depend on one (`saved_positions_support.Conditioned`)."""
+chains whose steps depend on one (`conditioned_step.Conditioned`)."""
 
 
 SAVED_UNDER_15 = Path(__file__).with_name("fixtures") / "positions" / "main-966b2031c"
@@ -300,7 +300,8 @@ def test_a_phases_position_saved_now_refuses_a_finished_phase_whose_hidden_field
 
     def stepped(scale: int):
         table = np.arange(8, dtype=np.int32) * scale
-        return compile(phases((source(1).map(Remapped(table)), 3), (source(2), None)), read="indexed",
+        return compile(phases(Phase(source(1).map(Remapped(table)), Steps(3)), Phase(source(2))),
+                       read="indexed",
                        loading=READ).train(DataPartition())
 
     stream = stepped(1)

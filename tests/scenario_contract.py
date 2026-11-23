@@ -9,6 +9,7 @@ import hashlib
 import importlib
 import json
 import shutil
+import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,10 +22,12 @@ from process_support import device_flags, fresh
 
 from dew._cache import enable_compilation_cache
 from dew.checkpoints import Checkpoints
+from dew.config import TrainerConfig
 from dew.data.dataset import DataPartition
 from dew.objectives.base import Step
+from dew.registry import to_record
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
-from dew.training import Pause, Trainer
+from dew.training import FitPolicy, Pause, Trainer
 
 HELD_OUT = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
 """The step a held-out loss is read at: its key fixed, so a run's loss before and after read one draw."""
@@ -115,11 +118,13 @@ class Phase:
     resume: str = "auto"
     data_resume: str = "relaxed"
 
-    def settings(self) -> dict[str, str]:
-        """The phase as `dew train` sets it (`--set`)."""
+    def settings(self) -> dict[str, object]:
+        """The phase's settings by dotted path, as its run's record holds them (`run_kinds.set_record`): its
+        stop as the record of the one stop it is of those the trainer takes (`TrainerConfig.stop`)."""
+        stop = typing.get_type_hints(TrainerConfig, include_extras=True)["stop"]
         return {"trainer.name": self.name, "trainer.compilation_cache_dir": str(self.cache),
                 "trainer.resume": self.resume, "trainer.data_resume": self.data_resume,
-                **({"trainer.stop": json.dumps({"fraction": self.pause})} if self.pause else {})}
+                **({"trainer.stop": to_record(self.stop, stop)} if self.pause else {})}
 
     @property
     def stop(self) -> Pause | None:
@@ -150,8 +155,8 @@ def resumption(root: Path) -> tuple[Phase, Phase, Phase]:
 @dataclass(frozen=True)
 class Recorded:
     """A scenario cell's run as `dew train` replays it in a fresh process that sees `devices` CPU devices
-    (`run_kinds.trained_record`, `recorded_run`): its saved record, the settings its command line sets
-    (`--set`, `run_kinds.cli_settings`), and the packages outside Dew its record imports, which it trusts."""
+    (`run_kinds.trained_record`, `recorded_run`): its saved record, the settings its record sets
+    (`run_kinds.cli_settings`), and the packages outside Dew its record imports, which it trusts."""
 
     record: Path
     settings: Mapping[str, str]
@@ -314,8 +319,9 @@ def first_steps(objective_of: Callable[[bool], object], laid: Callable[[str, int
 
     def trainer_of(rows: str, devices: int, split: int, wide: bool) -> Trainer:
         trainer = Trainer(objective_of(wide), optax.chain(stash(), optax.sgd(1e-3)), key=jax.random.key(0),
-                          mesh=MeshSpec(fsdp=devices), layout=Layout(min_shard=min_shard), split=split,
-                          checkpoints=None, tracker=None, param_dtype="float64" if wide else None)
+                          mesh=MeshSpec(fsdp=devices), layout=Layout(min_shard=min_shard),
+                          fit=FitPolicy(split=split), checkpoints=None, tracker=None,
+                          param_dtype="float64" if wide else None)
         trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
         return trainer
 

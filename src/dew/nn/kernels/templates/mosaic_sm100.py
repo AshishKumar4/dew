@@ -580,7 +580,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
 
         @pl.when(issuing)
         def _():
-            issue()  # into tensor memory in place; its returned accumulator no branch's value
+            # Into tensor memory in place; its returned accumulator no branch's value.
+            mosaic.predicated(issue)
 
         return acc
 
@@ -611,8 +612,9 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     def added_into(self, acc, value, interpret: bool):
         raise NotImplementedError(f"{self._HOME}; nothing adds a register tile into one")
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0):
-        del pending
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
+        del lhs, rhs, shape, between, pending
         raise NotImplementedError(f"{self._HOME}; a fresh product takes the launch's, not its own")
 
     def registers_product(self, lhs, rhs):
@@ -736,7 +738,7 @@ class Tcgen05Rings(Tcgen05Issuer, ring_family.RingFamily[Accumulator]):
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), summed: int = 0,
                 prepared: Callable | None = None, producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, chunks: tuple[int, int] | None = None) -> None:
         """`mosaic.Family.persist`, its tiles' accumulators turning in tensor memory, no ping-pong
         (`takes_pingpong`). With `prepared`, `prepared(tile, index, slots)` rewrites each step's slots before
         its products read them (a kernel gradient's neighbouring groups' rows zeroed), run by a role of its
@@ -763,7 +765,7 @@ class Tcgen05Rings(Tcgen05Issuer, ring_family.RingFamily[Accumulator]):
         opened = self.opened(streams)
         for ring in opened.values():
             ring.initialized()
-        staging = self.output_staging(outputs, consumers)
+        staging = self.output_staging(outputs, consumers, chunks)
         rewrites = () if prepared is None else tuple(ring.stages for ring in opened.values())
         width = sum(shape[1] for shape in accumulators)
         offsets = [sum(shape[1] for shape in accumulators[:index]) for index in range(len(accumulators))]
@@ -1194,8 +1196,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         return self._summed(shape, issue)
 
-    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False
-                        ) -> tuple[Callable, ...]:
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False,
+                        then: tuple[Callable | None, ...] | None = None) -> tuple[Callable, ...]:
         """`Issuer.summed_together` in tensor memory: each group issued into its own accumulator of the
         role's together scratch (`product_scratch`'s `together`, a width's groups its accumulators in turn),
         then one commit and one wait for every group, each group's reader then reading its accumulator, until
@@ -1216,7 +1218,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
                                    for shape, issue in zip(shapes, issues, strict=True)]
         if not wide:
             # No product pending: a commit here would stand behind the role's last wait (row 5671).
-            return tuple(readers)
+            return super().summed_together(shapes, issues, then=then)
         found, role = self._scoped(), mosaic.ROLE.get()
         taken: collections.Counter = collections.Counter()
         accumulators = []
@@ -1241,7 +1243,8 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
             self._waited(self._done())
         for index, tmem in zip(wide, accumulators, strict=True):
             readers[index] = functools.partial(_read, tmem)
-        return tuple(readers)
+        after = (None,) * len(shapes) if then is None else then
+        return tuple(mosaic.then_read(reader, each) for reader, each in zip(readers, after, strict=True))
 
     def keeps_sums(self, width: int) -> bool:
         # A sum at least an accumulator's least width: a narrower one's columns are no column slice of the
@@ -1390,16 +1393,18 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         return self.summed((lhs.shape[0], rhs.shape[1]), lambda acc: self.register_products(
             acc, (lhs,), rhs))
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
         if pending:
-            raise ValueError(f"{type(self).__name__}.product takes pending=0, got {pending}")
+            raise ValueError(f"{type(self).__name__}.product_with takes pending=0, got {pending}")
+        held: list[T] = []
 
-        def issue(acc):
-            self.products(acc, lhs, rhs)
-            if then is not None:
-                then()
-
-        return self.summed(shape, issue)
+        def issue(acc: Accumulator) -> Accumulator:
+            issued = self._issued(acc, lhs, rhs)
+            held.append(between())
+            return issued
+        found = self.summed(shape, issue)
+        return held[0], found
 
     def added_into(self, acc: Accumulator | jax.Array, value: jax.Array, interpret: bool
                    ) -> Accumulator | jax.Array:

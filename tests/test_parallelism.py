@@ -24,7 +24,7 @@ from dew.data import Loading
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.distributed.batches import DevicePrefetchIterator, shard_batch
 from dew.objectives.base import Aux, Objective
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, UpdateBatch
 from dew.training.evaluation import WARM_BATCHES
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -421,11 +421,8 @@ def test_a_checkpoint_without_a_position_does_not_resume_from_the_top_of_the_str
 # --------------------------------------------------------------------------
 
 def make_accumulating(tmp_path=None, accumulation=1):
-    return make_trainer(
-        tmp_path, fsdp=2, optimizer=optax.sgd(0.5), accumulation=accumulation,
-        # A ramp, not a constant, so indexing the schedule by micro-step
-        # instead of by update is visible in the result.
-        objective=DeterministicObjective(optax.linear_schedule(0.9, 1.0, transition_steps=8)))
+    return make_trainer(tmp_path, fsdp=2, optimizer=optax.sgd(0.5), update=UpdateBatch(batches=accumulation),
+                        objective=DeterministicObjective(optax.linear_schedule(0.9, 1.0, transition_steps=8)))
 
 
 def micro_steps(trainer, count, state=None):

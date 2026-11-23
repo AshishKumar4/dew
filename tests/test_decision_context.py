@@ -33,6 +33,7 @@ from dew.interop import Pretrained
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, crossing
 from dew.nn.multimodal import MultimodalTransformer
 from dew.training import Trainer
+from dew.training.budget import Horizon
 
 pytestmark = pytest.mark.mesh
 
@@ -913,7 +914,8 @@ def test_a_run_from_a_saved_run_holds_its_configured_encoders_weights_frozen_or_
                                 context_text=text, context_text_trained=True, calibrate=False,
                                 optim=OptimConfig(learning_rate=1e-2))
     # Two steps: the cross-attention's gate opens from zero on the first, so the second reaches the encoder.
-    state, _ = trained(first, tmp_path, "first", trainer={"steps": 2, "checkpoint_final": True})
+    state, _ = trained(first, tmp_path, "first", trainer={"horizon": Horizon(steps=2),
+                                                          "checkpoint_final": True})
     held = jax.tree.leaves(state.variables["params"]["context"])
     checkpoint = jax.tree.leaves(text.build(dtype="float32").encoder.params)
     assert any(np.any(np.asarray(one) != np.asarray(two)) for one, two in zip(held, checkpoint, strict=True))

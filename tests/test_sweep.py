@@ -15,14 +15,14 @@ from dew.config import RunConfig, TrainerConfig
 from dew.config.sweep import GridSearch
 from dew.data.dataset import Loader
 from dew.training import LocalTracker
+from dew.training.budget import Horizon
 
 SPACE = {'optim.learning_rate': [0.1, 0.01], 'optim.clip_grads': [0.0, 1.0]}
 
 
 def config(tmp_path, name='sweep'):
-    return RunConfig(trainer=TrainerConfig(
-        name=name, checkpoint_dir=str(tmp_path / 'runs'), steps=2,
-        eval_every=None, checkpoint_every=None))
+    return RunConfig(trainer=TrainerConfig(name=name, checkpoint_dir=str(tmp_path / 'runs'),
+                                           horizon=Horizon(steps=2), eval_every=None, checkpoint_every=None))
 
 
 def train(run: RunConfig) -> float:

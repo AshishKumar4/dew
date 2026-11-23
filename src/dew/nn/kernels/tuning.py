@@ -649,21 +649,37 @@ class KernelOp(tokamax.Op):
                 return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
             return self._captured(ba, config, awaiting)
 
+    def certified_walk(self, ba: tokamax.BoundArguments, config: Hashable
+                       ) -> Callable[[tuple, dict], jax.Array | tuple[jax.Array, ...]] | None:
+        """The kernels certification captures of a call of `ba` at `config` (`_captured`) and a resource
+        derivation lowers (`lowering`), as a function of the call's arguments and keywords, where they are
+        other than the call's own: a call whose program runs more than the launch it certifies (the attention
+        forward's conditional, its rare scaled op beside the common one) states its walk. None, every other
+        launch's: the call's own output (`_fwd`'s), captured once and run as captured."""
+        del ba, config
+        return None
+
     def _captured(self, ba: tokamax.BoundArguments, config: Hashable, awaiting: tuple):
         """The launch's call where its certification awaits it (`report.awaiting`): traced once into its
         program's jaxpr at its operands' own abstract values (a shard's in a shard_map), which certification
         replays and compiles aside (`report.capture`), and that jaxpr evaluated here, its equations bound into
-        the program as the call's own trace binds them (a custom derivative's rule kept as its equation)."""
+        the program as the call's own trace binds them (a custom derivative's rule kept as its equation). A
+        launch stating its walk (`certified_walk`) has that captured, and its call traced as it runs."""
         from jax.extend import core as jax_core
 
         arrays, fill = programs.holes((ba.args, ba.kwargs), lambda leaf: isinstance(leaf, jax.Array))
+        walk = self.certified_walk(ba, config)
 
         def launched(*values):
             args, kwargs = fill(values)
+            if walk is not None:
+                return walk(args, kwargs)
             return self._fwd(*args, config=config, **kwargs)[0]
 
         closed, shapes = jax.make_jaxpr(launched, return_shape=True)(*arrays)
         report.capture(awaiting, closed)
+        if walk is not None:
+            return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
         return jax.tree.unflatten(jax.tree.structure(shapes), jax_core.jaxpr_as_fun(closed)(*arrays))
 
     def exhausted(self, ba: tokamax.BoundArguments) -> report.Exhausted:
@@ -934,10 +950,12 @@ class KernelOp(tokamax.Op):
         """The launch of `ba` at `config` as a resource derivation lowers it (never run), or with `config`
         None at the config a call of it takes (`__call__`: derived, and where a device certifies launches
         certified as it traces, `report.certified`, a config whose kernels spill refused and the next taken):
-        a function of the call's arrays, making this launch's kernels alone, and their abstract values;
-        compiled, not interpreted, where the launch takes `interpret`."""
+        a function of the call's arrays, making this launch's kernels alone (its walk where it states one,
+        `certified_walk`), and their abstract values; compiled, not interpreted, where the launch takes
+        `interpret`."""
         leaves, treedef = jax.tree.flatten((ba.args, ba.kwargs))
         held = [hasattr(leaf, "shape") and hasattr(leaf, "dtype") for leaf in leaves]
+        walk = None if config is None else self.certified_walk(ba, config)
 
         def fn(*arrays):
             given = iter(arrays)
@@ -950,6 +968,8 @@ class KernelOp(tokamax.Op):
             # Traced as a call of it is (`__call__`): its kernels carry the launch's digest, and the register
             # models they state are the launch's (`report.Launch.kernels`).
             with report.launching(self, ba, config):
+                if walk is not None:
+                    return walk(args, kwargs)
                 return self._fwd(*args, config=config, **kwargs)[0]
 
         return fn, tuple(jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
@@ -1667,9 +1687,15 @@ def pinned(configs: Mapping[type[KernelOp], Hashable]) -> Iterator[None]:
     config where its space at the launch's key holds it, any stored pick
     or heuristic set aside: for the float64 gate at every config of a space,
     and for a lab that times one."""
-    with _cache.KERNEL_PINS(tuple(configs.items())):
+    # In one order whatever order `configs` names them, so equal pins are one trace context (the head
+    # review of row 12169).
+    with _cache.KERNEL_PINS(tuple(sorted(configs.items(), key=lambda pin: _kind_name(pin[0])))):
         yield
 
+
+def _kind_name(kind: type) -> str:
+    """A kernel kind's import path, by which the pins in a block are ordered (`pinned`)."""
+    return f"{kind.__module__}.{kind.__qualname__}"
 
 @contextlib.contextmanager
 def pinned_where_taken[Op: KernelOp](op: Op, ba: tokamax.BoundArguments) -> Iterator[Op]:

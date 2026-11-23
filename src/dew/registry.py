@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from dew.objectives.base import Metric, Objective
     from dew.objectives.rl.control import ControlRollout
     from dew.objectives.rl.dreamer import DreamerRollout
+    from dew.optim import OptimizerSpec
     from dew.optim_schedules import ScheduleBase
     from dew.sampling.solvers import Solver
 
@@ -1725,6 +1726,18 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
     "one_cycle": "dew.optim:OneCycle",
     "power": "dew.optim:Power",
 }, base="dew.optim_schedules:ScheduleBase")
+optimizers: Aliases[type[OptimizerSpec], OptimizerSpec] = Aliases("optimizer", {
+    "adam": "dew.optim:Adam",
+    "adamw": "dew.optim:AdamW",
+    "gauss_newton": "dew.optim:GaussNewton",
+    "lamb": "dew.optim:Lamb",
+    "laprop": "dew.optim:LaProp",
+    "muon": "dew.optim:Muon",
+    "muonclip": "dew.optim:MuonClip",
+    "optax": "dew.optim:Optax",
+}, base="dew.optim:OptimizerSpec")
+"""The optimizers a run's `OptimConfig.optimizer` names, each with its own settings
+(`dew.optim.OptimizerSpec`)."""
 
 
 # A run config's own class sits above the registry, which names it for the type checker alone. A run
@@ -1756,7 +1769,7 @@ rollouts: Aliases[type[DreamerRollout] | type[ControlRollout], DreamerRollout | 
 
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,
-                              projectors, schedules)
+                              projectors, schedules, optimizers)
 """Every kind, which a record's alias is looked up across."""
 
 register = models.register
@@ -2003,6 +2016,7 @@ __all__ = [
     "mixers",
     "models",
     "objectives",
+    "optimizers",
     "parameters",
     "presets",
     "projectors",

@@ -359,3 +359,44 @@ def test_a_recordings_units_merge_into_one_fixture_naming_each_devices_sites(tmp
     with pytest.raises(ValueError):
         worker.merged_units([first, unit("d.npz", "H100", ["gdn.out"])], Path("f.npz"), "MIT")
     assert saved == {}
+
+
+def _recording(path: Path, keys: dict[str, float], revision: str = "1", **placed) -> Path:
+    """A unit or a fixture at `path` holding `keys` filled with their value, its provenance a reference's at
+    `revision` recorded on `placed`'s device (`device=`), or on several (`devices=`, each device's sites)."""
+    import json
+
+    if "devices" in placed:
+        placed = {"device": " and ".join(placed["devices"]), **placed}
+    recorded = {"reference": "fla", "revision": revision, "command": "c", **placed}
+    arrays = {key: np.full(1, value) for key, value in keys.items()}
+    np.savez(path, provenance=np.asarray(json.dumps(recorded)), **arrays)
+    return path
+
+
+def test_a_few_sites_recorded_again_merge_over_the_pinned_fixture_keeping_its_other_sites(tmp_path):
+    """`merged_arrays` over a fixture of three sites on two devices, one site recorded again on a third and
+    a site the fixture lacks: every site kept, the one recorded again its new values alone (its keys the
+    fixture held and the unit does not, gone with it), the new one added, and the provenance naming each
+    device's sites (row 12213: a merge of its units alone dropped 71 of the fixture's 93 sites)."""
+    import json
+
+    held = {"gdn.out": 0.0, "kda.out": 0.0, "kda.old": 0.0, "rwkv.out": 0.0}
+    base = _recording(tmp_path / "base.npz", held, devices={"H100": ["gdn", "kda"], "A100": ["rwkv"]})
+    unit = _recording(tmp_path / "unit.npz", {"kda.out": 1.0, "lightning.out": 1.0}, device="GH200")
+    merged = protocol.merged_arrays([unit], base)
+    assert sorted(merged) == ["gdn.out", "kda.out", "lightning.out", "provenance", "rwkv.out"]
+    assert {key: float(merged[key][0]) for key in merged if key != "provenance"} == {
+        "gdn.out": 0.0, "kda.out": 1.0, "lightning.out": 1.0, "rwkv.out": 0.0}
+    assert json.loads(str(merged["provenance"])) == {
+        "reference": "fla", "revision": "1", "command": "c", "device": "GH200 and H100 and A100",
+        "devices": {"GH200": ["kda", "lightning"], "H100": ["gdn"], "A100": ["rwkv"]}}
+
+
+def test_a_pinned_fixture_recorded_under_another_revision_is_no_base_to_merge_over(tmp_path):
+    """`merged_arrays` refuses a base whose provenance is not its units': its sites recorded against
+    another reference cannot sit beside theirs."""
+    base = _recording(tmp_path / "base.npz", {"gdn.out": 0.0}, revision="0", device="H100")
+    unit = _recording(tmp_path / "unit.npz", {"kda.out": 1.0}, device="H100")
+    with pytest.raises(ValueError):
+        protocol.merged_arrays([unit], base)

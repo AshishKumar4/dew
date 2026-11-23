@@ -15,7 +15,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import after_walk, emission, handoffs, persistent, resources, swizzling
+from dew.nn.kernels.templates import after_walk, emission, handoffs, persistent, resources, stores, swizzling
 from dew.nn.kernels.templates.cost import Stated, Work
 from dew.nn.kernels.templates.mosaic import (
     Family,
@@ -173,22 +173,24 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         if again is not None:
             pl.when(again.taken())(lambda: streamed(rings, tiles, lo, hi, counted=hi - lo))
 
-    def output_staging(self, outputs: tuple, consumers: int) -> list:
-        # Each consumer's share of each output in two chunk buffers, not the whole tile (`output_staging`).
-        return [plgpu.SMEM((consumers, output_staging(shape[1], (dtype,))[1], shape[0],
-                            output_staging(shape[1], (dtype,))[0]), dtype)
-                for shape, dtype in outputs]
+    def output_staging(self, outputs: tuple, consumers: int, chunks: tuple[int, int] | None = None) -> list:
+        # Each consumer's share of each output in its chunk buffers, not the whole tile (`output_staging`).
+        staged = [(shape, dtype,
+                   output_staging(shape[1], (dtype,), chunks, piece=self.chunk_columns(shape[1])))
+                  for shape, dtype in outputs]
+        return [plgpu.SMEM((consumers, buffers, shape[0], chunk), dtype)
+                for shape, dtype, (chunk, buffers) in staged]
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, chunks: tuple[int, int] | None = None) -> None:
         del accumulators  # its consumers' walks carry their own
         self.pingponged(pingpong)
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
-        staging = self.output_staging(outputs, consumers)
+        staging = self.output_staging(outputs, consumers, chunks)
         # Ping-pong's turns on the tensor cores (`persistent.consumed`'s `turns`).
         turns = [self.meeting(consumers)] if pingpong else []
 
@@ -370,11 +372,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             # Mosaic GPU's interpreter (jax 0.11.2) takes no TMA reduction.
             view[...] = view[...] + value
             return
-        # A TMA reduce from `smem` a chunk of its columns at a time (`chunked`), the reads of it the add
-        # before made done first (`pending` of the earlier ones' through their own buffers still going on);
-        # its writes go on.
-        for index, (piece, place) in enumerate(chunked(value, view, smem)):
-            plgpu.wait_smem_to_gmem(pending if index == 0 else 0, wait_read_only=True)
-            smem[...] = piece
+        # A TMA reduce from `smem` a chunk of its columns at a time (`chunked`), rank-2 as the one-buffer
+        # case of a rank-3 `(buffers, rows, cols)` stage (`stores.buffer_waits`, row 5272), with `pending`
+        # earlier adds reading their own buffers folded into chunk 0's wait.
+        buffers = tuple(smem.at[i] for i in range(smem.shape[0])) if smem.ndim == 3 else (smem,)
+        chunks = chunked(value, view, buffers[0])
+        waits = stores.buffer_waits(len(chunks), len(buffers))
+        for index, ((piece, place), wait) in enumerate(zip(chunks, waits, strict=True)):
+            buf = buffers[index % len(buffers)]
+            plgpu.wait_smem_to_gmem(wait + pending if index == 0 else wait, wait_read_only=True)
+            buf[...] = piece
             plgpu.commit_smem()
-            plgpu.copy_smem_to_gmem(smem, place, reduction_op="add")
+            plgpu.copy_smem_to_gmem(buf, place, reduction_op="add")

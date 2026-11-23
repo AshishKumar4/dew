@@ -989,17 +989,19 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         return closed
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
-    from dew._cache import KERNEL_CHOICES
+    from dew._cache import KERNEL_CHOICES, KERNEL_PINS
     from dew.algebra import derive
 
     rewrites = _REWRITTEN.setdefault(closed, collections.OrderedDict())
     # With kernels, the context the substitutions are decided in too (the derivation's: the mesh, the target
-    # and the numerics; the kernel choices a call names; the launches the compiles refused), so a body
-    # rewritten under one choice is none of another's (spec alignment, 8994). Not fusion's whole choice
-    # context: its trace context holds every context variable set, a call's arrays among them, which this
-    # cache, held as long as the body is, would keep alive.
+    # and the numerics; the kernel choices a call names; the tiles a tuning pins, row 12169: two legal pins of
+    # one launch's tile are two bodies; the launches the compiles refused), so a body rewritten under one
+    # choice is none of another's (spec alignment, 8994). Not fusion's whole choice context: its trace
+    # context holds every context variable set, a call's arrays among them, which this cache, held as long
+    # as the body is, would keep alive.
     key = (_deriving(accurate, saturation), kernels,
-           (derive.context(), KERNEL_CHOICES.value, kernel_report.refusal_entries()) if kernels else None)
+           (derive.context(), KERNEL_CHOICES.value, KERNEL_PINS.value, kernel_report.refusal_entries())
+           if kernels else None)
     fresh: list[_Body] = []
 
     def rewrite() -> _Body:

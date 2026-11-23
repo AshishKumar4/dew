@@ -321,10 +321,10 @@ class FitPlan:
         stop = self.stop
         if stop is None:
             return False
-        assert isinstance(stop.metric, (Metric, TrainingScalar, Summary, SplitLoss)), (
+        assert isinstance(stop.metric, str) and stop.split is not None, (
             "fit binds the stopping selector before stepping"
         )
-        name = f'{stop.split}/{stop.metric.name}'
+        name = f'{stop.split}/{stop.metric}'
         if name not in scores:
             return False
         value = scores[name] if stop.mode == 'min' else -scores[name]
@@ -1007,26 +1007,32 @@ def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, s
         else (best,)
     )
 
+    def objectives_loss(choice) -> bool:
+        # The objective's own `loss` method, the shorthand for its training loss (`objective.scalars.loss`).
+        return (isinstance(choice, types.MethodType) and choice.__name__ == 'loss'
+                and choice.__self__ is objective)
+
     def owned(choice):
+        if objectives_loss(choice):
+            return objective.scalars.loss
         if isinstance(choice, types.MethodType):
-            if choice.__name__ == 'loss' and choice.__self__ is objective:
-                return objective.scalars.loss
             raise TypeError("a training selector must be this objective's loss or declared scalar")
         if isinstance(choice, TrainingScalar) and choice.owner is not objective:
             raise ValueError("training scalar belongs to a different objective")
-        if isinstance(choice, Best):
-            source = choice._source
-            if source is None and (choice.metric.startswith('train/') or choice.split == 'train'):
-                source = objective.scalars[choice.metric.removeprefix('train/')]
-            return dataclasses.replace(choice, _source=owned(source) if source is not None else None)
+        if isinstance(choice, Best) and objectives_loss(choice.score):
+            # The objective's loss as a score is ranked as its training scalar, as the loss given alone is;
+            # any other method a score is a custom score of the fit's scores (`Best.score`).
+            return dataclasses.replace(choice, metric=objective.scalars.loss.name, split="train", score=None)
         return choice
 
+    # The objective's training scalars, which a selection of the `train` split names (`Best.resolved`).
+    scalars = objective.scalars.__getitem__
     selection = tuple(
-        (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(scored)
-        for chosen in (owned(Best(choice) if isinstance(choice, str) else choice) for choice in raw)
+        (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(scored, scalars)
+        for chosen in (owned(choice) for choice in raw)
     )
     labels = [(choice.split, choice.metric) for choice in selection
-              if isinstance(choice._source, (Metric, TrainingScalar, SplitLoss))]
+              if choice.score is None and choice.split != Summary.SPLIT]
     if len(labels) != len(set(labels)):
         raise ValueError("select each metric once; one Best.top already keeps all its winners")
     if plateau is not None:
@@ -1036,10 +1042,8 @@ def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, s
             raise TypeError(
                 "Plateau selects a declared metric object or summary, not a Best policy or score function"
             )
-        chosen = owned(Best(metric, mode=plateau.mode, split=plateau.split))
-        stopping = (chosen if isinstance(chosen, Best) else Best(chosen, mode=plateau.mode,
-                                                                 split=plateau.split)).resolved(scored)
-        plateau = dataclasses.replace(plateau, metric=stopping._source, mode=stopping.mode,
+        stopping = Best(metric, mode=plateau.mode, split=plateau.split).resolved(scored, scalars)
+        plateau = dataclasses.replace(plateau, metric=stopping.metric, mode=stopping.mode,
                                       split=stopping.split)
     return selection, plateau, pause
 
@@ -1204,6 +1208,7 @@ class FitArguments(TypedDict, total=False):
     epochs: int | None
     tokens: int | None
     examples: int | None
+    max_tokens: int | None
     log_every: int | str | Counted
     eval_every: int | str | Counted | None
     checkpoint_every: int | str | Counted | datetime.timedelta | None
@@ -1280,7 +1285,7 @@ def unrecorded_parts(objective: str, dataset: Dataset | Loader | Handed, *, opti
 
 def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int] | None:
     """Where the run's commits reached the tokens of the schedule's stage it stands in
-    (`dew.data.pipeline.schedule`), on every process alike, as the committed tokens are the pool's: its
+    (`dew.data.phases` on `Tokens`), on every process alike, as the committed tokens are the pool's: its
     stream opened again where the step that reached them left it, the stages that step's commit passed
     ended there, reading nothing, and the stage it now reads; what the prefetch worker read ahead of
     the end is dropped untrained. The last stage's tokens, where they end the data, are the run's token

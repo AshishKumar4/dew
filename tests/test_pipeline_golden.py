@@ -27,7 +27,7 @@ import pytest
 import tensorflow_datasets as tfds
 from token_support import write_token_corpus
 
-from dew.data import Memory, images, phases, presets
+from dew.data import Memory, Phase, Steps, images, phases, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.images import EncodeCaptions
@@ -125,7 +125,7 @@ def chains(tmp_path_factory):
         "text_windows": (windows(tokens.train).batch(4),
                          TokenFiles(tokens.val).pipe(presets.token_windows, seq_len=16, batch=4, records=16)),
         "text_packed": (packed(tokens.train).shuffle(7).repeat().batch(4), packed(tokens.val, 4, 16)),
-        "text_phases": (phases((windows(tokens.train), 3), (windows(other.train), None)).batch(4),
+        "text_phases": (phases(Phase(windows(tokens.train), Steps(3)), Phase(windows(other.train))).batch(4),
                         TokenFiles(tokens.val).pipe(presets.token_windows, seq_len=16, batch=4, records=16)),
         "chat": (chat().shuffle(7).repeat().batch(4), chat(4, 16)),
         "prompts": (prompts.pipe(presets.prompts, "byte", max_prompt_len=16, batch=None).shuffle(7).repeat()

@@ -34,6 +34,7 @@ from dew.inference.tasks import SavedRun
 from dew.interop.release import computed_in
 from dew.registry import objectives
 from dew.training import LocalTracker
+from dew.training.budget import Horizon
 
 CORPUS = Path(__file__).with_name("fixtures") / "saved_runs"
 SAVED = [(recorded.name, kind) for recorded in sorted(CORPUS.iterdir()) if recorded.is_dir()
@@ -312,7 +313,8 @@ def test_an_earlier_mains_run_resumes_its_state_and_its_data_by_its_mode(
     # the checkout's root as the run that wrote it read it.
     monkeypatch.chdir(checkout_of(tmp_path, recorded))
     # A run counted in examples reads on to its bound; one counted in steps, one step more.
-    steps = {} if recorded_run.trainer.examples is not None else {"steps": last + 1}
+    clocked = recorded_run.trainer.horizon.examples is not None
+    steps = {} if clocked else {"horizon": Horizon(steps=last + 1)}
     trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), stop=None,
                                   resume="require", compilation_cache_dir=None, multi_host=False,
                                   data_resume=data_resume, **steps)
@@ -364,9 +366,10 @@ def rebuilt(tmp_path: Path, monkeypatch, recorded: str, kind: str, **stated) -> 
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
     monkeypatch.chdir(checkout_of(tmp_path, recorded))
-    clocked = recorded_run.trainer.examples is not None
+    clocked = recorded_run.trainer.horizon.examples is not None
     trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), stop=None,
-                                  **({} if clocked else {"steps": last + 1}), resume="require",
+                                  **({} if clocked else {"horizon": Horizon(steps=last + 1)}),
+                                  resume="require",
                                   compilation_cache_dir=None, multi_host=False)
     here = SAVED_KINDS[kind](tmp_path, drawn=False)
     sourced = {"pretrained": recorded_run.pretrained} if hasattr(recorded_run, "pretrained") else {}
@@ -499,7 +502,8 @@ def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_fr
         loaded = DecisionRunConfig.load(str(directory))
         assert loaded.option_text is None and loaded.resumed().option_text == written
         run = first if steps == 2 else loaded
-        trained(run, tmp_path, kind, trainer={"name": kind, "steps": steps, "checkpoint_final": True})
+        trained(run, tmp_path, kind, trainer={"name": kind, "horizon": Horizon(steps=steps),
+                                              "checkpoint_final": True})
         assert str(steps) in {path.name for path in directory.iterdir()}
         assert json.loads((directory / "run.json").read_text())["fields"]["option_text"] == written
 
