@@ -68,7 +68,7 @@ from dew.nn.kernels.formats import (
 )
 from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
-from dew.nn.kernels.templates.gemm import scattered, tiling
+from dew.nn.kernels.templates.gemm import rows_permuted, scattered, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
@@ -319,16 +319,6 @@ def _scattered_cotangent(cotangent, scatter, *, epilogue, first) -> tuple:
     if scatter is None or (epilogue is None and first is None):
         return cotangent, scatter
     return jax.tree.map(lambda d: rows_permuted(d, scatter), cotangent), None
-
-
-def rows_permuted(x: jax.Array, permutation: jax.Array, axis: int = 0) -> jax.Array:
-    """`x`'s rows along `axis` at `permutation`'s order, placed as `x` is where an Explicit axis splits it
-    (a permutation of its rows, whose placement its own is): JAX takes no gather of a split axis without its
-    output's placement."""
-    placed = explicit_spec(x)
-    if placed is None:
-        return jnp.take(x, permutation, axis=axis)
-    return x.at[(slice(None),) * axis + (permutation,)].get(out_sharding=placed)
 
 
 def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, lhs,
@@ -1722,6 +1712,10 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
                                **plain))
     else:
         accs = (zero(),) * count
+    # Each typed as the stand-in is, whatever its own operands vary over: a recomputed product reads its rows
+    # in the product's order, no scatter table among its operands, though its cotangent is the scattered
+    # one's, read back through it.
+    accs = tuple(varying_like(each, *operands) for each in accs)
 
     def epilogued(*args):
         # Each row's side values, whose transpose sums a groups axis's cotangents over each group's rows.

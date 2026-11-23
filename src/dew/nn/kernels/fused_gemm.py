@@ -60,6 +60,7 @@ from dew.nn.kernels import gemm, generation, grouped_matmul, launches, tuning
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost, emission
+from dew.nn.kernels.templates.gemm import rows_permuted
 from dew.nn.sharding import computed_from
 
 FUSION_ROW = 'ledger 1295'
@@ -318,8 +319,8 @@ def _written(program: algebra_cost.Seconds, written: float, xla: algebra_cost.Fu
 
 def _indexed_rows(operands: tuple, table: jax.Array) -> tuple:
     """Each `(side, axes)` side operand's rows along its `'rows'` axis at `table`'s order (`scatter`), placed
-    as it was (`gemm.rows_permuted`)."""
-    return tuple((gemm.rows_permuted(side, table, axes.index('rows')) if 'rows' in axes else side, axes)
+    as it was (`templates.gemm.rows_permuted`)."""
+    return tuple((rows_permuted(side, table, axes.index('rows')) if 'rows' in axes else side, axes)
                  for side, axes in operands)
 
 

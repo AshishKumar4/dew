@@ -737,12 +737,13 @@ def test_a_gathered_products_consumer_reads_it_as_varying_as_its_routing_table()
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("routed", ["gather", "scatter"])
-def test_a_routed_products_reverse_pass_reads_it_as_varying_as_its_routing_table(routed):
+@pytest.mark.parametrize(("routed", "consumer"), [("gather", "negated"), ("scatter", "negated"),
+                                                  ("scatter", "squared")])
+def test_a_routed_products_reverse_pass_reads_it_as_varying_as_its_routing_table(routed, consumer):
     """A fused product's VJP in a checked `shard_map`, its tokens, weight and sizes every device's and its
     routing table (a gather, or a scatter's permutation) each device's own, under a consumer of no sides
-    (`-y`): its reverse pass types the product varying as its table does, as its forward did, its tokens'
-    gradient the unfused program's (row 9808)."""
+    (`-y`, or `y * y`, whose derivative reads the product again): its reverse pass types the product
+    varying as its table does, as its forward did, its tokens' gradient the unfused program's (row 9808)."""
     tokens = jnp.asarray(np.random.default_rng(98080).integers(-3, 4, (8, 8)), jnp.bfloat16)
     weight = jnp.eye(8, dtype=jnp.bfloat16)[None]
     tables = jnp.asarray([0, 1, 2, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2, 1, 0], jnp.int32)
@@ -760,7 +761,7 @@ def test_a_routed_products_reverse_pass_reads_it_as_varying_as_its_routing_table
                 rows = x[table] if routed == "gather" else x
                 y = jax.lax.ragged_dot(rows, w, sizes, preferred_element_type=jnp.float32)
                 y = y if routed == "gather" else jnp.empty_like(y).at[table].set(y)
-            return -y
+            return -y if consumer == "negated" else y * y
         program = functools.partial(fused_gemm.fused, region) if fused else region
         return jax.grad(lambda x: jnp.sum(program(x, w) * jnp.arange(8, dtype=jnp.float32)))(x)
 
