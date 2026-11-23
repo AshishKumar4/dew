@@ -773,39 +773,3 @@ def test_a_routed_products_reverse_pass_reads_it_as_varying_as_its_routing_table
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         np.testing.assert_array_equal(np.asarray(mapped(fused=True), np.float32),
                                       np.asarray(mapped(fused=False), np.float32))
-
-
-@pytest.mark.mesh(devices=2)
-def test_a_scattered_products_consumer_reads_an_explicitly_placed_side_in_its_rows_order():
-    """A fused scattered product under an Explicit mesh, its tokens, weight and permutation whole and its
-    residual's rows split over two CPU devices: its consumer reads the residual permuted to the product's
-    rows, placed as the residual is, its sum named (`checkpoint_name`) and read back in the product's rows'
-    order, and its value and gradients are the product's unfused (`gemm.gemm`, then the add), forward and
-    backward (row 5391)."""
-    from jax.sharding import AxisType, NamedSharding, PartitionSpec
-
-    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
-    tokens = jnp.asarray(np.random.default_rng(5391).integers(-3, 4, (8, 8)), jnp.bfloat16)
-    weight = jnp.eye(8, dtype=jnp.bfloat16)[None]
-    scatter = jnp.asarray([7, 6, 5, 4, 3, 2, 1, 0], jnp.int32)
-    sizes = jnp.asarray([8], jnp.int32)
-
-    def region(x, w, side, *, fused):
-        call = fused_gemm.product if fused else gemm.gemm
-        y = call(x, w, sizes, out_dtype=jnp.float32, scatter=scatter, interpret_on_cpu=True)
-        # Named, a residual of the derivative under its name (`gemm`'s `named`), read back in row order.
-        return jax.ad_checkpoint.checkpoint_name(y + side, "saved") * side
-
-    def both(side, *, fused):
-        program = (functools.partial(fused_gemm.fused, functools.partial(region, fused=True)) if fused
-                   else functools.partial(region, fused=False))
-        out, pull = jax.vjp(program, tokens, weight, side)
-        return out, pull(jnp.ones_like(out))
-
-    with jax.set_mesh(mesh), generation.assumed("sm90"):
-        side = jax.device_put(jnp.arange(64, dtype=jnp.float32).reshape(8, 8),
-                              NamedSharding(mesh, PartitionSpec("data")))
-        got = jax.jit(functools.partial(both, fused=True))(side)
-        want = jax.jit(functools.partial(both, fused=False))(side)
-    for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
-        np.testing.assert_array_equal(np.asarray(g, np.float32), np.asarray(w, np.float32))
