@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 from arm_arithmetic import drawn_on_the_host
 from jax.sharding import Mesh, PartitionSpec
-from reference_error import assert_as_exact, equations, with_gradients
+from reference_error import as_given, assert_as_exact, equations, with_gradients
 from sharded import assert_runs_per_shard, placed_on
 from tuned import each_config
 
@@ -1015,8 +1015,8 @@ def test_a_packed_mlp_model_trains_on_an_explicit_data_mesh():
         val, grads = jax.value_and_grad(loss_f64)(truth_params)
         return (val, *jax.tree.leaves(grads))
 
-    assert_as_exact(lambda x, y: ran(explicit_trainer, explicit_step, x, y),
-                    lambda x, y: ran(one_trainer, one_step, x, y), draw,
+    assert_as_exact(as_given(lambda x, y: ran(explicit_trainer, explicit_step, x, y)),
+                    as_given(lambda x, y: ran(one_trainer, one_step, x, y)), draw,
                     "packed MLP Trainer on Explicit data mesh", seeds=SEEDS["per shard"], truth_fn=truth)
 
     step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
