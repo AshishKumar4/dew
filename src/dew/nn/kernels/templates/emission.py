@@ -133,6 +133,14 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
 _DEVICE = object()
 """A ref in device memory, as `emitted`'s walk holds it (`_Counting.equation` prices its reads and writes)."""
 
+_INVARIANT = object()
+"""A value of no data and no trip: an iota's, and what pure operations (`_PURE`) compute of such values,
+literals and concrete scalars alone (a tile's row and column indices and the masks made of them). The GPU's
+compile folds it or computes it once outside every loop, so it issues nothing a step: the recurrence solve's
+masks, priced at 6.1M integer operations a GH200 program (FS-4123-INT3, its launch integer-bound), compile
+to about a thousand integer instructions a thread a walk's trip, its moves and conversions among them
+(FS-SOLVE-SASS2), and their floor division and its truncating form to one binary (M-JS-258, row 4123)."""
+
 
 @dataclasses.dataclass(frozen=True)
 class _Barrier:
@@ -636,6 +644,8 @@ class _Counting:
         if (primitive is lax.select_n_p and programs.integral_scalar(values[0])
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
+        if primitive is lax.iota_p or (primitive in _PURE and values and all(map(_invariant, values))):
+            return [_INVARIANT] * len(equation.outvars)
         if primitive in _ARITHMETIC:
             self.add(operation_work(primitive, [variable.aval for variable in equation.invars],
                                     [variable.aval for variable in equation.outvars], params,
@@ -722,7 +732,9 @@ class _Counting:
                                                                                    strict=True)]
         body, consts = params["body_jaxpr"], held[params["cond_nconsts"]:][:params["body_nconsts"]]
         carry = len(body.invars) - len(consts)
-        ranged = _ranged(params, held)
+        # A range's bound held by its atom where its value is invariant alone, so a guard on it is read.
+        ranged = _ranged(params, [_Same(atom) if value is _INVARIANT else value
+                                  for atom, value in zip(equation.invars, held, strict=True)])
 
         def trip(at: str, parity: int) -> "_Counting":
             # A carried value is unknown past the first trip, but a range's counter and stop (`_ranged`).
@@ -904,6 +916,19 @@ def _operated(primitive, inputs: Sequence, outputs: Sequence) -> Work:
 _ARITHMETIC = _OPERATIONS | _REDUCTIONS | SPECIAL_FUNCTIONS | {lax.convert_element_type_p}
 """The primitives a kernel body's count prices by `operation_work`: its elementwise arithmetic, a product
 apart (`_Counting.equation`'s, a TPU core's)."""
+
+_PURE = _ARITHMETIC | frozenset({lax.broadcast_in_dim_p, lax.reshape_p, lax.squeeze_p, lax.transpose_p,
+                                 lax.bitcast_convert_type_p, gpu_core.layout_cast_p, lax.slice_p,
+                                 lax.concatenate_p, lax.rev_p})
+"""What computes its outputs of its operands' values alone, nothing read of memory nor of a thread's place:
+elementwise arithmetic and a value's elements rearranged, which of invariant operands is invariant
+(`_INVARIANT`)."""
+
+
+def _invariant(value) -> bool:
+    """Whether the count holds `value` as one of no data and no trip: invariant (`_INVARIANT`), or a host's
+    concrete value (a literal's, a fold's)."""
+    return value is _INVARIANT or isinstance(value, int | float | np.generic | np.ndarray)
 
 
 def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mapping,
