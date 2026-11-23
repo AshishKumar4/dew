@@ -228,8 +228,10 @@ def granular_tile(family: mosaic.Family, config: "Tiles", dtype, *, target,
     and tensor-memory column budget (shared by `_Mosaic` and `MosaicSyrk`, row 11982)."""
     from dew.nn.kernels.templates.gemm.tiling import CONSUMERS
 
+    most_programs = family.programs(config.warpgroups,
+                                    family.scalar_registers() if family.budgets_registers else None)
     if (config.warpgroups > min(family.consumers, CONSUMERS)
-            or config.programs > family.programs(config.warpgroups) or config.stages < 2
+            or config.programs > most_programs or config.stages < 2
             or config.block_m % (family.role_rows * config.sharing)
             or config.block_n % family.column_unit(dtype)
             or config.block_k not in (steps or family.depths(dtype))
@@ -238,7 +240,7 @@ def granular_tile(family: mosaic.Family, config: "Tiles", dtype, *, target,
     tensor = family.tensor_columns(tile_columns(config, family), accumulators, exact_sums)
     if tensor and stream_blocks is not None:
         tensor += family.stream_tensor_columns(stream_blocks(), config.stages)
-    return tensor <= (target.tmem_columns or 0)
+    return tensor * config.programs <= (target.tmem_columns or 0)
 
 
 def prefetch_registers(family: mosaic.Family, config: "Tiles", *, ba) -> int:
