@@ -282,7 +282,9 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     compile ends, never through a compile XLA's exit tears down under it."""
     from dew.nn.kernels.templates import report
 
-    traced = program.trace(*args, **kwargs)
+    # Dew's program's trace beside the launches refused as it traced, which its begun lowering is keyed by.
+    traced, refused = (program._snapshot_trace(args, kwargs) if isinstance(program, OuterProgram)
+                       else (program.trace(*args, **kwargs), None))
     lowered = traced.lower()
     attempt: Future = Future()
     # In this thread's context: the compile's target reads it (`report.for_devices`).
@@ -310,7 +312,7 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     thread = threading.Thread(target=attempted, name="dew-compile-ahead", daemon=True)
     withdraw = stop_at_exit(thread, said, timeout=None)
     thread.start()
-    abstract = program.abstract_of(args, kwargs) if isinstance(program, OuterProgram) else None
+    abstract = program.abstract_of(args, kwargs, refused) if isinstance(program, OuterProgram) else None
     return Compiling(program, abstract, lowered, attempt, _weak_types(traced))
 
 
@@ -453,8 +455,9 @@ def _abstractly_placed(tree) -> bool:
                and isinstance(leaf.sharding.mesh, AbstractMesh) for leaf in jax.tree.leaves(tree))
 
 
-type Relowered = list[tuple[jax.stages.Wrapped, jax.stages.Lowered]]
-"""The relowerings a spill made of a call (`OuterProgram.compiled`'s), each with the jit it traced by."""
+type Relowered = list[tuple[jax.stages.Wrapped, jax.stages.Lowered, tuple]]
+"""The relowerings a spill made of a call (`OuterProgram.compiled`'s), each with the jit it traced by and the
+launches refused when it traced (`report.refusal_entries`)."""
 
 @dataclasses.dataclass
 class _Lowering:
@@ -605,7 +608,9 @@ class OuterProgram:
 
     def __init__(self, function: Callable, **arguments):
         self.function, self.arguments = function, arguments
-        self.jitted = self._jitted()
+        # Its jit and the launches refused when it traced (`report.refusal_entries`; None before it traces),
+        # replaced together (`_published`): a trace reads the pair as one.
+        self._held: tuple[jax.stages.Wrapped, tuple | None] = (self._jitted(), None)
         # The static positions and names as jit resolves them, the ones given and those it infers.
         numbers, names = arguments.get("static_argnums"), arguments.get("static_argnames")
         signature = api_util.fun_signature(function)
@@ -629,11 +634,9 @@ class OuterProgram:
         self._shaped: collections.OrderedDict[Hashable, tuple[jax.stages.Compiled, str | None,
                                                               tuple[bool, ...]]] = (
             collections.OrderedDict())
-        # Its jits within another trace and the refusals they were made under (`_nested`); the refusals its
-        # own jit traced under, None before it traces (`trace`).
+        # Its jits within another trace and the refusals they were made under (`_nested`).
         self._nested_jits: dict[bool, jax.stages.Wrapped] = {}
         self._nested_refusals: tuple | None = None
-        self._traced_refusals: tuple | None = None
         self._compiling = threading.Lock()
         held_until_release(self)
 
@@ -648,8 +651,22 @@ class OuterProgram:
         """Its jit, of a callable of its own, past JAX's trace cache (a relowering's, `compiled`)."""
         return jax.jit(_fresh(self.function), **self.arguments)
 
-    def _traced(self, jitted: jax.stages.Wrapped, args: tuple, kwargs: dict
-                ) -> tuple[jax.stages.Traced, jax.stages.Wrapped]:
+    @property
+    def jitted(self) -> jax.stages.Wrapped:
+        """The jit its next trace takes, as its last trace or relowering left it."""
+        return self._held[0]
+
+    def _published(self, held: tuple[jax.stages.Wrapped, tuple]) -> None:
+        """`held` (a jit and the launches refused when it traced) the program's from here on, where it traced
+        past every refusal the one it replaces did: refusals only add, so a trace of fewer is stale, never
+        published over a later one by a slower thread (theme K01-e's review P0)."""
+        with self._compiling:
+            under = self._held[1]
+            if under is None or set(held[1]) >= set(under):
+                self._held = held
+
+    def _traced(self, held: tuple[jax.stages.Wrapped, tuple], args: tuple, kwargs: dict
+                ) -> tuple[jax.stages.Traced, tuple[jax.stages.Wrapped, tuple]]:
         """`jitted`'s trace of a call, its program the algebra pass's (`algebra.rewritten_program`), so its
         lowering, its trace, its executable and every relowering read one program (docs/design/algebra.md
         §6.7): the pass reads the trace jit made, which lowers as it is where no rule changes it; a program
@@ -659,20 +676,21 @@ class OuterProgram:
         certifying aside, the launches an outermost program's trace reaches settle before it is lowered, the
         program traced afresh past a refused config by a jit of its own, past JAX's trace cache (`_jitted`;
         `report.settled_trace`), so it lowers once; a program traced within another's (a launch's own, as its
-        capture traces it) settles nothing mid-trace. Beside its trace, the jit that made it."""
+        capture traces it) settles nothing mid-trace. Beside its trace, the jit that made it and the launches
+        refused as it traced (`held`'s, or a settle's own retrace's)."""
         from dew.nn.kernels.templates import report
 
         outermost = not _PASSING.get()
         token = _PASSING.set(True)
-        made = jitted
+        made = held
 
         def retraced() -> jax.stages.Traced:
             nonlocal made
-            made = self._jitted()
-            return made.trace(*args, **kwargs)
+            made = (self._jitted(), report.refusal_entries())
+            return made[0].trace(*args, **kwargs)
 
         try:
-            trace = functools.partial(jitted.trace, *args, **kwargs)
+            trace = functools.partial(held[0].trace, *args, **kwargs)
             traced = report.settled_trace(trace, retraced) if outermost else trace()
             rewritten = algebra.rewritten_program(traced.jaxpr)
             if rewritten is traced.jaxpr:
@@ -744,12 +762,12 @@ class OuterProgram:
             # state its first returned; another collection's in this process) takes the one it holds, and
             # its collection records it as the compile recorded it in the first.
             if held is None:
-                held = self._compiled_digested(*args, **kwargs)
-                # Held too under the refusals its compile settled past (`_keyed`), which a call after it
-                # keys on (row 12165).
-                settled = self.abstract_of(args, kwargs)
+                executable, digest, weak_types, refused = self._compiled_digested(*args, **kwargs)
+                held = executable, digest, weak_types
+                # Held by the refusals its program traced under (`_keyed`), a refusal recorded since its
+                # trace another key's (row 12165; theme K01-e's review P0).
                 with self._compiling:
-                    self._shaped[abstract] = self._shaped[settled] = held
+                    self._shaped[self.abstract_of(args, kwargs, refused)] = held
                     self._bounded()
             executable, digest, weak_types = held
             if digest is not None:
@@ -763,15 +781,6 @@ class OuterProgram:
         ready = self._ready.get(key)
         if ready is None:
             ready = self._shaped_for(key, args, kwargs) or self._kept(key, args, kwargs)
-            # Kept too under the refusals its compile settled past (`_keyed`): a compile that refused a
-            # launch's config relowered past it, the program a call after it runs (row 12165).
-            if (settled := self.key_of(args, kwargs)[0]) != key:
-                kept: Future[jax.stages.Compiled] = Future()
-                kept.set_result(ready)
-                with self._compiling:
-                    if settled not in self._executables:
-                        self._executables[settled], self._ready[settled] = kept, ready
-                        self._bounded()
         with _ran(self, ready, args, kwargs):
             return ready(*dynamic, **named)
 
@@ -880,40 +889,58 @@ class OuterProgram:
         pending, owner = self._reserved(key)
         if owner:
             try:
-                self._keep(key, pending, self.compiled(*args, **kwargs), [])
+                executable, _, _, refused = self._compiled_digested(*args, **kwargs)
+                self._keep(key, pending, executable, [])
             except BaseException as error:
                 self._released(key, pending, error)
+            else:
+                self._settled_as(self.key_of(args, kwargs, refused)[0], executable)
         return pending.result()
 
+    def _settled_as(self, settled: Hashable, executable: jax.stages.Compiled) -> None:
+        """`executable` kept too under `settled`, the key of the refusals its program traced under: a compile
+        that refused a launch's config relowered past it, the program a call after it runs (row 12165); never
+        a key of refusals recorded since it traced (theme K01-e's review P0)."""
+        kept: Future[jax.stages.Compiled] = Future()
+        kept.set_result(executable)
+        with self._compiling:
+            if settled not in self._executables:
+                self._executables[settled], self._ready[settled] = kept, executable
+                self._bounded()
+
     def _lowered_aside(self, args: tuple, kwargs: dict, relowered: Relowered
-                       ) -> tuple[jax.stages.Lowered, tuple[bool, ...]]:
+                       ) -> tuple[jax.stages.Lowered, tuple[bool, ...], tuple]:
         """The call's program lowered, its launches certified aside while it traces
         (`report.certifying_aside`), and lowered afresh (`_relowered`) for as long as it launches a refused
         config (`report.refused_in`), each refused launch's derivation stepping past its config and certifying
         the next in turn: its own certifications' refusals, or another caller's committed after its trace took
         the config (row 8603: another thread's drain left this program compiling at it). A relowering that
         launches a config refused before again (a derivation reading no refusal, a pin's) is its compile's to
-        read (`report.settled`)."""
+        read (`report.settled`). Beside it, its outputs' weak types and the launches refused as its program
+        traced (its last relowering's, else its trace's)."""
         from dew.nn.kernels.templates import report
 
-        traces: list[jax.stages.Traced] = []
+        traces: list[tuple[jax.stages.Traced, tuple]] = []
 
         def lowered() -> jax.stages.Lowered:
-            traces.append(self.trace(*args, **kwargs))
-            return traces[-1].lower()
+            traces.append(self._snapshot_trace(args, kwargs))
+            return traces[-1][0].lower()
 
         program = report.lowered_aside(lowered, lambda: self._relowered(args, kwargs, relowered),
                                        lambda lowered: lowered)
         # Its outputs' weak types, its first trace's: a relowering steps a launch's config, which changes
         # no output.
-        return program, _weak_types(traces[0])
+        return program, _weak_types(traces[0][0]), relowered[-1][2] if relowered else traces[-1][1]
 
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
         """A call's program traced afresh past a spill's refused config (`report.compiled`'s `relower`), on
-        the thread that keeps it, each relowering with its jit kept in `relowered`."""
-        traced, fresh = self._traced(self._jitted(), args, kwargs)
+        the thread that keeps it, each relowering with its jit and the launches refused as it traced kept in
+        `relowered`."""
+        from dew.nn.kernels.templates import report
+
+        traced, (fresh, refused) = self._traced((self._jitted(), report.refusal_entries()), args, kwargs)
         relowering = traced.lower()
-        relowered.append((fresh, relowering))
+        relowered.append((fresh, relowering, refused))
         return relowering
 
     def _together(self, together: dict[tuple[int, Hashable], _Lowering], key: Hashable, args: tuple,
@@ -945,7 +972,7 @@ class OuterProgram:
         """Settle the compile reserved under `key` (`_reserved`) with `executable`, kept for later calls;
         later calls trace as its last relowering did."""
         if relowered:
-            self.jitted = relowered[-1][0]
+            self._published((relowered[-1][0], relowered[-1][2]))
         pending.set_result(executable)
         with self._compiling:
             if key in self._executables:
@@ -1004,19 +1031,21 @@ class OuterProgram:
         state's layout) is handed it as a call is."""
         return self._compiled_digested(*args, **kwargs)[0]
 
-    def _compiled_digested(self, *args, **kwargs) -> tuple[jax.stages.Compiled, str | None, tuple[bool, ...]]:
+    def _compiled_digested(self, *args, **kwargs
+                           ) -> tuple[jax.stages.Compiled, str | None, tuple[bool, ...], tuple]:
         """`compiled`, the digest its collection holds it by where it compiles within `collecting` (None
         elsewhere, and for a program none can state), and its trace's outputs' weak types: its
         tracing, lowering and compile one compile's work in JAX's events (`telemetry.compiles.spanning`), the
         backend its executable targets stated on the span once it is compiled, which a ledger of what a block
-        compiled reads by backend (`dew.training.compiler.HostStartup`)."""
+        compiled reads by backend (`dew.training.compiler.HostStartup`); and the launches refused as its
+        program traced, which a key it is kept by holds (`_keyed`)."""
         with spanning(self.called) as span:
-            executable, digest, weak_types = self._compiled_spanned(span, args, kwargs)
+            executable, digest, weak_types, refused = self._compiled_spanned(span, args, kwargs)
             span.executable = executable
-        return executable, digest, weak_types
+        return executable, digest, weak_types, refused
 
     def _compiled_spanned(self, span: Span, args: tuple, kwargs: dict
-                          ) -> tuple[jax.stages.Compiled, str | None, tuple[bool, ...]]:
+                          ) -> tuple[jax.stages.Compiled, str | None, tuple[bool, ...], tuple]:
         """`_compiled_digested`'s compile, its `span` told whether it built its executable."""
         from dew.nn.kernels.templates import report
 
@@ -1025,13 +1054,14 @@ class OuterProgram:
         # the same abstract inputs, lowers nothing again: the begun lowering is its.
         begun = _ATTEMPTING.get()
         if begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs):
-            lowered, weak_types = begun.lowered, begun.weak_types
+            # The begun lowering traced under the refusals its abstract key holds (`_keyed`'s last).
+            lowered, weak_types, refused = begun.lowered, begun.weak_types, begun.abstract[-1]
             begun.taken.set()
         else:
-            lowered, weak_types = self._lowered_aside(args, kwargs, relowered)
+            lowered, weak_types, refused = self._lowered_aside(args, kwargs, relowered)
         # A program compiled ahead or kept for this target runs as it was compiled (`taking`).
         if (ahead := taken(lowered, self.options)) is not None:
-            return ahead(), None, weak_types
+            return ahead(), None, weak_types, refused
         # Its first compile from that thread, where it lowers the program begun there.
         first = None
         if begun is not None and (lowered is begun.lowered
@@ -1043,7 +1073,8 @@ class OuterProgram:
         span.built = True
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
-            self.jitted, lowered = relowered[-1]
+            fresh, lowered, refused = relowered[-1]
+            self._published((fresh, refused))
         # A program no file can hold (its trees hold a node no process names: a pullback's closure) is
         # collected by no digest; a call over arrays alike still runs it (`_shaped`).
         digest = None
@@ -1051,46 +1082,52 @@ class OuterProgram:
                 digest := stated_digest(lowered, self.options)) is not None:
             collected[digest] = executable
         _heard(self, lowered, executable)
-        return executable, digest, weak_types
+        return executable, digest, weak_types, refused
 
     def lower(self, *args, **kwargs) -> jax.stages.Lowered:
         return self.trace(*args, **kwargs).lower()
 
     def trace(self, *args, **kwargs) -> jax.stages.Traced:
-        # A trace a settle made afresh (`_traced`) is the program's from here on, as a relowering's is. Its
-        # jit made afresh where the launches refused differ from those it traced under, which JAX's trace
-        # cache keys on none of: a trace after a seeded refusal derives past it (row 12165).
+        return self._snapshot_trace(args, kwargs)[0]
+
+    def _snapshot_trace(self, args: tuple, kwargs: dict) -> tuple[jax.stages.Traced, tuple]:
+        """A call's trace and the launches refused as it traced (`report.refusal_entries`): its jit afresh
+        where they differ from those its jit traced under, which JAX's trace cache keys on none of, so a
+        trace after a seeded refusal derives past it (row 12165); the jit taken and the refusals read as one
+        pair, and the jit a settle made afresh (`_traced`) the program's from here on with the refusals it
+        traced under, as a relowering's is (`_published`)."""
         from dew.nn.kernels.templates import report
 
         refusals = report.refusal_entries()
         with self._compiling:
-            if self._traced_refusals not in (None, refusals):
-                self.jitted = self._jitted()
-            self._traced_refusals = refusals
-        traced, self.jitted = self._traced(self.jitted, args, kwargs)
-        return traced
+            jitted, under = self._held
+        if under is not None and under != refusals:
+            jitted = self._jitted()
+        traced, made = self._traced((jitted, refusals), args, kwargs)
+        self._published(made)
+        return traced, made[1]
 
-    def key_of(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
+    def key_of(self, args: tuple, kwargs: dict, refused: tuple | None = None) -> tuple[Hashable, tuple, dict]:
         """The key of the executable a call runs, and the arguments the executable takes, the static
         ones dropped. It holds what jit keys on: the trace context, with its abstract mesh, and the
         concrete mesh in place (`jax.sharding.get_mesh`), so a mesh of the same shape over other devices
-        compiles its own executable."""
-        return self._keyed(args, kwargs, _signature)
+        compiles its own executable; the launches refused, `refused` where given (`_keyed`)."""
+        return self._keyed(args, kwargs, _signature, refused)
 
-    def abstract_of(self, args: tuple, kwargs: dict) -> Hashable:
+    def abstract_of(self, args: tuple, kwargs: dict, refused: tuple | None = None) -> Hashable:
         """What a call over these arguments lowers from, arrays or their shapes alike: `key_of`'s key with
         each array or shape as its shape, dtype, weak type and sharding (`shapes_of`). Two calls of the
         program alike in it lower one program, so a begun compile's lowering serves both (`attempting`)."""
-        return self._keyed(args, kwargs, _abstract_signature)[0]
+        return self._keyed(args, kwargs, _abstract_signature, refused)[0]
 
-    def _keyed(self, args: tuple, kwargs: dict, signature: Callable[..., Hashable]
-               ) -> tuple[Hashable, tuple, dict]:
+    def _keyed(self, args: tuple, kwargs: dict, signature: Callable[..., Hashable],
+               refused: tuple | None = None) -> tuple[Hashable, tuple, dict]:
         """`key_of`'s key with each dynamic leaf as `signature` states it, and the launches the compiles
-        refused (`report.refusal_entries`), which a trace's launches derive past: an executable traced before
-        a refusal is no executable a call after it runs (row 12165)."""
+        refused (`refused`, else `report.refusal_entries` now), its last, which a trace's launches derive
+        past: an executable traced before a refusal is no executable a call after it runs (row 12165)."""
         from dew.nn.kernels.templates import report
 
-        refused = report.refusal_entries()
+        refused = report.refusal_entries() if refused is None else refused
         if not self.numbers and not self.names:
             leaves, structure = jax.tree.flatten((args, kwargs))
             return (len(args), ((), ()), structure, tuple(map(signature, leaves)),
