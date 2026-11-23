@@ -524,6 +524,7 @@ class MosaicForward(_Mainloop[Tiles]):
 
     HOOKS = ("score_mod", "output_mod", "query_mod")
     config_cls = Tiles
+    revision: int = 2
     output_mod: Callable | None = None
     output_kinds: tuple[Kind, ...] = ()
     output_dtypes: tuple[str, ...] = ()

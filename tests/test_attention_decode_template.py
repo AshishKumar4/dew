@@ -1303,3 +1303,97 @@ def test_a_decode_step_with_output_hooks_compiles_spill_free(generation_name):
     with generation.assumed(generation_name):
         found = compile_mosaic_kernels(cases, generation_name)
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
+
+
+def test_softcap_folds_into_base2_and_decode_segments_interior_tiles():
+    """Row 4045: bounded `Capped(softcap)` folds `scale/softcap` and `softcap * LOG2E` into base-2 log2 units
+    (`spec.base2=True`, `spec.reaches=False`, using 1-op `exp2` instead of 10-op `exp`), while `natural=True`
+    or degenerate caps stay natural; `_Program.segmented` clips empty interior runs (`raw_start > raw_end`)
+    without revisiting edge tiles and splits windowed spans into `(masked, unmasked, masked)`."""
+    from dew.nn.kernels.templates import attention_mosaic_program as program
+
+    class _ShiftedCapped(template.Capped):
+        def __call__(self, s, q_pos, k_pos):
+            return super().__call__(s, q_pos, k_pos) + 1.0
+
+    cap = template.Capped(30.0)
+    spec_fold = algebra.Forward("spans", 32768, ids=False, scale=64 ** -0.5, score_mod=cap, natural=False)
+    spec_nat = algebra.Forward("spans", 32768, ids=False, scale=64 ** -0.5, score_mod=cap, natural=True)
+    spec_zero = algebra.Forward("spans", 32768, ids=False, scale=64 ** -0.5,
+                                score_mod=template.Capped(0.0), natural=False)
+    spec_sub = algebra.Forward("spans", 32768, ids=False, scale=64 ** -0.5,
+                               score_mod=_ShiftedCapped(30.0), natural=False)
+    assert spec_fold.base2 and not spec_fold.reaches and not spec_fold.raw
+    assert not spec_nat.base2 and not spec_zero.base2 and not spec_sub.base2
+    # Subclass of `Capped` keeps its overridden `__call__` instead of folding.
+    q_pos = jnp.zeros((2, 2), jnp.int32)
+    coords = algebra.Coords(q_pos, q_pos, (), None, None)
+    raw_s = jnp.ones((2, 2), jnp.float32)
+    sub_logits = algebra.logits_of(spec_sub, raw_s, coords, masked=False)[0]
+    ref_sub = _ShiftedCapped(30.0)(raw_s * float(np.float32(64 ** -0.5)), q_pos, q_pos)
+    np.testing.assert_array_equal(np.asarray(sub_logits), np.asarray(ref_sub))
+    # Native `MosaicForward` wraps `score_mod` in `tuning.Prepared`; folding must unwrap it.
+    q_s = jax.ShapeDtypeStruct((1, 1, 8, 64), jnp.bfloat16)
+    k_s = jax.ShapeDtypeStruct((1, 4096, 2, 64), jnp.bfloat16)
+    sp_s = template.spans(1, 4096, 1, lengths=jnp.array([4096], jnp.int32))
+    op_cap, _ = attention_mosaic._forward_call(
+        q_s, k_s, k_s, sp_s, template.Hooks(cap), scale=64 ** -0.5, natural=False)
+    prepared_spec = algebra.Forward("spans", 4096, ids=False, scale=64 ** -0.5,
+                                    score_mod=op_cap.score_mod, natural=False)
+    assert prepared_spec.base2 and not prepared_spec.reaches and not prepared_spec.raw
+    assert attention_mosaic.MosaicForward.revision == 2
+
+    with generation.assumed("sm90"):
+        family = program.layouts("sm90", jnp.bfloat16, 4)[0]
+        tiles = attention_mosaic.Tiles(16, 64, 2, 1, family=family.name)
+        prog = program._Program(family, tiles, 64, 2, 4096, causal=False, queries=4, per_span=4)
+        # Empty interior (start=16, end=37 inside tile 0 -> full_lo=1 > full_hi=0) visits tile 0 once.
+        segs_empty = prog.segmented(lambda *a, **kw: None, (jnp.int32(1), jnp.int32(0)),
+                                    jnp.int32(0), jnp.int32(1))
+        assert [(int(s), int(e)) for _, s, e in segs_empty] == [(0, 1), (1, 1), (1, 1)]
+        # Windowed span [1000, 4096) at block_k=64: tile 15 masked, tiles [16, 64) unmasked, tail empty.
+        segs_win = prog.segmented(lambda *a, **kw: None, (jnp.int32(16), jnp.int32(64)),
+                                  jnp.int32(15), jnp.int32(64))
+        assert [(int(s), int(e)) for _, s, e in segs_win] == [(15, 16), (16, 64), (64, 64)]
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
+def test_softcap_and_windowed_decode_compile_spill_free(generation_name):
+    """Row 4045: base-2 folded `Capped(30.0)` and statically unmasked interior decode tiles compile
+    spill-free across sm80/sm90/sm100/sm120 on the softcap d64 (`32 x 32768`), windowed (`128 x 4096`,
+    `starts=3072`), and d256 softcap prefill (`ET-PINSOFT`) shapes."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    q_soft = jax.ShapeDtypeStruct((32, 1, 32, 64), jnp.bfloat16)
+    k_soft = jax.ShapeDtypeStruct((32, 32768, 8, 64), jnp.bfloat16)
+    sp_soft = template.spans(1, 32768, 32, lengths=jnp.full((32,), 32768, jnp.int32))
+    hk_soft = template.Hooks(template.Capped(30.0))
+
+    q_win = jax.ShapeDtypeStruct((128, 1, 32, 128), jnp.bfloat16)
+    k_win = jax.ShapeDtypeStruct((128, 4096, 8, 128), jnp.bfloat16)
+    sp_win = template.spans(1, 4096, 128, lengths=jnp.full((128,), 4096, jnp.int32),
+                            starts=jnp.full((128,), 3072, jnp.int32))
+
+    q_pre = jax.ShapeDtypeStruct((1, 1024, 16, 256), jnp.bfloat16)
+    k_pre = jax.ShapeDtypeStruct((1, 1024, 4, 256), jnp.bfloat16)
+    sp_pre = template.spans(1024, 1024, 1, causal=True)
+
+    def soft_decode(q, k, v):
+        return attention_decode.attend(q, k, v, sp_soft, hk_soft, interpret=False)
+
+    def win_decode(q, k, v):
+        return attention_decode.attend(q, k, v, sp_win, None, interpret=False)
+
+    def soft_prefill(q, k, v):
+        return attention_mosaic.forward(q, k, v, sp_pre, hk_soft, natural=False)
+
+    cases = [
+        KernelCase("softcap-d64-decode", lambda: (soft_decode, (q_soft, k_soft, k_soft))),
+        KernelCase("windowed-d128-decode", lambda: (win_decode, (q_win, k_win, k_win))),
+        KernelCase("softcap-d256-prefill", lambda: (soft_prefill, (q_pre, k_pre, k_pre))),
+    ]
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels(cases, generation_name)
+    assert not (failed := mosaic_failures(found)), "\n".join(failed)

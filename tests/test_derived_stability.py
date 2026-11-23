@@ -28,7 +28,7 @@ import numpy as np
 import pytest
 import test_attention_stability as attention_suite
 import test_recurrence_stability as recurrence_suite
-from reference_error import widened, with_gradients
+from reference_error import widened
 from test_recurrence_chunk import chunk_on, token_by_token
 
 from dew.nn.kernels import generation
@@ -64,15 +64,15 @@ def test_the_derived_attention_is_finite_where_the_truth_is_on_every_family(name
     family = attention_suite.FAMILIES[name]
     family = family if dtype is None else family.retyped(dtype)
     draw = attention_suite._cast(family, family.draw)
-    truth = with_gradients(attention_suite._reference(family, anchored=True))
+    truth = attention_suite._cached_reference_fn(*attention_suite._reference_key(family), anchored=True)
     label = f"portable derived {forms} {family.dtype} {name}"
     with derived(forms):
         natural, accurate = attention_route.run_forms()
-        mainloops = attention_suite._mainloops(family, {"natural": natural, "accurate": accurate})
-        differentiated = jax.jit(with_gradients(mainloops["portable"]))
+        differentiated = attention_suite._jitted_mainloop(
+            "portable", attention_suite._spans_key(family.spans),
+            (("accurate", accurate), ("natural", natural)), dropping=False)
         attention_suite.assert_finite(differentiated, truth, draw, label, seeds=attention_suite.SEEDS[name],
                                       empty=family.empty)
-
 
 def _rows(rows, dtype, width: int = 8):
     """A call's operand of one batch row and head, `rows` its first components (each row's rest zero)."""
@@ -128,29 +128,47 @@ def _edges(dtype) -> dict:
 EDGES = [(name, dtype) for dtype in ("float16", "bfloat16", "float32") for name in _edges(jnp.float32)]
 
 
+@functools.cache
+def _edge_reference(name: str):
+    """Cached jitted reference forward and VJP for edge `name` (row 12050)."""
+    _, _, _, _, spans, hooks = _edges(jnp.float32)[name]
+
+    @jax.jit
+    def run(query, key, value, dout):
+        out, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
+        return (out, *pull(dout))
+
+    return run
+
+
+@functools.cache
+def _edge_derived(name: str, forms: str):
+    """Cached jitted derived portable forward and backward for `(name, forms)` (row 12050)."""
+    _, _, _, _, spans, hooks = _edges(jnp.float32)[name]
+    tiles = attention_portable.Tiles(block_q=8, block_k=8, pad=8)
+
+    @jax.jit
+    def run(query, key, value, dout):
+        natural, accurate = attention_route.run_forms()
+        made = attention_portable.backward(tiles, query, key, value, spans, hooks, dout,
+                                           natural=natural, accurate=accurate)
+        out = attention_portable.xla_mainloop(tiles, query, key, value, spans, hooks, natural=natural)
+        return (out, made.query, made.key, made.value)
+
+    return run
+
 @pytest.mark.parametrize("forms", FORMS)
 @pytest.mark.parametrize(("name", "dtype"), EDGES, ids=[f"{name}-{dtype}" for name, dtype in EDGES])
 def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(name, dtype, forms):
     """The plain-JAX mainloop's derived forms under each of its `forms` at the edge `name` in `dtype`: its
     output and gradients finite wherever the reference's are."""
-    query, key, value, dout, spans, hooks = _edges(jnp.dtype(dtype))[name]
-    tiles = {"block_q": 8, "block_k": 8, "pad": 8}
-
-    def reference(q, k, v):
-        return template.reference(q, k, v, spans, hooks)
-
-    out, pull = jax.vjp(reference, query, key, value)
-    theirs = (out, *pull(dout))
+    query, key, value, dout, _, _ = _edges(jnp.dtype(dtype))[name]
+    theirs = _edge_reference(name)(query, key, value, dout)
     with derived(forms):
-        natural, accurate = attention_route.run_forms()
-        made = attention_portable.backward(attention_portable.Tiles(**tiles), query, key, value, spans, hooks,
-                                           dout, natural=natural, accurate=accurate)
-        mine = (attention_portable.xla_mainloop(attention_portable.Tiles(**tiles), query, key, value, spans,
-                                                hooks, natural=natural), made.query, made.key, made.value)
+        mine = _edge_derived(name, forms)(query, key, value, dout)
     for leaf, ours, exact in zip(("output", "dq", "dk", "dv"), mine, theirs, strict=True):
         finite = np.isfinite(np.asarray(exact, np.float32))
         assert np.isfinite(np.asarray(ours, np.float32))[finite].all(), f"{name} {dtype} {leaf}"
-
 
 DECAY_EDGES = {"no decay": [0.0] * 4, "every token vanishing": [-(2.0 ** 127)] * 4,
                "live then vanishing": [-100.0, -(2.0 ** 127), -1.0, -(2.0 ** 127)],

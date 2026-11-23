@@ -805,7 +805,7 @@ def folded_form(form: str, keys: int, *, ids: bool, dtype, width: int, scale: fl
     their scales and prescales are one (the head reviews of 0a8c9658b and 3846f5bfd, F3)."""
     power, factor = prescale(dtype, width, scale)
     folding = algebra.folds(factor, power, natural=natural, score_mod=score_mod)
-    taken = power if folding and form != "spans" and not subtracted else 1.0
+    taken = power if folding and form != "spans" and not subtracted and score_mod is None else 1.0
     return algebra.Forward(form, keys, ids=ids, scale=factor * taken, score_mod=score_mod, natural=natural,
                            prescale=power / taken, subtracted=subtracted, **fields), taken
 
@@ -1165,7 +1165,7 @@ def _status_stored(family: mosaic.Family, spec: algebra.Forward, state: algebra.
         # solver to infer backwards from the row it reduced to, which it does not (a full decode step's
         # packed rows, padded to 16, failed to lower; row 8981).
         queries = (family.as_row(first + family.iota(maximum.shape, 0))
-                   if algebra.padded_queries(spec) is not None else None)
+                   if spec.queries is not None else None)
         rewalked = algebra.rewalks(spec, maximum, queries)[0]
         # Its block's flag a vote of its warpgroup's predicates (`bar.red.or.pred`), no reduction scratch.
         live, block = jnp.where(rewalked, 1.0, 0.0), jnp.where(jnp.any(rewalked), 1.0, 0.0)
@@ -1267,7 +1267,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored
     if relay is not None:
         # Its weights reach the values' product through its own tile (`relays`).
         family = family.relaying(relay)
-    lo, hi, whole = program.reach(first, spans, row)
+    lo, hi, whole, whole_run = program.reach_segmented(first, spans, row)
     tile = program.tile_of(first, spans, row)
     q = _query_of(program, spec, q_view, q_smem, q_loaded, hooks, hooked, place, first, interpret=interpret)
     # The weighted values' running sums live in the family's accumulator (`Family.walk`), from the initial
@@ -1329,8 +1329,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored
 
         def walked(streams, lo, hi, counted):
             if not training:
-                run = (program.forward_whole_run(first, spans)
-                       if (segmented and not program.ahead and certified is None) else None)
+                run = whole_run if (segmented and not program.ahead and certified is None) else None
                 return inference(_walk_of(family, streams, lo, hi, counted, interpret=interpret,
                                           products=program.products,
                                           segment=lambda step, lo, hi: program.segmented(step, run, lo, hi)))
@@ -1356,7 +1355,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored
     store = functools.partial(_store_consumer, program, hooked, (row, head, first), hooks=hooks,
                               training=training, out_stage=out_stage, rows=(stored, row_smem),
                               kept=kept, interpret=interpret)
-    _walks_stored(walk, store, spec, consumer, turn, decided=decided, past=past_walks, streamed=streamed)
+    _walks_stored(walk, store, spec, consumer, turn, decided=decided, past=past_walks, streamed=streamed,
+                  family=family, first=first)
 
 
 def _store_consumer(program: _Program, hooked: _Hooked, place: tuple, spec: algebra.Forward,
@@ -1403,7 +1403,8 @@ def _merged_initial(spec: algebra.Forward, initial: algebra.Partial, state: alge
 
 
 def _walks_stored(walk: Callable, store: Callable, spec: algebra.Forward, consumer, turn: Callable, *,
-                  decided: after_walk.Decided | None, past: Callable | None, streamed: tuple) -> None:
+                  decided: after_walk.Decided | None, past: Callable | None, streamed: tuple,
+                  family: mosaic.Family, first) -> None:
     """A consumer's walk (`walk(spec, turns)`: in `spec`'s form, its steps `turns` past the rings' first) and
     its stores (`store(spec, *walked)`). Every consumer but the first takes a turn ahead of each walk, which
     the first's closing turn at the walk's end matches: each makes as many arrivals as the others at any count
@@ -1437,6 +1438,8 @@ def _walks_stored(walk: Callable, store: Callable, spec: algebra.Forward, consum
     rows = jnp.isnan(jnp.sum(state.acc * 0.0, axis=-1))
     if bound is not None:
         rows = rows | algebra.bound_exceeds(bound)
+    if spec.queries is not None:
+        rows = rows & (family.as_row(first + family.iota(rows.shape, 0)) < spec.queries)
     taken = decided.stated(consumer, jnp.any(rows))
     pl.when(jnp.logical_not(taken))(lambda: stored(spec, state, trained))
 
@@ -2044,7 +2047,7 @@ def _program_of(family: mosaic.Family, tiles: Tiles, spec: algebra.Forward, read
                          training=training, tmem_columns=tmem_columns)
     return _Program(family, tiles, steps, stages, spec.keys, spec.form == "causal", spec.queries, splits,
                     _per_span(spec, read.spans), parts=parts, products=declared(ahead, peaks=peaks),
-                    value_columns=value_columns)
+                    value_columns=value_columns, training=training)
 
 
 NATURAL_NAME = "_natural"

@@ -884,13 +884,47 @@ ACCURATE = {"natural": True, "accurate": True}
 """The template's accurate form: natural logits and the backward's accurate form."""
 
 
-def _spans(family: Family, query, key) -> template.KeySpans:
-    def placed(value):
+def _freeze_value(value):
+    """Hashable structural key for a `Family.spans` entry or `Family.keep` mask (`_spans_key`, row 7274)."""
+    if isinstance(value, np.ndarray):
+        return ("ndarray", value.shape, value.dtype.str, value.tobytes())
+    if isinstance(value, CrossDocuments):
+        return ("cross", _freeze_value(value.query), _freeze_value(value.key))
+    if isinstance(value, (tuple, list)):
+        return ("seq", tuple(_freeze_value(item) for item in value))
+    return ("scalar", value)
+
+
+def _thaw_value(frozen):
+    """Reconstruct a `Family.spans` entry or `Family.keep` mask from `_freeze_value`."""
+    tag = frozen[0]
+    if tag == "ndarray":
+        _, shape, dtype_str, raw = frozen
+        return np.frombuffer(raw, dtype=np.dtype(dtype_str)).reshape(shape).copy()
+    if tag == "cross":
+        return CrossDocuments(_thaw_value(frozen[1]), _thaw_value(frozen[2]))
+    if tag == "seq":
+        return tuple(_thaw_value(item) for item in frozen[1])
+    return frozen[1]
+
+
+def _spans_key(spans: dict) -> tuple:
+    return tuple((name, _freeze_value(value)) for name, value in sorted(spans.items()))
+
+
+def _spans_from_key(spans_key: tuple, query, key) -> template.KeySpans:
+    def placed(frozen):
+        value = _thaw_value(frozen)
         if isinstance(value, CrossDocuments):
             return CrossDocuments(jnp.asarray(value.query), jnp.asarray(value.key))
         return jnp.asarray(value) if isinstance(value, np.ndarray) else value
-    arguments = {name: placed(value) for name, value in family.spans.items()}
+
+    arguments = {name: placed(frozen) for name, frozen in spans_key}
     return template.spans(query.shape[1], key.shape[1], query.shape[0], **arguments)
+
+
+def _spans(family: Family, query, key) -> template.KeySpans:
+    return _spans_from_key(_spans_key(family.spans), query, key)
 
 
 def _hooks(query, extra) -> template.Hooks | None:
@@ -914,42 +948,57 @@ def _cast(family: Family, draw: Callable[[int], tuple]) -> Callable[[int], tuple
     return cast
 
 
-def _reference(family: Family, *, anchored: bool, round_logits=None) -> Callable:
-    """The reference's output `(query, key, value, extra) -> out`, in the call's dtype as every attention
-    call returns it, its gradients autodiff's (`reference_error.with_gradients`); the float64 truth's
-    derivative `anchored`. The reference arm
-    is jax's own attention (`jax.nn.dot_product_attention`'s xla path, differentiated by autodiff), the
-    established computation Dew's is held to at its declared precision, which rounds the probabilities to
-    the values' dtype for their products (the gate's ruling, row 1362), wherever its API holds the
-    family; the written-out one where a family has sinks or a resumed state, which it has no input for,
-    or a query of no keys, to which it gives the values' mean where Dew and the truth give zeros (every
-    such family fp32, whose probabilities round to nothing), or a float16 call on a CPU, whose dot into
-    float32 (F16_F16_F32, the algorithm jax's attention names for it) XLA's CPU compiler has none of, as
-    Dew's xla attention hands it to its reference path (`attention_kernels`' `cpu_float16`). A family whose
-    products pass fp32's largest before the scale (`Family.query_first`) gives jax's attention the query
-    scaled first and a scale of 1: the scale, 1/4 at its width of 16, a power of two, scales it exactly, so
-    the logits are the scaled products', rounded alike, but finite."""
-    cpu_float16 = jnp.dtype(family.dtype) == jnp.float16 and jax.default_backend() == "cpu"
-    jax_holds = not anchored and np.asarray(family.keep).any(-1).all() and not cpu_float16
+@functools.cache
+def _cached_reference_attend(keep_key: tuple, dtype_name: str, query_first: bool, *, anchored: bool,
+                             round_logits=None) -> Callable:
+    """Reference forward `(query, key, value, extra) -> out` cached by structural mask/dtype/form so
+    families with identical structure share one compiled XLA and float64 truth program (row 7274)."""
+    keep = _thaw_value(keep_key)
+    cpu_float16 = jnp.dtype(dtype_name) == jnp.float16 and jax.default_backend() == "cpu"
+    jax_holds = not anchored and np.asarray(keep).any(-1).all() and not cpu_float16
 
     def attend(query, key, value, extra):
         if isinstance(extra, tuple):
-            out = _resumed_attention(query, key, value, extra, family.keep, anchored=anchored,
+            out = _resumed_attention(query, key, value, extra, keep, anchored=anchored,
                                      round_logits=round_logits)
-        elif extra is None and jax_holds and family.query_first:
+        elif extra is None and jax_holds and query_first:
             scale = query.shape[-1] ** -0.5
             assert float(np.log2(scale)).is_integer(), "a query scaled first is exact at a power of two alone"
             out = jax.nn.dot_product_attention(query * jnp.asarray(scale, query.dtype), key, value, scale=1.0,
-                                               mask=jnp.asarray(family.keep), implementation="xla")
+                                               mask=jnp.asarray(keep), implementation="xla")
         elif extra is None and jax_holds:
-            out = jax.nn.dot_product_attention(query, key, value, mask=jnp.asarray(family.keep),
+            out = jax.nn.dot_product_attention(query, key, value, mask=jnp.asarray(keep),
                                                implementation="xla")
         else:
-            out = exact_attention(query, key, value, extra, keep=family.keep, anchored=anchored,
+            out = exact_attention(query, key, value, extra, keep=keep, anchored=anchored,
                                   round_logits=round_logits)
         return out.astype(query.dtype)
 
     return attend
+
+
+@functools.cache
+def _cached_reference_fn(keep_key: tuple, dtype_name: str, query_first: bool, *, anchored: bool,
+                         round_logits=None) -> Callable:
+    return with_gradients(_cached_reference_attend(
+        keep_key, dtype_name, query_first, anchored=anchored, round_logits=round_logits))
+
+
+@functools.cache
+def _jitted_reference(keep_key: tuple, dtype_name: str, query_first: bool, *, anchored: bool,
+                      round_logits=None) -> Callable:
+    return as_given(jax.jit(_cached_reference_fn(
+        keep_key, dtype_name, query_first, anchored=anchored, round_logits=round_logits)))
+
+
+def _reference_key(family: Family) -> tuple[tuple, str, bool]:
+    return _freeze_value(np.asarray(family.keep)), jnp.dtype(family.dtype).name, bool(family.query_first)
+
+
+def _reference(family: Family, *, anchored: bool, round_logits=None) -> Callable:
+    """The reference's output `(query, key, value, extra) -> out`, in the call's dtype as every attention
+    call returns it (`_cached_reference_attend`, row 7274)."""
+    return _cached_reference_attend(*_reference_key(family), anchored=anchored, round_logits=round_logits)
 
 
 def _resumed_attention(query, key, value, state, keep, *, anchored: bool, round_logits=None):
@@ -1003,13 +1052,11 @@ def _differentiated(forward: Callable, backward: Callable) -> Callable:
     return attend
 
 
-def _differentiable(family: Family, forward: Callable, backward: Callable, *, dropping: bool = False
-                    ) -> Callable:
-    """A mainloop's `forward` and `backward` as `(query, key, value, extra) -> out` over `family`'s spans,
-    its derivative the mainloop's own backward, the sinks' or resumed state's gradient through the softmax's
-    initial state; under `_dropping`'s draw where `dropping`."""
+def _differentiable_from_key(spans_key: tuple, forward: Callable, backward: Callable, *,
+                             dropping: bool = False) -> Callable:
+    """A mainloop's `forward` and `backward` as `(query, key, value, extra) -> out` over `spans_key`."""
     def run(query, key, value, extra):
-        spans, hooks = _spans(family, query, key), _hooks(query, extra)
+        spans, hooks = _spans_from_key(spans_key, query, key), _hooks(query, extra)
         drop = _dropping(query).drop if dropping else None
 
         def ahead(query, key, value, initial):
@@ -1020,8 +1067,16 @@ def _differentiable(family: Family, forward: Callable, backward: Callable, *, dr
 
         initial = None if hooks is None else hooks.initial
         return _differentiated(ahead, back)(query, key, value, initial)
+
     return run
 
+
+def _differentiable(family: Family, forward: Callable, backward: Callable, *, dropping: bool = False
+                    ) -> Callable:
+    """A mainloop's `forward` and `backward` as `(query, key, value, extra) -> out` over `family`'s spans,
+    its derivative the mainloop's own backward, the sinks' or resumed state's gradient through the softmax's
+    initial state; under `_dropping`'s draw where `dropping`."""
+    return _differentiable_from_key(_spans_key(family.spans), forward, backward, dropping=dropping)
 
 DROP_RATE = 0.25
 """The dropout rate a dropping family's call takes (`_dropping`): a kept key's multiplier 4/3, inexact in
@@ -1036,14 +1091,15 @@ def _dropping(query) -> template.Hooks:
                                                 jnp.arange(heads, dtype=jnp.int32), DROP_RATE))
 
 
-def _mainloops(family: Family, options: dict, *, dropping: bool = False) -> dict[str, Callable]:
-    """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
-    or none for the default), its derivative the mainloop's own backward (`_differentiable`); on an H100 the
-    Mosaic one's default form in both schedules, its derived one (one launch where the call is hookless) and
-    deterministic mode's two launches (`TWO_LAUNCHES`)."""
-    forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
+@functools.cache
+def _jitted_mainloop(name: str, spans_key: tuple, options_key: tuple, dropping: bool) -> Callable:
+    """One cached `jax.jit(with_gradients(...))` program per `(mainloop, spans, options, dropping)` shared
+    across all stability families with identical structure, avoiding 30+ redundant host traces and
+    certifications on GPU tiers (row 7274)."""
+    options = dict(options_key)
+    forward_options = {key: value for key, value in options.items() if key in ("natural", "scale")}
     tiles = attention_portable.Tiles(32, 32, attention_triton.BLOCK)
-    mainloop = functools.partial(_differentiable, family, dropping=dropping)
+    mainloop = functools.partial(_differentiable_from_key, spans_key, dropping=dropping)
 
     def triton_forward(*operands):
         with tuning.pinned(PINS):
@@ -1057,26 +1113,59 @@ def _mainloops(family: Family, options: dict, *, dropping: bool = False) -> dict
         return attention_mosaic.forward(*operands, **forward_options)
 
     def mosaic_backward(query, key, value, spans, hooks, dout):
-        # From the mainloop's own training forward's residuals.
         residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=template.Kept.SPLIT,
                                              **forward_options)[1:]
         return attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                          **options)
 
-    portable = mainloop(functools.partial(attention_portable.xla_mainloop, tiles, **forward_options),
-                        functools.partial(attention_portable.backward, tiles, **options))
-    # The Pallas-Triton mainloop takes no probability dropout (ledger row 1521).
-    mainloops = {"portable": portable} if dropping else {"triton": mainloop(triton_forward, triton_backward),
-                                                         "portable": portable}
     def two_launch_backward(*operands):
         with tuning.pinned({attention_mosaic.MosaicBackward: TWO_LAUNCHES}):
             return mosaic_backward(*operands)
 
+    if name == "portable":
+        fn = mainloop(functools.partial(attention_portable.xla_mainloop, tiles, **forward_options),
+                      functools.partial(attention_portable.backward, tiles, **options))
+    elif name == "triton":
+        fn = mainloop(triton_forward, triton_backward)
+    elif name == "mosaic":
+        fn = mainloop(mosaic_forward, mosaic_backward)
+    elif name == "mosaic two launches":
+        fn = mainloop(mosaic_forward, two_launch_backward)
+    else:
+        raise KeyError(name)
+    return jax.jit(with_gradients(fn))
+
+
+def _mainloop_names(family: Family, options: dict, *, dropping: bool = False) -> tuple[str, ...]:
+    names = ["portable"] if dropping else ["triton", "portable"]
     if ON_HOPPER and _mosaic_takes(family, family.draw(0)):
-        mainloops["mosaic"] = mainloop(mosaic_forward, mosaic_backward)
+        names.append("mosaic")
         if not options and family.draw(0)[3] is None:
-            mainloops["mosaic two launches"] = mainloop(mosaic_forward, two_launch_backward)
-    return mainloops
+            names.append("mosaic two launches")
+    return tuple(names)
+
+
+def _mainloops(family: Family, options: dict, *, dropping: bool = False) -> dict[str, Callable]:
+    """Each template mainloop as a cached jitted `(query, key, value, extra, dout) -> (out, grads)` at the
+    form `options` names (`ACCURATE`, or none for the default; row 7274)."""
+    spans_key = _spans_key(family.spans)
+    options_key = tuple(sorted(options.items()))
+    return {name: _jitted_mainloop(name, spans_key, options_key, dropping)
+            for name in _mainloop_names(family, options, dropping=dropping)}
+
+
+@functools.cache
+def _cached_truth(truth_fn: Callable, device) -> Truth:
+    return Truth(truth_fn, device)
+
+
+@functools.cache
+def _cached_dropping_truth(spans_key: tuple) -> Callable:
+    def truth(query, key, value, extra):
+        del extra
+        return template.reference(query, key, value, _spans_from_key(spans_key, query, key), _dropping(query))
+
+    return with_gradients(truth)
 
 
 TWO_LAUNCHES = attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=False, family="wgmma")
@@ -1116,7 +1205,7 @@ def assert_finite(dew_fn, truth_fn, draw, label: str, *, seeds: int, empty=None)
     draws are small, and XLA:GPU compiled each truth in 7.3 s where XLA:CPU takes 0.2 (MAINGPU-0243234e8's
     part 2 on an H100: 25 truths, 182 s). A family's `empty` rows, each draw's outputs held empty there
     (`_held_empty`)."""
-    truth_of = Truth(truth_fn, jax.local_devices(backend="cpu")[0])
+    truth_of = _cached_truth(truth_fn, jax.local_devices(backend="cpu")[0])
     for seed in range(seeds):
         inputs = draw(seed)
         with jax.enable_x64(new_val=True):
@@ -1166,11 +1255,12 @@ def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edge
     row 6302); a row that sees nothing, zero."""
     seeds, family = SEEDS[family], FAMILIES[family]
     draw = _cast(family, family.draw)
-    reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
-    truth = with_gradients(_reference(family, anchored=True))
-    rounded = with_gradients(_reference(family, anchored=True, round_logits=jnp.float32))
+    ref_key = _reference_key(family)
+    reference = _jitted_reference(*ref_key, anchored=False)
+    truth = _cached_reference_fn(*ref_key, anchored=True)
+    rounded = _cached_reference_fn(*ref_key, anchored=True, round_logits=jnp.float32)
     label = f"{name} accurate {family.dtype}"
-    differentiated = jax.jit(with_gradients(_mainloops(family, ACCURATE)[name]))
+    differentiated = _mainloops(family, ACCURATE)[name]
     # Each result check 1 draws (its second stage's too) held empty at the family's empty rows (row 9041).
     held = (None if family.empty is None
             else lambda outputs, inputs: _held_empty(family.empty, outputs, label))
@@ -1187,9 +1277,9 @@ def default_is_finite(family_name: str, mainloop_name: str) -> None:
     docstring)."""
     seeds, family = SEEDS[family_name], FAMILIES[family_name]
     draw = _cast(family, family.draw)
-    truth = with_gradients(_reference(family, anchored=True))
+    truth = _cached_reference_fn(*_reference_key(family), anchored=True)
     label = f"{mainloop_name} default {family.dtype}"
-    differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
+    differentiated = _mainloops(family, {})[mainloop_name]
     assert_finite(differentiated, truth, draw, label, seeds=seeds, empty=family.empty)
 
 
@@ -1202,13 +1292,10 @@ def test_the_default_form_under_dropout_is_finite_where_the_truth_is_at_fp32s_ed
     output is finite, and on D's sums before their product with dO overflowed dQ (row 8652)."""
     seeds, family_spec = min(SEEDS[family], 16), FAMILIES[family]
     draw = _cast(family_spec, family_spec.draw)
-
-    def truth(query, key, value, extra):
-        return template.reference(query, key, value, _spans(family_spec, query, key), _dropping(query))
-
+    truth = _cached_dropping_truth(_spans_key(family_spec.spans))
     for name, mainloop in _mainloops(family_spec, {}, dropping=True).items():
-        assert_finite(jax.jit(with_gradients(mainloop)), with_gradients(truth), draw,
-                      f"{name} dropping {family_spec.dtype}", seeds=seeds, empty=family_spec.empty)
+        assert_finite(mainloop, truth, draw, f"{name} dropping {family_spec.dtype}", seeds=seeds,
+                      empty=family_spec.empty)
 
 
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
@@ -1428,12 +1515,12 @@ def test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient(dty
     name = f"small values beside unseen ones near fp32's largest, {dtype}"
     family = dataclasses.replace(FAMILIES[name], draw=functools.partial(_masked_outlier, dtype=dtype,
                                                                         every_column=True))
-    draw, truth = _cast(family, family.draw), with_gradients(_reference(family, anchored=True))
+    draw = _cast(family, family.draw)
+    truth = _cached_reference_fn(*_reference_key(family), anchored=True)
     arms = {f"{mainloop} {form}": fn for form, options in (("default", {}), ("accurate", ACCURATE))
             for mainloop, fn in _mainloops(family, options).items()}
     for label, fn in arms.items():
-        assert_finite(jax.jit(with_gradients(fn)), truth, draw, f"{label} {dtype}", seeds=SEEDS[name])
-
+        assert_finite(fn, truth, draw, f"{label} {dtype}", seeds=SEEDS[name])
 
 BAND_FAMILIES = ("a share in bf16's subnormal band on a value near its largest",
                  "a share in bf16's subnormal band, the denominator's rest in a later tile")
@@ -1497,10 +1584,9 @@ def test_a_share_in_bf16s_subnormal_band_is_on_par_with_every_references_form(fa
                                                 query, key, value, _spans(cases, query, key), residuals=True)
     assert np.all(np.asarray(split.shift) > 0)
     reference = as_given(jax.jit(with_gradients(REFERENCE_FORMS[form](cases))))
-    truth = with_gradients(_reference(cases, anchored=True))
-    portable = jax.jit(with_gradients(_mainloops(cases, {})["portable"]))
+    truth = _cached_reference_fn(*_reference_key(cases), anchored=True)
+    portable = _mainloops(cases, {})["portable"]
     assert_as_exact(portable, reference, draw, f"portable against {form}", seeds=seeds, truth_fn=truth)
-
 
 @functools.cache
 def mosaic_families() -> tuple[str, ...]:
@@ -1557,9 +1643,8 @@ def test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pa
             return attention_triton.backward(*operands, interpret=INTERPRETED, split=False)
 
     unsplit = jax.jit(with_gradients(_differentiable(family_of, forward, backward)))
-    assert_finite(unsplit, with_gradients(_reference(family_of, anchored=True)),
+    assert_finite(unsplit, _cached_reference_fn(*_reference_key(family_of), anchored=True),
                   _cast(family_of, family_of.draw), f"triton unsplit {family_of.dtype}", seeds=seeds)
-
 
 def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
     """fp32, the default form: one query over one key of logit m0 = 24576.005859375 (folded below the fold's
@@ -1576,11 +1661,10 @@ def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
     state = (jnp.full((1, 1, 1), m0, jnp.float32), jnp.ones((1, 1, 1), jnp.float32), first(size, 1, 1, 1, 16))
     family = Family(lambda seed: (query, key, value, state, dout), np.ones((1, 1, 1, 1), bool))
     reference = with_gradients(lambda *args: _resumed_attention(*args, family.keep, anchored=False))
-    ours = jax.jit(with_gradients(_mainloops(family, {})["portable"]))
+    ours = _mainloops(family, {})["portable"]
     for name, found in (("reference", reference(query, key, value, state, dout)),
                         ("default", ours(query, key, value, state, dout))):
         assert all(np.isfinite(np.asarray(leaf, np.float32)).all() for leaf in jax.tree.leaves(found)), name
-
 
 @pytest.mark.parametrize("options", [{"scale": 7.99}, {"scale": 7.99, **ACCURATE}],
                          ids=["default", "accurate"])
@@ -1607,10 +1691,9 @@ def test_a_score_cotangent_past_bf16s_largest_keeps_the_gradients_finite(options
                       value)
     assert all(np.isfinite(np.asarray(leaf, np.float32)).all() for leaf in pull(dout)), "the reference's"
     for name, mainloop in _mainloops(family, options).items():
-        _, *grads = jax.jit(with_gradients(mainloop))(query, key, value, None, dout)
+        _, *grads = mainloop(query, key, value, None, dout)
         assert all(np.isfinite(np.asarray(leaf, np.float32)).all() for leaf in grads[:3]), name
         np.testing.assert_array_equal(np.asarray(grads[1], np.float32), 0.0, err_msg=f"{name}'s dK")
-
 
 @pytest.mark.parametrize("scale", [-1.0, -2.0, -0.75])
 def test_a_negative_scale_past_the_folds_reach_keeps_a_finite_logit_finite(scale):
@@ -1631,10 +1714,9 @@ def test_a_negative_scale_past_the_folds_reach_keeps_a_finite_logit_finite(scale
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), query, key, value)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in pull(dout)), "the reference's gradients"
     for name, mainloop in _mainloops(family, {"scale": scale}).items():
-        out, *grads = jax.jit(with_gradients(mainloop))(query, key, value, None, dout)
+        out, *grads = mainloop(query, key, value, None, dout)
         np.testing.assert_array_equal(np.asarray(out), np.asarray(value), err_msg=name)
         assert all(np.isfinite(np.asarray(leaf)).all() for leaf in grads[:3]), f"{name}'s gradients"
-
 
 SMALL_SCALE = 2.0 ** -80
 """A scale far below one, whose power of two the queries take for their logits (`attention.prescale`)."""
@@ -1664,10 +1746,9 @@ def test_gradients_at_a_scale_far_below_one_are_on_par(options, name, dtype):
         del extra
         return exact_attention(query * (query.shape[-1] ** 0.5 * SMALL_SCALE), key, value, anchored=True)
 
-    differentiated = jax.jit(with_gradients(_mainloops(family, {"scale": SMALL_SCALE, **options})[name]))
+    differentiated = _mainloops(family, {"scale": SMALL_SCALE, **options})[name]
     assert_as_exact(differentiated, as_given(jax.jit(with_gradients(attend))), _cast(family, family.draw),
                     f"{name} {options} {dtype} at scale 2^-80", seeds=8, truth_fn=with_gradients(exact))
-
 
 DECODED = [(family, form) for family, form in FAMILY_RUNS
            if _drawn_first(family)[0].shape[1] == 1 and _drawn_first(family)[0].shape[3] >= 16
@@ -1873,3 +1954,27 @@ def test_a_scaled_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
         assert_as_exact(found, fp32, draw, f"{name} {dtype} subnormal share",
                         seeds=SUBNORMAL_SHARE_SEEDS[dtype], truth_fn=exact)
 
+
+def test_stability_families_with_identical_structure_share_jitted_programs():
+    """Row 7274: stability families sharing spans, mask, and dtype reuse one cached `jax.jit` mainloop,
+    reference, and CPU `Truth` program instead of re-tracing and re-certifying per family on GPU tiers."""
+    buckets: dict[tuple, list[Family]] = {}
+    for name in TEMPLATE_FAMILIES:
+        fam = FAMILIES[name]
+        buckets.setdefault((_spans_key(fam.spans), _reference_key(fam)), []).append(fam)
+    shared = [group for group in buckets.values() if len(group) >= 2]
+    assert shared and len(buckets) < len(TEMPLATE_FAMILIES), (len(buckets), len(TEMPLATE_FAMILIES))
+    first_fam, second_fam = shared[0][0], shared[0][1]
+    assert _mainloops(first_fam, {})["portable"] is _mainloops(second_fam, {})["portable"]
+    assert _mainloops(first_fam, ACCURATE)["portable"] is _mainloops(second_fam, ACCURATE)["portable"]
+    assert _jitted_reference(*_reference_key(first_fam), anchored=False) is _jitted_reference(
+        *_reference_key(second_fam), anchored=False)
+    truth_a = _cached_reference_fn(*_reference_key(first_fam), anchored=True)
+    truth_b = _cached_reference_fn(*_reference_key(second_fam), anchored=True)
+    assert truth_a is truth_b
+    cpu = jax.local_devices(backend="cpu")[0]
+    assert _cached_truth(truth_a, cpu) is _cached_truth(truth_b, cpu)
+    # A family with distinct spans (causal/documents/empty) gets a distinct mainloop program.
+    spanned = next(FAMILIES[name] for name in TEMPLATE_FAMILIES
+                   if _spans_key(FAMILIES[name].spans) != _spans_key(first_fam.spans))
+    assert _mainloops(first_fam, {})["portable"] is not _mainloops(spanned, {})["portable"]

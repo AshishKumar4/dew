@@ -36,6 +36,7 @@ from jax.typing import DTypeLike
 from dew.algebra import derive, means, windows
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.float_bits import TWO_FACTOR_REACH, binade_of, raised_exactly
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import bodies, layout, product
 from dew.nn.kernels.templates.attention import (
     LN2,
@@ -65,14 +66,24 @@ from dew.nn.precision import (
 )
 
 
+def _built_in_capped(score_mod) -> Capped | None:
+    """`score_mod`'s built-in `Capped` softcap, unwrapping `tuning.Prepared`; None for subclasses."""
+    source = score_mod.source if isinstance(score_mod, tuning.Prepared) else score_mod
+    return source if isinstance(source, Capped) and type(source) is Capped else None
+
+
 def folds(scale: float, prescale: float, *, natural: bool, score_mod) -> bool:
-    """Whether a call folds log2(e) into its logits' scale for exp2 (`Forward.base2`, which says why), from
-    the scale left past its queries' power of two (`attention.prescale`) and that power: the factor as the
-    kernel multiplies the call's own products by it, rounded to fp32, below 1 in magnitude, the call not
-    keeping its logits `natural` and no score hook reading them. The one owner of the choice, which a
-    mainloop's derivation reads too (`attention_mosaic.MosaicForward`, row 2583)."""
+    """Whether a call folds log2(e) into its logits' scale for exp2 (`Forward.base2`), from `scale` and
+    `prescale`: factor below 1 in fp32, not `natural`, and either no score hook or a bounded built-in
+    `Capped` softcap (row 4045). One owner, read by `attention_mosaic.MosaicForward` (row 2583)."""
+    if natural:
+        return False
+    if (capped := _built_in_capped(score_mod)) is not None:
+        cap = abs(float(capped.softcap))
+        scaled = abs(float(np.float32(scale / capped.softcap))) if cap else 0.0
+        return 0.0 < scaled < 1e30 and cap * LOG2E < FOLD_REACH
     factor = abs(float(np.float32(scale * prescale * LOG2E)))
-    return not natural and score_mod is None and factor < 1.0
+    return score_mod is None and factor < 1.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -153,8 +164,8 @@ class Forward:
         of each logit at log2(e) times its size ties logits the reference keeps apart, so a walk whose rows'
         maxima pass it walks again natural (`walked`, `walked_launches`): folded logits scaled before their
         difference (`base2`, not `raw`), but for a cap's (`Capped`, whose logits stay within it)."""
-        cap = self.score_mod
-        bounded = isinstance(cap, Capped) and abs(float(cap.softcap)) * LOG2E < FOLD_REACH
+        cap = _built_in_capped(self.score_mod)
+        bounded = cap is not None and abs(float(cap.softcap)) * LOG2E < FOLD_REACH
         return self.base2 and not self.raw and not bounded
 
     @property
@@ -687,9 +698,9 @@ def rewalks(spec: Forward, maxima: jax.Array, rows: jax.Array | None = None) -> 
     padding rewalked its last tile in the natural form every call, 369 of its 1086 us, LF-PROF-sm90). A
     launch's programs state them so of their own rows."""
     walked = reached(maxima, unseen=spec.form == "spans") >= FOLD_REACH
-    if (queries := padded_queries(spec)) is not None:
+    if spec.queries is not None:
         rows = jax.lax.broadcasted_iota(jnp.int32, maxima.shape, maxima.ndim - 1) if rows is None else rows
-        walked = walked & (rows < queries)
+        walked = walked & (rows < spec.queries)
     return walked, rewalked_form(spec)
 
 
@@ -978,6 +989,10 @@ def logits_of(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Arr
         unseen = -jnp.inf if factor > 0 else jnp.inf
         products = _chosen(masked, lambda: _masked(spec, s, coords, unseen), lambda: s)
         return (products if spec.raw else products * factor), products
+    if (capped := _built_in_capped(spec.score_mod)) is not None and spec.base2:
+        cap = capped.softcap
+        logits = float(np.float32(cap * LOG2E)) * jnp.tanh(s * float(np.float32(spec.scale / cap)))
+        return _chosen(masked, lambda: _masked(spec, logits, coords, -jnp.inf), lambda: logits), None
     logits = s * factor
     if spec.score_mod is not None:
         logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
@@ -1998,8 +2013,6 @@ def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.
     §2, `tuning.prepared`: once, a launch's own prepared hook as it is; the hook as written where the pass is
     off), each window's derivation held across a launch's tiles (`program._derived`); a custom-derivative
     call in it lowers as its primal function (Dew's JAX build, constraints.txt)."""
-    from dew.nn.kernels import tuning
-
     return tuning.prepared(score_mod)(logits, q_pos, k_pos, *params)
 
 
