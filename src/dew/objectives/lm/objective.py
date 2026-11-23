@@ -779,8 +779,9 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return model.loop.steps if self._reads_exits(model) else 1
 
     def _weights_over(self, model, ran: Sequence[jax.Array | bool] = ()) -> Sequence[float | jax.Array]:
-        """Each pass's weight in the loss over `model`'s passes (`PassWeights.over`), where it weighs them; where
-        a count given per call ran some of them (`ran` traced), over those that ran (`PassWeights.ran`)."""
+        """Each pass's weight in the loss over `model`'s passes (`PassWeights.over`), where it weighs them;
+        where a count given per call ran some of them (`ran` traced), over those that ran
+        (`PassWeights.ran`)."""
         assert self.pass_weights is not None
         if not all(isinstance(each, bool) for each in ran):
             return self.pass_weights.ran(ran)
