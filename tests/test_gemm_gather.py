@@ -920,7 +920,7 @@ def test_producers_rungs_keeps_top_after_stated_cap_start(monkeypatch):
         top = producers._top(op, ba, tile, sm100)
         assert top is not None
         # Force consumer registers above `top` so `started` begins at `stated_producer(...) < top`.
-        monkeypatch.setattr(op, "registers", lambda *a, **kw: top + 32)
+        monkeypatch.setattr(grouped_matmul.MosaicGmm, "registers", lambda *a, **kw: top + 32)
         monkeypatch.setattr(producers, "_spilled", lambda *a, **kw: True)
         started = producers.started(op, ba, tile, sm100)
         start_cap = started.producers.of(op.KERNEL)
