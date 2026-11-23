@@ -54,10 +54,13 @@ fork.
 1. **mma.sync walks through `emit_pipeline`** (J, aa3936052). This means one call per segment, a dynamic grid,
    and the derived stages as `max_concurrent_steps`. A walk's segments each drain. GEMM walks have one segment
    and the recurrence's have one a document range. The drain's cost is measured in this round (§8).
-2. **The fork gives `emit_pipeline`'s cp.async path collective specs** (JAX fork, then upstream). For a
-   BlockSpec with `collective_axes=("wg",)` on the cp.async path:
-   - **Copy.** The block's first axis splits evenly over the axis's threads: whole 8-row tiles of a 2-D block,
-     whole 16-byte chunks of a vector. Each thread issues its share as one cp.async group a stream a step.
+2. **The fork gives `emit_pipeline`'s cp.async path a collective thread axis** (JAX fork, `pipeline.py:384`,
+   matching `docs/installation.md`). `BlockSpec.collective_axes` stays refused on `emit_pipeline`
+   (`pl.BlockSpec with collective_axes= is not supported`); instead `emit_pipeline(..., thread_axis="wg")`
+   runs every thread of a kernel's warpgroups collectively over one input pipeline of shared buffers:
+   - **Copy.** Each block's first axis splits evenly over the `thread_axis` threads: whole 8-row tiles of a
+     2-D block, whole 16-byte chunks of a vector. Each thread issues its share as one cp.async group a stream
+     a step.
    - **Ready.** Before `body` reads step s, each thread waits for its own copies of s, then all threads meet
      at a barrier of the axis's size (the "ready" meet). Past it, every thread's share of slot s has landed.
    - **Consumed.** JAX's schedule refills slot s right after `body` (:498-516). So before that refill, all
@@ -66,8 +69,8 @@ fork.
    - **Waits.** Per thread, the counts are JAX's own (:450, :562): the prologue fills every stage, and the
      steady state leaves `(stages - 1) x copies_per_step` groups pending, counted in the thread's own groups.
    - **End.** A final consumed meet precedes the drain, so a later scope may reuse the slots.
-   - **Allocation.** The pipeline allocates its slots and barriers collectively over `wg`, as the interpreter
-     requires of any threaded scoped allocation.
+   - **Allocation.** The pipeline allocates its slots and barriers collectively over `thread_axis`, as the
+     interpreter requires of any threaded scoped allocation.
    - The TMA path keeps its refusal.
    - Upstream fit: this is the general cp.async form for warpgroup semantics with several threads, the only
      way an sm80 kernel splits its loads.

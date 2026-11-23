@@ -6,6 +6,7 @@ JAX's cache directory is the boundary: a program JAX compiles is a `<key>-cache`
 import http.client
 import http.server
 import json
+import logging
 import socket
 import threading
 import time
@@ -200,7 +201,7 @@ print(remote.programs_fetched, remote.uploaded, int(counts.get("train/cache_miss
     value, fetched, uploaded, compiled = run("first")
     assert (value, fetched, uploaded) == ("18.0", "0", "1") and int(compiled) >= 1
     [key] = stored
-    assert key.startswith(f"/jaxlib{__import__('jaxlib').__version__}/")
+    assert key.startswith(f"/{remote_cache.FORMAT}/jaxlib{__import__('jaxlib').__version__}/")
     assert key.endswith(f"/cpu/{remote_cache.HOST.cpu_class()}/bundles/tests/test_step.py")
     programs = len(list(remote_cache.unpacked(stored[key])))
     assert programs >= 1
@@ -416,6 +417,20 @@ def test_a_bundle_holds_every_program_its_files_tests_compiled_however_they_ran(
         fresh.opened(f"tests/{name}.py")
         assert programs(tmp_path / name) == {} and fresh.programs_fetched == 0 and fresh.failures == 1
     assert not (tmp_path / "jit_escape-1-cache").exists()
+
+
+def test_a_bundles_program_whose_bytes_changed_within_its_frame_is_dropped_and_said(caplog):
+    """A program whose value is not the bytes it was written with, its frame whole (its lengths and key
+    sound), is dropped and a warning logged, so its file compiles it again, the bundle's other programs
+    read as they are (row 9797: XLA loads such bytes as they are, and a train's run aborted reading back a
+    cached program's result)."""
+    bundle = bytearray(remote_cache.packed([("jit_a-1", b"program a"), ("jit_b-1", b"program b")]))
+    bundle[-1] ^= 1
+    with caplog.at_level(logging.WARNING, logger=remote_cache.logger.name):
+        assert remote_cache.unpacked(bytes(bundle)) == [("jit_a-1", b"program a")]
+    assert [record.levelname for record in caplog.records if record.name == remote_cache.logger.name] == [
+        "WARNING"]
+
 
 def run_child(script: str, *arguments: str) -> list[str]:
     """`script` run in a fresh Python with the tests' directory on its path and JAX on the CPU: its

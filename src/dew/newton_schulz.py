@@ -20,7 +20,7 @@ from optax.contrib import _muon
 
 from dew import _cache
 from dew.mesh import STAGE_AXIS
-from dew.nn.kernels.gemm import batched_product
+from dew.nn.kernels.gemm import batched_product, symmetric_gram, symmetric_polynomial
 from dew.nn.precision import configured_precision, iteration_dtype
 from dew.nn.sharding import constrained
 
@@ -258,9 +258,7 @@ def newton_schulz(x: jax.Array, coeffs, steps: int, eps: float,
     last = x.ndim - 1
 
     def gram(matrices: jax.Array, conjugate: bool = True) -> jax.Array:
-        held = matrices.conj() if conjugate else matrices
-        return (batched_product(held, matrices, (last - 1, last - 1)) if tall
-                else batched_product(matrices, held, (last, last)))
+        return symmetric_gram(matrices, transpose=tall, conjugate=conjugate)
 
     def applied(polynomial: jax.Array, matrices: jax.Array) -> jax.Array:
         return batched_product(matrices, polynomial, (last, last - 1)) if tall else batched_product(
@@ -268,9 +266,7 @@ def newton_schulz(x: jax.Array, coeffs, steps: int, eps: float,
 
     def stepped(matrices: jax.Array, a: jax.Array, triple: jax.Array) -> jax.Array:
         # One product (the docstring's): the iterate's term on the Gram side.
-        squared = batched_product(a, a, (last, last - 1))
-        polynomial = triple[0] * jnp.eye(a.shape[-1], dtype=a.dtype) + triple[1] * a + triple[2] * squared
-        return applied(polynomial, matrices)
+        return applied(symmetric_polynomial(a, triple), matrices)
 
     def base(matrices: jax.Array, triple: jax.Array) -> jax.Array:
         return stepped(matrices, gram(matrices), triple)

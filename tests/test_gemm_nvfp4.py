@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import INTERPRETS, lowers
 from jax.sharding import Mesh
 from low_precision_support import nvfp4
 
@@ -447,3 +447,49 @@ def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix(group_s
     assert taken(whole) == {"packed"}
     assert taken(split) == {"xla"}
 
+
+@INTERPRETS
+@pytest.mark.parametrize(("minifloat", "out_dtype"),
+                         [(bits.E4M3, jnp.float8_e4m3fn), (bits.E5M2, jnp.float8_e5m2),
+                          (bits.E2M1, jnp.uint8)], ids=["e4m3", "e5m2", "e2m1"])
+def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
+    """`gemm.quantize_epilogue(minifloat)` encodes the GEMM accumulator via `bits.encode_form` bit-exact
+    with `bits.encoded` across E4M3, E5M2, and E2M1 (row 8547)."""
+    rng = np.random.default_rng(17)
+    lhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
+    rhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
+    acc = jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
+    words = jax.lax.bitcast_convert_type(acc, jnp.uint32)
+    expected_u8 = bits.encoded(words, minifloat).astype(jnp.uint8)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        got = gemm.gemm(lhs, rhs, epilogue=gemm.quantize_epilogue(minifloat), out_dtype=out_dtype,
+                        interpret_on_cpu=True)
+    got_u8 = jax.lax.bitcast_convert_type(got, jnp.uint8) if out_dtype != jnp.uint8 else got
+    np.testing.assert_array_equal(np.asarray(got_u8), np.asarray(expected_u8))
+
+
+@pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
+                                 pytest.param("sm90", marks=lowers("sm90"))])
+def test_gemm_quantize_epilogue_lowers_inline_ptx(gpu):
+    """`gemm.quantize_epilogue(bits.E4M3)` lowers through Mosaic GPU with `bits.encode_form`'s inline PTX
+    on sm80 and sm90 (row 8547)."""
+    x = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), gpu)
+    with (generation.assumed(gpu), jax.sharding.use_abstract_mesh(mesh),
+          generation.chosen(grouped_matmul="mosaic")):
+        jax.jit(lambda a, b: gemm.gemm(a, b, epilogue=gemm.quantize_epilogue(bits.E4M3),
+                                       out_dtype=jnp.float8_e4m3fn)).trace(x, w).lower(
+            lowering_platforms=("cuda",))
+
+
+def test_packed_consumer_layout_reads_and_refuses_missing_fragment():
+    """`packed.consumer_layout` resolves `mosaic_sm90.WGMMA.layout` through `bits.BitTransform.fragments`
+    and refuses a transform that omits `packed.CONSUMER` (algebra.md §7.4, rows 8676, 11984)."""
+    from dew.nn.kernels.templates import mosaic_sm90
+    from dew.nn.kernels.templates.gemm import packed
+
+    assert packed.consumer_layout(bits.NVFP4_BFLOAT16) == mosaic_sm90.WGMMA.layout
+    missing = dataclasses.replace(bits.NVFP4_BFLOAT16, fragments={})
+    with pytest.raises(ValueError):
+        packed.consumer_layout(missing)

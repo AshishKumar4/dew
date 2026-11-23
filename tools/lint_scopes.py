@@ -30,6 +30,17 @@ def dotted(node: ast.expr | None) -> str:
     return ""
 
 
+def last(node: ast.expr | None) -> str:
+    """The last name of a name or attribute (`compile` of `lowered.compile`), or "" for anything else."""
+    return dotted(node).rpartition(".")[2]
+
+
+def called(node: ast.AST | None) -> str:
+    """The last name of the function a call calls (`compile` of `lowered.compile()`), or "" for anything but
+    a call of a name or an attribute."""
+    return last(node.func) if isinstance(node, ast.Call) else ""
+
+
 def own(scope: ast.AST) -> Iterator[ast.AST]:
     """Every node in one scope, a nested scope's own node but not its contents."""
     for node in ast.iter_child_nodes(scope):
