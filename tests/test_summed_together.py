@@ -45,7 +45,7 @@ def _together(a, b, c, d, *, interpret):
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, TILE)
         pl.run_scoped(scoped, *(swizzling.staged((TILE, TILE), jnp.bfloat16, swizzle) for _ in range(4)),
-                      *(swizzling.plain((TILE, TILE), jnp.float32) for _ in range(2)))
+                      *(swizzling.plain((TILE, TILE), jnp.float32) for _ in range(2)), collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((2, TILE, TILE), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
