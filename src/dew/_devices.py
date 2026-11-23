@@ -179,12 +179,14 @@ def _gpu_default(name: str, assignment: str) -> None:
 
 
 def opens_tpu() -> bool:
-    """Whether this process's JAX backend will be a TPU's: its platforms (JAX_PLATFORMS, which JAX reads
-    as it imports, before the backend opens) name `tpu`, or name none on a Cloud TPU VM (`cloud_tpu_vm`),
-    where JAX opens the TPU. A CPU process compiling for compile-only GPUs opens none."""
+    """Whether this process's JAX backend will be a TPU's: its platforms name `tpu` (JAX's live
+    `jax_platforms` where JAX is imported, a program's update of it before the backend opens among them, row
+    12070; else JAX_PLATFORMS, which JAX reads as it imports), or name none on a Cloud TPU VM
+    (`cloud_tpu_vm`), where JAX opens the TPU. A CPU process compiling for compile-only GPUs opens none."""
     from dew.clusters import cloud_tpu_vm
 
-    platforms = os.environ.get("JAX_PLATFORMS", "")
+    jax = sys.modules.get("jax")
+    platforms = (jax.config.jax_platforms if jax is not None else os.environ.get("JAX_PLATFORMS")) or ""
     named = {platform.strip() for platform in platforms.split(",") if platform.strip()}
     return "tpu" in named if named else cloud_tpu_vm(os.environ)
 

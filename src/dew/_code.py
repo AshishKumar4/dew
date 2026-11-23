@@ -75,6 +75,7 @@ REVIEWED = {
     **dict.fromkeys((
         "dew._cache:unintercepted:sys.modules", "dew._devices:_seen:sys.modules",
         "dew._devices:backend_open:sys.modules", "dew._devices:flags_hold:sys.modules",
+        "dew._devices:opens_tpu:sys.modules",
         "dew._sources:file_of:sys.modules", "dew._sources:function_reads:sys.modules",
         "dew._sources:generated_fields:sys.modules", "dew._sources:own_source:sys.modules",
         "dew._sources:recorded:sys.modules", "dew._sources:source_file:sys.modules",
