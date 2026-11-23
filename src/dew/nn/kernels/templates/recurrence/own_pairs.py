@@ -116,20 +116,22 @@ def own_bands(queries, staged, betas, bands, *, products: tuple[str, ...], unit_
     columns each, one loop of `SUB + 1` steps over both rows' pairs at or before them alone (`p + 1` and
     `SUB - p`, so every thread steps alike), its pair's decay the product of its tokens' own formed back from
     its own token as the token recurrence forms it, each term the row times the key, then times the decay
-    (or, `unit_keys`, the row times the decay, then times the key), summed over its columns and then the
-    quad's (`utils.shfl_bfly`), the warpgroup met once when done. fla_kda's token-parallel diagonal
-    (chunk_kda_fwd_intra_token_parallel) walks the pairs at or before a token alone; the bands a tile in the
-    accumulator's layout took every offset of every row, its shifted reads whole tiles and its sums over a
-    key block's columns a warp's shuffles, 70% of an emulated GH200's intra_own issues (M-JS-145h)."""
+    (or, `unit_keys`, the row times the key decayed once for every output, `algebra.decayed_key`), summed
+    over its columns and then the quad's (`utils.shfl_bfly`), the warpgroup met once when done. fla_kda's
+    token-parallel diagonal (chunk_kda_fwd_intra_token_parallel) walks the pairs at or before a token alone;
+    the bands a tile in the accumulator's layout took every offset of every row, its shifted reads whole
+    tiles and its sums over a key block's columns a warp's shuffles, 70% of an emulated GH200's intra_own
+    issues (M-JS-145h)."""
     outputs, (chunk, keys) = len(products), staged.shape[1:]
     # Each row's pairs at or before it in its sub-chunk, each over the block's columns: its key and decay
-    # read and its decay's multiply (each output's own where `unit_keys`), and each output's row read (the
-    # system's its key and write strength, and their multiply), its two multiplies and an add; then each
-    # output's sum over the quad (two shuffles and two adds) and its band's entry read, added and written.
+    # read, its decay's multiply and (`unit_keys`) the decayed key's, and each output's row read (the
+    # system's its key and write strength, and their multiply), its multiplies (one where `unit_keys`, two
+    # else) and an add; then each output's sum over the quad (two shuffles and two adds) and its band's
+    # entry read, added and written.
     pairs = chunk * (algebra.SUB + 1) // 2
     columns = pairs * keys
     system = "system" in products
-    work = Work(operations=columns * (3 * outputs + (outputs if unit_keys else 1) + system)
+    work = Work(operations=columns * ((2 if unit_keys else 3) * outputs + 1 + unit_keys + system)
                 + pairs * outputs * 5,
                 shared_bytes=4 * columns * (2 + outputs) + 4 * pairs * system + 8 * pairs * outputs)
     refs = tuple(ref for ref in (queries, staged, betas, bands) if ref is not None)
@@ -205,11 +207,11 @@ def _own_span(row_words, staged_ref, bands_ref, short, long, p, columns, leader,
                 + [memref.load(staged_ref, at(1, own, column)) for column in columns]
                 + [word for name in products for word in row_words(name, row, columns)])
 
-    # The steps a loop, carrying the pair's decay (or each output's decayed row, `unit_keys`) and the next
-    # step's words, read a step ahead of the terms that take them: unrolled, ptxas held later steps' reads
-    # across earlier ones and spilled an H100's 80 registers (jsf-gate-steps3); read in the step, each step's
-    # adds waited on its reads, 42% of an emulated GH200's warp time a long scoreboard (M-JS-145k).
-    state = run * (outputs if unit_keys else 1)
+    # The steps a loop, carrying the pair's decay, one for every output, and the next step's words, read a
+    # step ahead of the terms that take them: unrolled, ptxas held later steps' reads across earlier ones
+    # and spilled an H100's 80 registers (jsf-gate-steps3); read in the step, each step's adds waited on its
+    # reads, 42% of an emulated GH200's warp time a long scoreboard (M-JS-145k).
+    state = run
     lower, upper, stride = at(0, sub + 1, 1)
     loop = scf.ForOp(lower, upper, stride, [one] * state + read(const(0)))
     with ir.InsertionPoint(loop.body):
@@ -220,23 +222,19 @@ def _own_span(row_words, staged_ref, bands_ref, short, long, p, columns, leader,
         ahead = read(arith.minsi(arith.addi(step, const(1)), const(sub)))
         row, e, first, _, _ = placed(step)
         key, factor = words[:run], words[run:2 * run]
-        after, decays = [], []
-        if not unit_keys:
-            # The pair's decay, one for every output, restarting at a row's own pair.
-            decays = [arith.select(first, one, arith.mulf(b, a)) for b, a in zip(before, factor, strict=True)]
-            after = decays
+        # The pair's decay, one for every output, restarting at a row's own pair; under `unit_keys` the key
+        # decayed by it once for every output (`algebra.decayed_key`).
+        decays = [arith.select(first, one, arith.mulf(b, a)) for b, a in zip(before, factor, strict=True)]
+        after = decays
+        if unit_keys:
+            key = [algebra.decayed_key(native.Word(k), native.Word(d)).value
+                   for k, d in zip(key, decays, strict=True)]
+        pairs = [None if unit_keys else native.Word(d) for d in decays]
         for o in range(outputs):
             values = words[(2 + o) * run:(3 + o) * run]
-            if unit_keys:
-                decayed = [arith.select(first, value, arith.mulf(b, a))
-                           for value, b, a in zip(values, before[o * run:(o + 1) * run], factor, strict=True)]
-                after += decayed
-                pairs = [None] * run
-            else:
-                decayed, pairs = values, [native.Word(d) for d in decays]
             # The algebra's own term (`algebra.band_term`), emitted a word at a time.
             terms = [algebra.band_term(native.Word(r), native.Word(k), d, unit_keys=unit_keys).value
-                     for r, k, d in zip(decayed, key, pairs, strict=True)]
+                     for r, k, d in zip(values, key, pairs, strict=True)]
             total = terms[0]
             for term in terms[1:]:
                 total = arith.addf(total, term)
@@ -389,10 +387,10 @@ def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
     if by_thread(call):
         # The bands summed in shared memory (`own_bands`): the keys' and decays' forming, then an
         # output's rows formed (its operand, its write strengths and the rows), then a thread's loop over its
-        # own pairs (`_own_span`): its carried decays (each output's decayed row where `unit_keys`), a step's
-        # words (a run of the keys, the factors and each output's row) and the next step's, read ahead.
+        # own pairs (`_own_span`): its carried pairs' decays, a step's words (a run of the keys, the factors
+        # and each output's row) and the next step's, read ahead.
         run = block // QUARTERS
-        state = run * (outputs if call.unit_keys else 1)
+        state = run
         words = run * (2 + outputs)
         return Held(phases=([f32(chunk, block)] * 6, [f32(chunk, block)] * 3,
                             [f32(scan.THREADS, state + 2 * words)], [f32(chunk, algebra.SUB)] * 2))

@@ -385,8 +385,9 @@ def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     k_jk exp2(E_ik - E_jk)`, each pair's decay the product of its tokens' own (`algebra.token_decays`,
     `between` of each token against the one before), rounded a factor at a time from the row's own token
     back (`pair_e = pair_(e - 1) a_(i - e + 1)`), each term the row times the key rounded, then times its
-    decay; under `Lane.unit_keys` the row itself decayed a factor at a time, then times the key (the native
-    loop's fold, `own_pairs._own_span`); the last multiply an add may fuse, and the terms' sum over every
+    decay; under `Lane.unit_keys` the key times its pair's decay rounded, then the row times it
+    (`algebra.decayed_key`, the native loop's fold, `own_pairs._own_span`); the last multiply an add may
+    fuse, and the terms' sum over every
     key block within one sum's bound of them (a key block's sum and its adds into the total, at most as
     many roundings as the width's terms)."""
     exact, bound = exponents.exact, exponents.bound
@@ -395,9 +396,8 @@ def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     placed = ((tokens[:, None] // SUB) == (tokens[None, :] // SUB)) & (tokens[:, None] >= tokens[None, :])
     # Each token's own decay against the one before, `own[t - 1]` token `t`'s.
     own = between(exact[1:], bound[1:], exact[:-1], bound[:-1], lane)
-    # Each row's chain so far, from its own token back: its pair's decay, or under `unit_keys` the row
-    # itself decayed (`own_pairs._own_span`'s fold), each factor rounded in turn.
-    start = Iv(rows.lo, rows.hi) if lane.unit_keys else point(np.ones(exact.shape))
+    # Each row's chain so far, from its own token back: its pair's decay, each factor rounded in turn.
+    start = point(np.ones(exact.shape))
     lo, hi = np.zeros((size, size, *exact.shape[1:])), np.zeros((size, size, *exact.shape[1:]))
     lo[tokens, tokens], hi[tokens, tokens] = start.lo, start.hi
     chain_lo, chain_hi = start.lo.copy(), start.hi.copy()
@@ -409,7 +409,7 @@ def key_diagonal(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
         lo[rows_e, rows_e - e], hi[rows_e, rows_e - e] = found.lo, found.hi
     chain, key = Iv(lo, hi), point(np.asarray(k)[None, :, :])
     if lane.unit_keys:
-        terms = fused(mul(chain, key), lane)
+        terms = fused(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), fp32(mul(chain, key), lane)), lane)
     else:
         keyed = fp32(mul(Iv(rows.lo[:, None, :], rows.hi[:, None, :]), key), lane)
         terms = fused(mul(keyed, chain), lane)
@@ -555,7 +555,7 @@ class Run:
     """Whether the template trains the call (`Mosaic.trains`): its records the training forward's, the primal
     of the route's VJP, and its fast backward the template's; else the inference forward's."""
     unit_keys: bool
-    """Whether its own pairs fold each decay into the row before the key (`Lane.unit_keys`): a delta rule's
+    """Whether its own pairs fold each decay into the key before the row (`Lane.unit_keys`): a delta rule's
     unit keys, as the draws' layers declare them."""
     rounded_prefix: bool
     """Whether its decay a key dimension's prefix is its rounded sum alone (`Lane.rounded_prefix`,
@@ -769,7 +769,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         form = (f"delta {delta}, rounded {rounded}, inference {inference}, segments {max_segments}, starts "
                 f"{None if starts is None else hasher.hexdigest()[:16]}")
         o, final, tiles, trained, bound = _route_forward(route, operands, form, inference=inference)
-        # Whether the call's own pairs fold each decay into the row first, as the op took it.
+        # Whether the call's own pairs fold each decay into the key first, as the op took it.
         unit_keys = bound.arguments.get("unit_keys", False)
         decay_bound = bound.arguments.get("decay_bound")
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's

@@ -781,9 +781,11 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     form and its transpose, each issue-bound (an emulated B200 at 8aab1729e65). Summed over a chunk's key
     blocks, a launch's bands are placed by its caller (`placed_bands`): placed a key block and an offset at a
     time, the `[C, C]` selects took an H100's Kimi Linear intra launch from 492 to 1982 us (M-JS-50d).
-    Where the keys are at most one in size (`unit_keys`, `mainloop.Call.unit_keys`), each row takes its
-    decay first instead, a multiply an element and a term's fused multiply-add (fla's token-parallel
-    diagonal folds it so, into the key): all the decayed row loses is below normal in the exact term too.
+    Where the keys are at most one in size (`unit_keys`, `mainloop.Call.unit_keys`), each key takes its
+    pair's decay first instead, once for every product (`decayed_key`), and each row's term is a fused
+    multiply-add of it (fla's token-parallel diagonal folds it so, into the key): all the decayed key loses
+    is below normal in the exact term too. Each product's row decayed apart, a thread's own pairs issued
+    twice the multiplies, an emulated GH200's intra_own issue-bound (M-JS-170).
     Unnormalised keys keep the row times the key first, which loses no term in range to the decay (row
     7299; a decayed row lost 2^-100 against a key of 2^60, base review 6ce025bc7 F1)."""
     index, _ = _grid(rows[0].shape)
@@ -799,20 +801,19 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
                       for band, total in zip(bands, summed, strict=True)), pair, decays)
 
     def folded(e, carried):
-        # Each row's decay folded in: a multiply an element and a term's fused multiply-add, where keys at
-        # most one in size (`unit_keys`) make what the decayed row loses below normal in the exact term too.
-        bands, decayed, following = carried
+        # Each key's decay folded in once for every product (`decayed_key`): a multiply an element and each
+        # row's term a fused multiply-add, where keys at most one in size (`unit_keys`) make what the
+        # decayed key loses below normal in the exact term too.
+        bands, pair, following = carried
         keys, decays = shifted(e)
-        decayed = tuple(row * following for row in decayed)
-        summed = [jnp.sum(band_term(row, keys, None, unit_keys=True), axis=1) for row in decayed]
+        pair = pair * following
+        keyed = decayed_key(keys, pair)
+        summed = [jnp.sum(band_term(row, keyed, None, unit_keys=True), axis=1) for row in rows]
         return (tuple(jnp.where(lane == e, total[:, None], band)
-                      for band, total in zip(bands, summed, strict=True)), decayed, decays)
+                      for band, total in zip(bands, summed, strict=True)), pair, decays)
 
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
-    if unit_keys:
-        bands = jax.lax.fori_loop(0, sub, folded, ((zero,) * len(rows), tuple(rows), one))[0]
-    else:
-        bands = jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), one, one))[0]
+    bands = jax.lax.fori_loop(0, sub, folded if unit_keys else offset, ((zero,) * len(rows), one, one))[0]
     # Each column written once, by its offset's select; a row before its offset selected out once, at the end.
     return [jnp.where(token % sub >= lane, band, 0.0) for band in bands]
 
@@ -872,9 +873,16 @@ def gated(word, strength):
 
 def band_term(row, key, pair, *, unit_keys: bool):
     """A sub-chunk's own pair's term (`key_diagonal_bands`): the row times the key, then times the pair's
-    decay; or where keys are at most one in size (`unit_keys`), the decayed row `row` (`row * pair`, carried
-    across the offsets) times the key, `pair` unread. On any values that multiply, as `gated`."""
+    decay; or where keys are at most one in size (`unit_keys`), the row times the decayed key `key`
+    (`decayed_key`'s, formed once for every product's row), `pair` unread. On any values that multiply, as
+    `gated`."""
     return row * key if unit_keys else row * key * pair
+
+
+def decayed_key(key, pair):
+    """A key decayed by its pair's decay, rounded once (`band_term`'s `unit_keys` key): what it loses below
+    normal, a key at most one in size and every row at most one, is below normal in the exact term too."""
+    return key * pair
 
 
 def columns_before(found: jax.Array, start: int) -> jax.Array:
