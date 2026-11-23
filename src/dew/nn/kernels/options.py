@@ -848,7 +848,10 @@ class OuterProgram:
         if staged():
             whole = _PASSING.get()
             return self._held_call(("nested", whole), lambda: self._nested(whole), args, kwargs)
-        if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
+        if jax_config.disable_jit.value:
+            # Its function run as Python, every fact it reads read as it runs.
+            return self._eager()(*args, **kwargs)
+        if not jax_core.trace_state_clean():
             return self._held_call(("eager",), self._eager, args, kwargs)
         if (lowering := _LOWERING.get()) is not None:
             platforms, lowerings = lowering
