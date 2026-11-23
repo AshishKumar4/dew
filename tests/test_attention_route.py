@@ -1444,3 +1444,50 @@ def test_bare_attention_route_supports_jvp_and_higher_order_with_hooks():
             qi, ki, vi, implementation="template", precision="highest"),
         (q, k, v), (jnp.ones_like(q), jnp.zeros_like(k), jnp.zeros_like(v)))
     assert jnp.all(jnp.isfinite(out_hi)) and jnp.all(jnp.isfinite(dout_hi))
+
+
+def test_a_routes_tangent_of_a_mean_past_the_format_is_its_values_mean():
+    """A query of zero logits over two fp32 values of 2^127 (their sum past fp32's largest, their mean
+    2^127): the routed output is 2^127 and its tangent along the values, ones, is 1, the mean's, where the
+    portable rule differentiated the unnormalized sum, inf, to 0 (the head review of 0320fa0a3f9, F1)."""
+    spans = template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 1, 8), jnp.float32)
+    key = jnp.zeros((1, 2, 1, 8), jnp.float32)
+    value = jnp.full((1, 2, 1, 8), 2.0 ** 127, jnp.float32)
+    out, tangent = jax.jvp(lambda v: attention_route.attend(query, key, v, spans, template.Hooks()),
+                           (value,), (jnp.ones_like(value),))
+    np.testing.assert_array_equal(np.asarray(out), 2.0 ** 127)
+    np.testing.assert_array_equal(np.asarray(tangent), 1.0)
+
+
+def test_a_routes_score_gradient_past_the_format_has_a_finite_tangent():
+    """A query of logits `[0, -0.25 k]` over fp32 values `2^127` and `1.5 * 2^127` (a finite mean and a finite
+    score gradient, its unnormalized sum past fp32's largest): the query gradient's tangent along the query
+    and a moving output cotangent (forward over reverse, the portable rule's) is on par with its float64
+    truth, where the overflowing sum left in the differentiated graph gave NaN (the head review's delta
+    confirm of d64daf1a049)."""
+    spans = template.spans(1, 2, 1)
+    query = np.zeros((1, 1, 1, 8), np.float32)
+    query[..., 0] = 1.0
+    # A cotangent on one column, so no product of it with the values passes the format itself.
+    cotangent = np.zeros((1, 1, 1, 8), np.float32)
+    cotangent[..., 0] = 1.0
+
+    def tangent_of(attend):
+        def tangent(q, k, v, ct):
+            def query_gradient(x, c):
+                _, pull = jax.vjp(lambda y: attend(y, k, v, spans, template.Hooks()), x)
+                return pull(c)[0]
+
+            return jax.jvp(query_gradient, (q, ct), (jnp.full_like(q, 0.5), ct * 0.5))[1]
+
+        return tangent
+
+    def draw(seed: int):
+        key = np.zeros((1, 2, 1, 8), np.float32)
+        key[0, 1, 0, 0] = -0.25 * (seed + 1)
+        value = np.stack([np.ones(8), np.full(8, 1.5)])[None, :, None, :] * 2.0 ** 127
+        return query, key, value.astype(np.float32), cotangent
+
+    assert_as_exact(jax.jit(tangent_of(attention_route.attend)), jax.jit(tangent_of(template.reference)),
+                    draw, "a route's score gradient's tangent past the format", seeds=FEWEST_SEEDS)

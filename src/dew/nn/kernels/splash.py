@@ -1298,9 +1298,14 @@ def _splash_portable(
     groups = num_q_heads // num_kv_heads
     wide = jnp.promote_types(q.dtype, jnp.float32)
     q_grouped = q.reshape(num_kv_heads, groups, q_seq_len, head_dim_qk)
-    logits = float32_einsum("hgqd,hkd->hgqk", q_grouped, k, preferred_element_type=wide).reshape(
-        num_q_heads, q_seq_len, kv_seq_len
-    )
+    # Each product at the precision the kernel's own takes it (`_dot`), never the caller's ambient one, which
+    # rounds fp32 operands to bf16 on a TPU: a key 2^-9 from another kept its own score's tangent.
+    scores_precision = programs.mosaic_tpu_dot_precision(q.dtype, k.dtype, blocks.block_q, head_dim_qk,
+                                                         blocks.block_kv_compute)
+    values_precision = programs.mosaic_tpu_dot_precision(jnp.float32, jnp.float32, blocks.block_q,
+                                                         blocks.block_kv_compute, head_dim_v)
+    logits = float32_einsum("hgqd,hkd->hgqk", q_grouped, k, precision=scores_precision,
+                            preferred_element_type=wide).reshape(num_q_heads, q_seq_len, kv_seq_len)
     if call.attn_logits_soft_cap is not None:
         logits = jnp.tanh(logits / call.attn_logits_soft_cap) * call.attn_logits_soft_cap
     visited, entry = _splash_mask(fwd_mask_info, segment_ids, q_seq_len=q_seq_len, kv_seq_len=kv_seq_len,
@@ -1310,8 +1315,9 @@ def _splash_portable(
     if visited is not None:
         logits = jnp.where(visited, logits, -jnp.inf)
     m = jnp.max(logits, axis=-1, initial=-jnp.inf)
-    if sinks is not None:
-        m = jnp.maximum(m, sinks[:, None].astype(wide))
+    # The walk's starting maximum, `_forward`'s: the sink, else the mask value, beneath which a logit's weight
+    # underflows as the kernel's does (a mask value of 0 over logits of -200: zeros, not their mean).
+    m = jnp.maximum(m, call.mask_value if sinks is None else sinks[:, None].astype(wide))
     safe = jnp.where(jnp.isfinite(m), m, 0.0)
     p = jnp.exp(logits - safe[..., None])
     total = jnp.sum(p, axis=-1)
@@ -1333,7 +1339,8 @@ def _splash_portable(
         def _block_out(_, pair):
             w_qb, vis_qb = pair
             v_safe = jnp.where(vis_qb[..., None], v_q, 0.0)
-            return None, float32_einsum("hqk,hkd->hqd", w_qb, v_safe, preferred_element_type=wide)
+            return None, float32_einsum("hqk,hkd->hqd", w_qb, v_safe, precision=values_precision,
+                                        preferred_element_type=wide)
 
         _, out_blocks = lax.scan(_block_out, None, (w_blocks, vis_blocks))
         out = jnp.swapaxes(out_blocks, 0, 1).reshape(num_q_heads, q_seq_len, head_dim_v)
@@ -1342,6 +1349,7 @@ def _splash_portable(
             "hgqk,hkd->hgqd",
             weights.reshape(num_kv_heads, groups, q_seq_len, kv_seq_len),
             v.astype(wide),
+            precision=values_precision,
             preferred_element_type=wide,
         ).reshape(num_q_heads, q_seq_len, head_dim_v)
     return out.astype(q.dtype)

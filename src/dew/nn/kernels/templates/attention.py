@@ -41,6 +41,7 @@ from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted, surrogate
 from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
+from dew.nn.kernels.templates import scaled_contraction
 from dew.nn.precision import (
     at_least_fp32,
     compensated_sum,
@@ -1344,7 +1345,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
         if hooks.initial is None or hooks.initial.valueless:
-            normalized = held_mean(normalized, acc, value.dtype)
+            normalized = held_mean(acc, total, value.dtype, functools.partial(
+                _scaled_mean, logits, value.astype(wide), m0, total0))
         if hooks.output_mod is None and jnp.dtype(query.dtype).itemsize == 2:
             # Rounded to odd for its narrowing, as the kernels' quotients outside a register epilogue are.
             normalized = narrowing_settled(normalized, acc, total, query.dtype)
@@ -1477,10 +1479,53 @@ def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
     return (significand & (2 * half - 1)) == half
 
 
-def held_mean(out: jax.Array, sums: jax.Array, dtype) -> jax.Array:
-    """The reference's mean saturation (`saturated`): its value, its derivative the mean's, `out`'s
-    (`derivative_of`)."""
-    return saturated(jax.lax.stop_gradient(out), jnp.abs(sums) < jnp.inf, dtype) + derivative_of(out)
+QUOTIENT_REACH = 63
+"""The binades either side of one a total's quotient is differentiated plainly within (`held_mean`): its
+derivative forms `total^-2`, which past 2^126 either way leaves fp32 (a mass of 2^100 moved by itself: its
+keys' gradient 0 where it is -2^28)."""
+
+
+def held_mean(acc: jax.Array, total: jax.Array, dtype, law) -> jax.Array:
+    """The reference's mean `acc / total` (zero where `total` is) saturated (`saturated`): its value, and its
+    derivative at every order the quotient's where its sums are finite and its total within
+    `2^+-QUOTIENT_REACH`, else `law`'s (`_scaled_mean`), whose every order is one contraction formed apart
+    from its binades (`scaled_contraction`): no sum, product or quotient of it a float past the format
+    beside the factor that brings it back. It runs only where some row needs it (`lax.cond`). The
+    overflowing sums are held out of the differentiated graph whole: a quotient of an infinite sum left in it
+    took a zero cotangent into its divisor's derivative, `0 * inf` (two values of 2^127: the value tangent 0
+    where the mean's is 1, a score gradient's tangent NaN)."""
+    finite = jnp.abs(jax.lax.stop_gradient(acc)) < jnp.inf
+    held = jax.lax.stop_gradient(total)[..., None]
+    reached = (held == 0) | ((held >= 2.0 ** -QUOTIENT_REACH) & (held <= 2.0 ** QUOTIENT_REACH))
+    plain = finite & reached
+    seen = held > 0
+    out = jnp.where(seen, jax.lax.stop_gradient(acc) / jnp.where(seen, held, 1), 0)
+    # A total past the reach is none of the quotient's operands, so its derivative there forms no
+    # `total^-2` for a masked cotangent of zero to meet (`0 * inf`).
+    quotient = jnp.where(seen, jnp.where(finite, acc, 0) / jnp.where(seen & reached, total[..., None], 1), 0)
+    differentiated = jax.lax.cond(jnp.all(plain), lambda: quotient,
+                                  lambda: jnp.where(plain, quotient, law()))
+    return saturated(out, finite, dtype) + derivative_of(differentiated)
+
+
+def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax.Array) -> jax.Array:
+    """The mean of the values `[B, K, Hk, Dv]` at the logits `[B, H, Q, K]` beside a valueless state (its
+    maximum `m0` and mass `total0`, `[B, H, Q]`), `[B, H, Q, Dv]`: each key's mass at the row's maximum held
+    out of the graph (`m`'s, any shift's derivative cancels), the state's its mass times its own, and the
+    masses' contraction with the values over their total formed apart from their binades
+    (`scaled_contraction`), whose every order is that contraction again; zero over a total of none."""
+    batch, heads, queries, keys = logits.shape
+    kv_heads, width = value.shape[2], value.shape[3]
+    grouped = (batch, kv_heads, heads // kv_heads, queries)
+    reached = jnp.maximum(m0, jnp.max(logits, axis=-1, initial=-jnp.inf))
+    shift = jax.lax.stop_gradient(jnp.where(jnp.isfinite(reached), reached, 0))
+    masses = jnp.where(jnp.isfinite(logits), jnp.exp(logits - shift[..., None]), 0)
+    carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - shift), 0)
+    total = jnp.sum(masses, axis=-1) + total0 * carried
+    divisor = jnp.where(total > 0, total, 1)
+    form = scaled_contraction.Form(((("bhgqk", 1), ("bhgq", -1)), (("bkhd", 1),)), "bhgqd")
+    mean = scaled_contraction.contract(form, masses.reshape(*grouped, keys), divisor.reshape(grouped), value)
+    return jnp.where(total[..., None] > 0, mean.reshape(batch, heads, queries, width), 0)
 
 
 def derivative_of(out: jax.Array) -> jax.Array:

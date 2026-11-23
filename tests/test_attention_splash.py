@@ -624,3 +624,40 @@ def test_native_bf16_splash_lowers_jvp_and_omitted_tiles_have_zero_jvp():
         o_hi, do_hi = jax.jvp(lambda qi: op_def(*args16[:3], qi, *args16[4:]), (q16,), (dq16,))
     np.testing.assert_array_equal(np.asarray(o_hi), np.asarray(o_def))
     np.testing.assert_array_equal(np.asarray(do_hi), np.asarray(do_def))
+
+
+def test_splash_tangents_take_the_kernels_products_and_starting_maximum():
+    """Splash's forward-mode rule computes as its kernel (`splash._dot`, `_forward`): its score products at
+    the kernel's precision whatever the caller's ambient one (bf16 on a TPU), so a key `2^-9` from the others
+    keeps its own score's tangent (`dQ` along that component: `127 * 2^-23` on its value, where a
+    bf16 product rounded every key to one score and gave 0); and with no sink, from the mask value as its
+    walk's starting maximum, so logits of -200 beneath a mask value of 0 weigh nothing, the kernel's
+    underflow, not their mean (the head review of 0320fa0a3f9, F2 and F4)."""
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+
+    from dew.nn.kernels import splash
+
+    full = splash_attention_mask.MultiHeadMask([splash_attention_mask.NumpyMask(np.ones((128, 128), bool))])
+    blocks = splash.BlockSizes(128, 128, 128, 128, 128, 128, 128, 128)
+    kernel = splash.make_splash_mha(full, block_sizes=blocks, interpret=True)
+    query = np.zeros((1, 128, 128), np.float32)
+    key = np.zeros((1, 128, 128), np.float32)
+    key[:, :, 0] = 1.0
+    key[0, 5, 0] = 1.0 + 2.0 ** -9
+    value = np.zeros((1, 128, 128), np.float32)
+    value[0, 5, :] = 1.0
+    direction = np.zeros_like(query)
+    direction[..., 0] = 1.0
+    with jax.default_matmul_precision("bfloat16"):
+        _, tangent = jax.jvp(lambda q: kernel(q, jnp.asarray(key), jnp.asarray(value)),
+                             (jnp.asarray(query),), (jnp.asarray(direction),))
+    # Every weight 2^-7 and every term exact in fp32: the tangent is 127 * 2^-23 bit for bit.
+    np.testing.assert_array_equal(np.asarray(tangent), np.float32(127 * 2.0 ** -23))
+
+    floored = splash.make_splash_mha(full, block_sizes=blocks, mask_value=0.0, interpret=True)
+    query[..., 0] = -200.0
+    key[0, 5, 0] = 1.0
+    out, tangent = jax.jvp(lambda v: floored(jnp.asarray(query), jnp.asarray(key), v),
+                           (jnp.asarray(value),), (jnp.ones_like(jnp.asarray(value)),))
+    np.testing.assert_array_equal(np.asarray(out), 0.0)
+    np.testing.assert_array_equal(np.asarray(tangent), 0.0)
