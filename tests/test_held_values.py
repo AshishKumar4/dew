@@ -476,3 +476,17 @@ def test_a_trace_reading_a_fact_under_a_gpu_it_assumes_is_taken_as_it_ran():
     running.join(timeout=120)
     assert len(traced) == 1, "the trace was let go and traced again without end"
     assert float(core.jaxpr_as_fun(traced[0].jaxpr)(x)[0]) == 40.0
+
+
+def test_a_program_called_under_disable_jit_within_a_trace_stages_its_operations_inline():
+    """A program called within `jax.make_jaxpr` under `jax.disable_jit`: its function runs as Python in the
+    trace around it, which stages its operations as a disabled jit does, binding no program of its own
+    (row 12296's review P0: a call within a trace took its held jit's trace and bound that program past the
+    disabled jit)."""
+    from dew.nn.kernels.options import owned_program
+
+    run = owned_program(lambda x: jnp.sin(x) * 2.0)
+    with jax.disable_jit():
+        staged = jax.make_jaxpr(run)(jax.ShapeDtypeStruct((), jnp.float32))
+    names = [equation.primitive.name for equation in staged.jaxpr.eqns]
+    assert "sin" in names and "jit" not in names, names

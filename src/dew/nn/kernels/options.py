@@ -811,12 +811,14 @@ class OuterProgram:
         (`made`'s, `_nested_jits`), so every call alike shares one program, which lowers once however many
         layers call it. Its trace is taken first, its facts by the program it made (`_programs`): those its
         trace read where its function ran, recorded into the recordings open there; those a trace JAX's cache
-        answered with read when it was made, read again. A program JAX's cache answers with whose facts are
-        not held (another thread's trace not yet returned) or answer otherwise now (a refusal it read moved,
-        its launches reading the enclosing trace's) is let go, the jit with it, and the call traced by a new
-        one, a trace that ran taken as it ran (a fact it read under a context of its own answers otherwise
-        outside it). A trace whose facts were another signature's, or not yet held where a second caller took
-        it, answers no call (row 12296's reviews' P0s)."""
+        answered with read when it was made, read again; and that program is the one the call binds
+        (`_bound`), never its jit's cache looked up again, which a concurrent trace at its signature may have
+        answered otherwise between. A program JAX's cache answers with whose facts are not held (another
+        thread's trace not yet returned) or answer otherwise now (a refusal it read moved, its launches
+        reading the enclosing trace's) answers no call: the call runs a jit of its own, and the held one is
+        let go for the next; a trace that ran is taken as it ran (a fact it read under a context of its own
+        answers otherwise outside it). A trace whose facts were another signature's, or not yet held where a
+        second caller took it, answers no call (row 12296's reviews' P0s)."""
         with self._compiling:
             held = self._nested_jits.get(mode)
             if held is None:
@@ -830,14 +832,23 @@ class OuterProgram:
                 with self._compiling:
                     if self._nested_jits.get(mode) is held:
                         self._nested_jits[mode] = made()
-                return self._held_call(mode, made, args, kwargs)
+                return made()(*args, **kwargs)
             _facts.replay(reads)
         else:
             with self._compiling:
                 self._programs[program] = reads
-        # The call its trace made, JAX's cache answering it; traced again where its caches were cleared
-        # between, its facts recorded as the trace runs.
-        return held(*args, **kwargs)
+        return self._bound(traced, args, kwargs)
+
+    def _bound(self, traced: jax.stages.Traced, args: tuple, kwargs: dict):
+        """`traced`'s program called at `args` and `kwargs` in the trace around it, bound as its jit's call
+        binds it (`jax._src.pjit`'s: its constants, then its dynamic arguments flattened as its trace took
+        them, its placements and options its own)."""
+        from jax._src import pjit as jax_pjit
+
+        dynamic = tuple(arg for at, arg in enumerate(args) if at not in self.numbers)
+        named = {name: value for name, value in kwargs.items() if name not in self.names}
+        outputs = jax_pjit.jit_p.bind(*traced._consts, *jax.tree.leaves((dynamic, named)), **traced._params)
+        return jax.tree.unflatten(traced.out_tree, outputs)
 
     def __call__(self, *args, **kwargs):
         from dew.nn.kernels.templates import report
@@ -845,12 +856,13 @@ class OuterProgram:
         # Within a staging trace the enclosing program compiles this one as part of its own, under its
         # own options (`_nested`); under an eager transformation alone, or `jax.disable_jit`, its jit
         # compiles itself with its options, or runs the function as Python.
+        if jax_config.disable_jit.value:
+            # Its function run as Python, every fact it reads read as it runs: as written where the pass reads
+            # an enclosing program whole, else rewritten (`_nested`, `_eager`).
+            return (self.function if staged() and _PASSING.get() else self._rewriting)(*args, **kwargs)
         if staged():
             whole = _PASSING.get()
             return self._held_call(("nested", whole), lambda: self._nested(whole), args, kwargs)
-        if jax_config.disable_jit.value:
-            # Its function run as Python, every fact it reads read as it runs.
-            return self._eager()(*args, **kwargs)
         if not jax_core.trace_state_clean():
             return self._held_call(("eager",), self._eager, args, kwargs)
         if (lowering := _LOWERING.get()) is not None:
