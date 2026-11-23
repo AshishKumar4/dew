@@ -812,10 +812,9 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
             if named is not None:
                 return _built(_member(named[0], (nominal,)), named[1], dtypes=dtypes)
             if dataclasses.is_dataclass(nominal):
-                built = _construct(nominal, value, dtypes=dtypes)
-                # A kind a command line chooses by subcommands reads as that subcommand's record (`flagged`):
-                # a run read from its record holds the class it was made with, its plain flags its fields.
-                return built.flagged() if isinstance(built, Registered) else built
+                # A record reads as its kind's own class: a command line's subcommands are its parser's
+                # alone (`RunConfig.cli`, `Registered.flagged`), so a run saved and read back is the run.
+                return _construct(nominal, value, dtypes=dtypes)
         if typing.get_origin(annotation) in _MAPPINGS:
             keys, entries = typing.get_args(annotation)
             return {_key(keys, str(name)): _rebuilt(entries, entry, dtypes=dtypes, name=str(name))

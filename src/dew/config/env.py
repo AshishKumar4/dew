@@ -214,7 +214,7 @@ class EnvRunConfig(RunConfig):
     """The environment the agent acts in (`EnvConfig`), a subcommand an environment, its arguments plain
     flags: `env:flight --env.count 4096 --env.difficulty 0.5`; a nested record (a race's `Racing`) an
     argument at a time, `override({"env.racing": {...}})`."""
-    rollout: RolloutChoice = dataclasses.field(default_factory=lambda: RolloutConfig().flagged())
+    rollout: RolloutChoice = dataclasses.field(default_factory=RolloutConfig)
     """The rollout and its settings (`RolloutConfig`), a subcommand a rollout: `rollout:control
     --rollout.unroll-length 64`, a setting at a time `override({"rollout.train_ratio": 128})`."""
     teacher: Annotated[TeacherConfig, tyro.conf.subcommand("teacher")] | None = None

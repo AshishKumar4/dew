@@ -624,6 +624,24 @@ def _names(held: "DataclassInstance | type[DataclassInstance]") -> set[str]:
 _RANDOM_SEARCH = RandomSearch()
 
 
+def _declared(field: dataclasses.Field) -> object:
+    """A dataclass field's declared default, its factory's value where it has one."""
+    if field.default_factory is not dataclasses.MISSING:
+        return field.default_factory()
+    return field.default
+
+
+def _flagged(value: object) -> object:
+    """`value` as a command line's parser holds it: a record of a kind chosen by subcommands its
+    subcommand's (`Registered.flagged`), any other value as it is."""
+    return value.flagged() if isinstance(value, Registered) else value
+
+
+def _recorded(value: object) -> object:
+    """`value` as a parsed run holds it: a subcommand's record its kind's own (`Registered.recorded`), any
+    other value as it is."""
+    return value.recorded() if isinstance(value, Registered) else value
+
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
     """A whole run's configuration. A kind of run subclasses it with its own
@@ -977,12 +995,17 @@ class RunConfig:
         parser = dataclasses.make_dataclass(
             cls.__name__, held_fields,
             bases=(cls,), frozen=True, namespace={"__post_init__": lambda self: None})
-        held = None if default is None else parser(
-            **{field.name: getattr(default, field.name) for field in dataclasses.fields(cls)})
+        # A kind its command line chooses by subcommands holds its default as that subcommand's record
+        # (`Registered.flagged`), which tyro reads a union's default by; the run it parses holds each as
+        # its kind's own record again (`Registered.recorded`), its subcommands the parser's alone.
+        held = parser(**{field.name: _flagged(getattr(default, field.name) if default is not None
+                                              else _declared(declared[field.name]))
+                         for field in dataclasses.fields(cls)})
         parsed = tyro.cli(tyro.conf.CascadeSubcommandArgs[parser], args=given, default=held)
         if parsed is None:
             raise ValueError("the command line built no run config")
-        return cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)})
+        return cls(**{field.name: _recorded(getattr(parsed, field.name))
+                      for field in dataclasses.fields(cls)})
 
     @classmethod
     def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:

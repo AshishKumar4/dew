@@ -60,3 +60,24 @@ def test_an_environment_runs_help_names_its_choices_and_their_flags_and_no_json(
     text = shown.getvalue()
     assert "rollout:control" in text and "rollout:dreamer" in text
     assert "--rollout.fields" not in text and "--env.fields" not in text, text
+
+
+@pytest.mark.parametrize("run", [EnvRunConfig(), EnvRunConfig(rollout=RolloutConfig("control"))],
+                         ids=["declared", "control"])
+def test_an_env_run_saved_and_read_back_is_the_run(run, tmp_path):
+    """An environment run, its rollout a kind its command line chooses by subcommands, saved and read back
+    is the run it saved (dataclass equality), its rollout its kind's own record: the subcommands' generated
+    classes are its parser's alone (the API03 review: read back, a run held them and was another run)."""
+    run.save(str(tmp_path))
+    read = EnvRunConfig.load(str(tmp_path))
+    assert read == run
+    assert type(read.rollout) is RolloutConfig
+
+
+def test_an_env_run_parsed_from_its_command_line_holds_its_kinds_own_records():
+    """A run parsed from its command line (`EnvRunConfig.cli`) holds each record as its kind's own class,
+    equal to the one a caller builds with the same settings (`Registered.recorded`)."""
+    parsed = EnvRunConfig.cli(["rollout:control", "--rollout.unroll-length", "64"])
+    assert type(parsed.rollout) is RolloutConfig
+    assert parsed.rollout == RolloutConfig("control", {"unroll_length": 64})
+    assert EnvRunConfig.cli([]) == EnvRunConfig()
