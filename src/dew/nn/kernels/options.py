@@ -475,7 +475,7 @@ class _Lowering:
 
     program: OuterProgram
     key: tuple[Hashable, tuple]
-    pending: Future[jax.stages.Compiled]
+    pending: Future[_Kept]
     lowered: jax.stages.Lowered
     args: tuple
     kwargs: dict
