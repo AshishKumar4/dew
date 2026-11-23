@@ -1563,6 +1563,20 @@ def test_a_process_that_lost_its_local_copy_recovers_it_from_a_replica(tmp_path,
                                     dumped_params(tmp_path / "whole" / f"process{index}.json"))
 
 
+def test_a_replicas_holder_whose_read_fails_ends_every_process_of_the_resume(tmp_path, killed_local_pool):
+    """Process 1 lost its local step and process 0, which holds its replica, cannot read that step's
+    metadata (a disk that went bad): the holder's read fails on every process of the resume, each ending
+    with an error, none left waiting for an answer it never sends (row 12175: the peer waited for ever,
+    `Stuck`)."""
+    directory = tmp_path / "unreadable"
+    shutil.copytree(killed_local_pool, directory)
+    shutil.rmtree(directory / "local" / "process1")
+    for written in local_committed(directory, 0, LOCAL_KILL_AFTER).rglob("_CHECKPOINT_METADATA"):
+        written.write_text("not a checkpoint's metadata")
+    with pytest.raises(AssertionError):
+        run_pool("fit", tmp_path / "resumed", 2, timeout=240, **local_flags(directory))
+
+
 @pytest.fixture(scope="module")
 def killed_split_pool(tmp_path_factory):
     """The killed pool run of `killed_local_pool` with fsdp over every device of the pool, so each
@@ -1628,6 +1642,15 @@ def test_a_local_step_on_two_meshes_is_recovered_on_each_from_a_replica(tmp_path
     for report in run_pool("replica_grids", tmp_path / "pool", 2, devices=2, script=REPLICA_KEY):
         assert report["grids"] == 2 and report["covered"] is True, report
         assert report["recovered"] == report["expected"], report
+
+
+@pytest.mark.distributed
+def test_a_pool_whose_first_process_cannot_mark_a_shared_directory_fails_on_every_process(tmp_path):
+    """Process 0's mark of a directory the pool asks whether it shares (`seen_by_every_process`) that it
+    cannot write fails on every process, process 0 with its own error and its peer with the agreement's,
+    none left waiting for the mark (row 12176: the peer waited for ever)."""
+    reports = run_pool("shared_mark_refused", tmp_path / "pool", 2, script=REPLICA_KEY, timeout=120)
+    assert [report["raised"] for report in reports] == ["NotADirectoryError", "PeerFailure"], reports
 
 
 @pytest.mark.distributed

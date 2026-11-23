@@ -99,7 +99,25 @@ def replica_complex(args) -> dict:
     return {"bits": recovered.view(np.uint32).tolist(), "expected": values.view(np.uint32).tolist()}
 
 
-MODES = {"replica_key": replica_key, "replica_grids": replica_grids, "replica_complex": replica_complex}
+def shared_mark_refused(args) -> dict:
+    """A pool asking whether its processes share a directory (`seen_by_every_process`) where process 0
+    cannot write its mark, a file standing where the directory would be (a read-only or full disk alike):
+    the error each process ends with, process 0's own and its peer's the agreement's (`PeerFailure`), none
+    left waiting for a mark that never lands (row 12176)."""
+    from dew._coordination import PeerFailure, seen_by_every_process
+
+    blocked = args.out.parent / "blocked"
+    if args.process_id == 0:
+        blocked.write_text("a file where the run's directory would be")
+    try:
+        seen_by_every_process(str(blocked / "run"))
+    except (OSError, PeerFailure) as error:
+        return {"raised": type(error).__name__}
+    return {"raised": None}
+
+
+MODES = {"replica_key": replica_key, "replica_grids": replica_grids, "replica_complex": replica_complex,
+         "shared_mark_refused": shared_mark_refused}
 
 
 def main(argv=None) -> None:

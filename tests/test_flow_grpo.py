@@ -814,9 +814,8 @@ def test_a_clip_reward_scores_each_sample_against_its_prompts_caption():
 
 def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
     import sys
-    from concurrent.futures import ThreadPoolExecutor
 
-    from process_support import run_pool, start_process
+    from process_support import run_pools, start_process
     from test_multiprocess import assert_same_parameters, dumped_params
 
     worker = Path(__file__).with_name("flow_grpo_worker.py")
@@ -828,12 +827,10 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
                               coordinator if processes > 1 else "unused", str(out)], 1,
                              environment={"JAX_ENABLE_X64": "0"})
 
-    # The pool of two and the one process run at once, each its own processes (row 12299: one after the
+    # The pool of two and the one process run at once, each its own coordinator (row 12299: one after the
     # other took 126 s).
-    with ThreadPoolExecutor(2) as running:
-        pooled = running.submit(run_pool, "flow", tmp_path / "pool", 2, timeout=120, start=started)
-        single = running.submit(run_pool, "flow", tmp_path / "single", 1, timeout=120, start=started)
-        reports, [baseline] = pooled.result(), single.result()
+    reports, [baseline] = run_pools(("flow", tmp_path / "pool", 2, {}), ("flow", tmp_path / "single", 1, {}),
+                                    timeout=120, start=started)
     # Where run_pool has each rank write its report, its parameters beside it.
     outputs = [tmp_path / "pool" / f"process{rank}.json" for rank in range(2)]
     baseline_path = tmp_path / "single" / "process0.json"
