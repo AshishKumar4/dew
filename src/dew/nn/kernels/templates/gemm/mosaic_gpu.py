@@ -1189,13 +1189,12 @@ def _normalized_gather(table: jax.Array, rows: int) -> jax.Array:
     return jnp.clip(jnp.where(indices < 0, indices + rows, indices), 0, max(rows - 1, 0)).astype(jnp.int32)
 
 
-def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, prologue, dense: bool,
+def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, dense: bool,
                     transpose_lhs: bool) -> None:
     """Dew: `gmm`'s refusal of a gathered product (`gather`) but on a family that gathers rows beside the
     matrix's whole loads (`Family.gathers_rows`, `gathers_alone`), of no transposed rows or dense call (a
     prologue runs fused on the gathered rows in the mainloop, row 5391), and of a scattered one (`scatter`)
     but a grouped call's on such a family (its stores `stores.staged_rows`')."""
-    del prologue
     gathers = family.gathers_rows and family.gathers_alone
     if gather is not None and (dense or transpose_lhs or not gathers):
         raise ValueError(f"a gathered product's rows are a ring family's gather, with no "
@@ -1204,13 +1203,10 @@ def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, pro
         raise ValueError(f"scattered rows are a grouped call's on a ring family, not {tiles}'s")
 
 
-def _tgmm_tables_refused(tables: tuple, tiles: Tiles, family: mosaic.Family, *, prologue, dense: bool,
+def _tgmm_tables_refused(tables: tuple, tiles: Tiles, family: mosaic.Family, *, dense: bool,
                          k_major: bool, step_scaled: bool) -> None:
     """Dew: `tgmm`'s refusal of a gathered operand (`tables`, each operand's) but on a family that gathers
-    rows, of no rows-contiguous layout, step scales or dense call, and of a prologue on a family whose
-    consumers do not issue products (`not family.issues_in_consumers`; row 5391)."""
-    if prologue is not None and not family.issues_in_consumers:
-        raise ValueError(f"a kernel gradient's prologue requires consumer-issued products, not {tiles}'s")
+    rows, of no rows-contiguous layout, step scales or dense call."""
     if any(table is not None for table in tables) and (
             dense or k_major or step_scaled or not (family.gathers_rows and family.gathers_alone)):
         raise ValueError(f"a gathered kernel gradient's rows are a ring family's gather, with no "
@@ -1291,8 +1287,7 @@ def _gmm_shape_refused(lhs, rhs, tiles: Tiles, extents: tuple, interpret, *, dty
                                       gathered=gather is not None, scattered=scatter is not None))
     _pair_refused(tiles, family, transpose_lhs=transpose_lhs, exact_sums=exact_sums, scaled=not plain,
                   parts=(prologue, gather))
-    _tables_refused(gather, scatter, tiles, family, prologue=prologue, dense=dense,
-                    transpose_lhs=transpose_lhs)
+    _tables_refused(gather, scatter, tiles, family, dense=dense, transpose_lhs=transpose_lhs)
 
 
 def _gmm_refused(rhs, tiles: Tiles, extents: tuple, *, columns: int, dense: bool, first, paired,
@@ -1910,21 +1905,23 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     4518). `gather`, a table for either operand (`(lhs_table, rhs_table)`, int32 `[rows]` or None), makes
     the rows that operand's rows at the table's entries, read where they lie (`gmm`'s `gather`: a mixture of
     experts' tokens, and a scattered product's cotangent at its slots, row 1376), on a ring family's
-    producer, with no prologue, rows-contiguous layout, step scales or dense call. `registers`, `shared` and
+    producer, with no rows-contiguous layout, step scales or dense call. `registers`, `shared` and
     `balanced` as `gmm`'s, its split's runs at the tile unsplit, as the launch prices them."""
     block_m, block_k = tiles.block_m, tiles.block_k
+    family = family_of(tiles, lhs.dtype)
     if k_major and (prologue is not None or tiles.splits > 1 or (step_scales is not None and (
             not exact_sums or block_k != SCALE_DEPTH))):
         raise ValueError(f"a rows-contiguous kernel gradient takes no prologue or split, and its step "
                          f"scales an exact {SCALE_DEPTH}-row step, not {tiles}")
+    if prologue is not None and not family.issues_in_consumers:
+        raise ValueError(f"a kernel gradient's prologue requires consumer-issued products, not {tiles}'s")
     tables = (None, None) if gather is None else tuple(gather)
-    _tgmm_tables_refused(tables, tiles, family_of(tiles, lhs.dtype), prologue=prologue, dense=dense,
-                         k_major=k_major, step_scaled=step_scales is not None)
+    _tgmm_tables_refused(tables, tiles, family, dense=dense, k_major=k_major,
+                         step_scaled=step_scales is not None)
     m, k = lhs.shape if k_major else lhs.shape[::-1]
     n, k2 = rhs.shape if k_major else rhs.shape[::-1]
     k, k2 = (rows if table is None else table.shape[0] for rows, table in zip((k, k2), tables, strict=True))
     g = group_sizes.shape[0]
-    family = family_of(tiles, lhs.dtype)
     # Dew: a depth the tile's rows do not divide takes a partial last row tile (`ragged_rows`); a cluster's
     # tiles (`tile_rows`, `tile_columns`: a pair's products spanning two CTAs, or a multicast's row tiles
     # side by side) are whole, as `gmm`'s (`partial_runs`).

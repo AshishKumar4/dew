@@ -85,7 +85,7 @@ class Producers(ByLaunch):
     def stepped(self, tops: Mapping[str, int], stated: Mapping[str, int] | None = None) -> "Producers | None":
         """These, with each of `tops`' launches' producers at the next rung of its ladder: from the least, its
         `stated` cap where given (where its consumers' statement leaves the producer more than the least,
-        `stated_producer`; a GEMM's gathering producer states none, `gemm.producers`), then its top (its
+        `stated_producer`), then its top (its
         program's entry share, where every role holds the same and no register moves: past it the roles'
         setmaxnreg moves invert, the producer's drop a rise, and the assembler rejects the kernel), then down
         a setmaxnreg step at a time past the stated cap, asked already, to a step above the least; None where

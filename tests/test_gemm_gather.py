@@ -858,17 +858,73 @@ def test_gathered_prologued_negative_indices_and_sm80_forced_mosaic():
 
     # Paired + scatter under forced Mosaic on sm80 (`mma.sync` has `gathers_alone=False`): `'tables'`
     # hands off before `'launch'` so forward AND reverse (`_keeps_launch`) both run Mosaic without raising
-    # `KernelRefused` (row 12305).
+    # `KernelRefused` and hold check 1 against float64 truth (rows 12305, 12307).
     perm = jnp.asarray(rng.permutation(rows), jnp.int32)
-    up_w = jnp.asarray(rng.normal(size=(4, 64, 64)) / 8, jnp.bfloat16)
-    dy_pair = (jnp.asarray(rng.normal(size=(rows, 64)) / 8, jnp.bfloat16),
-               jnp.asarray(rng.normal(size=(rows, 64)) / 8, jnp.bfloat16))
+
+    def draw_pair(seed):
+        r = np.random.default_rng(12305 + seed)
+        return (jnp.asarray(r.normal(size=(rows, 64)) / 8, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(4, 64, 64)) / 8, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(4, 64, 64)) / 8, jnp.bfloat16),
+                (jnp.asarray(r.normal(size=(rows, 64)) / 8, jnp.bfloat16),
+                 jnp.asarray(r.normal(size=(rows, 64)) / 8, jnp.bfloat16)))
+
+    def pair_ref(t, gw, uw, *, dtype=jnp.float32):
+        def one(w):
+            y = jax.lax.ragged_dot(t, w, sizes, preferred_element_type=dtype).astype(
+                jnp.bfloat16 if dtype == jnp.float32 else dtype)
+            return jnp.empty_like(y).at[perm].set(y)
+
+        return one(gw), one(uw)
+
+    def pair_truth(t, gw, uw, dy):
+        outs, pull = jax.vjp(lambda a, b, c: pair_ref(a, b, c, dtype=jnp.float64),
+                             t.astype(jnp.float64), gw.astype(jnp.float64), uw.astype(jnp.float64))
+        return outs, pull(tuple(d.astype(jnp.float64) for d in dy))
+
+    def pair_plain_vjp(t, gw, uw, dy):
+        outs, pull = jax.vjp(pair_ref, t, gw, uw)
+        return outs, pull(dy)
+
+    def pair_dew_vjp(t, gw, uw, dy):
+        with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
+            outs, pull = jax.vjp(
+                lambda a, b, c: gemm.gemm(a, b, sizes, paired=c, scatter=perm, out_dtype=jnp.bfloat16,
+                                          out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True),
+                t, gw, uw)
+            return outs, pull(dy)
+
+    t0, gw0, uw0, dy0 = draw_pair(0)
     with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"), generation.routes() as seen:
-        outs, pull = jax.vjp(
-            lambda t, gw, uw: gemm.gemm(t, gw, sizes, paired=uw, scatter=perm, out_dtype=jnp.bfloat16,
-                                        out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True),
-            tokens[:rows] if tokens.shape[0] >= rows else jnp.concatenate([tokens, tokens], axis=0),
-            matrices, up_w)
-        grads = pull(dy_pair)
+        pair_dew_vjp(t0, gw0, uw0, dy0)
     assert any(r.kernel == "mosaic" for r in seen), seen
-    assert all(jnp.all(jnp.isfinite(x)) for x in (*outs, *grads))
+    assert_as_exact(jax.jit(pair_dew_vjp), jax.jit(pair_plain_vjp), draw_pair,
+                    "sm80 forced-mosaic paired+scatter", seeds=SEEDS, truth_fn=pair_truth)
+
+
+def test_producers_rungs_keeps_top_after_stated_cap_start(monkeypatch):
+    """When `producers.started` picks a `stated` cap below `top` on a tensor-memory family, `producers.rungs`
+    passes that same `stated` cap into `Producers.stepped` so the first spill rung visits `top` instead of
+    skipping it (Train 1231 F2)."""
+    from dew.nn.kernels.templates import resources
+    from dew.nn.kernels.templates.gemm import producers
+
+    op = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    ba = op.bind(bf16((128, 64)), bf16((2, 64, 128)), jax.ShapeDtypeStruct((2,), jnp.int32),
+                 (), (), None, None, jax.ShapeDtypeStruct((128,), jnp.int32),
+                 out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    tile = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=1, cluster=1, family="tcgen05", programs=2)
+    with generation.assumed("sm100"):
+        sm100 = generation.gpu_target()
+        top = producers._top(op, ba, tile, sm100)
+        assert top is not None
+        # Force consumer registers above `top` so `started` begins at `stated_producer(...) < top`.
+        monkeypatch.setattr(op, "registers", lambda *a, **kw: top + 32)
+        monkeypatch.setattr(producers, "_spilled", lambda *a, **kw: True)
+        started = producers.started(op, ba, tile, sm100)
+        start_cap = started.producers.of(op.KERNEL)
+        assert start_cap is not None and start_cap < top
+        ladder = [rung.producers.of(op.KERNEL) for rung in producers.rungs(op, ba, started, sm100)]
+        assert ladder[0] == resources.facts().raises().below(top), (start_cap, top, ladder)
+        assert start_cap not in ladder, (start_cap, ladder)
