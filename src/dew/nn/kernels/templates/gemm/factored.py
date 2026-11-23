@@ -32,9 +32,9 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
     reads `rows` through a gather table (`gemm`'s `gather`, among `operands`), is that table and the
     operands of `wide` (`(gather, wide_operands)`), `wide(cotangent, *wide_operands)` the routed rows'
     fp32 transpose of `run`'s product (no rounding to the rows' dtype): the plain transpose is `run`'s own,
-    and the moved one pulls each route back wide at its own power, moved back and summed into its token in
-    fp32 before the one rounding, then over the devices whose routes differ (a route whose products cancel
-    past fp32's largest keeps other routes' small sum)."""
+    and the moved one pulls each route back wide at its token's power (its routes' largest, on every
+    device), summed into its token in fp32 and over the devices whose routes differ, then moved back once
+    and rounded once (a route whose products cancel past fp32's largest keeps other routes' small sum)."""
     if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
         return run(rows.astype(jnp.bfloat16), *operands) * factor
     transpose = _Transpose(run, rows.shape, rows.dtype, frozenset(jax.typeof(rows).mat.varying),
@@ -128,23 +128,32 @@ class _Transpose:
         counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
         e_c, e_f = jnp.where(counted, e_c, 0), jnp.where(counted, e_f, 0)
         top = jnp.max(jnp.where(counted, e_c + e_f, -1024), axis=-1, keepdims=True, initial=-1024)
-        # A row's power shared by the devices that sum it; a route's is its own, moved back before its sum.
-        for axes in (before, () if routed else excess):
-            top = jax.lax.pmax(top, axes) if axes else top
-        lift = jnp.where(top > -1024, FACTORED_RESCUE - top, 0)
+        top = jax.lax.pmax(top, before) if before else top
+        if routed:
+            gather, wide_operands = routed
+            # A token's power, its routes' largest on every device that routes to it, shared by them all:
+            # their partials meet in its sum still moved (+-2**140 from two devices sum to 0, not inf - inf).
+            token_top = varying_like(jnp.full((self.shape[0], 1), -1024, top.dtype), top, gather)
+            token_top = token_top.at[gather].max(top)
+            axes = tuple(sorted(jax.typeof(token_top).mat.varying - self.held))
+            token_top = jax.lax.pmax(token_top, axes) if axes else token_top
+            token_lift = jnp.where(token_top > -1024, FACTORED_RESCUE - token_top, 0)
+            lift = token_lift[gather]
+        else:
+            top = jax.lax.pmax(top, excess) if excess else top
+            lift = jnp.where(top > -1024, FACTORED_RESCUE - top, 0)
         near = power2(power2(cotangent, -e_c) * power2(f, -e_f), e_c + e_f + lift)
         near = jax.lax.psum(near, before) if before else near
         if not routed:
             partial, excess = self.pulled(near, ran)
             return power2(self.summed(partial, excess), -lift)
-        # Each route pulled back wide, moved back by its own power, summed into its token in fp32 (`take`'s
-        # transpose), then over the axes its routes vary over and the rows do not.
+        # Each route pulled back wide at its token's power, summed into its token in fp32 (`take`'s
+        # transpose), then over the axes its routes vary over and the rows do not, moved back last.
         assert self.wide is not None, "a routed product's rescue pulls its routes back wide"
-        gather, wide_operands = routed
-        moved_back = power2(self.wide(near, *wide_operands).astype(jnp.float32), -lift)
-        tokens = varying_like(jnp.zeros(self.shape, jnp.float32), moved_back, gather)
-        tokens = tokens.at[gather].add(moved_back)
-        return self.summed(tokens, tuple(sorted(jax.typeof(tokens).mat.varying - self.held)))
+        moved = self.wide(near, *wide_operands).astype(jnp.float32)
+        tokens = varying_like(jnp.zeros(self.shape, jnp.float32), moved, gather).at[gather].add(moved)
+        tokens = self.summed(tokens, tuple(sorted(jax.typeof(tokens).mat.varying - self.held)))
+        return power2(tokens, -token_lift)
 
     def tangent(self, ran, routed, primals, tangents):
         """The plain transpose's derivative, `cotangent * scale` pulled back, every term of a perturbed

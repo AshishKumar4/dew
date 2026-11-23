@@ -866,3 +866,28 @@ def test_an_nvfp4_products_gathered_gradient_in_a_checked_map_is_the_tokens_sum(
                                      check_vma=True))(tokens, tables, weights)
 
     np.testing.assert_array_equal(np.asarray(gradient(packed)), np.asarray(gradient(plain)))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_nvfp4_products_gathered_rescue_sums_devices_routes_before_it_moves_them_back():
+    """One token every device holds, each of two CPU devices routing it to its own expert in a checked
+    `shard_map`, +1 on one and -1 on the other at a tensor scale of 2**110 under a cotangent of 2**30: each
+    device's partial, +-2**140, is past fp32's largest, and their sum is 0, not inf - inf, the devices'
+    partials summed while still moved by the token's shared power (row 1464)."""
+    codes = jnp.zeros((2, 512, 128), jnp.float32).at[0, 0, 0].set(1.0).at[1, 0, 0].set(-1.0)
+    bank = formats.NvFp4.of(codes, jnp.ones((2, 32, 128), jnp.float8_e4m3fn),
+                            jnp.asarray([2.0 ** 110, 2.0 ** 110], jnp.float32))
+    token = jnp.zeros((1, 512), jnp.float32).at[0, 0].set(1.0)
+    tables = jnp.zeros((2,), jnp.int32)
+    sizes = jnp.asarray([1, 0, 0, 1], jnp.int32)
+    cotangents = jnp.zeros((2, 128), jnp.float32).at[:, 0].set(2.0 ** 30)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+
+    def each_device(x, table, size, w):
+        return jax.grad(lambda x: jnp.sum(gemm.nvfp4_product(x, bank, size, table, out_dtype=jnp.float32)
+                                          * w))(x)
+
+    d_token = jax.jit(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, data, data, data),
+                                    out_specs=whole, check_vma=True))(token, tables, sizes, cotangents)
+    np.testing.assert_array_equal(np.asarray(d_token), np.zeros((1, 512), np.float32))

@@ -1178,18 +1178,29 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
 
         product: Callable[..., jax.Array] = packed
         operands = (words, scales, sizes, gather, first)
+        # The rescue's wide transpose decodes the bank only where it runs (`factored`'s `lax.cond`).
+        wide = functools.partial(_wide_transpose_packed, interpret_on_cpu=interpret_on_cpu)
+        routed = (bank.words, bank.scales, sizes)
     else:
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
         # product's, whatever precision the program defaults to (`decoded_product`).
         product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
         operands = (bank.decoded(), group_sizes, gather)
+        wide = functools.partial(_wide_transpose, interpret_on_cpu=interpret_on_cpu)
+        routed = (operands[0], sizes)
     factor = bank.factor if group_sizes is None else jnp.repeat(
         bank.factor, sizes, total_repeat_length=count)[:, None]
     # Each row's (its group's) factor joins the sum as `factored` takes a row's: a cancelling cotangent
     # under a factor past fp32's largest pulls back its finite sum, each route at its own power.
-    wide = functools.partial(_wide_transpose, interpret_on_cpu=interpret_on_cpu)
     return factored(product, operands, factor, lhs, wide=wide,
-                    routes=() if gather is None else (gather, (bank.decoded(), sizes))).astype(out_dtype)
+                    routes=() if gather is None else (gather, routed)).astype(out_dtype)
+
+
+def _wide_transpose_packed(cotangent: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Array, *,
+                           interpret_on_cpu: bool) -> jax.Array:
+    """`_wide_transpose` of a bank's packed `words` and `scales`, decoded here (`_undeferred`)."""
+    return _wide_transpose(cotangent, _undeferred(words, scales).decoded(), sizes,
+                           interpret_on_cpu=interpret_on_cpu)
 
 
 def _wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array | None, *,
