@@ -340,7 +340,7 @@
 "tests/test_attention_mosaic_compile.py::test_a_short_training_calls_backward_compiles_spill_free_for_an_a100[32-one-launch]",
 "tests/test_attention_mosaic_compile.py::test_a_stack_of_layers_holds_no_launchs_accumulator_past_its_own_layer",
 "tests/test_attention_mosaic_compile.py::test_a_start_runs_the_kernels_its_launches_certified[temperature]",
-"tests/test_attention_mosaic_compile.py::test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block[default]",
+"tests/test_attention_mosaic_compile.py::test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block[accurate]",
 "tests/test_attention_mosaic_compile.py::test_an_a100_d128_and_d256_forward_use_whole_row_warps_and_high_residency",
 "tests/test_attention_mosaic_compile.py::test_an_a100_forward_counts_the_shared_memory_its_lowering_asks_for[inference-bfloat16]",
 "tests/test_attention_mosaic_compile.py::test_an_fp16_backward_compiles_spill_free_as_its_model_decides[128]",
@@ -852,15 +852,15 @@
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-128x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-64x128]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-forward-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-fp32-forward-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-softcap-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-fp32-step-128x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-temperature-forward-32x32]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-tile-step-64x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-forward-32x32]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-step-32x32]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-fp32-step-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp16-forward-128x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[rtx5090-bf16-forward-128x64]",
-"tests/test_attention_triton.py::test_an_fp16_weight_too_small_once_normalized_still_reaches_dv",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-forward-64x128]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-fp32-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-bf16-forward-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp32-step-32x32]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[rtx5090-bf16-step-32x32]",
 "tests/test_attention_triton.py::test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block[64]",
 "tests/test_attention_triton.py::test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound[float16]",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two[192-160-portable]",
@@ -1854,6 +1854,9 @@
 "tests/test_forked_calls.py::test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole[memory hybrid]",
 "tests/test_forked_calls.py::test_the_per_layer_embedding_reads_each_documents_chain_over_forks[one token each]"
 ],
+"tests/test_fp8_base.py": [
+"tests/test_fp8_base.py::test_lora_packs_the_frozen_base_once_in_place_of_its_kernels_and_training_moves_neither"
+],
 "tests/test_fp8_preset.py": [
 "tests/test_fp8_preset.py::test_a_training_step_in_the_fp8_preset_is_on_par_with_a_fake_quantized_model",
 "tests/test_fp8_preset.py::test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference[experts-mxfp8]",
@@ -2071,6 +2074,9 @@
 "tests/test_hf_phi3.py::test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild",
 "tests/test_hf_phi3.py::test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64_rule",
 "tests/test_hf_phi3.py::test_phi3_short_and_long_logits_match_transformers[False]"
+],
+"tests/test_hf_qwen35_moe_wrapper.py": [
+"tests/test_hf_qwen35_moe_wrapper.py::test_qwen35_moe_text_and_images_match_the_conditional_reference"
 ],
 "tests/test_hf_reference_decoders.py": [
 "tests/test_hf_reference_decoders.py::test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_reference[k2-horizon-tiny]",
@@ -2404,6 +2410,9 @@
 "tests/test_linear_attention.py::test_the_layer_decodes_as_it_prefills",
 "tests/test_linear_attention.py::test_the_layer_reads_a_holed_row_as_the_row_without_its_holes",
 "tests/test_linear_attention.py::test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound"
+],
+"tests/test_live_bridge.py": [
+"tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
 ],
 "tests/test_llama4.py": [
 "tests/test_llama4.py::test_a_paged_cache_draws_what_the_dense_cache_draws[paged]"
@@ -3193,8 +3202,8 @@
 "tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks14-False]",
 "tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks32-False]",
 "tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks4-False]",
-"tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks49-False]",
-"tests/test_recurrence_mosaic.py::test_the_identity_tests_cover_is_its_targets_reach[sm80]",
+"tests/test_recurrence_mosaic.py::test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_interpreted[hooks50-True]",
+"tests/test_recurrence_mosaic.py::test_the_identity_tests_cover_is_its_targets_reach[sm89]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-a write gate-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-a write gate-float32-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm100-kimi-linear-kda-bfloat16-training-packed]",
@@ -3207,7 +3216,7 @@
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-minimax-text-01-lightning-bfloat16-training-variant-two roles]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-qwen3.5-27b-gdn-bfloat16-forward]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm120-qwen3.5-27b-gdn-bfloat16-training-packed]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-kimi-linear-kda-bfloat16-forward]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-kimi-linear-kda-bfloat16-forward-variant-0]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-minimax-text-01-lightning-bfloat16-forward]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-qwen3.5-27b-gdn-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm80-qwen3.5-27b-gdn-bfloat16-training-packed]",
