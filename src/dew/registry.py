@@ -2021,7 +2021,7 @@ def record_flags(record: type[Registered], member: type | Callable[..., Configur
     reserved = {field.name for field in dataclasses.fields(record)} | set(dir(record))
     # Each flag's annotation, `make_dataclass`'s field type, and its flat part (`_flat`), which `flagged`
     # reads a value by.
-    flags: list[tuple[str, object, object]] = []
+    flags: list[tuple[str, Annotation, Configured]] = []
     flats: dict[str, Annotation] = {}
     stated_defaults: dict[str, Configured] = {}
     for name, declared, annotation in member_fields(member):
