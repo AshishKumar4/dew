@@ -547,9 +547,8 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
     `c` `[R, N, T]`, `parameters` (`forward`'s), its blocks' entering states `entered` `[R, blocks, N, D]`
     fp32, `resets` `[R, T]` int8 and the final state's cotangent `dfinal` `[R, N, D]` fp32, `T` a whole
     number of blocks (`block_positions`). Returns `(dx, ddt [R, D, T], db, dc [R, N, T], dA [R, N, D],
-    dD [R, D], dstate [R, N, D])`, fp32 but `dx` and `ddt`, in `x`'s and `dt`'s dtypes: each rounded once as
-    it is stored, where XLA converted them after its transpose back (273 us of a GH200's 8.42 ms Mamba-1
-    2.8B bf16 training step, its transpose 291 more over fp32 words, M-JS-237).
+    dD [R, D], dstate [R, N, D])`, fp32 but `dx`, `ddt` in `x`'s and `dt`'s dtypes, rounded once as stored
+    (M-JS-240: an XLA convert after them took 274 us of a GH200's 8.42 ms Mamba-1 2.8B bf16 training step).
 
     A program takes a row and a channel, a warpgroup's threads its block's tokens (`block_scan.blocked`), and
     walks the row's blocks from the last, each state in turn: its states through the block from the
