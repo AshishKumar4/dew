@@ -512,7 +512,7 @@ dew.config.env.EnvRunConfig
   suites: Annotated[collections.abc.Mapping[str, dew.config.Suite], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.scores.Summary, ...], PrimitiveConstructorSpec] = ()
   env: EnvChoice | None = None
-  rollout: RolloutChoice = (lambda: RolloutConfig().flagged())()
+  rollout: RolloutChoice = dew.config.env.RolloutConfig()
   teacher: Annotated[TeacherConfig, tyro.conf.subcommand('teacher')] | None = None
   pretrained: str | None = None
   episodes: Annotated[Mapping[str, EpisodesConfig], record_argument(Mapping[str, EpisodesConfig])] = builtins.dict()
