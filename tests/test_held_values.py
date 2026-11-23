@@ -190,3 +190,35 @@ def test_a_call_waiting_on_a_compile_kept_past_its_refusals_compiles_its_own():
     first.join(timeout=120)
     second.join(timeout=120)
     assert found == {"refusing": 1.0, "of none": 0.0}
+
+
+def test_a_held_jit_raced_at_a_new_shape_answers_a_scope_of_none_with_its_own_program():
+    """A program traced in a scope of no refusal at one shape, then at another while another thread records
+    a refusal into that scope, runs the program past the refusal there, and a scope of none after it runs
+    its own program at both shapes: a trace reads the refusals it began under and its own alone, and a held
+    jit answers its one call (theme K01-e's review P0: a held jit traced at a new shape read the other
+    thread's refusal, which its trace cache then answered a scope of none with)."""
+    import contextvars
+    import threading
+
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    scope: list[contextvars.Context] = []
+
+    def chosen(x):
+        if x.shape == (2,) and len(scope) == 1:
+            # Another thread's refusal into this scope as it traces, recorded before the trace reads it.
+            other = threading.Thread(target=scope.pop().run, args=(report.refuse, [("a launch", 1, ("k",))]))
+            other.start()
+            other.join()
+        return x + (1.0 if report.refusals_of("a launch") else 0.0)
+
+    run = owned_program(chosen)
+    one, two = jnp.zeros((1,), jnp.float32), jnp.zeros((2,), jnp.float32)
+    with report.refusals():
+        scope.append(contextvars.copy_context())
+        assert float(run(one)[0]) == 0.0
+        assert float(run(two)[0]) == 1.0
+    with report.refusals():
+        assert float(run(one)[0]) == 0.0 and float(run(two)[0]) == 0.0
