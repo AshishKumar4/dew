@@ -17,6 +17,7 @@ from dew.nn import float_bits, precision
 from dew.nn.derivatives import KernelGlue, contracted, surrogate
 from dew.nn.kernels import gemm, generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import TernaryWeights, fp8_factor, fp8_scale_checked
+from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.sharding import automatic_axes
 
 TERNARY_WEIGHT_ROW = "ledger 1464"
@@ -113,7 +114,7 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
 
     scale_f32 = jnp.asarray(weights.scale, jnp.float32)
     if not quantize_activations:
-        scaled = gemm.factored(run, operands, factor_of(scale_f32), lhs)
+        scaled = factored(run, operands, factor_of(scale_f32), lhs)
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
     def ste_value(a: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -133,7 +134,7 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
         prod_held = jax.lax.stop_gradient(prod)
         factor = factor_of(s)
         d_factor = factor_of(d_s)
-        dy_a = gemm.factored(run, operands, factor, d_a)
+        dy_a = factored(run, operands, factor, d_a)
         once = prod_held * peak_col
         tiny = jnp.finfo(prod_held.dtype).tiny
         kept = jnp.isfinite(once) & ((jnp.abs(once) >= tiny) | (prod_held == 0))
