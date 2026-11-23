@@ -2081,16 +2081,15 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
     eligibility for the call (`Template.eligible`), then what the targets measured of it (`measured`, which
     a call naming it overrides)."""
     return selection.Kernel(name, (*SUPPORTS, _Need(
-        'pair', lambda case: not case.paired or _takes_pair(name, case),
+        'pair', lambda case: not case.paired or _mosaic_takes(name, case),
         lambda case: f"the {name} launches take no paired product on {case.call.target.generation}, whose "
                      "two products then run apart", row='ledger 2100', kind='handoff'), _Need(
-        'tables', lambda case: not (case.gathered or case.scattered) or _takes_tables(name, case),
+        'tables', lambda case: not (case.gathered or case.scattered) or _mosaic_takes(name, case),
         lambda case: f"the {name} launches read and write no rows through a table on "
                      f"{case.call.target.generation}", row='ledger 1376', kind='handoff'), _Need(
         # Paired or tabled calls no bundle of `name` takes hand on (`pair`, `tables`) before `launch`.
-        'launch', lambda case: ((case.paired and not _takes_pair(name, case))
-                                or ((case.gathered or case.scattered) and not _takes_tables(name, case))
-                                or case.call.eligible(name)),
+        'launch', lambda case: (((case.paired or case.gathered or case.scattered)
+                                 and not _mosaic_takes(name, case)) or case.call.eligible(name)),
         lambda case: f"the {name} launches take no call of these dtypes, widths, side operands or hooks on "
                      f"{case.call.target.generation}", row='ledger 1295'), *measured))
 
@@ -2113,16 +2112,8 @@ _GMMS = tuple(product for product, _ in IMPLEMENTATIONS)
 _TGMMS = tuple(gradient for _, gradient in IMPLEMENTATIONS)
 
 
-def _takes_pair(name: str, case: GroupedCase) -> bool:
-    """Whether `name` takes paired product `case` whole (else `APART`)."""
-    bound = case.call.bound.get(name)
-    if name != MosaicGmm.name or bound is None:
-        return False
-    return bool(MosaicGmm()._families(bound[1], case.call.target))
-
-
-def _takes_tables(name: str, case: GroupedCase) -> bool:
-    """Whether `name` reads/writes rows through gather/scatter tables on `case`'s target."""
+def _mosaic_takes(name: str, case: GroupedCase) -> bool:
+    """Whether `name` (Mosaic GPU) has a family bundle taking `case` whole (paired and/or tabled)."""
     bound = case.call.bound.get(name)
     if name != MosaicGmm.name or bound is None:
         return False

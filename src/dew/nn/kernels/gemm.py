@@ -397,27 +397,28 @@ BATCHED: selection.Op[BatchedCase] = selection.Op(generation.Choice.GROUPED_MATM
 where a receipt names it; else XLA's dot as the caller wrote it."""
 
 
-def joined_depths(products: Sequence[tuple[jax.Array, jax.Array]], *, transpose_rhs: bool = False, out_dtype,
-                  precision: PrecisionLike = None, interpret_on_cpu: bool = False) -> jax.Array:
-    """The sum of `products`' `rows @ matrix` (`rows` `[rows, depth_i]`, `matrix` `[depth_i, width]`, or
-    `[width, depth_i]` where `transpose_rhs`), in the first rows' dtype, rounded to `out_dtype`: walked in
-    place via `mosaic_gpu.gmm`'s `chained` launch when Mosaic takes it (zero copy of base operands; row 1304),
-    else joined along depth into one `gemm`."""
+def joined_depths(products: Sequence[tuple[jax.Array, jax.Array]], group_sizes: jax.Array | None = None, *,
+                  transpose_rhs: bool = False, out_dtype, precision: PrecisionLike = None,
+                  interpret_on_cpu: bool = False) -> jax.Array:
+    """The sum of `products`' `rows @ matrix` (dense or grouped by `group_sizes`), in the first rows' dtype,
+    rounded to `out_dtype`: walked in place via `mosaic_gpu.gmm`'s `chained` launch when Mosaic takes it
+    (zero copy of base operands; row 1304), else joined along depth into one `gemm`."""
     from .templates.gemm import chained as chained_mod
 
     dtype = products[0][0].dtype
     nonempty = [(rows.astype(dtype), matrix.astype(dtype)) for rows, matrix in products if rows.shape[1]]
     if len(nonempty) >= 2:
         out = chained_mod.joined_in_place(
-            nonempty, transpose_rhs=transpose_rhs, out_dtype=out_dtype, precision=precision,
-            interpret_on_cpu=interpret_on_cpu, launch_route=_launch_route, run_gemm=_gemm,
-            gemm_fn=gemm, gemm_t_fn=gemm_t)
+            nonempty, group_sizes=group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
+            precision=precision, interpret_on_cpu=interpret_on_cpu, launch_route=_launch_route,
+            run_gemm=_gemm, gemm_fn=gemm, gemm_t_fn=gemm_t)
         if out is not None:
             return out
     joined_rows = jnp.concatenate([rows.astype(dtype) for rows, _ in products], axis=1)
-    joined = jnp.concatenate([matrix.astype(dtype) for _, matrix in products], axis=1 if transpose_rhs else 0)
-    return gemm(joined_rows, joined, transpose_rhs=transpose_rhs, out_dtype=out_dtype, precision=precision,
-                interpret_on_cpu=interpret_on_cpu)
+    axis = (2 if transpose_rhs else 1) if group_sizes is not None else (1 if transpose_rhs else 0)
+    joined = jnp.concatenate([matrix.astype(dtype) for _, matrix in products], axis=axis)
+    return gemm(joined_rows, joined, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
+                precision=precision, interpret_on_cpu=interpret_on_cpu)
 
 def batched_product(a: jax.Array, b: jax.Array, contract: tuple[int, int], *,
                     interpret_on_cpu: bool = False) -> jax.Array:

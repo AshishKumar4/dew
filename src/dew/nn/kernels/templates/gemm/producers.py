@@ -10,6 +10,20 @@ from dew.nn.kernels.templates import report, resources
 from dew.nn.kernels.templates.gemm import pricing, tiling
 
 
+def _stated(op, ba, config: tiling.Tiles, top: int, target) -> tuple[dict[str, int] | None, bool]:
+    """The stated producer cap `{op.KERNEL: cap}` for a tensor-memory family whose consumers exceed `top`,
+    and whether starting above the floor fits (`False` when `stated_producer` is None)."""
+    family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
+    if not family.tensor_columns(pricing.tile_columns(config, family), 1):
+        return None, True
+    regs = op.registers(ba, config, target)
+    if regs is None or regs <= top:
+        return None, True
+    consumers = config.warpgroups + op.rewritten(ba, family)
+    cap = resources.stated_producer(regs, family.warpgroups(consumers), consumers, config.programs)
+    return (None, False) if cap is None else ({op.KERNEL: cap}, True)
+
+
 def started(op, ba, config: tiling.Tiles, target=None) -> tiling.Tiles:
     """`config` with its producer at its ladder's top (`_top`) where it states no registers of its own yet and
     its consumers hold their accumulators in tensor memory (`mosaic.Issuer.tensor_columns`), so its first
@@ -26,14 +40,9 @@ def started(op, ba, config: tiling.Tiles, target=None) -> tiling.Tiles:
         if (top is None or config.producers.of(op.KERNEL) is not None
                 or not family.tensor_columns(pricing.tile_columns(config, family), 1)):
             return config
-        regs = op.registers(ba, config, target)
-        consumers = config.warpgroups + op.rewritten(ba, family)
-        stated = None
-        if regs is not None and regs > top:
-            cap = resources.stated_producer(regs, family.warpgroups(consumers), consumers, config.programs)
-            if cap is None:
-                return config
-            stated = {op.KERNEL: cap}
+        stated, fits = _stated(op, ba, config, top, target)
+        if not fits:
+            return config
         stepped = config.producers.stepped({op.KERNEL: top}, stated)
         return config if stepped is None else dataclasses.replace(config, producers=stepped)
 
@@ -67,7 +76,8 @@ def rungs(op, ba, config: tiling.Tiles, target=None) -> Iterator[tiling.Tiles]:
         top = _top(op, ba, config, target)
         if top is None or not _spilled(op, ba, config, target):
             return
-        while (stepped := config.producers.stepped({op.KERNEL: top})) is not None:
+        stated, _ = _stated(op, ba, config, top, target)
+        while (stepped := config.producers.stepped({op.KERNEL: top}, stated)) is not None:
             config = dataclasses.replace(config, producers=stepped)
             yield config
 
