@@ -300,8 +300,10 @@ def test_newton_schulz_and_syrk_xla_fallback_numerics():
     # 2. Deterministic #12025 witness: bf16 A=I, c=(1, -1-1/512, 0) yields exact -I/512 in fp32 accumulation.
     eye_bf16 = jnp.eye(8, dtype=jnp.bfloat16)
     c_witness = jnp.asarray((1.0, -1.0 - 1.0 / 512.0, 0.0), jnp.float32)
-    got_w = jax.jit(lambda a, c: gemm.symmetric_polynomial(a, c))(eye_bf16, c_witness)
-    np.testing.assert_array_equal(np.asarray(got_w), np.asarray((-1.0 / 512.0) * eye_bf16))
+    for batch_shape in ((), (5,), (16,)):
+        batched_eye = jnp.broadcast_to(eye_bf16, (*batch_shape, 8, 8))
+        got_w = jax.jit(lambda a, c: gemm.symmetric_polynomial(a, c))(batched_eye, c_witness)
+        np.testing.assert_array_equal(np.asarray(got_w), np.asarray((-1.0 / 512.0) * batched_eye))
 
     # 3. End-to-end `newton_schulz` bit-equality on float32 and complex64 across ALL FOUR preconditionings.
     def ref_ns(x, preconditioning, *, dtype=None):
