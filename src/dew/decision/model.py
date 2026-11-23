@@ -3,7 +3,7 @@
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -53,10 +53,22 @@ class BackboneContext(BackboneEncoder[Sequence[int]]):
         return encode_context(backbone.module, backbone.variables, tokens.tokens, tokens.lengths,
                               encoder=self.encoder, train=backbone.train, rngs=backbone.rngs,
                               segments=tokens.segments, max_segments=tokens.max_segments,
-                              progress=backbone.progress)
+                              progress=backbone.progress, loop_passes=backbone.loop_passes)
 
     def recorded_fields(self) -> Mapping[str, object]:
         return {"encoder": self.encoder}
+
+
+class PassLogits(NamedTuple):
+    """Each pass's option logits of a looped backbone whose every pass exits (`DecisionModel.pass_logits`),
+    the last the model's own; every pass's exit-gate logits, none without a gate, a pass a count given per
+    call left unrun at no chance (`never_exiting`); whether each earlier pass ran (`ExitPasses.ran`); and
+    what the rows' pass sowed into the collections the call opened."""
+
+    logits: tuple[jax.Array, ...]
+    gates: tuple[jax.Array, ...]
+    ran: tuple[jax.Array | bool, ...]
+    sown: Variables
 
 
 @dataclass(frozen=True)
@@ -189,12 +201,16 @@ class DecisionModel(HeadedModel):
 
     def _read(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None,
               train: bool, rngs: dict[str, jax.Array] | None, progress: Progress,
-              opened: Sequence[str] = ()) -> tuple[jax.Array, jax.Array | None, Variables]:
+              opened: Sequence[str] = (), loop_passes: jax.Array | None = None
+              ) -> tuple[jax.Array, jax.Array | None, Variables]:
         """The row's final states (`states`), the context's where the questions' spans are in it, and
-        what the row's pass sowed into the `opened` collections."""
+        what the row's pass sowed into the `opened` collections; a looped backbone runs `loop_passes` of its
+        loop's passes where the call gives a count (`dew.batch.LOOP_PASSES`), every pass where None."""
         backbone = thaw(part(variables, "backbone"))
-        # The run's progress, the declared input of a backbone that reads it (`dew.nn.progress`).
-        stepped = progressed(self.backbone, progress)
+        # The run's progress, the declared input of a backbone that reads it (`dew.nn.progress`), and the
+        # call's pass count, where it gives one.
+        stepped: dict[str, object] = {**progressed(self.backbone, progress),
+                                      **({} if loop_passes is None else {"loop_passes": loop_passes})}
 
         def applied(*args, **kwargs) -> tuple[jax.Array, Variables]:
             with component("backbone"):
@@ -216,7 +232,8 @@ class DecisionModel(HeadedModel):
             assert inputs.context_lengths is not None, "a row's context comes with its length"
             # The row's context condition (`context_condition`), the backbone handed to it where it is its
             # encoder; a window's rows each read their own context (`DecisionInputs.context_segments`).
-            live = BackboneCall(self.backbone, part(variables, "backbone"), train, rngs, progress)
+            live = BackboneCall(self.backbone, part(variables, "backbone"), train, rngs, progress,
+                                loop_passes)
             condition = self.context_condition(inputs.spans_in_context)
             conditioning = self._conditioned(condition, variables, inputs, live)
             spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
@@ -273,12 +290,13 @@ class DecisionModel(HeadedModel):
     def observed_logits(self, variables: Variables, inputs: DecisionInputs, *,
                         media: ModelInputs | None = None, train: bool = False,
                         rngs: dict[str, jax.Array] | None = None, progress: Progress = END,
-                        opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
+                        opened: Sequence[str] = (), loop_passes: jax.Array | None = None
+                        ) -> tuple[jax.Array, Variables]:
         """The option logits (`logits`), and what the row's pass sowed into the `opened` collections
         (`dew.objectives.base.Step.sown`): the backbone's and the head's, each of which it applies apart
-        (`beside_head`)."""
+        (`beside_head`); the backbone at the call's pass count, where it gives one (`_read`)."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
-                                           progress=progress, opened=opened)
+                                           progress=progress, opened=opened, loop_passes=loop_passes)
         logits, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
                                              opened=opened)
         return logits, beside_head(sown, head_sown, opened)
@@ -305,16 +323,17 @@ class DecisionModel(HeadedModel):
     def pass_logits(self, variables: Variables, inputs: DecisionInputs, *,
                     media: ModelInputs | None = None, train: bool = False,
                     rngs: dict[str, jax.Array] | None = None, progress: Progress = END,
-                    opened: Sequence[str] = ()
-                    ) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...], Variables]:
+                    opened: Sequence[str] = (), loop_passes: jax.Array | None = None) -> PassLogits:
         """Each pass's option logits of a looped backbone whose every pass exits (`Loop.exiting`), in
         order, the last pass's `observed_logits`': each earlier pass's exit states as the backbone's forward
         gathered them (`Looped.exit_passes`) read by the head as the last pass's states are; every pass's
         exit-gate logits `[B, L, 1]`, none without a gate, which Ouro's exit objective weighs
-        (`DecisionObjective.exit_entropy`); and what the rows' pass sowed into the `opened` collections, as
-        `observed_logits` gives it."""
+        (`DecisionObjective.exit_entropy`); whether each earlier pass ran, at the call's pass count where it
+        gives one (`loop_passes`, `ExitPasses.ran`); and what the rows' pass sowed into the `opened`
+        collections, as `observed_logits` gives it."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
-                                           progress=progress, opened=[*opened, EXITS])
+                                           progress=progress, opened=[*opened, EXITS],
+                                           loop_passes=loop_passes)
         backbone = self.backbone
         assert isinstance(backbone, Looped), "a looped backbone's exits"
         exited = backbone.exit_passes(sown)
@@ -330,7 +349,8 @@ class DecisionModel(HeadedModel):
         head = dict(read[-1][1])
         if QK in opened:
             head[QK] = functools.reduce(sows_appended, (held.get(QK, {}) for _, held in read), {})
-        return tuple(logits for logits, _ in read), gates, beside_head(sown, head, opened)
+        return PassLogits(tuple(logits for logits, _ in read), gates, exited.ran,
+                          beside_head(sown, head, opened))
 
     def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                     spanned: jax.Array | None = None, *, train: bool = False,

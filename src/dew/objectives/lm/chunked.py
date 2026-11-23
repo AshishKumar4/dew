@@ -148,6 +148,12 @@ def refuse_without_logits(model, objective: str) -> None:
                     f"and no forward")
 
 
+def read_method(model) -> str | None:
+    """The method a loss reads `model` by (`final_read`): its `hidden_states` where it scores its final
+    states through a head (`reads_states`), else its `logits` or its own forward (`forward_method`)."""
+    return "hidden_states" if reads_states(model) else forward_method(model, "logits")
+
+
 def final_read(model, variables, *args, **kwargs):
     """`model.apply(variables, *args, **kwargs)` reading what a loss scores:
     the final states of a model that scores them through a head
@@ -156,7 +162,7 @@ def final_read(model, variables, *args, **kwargs):
     give `[B, S, vocab]`, its `vocab_size` where it declares one (`StatesVocabulary`): a
     forward that gives anything else (its hidden states) is refused by name
     here, not read as logits by the loss."""
-    method = "hidden_states" if reads_states(model) else forward_method(model, "logits")
+    method = read_method(model)
     read = model.apply(variables, *args, method=method, **kwargs)
     if method == "__call__":
         _refuse_unlike_logits(model, read)

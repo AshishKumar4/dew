@@ -295,7 +295,12 @@ def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[b
     not the shardings', says where its leaves are."""
     arguments, _ = executable.input_shardings
     tree, _ = signature
-    return tuple(sharding is not None for sharding in tree.flatten_up_to(arguments[STEP_BATCH]))
+    placed = arguments[STEP_BATCH]
+    # A field the step adds to the batch it fetched (a drawn pass count, `LOOP_PASSES`) is none of its leaves.
+    fetched = tree.unflatten(range(tree.num_leaves))
+    if isinstance(placed, dict) and isinstance(fetched, dict):
+        placed = {name: placed[name] for name in fetched}
+    return tuple(sharding is not None for sharding in tree.flatten_up_to(placed))
 
 
 @dataclasses.dataclass

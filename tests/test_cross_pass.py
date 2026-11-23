@@ -17,7 +17,6 @@ from flax import linen as nn
 from map_judge import marked_seeds
 from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
-from test_loop_sampled import counts_compiled_off_the_loop
 
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -466,7 +465,6 @@ def test_a_source_written_in_its_own_bindings_refuses_its_export_once_it_passes_
     assert refused.value.args == (MESSAGES_UNWRITTEN,)
 
 
-@pytest.mark.usefixtures(counts_compiled_off_the_loop.__name__)
 def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies():
     """A bf16 decoder passing messages over a block every pass exits through (an exit gate), its passes
     recomputed and drawn per microbatch (`SampledPasses`), its parameters read through narrow copies,
@@ -490,7 +488,7 @@ def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies()
         interval = Interval(0.0, None, microbatches=0)
         drawn = []
         for index in range(6):
-            step.drawn(interval, index, state)
+            step.drawn(interval, index)
             drawn.extend(step.counts)
             state, loss, *_ = step(state, batch)
             assert np.isfinite(float(loss)), (index, step.counts)
