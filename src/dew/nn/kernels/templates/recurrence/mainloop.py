@@ -443,19 +443,19 @@ PREFIX_STREAMS = ("gates", "lows")
 rounded sum, and the compensated pair's low half where its call keeps it."""
 
 
-def prefix_blocks(call: Call, rows: int, columns: int) -> dict:
+def limb_blocks(call: Call, rows: int, columns: int) -> dict:
     """The prefix's streams' tiles by name (`stream_blocks`' entries), `[rows, columns]` each in its form."""
     return dict.fromkeys(PREFIX_STREAMS[:call.prefix_limbs], ((rows, columns), call.gates))
 
 
-def prefix_views(call: Call, refs: Sequence, row, rows: int, column, columns: int) -> dict:
+def limb_views(call: Call, refs: Sequence, row, rows: int, column, columns: int) -> dict:
     """The prefix's streams' views by name (`stream_views`' entries) of its launch's refs `refs`, a limb's
     each, `[rows, columns]` from `row` and `column`."""
     return {name: call.gates.views(ref, row, rows, column, columns)
-            for name, ref in zip(PREFIX_STREAMS, refs, strict=True)}
+            for name, ref in zip(PREFIX_STREAMS[:len(refs)], refs, strict=True)}
 
 
-def prefix_tiles(call: Call, slots) -> tuple:
+def limb_tiles(call: Call, slots) -> tuple:
     """The prefix's limbs' tiles of a step's slots (`stream_tile`), in the gates' form."""
     return tuple(stream_tile(slots, name, call.gates) for name in PREFIX_STREAMS[:call.prefix_limbs])
 
@@ -1491,7 +1491,7 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         given = {"keys": call.given.views(k_ref, row, chunk, h // call.group * width, width)}
         if call.per_key:
-            given.update(prefix_views(call, prefix_refs, row, chunk, h * width, width))
+            given.update(limb_views(call, prefix_refs, row, chunk, h * width, width))
         whole = {}
         if call.delta:
             whole.update(inverse=held.views(a_ref, row, chunk, h * chunk, chunk))
@@ -1544,7 +1544,7 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
                              else [(c, pl.ds(c * keyed, keyed)) for c in range(width // keyed)]):
                 tile = stream_tile(slots, "keys", call.given, columns=block).value()
                 if call.per_key:
-                    limbs = tuple(tile.value() for tile in prefix_tiles(call, slots))
+                    limbs = tuple(tile.value() for tile in limb_tiles(call, slots))
                     decay = algebra.raised(*limbs)
                     ends = pl.ds(h * width + c * keyed, keyed)
                     last = tuple(family.columns_of(ref.at[row + chunk - 1, ends]) for ref in prefix_refs)
@@ -1596,7 +1596,7 @@ def _weighted_blocks(call: Call, keyed: int) -> dict:
     width = keyed if call.per_key else call.width
     given = {"keys": ((chunk, width), call.given)}
     if call.per_key:
-        given.update(prefix_blocks(call, chunk, width))
+        given.update(limb_blocks(call, chunk, width))
     if call.delta:
         given.update(inverse=((chunk, chunk), dataclasses.replace(call.held, rows=call.rows)))
     if call.delta and not call.per_key:

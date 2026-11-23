@@ -377,16 +377,12 @@ def test_an_unbounded_steep_decay_keeps_the_mild_pairs_after_it_interpreted(dtyp
 
     def draw(seed):
         rng = np.random.default_rng([12067, seed])
-
-        def unit(shape):
-            x = rng.normal(size=shape)
-            return x / np.linalg.norm(x, axis=-1, keepdims=True)
-
         g = -rng.uniform(0.5, 1.5, (1, length, 1, width))
         # The steep token inside a chunk, mild tokens after it in the same chunk and the next.
         g[0, int(rng.integers(2, 48))] = -2.0 ** 26
         shape = (1, length, 1, width)
-        query, key, value = (np.asarray(x, dtype) for x in (unit(shape), unit(shape), rng.normal(size=shape)))
+        query, key = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in rng.normal(size=(2, *shape)))
+        query, key, value = (np.asarray(x, dtype) for x in (query, key, rng.normal(size=shape)))
         gate = np.asarray(1 / (1 + np.exp(-rng.normal(size=(1, length, 1)))), dtype)
         operands = Chunk(query, key, value, state=np.zeros((1, 1, width, width), np.float32),
                          log_decay=np.asarray(g, np.float32), beta=gate)

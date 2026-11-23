@@ -35,11 +35,11 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     held_tile,
     key_block,
     launch_kernel,
+    limb_blocks,
+    limb_tiles,
+    limb_views,
     lowered_once,
     masks,
-    prefix_blocks,
-    prefix_tiles,
-    prefix_views,
     product_fragments,
     product_results,
     staging_tiles,
@@ -169,7 +169,7 @@ def _key_memory_back(q, k, prefix, do, corrected, dv, memory, dh, a, beta, taken
                  **stream_views(lambda i: (0, i),
                                 queries=given.views(q_ref, row, chunk, keyed, width),
                                 keys=given.views(k_ref, row, chunk, keyed, width),
-                                **prefix_views(call, prefix_refs, row, chunk, h * width, width)),
+                                **limb_views(call, prefix_refs, row, chunk, h * width, width)),
                  **stream_views(lambda i: (i, 0),
                                 entered=memories.views(h_ref, memory_row, width, 0, value_width),
                                 leaving=memories.views(dh_ref, memory_row, width, 0, value_width))}
@@ -192,7 +192,7 @@ def _key_memory_back(q, k, prefix, do, corrected, dv, memory, dh, a, beta, taken
                 ("leaving", memories))}
             d_system, beta_terms = algebra.key_memory_block(
                 stream_tile(slots, "queries", given), stream_tile(slots, "keys", given),
-                tuple(tile.value() for tile in prefix_tiles(call, slots)), last_prefix, loads["out"],
+                tuple(tile.value() for tile in limb_tiles(call, slots)), last_prefix, loads["out"],
                 loads["corrected"], loads["value_grads"], loads["entered"], loads["leaving"],
                 blocks, stream_tile(slots, "lower", held), betas, d_system, scale, held.dtype, issue,
                 issue.summed, emit=stored, columns=column_sums(call, scratch))
@@ -214,7 +214,7 @@ def _key_memory_back(q, k, prefix, do, corrected, dv, memory, dh, a, beta, taken
     tiles = stream_blocks(out=((chunk, value_width), given), corrected=((chunk, value_width), held),
                           value_grads=((chunk, value_width), grads), lower=((chunk, chunk), held),
                           queries=((chunk, keys), given), keys=((chunk, keys), given),
-                          **prefix_blocks(call, chunk, keys),
+                          **limb_blocks(call, chunk, keys),
                           entered=((keys, value_width), memories), leaving=((keys, value_width), memories))
     fp32_rows = square.shape(call.heads * width)
     out_type = (fp32_rows, fp32_rows, fp32_rows, square.shape(call.heads * chunk),
@@ -435,7 +435,7 @@ def _key_pairs_back(q, k, prefix, beta, d_scores, d_system, taken, call: Call, *
                 return stream_tile(slots, "keys", given).value().astype(jnp.float32)
 
             def gated(c):
-                return tuple(tile.value() for tile in prefix_tiles(call, slots))
+                return tuple(tile.value() for tile in limb_tiles(call, slots))
 
             staged_rows = iter(gated_rows)
 
@@ -471,7 +471,7 @@ def _key_pairs_back(q, k, prefix, beta, d_scores, d_system, taken, call: Call, *
                            carry=family.as_row(family.zeros((chunk,))))
 
     tiles = stream_blocks(queries=((chunk, keys), given), keys=((chunk, keys), given),
-                          **prefix_blocks(call, chunk, keys))
+                          **limb_blocks(call, chunk, keys))
     staging, landing = _key_pairs_staged(call, keys)
     fp32_rows = square.shape(call.heads * width)
     out_type = (fp32_rows, fp32_rows, fp32_rows, jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))

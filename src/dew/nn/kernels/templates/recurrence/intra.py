@@ -33,11 +33,11 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     held_tile,
     key_block,
     launch_kernel,
+    limb_blocks,
+    limb_tiles,
+    limb_views,
     lowered_once,
     masks,
-    prefix_blocks,
-    prefix_tiles,
-    prefix_views,
     product_fragments,
     shared_allocation,
     solve_persistent,
@@ -385,7 +385,7 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, call: Call, *, scale: float, prod
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         keyed = h // call.group * width
         views = stream_views(lambda i: (0, i), keys=call.given.views(k_ref, row, chunk, keyed, width),
-                             **prefix_views(call, prefix_refs, row, chunk, h * width, width),
+                             **limb_views(call, prefix_refs, row, chunk, h * width, width),
                              **({"queries": call.given.views(q_ref, row, chunk, keyed, width)} if scored
                                 else {}))
         lefts, raised, separated = staging
@@ -394,7 +394,7 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, call: Call, *, scale: float, prod
             del index
             slots.acquire_all()
             # Laid in the family's layout (`Family.tile_of`), as the scan lays it.
-            whole = algebra.separated(*(family.tile_of(tile.refs[0]) for tile in prefix_tiles(call, slots)))
+            whole = algebra.separated(*(family.tile_of(tile.refs[0]) for tile in limb_tiles(call, slots)))
             mosaic.synced(call.interpret)
             for half, value in enumerate(whole):
                 plgpu.store(separated.at[half], value, optimized=False)
@@ -489,7 +489,7 @@ def pair_streams(call: Call, keys: int, *, queries: bool) -> dict:
     `own_pairs.intra_own`'s): the keys and the prefix a block at a time, and the queries where it forms the
     scores."""
     chunk = call.chunk
-    return stream_blocks(keys=((chunk, keys), call.given), **prefix_blocks(call, chunk, keys),
+    return stream_blocks(keys=((chunk, keys), call.given), **limb_blocks(call, chunk, keys),
                          **({"queries": ((chunk, keys), call.given)} if queries else {}))
 
 

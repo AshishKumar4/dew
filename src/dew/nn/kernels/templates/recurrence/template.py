@@ -280,6 +280,9 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                   f"{generation.family(generation.device_generation())!r} family")
     run = {"family": issuing, "interpret": interpret, "tiles": tiles,
            "ranged": ranged(dtype, delta, bound)}
+    # The call's forms every launch it plans or runs reads, beside its geometry.
+    forms = {"max_segments": max_segments, "delta": delta, "wide": wide, "rounded": rounded, "apart": apart,
+             "values_gated": values_gated, "unit_keys": unit_keys, "decay_bound": decay_bound}
     table = None
     if forked is not None:
         batch, length = query.shape[:2]
@@ -287,13 +290,9 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         state = None
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
     fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=wide)
-            and backward_holds(
-                query, key, value, g, beta, state, tiles=tiles, family=issuing,
-                target=Mosaic.launched(), starts=starts,
-                max_segments=max_segments, delta=delta, rounded=rounded, apart=apart,
-                values_gated=values_gated, unit_keys=unit_keys, decay_bound=decay_bound, wide=wide,
-                ranged=run["ranged"],
-                skip=skip, forked=table))
+            and backward_holds(query, key, value, g, beta, state, tiles=tiles, family=issuing,
+                               target=Mosaic.launched(), starts=starts, ranged=run["ranged"], skip=skip,
+                               forked=table, **forms))
 
     # The launch tracing the forward (`report.launch_digest`), whose name the fast backward's kernels carry
     # too (`report.relaunched`): JAX traces the backward after that launch's scope ended.
@@ -305,10 +304,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
         alone = {**run, "tiles": tiles.forward or tiles}
         return chunk_forward.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
-                                max_segments=max_segments, scale=scale, delta=delta, wide=wide,
-                                rounded=rounded, apart=apart, values_gated=values_gated,
-                                unit_keys=unit_keys,
-                                decay_bound=decay_bound, skip=skip, forked=table, **alone)
+                                     scale=scale, skip=skip, forked=table, **forms, **alone)
 
     def forward(*operands):
         if not fast:
@@ -317,14 +313,9 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # weighted keys and corrected values, as the port keeps its memory, but where the block's remat rung
         # recomputes them (`recomputed`). Each is named as the port names its own, so a rung that saves names
         # keeps them rather than replaying the forward's launches for them (`residuals.DELTA_RESIDUALS`).
-        out, final, (inverse, kept) = chunk_forward.kept_forward(*operands[:6], starts=operands[6],
-                                                            firsts=operands[7], max_segments=max_segments,
-                                                            scale=scale, delta=delta, wide=wide,
-                                                            rounded=rounded, apart=apart,
-                                                            values_gated=values_gated,
-                                                            unit_keys=unit_keys,
-                                                            decay_bound=decay_bound, skip=operands[8],
-                                                            forked=operands[9], **run)
+        out, final, (inverse, kept) = chunk_forward.kept_forward(
+            *operands[:6], starts=operands[6], firsts=operands[7], scale=scale, skip=operands[8],
+            forked=operands[9], **forms, **run)
         kept = None if recomputed else checkpoint_name(kept, Residual.DELTA_MEMORY)
         return (out, final), (operands, (checkpoint_name(inverse, Residual.DELTA_INVERSE), kept))
 
@@ -342,10 +333,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         with report.relaunched(launch):
             *grads, dh0, dskip, dentries = mainloop_backward.gradients(
                 query, key, value, g, beta, state, out_grad, final_grad, starts=starts, firsts=firsts,
-                max_segments=max_segments, scale=scale, inverse=inverse, kept=kept, delta=delta,
-                rounded=rounded, apart=apart, values_gated=values_gated, unit_keys=unit_keys,
-                decay_bound=decay_bound, skip=skip,
-                    forked=table, **run)
+                scale=scale, inverse=inverse, kept=kept, skip=skip, forked=table,
+                **{name: value for name, value in forms.items() if name != "wide"}, **run)
         # A forked call's given memories' gradient its table's first, its slots' none.
         tabled_grads = None if table is None else dataclasses.replace(table, given=dh0, loads=None, rows=None,
                                                                        stores=None, entries=dentries)

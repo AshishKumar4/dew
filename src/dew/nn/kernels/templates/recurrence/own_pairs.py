@@ -33,10 +33,10 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     held_tile,
     key_block,
     launch_kernel,
+    limb_blocks,
+    limb_tiles,
+    limb_views,
     masks,
-    prefix_blocks,
-    prefix_tiles,
-    prefix_views,
     stream_blocks,
     stream_tile,
     stream_views,
@@ -278,7 +278,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         keyed = h // call.group * width
         views = stream_views(lambda i: (0, i), keys=call.given.views(k_ref, row, chunk, keyed, width),
-                             **prefix_views(call, prefix_refs, row, chunk, h * width, width),
+                             **limb_views(call, prefix_refs, row, chunk, h * width, width),
                              **({"queries": call.given.views(q_ref, row, chunk, keyed, width)}
                                 if scored else {}))
         shifts, *threaded = staging
@@ -289,7 +289,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
             def operand(name):
                 return stream_tile(slots, name, call.given).value().astype(jnp.float32)
 
-            limbs = tuple(tile.value() for tile in prefix_tiles(call, slots))
+            limbs = tuple(tile.value() for tile in limb_tiles(call, slots))
             shifted = shifted_keys(call, shifts, operand("keys"), limbs)
             if not by_thread(call):
                 found = algebra.key_diagonal_bands(
@@ -410,7 +410,7 @@ def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, prefix_refs: tuple) 
     return stream_views(lambda i: (0, i),
                         queries=given.views(q_ref, row, chunk, keyed, width),
                         keys=given.views(k_ref, row, chunk, keyed, width),
-                        **prefix_views(call, prefix_refs, row, chunk, h * width, width))
+                        **limb_views(call, prefix_refs, row, chunk, h * width, width))
 
 
 def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, operands: tuple, grads: tuple,
@@ -487,7 +487,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
             betas = family.rows_of(beta_ref.at[h, span])
             query = stream_tile(slots, "queries", given).value().astype(jnp.float32)
             key = stream_tile(slots, "keys", given).value().astype(jnp.float32)
-            limbs = tuple(tile.value() for tile in prefix_tiles(call, slots))
+            limbs = tuple(tile.value() for tile in limb_tiles(call, slots))
             # Each pairs' gradient's band read at each offset, its row (every token's pair `e` back) as a
             # row's vector, the scores' scaled as their pairs were.
             def strip(name, scaled, e):
@@ -550,7 +550,7 @@ def _keypair_streams(call: Call, keys: int) -> dict:
     bands = ((algebra.SUB, chunk), square)
     return stream_blocks(scores=bands, system=bands,
                          queries=((chunk, keys), given), keys=((chunk, keys), given),
-                         **prefix_blocks(call, chunk, keys))
+                         **limb_blocks(call, chunk, keys))
 
 
 def _key_own_staged(call: Call, keys: int, *, summed: Operand) -> tuple:

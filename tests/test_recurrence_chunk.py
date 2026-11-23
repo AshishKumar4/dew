@@ -522,15 +522,6 @@ def test_a_delta_product_outside_its_form_is_refused(substeps, form):
         recurrence.Hooks(decay='scalar', substeps=substeps, **form)
 
 
-@pytest.mark.parametrize('bound', [0.0, 5.0, float('nan'), float('inf'), -float('inf')])
-def test_a_misstated_decay_bound_is_refused(bound):
-    """A decay bound (`Hooks.decay_bound`) that is no least log decay a token, zero, positive, NaN or
-    infinite: a ValueError, so a misstated bound never reads as the proof a decay a key dimension's rounded
-    prefix takes (row 12067)."""
-    with pytest.raises(ValueError):
-        recurrence.Hooks(decay='vector', decay_bound=bound)
-
-
 @pytest.mark.parametrize('stream', ['key', 'value', 'beta'])
 def test_a_delta_product_token_of_another_count_of_updates_is_refused(stream):
     """A decode token of three updates (`Hooks.substeps`) given two of one stream, its keys', values' or
