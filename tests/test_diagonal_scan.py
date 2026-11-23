@@ -92,16 +92,24 @@ def test_a_diagonal_scan_is_as_exact_as_its_token_recurrence(route, dtype, lengt
                     truth_fn=jax.jit(differentiated(token_by_token)))
 
 
-def test_a_spans_decay_below_float32s_range_carries_a_normal_state():
-    """ReviewRecurrenceBatch's span underflow: a state of 2^100 decayed by `g = -2` over the first span's 64
-    tokens, then held, is 2^-84.7, normal, on every later span: the kernels carry the first span's decay,
-    e^-128, past float32's least normal 2^-126 (`diagonal._decayed`) and are on par with the token
-    recurrence from float64 (check 1), where a span's decay held as one float32 flushed to zero and the
-    later spans entered from nothing."""
+GATES = {"-2 over a span": [-2.0] * 64, "-44 then -64": [-44.0, -64.0]}
+"""The first span's log decays of each span-underflow case: their sum below float32's normal exponents, a
+state of 2^100 through them normal."""
+
+
+@pytest.mark.parametrize('gates', list(GATES))
+def test_a_spans_decay_below_float32s_range_carries_a_normal_state(gates):
+    """ReviewRecurrenceBatch's span underflows: a state of 2^100 decayed by the first span's log decays
+    (`GATES`), then held, is normal on every later span: the kernels carry the first span's decay, e^-128 or
+    e^-108, past float32's least normal 2^-126 (`diagonal._decayed`, its mantissa raised before each
+    product) and are on par with the token recurrence from float64 (check 1), where a span's decay held as
+    one float32, or raised only after a product, flushed to zero and the later spans entered from
+    nothing."""
     def draw(seed):
         rng = np.random.default_rng([1453, 1, seed])
         g = np.zeros((ROWS, 300, CHANNELS))
-        g[:, :64] = -2.0 + 0.01 * rng.standard_normal((ROWS, 64, CHANNELS))
+        decays = np.asarray(GATES[gates])
+        g[:, :decays.size] = decays[:, None] + 0.01 * rng.standard_normal((ROWS, decays.size, CHANNELS))
         state = 2.0 ** 100 * (1.0 + 0.1 * rng.standard_normal((ROWS, CHANNELS)))
         cotangents = (rng.standard_normal(g.shape).astype(np.float32),
                       rng.standard_normal(state.shape).astype(np.float32))
@@ -154,6 +162,28 @@ def test_a_document_after_an_overflowed_one_reads_none_of_it():
     np.testing.assert_array_equal(np.asarray(dx[:, 64:]), later)
     np.testing.assert_array_equal(np.asarray(dg[:, 65:]), later[:, 1:])
     np.testing.assert_array_equal(np.asarray(dg[:, 64]), 0.0)
+
+
+def test_a_spans_write_from_zero_past_float32s_range_carries_finite_states():
+    """ReviewRecurrenceBatch's write overflow: after a state of -2^127, writes of 2^127 and 2^127 (every gate
+    zero) give states 0 and 2^127, finite, and the first span's write from zero, 2^128, is past float32's
+    largest: the kernels carry it halved (`diagonal._entering`), so every later span enters at 2^127 and
+    its outputs, final state and gradients under cotangents of 2^-20 are each exactly the recurrence's,
+    where whole it entered the next span infinite."""
+    x = np.zeros((ROWS, 150, CHANNELS), np.float32)
+    x[:, :2] = 2.0 ** 127
+    state = np.full((ROWS, CHANNELS), -(2.0 ** 127), np.float32)
+    cotangents = (np.full(x.shape, 2.0 ** -20, np.float32), np.zeros(state.shape, np.float32))
+    (out, final), dx, dg, _ = jax.jit(differentiated(routed("kernels")))(
+        x, np.zeros(x.shape, np.float32), state, np.zeros((ROWS, 150), bool), cotangents)
+    np.testing.assert_array_equal(np.asarray(out[:, 0]), 0.0)
+    np.testing.assert_array_equal(np.asarray(out[:, 1:]), 2.0 ** 127)
+    np.testing.assert_array_equal(np.asarray(final), 2.0 ** 127)
+    # Each token's state's cotangent the cotangents of its own output and every later one's.
+    later = np.broadcast_to((150 - np.arange(150, dtype=np.float32))[None, :, None] * 2.0 ** -20, x.shape)
+    np.testing.assert_array_equal(np.asarray(dx), later)
+    before = np.concatenate([state[:, None], np.asarray(out[:, :-1], np.float32)], axis=1)
+    np.testing.assert_array_equal(np.asarray(dg), later * before)
 
 
 @pytest.mark.parametrize('route', list(ROUTES))
