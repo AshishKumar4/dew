@@ -1091,9 +1091,11 @@ on a CPU, past a CI task's time, and the interpreter is coverage, not proof (`te
 
 def _mosaic_takes(family: Family, drawn: tuple) -> bool:
     """Whether the Mosaic mainloop takes `family`'s calls, forward and backward, by its own legality rule
-    (`attention_mosaic.refused`), read off a draw of the family's (`drawn`)."""
+    (`attention_mosaic.refused`), read off a draw of the family's (`drawn`): its hooks' types alone
+    (`jax.eval_shape`), computing nothing, as a GPU tier part's prepare builds the cells reading it, whose
+    device computes nothing (rows 8025, 8071-8073)."""
     query, _, value, extra, _ = drawn
-    hooks = _hooks(jnp.asarray(query), jax.tree.map(jnp.asarray, extra))
+    hooks = jax.eval_shape(_hooks, query, extra)
     return attention_mosaic.refused(jnp.dtype(family.dtype), query.shape[-1], value.shape[-1], hooks,
                                     backward=True, family=mosaic_sm90.WGMMA) is None
 

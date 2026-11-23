@@ -551,7 +551,8 @@ def packed_windowed_bf16_attention_runs_its_band_on_par(without_deterministic_op
     lengths = [300, 200, 380]
     segments = np.concatenate([np.repeat(np.arange(1, 4), lengths),
                                np.zeros(length - sum(lengths), int)])[None]
-    segment_ids = jnp.asarray(segments, jnp.int32)
+    # A host array, placed by the programs that read it: a GPU tier part's prepare places nothing.
+    segment_ids = np.asarray(segments, np.int32)
 
     def draw(seed):
         streams = jax.random.split(jax.random.key(seed), 4)

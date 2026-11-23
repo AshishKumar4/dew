@@ -257,6 +257,7 @@ def _replayed(network, routes):
 
 @attending("xla")
 @pytest.mark.parametrize("forward", ["bare", "conditioned", "image_logits"])
+@pytest.mark.check1_shards(seeds=32, per_task=16)
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16(forward):
     """DiffusionGemma's shared text tree with routed experts, a sliding and a full layer, self-conditioning
     and the vision conditioner, each forward the fp32 test in tests/test_block_diffusion.py makes, in bf16:
@@ -266,7 +267,8 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16(forward):
     bf16 router: a top-k on near-ties is no function check 1 can hold at bf16, its float64 margins a median
     9.9e-3 of their scale and none of 64 draws past `NARROW_MARGIN`, where bf16 moves the scores a median
     2.2e-2 (row 4739, armada IG-DG-MARGIN2). The choice itself is held by tests/test_block_diffusion.py's
-    float32 sites."""
+    float32 sites. Its `ROUTED_SEEDS` draws run as armada's map tasks of 16 (`check1_shards`): a forward's
+    cell took 131 s whole in CI (row 12373)."""
     import test_block_diffusion as block
     import torch
 
