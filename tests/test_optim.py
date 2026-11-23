@@ -2199,3 +2199,20 @@ def test_a_schedule_naming_no_peak_climbs_to_its_configs_rate():
     assert moved.rate == Cosine(peak_value=2e-2, warmup_steps=1), moved
     with pytest.raises(ValueError):
         Linear().rates()
+
+
+def test_a_groups_schedule_naming_no_peak_climbs_to_the_peak_its_configs_schedule_names():
+    """A config whose schedule names its peak and no `lr` gives a param group's schedule naming none that
+    peak, as its solvers run it, writing it into neither record: the group's step is the one a group
+    naming the peak itself takes (review of API03: such a group's schedule had no peak and its solver
+    refused it)."""
+    owned = OptimConfig(optimizer=Adam(), schedule=Cosine(peak_value=1e-2, warmup_steps=1),
+                        param_groups=(ParamGroup("all", ("*",), schedule=Linear()),))
+    named = OptimConfig(optimizer=Adam(), schedule=Cosine(peak_value=1e-2, warmup_steps=1),
+                        param_groups=(ParamGroup("all", ("*",), schedule=Linear(peak_value=1e-2)),))
+    assert owned.grouped_rates() == named.grouped_rates() == {"all": (Linear(peak_value=1e-2), 1.0)}
+    assert owned.param_groups[0].schedule == Linear() and owned.lr is None, owned
+    params = {"w": jnp.ones((3,))}
+    solvers = [config.build(4) for config in (owned, named)]
+    stepped = [solver.update(params, solver.init(params), params)[0] for solver in solvers]
+    np.testing.assert_array_equal(stepped[0]["w"], stepped[1]["w"])

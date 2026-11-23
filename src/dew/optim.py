@@ -2144,9 +2144,12 @@ class OptimConfig:
         return self.lr
 
     def _peaked(self, schedule: ScheduleBase) -> ScheduleBase:
-        """`schedule` climbing to `lr` where it is a `Peaked` one that names no peak."""
-        if isinstance(schedule, Peaked) and schedule.peak_value is None and self.lr is not None:
-            return dataclasses.replace(schedule, peak_value=self.lr)
+        """`schedule` climbing to the config's peak where it is a `Peaked` one that names none: `lr`, or the
+        peak its own schedule names where `lr` is unset, read here, written into neither record."""
+        peak = self.lr if self.lr is not None else (
+            self.schedule.peak_value if isinstance(self.schedule, Peaked) else None)
+        if isinstance(schedule, Peaked) and schedule.peak_value is None and peak is not None:
+            return dataclasses.replace(schedule, peak_value=peak)
         return schedule
 
     def _rated(self, group: ParamGroup) -> float | ScheduleBase:
