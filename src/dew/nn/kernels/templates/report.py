@@ -606,7 +606,7 @@ def _reversed(op) -> bool:
     gradient's product (`pulled`) or a pulled op (`tuning.KernelOp.pulled`, its tuner's candidates certified
     outside a gradient's trace, `tuning._candidates`, where a spilling backward passed), of an op whose call
     carries its derivative."""
-    return (_PULLED.get() or getattr(op, "pulled", False)) and op.CARRIES_DERIVATIVE
+    return (_PULLED.get() or op.pulled) and op.CARRIES_DERIVATIVE
 
 
 @contextlib.contextmanager
