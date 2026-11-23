@@ -1023,16 +1023,15 @@ def key_memory_decay(entered, leaving) -> jax.Array:
 
 def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower: Tile, betas, dtype,
                     issue: Issue, summed: Callable[..., jax.Array], *,
-                    emit: Callable[[int, jax.Array], None], system=None,
-                    d_betas: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
+                    emit: Callable[[int, jax.Array], None], onto: tuple | None = None
+                    ) -> tuple[jax.Array, jax.Array]:
     """The values' part of a decay a key dimension's backward (`templates.recurrence.key_backward`): through
     `u = (I + L) (v beta)`, each value block `j`'s `d(v beta) = (I + L)^T du` ('values_merge') of the
     corrected values' gradient `value_grads(j)`, its values' gradient `beta d(v beta)` `[C, BV]` fp32 to
     `emit(j, dv)`, and `(dA, dbeta)`, the inverse's gradient's part `du (v beta)^T` `[C, C]` and the write
-    gates' `sum(v d(v beta))`, fp32. A walk of a row's value blocks a few at a time gives the sums its
-    earlier steps left, `system` (an accumulator, `summed`'s `into`) and `d_betas`, these blocks' added onto
-    them in the order one call over the row adds them."""
-    d_betas = jnp.zeros(betas.shape, jnp.float32) if d_betas is None else d_betas
+    gates' `sum(v d(v beta))`, fp32. A walk of a row's value blocks a few at a time adds these blocks' onto
+    the two sums its earlier steps left (`onto`)."""
+    d_betas = jnp.zeros(betas.shape, jnp.float32) if onto is None else onto[1]
     for j in range(blocks):
         value = values(j).value().astype(jnp.float32)
         d_scaled = (value_grads(j).value().astype(jnp.float32)
@@ -1044,8 +1043,8 @@ def key_values_back(value_grads: TileLoad, values: TileLoad, blocks: int, lower:
     # launch spilled 96 bytes a thread (kda-gate6 at 306006c01).
     d_system = summed([("values_merge", value_grads(j), lambda j=j: Transposed(
         write_gated(values(j).value().astype(jnp.float32), betas).astype(dtype))) for j in range(blocks)],
-        shape=(lower.shape[0],) * 2, into=system)
-    return d_system, d_betas
+        shape=(lower.shape[0],) * 2)
+    return (d_system if onto is None else onto[0] + d_system), d_betas
 
 
 def key_memory_sums(out_grads: TileLoad, corrected: TileLoad, value_grads: TileLoad, entered: TileLoad,
