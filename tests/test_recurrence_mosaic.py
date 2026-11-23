@@ -1680,9 +1680,8 @@ def test_a_launchs_call_and_its_gradients_product_are_two_launches_in_either_ord
     assert digests[False] != digests[True]
     launches = {reverse: report.traced(found) for reverse, found in digests.items()}
     assert {reverse: launch.reverse for reverse, launch in launches.items()} == {False: False, True: True}
-    target = generation.gpu_target().generation
-    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse, launch.provenance, target)
-            for launch in launches.values()}
+    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse, launch.provenance,
+                                generation.gpu_target().generation) for launch in launches.values()}
     assert len(keys) == 2 or keys == {None}, keys
 
 
@@ -2195,10 +2194,9 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
     found = report._misses_of([dataclasses.replace(binary, spilled=8)])
     report._held(found, programs[1])
     (identity, _), _, refused = found[0]
-    target = report.verdict_target(device)
-    keys = [report._verdict_key(identity, rung, refused.reverse, refused.provenance, target)
-            for rung in rungs]
-    verdicts = [tuning.stored_verdict(target, key) for key in keys]
+    where = report.verdict_target(device)
+    keys = [report._verdict_key(identity, rung, refused.reverse, refused.provenance, where) for rung in rungs]
+    verdicts = [tuning.stored_verdict(where, key) for key in keys]
 print(json.dumps({"stored": [v is not None for v in verdicts],
                   "refused": [v is not None and any(b.refused for _, b in v.values()) for v in verdicts]}))
 """
