@@ -480,7 +480,7 @@ SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
             "automatic mesh axes keep XLA's dot outside per-shard launch", SYRK_ROW),
         selection.Requirement(
             'measured', lambda case: case.measured, "no receipt yet has Mosaic SYRK beat XLA's batched dot "
-            "(M-NG-45-a100 admits whole-tile mma.sync Gram; GH200 & poly pending)", SYRK_ROW, kind='measured'),
+            "(M-NG-45-a100/gh200 admit whole-tile Gram; poly pending)", SYRK_ROW, kind='measured'),
         selection.Requirement(
             'launch', lambda case: case.call.eligible('mosaic'),
             "no legal square super-tile holds this symmetric product on the target", SYRK_ROW))),
