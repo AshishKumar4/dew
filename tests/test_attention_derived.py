@@ -976,49 +976,38 @@ def test_step_live_tiles_covers_keys_first_ragged_spans_and_array_field_hooks():
 @COMPILES_ON_CPU
 @pytest.mark.kernel
 @pytest.mark.usefixtures("without_deterministic_ops")
-def test_sm90_roofline_forward_and_fused_backward_compile_spill_free():
-    """Row 5272: sm90 compute-bound causal forward (d64/d128 unscaled + segmented, d256 single-launch)
-    and fused dK/dV backward (overlapped scaled dP/dV WGMMAs via `product_with` + double-buffered TMA dQ
-    adds at d128) derive and compile spill-free."""
+@pytest.mark.parametrize("width", [256, 64, 128])
+def test_sm90_roofline_forward_and_fused_backward_compile_spill_free(width):
+    """Row 5272: sm90 compute-bound causal forward (d64/d128, d256 single-launch) and fused dK/dV backward
+    (overlapped scaled dP/dV WGMMAs via `product_with` + double-buffered TMA dQ adds at d128) derive and
+    compile spill-free, a width a case (row 12410: the five in one took 131 s)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn.kernels.templates import attention_mosaic
 
     spans = template.spans(4096, 4096, 2, causal=True)
-    cases = []
+    heads, kv_heads = (16, 4) if width == 256 else (32, 8)
+    q = jax.ShapeDtypeStruct((2, 4096, heads, width), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((2, 4096, kv_heads, width), jnp.bfloat16)
+    cases = [KernelCase(f"sm90-fwd-d{width}", lambda: (
+        lambda query, key, value: attention_mosaic.forward(
+            query, key, value, spans, None, residuals=template.Kept.NONE), (q, k, k)))]
     with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        q256 = jax.ShapeDtypeStruct((2, 4096, 16, 256), jnp.bfloat16)
-        k256 = jax.ShapeDtypeStruct((2, 4096, 4, 256), jnp.bfloat16)
-        op256, args256 = attention_mosaic._forward_call(
-            q256, k256, k256, spans, None, scale=None, natural=attention_mosaic.NATURAL)
-        ba256 = op256.bind(*args256, residuals=template.Kept.NONE, interpret=False)
-        cfg256 = op256.derived(ba256, target)
-        assert cfg256 is not None and op256.takes(ba256, cfg256, target), cfg256
-        cases.append(KernelCase(
-            "sm90-fwd-d256",
-            lambda: (lambda query, key, value: attention_mosaic.forward(
-                query, key, value, spans, None, residuals=template.Kept.NONE), (q256, k256, k256))))
-        for width, kv_heads in ((64, 8), (128, 8)):
-            q = jax.ShapeDtypeStruct((2, 4096, 32, width), jnp.bfloat16)
-            k = jax.ShapeDtypeStruct((2, 4096, kv_heads, width), jnp.bfloat16)
-            zero_row = jax.ShapeDtypeStruct((2, 32, 4096), jnp.float32)
-            zero_idx = jax.ShapeDtypeStruct((2, 32, 4096), jnp.int32)
+        if width == 256:
+            op, args = attention_mosaic._forward_call(q, k, k, spans, None, scale=None,
+                                                      natural=attention_mosaic.NATURAL)
+            bound = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+            config = op.derived(bound, generation.gpu_target())
+            assert config is not None and op.takes(bound, config, generation.gpu_target()), config
+        else:
+            zero_row = jax.ShapeDtypeStruct((2, heads, 4096), jnp.float32)
+            zero_idx = jax.ShapeDtypeStruct((2, heads, 4096), jnp.int32)
             res = (zero_row, zero_row, zero_idx, template.Split(
-                jax.ShapeDtypeStruct((2, 32, 4096, width), jnp.float32), zero_row, zero_row, zero_row))
-            cases.append(KernelCase(
-                f"sm90-fwd-d{width}",
-                lambda q=q, k=k: (
-                    lambda query, key, value: attention_mosaic.forward(
-                        query, key, value, spans, None, residuals=template.Kept.NONE),
-                    (q, k, k))))
-            cases.append(KernelCase(
-                f"sm90-bwd-d{width}",
-                lambda q=q, k=k, res=res: (
-                    lambda query, key, value, dout, r: attention_mosaic.backward(
-                        query, key, value, spans, None, dout, residuals=r, accurate=False),
-                    (q, k, k, q, res))))
+                jax.ShapeDtypeStruct((2, heads, 4096, width), jnp.float32), zero_row, zero_row, zero_row))
+            cases.append(KernelCase(f"sm90-bwd-d{width}", lambda: (
+                lambda query, key, value, dout, r: attention_mosaic.backward(
+                    query, key, value, spans, None, dout, residuals=r, accurate=False), (q, k, k, q, res))))
     found = compile_mosaic_kernels(cases, "sm90")
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
