@@ -31,8 +31,10 @@ def test_a_stated_chunk_stores_whole_tma_rows_in_each_output_dtype():
     (128, (jnp.bfloat16,), (4, 1), None, False), (128, (jnp.bfloat16,), (8, 1), None, True),
     (128, (jnp.float4_e2m1fn,), (16, 1), None, False), (128, (jnp.float4_e2m1fn,), (32, 1), None, True),
     (128, (jnp.float32,), (128, 1), 64, False), (128, (jnp.float32,), (64, 0), None, False),
-    (96, (jnp.float32,), None, None, True),
-], ids=["bf16-4", "bf16-8", "fp4-16", "fp4-32", "past-a-piece", "no-buffer", "derived"])
+    (96, (jnp.float32,), None, None, True), (128, (jnp.float32,), (0, 1), None, False),
+    (128, (jnp.float32,), (-8, 1), None, False),
+], ids=["bf16-4", "bf16-8", "fp4-16", "fp4-32", "past-a-piece", "no-buffer", "derived", "no-column",
+        "negative"])
 def test_a_candidate_asks_whether_a_staging_holds_with_no_exception(columns, dtypes, staging, piece, holds):
     """A launch's candidate asks whether a staging holds before it pins it (`stores.staging_refusal`, None
     where it does, its reason where it does not, raising nothing): chunks of whole 16-byte TMA rows in each
