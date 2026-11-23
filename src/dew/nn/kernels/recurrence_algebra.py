@@ -273,7 +273,7 @@ def decay(later, earlier):
     return jnp.exp2(fraction - its_fraction) * exact_power2(jnp.maximum(whole - other, -127.0))
 
 
-def first_decays(dg, entered, d_entered, first, memory, takes, live):
+def first_decays(dg, entered, d_entered, first, memory, takes, live, passed=None):
     """`dg` `[N, ...]`, a decay a key dimension's gradient summed back over each chunk (a token or a laid
     row a row), with each sequence's first token's taken from the memory its decay scales: the memory it
     enters (`entered` `[M, ..., Dv]`, its index `memory` among them) against that memory's gradient
@@ -282,11 +282,14 @@ def first_decays(dg, entered, d_entered, first, memory, takes, live):
     back, that token's gradient is every term of its chunk, which cancel to fp32's residue where the memory
     is zero: rows of float64 zero 1.5e-7 from it against fla's 3.3e-9 (row 5194, M-JS-26-a100), 2.7e-11 on a
     zero initial memory, as a float64 recurrence holds it exactly. fla_kda's port and the template read
-    it alike."""
+    it alike. Where `passed` (`dg`'s shape) is given, a token's value only where it holds: a clamped log
+    decay's derivative zero (`templates.recurrence.mainloop.clamped_gradient`)."""
     shared = jnp.sum(entered.astype(jnp.float32) * d_entered, axis=-1).reshape(-1, *dg.shape[1:])
     taking = takes.reshape(-1, *(1,) * (dg.ndim - 1))
     value = jnp.where(taking, shared[memory], 0.0)
     index = jnp.where(live, first, dg.shape[0])
+    if passed is not None:
+        value = jnp.where(passed[jnp.minimum(index, dg.shape[0] - 1)], value, 0.0)
     return dg.at[index].set(value.astype(dg.dtype), mode="drop")
 
 

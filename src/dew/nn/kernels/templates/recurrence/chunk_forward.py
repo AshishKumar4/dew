@@ -26,7 +26,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _states,
     _weighted,
     _weighted_values,
-    clamped,
     family_of,
     padded_widths,
     per_key_refusal,
@@ -366,10 +365,6 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
     a, w, u, keys, scores, system = None, None, v, k, None, []
     decays = laid(g).reshape(rows, -1)
-    if call.clamped:
-        # A 16-bit call's unbounded log decays clamped where every pair across a token decays to zero
-        # (`mainloop.LOG2_DECAY_FLOOR`), its rounded prefix's reach held (`Call.prefix_limbs`).
-        decays = clamped(decays)
     if per_key:
         # A decay a key dimension's prefix's limbs `[R, HV * Dk]` and its scores, and its system where the
         # call solves it (no inverse given), one launch's (`_intra`).

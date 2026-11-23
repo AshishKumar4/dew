@@ -21,12 +21,13 @@ from jax.extend.mlir.dialects import arith, memref, scf
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.templates import emission, mosaic, native, resources, scan, swizzling
 from dew.nn.kernels.templates.cost import Work
-from dew.nn.kernels.templates.recurrence.intra import _named, _rows_of, intra_rows, pair_streams, systems
+from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, pair_streams, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
     Operand,
     chunk_liveness,
+    clamped_gradient,
     f32,
     finished_form,
     fp32_operand,
@@ -445,7 +446,7 @@ def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, opera
 
 
 def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memory, decays: tuple, ending,
-                  call: Call, *, scale: float):
+                  call: Call, *, scale: float, clamp=None):
     """`(dq, dk, dg [R, HV * Dk], dbeta [HV, R])`: each chunk and value head's gradients through its
     sub-chunks' own pairs, each its own decay (`algebra.key_diagonal_pairs_back`), given the pairs'
     gradients `d_scores` and `d_system` `[R, HV * C]`: a launch of their own, no products on the tensor
@@ -465,7 +466,9 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     last token down, each started at its memory decay's term `ending` `[chunks, HV * Dk]` (the last token's,
     `sum(h dh) exp2(g_last)`), compensated (`scan.suffix_columns`; interpreted, `algebra.suffix_summed`).
     In XLA, the terms' sum and the last token's term were a pass over them and the suffix sums a batched
-    fp32 product, 197 and 209 us of Kimi Linear's training on an A100 (M-JS-222)."""
+    fp32 product, 197 and 209 us of Kimi Linear's training on an A100 (M-JS-222). A clamped call's
+    (`Call.clamped`) its clamp's derivative applied as it is stored, from the call's log decays laid
+    `clamp` `[R, HV * Dk]` (`mainloop.clamped_gradient`): in XLA, a pass over it, 149 us (M-JS-226)."""
     chunk, width, family = call.chunk, call.width, call.family
     given, square = call.given, fp32_operand(call)
     # The block a multiprocessor holds most programs of, at its registers and its shared memory: by its
@@ -481,7 +484,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     def program(at, q_ref, k_ref, *refs, streams, staging, landing):
         prefix_refs, refs = refs[:len(prefix)], refs[len(prefix):]
         (beta_ref, ds_ref, da_ref, _taken_ref, factored_q_ref, factored_k_ref, memory_q_ref, memory_k_ref,
-         factored_g_ref, memory_g_ref, ending_ref, dq_ref, dk_ref, dg_ref, db_ref) = refs
+         factored_g_ref, memory_g_ref, ending_ref, *clamp_ref, dq_ref, dk_ref, dg_ref, db_ref) = refs
         shifts, *suffix = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
@@ -521,6 +524,10 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                 (zero, zero), zero)
             column = h * width + index * keys
             start = family.columns_of(ending_ref.at[n, pl.ds(column, keys)])
+            floor = None
+            if clamp_ref:
+                (view,) = square.views(clamp_ref[0], row, chunk, column, keys)
+                floor = family.tile_of(view)
             d_betas = d_betas + pairs_back_stored(
                 call, (dq_ref, dk_ref, dg_ref), (row, column), keys,
                 (landing.get("summed", landing["block"]),) * 2 + (landing["block"],), (query, key, betas),
@@ -528,7 +535,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                 added=((factored_q_ref, memory_q_ref), (factored_k_ref, memory_k_ref),
                        (factored_g_ref, memory_g_ref)),
                 forms=(summed, summed, square),
-                finished=(None, None, functools.partial(_suffix_summed, call, suffix, start)))
+                finished=(None, None, functools.partial(_suffix_summed, call, suffix, start, floor)))
 
             @pl.when(index == steps - 1)
             def _():
@@ -555,7 +562,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                          # The bands read a row at a time, at a traced offset: staged plain.
                          swizzles={f"{name}{p}": swizzling.UNSWIZZLED for name in ("scores", "system")
                                    for p in range(fp32_operand(call).parts)})(
-        *inputs, *factored, *memory, *decays, ending)
+        *inputs, *factored, *memory, *decays, ending, *(() if clamp is None else (clamp,)))
 
 
 def _keypair_streams(call: Call, keys: int) -> dict:
@@ -584,19 +591,22 @@ def _key_own_staged(call: Call, keys: int, *, summed: Operand) -> tuple:
     return (*own_staging(call, keys), *suffix), landing
 
 
-def _suffix_summed(call: Call, suffix: list, start, terms: jax.Array) -> jax.Array:
+def _suffix_summed(call: Call, suffix: list, start, floor, terms: jax.Array) -> jax.Array:
     """A key block's decay gradient `terms` `[C, keys]` summed back over its chunk, each column started at
-    `start` (`key_pairs_own`'s): natively through the staged tile `suffix` (its terms' rows, then the starts'
-    row, `scan.suffix_columns`), read back row-major (`intra._rows_of`); interpreted, as a tile
-    (`algebra.suffix_summed`)."""
+    `start` (`key_pairs_own`'s), and where `floor` gives its log decays `[C, keys]` (a clamped call's) the
+    clamp's derivative applied (`clamped_gradient`): natively through the staged tile `suffix` (its terms'
+    rows, then the starts' row, `scan.suffix_columns`), read back in the terms' layout (`Family.tile_of`);
+    interpreted, as a tile (`algebra.suffix_summed`)."""
     if call.interpret:
-        return algebra.suffix_summed(terms, start)
-    (tile,), chunk = suffix, call.chunk
-    plgpu.store(tile.at[pl.ds(0, chunk)], terms, optimized=False)
-    tile[chunk, :] = start
-    mosaic.synced(call.interpret)
-    scan.suffix_columns(tile)
-    return _rows_of(tile.at[pl.ds(0, chunk)], terms.shape[1])
+        summed = algebra.suffix_summed(terms, start)
+    else:
+        (tile,), chunk = suffix, call.chunk
+        plgpu.store(tile.at[pl.ds(0, chunk)], terms, optimized=False)
+        tile[chunk, :] = start
+        mosaic.synced(call.interpret)
+        scan.suffix_columns(tile)
+        summed = call.family.tile_of(tile.at[pl.ds(0, chunk)])
+    return summed if floor is None else clamped_gradient(floor, summed)
 
 
 def _key_own_held(call: Call, keys: int) -> Held:

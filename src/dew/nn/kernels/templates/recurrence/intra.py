@@ -29,6 +29,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     building,
     bundle_dtype,
     chunk_liveness,
+    clamped,
     f32,
     held_tile,
     key_block,
@@ -248,13 +249,16 @@ def _prefix(g, taken, call: Call):
             slots.acquire_all()
             tile = stream_tile(slots, "decays", gates)
             found = None
+            # A clamped call's decays clamped as they are read (`Call.clamped`): in XLA, a pass over
+            # them, 91 us of Kimi Linear's forward on an A100 (M-JS-226).
+            floored = clamped if call.clamped else (lambda decays: decays)
             if running:
                 # Row-major from the slot, plain (`_plain_decays`), as a step's rows are fewer than a
                 # warpgroup accumulator's tile takes (the gates one fp32 part).
-                _running_prefix(call, rows, carried[0], _rows_of(tile.refs[0], keys), keys)
+                _running_prefix(call, rows, carried[0], floored(_rows_of(tile.refs[0], keys)), keys)
             else:
                 _scan_zeroed(call, rows, keys)
-                found = _intra_prefix(call, rows, tile.value(), keys)
+                found = _intra_prefix(call, rows, floored(tile.value()), keys)
             for i, ref in enumerate(prefix_refs):
                 # A running sum's halves read as each is stored, one tile held at a time: both at once
                 # spilled the program's 128 registers at two programs a multiprocessor (M-JS-145g). Row-major,
