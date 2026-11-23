@@ -336,7 +336,7 @@ report.refuse([foreign])
 with assumed(step.target), handed(step):
     within = report.refused_launches()
 print(json.dumps({"within": sorted(map(repr, within)), "step": sorted(map(repr, step.refusals)),
-                  "after": repr(foreign) in map(repr, report.refusal_entries())}))
+                  "after": repr(foreign) in map(repr, report.refusal_snapshot())}))
 """
 """A process on the step's GPU (`AheadOfTime.target`) that refused a launch of another program, handed the
 step compiled ahead at argv[1]."""

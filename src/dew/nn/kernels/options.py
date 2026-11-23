@@ -275,7 +275,7 @@ class Compiling:
     """Its trace's outputs' weak types, which its lowering's `out_info` drops (`_weak_types`)."""
     taken: threading.Event = dataclasses.field(default_factory=threading.Event, compare=False)
     refused: tuple | None = None
-    """The launches refused as its trace traced (`report.refusal_entries`), a Dew program's; None for
+    """The launches refused as its trace traced (`report.refusal_snapshot`), a Dew program's; None for
     another's."""
 
 
@@ -463,7 +463,7 @@ def _abstractly_placed(tree) -> bool:
 
 type Relowered = list[tuple[jax.stages.Wrapped, jax.stages.Lowered, tuple]]
 """The relowerings a spill made of a call (`OuterProgram.compiled`'s), each with the jit it traced by and the
-launches refused when it traced (`report.refusal_entries`)."""
+launches refused when it traced (`report.refusal_snapshot`)."""
 
 @dataclasses.dataclass
 class _Lowering:
@@ -478,7 +478,7 @@ class _Lowering:
     args: tuple
     kwargs: dict
     refused: tuple
-    """The launches refused as its lowering traced (`report.refusal_entries`)."""
+    """The launches refused as its lowering traced (`report.refusal_snapshot`)."""
     relowered: Relowered = dataclasses.field(default_factory=list)
     kept_from: list[jax.stages.Lowered] = dataclasses.field(default_factory=list)
     """The lowering its compile kept (`report.compiled`'s `kept_from`)."""
@@ -747,7 +747,7 @@ class OuterProgram:
 
         def retraced() -> jax.stages.Traced:
             nonlocal made
-            made = (self._jitted(), report.refusal_entries())
+            made = (self._jitted(), report.refusal_snapshot())
             return traced_by(made, frozen=False)
 
         try:
@@ -788,7 +788,7 @@ class OuterProgram:
         enclosing program whole (`_PASSING`): as written where it does (one of these, `_traced`); rewritten
         as it traces where it does not, so a transformation outside it (`jax.grad` of it within a plain
         `jax.jit`) reads the pass's program, the templates' derivatives among it (row 3450). One of the
-        launches refused so far (`report.refusal_entries`), which JAX's trace cache keys on none of: a trace
+        launches refused so far (`report.refusal_snapshot`), which JAX's trace cache keys on none of: a trace
         after a refusal traces it afresh, its launches deriving past the refused config and their routes
         reported (`report.settled_trace`'s retry, row 11783), where its jit's cached trace kept the config.
         Within an enclosing trace's reading (`report.reading`) its jits are that trace's alone, its refusals
@@ -811,7 +811,7 @@ class OuterProgram:
                 if held is None:
                     held = self._nested_read[read] = made()
                 return held[whole]
-            refusals = report.refusal_entries()
+            refusals = report.refusal_snapshot()
             if self._nested_refusals != refusals:
                 self._nested_jits, self._nested_refusals = made(), refusals
             return self._nested_jits[whole]
@@ -835,7 +835,7 @@ class OuterProgram:
             return _outputs(lowered.out_info, _weak_types(traced))
         # The launches refused, read once a call: its keys, abstract and concrete, are of one snapshot (theme
         # K01-e's review P0).
-        refusals = report.refusal_entries()
+        refusals = report.refusal_snapshot()
         if (collected := _COLLECTED.get()) is not None:
             abstract = self.abstract_of(args, kwargs, refusals)
             with self._compiling:
@@ -1154,7 +1154,7 @@ class OuterProgram:
         begun = _ATTEMPTING.get()
         if begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs):
             lowered, weak_types = begun.lowered, begun.weak_types
-            refused = report.refusal_entries() if begun.refused is None else begun.refused
+            refused = report.refusal_snapshot() if begun.refused is None else begun.refused
             begun.taken.set()
         else:
             lowered, weak_types, refused = self._lowered_aside(args, kwargs, relowered)
@@ -1190,7 +1190,7 @@ class OuterProgram:
         return self._snapshot_trace(args, kwargs)[0]
 
     def _snapshot_trace(self, args: tuple, kwargs: dict) -> tuple[jax.stages.Traced, tuple]:
-        """A call's trace and the launches refused as it traced (`report.refusal_entries`), its jit their
+        """A call's trace and the launches refused as it traced (`report.refusal_snapshot`), its jit their
         own call's (`_held_jit`), as JAX's trace cache keys on none of them: a trace after a seeded refusal
         derives past it (row 12165)."""
         traced, refused, made = self._stable_trace(args, kwargs, fresh=False)
@@ -1212,7 +1212,7 @@ class OuterProgram:
         # Past a held jit's trace that refused, a jit of its own each time, so its retrying ends.
         unheld = fresh
         while True:
-            refusals = report.refusal_entries()
+            refusals = report.refusal_snapshot()
             key = None if unheld else self._held_key(args, kwargs, refusals)
             held = None if key is None else self._held_jit(key)
             marks = route_marks()
@@ -1224,7 +1224,7 @@ class OuterProgram:
                 unheld = True
                 continue
             traced, (made, under) = outcome
-            raced = report.refusal_entries() != under
+            raced = report.refusal_snapshot() != under
             if held is not None and (raced or under != refusals):
                 self._invalidated(key, held)
             if not raced:
@@ -1247,11 +1247,11 @@ class OuterProgram:
     def _keyed(self, args: tuple, kwargs: dict, signature: Callable[..., Hashable],
                refused: tuple | None = None) -> tuple[Hashable, tuple, dict]:
         """`key_of`'s key with each dynamic leaf as `signature` states it, and the launches the compiles
-        refused (`refused`, else `report.refusal_entries` now), its last, which a trace's launches derive
+        refused (`refused`, else `report.refusal_snapshot` now), its last, which a trace's launches derive
         past: an executable traced before a refusal is no executable a call after it runs (row 12165)."""
         from dew.nn.kernels.templates import report
 
-        refused = report.refusal_entries() if refused is None else refused
+        refused = report.refusal_snapshot() if refused is None else refused
         if not self.numbers and not self.names:
             leaves, structure = jax.tree.flatten((args, kwargs))
             return (len(args), ((), ()), structure, tuple(map(signature, leaves)),
@@ -1290,7 +1290,7 @@ def trace_context() -> Hashable:
     facts a trace reads (`_facts.traced_fact`) are no part of it: each is answered where a trace asks
     it, under the trace's own target, and one read outside a trace may have no answer (a compile-only GPU
     mesh's devices hold no memory statistics); a caller whose trace reads one names it beside this key (the
-    compiles' refusals, `report.refusal_entries`). A value it leaves out costs a trace, never a program
+    compiles' refusals, `report.refusal_snapshot`). A value it leaves out costs a trace, never a program
     traced under other state."""
     import decimal
     import os
@@ -1319,14 +1319,14 @@ def trace_context() -> Hashable:
 def held_context() -> Hashable:
     """The key a trace kept outside the compile point is held by, beside what it is of: the state a trace
     reads of this thread's context (`trace_context`) and the launches the compiles refused, which a
-    template's legality reads as the call traces (`report.refusal_entries`, a process's fact a trace reads
+    template's legality reads as the call traces (`report.refusal_snapshot`, a process's fact a trace reads
     and a caller names beside the trace's state). A step's candidates (`dew.training._candidates`) and the
     algebra's held kernel decisions (`fusion.choice_context`, the derivation's context beside it) are each
     held by it, so a fact added to it reaches both; a launch's derived config is keyed by what its
     derivation reads (`report.derivation_inputs`, `templates.base`)."""
     from dew.nn.kernels.templates import report
 
-    return trace_context(), report.refusal_entries()
+    return trace_context(), report.refusal_snapshot()
 
 
 def _signature(leaf) -> Hashable:
