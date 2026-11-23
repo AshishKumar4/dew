@@ -76,17 +76,18 @@ class PassWeights:
             weights = self.stated
         return None if all(weight == 0.0 for weight in weights[:-1]) else weights
 
-    def ran(self, ran: Sequence[jax.Array | bool]) -> tuple[jax.Array, ...]:
+    def ran(self, ran: Sequence[jax.Array | bool], dtype: jax.typing.DTypeLike = jax.numpy.float32
+            ) -> tuple[jax.Array, ...]:
         """Each pass's weight where a count given per call ran some of a loop's passes (`ran`, whether each
         pass before the last ran, `dew.nn.protocols.ExitPasses.ran`; the last always runs): "mean" weighs
         the passes that ran alike, `1/c` over the `c` of them, and a skipped pass none, as a loop of `c`
-        passes weighs its own; stated weights, one a pass of one count, are refused, as `over` refuses them
-        for another."""
+        passes weighs its own, each in `dtype`, the terms' (a float64 loss's shares its own); stated weights,
+        one a pass of one count, are refused, as `over` refuses them for another."""
         if self.stated != "mean":
             raise ValueError("pass_weights' stated shares weigh one count of passes; a count given per call "
                              "weighs the passes that ran alike: pass_weights='mean'")
-        held = [jax.numpy.asarray(each, jax.numpy.float32) for each in ran]
-        count = 1.0 + functools.reduce(lambda total, each: total + each, held, jax.numpy.float32(0.0))
+        held = [jax.numpy.asarray(each, dtype) for each in ran]
+        count = 1.0 + functools.reduce(lambda total, each: total + each, held, jax.numpy.zeros((), dtype))
         return (*(each / count for each in held), 1.0 / count)
 
     def of_model(self, model: object) -> tuple[float, ...] | None:

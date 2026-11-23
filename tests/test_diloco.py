@@ -19,7 +19,7 @@ from dew.averaging import power_decay
 from dew.checkpoints import frozen_entries
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Weighted
 from dew.optim import PowerProfilesState, power_profiles
-from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, DiLoCo, FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch
 
 RATE, OUTER_RATE, MOMENTUM = 0.05, 0.7, 0.9
 
@@ -144,7 +144,7 @@ def test_a_two_replica_diloco_run_pooling_two_steps_an_update_is_the_float64_ref
     its window's gradients (row 876 review)."""
     with jax.enable_x64(new_val=True):
         run = trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM),
-                      optimizer=optax.sgd(RATE, momentum=0.5), accumulation=2)
+                      optimizer=optax.sgd(RATE, momentum=0.5), update=UpdateBatch(batches=2))
         initial = jax.device_get(run.initial_state().variables["params"]["Dense_0"])
         state = run.fit(dataset(), steps=8, log_every=1)
         found = params(state.variables["params"])
@@ -210,8 +210,8 @@ def test_a_resumed_diloco_run_restores_each_replica_and_ends_where_an_unbroken_o
         if carried:
             objective.ema = EMASpec(decay=optax.constant_schedule(0.9))
         return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM),
-                       optimizer=optax.adam(RATE), path=path, objective=objective, accumulation=accumulation,
-                       dynamic_scale=carried)
+                       optimizer=optax.adam(RATE), path=path, objective=objective,
+                       update=UpdateBatch(batches=accumulation), dynamic_scale=carried)
 
     with jax.enable_x64(new_val=True):
         unbroken = run().fit(dataset(), steps=5, log_every=1)
@@ -230,9 +230,9 @@ def test_a_diloco_run_resumes_at_the_split_its_replicas_pool(tmp_path):
     """Each replica pools a window of the split its run was saved at, which no other split reads: a resume
     that states another is refused, one that leaves it open plans at it, however the planner would choose
     (row 5558)."""
-    def run(split=None):
+    def run(split="auto"):
         return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM), path=tmp_path / "run",
-                       split=split)
+                       fit=FitPolicy(split=split))
 
     with jax.enable_x64(new_val=True):
         run(2).fit(dataset(), steps=2, checkpoint_every=1, log_every=1)
@@ -316,7 +316,7 @@ def test_a_diloco_run_of_replayed_windows_trains_as_one_pooling_its_gradients(st
     with jax.enable_x64(new_val=True):
         def run(objective):
             return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM), objective=objective,
-                           accumulation=2).fit(dataset(), steps=4, log_every=1)
+                           update=UpdateBatch(batches=2)).fit(dataset(), steps=4, log_every=1)
         replayed, pooled = run(Regression64(**{statistics: True})), run(Regression64())
     # Each parameter sums its replica's rows' terms over 4 steps, and 2 replicas' means.
     assert_computes_the_oracle(params(replayed.variables["params"]), params(pooled.variables["params"]),

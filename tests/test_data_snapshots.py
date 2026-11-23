@@ -5,6 +5,7 @@ import threading
 import numpy as np
 import pytest
 
+from dew.data import Loading
 from dew.data.sources import Files, Memory
 
 
@@ -35,7 +36,8 @@ def test_snapshot_uses_requested_or_preferred_read_and_loading(tmp_path, read):
                 with lock:
                     active -= 1
 
-    chain = from_torch(Counted(), identity="snapshot@1").map(lambda row: {"id": row["id"] * 2}).threads(2)
+    chain = from_torch(Counted(), identity="snapshot@1").map(lambda row: {"id": row["id"] * 2}).loading(
+        Loading(workers="auto", threads=2))
     if read is not None:
         chain = chain.read(read)
     destination = tmp_path / "snapshot"
@@ -52,7 +54,7 @@ def test_snapshot_provisions_the_requested_indexed_read(tmp_path):
     files = Files(str(input))
     assert not files.supports("indexed")
     destination = tmp_path / "snapshot"
-    files.read("indexed").threads(1).snapshot(str(destination))
+    files.read("indexed").loading(Loading(workers="auto", threads=1)).snapshot(str(destination))
     assert Files(str(input)).supports("indexed")
     stored = Files(str(destination)).records("indexed")
     assert [stored[index] for index in range(len(stored))] == [{"id": 0}, {"id": 1}]

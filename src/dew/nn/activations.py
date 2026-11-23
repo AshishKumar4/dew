@@ -364,22 +364,17 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
     recomputes from the packed output itself, so neither copies a half out.
     `axes` are the product's logical axes, `[..., H]`'s."""
     from .kernels import norm_swiglu
-    from .sharding import explicit_spec
+    from .sharding import whole_along
 
-    def halves(gate_up: jax.Array) -> tuple[jax.Array, jax.Array]:
-        placed = explicit_spec(gate_up)
-        if placed is not None:
-            entries = (*placed.spec, *(None,) * (gate_up.ndim - len(placed.spec)))
-            if entries[-2] is not None:
-                whole_pair = jax.sharding.NamedSharding(
-                    placed.mesh, jax.sharding.PartitionSpec(*entries[:-2], None, entries[-1]))
-                gate_up = jax.sharding.reshard(gate_up, whole_pair)
-        return gate_up[..., 0, :], gate_up[..., 1, :]
-
-    portable = _portable(_gate_function(activation, implementation), halves)
-    return _dispatched(activation, portable,
-                       lambda gate_up: norm_swiglu.packed_swiglu_kernel(implementation, gate_up, axes=axes),
-                       lambda gate_up, portable: norm_swiglu.packed_swiglu(gate_up, portable, axes=axes))
+    portable = _portable(_gate_function(activation, implementation),
+                         lambda gate_up: (gate_up[..., 0, :], gate_up[..., 1, :]))
+    product = _dispatched(
+        activation, portable,
+        lambda gate_up: norm_swiglu.packed_swiglu_kernel(implementation, gate_up, axes=axes),
+        lambda gate_up, portable: norm_swiglu.packed_swiglu(gate_up, portable, axes=axes))
+    # The pair whole on each device before either product reads it (`whole_along`, row 12224), so neither
+    # reads a pair a mesh axis splits.
+    return lambda gate_up: product(whole_along(gate_up, -2))
 
 
 def _portable(activate, halves):

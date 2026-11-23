@@ -103,23 +103,20 @@ dew tpu copy dew-16 /tmp/dew-first-recipe/tokens '~/dew-tokens' \
     --zone us-central2-b --dry-run
 ```
 
-`copy` sends to every worker unless you pass `--worker`. For the example SSH user the data goes to `/home/you/dew-tokens`; change that path if your home directory on the workers is different. Go back to the Dew checkout and preview a short launch:
+`copy` sends to every worker unless you pass `--worker`. For the example SSH user the data goes to `/home/you/dew-tokens`; change that path if your home directory on the workers is different. A run is a Python file: copy `recipes/lm/train.py` and point its `default` at the copied store (`default("/home/you/dew-tokens/train")`), with the model and windows it states sized for your run. Sync the checkout to the workers, then preview a short launch from it:
 
 ```bash
-dew tpu train dew-16 --zone us-central2-b --job byte-demo --dry-run -- \
-    recipes/lm/train.py \
-    --set data.source.url=/home/you/dew-tokens/train --set data.token_windows.seq_len=16 --set data.token_windows.batch=32 \
-    --model.emb-features 16 --model.num-layers 1 --model.num-heads 2 --model.mlp-features 32 \
-    --trainer.steps 2 --trainer.log-every 1 --trainer.checkpoint-every 2 \
-    --trainer.checkpoint-dir /home/you/dew-checkpoints \
-    --trainer.name byte-demo --max-new-tokens 0
+dew tpu sync dew-16 --zone us-central2-b --dry-run
+dew launch --tpu dew-16 --zone us-central2-b --cwd dew --dry-run -- \
+    python recipes/lm/train.py --trainer.horizon.steps 2 --trainer.log-every 1 --trainer.checkpoint-every 2 \
+    --trainer.checkpoint-dir /home/you/dew-checkpoints --trainer.name byte-demo --max-new-tokens 0
 ```
 
-The model is tiny so that you can inspect the launch; its settings say nothing about TPU performance. `train` syncs the checkout, adds `--trainer.multi-host True` and starts the recipe in the background on every worker, then follows worker 0's log.
+The settings say nothing about TPU performance. `sync` copies the checkout to every worker, and `dew launch --tpu` starts the recipe on every worker as one pool, prefixing each line of output with its worker's rank.
 
 In this example each worker writes checkpoints to its own local disk. The same local path on two workers is usually two different disks, so this is not durable shared storage for a multi-host run. Before a real run, pick a checkpoint store that every process can reach, set up its credentials and test it.
 
-Ctrl-C stops following the log, and the training job keeps running. The logs are in `~/dew-runs/<job>/worker-<index>.log` on each worker. To preview the commands for checking on it later:
+A job started detached by `dew tpu run --detach` keeps running after you disconnect; its logs are in `~/dew-runs/<job>/worker-<index>.log` on each worker. To preview the commands for checking on it later:
 
 ```bash
 dew tpu logs dew-16 byte-demo --zone us-central2-b --worker all --dry-run

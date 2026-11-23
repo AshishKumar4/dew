@@ -50,7 +50,7 @@ from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout, transition_ro
 from dew.sampling import CFG, sample
 from dew.sampling.flow import FlowSDE, flow_transition
 from dew.telemetry.records import RECORD_TYPES
-from dew.training import Trainer
+from dew.training import FitPolicy, Trainer
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
 from tools.parity_verl_omni_flow_loss import RECORDED as VERL_OMNI, dew_loss, loss_inputs
 
@@ -977,7 +977,8 @@ def test_a_step_read_in_two_microbatches_trains_and_logs_its_reward_and_policy_t
     collected = rollout(initial, {"image": np.zeros((count, 4, 4, 1), np.uint8)}, jax.random.key(94),
                         objective=objective)
     tracker = RecordingTracker()
-    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(93), split=2, tracker=tracker)
+    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(93), fit=FitPolicy(split=2),
+                      tracker=tracker)
     rows = len(collected["rewards"])
     # The images the objective's inputs declare, which a step of collected trajectories reads none of.
     collected = {**collected, "image": np.zeros((rows, 4, 4, 1), np.uint8)}

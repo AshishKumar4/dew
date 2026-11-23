@@ -1390,3 +1390,75 @@ def test_triton_kernel_dot_keeps_ieee_fp32_range_in_native_launch():
 
     assert_as_exact(jax.jit(ours), jax.jit(jnp.matmul), draw,
                     "triton kernel_dot keeps IEEE fp32 range above bfloat16.max", seeds=1)
+
+
+def test_common_triton_forward_lowering_isolates_scaled_op():
+    """Row 11648: certifying the common `TritonForward` (`lowering(ba, config)`) traces only its own
+    unscaled kernel(s), never compiling `rare()`'s separate `scaled=True` op inside the common op's
+    certification."""
+    from dew.nn import programs
+
+    spans = template.spans(256, 256, 1, causal=True)
+    q = jnp.zeros((1, 256, 2, 128), jnp.bfloat16)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        op, args, _ = attention_triton._forward_call(q, q, q, spans, None, scale=None, natural=False)
+        ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        cfg = op.derived(ba, target)
+        assert cfg is not None
+        fn, specs = op.lowering(ba, cfg)
+        traced = jax.make_jaxpr(fn)(*specs).jaxpr
+        names = [eq.params.get("name", "") for eq in programs.equations(traced) if programs.opaque(eq)]
+        assert names and all("scaled" not in name for name in names), names
+        assert any("attention_forward" in name for name in names), names
+        # Captured certification (`_captured_jaxpr`) isolates the common walk, while runtime keeps `rare()`.
+        cap_jaxpr = op._captured_jaxpr(ba, cfg).jaxpr
+        cap_names = [eq.params.get("name", "") for eq in programs.equations(cap_jaxpr) if programs.opaque(eq)]
+        assert cap_names and all("scaled" not in name for name in cap_names), cap_names
+        with tuning.pinned({attention_triton.TritonForward: cfg}):
+            runtime_jaxpr = jax.make_jaxpr(
+                lambda *xs: op(*xs, residuals=template.Kept.NONE, interpret=False))(*args).jaxpr
+        runtime_names = [eq.params.get("name", "") for eq in programs.equations(runtime_jaxpr)
+                         if programs.opaque(eq)]
+        assert any("scaled" in name for name in runtime_names), runtime_names
+
+
+def test_triton_forward_settles_interior_and_overflow_midpoints():
+    """`attention_triton.forward` retains full single-rounding (`narrowing_settled`) on 16-bit outputs:
+    settling both finite interior BF16 midpoints (`denom = 1 + 2^-23`, `acc = 1 + 3/256 + 2^-23` ->
+    `1 + 1/128`, not double-rounded `1 + 2/128`) and BF16/FP16 overflow midpoints whose fp32 quotient lands
+    on the midpoint while the exact quotient lies below it (`max`, not `inf`)."""
+    spans = template.spans(1, 1, 1, lengths=jnp.zeros((1,), jnp.int32))
+    bf16_mid = np.float32(float(jnp.finfo(jnp.bfloat16).max)
+                          + float(jnp.finfo(jnp.bfloat16).eps) * 2.0 ** 126)
+    fp16_mid = np.float32(float(jnp.finfo(jnp.float16).max)
+                          + float(jnp.finfo(jnp.float16).eps) * 2.0 ** 14)
+    # Choose a divisor (`0.75 - 4 * 2^-24`) where both IEEE `a / d` and reciprocal `a * (1 / d)` land
+    # exactly on the BF16/FP16 overflow midpoint while the exact quotient lies strictly below it.
+    denom_over = np.float32(0.75 - 4.0 * 2.0 ** -24)
+    cases = [
+        (jnp.bfloat16, np.float32(1.0 + 2.0 ** -23), np.float32(1.0 + 3.0 / 256.0 + 2.0 ** -23),
+         np.float32(1.0 + 3.0 / 256.0), np.float32(1.0 + 1.0 / 128.0)),
+        (jnp.bfloat16, denom_over, np.float32(np.float64(bf16_mid) * np.float64(denom_over)),
+         bf16_mid, np.float32(jnp.finfo(jnp.bfloat16).max)),
+        (jnp.float16, denom_over, np.float32(np.float64(fp16_mid) * np.float64(denom_over)),
+         fp16_mid, np.float32(jnp.finfo(jnp.float16).max)),
+    ]
+    for dtype, denom, acc_scalar, midpoint, expected in cases:
+        # Independently verify each case lands on the tie in fp32 while its exact quotient is strictly below,
+        # so plain narrowing without single-rounding settling produces the wrong value (`1+2/128` or `inf`).
+        raw_fp32 = np.float32(acc_scalar / denom)
+        recip_fp32 = np.float32(acc_scalar * np.float32(np.float32(1.0) / denom))
+        assert raw_fp32 == midpoint and recip_fp32 == midpoint, (dtype, raw_fp32, recip_fp32, midpoint)
+        assert float(np.float64(acc_scalar) / np.float64(denom)) < float(midpoint)
+        assert float(np.asarray(jnp.asarray(raw_fp32).astype(dtype), np.float32)) != float(expected)
+        zeros = jnp.zeros((1, 1, 1, 16), dtype)
+        initial = template.Initial(jnp.zeros((1, 1, 1), jnp.float32),
+                                   jnp.full((1, 1, 1), denom, jnp.float32),
+                                   jnp.full((1, 1, 1, 16), acc_scalar, jnp.float32))
+        hooks = template.Hooks(initial=initial)
+        with tuning.pinned({attention_triton.TritonForward: PINNED[0]}):
+            got = attention_triton.forward(zeros, zeros, zeros, spans, hooks, interpret=not ON_GPU)
+        ref = template.reference(zeros, zeros, zeros, spans, hooks)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+        assert float(np.asarray(got, np.float32)[0, 0, 0, 0]) == float(expected), (dtype, got)

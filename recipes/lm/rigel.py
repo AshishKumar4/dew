@@ -36,11 +36,12 @@ import tyro
 
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.lm import LMRunConfig
-from dew.data import mix, phases, presets
+from dew.data import Phase, Steps, mix, phases, presets
 from dew.data.pipeline import Pipeline
 from dew.data.sources.tokens import TokenFiles
-from dew.optim import OptimConfig, ParamGroup, Power, PowerTail
+from dew.optim import AdamW, OptimConfig, ParamGroup, Power, PowerTail
 from dew.registry import ModelConfig
+from dew.training.budget import Horizon
 
 LAYERS = 40
 VOCAB = 100_352
@@ -89,12 +90,11 @@ def optim_config(width: int, steps: int, batch: int, seq_len: int) -> OptimConfi
     """lm-engine's muP AdamW on Rigel's power-then-linear schedule, its
     boundaries rescaled from 725,000 steps to `steps`."""
     scale = steps / STEPS
-    return OptimConfig(
-        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-10},
-        learning_rate=Power(peak_value=0.01, warmup_steps=max(round(5_000 * scale), 1),
+    return OptimConfig(optimizer=AdamW(eps=1e-10, b1=0.9, b2=0.95, weight_decay=0.1),
+                       learning_rate=Power(peak_value=0.01, warmup_steps=max(round(5_000 * scale), 1),
                        a=4.0 * batch, b=-0.51, c=float(batch * seq_len),
-                       tail=PowerTail(start=round(DECAY_START * scale))),
-        weight_decay=0.1, clip_grads=1.0, param_groups=ParamGroup.mup(width / 128))
+                       tail=PowerTail(start=round(DECAY_START * scale))), clip_grads=1.0,
+                       param_groups=ParamGroup.mup(width / 128))
 
 
 def schedule(corpora: Mapping[str, str], steps: int) -> tuple[tuple[dict[str, float], int | None], ...]:
@@ -136,8 +136,8 @@ def phased(corpora: Mapping[str, str], steps: int, seq_len: int, batch: int) -> 
             return packed(next(iter(mixture)))
         return mix([packed(url) for url in mixture], list(mixture.values()), by="tokens")
 
-    return phases(*((phase(mixture), until) for mixture, until in schedule(corpora, steps))
-                  ).shuffle(0).repeat().batch(batch)
+    return phases(*(Phase(phase(mixture), None if until is None else Steps(until))
+                    for mixture, until in schedule(corpora, steps))).shuffle(0).repeat().batch(batch)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -161,7 +161,7 @@ def run_config(args: RigelArgs) -> LMRunConfig:
         model=ModelConfig("causal_transformer", {**model_config(args.width), "dtype": "bfloat16"}),
         data=phased(args.corpora, args.steps, args.seq_len, args.batch_size),
         optim=optim_config(args.width, args.steps, args.batch_size, args.seq_len),
-        trainer=TrainerConfig(steps=args.steps, eval_every=None, checkpoint_every=5_000),
+        trainer=TrainerConfig(horizon=Horizon(steps=args.steps), eval_every=None, checkpoint_every=5_000),
         objective=ObjectiveConfig("lm", {"balance": {
             "aux_loss_alpha": 0.001, "seq_aux": False, "router_z_loss": 0.0001}}),
         tokenizer=args.tokenizer, max_new_tokens=0)

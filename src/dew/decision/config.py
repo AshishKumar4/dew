@@ -368,8 +368,8 @@ class DecisionRunConfig(DecoderRunConfig):
         self.sourced_model()
         decided = sorted(set(self.model.fields) - {"dtype", "attention_impl"})
         if decided:
-            raise ValueError(f"--model sets {decided}, which {self.pretrained} decides; only dtype and "
-                             "attention_impl are choices")
+            raise ValueError(f"the run's model sets {decided}, which {self.pretrained} decides; only dtype "
+                             "and attention_impl are choices")
         dtype = self.compute_dtype()
         attention_impl = self.source_attention()
         budgets = self._row_fields()

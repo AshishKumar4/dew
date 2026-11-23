@@ -64,14 +64,15 @@ def uncounted(batch: Batch, counts: int | None = None) -> Batch:
     return {**batch, TRAINING_FLOPS: np.full(shape, np.nan, np.float32)}
 
 
-def step_counts(batch: Batch, part: Batch | None = None, passes: int | None = None) -> dict[str, jax.Array]:
+def step_counts(batch: Batch, part: Batch | None = None,
+                passes: jax.Array | None = None) -> dict[str, jax.Array]:
     """Global device-side sums, returned with the step's other scalar metrics: the batch's work, or where its
     program runs a sampled pass count's `passes` (`prepare_counts`'s `counts`), its microbatch `part`'s
     rows' work at that count, which the step's whole sums over its microbatches (`whole_step`)."""
     work = {}
     if TRAINING_FLOPS in batch:
         worked = (batch[TRAINING_FLOPS] if passes is None or part is None
-                  else part[TRAINING_FLOPS][:, passes - 1])
+                  else jnp.take(part[TRAINING_FLOPS], passes - 1, axis=1))
         work[TRAINING_FLOPS] = jnp.sum(worked, dtype=jnp.float32)
     if TOKENS in batch:
         work[TOKENS] = TokenCount.sum(batch[TOKENS])

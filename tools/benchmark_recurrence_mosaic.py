@@ -32,9 +32,9 @@ import traceback
 
 import jax
 import jax.numpy as jnp
-from benchmark_recurrence import SHAPES, operands
+from benchmark_recurrence import SHAPES, gated_hooks, operands
 
-from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels import generation
 from dew.nn.kernels.options import program
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.residuals import recomputing
@@ -80,9 +80,7 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
     shape = SHAPES[name]
     given = {key: jnp.asarray(value) for key, value in operands(shape).items()
              if key in ('q', 'k', 'v', 'g', 'beta')}
-    # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as the layers declare.
-    hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                             scale=shape.key_width ** -0.5, write_bound=1.0)
+    hooks = gated_hooks(shape)
     args = (*(given[key].astype(dtype) for key in ('q', 'k', 'v')), given['g'], given['beta'].astype(dtype))
 
     def forward(q, k, v, g, beta):

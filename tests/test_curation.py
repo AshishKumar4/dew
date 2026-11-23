@@ -220,6 +220,9 @@ def test_curation_reads_alike_on_many_threads():
     keep what one does."""
     chain = Pipeline(web_pages()).filter_map(text.Quality("gopher"),
                                              text.Decontaminated(against=(EVALUATION,)))
-    alone = [int(record["id"]) for record in iterate(chain.read("indexed").threads(1), read="indexed")]
-    together = [int(record["id"]) for record in iterate(chain.read("indexed").threads(8), read="indexed")]
+    def read_by(threads: int) -> list[int]:
+        loaded = chain.read("indexed").loading(Loading(workers="auto", threads=threads))
+        return [int(record["id"]) for record in iterate(loaded, read="indexed")]
+
+    alone, together = read_by(1), read_by(8)
     assert together == alone == [0, 1, 2]

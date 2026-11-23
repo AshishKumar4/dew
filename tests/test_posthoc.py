@@ -15,7 +15,7 @@ from dew.checkpoints import Checkpoints, Keep, Ranking
 from dew.config import RunConfig
 from dew.objectives.base import EMASpec
 from dew.optim import OptimConfig, PowerProfilesState, power_profiles
-from dew.training import Layout, Trainer
+from dew.training import Layout, Trainer, UpdateBatch
 
 # Outputs of NVlabs/edm2 training/phema.py (std_to_exp, power_function_beta,
 # solve_posthoc_coefficients) on the same inputs, float64.
@@ -77,8 +77,8 @@ def test_an_accumulating_run_snapshotted_every_step_reconstructs_its_average(tmp
     twice, which would make the solve singular: the reconstruction counts each update once, so it is
     the one a run snapshotted only at its committed updates rebuilds, bit for bit."""
     def rebuilt(name, every):
-        trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)),
-                          key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0), accumulation=2,
+        trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=2),
                           checkpoints=Checkpoints(str(tmp_path / name)))
         trainer.fit(dataset(), steps=16, log_every=16, checkpoint_every=every)
         trainer.checkpoints.wait()

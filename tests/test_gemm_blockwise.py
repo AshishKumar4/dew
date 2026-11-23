@@ -122,13 +122,11 @@ def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
     GEMM on the same codes a block at a time (check 1, `_gradient_cublaslt`: block-scaled FP8 on Hopper is
     held at parity with cuBLASLt), from float64; an empty group's gradient is zero. On this GPU, or
     `interpret`ed (test_gpu_gemm's cell)."""
-    reference = jax.jit(_gradient("xla"))
-    library = blockwise_matrix.cublaslt_arm(_gradient_cublaslt, _gradient_operands(0))
+    reference = blockwise_matrix.cublaslt_arm(_gradient_cublaslt, _gradient_operands(0))
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_gradient("mosaic", interpret)), reference, _gradient_operands,
                         "blockwise kernel gradient", seeds=blockwise_matrix.SEEDS,
-                        truth_fn=_gradient_truth, library_fn=library, library_row=4518,
-                        library_leaves=("",))
+                        truth_fn=_gradient_truth)
     assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 def a_blockwise_kernel_gradients_portable_arm_sums_exactly():
@@ -205,10 +203,12 @@ def test_blockwise_fp8_named_mosaic_uninterpreted_dispatches_portable_on_cpu():
     rhs_t = jnp.asarray(rng.normal(size=(128, 128)) / 4, jnp.float8_e4m3fn)
     grad_row_scales = jnp.ones((1, 128), jnp.float32)
     grad_col_scales = jnp.ones((1, 128), jnp.float32)
+    from dew.nn.kernels import xla_products
+
     cpu = jax.devices("cpu")[0]
     committed = tuple(jax.device_put(a, cpu) for a in (lhs, kernel, sizes, row_scales, col_scales))
-    assert gemm._committed_device(committed) == cpu
-    assert gemm._committed_device((np.zeros(4), jnp.zeros(4))) is None
+    assert xla_products.committed_device(committed) == cpu
+    assert xla_products.committed_device((np.zeros(4), jnp.zeros(4))) is None
     with generation.assumed("sm90"), jax.default_device(cpu):
         with generation.chosen(blockwise_fp8="mosaic"):
             got_fwd = gemm.blockwise_fp8_product(*committed, out_dtype=jnp.float32, interpret_on_cpu=False)
@@ -222,3 +222,29 @@ def test_blockwise_fp8_named_mosaic_uninterpreted_dispatches_portable_on_cpu():
                                                           interpret_on_cpu=False)
     np.testing.assert_array_equal(np.asarray(got_fwd), np.asarray(ref_fwd))
     np.testing.assert_array_equal(np.asarray(got_grad), np.asarray(ref_grad))
+
+
+def test_restored_blockwise_cublaslt_references_prepare_on_sm90(tmp_path, monkeypatch):
+    """Both restored blockwise FP8 cells (`blockwise_matrix.a_blockwise_fp8_product_is_on_par` and
+    `a_blockwise_kernel_gradient_is_on_par`) with cuBLASLt as `reference` prepare cleanly under a
+    compile-only sm90 GPU-tier prepare with zero unprepared sites (row 12062)."""
+    import pickle
+
+    import generation_support
+    import model_flows
+    import tier_wire
+    from truths_ahead import AT_RUN, DEFERRED, HELD, SITE, UNPREPARED, prepared
+
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(generation_support.node_topology(tmp_path / "topology.bin",
+                                                                                   gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    store = tmp_path / "store"
+    with prepared(store, stamp="blockwise-12062", target=generation_support.node_target()):
+        blockwise_matrix.a_blockwise_fp8_product_is_on_par(blockwise_matrix.CASES[0])
+        a_blockwise_kernel_gradient_is_on_par(interpret=False)
+    for record in (UNPREPARED, AT_RUN, DEFERRED):
+        assert not (store / record).exists(), (store / record).read_text()
+    arm_sites = [pickle.loads((s.parent / HELD).read_bytes()) for s in store.rglob(SITE)]
+    with_ref = [h for h in arm_sites
+                if any(k.startswith("dew ") for k in h) and any(k.startswith("reference ") for k in h)]
+    assert len(with_ref) == 2, [list(h.keys()) for h in arm_sites]

@@ -169,18 +169,29 @@ def test_a_gathered_product_lowers_for_cuda(paired):
 def test_a_gathered_kernel_gradient_reads_each_operands_rows_where_its_table_says(generation_name, splits):
     """`a_gathered_kernel_gradient_is_its_gathered_rows_gradient` on an H100 (its depth split or not) and a
     B200, interpreted, each family's tile (`KERNEL_GRADIENT_TILES`: Hopper's producer warpgroup's cp.async
-    gathers, Blackwell's load warp's TMA gathers); a gathered operand beside a prologue on the rows, and on
-    mma.sync (no producer warpgroup), refused."""
+    gathers, Blackwell's load warp's TMA gathers); a gathered operand beside a prologue runs fused on wgmma
+    (row 5391) and is refused on tcgen05 (no consumer-issued prologue) and mma.sync (no producer gather)."""
     with generation.assumed(generation_name):
         tokens, cotangent, table = a_gathered_kernel_gradient_is_its_gathered_rows_gradient(
             grouped_launch.INTERPRETED, splits, tiles=KERNEL_GRADIENT_TILES[generation_name])
-    with generation.assumed("sm90"), pytest.raises(ValueError):
-        mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
-                        tiles=KERNEL_GRADIENT_TILES["sm90"], out_dtype=jnp.float32, multiprocessors=4,
-                        interpret=grouped_launch.INTERPRETED, gather=(table, None),
-                        prologue=lambda rows: rows)
+    sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
+    if generation_name == "sm90" and splits == 1:
+        with generation.assumed("sm90"):
+            fused = mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=KERNEL_GRADIENT_TILES["sm90"],
+                                    out_dtype=jnp.float32, multiprocessors=4,
+                                    interpret=grouped_launch.INTERPRETED, gather=(table, None),
+                                    prologue=lambda rows: rows * jnp.bfloat16(1.5))
+            plain = mosaic_gpu.tgmm(tokens[table], cotangent, sizes, tiles=KERNEL_GRADIENT_TILES["sm90"],
+                                    out_dtype=jnp.float32, multiprocessors=4,
+                                    interpret=grouped_launch.INTERPRETED,
+                                    prologue=lambda rows: rows * jnp.bfloat16(1.5))
+        np.testing.assert_array_equal(np.asarray(fused), np.asarray(plain))
+    with generation.assumed("sm100"), pytest.raises(ValueError):
+        mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=KERNEL_GRADIENT_TILES["sm100"],
+                        out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_launch.INTERPRETED,
+                        gather=(table, None), prologue=lambda rows: rows)
     with generation.assumed("sm80"), pytest.raises(ValueError):
-        mosaic_gpu.tgmm(tokens, cotangent, jnp.asarray([70, 0, 129, 51], jnp.int32),
+        mosaic_gpu.tgmm(tokens, cotangent, sizes,
                         tiles=tiling.Tiles(128, 128, 32, 3, 1, family="mma.sync"), out_dtype=jnp.float32,
                         multiprocessors=4, interpret=grouped_launch.INTERPRETED, gather=(table, None))
 
@@ -251,14 +262,13 @@ def a_gathered_ring_reads_a_strided_tables_entries() -> None:
     gather token 0's (base review 51d5c0f0a F2). On this GPU (test_gpu_gemm's Blackwell cell): its load
     warps' code runs on none other."""
     (height, width), steps, rows = STRIDED_BLOCK, 2, 128
-    table = jnp.asarray(np.concatenate([np.tile([0, 1], (height, 1)), np.tile([1, 0], (height, 1))]),
-                        jnp.int32)
+    table = np.concatenate([np.tile([0, 1], (height, 1)), np.tile([1, 0], (height, 1))]).astype(np.int32)
 
     def gathered(tokens, plain):
-        return _strided_gathers(tokens, table, plain)
+        return _strided_gathers(tokens, jnp.asarray(table, jnp.int32), plain)
 
     def first(tokens, plain):
-        return jnp.dot(plain, tokens[table[:, 0]], preferred_element_type=jnp.float32)
+        return jnp.dot(plain, tokens[jnp.asarray(table[:, 0], jnp.int32)], preferred_element_type=jnp.float32)
 
     def draw(seed):
         rng = np.random.default_rng([seed, 9])
@@ -267,8 +277,7 @@ def a_gathered_ring_reads_a_strided_tables_entries() -> None:
 
     with generation.assumed("sm100"):
         assert_as_exact(gathered, jax.jit(first), draw, "a gathered ring over a strided table", seeds=SEEDS,
-                        truth_fn=lambda tokens, plain: plain @ tokens[table[:, 0]])
-
+                        truth_fn=lambda tokens, plain: plain @ tokens[jnp.asarray(table[:, 0], jnp.int32)])
 
 def test_a_gathered_ring_over_a_strided_table_lowers_for_cuda():
     """`a_gathered_ring_reads_a_strided_tables_entries`' kernel lowered for a B200 on this CPU, its table a
@@ -502,10 +511,11 @@ def test_a_grouped_products_depth_split_sums_as_its_walk_apart():
 
 
 def test_a_hoppers_moe_decode_splits_its_experts_depth():
-    """A MoE decode step on an H100 (Qwen3-30B-A3B's down projection: 768 deep, 2048 wide, eight of 128
-    experts active a token, one token's slots, row 3622): its eight experts' 64 tiles leave half the wave's
-    multiprocessors idle, so the derived tile splits its depth over them (`MosaicGmm._decode_split`),
-    legally; a prefill's rows keep it unsplit."""
+    """A MoE decode step on an H100 (Qwen3-30B-A3B's down projection: 768 deep, 2048 wide, row 3622):
+    unpinned `derived` returns legal tiles across decode and prefill row counts, and `pricing.split_count`
+    splits underfilled expert walks while keeping a full-wave prefill unsplit."""
+    from dew.nn.kernels.templates.gemm import pricing
+
     launch = grouped_matmul.MosaicGmm()
 
     def derived(rows):
@@ -516,10 +526,64 @@ def test_a_hoppers_moe_decode_splits_its_experts_depth():
         target = generation.gpu_target()
         tile = launch.derived(bound, target)
         assert tile is not None and launch.legal(bound, tile, target), tile
-        return tile
+        return bound, tile, target
 
     with generation.assumed("sm90"):
-        assert derived(8).splits > 1 and derived(8192).splits == 1
+        b4, t4, sm90 = derived(4)
+        _, _, _ = derived(8)
+        _, t_pre, _ = derived(8192)
+        one_prog = tiling.Tiles(64, 256, 64, 4, 1, warpgroups=1, programs=1, family="wgmma")
+        assert pricing.split_count(one_prog, **launch._contraction(b4, one_prog, sm90)) > 1
+        assert t_pre.splits == 1 and t4.splits >= 1
+
+
+def test_hopper_decode_derives_two_resident_programs_per_sm_and_compiles():
+    """Hopper 1-consumer decode (`rows < 64`, DeepSeek-V3 / Qwen3-30B-A3B 1-token MoE down & dense M=16,
+    rows 3622, 483): unpinned public `derived` returns legal tiles across decode, dense and prefill calls,
+    both explicit 1- and 2-resident schedules are legal and price cleanly via `walk_seconds`, and explicit
+    1-/2-resident Hopper decode schedules compile spill-free on `sm90`."""
+    import functools
+
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    from dew.nn.kernels.templates.gemm import pricing
+
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    i32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.int32)
+    with generation.assumed("sm90"):
+        sm90 = generation.gpu_target("sm90")
+        moe_ba = launch.bind(bf16((8, 2048)), bf16((256, 2048, 7168)), i32((256,)),
+                             out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=False)
+        qwen_ba = launch.bind(bf16((8, 768)), bf16((128, 768, 2048)), i32((128,)),
+                              out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=False)
+        dense_ba = launch.bind(bf16((16, 4096)), bf16((1, 4096, 14336)), i32((1,)),
+                               out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        prefill_ba = launch.bind(bf16((2048, 4096)), bf16((1, 4096, 14336)), i32((1,)),
+                                 out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        for ba in (moe_ba, qwen_ba, dense_ba, prefill_ba):
+            tile = launch.derived(ba, sm90)
+            assert tile is not None and launch.legal(ba, tile, sm90), tile
+        # Explicit 1-resident and 2-resident schedules both legal and priced by walk_seconds.
+        one_res = tiling.Tiles(64, 256, 64, 4, 1, warpgroups=1, programs=1, family="wgmma")
+        two_res = tiling.Tiles(64, 128, 64, 3, 1, warpgroups=1, programs=2, family="wgmma")
+        for ba in (moe_ba, qwen_ba, dense_ba):
+            for sched in (one_res, two_res):
+                assert launch.legal(ba, sched, sm90), sched
+                assert np.isfinite(pricing.walk_seconds(sched, launch._contraction(ba, sched, sm90)))
+        if generation.compile_only_gpus("sm90"):
+            cases = [
+                KernelCase("sm90_decode_moe_1prog", lambda: launch.lowering(moe_ba, one_res)),
+                KernelCase("sm90_decode_moe_2prog", lambda: launch.lowering(moe_ba, two_res)),
+                KernelCase("sm90_decode_qwen_2prog", lambda: launch.lowering(qwen_ba, two_res)),
+                KernelCase("sm90_decode_dense_2prog", lambda: launch.lowering(dense_ba, two_res)),
+            ]
+            records = compile_mosaic_kernels(cases, "sm90")
+            for rec in records:
+                assert not rec.get("error"), rec
+                assert rec["kernels"], rec
+                assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
 
 
 def test_a_kernel_gradient_no_launch_reads_through_its_tables_runs_a_launch_on_its_gathered_rows():
@@ -633,3 +697,240 @@ def test_a_gathered_product_with_a_prologue_holds_check_1_with_its_gradients(gen
     assert_as_exact(jax.jit(emulated), jax.jit(run(plain)), draw,
                     "a gathered product with a prologue and its gradients", seeds=SEEDS,
                     truth_fn=run(functools.partial(plain, wide=jnp.float64)))
+
+
+@pytest.mark.parametrize("gpu", ["sm90", "sm100"])
+def test_gathered_prologued_paired_stacked_layer_runs_fused_and_compiles(gpu: str):
+    """A gathered, prologued, paired, stacked-layer grouped GEMM (`#5391`: scanned MoE gate|up over a
+    normalized/scaled token stream) runs inside the one Mosaic mainloop without an XLA gather pre-copy,
+    holds check 1 forward + VJP, and compiles spill-free on Hopper `sm90` and Blackwell `sm100`."""
+    from fla_gdn_support import KernelCase
+    from jax.core import ShapedArray
+    from kernel_compile import compile_mosaic_kernels
+
+    sizes = jnp.asarray([70, 0, 129, 57], jnp.int32)
+    rows = int(sizes.sum())
+
+    def normed(x, inv_rms, weight):
+        return x * inv_rms[:, None] * weight[None, :]
+
+    def swiglu(gate, up):
+        return jax.nn.silu(gate) * up
+
+    def draw(seed):
+        rng = np.random.default_rng(5391 + seed)
+        table = jnp.asarray(rng.integers(0, 192, rows), jnp.int32)
+        return (jnp.asarray(rng.normal(size=(192, 128)) / 8, jnp.bfloat16), table,
+                jnp.asarray(rng.uniform(0.5, 1.5, size=(rows,)), jnp.float32),
+                jnp.asarray(rng.uniform(0.7, 1.3, size=(128,)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(2, 4, 128, 256)) / 16, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(2, 4, 128, 256)) / 16, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(rows, 256)) / 8, jnp.bfloat16))
+
+    def run_dew(tokens, table, inv_rms, weight, gate_w, up_w, cotangent):
+        def fn(t, r, w, gw, uw):
+            return gemm.gemm(t, gw, sizes, paired=uw, layer=jnp.int32(1), gather=table,
+                             prologue=normed,
+                             prologue_operands=((r, ("rows",)), (w, ("depth",))),
+                             epilogue=swiglu, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+        with generation.assumed(gpu):
+            out, pull = jax.vjp(fn, tokens, inv_rms, weight, gate_w, up_w)
+            return out, *pull(cotangent)
+
+    def run_plain(tokens, table, inv_rms, weight, gate_w, up_w, cotangent, *, wide=jnp.float32):
+        def fn(t, r, w, gw, uw):
+            x = normed(t[table].astype(wide), r.astype(wide), w.astype(wide)).astype(
+                wide if wide == jnp.float64 else t.dtype).astype(wide)
+            grp = jnp.repeat(jnp.arange(4), sizes, total_repeat_length=rows)
+            g = jnp.einsum("rk,rkn->rn", x, gw[1].astype(wide)[grp])
+            u = jnp.einsum("rk,rkn->rn", x, uw[1].astype(wide)[grp])
+            out = swiglu(g, u)
+            return out if wide == jnp.float64 else out.astype(jnp.bfloat16)
+        out, pull = jax.vjp(fn, tokens, inv_rms, weight, gate_w, up_w)
+        return out, *pull(cotangent.astype(out.dtype))
+
+    t0, tbl0, r0, w0, gw0, uw0, _ = draw(0)
+    with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"), generation.routes() as seen:
+        gemm.gemm(t0, gw0, sizes, paired=uw0, layer=jnp.int32(1), gather=tbl0, prologue=normed,
+                  prologue_operands=((r0, ("rows",)), (w0, ("depth",))), epilogue=swiglu,
+                  out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+    assert any(r.kernel == "mosaic" for r in seen), seen
+    assert_as_exact(jax.jit(run_dew), jax.jit(run_plain), draw, "gathered+prologue+paired+layer",
+                    seeds=SEEDS, truth_fn=functools.partial(run_plain, wide=jnp.float64))
+
+    if generation.compile_only_gpus(gpu):
+        bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+        f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+        i32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.int32)
+        specs = (bf16((192, 128)), i32((rows,)), f32((rows,)), bf16((128,)),
+                 bf16((2, 4, 128, 256)), bf16((2, 4, 128, 256)), i32((4,)))
+
+        def compiled(t, tbl, r, w, gw, uw, sz):
+            with generation.chosen(grouped_matmul="mosaic"):
+                return gemm.gemm(t, gw, sz, paired=uw, layer=jnp.int32(1), gather=tbl,
+                                 prologue=normed,
+                                 prologue_operands=((r, ("rows",)), (w, ("depth",))),
+                                 epilogue=swiglu, out_dtype=jnp.bfloat16)
+
+        with generation.assumed(gpu):
+            graph = jax.make_jaxpr(compiled)(*specs)
+            assert not any(
+                eqn.primitive.name == "gather"
+                and any(isinstance(v.aval, ShapedArray) and v.aval.shape == (192, 128) for v in eqn.invars)
+                for eqn in equations(graph, platform="cuda")
+            ), "tokens pre-gathered in CUDA path before Mosaic mainloop"
+            records = compile_mosaic_kernels(
+                [KernelCase(f"gathered_prologue_paired_layer_{gpu}", lambda: (compiled, specs))], gpu)
+        for rec in records:
+            assert not rec.get("error"), rec
+            assert rec["kernels"], rec
+            assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+def test_gathered_prologued_negative_indices_and_sm80_forced_mosaic():
+    """Signed gather indices (repeated `-1` and negative offsets) match `lhs[gather]` forward and VJP
+    without negative native row loads, and forced `grouped_matmul='mosaic'` on `sm80` (where `mma.sync`
+    cannot consume tables) gathers first instead of raising `KernelRefused` (row 5391)."""
+    sizes = jnp.asarray([16, 0, 24, 24], jnp.int32)
+    rows = int(sizes.sum())
+    rng = np.random.default_rng(53910)
+    tokens = jnp.asarray(rng.normal(size=(32, 64)) / 8, jnp.bfloat16)
+    scale = jnp.asarray(rng.uniform(0.5, 1.5, size=(rows,)), jnp.float32)
+    matrices = jnp.asarray(rng.normal(size=(4, 64, 64)) / 8, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(rows, 64)) / 8, jnp.float32)
+    base = rng.integers(0, 32, rows, dtype=np.int32)
+    base[:10] = -1
+    base[10:14] = -32
+    base[14:18] = -5
+    table = jnp.asarray(base, jnp.int32)
+
+    def scaled(x, s):
+        return x * s[:, None]
+
+    def ref_run(t, s, m):
+        x = scaled(t[table].astype(jnp.float32), s).astype(t.dtype).astype(jnp.float32)
+        grp = jnp.repeat(jnp.arange(4), sizes, total_repeat_length=rows)
+        return jnp.einsum("rk,rkn->rn", x, m.astype(jnp.float32)[grp])
+
+    def mosaic_run(gpu: str, t, s, m):
+        with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"), generation.routes() as seen:
+            out, pull = jax.vjp(
+                lambda a, b, c: gemm.gemm(a, c, sizes, prologue=scaled, prologue_operands=((b, ("rows",)),),
+                                          gather=table, out_dtype=jnp.float32, interpret_on_cpu=True),
+                t, s, m)
+            grads = pull(cotangent)
+        assert any(r.kernel == "mosaic" for r in seen), (gpu, seen)
+        return (out, *grads)
+
+    def draw(seed):
+        r = np.random.default_rng(53911 + seed)
+        return (jnp.asarray(r.normal(size=(32, 64)) / 8, jnp.bfloat16),
+                jnp.asarray(r.uniform(0.5, 1.5, size=(rows,)), jnp.float32),
+                jnp.asarray(r.normal(size=(4, 64, 64)) / 8, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(rows, 64)) / 8, jnp.float32))
+
+    def truth(t, s, m, dy):
+        def fn(a, b, c):
+            x = scaled(a[table].astype(jnp.float64), b.astype(jnp.float64))
+            grp = jnp.repeat(jnp.arange(4), sizes, total_repeat_length=rows)
+            return jnp.einsum("rk,rkn->rn", x, c.astype(jnp.float64)[grp])
+        out, pull = jax.vjp(fn, t, s, m)
+        return (out, *pull(dy.astype(jnp.float64)))
+
+    def plain_vjp(t, s, m, dy):
+        out, pull = jax.vjp(ref_run, t, s, m)
+        return (out, *pull(dy))
+
+    for gpu in ("sm90", "sm80"):
+        def dew_vjp(t, s, m, dy, gpu=gpu):
+            with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"):
+                out, pull = jax.vjp(
+                    lambda a, b, c: gemm.gemm(a, c, sizes, prologue=scaled,
+                                              prologue_operands=((b, ("rows",)),), gather=table,
+                                              out_dtype=jnp.float32, interpret_on_cpu=True),
+                    t, s, m)
+                return (out, *pull(dy))
+
+        mosaic_run(gpu, tokens, scale, matrices)
+        assert_as_exact(jax.jit(dew_vjp), jax.jit(plain_vjp), draw,
+                        f"negative gather+prologue {gpu}", seeds=SEEDS, truth_fn=truth)
+
+    # Paired + scatter under forced Mosaic on sm80 (`mma.sync` has `gathers_alone=False`): `'tables'`
+    # hands off before `'launch'` so forward AND reverse (`_keeps_launch`) both run Mosaic without raising
+    # `KernelRefused` and hold check 1 against float64 truth (rows 12305, 12307).
+    perm = jnp.asarray(rng.permutation(rows), jnp.int32)
+
+    def draw_pair(seed):
+        r = np.random.default_rng(12305 + seed)
+        return (jnp.asarray(r.normal(size=(rows, 64)) / 8, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(4, 64, 64)) / 8, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(4, 64, 64)) / 8, jnp.bfloat16),
+                (jnp.asarray(r.normal(size=(rows, 64)) / 8, jnp.bfloat16),
+                 jnp.asarray(r.normal(size=(rows, 64)) / 8, jnp.bfloat16)))
+
+    def pair_ref(t, gw, uw, *, dtype=jnp.float32):
+        def one(w):
+            y = jax.lax.ragged_dot(t, w, sizes, preferred_element_type=dtype).astype(
+                jnp.bfloat16 if dtype == jnp.float32 else dtype)
+            return jnp.empty_like(y).at[perm].set(y)
+
+        return one(gw), one(uw)
+
+    def pair_truth(t, gw, uw, dy):
+        outs, pull = jax.vjp(lambda a, b, c: pair_ref(a, b, c, dtype=jnp.float64),
+                             t.astype(jnp.float64), gw.astype(jnp.float64), uw.astype(jnp.float64))
+        return outs, pull(tuple(d.astype(jnp.float64) for d in dy))
+
+    def pair_plain_vjp(t, gw, uw, dy):
+        outs, pull = jax.vjp(pair_ref, t, gw, uw)
+        return outs, pull(dy)
+
+    def pair_dew_vjp(t, gw, uw, dy):
+        with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
+            outs, pull = jax.vjp(
+                lambda a, b, c: gemm.gemm(a, b, sizes, paired=c, scatter=perm, out_dtype=jnp.bfloat16,
+                                          out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True),
+                t, gw, uw)
+            return outs, pull(dy)
+
+    t0, gw0, uw0, dy0 = draw_pair(0)
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"), generation.routes() as seen:
+        pair_dew_vjp(t0, gw0, uw0, dy0)
+    assert any(r.kernel == "mosaic" for r in seen), seen
+    assert_as_exact(jax.jit(pair_dew_vjp), jax.jit(pair_plain_vjp), draw_pair,
+                    "sm80 forced-mosaic paired+scatter", seeds=SEEDS, truth_fn=pair_truth)
+
+
+def test_producers_rungs_keeps_top_after_stated_cap_start():
+    """When `producers.started` picks a `stated` cap below `top` on a tensor-memory family, `producers.rungs`
+    passes that same `stated` cap into `Producers.stepped` so the first spill rung visits `top` instead of
+    skipping it (Train 1231 F2)."""
+    from dew.nn.kernels.templates import report, resources
+    from dew.nn.kernels.templates.gemm import producers
+
+    @dataclasses.dataclass(frozen=True)
+    class _HighRegGmm(grouped_matmul.MosaicGmm):
+        need: int = 160
+
+        def registers(self, ba, config, target=None) -> int:
+            del ba, config, target
+            return self.need
+
+    op = _HighRegGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    ba = op.bind(bf16((128, 64)), bf16((2, 64, 128)), jax.ShapeDtypeStruct((2,), jnp.int32),
+                 (), (), None, None, jax.ShapeDtypeStruct((128,), jnp.int32),
+                 out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    tile = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=1, cluster=1, family="tcgen05", programs=2)
+    with generation.assumed("sm100"), report.refusals():
+        sm100 = generation.gpu_target()
+        top = producers._top(op, ba, tile, sm100)
+        assert top is not None and op.need > top
+        started = producers.started(op, ba, tile, sm100)
+        start_cap = started.producers.of(op.KERNEL)
+        assert start_cap is not None and start_cap < top
+        report.refuse([(report._identity(op, ba, sm100), started, (op.KERNEL,))])
+        ladder = [rung.producers.of(op.KERNEL) for rung in producers.rungs(op, ba, started, sm100)]
+        assert ladder[0] == resources.facts().raises().below(top), (start_cap, top, ladder)
+        assert start_cap not in ladder, (start_cap, ladder)

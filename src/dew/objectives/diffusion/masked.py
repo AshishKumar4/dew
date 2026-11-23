@@ -33,7 +33,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
-from dew.batch import TEXT_KEY, Batch, Variables, flat_field, real_slots, thaw
+from dew.batch import TEXT_KEY, Batch, Variables, counted_passes, flat_field, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, processor_settings
 from dew.inputs import Field, InputSpec, OutsideTable
@@ -54,7 +54,7 @@ from dew.objectives.base import (
     ended,
     model_rngs,
 )
-from dew.objectives.lm.chunked import final_read, refuse_without_logits
+from dew.objectives.lm.chunked import final_read, read_method, refuse_without_logits
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.objective import batch_text, text_preview
 from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
@@ -218,6 +218,15 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         nelbo, _, scores = self._scored(params, batch, step, train=False)
         return nelbo, scores
 
+    @property
+    def reads_pass_counts(self) -> bool:
+        """Its loss runs its model at a microbatch's count (`counted_passes`), as a language model's does."""
+        return True
+
+    def counted_forward(self, module: nn.Module) -> str | None:
+        """The method its loss reads its model by (`chunked.read_method`), which takes a call's count."""
+        return read_method(module) if module is self.model else None
+
     def reduce_loss(self, stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
         return reduce_routed(self.balance, stats)
 
@@ -301,7 +310,8 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         observed = final_read(self.model, params, masked, train=train,
                               rngs=model_rngs(dropout_key, training=train),
                               mutable=opened or False, capture_intermediates=False,
-                              **prepared.kwargs(), **progressed(self.model, self.progress(step)))
+                              **prepared.kwargs(), **progressed(self.model, self.progress(step)),
+                              **counted_passes(batch))
         read, sown = observed if opened else (observed, {})
         read = aligned(self.model, read, fields)
         # MDLM's SUBS parameterization gives the mask token no mass: it is

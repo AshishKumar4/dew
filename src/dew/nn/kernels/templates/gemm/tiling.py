@@ -4,11 +4,13 @@ kernels' names, which a tile's producer registers are kept by. Light at import: 
 type (a selector's launch, `grouped_matmul`) reads no toolkit module until a tile is made."""
 
 import dataclasses
+from typing import ClassVar
 
 import jax
 from jax import numpy as jnp
 
-from dew.nn.kernels.templates import resources
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import base, resources
 
 GMM = "dew_gmm"
 """The name of a product's kernel (`gmm`), its producer's registers `Tiles.producers`' by it."""
@@ -106,3 +108,71 @@ class Tiles:
 CONSUMERS = 2
 """The most consumer warpgroups a GEMM tile takes: CUTLASS's sm90 cooperative kernel's two; a family's third
 (wgmma's, FlashAttention 3's d64 forward's) unmeasured on a product."""
+
+
+@dataclasses.dataclass(frozen=True)
+class TilesTemplate(base.Template[Tiles]):
+    """Shared `Template[Tiles]` lifecycle for GEMM-family templates (`_Mosaic`, `MosaicSyrk`,
+    `MosaicLinearCE`, row 12141): staged bytes, register budget, shared memory per program, legality,
+    TPU budget gating, and eligibility with explicit `target` threading."""
+
+    name: ClassVar[str] = "mosaic"
+    GENERATES: ClassVar[bool] = True
+    ROWS: ClassVar[tuple[str, ...]] = ("x",)
+
+    def _operand_dtype(self, ba):
+        return ba.arguments["x"].dtype
+
+    def _supports_ba(self, ba) -> bool:
+        raise NotImplementedError
+
+    def candidate(self, ba, config: Tiles, target) -> bool:
+        raise NotImplementedError
+
+    def launch_of(self, ba, config: Tiles, target=None) -> resources.Launch:
+        raise NotImplementedError
+
+    @staticmethod
+    def tpu_budgeted(target) -> bool:
+        """Whether `target` states its TPU scoped VMEM budget (always True for non-TPU targets)."""
+        return not generation.tpu(target) or target.scoped_vmem is not None
+
+    def staged_bytes(self, ba, config: Tiles, target) -> int:
+        from . import pricing
+
+        family = pricing.family_of(config, self._operand_dtype(ba), target)
+        return resources.shared_bytes(family, self.launch_of(ba, config, target).scope(config.stages))
+
+    def register_budget(self, config: Tiles, target: generation.GpuTarget | None = None) -> int:
+        from . import pricing
+
+        family = pricing.family_of(config, jnp.bfloat16, self.launch_target() if target is None else target)
+        return family.registers(config.warpgroups) if family.budgets_registers else 0
+
+    def program_shared(self, config: Tiles, target) -> int:
+        return resources.program_shared(super().program_shared(config, target), config.programs)
+
+    def legal(self, ba, config: Tiles, target) -> bool:
+        """Whether `config` runs the call `ba` binds on `target` (`_legal`), read under `target` whatever GPU
+        is in effect (`generation.as_target`): its family's registers and resources are `target`'s."""
+        with generation.as_target(target):
+            return self._legal(ba, config, target)
+
+    def _legal(self, ba, config: Tiles, target) -> bool:
+        """`legal`'s judgment under `target`: a candidate whose ring of `config.stages` and registers the
+        planner holds at its programs (`resources.plan`)."""
+        from . import pricing
+
+        if not self.candidate(ba, config, target):
+            return False
+        family = pricing.family_of(config, self._operand_dtype(ba), target)
+        launch = dataclasses.replace(self.launch_of(ba, config, target),
+                                     floor=config.stages, most=config.stages)
+        return resources.plan([launch], family, target, programs=config.programs) is not None
+
+    def eligible(self, ba, target) -> bool:
+        if not self._supports_ba(ba):
+            return False
+        if not self.tpu_budgeted(target) or self.derived(ba, target) is None:
+            return False
+        return target != self.launch_target() or self.holds(ba)

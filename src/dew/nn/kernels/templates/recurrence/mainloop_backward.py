@@ -13,7 +13,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import generation, recurrence_algebra as algebra, tables
+from dew.nn.kernels import recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
 from dew.nn.kernels.templates import mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.operands import Issuer, Parts
@@ -25,7 +25,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Operand,
     Tiles,
     Walked,
-    addressed,
     block_stored,
     chunk_liveness,
     column_tile,
@@ -35,6 +34,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     finished_form,
     fitting_block,
     held_tile,
+    launch_fits,
     launch_kernel,
     lowered_once,
     masks,
@@ -45,7 +45,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     role_tiles,
     sequence_live,
     sequence_walk,
-    shared_allocation,
     staging_tiles,
     stream_blocks,
     stream_tile,
@@ -924,13 +923,10 @@ def _query_key_fits(call: Call, vq: int, *, holds: bool) -> bool:
     sums, their staging (`_query_key_staging`): each split's bytes the launch's own (`shared_allocation`, as
     `launch_kernel` lays it)."""
     splits = call.value_width // vq
-    tiles = _query_key_streams(call, vq)
     landing = _query_key_landing(call, splits, _query_key_summed(call, splits, holds))
     staging = _query_key_staging(call) if holds else ()
-    _, scope, _, _ = shared_allocation(call, tiles, staging, landing)
-    registers = _query_key_held(call, vq, holds=holds).registers(call.family, addressed(staging, landing))
-    return (resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
-            and registers <= call.family.registers(1))
+    return launch_fits(call, _query_key_held(call, vq, holds=holds), (staging, landing),
+                       _query_key_streams(call, vq))
 
 
 def _query_key_held(call: Call, vq: int, *, holds: bool) -> Held:

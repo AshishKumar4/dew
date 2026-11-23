@@ -121,7 +121,7 @@ def resolved(pending: Pending, accumulation: int) -> tuple[int, str]:
 
 def schedule_ended(token_ends: Sequence[int | None] | None, committed: Callable[[], int]) -> bool:
     """Whether a branch's `committed` tokens reached the end of a schedule whose last stage ends its
-    data at its tokens (`dew.data.pipeline.schedule`), as the run's own budget ends it there; the count,
+    data at its tokens (`dew.data.phases` on `Tokens`), as the run's own budget ends it there; the count,
     read from the devices, is asked only of such a schedule."""
     return token_ends is not None and token_ends[-1] is not None and committed() >= token_ends[-1]
 

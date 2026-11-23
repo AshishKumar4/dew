@@ -112,7 +112,8 @@ tokens, root = sys.argv[1:3]
 chain = TokenFiles(tokens).pipe(presets.lm, None, seq_len=8, batch=8, pack=None).loading(Loading(workers=0))
 LMRunConfig.cli(["--pretrained", "local/llama", "--tokenizer", "local/llama", "--trainer.name", "run",
                  "--trainer.checkpoint-dir", root,
-                 "--trainer.steps", "1", "--trainer.compilation-cache-dir", "None", "--trainer.multi-host",
+                 "--trainer.horizon.steps", "1", "--trainer.compilation-cache-dir", "None",
+                 "--trainer.multi-host",
                  "False", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "1",
                  "--max-new-tokens", "0"], default=LMRunConfig(data=chain)).run()
 """
@@ -124,15 +125,18 @@ import sys
 from dew.data import Files, Loading
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
+from dew.registry import ModelConfig
 
 table, root = sys.argv[1:3]
 rows = Files(table, format="csv").pipe(decisions, question="team").read("memory").batch(8)
 DecisionRunConfig.cli(["--pretrained", "local/chat", "--trainer.name", "run",
-                       "--trainer.checkpoint-dir", root, "--trainer.steps", "1",
+                       "--trainer.checkpoint-dir", root, "--trainer.horizon.steps", "1",
                        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
                        "--trainer.eval-every", "None",
-                       "--trainer.checkpoint-every", "1", "--model.dtype", "float32", "--no-calibrate"],
-                      default=DecisionRunConfig(data=rows.loading(Loading(workers=0)))).run()
+                       "--trainer.checkpoint-every", "1", "--no-calibrate"],
+                      default=DecisionRunConfig(
+                          data=rows.loading(Loading(workers=0)),
+                          model=ModelConfig("causal_transformer", {"dtype": "float32"}))).run()
 """
 """A recorded decision run over a Hub backbone, through the command line, in a process of its own: the
 rows' table and the runs' root."""

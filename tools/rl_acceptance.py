@@ -42,9 +42,10 @@ from dew.config.env import EnvConfig, EnvRunConfig, EpisodesConfig, RolloutConfi
 from dew.config.world_model import TokenizerConfig, WorldModelRunConfig
 from dew.data.dataset import Loader
 from dew.data.pipeline import Dataset, Pipeline
-from dew.optim import Linear, OptimConfig
+from dew.optim import Adam, LaProp, Linear, OptimConfig
 from dew.registry import ModelConfig
 from dew.training import LocalTracker
+from dew.training.budget import Horizon
 
 CONTROL, DREAMER = "dew.objectives.rl.control", "dew.objectives.rl.dreamer"
 """The modules of the agents' networks and objectives, which a record names by import path."""
@@ -115,15 +116,9 @@ def ppo_run(
             {"discount": 0.995, "reward_scaling": 10.0, "entropy_cost": 1e-2, "clip": 0.3},
         ),
         rollout=RolloutConfig("control", rollout),
-        optim=OptimConfig(optimizer="adam", learning_rate=1e-3),
-        trainer=TrainerConfig(
-            checkpoint_dir=str(out),
-            steps=collections * every,
-            log_every=every,
-            eval_every=None,
-            checkpoint_every=None,
-            resume="never",
-        ),
+        optim=OptimConfig(optimizer=Adam(), learning_rate=1e-3),
+        trainer=TrainerConfig(checkpoint_dir=str(out), horizon=Horizon(steps=collections * every),
+                              log_every=every, eval_every=None, checkpoint_every=None, resume="never"),
         episodes={
             GREEDY: EpisodesConfig(1000, EnvConfig("playground", playground, count=128, episode_length=1000))
         },
@@ -153,7 +148,7 @@ def ppo(
     report = {
         "task": task,
         "environment_steps": collections * 16 * 30 * envs,
-        "updates": prepared.run.trainer.steps,
+        "updates": prepared.run.trainer.horizon.steps,
         "returns": returns,
         "target": target,
         "seconds_to_target": reached,
@@ -184,17 +179,10 @@ def dreamer_run(
         model=ModelConfig(f"{DREAMER}:WorldModel"),
         objective=ObjectiveConfig(f"{DREAMER}:DreamerV3Objective"),
         rollout=RolloutConfig("dreamer", rollout),
-        optim=OptimConfig(
-            optimizer="laprop", learning_rate=Linear(peak_value=4e-5, warmup_steps=1000, end_value=4e-5)
-        ),
-        trainer=TrainerConfig(
-            checkpoint_dir=str(out),
-            steps=updates,
-            log_every=1000,
-            eval_every=None,
-            checkpoint_every=None,
-            resume="never",
-        ),
+        optim=OptimConfig(optimizer=LaProp(),
+                          learning_rate=Linear(peak_value=4e-5, warmup_steps=1000, end_value=4e-5)),
+        trainer=TrainerConfig(checkpoint_dir=str(out), horizon=Horizon(steps=updates), log_every=1000,
+                              eval_every=None, checkpoint_every=None, resume="never"),
         episodes={DRAWN: EpisodesConfig(1000, drawn=True), GREEDY: EpisodesConfig(1000)},
     )
 
@@ -215,7 +203,7 @@ def dreamer(
     report = {
         "task": task,
         "environment_steps": rollout.environment_steps,
-        "updates": prepared.run.trainer.steps,
+        "updates": prepared.run.trainer.horizon.steps,
         "return": drawn,
         "greedy_return": greedy,
         "paper_return_at_500k": 990,
@@ -386,18 +374,11 @@ def dreamer4_stages(
     forcing ("shortcut") and one by diffusion forcing ("diffusion"), `dynamics_steps` steps each (run key
     1)."""
     world = "dew.objectives.world_model"
-    adam = OptimConfig(optimizer="adam", learning_rate=3e-4)
+    adam = OptimConfig(optimizer=Adam(), learning_rate=3e-4)
 
     def trainer(steps: int, key: int) -> TrainerConfig:
-        return TrainerConfig(
-            checkpoint_dir=str(out),
-            steps=steps,
-            log_every=steps,
-            eval_every=None,
-            checkpoint_every=None,
-            key=key,
-            resume="never",
-        )
+        return TrainerConfig(checkpoint_dir=str(out), horizon=Horizon(steps=steps), log_every=steps,
+                             eval_every=None, checkpoint_every=None, key=key, resume="never")
 
     tokenizer = ModelConfig(
         f"{world}:CausalTokenizer",

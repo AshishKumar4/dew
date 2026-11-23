@@ -35,7 +35,7 @@ from dew.objectives.base import TEACHER, Aux, EMASpec, Objective, Ratio
 from dew.objectives.distillation import DistillationObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
-from dew.training import Layout, Trainer
+from dew.training import FitPolicy, Layout, Trainer, UpdateBatch
 
 HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)
@@ -154,9 +154,9 @@ def test_a_host_step_read_in_a_stated_split_is_on_par_with_the_devices_split_ste
     microbatches, each an attempt of its own across the execution boundary, its update their pooled
     window's under a dynamic loss scale: three updates on par from float64 with the device-resident run
     stating the same split (check 1), its counts and keys exact."""
-    placed = compiled_for(lambda layout: Trainer(
-        Tiny(composite=False), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9), split=2,
-        dynamic_scale=SHORT_SCALE, layout=layout))
+    placed = compiled_for(lambda layout: Trainer(Tiny(composite=False), optax.adamw(.03, weight_decay=.1),
+                                                 key=jax.random.PRNGKey(9), fit=FitPolicy(split=2),
+                                                 dynamic_scale=SHORT_SCALE, layout=layout))
 
     def run(layout, batch):
         state, step, _ = placed(layout, batch)
@@ -195,7 +195,7 @@ def test_a_host_window_that_replays_steps_on_its_startups_programs_alone():
 
     def run(quiet: bool):
         trainer = Trainer(Tiny(composite=True), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-                          accumulation=2, dynamic_scale=SHORT_SCALE, layout=HOST)
+                          update=UpdateBatch(batches=2), dynamic_scale=SHORT_SCALE, layout=HOST)
         state, _, _ = trainer.place()
         data = [placed_batch(trainer, batch) for batch in batches()]
         step = trainer.compile(state, data[0])
@@ -411,9 +411,9 @@ def test_a_host_decoders_steps_run_on_its_startups_programs_alone():
 @pytest.mark.parametrize("composite", [False, True])
 def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, composite):
     data = batches()
-    placed = compiled_for(lambda layout: Trainer(
-        Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-        accumulation=2, dynamic_scale=SHORT_SCALE, layout=layout))
+    placed = compiled_for(lambda layout: Trainer(Tiny(composite), optax.adamw(.03, weight_decay=.1),
+                                                 key=jax.random.PRNGKey(9), update=UpdateBatch(batches=2),
+                                                 dynamic_scale=SHORT_SCALE, layout=layout))
 
     def run(layout, *microbatches):
         state, step, _ = placed(layout, microbatches[0])
@@ -442,9 +442,9 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
                   DEVICE)
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    trainer = Trainer(
-        Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-        accumulation=2, dynamic_scale=SHORT_SCALE, layout=HOST, checkpoints=checkpoints)
+    trainer = Trainer(Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
+                      update=UpdateBatch(batches=2), dynamic_scale=SHORT_SCALE, layout=HOST,
+                      checkpoints=checkpoints)
     start, _, _ = trainer.place()
     step = trainer.compile(start, data[0])
     prefix, *_ = step(start, data[0])
@@ -488,7 +488,8 @@ def test_dropout_composite_replay_restarts_with_effects_and_ema_intact(tmp_path)
     checkpoints = Checkpoints(str(tmp_path / "dropout"))
     def make(checkpoints=None):
         return Trainer(objective, optax.chain(optax.clip_by_global_norm(.5), optax.adam(.001)),
-                       key=jax.random.key(3), layout=HOST, accumulation=2, checkpoints=checkpoints)
+                       key=jax.random.key(3), layout=HOST, update=UpdateBatch(batches=2),
+                       checkpoints=checkpoints)
     data = {"text": jnp.tile(jnp.arange(9, dtype=jnp.int32)[None], (jax.device_count(), 1))}
     trainer = make()
     initial, _, _ = trainer.place()
@@ -556,7 +557,7 @@ def test_composite_replay_does_not_apply_effects_twice():
     results = []
     for layout in (DEVICE, HOST):
         trainer = Trainer(Effects(), optax.adam(.01), key=jax.random.PRNGKey(9),
-                          accumulation=2, layout=layout)
+                          update=UpdateBatch(batches=2), layout=layout)
         state, _, _ = trainer.place()
         data = batches()[0]
         step = trainer.compile(state, data)
@@ -689,7 +690,8 @@ def test_a_warm_host_run_traces_nothing():
     next windows run the programs it compiled: an eager vjp handed the
     pullback a new static function every realization, which traced again."""
     objective = LMObjective(decoder(), 8, head_chunks=1)
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST, accumulation=2)
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST,
+                      update=UpdateBatch(batches=2))
     state, _, _ = trainer.place()
     batch = tokens()
     step = trainer.compile(state, batch)
@@ -712,7 +714,8 @@ def test_a_host_master_steps_phases_compile_with_the_options_dew_compiles_with(t
     from dew.training.transaction import Transaction
 
     objective = LMObjective(decoder(), 8, head_chunks=1)
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST, accumulation=2)
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST,
+                      update=UpdateBatch(batches=2))
     state, _, _ = trainer.place()
     batch = tokens()
     cached = jax.config.jax_enable_compilation_cache
@@ -1313,11 +1316,12 @@ def test_a_node_two_places_share_goes_to_each_places_own_target():
 
 def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | None = None,
                       dtype=None, rollout=None, optimizer: optax.GradientTransformation | None = None,
-                      split: int | None = None) -> Trainer:
+                      split: int | str = "auto", remat: str = "auto") -> Trainer:
     """A decoder of four scanned layers computing in `dtype` (its parameters' where None) trained by Adam
     (`optimizer`, a fresh one where None), whose optimizer state the devices hold beside its parameters,
     laid out as `layout` states, else as its run chooses, checkpointed by `checkpoints`, its batches drawn
-    through `rollout` where one is given, its batch read in `split` microbatches where stated. Each its own
+    through `rollout` where one is given, its batch read in `split` microbatches where stated, its layers
+    recomputed as `remat` states (`FitPolicy.remat`). Each its own
     Adam's, so two decoders key their steps apart
     (`Trainer._step_key`) and a run compared with another traces its own step; decoders handed one Adam
     key theirs alike, as a resumed run's and the run it resumes do, and read the step the first traced."""
@@ -1326,7 +1330,46 @@ def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | N
     given = {} if layout is None else {"layout": layout}
     return Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None),
                    optax.adam(.001) if optimizer is None else optimizer, key=jax.random.key(6),
-                   checkpoints=checkpoints, rollout=rollout, split=split, **given)
+                   checkpoints=checkpoints, rollout=rollout, fit=FitPolicy(split=split, remat=remat), **given)
+
+
+def test_a_fit_choosing_its_layout_prices_the_streamed_step_at_its_policys_rung():
+    """A fresh fit whose devices (the host's CPUs standing in for H100s) hold only the step streaming its
+    parameters from the host chooses it pricing that step at the rung it compiles at
+    (`StepCompiler.unsearched_rung`): under a policy recomputing every layer (`FitPolicy(remat="full")`)
+    the top of its ladder, whose activations its devices hold less of than at the objective's own rung, so
+    its fit check finds more to spare than the same fit's at its own (review of API01: priced at its own
+    rung, compiled at the top)."""
+    from model_support import memory_limited_to
+
+    from dew.training.ahead import stand_in_gpus
+
+    spared = []
+    for remat in ("auto", "full"):
+        with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to(streamed_only())):
+            trainer = streaming_decoder(remat=remat)
+            trainer.fit(streaming_data(), steps=1, log_every=100)
+        choice = trainer.layout_choice
+        assert choice is not None and choice.streams and choice.streamed_headroom is not None, choice
+        spared.append(choice.streamed_headroom)
+    assert spared[1] > spared[0], spared
+
+
+def test_a_host_step_under_a_full_remat_policy_recomputes_every_layer():
+    """A step whose variables live on the host (`Layout(host=("variables",))`), which no fit search climbs,
+    under a fit policy recomputing everything (`FitPolicy(remat="full")`) compiles at that rung: every
+    module the objective trains at the top of its ladder, as the policy starts a device step there
+    (review of API01: the host step compiled at the run's own rung)."""
+    from dew.training.memory import recompute_record, remat_topmost
+
+    held = streaming_decoder(Layout(host=("variables",)))
+    trainer = Trainer(held.objective, optax.adam(.001), key=jax.random.key(6), layout=held.layout,
+                      fit=FitPolicy(remat="full"))
+    trainer.fit(streaming_data(), steps=1, log_every=100)
+    own, topmost = (streaming_decoder(Layout(host=("variables",))).objective for _ in range(2))
+    remat_topmost(topmost)
+    assert recompute_record(topmost) != recompute_record(own)
+    assert trainer.host_master and recompute_record(trainer.objective) == recompute_record(topmost)
 
 
 def assumed_on_cpu(generation_name: str):
@@ -1473,7 +1516,7 @@ def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout():
     with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
         split = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
                                     variables=adapted.variables), optax.adam(.001), key=jax.random.key(6),
-                        split=3)
+                        fit=FitPolicy(split=3))
         with pytest.raises(LayoutRefused):
             split.fit(streaming_data(), steps=1, log_every=100)
     # Its devices too small for its state between steps, which the given layout's placement refuses before
@@ -1841,7 +1884,7 @@ def test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companion
     assert startup["gpu"]["programs"] > 0 and startup["cpu"]["programs"] > 0, startup
     # A configured run compiling ahead reaches it (`AheadTarget.compiled`, row 8380), a step of many programs
     # into the cache its run reads, refused a file to save it to.
-    from dew.training.ahead import AheadTarget
+    from dew.training.targets import AheadTarget
 
     with pytest.raises(ValueError):
         AheadTarget("sm90", 1, path=str(tmp_path / "host.dew-aot")).compiled(trainer, None, steps=1)
@@ -2075,7 +2118,8 @@ def test_a_host_step_under_autopgle_runs_its_programs_guided_by_a_trials_profile
         stepped.append(executable)
         yield
 
-    accumulating = Trainer(Coupled(), optax.adam(.01), key=jax.random.key(4), layout=HOST, accumulation=2)
+    accumulating = Trainer(Coupled(), optax.adam(.01), key=jax.random.key(4), layout=HOST,
+                           update=UpdateBatch(batches=2))
     data = {"small": jnp.asarray(np.float32(.5)), "large": jnp.asarray(np.float32(40.))}
     trial = Handed(widened_start(accumulating), data)
     with autopgle(2):

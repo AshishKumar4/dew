@@ -34,13 +34,16 @@ from token_support import token_rows
 
 from dew._devices import allocator_limit, device_memory
 from dew._records import listed, record
+from dew.data import Phase, Steps
 from dew.nn.kernels.generation import capability
 from dew.nn.sharding import Link
 from dew.objectives.lm import LMObjective
-from dew.optim import OptimConfig
+from dew.optim import AdamW, OptimConfig
 from dew.registry import models
 from dew.telemetry.compiles import Compiles
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch
+from dew.training.budget import Horizon
+from dew.training.targets import AheadTarget, LowerFor
 
 VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
@@ -65,14 +68,14 @@ def this_gpus(count: int = 1) -> tuple:
     return compile_only_gpus(generation, count, memory, multiprocessors=multiprocessors)
 
 
-def this_gpus_ahead(path) -> list[str]:
-    """A run's command-line flags compiling its step ahead into `path` for one GPU of this GPU's own target
+def this_gpus_ahead(path):
+    """The target compiling a run's step ahead into `path` for one GPU of this GPU's own target
     (`this_gpu`), with no topology."""
+    from dew.training.targets import AheadTarget
+
     generation, multiprocessors, memory = this_gpu()
-    return ["--trainer.compile-ahead.generation", generation,
-            "--trainer.compile-ahead.multiprocessors", str(multiprocessors),
-            "--trainer.compile-ahead.capacity-gib", str(memory / 2**30),
-            "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)]
+    return AheadTarget(generation=generation, devices=1, path=str(path), capacity_gib=memory / 2**30,
+                       multiprocessors=multiprocessors)
 
 
 def gpus(generation: str, count: int = 1, limit: int = 2**36) -> tuple:
@@ -91,8 +94,8 @@ def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, 
               **({} if dtype is None else {"dtype": dtype})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, inspection=inspection,
-                   tracker=tracker)
+                   layout=Layout(min_shard=TINY_SHARD), fit=FitPolicy(split=split), ahead=ahead,
+                   inspection=inspection, tracker=tracker)
 
 
 @functools.cache
@@ -126,21 +129,19 @@ def need_run(root, generation: str, split: int) -> int:
     root.mkdir()
     path = root / "step.dew-aot"
     run = LMRunConfig.cli(["--trainer.name", "need", "--trainer.checkpoint-dir", str(root / "runs"),
-                           "--trainer.steps", "2", "--trainer.split", str(split),
-                           "--trainer.compile-ahead.generation", generation,
-                           "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
-                           "--trainer.compile-ahead.capacity-gib", capacity_gib(2**36),
-                           "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None"],
-                          default=lm(root, drawn=False))
+                           "--trainer.horizon.steps", "2", "--trainer.fit.split", str(split),
+                           "--trainer.eval-every",
+                           "None", "--trainer.checkpoint-every", "None"], default=lm(root, drawn=False))
     with pytest.raises(CompiledAhead):
-        run.run()
+        run.lower(AheadTarget(generation=generation, devices=1, path=str(path),
+                              capacity_gib=capacity_gib(2**36)))
     ahead = AheadOfTime.load(path)
     return ahead.capacity - record(ahead.plan, "plan")["probes"][0]["headroom"]
 
 
-def capacity_gib(room: int) -> str:
-    """`--trainer.compile-ahead.capacity-gib` for a GPU whose allocator is limited to `room` bytes."""
-    return str(memory_limited_to(room) / 2**30)
+def capacity_gib(room: int) -> float:
+    """`AheadTarget.capacity_gib` for a GPU whose allocator is limited to `room` bytes."""
+    return memory_limited_to(room) / 2**30
 
 
 def test_a_background_compile_takes_no_slot_a_step_waits_for():
@@ -583,7 +584,7 @@ def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_
     def accumulating(**mesh):
         model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
         return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), **mesh,
-                       layout=Layout(min_shard=TINY_SHARD), accumulation=2,
+                       layout=Layout(min_shard=TINY_SHARD), update=UpdateBatch(batches=2),
                        checkpoints=Checkpoints(str(tmp_path / "run")))
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
@@ -624,7 +625,7 @@ def test_a_resume_compiled_ahead_steps_at_the_split_its_checkpoint_was_saved_at(
                        **options)
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    saved = run(split=2, mesh=MeshSpec().build(jax.devices()[:1]))
+    saved = run(fit=FitPolicy(split=2), mesh=MeshSpec().build(jax.devices()[:1]))
     saved.fit(batch, steps=1, checkpoint_every=1)
     saved.checkpoints.wait()
     assert saved.checkpoints.window_size(1) == 2 and saved.checkpoints.accumulation_template(1) is None
@@ -659,7 +660,7 @@ def test_a_step_compiled_ahead_over_phases_of_other_batches_takes_a_split_that_c
     from dew.training.ahead import compile_ahead, first_step_batch
 
     corpus = Pipeline(Memory(token_rows(VOCAB, 64, SEQ_LEN + 1))).repeat()
-    loader = compile(phases((corpus.batch(12), 2), (corpus.batch(8), None)), read="memory")
+    loader = compile(phases(Phase(corpus.batch(12), Steps(2)), Phase(corpus.batch(8))), read="memory")
     for split, refused in ((2, False), (3, True)):
         trainer = fine_tune(MeshSpec().build(gpus("sm90")), split=split)
         with pytest.raises(LayoutRefused) if refused else contextlib.nullcontext():
@@ -764,7 +765,7 @@ def admitted(tmp_path_factory, needing_microbatches):
         # The module's own data and Hub caches, as each test's (`own_settings`), its rung records `records`.
         lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
         patch.setenv("DEW_RUNG_RECORDS", str(records))
-        trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=needing_microbatches)), split=None)
+        trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=needing_microbatches)), split="auto")
         ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
     return records, trainer, ahead, needing_microbatches
 
@@ -914,7 +915,7 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
 
     records, _, earlier, limit = admitted
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
-    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=limit)), split=None)
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=limit)), split="auto")
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
@@ -964,7 +965,7 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
         sibling = need_ahead("sm90", split=2, remat="minimal_offloaded", tiled=True)
         capacity = max(two, sibling)
         assert capacity < one, (one, two, sibling)
-    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=capacity)), split=None, remat="full")
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=capacity)), split="auto", remat="full")
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
@@ -1001,7 +1002,7 @@ def test_a_fused_tiled_heads_plan_compiled_ahead_with_its_frontier_restores_the_
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     one, room = (need_ahead("sm90", split=split, remat="full", tiled=True) for split in (1, 2))
     assert room < one, (one, room)
-    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split=None, remat="full")
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=room)), split="auto", remat="full")
     trainer.objective.tile_head()
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
@@ -1056,7 +1057,7 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
         "xla_gpu_enable_triton_gemm": False}
     # A step whose options are the run's own compiles as the half rung of XLA's defaults does, one
     # program (row 3506).
-    objective = fine_tune(deviceless, split=None).objective
+    objective = fine_tune(deviceless, split="auto").objective
     search = FitSearch(lower=None, options=lambda candidate: compiler_options() or None,
                        objective=objective, mesh=deviceless, xla_defaults=False, narrow=False, ns_group=None,
                        base=None, resumed=None)
@@ -1104,12 +1105,9 @@ def test_a_configured_run_compiling_ahead_for_gpus_of_no_stated_memory_is_refuse
     from dew.training.ahead import stated_limit
 
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-                           "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
-                           "--trainer.compile-ahead.devices", "1",
-                           "--trainer.compile-ahead.path", str(tmp_path / "step.dew-aot")],
-                          default=lm(tmp_path, drawn=False))
+                           "--trainer.horizon.steps", "2"], default=lm(tmp_path, drawn=False))
     with Compiles("step") as compiles, pytest.raises(ValueError):
-        run.run()
+        run.lower(AheadTarget(generation="sm80", devices=1, path=str(tmp_path / "step.dew-aot")))
     assert compiles.count == 0 and not (tmp_path / "step.dew-aot").exists()
     assert stated_limit(gpus("sm80", limit=2**34)) == 2**34
 
@@ -1270,6 +1268,7 @@ from dew.config.lm import LMRunConfig
 from dew.nn.kernels.generation import routes
 from dew.registry import ModelConfig
 from dew.training.ahead import AheadOfTime, CompiledAhead
+from dew.training.targets import AheadTarget
 
 root = Path(sys.argv[1])
 model = ModelConfig("causal_transformer", {
@@ -1278,14 +1277,11 @@ model = ModelConfig("causal_transformer", {
         "class": "gated_delta_net", "fields": {"linear_num_key_heads": 2, "linear_num_value_heads": 2,
                                                "linear_key_head_dim": 64, "linear_value_head_dim": 64}}}}})
 run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(root / "runs"),
-                       "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
-                       "--trainer.compile-ahead.devices", "1",
-                       "--trainer.compile-ahead.path", str(root / "step"),
-                       "--trainer.compile-ahead.capacity-gib", "32"],
+                       "--trainer.horizon.steps", "2"],
                       default=dataclasses.replace(lm(root, drawn=False), model=model))
 with routes() as taken:
     try:
-        run.run()
+        run.lower(AheadTarget(generation="sm80", devices=1, path=str(root / "step"), capacity_gib=32.0))
     except CompiledAhead as ended:
         assert ended.code == 0
 saved = AheadOfTime.load(root / "step")
@@ -1299,7 +1295,7 @@ saved step's generation and every kernel its routes took."""
 
 def test_a_gated_delta_steps_mosaic_kernels_compile_ahead_for_the_gpu_it_targets(tmp_path):
     """A bf16 gated-delta decoder's run compiled ahead for a compile-only A100 by its command
-    (`--trainer.compile-ahead.generation sm80`, rows 3916, 3977) saves a step for sm80 whose gated delta
+    (`AheadTarget(generation="sm80")`, rows 3916, 3977) saves a step for sm80 whose gated delta
     rule runs its Mosaic GPU recurrence, lowered for the architecture its trace's abstract device states,
     the A100's 8.0 (row 3885): a mesh's abstract device stated none, so Mosaic lowered for an H100's, and
     its `nvvm.elect.sync` failed sm80's LLVM instruction selection and aborted the process, every A100
@@ -1559,7 +1555,7 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
 
 
 def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_nothing(tmp_path):
-    """A run parsed with `--trainer.compile-ahead.generation`, `.devices` and `.path` (`RunConfig.cli`,
+    """A run lowered for an `AheadTarget` of a generation, devices and path (`RunConfig.lower`,
     its default the run's own config) compiles its first step for one compile-only A100, writes it
     where it names, and ends with status 0, the step loadable and what it costs stated; it writes no
     checkpoint or tracking, as it trains nothing (row 1915)."""
@@ -1572,12 +1568,9 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     default = lm(tmp_path, drawn=False)
     assert isinstance(default, LMRunConfig)
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
-                           "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
-                           "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
-                           "--trainer.compile-ahead.capacity-gib", "1"],
-                          default=default)
+                           "--trainer.horizon.steps", "2"], default=default)
     with pytest.raises(CompiledAhead) as ended:
-        run.run()
+        run.lower(AheadTarget(generation="sm80", devices=1, path=str(path), capacity_gib=1.0))
     assert ended.value.code == 0
     saved = AheadOfTime.load(path)
     assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
@@ -1594,24 +1587,25 @@ def test_a_configured_fresh_run_that_pauses_compiles_ahead_planned_as_it_trains_
     and asking a local tier for its step opened it (`Checkpoints.latest`)."""
     from run_kinds import lm
 
-    from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
+    from dew.training.ahead import AheadOfTime, CompiledAhead
     from dew.training.budget import Pause
 
     runs, local, path = tmp_path / "runs", tmp_path / "local", tmp_path / "step.dew-aot"
     default = lm(tmp_path, drawn=False)
     target = AheadTarget(generation="sm80", devices=1, path=str(path), capacity_gib=1)
-    run = dataclasses.replace(default, trainer=dataclasses.replace(
-        default.trainer, name="ahead", checkpoint_dir=str(runs), local_directory=str(local), local_every=2,
-        steps=4, stop=Pause(0.5), compile_ahead=target))
+    run = dataclasses.replace(default, trainer=dataclasses.replace(default.trainer, name="ahead",
+                                                                   checkpoint_dir=str(runs),
+                                                                   local_directory=str(local), local_every=2,
+                                                                   horizon=Horizon(steps=4), stop=Pause(0.5)))
     with pytest.raises(CompiledAhead) as ended:
-        run.run()
+        run.lower(target)
     assert ended.value.code == 0 and AheadOfTime.load(path).plan is not None
     assert not runs.exists() and not local.exists()
 
 
 def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_loads_only_there(
         tmp_path, monkeypatch):
-    """`--trainer.compile-ahead.multiprocessors` states the GPU a step is compiled ahead for within its
+    """`AheadTarget.multiprocessors` states the GPU a step is compiled ahead for within its
     generation (an H100 PCIe's 114 against the canonical H100's 132, rows 3606 and 3669): XLA compiles the
     step and its sampled step over compile-only GPUs of 114 (as they state), and the saved build target and
     the facts its launches derived for are that GPU's, so a GPU of 114 runs it and the canonical one is
@@ -1635,27 +1629,25 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
 
     builds = iter(range(3))
 
-    def compiled(*stated: str, inspected: bool = False) -> AheadOfTime:
+    def compiled(multiprocessors: int | None = None, inspected: bool = False) -> AheadOfTime:
         root = tmp_path / f"run{next(builds)}"
         root.mkdir()
         path = root / "step.dew-aot"
         run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(root / "runs"),
-                               "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm90",
-                               "--trainer.compile-ahead.devices", "1",
-                               "--trainer.compile-ahead.path", str(path),
-                               "--trainer.compile-ahead.capacity-gib", capacity_gib(room),
+                               "--trainer.horizon.steps", "2",
                                *(["--trainer.inspection.every", "1"] if inspected else []),
-                               "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None", *stated],
+                               "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None"],
                               default=lm(root, drawn=False))
         with pytest.raises(CompiledAhead):
-            run.run()
+            run.lower(AheadTarget(generation="sm90", devices=1, path=str(path),
+                                  capacity_gib=capacity_gib(room), multiprocessors=multiprocessors))
         return AheadOfTime.load(path)
 
-    pcie = compiled("--trainer.compile-ahead.multiprocessors", "114", inspected=True)
-    again = compiled("--trainer.compile-ahead.multiprocessors", "114")
+    pcie = compiled(114, inspected=True)
+    again = compiled(114)
     canonical = compiled()
     assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
-    assert pcie.target.memory == allocator_limit(int(float(capacity_gib(room)) * 2**30))
+    assert pcie.target.memory == allocator_limit(int(capacity_gib(room) * 2**30))
     assert 0 < pcie.built.memory <= pcie.target.memory
     # One target, its need the programs each carries: the inspected build's sampled step beside its step.
     assert pcie.sampled is not None
@@ -1707,7 +1699,7 @@ def test_a_build_binds_its_loader_to_its_plugin_and_linked_libraries_and_not_to_
 
 
 def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_saved_plan(tmp_path):
-    """`--trainer.compile-ahead.frontier` (`RunConfig.cli`) asks the step compiled ahead for its frontier,
+    """`AheadTarget.frontier` (`RunConfig.lower`) asks the step compiled ahead for its frontier,
     which its saved plan records (rows 3108, 3147): on GPUs whose room is what the step needs at two
     microbatches, less than one needs (each measured, `need_run`), where the plan's compile at one did not
     fit and the plan takes two, a rung above it that fits at one."""
@@ -1720,13 +1712,10 @@ def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_sa
     assert room < one, (one, room)
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
-                           "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
-                           "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path),
-                           "--trainer.compile-ahead.capacity-gib", capacity_gib(room),
-                           "--trainer.compile-ahead.frontier"],
-                          default=lm(tmp_path, drawn=False))
+                           "--trainer.horizon.steps", "2"], default=lm(tmp_path, drawn=False))
     with pytest.raises(CompiledAhead) as ended:
-        run.run()
+        run.lower(AheadTarget(generation="sm80", devices=1, path=str(path), capacity_gib=capacity_gib(room),
+                              frontier=True))
     assert ended.value.code == 0
     plan = record(AheadOfTime.load(path).plan, "plan")
     whole = [probe for probe in plan["probes"]
@@ -1738,10 +1727,10 @@ def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_sa
 
 
 def test_a_configured_run_compiles_its_step_ahead_for_a_tpu_topology_with_its_stated_links(tmp_path):
-    """`--trainer.compile-ahead.generation` names a TPU topology as well as a CUDA generation: the run
+    """`AheadTarget.generation` names a TPU topology as well as a CUDA generation: the run
     compiles its first step for that topology's compile-only devices here, through the plan a run takes,
     and writes it as any step compiled ahead (ledger 2551). The links it compiles with are the run's own
-    (`trainer.links`), which the step records (ledger 2552)."""
+    (`diagnostics.links`), which the step records (ledger 2552)."""
     from run_kinds import lm
 
     from dew.config.lm import LMRunConfig
@@ -1752,12 +1741,11 @@ def test_a_configured_run_compiles_its_step_ahead_for_a_tpu_topology_with_its_st
     assert isinstance(default, LMRunConfig)
     links = {"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}
     run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
-                           "--trainer.steps", "2", "--trainer.compile-ahead.generation", "v5e:2x2",
-                           "--trainer.compile-ahead.devices", "4", "--trainer.compile-ahead.path", str(path),
-                           "--trainer.mesh.tensor", "2", "--set", f"trainer.links={json.dumps(links)}"],
-                          default=default)
+                           "--trainer.horizon.steps", "2", "--trainer.mesh.tensor", "2",
+                           "--diagnostics.links",
+                           json.dumps(links)], default=default)
     with pytest.raises(CompiledAhead) as ended:
-        run.run()
+        run.lower(AheadTarget(generation="v5e:2x2", devices=4, path=str(path)))
     assert ended.value.code == 0
     saved = AheadOfTime.load(path)
     assert (saved.generation, saved.devices) == ("v5e", 4) and saved.peak_bytes > 0
@@ -1781,21 +1769,16 @@ def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progres
     default = decision(tmp_path, drawn=False)
     assert isinstance(default, DecisionRunConfig)
     run = DecisionRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
-                                 "--trainer.examples", "16", "--trainer.eval-every", "3",
+                                 "--trainer.horizon.examples", "16", "--trainer.eval-every", "3",
                                  "--trainer.checkpoint-every", "3", "--optim.learning-rate",
-                                 '{"class": "linear", "fields": {"peak_value": 0.001}}',
-                                 "--trainer.compile-ahead.generation", "sm80",
-                                 "--trainer.compile-ahead.devices", "1",
-                                 "--trainer.compile-ahead.path", str(path),
-                                 "--trainer.compile-ahead.capacity-gib", "4"],
-                                default=default)
+                                 '{"class": "linear", "fields": {"peak_value": 0.001}}'], default=default)
     with pytest.raises(CompiledAhead) as ended:
-        run.run()
+        run.lower(AheadTarget(generation="sm80", devices=1, path=str(path), capacity_gib=4.0))
     assert ended.value.code == 0
     assert AheadOfTime.load(path).peak_bytes > 0
 
 
-CLOCKED = ["--trainer.examples", "48", "--trainer.eval-every", "3", "--trainer.checkpoint-every", "3",
+CLOCKED = ["--trainer.horizon.examples", "48", "--trainer.eval-every", "3", "--trainer.checkpoint-every", "3",
            "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
            "--trainer.cooldowns.at", "50%", "--trainer.cooldowns.length", "25%",
            "--optim.learning-rate", '{"class": "linear", "fields": {"peak_value": 0.001}}']
@@ -1805,8 +1788,8 @@ evaluations and checkpoints are counted in steps (ledger 3153)."""
 
 def test_a_decision_runs_step_compiled_ahead_is_the_program_its_run_lowers_as_fit_hands_its_step(tmp_path):
     """The clocked GPU cell's property, read where a host has no GPU (ledger 3153): the decision run compiled
-    ahead for eight sm90 GPUs (`--trainer.compile-ahead`) and the same run lowered for them as `fit` hands it
-    its step, its batch placed on the devices (`--trainer.lower-for`), are one program, so a run handed the
+    ahead for eight sm90 GPUs (`AheadTarget`) and the same run lowered for them as `fit` hands it
+    its step, its batch placed on the devices (`LowerFor`), are one program, so a run handed the
     step it compiled ahead takes it. A step lowered over the host batch the loader gave and over that batch
     placed came to two module texts, a helper call's function told apart by its arguments' shardings."""
     from run_kinds import decision
@@ -1818,23 +1801,21 @@ def test_a_decision_runs_step_compiled_ahead_is_the_program_its_run_lowers_as_fi
 
     path = tmp_path / "ahead.dew-aot"
     stated = ["--trainer.checkpoint-dir", str(tmp_path / "runs"), *CLOCKED]
-    target = ["--trainer.compile-ahead.generation", "sm90", "--trainer.compile-ahead.devices", "8",
-              "--trainer.compile-ahead.path", str(path), "--trainer.compile-ahead.capacity-gib", "80"]
-    ahead = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *target],
+    ahead = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated],
                                   default=decision(tmp_path, drawn=False))
     with pytest.raises(CompiledAhead):
-        ahead.run()
-    lowering = DecisionRunConfig.cli(["--trainer.name", "lowered", *stated, "--trainer.lower-for", "sm90"],
+        ahead.lower(AheadTarget(generation="sm90", devices=8, path=str(path), capacity_gib=80.0))
+    lowering = DecisionRunConfig.cli(["--trainer.name", "lowered", *stated],
                                      default=decision(tmp_path, drawn=False))
     with pytest.raises(Lowered) as lowered:
-        lowering.run()
+        lowering.lower(LowerFor("sm90"))
     assert program_digest(lowered.value.lowered) == AheadOfTime.load(path).program
 
 
 def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other(tmp_path):
     """A GPU flow's cell (tests/test_gpu_training.py; it trains from a step compiled ahead on this host's own
     GPU): a decision run on the examples clock under a schedule over the run, with a cooldown, compiled
-    ahead through its command line for this GPU's generation (`--trainer.compile-ahead`) and then handed
+    ahead for this GPU's generation (`RunConfig.lower`) and then handed
     the step it saved (`--trainer.ahead`), trains from that step through its cooldown's branch, its last
     window's too, and compiles no step program of its own: each batch it steps closes its window as the
     one it compiled ahead over did (ledgers 2434, 2527)."""
@@ -1847,10 +1828,9 @@ def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_
     default = decision(tmp_path, drawn=False)
     stated = ["--trainer.checkpoint-dir", str(runs), *CLOCKED]
     # This GPU's own target, its multiprocessors as it counts them (an H100 PCIe's 114).
-    compiling = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *this_gpus_ahead(path)],
-                                      default=default)
+    compiling = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated], default=default)
     with pytest.raises(CompiledAhead):
-        compiling.run()
+        compiling.lower(this_gpus_ahead(path))
     handed = DecisionRunConfig.cli(["--trainer.name", "handed", *stated, "--trainer.ahead", str(path)],
                                    default=default)
     with Compiles("step") as compiles:
@@ -1881,8 +1861,8 @@ def a_run_handed_an_untuned_file_by_its_command_compiles_its_own(tmp_path, monke
     assert xla_flag("xla_gpu_autotune_level") is None
     # This GPU's own target, so the file differs from what the run compiles by its tuning alone.
     with pytest.raises(CompiledAhead) as compiled:
-        DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *this_gpus_ahead(path)],
-                              default=default).run()
+        DecisionRunConfig.cli(["--trainer.name", "ahead", *stated],
+                              default=default).lower(this_gpus_ahead(path))
     assert not compiled.value.ahead.tuned
     handed = DecisionRunConfig.cli(["--trainer.name", "handed", *stated, "--trainer.ahead", str(path)],
                                    default=default)
@@ -1922,9 +1902,10 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
     model = models.build("causal_transformer", vocab_size=VOCAB, **WIDE_MLP, num_kv_heads=2, dtype=dtype)
 
     def ahead(accumulation: int, rows: int):
-        trainer = Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer="adamw", learning_rate=1e-3),
+        trainer = Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer=AdamW(), learning_rate=1e-3),
                           key=jax.random.key(0), mesh=MeshSpec().build(gpus(generation)),
-                          layout=Layout(min_shard=TINY_SHARD), split=1, accumulation=accumulation)
+                          layout=Layout(min_shard=TINY_SHARD), update=UpdateBatch(batches=accumulation),
+                          fit=FitPolicy(split=1))
         trainer.validate(steps=8)
         return compile_ahead(trainer, token_rows(VOCAB, rows, SEQ_LEN + 1))
 
@@ -2136,7 +2117,7 @@ def test_a_run_naming_its_input_alone_compiles_its_step_ahead(tmp_path):
 
     from dew.data.dataset import Loader
     from dew.objectives.supervised import Supervised
-    from dew.training.ahead import AheadTarget
+    from dew.training.targets import AheadTarget
 
     data = Loader(train=lambda partition: iter([{"x": np.ones((BATCH, 8), np.float32),
                                                   "y": np.zeros((BATCH, 4), np.float32)}] * 4),
@@ -2184,7 +2165,7 @@ def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():
 
 
 def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run_traces_with(caplog):
-    """A step compiled ahead over a link its trainer states, as `trainer.links` states one, records
+    """A step compiled ahead over a link its trainer states, as `diagnostics.links` states one, records
     that link whole, bandwidth and peak, and is the program a stated link spreads by; a run
     handed it that states another traces with the step's, and says so once (train 300's review: the
     step recorded the bandwidth alone, so a run stating the same link traced with its own peak)."""
@@ -2241,7 +2222,7 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
         path = tmp_path / "split.dew-aot"
         saved.save(path)
         here = MeshSpec().build(jax.devices()[:1])
-        run = fine_tune(here, ahead=AheadOfTime.load(path), xla=True, split=None)
+        run = fine_tune(here, ahead=AheadOfTime.load(path), xla=True, split="auto")
         state = run.fit(batch, steps=1, log_every=1)
     plan = record(run.plan, "plan")
     first, *_ = listed(plan["probes"], "probes", read=record, what="probes")
@@ -2418,7 +2399,8 @@ def test_a_step_compiled_ahead_is_admitted_at_the_loading_runs_pool_share_not_th
     `compile_only_gpus` (the library's path), where the last target's share was every alike GPU's and a
     direct one took the process's (train 1026's review, F1)."""
     from dew._devices import DEW_SHARE, FRACTIONS, device_memory
-    from dew.training.ahead import AheadTarget, compile_only_gpus
+    from dew.training.ahead import compile_only_gpus
+    from dew.training.targets import AheadTarget
 
     for name in FRACTIONS:
         monkeypatch.delenv(name, raising=False)

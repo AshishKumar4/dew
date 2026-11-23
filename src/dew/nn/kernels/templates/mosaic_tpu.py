@@ -163,12 +163,11 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         del interpret
         return acc + value.astype(jnp.float32)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
         if pending:
-            raise ValueError(f"{type(self).__name__}.product is synchronous (pending={pending})")
-        if then is not None:
-            then()
-        return _product(lhs, rhs)
+            raise ValueError(f"{type(self).__name__}.product_with is synchronous (pending={pending})")
+        return between(), _product(lhs, rhs)
 
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         return _product(lhs, rhs)
@@ -544,13 +543,10 @@ def _product(lhs, rhs) -> jax.Array:
     left, left_transposed = _operand(lhs)
     right, right_transposed = _operand(rhs)
     contracting = ((0 if left_transposed else 1,), (1 if right_transposed else 0,))
-    if left.dtype == jnp.float32 and right.dtype == jnp.float32:
-        precision = programs.mosaic_tpu_fp32_precision(
-            left.shape[1 if left_transposed else 0], left.shape[0 if left_transposed else 1],
-            right.shape[0 if right_transposed else 1])
-    else:
-        # TPU refused a bf16 matmul at an fp32 contract precision, "Bad lhs type", the compile gate's libtpu).
-        precision = lax.Precision.DEFAULT
+    precision = programs.mosaic_tpu_dot_precision(
+        left.dtype, right.dtype,
+        left.shape[1 if left_transposed else 0], left.shape[0 if left_transposed else 1],
+        right.shape[0 if right_transposed else 1])
     return lax.dot_general(left, right, (contracting, ((), ())), precision=precision,
                            preferred_element_type=jnp.float32)
 

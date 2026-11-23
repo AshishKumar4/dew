@@ -18,7 +18,7 @@ import jax
 import jax.extend.core as jcore
 import jax.numpy as jnp
 import numpy as np
-from jax._src import config as jax_config, core as jax_core, dtypes, mesh as mesh_lib
+from jax._src import config as jax_config, core as jax_core, dtypes, effects as jax_effects, mesh as mesh_lib
 from jax._src.interpreters import partial_eval
 from jax._src.literals import TypedNdArray
 from jax._src.pallas.mpmd import mpmd_map_p
@@ -108,6 +108,28 @@ def with_bodies(params: Mapping, rebuilt: Callable[[jcore.Jaxpr], jcore.Jaxpr]) 
         return value
 
     return {key: replaced(value) for key, value in params.items()}
+
+
+def outer_effects(effects: jax_core.Effects) -> jax_core.Effects:
+    """`effects` less those that name one of their jaxpr's inputs (`JaxprInputEffect`), which mean an input
+    of the jaxpr that holds them, never of the program around it."""
+    return {effect for effect in effects if not isinstance(effect, jax_effects.JaxprInputEffect)}
+
+
+def with_equations(jaxpr: jcore.Jaxpr, eqns: list[jcore.JaxprEqn], **changes) -> jcore.Jaxpr:
+    """`jaxpr` holding `eqns` (and `changes`, `Jaxpr.replace`'s), its effects its own and every equation's
+    it now holds: a pass that writes an equation in (a region's call, a kernel's launch: an interpreted
+    one's ordered IO) states its effect on the program that runs it, whose lowering threads that effect's
+    token (row 12217: a call lowered inside a branch that stated none raised `KeyError: OrderedIOEffect`)."""
+    return jaxpr.replace(eqns=eqns, effects=jax_core.join_effects(
+        jaxpr.effects, *(outer_effects(equation.effects) for equation in eqns)), **changes)
+
+
+def with_bodies_of(equation: jcore.JaxprEqn, params: dict) -> jcore.JaxprEqn:
+    """`equation` binding `params` (`with_bodies`' rewrite of its bodies), its effects its own and every
+    effect its bodies now hold (`with_equations`)."""
+    return equation.replace(params=params, effects=jax_core.join_effects(
+        equation.effects, *(outer_effects(body.effects) for body in jax_core.jaxprs_in_params(params))))
 
 
 def equations(jaxpr: jcore.Jaxpr) -> Iterator[jcore.JaxprEqn]:
@@ -222,6 +244,14 @@ def mosaic_tpu_fp32_precision(m: int = 64, k: int = 64, n: int = 64) -> jax.lax.
         admits=error.at_least(jax.lax.DotAlgorithmPreset.F32_F32_F32, wide),
         stated=MOSAIC_TPU_ALGORITHMS)
     return MOSAIC_TPU_ALGORITHMS[chosen]
+
+
+def mosaic_tpu_dot_precision(lhs_dtype, rhs_dtype, m: int, k: int, n: int) -> jax.lax.Precision:
+    """Mosaic TPU dot precision for `mosaic_tpu._product` and `splash._dot` (row 11970):
+    `mosaic_tpu_fp32_precision(m, k, n)` when both operands are float32, else `lax.Precision.DEFAULT`."""
+    if jnp.dtype(lhs_dtype) == jnp.float32 and jnp.dtype(rhs_dtype) == jnp.float32:
+        return mosaic_tpu_fp32_precision(m, k, n)
+    return jax.lax.Precision.DEFAULT
 
 
 @functools.cache

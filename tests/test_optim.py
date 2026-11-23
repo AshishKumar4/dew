@@ -53,13 +53,17 @@ from dew.nn.kernels.generation import run_precision
 from dew.nn.precision import ACCURATE, Numerics
 from dew.nn.sharding import boxed
 from dew.optim import (
-    OPTIMIZER_MAP,
+    Adam,
+    AdamW,
     Cosine,
     Exponential,
+    GaussNewton,
+    LaProp,
     Linear,
+    Muon,
+    MuonClip,
     OneCycle,
     OptimConfig,
-    Optimizer,
     ParamGroup,
     Power,
     PowerTail,
@@ -73,8 +77,12 @@ from dew.optim import (
     weight_decay_mask,
 )
 from dew.optim_schedules import ScheduleBase, learning_rate, rates_of, with_rates
+from dew.registry import optimizers
 from dew.training import MeshSpec
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
+
+DEW_OPTIMIZERS = [name for name in optimizers.paths if name != "optax"]
+"""Dew's own optimizers by name (`dew.registry.optimizers`), an Optax factory's spec aside."""
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -111,14 +119,14 @@ def axes_of_the_drawn_trees():
         yield
 
 
-def muon_solver(forms: str = "accurate", optimizer: str = "muon", *, wide: bool = False, **kwargs):
+def muon_solver(forms: str = "accurate", optimizer: str = "muon", *, wide: bool = False, **settings):
     """Dew's Muon, or `optimizer` its MuonClip, over the run's own build, its update traced under numerics
     in `forms` (`generation.run_precision`): the accurate forms' float32 Newton-Schulz where it is held to
     optax's Muon, which iterates in its momentum's float32; `wide`, a float64 truth's, its moments in the
     parameters' float64 (`WIDE_MOMENTS`) and its iteration in a float64 run's numerics (`FLOAT64`)."""
     if wide:
-        kwargs = {**kwargs, "optimizer_opts": {**kwargs.get("optimizer_opts", {}), **WIDE_MOMENTS}}
-    built = OptimConfig(optimizer=optimizer, learning_rate=LR, **kwargs).build(10)
+        settings = {**settings, **WIDE_MOMENTS}
+    built = OptimConfig(optimizer=optimizers.build(optimizer, **settings), learning_rate=LR).build(10)
     return in_forms(built, forms, FLOAT64.dtypes if wide else None)
 
 
@@ -139,14 +147,6 @@ def fixed_gradients(params):
         lambda path, x: jax.random.normal(
             jax.random.key(abs(hash(jax.tree_util.keystr(path))) % 2**31), x.shape),
         params)
-
-
-def group_updates(params, **kwargs):
-    """One step of the split solver on the fixed gradients."""
-    grads = fixed_gradients(params)
-    solver = muon_solver(**kwargs)
-    updates, _ = solver.update(grads, solver.init(params), params)
-    return updates, grads
 
 
 UPDATE_SEEDS = 8
@@ -205,7 +205,7 @@ def test_muon_takes_optaxs_coefficients_and_preconditioning(opts):
     """Optax's Muon options reach Dew's: a coefficient preset by its name, a schedule of coefficient
     triples and a spectral preconditioning, each update on par with optax's Muon under the same options
     (check 1)."""
-    assert_updates_as(muon_solver(optimizer_opts=opts), optax.contrib.muon(LR, **opts), decoder_params(),
+    assert_updates_as(muon_solver(**opts), optax.contrib.muon(LR, **opts), decoder_params(),
                       [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')], f"Muon with {opts}")
 
 
@@ -213,7 +213,7 @@ def test_muons_default_precision_preconditions_spectrally():
     """A spectral preconditioning at Muon's default bfloat16 products, whose norm is an SVD of float32
     operands: its update on par with optax's spectral Muon of the matrix (check 1)."""
     opts = {"preconditioning": "spectral"}
-    assert_updates_as(muon_solver("fast", optimizer_opts=opts), optax.contrib.muon(LR, **opts),
+    assert_updates_as(muon_solver("fast", **opts), optax.contrib.muon(LR, **opts),
                       decoder_params(), [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')],
                       "spectral Muon in bfloat16")
 
@@ -221,8 +221,7 @@ def test_muons_default_precision_preconditions_spectrally():
 def test_muon_refuses_a_real_dot_algorithm_for_a_complex_update():
     """A dot algorithm states real products (`ns_precision`), which a complex update's Newton-Schulz cannot
     take: Muon refuses it by name rather than multiply the update's real part alone."""
-    solver = OptimConfig(optimizer="muon", learning_rate=LR,
-                         optimizer_opts={"ns_precision": "F32_F32_F32"}).build(10)
+    solver = OptimConfig(optimizer=Muon(ns_precision="F32_F32_F32"), learning_rate=LR).build(10)
     params = {"w": jnp.zeros((16, 24), jnp.complex64)}
     with pytest.raises(ValueError):
         solver.update({"w": jnp.ones((16, 24), jnp.complex64) * 1j}, solver.init(params), params)
@@ -241,8 +240,8 @@ def test_muon_steps_a_complex_matrix_as_optax_does():
         return step
 
     reference = optax.contrib.muon(LR)
-    assert_as_exact(stepped(OPTIMIZER_MAP["muon"](LR)), stepped(reference), draw, "a complex Muon update",
-                    seeds=UPDATE_SEEDS, truth_fn=stepped(reference))
+    assert_as_exact(stepped(Muon(state_dtype="params").transform(LR)), stepped(reference), draw,
+                    "a complex Muon update", seeds=UPDATE_SEEDS, truth_fn=stepped(reference))
 
 
 def test_muons_state_is_optaxs_tree_and_steps_its_moments_bit_for_bit():
@@ -251,7 +250,7 @@ def test_muons_state_is_optaxs_tree_and_steps_its_moments_bit_for_bit():
     for bit, which no Newton-Schulz reads back, so a run saved under optax's Muon resumes under Dew's. Its
     updates are held to optax's by the groups' tests above."""
     params = decoder_params()
-    dew = OPTIMIZER_MAP["muon"](LR, mu_dtype="float32")
+    dew = Muon().transform(LR)
     reference = optax.contrib.muon(LR, weight_decay=0.0, adam_weight_decay=0.0, mu_dtype="float32",
                                    muon_weight_dimension_numbers=muon_weight_dimension_numbers)
     state, expected = dew.init(params), reference.init(params)
@@ -277,7 +276,7 @@ def test_muons_newton_schulz_multiplies_in_the_runs_numerics(forms):
     accurate preset (`--precision accurate`), float32 operands at IEEE float32 (HIGHEST), each product
     stating its precision; the accurate forms at the default matmul precision state none."""
     params = decoder_params()
-    solver = OPTIMIZER_MAP["muon"](LR)
+    solver = Muon(state_dtype="params").transform(LR)
     policies = ({"fast": Numerics()} if forms == "fast"
                 else {"default": Numerics(forms="accurate"), "highest": ACCURATE})
     found = {}
@@ -302,8 +301,7 @@ def test_a_stated_dot_algorithm_is_muons_products_or_its_platforms_refusal(algor
     operands' type (`ns_operands`), and it compiles; a platform that has not the algorithm refuses it in
     JAX's own words, as a CPU refuses TF32, with no fallback of Dew's."""
     params = decoder_params()
-    solver = OptimConfig(optimizer="muon", learning_rate=LR,
-                         optimizer_opts={"ns_precision": algorithm}).build(10)
+    solver = OptimConfig(optimizer=Muon(ns_precision=algorithm), learning_rate=LR).build(10)
     operand = jnp.dtype(jnp.bfloat16 if algorithm.startswith("BF16") else jnp.float32)
 
     def update(grads, state):
@@ -337,8 +335,8 @@ def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(rec
 
     run = lm(tmp_path, drawn=False)
     trainer = run.trainer if forms == "fast" else dataclasses.replace(run.trainer, precision=ACCURATE)
-    run = dataclasses.replace(run, trainer=trainer, optim=OptimConfig(
-        optimizer="muon", learning_rate=LR, optimizer_opts={"ns_precision": recorded}))
+    run = dataclasses.replace(run, trainer=trainer, optim=OptimConfig(optimizer=Muon(ns_precision=recorded),
+                                                                      learning_rate=LR))
     run.save(str(tmp_path / "saved"))
     if forms == "accurate attention":
         written = tmp_path / "saved" / "run.json"
@@ -347,7 +345,8 @@ def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(rec
         record["fields"]["trainer"] = {**trainer, "attention_form": "accurate"}
         written.write_text(json.dumps(record))
     loaded = RunConfig.load(str(tmp_path / "saved"))
-    assert loaded.optim.optimizer_opts.get("ns_precision") == stated
+    muon = loaded.optim.optimizer
+    assert isinstance(muon, Muon) and muon.ns_precision == stated
     loaded.optim.build(10)
 
 
@@ -436,7 +435,7 @@ def test_a_meshs_muon_iterates_each_matrix_whole_on_par_with_optaxs_muon_of_it(l
                       given=True)
     moved = {}
     for steps in (1, 5):
-        stepped = Placed(muon_solver(optimizer_opts={"ns_steps": steps}), mesh)
+        stepped = Placed(muon_solver(ns_steps=steps), mesh)
         text = stepped.compiled(fixed_gradients(params), stepped.init(params), params)
         moved[steps] = sorted((kind, sorted(map(tuple, shapes))) for kind, shapes in collectives(text))
     assert moved[1] == moved[5]
@@ -478,7 +477,7 @@ def test_a_16_mixed_dits_first_muon_step_stays_finite():
     grads = jax.grad(loss)(params)
     query = ('params', 'dit_block_0', 'attention', 'to_q', 'kernel')
     assert not np.any(np.asarray(functools.reduce(lambda tree, key: tree[key], query, grads)))
-    solver = OptimConfig(optimizer="muon", learning_rate=LR).build(10)
+    solver = OptimConfig(optimizer=Muon(), learning_rate=LR).build(10)
     with run_precision(Numerics("16-mixed")):
         updates, _ = solver.update(grads, solver.init(params), params)
     stepped = optax.apply_updates(params, updates)
@@ -502,7 +501,7 @@ def test_a_schedule_that_marks_no_rate_is_its_own_shape():
             return lambda count: self.start * 0.5 ** count
 
     assert Halving().rates() == {}
-    solver = OptimConfig(optimizer="adam", learning_rate=Halving(), clip_grads=0).build(4)
+    solver = OptimConfig(optimizer=Adam(), learning_rate=Halving(), clip_grads=0).build(4)
     params = {"w": jnp.ones(3)}
     state = solver.init(params)
     for step in range(3):
@@ -526,9 +525,11 @@ def test_weight_decay_spares_the_biases_and_the_norms_unless_a_group_claims_them
     kernels as one all-parameter group does, and spares the norm and biases (a per-head one too)."""
     params = fixed_gradients(dit_params()['params'])
 
+    stored = {} if state_dtype == "float32" else {"state_dtype": state_dtype}
+
     def decay_step(**groups):
-        solver = OptimConfig(optimizer=optimizer, learning_rate=LR, weight_decay=0.1,
-                             state_dtype=state_dtype, **groups).build(1)
+        solver = OptimConfig(optimizer=optimizers.build(optimizer, weight_decay=0.1, **stored),
+                             learning_rate=LR, **groups).build(1)
         return solver.update(jax.tree.map(jnp.zeros_like, params), solver.init(params), params)[0]
 
     spared, grouped = decay_step(), decay_step(param_groups=(ParamGroup('all', ('*',)),))
@@ -538,6 +539,77 @@ def test_weight_decay_spares_the_biases_and_the_norms_unless_a_group_claims_them
     for path in [('dit_block_0', 'attention', 'to_q', 'kernel'), ('embed', 'patch_embed', 'Conv_0', 'kernel'),
                  ('output', 'final_proj', 'kernel')]:
         np.testing.assert_array_equal(node(spared, path), node(grouped, path), err_msg=str(path))
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["config", "param-group"])
+def test_a_decay_mask_decays_the_parameters_its_tree_names_alone(grouped):
+    """On a zero gradient an update is the decay alone: an unspared decay masked by a tree of booleans
+    (`OptimConfig.decay_mask`, `ParamGroup.decay_mask`) moves the parameters its tree names True, the rest
+    not at all."""
+    params = {"w": jnp.ones((2, 2)), "b": jnp.ones(2)}
+    mask = {"w": False, "b": True}
+    held = ({"param_groups": (ParamGroup("all", ("*",), decay_mask=mask),)} if grouped
+            else {"spared": False, "decay_mask": mask})
+    solver = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=LR, **held).build(1)
+    updates = solver.update(jax.tree.map(jnp.zeros_like, params), solver.init(params), params)[0]
+    assert not np.any(updates["w"]) and np.all(updates["b"] < 0)
+
+
+@pytest.mark.parametrize("held", [
+    {"decay_mask": {"w": False}},
+    {"spared": False, "decay_mask": {"w": 0}},
+    {"spared": False, "decay_mask": {"w": None}},
+    {"spared": False, "decay_mask": {}},
+    {"group": {"spared": True, "decay_mask": {"w": True}}},
+    {"group": {"spared": False, "decay_mask": {"w": 1}}},
+], ids=["spared", "int-leaf", "none-leaf", "empty", "spared-group", "int-leaf-group"])
+def test_a_decay_mask_a_spared_decay_writes_over_or_of_other_leaves_than_booleans_is_refused(held):
+    """A decay mask beside a decay that spares, whose own mask is written over it, or whose leaves are not
+    booleans, is refused as the config or its param group is made, never trained under another mask than it
+    names."""
+    with pytest.raises(ValueError):
+        if "group" in held:
+            ParamGroup("all", ("*",), **held["group"])
+        else:
+            OptimConfig(optimizer=AdamW(weight_decay=0.1), **held)
+
+
+def test_a_decay_mask_on_an_optimizer_that_takes_none_is_refused():
+    """Gauss-Newton's solved direction takes no decay mask (`OptimizerSpec.masked_by`): a decay mask it would
+    never read is refused as its solver is built."""
+    with pytest.raises(ValueError):
+        OptimConfig(optimizer=GaussNewton(), decay_mask={"w": True}).build(1)
+
+
+def test_muons_matrices_decay_where_its_decay_mask_says():
+    """Muon decays every matrix it orthogonalizes unless a run masks that decay (`OptimConfig.decay_mask`,
+    by Muon's own `weight_decay_mask`): on a zero gradient its update is the decay alone, moving the
+    matrix the mask names True and leaving the other (review of API01: the mask was refused, an earlier
+    Muon run's `weight_decay_mask` with it)."""
+    params = {"w": jnp.ones((4, 4)), "v": jnp.ones((4, 4))}
+    solver = OptimConfig(optimizer=Muon(weight_decay=0.1), learning_rate=LR,
+                         decay_mask={"w": False, "v": True}).build(1)
+    updates = solver.update(jax.tree.map(jnp.zeros_like, params), solver.init(params), params)[0]
+    assert not np.any(updates["w"]) and np.all(updates["v"] < 0)
+
+
+@pytest.mark.parametrize("named", [False, True], ids=["ungrouped", "named-groups"])
+def test_a_decay_mask_reaches_the_groups_a_fresh_module_makes_and_is_refused_beside_named_groups(named):
+    """An ungrouped decay's mask is the fresh and base groups' a run that draws modules fresh trains in
+    (`OptimConfig.claiming`), never dropped as its groups are made; a mask beside named groups, which state
+    their own (`ParamGroup.decay_mask`), is refused (review of API01: it was dropped)."""
+    mask = {"w": False, "b": True}
+    if named:
+        with pytest.raises(ValueError):
+            OptimConfig(optimizer=AdamW(weight_decay=0.1), spared=False, decay_mask=mask,
+                        param_groups=(ParamGroup("all", ("*",)),))
+        return
+    claimed = OptimConfig(optimizer=AdamW(weight_decay=0.1), spared=False, decay_mask=mask).claiming(["head"])
+    assert claimed.decay_mask is None and claimed.param_groups
+    assert all(group.decay_mask == mask for group in claimed.param_groups)
+    # Muon spares nothing, so its groups decay where the mask says, its run's `spared` read as none.
+    muon = OptimConfig(optimizer=Muon(weight_decay=0.1), decay_mask=mask).claiming(["head"])
+    assert all(group.decay_mask == mask and not group.spared for group in muon.param_groups)
 
 
 def test_muon_takes_qwen35s_hidden_matrices_and_adamw_its_filters_vectors_and_lookups():
@@ -561,7 +633,7 @@ def test_muon_takes_qwen35s_hidden_matrices_and_adamw_its_filters_vectors_and_lo
     params = variables["params"]
     with drawn_axes(drawn):
         placed = muon_partition(params)
-        state = jax.eval_shape(OptimConfig(optimizer="muon", learning_rate=1e-3).build(4).init, variables)
+        state = jax.eval_shape(OptimConfig(optimizer=Muon(), learning_rate=1e-3).build(4).init, variables)
     shapes = {jax.tree_util.keystr(path): leaf.shape
               for path, leaf in jax.tree_util.tree_leaves_with_path(params)}
     sizes = {path: math.prod(shape) for path, shape in shapes.items()}
@@ -585,10 +657,10 @@ def test_both_groups_step_with_the_one_schedule():
     (check 1), both from the unscaled run's float64 run times optax's warmup
     cosine in float64. The rate's own rounding is the schedules' tests'."""
     cosine = Cosine(init_value=1e-4, peak_value=4e-3, end_value=1e-3, warmup_steps=1, decay_steps=4)
-    scheduled = OptimConfig(optimizer='muon', learning_rate=cosine).build(4)
-    unscaled = OptimConfig(optimizer='muon', learning_rate=1.0).build(4)
+    scheduled = OptimConfig(optimizer=Muon(), learning_rate=cosine).build(4)
+    unscaled = OptimConfig(optimizer=Muon(), learning_rate=1.0).build(4)
     # The truth's: its moments in the parameters' float64, its iteration in float64 (`in_float64`).
-    wide = OptimConfig(optimizer='muon', learning_rate=1.0, optimizer_opts=WIDE_MOMENTS).build(4)
+    wide = OptimConfig(optimizer=Muon(**WIDE_MOMENTS), learning_rate=1.0).build(4)
     rate = optax.warmup_cosine_decay_schedule(
         init_value=cosine.init_value, peak_value=cosine.peak_value,
         warmup_steps=cosine.warmup_steps, decay_steps=4, end_value=cosine.end_value)
@@ -1005,7 +1077,7 @@ def test_a_bounded_clipped_group_clamps_after_the_clip():
     params, grads = qk_tree()
     stats = qk_stats(values=[[200.0] * 4] * 3)
     lower, upper = 0.1, 1.0
-    solver = OptimConfig(optimizer='muonclip', learning_rate=LR, param_groups=(
+    solver = OptimConfig(optimizer=MuonClip(), learning_rate=LR, param_groups=(
         ParamGroup('all', ('*',), bounds=(lower, upper)),)).build(10)
     initial = solver.init(params)
     updates, state = solver.update(grads, initial, params, qk_stats=stats)
@@ -1227,8 +1299,8 @@ THRESHOLD_SEEDS = 8
 """Check 1's declared seeds for the clip at a configured threshold against the paper's (`seeds_for`)."""
 
 
-def test_the_threshold_rides_optimizer_opts():
-    """`--optim.optimizer-opts '{"qk_clip_threshold": 5.0}'` reaches the
+def test_the_threshold_rides_muonclips_settings():
+    """`MuonClip(qk_clip_threshold=5.0)` reaches the
     transform: maxima of 50 clip nothing at the default 100, which steps as
     Muon bit for bit, and at 5 rescale each side of the Muon-stepped kernels
     by sqrt(5/50), so their product carries the tenth: on par with the
@@ -1242,7 +1314,7 @@ def test_the_threshold_rides_optimizer_opts():
     updates, state = default.update(grads, initial, params, qk_stats=stats)
     moved = stepped(params, updates, initial, state, post_step_order(default, params))
     assert largest_difference(moved, optax.apply_updates(params, plain)) == 0.0
-    clipped = clip_step(muon_solver(optimizer="muonclip", optimizer_opts={'qk_clip_threshold': 5.0}), stats)
+    clipped = clip_step(muon_solver(optimizer="muonclip", qk_clip_threshold=5.0), stats)
 
     def paper(solver):
         def rescaled(params, grads):
@@ -1355,8 +1427,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
         packing = {"coordinates": coordinates(segments=batch["text_segment_ids"][:, :-1],
                                               positions=batch["text_positions"][:, :-1])}
     threshold = .01
-    optimizer = OptimConfig(optimizer="muonclip", learning_rate=0.,
-                            optimizer_opts={"qk_clip_threshold": threshold}).build(1)
+    optimizer = OptimConfig(optimizer=MuonClip(qk_clip_threshold=threshold), learning_rate=0.).build(1)
     trainer = Trainer(objective, optimizer, key=jax.random.key(0))
     initial = trainer.initial_state()
     variables = initial.variables
@@ -1460,7 +1531,7 @@ def test_every_objective_carries_live_qk_statistics_to_muonclip(kind, tmp_path):
         batch, other = ({"image": np.random.default_rng(seed).integers(0, 256, (8, 4, 4, 3), dtype=np.uint8)}
                         for seed in (9, 10))
         clipped = ("attention",)
-    optimizer = OptimConfig(optimizer="muonclip", learning_rate=0., optimizer_opts={"qk_clip_threshold": .01})
+    optimizer = OptimConfig(optimizer=MuonClip(qk_clip_threshold=.01), learning_rate=0.)
     trainer = Trainer(objective, optimizer.build(2), key=jax.random.key(0))
     initial = trainer.initial_state()
     asked = Step(jnp.array(0), jax.random.key(1), None, qk_stats=True)
@@ -1512,7 +1583,7 @@ def program_of(closed) -> tuple:
     return tuple(steps), constants(closed.consts)
 
 
-@pytest.mark.parametrize("optimizer", typing.get_args(Optimizer))
+@pytest.mark.parametrize("optimizer", DEW_OPTIMIZERS)
 @pytest.mark.parametrize("form", ["constant", "schedule", "groups"])
 def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
     """Two runs at different rates of one schedule's shape, a group's
@@ -1529,8 +1600,8 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
             ParamGroup("kernels", ("*kernel",), learning_rate_multiplier=rate * 100,
                        schedule=Linear(peak_value=rate * 2, warmup_steps=1, end_value=rate / 8)),
             ParamGroup("rest", ("*",)))
-        return OptimConfig(optimizer=optimizer, learning_rate=rate if schedule is None else schedule,
-                           param_groups=groups)
+        return OptimConfig(optimizer=optimizers.build(optimizer), learning_rate=rate if schedule is None
+                           else schedule, param_groups=groups)
 
     # Gauss-Newton solves its update's system, which a run hands it (`dew.gauss_newton`): four rows of it.
     flat = jax.flatten_util.ravel_pytree(params)[0]
@@ -1571,8 +1642,8 @@ SCHEDULES = {
 ], ids=["lamb-cosine", "adam-linear", "adamw-exponential", "muon-power", "muonclip-one_cycle",
         "adamw-constant"])
 def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimizer, schedule):
-    """`OptimConfig` runs the optax optimizer it names (`OPTIMIZER_MAP`)
-    behind the global-norm clip, its betas and `optimizer_opts` reaching
+    """`OptimConfig` runs the optax optimizer it holds (`OptimizerSpec.factory`)
+    behind the global-norm clip, its betas and other settings reaching
     it, at the rate its state holds (`scheduled_solver`). Six steps on
     changing gradients, through the warmups, decays and tails, are optax's
     own optimizer at the schedule's own values bit for bit, and each step
@@ -1581,13 +1652,13 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
     params = decoder_params()["params"]
     adam = optimizer in ("adam", "adamw", "lamb")
     betas, opts = ({"b1": 0.8, "b2": 0.95}, {"eps": 1e-5, "eps_root": 1e-9}) if adam else ({}, {})
-    config = OptimConfig(optimizer=optimizer, **betas, optimizer_opts=opts,
-                         learning_rate=3e-3 if schedule is None else schedule, clip_grads=0.5)
+    spec = optimizers.build(optimizer, **betas, **opts)
+    config = OptimConfig(optimizer=spec, learning_rate=3e-3 if schedule is None else schedule, clip_grads=0.5)
     solver = config.build(10)
-    given = {**betas, **opts, **({"mask": weight_decay_mask} if adam else {})}
+    given = {**spec.options(), **({"mask": weight_decay_mask} if adam else {})}
     # The reference steps at the rate each of Dew's updates reports, read as it is reported.
     reported = []
-    reference = optax.chain(optax.clip_by_global_norm(0.5), OPTIMIZER_MAP[optimizer](
+    reference = optax.chain(optax.clip_by_global_norm(0.5), spec.factory()(
         lambda count: jnp.stack(reported)[count], **given))
     state, expected_state = solver.init(params), reference.init(params)
     for step in range(6):
@@ -1627,7 +1698,7 @@ def test_laprop_is_dreamerv3s_optimizer_and_a_run_config_names_it():
     1,002 updates on gradients of changing scale, so that its adaptive clip binds at some and not at others,
     at the code's rate (4e-5 ramped linearly from zero over 1,000 updates), a matrix, a vector and a bias
     at zero (held to the clip's floor) take updates within float64 rounding of the code's clip, mean
-    square and momentum written out in NumPy. `OptimConfig(optimizer="laprop")` builds it, its betas,
+    square and momentum written out in NumPy. `OptimConfig(optimizer=LaProp())` builds it, its betas,
     `eps` and `agc` the config's and its rate the configured schedule's, a clip of 0 leaving the updates
     whole; a weight decay, which it has none of, is refused."""
     rng = np.random.default_rng(21)
@@ -1657,7 +1728,7 @@ def test_laprop_is_dreamerv3s_optimizer_and_a_run_config_names_it():
     long, short = drawn(1002), drawn(12)
     with jax.enable_x64(new_val=True):
         own = run(laprop(), long)
-        config = OptimConfig(optimizer="laprop", b1=0.85, b2=0.99, optimizer_opts={"eps": 1e-6, "agc": 0},
+        config = OptimConfig(optimizer=LaProp(eps=1e-6, agc=0, b1=0.85, b2=0.99),
                              learning_rate=Linear(peak_value=3e-3, warmup_steps=4, end_value=3e-3))
         configured = run(config.build(len(short)), short)
     truths = [
@@ -1670,7 +1741,7 @@ def test_laprop_is_dreamerv3s_optimizer_and_a_run_config_names_it():
             assert_computes_the_oracle(found[name], expected[name], f"laprop's {name} updates",
                                        roundings=roundings)
     with pytest.raises(TypeError):
-        OptimConfig(optimizer="laprop", weight_decay=1e-2).build(10)
+        OptimConfig(optimizer=LaProp(weight_decay=1e-2)).build(10)
 
 
 def rate_fields(name: str, multiplier: float) -> dict[str, float]:
@@ -1766,7 +1837,7 @@ def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
     multiplier sets them) and steps through the one compiled update, which the fields being operands
     makes possible."""
     schedule, params, unit = SCHEDULES[name], {"w": jnp.ones(3)}, {"w": jnp.ones(())}
-    solver = OptimConfig(optimizer="adam", learning_rate=schedule, clip_grads=0).build(10)
+    solver = OptimConfig(optimizer=Adam(), learning_rate=schedule, clip_grads=0).build(10)
     initial = solver.init(params)
     update = jax.jit(jax.vmap(solver.update, in_axes=(None, 0, None)))
 
@@ -1834,7 +1905,7 @@ def test_a_resumed_rate_reaches_a_solver_inside_an_injected_wrapper(name):
     def configured(scale):
         rate = 3e-3 * scale if name == "constant" else dataclasses.replace(
             SCHEDULES["cosine"], peak_value=1e-2 * scale, init_value=1e-4 * scale, end_value=1e-3 * scale)
-        config = OptimConfig(optimizer="adam", learning_rate=rate, clip_grads=0)
+        config = OptimConfig(optimizer=Adam(), learning_rate=rate, clip_grads=0)
         solver = config.build(10)
         return config, optax.inject_hyperparams(lambda gain: optax.chain(solver, optax.scale(gain)))(gain=2.0)
 
@@ -1862,7 +1933,7 @@ def test_a_solver_set_to_another_end_value_decays_to_it():
     at."""
     schedule = Cosine(peak_value=1e-2, warmup_steps=1, end_value=1e-3, decay_steps=4)
     def configured(end):
-        config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(schedule, end_value=end),
+        config = OptimConfig(optimizer=Adam(), learning_rate=dataclasses.replace(schedule, end_value=end),
                              clip_grads=0)
         return config, config.build(6)
 
@@ -1883,7 +1954,7 @@ def test_stated_horizons_reach_a_solver_inside_an_injected_wrapper_and_its_repor
     first, before any update takes it."""
     from dew.optim_schedules import with_horizons
 
-    config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(
+    config = OptimConfig(optimizer=Adam(), learning_rate=dataclasses.replace(
         SCHEDULES["cosine"], peak_value=1e-2, init_value=1e-4, end_value=1e-3), clip_grads=0)
     stated = optax.inject_hyperparams(lambda gain: optax.chain(config.build(10, stated=True),
                                                                optax.scale(gain)))(gain=2.0)
@@ -1907,7 +1978,7 @@ def test_a_clocked_state_supplied_to_a_run_of_steps_takes_its_optimizers_horizon
     optimizer's own horizons, so it steps and reports the rates that optimizer's fresh state does."""
     from dew.optim_schedules import reclocked, schedule_states
 
-    config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(
+    config = OptimConfig(optimizer=Adam(), learning_rate=dataclasses.replace(
         SCHEDULES["cosine"], peak_value=1e-2, init_value=1e-4, end_value=1e-3, warmup_steps=2), clip_grads=0)
     params, grads = {"w": jnp.ones(3)}, {"w": jnp.ones(3)}
     built = config.build(10)
@@ -1932,7 +2003,7 @@ def test_adamw_steps_land_as_near_float64_as_torchs():
     import torch
 
     rate, decay, b1, b2, eps = 1e-3, 1e-2, 0.9, 0.999, 1e-8
-    solver = OPTIMIZER_MAP['adamw'](rate, b1=b1, b2=b2, eps=eps, weight_decay=decay)
+    solver = AdamW(b1=b1, b2=b2, eps=eps, weight_decay=decay, state_dtype="params").transform(rate)
 
     def draw(seed):
         return (np.random.default_rng([0xADA, seed]).normal(size=(3, 4096)).astype(np.float32),)
@@ -1975,7 +2046,8 @@ def test_narrow_weights_step_on_float32_moments_as_float32_weights_do(optimizer,
     same gradient steps float32 weights, by the rate and not by the rate over eps; a norm's scale under
     Muon or MuonClip too, which their AdamW group steps. (A decay of the weights themselves reads them
     in their own dtype, so none is taken here.)"""
-    solver = OptimConfig(optimizer=optimizer, learning_rate=1e-3, clip_grads=0, weight_decay=0.0).build(4)
+    solver = OptimConfig(optimizer=optimizers.build(optimizer, weight_decay=0.0), learning_rate=1e-3,
+                         clip_grads=0).build(4)
     weights = {"w": jnp.full((4,), 0.5, dtype)}
     gradient = {"w": jnp.full((4,), 1e-4, dtype)}
     narrow, _ = solver.update(gradient, solver.init(weights), weights)
@@ -2000,7 +2072,7 @@ def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtyp
 
     shape = (16, 256)
     params = {"w": jnp.full(shape, 0.5 + 0.5j, jnp.complex64), "v": jnp.full(shape, 0.5, jnp.float32)}
-    optimizer = OptimConfig(optimizer="adam", learning_rate=1e-3, state_dtype=state_dtype).build(None)
+    optimizer = OptimConfig(optimizer=Adam(state_dtype=state_dtype), learning_rate=1e-3).build(None)
     state = optimizer.init(params)
     gradient = {"w": jnp.full(shape, 1 + 2j, jnp.complex64), "v": jnp.full(shape, 0.25, jnp.float32)}
     for _ in range(2):
@@ -2088,7 +2160,7 @@ def test_a_muon_config_builds_inside_a_trace():
     numbers failed on them as an array of the trace (the round-3 head review's F10)."""
     params = {"w": jnp.ones((8, 4)), "b": jnp.ones((4,))}
     wrapped = optax.inject_hyperparams(
-        lambda gain: optax.chain(OptimConfig(optimizer="muon", learning_rate=2e-2).build(10),
+        lambda gain: optax.chain(OptimConfig(optimizer=Muon(), learning_rate=2e-2).build(10),
                                  optax.scale(gain)))(gain=1.0)
     state = jax.jit(wrapped.init)(params)
     updates, _ = jax.jit(wrapped.update)(params, state, params)

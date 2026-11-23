@@ -713,8 +713,9 @@ def call_form(family, *, wide: bool, delta: bool, rounded: bool) -> tuple[int, i
     one of a 16-bit value; an fp32 one's three, or under the fast forms its `family`'s
     (`mainloop._fast_parts`); and what its walk writes (`Run.write`)."""
     fast = 1 if family.takes_tf32 and family.transposes_tf32 else mainloop.FAST_PARTS
-    given = (fast if rounded else product.EXACT_PARTS) if wide else 1
-    held = given if delta or rounded else product.EXACT_PARTS
+    exact_parts = product.bf16_part_count(accurate=True)
+    given = (fast if rounded else exact_parts) if wide else 1
+    held = given if delta or rounded else exact_parts
     return given, held, "delta" if delta else ("keys" if held == 1 else "values")
 
 
@@ -1151,8 +1152,12 @@ def assert_clamped_key_decays_witnessed(lane: Lane, dtype=None) -> None:
     back = recorded_key_backward(operands, run=run)
     for name, inside in key_back_witnessed(back, lane).items():
         assert np.all(inside), (name, np.mean(inside))
+    # Zero at each steep entry alone: its token's mild columns keep their terms (a mask broadcast over the
+    # token zeroed them), which test_kda's steep cell holds against the float64 recurrence (check 1).
     dg, steep = back.grads[3], operands[3] < mainloop.DECAY_FLOOR
+    beside = np.any(steep, axis=-1, keepdims=True) & ~steep
     assert np.all(np.isfinite(dg)) and np.all(dg[steep] == 0), (np.sum(~np.isfinite(dg)), dg[steep])
+    assert np.all(dg[beside] != 0), np.mean(dg[beside] == 0)
 
 
 UNGATED_SHARES = {"leaving": 0.5}

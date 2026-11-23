@@ -34,6 +34,7 @@ from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.memory import CARRY, CHUNK, Gate, InContextMemory, MLPMemory, Objective
 from dew.nn.mlp import GatedMLP
+from dew.optim import Muon
 
 SEEDS = {"scanned memory decoder gradient": 32, "rematted memory decoder gradient": 64,
          "memory decoder decode": 16, "adapted memory": 8, "rows split": 256, "rows split cms": 512,
@@ -800,7 +801,7 @@ def test_muon_steps_each_memory_heads_matrices_on_their_own():
               for index in (0, 1)}
     assert {name: tree for name, tree in numbers.items() if head_of((name,)) is not None} == {
         f"head_{head}": layers for head in range(2)}
-    solver = OptimConfig(optimizer="muon", learning_rate=1e-3).build(10)
+    solver = OptimConfig(optimizer=Muon(), learning_rate=1e-3).build(10)
     updates, _ = solver.update(jax.tree.map(jnp.ones_like, params), solver.init(params), params)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(updates))
 
