@@ -1334,9 +1334,11 @@ def test_llada_moe_routing_limits_change_the_forward(llada_moe_source):
 
 
 def llada22_routes(source, tokens, **fields) -> dict:
-    """Each routed layer's chosen experts `[B, S, top_k]`, sorted, for `tokens` under `fields`."""
-    _, state = source.model.apply(source.variables, jnp.asarray(tokens, jnp.int32), **fields,
-                                  mutable=['router'])
+    """Each routed layer's chosen experts `[B, S, top_k]`, sorted, for `tokens` under `fields`: one
+    compiled program a shape, where an eager call ran its layers op by op, nine calls 131 s (row 11914)."""
+    routed = jax.jit(lambda variables, tokens, fields: source.model.apply(variables, tokens, **fields,
+                                                                         mutable=['router']))
+    _, state = routed(source.variables, jnp.asarray(tokens, jnp.int32), fields)
     return {layer: np.sort(np.asarray(values['mlp']['gate']['indices'][0]), axis=-1)
             for layer, values in state['router'].items()}
 

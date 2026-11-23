@@ -1261,14 +1261,14 @@ def test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic(cell, r
 
 
 QUANTIZED_CACHES = {
-    "int8": ({"slots": 2, "capacity": 64, "cache": DenseKV(quantized="int8")},
+    "int8": ({"slots": 2, "capacity": 64, "cache": DenseKV(KVCache(quantized="int8"))},
              (Served(7), Served(5), Served(9)), None),
     "float8-over-pages": ({"slots": 2, "capacity": 64, "decode_steps": 3,
-                           "cache": PagedKV(quantized="float8_e4m3fn", page_size=4, pages=12,
+                           "cache": PagedKV(layout=KVCache(quantized="float8_e4m3fn", page_size=4, pages=12),
                                             prefix_cache=False)},
                           (Served(7), Served(5), Served(9)), None),
     "int8-over-a-shared-prefix": ({"slots": 2, "capacity": 64,
-                                   "cache": PagedKV(quantized="int8", page_size=4, pages=24,
+                                   "cache": PagedKV(layout=KVCache(quantized="int8", page_size=4, pages=24),
                                                     prefix_cache=True)},
                                   (Served(7), Served(5), Served(9, flipped=(4,))), (0, 4, 4)),
 }
@@ -1317,6 +1317,20 @@ def test_a_server_that_prefills_on_a_mesh_of_its_own_scores_its_draws_as_a_full_
                            "served arithmetic: a prefill mesh",
                            serving={"slots": 3, "capacity": 64, "prefill_mesh": prefilling}, budget=8,
                            seeds=(PREFILL_MESH_SEEDS,) * 2)
+
+
+def test_a_host_tier_keeps_a_digest_it_holds_in_the_slot_that_holds_it():
+    """A host tier asked to keep a digest it holds already (a prefix recomputed after its page left the
+    device) hands back the slot that holds it, kept most recently, so its two slots hold two entries:
+    kept again, the second slot it took was never freed, and the next entry evicted the first (row 12173)."""
+    from dew.inference.pages import HostTier
+
+    tier = HostTier(2)
+    first = tier.kept(b"a")
+    assert tier.kept(b"a") == first
+    tier.kept(b"b")
+    assert b"a" in tier and b"b" in tier
+    assert tier.kept(b"c") != tier.slot(b"b") and b"a" not in tier
 
 
 def test_a_host_tier_reads_back_a_prefix_whose_upload_reclaims_the_last_device_pages():
@@ -1414,8 +1428,8 @@ def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits, offl
     requests = [shared, *others, shared]
     alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
     server = Server.from_task(bound, slots=1, capacity=64, admission=1,
-                              cache=PagedKV(page_size=4, pages=8, offloaded=offloaded, prefix_cache=True,
-                                            host_pages=host_pages),
+                              cache=PagedKV(layout=KVCache(page_size=4, pages=8, offloaded=offloaded),
+                                            prefix_cache=True, host_pages=host_pages),
                               )
     drawn = []
     for index, held in enumerate(requests):
@@ -2213,16 +2227,37 @@ def test_a_padding_positions_value_is_not_part_of_a_served_row():
     np.testing.assert_array_equal(ticket.result().tokens, expected.tokens)
 
 
-@pytest.mark.parametrize("cache", [PagedKV(page_size=16), DenseKV()], ids=["paged", "dense"])
-def test_an_offloaded_cache_serves_what_a_resident_one_serves(cache):
+def test_a_server_lays_the_cache_it_names_in_place_of_its_models_own():
+    """A server over a model whose own layout quantizes its cache serves through `cache=` the layout it
+    names, exactly: an unquantized one, dense or paged (`quantized` None, the value Train 1209's review F2
+    found no way to ask for), a paged layout naming no page size in pages of `PAGE_SIZE`; and the model's
+    own format in pages of the size it names. A layout beside the pages named over the model's own, or a
+    dense cache's naming pages, is refused."""
+    from dew.inference.serving import PAGE_SIZE
+
+    bound = task(capacity=2 * PAGE_SIZE)
+    quantized = dataclasses.replace(bound, model=bound.model.with_kv_cache(KVCache(quantized="int8")))
+    laid = {name: Server.from_task(quantized, slots=2, capacity=2 * PAGE_SIZE, cache=cache).model.kv_cache
+            for name, cache in (("dense", DenseKV(KVCache())), ("paged", PagedKV(layout=KVCache())),
+                                ("own", PagedKV(page_size=8)))}
+    assert {name: (layout.quantized, layout.page_size) for name, layout in laid.items()} == {
+        "dense": (None, None), "paged": (None, PAGE_SIZE), "own": ("int8", 8)}
+    with pytest.raises(ValueError):
+        PagedKV(layout=KVCache(), page_size=8)
+    with pytest.raises(ValueError):
+        DenseKV(KVCache(page_size=8))
+
+
+@pytest.mark.parametrize("paged", [True, False], ids=["paged", "dense"])
+def test_an_offloaded_cache_serves_what_a_resident_one_serves(paged):
     """A server whose keys and values live in host memory (`KVCache.offloaded`, Hugging Face's offloaded
     cache), each layer's brought to the device for its step and written back after it, serves every
     request what the same server over a resident cache serves, its pool held in pinned host memory: the
     same program over the same values, moved and not recomputed, so the draws are the same bits; a prefix
     cache's host tier beside it is `test_a_host_tier_keeps_prefix_pages_the_pool_reclaims`'s."""
     bound = task()
-    resident, offloaded = (Server.from_task(bound, slots=4, capacity=128, admission=2,
-                                            cache=dataclasses.replace(cache, offloaded=held))
+    resident, offloaded = (Server.from_task(bound, slots=4, capacity=128, admission=2, cache=(
+        PagedKV(layout=KVCache(page_size=16, offloaded=held)) if paged else DenseKV(KVCache(offloaded=held))))
                            for held in (False, True))
     pooled = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(offloaded.cache)
               if leaf_name(path) in POOLED]

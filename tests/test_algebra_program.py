@@ -1758,6 +1758,29 @@ def test_a_window_rewritten_under_another_matmul_precision_is_derived_again():
 
 
 
+def test_a_branch_a_pass_writes_an_ordered_effect_into_compiles_and_runs_both_ways():
+    """A conditional one of whose branches a pass writes an equation into that holds an ordered effect (an
+    interpreted kernel's IO callbacks, as fusion writes a launch's portable branch: `programs.with_bodies_of`,
+    `with_equations`), lowered as jit lowers a rewritten program, never traced again (`program.traced_as`),
+    and run down both branches: the conditional and the program holding it state the effect, so its lowering
+    threads the effect's token, where they kept the effects they were traced with and the lowering raised a
+    `KeyError` on the effect (an interpreted launch's `OrderedIOEffect`, row 12217; the models review)."""
+    def branched(p, x):
+        return jax.lax.cond(p, lambda x: x + 1, lambda x: x * 2, x)
+
+    x, taken = jnp.float32(3.0), jnp.ones((), bool)
+    traced = jax.jit(branched).trace(taken, x)
+    closed = traced.jaxpr
+    printed = jax.make_jaxpr(lambda x: (jax.debug.print("{}", x, ordered=True), x + 1)[1])(x)
+    (conditional,) = [equation for equation in closed.jaxpr.eqns if equation.primitive.name == "cond"]
+    params = {**conditional.params, "branches": (conditional.params["branches"][0], printed)}
+    written = programs.with_equations(closed.jaxpr, [
+        programs.with_bodies_of(equation, params) if equation is conditional else equation
+        for equation in closed.jaxpr.eqns])
+    run = program.traced_as(traced, closed.replace(jaxpr=written)).lower().compile()
+    assert [float(run(taken, x)), float(run(~taken, x))] == [4.0, 6.0]
+
+
 def test_a_held_body_rewritten_under_another_tile_pin_takes_that_pin():
     """A body's rewrite is keyed by the tiles a tuning pins (`tuning.pinned`, which a launch reads at its
     rewrite, `KernelOp.pinned`): one held program rewritten again under another legal pin of its product's

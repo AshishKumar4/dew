@@ -516,6 +516,12 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
         return -np.square(images.mean(axis=(1, 2, 3)) - context["target"])
 
     rollout = FlowRollout(objective, reward, groups=3, steps=4, train_steps=2)
+    # The walk its collective gathers to every process is that prefix alone (row 10795): its states one
+    # past it, its densities and stochastic steps cut to it, its grid whole (row 10985).
+    walked = jax.eval_shape(rollout._generate_impl, variables, rollout._expanded(prompts)[0],
+                            jax.random.key(23))[0]
+    assert (walked.states.shape[1], walked.log_probs.shape[1], walked.stochastic.shape[1],
+            walked.times.shape[-1]) == (3, 2, 2, 4)
     batch = rollout(state, prompts, jax.random.key(23), objective=objective)
     # Its rows hold the walk's first two transitions alone, its trained prefix (row 10903).
     assert batch["timesteps"].shape == batch["transition_mask"].shape == (6, 2)

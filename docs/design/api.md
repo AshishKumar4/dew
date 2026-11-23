@@ -348,7 +348,7 @@ default wherever its layout pages (`PagedKV.prefix_cache` None), a finished requ
 history (its prompt and every draw its cache holds) named for a later prompt that continues it,
 `server(prompts, max_new_tokens, key=..., first=0)` folding row `i`'s key by `first + i`; an episode
 cohort's turns run through it in process
-(`EpisodeCollector(kv_cache=KVCache(page_size=...))`); and `ScoringServer`, a
+(`EpisodeCollector(cache=PagedKV(page_size=...))`); and `ScoringServer`, a
 task answered by forward passes over its requests' rows. A scoring task (`Scoring`) holds no
 weights. It lays a request out as rows at submission (`admit`, refusing one alone, a ValueError), says
 which rows one pass holds (`fits`), runs a pass over the weights the server hands it (`forward`), and

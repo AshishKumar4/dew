@@ -456,12 +456,13 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, record, t
                                           if key not in ("checkpoint", "dtype")},
         params=again.variables["encoders"]["conditioning"])
     tokens = rebuilt.tokenize(prompts)
-    condition = rebuilt.encode(again.variables["encoders"]["conditioning"], tokens)
+    condition = jax.jit(rebuilt.encode)(again.variables["encoders"]["conditioning"], tokens)
     grid = (record["pipeline"]["height"] // 16, record["pipeline"]["width"] // 16)
     latent = jnp.asarray(nhwc(pipeline_draw(record)(0)["x_T"], *grid))
     times = jnp.asarray([500.0, 100.0])
-    trained = loaded.model.apply({"params": state.variables["params"]}, latent, times, condition)
-    reloaded = again.model.apply({"params": again.variables["params"]}, latent, times, condition)
+    # Both forwards one compiled program each, where eager calls ran the transformer op by op (row 11919).
+    trained = jax.jit(loaded.model.apply)({"params": state.variables["params"]}, latent, times, condition)
+    reloaded = jax.jit(again.model.apply)({"params": again.variables["params"]}, latent, times, condition)
     np.testing.assert_array_equal(reloaded, trained)
 
 

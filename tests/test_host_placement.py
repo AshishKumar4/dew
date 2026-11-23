@@ -190,8 +190,25 @@ def stores(scanned, variables, **kwargs):
             HeldBanks(variables).place(scanned, layout=BANKS, **kwargs))
 
 
+CHECK1_SHARDS = {
+    "test_a_host_resident_bank_scores_what_a_resident_bank_scores[gated_delta_net]": {"seeds": 32,
+                                                                                     "per_task": 8},
+}
+"""The cells whose draws run as CI's map tasks (`check1_shards`), by node id: the gated delta net's fetched
+stack, its resident banks and its plain loop over 32 draws took 136 s in one task in train 1190's CI, 8 a
+task (row 11916)."""
+
+
+def _scored_shapes() -> list:
+    """`SHAPES`' names as parameters, each marked from `CHECK1_SHARDS` by its node id."""
+    test = "test_a_host_resident_bank_scores_what_a_resident_bank_scores"
+    marked = {name: [pytest.mark.check1_shards(**counts)] for name, counts in CHECK1_SHARDS.items()}
+    return [pytest.param(shape, id=shape, marks=marked.get(f"{test}[{shape}]", []))
+            for shape in sorted(SHAPES)]
+
+
 @pytest.mark.usefixtures("scanned_stacks")
-@pytest.mark.parametrize("shape", sorted(SHAPES))
+@pytest.mark.parametrize("shape", _scored_shapes())
 def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
     """The logits of a stack whose banks are in host memory, against the same
     banks on the device and against the plain loop.

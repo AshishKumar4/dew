@@ -333,7 +333,7 @@ def assert_served_through_its_cache_as_exact(task: TextGeneration, requests: Seq
     cache's: `serving`'s `cache.prefix_cache`), each round reads that many prompt tokens from the pages
     earlier rounds left, and a request's slots before its own writes hold the codes those rounds wrote
     (`cache_roundings.held`). `seeds` is the site's declared count, sized paired by `seeds_for` on armada."""
-    quantized = serving["cache"].quantized
+    quantized = serving["cache"].layout.quantized
     decoder, variables, vocab = task.model, task.variables, task.model.vocab_size
     width = max(request.length for request in requests)
 
