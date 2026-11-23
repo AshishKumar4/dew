@@ -2240,8 +2240,8 @@ def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
 
         t64 = tiling.Tiles(128, 64, 64, 2, 1, warpgroups=1, cluster=1, family="tcgen05", programs=2)
         fam = pricing.family_of(t64, jnp.bfloat16, sm100)
-        tensor = fam.tensor_columns(64, 1, False) + fam.stream_tensor_columns(scales(), 2)
-        assert 128 < tensor and tensor * 3 <= (sm100.tmem_columns or 0), tensor
+        tensor = fam.tensor_columns(64, 1) + fam.stream_tensor_columns(scales(), 2)
+        assert tensor > 128 and tensor * 3 <= (sm100.tmem_columns or 0), tensor
         assert pricing.granular_tile(fam, t64, jnp.bfloat16, target=sm100, stream_blocks=scales)
         assert not pricing.granular_tile(
             fam, dataclasses.replace(t64, programs=3), jnp.bfloat16, target=sm100, stream_blocks=scales)
