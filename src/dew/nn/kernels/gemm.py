@@ -919,11 +919,9 @@ def _packed_weight_product(rows: jax.Array, words: jax.Array, sizes: jax.Array,
     def decoded(packed_words: jax.Array) -> jax.Array:
         matrices = make_bank(packed_words).unscaled()
         return matrices[0] if dense else matrices
-
     def kernel(r: jax.Array, w: jax.Array, s: jax.Array, *, interpret: bool) -> jax.Array:
         return launch(r, make_bank(w), s, (), (), None, None, None, out_dtype='float32',
                       trans_rhs=False, interpret=interpret, dense=dense, exact_sums=False)
-
     def portable(r: jax.Array, w: jax.Array, s: jax.Array) -> jax.Array:
         matrices = decoded(w)
         return (jax.lax.dot(r, matrices, preferred_element_type=jnp.float32) if dense
@@ -934,7 +932,6 @@ def _packed_weight_product(rows: jax.Array, words: jax.Array, sizes: jax.Array,
                if xla_products.interpreted(interpret) else contextlib.nullcontext())
         with ctx:
             return _dispatched(kernel, portable, interpret, r, w, s), ()
-
     def backward(saved, operands, cotangent, live):
         del saved
         r, w, s = operands
@@ -948,7 +945,6 @@ def _packed_weight_product(rows: jax.Array, words: jax.Array, sizes: jax.Array,
                      precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
         leaves = (d_rows.astype(r.dtype), zero_from_primal(w), zero_from_primal(s))
         return tuple(leaves[index] for index in live)
-
     differentiable = contracted(contract)(
         generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
     return differentiable(rows, words, sizes)
@@ -985,10 +981,9 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
         tile = _planned(launch, bound)
         case = Fp8WeightCase(tile, not automatic_axes(), interpret_on_cpu)
         if selection.select(FP8_WEIGHT, case).kernel == 'mosaic':
-            form_bytes = jnp.zeros((8,), jnp.uint8)
-            one = jnp.ones((), jnp.float32)
+            form_b, one = jnp.zeros((8,), jnp.uint8), jnp.ones((), jnp.float32)
             summed = _packed_weight_product(
-                rows, words, sizes, launch, lambda w: Fp8Weights(w, one, form_bytes, fmt=weights.fmt),
+                rows, words, sizes, launch, lambda w: Fp8Weights(w, one, form_b, fmt=weights.fmt),
                 interpret_on_cpu, dense=dense, contract="test_an_fp8_weight_product_holds_every_order")
         else:
             summed = gemm(rows, weights.unscaled(jnp.bfloat16), group_sizes, out_dtype=jnp.float32,
