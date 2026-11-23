@@ -31,9 +31,9 @@ from dew.decision.task import Decide
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.lora import LoRA
-from dew.nn.precision import numerics_of
+from dew.nn.precision import Numerics, numerics_of
 from dew.registry import ModelConfig
-from dew.training.budget import Pause
+from dew.training.budget import Horizon, Pause
 
 MULTIMODAL = "tests/fixtures/hf/gemma3-tiny-mm"
 """A multimodal source whose decoder its model nests (`MultimodalTransformer.language_model`), by its
@@ -148,11 +148,12 @@ def blockwise(root: Path, drawn: bool) -> RunConfig:
 
 
 def clocked(root: Path, drawn: bool) -> RunConfig:
-    """An LM run on the examples clock (`--trainer.examples`), its progress the examples it consumed,
+    """An LM run on the examples clock (`--trainer.horizon.examples`), its progress the examples it consumed,
     paused halfway (`--trainer.stop.fraction`), so a resume trains on to its bound: `lm`'s windows,
     unpacked, which its record reads back with no store to read (a packed chain checks its store's
     document ends as it is built)."""
-    return dataclasses.replace(lm(root, drawn), trainer=TrainerConfig(examples=32, stop=Pause(0.5)))
+    return dataclasses.replace(lm(root, drawn), trainer=TrainerConfig(horizon=Horizon(examples=32),
+                                                                      stop=Pause(0.5)))
 
 
 def fresh(root: Path, drawn: bool, precision: str = "bf16-mixed") -> RunConfig:
@@ -170,8 +171,9 @@ def scaled(root: Path, drawn: bool) -> RunConfig:
 
 def chosen_scale(root: Path, drawn: bool) -> RunConfig:
     """An LM run computing in float32 that states a dynamic loss scale, which no compute would choose
-    (`--trainer.dynamic-scale`), as a run saved before its numerics records it."""
-    return dataclasses.replace(lm(root, drawn), trainer=TrainerConfig(dynamic_scale=True))
+    (`Numerics.loss_scaling`)."""
+    return dataclasses.replace(lm(root, drawn),
+                               trainer=TrainerConfig(precision=Numerics(loss_scaling="dynamic")))
 
 
 def stored(root: Path, drawn: bool) -> RunConfig:

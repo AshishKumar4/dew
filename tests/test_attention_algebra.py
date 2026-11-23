@@ -1123,6 +1123,26 @@ def _scaled_masses(totals, *others):
     return tuple(jnp.ldexp(x, -exponent) for x in (totals, *others))
 
 
+def _op_by_op(fn):
+    """`fn` traced once per input signature and evaluated primitive-by-primitive (`eval_jaxpr`): keeps
+    XLA:CPU's per-primitive fp32 subnormal handling (row 4023) without re-tracing `jax.jvp` or `jax.grad` in
+    Python on every seed (row 10669)."""
+    from jax.core import eval_jaxpr
+
+    traced = {}
+
+    def run(*inputs):
+        leaves, treedef = jax.tree.flatten(inputs)
+        key = (treedef, tuple((np.shape(x), jnp.result_type(x)) for x in leaves))
+        if key not in traced:
+            closed, shapes = jax.make_jaxpr(fn, return_shape=True)(*inputs)
+            traced[key] = (closed.jaxpr, closed.consts, jax.tree.structure(shapes))
+        jaxpr, consts, out_tree = traced[key]
+        return jax.tree.unflatten(out_tree, eval_jaxpr(jaxpr, consts, *leaves))
+
+    return run
+
+
 def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int,
                                 run: str | None = None) -> None:
     """`ours` on par with `reference` against float64 (check 1), jitted and as written: its compiler
@@ -1130,13 +1150,15 @@ def _on_par_jitted_and_op_by_op(ours, reference, draw, label: str, *, seeds: int
     product with its reciprocal and a sum of products into one of unrounded products, so each order is held
     as written and as compiled. As written is op by op (`as_given`, which the gate runs uncompiled) where the
     draw reaches fp32's subnormals (`_reaches_subnormals`), which XLA's CPU keeps one primitive at a time and
-    flushes in a compiled program (row 4023); compiled with no rewrite, its products held from any fused
-    multiply-add (`arm_arithmetic.as_written`, `products_held`, its own program run as given) for every other
-    draw, where op by op compiled each primitive of the merge's windows apart (the cotangent cell 6.81 GiB op
-    by op, 1.28 jitted). The reference runs op by op, so none of those rewrites reaches the bar it sets (row
-    6909: a compiled reference summing products shared Dew's error)."""
+    flushes in a compiled program (row 4023), traced once per signature (`_op_by_op`, row 10669); compiled
+    with no rewrite, its products held from any fused multiply-add (`arm_arithmetic.as_written`,
+    `products_held`, its own program run as given) for every other draw, where op by op compiled each
+    primitive of the merge's windows apart (the cotangent cell 6.81 GiB op by op, 1.28 jitted). The reference
+    runs op by op, so none of those rewrites reaches the bar it sets (row 6909: a compiled reference summing
+    products shared Dew's error)."""
     reaches = getattr(draw, "reaches_subnormals", False)
-    written = as_given(ours if reaches else jax.jit(products_held(ours), compiler_options=as_written()))
+    written = as_given(_op_by_op(ours) if reaches
+                       else jax.jit(products_held(ours), compiler_options=as_written()))
     for program, mode in ((jax.jit(ours), "jitted"), (written, "as written")):
         if run is None or run == mode:
             assert_as_exact(program, as_given(reference), draw, f"{label} {mode}", seeds=seeds)

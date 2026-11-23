@@ -31,7 +31,7 @@ from dew import Trainer
 from dew.data import Hub, Loading, images, presets
 from dew.data.compile import compile as compile_data
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
-from dew.optim import Cosine, OptimConfig
+from dew.optim import AdamW, Cosine, OptimConfig
 
 FLOWERS, REVISION = "dpdl-benchmark/oxford_flowers102", "544b55c9af69a05742ead7571cd7ae23cfcd758b"
 SIZE, STAGED, BATCH, CLASSES = 64, 80, 64, 102
@@ -90,7 +90,7 @@ def trained(policy: str, seed: int, steps: int) -> tuple[float, float]:
                         loading=Loading(workers=0, threads=16, read_buffer=64))
     model = Classifier()
     optimizer = OptimConfig(learning_rate=Cosine(peak_value=2e-3, warmup_steps=steps // 20, end_value=2e-5),
-                            weight_decay=0.05, clip_grads=1.0)
+                            optimizer=AdamW(weight_decay=0.05), clip_grads=1.0)
     trainer = Trainer(Supervised(model, CrossEntropy(), (Accuracy(),), inputs="image"), optimizer, key=seed)
     start = time.perf_counter()
     state = trainer.fit(data, steps=steps, log_every=max(1, steps // 10))

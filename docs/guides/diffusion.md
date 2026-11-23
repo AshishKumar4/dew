@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import Field, InputSpec, Trainer
-from dew.optim import OptimConfig
+from dew.optim import Adam, OptimConfig
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones.dit import SimpleDiT
@@ -31,7 +31,7 @@ model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                   mlp_ratio=2, dtype=jnp.float32, attention_impl="xla")
 objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (8, 8, 3))),
                                solver=Euler(), steps=4)
-trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.001), key=jax.random.key(0))
+trainer = Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=0.001), key=jax.random.key(0))
 state = trainer.fit(data, steps=3, log_every=1)
 info = Step(step=state.step, key=jax.random.key(1), ema=state.averaged)
 preview = objective.evaluate(state.variables, batch, info)

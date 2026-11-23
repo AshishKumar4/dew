@@ -10,7 +10,7 @@ import dataclasses
 import numpy as np
 from saved_positions_support import READ, source
 
-from dew.data import Memory, phases
+from dew.data import Memory, Phase, Steps, phases
 from dew.data.compile import compile
 from dew.data.pipeline import Pipeline
 
@@ -51,8 +51,9 @@ def hidden_global_phases():
     first = Memory({"id": np.arange(1, 41, dtype=np.int32)}, shard_rows=4)
     second = Memory({"id": np.arange(101, 141, dtype=np.int32)}, shard_rows=4)
     stacked = Stacked(np.zeros(4, dtype=np.int32))
-    return compile(phases((Pipeline(first).shuffle(seed=3).repeat().batch(2, batch_fn=stacked), 6),
-                          (Pipeline(second).shuffle(seed=4).repeat().batch(2, batch_fn=stacked), None)),
+    return compile(phases(Phase(Pipeline(first).shuffle(seed=3).repeat().batch(2, batch_fn=stacked),
+                                Steps(6)),
+                          Phase(Pipeline(second).shuffle(seed=4).repeat().batch(2, batch_fn=stacked))),
                    read="memory", loading=READ)
 
 
@@ -65,7 +66,8 @@ def hidden():
 
 def hidden_phases():
     """Two sources read in two phases, the first's rows through a step whose table its repr hides."""
-    return compile(phases((source(1).map(Remapped(np.arange(8, dtype=np.int32))), 3), (source(2), None)),
+    return compile(phases(Phase(source(1).map(Remapped(np.arange(8, dtype=np.int32))), Steps(3)),
+                          Phase(source(2))),
                    read="indexed", loading=READ)
 
 

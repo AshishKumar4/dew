@@ -18,7 +18,7 @@ trainer.fit(train.shuffle(seed=0).batch(64), validation=val.batch(64), epochs=1)
 flowchart LR
   S["Source<br/>Files · Hub · TFDS · Memory<br/>from_hf · from_torch · from_grain · from_iter"]
   R["Per-record functions<br/>map · random_map · filter<br/>filter_map · random_filter_map · flat_map"]
-  X["Cross-record verbs<br/>pack · shuffle · mix · concat<br/>interleave · schedule · holdout · cache"]
+  X["Cross-record verbs<br/>pack · shuffle · mix · concat<br/>interleave · phases · holdout · cache"]
   B["batch(n)<br/>the global training batch"]
   T["Trainer<br/>host share from the mesh<br/>device prefetch"]
   S --> R --> X --> B --> T
@@ -213,7 +213,7 @@ trainer.fit(prep(train).shuffle(seed=0, window=200_000).batch(1024),
 
 ### A staged frontier pretraining run
 
-A schedule's stages switch on the run's committed-token clock; `phases` switch at the training steps they name.
+`phases` switch at the training steps (`Steps`) or the run's committed tokens (`Tokens`) each phase ends at.
 
 Each member is tokenized and packed before the mix weighs it by its tokens (the order rule, and packing
 per source).
@@ -226,11 +226,11 @@ pretrain = mix([packed(source) for source in sources], weights=[.75, .12, .05, .
 anneal   = mix([packed(source) for source in high_quality], weights=[.40, .25, .15, .15, .05], by="tokens")
 longdocs = packed(long_docs)
 
-data = schedule([
-    (pretrain.shuffle(seed=0, window=10**6).batch(1024), 13e12),
-    (anneal.shuffle(seed=1, window=10**6).batch(1024),   0.5e12),
-    (longdocs.batch(1024),                               0.1e12),
-])
+data = phases(
+    Phase(pretrain.shuffle(seed=0, window=10**6).batch(1024), until=Tokens(13e12)),
+    Phase(anneal.shuffle(seed=1, window=10**6).batch(1024),   until=Tokens(13.5e12)),
+    Phase(longdocs.batch(1024),                               until=Tokens(13.6e12)),
+)
 trainer.fit(data, validation=val)
 ```
 
@@ -413,7 +413,7 @@ train.pipe(flowers, 64, batch=16, augment=True)
 ## 6. Workers and parallelism
 
 ```python
-ds = (Files("gs://data/laion/*.array_record").threads(32)   # read parallelism at the source
+ds = (Files("gs://data/laion/*.array_record").loading(Loading(threads=32, read_buffer=32))  # read parallelism
         .filter_map(images.fetch(threads=64))                # an IO stage's own thread pool
         .filter_map(images.DecodeImage())
         .random_map(images.Albumentations(aug))
@@ -424,7 +424,7 @@ ds = (Files("gs://data/laion/*.array_record").threads(32)   # read parallelism a
 trainer.fit(ds, device_prefetch=2)                            # batches already placed on the GPUs
 ```
 
-`.workers(n)` splits the chain where you put it: heavy decoding and augmentation go before it, cheap work after. A chain whose steps can drop records (a filter, a rejecting step, an expansion, a cache read as each input's outputs, a Grain step of your own) is split earlier: the workers run its steps and repeats up to the first that lays out, mixes or batches records, or shuffles, slices or takes them after a drop, and hand on a marker for each record they drop, which the training process drops and counts before running the rest. A worker whose share of the inputs is all dropped then still hands rows on, so it never holds up the others, as Grain advises for a pipeline that filters in its workers. A mixture's corpora each read in an equal share of the workers, or in the workers a corpus writes itself. They share the read's threads and read-ahead the same way, so a mixture of hundreds of sources holds the threads and buffers one read does, a corpus whose share is no thread reading on the thread that draws from it; and a mixture opens and reads a corpus only when it draws from it, so a source it has not reached opens no file and holds no buffer. The ArrayRecord files a process's sources hold open are bounded together, at Loading's default read threads, the least recent closed as another opens. A Grain step of your own runs in the workers over indexed rows, where what it drops reads as a marker; over a stream the workers hand on before it, and one that turns indexed rows into a stream runs in the workers with what it drops unmarked, so if it drops every one of a worker's inputs that worker holds the others up. Settings are per host. A training read whose chain names no loading, or names only its threads (`.threads(n)`), reads with automatic workers (`Loading(workers="auto")`, `Loading.resolved`): it measures the Python a batch takes over its first batches, read in turn, and starts workers where that Python over the batches the run reads pays for their starts, as many as cost the run least, at most as many as the host's CPUs and memory hold, else it reads in the process. The batches are the run's steps, its `examples` bound's, its epochs over its records or its source examples a pass holds, or its token budget over the most tokens a batch holds, a phased run's each phase's share of its length; a run whose length nothing states reads in the process. A validation pass is sized for its own batches the same way, as each pass starts its workers again, so a short pass reads in the process; any other read (`iterate`, a publish) reads in the process, the workers its chain names left out, so its records come in the order it hands them on (row 5735). A per-share read in workers reads its inputs in their order, so its batches and its saved position are a read in none's and it resumes on any worker count; a stream read per share, or a read that drops a cache's records, keeps its worker count in its topology. A stream read per share takes no automatic workers: its rows are its worker count's, which a count sized from a host's timing would make another host's or another start's, so it reads in the process, and the run's log says once where that holds up the step; state its workers (`.workers(n)`), or read it `.elastic()`, whose rows no worker count changes. A chain that names a worker count reads with it. A host `map` after `batch` always runs last, in the training process. A device step runs inside the compiled step, so the reader only ever yields numpy.
+`.workers(n)` splits the chain where you put it: heavy decoding and augmentation go before it, cheap work after. A chain whose steps can drop records (a filter, a rejecting step, an expansion, a cache read as each input's outputs, a Grain step of your own) is split earlier: the workers run its steps and repeats up to the first that lays out, mixes or batches records, or shuffles, slices or takes them after a drop, and hand on a marker for each record they drop, which the training process drops and counts before running the rest. A worker whose share of the inputs is all dropped then still hands rows on, so it never holds up the others, as Grain advises for a pipeline that filters in its workers. A mixture's corpora each read in an equal share of the workers, or in the workers a corpus writes itself. They share the read's threads and read-ahead the same way, so a mixture of hundreds of sources holds the threads and buffers one read does, a corpus whose share is no thread reading on the thread that draws from it; and a mixture opens and reads a corpus only when it draws from it, so a source it has not reached opens no file and holds no buffer. The ArrayRecord files a process's sources hold open are bounded together, at Loading's default read threads, the least recent closed as another opens. A Grain step of your own runs in the workers over indexed rows, where what it drops reads as a marker; over a stream the workers hand on before it, and one that turns indexed rows into a stream runs in the workers with what it drops unmarked, so if it drops every one of a worker's inputs that worker holds the others up. Settings are per host. A training read whose chain names no loading reads with automatic workers (`Loading(workers="auto")`, `Loading.resolved`): it measures the Python a batch takes over its first batches, read in turn, and starts workers where that Python over the batches the run reads pays for their starts, as many as cost the run least, at most as many as the host's CPUs and memory hold, else it reads in the process. The batches are the run's steps, its `examples` bound's, its epochs over its records or its source examples a pass holds, or its token budget over the most tokens a batch holds, a phased run's each phase's share of its length; a run whose length nothing states reads in the process. A validation pass is sized for its own batches the same way, as each pass starts its workers again, so a short pass reads in the process; any other read (`iterate`, a publish) reads in the process, the workers its chain names left out, so its records come in the order it hands them on (row 5735). A per-share read in workers reads its inputs in their order, so its batches and its saved position are a read in none's and it resumes on any worker count; a stream read per share, or a read that drops a cache's records, keeps its worker count in its topology. A stream read per share takes no automatic workers: its rows are its worker count's, which a count sized from a host's timing would make another host's or another start's, so it reads in the process, and the run's log says once where that holds up the step; state its workers (`.workers(n)`), or read it `.elastic()`, whose rows no worker count changes. A chain that names a worker count reads with it. A host `map` after `batch` always runs last, in the training process. A device step runs inside the compiled step, so the reader only ever yields numpy.
 
 ## 7. Training on a mesh
 
@@ -532,7 +532,7 @@ record the earlier phase read, once as the later phase is compiled or, on the to
 #### Resuming data: relaxed or exact
 
 A run chooses how its resume treats its data (`TrainerConfig.data_resume`; on the command line
-`--set trainer.data_resume=exact`). Either way its
+`--trainer.data-resume exact`). Either way its
 parameters, optimizer state, step, schedule and random state resume as they were saved; the choice is the
 data's alone.
 

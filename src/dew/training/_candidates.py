@@ -21,7 +21,7 @@ import numpy as np
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew import newton_schulz
-from dew.batch import CLOSES_WINDOW, Batch
+from dew.batch import CLOSES_WINDOW, Batch, loop_passes_given
 from dew.data.dataset import Stage
 from dew.data.pipeline import DeviceStep
 from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_bytes
@@ -106,10 +106,6 @@ class StepSettings[LossT, EffectsT]:
     ns_group: int | None = None
     """The stacks of one shape the step's Newton-Schulz joins at a time where the run states none, its plan's
     (`dew.newton_schulz.released`, `FitSearch`'s release): None joins them all."""
-    sampled_passes: int | None = None
-    """The pass count the step runs where its run draws one per microbatch
-    (`dew.training.phase_passes.SampledPasses`): its microbatch counts its own rows' work at it
-    (`step_counts`); None for every other run."""
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -201,19 +197,17 @@ def _shapes(tree):
 def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
                                    schedule: Schedule, placement, replicated, split: int, narrow: bool, *,
                                    mesh: Mesh | AbstractMesh | None = None,
-                                   platforms: tuple[str, ...] | None = None,
-                                   copies: dict | None = None) -> Candidate:
+                                   platforms: tuple[str, ...] | None = None) -> Candidate:
     """`_candidate`'s step, or the one an equal trainer traced in this process over the same shapes
     (`Trainer._step_key`; row 3873: each fit of a resumed run traced its step again, 6.5 to 12.9 s, and
     lowered it, 9 s), its pipeline's schedule the one its microbatches make; a trainer whose step no value
-    states traces its own. `copies`, where given, are the narrow copies it reads (`prepared_for`)."""
+    states traces its own."""
     # Read as the candidate is made, at the rung the search put the objective at (row 3873).
     stated = stepping.step_key()
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
         stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow,
-        None if copies is None else tuple(sorted((path, str(dtype)) for path, dtype in copies.items())),
         stepping.settings.ns_group, mesh,
         platforms, stepping.shape.rows,
         stepping.shape.split, stepping.shape.prefetch, stepping.shape.examples, held_context())
@@ -226,7 +220,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
                 sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
                 return dataclasses.replace(kept, sampled=sampled)
     candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow,
-                           mesh=mesh, platforms=platforms, copies=copies)
+                           mesh=mesh, platforms=platforms)
     if key is not None:
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
         # builds the reader's own).
@@ -272,15 +266,14 @@ def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Ca
 def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
                                 schedule: Schedule, placement, replicated, split: int, narrow: bool, *,
                                 mesh: Mesh | AbstractMesh | None = None,
-                                platforms: tuple[str, ...] | None = None,
-                                copies: dict | None = None) -> Candidate:
+                                platforms: tuple[str, ...] | None = None) -> Candidate:
     """The step reading `batch` in `split` microbatches, lowered at the objective's current rung, with what
     the fit check holds beside it. Each launch takes its derived config, but where the run measures configs
     (`tune_kernels`), whose lowering settles them (`tune`). `mesh` and `platforms` lower it for other
     devices, untuned (`lowered_for`)."""
     settings = stepping.settings
     micro = microbatch_shapes(batch, split)
-    shapes, copies, prepared, _ = prepared_for(stepping, state, micro, schedule, split, narrow, copies)
+    shapes, copies, prepared, _ = prepared_for(stepping, state, micro, schedule, split, narrow)
     shardings = stepping.shardings(prepared)
     if mesh is not None:
         shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
@@ -336,15 +329,11 @@ class Prepared(NamedTuple):
 
 
 def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
-                                  schedule: Schedule, split: int, narrow: bool,
-                                  copies: dict | None = None) -> Prepared:
+                                  schedule: Schedule, split: int, narrow: bool) -> Prepared:
     """The loss's shapes (None under a custom step), the narrow copies and the state's shapes with the
     accumulation of an update's window, `split` microbatches a step (DiLoCo's groups' `windowed`), and
     the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
-    `narrow` is off, or `copies` whole where given (a sampled pass count's step takes its cap's, which
-    every step of the window reads: `StepCompiler.admitted_at`): a parameter it would copy and they do not
-    it reads whole and casts, and one they copy it must read through that one cast or not at all, refused
-    otherwise; and the loss's forward program that trace made (None under a custom step)."""
+    `narrow` is off; and the loss's forward program that trace made (None under a custom step)."""
     settings = stepping.settings
     window = split * settings.accumulation
     with group_of(state, batch) as (view, rows):
@@ -358,22 +347,8 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     # A step the trainer composes narrows, from the loss it traced; a custom step's traces none (`traced`
     # None), and a scaled loss's copies none.
     narrows = narrow and not settings.dynamic_scale and settings.diloco is None and narrow_copies(state)
-    reads = state_reads(state, traced) if traced is not None and (narrows or copies is not None) else None
-    own = reads.casts if narrows and reads is not None else {}
-    if copies is not None:
-        # The window's copies, its cap's, are read by every step of it: a step reads a copy only of a
-        # parameter whose one use in it is that cast, which the copy is (row 10770: a sampled count below an
-        # implicit loop's cap narrows the loop's layers, whose cap sums their cotangents over its passes and
-        # reads them whole). A parameter it would narrow and the window does not it reads whole and casts.
-        # A copy of a parameter the step reads nowhere is no part of it (a later pass's θ, at one pass).
-        read = frozenset() if reads is None else reads.read
-        unread = sorted(".".join(path) for path, dtype in copies.items()
-                        if (path in own and jnp.dtype(own[path]) != jnp.dtype(dtype))
-                        or (path not in own and path in read))
-        if unread:
-            raise ValueError(f"the step reads {unread} other than through the narrow copies its window holds "
-                             "of them: every step of one window reads one set of copies, each its one cast")
-    copies = own if copies is None else copies
+    reads = state_reads(state, traced) if traced is not None and narrows else None
+    copies = reads.casts if reads is not None else {}
     prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
         lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
     return Prepared(shapes, copies, prepared, traced)
@@ -415,7 +390,7 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
                                               micro.get(CLOSES_WINDOW), whole)
         stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1,
                                  batch_consumed(micro), split=split, part=micro,
-                                 passes=settings.sampled_passes)
+                                 passes=loop_passes_given(micro))
         return (apart(stepped)[0], *rest)
 
     returned = (moving, replicated, replicated, replicated, replicated, replicated)

@@ -377,9 +377,7 @@ def _spread(held: int, programs: int, target: generation.GpuTarget) -> int:
     """The programs of a launch holding `held` a multiprocessor of `target` runs at once: no more than its
     `programs` spread over the device's multiprocessors where it knows them, as a launch's blocks go to its
     multiprocessors in turn (`_running`'s states launch, `_output_hides`' output)."""
-    if target.multiprocessors is None:
-        return held
-    return min(held, -(-programs // target.multiprocessors))
+    return cost.sharing(programs, held, target)
 
 
 def _states_launch(launches: tuple[mainloop.Launch, ...]) -> mainloop.Launch:

@@ -19,6 +19,7 @@ from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import EXAMPLE_STREAM, Aux, Objective, Ratio, Recorder, Step, stream
 from dew.objectives.diffusion.few_step import MeanFlowObjective, ShortcutObjective
+from dew.training import FitPolicy, UpdateBatch
 from dew.training.distributed import marked
 from dew.training.transaction import example_places
 
@@ -385,8 +386,8 @@ def test_a_rejected_microbatch_drops_its_window_and_the_next_draws_afresh():
     dropped part."""
     from dew.training import MeshSpec, Trainer
 
-    trainer = Trainer(Drawing(), optax.sgd(.1), key=jax.random.key(4), split=2, dynamic_scale=True,
-                      checkpoints=None, tracker=None)
+    trainer = Trainer(Drawing(), optax.sgd(.1), key=jax.random.key(4), fit=FitPolicy(split=2),
+                      dynamic_scale=True, checkpoints=None, tracker=None)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     state = trainer.initial_state()
     rejected = {"y": jnp.ones((4,)), "bad": jnp.asarray([False, True, False, True])}
@@ -429,7 +430,7 @@ def test_a_replayed_microbatch_draws_as_its_input_first_drew():
     from dew.training import MeshSpec, Trainer
 
     seen: list = []
-    trainer = Trainer(ReplayedDrawing(seen), optax.sgd(.1), key=jax.random.key(4), split=2,
+    trainer = Trainer(ReplayedDrawing(seen), optax.sgd(.1), key=jax.random.key(4), fit=FitPolicy(split=2),
                       dynamic_scale=True, checkpoints=None, tracker=None)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     state = trainer.initial_state()
@@ -535,8 +536,8 @@ def test_a_recording_step_returns_what_each_evaluation_drew_its_replays_each_the
     from dew.training import Layout, MeshSpec, Trainer
 
     layout = Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.)
-    trainer = Trainer(Witnessed(), optax.sgd(.1), key=jax.random.key(4), accumulation=2, layout=layout,
-                      checkpoints=None, tracker=None, record=True)
+    trainer = Trainer(Witnessed(), optax.sgd(.1), key=jax.random.key(4), update=UpdateBatch(batches=2),
+                      layout=layout, checkpoints=None, tracker=None, record=True)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     state = trainer.initial_state()
     first = {"y": jnp.arange(4, dtype=jnp.float32), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}
@@ -601,8 +602,8 @@ def test_a_split_recording_step_returns_every_microbatchs_evaluation():
     from dew.objectives.base import taken_record
     from dew.training import MeshSpec, Trainer
 
-    trainer = Trainer(WitnessedMean(), optax.sgd(.1), key=jax.random.key(4), split=2, checkpoints=None,
-                      tracker=None, record=True)
+    trainer = Trainer(WitnessedMean(), optax.sgd(.1), key=jax.random.key(4), fit=FitPolicy(split=2),
+                      checkpoints=None, tracker=None, record=True)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     state = trainer.initial_state()
     batch = {"y": jnp.arange(4, dtype=jnp.float32), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}

@@ -1,26 +1,40 @@
-"""The shipped recipes run through their entry points (each recipe's `main`) at a tiny size on CPU: each its
-documented command's flags (the recipe's docstring) with the model's sizes, the run's length, the data and
-the pretrained source swapped for small local ones, and the run it saves checked. A recipe whose defaults
-refuse its own command is red: the decision recipe's `--trainer.steps 2000` was refused at its default
+"""The shipped recipes run at a tiny size on CPU: each its documented command's flags (the recipe's docstring)
+over its own run (`default`, its `main`'s where the command sets nothing a run file states), with the
+model's sizes, the run's length, the data and the pretrained source swapped for small local ones as a user
+edits a recipe's run, and the run it saves checked. A recipe whose defaults
+refuse its own command is red: the decision recipe's `--trainer.horizon.steps 2000` was refused at its default
 cadence ("epoch"), which no test of the recipes ran."""
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
 import pytest
+import tyro
 from objective_data import IMAGES
 from run_kinds import QWEN_TINY, TINY_LAYA, pictures
 from token_support import write_token_corpus
 from tool_support import load
 
+from dew.config.diffusion import DiffusionRunConfig
+from dew.config.jepa import JepaRunConfig
+from dew.config.lm import LMRunConfig
 from dew.data import TFDS, Memory
 from dew.data.text import export_tokens
+from dew.registry import ModelConfig
 
 TRAINED = ["--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None"]
 """What every run here adds: one process, no shared compilation cache."""
 
-IMAGE_MODEL = ["--model.patch-size", "2", "--model.emb-features", "16", "--model.num-layers", "1",
-               "--model.num-heads", "2"]
+IMAGE_MODEL = {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2}
+"""The tiny image model every image recipe's run trains here."""
+
+
+def with_model(run, name: str | None = None, **fields):
+    """`run` with its model's `fields` over its own, of the class `name` names where given: what a user states
+    by editing a recipe's run."""
+    model = run.model if name is None else ModelConfig(name)
+    return dataclasses.replace(run, model=dataclasses.replace(model, fields={**model.fields, **fields}))
 
 
 def saved(root: Path, state) -> bool:
@@ -58,9 +72,9 @@ def byte_store(root: Path, name: str) -> str:
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("command", [
-    ["--trainer.epochs", "1"],
+    ["--trainer.horizon.epochs", "1"],
     ["--pretrained", str(QWEN_TINY), "--lora.rank", "2", "--lora.modules", "q_proj", "v_proj",
-     "--optim.learning-rate", "1e-4", "--trainer.steps", "2"],
+     "--optim.learning-rate", "1e-4", "--trainer.horizon.steps", "2"],
 ], ids=["epochs", "lora"])
 def test_the_decision_recipe_trains_and_saves_its_run(command, tmp_path):
     """recipes/decision/train.py's two documented commands over a small table: a run by epochs over the
@@ -69,7 +83,7 @@ def test_the_decision_recipe_trains_and_saves_its_run(command, tmp_path):
     pretrained = [] if "--pretrained" in command else ["--pretrained", str(TINY_LAYA)]
     state = recipe.main([*pretrained, *command, *TRAINED, "--trainer.checkpoint-dir", str(tmp_path / "runs")],
                         tickets())
-    assert int(state.step) == 2 if "--trainer.steps" in command else int(state.step) > 0
+    assert int(state.step) == 2 if "--trainer.horizon.steps" in command else int(state.step) > 0
     assert saved(tmp_path, state)
 
 
@@ -78,12 +92,12 @@ def test_the_diffusion_recipe_trains_and_saves_its_run(tmp_path):
     """recipes/diffusion/train.py's documented command at 8 pixels, a batch of eight, one epoch of a small
     picture table, captioned by a character table in place of the Hub's encoder, and no CLIP score."""
     recipe = load("train", "recipes/diffusion")
-    state = recipe.main(["--set", "data.images.size=8", "--set", "data.images.batch=8",
-                         "--trainer.epochs", "1", "--model", "simple_dit", *IMAGE_MODEL, *TRAINED,
-                         "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-                         "--set", "validation.images.size=8", "--set", "validation.images.batch=8",
-                         "--val-metrics", "[]", "--text.encoder", "char_table", "--text.checkpoint",
-                         "char_table"], pictures())
+    run = with_model(recipe.default(*pictures()), "simple_dit", **IMAGE_MODEL).override({
+        "data.images.size": 8, "data.images.batch": 8, "validation.images.size": 8,
+        "validation.images.batch": 8})
+    state = DiffusionRunConfig.cli(["--trainer.horizon.epochs", "1", *TRAINED, "--trainer.checkpoint-dir",
+                                    str(tmp_path / "runs"), "--val-metrics", "[]", "--text.encoder",
+                                    "char_table", "--text.checkpoint", "char_table"], default=run).run()
     assert int(state.step) > 0 and saved(tmp_path, state)
 
 
@@ -93,11 +107,11 @@ def test_the_jepa_recipe_trains_and_saves_its_run(tmp_path):
     epoch of a small image table."""
     recipe = load("train", "recipes/jepa")
     images = TFDS("dew_images", path=str(IMAGES), split="train")
-    state = recipe.main(["--set", "data.images.size=16", "--set", "data.images.batch=8", "--trainer.epochs",
-                         "1", "--probe-classes", "2", *IMAGE_MODEL, *TRAINED,
-                         "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-                         "--set", "validation.images.size=16", "--set", "validation.images.batch=8"],
-                        images.holdout(split="test"))
+    run = with_model(recipe.default(*images.holdout(split="test")), **IMAGE_MODEL).override({
+        "data.images.size": 16, "data.images.batch": 8, "validation.images.size": 16,
+        "validation.images.batch": 8})
+    state = JepaRunConfig.cli(["--trainer.horizon.epochs", "1", "--probe-classes", "2", *TRAINED,
+                               "--trainer.checkpoint-dir", str(tmp_path / "runs")], default=run).run()
     assert int(state.step) > 0 and saved(tmp_path, state)
 
 
@@ -110,11 +124,10 @@ def test_the_lm_recipe_trains_an_epoch_of_its_store_and_saves_its_run(tmp_path):
     recipe = load("train", "recipes/lm")
     tokens = np.random.default_rng(0).integers(1, 250, 40 * 16).astype(np.uint8)
     store = write_token_corpus(tmp_path / "shakespeare-byte", tokens).train
-    state = recipe.main(["--set", f"data.source.url={store}", "--set", "data.token_windows.seq_len=16",
-                         "--set", "data.token_windows.batch=8", "--trainer.epochs", "1",
-                         "--model.emb-features", "16", "--model.num-layers", "1", "--model.num-heads", "2",
-                         *TRAINED, "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-                         "--max-new-tokens", "0"])
+    run = with_model(recipe.default(store), emb_features=16, num_layers=1, num_heads=2).override({
+        "data.token_windows.seq_len": 16, "data.token_windows.batch": 8})
+    state = LMRunConfig.cli(["--trainer.horizon.epochs", "1", *TRAINED, "--trainer.checkpoint-dir",
+                             str(tmp_path / "runs"), "--max-new-tokens", "0"], default=run).run()
     assert int(state.step) == 5 and saved(tmp_path, state)
 
 
@@ -126,11 +139,12 @@ def test_the_rigel_recipe_trains_its_phases_and_saves_its_run(corpora, tmp_path)
     proxy on one."""
     recipe = load("rigel", "recipes/lm")
     named = [word for name in corpora for word in (name, byte_store(tmp_path, name))]
-    state = recipe.main(["--corpora", *named, "--width", "128", "--steps", "8", "--batch-size", "8",
-                         "--seq-len", "16", "--tokenizer", "byte", "--model.num-layers", "4",
-                         "--model.layer-types", "mamba", "mamba", "mamba", "attention",
-                         "--max-new-tokens", "0",
-                         *TRAINED, "--trainer.checkpoint-dir", str(tmp_path / "runs")])
+    args = tyro.cli(recipe.RigelArgs, args=["--corpora", *named, "--width", "128", "--steps", "8",
+                                            "--batch-size", "8", "--seq-len", "16", "--tokenizer", "byte"])
+    run = with_model(recipe.run_config(args), num_layers=4,
+                     layer_types=["mamba", "mamba", "mamba", "attention"])
+    state = LMRunConfig.cli(["--max-new-tokens", "0", *TRAINED, "--trainer.checkpoint-dir",
+                             str(tmp_path / "runs")], default=run).run()
     assert int(state.step) == 8 and saved(tmp_path, state)
 
 

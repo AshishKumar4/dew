@@ -65,7 +65,7 @@ OPTION_TOKENS, BATCH = 10, 4
 """A question row's option budget, and the rows a step reads: four, whose joint cell over a context trains
 in a fresh process peaking at 5.7 GiB on CPU, its rows' attention scores dense over 3072 tokens, where eight
 peaked at 9.3 GiB and a CI task of 10 GiB was killed."""
-CONTEXT_LAYERS = "0"
+CONTEXT_LAYERS = [0]
 SHARE = 0.5
 
 
@@ -192,9 +192,10 @@ def recorded(cell: Cell, backbone: Path, root: Path, examples: int | None = None
     """The cell's run as `dew train` replays it (`Recorded`), bounded to every training example its layout
     keeps, or to `examples` of them where given (`examples`), or to a share of those (`stop`), its context
     read through cross-attention where the cell reads one, each step logged."""
-    given = {"trainer.log_every": "1", "trainer.steps": "None",
-             "trainer.examples": str(kept(cell) if examples is None else examples),
-             **({"trainer.stop": f'{{"fraction": {SHARE}}}'} if cell.bound == "share" else {}),
+    given = {"trainer.log_every": "1", "trainer.horizon.steps": "None",
+             "trainer.horizon.examples": str(kept(cell) if examples is None else examples),
+             **({"trainer.stop": {"class": "dew.training.budget:Pause", "fields": {"fraction": SHARE}}}
+                if cell.bound == "share" else {}),
              **({"context_layers": CONTEXT_LAYERS} if cell.context else {})}
     return Recorded(saved_record(run_of(cell, backbone, root), root, "cell"),
                     cli_settings(root, "cell", given), devices=1)

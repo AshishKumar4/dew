@@ -40,11 +40,12 @@ from dew.diffusion.presets import EDM
 from dew.distributed import collective_host
 from dew.inputs import TextCondition
 from dew.nn.backbones import SimpleDiT
-from dew.optim import Cosine, OptimConfig
+from dew.optim import AdamW, Cosine, OptimConfig
 from dew.registry import ModelConfig
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
 from dew.training import LocalTracker, MeshSpec, ProfileWindow, prepare_process
+from dew.training.budget import Horizon
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
 
@@ -119,9 +120,8 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
                      MetricConfig("clip_score", {"modelname": config.clip_model})),
         optim=OptimConfig(learning_rate=1e-3),
-        trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), steps=3,
-                              log_every=1, eval_every=3, checkpoint_every=3,
-                              mesh=MeshSpec(fsdp=1), multi_host=False,
+        trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), horizon=Horizon(steps=3), log_every=1,
+                              eval_every=3, checkpoint_every=3, mesh=MeshSpec(fsdp=1), multi_host=False,
                               compilation_cache_dir=None))
 
 
@@ -147,15 +147,14 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
         val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
                      MetricConfig("clip_score", {"modelname": config.clip_model})),
-        optim=OptimConfig(weight_decay=0.01, learning_rate=Cosine(
+        optim=OptimConfig(optimizer=AdamW(weight_decay=0.01), learning_rate=Cosine(
             peak_value=config.learning_rate, warmup_steps=2000, init_value=config.learning_rate,
             end_value=2e-4)),
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
-                              steps=config.steps,
-                              log_every=50, eval_every=2000, checkpoint_every=2000,
+                              horizon=Horizon(steps=config.steps), log_every=50, eval_every=2000,
+                              checkpoint_every=2000,
                               profile=ProfileWindow(str(config.out / "profile"), steps=5,
-                                                    warmup=20),
-                              multi_host=True))
+                                                    warmup=20), multi_host=True))
 
 
 def grid(images: np.ndarray, path: Path) -> None:
@@ -169,7 +168,7 @@ def main(config: Config) -> Path:
     if config.smoke:
         config = replace(config, clip_model=str(SMOKE_CLIP), inception_weights=str(SMOKE_INCEPTION))
     run = smoke_config(config, config.out) if config.smoke else slice_config(config)
-    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
+    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.diagnostics.xla_flags,
                     run.trainer.compilation_cache_dir)
     if not config.smoke:
         # Only now: counting devices opens the backend, which has to come

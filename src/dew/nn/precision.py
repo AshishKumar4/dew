@@ -1184,6 +1184,10 @@ class Numerics:
     forms: Literal["fast", "accurate"] = "fast"
     low_precision: LowPrecision | None = None
     """The recipe the run's projections train in by role (`LowPrecision`), None for none."""
+    loss_scaling: Literal["auto", "none", "dynamic"] = "auto"
+    """How the loss is scaled before its gradient: "dynamic" by a scale that halves where a gradient
+    overflows and grows where none has (`flax.training.dynamic_scale`), "none" not at all, "auto" dynamic
+    where the run computes in float16, whose range a gradient overflows, else none (`scales_loss`)."""
 
     def __post_init__(self):
         if isinstance(self.dtypes, str):
@@ -1200,6 +1204,15 @@ class Numerics:
                              f"jax.lax.DotAlgorithmPreset, not {self.matmul!r}")
         if self.forms not in ("fast", "accurate"):
             raise ValueError(f"a run's forms are fast or accurate, not {self.forms!r}")
+        if self.loss_scaling not in ("auto", "none", "dynamic"):
+            raise ValueError(f"a run's loss scaling is auto, none or dynamic, not {self.loss_scaling!r}")
+
+    def scales_loss(self, compute: str | None = None) -> bool:
+        """Whether the run scales its loss dynamically (`loss_scaling`): stated, or "auto" where it computes
+        in float16, `compute` where its model states its own compute dtype, else its dtypes'."""
+        if self.loss_scaling == "auto":
+            return jnp.dtype(self.dtypes.compute if compute is None else compute) == jnp.float16
+        return self.loss_scaling == "dynamic"
 
 
 ACCURATE = Numerics(DTYPE_PRESETS["32-true"], matmul="highest", forms="accurate")
@@ -1722,6 +1735,24 @@ def triton_lowerings() -> None:
 
     triton_lowering.register_lowering(correctly_rounded_divide_p)(
         triton_lowering.lower_fun(divided, multiple_results=False))
+
+
+@functools.cache
+def mosaic_gpu_lowerings() -> None:
+    """Register `correctly_rounded_divide_p`'s Pallas Mosaic GPU warpgroup lowering lazily
+    (`dew.nn.kernels.launches.kernel`, row 9795). Lowers through `_correctly_rounded_divide` so quotients
+    stay IEEE-754 nearest-even including subnormals regardless of `approx_math` or flush-to-zero."""
+    from jax._src.pallas.mosaic_gpu import lowering as mosaic_lowering
+    from jax.experimental.mosaic import gpu as mgpu
+
+    @mosaic_lowering.register_lowering_rule(correctly_rounded_divide_p, mgpu.LoweringSemantics.Warpgroup)
+    def _divide_wg(ctx, numerator, denominator):
+        ir_args = tuple(mosaic_lowering._ensure_ir_value(v, a.dtype)
+                        for v, a in zip((numerator, denominator), ctx.avals_in, strict=True))
+        closed = jax.make_jaxpr(_correctly_rounded_divide)(*ctx.avals_in)
+        (out,) = mosaic_lowering.lower_jaxpr_to_mosaic_gpu(
+            ctx.module_ctx, ctx.launch_ctx, closed.jaxpr, ir_args, closed.consts)
+        return out
 
 
 batching.defbroadcasting(correctly_rounded_divide_p)

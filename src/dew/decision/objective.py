@@ -13,14 +13,14 @@ from flax import linen as nn
 
 from dew._records import record
 from dew.artifacts import Decisions
-from dew.batch import FROZEN, Batch, Variables, dicts, part, thaw, unboxed
+from dew.batch import FROZEN, Batch, Variables, counted_passes, dicts, loop_passes_given, part, thaw, unboxed
 from dew.data.pipeline import Configured, ObjectiveData
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.head import DecisionHead, Head
 from dew.decision.inputs import OPTION_TILE, DecisionInputs
 from dew.decision.layout import Bounds, Layout, Specials, default_layout, per_question
-from dew.decision.model import BackboneContext, DecisionModel
+from dew.decision.model import BackboneContext, DecisionModel, PassLogits
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import (
     ConfigureLayout,
@@ -189,6 +189,16 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     counts_tokens = True
 
+
+    @property
+    def reads_pass_counts(self) -> bool:
+        """Its loss runs its backbone at a microbatch's count: its option scoring, its exits and its rows'
+        own next-token term (`loop_passes_given`)."""
+        return True
+
+    def counted_forward(self, module: nn.Module) -> str | None:
+        """The method its loss reads its backbone by (`HeadedModel.states_method`); its head runs no loop."""
+        return self.model.states_method if module is self.model.backbone else None
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Each packed row's own length, not its window's."""
         return _rows(batch, self.spans_in_context)[0]
@@ -579,10 +589,12 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention, fork_depth=self._fork_depth,
                           joint_forks=self._joint_forks)
-        passes, gates, sown = self._pass_logits(
+        counted = loop_passes_given(batch)
+        passes, gates, ran, sown = self._pass_logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
-            progress=self.progress(step), opened=step.sown())
-        loss, aux = self._charged(passes, inputs, batch, gates)
+            progress=self.progress(step), opened=step.sown(), loop_passes=counted)
+        # Each earlier pass weighed where it ran, where the call gives its count.
+        loss, aux = self._charged(passes, inputs, batch, gates, () if counted is None else ran)
         term = self.input_terms(variables, inputs, batch, step) if self.input_lm else None
         loss = self._with_input_term(loss, term)
         if term is not None:
@@ -635,7 +647,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                            right_padded=True)
         read = final_read(backbone, held, tokens[:, :-1], train=step.training, coordinates=laid,
                           rngs=model_rngs(step.key, training=step.training),
-                          **progressed(backbone, self.progress(step)))
+                          **progressed(backbone, self.progress(step)), **counted_passes(batch))
         # A token's successor in its own row, as a language model scores its targets (`scored_targets`): none
         # after a row's last token or on the padding.
         scored = scored_targets(jnp, tokens, None, None, segments).astype(jnp.float32)
@@ -662,7 +674,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         laid = batch_inputs.coordinates()
         read = final_read(backbone, held, tokens, train=step.training, coordinates=laid,
                           rngs=model_rngs(step.key, training=step.training),
-                          **progressed(backbone, self.progress(step)))
+                          **progressed(backbone, self.progress(step)), **counted_passes(batch))
         before = laid.predecessors()
         states = jnp.take_along_axis(read, jnp.maximum(before, 0)[:, :, None], axis=1)
         rows = jnp.take_along_axis(asked_over(documents, parents, batch_inputs.fork_depth),
@@ -672,14 +684,14 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                                           predict=False)
         return self.row_mean(losses, batch, weights=scored)
 
-    def _pass_logits(self, variables: Variables, inputs: DecisionInputs, **read
-                     ) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...], Variables]:
+    def _pass_logits(self, variables: Variables, inputs: DecisionInputs, **read) -> PassLogits:
         """The option logits of each pass the loss weighs (`pass_weights`, `exit_entropy`), in order, its
         last the model's own, else the model's alone (`DecisionModel.observed_logits`); every pass's
-        exit-gate logits where they are read (`DecisionModel.pass_logits`); and what the pass sowed."""
+        exit-gate logits where they are read, whether each earlier pass ran (`DecisionModel.pass_logits`);
+        and what the pass sowed."""
         if self._weights is None and self.exit_entropy is None:
             logits, sown = self.model.observed_logits(variables, inputs, **read)
-            return (logits,), (), sown
+            return PassLogits((logits,), (), (), sown)
         exits = replace(self.model, backbone=exiting(self.model.backbone))
         return exits.pass_logits(variables, inputs, **read)
 
@@ -742,14 +754,16 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         return self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE), logits
 
     def _charged(self, passes: tuple[jax.Array, ...], inputs: DecisionInputs, batch: Batch,
-                 gates: tuple[jax.Array, ...] = ()) -> tuple[Ratio | Weighted, Aux]:
+                 gates: tuple[jax.Array, ...] = (), ran: tuple[jax.Array | bool, ...] = ()
+                 ) -> tuple[Ratio | Weighted, Aux]:
         """The loss and its accuracy report over the questions' option logits at each pass the loss weighs
         (`passes`, the last the model's own, at `pass_weights`): where it adds a consistency term, the
         label loss and the groups' divergence, each its own `Ratio`, `consistency` weighing the divergence
         (`Weighted`). Each pass's charge and divergence are weighed before their means, whose masses every
         pass shares; the accuracy is the last pass's. Where it trains a loop's exit gate (`exit_entropy`),
         Ouro's exit objective over every pass's charge and `gates`, each pass's gate logits, is the label
-        loss."""
+        loss. Where the call gives its pass count, `ran` says whether each pass before the last ran, a pass
+        it left unrun weighing nothing (`_weighed`; its gate never exits, `never_exiting`)."""
         # The questions' mask in the logits' precision, so a float64 run's masses sum in float64.
         scored = jnp.asarray(batch["scored"]).astype(at_least_fp32(passes[-1].dtype))
         charged = [self._charge(logits, inputs, batch) for logits in passes]
@@ -758,7 +772,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         metrics: dict[str, jax.Array | Ratio] = {"accuracy": self.accuracy(correct, batch, scored)}
         if self.exit_entropy is None:
-            charge = self._weighed(charges)
+            charge = self._weighed(charges, ran)
         else:
             if len(passes) == 1:
                 # One pass exits surely: its label loss is the expectation, its exit distribution's entropy
@@ -784,15 +798,20 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         options = inputs.options | ~jnp.any(inputs.options, axis=-1, keepdims=True)
         groups, canonical = jnp.asarray(batch["groups"]), jnp.asarray(batch["canonical"])
         divided = [categorical.group_divergence(logits, groups, canonical, options) for logits in passes]
-        divergence, members = self._weighed([divergence for divergence, _ in divided]), divided[-1][1]
+        divergence, members = self._weighed([divergence for divergence, _ in divided], ran), divided[-1][1]
         term = Ratio(self.row_mean(divergence, batch).total, self.row_mean(members, batch).total)
         return (Weighted((loss, term), (1.0, self.consistency)),
                 Aux(metrics={**metrics, "consistency": term}))
 
-    def _weighed(self, terms: list[jax.Array]) -> jax.Array:
+    def _weighed(self, terms: list[jax.Array], ran: tuple[jax.Array | bool, ...] = ()) -> jax.Array:
         """The passes' terms at their weights (`passes.weighed`), the last pass's where the loss weighs none
-        (one pass, or `exit_entropy`, whose exit objective weighs the label loss's passes itself)."""
-        return terms[-1] if len(terms) == 1 or self._weights is None else weighed(self._weights, terms)
+        (one pass, or `exit_entropy`, whose exit objective weighs the label loss's passes itself); where the
+        call gives its pass count, each pass before the last weighed where it ran (`PassWeights.ran`)."""
+        if len(terms) == 1 or self._weights is None:
+            return terms[-1]
+        assert self.pass_weights is not None
+        return weighed(self.pass_weights.ran(ran, at_least_fp32(terms[-1].dtype)) if ran else self._weights,
+                       terms)
 
     def evaluate(self, params: Variables, batch: Batch, step: Step
                  ) -> Decisions | tuple[Decisions, PassReports]:
@@ -828,7 +847,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention, fork_depth=self._fork_depth,
                           joint_forks=self._joint_forks)
-        passes, gates, _ = self._pass_logits(params, inputs)
+        passes, gates, _, _ = self._pass_logits(params, inputs)
         term = self.input_terms(params, inputs, batch, step) if self.input_lm else None
         loss = self._with_input_term(self._charged(passes, inputs, batch, gates)[0], term)
         losses = [self._with_input_term(self._charged((logits,), inputs, batch)[0], term)

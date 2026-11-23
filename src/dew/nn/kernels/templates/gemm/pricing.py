@@ -325,16 +325,15 @@ class SplitWalk:
         their measured time (M-FS-9), where an underfilled wave, one program a multiprocessor, runs at the
         whole rate."""
         programs = self.output * splits
-        waves = -(-programs // self.wave)
-        sharing = -(-min(programs, self.wave) // self.multiprocessors)
+        running = unit_cost.busiest_programs(programs, self.wave, self.multiprocessors)
         slice_steps = -(-self.steps // splits)
-        busiest = waves * slice_steps * sharing
+        busiest = running * slice_steps
         # The busiest multiprocessor's programs' shares of the operands, at its share of the memory's rate.
-        rate = self.bandwidth / self.multiprocessors
-        stream = waves * sharing * self.operand_bytes / programs / rate / self.step_seconds
+        stream = unit_cost.streamed(self.operand_bytes / programs, running, self.bandwidth,
+                                    self.multiprocessors) / self.step_seconds
         base = max(busiest, stream)
         if self.drift_horizon > 0.0 and slice_steps > self.drift_horizon:
-            base += waves * (slice_steps - self.drift_horizon) * self.drift_extra
+            base += -(-programs // self.wave) * (slice_steps - self.drift_horizon) * self.drift_extra
         return base
 
     def seconds(self, splits: int) -> float:

@@ -24,7 +24,7 @@ from test_host_training import HOST, Coupled, centered
 
 from dew.checkpoints import Checkpoints, Keep, Ranking
 from dew.objectives.base import Aux, Objective, Ratio
-from dew.training import Trainer
+from dew.training import Trainer, UpdateBatch
 
 ROWS = 2 * jax.device_count()
 
@@ -105,7 +105,7 @@ def microbatches(masks):
 
 
 def windowed(batches, tx, accumulation):
-    trainer = Trainer(Linear(), tx, key=jax.random.key(0), accumulation=accumulation)
+    trainer = Trainer(Linear(), tx, key=jax.random.key(0), update=UpdateBatch(batches=accumulation))
     state = trainer.initial_state()
     run = trainer.compile(state, batches[0])
     for batch in batches:

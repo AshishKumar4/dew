@@ -1,5 +1,5 @@
 """Optimizer state stored narrower than the step computes it: AdamW's bf16 moments
-(`OptimConfig(state_dtype='bfloat16')`), each step optax's own from fp32 moments, the moments stored
+(`AdamW(state_dtype='bfloat16')`), each step optax's own from fp32 moments, the moments stored
 stochastically rounded."""
 
 import jax
@@ -10,12 +10,12 @@ from learning_gate import assert_learns, within
 from optim_support import LR, decoder_params, drawn_tree
 from reference_error import assert_as_exact
 
-from dew.optim import OPTIMIZER_MAP, OptimConfig
+from dew.optim import AdamW, OptimConfig
 
 
-def bf16_state_adamw(**kwargs):
-    return OptimConfig(optimizer='adamw', learning_rate=LR, weight_decay=0.0,
-                                       state_dtype='bfloat16', **kwargs).build(10)
+def bf16_state_adamw(**settings):
+    return OptimConfig(optimizer=AdamW(weight_decay=0.0, state_dtype='bfloat16', **settings),
+                       learning_rate=LR).build(10)
 
 
 BF16_FIRST_SEEDS = 8
@@ -29,7 +29,7 @@ BF16_SECOND_SEEDS = 16
 def test_bf16_state_takes_optax_adamw_steps_from_the_fp32_moments():
     """The update is computed from the fp32 moments before they are rounded.
     The first starts from zero moments, which bf16 holds exactly, so it is
-    the fp32-state AdamW update (`OPTIMIZER_MAP`), its options (nesterov,
+    the fp32-state AdamW update (`AdamW`), its options (nesterov,
     eps_root, b2) included; the second is AdamW's update from the bf16 state's
     own moments, widened. Each over drawn parameters and gradients, on par
     with optax's (check 1), its truth optax's float64 run from the same
@@ -40,8 +40,8 @@ def test_bf16_state_takes_optax_adamw_steps_from_the_fp32_moments():
     the storage is held exactly; with the second step's arithmetic it holds
     the second update within the storage's rounding of the fp32 run's."""
     opts = {'nesterov': True, 'eps_root': 1e-8}
-    reference = OPTIMIZER_MAP['adamw'](LR, b2=0.99, weight_decay=0.0, **opts)
-    solver = bf16_state_adamw(b2=0.99, optimizer_opts=opts)
+    reference = AdamW(b2=0.99, weight_decay=0.0, state_dtype="params", **opts).transform(LR)
+    solver = bf16_state_adamw(b2=0.99, **opts)
     first = jax.jit(lambda grads, params: solver.update(grads, solver.init(params), params)[1])
 
     def draw(seed):

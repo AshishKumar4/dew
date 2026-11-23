@@ -126,6 +126,16 @@ def _ratio_sums(operands, form: Ratio):
     rank = max(operand.ndim for operand in operands)
     laid = [_laid_to(operand, rank) for operand in operands]
     states = max(operand.shape[form.axis] for operand in laid)
+    if (states == 1 and form.reduced and not form.over and not form.across and form.power == 1
+            and form.numerator == ((1.0, (("v", 0),)),)
+            and form.denominator == ((1.0, (("v", 1),)),)
+            and laid[0].dtype == laid[1].dtype):
+        numerator_scaled = scaled.scaled(jnp.squeeze(laid[0], form.axis))
+        denominator_scaled = scaled.scaled(jnp.squeeze(laid[1], form.axis))
+        return ((numerator_scaled.significand, jnp.zeros_like(numerator_scaled.significand),
+                 numerator_scaled.exponent),
+                (denominator_scaled.significand, jnp.zeros_like(denominator_scaled.significand),
+                 denominator_scaled.exponent))
     count = -(-states // chunk_width(states)) * chunk_width(states)
     over_states = [_Sum(form.numerator, form.axis, form.over, count)] if form.reduced else []
     if form.denominator:

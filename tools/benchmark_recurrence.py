@@ -152,7 +152,7 @@ def operands(shape: Shape, seed: int = 0) -> dict[str, np.ndarray]:
                 'dt': np.log1p(np.exp(normal(batch, length, channels) - 2.0)),
                 'A': -np.exp(rng.uniform(0.0, np.log(16.0), (channels, state))).astype(np.float32),
                 'B': normal(batch, length, state), 'C': normal(batch, length, state), 'D': normal(channels),
-                'dy': normal(batch, length, channels), 'dfinal': normal(batch, channels, state)}
+                'dy': normal(batch, length, channels)}
     if shape.kind == 'ssd':
         heads, groups = shape.value_heads, shape.key_heads
         return {'x': normal(batch, length, heads, shape.value_width),
@@ -250,21 +250,28 @@ def _ssd_parts(shape: Shape, given: dict) -> tuple:
 
 
 def _selective_parts(shape: Shape, given: dict) -> tuple:
-    """A Mamba-1 shape's (`_ssd_parts`'s): its selective scan as its layer runs it (`mixers.mamba.
-    selective_scan`, its step already through softplus), `x`, the step, `B` and `C` in bf16 as mamba_ssm's
-    bf16 training takes them, `A` and `D` fp32."""
+    """A Mamba-1 shape's (`_ssd_parts`'s): its selective scan as its layer calls it (`Mamba._scan`: the
+    kernel its selector gives each product, `recurrence_chunk.selective_scan`, the portable scan its
+    fallback; its step already through softplus), `x`, the step, `B` and `C` in bf16 as mamba_ssm's bf16
+    training takes them, `A` and `D` fp32. Its output alone timed and differentiated: mamba_ssm's
+    `selective_scan_fn` takes no final state's cotangent (`SelectiveScanFn.backward(ctx, dout, *args)`)."""
+    import functools
+
     import jax.numpy as jnp
 
-    from dew.nn.mixers.mamba import selective_scan
+    from dew.nn.kernels import recurrence_chunk
+    from dew.nn.mixers import mamba
 
     bf16 = jnp.bfloat16
     inputs = (given['x'].astype(bf16), given['dt'].astype(bf16), given['A'], given['B'].astype(bf16),
               given['C'].astype(bf16), given['D'])
+    portable = functools.partial(mamba.selective_scan, chunk_size=shape.chunk)
 
     def template(x, dt, A, B, C, D):
-        return selective_scan(x, dt, A, B, C, D, chunk_size=shape.chunk)
+        out, _ = recurrence_chunk.selective_scan(x, dt, A, B, C, D, None, None, portable=portable)
+        return (out,)
 
-    return inputs, template, {}, {}, (given['dy'].astype(bf16), given['dfinal'])
+    return inputs, template, {}, {}, (given['dy'].astype(bf16),)
 
 
 def _loglinear_parts(shape: Shape, given: dict) -> tuple:
@@ -457,7 +464,8 @@ def _mamba_ssm_case(shape: Shape, given: dict, bf16) -> tuple:
 
 def _mamba_selective_case(shape: Shape, given: dict, bf16) -> tuple:
     """mamba_ssm's `selective_scan_fn` (its CUDA kernels) on a Mamba-1 shape, laid as it takes them before the
-    timed call (`u` and `delta` `[B, D, S]`, `B` and `C` `[B, N, S]`), its step already through softplus."""
+    timed call (`u` and `delta` `[B, D, S]`, `B` and `C` `[B, N, S]`), its step already through softplus: its
+    output alone, whose gradient its backward takes (no final state's cotangent, `_selective_parts`)."""
     scan = importlib.import_module('mamba_ssm.ops.selective_scan_interface').selective_scan_fn
 
     def laid(name, dtype=None):
@@ -467,9 +475,9 @@ def _mamba_selective_case(shape: Shape, given: dict, bf16) -> tuple:
     leaves = [laid('x', bf16), laid('dt', bf16), given['A'], laid('B', bf16), laid('C', bf16), given['D']]
 
     def run(x, dt, A, B, C, D):
-        return scan(x, dt, A, B, C, D, return_last_state=True)
+        return (scan(x, dt, A, B, C, D),)
 
-    return leaves, run, (laid('dy', bf16), given['dfinal'])
+    return leaves, run, (laid('dy', bf16),)
 
 
 def _flashqla_case(shape: Shape, given: dict, bf16, torch) -> tuple | str:
