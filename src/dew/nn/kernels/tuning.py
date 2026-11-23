@@ -1210,13 +1210,15 @@ def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:
     """`op` as its picks name it: without the config and the vjp a call sets, its hook
     fields by what they compute (`KernelOp.traced`, a tuning run's alone: `reading`, `seen`, `tune`, whose
     picks persist under it across checkouts), or, not `traced`, as every launch's identity reads them
-    (`KernelOp.identified`, `report._identity`), tracing nothing."""
+    (`KernelOp.identified`, `report._identity`), tracing nothing, and unpulled: a launch's certification
+    keys its reverse mode itself (`report.certified`), so a gradient's call and its pulled op's certify,
+    and name their kernels, as one launch."""
     if not isinstance(op, KernelOp):
         return op.replace(config=None, vjp=None)
     fields = {field.name for field in dataclasses.fields(op)}
     read = op.traced if traced else op.identified
     hooks = {name: read(name, getattr(op, name)) for name in op.HOOKS if name in fields}
-    return op.replace(config=None, vjp=None, **hooks)
+    return op.replace(config=None, vjp=None, **hooks, **({} if traced else {"pulled": False}))
 
 
 def _kind(ba: tokamax.BoundArguments) -> str:
