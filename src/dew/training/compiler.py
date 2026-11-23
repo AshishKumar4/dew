@@ -524,7 +524,7 @@ class Unplaced(NamedTuple):
     planned: Planned
     compiled: Compiled
     keep: Callable[[], None]
-    release: Callable[[Planned], None]
+    release: Callable[[Planned | None], None]
     """Drop what its search kept but the plan a compile takes, its own or one searched on the placed devices
     (`FitSearch.released_unplanned`)."""
 
@@ -698,7 +698,7 @@ class StepCompiler[L, E]:
         # The last search's release of what it kept but a plan taken in its place (`Unplaced.release`).
         # A provisional search's release of what it kept but the plan taken in its place, until the plan made
         # before the state was placed takes it (`Unplaced.release`); none past that, so no search outlives it.
-        self._settle: Callable[[Planned], None] | None = None
+        self._settle: Callable[[Planned | None], None] | None = None
         # Where that search found none, its refusal, which the placed state may not cover (`refuse_unplaced`).
         self._refused: tuple[Hashable, PlanRefused] | None = None
         # The fit's interval its host steps count their misses in (`counting`), None outside a fit.
