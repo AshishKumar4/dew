@@ -526,12 +526,14 @@ def test_a_loop_passing_messages_resumes_as_it_never_stopped(tmp_path):
     assert_same(parameters(whole), parameters(resumed), "the resumed run is not the run unstopped")
 
 
-def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes():
+@pytest.mark.parametrize("watched", [False, True], ids=["unwatched", "watching its MLPs"])
+def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes(watched):
     """A bf16 decoder passing messages over an exit-gated loop (`Loop.messages`, `exit_gate=True`), every
     block rematerialized (`full`), compiled ahead on two compile-only H100s splitting its rows: its live
     memory past its arguments grows from three passes to seven by no more than a message-free loop's growth
     plus the added passes' saved banks, rather than holding deferred fp32 merge intermediates or un-summed
-    bank cotangents live across its passes (row 11713)."""
+    bank cotangents live across its passes (row 11713); so too where the step watches its MLPs. Each a cell
+    of its own (row 11902: their six compiles in one cell took 360 s)."""
     from step_memory import MIXER_HEAD, MIXER_LENGTH, MIXER_ROWS, MIXER_WIDTH, STEP_LAYOUT
     from token_support import token_rows
 
@@ -573,13 +575,13 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
     added_banks = 4 * (MIXER_ROWS // devices) * MIXER_LENGTH * 2 * MIXER_WIDTH * 2
     # So too where the step watches its MLPs (row 11820: a watch of other modules leaves the merges to their
     # own rules), its sampled step the one compiled.
-    for inspection in (None, Inspection(modules=("*MLP",), every=1)):
-        msg_two, msg_six = live_past_args(3, spec, inspection), live_past_args(7, spec, inspection)
-        msg_growth = msg_six - msg_two
-        assert msg_growth <= plain_growth + 2 * added_banks, (
-            f"cross-pass live growth {msg_growth} B, watching {inspection}, exceeded plain growth "
-            f"{plain_growth} B + 2 * added_banks {2 * added_banks} B "
-            f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
+    inspection = Inspection(modules=("*MLP",), every=1) if watched else None
+    msg_two, msg_six = live_past_args(3, spec, inspection), live_past_args(7, spec, inspection)
+    msg_growth = msg_six - msg_two
+    assert msg_growth <= plain_growth + 2 * added_banks, (
+        f"cross-pass live growth {msg_growth} B, watching {inspection}, exceeded plain growth "
+        f"{plain_growth} B + 2 * added_banks {2 * added_banks} B "
+        f"(msg: {msg_two} -> {msg_six}, plain: {plain_two} -> {plain_six})")
 
 
 @pytest.mark.parametrize("watch", ["captured", "inspected"])
