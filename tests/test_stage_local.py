@@ -1062,13 +1062,14 @@ def test_a_local_saves_rows_on_each_stages_mesh_are_recovered_where_its_holders_
 
 
 @pytest.mark.mesh(devices=8)
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("devices", [1, 8], ids=["1dev", "8dev"])
 def test_a_one_stage_scanned_fit_keeps_shared_frozen_arrays_alive(devices):
     """A one-stage scanned fit's state returned on its stored layers (`StageLocal.stored`, consumed) donates
     its stacked `stages` arrays alone, its unstacked collections (`FROZEN`) untouched, so the arrays it
     shares with the objective's held tree and its initial state stay readable and a second fit reads them
     (row 12079: the frozen base was donated and deleted)."""
-    model = decoder(scan_layers=True)
+    model = decoder()
     base = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32)))
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
     objective = LMObjective(adapter.model, SEQ, variables=adapter.variables, ema_decay=None)
