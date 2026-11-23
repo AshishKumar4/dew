@@ -924,7 +924,7 @@ def _rejected_instruction(ctx) -> None:
 
 class AssemblerRejected(grouped_matmul.MosaicGmm):
     """The grouped forward beside a kernel of its launch that lowers and that the assembler refuses, its
-    result a residual alone."""
+    result added to every output."""
 
     @functools.wraps(grouped_matmul.MosaicGmm._fwd)  # its binding reads its forward's signature
     def _fwd(self, tokens, kernel, sizes, *args, **kwargs):
@@ -936,9 +936,7 @@ class AssemblerRejected(grouped_matmul.MosaicGmm):
 
         flag = plgpu.kernel(rejected, out_type=jax.ShapeDtypeStruct((128,), jnp.float32))(
             jnp.zeros((128,), jnp.float32))
-        # A residual alone: the launch certified alone keeps it, and a forward that discards its residuals
-        # compiles without it.
-        return outputs, (residuals, flag)
+        return jax.tree.map(lambda out: out + flag[0].astype(out.dtype), outputs), residuals
 
 
 @COMPILE_ONLY
@@ -947,13 +945,19 @@ def test_a_launch_the_assembler_refuses_alone_fails_the_compile_gate_uncertified
     """A launch whose kernel lowers and whose PTX the assembler refuses, through the compile gate on a
     compile-only H100: certification's own compile of it fails (`report.certified`'s refusal by XLA), it is
     recorded uncertified (`report.uncertified`), and the gate's record names it, so the gate fails the case
-    (row 6002: the route tested on a hand-made record alone). The program itself compiles, the refused
-    kernel's result discarded there: the gate fails it as uncertified alone."""
+    (row 6002: the route tested on a hand-made record alone). The program discards the launch's result, so
+    it compiles without the refused kernel, which the launch's own certification, made as it traces, keeps:
+    the gate fails it as uncertified alone."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures, refused
 
     _, made, operands = _paired(AssemblerRejected())
-    [record] = compile_mosaic_kernels([KernelCase("refused", lambda: (made(), tuple(operands)))], "sm90")
+
+    def discarding(x, gate, up):
+        made()(x, gate, up)
+        return x
+
+    [record] = compile_mosaic_kernels([KernelCase("refused", lambda: (discarding, tuple(operands)))], "sm90")
     assert record["uncertified"] and not refused(record), record
     assert mosaic_failures([record]) and not mosaic_failures([{**record, "uncertified": []}]), record
 
