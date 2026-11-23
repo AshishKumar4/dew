@@ -680,11 +680,12 @@ def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(
         gc.collect()
         assert charged(probe) == alone + each, (alone, each)
         # The step's first run, its completion seen (`dew.training.memory.first_run`): nothing is charged
-        # ahead of a later program.
+        # ahead of a later program, which is charged its own load alone, what that first run measured.
         rows = Replaying(lambda position: {"text": jax.device_get(BATCH["text"])})
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
         gc.collect()
-        assert charged(probe) == alone, (alone, each)
+        measured = communicators._RESIDENT.cost.get(gpu, communicators.PROGRAM_FLOOR)
+        assert charged(probe) == measured, (alone, each, measured)
     finally:
         communicators.hold(held)
 
