@@ -1067,8 +1067,8 @@ def key_memory_sums(out_grads: TileLoad, corrected: TileLoad, value_grads: TileL
     return tuple(functools.partial(total, *pair, start) for pair, start in zip(pairs, onto, strict=True))
 
 
-def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tuple, lower: Tile, betas, system,
-                     scale: float, dtype, issue: Issue, *, emit: Callable[[str, jax.Array], None],
+def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, sums: tuple, lower: Tile, betas,
+                     system, scale: float, dtype, issue: Issue, *, emit: Callable[[str, jax.Array], None],
                      columns: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """One key block's part of a decay a key dimension's backward (`templates.recurrence.key_backward`), its
     queries `query` and keys `key` `[C, BK]`, their prefix from the chunk's start `gates` `[C, BK]` and the
