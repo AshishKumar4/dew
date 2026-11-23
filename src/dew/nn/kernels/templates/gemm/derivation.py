@@ -132,7 +132,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     from dew.nn.kernels import generation
     with generation.as_target(target):
         for consumers in dict.fromkeys((most if whole else 1, 1)):
-            program_counts = (range(family.programs(consumers), 0, -1) if programs is None else (programs,))
+            program_counts = (range(pricing.max_programs(family, consumers), 0, -1)
+                              if programs is None else (programs,))
             held = [tiled(consumers, count) for count in program_counts]
             tile = next((tile for tile, balanced in held if balanced), None)
             if tile := tile or next((tile for tile, _ in held if tile is not None), None):

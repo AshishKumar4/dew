@@ -1603,9 +1603,9 @@ def _idle(tiles: Tiles, group: "row_tiles.GroupInfo", row_start, consumer) -> ja
 def uses_row_bound(family: mosaic.Family, tiles: Tiles, dtype, *, dense: bool,
                    staged_rows: bool = False) -> bool:
     """Single bounded-MMA eligibility rule shared by `_row_bound` and `pricing.bounded_registers` (rows 5623,
-    7091): one-consumer grouped non-fp32 `gmm` on an issuer whose `bounded()` binds a bound."""
+    7091): one-consumer grouped non-fp32 `gmm` on an issuer overriding `Issuer.bounded`."""
     return (not staged_rows and not dense and tiles.sharing == 1
-            and jnp.dtype(dtype) != jnp.float32 and family.bounded(0) is not family)
+            and jnp.dtype(dtype) != jnp.float32 and type(family).bounded is not mosaic.Issuer.bounded)
 
 
 def _row_bound(family: mosaic.Family, tiles: Tiles, dtype, group: "row_tiles.GroupInfo", row_start,

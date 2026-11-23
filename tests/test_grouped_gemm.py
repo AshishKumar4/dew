@@ -2230,6 +2230,15 @@ def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
         dw_ba = tgmm.bind(bf16((8192, 1024)), bf16((8192, 1024)), one, out_dtype="float32",
                           interpret=False, dense=True)
         assert not tgmm.legal(dw_ba, dataclasses.replace(pair_tile, splits=2), sm100)
+        # Power-of-two tcgen05.alloc rounding: 80 cols x 2 turns = 160 TMEM cols allocate 256/program,
+        # so 2 programs (512 <= 512) fit while 3 programs (768 > 512, vs unrounded 480) refuse (#12302).
+        from dew.nn.kernels.templates.gemm import pricing
+
+        t80 = tiling.Tiles(128, 80, 64, 2, 1, warpgroups=1, cluster=1, family="tcgen05", programs=2)
+        fam = pricing.family_of(t80, jnp.bfloat16, sm100)
+        assert pricing.granular_tile(fam, t80, jnp.bfloat16, target=sm100)
+        assert not pricing.granular_tile(
+            fam, dataclasses.replace(t80, programs=3), jnp.bfloat16, target=sm100)
 
 
 @INTERPRETS

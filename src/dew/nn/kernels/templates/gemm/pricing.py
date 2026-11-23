@@ -220,18 +220,23 @@ def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: 
     return max(hook, staged)
 
 
+def max_programs(family: mosaic.Family, consumers: int) -> int:
+    """Most resident programs/SM for `consumers` warpgroups at `family`'s scalar-register floor (shared by
+    `granular_tile`, `derivation.derived` and `MosaicGmm._tile`)."""
+    return family.programs(consumers, family.scalar_registers() if family.budgets_registers else None)
+
+
 def granular_tile(family: mosaic.Family, config: "Tiles", dtype, *, target,
                   steps: tuple[int, ...] | None = None, accumulators: int = 1, exact_sums: bool = False,
                   stream_blocks: Callable[[], dict[str, tuple[tuple[int, ...], object]]] | None = None
                   ) -> bool:
     """Whether `config` satisfies `family`'s granularity, register-program residency, fixed accumulator rows,
-    and tensor-memory column budget (shared by `_Mosaic` and `MosaicSyrk`, row 11982)."""
+    and power-of-two tensor-memory column budget (shared by `_Mosaic` and `MosaicSyrk`, rows 11982, 12302)."""
+    from dew.nn.kernels.templates import resources
     from dew.nn.kernels.templates.gemm.tiling import CONSUMERS
 
-    most_programs = family.programs(config.warpgroups,
-                                    family.scalar_registers() if family.budgets_registers else None)
     if (config.warpgroups > min(family.consumers, CONSUMERS)
-            or config.programs > most_programs or config.stages < 2
+            or config.programs > max_programs(family, config.warpgroups) or config.stages < 2
             or config.block_m % (family.role_rows * config.sharing)
             or config.block_n % family.column_unit(dtype)
             or config.block_k not in (steps or family.depths(dtype))
@@ -240,7 +245,7 @@ def granular_tile(family: mosaic.Family, config: "Tiles", dtype, *, target,
     tensor = family.tensor_columns(tile_columns(config, family), accumulators, exact_sums)
     if tensor and stream_blocks is not None:
         tensor += family.stream_tensor_columns(stream_blocks(), config.stages)
-    return tensor * config.programs <= (target.tmem_columns or 0)
+    return resources.tensor_memory_allocated(tensor) * config.programs <= (target.tmem_columns or 0)
 
 
 def prefetch_registers(family: mosaic.Family, config: "Tiles", *, ba) -> int:

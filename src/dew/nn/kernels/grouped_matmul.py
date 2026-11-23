@@ -993,17 +993,17 @@ class MosaicGmm(_Mosaic):
         # its walk prices below the unswapped tile's (row 5874: an NVFP4 decode's swap won on wide outputs
         # and lost 25-31% on square and narrow ones, M-EM-26-gh200).
         from .templates.gemm import pricing
+
         plain = self._decode_split(ba, super()._tile(ba, target), target)
         candidates = [] if plain is None else [plain]
-        if plain is not None and plain.warpgroups == 1 and plain.programs == 1:
+        if plain is not None and plain.warpgroups == 1:
             family = pricing.family_of(plain, ba.arguments['tokens'].dtype, target)
-            if (family.warpgroups(1) > 1 and family.budgets_registers
-                    and not target.tmem_columns and not family.pairs_product):
-                two_base = self._derived(ba, target, programs=2)
-                if two_base is not None and two_base.stages >= 1 + family.loads_ahead + family.in_flight:
-                    two = self._decode_split(ba, two_base, target)
-                    if two is not None:
-                        candidates.append(two)
+            for count in range(pricing.max_programs(family, 1), plain.programs, -1):
+                alt_base = self._derived(ba, target, programs=count)
+                if alt_base is not None and alt_base.stages >= 1 + family.loads_ahead + family.in_flight:
+                    alt = self._decode_split(ba, alt_base, target)
+                    if alt is not None:
+                        candidates.append(alt)
         swapped = self._swapped(ba, target)
         tile = None if swapped is None else self._derived(swapped, target, admits=lambda tile: (
             self._left_fits(ba, tile, target) and tile.block_m <= SWAPPED_ROWS))
