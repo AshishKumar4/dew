@@ -127,6 +127,7 @@ from dew.checkpoints._state_trees import (
     _with,
     _with_ema_deltas,
     decodes_done,
+    earlier_unmasked,
     formed_as,
     masked_decay_unsaved,
 )
@@ -1018,6 +1019,9 @@ class Checkpoints:
         # The newest local step, the processes holding it and where its arrays lie, where some process
         # lost its copy and recovers it from them (`_local_latest`); None where every process holds it.
         self._recovery: tuple[int, frozenset[int], tuple[Grid, ...]] | None = None
+        # Whether the run's record was an earlier run's whose optimizer read a mask of False, read before a
+        # run writes its record in its translation (`earlier_unmasked`).
+        self._unmasked = earlier_unmasked(self.directory, RUN_FILE)
         # The digests the save still in flight records, which no kept step lists yet.
         self._frozen_pending: set[str] = set()
 
@@ -2201,8 +2205,10 @@ class Checkpoints:
         stored = metadata.keys()
         _check_template(template, metadata, stored, mapping=mapping)
         placed = template
-        template, form = masked_decay_unsaved(
-            _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata), metadata, _OPTIMIZERS)
+        template = _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata)
+        # An earlier run's masked decay step read across, its record's alone (`earlier_unmasked`).
+        template, form = masked_decay_unsaved(template, metadata, _OPTIMIZERS) if self._unmasked else (
+            template, None)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:
