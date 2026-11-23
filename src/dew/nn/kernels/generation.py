@@ -186,6 +186,14 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False,
         yield
 
 
+def as_target(target: GpuTarget) -> contextlib.AbstractContextManager:
+    """Within the block, the GPU in effect is `target` (`assumed` of it, where it is not the one in effect
+    already): what a model asked for a given target reads, whatever target the call is made under (a
+    register model's, `resources.register_model`; a launch's register proposal, `templates.base.Template`,
+    rows 11987 and 12000)."""
+    return contextlib.nullcontext() if target == gpu_target() else assumed(target)
+
+
 def _cross_compiled(value: Assumption | None) -> contextlib.AbstractContextManager:
     """tokamax's kernels lowered for an assumed GPU on any host: tokamax checks the device a kernel runs on
     against this host's (its Triton attention raised "Not supported on cpu" for a step traced for a
@@ -234,6 +242,12 @@ class Choice(enum.StrEnum):
 CHOICES = frozenset(choice.value for choice in Choice)
 """The choices' names (`Choice`), those `chosen` may name (`dew.kernels.choices`)."""
 
+SITE_KERNELS: dict[Choice, frozenset[str]] = {Choice.NARROW_COPIES: frozenset({'on', 'off'})}
+"""The kernels of each choice a site decides without a selector (`chosen_kernel`), which `chosen` names
+among: a selector's are its op's own, which its selection refuses a name outside of (`selection.select`);
+one of these a site reads by name alone, a misspelt name read as not its kernel (`narrow_copies="of"`,
+off)."""
+
 
 @contextlib.contextmanager
 def chosen(**kernels: str) -> Iterator[None]:
@@ -247,6 +261,9 @@ def chosen(**kernels: str) -> Iterator[None]:
     if unknown := set(kernels) - CHOICES:
         raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
                          f"the choices are {', '.join(sorted(CHOICES))}")
+    for choice, kernel in kernels.items():
+        if (known := SITE_KERNELS.get(Choice(choice))) is not None and kernel not in known:
+            raise ValueError(f"{choice} has no kernel {kernel!r}; its kernels are {', '.join(sorted(known))}")
     named = {str(choice): kernel for choice, kernel in kernels.items()}
     with _cache.KERNEL_CHOICES(tuple(sorted({**dict(_cache.KERNEL_CHOICES.value), **named}.items()))):
         yield
@@ -1470,9 +1487,10 @@ def _resolved(device, generation: str, real: bool) -> GpuTarget:
 
 def chosen_kernel(choice: Choice, default: str) -> str:
     """The kernel `chosen` names for `choice` within its block, else `default`: a choice a site decides
-    without a selector (a step's narrow copies)."""
+    without a selector (a step's narrow copies), its kernels `SITE_KERNELS`' (`default` among them)."""
     from dew import _cache
 
+    assert default in SITE_KERNELS[choice], (choice, default)
     return dict(_cache.KERNEL_CHOICES.value).get(choice, default)
 
 

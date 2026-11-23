@@ -1319,6 +1319,16 @@ def _forward_call(shape, width: int, value_width: int, residuals: template.Kept)
                       residuals=residuals)
 
 
+def test_a_forward_proposed_for_an_h100_is_proposed_whatever_gpu_is_in_effect():
+    """An H100 forward's config is proposed for it with an A100 in effect (`Template.proposes`, row 12000)."""
+    h100 = generation.gpu_target("sm90")
+    op, ba = _forward_call((1, 4096, 16, 4), 128, 128, template.Kept.SPLIT)
+    with generation.assumed("sm90"):
+        own = op.derived(ba, h100)
+    with generation.assumed("sm80"):
+        assert own is not None and op.proposes(ba, own, h100)
+
+
 @pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
 def test_a_refused_forward_config_is_derived_no_more(residuals):
     """A B200's forward of Qwen3.5-4B's attention (16 heads over 4, width 256, a 12,288-token causal row):

@@ -412,7 +412,7 @@ def test_a_profiled_benchmark_case_writes_the_reports_attribute_step_reads(tmp_p
     import sys
 
     from lane_environment import outside_suite
-    from test_benchmark_step import peak_row
+    from test_benchmark_step import SMOKE_CASE, peak_row
     from tier_wire import TRUTHS, preparing
     from tool_support import REPO_ROOT
 
@@ -422,9 +422,8 @@ def test_a_profiled_benchmark_case_writes_the_reports_attribute_step_reads(tmp_p
 
         node = model_flows.node_target()
         tool = str(REPO_ROOT / "tools/benchmark_step.py")
-        done = subprocess.run([sys.executable, tool, "--preset", "cpu-smoke",
-                               "--architectures", "causal_transformer", "--dtype", "float32", "--mesh", "{}",
-                               "--compile-ahead", ahead, "--generation", node.generation,
+        done = subprocess.run([sys.executable, tool, *SMOKE_CASE, "--compile-ahead", ahead,
+                               "--generation", node.generation,
                                "--capacity-gib", str(node.memory // 2**30)],
                               env={**outside_suite(os.environ), "JAX_PLATFORMS": "cpu",
                                    "PYTHONPATH": str(REPO_ROOT / "src")},
