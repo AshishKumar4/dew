@@ -572,10 +572,11 @@ def image_run(inputs):
 
 
 @attending("xla")
-@pytest.mark.check1_shards(seeds=512, per_task=180)
+@pytest.mark.check1_shards(seeds=512, per_task=64)
 def test_an_image_sft_trainers_gradient_is_the_objectives(image_source):
     """The image SFT trainer's gradient is the objective's at the step's draws, the float64 twin of the
-    loaded multimodal fixture the truth (`assert_the_objectives_gradient`)."""
+    loaded multimodal fixture the truth (`assert_the_objectives_gradient`), its 512 draws in map tasks of
+    64 (row 12128: tasks of 180 took 515-615 s, past a CI group's bound)."""
     _, inputs, obj, variables, _ = image_source
     batch, _, run_key = image_run(inputs)
     with jax.enable_x64(new_val=True):
@@ -595,10 +596,13 @@ def test_an_image_sft_runs_own_path_takes_the_trainers_update(image_source):
 
 
 @attending("xla")
-def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
-    """Native lifecycle evidence, not an official image-conditioned SFT oracle."""
-    loaded, inputs, obj, variables, _ = image_source
-    batch, data, run_key = image_run(inputs)
+def test_image_sft_trainer_resumes_where_its_uninterrupted_run_lands(image_source, tmp_path):
+    """Native lifecycle evidence, not an official image-conditioned SFT oracle: an image-conditioned block
+    SFT run trains its conditioner, and resumed from its checkpoint lands bit for bit where the same run
+    uninterrupted does. Its publication is its own cell
+    (`test_image_sft_run_published_reads_back_and_generates_as_its_run`)."""
+    _, inputs, obj, variables, _ = image_source
+    _, data, run_key = image_run(inputs)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)
@@ -613,6 +617,15 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     assert_tree_close(resumed.opt_state, direct.opt_state, 0)
     assert int(resumed.updates) == 2
 
+
+@attending("xla")
+def test_image_sft_run_published_reads_back_and_generates_as_its_run(image_source, tmp_path):
+    """Native lifecycle evidence, not an official image-conditioned SFT oracle: an image-conditioned block
+    SFT run's trained weights published as its source's checkpoint read back as the same objective, its
+    loss under the run's draws the run's, and its block generation the run's own, token for token."""
+    loaded, inputs, obj, _, _ = image_source
+    batch, data, run_key = image_run(inputs)
+    resumed = Trainer(obj, optax.sgd(0.001), key=run_key).fit(data, steps=1, log_every=1)
     replace(loaded, model=obj.model).save(tmp_path / "published", variables=resumed.variables)
     readback = Pretrained.load(tmp_path / "published", dtype="float32", max_seq_len=32)
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, variables=readback.variables)
