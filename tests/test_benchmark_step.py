@@ -426,15 +426,16 @@ def test_a_benchmarks_rows_reach_a_tracker_after_its_cases_one_step_a_case(tmp_p
         (1, {"unet/ms_per_step": 30.0, "unet/devices": 1.0})]
 
 
-@pytest.mark.parametrize("mesh, split", [({}, 1), ({"fsdp": 2}, 1), ({"stage": 2}, "auto"),
-                                         ({"stage": 2, "microbatches": 4}, 4)],
+@pytest.mark.parametrize("mesh, microbatches", [({}, None), ({"fsdp": 2}, None), ({"stage": 2}, None),
+                                                ({"stage": 2, "microbatches": 4}, 4)],
                          ids=["single", "fsdp", "staged", "staged-microbatches"])
-def test_a_cases_step_is_read_whole_and_its_pipeline_in_the_microbatches_it_names(mesh, split):
+def test_a_cases_step_is_read_whole_and_its_pipeline_in_the_microbatches_it_names(mesh, microbatches):
     """A case's step is read whole (`FitPolicy(split=1)`), as the benchmark has always timed it, the remat
-    ladder its one way to fit, never split behind the timing's back; under pipeline stages it is read in the
-    microbatches its mesh record names, the plan's where it names none; microbatches where it stages none
-    are refused (review of API01: every case's split was left to the plan)."""
+    ladder its one way to fit, never split behind the timing's back, staged or not; under pipeline stages
+    its pipeline feeds the microbatches its mesh record names (`FitPolicy.microbatches`), one a stage where
+    it names none; microbatches where it stages none are refused (review of API01: every case's split was
+    left to the plan, and a staged case's outer split lost)."""
     fields = load("benchmark_models").trainer_mesh(mesh)
-    assert fields["fit"].split == split
+    assert (fields["fit"].split, fields["fit"].microbatches) == (1, microbatches)
     with pytest.raises(ValueError):
         load("benchmark_models").trainer_mesh({"microbatches": 4})

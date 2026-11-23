@@ -110,7 +110,7 @@ flowchart LR
   E --> F; Mm --> F; Mm --> T; H --> T; V --> T; X --> Ex; L --> S; B --> D; B --> F
 ```
 
-A pipeline's microbatches are the fit policy's split (`Trainer(fit=FitPolicy(split=8))`; "auto", one per stage), the same for both mesh forms.
+A pipeline's microbatches are the fit policy's own (`Trainer(fit=FitPolicy(microbatches=8))`; unset, one per stage), beside the step's split, the same for both mesh forms.
 
 Where the layout splits a leaf, the shared rule table and that leaf's declared logical axes place it; a parameter that declares none is placed by a shape heuristic (its largest dimension fsdp divides, else whole; a leaf below `Layout.min_shard` elements, 2**16 by default, whole, as a declared one is, its collectives costing more than its shards save), and the layout's report names every parameter it placed so; it is never refused (the owner, 2026-11-16: "no refusals!"). A placement changes only where a value lives, never what is computed, beyond a sum's order over split shards. A rule outside Dew's defaults (`DEFAULT_RULES`) that names an axis the mesh lacks is refused, a role axis among them, since it would split nothing; Dew's own rules take a missing role axis as size 1. A placement rule that deviates for one model family is a separate rule (expert parallelism's, tensor parallelism's), never a branch in the default.
 

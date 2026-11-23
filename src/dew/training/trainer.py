@@ -158,7 +158,6 @@ from dew.training.distributed import (
     check_batch,
     check_stream,
     marked,
-    mesh_stages,
     microbatch_shapes,
     placed_start,
     ruled,
@@ -332,16 +331,14 @@ class Trainer(Generic[Loss, Effects]):
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
         self.mesh = mesh
-        # An update's steps are its batches, or one until `fit` reads its tokens' (`UpdateBatch.of_tokens`);
-        # under a mesh of stages the split is the microbatches the stages feed (`stage_microbatches`).
+        # An update's steps are its batches, or one until `fit` reads its tokens' (`UpdateBatch.of_tokens`).
         self.update, self.fit_policy, self.accumulation = update, fit, update.stated_batches
         self._update_read = update.tokens is None
-        staged = mesh_stages(mesh) > 1
-        self.split = split = None if staged else fit.stated_split
+        self.split = split = fit.stated_split
         # How a resume treats its data (`DataResume`): relaxed starts it again where its plan differs.
         self.data_resume: DataResume = data_resume
         self.skip_nonfinite = skip_nonfinite
-        self._microbatches, self._loss_scale = fit.stated_split if staged else None, loss_scale(dynamic_scale)
+        self._microbatches, self._loss_scale = fit.microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
         self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None

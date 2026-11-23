@@ -730,7 +730,7 @@ def padding_invariant_summaries(tail, *, packed: bool = False, pipelined: bool =
              else models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                                num_kv_heads=2))
     indexer = {"indexer": IndexerTraining("warmup")} if warmup else {}
-    staged = ({"fit": FitPolicy(split=2), "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
+    staged = ({"fit": FitPolicy(microbatches=2), "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
               if pipelined else {})
     run = Trainer(LMObjective(model, 16, pad_id=None if packed else tail, **indexer), optax.sgd(RATE),
                   key=jax.random.key(0), inspection=Inspection(modules=("*MLP",), targets=("params",)),
@@ -811,8 +811,8 @@ def test_a_pipelined_stacks_watched_layers_each_report_every_microbatch():
 
     model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                          num_kv_heads=2)
-    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), fit=FitPolicy(split=2),
-                  mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
+    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0),
+                  fit=FitPolicy(microbatches=2), mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
                   inspection=Inspection(modules=("*MLP",), targets=("params",)))
     tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
     logged = inspected(run, {"text": tokens})
@@ -1030,7 +1030,7 @@ def test_a_pipelined_stacks_watched_cotangents_are_each_layers_over_its_microbat
         return {name: value for name, value in inspected(run, {"text": tokens}).items()
                 if name.startswith("inspect/cotangents/")}
 
-    piped = cotangents(fit=FitPolicy(split=2), mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]))
+    piped = cotangents(fit=FitPolicy(microbatches=2), mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]))
     whole = cotangents(mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
     assert set(piped) == set(whole)
     assert {f"inspect/cotangents/layers_{layer}/mlp/rms" for layer in range(4)} <= set(piped)
@@ -1115,8 +1115,8 @@ def test_a_path_glob_selects_the_layer_its_log_names(stacked):
     def logged(*modules: str) -> dict[str, float]:
         fields = {**TINY_DECODER, "num_layers": 4, **({"scan_layers": True} if stacked == "scanned" else {})}
         model = models.build("causal_transformer", vocab_size=64, **fields, num_kv_heads=2)
-        placed = ({"fit": FitPolicy(split=2), "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
-                  if stacked == "pipelined" else {})
+        staged = MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])
+        placed = {"fit": FitPolicy(microbatches=2), "mesh": staged} if stacked == "pipelined" else {}
         run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
                       inspection=Inspection(modules=modules, targets=("params",), cotangents=True))
         tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
@@ -1151,8 +1151,8 @@ def test_a_pipeline_stage_modules_cotangent_is_refused():
 
     model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
                          num_kv_heads=2)
-    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), fit=FitPolicy(split=2),
-                  mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
+    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0),
+                  fit=FitPolicy(microbatches=2), mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
                   inspection=Inspection(modules=("stages",), targets=("params",), cotangents=True))
     with pytest.raises(ValueError):
         inspected(run, {"text": np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)})
