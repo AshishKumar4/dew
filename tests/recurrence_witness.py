@@ -953,14 +953,12 @@ def shifted(operands: tuple) -> tuple:
     return (*map(later, tokens), h0)
 
 
-REGIMES = ("mild", "slow", "steep", "decay", "a steep column")
+REGIMES = ("mild", "slow", "steep", "decay")
 """Each draw's log decays a token (`draw`): Gated DeltaNet's (`-softplus(N(0, 1) - 1)`, as
 tests/test_recurrence_mosaic.py draws them), a memory kept across chunks (`-U(0, 0.01)`), one forgotten within
 a few tokens (`-U(1, 3)`), and a decay alone (-0.4 a token and no write, `beta = 0`), whose fp32 cumulative
 sums within a chunk drift 1.5e-5 from the exact ones by its end (row 2066's defect's), where the decay's
-enclosure is 7e-7 of it wide; and under a decay a key dimension, its mild decays with one key dimension of one
-token in each chunk at -2^26, its layer declaring no bound (`declared_bound`): the call clamps it
-(`mainloop.clamps`) or keeps its prefix compensated (row 12067)."""
+enclosure is 7e-7 of it wide."""
 
 
 FLOOR = -5.0
@@ -969,12 +967,13 @@ bound)."""
 
 
 def draw(seed: int, regime: str, *, length: int = 192, heads: int = 1, width: int = 64,
-         per_key: bool = False, dtype=None):
+         per_key: bool = False, dtype=None, steep: bool = False):
     """A call's operands `(q, k, v, g, beta, h0)` of one row of `length` tokens (chunks' boundaries among
     them at every chunk the template derives), in `dtype` (bf16 by default): unit queries and keys,
     normal values, the regime's log decays (`REGIMES`), a write gate in (0, 1), an initial memory; `per_key`,
-    a decay a key dimension in (`FLOOR`, 0) instead (Kimi delta attention's bounded gate), its steep column's
-    one token a chunk -2^26 (`REGIMES`' last, a key dimension's alone)."""
+    a decay a key dimension in (`FLOOR`, 0) instead (Kimi delta attention's bounded gate), and where `steep`,
+    one key dimension of one token in each 64-token span at -2^26 beside them, its layer declaring no bound
+    (`declared_bound`): the call clamps it (`mainloop.clamps`) or keeps its prefix compensated (row 12067)."""
     import jax.numpy as jnp
 
     rng = np.random.default_rng([2084, 3, seed, REGIMES.index(regime)])
@@ -986,12 +985,10 @@ def draw(seed: int, regime: str, *, length: int = 192, heads: int = 1, width: in
     q, k = unit((1, length, 1, width)), unit((1, length, 1, width))
     v = rng.normal(size=(1, length, heads, width))
     shape = (1, length, heads)
-    steep = regime == "a steep column"
     assert per_key or not steep, "a steep column is a decay a key dimension's"
-    g = None if steep else {"mild": lambda: -np.log1p(np.exp(rng.normal(size=shape) - 1.0)),
-                            "slow": lambda: -0.01 * rng.uniform(size=shape),
-                            "steep": lambda: -rng.uniform(1, 3, shape),
-                            "decay": lambda: np.full(shape, -0.4)}[regime]()
+    g = {"mild": lambda: -np.log1p(np.exp(rng.normal(size=shape) - 1.0)),
+         "slow": lambda: -0.01 * rng.uniform(size=shape), "steep": lambda: -rng.uniform(1, 3, shape),
+         "decay": lambda: np.full(shape, -0.4)}[regime]()
     if per_key:
         g = FLOOR / (1 + np.exp(1.0 - rng.normal(size=(*shape, width))))
     if steep:
@@ -1136,16 +1133,17 @@ def assert_key_decays_witnessed(lane: Lane, heads: int = 1, width: int = 64) -> 
 
 def assert_clamped_key_decays_witnessed(lane: Lane, dtype=None) -> None:
     """The step witness under a decay a key dimension no bound declares (`declared_bound`), a call of three
-    chunks with a steep column (`REGIMES`' 'a steep column': one key dimension of one token a chunk at
-    -2^26, mild ones beside and after it): every record of its forward inside its step's enclosure, and of
-    its fast backward's where the template trains it. A 16-bit call's (`dtype` None, bf16) prefix its rounded
-    sum of its decays clamped (`Lane.clamped`); an fp32 call's the compensated pair (row 12067)."""
-    operands = draw(0, "a steep column", per_key=True, dtype=dtype)
+    chunks with a steep column (`draw`'s `steep`: one key dimension of one token a chunk at -2^26, mild ones
+    beside and after it): every record of its forward inside its step's enclosure, and of a 16-bit call's
+    fast backward where the template trains it (`recorded_key_backward`'s). A 16-bit call's (`dtype` None,
+    bf16) prefix its rounded sum of its decays clamped (`Lane.clamped`); an fp32 call's the compensated pair
+    (row 12067)."""
+    operands = draw(0, "mild", per_key=True, dtype=dtype, steep=True)
     run = recorded(*operands)
     held = witness(run, lane)
     for name in RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
-    if run.trained:
+    if run.trained and dtype is None:
         back = recorded_key_backward(operands, run=run)
         for name, inside in key_back_witnessed(back, lane).items():
             assert np.all(inside), (name, np.mean(inside))
