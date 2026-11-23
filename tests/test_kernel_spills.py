@@ -1189,8 +1189,8 @@ def test_a_launch_is_certified_on_the_compile_only_gpu_its_trace_is_placed_on(pl
     launch traced outside its certifying block twice, apart (rows 6791, 6824: the GH200's recurrent step
     certified 5 of its 28 programs twice), and a host of no GPU certified none of them."""
     # `TwoKernels`, a launch of its own each placement, by its name: certified here, whatever this process
-    # certified before (row 10853: run after the file's other tests, `TwoKernels` was certified already and
-    # this saw none).
+    # certified before, the other placement's case among it (row 10853: run after the file's other tests,
+    # `TwoKernels` was certified already and this saw none; Train 1216: both placements in one process).
     op = type(f"Placed{'OnMesh' if placed == 'its mesh' else 'ByTarget'}", (TwoKernels,), {})()
     devices, lowered = _paired_step(op)
     before = {id(each) for each in report.certifications()}

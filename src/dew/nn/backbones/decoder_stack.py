@@ -407,6 +407,10 @@ class PassView:
             return name
         return f'layers_{run.start + by}' if len(run) == 1 else group_name(run.start + by, len(run))
 
+    def stored(self, name: str) -> str:
+        """The name the pass's entry `name`, under its layers' own names, is stored by."""
+        return self._moved(name, self.offset - self.first)
+
     def _ours(self, name: str) -> bool:
         """Whether `name` is a layer entry this pass stores, or a name of no layer."""
         run = group_layers(name)
@@ -430,7 +434,7 @@ class PassView:
                 out[collection] = sows_appended(out.get(collection, {}), tree)
                 continue
             out.setdefault(collection, {}).update(
-                {self._moved(name, self.offset - self.first): value for name, value in tree.items()})
+                {self.stored(name): value for name, value in tree.items()})
         return out
 
 

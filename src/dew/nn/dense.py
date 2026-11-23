@@ -117,6 +117,24 @@ def pre_call_capture(keep: Callable) -> Callable:
     return keep
 
 
+def captures_any_method(module: nn.Module) -> bool:
+    """Whether a caller's capture (`capture_intermediates`, `module`'s `intermediates` collection open) may
+    keep the output of a method other than a call: a filter of the caller's own, which may take a helper
+    method returning no array (a layer's resolved kind, a submodule), where Flax's call filter and Dew's
+    pre-call filters (`PRE_CALL_CAPTURES`) keep modules' calls."""
+    from flax.linen import module as flax_module
+
+    if not module.is_mutable_collection('intermediates'):
+        return False
+    captures = flax_module._context.capture_stack
+    keep = captures[-1] if captures else None
+    if not keep:
+        return False
+    method = keep.__func__ if isinstance(keep, types.MethodType) else keep
+    return not (method is flax_module.capture_call_intermediates
+                or any(method is each for each in PRE_CALL_CAPTURES))
+
+
 def observed(module: nn.Module) -> bool:
     """Whether a caller keeps `module`'s own calls' outputs as Flax captures a module's (its
     `intermediates` collection open and the capture's filter, `capture_intermediates`', taking its call;

@@ -428,7 +428,7 @@ def cut_loop_loss(model, weights, tokens):
         def loss(params):
             held = {**variables, "params": params}
             hidden, sown = passing.apply(held, inputs, method="hidden_states", mutable=[EXITS])
-            earlier, _ = passing.exit_passes(sown)
+            earlier = passing.exit_passes(sown).states
             terms = [optax.softmax_cross_entropy_with_integer_labels(
                 passing.apply(held, states, method="logits_from_hidden"), targets)
                 for states in (*earlier, hidden)]
