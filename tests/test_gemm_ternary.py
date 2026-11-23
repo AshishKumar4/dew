@@ -21,6 +21,7 @@ from dew.nn import precision
 from dew.nn.kernels import formats, gemm, generation, grouped_matmul
 from dew.nn.kernels.templates.gemm import packed
 
+
 def test_ternary_weights_pack_decode_and_stage_match_bitwise():
     """`formats.TernaryWeights` packs 16 2-bit codes per uint32 word (`0->0`, `1->+1`, `2->-1`, `3->0`),
     matches `packed.stage_decoded_ternary` bitwise, and validates form version & scale shapes (row 1464)."""
