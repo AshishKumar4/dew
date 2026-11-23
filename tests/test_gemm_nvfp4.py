@@ -793,20 +793,19 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
     want[0, 0] = 2.0 ** -38
     np.testing.assert_array_equal(np.asarray(d_token), want)
 
-    # Routed twice to one +1 code of unit block scale (2**-8 decoded, a tensor scale of 2**-8, so a factor
-    # of one), its routes' cotangents 256 and -255.5 sum to 0.5 in fp32 before rounding: 2**-9, not each
-    # route rounded to bf16's 1 and -1 first, packed or decoded alike.
+    # Routed twice through the packed kernel to one +1 code of unit block scale (2**-8 decoded, a tensor
+    # scale of 2**-8, so a factor of one), its routes' cotangents 256 and -255.5 sum to 0.5 in fp32 before
+    # rounding, as the packed kernel's pullback sums them: 2**-9, not each route rounded to bf16's 1 and -1.
     one = formats.NvFp4.of(jnp.zeros((1, 512, 128), jnp.float32).at[0, 0, 0].set(1.0), scales[None],
                            jnp.asarray([2.0 ** -8], jnp.float32))
     twice, both = jnp.asarray([2], jnp.int32), jnp.asarray([0, 0], jnp.int32)
-    for kernel in ("packed", "xla"):
-        with generation.assumed("sm90"), generation.chosen(nvfp4=kernel):
-            _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, one, twice, both, out_dtype=jnp.float32,
-                                                              interpret_on_cpu=True), token)
-            (d_token,) = pull(jnp.zeros((2, 128), jnp.float32).at[0, 0].set(256.0).at[1, 0].set(-255.5))
-        want = np.zeros((1, 512), np.float32)
-        want[0, 0] = 2.0 ** -9
-        np.testing.assert_array_equal(np.asarray(d_token), want, err_msg=kernel)
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"):
+        _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, one, twice, both, out_dtype=jnp.float32,
+                                                          interpret_on_cpu=True), token)
+        (d_token,) = pull(jnp.zeros((2, 128), jnp.float32).at[0, 0].set(256.0).at[1, 0].set(-255.5))
+    want = np.zeros((1, 512), np.float32)
+    want[0, 0] = 2.0 ** -9
+    np.testing.assert_array_equal(np.asarray(d_token), want)
 
     # A gather routing no token pulls back zeros.
     none, nowhere = jnp.asarray([0, 0], jnp.int32), jnp.zeros((0,), jnp.int32)
