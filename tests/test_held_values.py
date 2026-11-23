@@ -611,3 +611,64 @@ def test_a_compile_settled_under_a_snapshot_is_compiled_again_where_its_facts_an
     answer[0] = 1
     with report.refusals():
         assert float(run(x)) == 1.0
+
+
+def test_a_fact_whose_reader_traces_the_program_is_judged_past_the_programs_lock():
+    """A fact a program's trace reads (`_facts.traced_fact`) whose reader traces the program itself at another
+    shape (`trace`, which takes the program's lock), then answering otherwise: the program's next call
+    judges its executable and its settled compile by the fact, the reader tracing again, and runs a program
+    of the fact's answer now (rows 12311, 12328's review P0: judged under the program's lock, the reader's
+    trace waited on it without end)."""
+    import threading
+
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    answer, reentering, inside = [0], [], []
+
+    @_facts.traced_fact
+    def flag() -> int:
+        if reentering and not inside:
+            inside.append(True)
+            try:
+                run.trace(jnp.zeros((2,)))
+            finally:
+                inside.pop()
+        return answer[0]
+
+    run, x = owned_program(lambda x: x + flag()), jnp.zeros(())
+    ran: list[float] = []
+    entered = _cache.carried()
+
+    def called() -> None:
+        with entered(), report.refusals():
+            ran.append(float(run(x)))
+            answer[0] = 1
+            reentering.append(True)
+            ran.append(float(run(x)))
+
+    running = threading.Thread(target=called, daemon=True)
+    running.start()
+    running.join(timeout=120)
+    assert ran == [0.0, 1.0], "the call waited on the program's lock without end"
+
+
+def test_a_call_within_a_block_compiled_together_answers_by_its_facts_now():
+    """A program called twice within `compiled_together`, a fact its trace reads (`_facts.traced_fact`)
+    answering otherwise between the calls: the second answers with the shapes of a program of the fact's
+    answer now, and the block compiles that program, which the call after it runs (rows 12311, 12328's review
+    P0: the block's first lowering answered both, its shapes stale)."""
+    from dew.nn.kernels import options
+
+    answer = [0]
+
+    @_facts.traced_fact
+    def flag() -> int:
+        return answer[0]
+
+    run, x = options.owned_program(lambda x: x[:1 + flag()]), jnp.zeros((4,))
+    with options.compiled_together():
+        assert run(x).shape == (1,)
+        answer[0] = 1
+        assert run(x).shape == (2,)
+    assert run(x).shape == (2,)
