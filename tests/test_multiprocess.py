@@ -1571,7 +1571,8 @@ def test_a_replicas_holder_whose_read_fails_ends_every_process_of_the_resume(tmp
     directory = tmp_path / "unreadable"
     shutil.copytree(killed_local_pool, directory)
     shutil.rmtree(directory / "local" / "process1")
-    for written in local_committed(directory, 0, LOCAL_KILL_AFTER).rglob("_CHECKPOINT_METADATA"):
+    step = local_committed(directory, 0, LOCAL_KILL_AFTER).parent
+    for written in [*step.rglob("_CHECKPOINT_METADATA"), *step.rglob("_METADATA")]:
         written.write_text("not a checkpoint's metadata")
     with pytest.raises(AssertionError):
         run_pool("fit", tmp_path / "resumed", 2, timeout=240, **local_flags(directory))

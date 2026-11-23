@@ -1354,10 +1354,8 @@ class Checkpoints:
 
     def _from_holder(self, holders: frozenset[int], read: Callable[[], JSON]) -> JSON:
         """What `read` gives on the first of `holders`, the processes holding the local step a process
-        lost, handed to every process; every process calls it alike, and a read that fails on the holder
-        raises on every process (`agreed`), none left waiting for its answer (row 12175)."""
-        held = agreed("the local step's holder's read", lambda: read() if jax.process_index() == min(holders)
-                      else None)
+        lost, handed to every process: a read that fails on the holder raises on all (`agreed`, row 12175)."""
+        held = agreed("a holder's read", lambda: read() if jax.process_index() == min(holders) else None)
         return from_every_process(held)[min(holders)]
 
     def _lost(self, step: int) -> bool:

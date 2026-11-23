@@ -12,7 +12,7 @@ from saved_positions_support import named
 
 from dew.data import Memory, Phase, Steps
 from dew.data.compile import compile
-from dew.data.dataset import DataPartition, Loading
+from dew.data.dataset import Checkpointable, Closeable, DataPartition, Loading
 from dew.data.pipeline import Pipeline, mix
 
 
@@ -247,6 +247,7 @@ def test_a_position_another_grain_wrote_whose_read_fails_to_open_raises_that_fai
         decoded["dew_data_plan"]["rules"]["grain"] = "0.0.1"
 
     stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    assert isinstance(stream, Checkpointable) and isinstance(stream, Closeable)
     unreadable = ValueError("the store's manifest is unreadable")
     refused.append(unreadable)
     try:
