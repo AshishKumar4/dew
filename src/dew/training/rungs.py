@@ -56,7 +56,8 @@ RECORD_VERSION = 3
 
 
 def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-             mesh: Mesh, step: Callable[..., StepFn] | None = None) -> dict[str, JSON] | None:
+             mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto"
+             ) -> dict[str, JSON] | None:
     """What a recorded rung was decided for, read before the step traces: the
     configuration of the `modules` its programs run at the rung it starts from
     (`Objective.program_key`) and a custom `step`, as an identity states them
@@ -66,7 +67,8 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     pins it), the mesh and its devices' kind and allocator limit, the kernels their
     generation runs (`gpu_target`), what a model reads from context as it traces
     (`trace_context`), the libraries that compile it and the allocator and
-    XLA_FLAGS settings it compiles under. None where an identity states none of the step (a module holding
+    XLA_FLAGS settings it compiles under, and the recomputation the run's fit policy asks (`remat`,
+    `FitPolicy.remat`), whose plans differ. None where an identity states none of the step (a module holding
     a class made inside a function, or an array this process holds only part of): such a run keeps no
     record and decides its rung as it compiles."""
     leaves, structure = jax.tree.flatten(arguments)
@@ -91,13 +93,13 @@ def rung_key(modules: Sequence[object], arguments: tuple[TrainState, Batch], spl
     target = (repr(gpu_target()) if jax.default_backend() == 'gpu' or assumption() is not None
               else jax.default_backend())
     program = json.dumps([RECORD_VERSION, traced, whole_digest(), list(splits), dict(mesh.shape),
-                          target, jax.__version__, importlib.metadata.version('jaxlib'), allocator])
+                          target, jax.__version__, importlib.metadata.version('jaxlib'), allocator, remat])
     return {'program': hashlib.sha256(program.encode()).hexdigest(), 'devices': devices_seen,
             'xla_flags': ' '.join(settings)}
 
 
 def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch], splits: Sequence[int],
-                  mesh: Mesh, step: Callable[..., StepFn] | None = None
+                  mesh: Mesh, step: Callable[..., StepFn] | None = None, remat: str = "auto"
                   ) -> tuple[Path | None, dict[str, JSON], JSON]:
     """Where the rung of the step over `arguments` on `mesh` is recorded, its key
     (`rung_key`), and the rung the record holds (None if there is none). A
@@ -109,7 +111,7 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     directory = rung_records()
     if directory is None or jax.process_count() > 1:
         return None, {}, None
-    key = rung_key(modules, arguments, splits, mesh, step)
+    key = rung_key(modules, arguments, splits, mesh, step, remat)
     if key is None:
         return None, {}, None
     path = directory / f"{hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()}.json"

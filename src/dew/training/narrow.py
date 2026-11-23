@@ -44,7 +44,7 @@ from jax.extend import core
 
 from dew.batch import FROZEN, Variables, merge, select, under_roots
 from dew.nn.kernels.options import OuterProgram, owned_program
-from dew.nn.programs import called, own_derivative, scan_body
+from dew.nn.programs import branches, called, own_derivative, scan_body
 
 
 def _inner(eqn, index: int):
@@ -59,11 +59,15 @@ def _inner(eqn, index: int):
         return None
     # A scan's constants and carries are read by every iteration, whose
     # cotangents it sums in the operand's dtype; only its stacked operands
-    # are sliced, one slice an iteration, the leading axis gone.
+    # are sliced, one slice an iteration, the leading axis gone. A scan of one
+    # iteration (a loop's one later pass, scanned where a call's count runs it,
+    # row 11951's design) reads its constants and carries once.
     if scanned is not None:
         outer, bound = eqn.invars[index].aval, inner.invars[index].aval
-        if not (isinstance(outer, ShapedArray) and isinstance(bound, ShapedArray)
-                and outer.shape == (eqn.params["length"], *bound.shape)):
+        if not (isinstance(outer, ShapedArray) and isinstance(bound, ShapedArray)):
+            return None
+        once = eqn.params["length"] == 1 and outer.shape == bound.shape
+        if not once and outer.shape != (eqn.params["length"], *bound.shape):
             return None
     return inner, inner.invars[index]
 
@@ -113,6 +117,16 @@ def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
         if stacked.aval.size != sum(aval.size for aval in sized):
             return None
         return _cast_once(stacked, jaxpr, weights | {stacked})
+    if eqn.primitive is jax.lax.cond_p and index > 0:
+        # A conditional's operand reaches each branch as it is, and runs where its branch is taken (a loop's
+        # pass a call's count runs, `loop_passes`): cast alike by every branch that reads it, it is that
+        # cast, and its cotangent the taken branch's (row 11951's design: one program at a loop's cap).
+        found = set()
+        for branch in branches(eqn):
+            bound = branch.jaxpr.invars[index - 1]
+            if _uses(bound, branch.jaxpr) or bound in branch.jaxpr.outvars:
+                found.add(_cast_once(bound, branch.jaxpr, frozenset()))
+        return found.pop() if len(found) == 1 and None not in found else None
     callee = _inner(eqn, index)
     if callee is None:
         return None

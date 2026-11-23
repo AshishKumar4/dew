@@ -357,10 +357,13 @@ def laid_start(trainer, run, dataset, resume) -> Start:
         start = None
     plan = trainer._compiler.unplaced if start is not None else None
     trainer._laid_out(dataclasses.replace(given, host=STREAMED))
-    # The device plan's climb and plans undone: the streamed step is priced at the objective's own rung.
+    # The device plan's climb and plans undone: the streamed step is priced at the rung its host step starts
+    # at, the objective's own or the one its remat policy states (`StepCompiler.unsearched_rung`), as it
+    # compiles there.
     devices_compiler, devices_rung = trainer._compiler, Rung.of(active, xla_defaults=False, narrow=True)
     rung.put(active)
     trainer._compiler = devices_compiler.anew()
+    trainer._compiler.unsearched_rung(active)
     laid = trainer._started(resume, known)
     dtype = compute_dtype(trainer, laid)
     unpriced = None

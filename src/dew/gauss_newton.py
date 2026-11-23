@@ -118,8 +118,8 @@ def solved_directions(damping: float = 0.0,
         if statistics is None:
             raise ValueError("a Gauss-Newton update was handed no statistics: a wrapper that hands its inner "
                              "update no extra arguments (optax.MultiSteps) holds it, which pools no system "
-                             "across the steps it holds; accumulate with Trainer(accumulation=k), which "
-                             "pools the update's system whole")
+                             "across the steps it holds; accumulate with "
+                             "Trainer(update=UpdateBatch(batches=k)), which pools the update's system whole")
         if not isinstance(statistics, NormalEquations | RowEquations):
             raise ValueError("a Gauss-Newton update solves its objective's system (NormalEquations or "
                              "RowEquations, dew.objectives.Step.equations), which this run's statistics are "
@@ -140,8 +140,7 @@ def gauss_newton(learning_rate: optax.ScalarOrSchedule = 1.0, damping: float = 0
     """Gauss-Newton's update, damped as Levenberg-Marquardt's: the solve's direction (`solved_directions`)
     scaled by `learning_rate` (a constant, or a schedule over the updates; 1.0 the whole step) as Optax
     scales any optimizer's (`optax.scale_by_learning_rate`), its direction capped at `clip` where set, so
-    `OptimConfig` names it as it names any (`optimizer: gauss_newton`, `damping` among its
-    `optimizer_opts`, `clip_grads` its `clip`)."""
+    `OptimConfig` names it as it names any (`GaussNewton(damping=...)`, `clip_grads` its `clip`)."""
     return optax.chain(solved_directions(damping, clip), optax.scale_by_learning_rate(learning_rate))
 
 

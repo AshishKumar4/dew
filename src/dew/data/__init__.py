@@ -1,7 +1,7 @@
 """Datasets for training and evaluation: a store, and the steps that read it.
 
 A store (`Files`, `Hub`, `TFDS`, `Memory`, several of them in turn
-(`Concatenate`), or a Grain, Hugging Face or PyTorch dataset brought in) is a
+(`concat`), or a Grain, Hugging Face or PyTorch dataset brought in) is a
 `Dataset`, and every verb returns a new
 one: `map`, `random_map`, `filter` and `flat_map` per record, `shuffle`,
 `repeat`, `pack` and `batch` across records, `mix` and `holdout` across
@@ -34,19 +34,8 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.data import audio, chat, images, preferences, presets, prompts, text, video
     from dew.data.chat import Role
     from dew.data.dataset import Loading
-    from dew.data.pipeline import Dataset, Rejected, concat, mix, phases, schedule
-    from dew.data.sources import (
-        TFDS,
-        Concatenate,
-        Files,
-        Hub,
-        Memory,
-        Source,
-        from_grain,
-        from_hf,
-        from_iter,
-        from_torch,
-    )
+    from dew.data.pipeline import Dataset, Phase, Rejected, Steps, Tokens, concat, mix, phases
+    from dew.data.sources import TFDS, Files, Hub, Memory, Source, from_grain, from_hf, from_iter, from_torch
     from dew.data.text import ByteTokenizer, HFTokenizer
 
 _EXPORTS = {
@@ -65,9 +54,10 @@ _EXPORTS = {
     "concat": "dew.data.pipeline",
     "mix": "dew.data.pipeline",
     "phases": "dew.data.pipeline",
-    "schedule": "dew.data.pipeline",
+    "Phase": "dew.data.pipeline",
+    "Steps": "dew.data.pipeline",
+    "Tokens": "dew.data.pipeline",
     "TFDS": "dew.data.sources",
-    "Concatenate": "dew.data.sources",
     "Files": "dew.data.sources",
     "Hub": "dew.data.sources",
     "Memory": "dew.data.sources",
@@ -85,16 +75,18 @@ __getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 __all__ = [
     "TFDS",
     "ByteTokenizer",
-    "Concatenate",
     "Dataset",
     "Files",
     "HFTokenizer",
     "Hub",
     "Loading",
     "Memory",
+    "Phase",
     "Rejected",
     "Role",
     "Source",
+    "Steps",
+    "Tokens",
     "audio",
     "chat",
     "concat",
@@ -108,7 +100,6 @@ __all__ = [
     "preferences",
     "presets",
     "prompts",
-    "schedule",
     "text",
     "video",
 ]

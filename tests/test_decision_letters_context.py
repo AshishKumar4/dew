@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from run_kinds import stated
 from test_decision_context import assert_packed_as_alone, opened, windows_of
 
 from dew.batch import thaw
@@ -203,16 +204,18 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
     # A batch of as many rows as the test mesh has shards, one an example.
     rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
     # A backbone with a tokenizer of its own, which the run lays its rows out with and names its letters by.
-    config = DecisionRunConfig.cli(
-        ["--pretrained", str(LLAMA.parent / "qwen38-dense-tiny"), "--segments",
-         json.dumps(to_record(SEGMENTS, tuple[Segment, ...])), "--context-layers", "0", "head:letters",
-         "--head.count", "4", "--head.labels.names", *(LABELS.names or ()),
-         "--head.labels.variants", *LABELS.variants, "--head.labels.cue", LABELS.cue,
-         "--trainer.name", "letters",
-         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "1",
-         "--trainer.checkpoint-every", "1", "--trainer.eval-every", "None", "--trainer.multi-host", "False",
-         "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
-        default=DecisionRunConfig(data=rows))
+    config = DecisionRunConfig.cli(["--pretrained", str(LLAMA.parent / "qwen38-dense-tiny"), "--segments",
+                                    json.dumps(to_record(SEGMENTS, tuple[Segment, ...])), "--context-layers",
+                                    "0", "head:letters", "--head.count", "4", "--head.labels.names",
+                                    *(LABELS.names or ()), "--head.labels.variants", *LABELS.variants,
+                                    "--head.labels.cue", LABELS.cue, "--trainer.name", "letters",
+                                    "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                                    "--trainer.horizon.steps",
+                                    "1", "--trainer.checkpoint-every", "1", "--trainer.eval-every", "None",
+                                    "--trainer.multi-host", "False", "--trainer.compilation-cache-dir",
+                                    "None"],
+                                   default=stated(DecisionRunConfig(data=rows),
+                                                  model_fields={"dtype": "float32"}))
     # The run's own labels, each a single token of the backbone's byte-level vocabulary.
     assert config.segments == SEGMENTS and isinstance(config.head, Letters) and config.head.labels == LABELS
     with pytest.raises(ValueError):

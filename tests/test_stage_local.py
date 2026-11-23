@@ -32,14 +32,17 @@ from dew.lora import Adapter, LoRA
 from dew.nn.backbones.decoder_stack import stacked_rows
 from dew.objectives.lm import LMObjective
 from dew.optim import (
-    STACKED_OPTIMIZERS,
+    Adam,
+    AdamW,
+    Muon,
+    Optax,
     OptimConfig,
     ParamGroup,
     parameter_name,
     scale_by_m3,
     weight_decay_mask,
 )
-from dew.registry import models
+from dew.registry import models, optimizers
 from dew.training import Inspection, Layout, MeshSpec, Observe, Trainer
 from dew.training.diloco import DiLoCo
 from dew.training.inspection import inspected
@@ -121,43 +124,40 @@ its gradient. At Adam's 1e-8 a gradient within rounding of zero steps by lr one 
 an error of 2 lr that no layout makes or removes, and check 1's ratio would count such gradients in
 a draw rather than the layout's rounding."""
 
-ADAM = OptimConfig(optimizer="adam", learning_rate=1e-3)
+ADAM = OptimConfig(optimizer=Adam(), learning_rate=1e-3)
 """Dew's named Adam, which reads a stage-local run's stacked leaf as its stored layers, as optax's Adam given
-built does not say it does (`STACKED_OPTIMIZERS`, row 3934)."""
+built does not say it does (`OptimizerSpec.STACKED`, row 3934)."""
 
-ADAM_FAST = OptimConfig(optimizer="adam", learning_rate=1e-2)
+ADAM_FAST = OptimConfig(optimizer=Adam(), learning_rate=1e-2)
 """`ADAM` at a rate whose two steps move the decoder's state measurably."""
 
 
-NAMED_FIELDS: dict[str, tuple[dict, dict]] = {
+SETTINGS: dict[str, tuple[dict, dict]] = {
     "adamw": ({"weight_decay": 0.1}, {}),
     "lamb": ({"weight_decay": 0.1}, {}),
     "muon": ({"weight_decay": 0.1}, {}),
-    "muonclip": ({"optimizer_opts": {**SMOOTH, "qk_clip_threshold": 0.05}}, {"qk_norm": False}),
+    "muonclip": ({"qk_clip_threshold": 0.05}, {"qk_norm": False}),
     # LaProp's adaptive clip engaged on every layer, its update clipped to a thousandth of each layer's norm.
-    "laprop": ({"optimizer_opts": {**SMOOTH, "agc": 1e-3}}, {}),
+    "laprop": ({"agc": 1e-3}, {}),
 }
-"""What a named optimizer of `STACKED_OPTIMIZERS` needs set for its per-layer rule to act, its config's
-fields and the decoder's: weight decay's mask, QK-Clip's maxima on a decoder whose queries and keys no norm
-divides, LaProp's clip engaged."""
+"""What each of Dew's optimizers that stacks (`OptimizerSpec.STACKED`) needs set for its per-layer rule to
+act, its own settings and the decoder's fields: weight decay's mask, QK-Clip's maxima on a decoder whose
+queries and keys no norm divides, LaProp's clip engaged."""
 
 OPTIMIZERS = {
-    **{name: (OptimConfig(optimizer=name, learning_rate=1e-2,
-                          **{"optimizer_opts": SMOOTH, **NAMED_FIELDS.get(name, ({}, {}))[0]}),
-              NAMED_FIELDS.get(name, ({}, {}))[1])
-       for name in sorted(STACKED_OPTIMIZERS)},
-    "groups": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, optimizer_opts=SMOOTH,
+    **{name: (OptimConfig(optimizer=optimizers.build(name, **SMOOTH, **SETTINGS.get(name, ({}, {}))[0]),
+                          learning_rate=1e-2), SETTINGS.get(name, ({}, {}))[1])
+       for name in sorted(optimizers.paths) if optimizers[name].STACKED},
+    "groups": (OptimConfig(optimizer=AdamW(**SMOOTH, weight_decay=0.1), learning_rate=1e-2,
                            param_groups=(ParamGroup("mlp", ("*mlp*",), learning_rate_multiplier=0.5,
                                                     weight_decay=0.0),
                                          ParamGroup("rest", ("*",)))), {}),
     # Muon's variants that read a matrix's own sums or its name: the dual norm of a layer's momentum, its
     # projections' heads by their stored names, and NorMuon's neuron moments, each per stored layer.
-    "muon_adaptive": (OptimConfig(optimizer="muon", learning_rate=1e-2,
-                                  optimizer_opts={**SMOOTH, "adaptive": True}), {}),
-    "muon_per_head": (OptimConfig(optimizer="muon", learning_rate=1e-2, optimizer_opts={
-        **SMOOTH, "per_head": {"layers_*/self_attn/q_proj/kernel": 8}}), {}),
-    "normuon": (OptimConfig(optimizer="muon", learning_rate=1e-2,
-                            optimizer_opts={**SMOOTH, "neuron_beta2": 0.95}), {}),
+    "muon_adaptive": (OptimConfig(optimizer=Muon(**SMOOTH, adaptive=True), learning_rate=1e-2), {}),
+    "muon_per_head": (OptimConfig(optimizer=Muon(**SMOOTH, per_head={"layers_*/self_attn/q_proj/kernel": 8}),
+                                  learning_rate=1e-2), {}),
+    "normuon": (OptimConfig(optimizer=Muon(**SMOOTH, neuron_beta2=0.95), learning_rate=1e-2), {}),
     # M3 on every matrix, its matrices by its own default (rows the reduction), Adam on the vectors, each
     # stepped at its rate by a schedule, given built: M3's products batched on a stacked leaf's rows are
     # each its layer's (`_row_form`, rows 4031, 4035).
@@ -171,17 +171,16 @@ OPTIMIZERS = {
     # (`_Numbering.summed`, row 4036).
     "global_clip": (optax.chain(optax.clip_by_global_norm(0.05), optax.adam(1e-2)), {}),
     # A layer's 8 x 256 up projection is below int8's threshold of 4096 values, two layers stacked are not.
-    "int8": (OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8",
-                         optimizer_opts=SMOOTH),
+    "int8": (OptimConfig(optimizer=AdamW(**SMOOTH, weight_decay=0.1, state_dtype="int8"), learning_rate=1e-2),
              {"emb_features": 8, "num_heads": 2, "num_kv_heads": 1, "mlp_features": 256}),
 }
 """Each optimizer whose rules read a leaf as one layer, with the decoder fields its rule needs to act:
-every named optimizer Dew stacks (`STACKED_OPTIMIZERS`), its weight-decay mask's rank, Muon's matrix axes,
+every named optimizer Dew stacks (`OptimizerSpec.STACKED`), its weight-decay mask's rank, Muon's matrix axes,
 QK-Clip's per-layer maxima, LAMB's trust ratio and LaProp's clip; a param group's patterns, int8 moments'
 threshold and Muon's variants. A transformation given built is stage-local where its update is its layers'
 expression row by row (`whole_reading`), as optax's Adam's is, which the read-whole test reads."""
 
-LORA_OPTIMIZER = OptimConfig(optimizer="adamw", learning_rate=1e-2, optimizer_opts=SMOOTH)
+LORA_OPTIMIZER = OptimConfig(optimizer=AdamW(**SMOOTH), learning_rate=1e-2)
 """What the LoRA cell trains its factors with."""
 
 
@@ -388,7 +387,7 @@ def test_a_stage_local_runs_episodes_score_the_model_every_layer_whole():
     def flown(variables, key):
         return {"logit": float(jnp.mean(model.apply({"params": variables["params"]}, ids)))}
 
-    run = trainer(model, OptimConfig(optimizer="adamw", learning_rate=1e-2), STAGED, 8)
+    run = trainer(model, OptimConfig(optimizer=AdamW(), learning_rate=1e-2), STAGED, 8)
     run.tracker = RecordingTracker()
     trained = run.fit(stream(), steps=STEPS, log_every=1,
                       validation={"flight": EvalSuite(Episodes(flown, {"logit": Shown()}), every=STEPS)})
@@ -436,7 +435,7 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
     stopped after its first step resumes from that checkpoint into the second step the uninterrupted
     run took, bit for bit."""
     model = decoder()
-    optimizer = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1)
+    optimizer = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2)
 
     def fit(directory, mesh: MeshSpec, devices: int, steps: int):
         run = trainer(model, optimizer, mesh, devices, checkpoints=Checkpoints(str(directory)))
@@ -574,7 +573,7 @@ WHOLE = {"lamb": lambda: optax.lamb(1e-3), "adafactor": lambda: optax.adafactor(
          "rank-masked": lambda: optax.adamw(1e-3, mask=lambda params: jax.tree.map(lambda leaf: leaf.ndim > 1,
                                                                                      params)),
          # An OptimConfig's transformation is built over the run's length, which fit gives.
-         "adafactor-config": lambda: OptimConfig(optimizer="optax:adafactor", learning_rate=1e-3),
+         "adafactor-config": lambda: OptimConfig(optimizer=Optax('optax:adafactor'), learning_rate=1e-3),
          "doubled-gains": doubled_gains, "spread-sums": spread_sums,
          # A loop over a stack that carries across its rows, acts beside its results, or takes no step.
          "carried-across-rows": carried_across_rows, "mapped-beside-a-callback": mapped_beside_a_callback,
@@ -658,7 +657,7 @@ def test_a_diloco_run_over_stages_keeps_each_layer_whole_on_every_stage():
     pipelined layer whole on every stage, its outer and inner states alike, so its checkpoint holds each
     layer as one device's would."""
     def run(stage_local: bool) -> Trainer:
-        return Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer="adamw", learning_rate=1e-2),
+        return Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer=AdamW(), learning_rate=1e-2),
                        key=jax.random.key(0), mesh=MeshSpec(diloco=2, stage=2, fsdp=2),
                        layout=Layout(min_shard=TINY_SHARD, stage_local=stage_local),
                        diloco=DiLoCo(every=2, rate=0.7, momentum=0.9), tracker=None)
@@ -693,7 +692,7 @@ def test_a_stage_local_runs_inspection_reports_each_stored_layer_by_its_name():
                          targets=("params",), every=1)
     logged, runs = [], []
     for stage_local in (True, False):
-        run = Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer="adamw", learning_rate=1e-2),
+        run = Trainer(LMObjective(decoder(), SEQ), OptimConfig(optimizer=AdamW(), learning_rate=1e-2),
                       key=jax.random.key(0), mesh=STAGED, layout=Layout(min_shard=TINY_SHARD,
                                                                          stage_local=stage_local),
                       inspection=watched, tracker=None)
@@ -818,7 +817,7 @@ def test_a_periodic_one_stage_state_goes_back_onto_its_layers_for_a_run_that_doe
     not scan, its parameters and every moment alike, period and all."""
     kinds = {"layer_types": ("sliding_attention", "full_attention") * 2,
              "kinds": {"sliding_attention": {"window": 4}}}
-    optimizer = OptimConfig(optimizer="adamw", learning_rate=1e-2, optimizer_opts=SMOOTH)
+    optimizer = OptimConfig(optimizer=AdamW(**SMOOTH), learning_rate=1e-2)
     scanned = trainer(decoder(scan_layers=True, **kinds), optimizer, MeshSpec(fsdp=2), 8)
     scanned.validate(steps=1)
     batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))

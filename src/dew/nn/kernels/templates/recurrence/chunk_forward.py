@@ -25,7 +25,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _solves_apart,
     _states,
     _weighted,
-    _weighted_values,
     family_of,
     padded_widths,
     per_key_refusal,
@@ -345,7 +344,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # and under the accurate forms, fp32's three parts, as the portable math holds them (a 16-bit call's
     # rounded put the output 1.7 times and the final memory up to 540 times the portable math's distance from
     # float64).
-    held = given if delta or rounded else Operand(rows, product.EXACT_PARTS, jnp.dtype(jnp.float32))
+    held = given if delta or rounded else Operand(rows, product.bf16_part_count(), jnp.dtype(jnp.float32))
     if apart and (delta or per_key or tiles.chunk % apart):
         raise NotImplementedError("the mainloop reads a token's state apart from its group's writes under a "
                                   "decay a head without the delta rule alone, its chunk whole groups: the "
@@ -384,12 +383,10 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         # The forward's inverse given without its states (a recomputed forward, `delta_memory`): its weights
         # from the inverse, the system's launch and the solve not repeated.
         a = inverse
-        w, keys = _weighted(k, v, a, prefix, beta, taken, call)
-        u = _weighted_values(v, a, beta, taken, call)
+        w, u, keys = _weighted(k, v, a, prefix, beta, taken, call)
     elif per_key and delta:
         a = _intra_solve(system[0], taken, call)
-        w, keys = _weighted(k, v, a, prefix, beta, taken, call)
-        u = _weighted_values(v, a, beta, taken, call)
+        w, u, keys = _weighted(k, v, a, prefix, beta, taken, call)
     elif per_key:
         (keys,) = _weighted(k, v, None, prefix, beta, taken, call)
     elif delta and inverse is None:

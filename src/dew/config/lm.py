@@ -30,7 +30,7 @@ from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.objectives.drawn import WHOLE, drawn_once
 from dew.objectives.lm.objective import Samples
-from dew.optim import OptimConfig
+from dew.optim import AdamW, OptimConfig
 from dew.registry import ModelConfig, objectives
 from dew.sampling.text import Sampling
 
@@ -52,7 +52,7 @@ class ServedRollout:
     `slots` rows the server decodes at once, `ahead` batches submitted before the trainer reads them, a
     rollout at most `max_lag` updates behind the trainer, and the weights pushed every `sync_every`
     updates. A `max_lag` above 0 trains on stale rollouts, which the objective's behavior importance
-    weights (`--objective.behavior-importance`). With `page_size` the server pages its cache and shares
+    weights (the objective's `behavior_importance`). With `page_size` the server pages its cache and shares
     prompt pages, so a group's samples of one prompt prefill it once; 'whole' keeps each row's cache whole;
     None pages it for the prompts a group's samples repeat, as `Server.from_task`'s 'shared' does."""
 
@@ -74,7 +74,7 @@ class PromptRollout:
     (`RolloutScheduler.generation_batches`).
 
     `method` names a composition (`dew.objectives.rl.methods`: grpo, dapo, dr_grpo, gspo, cispo, gmpo,
-    reinforce_pp, rloo), which fixes the objective's settings it names, stated `--objective.*`
+    reinforce_pp, rloo), which fixes the objective's settings it names, stated as the objective's fields
     arguments refused, and the rollout's estimator, dynamic sampling and overlong punishment over
     `max_new_tokens`, ramping over its last `overlong_cache` tokens (a quarter of it where None);
     `estimator` is then the method's.
@@ -194,9 +194,8 @@ class LMRunConfig(DecoderRunConfig):
     # GPT-3 Small's (Brown et al. 2020, table 2.1 and appendix B): peak rate 6e-4, weight decay 0.1,
     # the gradient's global norm clipped at 1.0, as nanoGPT trains its 124M model.
     optim: OptimConfig = dataclasses.field(
-        default_factory=lambda: OptimConfig(
-            learning_rate=6e-4,
-            weight_decay=0.1, clip_grads=1.0))
+        default_factory=lambda: OptimConfig(learning_rate=6e-4, optimizer=AdamW(weight_decay=0.1),
+                                            clip_grads=1.0))
     tokenizer: str = "byte"
     """The tokenizer the ids were written with: 'byte', or an HF tokenizer name."""
     prompt: str = ""
@@ -211,7 +210,7 @@ class LMRunConfig(DecoderRunConfig):
     `repo@revision` (a branch, tag or commit), or a local directory in that
     layout. A run records a hub repo as `repo@commit`, with the commit it
     resolved to. The checkpoint sets the architecture, so of its fields
-    --model.max-seq-len alone may be set."""
+    the model's max_seq_len alone may be set."""
     rollout: Annotated[PromptRollout, tyro.conf.subcommand("rollout")] | None = None
     """The rollout a GRPO run trains on (`--rollout.reward`), over its chain's prompts
     (`dew.data.presets.prompts`): GRPO needs one, and another objective takes none. The model's
@@ -386,11 +385,11 @@ class LMRunConfig(DecoderRunConfig):
         choices = ("max_seq_len", "dtype", "attention_impl")
         overridden = sorted(set(self.model.fields) - set(choices))
         if overridden:
-            raise ValueError(f"--model sets {overridden}, which the checkpoint at {self.pretrained} decides. "
-                             f"Only {', '.join(choices)} are still choices.")
+            raise ValueError(f"the run's model sets {overridden}, which the checkpoint at {self.pretrained} "
+                             f"decides. Only {', '.join(choices)} are still choices.")
         reach = self.model.fields.get("max_seq_len", context)
         if reach is not None and not isinstance(reach, int):
-            raise ValueError(f"--model.max_seq_len is {reach!r}; the context a checkpoint is reloaded at "
+            raise ValueError(f"the model's max_seq_len is {reach!r}; the context a checkpoint is reloaded at "
                              "is a number of tokens")
         reference = SourceReference.parse(self.pretrained)
         # The checkpoint computes in the run's compute dtype and stores its parameters as its source
@@ -416,7 +415,7 @@ class LMRunConfig(DecoderRunConfig):
         """MDLM over a bidirectional model, its mask id from the model's fields.
 
         A `pretrained` diffusion checkpoint carries `mask_token_id`; a
-        from-scratch run names it beside --model.no-causal. A token window is
+        from-scratch run names it beside the model's causal=False. A token window is
         `seq_len + 1` ids wide, and masked diffusion has no shift, so it
         denoises the whole row. The validation text is the unmasked rows
         decoded with the run's tokenizer, or bare ids with no preview budget. A loaded `source` is
@@ -426,8 +425,8 @@ class LMRunConfig(DecoderRunConfig):
         mask = fields.get("mask_token_id")
         if mask is None:
             raise ValueError("masked_diffusion trains a model with a mask token id: continue a --pretrained "
-                             "diffusion checkpoint, which carries one, or name --model.mask-token-id beside "
-                             "--model.no-causal")
+                             "diffusion checkpoint, which carries one, or name the model's mask_token_id "
+                             "beside causal=False")
         decode = None if self.max_new_tokens <= 0 else tokenizer_for(self.tokenizer).decode
         return self.objective.build(model=model if source is None else source,
                                     process=MDLM(mask_id=int(mask))(), seq_len=self.tokens().seq_len + 1,
@@ -435,7 +434,7 @@ class LMRunConfig(DecoderRunConfig):
 
     def block_objective(self, model, variables, source=None):
         """Each complete token-window row split into the clean prompt the run
-        names (`--objective.prompt-length`) and response canvases, over a loaded `source`
+        names (the objective's `prompt_length`) and response canvases, over a loaded `source`
         where there is one, whose end-of-sequence ids the task takes."""
         from dew.nn.protocols import BlockDenoiser
 
@@ -445,7 +444,7 @@ class LMRunConfig(DecoderRunConfig):
         prompt = self.objective.fields.get("prompt_length")
         width = self.objective.fields.get("canvas_size") or model.canvas_length
         if not isinstance(prompt, int) or not isinstance(width, int):
-            raise ValueError("block_diffusion splits each row at --objective.prompt-length")
+            raise ValueError("block_diffusion splits each row at its objective's prompt_length")
         response = self.tokens().seq_len + 1 - prompt
         if width < 1 or response < width or response % width:
             raise ValueError("seq_len + 1 must equal prompt_length plus whole training canvases")

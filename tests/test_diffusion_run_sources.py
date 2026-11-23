@@ -37,6 +37,7 @@ from dew.objectives.rl.flow import OLD_LOG_PROBS_KEY, REWARDS_KEY, FlowGRPOObjec
 from dew.registry import ModelConfig, to_record
 from dew.sampling import Euler
 from dew.training import Trainer
+from dew.training.budget import Horizon
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -79,9 +80,9 @@ def test_a_resumed_pipeline_run_reads_none_of_the_pipelines_weights(pipelines, t
 
     def trained(steps: int):
         # Named in its config, as the command line names it, so its build knows the run it resumes.
-        trainer = TrainerConfig(name="resumed", checkpoint_dir=str(tmp_path / "runs"), steps=steps,
-                                log_every=1, eval_every=None, checkpoint_every=None, multi_host=False,
-                                mesh=MeshSpec())
+        trainer = TrainerConfig(name="resumed", checkpoint_dir=str(tmp_path / "runs"),
+                                horizon=Horizon(steps=steps), log_every=1, eval_every=None,
+                                checkpoint_every=None, multi_host=False, mesh=MeshSpec())
         return dataclasses.replace(config, trainer=trainer).prepare().train("resumed")
 
     first = trained(1)
@@ -705,8 +706,11 @@ def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
         dataclasses.replace(grpo_run(), objective=ObjectiveConfig("diffusion", {}))
     with pytest.raises(ValueError):
         FlowRolloutConfig(reward="no_such_metric")
-    parsed = DiffusionRunConfig.cli(["preset:flow", "--objective", "flow_grpo", "--rollout.reward", "psnr",
-                                     "--rollout.groups", "2", "--rollout.train-steps", "3"])
+    parsed = DiffusionRunConfig.cli(["preset:flow", "--rollout.reward", "psnr", "--rollout.groups", "2",
+                                     "--rollout.train-steps", "3"],
+                                    default=dataclasses.replace(DiffusionRunConfig(),
+                                                                objective=ObjectiveConfig("flow_grpo"),
+                                                                rollout=FlowRolloutConfig()))
     assert parsed.rollout == FlowRolloutConfig(reward="psnr", groups=2, train_steps=3)
     assert DiffusionRunConfig.from_dict(parsed.to_dict()).rollout == parsed.rollout
 
@@ -897,8 +901,8 @@ def a_256_pixel_diffusion_run_trains_saves_resumes_and_draws(tmp_path):
             model=dataclasses.replace(config.model, fields={
                 **config.model.fields, "patch_size": 16, "emb_features": 64, "num_layers": 2, "num_heads": 4,
                 "dtype": "bfloat16"}),
-            trainer=dataclasses.replace(config.trainer, name="large", steps=steps, checkpoint_every=2,
-                                        checkpoint_final=True))
+            trainer=dataclasses.replace(config.trainer, name="large", horizon=Horizon(steps=steps),
+                                        checkpoint_every=2, checkpoint_final=True))
         return config.train(config.build(), data, name="large")
 
     assert int(trained(2).step) == 2

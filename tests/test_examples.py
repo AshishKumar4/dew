@@ -231,11 +231,10 @@ def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
 # ---------------------------------------------------------------------------------
 
 def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_new_process(tmp_path):
-    """`dew train examples/train_supervised.py --set ...` trains the run the
-    file builds, each `--set` read as its field's type reads it. A new
-    process given only the run's `run.json`, trusting the file's module,
-    rebuilds the same model, loss and data and trains the same loss, step
-    for step: the record carries the run exactly."""
+    """`dew train` over a run file that sets the run examples/train_supervised.py
+    builds (`RunConfig.override`) trains it. A new process given only the run's
+    `run.json`, trusting the file's module, rebuilds the same model, loss and data
+    and trains the same loss, step for step: the record carries the run exactly."""
     environment = {**single_device(), "XDG_CACHE_HOME": str(tmp_path / "cache"),
                    "PYTHONPATH": os.pathsep.join([str(REPO_ROOT / "src"), str(REPO_ROOT / "examples")])}
 
@@ -245,15 +244,22 @@ def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_n
     def losses(directory):
         return logged_losses(directory / "train_supervised")
 
-    train(str(REPO_ROOT / "examples" / "train_supervised.py"),
-          "--set", f"trainer.checkpoint_dir={tmp_path / 'first'}", "--set", "trainer.steps=6",
-          "--set", "trainer.log_every=1", "--set", "model.hidden=8")
+    settings = {"trainer.name": "train_supervised", "trainer.checkpoint_dir": str(tmp_path / "first"),
+                "trainer.horizon.steps": 6, "trainer.log_every": 1, "model.hidden": 8}
+    (tmp_path / "set_supervised.py").write_text(
+        "from train_supervised import run as built\n"
+        f"run = (built() if callable(built) else built).override({settings!r})\n")
+    train(str(tmp_path / "set_supervised.py"))
     record = tmp_path / "first" / "train_supervised" / "run.json"
     written = json.loads(record.read_text())["fields"]
-    assert written["trainer"]["steps"] == 6 and written["model"]["fields"]["hidden"] == 8
+    assert written["trainer"]["horizon"]["steps"] == 6 and written["model"]["fields"]["hidden"] == 8
     assert written["objective"]["fields"]["loss"] == {"function": "train_supervised:cross_entropy"}
 
-    train(str(record), "--trust", "train_supervised", "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
+    again = {"trainer.name": "train_supervised", "trainer.checkpoint_dir": str(tmp_path / "again")}
+    (tmp_path / "again_supervised.py").write_text(
+        "from dew.config import RunConfig\n"
+        f"run = RunConfig.load({str(record)!r}, trust=('train_supervised',)).override({again!r})\n")
+    train(str(tmp_path / "again_supervised.py"), "--trust", "train_supervised")
     assert len(losses(tmp_path / "first")) == 6
     assert losses(tmp_path / "again") == losses(tmp_path / "first")
 

@@ -1151,7 +1151,7 @@ class Phases:
     pipelines: tuple[Pipeline, ...]
     ends: tuple[int | None, ...]
     """Where each phase ends, as `clock` counts them: at the training step it names (`phases`), or at
-    the run's committed tokens (`schedule`). The last runs on (None); on the token clock it may end
+    the run's committed tokens (`Tokens`, `phases`). The last runs on (None); on the token clock it may end
     instead, where the data ends."""
     clock: Literal["steps", "tokens"] = "steps"
 
@@ -1235,7 +1235,7 @@ class Dataset:
 
     @property
     def phase_count(self) -> int:
-        """The phases a run reads this dataset in: its `Phases`' pipelines (`phases`, `schedule`), one for a
+        """The phases a run reads this dataset in: its `Phases`' pipelines (`phases`), one for a
         dataset read whole."""
         source = self._chain().source
         return len(source.pipelines) if isinstance(source, Phases) else 1
@@ -1648,16 +1648,6 @@ class Dataset:
         chain = self._chain()
         return dataclasses.replace(chain, mode=mode)
 
-    def threads(self, count: int) -> Pipeline:
-        """Read with `count` threads a worker, rather than the measured default, every other setting the
-        chain's, or where it names none the one a chain naming none reads with: automatic workers, which
-        a training read sizes and any other read takes none of (`Loading.resolved`, unsized)."""
-        from dew.data.dataset import Loading
-
-        loading = self._chain()._loading or Loading(workers="auto")
-        return self.loading(dataclasses.replace(loading, threads=count,
-                                                read_buffer=max(loading.read_buffer, count)))
-
     def elastic(self) -> Pipeline:
         """Read it for training so a run resumes on any number of readers that splits its batch, as
         a global order does, where its own order is read per share (a stream, or steps that drop,
@@ -1673,7 +1663,8 @@ class Dataset:
 
     def loading(self, loading: Loading) -> Pipeline:
         """Read with these workers, threads and buffers (`Loading`), rather than the measured
-        defaults, recorded with the chain; `threads` sets its read threads alone."""
+        defaults, recorded with the chain: the one owner of how the chain loads, as `workers` and
+        `prefetch` are stages of it where they stand."""
         return dataclasses.replace(self._chain(), _loading=loading)
 
     def __iter__(self) -> Iterator[Batch]:
@@ -1800,35 +1791,55 @@ def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
     return Pipeline(Mixture(chains, shares, tokens, seed))
 
 
-def phases(*entries: tuple[Dataset, int | None]) -> Pipeline:
-    """Datasets read one after another: each `(dataset, until_step)` until the training step it
-    names, the last until the run ends (`None`). Each phase is a whole chain, laid out and batched
-    as it reads, each in its own batch (`Phases`)."""
+@dataclasses.dataclass(frozen=True)
+class Steps:
+    """A phase's end on the run's step clock: the training step it reads until (`Phase.until`)."""
+
+    count: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Tokens:
+    """A phase's end on the run's committed-token clock, the clock `fit(tokens=)` counts: the valid target
+    tokens the run's commits reach before the next phase reads (`Phase.until`)."""
+
+    count: float
+
+
+@dataclasses.dataclass(frozen=True)
+class Phase:
+    """One dataset of `phases`, read until the run reaches `until` on its clock, the steps it trains
+    (`Steps`) or the tokens it commits (`Tokens`); the last phase's None reads until the run ends."""
+
+    data: Dataset
+    until: Steps | Tokens | None = None
+
+
+def phases(*entries: Phase) -> Pipeline:
+    """Datasets read one after another, each phase until the run reaches its end (`Phase.until`), the
+    last until the run ends: on the step clock, each until the training step it names; on the
+    committed-token clock, each until the run's commits reach its tokens, on every process alike, so a
+    phase's last step may commit past them and one that a single step's commit passes reads nothing; a
+    corpus that an earlier phase read continues from where it left it, and what the run had read ahead
+    of a phase's end is not trained on. Every phase's end is on one clock, each past the one before it.
+    Each phase is a whole chain, laid out and batched as it reads, each in its own batch (`Phases`)."""
     if not entries:
-        raise ValueError("phases need at least one (dataset, until_step)")
-    return Pipeline(Phases(tuple(dataset._chain() for dataset, _ in entries),
-                           tuple(until for _, until in entries)))
-
-
-def schedule(stages: Sequence[tuple[Dataset, float | None]]) -> Pipeline:
-    """Datasets read one after another on the run's committed-token clock, the clock `fit(tokens=)`
-    counts: each `(dataset, tokens)` for the valid target tokens its steps commit, the last for the
-    rest of the run (`None`), or for its tokens, where the data ends (the run's last step). A stage
-    ends at the step whose commit reaches its tokens, on every process alike, so its last step may
-    commit past them; one that a single step's commit passes reads nothing. A corpus that an earlier
-    stage read continues from where it left it, and what the run had read ahead of the end is not
-    trained on. Each stage is a whole chain, laid out and batched as it reads, each in its own batch
-    (`Phases`)."""
-    if not stages:
-        raise ValueError("a schedule needs at least one (dataset, tokens)")
-    budgets = [tokens for _, tokens in stages]
-    if any(tokens is None for tokens in budgets[:-1]) or any(
-            tokens is not None and not (math.isfinite(tokens) and tokens >= 1) for tokens in budgets):
-        raise ValueError(f"every stage but the last commits a count of tokens, of at least one; got "
-                         f"{budgets}")
-    ends = list(itertools.accumulate(int(tokens) for tokens in budgets if tokens is not None))
-    return Pipeline(Phases(tuple(dataset._chain() for dataset, _ in stages),
-                           (*ends[:len(stages) - 1], None if budgets[-1] is None else ends[-1]), "tokens"))
+        raise ValueError("phases need at least one Phase(data, until)")
+    ends = [entry.until for entry in entries]
+    if any(end is None for end in ends[:-1]):
+        raise ValueError("every phase but the last ends where the run reaches its Steps or Tokens")
+    clocks = {type(end) for end in ends if end is not None}
+    if len(clocks) > 1:
+        raise ValueError("phases end on one clock, the steps a run trains or the tokens it commits; got both")
+    counts = [None if end is None else end.count for end in ends]
+    stated = [count for count in counts if count is not None]
+    if any(not (math.isfinite(count) and count >= 1) for count in stated) or any(
+            later <= earlier for earlier, later in itertools.pairwise(stated)):
+        raise ValueError(f"each phase ends at a positive count past the one before it; got {counts}")
+    tokens = clocks == {Tokens}
+    until = tuple(None if count is None else int(count) for count in counts)
+    return Pipeline(Phases(tuple(entry.data._chain() for entry in entries), until,
+                           *(("tokens",) if tokens else ())))
 
 
 @dataclasses.dataclass(frozen=True)
