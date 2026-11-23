@@ -291,7 +291,7 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     from dew.nn.kernels.templates import report
 
     # Dew's program's trace beside the launches refused as it traced and the facts it read, by which its
-    # begun lowering is taken (`_refusals_hold`).
+    # begun lowering is taken (`_holds`).
     traced, refused, reads = (program._snapshot_trace(args, kwargs) if isinstance(program, OuterProgram)
                               else (program.trace(*args, **kwargs), None, {}))
     lowered = traced.lower()
@@ -558,26 +558,34 @@ class _Kept:
     reserved: Hashable
 
 
-def _refusals_hold(reads: Facts) -> bool:
-    """Whether the refusals of each launch a trace read (`report.refusals_of`, among `reads`) answer now as
-    it read them: what an executable, a begun compile or a program compiled over shapes of it holds by, a
-    refusal of another launch none of it (rows 12311, 12328: the whole registry keyed every program, so any
-    refusal compiled each again, an evaluation's spill the training step)."""
+def _holds(reads: Facts, refusals: tuple) -> bool:
+    """Whether a program whose trace read `reads` runs a call under `refusals` (a `report.refusal_snapshot`):
+    the refusals of each launch it read (`report.refusals_of`) are those `refusals` hold, asked of the
+    snapshot itself (`report.reading`), never of the registry a compile adds to as it is judged; and every
+    other fact it read answers now as it did (`_facts.still`). What an executable, a begun compile or a
+    program compiled over shapes of it is taken by: a refusal of another launch none of it (rows 12311,
+    12328: the whole registry keyed every program, so any refusal compiled each again, an evaluation's spill
+    the training step), any other fact that moved compiling it again, as the registry's key did (their
+    review's P0s: judged by the live registry, and by the refusals alone)."""
     from dew.nn.kernels.templates import report
 
-    return _facts.still(_facts.of(report.refusals_of, reads))
+    refused = _facts.of(report.refusals_of, reads)
+    with report.reading(refusals):
+        if not _facts.still(refused):
+            return False
+    return _facts.still({key: fact for key, fact in reads.items() if key not in refused})
 
 
 def _holding(kept: Sequence[_Kept], refusals: tuple) -> jax.stages.Compiled | None:
     """The executable of `kept`, a key's, that a call under `refusals` (`report.refusal_snapshot`) runs: one
-    found to hold under them, else one whose trace's refusals answer now as it read them (`_refusals_hold`),
-    found so from here on; None where none does. A key keeps one a refusal scope its calls ran in, so two
-    scopes in turn compile none again."""
+    found to hold under them, else one its trace's facts hold under them (`_holds`), found so from here on;
+    None where none does. A key keeps one a refusal scope its calls ran in, so two scopes in turn compile
+    none again."""
     for each in kept:
         if each.under == refusals:
             return each.executable
     for each in kept:
-        if _refusals_hold(each.reads):
+        if _holds(each.reads, refusals):
             each.under = refusals
             return each.executable
     return None
@@ -922,9 +930,9 @@ class OuterProgram:
                 held = self._shaped.get(abstract)
             # Compiled once over these shapes: a pass over shapes again (a host step's next step's, whose
             # state its first returned; another collection's in this process) takes the one it holds where
-            # the refusals its trace read hold (`_refusals_hold`), and its collection records it as the
-            # compile recorded it in the first.
-            if held is None or not _refusals_hold(self._reads.get(held[0], {})):
+            # its trace's facts hold (`_holds`), and its collection records it as the compile recorded it in
+            # the first.
+            if held is None or not _holds(self._reads.get(held[0], {}), refusals):
                 executable, digest, weak_types, (_, _, reads) = self._compiled_digested(*args, **kwargs)
                 held = executable, digest, weak_types
                 with self._compiling:
@@ -952,7 +960,7 @@ class OuterProgram:
                     ) -> jax.stages.Compiled | None:
         """The executable a compile within `collecting` made for a call alike in its abstract signature
         (`_shaped`), kept from here on under this call's `key` and run, tracing nothing; None where none
-        was made, or the refusals its trace read hold no longer (`_refusals_hold`). It stays held by its
+        was made, or its trace's facts hold no longer under `refusals` (`_holds`). It stays held by its
         abstract signature too: a later call alike in it under another key (an array its last step committed
         where the first call's was not, or placed under an equal sharding of another object) runs it, where
         it compiled the program again (a host step's EMA update at its second step). Kept as a compile under
@@ -962,7 +970,7 @@ class OuterProgram:
         abstract = self.abstract_of(args, kwargs)
         with self._compiling:
             held = self._shaped.get(abstract)
-            if held is None or not _refusals_hold(reads := self._reads.get(held[0], {})):
+            if held is None or not _holds(reads := self._reads.get(held[0], {}), refusals):
                 return None
             self._shaped.move_to_end(abstract)
             executable = held[0]
@@ -1272,7 +1280,7 @@ class OuterProgram:
         # the same abstract inputs, lowers nothing again: the begun lowering is its.
         begun = _ATTEMPTING.get()
         if (begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs)
-                and _refusals_hold(begun.reads)):
+                and _holds(begun.reads, report.refusal_snapshot())):
             lowered, weak_types = begun.lowered, begun.weak_types
             refused = report.refusal_snapshot() if begun.refused is None else begun.refused
             reads = begun.reads
