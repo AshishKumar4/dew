@@ -458,7 +458,7 @@ def ternary_staged_rows(depth: int) -> np.ndarray:
 
 def ternary_form_version() -> np.ndarray:
     """8-byte digest identifying the BitNet b1.58 2-bit ternary staging layout (`TernaryWeights`)."""
-    return form_version(b"ternary-b158-v1\x00", ternary_staged_rows(TERNARY_STAGE))
+    return form_version(b"ternary-b158-v1\x00".hex(), ternary_staged_rows(TERNARY_STAGE))
 
 
 def ternary_packed(codes: jax.Array) -> jax.Array:
