@@ -1441,20 +1441,18 @@ def test_an_adapted_products_replicated_gradient_sums_before_it_rounds():
     np.testing.assert_array_equal(np.asarray(d_kernel), want)
 
 
-def test_an_adapted_products_backward_under_an_fp8_preset_traces():
-    """An adapted product's reverse pass under the `ANY_F8_ANY_F8_F32` preset, which JAX takes for FP8
-    operands alone, and an F8 X4 one, whose four products name no split of an operand: its fp32 factor
-    products take `HIGHEST` (`low_rank._kept`) rather than raising (row 12394)."""
-    from dew.nn.kernels.low_rank import low_rank
+def test_an_adapted_products_backward_keeps_fp32_products_whole_under_any_preset():
+    """An adapted product's backward takes its fp32 factor products at a precision that keeps fp32 operands
+    (`low_rank._kept`): `HIGHEST` for a preset of narrower operands (BF16, TF32) and for one JAX refuses
+    fp32 operands for or whose products name no split (ANY_F8, an F8 X4), rather than raising; the default
+    and an fp32 preset as they are (row 12394)."""
+    from dew.nn.kernels.low_rank import _kept
 
-    x = jax.ShapeDtypeStruct((8, 16), jnp.float8_e4m3fn)
-    kernel, a, b = (jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn) for shape in ((16, 8), (16, 4), (4, 8)))
+    presets = jax.lax.DotAlgorithmPreset
+    narrow = [presets.BF16_BF16_F32, presets.TF32_TF32_F32, presets.ANY_F8_ANY_F8_F32,
+              *(getattr(presets, name) for name in ("F8E4M3FN_F8E4M3FN_F32_X4",) if hasattr(presets, name))]
+    for preset in narrow:
+        assert _kept(preset) == jax.lax.Precision.HIGHEST, preset
+    for whole in (None, presets.F32_F32_F32, jax.lax.Precision.HIGHEST):
+        assert _kept(whole) == whole, whole
 
-    def loss(x, kernel, a, b, precision):
-        return jnp.sum(low_rank(x, kernel, a, b, 1.0, out_dtype=jnp.float32, precision=precision))
-
-    for preset in ("ANY_F8_ANY_F8_F32", "F8E4M3FN_F8E4M3FN_F32_X4"):
-        if hasattr(jax.lax.DotAlgorithmPreset, preset):
-            precision = getattr(jax.lax.DotAlgorithmPreset, preset)
-            jax.make_jaxpr(jax.grad(functools.partial(loss, precision=precision), argnums=(2, 3)))(
-                x, kernel, a, b)
