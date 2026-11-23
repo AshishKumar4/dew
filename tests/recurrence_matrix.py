@@ -35,7 +35,7 @@ from delta_rule_support import fla_layer_side
 from gpu_flow import cell
 from kernel_matrix import AXES
 from reference_error import FEWEST_SEEDS, assert_as_exact, indexed_recording, recording, with_gradients
-from ssd_support import mamba_side
+from ssd_support import MAMBA_SSM, mamba_side
 from test_recurrence_chunk import (
     FORMED,
     LENGTH,
@@ -106,6 +106,18 @@ interpreted cells; tools/matrix_reference.py), the same upstream at its pinned r
 
 INTERPRETERS = {"fla": "DEW_FLA_PYTHON", "mamba_ssm": "DEW_MAMBA_PYTHON"}
 """The variable naming each upstream's GPU tier reference interpreter, where a host holds one."""
+
+
+def tier_release(upstream: str) -> str:
+    """The release of `upstream` its GPU tier's reference interpreter runs, which a recording of it states
+    and is held to (`_on_par_recorded`; tools/matrix_reference.py refuses to record another): fla-core's
+    cohort pin (tools/reference_releases.py), mamba_ssm's release wheel (`ssd_support.MAMBA_SSM`), not its
+    cohort's git pin (row 12216)."""
+    from tool_support import load
+
+    if upstream == "mamba_ssm":
+        return MAMBA_SSM
+    return load("reference_releases").RELEASES[upstream][f"{upstream}-core"]
 
 UPSTREAM_SEEDS = 8 * MOST_SEEDS
 """The most of a cell's seeds its upstream runs (`_upstream`): every seed a sizing reads (`seeds_for`'s
@@ -352,15 +364,13 @@ def _on_par_recorded(named: dict[str, str], step, truth, upstream: str, seeds: i
     `indexed_recording` refuses short of), its draws drawn again on this host (`_inputs`, NumPy's) and Dew's
     float64 truth held to the recorded truth's sketch; a recording of another release than the tier's pin
     is stale, refused."""
-    from tool_support import load
-
     site = "-".join(named.values())
     # Only the recorded upstreams' cells are held here: another's is its GPU tier's alone.
     assert upstream in RECORDED, (f"{site}: no recording of {upstream}; its cells run where "
                                   f"{INTERPRETERS[upstream]} names its reference interpreter")
     stored = recording(RECORDED[upstream])
     recorded = json.loads(str(stored["provenance"]))["revision"]
-    pinned = load("reference_releases").RELEASES[upstream][f"{upstream}-core"]
+    pinned = tier_release(upstream)
     assert recorded == pinned, f"{site}: recorded on {upstream} {recorded}, the tier pins {pinned}: stale"
     drawn, reference, recorded_truth = indexed_recording(
         stored, site, seeds, inputs_of=functools.partial(_inputs, named),
