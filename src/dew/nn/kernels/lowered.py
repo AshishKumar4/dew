@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.experimental.mosaic.gpu as mgpu
+from jax._src.lib.mlir.dialects import gpu
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
@@ -453,10 +454,10 @@ def unsynced_commits(module: bytes) -> list[str]:
             return []
         for name, function in functions.items():
             for launch in _launches(function):
-                view = launch.opview
-                sizes = (view.blockSizeX, view.blockSizeY, view.blockSizeZ)
-                block = tuple(_value(size, None) for size in sizes)
-                if None in block:
+                sizes = [_value(size, None)
+                         for size in (launch.blockSizeX, launch.blockSizeY, launch.blockSizeZ)]
+                block = tuple(size for size in sizes if size is not None)
+                if len(block) != len(sizes):
                     raise ValueError(f"{name}'s block states no constant size")
                 walks = []
                 for first in range(0, math.prod(block), WARP_THREADS):
@@ -574,7 +575,7 @@ def _value(value: ir.Value, thread: _Thread | None) -> int | None:
     name = operation.name
     if name == "arith.constant":
         constant = operation.attributes["value"]
-        return ir.IntegerAttr(constant).value if ir.IntegerAttr.isinstance(constant) else None
+        return constant.value if isinstance(constant, ir.IntegerAttr) else None
     if name in ("gpu.thread_id", "gpu.block_dim"):
         if thread is None:
             return None
@@ -606,13 +607,13 @@ def _commits(operation: ir.Operation) -> bool:
                for each in operation.regions for block in each.blocks for inner in block.operations)
 
 
-def _launches(operation: ir.Operation) -> Iterator[ir.Operation]:
+def _launches(operation: ir.Operation) -> Iterator[gpu.LaunchOp]:
     """The `gpu.launch` operations within `operation`."""
     for each in operation.regions:
         for block in each.blocks:
             for inner in block.operations:
-                if inner.operation.name == "gpu.launch":
-                    yield inner.operation
+                if isinstance(inner, gpu.LaunchOp):
+                    yield inner
                 yield from _launches(inner.operation)
 
 
