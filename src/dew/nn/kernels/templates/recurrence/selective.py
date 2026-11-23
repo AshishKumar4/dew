@@ -547,7 +547,9 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
     `c` `[R, N, T]`, `parameters` (`forward`'s), its blocks' entering states `entered` `[R, blocks, N, D]`
     fp32, `resets` `[R, T]` int8 and the final state's cotangent `dfinal` `[R, N, D]` fp32, `T` a whole
     number of blocks (`block_positions`). Returns `(dx, ddt [R, D, T], db, dc [R, N, T], dA [R, N, D],
-    dD [R, D], dstate [R, N, D])`, fp32.
+    dD [R, D], dstate [R, N, D])`, fp32 but `dx` and `ddt`, in `x`'s and `dt`'s dtypes: each rounded once as
+    it is stored, where XLA converted them after its transpose back (273 us of a GH200's 8.42 ms Mamba-1
+    2.8B bf16 training step, its transpose 291 more over fp32 words, M-JS-237).
 
     A program takes a row and a channel, a warpgroup's threads its block's tokens (`block_scan.blocked`), and
     walks the row's blocks from the last, each state in turn: its states through the block from the
@@ -639,8 +641,8 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
                 return dx + d_value, ddt + d_step
             dx, ddt = lax.fori_loop(0, states, state, (dx_init, jnp.zeros((positions,), jnp.float32)))
             dx = dx * dx_inv
-            plgpu.store(dx_ref.at[row, channel, span], dx, optimized=False)
-            plgpu.store(ddt_ref.at[row, channel, span], ddt, optimized=False)
+            plgpu.store(dx_ref.at[row, channel, span], dx.astype(dx_ref.dtype), optimized=False)
+            plgpu.store(ddt_ref.at[row, channel, span], ddt.astype(ddt_ref.dtype), optimized=False)
             return d_skip + block_scan.summed(dys * xs, exchanged, interpret=interpret)
 
         def turned(turn, carry):
@@ -676,7 +678,8 @@ def _block_scans(a, written, read, entering, carried, exchanged, interpret: bool
 def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, table: tuple,
                        *, programs: int, partials: int):
     """`backward`'s launch of its program `entry`, a row's `programs` a program each, and its outputs:
-    `(dx, ddt, db, dc, dA, dD, dstate)`, B's and C's gradients summed over their `partials` buffers; a forked
+    `(dx, ddt, db, dc, dA, dD, dstate)` (`dx` and `ddt` in `x`'s and `dt`'s dtypes), B's and C's gradients
+    summed over their `partials` buffers; a forked
     call's (`table`: its given states, its stored slots, its documents' firsts, slots and stored slots, and
     each block's documents, `DocumentsBack`) the given
     states' gradient `[R * count, N, D]` after them, its stored slots' sums a scratch of the launch's."""
@@ -686,7 +689,7 @@ def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfin
         raise ValueError(f"a backward block of {positions} tokens holds no whole chunks of {scan.chunk}")
     interpret = scan.interpret
     sized = jax.ShapeDtypeStruct
-    out_type = (sized(x.shape, jnp.float32), sized(x.shape, jnp.float32),
+    out_type = (sized(x.shape, x.dtype), sized(x.shape, dt.dtype),
                 sized((rows, states, channels), jnp.float32), sized((rows, channels), jnp.float32),
                 sized((rows, states, channels), jnp.float32))
     scratch = (block_scan.scratch(), block_scan.exchange_scratch(positions),
@@ -835,7 +838,7 @@ def _scan_backward(scan: Scan, residuals, grads):
         return jnp.moveaxis(t[..., :scan.length], -1, 1)
 
     # `A`'s and `D`'s gradients formed in their dtypes before the inputs' cotangents leave (row 6027).
-    inputs = (trailing(dx).astype(x.dtype), trailing(ddt).astype(dt.dtype), trailing(db).astype(B.dtype),
+    inputs = (trailing(dx), trailing(ddt), trailing(db).astype(B.dtype),
               trailing(dc).astype(C.dtype), dstate, dgiven)
     (dx, ddt, db, dc, dstate, dgiven), (da, dd) = derivatives.with_gradients_formed(
         inputs, (da.sum(0).T.astype(A.dtype), dd.sum(0).astype(D.dtype)))
