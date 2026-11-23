@@ -119,7 +119,8 @@ import ast, gc, json
 from dew._code import closure
 closure("dew.nn.kernels.templates.report")
 gc.collect()
-print(json.dumps(sum(isinstance(each, ast.AST) for each in gc.get_objects())))
+# A tree's own nodes, not the operator and context singletons every parse shares.
+print(json.dumps(sum(isinstance(each, (ast.mod, ast.stmt, ast.expr)) for each in gc.get_objects())))
 """
 
 
