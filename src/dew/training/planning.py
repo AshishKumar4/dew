@@ -912,7 +912,7 @@ class FitSearch[LossT, EffectsT]:
         # (`report.targeted`).
         self.required = compiler_options() or None
 
-    def released_unplanned(self, planned: Planned, *, settled: bool = False) -> None:
+    def released_unplanned(self, planned: Planned | None, *, settled: bool = False) -> None:
         """Drop what the search kept of every program it compiled but the plan's, now it settled on
         `planned`: each executable it held but the plan's step's and its sampled step's (`unhold`), and each
         traced step it kept for a refit but the plan's (`dew.training._candidates.forget_unplanned`), every
@@ -921,11 +921,18 @@ class FitSearch[LossT, EffectsT]:
         (row 12131: 24 kept beside a 4B run's step left an all-reduce no room on a 2xH100). A provisional
         search keeps them, for the plan made on the devices as they stand to take (`provisional`), until a
         plan is taken in its place (`settled`): its own, or the one a search on the placed devices made,
-        whose programs it then keeps where it compiled them too."""
+        whose programs it then keeps where it compiled them too; none (`planned` None), every one dropped (a
+        later phase's search its run abandoned, `dew.training.ahead.LaterPlans`)."""
         if self.provisional and not settled:
             return
         from dew.training._candidates import forget_unplanned
 
+        if planned is None:
+            for key in self.holding:
+                unhold(key)
+            self.holding.clear()
+            forget_unplanned([candidate.lowered for candidate in self.lowered.values()], None)
+            return
         sampled = planned.sampled
         lowered = [planned.candidate.lowered, *([] if sampled is None or sampled.lowered is None
                                                  else [sampled.lowered])]

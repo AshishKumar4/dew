@@ -199,7 +199,7 @@ _input_log = logging.getLogger("dew.training.input")
 if TYPE_CHECKING:
     from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
-    from dew.training.ahead import AheadOfTime, LaterPlans
+    from dew.training.ahead import AheadOfTime, LaterPlans, Release
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
@@ -1087,6 +1087,15 @@ class Trainer(Generic[Loss, Effects]):
         from is released with its plan (`Planned.released`)."""
         return None if self._compiled is None else self._compiled.executable
 
+    def _dispatched(self, sampled: bool) -> jax.stages.Compiled | None:
+        """The executable a step of the last compile ran: its sampled step's where it summarized what the run
+        inspects (`Planned.sampled`), else the plan's, whose first run is taken as its own
+        (`dew.communicators.first_ran`)."""
+        planned = None if self._compiled is None else self._compiled.planned
+        if sampled and planned is not None and planned.sampled is not None:
+            return planned.sampled.executable
+        return self.executable
+
     @property
     def step_flops(self) -> StepFlops | None:
         """The FLOPs of the last compiled step; a ramped run has one value per stage, which `fit` keeps
@@ -1356,9 +1365,9 @@ class Trainer(Generic[Loss, Effects]):
                     # its steps', its first draw's admissions (`DrawingStep.drawn`) among it.
                     interval.compiling = before + time.perf_counter() - began
                 with region("train.step"):
-                    state, loss, aux, finite, accepted, committed = train_step(
-                        state, device, sampled=self.inspection is not None and self.inspection.samples(
-                            run.current + 1, self.accumulation))
+                    state, loss, aux, finite, accepted, committed = train_step(state, device, sampled=(
+                        sampled := self.inspection is not None and self.inspection.samples(
+                            run.current + 1, self.accumulation)))
                 if not seen and self.phase_passes.counts:
                     # Once the first step is dispatched, its later phases' steps are planned off the loop.
                     from dew.training.ahead import LaterPlans
@@ -1372,7 +1381,7 @@ class Trainer(Generic[Loss, Effects]):
                     # outputs, the loss counters, so a newly compiled step's first run is awaited here,
                     # where its failure can be named.
                     self._unproven = False
-                    first_run(loss, run.current, self.memory, self.device_mesh)
+                    first_run(loss, run.current, self.memory, self.device_mesh, self._dispatched(sampled))
                 run.loss = loss
                 assert run.train is not None
                 position = run.train.source_state if ahead is None else ahead
@@ -2234,6 +2243,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         state = self._staged(state, run.current)
         signature = self.phase_passes.key(batch_signature(batch))
+        release: Release | None = None
         if signature not in compiled and self.phase_passes.begins(compiled) and (
                 not occupied(state.window)):
             # A phase of other passes begins at an update's end: its step is planned afresh, at the split
@@ -2246,8 +2256,9 @@ class Trainer(Generic[Loss, Effects]):
                 # Its empty window binds no split: the new step's window is built over it.
                 self._compiler.afresh = True
             if self._later is not None:
-                # The phase's plan off the loop waited for, its executables the process's (`LaterPlans`).
-                self._later.waited(self.phase_passes.current)
+                # The phase's plan off the loop waited for, its executables the process's (`LaterPlans`),
+                # each but those the boundary's plan takes dropped once it takes one.
+                release = self._later.waited(self.phase_passes.current)
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
         if signature not in compiled:
@@ -2258,6 +2269,8 @@ class Trainer(Generic[Loss, Effects]):
             began = time.perf_counter()
             with region("compile"), run.held():
                 compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
+            if release is not None:
+                release(None if self._compiled is None else self._compiled.planned)
             seconds = time.perf_counter() - began
             settled_heap(run, compiled=True)
             links = {axis: AxisLink(link.bytes_per_second, link.spread) for axis, link in self.links.items()}

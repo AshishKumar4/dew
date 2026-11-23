@@ -248,10 +248,12 @@ def forget(lowered: jax.stages.Lowered) -> None:
             del _CANDIDATES[key]
 
 
-def forget_unplanned(lowerings: Sequence[jax.stages.Lowered], planned: jax.stages.Lowered) -> None:
+def forget_unplanned(lowerings: Sequence[jax.stages.Lowered],
+                     planned: jax.stages.Lowered | None) -> None:
     """Drop every step this process keeps for a trainer built anew (`candidate_for`) whose program is one of
-    `lowerings` but `planned`'s, by the lowering itself: a search's losing and frontier rungs, whose
-    lowerings key their executables while they live (`dew.training.planning.FitSearch.released_unplanned`)."""
+    `lowerings` but `planned`'s (every one, where None), by the lowering itself: a search's losing and
+    frontier rungs, whose lowerings key their executables while they live
+    (`dew.training.planning.FitSearch.released_unplanned`)."""
     dropped = {id(lowered) for lowered in lowerings if lowered is not planned}
     with _KEEPING:
         for key in [key for key, kept in _CANDIDATES.items() if id(kept.lowered) in dropped]:

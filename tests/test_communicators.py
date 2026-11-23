@@ -275,6 +275,34 @@ def test_a_program_not_yet_run_is_charged_its_load_beside_every_other_not_yet_ru
     resident.admit(Collectives(), FOUR, room, lambda gpu: floor, evaluation)
 
 
+def test_a_first_runs_measured_load_is_what_each_later_program_not_yet_run_is_charged():
+    """What a program's first run, seen to complete, took on its GPUs outside XLA's pool past the
+    communicators its admission charged and the pool's growth is what loading it took (`Resident.ran`):
+    every later program not yet run is charged the most a first run took there, never the floor once a
+    heavier load was measured (review of row 12131's P0: the measure was dropped, a 96 MiB load charged 8
+    MiB for ever); a pool that gave regions back over the run hid as much of the load, which the measure
+    adds back (a 48 MiB load beside a 32 MiB give-back read 16 MiB)."""
+    room = dict.fromkeys(range(4), 8 * GIB)
+    every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+    resident = communicators.Resident()
+    step, evaluation = communicators.Loaded((0, 1, 2, 3), 1), communicators.Loaded((0, 1), 2)
+    resident.admit(every, FOUR, room, lambda gpu: 4 * GIB, step)
+    # Its first run: the GPU lost its communicators (2 GiB), 96 MiB of load and 32 MiB of pool growth.
+    took = 96 << 20
+    before, after = dict.fromkeys(range(4), 6 * GIB), dict.fromkeys(range(4), 4 * GIB - took - (32 << 20))
+    resident.ran(step.key, before, after, dict.fromkeys(range(4), 32 << 20))
+    assert resident.cost == dict.fromkeys(range(4), took) and resident.held == every
+    with pytest.raises(CommunicatorRoom) as charged:
+        resident.admit(Collectives(), FOUR, room, lambda gpu: took - 1, evaluation)
+    assert charged.value.needed == {0: took, 1: took, 2: 0, 3: 0}
+    # A pool that gave 32 MiB back over a 48 MiB load: the GPU lost 16 MiB.
+    gave = communicators.Resident()
+    alone = communicators.Loaded((0,), 3)
+    gave.admit(Collectives(), FOUR, {0: 8 * GIB}, lambda gpu: GIB, alone)
+    gave.ran(alone.key, {0: GIB}, {0: GIB - (16 << 20)}, {0: -(32 << 20)})
+    assert gave.cost == {0: 48 << 20}
+
+
 def test_a_program_of_no_identity_is_admitted_by_its_communicators_alone_and_held_as_made():
     """A program whose runtime states no fingerprint, which no run of it is taken by (`admit`'s
     `loaded=None`), is admitted by its communicators alone, no load charged for it, and holds them as made at

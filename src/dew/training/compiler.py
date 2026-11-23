@@ -19,7 +19,6 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
-from dew import communicators
 from dew._coordination import agreed, agreed_count, from_every_process
 from dew._records import JSON, boolean, integer, json_value, listed, record
 from dew.batch import CLOSES_WINDOW, LOOP_PASSES, Batch, Variables, at_path, placed_at
@@ -1250,8 +1249,6 @@ class StepCompiler[L, E]:
                 for part, executable in zip(parts, executables, strict=True):
                     moving, *output = executable(moving, frozen, batch, part)
                     outputs.append(tuple(output))
-                # Each executable a call of which returned run: its admission's charge is free memory's now.
-                communicators.dispatched(held)
                 stepped = together(moving, frozen)
                 returned[0] = stepped.window_size
                 # A split step's metrics through its whole, which pools them and reads each as its value.
@@ -1343,6 +1340,10 @@ class StepCompiler[L, E]:
             None if self._base_rung is None
             else self._base_rung[1], resumed, remat=self.remat, ahead=self.ahead,
             provisional=provisional, unplaced=unplaced)
+        if search.provisional:
+            # Its programs held until a plan is taken in its place, or its run abandons it, even where it
+            # refuses (`Unplaced.release`, `dew.training.ahead.LaterPlans`).
+            self._settle = functools.partial(search.released_unplanned, settled=True)
         try:
             planned, probes = search.admitted(
                 candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
@@ -1380,8 +1381,6 @@ class StepCompiler[L, E]:
         # Every executable and traced step the search kept but the plan's dropped (row 12131); a provisional
         # search's once a plan is taken in its place (`Unplaced.release`).
         search.released_unplanned(planned)
-        if search.provisional:
-            self._settle = functools.partial(search.released_unplanned, settled=True)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)

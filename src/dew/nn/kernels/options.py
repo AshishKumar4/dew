@@ -420,22 +420,12 @@ def _ran(program: OuterProgram, executable: jax.stages.Compiled, args: tuple, kw
          ) -> contextlib.AbstractContextManager:
     """The contexts every enclosing `running` block runs `executable`, `program`'s for these arguments,
     inside, the outermost first, each entered here, at the call, not at the caller's `with`, which leaves
-    them; none outside any. Innermost, the run itself, which its admission takes once the call returns
-    (`_called`): a call that raised is no run of it."""
+    them; none outside any."""
     stack = contextlib.ExitStack()
     with stack:
         for around in _RUNNING.get():
             stack.enter_context(around(program, executable, args, kwargs))
-        stack.enter_context(_called(executable))
         return stack.pop_all()
-
-
-@contextlib.contextmanager
-def _called(executable: jax.stages.Compiled) -> Iterator[None]:
-    """Take a call of `executable` that returns as its run (`dew.communicators.dispatched`): what it loads
-    and connects is free memory's to read from there on; one that raises leaves it charged as not run."""
-    yield
-    communicators.dispatched(executable)
 
 
 @contextlib.contextmanager
@@ -767,7 +757,11 @@ class OuterProgram:
         if ready is None:
             ready = self._shaped_for(key, args, kwargs) or self._kept(key, args, kwargs)
         with _ran(self, ready, args, kwargs):
-            return ready(*dynamic, **named)
+            outputs = ready(*dynamic, **named)
+        # Its first run's completion taken as its run (`dew.communicators.completed`), never its dispatch,
+        # which an asynchronous one returns before the run loads it.
+        communicators.completed(ready, outputs)
+        return outputs
 
     def _shaped_for(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
         """The executable a compile within `collecting` made for a call alike in its abstract signature
