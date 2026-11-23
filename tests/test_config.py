@@ -611,9 +611,9 @@ def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(t
 
 
 class _Bucket:
-    """The three calls a run record makes on a path, recorded, and backed by a
-    local directory: a real gs:// write needs credentials and a network, and
-    what is under test is that a URI is never taken apart with os.path."""
+    """The calls a run record makes on a path, recorded, and backed by a local
+    directory: a real gs:// write needs credentials and a network, and what is
+    under test is that a URI is never taken apart with os.path."""
 
     def __init__(self, uri, root, seen):
         self.uri, self.root, self.seen = str(uri), root, seen
@@ -627,6 +627,10 @@ class _Bucket:
     def mkdir(self, parents=False, exist_ok=False):
         self.seen.append(("mkdir", self.uri))
         self._local().mkdir(parents=parents, exist_ok=exist_ok)
+
+    def exists(self):
+        self.seen.append(("exists", self.uri))
+        return self._local().exists()
 
     def write_text(self, text):
         self.seen.append(("write", self.uri))
@@ -655,7 +659,8 @@ def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
     path = config.save("gs://dew-runs/flowers")
 
     assert path == "gs://dew-runs/flowers/run.json"
-    assert seen == [("mkdir", "gs://dew-runs/flowers"),
+    # The record already there read first, an earlier masked run's marked beside it (`keep_unmasked_mark`).
+    assert seen == [("mkdir", "gs://dew-runs/flowers"), ("exists", "gs://dew-runs/flowers/run.json"),
                     ("write", "gs://dew-runs/flowers/run.json")]
     assert RunConfig.load("gs://dew-runs/flowers") == config
     assert seen[-1] == ("read", "gs://dew-runs/flowers/run.json")

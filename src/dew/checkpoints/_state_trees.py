@@ -444,14 +444,15 @@ def earlier_typed(named: str) -> str | None:
     return named if named in registry.optimizers.paths and named != "optax" else None
 
 
-def mask_readers(config: Mapping[str, JSON]) -> tuple[list[JSON], list[Mapping[str, JSON]]]:
+def mask_readers(config: Mapping[str, JSON]) -> tuple[list[JSON], Sequence[Mapping[str, JSON]]]:
     """An earlier optimizer config's param groups, and the parts of it that read a mask among its optimizer's
     options: where it spared its decay (`OptimConfig.spared`, on by default) its own mask was written over
     the options', as a group's that spared (`ParamGroup.spared`, off by default) was, every group reading it
     alike; so the config where it neither groups nor spares, else each group that does not spare."""
     groups = config.get("param_groups") or []
     assert isinstance(groups, list), groups
-    held = [group for group in groups if isinstance(group, Mapping) and not group.get("spared", False)]
+    held: list[Mapping[str, JSON]] = [group for group in groups
+                                      if isinstance(group, Mapping) and not group.get("spared", False)]
     return groups, held if groups else ([] if config.get("spared", True) else [config])
 
 
@@ -464,7 +465,7 @@ def unmasked_decay(record: Mapping[str, JSON]) -> bool:
     fields = record.get("fields")
     optim = fields.get("optim") if isinstance(fields, Mapping) else None
     tagged = _records.class_record(optim) if isinstance(optim, Mapping) else None
-    config = tagged[1] if tagged is not None else optim
+    config = _records.json_value(tagged[1] if tagged is not None else optim, "optim")
     if not isinstance(config, Mapping):
         return False
     named, options = config.get("optimizer", "adamw"), config.get("optimizer_opts") or {}
