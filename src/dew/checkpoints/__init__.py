@@ -85,7 +85,6 @@ from dew._coordination import agreed, broadcast_from_process_zero, from_every_pr
 from dew._files import is_uri, write_atomically
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
-from dew.checkpoints import _step_records
 from dew.checkpoints._integrity import _digest
 from dew.checkpoints._payloads import (
     _NEEDS,
@@ -128,9 +127,6 @@ from dew.checkpoints._state_trees import (
     _with,
     _with_ema_deltas,
     decodes_done,
-    earlier_unmasked,
-    formed_as,
-    masked_decay_unsaved,
 )
 from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
 from dew.checkpoints.averaging import (
@@ -1020,9 +1016,6 @@ class Checkpoints:
         # The newest local step, the processes holding it and where its arrays lie, where some process
         # lost its copy and recovers it from them (`_local_latest`); None where every process holds it.
         self._recovery: tuple[int, frozenset[int], tuple[Grid, ...]] | None = None
-        # Whether the run's record was an earlier run's whose optimizer read a mask of False, read before a
-        # run writes its record in its translation (`earlier_unmasked`).
-        self._unmasked = earlier_unmasked(self.directory, RUN_FILE)
         # The digests the save still in flight records, which no kept step lists yet.
         self._frozen_pending: set[str] = set()
 
@@ -2208,10 +2201,6 @@ class Checkpoints:
         _check_template(template, metadata, stored, mapping=mapping)
         placed = template
         template = _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata)
-        # An earlier run's masked decay step read across, its record's alone (`earlier_unmasked`).
-        form = None
-        if self._unmasked and not (snapshot.custom_metadata or {}).get(_step_records.TYPED_OPTIMIZER):
-            template, form = masked_decay_unsaved(template, metadata, _OPTIMIZERS, self._unmasked)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:
@@ -2272,7 +2261,6 @@ class Checkpoints:
         restored = self._with_frozen(dict(restored), frozen, held)
         table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
-        restored = restored if form is None else formed_as(restored, form, _OPTIMIZERS)
         restored = _filled(placed, restored, step)
         _packed_checked(restored)
         return restored, saved

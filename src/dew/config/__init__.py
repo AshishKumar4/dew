@@ -43,7 +43,6 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.checkpoints import RUN_FILE, Checkpoints
-from dew.checkpoints._state_trees import keep_unmasked_mark
 from dew.config.earlier import ADDITIVE_UNSETTABLE, LAYOUT_UNSETTABLE, MARKERS, earlier_run
 from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -795,9 +794,6 @@ class RunConfig:
         path = epath.Path(directory)
         path.mkdir(parents=True, exist_ok=True)
         target = path / RUN_FILE
-        # An earlier masked run's record, about to be written over in its translation, marked beside it
-        # first, so its checkpoints read across its masked decay alike (`earlier_unmasked`).
-        keep_unmasked_mark(target)
         # Whole or not at all: `load` reads it while a run is resumed.
         write_atomically(target, json.dumps(self.record(), indent=2, sort_keys=True))
         return str(target)

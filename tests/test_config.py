@@ -660,8 +660,7 @@ def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
     path = config.save("gs://dew-runs/flowers")
 
     assert path == "gs://dew-runs/flowers/run.json"
-    # The record already there read first, an earlier masked run's marked beside it (`keep_unmasked_mark`).
-    assert seen == [("mkdir", "gs://dew-runs/flowers"), ("exists", "gs://dew-runs/flowers/run.json"),
+    assert seen == [("mkdir", "gs://dew-runs/flowers"),
                     ("write", "gs://dew-runs/flowers/run.json")]
     assert RunConfig.load("gs://dew-runs/flowers") == config
     assert seen[-1] == ("read", "gs://dew-runs/flowers/run.json")
@@ -1107,19 +1106,6 @@ def _saved_optimizer(tmp_path, earlier):
     return LMRunConfig.load(str(path)).optim
 
 
-def _as_earlier_dews(*roots):
-    """The checkpoints under `roots` as an earlier Dew wrote them: their steps' metadata naming no optimizer
-    state of this Dew's (`TYPED_OPTIMIZER`), which a step written before each optimizer held its own spec
-    held none of."""
-    from dew.checkpoints._step_records import TYPED_OPTIMIZER
-
-    for root in roots:
-        for written in root.rglob("_CHECKPOINT_METADATA"):
-            held = json.loads(written.read_text())
-            held["custom_metadata"].pop(TYPED_OPTIMIZER)
-            written.write_text(json.dumps(held))
-
-
 def _checkpointed(directory, optimizer, steps, local=None, persistent: bool = True):
     """A tiny language run of `optimizer` fitted to `steps`, checkpointed each step in `directory` where
     `persistent`, and on this host in `local` where given (`local_every`), which resumes from its latest
@@ -1144,26 +1130,22 @@ def _checkpointed(directory, optimizer, steps, local=None, persistent: bool = Tr
 
 @pytest.mark.parametrize("case", sorted(MASKED))
 def test_a_run_whose_decay_its_options_masked_off_resumes_its_optimizers_state_as_it_trained(tmp_path, case):
-    """A run saved while its optimizer's options masked its decay off (`optimizer_opts={"mask": False}`) or
-    by a tree, unspared or in a param group that did not spare (`ParamGroup.spared`), whatever the config
-    spared, loads an optimizer that decays nothing there (its decay 0) or where the tree says
-    (`OptimConfig.decay_mask`), a spared decay's tree dropped as that Dew wrote its own over it, each leaf of
-    its state, in order, of the shape and dtype the earlier Dew's held, at its path but where a masked coupled
-    decay's step led its chain, and whose step updates as that one's did; Adam's coupled decay of 0, which
-    held no decay step, holds its tree's every node as it did. A masked decay step held an empty state of a
-    mask's, which a decay of 0 holds bare or, coupled, not at all: a checkpoint of it restores
-    (`test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optimizer_its_record_loads`)."""
+    """A run saved while its optimizer's options masked its decay (`optimizer_opts={"mask": False}`, or by a
+    tree of booleans), unspared or in a param group that did not spare (`ParamGroup.spared`), whatever the
+    config spared, loads an optimizer whose decay that mask masks as it did (`OptimConfig.decay_mask`,
+    `ParamGroup.decay_mask`), a spared decay's mask dropped as that Dew wrote its own over it: its state the
+    earlier Dew's tree, node for node (`MASKED`'s `treedef`), each leaf at its path of its shape and dtype,
+    and its step updating as that one's did, so a checkpoint of it restores as it was written
+    (`test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optimizer_its_record_loads`;
+    review of API01: a mask of False was read as a decay of 0, another state tree)."""
     held = MASKED[case]
     optimizer = _saved_optimizer(tmp_path, held["optim"]).build(None)
     params = {"w": jnp.arange(4.0).reshape(2, 2) / 10, "b": jnp.arange(2.0) / 10}
     state = optimizer.init(params)
-    if case == "adam-coupled-undecayed":
-        assert str(jax.tree.structure(state)) == held["treedef"]
+    assert str(jax.tree.structure(state)) == held["treedef"]
     leaves = [[jax.tree_util.keystr(path), list(leaf.shape), str(leaf.dtype)]
               for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]]
-    assert [leaf[1:] for leaf in leaves] == [leaf[1:] for leaf in held["state"]], leaves
-    if case != "adam-coupled-unspared":
-        assert leaves == held["state"], leaves
+    assert leaves == held["state"], leaves
     updates, _ = optimizer.update(jax.tree.map(jnp.ones_like, params), state, params)
     assert jax.tree.map(lambda leaf: leaf.tolist(), updates) == held["updates"]
 
@@ -1192,16 +1174,13 @@ group."""
 def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optimizer_its_record_loads(
         tmp_path, optimizer, grouped):
     """A checkpoint an earlier Dew wrote of a run whose options masked its decay off where they were read,
-    unspared or in an unspared param group, holds its decay step masked whole: AdamW's empty state as a
-    mask's (`optax.MaskedState`), which the optimizer its record now loads holds bare (its decay 0), and
-    Adam's coupled decay step ahead of its moments, which a decay of 0 holds none of (`Adam.COUPLED`).
-    Written here by an optimizer whose state is that earlier one's tree, node for node (an unspared one's
-    `MASKED`'s `treedef`), beside the earlier run's record (`run.json`), it restores into the loaded
-    optimizer through Orbax, its every leaf as written, and the run steps on, its record that translation
-    from then on (`dew.checkpoints._state_trees.masked_decay_unsaved`, gated by `earlier_unmasked`; review
-    of API01: Orbax refused it, and the coupled one was refused as it loaded). A group that spared its
-    decay (`rest`) read no mask, so it is read as Orbax holds it: a resume that drops its active decay is
-    refused."""
+    unspared or in an unspared param group, holds its decay step masked whole (`optax.MaskedState` over its
+    empty state, Adam's coupled one ahead of its moments): the optimizer its record now loads masks it off
+    alike (`decay_mask=False`), its state that tree node for node, so a persistent step and a newer local
+    one restore through Orbax as written, every leaf, and the run steps on, its record rewritten as any
+    resumed run's is (review of API01: a decay of 0 held another tree, which a restore shim read across).
+    A group that spared its decay (`rest`) read no mask: a resume that drops its active decay is refused."""
+    from dew.config.lm import LMRunConfig
     from dew.optim import ParamGroup
 
     earlier = {"optimizer": optimizer, "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
@@ -1212,31 +1191,18 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
                    for group in UNMASKED_GROUPS) if grouped else ()
     spec = AdamW(weight_decay=0.1) if optimizer == "adamw" else Adam(weight_decay=0.1)
     written = OptimConfig(optimizer=spec, learning_rate=1e-2, param_groups=groups)
-    params = {"w": jnp.arange(4.0).reshape(2, 2) / 10, "b": jnp.arange(2.0) / 10}
-    if not grouped:
-        built = str(jax.tree.structure(written.build(None).init(params)))
-        assert built == MASKED[f"{'adamw' if optimizer == 'adamw' else 'adam-coupled'}-unspared"]["treedef"]
     run, local = tmp_path / "run", tmp_path / "local"
-    # Its earlier checkpoints: a persistent step and a newer local one (`local_every`), the newest resumed.
     _checkpointed(run, written, 1)
     saved = _checkpointed(run, written, 2, local=local, persistent=False)
     assert not (run / "2").exists() and list(local.rglob("2"))
-    _as_earlier_dews(run, local)
-    # The earlier run's record beside its checkpoints, as that Dew wrote it.
     loaded = _saved_optimizer(run, earlier)
     resumed = _checkpointed(run, loaded, 2, local=local, persistent=False)
-    assert jax.tree.structure(resumed.opt_state) != jax.tree.structure(saved.opt_state)
+    assert jax.tree.structure(resumed.opt_state) == jax.tree.structure(saved.opt_state)
     for got, want in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(saved.opt_state), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    # Its record rewritten in its translation, as a resumed run writes its own (`RunConfig.save`), which
-    # marks the earlier one beside it first: its next start reads alike.
-    from dew.config.lm import LMRunConfig
-
     LMRunConfig(optim=loaded).save(str(run))
-    assert (run / "earlier-masked-decay.json").exists()
     if grouped:
-        # The spared group's decay, active as it trained, dropped on resume: its state no group of the mask's,
-        # so its checkpoint is held to the template and refused.
+        # The spared group's decay, active as it trained, dropped on resume: its state another tree.
         rest = [dataclasses.replace(group, weight_decay=0.0, spared=False) if group.name == "rest" else group
                 for group in loaded.param_groups]
         with pytest.raises(ValueError):
@@ -1263,7 +1229,6 @@ def test_a_checkpoint_whose_decay_its_options_masked_by_a_tree_restores_into_the
     assert str(jax.tree.structure(written.build(None).init(params))) == case["treedef"]
     run = tmp_path / "run"
     saved = _checkpointed(run, written, 1)
-    _as_earlier_dews(run)
     # The earlier run's mask, by the names of the parameters its optimizer stepped (its first moment's).
     mask = jax.tree.map(lambda moment: moment.ndim > 1, optax.tree_utils.tree_get(saved.opt_state, "mu"))
     assert {False, True} == set(jax.tree.leaves(mask)), mask
@@ -1276,58 +1241,14 @@ def test_a_checkpoint_whose_decay_its_options_masked_by_a_tree_restores_into_the
     assert int(_checkpointed(run, loaded, 2).step) == 2
 
 
-def test_a_masked_decay_read_in_some_groups_is_read_across_in_those_groups_alone():
-    """A restore's translation of an earlier run whose mask its param groups `a` read alone templates a
-    masked empty decay step within `a`'s state alone: an empty state outside the groups, and in group `b`,
-    each of which the checkpoint holds masked, stays as the template holds it, so Orbax holds it to the
-    template (review of API01: a group-scoped translation rewrote an outer node too)."""
-    import optax
-
-    from dew.checkpoints._state_trees import _masked_as_saved
-
-    masked = {"inner_state": {}}
-    node = (optax.EmptyState(), optax.PartitionState(inner_states={"a": optax.EmptyState(),
-                                                                   "b": optax.EmptyState()}))
-    saved = [masked, {"inner_states": {"a": masked, "b": masked}}]
-    outer, groups = _masked_as_saved(node, saved, frozenset({"a"}))
-    assert outer == optax.EmptyState()
-    assert groups.inner_states == {"a": optax.MaskedState(inner_state=optax.EmptyState()),
-                                   "b": optax.EmptyState()}
-
-
-@pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
-def test_a_step_this_dew_wrote_after_an_earlier_masked_runs_is_held_to_its_template(tmp_path, optimizer):
-    """An earlier masked run (`optimizer_opts={"mask": False}`, unspared) resumed under an active decay its
-    config spares (`RunConfig.RESUMABLE`'s optimizer), whose state holds the same masked step, writes its
-    next step this Dew's way, its metadata naming its optimizer state this Dew's (`TYPED_OPTIMIZER`): a
-    resume of it that drops the active decay is refused by its restore, never read across as the earlier
-    steps are (review of API01: the mark held for every step of the directory)."""
-    from dew.config.lm import LMRunConfig
-
-    spec = AdamW if optimizer == "adamw" else Adam
-    active = OptimConfig(optimizer=spec(weight_decay=0.1), learning_rate=1e-2)
-    run = tmp_path / "run"
-    _checkpointed(run, active, 1)
-    _as_earlier_dews(run)
-    earlier = {"optimizer": optimizer, "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
-               "spared": False}
-    undecayed = _saved_optimizer(run, earlier)
-    LMRunConfig(optim=active).save(str(run))
-    # Step 1, the earlier Dew's, read across; step 2 written under the active decay.
-    assert int(_checkpointed(run, active, 2).step) == 2
-    with pytest.raises(ValueError):
-        _checkpointed(run, undecayed, 3)
-
-
 @pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
 @pytest.mark.parametrize("record", ["absent", "today"])
 def test_an_active_decays_checkpoint_resumed_without_its_decay_is_refused(tmp_path, optimizer, record):
     """A checkpoint of a run decaying its parameters as its config spared them (`OptimConfig.spared`, its
     decay step masked by the sparing: `optax.MaskedState` over an empty state, AdamW's and Adam's coupled
     one's alike) resumed by an optimizer that decays nothing (its decay 0, unspared) is refused by its
-    restore, its run's record no earlier masked run's (`run.json` absent, or today's): the one translation
-    of a masked decay step reads an earlier record's checkpoints alone (`earlier_unmasked`), never an active
-    decay's into a template without it (review of API01: the translation ran on every restore)."""
+    restore, its run's record absent or today's: no restore reads one optimizer's state into another's
+    tree."""
     from dew.config.lm import LMRunConfig
 
     spec = AdamW if optimizer == "adamw" else Adam
