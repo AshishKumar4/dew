@@ -61,6 +61,8 @@ REVIEWED = {
     "dew.registry:import_trusted:package": "a package the run trusts, as `dew.registry:imported:module`",
     "dew.registry:import_trusted:module": "a trusted package's module a record names, as its package",
     "dew.registry:module_from_file:<loader>": "a user's file a run names, the user's code",
+    "dew.clusters:tpu_chips:<loader>":
+        "JAX's hardware_utils, read by its file to count TPU chips: JAX's code",
     "dew.data.sources.codec:_dataclass_decoded:module":
         "a dataclass a stored artifact names, rebuilt as data from its fields, as "
         "`dew.registry:imported:module`",
@@ -75,6 +77,7 @@ REVIEWED = {
     **dict.fromkeys((
         "dew._cache:unintercepted:sys.modules", "dew._devices:_seen:sys.modules",
         "dew._devices:backend_open:sys.modules", "dew._devices:flags_hold:sys.modules",
+        "dew._devices:opens_tpu:sys.modules",
         "dew._sources:file_of:sys.modules", "dew._sources:function_reads:sys.modules",
         "dew._sources:generated_fields:sys.modules", "dew._sources:own_source:sys.modules",
         "dew._sources:recorded:sys.modules", "dew._sources:source_file:sys.modules",

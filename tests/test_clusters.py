@@ -79,8 +79,8 @@ def _tpu_vm() -> bool:
     """Whether this host is a Cloud TPU VM JAX runs as one (libtpu and a TPU chip)."""
     import importlib.util
 
-    from dew.clusters import _tpu_chips
-    return importlib.util.find_spec("libtpu") is not None and _tpu_chips() > 0
+    from dew.clusters import tpu_chips
+    return importlib.util.find_spec("libtpu") is not None and tpu_chips() > 0
 
 
 def test_mpirun_inside_a_slurm_allocation_is_open_mpis_pool_and_dew_launchs_is_its_own():
