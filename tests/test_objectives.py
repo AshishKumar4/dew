@@ -109,6 +109,19 @@ def test_the_initializer_dispatches_through_the_public_init():
                 assert nonzero == 0, f"the override was bypassed; {nonzero} values are nonzero"
 
 
+def test_an_objectives_drawn_shapes_and_axes_compute_nothing():
+    """An objective's drawn shapes (`drawn_shapes`) and its parameters' axes (`parameter_axes`), read on a
+    compile-only GPU as the default device, on which nothing computes (a GPU tier's prepare): each traces its
+    draw for shapes alone, its key made within the trace, where its key made outside raised on such a
+    device and the tier ran the test unprepared (rows 12147-12150)."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    objective = lm_objective()
+    with jax.default_device(compile_only_gpus("sm80")[0]):
+        shapes, axes = objective.drawn_shapes(), objective.parameter_axes
+    assert jax.tree.leaves(shapes) and axes
+
+
 def test_the_initializer_and_init_return_the_same_tree():
     """One initialization implementation behind both entry points, so a
     caller of `init` and the trainer's state JIT cannot disagree."""
