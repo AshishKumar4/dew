@@ -1241,7 +1241,7 @@ class OuterProgram:
             traced, (made, under), program = outcome
             answered = reads is None
             with self._compiling:
-                if answered:
+                if reads is None:
                     reads = self._programs.get(program)
                 else:
                     self._programs[program] = reads
@@ -1455,10 +1455,10 @@ def _read_by[R](call: Callable[[], R]) -> tuple[R, Facts | None]:
     token = _RAN.set(ran)
     try:
         with _facts.recording() as reads:
-            result = call()
+            returned = call()
     finally:
         _RAN.reset(token)
-    return result, reads if ran else None
+    return returned, reads if ran else None
 
 
 def _weak_types(traced: jax.stages.Traced) -> tuple[bool, ...]:
