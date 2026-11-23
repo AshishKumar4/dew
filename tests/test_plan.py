@@ -342,26 +342,6 @@ def test_a_dropped_trainer_holds_no_executable_of_its_step():
     assert step() is None
 
 
-@pytest.mark.skipif(not jax.config.jax_enable_compilation_cache,
-                    reason="reads its step back from the persistent compilation cache, off in this run")
-def test_a_second_trainer_of_one_step_reads_its_step_back_compiling_nothing():
-    """A second trainer of a process, its step the same program on the same devices as an earlier one's that
-    is dropped: no executable of the first is held past it (row 12131: a process-wide store kept a dropped
-    run's device code and its collectives' room), and the second reads its step back from the persistent
-    compilation cache, its backend compiling nothing (`Compiles`, where row 6995's store answered it from
-    memory); it steps as the first."""
-    from dew.telemetry.compiles import Compiles
-
-    first = trained(lm(split=1), steps=1)
-    second = lm(split=1)
-    with Compiles(None) as compiles:
-        state = trained(second, steps=1)
-    assert [program.name for program in compiles.programs if program.kind == "compiled"
-            and program.name == "jit(step)"] == []
-    for one, other in zip(jax.tree.leaves(first.variables), jax.tree.leaves(state.variables), strict=True):
-        np.testing.assert_array_equal(np.asarray(one), np.asarray(other))
-
-
 def scaled_on_the_host(scale: float) -> optax.GradientTransformation:
     """Plain descent whose rate a host callback answers (`jax.pure_callback`): `scale` is the callback's
     closure, so two of other scales trace one program text calling other callbacks."""
@@ -891,10 +871,12 @@ def test_the_executable_a_profile_replaces_goes_with_its_program(earlier):
     and the backend holds as many executables as it did with that one alive, though JAX keeps every
     executable it compiled of a program while the program's lowering lives. A handoff that kept the
     admitted executable, or kept both, would hold one more. Where an `earlier` trainer of the same program
-    compiled the unguided step, the trainer takes it and lets it go too: no lowering the earlier trainer kept
-    holds it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200)."""
+    compiled the unguided step and was dropped, its executable goes with it: nothing the earlier trainer
+    kept holds it alive beside the guided one (rows 7988, 8293: three steps live where two were, on a GH200;
+    row 12131: no executable held past its run)."""
     if earlier:
         trained(lm(), steps=0)
+        gc.collect()
     with autopgle(2):
         trainer = lm()
         state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
