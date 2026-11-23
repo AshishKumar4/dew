@@ -541,6 +541,22 @@ def called_beside() -> optax.GradientTransformation:
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
 
 
+def called_on_a_layer() -> optax.GradientTransformation:
+    """`mapped_by_row`'s loop, three rows a step, over a stacked matrix, and beside a layer's own vector (a
+    bias, a norm's scale) a callback over the same `tanh`, which its stacked rows, one rank more, take
+    without: the stack's program acts on nothing, its layer's beside its result, which a stage holding its
+    own layers would drop (review of Train 1224's fixes: admitted)."""
+    def update(updates, state, params=None):
+        def mapped(gradient):
+            if gradient.ndim < 2:
+                jax.debug.callback(lambda total: None, jnp.sum(gradient))
+            if gradient.ndim < 3:
+                return jnp.tanh(gradient)
+            return jax.lax.map(jnp.tanh, gradient, batch_size=3)
+        return jax.tree.map(mapped, updates), state
+    return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
+
+
 def spread_sums() -> optax.GradientTransformation:
     """Each leaf's update from a primitive of its own named `copy`, JAX's entrywise copy's name, that
     broadcasts its operand's sum over it: no operation one entry at a time, whatever its name."""
@@ -577,7 +593,7 @@ WHOLE = {"lamb": lambda: optax.lamb(1e-3), "adafactor": lambda: optax.adafactor(
          "doubled-gains": doubled_gains, "spread-sums": spread_sums,
          # A loop over a stack that carries across its rows, acts beside its results, or takes no step.
          "carried-across-rows": carried_across_rows, "mapped-beside-a-callback": mapped_beside_a_callback,
-         "called-beside": called_beside}
+         "called-beside": called_beside, "called-on-a-layer": called_on_a_layer}
 """Transformations whose update reads a leaf whole, or whose build reads its tree's shapes: each keeps every
 layer whole on every stage."""
 

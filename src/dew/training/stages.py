@@ -286,9 +286,13 @@ class StageLocal:
 
     def rows_placement(self, placement):
         """`placement`'s stored layers' own: each row the spec its stacked leaf gives it past the stack,
-        on every stage."""
-        return self.layered(placement, lambda path, sharding, shape: [
-            _sharded(sharding, self.mesh, sharding.spec[len(shape):])] * math.prod(shape))
+        on every stage (`_row_shardings`)."""
+        return self.layered(placement, self._row_shardings)
+
+    def _row_shardings(self, path, sharding: NamedSharding, shape: tuple[int, ...]) -> list[NamedSharding]:
+        """A stacked leaf's rows' shardings (`RowCut`): each the spec its `sharding` gives it past the
+        `shape` of its stack, on every stage."""
+        return [_sharded(sharding, self.mesh, sharding.spec[len(shape):])] * math.prod(shape)
 
     @contextlib.contextmanager
     def held(self, *within: contextlib.AbstractContextManager) -> Iterator[None]:
@@ -430,33 +434,35 @@ class StageLocal:
         entries: list[tuple[DecoderBank, Mapping]] = []
 
         def collect(site: DecoderBank, where: str, node: Mapping) -> Mapping:
-            if self._stacks(site, where) and "stages" in node:
-                entries.append((site, node["stages"]))
-            return node
+            # Each stacked run taken out in the one walk, its place held for the layers it becomes.
+            if not (self._stacks(site, where) and "stages" in node):
+                return node
+            entries.append((site, node["stages"]))
+            rest = {key: value for key, value in node.items() if key != "stages"}
+            return _Unstacked(len(entries) - 1, rest)
 
-        _walked(variables, self.sites, collect)
+        template = _walked(variables, self.sites, collect)
         if not entries:
             return variables
         sites, stacked = tuple(site for site, _ in entries), tuple(held for _, held in entries)
-        placements = tuple(
-            site.view.layer_form(
-                {"stages": jax.tree.map(lambda leaf: leaf.sharding, held)},
-                lambda path, sharding, shape: [
-                    _sharded(sharding, self.mesh, sharding.spec[len(shape):])] * math.prod(shape),
-            )
-            for site, held in entries
-        )
-        unstacked = iter(
-            program(_layered_entries, static_argnums=0, out_shardings=placements,
-                    donate_argnums=(1,) if consumed else ())(sites, stacked)
-            if jax.tree.leaves(stacked) else _layered_entries(sites, stacked))
+        placements = tuple(site.view.layer_form({"stages": jax.tree.map(lambda leaf: leaf.sharding, held)},
+                                                self._row_shardings)
+                           for site, held in entries)
+        unstacked = (program(_layered_entries, static_argnums=0, out_shardings=placements,
+                             donate_argnums=(1,) if consumed else ())(sites, stacked)
+                     if jax.tree.leaves(stacked) else _layered_entries(sites, stacked))
+        return jax.tree.map(lambda held: {**held, **unstacked[held.index]} if isinstance(held, _Unstacked)
+                            else held, template, is_leaf=lambda node: isinstance(node, _Unstacked))
 
-        def placed(site: DecoderBank, where: str, node: Mapping) -> Mapping:
-            if not (self._stacks(site, where) and "stages" in node):
-                return node
-            return {**{key: value for key, value in node.items() if key != "stages"}, **next(unstacked)}
 
-        return _walked(variables, self.sites, placed)
+class _Unstacked(dict):
+    """A stacked run's place in a tree `StageLocal.whole` takes apart: the rest of its node, beside which
+    its layers go, and its entry's `index` among the runs it unstacks. A dict of its own kind, which no
+    pytree registry flattens, so the tree's one map back finds it whole."""
+
+    def __init__(self, index: int, rest: Mapping):
+        super().__init__(rest)
+        self.index = index
 
 
 _MIRRORS = ("variables", "opt_state", "ema", "compute")
@@ -581,10 +587,12 @@ def _expressions(layered, stacked, inputs: Sequence, outputs: Sequence) -> list[
     otherwise at its threshold (the admission row 4036 asked for, a global-norm clip stage-local). Row
     r of a stack of n rows is read against row r of every stacked input of n rows; a stack of another
     count is no row's. A program that acts beside what it returns (an effect: a callback's read of a whole
-    stack) is compared by no result, wherever it acts."""
+    stack, or of a layer's own leaf), the layer's or the stack's, is compared by no result, wherever it
+    acts."""
     from dew.training.staging import flattened
 
-    if stacked.jaxpr.effects:
+    if layered.jaxpr.effects or stacked.jaxpr.effects:
+        # Either program's: an effect over a layer's leaf the stack reads otherwise is no row of it either.
         return ["it acts beside what it returns (a callback), which no result compares and a stage holding "
                 "its own layers would act on otherwise"]
     numbering = _Numbering()
