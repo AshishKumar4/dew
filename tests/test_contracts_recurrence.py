@@ -274,23 +274,26 @@ def plain_ssd(x, dt, a, b, c, skip, state):
 
 
 def delta_rule_draw(salt: int, seed: int, scale: float, *, key_heads: int, value_heads: int, width: int,
-                    length: int, per_key: bool, unit_keys: bool = False):
+                    length: int, per_key: bool, unit_keys: bool = False, fixture: int | None = None):
     """A delta rule's operands `(query, key, value, g, beta, state)`, their direction and the outputs'
-    cotangents, a cell's draws 0 to 2 at `seed` (`draw_stream`, its `salt`): queries, values and memory at
-    `scale`, keys at it or of unit norm, a log decay in (-inf, 0) a head or a key dimension, write gates in
-    (0, 1)."""
+    cotangents, a cell's draws 0 to 2 at `seed` (`draw_stream`, its `salt`; seed zero's from `fixture` where
+    another cell's fixture is its own): queries, values and memory at `scale`, keys at it or of unit norm, a
+    log decay in (-inf, 0) a head or a key dimension, write gates in (0, 1)."""
+    def stream(at):
+        return draw_stream(salt, seed, at, fixture=None if fixture is None else fixture + at)
+
     query, key, value, decay, gate, state = normal_draw(
-        draw_stream(salt, seed, 0), (1, length, key_heads, width), (1, length, key_heads, width),
+        stream(0), (1, length, key_heads, width), (1, length, key_heads, width),
         (1, length, value_heads, width), (1, length, value_heads, *((width,) if per_key else ())),
         (1, length, value_heads),
         (1, value_heads, width, width))
     key = key / jnp.linalg.norm(key, axis=-1, keepdims=True) if unit_keys else key * scale
     primals = (query * scale, key, value * scale, -jax.nn.softplus(decay), jax.nn.sigmoid(gate),
                state * scale)
-    drawn = normal_draw(draw_stream(salt, seed, 1), *(x.shape for x in primals))
+    drawn = normal_draw(stream(1), *(x.shape for x in primals))
     direction = tuple(along * (scale if at in (0, 2, 5) or (at == 1 and not unit_keys) else 1.0)
                       for at, along in enumerate(drawn))
-    cotangent = normal_draw(draw_stream(salt, seed, 2), value.shape, state.shape)
+    cotangent = normal_draw(stream(2), value.shape, state.shape)
     return primals, direction, cotangent
 
 
@@ -508,12 +511,13 @@ def test_the_chunked_op_holds_every_order(edge):
     whose products near float32's ends; near float32's largest wherever fla's own chunked form with the skip
     is (`precedent_chunked`, as the portable rule's edge: ledger 2470)."""
     def draw(seed, scale):
+        # Its own streams past seed zero (2680), its fixture the template cell's (2664).
         (query, key, value, g, beta, _), direction, _ = delta_rule_draw(
-            2664, seed, scale, key_heads=2, value_heads=2, width=8, length=12, per_key=False)
-        (skip,) = normal_draw(2667 + 4096 * seed, (2,))
-        (skip_direction,) = normal_draw(2668 + 4096 * seed, (2,))
+            2680, seed, scale, key_heads=2, value_heads=2, width=8, length=12, per_key=False, fixture=2664)
+        (skip,) = normal_draw(draw_stream(2680, seed, 3, fixture=2667), (2,))
+        (skip_direction,) = normal_draw(draw_stream(2680, seed, 4, fixture=2668), (2,))
         return ((query, key, value, g, beta, skip), (*direction[:5], skip_direction),
-                normal_draw(2669 + 4096 * seed, value.shape)[0])
+                normal_draw(draw_stream(2680, seed, 5, fixture=2669), value.shape)[0])
     hooks = recurrence.Hooks(decay="scalar", skip=True, scale=8 ** -0.5)
 
     def chunked(query, key, value, g, beta, skip):
@@ -553,8 +557,8 @@ def assert_decode_contract(edge: str, seeds: int | None = None) -> None:
     def draw(seed, scale):
         (query, key, value, g, beta, state), direction, cotangent = delta_rule_draw(
             2669, seed, scale, key_heads=1, value_heads=2, width=128, length=1, per_key=False)
-        (skip,) = normal_draw(2672 + 4096 * seed, (2,))
-        (skip_direction,) = normal_draw(2673 + 4096 * seed, (2,))
+        (skip,) = normal_draw(draw_stream(2669, seed, 3, fixture=2672), (2,))
+        (skip_direction,) = normal_draw(draw_stream(2669, seed, 4, fixture=2673), (2,))
         flat = jnp.concatenate([cotangent[0][:, 0].ravel(), cotangent[1].ravel()])
         return (query, key, value, g, beta, state, skip), (*direction, skip_direction), flat
     hooks = recurrence.Hooks(decay="scalar", skip=True)

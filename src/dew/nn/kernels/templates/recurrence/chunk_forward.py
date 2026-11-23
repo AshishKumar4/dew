@@ -16,7 +16,6 @@ from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence import own_pairs
 from dew.nn.kernels.templates.recurrence.intra import _intra, _intra_solve
 from dew.nn.kernels.templates.recurrence.mainloop import (
-    LOG2_DECAY_FLOOR,
     Call,
     Operand,
     Tiles,
@@ -27,6 +26,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _states,
     _weighted,
     _weighted_values,
+    clamped,
     family_of,
     padded_widths,
     per_key_refusal,
@@ -369,7 +369,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     if call.clamped:
         # A 16-bit call's unbounded log decays clamped where every pair across a token decays to zero
         # (`mainloop.LOG2_DECAY_FLOOR`), its rounded prefix's reach held (`Call.prefix_limbs`).
-        decays = jnp.maximum(decays, LOG2_DECAY_FLOOR / algebra.LOG2_E)
+        decays = clamped(decays)
     if per_key:
         # A decay a key dimension's prefix's limbs `[R, HV * Dk]` and its scores, and its system where the
         # call solves it (no inverse given), one launch's (`_intra`).

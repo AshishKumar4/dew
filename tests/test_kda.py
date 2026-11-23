@@ -399,6 +399,24 @@ def test_an_unbounded_steep_decay_keeps_the_mild_pairs_after_it_interpreted():
                     label, seeds=8, truth_fn=jax.jit(with_gradients(partial(token_by_token, hooks))))
 
 
+def test_the_decay_clamps_derivative_is_its_forwards_at_and_around_the_fp32_floor():
+    """The template's log decay clamp (`mainloop.clamped`) and the derivative its backward applies
+    (`mainloop.clamped_gradient`) at fp32 values about its floor: the derivative is the forward's
+    (`jax.grad` of the clamp) away from the floor, the one from above at it (a decay there kept, its
+    gradient passed), and zero below, where the clamp moves the decay (row 12104)."""
+    from dew.nn.kernels.templates.recurrence import mainloop
+
+    floor = np.float32(mainloop.DECAY_FLOOR)
+    below, above = np.nextafter(floor, np.float32(-np.inf)), np.nextafter(floor, np.float32(0))
+    points = jnp.asarray([2 * floor, below, floor, above, floor / 2], jnp.float32)
+    assert np.array_equal(mainloop.clamped(points), jnp.maximum(points, floor))
+    passed = np.asarray(mainloop.clamped_gradient(points, jnp.ones_like(points)))
+    assert np.array_equal(passed, [0.0, 0.0, 1.0, 1.0, 1.0]), passed
+    for at, point in enumerate(points):
+        if point != floor:
+            assert passed[at] == jax.grad(mainloop.clamped)(point), (point, passed[at])
+
+
 def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
     """Kimi delta attention's own pairs' log decay gradient on the recurrence template, interpreted, over
     two bf16 tokens of unit-basis keys `e0` (scale one, a zero memory and decays): the first writing `e0`

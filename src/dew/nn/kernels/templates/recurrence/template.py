@@ -376,10 +376,26 @@ def walk_roles(family: mosaic.Family) -> int:
 def _spread(held: int, programs: int, target: generation.GpuTarget) -> int:
     """The programs of a launch holding `held` a multiprocessor of `target` runs at once: no more than its
     `programs` spread over the device's multiprocessors where it knows them, as a launch's blocks go to its
-    multiprocessors in turn (`Mosaic._running`'s states launch, `_output_hides`' output)."""
+    multiprocessors in turn (`_running`'s states launch, `_output_hides`' output)."""
     if target.multiprocessors is None:
         return held
     return min(held, -(-programs // target.multiprocessors))
+
+
+def _states_launch(launches: tuple[mainloop.Launch, ...]) -> mainloop.Launch:
+    """The forward's states launch of one product's `launches`: the one whose ring its tiles' stages are
+    (`mainloop.Launch.ring`)."""
+    return next(launch for launch in launches if launch.ring is not None)
+
+
+def _running(states: mainloop.Launch, target: generation.GpuTarget) -> int:
+    """The programs of a states launch `states` a multiprocessor of `target` runs at once: those it holds
+    (`Launch.resident`), but no more than its programs spread over the device's multiprocessors
+    (`_spread`). A residency past them hides nothing: on an A100 Qwen3-Next's 128 programs 32 wide held three
+    a multiprocessor one deep and two two deep, and ran two a multiprocessor either way, the forward 0.749 ms
+    one deep against 0.727 two deep (the 27B's 0.943 against 0.916), where the one deep ring narrowed the
+    block to 16 at 0.752 (1.193, gdn-pins-a100-3b0d2267d)."""
+    return _spread(states.resident, states.programs, target)
 
 
 def _output_hides(launches: tuple[mainloop.Launch, ...], target: generation.GpuTarget) -> bool:
@@ -973,10 +989,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                 training: bool = False) -> mainloop.Launch:
         """The forward's walk over each sequence's chunks, its states launch: a forward without a gradient's,
         or where `training` the forward its fast backward takes (`chunk_forward.kept_forward`)."""
-        # The launch whose ring its tiles' stages are (`mainloop.Launch.ring`), the states launch's alone.
-        return next(launch for launch in self.launches(ba, tiles, target, backward=False,
-                                                        training_forward=training)
-                    if launch.ring is not None)
+        return _states_launch(self.launches(ba, tiles, target, backward=False, training_forward=training))
 
     def _blocks(self, ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
                 ) -> list[int]:
@@ -1001,47 +1014,43 @@ class Mosaic(base.Template[mainloop.Tiles]):
         family = bundle(target, _dtype(ba))
         assert family is not None
         widths = self._blocks(ba, family, training=training) if wide is None else [wide]
-        def held(tiles: mainloop.Tiles) -> bool:
-            return tiles not in refused and self._product_holds(ba, tiles, target, training=training)
 
-        # Widest first: the first legal width whose output launch hides latency, else the first legal.
+        # Widest first: the first legal width whose output launch hides latency, else the first legal, each
+        # width's launches planned once, for its fit, its output's latency and its rings alike.
         widest = shallowest = None
         for width in widths:
             tiles = mainloop.Tiles(block, 1, None if width == block else width, walkers, chunk=chunk)
             if tiles in refused:
                 continue
-            # Each width's launches planned once, for its fit and its output's latency alike.
             launches = self._product_launches(ba, tiles, target, training=training)
             if not self._product_holds(ba, tiles, target, training=training, launches=launches):
                 continue
-            widest = widest or tiles
+            widest = widest or (tiles, launches)
             if _output_hides(launches, target):
-                shallowest = tiles
+                shallowest = (tiles, launches)
                 break
         shallowest = shallowest or widest
         if shallowest is None:
             return None
-        states = self._states(ba, shallowest, target, training=training)
+        tiles, launches = shallowest
+        states = _states_launch(launches)
         order = resources.hidden(family, states.consumers)
-        deeper = (dataclasses.replace(shallowest, stages=stages)
-                  for stages in range(2, min(resources.MOST_STAGES,
-                                             generation.shared_budget(target)
-                                             // max(states.step_bytes, 1)) + 1))
-        rings = [shallowest, *(tiles for tiles in deeper if held(tiles))]
-        return max(rings, key=lambda tiles: order(self._running(ba, tiles, target, training=training),
-                                                  tiles.stages))
+        # Each deeper ring's launches the shallowest's deepened (`Launch.deepened`, as `_planned` deepens its
+        # one trace): planned again, each depth traced the call's layout again, a forked call's table
+        # (`forked_table`) among it (row 12086).
+        rings = [(tiles, launches)]
+        for stages in range(2, min(resources.MOST_STAGES,
+                                   generation.shared_budget(target) // max(states.step_bytes, 1)) + 1):
+            deep = dataclasses.replace(tiles, stages=stages)
+            deepened = tuple(launch.deepened(stages, target) for launch in launches)
+            if deep not in refused and self._product_holds(ba, deep, target, training=training,
+                                                           launches=deepened):
+                rings.append((deep, deepened))
+        def hidden(ring) -> tuple:
+            deep, deepened = ring
+            return order(_running(_states_launch(deepened), target), deep.stages)
 
-    def _running(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget, *,
-                 training: bool = False) -> int:
-        """The programs of the states launch at `tiles` a multiprocessor of `target` runs at once: those it
-        holds (`states_held`), but no more than its programs spread over the device's multiprocessors where
-        it knows them, as a launch's blocks go to its multiprocessors in turn. A residency past them hides
-        nothing: on an A100 Qwen3-Next's 128 programs 32 wide held three a multiprocessor one deep and two
-        two deep, and ran two a multiprocessor either way, the forward 0.749 ms one deep against 0.727 two
-        deep (the 27B's 0.943 against 0.916), where the one deep ring narrowed the block to 16 at 0.752
-        (1.193, gdn-pins-a100-3b0d2267d)."""
-        states = self._states(ba, tiles, target, training=training)
-        return _spread(states.resident, states.programs, target)
+        return max(rings, key=hidden)[0]
 
     def neighbours(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> list[mainloop.Tiles]:
         """The tiles the opt-in tuner times beside the derived `config` (`variants`; the gate holds at each):
