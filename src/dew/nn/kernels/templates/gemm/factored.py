@@ -17,7 +17,8 @@ from dew.nn.precision import power2
 from dew.nn.sharding import explicit_spec, varying_like
 
 
-def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array) -> jax.Array:
+def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array, *, gathered: bool = False
+             ) -> jax.Array:
     """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows, each output
     row its own input row's (no gather), and `factor` a packed matrix's fp32 scales broadcast against its
     output (`formats.fp8_factor`). Its transpose is the plain one, the cotangent times its factor through
@@ -26,7 +27,9 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
     after the pullback's sum, so a scale of 2**126 under cotangents that cancel pulls back 0, not inf - inf
     (ledger 1464), each value otherwise the plain transpose's, rounded where it rounds; a replicated factor
     joins after a checked `shard_map`'s devices sum their partials. A factor of each column, which the
-    transpose sums over, stays with the cotangent, as the plain transpose has it."""
+    transpose sums over, stays with the cotangent, as the plain transpose has it. A `gathered` product's
+    output rows are rows of `rows` read by a table (`gemm`'s `gather`), which the pullback sums back into
+    them: its rescue moves the whole cotangent by one power, not each row by its own."""
     if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
         return run(rows.astype(jnp.bfloat16), *operands) * factor
     shape, dtype = rows.shape, rows.dtype
@@ -60,6 +63,24 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
     def summed(partial, excess):
         return jax.lax.psum(partial, excess) if excess else partial
 
+    def gathered_rescue(cotangent, scale, ran, before, excess):
+        # A gathered product's rows sum back into the rows its table read, so one power moves its whole
+        # cotangent: each entry's product from its cotangent's and factor's significands (the cotangent
+        # halved where its own binade would carry their product past fp32's largest) and powers, moved so the
+        # largest product's binade is `FACTORED_RESCUE`, then back after the sum.
+        f = jnp.broadcast_to(scale, cotangent.shape)
+        e_c, e_f = float_bits.binade_of(cotangent), float_bits.binade_of(f)
+        counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
+        top = jnp.max(jnp.where(counted, e_c + e_f, -1024), initial=-1024)
+        for axes in (before, excess):
+            top = jax.lax.pmax(top, axes) if axes else top
+        lift = jnp.where(top > -1024, FACTORED_RESCUE - top, 0)
+        e = jnp.clip(e_f, -126, 127)
+        halved = e_c >= 126
+        near = power2((cotangent * jnp.where(halved, 0.5, 1.0)) * power2(f, -e), e + halved + lift)
+        partial, excess = pulled(near, ran)
+        return power2(summed(partial, excess), -lift)
+
     def transposed_value(cotangent, scale, ran):
         # The plain transpose, the cotangent times its factor pulled back; where an entry of it is past
         # fp32's largest, the factor past 1 as its significand in the cotangent and its power of two
@@ -68,10 +89,15 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
         plain = summed(*pulled(cotangent * scale, ran))
 
         def moved():
-            binade = float_bits.binade_of(scale)
-            power = jnp.where((jnp.abs(scale) > 1) & (binade < 128), binade, 0)
             # Summed before its pullback where the operands are every device's, at one shared power.
             before = alone(ran, cotangent, scale)
+            # The axes its partials will vary over that the rows do not, the operands', from types alone.
+            excess = tuple(sorted(operand_axes(ran) - held))
+            if gathered:
+                return jnp.where(jnp.isfinite(plain), plain, gathered_rescue(cotangent, scale, ran, before,
+                                                                             excess))
+            binade = float_bits.binade_of(scale)
+            power = jnp.where((jnp.abs(scale) > 1) & (binade < 128), binade, 0)
             power = jax.lax.pmax(power, before) if before else power
             near = cotangent * power2(scale, -power)
             near = jax.lax.psum(near, before) if before else near
@@ -80,8 +106,6 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
             e = float_bits.binade_of(near)
             top = jnp.max(jnp.where((e > -1024) & (e < 128), e, -1024), axis=-1, keepdims=True,
                           initial=-1024)
-            # The axes its partials will vary over that the rows do not, the operands', from types alone.
-            excess = tuple(sorted(operand_axes(ran) - held))
             top = jax.lax.pmax(top, excess) if excess else top
             lift = jnp.where(top > -1024, FACTORED_RESCUE - top, 0)
             partial, excess = pulled(power2(near, lift), ran)

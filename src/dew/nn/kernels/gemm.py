@@ -889,12 +889,12 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
 
-def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None, *,
-                    interpret_on_cpu: bool) -> jax.Array:
-    """A packed matrix's portable product: bf16 `rows` times its decoded bf16 `matrix` (grouped by
-    `group_sizes`, or dense), each product exact and summed in fp32."""
+def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None,
+                    gather: jax.Array | None = None, *, interpret_on_cpu: bool) -> jax.Array:
+    """A packed matrix's portable product: bf16 `rows` (those `gather` reads, where given) times its decoded
+    bf16 `matrix` (grouped by `group_sizes`, or dense), each product exact and summed in fp32."""
     summed = gemm(rows, matrix, group_sizes, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT,
-                  interpret_on_cpu=interpret_on_cpu)
+                  interpret_on_cpu=interpret_on_cpu, gather=gather)
     assert isinstance(summed, jax.Array), "an unpaired product has one output"
     return summed
 
@@ -1170,17 +1170,21 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     tile = _planned(launch, bound)
     if selection.select(NVFP4, PackedCase(tile, count, whole=not automatic_axes())).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
-        summed = _packed(rows, words, scales, sizes, gather, first, launch, interpret_on_cpu,
-                         dense=group_sizes is None)
+
+        def product(r, *packed):
+            return _packed(r, *packed, launch, interpret_on_cpu, dense=group_sizes is None)
+
+        operands = (words, scales, sizes, gather, first)
     else:
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
-        # product's, whatever precision the program defaults to.
-        summed = gemm(rows, bank.decoded(), group_sizes, out_dtype=jnp.float32,
-                      precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu, gather=gather)
-        assert isinstance(summed, jax.Array), "an unpaired product has one output"
+        # product's, whatever precision the program defaults to (`decoded_product`).
+        product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
+        operands = (bank.decoded(), group_sizes, gather)
     factor = bank.factor if group_sizes is None else jnp.repeat(
         bank.factor, sizes, total_repeat_length=count)[:, None]
-    return (summed * factor).astype(out_dtype)
+    # Each row's (its group's) factor joins the sum as `factored` takes a row's: a cancelling cotangent
+    # under a factor past fp32's largest pulls back its finite sum.
+    return factored(product, operands, factor, lhs, gathered=gather is not None).astype(out_dtype)
 
 
 def _undeferred(words, scales) -> NvFp4:

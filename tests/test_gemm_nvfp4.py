@@ -753,3 +753,30 @@ def test_fp8_and_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_
             bad_ckpt.wait()
             with pytest.raises(ValueError):
                 Checkpoints(str(tmp_path / f"{label}_{tag}")).restore(template({"w": bad}))
+
+
+def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
+    """An NVFP4 product's input gradient where each cotangent times the matrix's factor (2**8 owed times a
+    tensor scale of 2**110) passes fp32's largest, against codes +1 and -1 that cancel: 0, not inf - inf.
+    Gathered, one token routed to two experts, the first's cancelling (cotangents 2**20 at a factor of
+    2**118) beside the second's single 2**-8 value under a cotangent of 2**110 at a factor of 2**-110: the
+    token's gradient is that second route's 2**-8 (row 1464's transpose, `factored`)."""
+    codes = jnp.zeros((512, 128), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
+    scales = jnp.ones((32, 128), jnp.float8_e4m3fn)
+    x = jnp.zeros((4, 512), jnp.float32).at[:, 0].set(1.0)
+    matrix = formats.NvFp4.of(codes, scales, jnp.float32(2.0 ** 110))
+    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32), x)
+    (d_x,) = pull(jnp.zeros((4, 128), jnp.float32).at[:2, :2].set(2.0 ** 20))
+    np.testing.assert_array_equal(np.asarray(d_x), np.zeros((4, 512), np.float32))
+
+    second = jnp.zeros((512, 128), jnp.float32).at[0, 2].set(1.0)
+    bank = formats.NvFp4.of(jnp.stack([codes, second]), jnp.stack([scales, scales]),
+                            jnp.asarray([2.0 ** 110, 2.0 ** -118], jnp.float32))
+    token = jnp.zeros((1, 512), jnp.float32).at[0, 0].set(1.0)
+    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, bank, jnp.asarray([1, 1], jnp.int32),
+                                                      jnp.asarray([0, 0], jnp.int32), out_dtype=jnp.float32),
+                      token)
+    (d_token,) = pull(jnp.zeros((2, 128), jnp.float32).at[0, :2].set(2.0 ** 20).at[1, 2].set(2.0 ** 110))
+    want = np.zeros((1, 512), np.float32)
+    want[0, 0] = 2.0 ** -8
+    np.testing.assert_array_equal(np.asarray(d_token), want)
