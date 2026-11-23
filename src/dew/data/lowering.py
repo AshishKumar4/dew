@@ -2315,7 +2315,7 @@ class _Build:
             # A pool's shares of a global order that ends step together, a share past the order's last
             # batch with batches of no real row (`_evened`), so each marks its rows, filled or whole.
             evened = self.training and partition.count > 1 and not self.lowering.records_unending
-            batches = batches.map(FilledBatch(size, real=real, marked=evened or not self.training))
+            batches = batches.map(FilledBatch(size, real=real, marked=evened))
             if evened and len(whole):
                 batches = _evened(batches, whole, -(-len(whole) // batch_stage.size), size, batch_stage)
         batches = self.placed(batches, pipeline, partition, after)

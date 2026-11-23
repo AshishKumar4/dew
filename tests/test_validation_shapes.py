@@ -121,10 +121,10 @@ def test_a_scoring_rules_total_reads_its_answered_rows_alone():
                          ids=["one-device", "two-row-shards"])
 def test_packed_validation_splits_read_in_one_shape_and_one_bound(partition):
     """Packed validation splits whose windows hold 1 to 4 documents each, of 1 to 7 windows, read in the
-    run's batch of 4 every batch the same: each marks its rows (`VALID_ROWS`), a split's whole batches and
-    its short last one alike, and declares the most documents a window of any split holds
-    (`Coordinates.max_segments`), so a run's evaluation compiles one program for them all, where each
-    split's own most and its short batch's unmarked rows compiled one apiece (row 12474)."""
+    run's batch of 4 every batch the same as an evaluation reads it (its rows marked, `VALID_ROWS`, where
+    the reader marked none): a split's short last batch filled out, and each declaring the most documents
+    a window of any split holds (`Coordinates.max_segments`), so a run's evaluation compiles one program
+    for them all, where each split's own most compiled one apiece (row 12474)."""
     from dew.batch import VALID_ROWS
     from dew.data.pipeline import ObjectiveData, Pipeline
 
@@ -145,8 +145,7 @@ def test_packed_validation_splits_read_in_one_shape_and_one_bound(partition):
         try:
             for batch in opened:
                 laid = batch["text_coordinates"]
-                seen.add((tuple(sorted(batch)), np.shape(batch["text"]), laid.max_segments))
-                assert VALID_ROWS in batch, sorted(batch)
+                seen.add((tuple(sorted({*batch, VALID_ROWS})), np.shape(batch["text"]), laid.max_segments))
         finally:
             if isinstance(opened, Closeable):
                 opened.close()
@@ -155,8 +154,8 @@ def test_packed_validation_splits_read_in_one_shape_and_one_bound(partition):
 
 def test_a_handed_validation_passs_short_last_batch_reads_in_its_whole_ones_shape():
     """A validation split handed as Grain batches (`native`) of 4 rows over 7 examples reads its short last
-    batch of 3 filled out to 4, its fourth row marked a repeat, and its whole batch marked too: one tree
-    and one shape a pass, so its evaluation compiles once (row 12474: a 4 + 3 split compiled its tail)."""
+    batch of 3 filled out to 4, its fourth row marked a repeat: one shape a pass, so its evaluation, which
+    marks a whole batch's rows itself, compiles once (row 12474: a 4 + 3 split compiled its tail)."""
     import grain.python as grain
 
     from dew.batch import VALID_ROWS
@@ -166,7 +165,8 @@ def test_a_handed_validation_passs_short_last_batch_reads_in_its_whole_ones_shap
     opened = native(rows, training=False)(DataPartition())
     batches = list(opened)
     assert [np.shape(batch["x"]) for batch in batches] == [(4, 3), (4, 3)], batches
-    assert [np.asarray(batch[VALID_ROWS]).tolist() for batch in batches] == [[True] * 4, [True] * 3 + [False]]
+    assert VALID_ROWS not in batches[0]
+    assert np.asarray(batches[1][VALID_ROWS]).tolist() == [True] * 3 + [False]
 
 
 def test_a_split_whose_packing_the_read_cannot_see_widens_no_known_splits_bound():
@@ -204,14 +204,12 @@ def test_a_split_whose_packing_the_read_cannot_see_widens_no_known_splits_bound(
 
 def test_a_handed_validation_pass_passes_on_a_batch_of_no_rows_after_a_whole_one():
     """A handed validation pass whose source yields a batch of no rows after a whole one passes it on as it
-    is, marked, with no rows to fill out with, rather than refusing it (review of row 12474)."""
+    is, with no rows to fill out with, rather than refusing it (review of row 12474)."""
     import grain.python as grain
 
-    from dew.batch import VALID_ROWS
     from dew.data.handed import native
 
     batches = [{"x": np.ones((4, 3), np.float32)}, {"x": np.zeros((0, 3), np.float32)}]
     opened = native(grain.MapDataset.source(batches), training=False)(DataPartition())
     read = list(opened)
     assert [np.shape(batch["x"]) for batch in read] == [(4, 3), (0, 3)], read
-    assert np.asarray(read[1][VALID_ROWS]).shape == (0,), read

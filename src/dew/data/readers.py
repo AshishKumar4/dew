@@ -470,9 +470,7 @@ class _FillShare:
 
     def __call__(self, batch: Batch) -> Batch:
         held, real = self.partition.held(rows_of(batch))
-        # Every batch of a held pass marks its rows, filled or whole, so its batches hold one tree.
-        return FilledBatch(self.partition.rows(self.batch), real=real, marked=True).map(
-            take_batch(batch, held))
+        return FilledBatch(self.partition.rows(self.batch), real=real).map(take_batch(batch, held))
 
 
 class Replayed:

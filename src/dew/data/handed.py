@@ -57,17 +57,18 @@ class _Whole:
 def _share(batch: Batch, partition: DataPartition, *, held: bool, nominal: int = 0) -> Batch:
     """`partition`'s share of `batch` (`DataPartition`: rows `index :: count`); `held`, a validation
     share, filled out to every share's rows of the pass's `nominal` batch (its largest, its first) or of
-    this one where larger, a whole number of its row shards, every row marked (`DataPartition.held`,
+    this one where larger, a whole number of its row shards, its repeats marked (`DataPartition.held`,
     `FilledBatch`), so every share reads a batch its devices split where any does, a pass's short last
-    batch in its whole ones' shape and tree, and every real row scores once (row 12474)."""
+    batch in its whole ones' shape, and every real row scores once (row 12474); an evaluation marks a
+    whole batch's rows itself (`dew.training.evaluation`), so its batches hold one tree."""
     rows = rows_of(batch)
     if not held:
         return batch if partition.count == 1 else take_batch(batch, np.arange(rows)[partition.cut()])
     mine, real = partition.held(rows) if partition.count > 1 else (slice(None), True)
     shards = partition.count * partition.row_multiple
-    # A batch of no rows has none to fill out with: passed on as it is, marked (review of row 12474).
+    # A batch of no rows has none to fill out with: passed on as it is (review of row 12474).
     filled = 0 if rows == 0 else -(-max(rows, nominal) // shards) * partition.row_multiple
-    return FilledBatch(filled, real=real, marked=True).map(take_batch(batch, np.arange(rows)[mine]))
+    return FilledBatch(filled, real=real).map(take_batch(batch, np.arange(rows)[mine]))
 
 
 class _Shared(Forwarding):
