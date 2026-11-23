@@ -62,7 +62,7 @@ import time
 import types
 import weakref
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import filelock
 import jax
@@ -650,7 +650,7 @@ class KernelOp(tokamax.Op):
             return self._captured(ba, config, awaiting)
 
     def certified_walk(self, ba: tokamax.BoundArguments, config: Hashable
-                       ) -> Callable[[tuple, dict], Any] | None:
+                       ) -> Callable[[tuple, dict], object] | None:
         """The kernels certification captures of a call of `ba` at `config` (`_captured`) and a resource
         derivation lowers (`lowering`), as a function of the call's arguments and keywords, where they are
         other than the call's own: a call whose program runs more than the launch it certifies (the attention
