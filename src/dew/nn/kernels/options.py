@@ -842,10 +842,11 @@ class OuterProgram:
     def _bound(self, traced: jax.stages.Traced, args: tuple, kwargs: dict):
         """`traced`'s program called at `args` and `kwargs` in the trace around it, bound as its jit's call
         binds it (`jax._src.pjit`'s: its constants, then its dynamic arguments flattened as its trace took
-        them, its placements and options its own)."""
+        them, a static position counted from the end as jit counts it, its placements and options its own)."""
         from jax._src import pjit as jax_pjit
 
-        dynamic = tuple(arg for at, arg in enumerate(args) if at not in self.numbers)
+        static = {at + len(args) if at < 0 else at for at in self.numbers}
+        dynamic = tuple(arg for at, arg in enumerate(args) if at not in static)
         named = {name: value for name, value in kwargs.items() if name not in self.names}
         outputs = jax_pjit.jit_p.bind(*traced._consts, *jax.tree.leaves((dynamic, named)), **traced._params)
         return jax.tree.unflatten(traced.out_tree, outputs)
