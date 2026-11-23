@@ -2411,6 +2411,12 @@ def test_sm120_output_staging_admits_three_stage_128x256_and_compiles():
         assert gmm.legal(ba, arm_32x2, sm120)
         assert gmm.staged_bytes(ba, base, sm120) - gmm.staged_bytes(ba, arm_64x1, sm120) == 16384
         assert gmm.staged_bytes(ba, arm_64x1, sm120) == gmm.staged_bytes(ba, arm_32x2, sm120)
+        # One warpgroup's 128 x 128 tile splits its warps two along its rows: 16-column atoms, which an
+        # 8-column chunk slices mid-way, refused by the launch and its kernel.
+        single = tiling.Tiles(128, 128, 32, 2, 1, warpgroups=1, family="mma.sync.fed")
+        square = gmm.bind(bf16((256, 128)), bf16((1, 128, 128)), one, out_dtype="bfloat16", trans_rhs=False,
+                          interpret=False, dense=True)
+        assert not gmm.legal(square, dataclasses.replace(single, staging=(8, 1)), sm120)
         # Four bf16 columns are 8 bytes a chunk's row: no whole 16-byte TMA store, which the launch refuses
         # and its kernel too where called at that pin; four fp32 columns are one store but half an
         # accumulator fragment, and sixteen 4-bit floats 64 bits. A 64-row share of 256 columns specializes
@@ -2423,12 +2429,6 @@ def test_sm120_output_staging_admits_three_stage_128x256_and_compiles():
                 dataclasses.replace(base, staging=(chunk, 1)).stated((((64, 256), dtype),), family)
         for dtype in (jnp.bfloat16, jnp.float32):
             assert dataclasses.replace(base, staging=(32, 1)).stated((((64, 256), dtype),), family) == (32, 1)
-        # One warpgroup's 128 x 128 tile splits its warps two along its rows: 16-column atoms, which an
-        # 8-column chunk slices mid-way, refused by the launch and its kernel.
-        single = tiling.Tiles(128, 128, 32, 2, 1, warpgroups=1, family="mma.sync.fed")
-        square = gmm.bind(bf16((256, 128)), bf16((1, 128, 128)), one, out_dtype="bfloat16", trans_rhs=False,
-                          interpret=False, dense=True)
-        assert not gmm.legal(square, dataclasses.replace(single, staging=(8, 1)), sm120)
         atoms = pricing.family_of(single, jnp.bfloat16, sm120)
         with pytest.raises(ValueError):
             dataclasses.replace(single, staging=(8, 1)).stated((((128, 128), jnp.bfloat16),), atoms)
