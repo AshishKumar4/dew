@@ -1320,9 +1320,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         compilation, and the call always goes through the public `init`.
         """
         held = self.held_variables()
-        return Partial(self.drawn) if held is None else Partial(self.drawn, variables=held)
+        return Partial(self._drawn) if held is None else Partial(self._drawn, variables=held)
 
-    def drawn(self, key: jax.Array, variables: Variables | None = None) -> Variables:
+    def _drawn(self, key: jax.Array, variables: Variables | None = None) -> Variables:
         """`init` within `generation.drawing`: its forward runs for the variables its modules make, none of
         its values reaching them, so every selector takes its op's generic program and no launch is derived,
         traced or certified at the draw's shapes (row 11803). The one way a draw runs (`initializer`,
