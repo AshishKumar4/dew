@@ -67,17 +67,20 @@ def test_the_fp8_preset_names_the_recipe_and_keeps_the_runs_dtypes():
 def test_a_models_projections_take_the_recipe_or_are_refused_for_their_role_alone():
     """Under the 'fp8' numerics a model's forward routes each projection by its role (the routes its trace
     reports, `generation.routes`): every projection the recipe considers is taken, or refused for its role
-    (`kept_role`: the shared expert's gate's), never for its shape; the router, whose scores are an fp32
-    einsum, the untied head, whose product keeps its fp32 result, the norms and the embedding reach no
-    product the recipe considers."""
+    (`kept_role`: the shared expert's gate's), never for its shape, one route each; the router, whose scores
+    are an fp32 einsum, the untied head, whose product keeps its fp32 result, the norms and the embedding
+    reach no product the recipe considers (Train 1223's review F3)."""
     model = mixed()
     tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (2, 64)), jnp.int32)
     params = jax.eval_shape(model.init, jax.random.key(0), tokens)
     with generation.run_precision(FP8), generation.routes() as found:
         jax.eval_shape(model.apply, params, tokens)
     recipe = [route for route in found if route.choice == "blockwise_fp8"]
-    refused = {route.refusal.code for route in recipe if route.kernel == "unquantized" and route.refusal}
-    assert any(route.kernel != "unquantized" for route in recipe) and refused == {"kept_role"}, recipe
+    taken = [route for route in recipe if route.kernel != "unquantized"]
+    refused = [route.refusal.code for route in recipe if route.kernel == "unquantized" and route.refusal]
+    # Each layer's query, key, value and output; the dense layer's and the shared expert's gate, up and down;
+    # the experts' three; the shared expert's gate the one its role keeps. No router's, no head's.
+    assert len(taken) == model.num_layers * 4 + 3 + 3 + 3 and refused == ["kept_role"], recipe
 
 
 @pytest.mark.parametrize("role", [*PROJECTION_ROLES, None])
