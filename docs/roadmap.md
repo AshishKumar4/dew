@@ -112,3 +112,4 @@ This page is generated from the maintainers' findings ledger as each change land
 - The perf gate's regressions since 11-07: compile time, the 4B step's stall, a DiT's peak. [10138]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
 - Tools that import their siblings by putting tools/ on sys.path at import time. [11756]
+- Jaxlib/XLA fork (abort a GPU's NCCL cliques when an execution fails on one rank, so its peers end instead of hanging in a running collective). [12352]
