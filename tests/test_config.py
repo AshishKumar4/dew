@@ -1085,7 +1085,7 @@ gradients, recorded by that Dew's own `OptimConfig.build`."""
 
 def _saved_optimizer(tmp_path, earlier):
     """The optimizer a language run saved with the optimizer config `earlier` (its earlier fields, over
-    `OptimConfig(learning_rate=1e-2)`'s others) loads."""
+    `OptimConfig(learning_rate=1e-2)`'s others) loads, its record written in `tmp_path` (`run.json`)."""
     from dew.config.lm import LMRunConfig
     from dew.registry import to_record
 
@@ -1094,9 +1094,28 @@ def _saved_optimizer(tmp_path, earlier):
     held = to_record(OptimConfig(learning_rate=1e-2), OptimConfig)
     assert isinstance(fields, dict) and isinstance(held, dict)
     optim = {key: value for key, value in held.items() if key != "optimizer"}
+    tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "run.json"
     path.write_text(json.dumps({**today, "fields": {**fields, "optim": {**optim, **earlier}}}))
     return LMRunConfig.load(str(path)).optim
+
+
+def _checkpointed(directory, optimizer, steps):
+    """A tiny language run of `optimizer` fitted to `steps`, checkpointed each step in `directory`, which
+    resumes from its latest checkpoint there."""
+    from dew.data.dataset import Loader, replayed
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+
+    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
+                              max_seq_len=8)
+    batch = {"text": jnp.arange(40, dtype=jnp.int32).reshape(8, 5) % 32}
+    trainer = Trainer(LMObjective(model, seq_len=4), optimizer, key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0), checkpoints=Checkpoints(str(directory)))
+    state = trainer.fit(Loader(train=replayed(lambda partition: iter([batch] * 4)), val=None, records=8,
+                               batch=8), steps=steps, log_every=1, checkpoint_every=1)
+    trainer.checkpoints.wait()
+    return state
 
 
 @pytest.mark.parametrize("case", sorted(MASKED))
@@ -1150,13 +1169,11 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
     mask's (`optax.MaskedState`), which the optimizer its record now loads holds bare (its decay 0), and
     Adam's coupled decay step ahead of its moments, which a decay of 0 holds none of (`Adam.COUPLED`).
     Written here by an optimizer whose state is that earlier one's tree, node for node (an unspared one's
-    `MASKED`'s `treedef`), it restores into the loaded optimizer through Orbax, its every leaf as written,
-    and the run steps on (`dew.checkpoints._state_trees.masked_decay_unsaved`; review of API01: Orbax
-    refused it, and the coupled one was refused as it loaded)."""
-    from dew.data.dataset import Loader, replayed
-    from dew.objectives.lm import LMObjective
+    `MASKED`'s `treedef`), beside the earlier run's record (`run.json`), it restores into the loaded
+    optimizer through Orbax, its every leaf as written, and the run steps on, its record that translation
+    from then on (`dew.checkpoints._state_trees.masked_decay_unsaved`, gated by `earlier_unmasked`; review
+    of API01: Orbax refused it, and the coupled one was refused as it loaded)."""
     from dew.optim import ParamGroup
-    from dew.training import Trainer
 
     earlier = {"optimizer": optimizer, "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
                **({"param_groups": UNMASKED_GROUPS} if grouped else {"spared": False})}
@@ -1170,27 +1187,41 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
     if not grouped:
         built = str(jax.tree.structure(written.build(None).init(params)))
         assert built == MASKED[f"{'adamw' if optimizer == 'adamw' else 'adam-coupled'}-unspared"]["treedef"]
-    loaded = _saved_optimizer(tmp_path, earlier)
-    model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
-                              max_seq_len=8)
-    batch = {"text": jnp.arange(40, dtype=jnp.int32).reshape(8, 5) % 32}
-
-    def fitted(optimizer, steps):
-        trainer = Trainer(LMObjective(model, seq_len=4), optimizer, key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0),
-                          checkpoints=Checkpoints(str(tmp_path / "run")))
-        state = trainer.fit(Loader(train=replayed(lambda partition: iter([batch] * 4)), val=None, records=8,
-                                   batch=8),
-                            steps=steps, log_every=1, checkpoint_every=1)
-        trainer.checkpoints.wait()
-        return state
-
-    saved = fitted(written, 1)
-    resumed = fitted(loaded, 1)
+    run = tmp_path / "run"
+    saved = _checkpointed(run, written, 1)
+    # The earlier run's record beside its checkpoints, as that Dew wrote it.
+    loaded = _saved_optimizer(run, earlier)
+    resumed = _checkpointed(run, loaded, 1)
     assert jax.tree.structure(resumed.opt_state) != jax.tree.structure(saved.opt_state)
     for got, want in zip(jax.tree.leaves(resumed.opt_state), jax.tree.leaves(saved.opt_state), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    assert int(fitted(loaded, 2).step) == 2
+    # Its record rewritten in its translation, as a resumed run writes its own: its next start reads alike.
+    (run / "run.json").write_text(json.dumps({"fields": {"optim": {"optimizer": "adamw"}}}))
+    assert int(_checkpointed(run, loaded, 2).step) == 2
+
+
+@pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
+@pytest.mark.parametrize("record", ["absent", "today"])
+def test_an_active_decays_checkpoint_resumed_without_its_decay_is_refused(tmp_path, optimizer, record):
+    """A checkpoint of a run decaying its parameters as its config spared them (`OptimConfig.spared`, its
+    decay step masked by the sparing: `optax.MaskedState` over an empty state, AdamW's and Adam's coupled
+    one's alike) resumed by an optimizer that decays nothing (its decay 0, unspared) is refused by its
+    restore, its run's record no earlier masked run's (`run.json` absent, or today's): the one translation
+    of a masked decay step reads an earlier record's checkpoints alone (`earlier_unmasked`), never an active
+    decay's into a template without it (review of API01: the translation ran on every restore)."""
+    from dew.config.lm import LMRunConfig
+
+    spec = AdamW if optimizer == "adamw" else Adam
+    active = OptimConfig(optimizer=spec(weight_decay=0.1), learning_rate=1e-2)
+    undecayed = OptimConfig(optimizer=spec(weight_decay=0.0), learning_rate=1e-2, spared=False)
+    run = tmp_path / "run"
+    _checkpointed(run, active, 1)
+    if record == "absent":
+        (run / "run.json").unlink()
+    else:
+        LMRunConfig(optim=active).save(str(run))
+    with pytest.raises(ValueError):
+        _checkpointed(run, undecayed, 2)
 
 
 @pytest.mark.parametrize("mask", [False, None], ids=["masked-off", "named-none"])

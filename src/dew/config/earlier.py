@@ -8,6 +8,7 @@ from collections.abc import Mapping
 
 from dew import _records, registry
 from dew._records import JSON, earlier_fields
+from dew.checkpoints._state_trees import EARLIER_OPTIMIZER_PATHS, earlier_typed, mask_readers
 from dew.data import records
 from dew.nn.precision import Numerics, numerics_of
 from dew.registry import from_record, models, objectives
@@ -272,12 +273,6 @@ EARLIER_OPTIMIZER_FIELDS = ("optimizer_opts", "b1", "b2", "weight_decay", "state
 (`dew.optim.OptimizerSpec`, row 11933)."""
 
 
-EARLIER_OPTIMIZER_PATHS = {"dew.optim:_adam": "adam", "dew.optim:_adamw": "adamw", "dew.optim:_lamb": "lamb",
-                           "dew.optim:_muon_groups": "muon", "dew.optim:_muonclip_groups": "muonclip",
-                           "dew.laprop:laprop": "laprop", "dew.gauss_newton:gauss_newton": "gauss_newton"}
-"""Dew's own optimizers by the import paths of the factories a config could name them by before each held
-its own settings (row 11933's review): each the optimizer of its alias, never a generic `Optax` spec."""
-
 MOMENTS_HELD = ("adam", "adamw", "muon", "muonclip")
 """The optimizers whose moments a float32 `state_dtype` held in float32 before their own `state_dtype`, a
 `mu_dtype` or `nu_dtype` among their options holding a moment otherwise."""
@@ -298,8 +293,8 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     assert isinstance(given, Mapping), given
     opts: dict[str, _records.JSON] = dict(given)
     assert isinstance(named, str), named
+    typed = earlier_typed(named) is not None
     named = EARLIER_OPTIMIZER_PATHS.get(named, named)
-    typed = named in registry.optimizers.paths and named != "optax"
     # Dew's own optimizers take no mask; an Optax factory takes its options as they were given.
     mask = opts.pop("mask", None) if typed else None
     stated = {key: fields[key] for key in ("b1", "b2", "weight_decay") if fields.get(key) is not None}
@@ -330,17 +325,15 @@ def _unmasked(mask: _records.JSON, settings: _Fields, config: _Fields) -> tuple[
     returned. Where the config spared its decay (`OptimConfig.spared`, on by default) its own mask was
     written over it, as a group's that spared (`ParamGroup.spared`, off by default) was, every group reading
     it alike: it changed nothing, as a mask of True or None did not. A mask of False read decayed nothing
-    there: its decay 0, the config's ungrouped, each unspared group's grouped, as it trained. The empty
-    state its masked decay step held, which a decay of 0 holds bare, and Adam's coupled decay step ahead of
-    its moments, which a decay of 0 holds none of (`Adam.COUPLED`), a restore takes as they are
+    there (`mask_readers`): its decay 0, the config's ungrouped, each unspared group's grouped, as it
+    trained. The empty state its masked decay step held, which a decay of 0 holds bare, and Adam's coupled
+    decay step ahead of its moments, which a decay of 0 holds none of (`Adam.COUPLED`), a restore of a run
+    whose record was this one (`unmasked_decay`) takes as they are
     (`dew.checkpoints._state_trees.masked_decay_unsaved`). Refused where it masked by a tree, which no record
     rebuilds."""
-    groups = config.get("param_groups") or []
-    assert isinstance(groups, list), groups
     if mask is None or mask is True:
         return settings, config
-    held = [group for group in groups if isinstance(group, Mapping) and not group.get("spared", False)]
-    read = held if groups else ([] if config.get("spared", True) else [config])
+    groups, read = mask_readers(config)
     if not read:
         return settings, config
     if mask is not False:
@@ -348,7 +341,7 @@ def _unmasked(mask: _records.JSON, settings: _Fields, config: _Fields) -> tuple[
                          "set OptimConfig.spared or its param groups' (ParamGroup.spared) in its place")
     if not groups:
         return {**settings, "weight_decay": 0.0}, config
-    unmasked: list[_records.JSON] = [{**group, "weight_decay": 0.0} if group in held else group
+    unmasked: list[_records.JSON] = [{**group, "weight_decay": 0.0} if group in read else group
                                      for group in groups]
     return settings, {**config, "param_groups": unmasked}
 

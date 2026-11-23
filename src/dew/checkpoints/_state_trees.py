@@ -420,6 +420,84 @@ def _held_apart(state_tree: dict, frozen: Mapping[str, Mapping[str, str]]) -> di
     return held
 
 
+EARLIER_OPTIMIZER_PATHS = {"dew.optim:_adam": "adam", "dew.optim:_adamw": "adamw", "dew.optim:_lamb": "lamb",
+                           "dew.optim:_muon_groups": "muon", "dew.optim:_muonclip_groups": "muonclip",
+                           "dew.laprop:laprop": "laprop", "dew.gauss_newton:gauss_newton": "gauss_newton"}
+"""Dew's own optimizers by the import paths of the factories a config could name them by before each held
+its own settings (row 11933's review): each the optimizer of its alias, never a generic `Optax` spec."""
+
+MASKED_DECAY_MARK = "earlier-masked-decay.json"
+"""The file beside a run's checkpoints that says its record was an earlier run's whose optimizer read a mask
+of False among its options (`unmasked_decay`), kept once its checkpoints first read that record, whose
+translation the run's record is written in from then on (`masked_decay_unsaved`)."""
+
+
+def earlier_typed(named: str) -> str | None:
+    """The alias of the Dew optimizer an earlier optimizer config named, by its alias or its factory's import
+    path (`EARLIER_OPTIMIZER_PATHS`); None for any other, an Optax factory's."""
+    from dew import registry
+
+    named = EARLIER_OPTIMIZER_PATHS.get(named, named)
+    return named if named in registry.optimizers.paths and named != "optax" else None
+
+
+def mask_readers(config: Mapping[str, JSON]) -> tuple[list[JSON], list[Mapping[str, JSON]]]:
+    """An earlier optimizer config's param groups, and the parts of it that read a mask among its optimizer's
+    options: where it spared its decay (`OptimConfig.spared`, on by default) its own mask was written over
+    the options', as a group's that spared (`ParamGroup.spared`, off by default) was, every group reading it
+    alike; so the config where it neither groups nor spares, else each group that does not spare."""
+    groups = config.get("param_groups") or []
+    assert isinstance(groups, list), groups
+    held = [group for group in groups if isinstance(group, Mapping) and not group.get("spared", False)]
+    return groups, held if groups else ([] if config.get("spared", True) else [config])
+
+
+def unmasked_decay(record: Mapping[str, JSON]) -> bool:
+    """Whether a run's record (`run.json`) is an earlier run's whose Dew optimizer read a mask of False among
+    its options where its config or a group did not spare (`mask_readers`): the run its record's translation
+    trains at a decay of 0 there (`dew.config.earlier._unmasked`), whose checkpoints hold a masked decay step
+    the translation's optimizer holds bare or none of (`masked_decay_unsaved`). Any other record, today's
+    among them, holds none such."""
+    fields = record.get("fields")
+    optim = fields.get("optim") if isinstance(fields, Mapping) else None
+    tagged = _records.class_record(optim) if isinstance(optim, Mapping) else None
+    config = tagged[1] if tagged is not None else optim
+    if not isinstance(config, Mapping):
+        return False
+    named, options = config.get("optimizer", "adamw"), config.get("optimizer_opts") or {}
+    return (isinstance(named, str) and earlier_typed(named) is not None and isinstance(options, Mapping)
+            and options.get("mask") is False and bool(mask_readers(config)[1]))
+
+
+def earlier_unmasked(directory: str, run_file: str) -> bool:
+    """Whether the checkpoints in `directory` are of a run whose record (`run_file`) was an earlier run's
+    whose Dew optimizer read a mask of False among its options (`unmasked_decay`): the one run whose
+    checkpoints a restore reads across its masked decay step (`masked_decay_unsaved`), every other's held to
+    its template as Orbax holds it, an active decay's among them. Read as the checkpoints are made, before
+    the run writes its record in its translation, and kept beside them from then on (`MASKED_DECAY_MARK`),
+    so every later start of the run reads it alike."""
+    import json
+
+    from etils import epath
+
+    from dew._files import write_atomically
+
+    root = epath.Path(directory)
+    if (root / MASKED_DECAY_MARK).exists():
+        return True
+    saved = root / run_file
+    try:
+        held = json.loads(saved.read_text()) if saved.exists() else None
+    except ValueError:
+        return False
+    if not (isinstance(held, Mapping) and unmasked_decay(held)):
+        return False
+    if jax.process_index() == 0:
+        root.mkdir(parents=True, exist_ok=True)
+        write_atomically(root / MASKED_DECAY_MARK, json.dumps({"unmasked_decay": True}))
+    return True
+
+
 def masked_decay_unsaved(template, metadata, optimizers: Sequence[TreePath]):
     """A restore's `template`, a train state's, read against a checkpoint whose optimizer state holds a decay
     step masked off whole that the template's holds none of or holds bare: an earlier Dew's
