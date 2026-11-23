@@ -271,6 +271,9 @@ class Compiling:
     weak_types: tuple[bool, ...]
     """Its trace's outputs' weak types, which its lowering's `out_info` drops (`_weak_types`)."""
     taken: threading.Event = dataclasses.field(default_factory=threading.Event, compare=False)
+    refused: tuple | None = None
+    """The launches refused as its trace traced (`report.refusal_entries`), a Dew program's; None for
+    another's."""
 
 
 def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
@@ -313,7 +316,7 @@ def compiling(program: OuterProgram, *args, **kwargs) -> Compiling:
     withdraw = stop_at_exit(thread, said, timeout=None)
     thread.start()
     abstract = program.abstract_of(args, kwargs, refused) if isinstance(program, OuterProgram) else None
-    return Compiling(program, abstract, lowered, attempt, _weak_types(traced))
+    return Compiling(program, abstract, lowered, attempt, _weak_types(traced), refused=refused)
 
 
 _ATTEMPTING: contextvars.ContextVar[Compiling | None] = _cache.untraced(
@@ -610,7 +613,7 @@ class OuterProgram:
         self.function, self.arguments = function, arguments
         # Its jit and the launches refused when it traced (`report.refusal_entries`; None before it traces),
         # replaced together (`_published`): a trace reads the pair as one.
-        self._held: tuple[jax.stages.Wrapped, tuple | None] = (self._jitted(), None)
+        self._tracing: tuple[jax.stages.Wrapped, tuple | None] = (self._jitted(), None)
         # The static positions and names as jit resolves them, the ones given and those it infers.
         numbers, names = arguments.get("static_argnums"), arguments.get("static_argnames")
         signature = api_util.fun_signature(function)
@@ -654,16 +657,16 @@ class OuterProgram:
     @property
     def jitted(self) -> jax.stages.Wrapped:
         """The jit its next trace takes, as its last trace or relowering left it."""
-        return self._held[0]
+        return self._tracing[0]
 
     def _published(self, held: tuple[jax.stages.Wrapped, tuple]) -> None:
         """`held` (a jit and the launches refused when it traced) the program's from here on, where it traced
         past every refusal the one it replaces did: refusals only add, so a trace of fewer is stale, never
         published over a later one by a slower thread (theme K01-e's review P0)."""
         with self._compiling:
-            under = self._held[1]
+            under = self._tracing[1]
             if under is None or set(held[1]) >= set(under):
-                self._held = held
+                self._tracing = held
 
     def _traced(self, held: tuple[jax.stages.Wrapped, tuple], args: tuple, kwargs: dict
                 ) -> tuple[jax.stages.Traced, tuple[jax.stages.Wrapped, tuple]]:
@@ -1054,8 +1057,8 @@ class OuterProgram:
         # the same abstract inputs, lowers nothing again: the begun lowering is its.
         begun = _ATTEMPTING.get()
         if begun is not None and begun.program is self and begun.abstract == self.abstract_of(args, kwargs):
-            # The begun lowering traced under the refusals its abstract key holds (`_keyed`'s last).
-            lowered, weak_types, refused = begun.lowered, begun.weak_types, begun.abstract[-1]
+            lowered, weak_types = begun.lowered, begun.weak_types
+            refused = report.refusal_entries() if begun.refused is None else begun.refused
             begun.taken.set()
         else:
             lowered, weak_types, refused = self._lowered_aside(args, kwargs, relowered)
@@ -1100,7 +1103,7 @@ class OuterProgram:
 
         refusals = report.refusal_entries()
         with self._compiling:
-            jitted, under = self._held
+            jitted, under = self._tracing
         if under is not None and under != refusals:
             jitted = self._jitted()
         traced, made = self._traced((jitted, refusals), args, kwargs)
