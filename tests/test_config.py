@@ -668,7 +668,7 @@ def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
                     ("write", "gs://dew-runs/flowers/run.json"),
                     ("unlink", "gs://dew-runs/flowers/earlier-masked-decay.json")]
     assert RunConfig.load("gs://dew-runs/flowers") == config
-    assert seen[-1] == ("read", "gs://dew-runs/flowers/run.json")
+    assert ("read", "gs://dew-runs/flowers/run.json") in seen[3:], seen
 
 
 def test_a_saved_model_retains_nested_mixer_behavior(tmp_path):

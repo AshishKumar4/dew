@@ -375,7 +375,10 @@ def typed_since(record: Mapping[str, object], directory) -> bool:
 
     named = _records.class_record({key: value for key, value in record.items() if key not in MARKERS})
     fields = {} if named is None else named[1]
-    trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
+    held = fields.get("trainer") if isinstance(fields, Mapping) else None
+    # Its trainer's fields, under its class record where it names one.
+    tagged = _records.class_record(held) if isinstance(held, Mapping) else None
+    trainer = tagged[1] if tagged is not None else held
     local = trainer.get("local_directory") if isinstance(trainer, Mapping) else None
     roots = [directory, *([epath.Path(local) / directory.name] if isinstance(local, str) else [])]
     steps = [entry for root in roots if root.exists() for entry in root.iterdir() if entry.name.isdigit()

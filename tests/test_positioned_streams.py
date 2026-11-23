@@ -259,7 +259,8 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
     path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(130)))
     files = Files(str(path))
     files.provision()
-    chain = Pipeline(files).map_with_index(lambda index, row: {**row, "at": np.int64(index)}).batch(shares)
+    chain = Pipeline(files).map_with_index(lambda index, row: {**row, "at": np.int64(index)},
+                                           identity="at").batch(shares)
     loading = Loading(workers=0, threads=1, read_buffer=1)
     partition = DataPartition(index=0, count=shares)
 
