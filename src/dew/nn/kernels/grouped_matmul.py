@@ -38,8 +38,8 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 import jax
 import jax.numpy as jnp
 
-from .formats import Fp8Weights, TernaryWeights
 from . import generation, selection
+from .formats import Fp8Weights, TernaryWeights
 from .generation import INHERENT
 from .grouped_cells import (
     B200_GRID,
