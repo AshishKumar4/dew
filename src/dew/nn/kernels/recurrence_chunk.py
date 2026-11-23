@@ -79,8 +79,8 @@ def held_chunk(chunk_size: int, key_width: int) -> int:
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
                            starts=None, max_segments: int | None = None,
-                           write_bound: float | None = None, decay_bound: float | None = None, firsts=None,
-                           loads=None, stores=None, held: int = 0):
+                           write_bound: float | None = None, decay_bound: float | None = None,
+                           unit_queries: bool = False, firsts=None, loads=None, stores=None, held: int = 0):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
     (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
@@ -105,11 +105,11 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     which needs none. `write_bound` is the largest write gate the layer declares of keys it l2-normalized
     (`recurrence.Hooks.write_bound`), which the template's 16-bit solve reads (`mainloop._merged`), and
     `decay_bound` the least log decay a token the layer proves (`recurrence.Hooks.decay_bound`), which a
-    decay a key dimension's template prefix reads. `loads`, `stores` and `held` are a forked call's
-    (`Chunk.loads`).
+    decay a key dimension's template prefix reads, and `unit_queries` whether its queries are l2-normalized
+    (`recurrence.Hooks.unit_queries`). `loads`, `stores` and `held` are a forked call's (`Chunk.loads`).
     """
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
-                             write_bound=write_bound, decay_bound=decay_bound)
+                             write_bound=write_bound, decay_bound=decay_bound, unit_queries=unit_queries)
     return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta, state=state, starts=starts,
                               firsts=firsts, loads=loads, stores=stores, held=held),
                  chunk_size=chunk_size, max_segments=max_segments)
@@ -311,9 +311,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # fla's simple GLA rounds as its release places it, values gated (`mainloop.Call.values_gated`).
         values_gated = simple_gla(hooks)
         transition = hooks.erase != 'tied' or hooks.value_decay
-        # Keys of unit norm (the op's `l2norm`, or as `write_bound` declares: `Hooks.inverse_bound`'s
-        # contract), which the template's own pairs may fold their decays against (`mainloop.Call.unit_keys`).
-        unit_keys = hooks.l2norm or hooks.write_bound is not None
+        unit_pairs = _unit_pairs(hooks)
         # The least log decay a token the layer proves, which a decay a key dimension's prefix reads
         # (`mainloop.Call.prefix_limbs`); a head's takes its compensated pair whatever it is.
         decay_bound = hooks.decay_bound if hooks.decay == 'vector' else None
@@ -329,7 +327,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                product=product, forked=forked, delta=hooks.delta,
                                decayed=hooks.decay != 'none', skip=None if hooks.delta else skip,
                                rounded=rounded, firsts=firsts, readout=readout, apart=apart,
-                               values_gated=values_gated, unit_keys=unit_keys,
+                               values_gated=values_gated, unit_pairs=unit_pairs,
                                decay_bound=decay_bound, turns=hooks.turns,
                                transition=transition)
 
@@ -348,7 +346,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 out, final = _on_template(hooks, query, key, own, g, beta, state, skip if fused else None,
                                           turn, starts=starts, firsts=firsts, forked=carried,
                                           max_segments=max_segments, scale=scale, wide=fused_wide,
-                                          rounded=rounded, values_gated=values_gated, unit_keys=unit_keys,
+                                          rounded=rounded, values_gated=values_gated, unit_pairs=unit_pairs,
                                           decay_bound=decay_bound)
             elif kernel == 'fla':
                 out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
@@ -1325,7 +1323,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                 bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
                 decayed: bool = True, forked: Forked | None = None, skip=None, rounded: bool | None = None,
                 firsts=None, readout: bool = True, apart: int = 0, values_gated: bool = False,
-                unit_keys: bool = False,
+                unit_pairs: bool = False,
                 decay_bound: float | None = None, turns: int = 0, transition: bool = False) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
@@ -1349,7 +1347,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
         call, shards = template_bind(
             query, key, value, g, beta, state, starts, firsts, skip, forked, max_segments=max_segments,
             scale=scale, delta=delta, wide=wide, bound=bound, rounded=rounded, apart=apart,
-            values_gated=values_gated, unit_keys=unit_keys, decay_bound=decay_bound)
+            values_gated=values_gated, unit_pairs=unit_pairs, decay_bound=decay_bound)
     _, shard_key, shard_value, *_ = shards
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying), dtype=dtype,
@@ -1491,13 +1489,25 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
     return jnp.where(begins[:, None, None, None], 0.0, memory)
 
 
+def _unit_pairs(hooks: recurrence.Hooks) -> bool:
+    """Whether `hooks` bound every own pair's operand at most one in size, which the template's own pairs may
+    fold their decays against (`mainloop.Call.unit_pairs`): keys of unit norm (the op's `l2norm`, or as
+    `write_bound` declares: `Hooks.inverse_bound`'s contract), queries so (`l2norm`, or as `unit_queries`
+    declares), and under the delta rule each system row's write gate at most one (`write_bound`). Keys alone
+    bounded, a query of 2^100 times a key of 2^-100 decayed by 2^-60 lost its term, the decayed key 2^-160
+    rounding to zero (#3703 review)."""
+    keys = hooks.l2norm or hooks.write_bound is not None
+    gates = not hooks.delta or (hooks.write_bound is not None and hooks.write_bound <= 1)
+    return keys and (hooks.l2norm or hooks.unit_queries) and gates
+
+
 def kernel_routed(query, key, value, g, beta, *, write_bound: float | None = None,
-                  decay_bound: float | None = None) -> bool:
+                  decay_bound: float | None = None, unit_queries: bool = False) -> bool:
     """Whether the delta rule's selector gives a call over these operands a kernel, its forward's
-    (`port_kernel`, unreported: the call reports its own), under the layer's declared `write_bound` and
-    `decay_bound` (`chunk_gated_delta_rule`'s): what a layer rounds its operands for, the projections' dtype
-    for a kernel, as fla's layer hands them over, the wide one for the portable math."""
-    hooks = recurrence.Hooks(write_bound=write_bound, decay_bound=decay_bound)
+    (`port_kernel`, unreported: the call reports its own), under the layer's declared `write_bound`,
+    `decay_bound` and `unit_queries` (`chunk_gated_delta_rule`'s): what a layer rounds its operands for, the
+    projections' dtype for a kernel, as fla's layer hands them over, the wide one for the portable math."""
+    hooks = recurrence.Hooks(write_bound=write_bound, decay_bound=decay_bound, unit_queries=unit_queries)
     return port_kernel(query, key, value, g, beta, bound=hooks.inverse_bound,
                        decay_bound=hooks.decay_bound if g.ndim == 4 else None, report=False) != 'xla'
 

@@ -75,28 +75,32 @@ def portable_einsum(subscripts: str, *operands):
     return float32_einsum(subscripts, *operands, precision=STATE_PRECISION)
 
 
-def suffix_sums(x: jax.Array, *, scanned: bool = False) -> jax.Array:
+def suffix_sums(x: jax.Array) -> jax.Array:
     """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a chunk's
-    tokens), in at least float32 (a float64 truth's own): a product with the chunk's upper triangle of ones
-    (`portable_einsum`, its ones exact in every form a product splits `x` into), one dot batched over `x`'s
-    leading axes, a chunk's triangle against its own tokens: one triangle against every chunk's tokens
-    contracted a middle axis XLA transposed `x` for, 134 of Kimi delta attention's training's 1723 MB of XLA
-    traffic on an A100 (row 5260). As a reversed cumulative sum, XLA's GPU reduce-window summed each
-    position's window apart: Kimi delta attention's decay gradient's, the one cumulative sum its training
-    traces, took 0.336 ms of its 5.806 ms on a B200 (M-JS-114). Where `scanned`, that reversed cumulative sum:
-    a term no position's sum takes meets no arithmetic of it, where the dot multiplies it by zero, a nonfinite
-    one NaN in every sum (a turned gradient's entering-memory term of 2^126 times its cotangent,
-    `templates.recurrence.turned`)."""
+    tokens), in at least float32 (a float64 truth's own): a reversed cumulative sum, a term no position's sum
+    takes meeting no arithmetic of it, where a product with the chunk's upper triangle of ones multiplied it
+    by zero, a nonfinite one NaN in every sum (a turned gradient's entering-memory term of 2^126 times its
+    cotangent, `templates.recurrence.turned`). Kimi delta attention's decay gradient's sums run in its own
+    pairs' launch (`suffix_summed`)."""
     x = _wide(x)
-    if scanned:
-        return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
-    upper = jnp.triu(jnp.ones((x.shape[-2],) * 2, x.dtype))
-    return portable_einsum('...ij,...jt->...it', jnp.broadcast_to(upper, (*x.shape[:-2], *upper.shape)), x)
+    return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
+
+
+def suffix_summed(terms: jax.Array, start: jax.Array) -> jax.Array:
+    """Each position's sum over its tile's positions at and after it along `terms`' first axis (a chunk's
+    tokens), each column's `start` added, a running compensated pair down each column from its last position
+    (`precision.compensated_add`), each sum rounded once: the arithmetic `templates.scan.suffix_columns` runs
+    natively, a column a thread (Kimi delta attention's decay gradient finished in its own pairs' launch,
+    `own_pairs.key_pairs_own`)."""
+    terms = _wide(terms)
+    pairs = (terms, jnp.zeros_like(terms))
+    hi, lo = jax.lax.associative_scan(compensated_add, pairs, reverse=True, axis=0)
+    return compensated_add((hi, lo), (_wide(start)[None], jnp.zeros_like(hi[:1])))[0]
 
 
 def sums_before(x: jax.Array) -> jax.Array:
     """Each position's sum over its chunk's positions before it, along `x`'s second-last axis, in at least
-    float32 (`suffix_sums`' exclusive prefix twin, as `scanned`): a cumulative sum shifted a position, each
+    float32 (`suffix_sums`' exclusive prefix twin): a cumulative sum shifted a position, each
     sum of the earlier terms alone, a later term meeting none of its arithmetic, where an inclusive sum less
     its own term lost a small sum beside a large term to its rounding (a chunk's last writer's whole weight
     beside its earlier ones' exp(-30) each, Mamba-3's turns' gradient's worst row 3.75 from float64 over its
@@ -269,7 +273,7 @@ def decay(later, earlier):
     return jnp.exp2(fraction - its_fraction) * exact_power2(jnp.maximum(whole - other, -127.0))
 
 
-def first_decays(dg, entered, d_entered, first, memory, takes, live):
+def first_decays(dg, entered, d_entered, first, memory, takes, live, passed=None):
     """`dg` `[N, ...]`, a decay a key dimension's gradient summed back over each chunk (a token or a laid
     row a row), with each sequence's first token's taken from the memory its decay scales: the memory it
     enters (`entered` `[M, ..., Dv]`, its index `memory` among them) against that memory's gradient
@@ -278,11 +282,14 @@ def first_decays(dg, entered, d_entered, first, memory, takes, live):
     back, that token's gradient is every term of its chunk, which cancel to fp32's residue where the memory
     is zero: rows of float64 zero 1.5e-7 from it against fla's 3.3e-9 (row 5194, M-JS-26-a100), 2.7e-11 on a
     zero initial memory, as a float64 recurrence holds it exactly. fla_kda's port and the template read
-    it alike."""
+    it alike. Where `passed` (`dg`'s shape) is given, a token's value only where it holds: a clamped log
+    decay's derivative zero (`templates.recurrence.mainloop.clamped_gradient`)."""
     shared = jnp.sum(entered.astype(jnp.float32) * d_entered, axis=-1).reshape(-1, *dg.shape[1:])
     taking = takes.reshape(-1, *(1,) * (dg.ndim - 1))
     value = jnp.where(taking, shared[memory], 0.0)
     index = jnp.where(live, first, dg.shape[0])
+    if passed is not None:
+        value = jnp.where(passed[jnp.minimum(index, dg.shape[0] - 1)], value, 0.0)
     return dg.at[index].set(value.astype(dg.dtype), mode="drop")
 
 
@@ -754,7 +761,7 @@ def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, pr
 
 
 def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub: int = SUB,
-                       unit_keys: bool = False) -> list:
+                       unit_pairs: bool = False) -> list:
     """Each sub-chunk's own pairs of one key block under a decay a key dimension, each its own decay, as a
     band `[C, sub]` a product: its row `i`'s column `e` the pair `(i, i - e)`, `sum_k r_ik k_(i-e)k
     exp2(g_ik - g_(i-e)k)`, zero where token `i - e` precedes `i`'s sub-chunk (fla_kda's token-parallel
@@ -774,11 +781,14 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
     form and its transpose, each issue-bound (an emulated B200 at 8aab1729e65). Summed over a chunk's key
     blocks, a launch's bands are placed by its caller (`placed_bands`): placed a key block and an offset at a
     time, the `[C, C]` selects took an H100's Kimi Linear intra launch from 492 to 1982 us (M-JS-50d).
-    Where the keys are at most one in size (`unit_keys`, `mainloop.Call.unit_keys`), each row takes its
-    decay first instead, a multiply an element and a term's fused multiply-add (fla's token-parallel
-    diagonal folds it so, into the key): all the decayed row loses is below normal in the exact term too.
-    Unnormalised keys keep the row times the key first, which loses no term in range to the decay (row
-    7299; a decayed row lost 2^-100 against a key of 2^60, base review 6ce025bc7 F1)."""
+    Where the keys and rows are at most one in size (`unit_pairs`, `mainloop.Call.unit_pairs`), each key
+    takes its pair's decay first instead, once for every product (`decayed_key`), and each row's term is a
+    fused multiply-add of it (fla's token-parallel diagonal folds it so, into the key): all the decayed key
+    loses is below normal in the exact term too. Each product's row decayed apart, a thread's own pairs
+    issued twice the multiplies, an emulated GH200's intra_own issue-bound (M-JS-170). Other operands keep
+    the row times the key first, which loses no term in range to the decay (row 7299; a decayed row lost
+    2^-100 against a key of 2^60, base review 6ce025bc7 F1; a decayed key 2^-160 against a row of 2^100,
+    #3703 review)."""
     index, _ = _grid(rows[0].shape)
     lane = jax.lax.broadcasted_iota(jnp.int32, (index.shape[0], sub), 1)
     token = jax.lax.broadcasted_iota(jnp.int32, lane.shape, 0)
@@ -787,25 +797,24 @@ def key_diagonal_bands(rows: list, shifted: Callable[[jax.Array], tuple], *, sub
         bands, pair, following = carried
         keys, decays = shifted(e)
         pair = pair * following
-        summed = [jnp.sum(band_term(row, keys, pair, unit_keys=False), axis=1) for row in rows]
+        summed = [jnp.sum(band_term(row, keys, pair, unit_pairs=False), axis=1) for row in rows]
         return (tuple(jnp.where(lane == e, total[:, None], band)
                       for band, total in zip(bands, summed, strict=True)), pair, decays)
 
     def folded(e, carried):
-        # Each row's decay folded in: a multiply an element and a term's fused multiply-add, where keys at
-        # most one in size (`unit_keys`) make what the decayed row loses below normal in the exact term too.
-        bands, decayed, following = carried
+        # Each key's decay folded in once for every product (`decayed_key`): a multiply an element and each
+        # row's term a fused multiply-add, where keys and rows at most one in size (`unit_pairs`) make what
+        # the decayed key loses below normal in the exact term too.
+        bands, pair, following = carried
         keys, decays = shifted(e)
-        decayed = tuple(row * following for row in decayed)
-        summed = [jnp.sum(band_term(row, keys, None, unit_keys=True), axis=1) for row in decayed]
+        pair = pair * following
+        keyed = decayed_key(keys, pair)
+        summed = [jnp.sum(band_term(row, keyed, None, unit_pairs=True), axis=1) for row in rows]
         return (tuple(jnp.where(lane == e, total[:, None], band)
-                      for band, total in zip(bands, summed, strict=True)), decayed, decays)
+                      for band, total in zip(bands, summed, strict=True)), pair, decays)
 
     zero, one = jnp.zeros(lane.shape, jnp.float32), jnp.ones(index.shape, jnp.float32)
-    if unit_keys:
-        bands = jax.lax.fori_loop(0, sub, folded, ((zero,) * len(rows), tuple(rows), one))[0]
-    else:
-        bands = jax.lax.fori_loop(0, sub, offset, ((zero,) * len(rows), one, one))[0]
+    bands = jax.lax.fori_loop(0, sub, folded if unit_pairs else offset, ((zero,) * len(rows), one, one))[0]
     # Each column written once, by its offset's select; a row before its offset selected out once, at the end.
     return [jnp.where(token % sub >= lane, band, 0.0) for band in bands]
 
@@ -863,11 +872,18 @@ def gated(word, strength):
     return word * strength
 
 
-def band_term(row, key, pair, *, unit_keys: bool):
+def band_term(row, key, pair, *, unit_pairs: bool):
     """A sub-chunk's own pair's term (`key_diagonal_bands`): the row times the key, then times the pair's
-    decay; or where keys are at most one in size (`unit_keys`), the decayed row `row` (`row * pair`, carried
-    across the offsets) times the key, `pair` unread. On any values that multiply, as `gated`."""
-    return row * key if unit_keys else row * key * pair
+    decay; or where keys and rows are at most one in size (`unit_pairs`), the row times the decayed key `key`
+    (`decayed_key`'s, formed once for every product's row), `pair` unread. On any values that multiply, as
+    `gated`."""
+    return row * key if unit_pairs else row * key * pair
+
+
+def decayed_key(key, pair):
+    """A key decayed by its pair's decay, rounded once (`band_term`'s `unit_pairs` key): what it loses below
+    normal, a key at most one in size and every row at most one, is below normal in the exact term too."""
+    return key * pair
 
 
 def columns_before(found: jax.Array, start: int) -> jax.Array:
