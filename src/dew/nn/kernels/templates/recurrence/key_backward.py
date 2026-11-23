@@ -351,11 +351,11 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
 
             first = h * value_width + (index * values if walked else 0)
             stored = _value_blocks(values_out, dv_out_ref, row, first, call, landing["values"], vb)
-            system, d_betas = carry if walked else (None, None)
+            summed_before, d_betas = carry if walked else (None, None)
             summed, d_betas = algebra.key_values_back(
                 functools.partial(column, "value_grads", grads), functools.partial(column, "values", given),
                 blocks, lower, family.rows_of(beta_ref.at[h, span]), held.dtype, issue,
-                _carried_summed(call, issue, system), emit=stored, d_betas=d_betas)
+                _carried_summed(call, issue, summed_before), emit=stored, d_betas=d_betas)
             if not last:
                 return (summed, d_betas), accumulators
             d_system = stream_tile(slots, "system", square).value() + summed
