@@ -1479,18 +1479,32 @@ def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
     return (significand & (2 * half - 1)) == half
 
 
+PLAIN_REACH = 63
+"""The binades either side of one a row's sums and total stay within for its mean to be differentiated as the
+quotient it is (`held_mean`): its derivative forms `total^-2` and the sums times the total's tangent, which
+past 2^126 either way leave fp32 (a value of 2^126 over a total of 2^62 moved by 2^62: 2^188)."""
+
+
 def held_mean(acc: jax.Array, total: jax.Array, dtype, law) -> jax.Array:
     """The reference's mean `acc / total` (zero where `total` is) saturated (`saturated`): its value, and its
-    derivative at every order `law`'s (`_scaled_mean`), one contraction formed apart from its binades
-    (`scaled_contraction`) whose every order is that contraction again: no sum, product or quotient of it a
-    float past the format beside the factor that brings it back, where the quotient's own derivative
-    multiplied its sums by the total's tangent first (a value of 2^126 over a total of 2^62 moved by 2^62:
-    2^188, infinite, where the derivative is -2^64) or formed `total^-2` (2^-200 at a mass of 2^100, zero)."""
-    finite = jnp.abs(jax.lax.stop_gradient(acc)) < jnp.inf
+    derivative at every order the quotient's, its sums as the call narrowed them (`valued`), so the reference
+    differentiates the arithmetic the kernels run, where its sums and total lie within `2^+-PLAIN_REACH`;
+    elsewhere `law`'s (`_scaled_mean`), one contraction formed apart from its binades (`scaled_contraction`)
+    whose every order is that contraction again. It runs only where some row needs it (`lax.cond`). The
+    sums past the reach are held out of the differentiated quotient whole: a quotient of an infinite sum
+    left in it took a zero cotangent into its divisor's derivative, `0 * inf`."""
+    held_acc = jax.lax.stop_gradient(acc)
+    finite = jnp.abs(held_acc) < jnp.inf
     held = jax.lax.stop_gradient(total)[..., None]
+    reached = (held == 0) | ((held >= 2.0 ** -PLAIN_REACH) & (held <= 2.0 ** PLAIN_REACH))
+    plain = finite & reached & (jnp.max(jnp.abs(jnp.where(finite, held_acc, 0)), axis=-1, keepdims=True)
+                                <= 2.0 ** PLAIN_REACH)
     seen = held > 0
-    out = jnp.where(seen, jax.lax.stop_gradient(acc) / jnp.where(seen, held, 1), 0)
-    return saturated(out, finite, dtype) + derivative_of(law())
+    out = jnp.where(seen, held_acc / jnp.where(seen, held, 1), 0)
+    quotient = jnp.where(seen, jnp.where(plain, acc, 0) / jnp.where(seen & plain, total[..., None], 1), 0)
+    differentiated = jax.lax.cond(jnp.all(plain), lambda: quotient,
+                                  lambda: jnp.where(plain, quotient, law()))
+    return saturated(out, finite, dtype) + derivative_of(differentiated)
 
 
 def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax.Array,
