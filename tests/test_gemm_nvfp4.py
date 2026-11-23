@@ -639,6 +639,21 @@ def test_the_rescues_routes_add_into_their_tokens_alike_at_any_fan_in():
     assert (one[1:] >= 0).all() and (one[1:] < 2 ** factored.FACTORED_SLICE).all()
 
 
+def test_the_rescues_rounding_reads_a_leading_limb_past_one_digit():
+    """A sum whose first limb (`factored._rounded`'s, of any int32 size) is 128, past one digit: 2**169 at a
+    unit of 2**162 is +inf (-inf negated), not its wrapped bits; 128 + 2**-6 at a unit of one is exact, and
+    2**30 at a unit of 2**-40 is 2**-10 (rows 1464, 12403)."""
+    from dew.nn.kernels.templates.gemm import factored
+
+    def rounded(digits, unit):
+        limbs = jnp.zeros((8, 1, 1), jnp.int32).at[:len(digits), 0, 0].set(jnp.asarray(digits, jnp.int32))
+        return float(factored._rounded(limbs, jnp.full((1, 1), unit, jnp.int32))[0, 0])
+
+    assert np.isposinf(rounded([128], 162)) and np.isneginf(rounded([-128], 162))
+    assert rounded([128, 1], 0) == 128.0 + 2.0 ** -6
+    assert rounded([2 ** 30], -40) == 2.0 ** -10
+
+
 @INTERPRETS
 def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
     """An NVFP4 product's input gradient where each cotangent times the matrix's factor (2**8 owed times a
