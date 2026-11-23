@@ -381,8 +381,9 @@ def test_a_conv_backward_hands_no_more_partial_sums_than_a_wave_of_programs(gene
     calls = custom_calls(lowered_for(jax.grad(loss), shapes, generation_name))
     (backward,) = [call for call in calls if (rows, length, channels) in call.results]
     handed = sum(int(np.prod(shape)) for shape in backward.results if shape != (rows, length, channels))
-    # Each program's partials its channels' (`conv.lanes`), the taps' and the bias's.
-    width = conv.lanes(parts, jnp.bfloat16)
+    # Each program's partials its channels' (`conv.lanes` of the backward's one unnormalised piece), the
+    # taps' and the bias's.
+    width = conv.lanes(((channels, None),), jnp.bfloat16)
     programs = handed // ((taps + 1) * width)
     target = generation.gpu_target(generation_name)
     held = target.multiprocessor

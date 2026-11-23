@@ -155,8 +155,8 @@ def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bo
                                 interpret)
     joined = jnp.result_type(*cotangents)
     cotangent = jnp.concatenate([c.astype(joined) for c in cotangents], axis=-1)
-    dx, dw, db = conv.backward(x, taps, bias, valid, documents, (cotangent,), parts=((x.shape[-1], None),),
-                               activation=activation, **_launched(interpret))
+    dx, dw, db = conv.backward(x, taps, bias, valid, documents, cotangent, activation=activation,
+                               **_launched(interpret))
     # The taps' and bias's gradients formed in their dtypes before the input's cotangent leaves (row 6027).
     dx, (d_taps, d_bias) = with_gradients_formed(
         dx, (dw.T.astype(taps.dtype), None if bias is None else db.astype(bias.dtype)))
@@ -174,17 +174,20 @@ def _through_norms(x, taps, bias, valid, documents, cotangents: tuple, parts, ac
     against its forward's 0.07, 19 ms of its training step (M-JS-250)."""
     from .templates.recurrence import conv
 
-    if all(head is None for _, head in parts):
+    normed = [(first, width, head) for first, width, head in conv.pieces(parts) if head is not None]
+    if not normed:
         return cotangents
+    # Every normalised piece's activation in one launch, each read where it lies in `x`.
+    recomputed = iter(conv.forward(x, taps, bias, valid, documents,
+                                   parts=tuple((width, None) for _, width, _ in normed),
+                                   firsts=tuple(first for first, _, _ in normed), activation=activation,
+                                   eps=eps, dtype=jnp.float32, **_launched(interpret)))
     through = []
-    for (first, width, head), dy in zip(conv.pieces(parts), cotangents, strict=True):
+    for (_, width, head), dy in zip(conv.pieces(parts), cotangents, strict=True):
         if head is None:
             through.append(dy)
             continue
-        channels = slice(first, first + width)
-        (out,) = conv.forward(x[..., channels], taps[channels], None if bias is None else bias[channels],
-                              valid, documents, parts=((width, None),), activation=activation, eps=eps,
-                              dtype=jnp.float32, **_launched(interpret))
+        out = next(recomputed)
         headed = out.reshape(*out.shape[:-1], width // head, head)
         scale = 1.0 / jnp.sqrt(jnp.sum(headed * headed, axis=-1, keepdims=True) + eps)
         unit = headed * scale
