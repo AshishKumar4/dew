@@ -1021,7 +1021,7 @@ class Checkpoints:
         self._recovery: tuple[int, frozenset[int], tuple[Grid, ...]] | None = None
         # Whether the run's record was an earlier run's whose optimizer read a mask of False, read before a
         # run writes its record in its translation (`earlier_unmasked`).
-        self._unmasked = earlier_unmasked(self.directory, RUN_FILE)
+        self._unmasked, self._unmasked_steps = earlier_unmasked(self.directory, RUN_FILE)
         # The digests the save still in flight records, which no kept step lists yet.
         self._frozen_pending: set[str] = set()
 
@@ -2208,7 +2208,7 @@ class Checkpoints:
         template = _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata)
         # An earlier run's masked decay step read across, its record's alone (`earlier_unmasked`).
         form = None
-        if self._unmasked:
+        if self._unmasked and step in self._unmasked_steps:
             template, form = masked_decay_unsaved(template, metadata, _OPTIMIZERS, self._unmasked)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None

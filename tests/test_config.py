@@ -1218,6 +1218,50 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
     assert int(_checkpointed(run, loaded, 2).step) == 2
 
 
+def test_a_masked_decay_read_in_some_groups_is_read_across_in_those_groups_alone():
+    """A restore's translation of an earlier run whose mask its param groups `a` read alone templates a
+    masked empty decay step within `a`'s state alone: an empty state outside the groups, and in group `b`,
+    each of which the checkpoint holds masked, stays as the template holds it, so Orbax holds it to the
+    template (review of API01: a group-scoped translation rewrote an outer node too)."""
+    import optax
+
+    from dew.checkpoints._state_trees import _masked_as_saved
+
+    masked = {"inner_state": {}}
+    node = (optax.EmptyState(), optax.PartitionState(inner_states={"a": optax.EmptyState(),
+                                                                   "b": optax.EmptyState()}))
+    saved = [masked, {"inner_states": {"a": masked, "b": masked}}]
+    outer, groups = _masked_as_saved(node, saved, frozenset({"a"}))
+    assert outer == optax.EmptyState()
+    assert groups.inner_states == {"a": optax.MaskedState(inner_state=optax.EmptyState()),
+                                   "b": optax.EmptyState()}
+
+
+@pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
+def test_a_step_this_dew_wrote_after_an_earlier_masked_runs_is_held_to_its_template(tmp_path, optimizer):
+    """An earlier masked run (`optimizer_opts={"mask": False}`, unspared) resumed under an active decay its
+    config spares (`RunConfig.RESUMABLE`'s optimizer), whose state holds the same masked step, writes its
+    next step this Dew's way: that step is no step the earlier Dew wrote (`earlier_unmasked`'s steps, kept
+    in the mark as the record was rewritten), so a resume of it that drops the active decay is refused by
+    its restore, never read across as the earlier steps are (review of API01: the mark held for every step
+    of the directory)."""
+    from dew.config.lm import LMRunConfig
+
+    spec = AdamW if optimizer == "adamw" else Adam
+    active = OptimConfig(optimizer=spec(weight_decay=0.1), learning_rate=1e-2)
+    run = tmp_path / "run"
+    _checkpointed(run, active, 1)
+    earlier = {"optimizer": optimizer, "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
+               "spared": False}
+    undecayed = _saved_optimizer(run, earlier)
+    LMRunConfig(optim=active).save(str(run))
+    assert json.loads((run / "earlier-masked-decay.json").read_text())["steps"] == [1]
+    # Step 1, the earlier Dew's, read across; step 2 written under the active decay.
+    assert int(_checkpointed(run, active, 2).step) == 2
+    with pytest.raises(ValueError):
+        _checkpointed(run, undecayed, 3)
+
+
 @pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
 @pytest.mark.parametrize("record", ["absent", "today"])
 def test_an_active_decays_checkpoint_resumed_without_its_decay_is_refused(tmp_path, optimizer, record):
