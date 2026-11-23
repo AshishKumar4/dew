@@ -82,6 +82,6 @@ def test_a_warpgroup_mmas_groups_summed_together_are_each_read_as_their_own_comp
     (call,) = [call for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
     typed = mgpu.deserialized(call.ir)
     with typed.context:
-        waits = [int(left) for left in re.findall(r"wgmma\.wait\.group\.sync\.aligned (\d+)", str(typed))]
+        waits = [int(left) for left in re.findall(r"wgmma\.wait_group\.sync\.aligned (\d+);", str(typed))]
     assert waits == [1, 0], waits
 
