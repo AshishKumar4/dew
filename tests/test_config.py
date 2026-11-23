@@ -1177,7 +1177,9 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
     `MASKED`'s `treedef`), beside the earlier run's record (`run.json`), it restores into the loaded
     optimizer through Orbax, its every leaf as written, and the run steps on, its record that translation
     from then on (`dew.checkpoints._state_trees.masked_decay_unsaved`, gated by `earlier_unmasked`; review
-    of API01: Orbax refused it, and the coupled one was refused as it loaded)."""
+    of API01: Orbax refused it, and the coupled one was refused as it loaded). A group that spared its
+    decay (`rest`) read no mask, so it is read as Orbax holds it: a resume that drops its active decay is
+    refused."""
     from dew.optim import ParamGroup
 
     earlier = {"optimizer": optimizer, "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
@@ -1206,6 +1208,13 @@ def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optim
 
     LMRunConfig(optim=loaded).save(str(run))
     assert (run / "earlier-masked-decay.json").exists()
+    if grouped:
+        # The spared group's decay, active as it trained, dropped on resume: its state no group of the mask's,
+        # so its checkpoint is held to the template and refused.
+        rest = [dataclasses.replace(group, weight_decay=0.0, spared=False) if group.name == "rest" else group
+                for group in loaded.param_groups]
+        with pytest.raises(ValueError):
+            _checkpointed(run, dataclasses.replace(loaded, param_groups=tuple(rest)), 2)
     assert int(_checkpointed(run, loaded, 2).step) == 2
 
 
