@@ -1171,9 +1171,11 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     if selection.select(NVFP4, PackedCase(tile, count, whole=not automatic_axes())).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
 
-        def product(r, *packed):
-            return _packed(r, *packed, launch, interpret_on_cpu, dense=group_sizes is None)
+        def packed(r, words, scales, sizes, gather, first):
+            return _packed(r, words, scales, sizes, gather, first, launch, interpret_on_cpu,
+                           dense=group_sizes is None)
 
+        product: Callable[..., jax.Array] = packed
         operands = (words, scales, sizes, gather, first)
     else:
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
