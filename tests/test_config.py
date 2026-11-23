@@ -1134,7 +1134,8 @@ def _checkpointed(directory, optimizer, steps, local=None, persistent: bool = Tr
                       layout=Layout(min_shard=1, tolerance=1.0),
                       checkpoints=Checkpoints(str(directory), **tiers))
     state = trainer.fit(Loader(train=replayed(lambda partition: iter([batch] * 4)), val=None, records=8,
-                               batch=8), steps=steps, log_every=1, checkpoint_every=1 if persistent else None)
+                               batch=8), steps=steps, log_every=1, checkpoint_every=1 if persistent else None,
+                        checkpoint_final=persistent)
     trainer.checkpoints.wait()
     return state
 
