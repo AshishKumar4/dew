@@ -1112,7 +1112,7 @@ def test_a_run_whose_decay_its_options_masked_off_resumes_its_optimizers_state_a
     optimizer = _saved_optimizer(tmp_path, held["optim"]).build(None)
     params = {"w": jnp.arange(4.0).reshape(2, 2) / 10, "b": jnp.arange(2.0) / 10}
     state = optimizer.init(params)
-    if case.startswith("adam-coupled"):
+    if case == "adam-coupled-undecayed":
         assert str(jax.tree.structure(state)) == held["treedef"]
     leaves = [[jax.tree_util.keystr(path), list(leaf.shape), str(leaf.dtype)]
               for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]]
@@ -1122,41 +1122,51 @@ def test_a_run_whose_decay_its_options_masked_off_resumes_its_optimizers_state_a
 
 
 @pytest.mark.parametrize("earlier", [
-    {"optimizer": "adam", "optimizer_opts": {"mask": False}, "spared": False, "weight_decay": 0.1},
-    {"optimizer": "adam", "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
-     "param_groups": [{"name": "kernel", "patterns": ["w"]}]},
-    {"optimizer": "adamw", "optimizer_opts": {"mask": {"w": False}}, "spared": False}],
-    ids=["coupled-unspared", "coupled-grouped", "tree-mask"])
+    {"optimizer": "adamw", "optimizer_opts": {"mask": {"w": False}}, "spared": False}], ids=["tree-mask"])
 def test_a_run_whose_masked_decay_this_dew_holds_no_state_of_is_refused_as_it_loads(tmp_path, earlier):
-    """A run whose options masked off Adam's coupled decay, whose state held a decay step ahead of its
-    moments this Dew's Adam holds only where it decays, ungrouped or in an unspared group, or masked its
-    decay by a tree no record rebuilds, is refused as it loads, never loaded into another optimizer state."""
+    """A run whose options masked its decay by a tree, which no record rebuilds, is refused as it loads, never
+    loaded into another optimizer state."""
     with pytest.raises(ValueError):
         _saved_optimizer(tmp_path, earlier)
 
 
-@pytest.mark.parametrize("case", ["adamw-unspared", "adamw-grouped"])
+UNMASKED_GROUPS = [{"name": "kernels", "patterns": ["*kernel*"]},
+                   {"name": "rest", "patterns": ["*"], "spared": True}]
+"""An earlier run's param groups, its kernels' unspared and the rest's spared, so its mask reads in one
+group."""
+
+
+@pytest.mark.parametrize(("optimizer", "grouped"), [("adamw", False), ("adamw", True), ("adam", False),
+                                                    ("adam", True)],
+                         ids=["adamw-unspared", "adamw-grouped", "adam-coupled-unspared",
+                              "adam-coupled-grouped"])
 def test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optimizer_its_record_loads(
-        tmp_path, case):
-    """A checkpoint an earlier Dew wrote of a run whose options masked AdamW's decay off holds its decay
-    step's empty state as a mask's (`optax.MaskedState`), a node the optimizer its record now loads holds
-    bare (its decay 0): written here by an optimizer whose state is that earlier one's tree, node for node
-    (`MASKED`'s `treedef`), it restores into the loaded optimizer through Orbax, its every leaf as written,
-    and the run steps on (`dew.checkpoints._masked_decay_unsaved`; review of API01: Orbax refused it)."""
+        tmp_path, optimizer, grouped):
+    """A checkpoint an earlier Dew wrote of a run whose options masked its decay off where they were read,
+    unspared or in an unspared param group, holds its decay step masked whole: AdamW's empty state as a
+    mask's (`optax.MaskedState`), which the optimizer its record now loads holds bare (its decay 0), and
+    Adam's coupled decay step ahead of its moments, which a decay of 0 holds none of (`Adam.COUPLED`).
+    Written here by an optimizer whose state is that earlier one's tree, node for node (an unspared one's
+    `MASKED`'s `treedef`), it restores into the loaded optimizer through Orbax, its every leaf as written,
+    and the run steps on (`dew.checkpoints._state_trees.masked_decay_unsaved`; review of API01: Orbax
+    refused it, and the coupled one was refused as it loaded)."""
     from dew.data.dataset import Loader, replayed
     from dew.objectives.lm import LMObjective
     from dew.optim import ParamGroup
     from dew.training import Trainer
 
-    earlier = MASKED[case]["optim"]
+    earlier = {"optimizer": optimizer, "optimizer_opts": {"mask": False}, "weight_decay": 0.1,
+               **({"param_groups": UNMASKED_GROUPS} if grouped else {"spared": False})}
     # Its earlier optimizer's state, a masked decay step's empty one where it read its mask, as a spared
     # decay's holds: the same tree the earlier Dew built.
     groups = tuple(ParamGroup(group["name"], tuple(group["patterns"]), spared=True)
-                   for group in earlier.get("param_groups", ()))
-    written = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2, param_groups=groups)
+                   for group in UNMASKED_GROUPS) if grouped else ()
+    spec = AdamW(weight_decay=0.1) if optimizer == "adamw" else Adam(weight_decay=0.1)
+    written = OptimConfig(optimizer=spec, learning_rate=1e-2, param_groups=groups)
     params = {"w": jnp.arange(4.0).reshape(2, 2) / 10, "b": jnp.arange(2.0) / 10}
-    if not groups:
-        assert str(jax.tree.structure(written.build(None).init(params))) == MASKED[case]["treedef"]
+    if not grouped:
+        built = str(jax.tree.structure(written.build(None).init(params)))
+        assert built == MASKED[f"{'adamw' if optimizer == 'adamw' else 'adam-coupled'}-unspared"]["treedef"]
     loaded = _saved_optimizer(tmp_path, earlier)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
                               max_seq_len=8)

@@ -422,37 +422,51 @@ def _held_apart(state_tree: dict, frozen: Mapping[str, Mapping[str, str]]) -> di
 
 def masked_decay_unsaved(template, metadata, optimizers: Sequence[TreePath]):
     """A restore's `template`, a train state's, read against a checkpoint whose optimizer state holds a decay
-    step masked off whole where the template's holds it bare: an earlier Dew's `optimizer_opts={"mask":
-    False}`, its masked step's empty state (`optax.MaskedState` over `optax.EmptyState`), which the record's
-    translation trains as a decay of 0, its empty state bare (`dew.config.earlier._unmasked`). Each such
-    node of each optimizer state at `optimizers` templated as the checkpoint holds it, so the restore reads
-    the leaves alike, both nodes holding none; returned beside the template's own form, which the restored
-    state takes back (`formed_as`), or none where it templates none so. The one translation of that form at
-    the restore boundary (CONTRIBUTING), deleted at 1.0."""
-    import optax
-
+    step masked off whole that the template's holds none of or holds bare: an earlier Dew's
+    `optimizer_opts={"mask": False}`, which the record's translation trains as a decay of 0
+    (`dew.config.earlier._unmasked`). Its masked step's empty state (`optax.MaskedState` over
+    `optax.EmptyState`) where the template holds the empty state bare (AdamW's decay step, decoupled), and
+    that masked step ahead of a solver's state where the template holds the solver's alone (Adam's coupled
+    decay, `Adam.COUPLED`, whose chain a decay of 0 drops): each templated as the checkpoint holds it, at
+    each optimizer state at `optimizers`, so the restore reads the leaves alike, neither node holding any;
+    returned beside the template's own form, which the restored state takes back (`formed_as`), or none
+    where it templates none so. The one translation of that form at the restore boundary (CONTRIBUTING),
+    deleted at 1.0."""
     from dew.state import TrainState
 
     if not isinstance(template, TrainState):
         return template, None
-    found: list[bool] = []
-
-    def masked_at(saved):
-        def masked(path, node):
-            held = _saved_at(saved, [_key_name(key) for key in path])
-            if isinstance(held, Mapping) and held.keys() == {"inner_state"} and not held["inner_state"]:
-                found.append(True)
-                return optax.MaskedState(inner_state=node)
-            return node
-        return masked
-
     translated = template
     for at in optimizers:
         state = _at(translated, at)
         if state is not None:
-            translated = _with(translated, at, jax.tree_util.tree_map_with_path(
-                masked_at(_at(metadata, at)), state, is_leaf=lambda node: isinstance(node, optax.EmptyState)))
-    return (translated, template) if found else (template, None)
+            translated = _with(translated, at, _masked_as_saved(state, _at(metadata, at)))
+    return (template, None) if jax.tree.structure(translated) == jax.tree.structure(template) else (
+        translated, template)
+
+
+def _masked_as_saved(node, saved):
+    """`node`, an optimizer state or a part of one, with each node the checkpoint's metadata `saved` holds as
+    a masked empty decay step templated so (`masked_decay_unsaved`), every other node as it is."""
+    import optax
+
+    if isinstance(node, optax.EmptyState):
+        return optax.MaskedState(inner_state=node) if _masked_empty(saved) else node
+    if (type(node) is tuple and node and not isinstance(node[0], optax.EmptyState | optax.MaskedState)
+            and isinstance(saved, list | tuple) and len(saved) == 2 and _masked_empty(saved[0])):
+        # A chain's state led by the decay step a coupled decay of 0 drops, the solver's state after it.
+        return optax.MaskedState(inner_state=optax.EmptyState()), _masked_as_saved(node, saved[1])
+    children, rebuilt = jax.tree_util.tree_flatten_with_path(node, is_leaf=lambda part: part is not node)
+    if len(children) == 1 and children[0][1] is node:
+        return node
+    return jax.tree.unflatten(rebuilt, [_masked_as_saved(child, _saved_at(saved, [_key_name(path[0])]))
+                                        for path, child in children])
+
+
+def _masked_empty(saved) -> bool:
+    """Whether a checkpoint's metadata `saved` holds a masked step over an empty state: Orbax's record of an
+    `optax.MaskedState` whose inner state holds no array."""
+    return isinstance(saved, Mapping) and saved.keys() == {"inner_state"} and not saved["inner_state"]
 
 
 def _saved_at(saved, names: Sequence[str | int]):
