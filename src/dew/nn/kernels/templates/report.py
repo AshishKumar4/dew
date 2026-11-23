@@ -852,12 +852,6 @@ def settling() -> Iterator[None]:
         settlement.ended()
 
 
-def _refused_before(op, arguments: tokamax.BoundArguments) -> bool:
-    """Whether `op`'s launch of `arguments` had a config refused in this context (`refused_launches`)."""
-    identity = _identity(op, arguments, generation.gpu_target())
-    return any(refused == identity for refused, _, _ in refused_launches())
-
-
 @contextlib.contextmanager
 def targeting(mesh: jax.sharding.Mesh) -> Iterator[None]:
     """Within the block, a trace outside any mesh certifies as one under `mesh` does (`_certifying_device`):
@@ -918,7 +912,9 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
             taken.reporting.append(reporting)
     if taken is not None:
         return ()
-    if aside is not None and not _refused_before(op, arguments) and _traced_for(device):
+    # A launch a config of which was refused here is certified now; asked of its own refusals alone, so a
+    # trace held past another launch's refusal holds (row 12167).
+    if aside is not None and not refusals_of(key[0]) and _traced_for(device):
         # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
         # compiled aside (`capture`), the block's end settling it (`_settled_aside`), once a block.
         aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, [reporting])
