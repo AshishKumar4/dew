@@ -378,9 +378,10 @@ def test_a_fused_regions_launch_is_launched_once():
 
     x, w = (jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((8192, 4096), (4096, 4096)))
     bias = jax.ShapeDtypeStruct((4096,), jnp.float32)
-    found = {}
+    found, h100 = {}, generation.gpu_target("sm90")
     for launch in (0.0, 1.0):
-        with generation.assumed(dataclasses.replace(generation.gpu_target("sm90"), launch_seconds=launch)):
+        measured = {kind: dataclasses.replace(part, launch=launch) for kind, part in h100.measured.items()}
+        with generation.assumed(dataclasses.replace(h100, measured=measured)):
             found[launch] = fused_gemm.analysis(
                 lambda x, w, bias: fused_gemm.product(x, w, out_dtype=jnp.float32) + bias, x, w, bias)
     assert found[0.0].fused_seconds is not None, found[0.0]
