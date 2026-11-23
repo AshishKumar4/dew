@@ -185,9 +185,21 @@ def backend_open() -> bool:
 
 def _gpu_default(name: str, assignment: str) -> None:
     """Pass XLA's GPU compiler `assignment` (`--name=value`) before the backend opens, unless the run
-    named `name`."""
-    if not backend_open() and cuda_plugin() and xla_flag(name) is None:
+    named `name` or a TPU opens (`opens_tpu`): libtpu reads XLA_FLAGS too, and its LLVM, which has no NVPTX
+    backend, exits the process on an NVPTX option as it compiles a host-offloaded step (row 12017)."""
+    if not backend_open() and cuda_plugin() and not opens_tpu() and xla_flag(name) is None:
         apply_xla_flags(assignment)
+
+
+def opens_tpu() -> bool:
+    """Whether this process's JAX backend will be a TPU's: its platforms (JAX_PLATFORMS, which JAX reads
+    as it imports, before the backend opens) name `tpu`, or name none on a Cloud TPU VM (`cloud_tpu_vm`),
+    where JAX opens the TPU. A CPU process compiling for compile-only GPUs opens none."""
+    from dew.clusters import cloud_tpu_vm
+
+    platforms = os.environ.get("JAX_PLATFORMS", "")
+    named = {platform.strip() for platform in platforms.split(",") if platform.strip()}
+    return "tpu" in named if named else cloud_tpu_vm(os.environ)
 
 
 def unpartition_gpu_pool() -> None:
