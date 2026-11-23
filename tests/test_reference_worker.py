@@ -358,6 +358,7 @@ def test_a_recordings_units_merge_into_one_fixture_naming_each_devices_sites(tmp
         worker.merged_units([first, unit("c.npz", "H100", ["x.out"], revision="2")], Path("f.npz"), "MIT")
     with pytest.raises(ValueError):
         worker.merged_units([first, unit("d.npz", "H100", ["gdn.out"])], Path("f.npz"), "MIT")
+    assert saved == {}
 
 
 def _recording(path: Path, keys: dict[str, float], revision: str = "1", **placed) -> Path:
@@ -399,4 +400,3 @@ def test_a_pinned_fixture_recorded_under_another_revision_is_no_base_to_merge_ov
     unit = _recording(tmp_path / "unit.npz", {"kda.out": 1.0}, device="H100")
     with pytest.raises(ValueError, match="another provenance"):
         protocol.merged_arrays([unit], base)
-    assert saved == {}
