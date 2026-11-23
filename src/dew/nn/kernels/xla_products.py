@@ -170,9 +170,7 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     grouped = jnp.arange(tokens.shape[0], dtype=index_dtype)[:, None] < jnp.sum(
         group_sizes, dtype=index_dtype
     )
-    product = functools.partial(jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_GROUPED_ROWS,
-                                precision=precision,
-                                out_sharding=ragged_placement(((tokens, 0), (kernel, kernel.ndim - 1))))
+    product = functools.partial(placed_ragged_dot, precision=precision)
     out = accumulated(product, jnp.where(grouped, tokens, 0), kernel, group_sizes,
                       preferred_element_type=preferred_element_type)
     return jnp.where(grouped, out, 0)

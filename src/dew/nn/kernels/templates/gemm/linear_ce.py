@@ -433,7 +433,7 @@ class MosaicLinearCE(TilesTemplate):
         target = generation.gpu_target()
         bound = self.bind(x, weight, targets, bias, transpose_rhs=transpose_rhs, softcap=softcap,
                           round_logits=round_logits, interpret=interpret)
-        mp = config.cluster if interpret else (target.multiprocessors or 1) * config.programs
+        mp = config.cluster if interpret else unit_cost.wave(target, config.programs)
         regs = self.registers(bound, config, target)
         shared = regs and self.staged_bytes(bound, config, target)
         out = linear_ce(x, weight, targets, tiles=config, transpose_rhs=transpose_rhs, bias=bias,
