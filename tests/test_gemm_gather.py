@@ -860,7 +860,7 @@ def test_gathered_prologued_negative_indices_and_sm80_forced_mosaic():
                jnp.asarray(rng.normal(size=(rows, 64)) / 8, jnp.bfloat16))
     with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"), generation.routes() as seen:
         outs, pull = jax.vjp(
-            lambda t, gw, uw: gemm.gemm(t, gw, sizes, paired=uw, scatter=perm,
+            lambda t, gw, uw: gemm.gemm(t, gw, sizes, paired=uw, scatter=perm, out_dtype=jnp.bfloat16,
                                         out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True),
             tokens[:rows] if tokens.shape[0] >= rows else jnp.concatenate([tokens, tokens], axis=0),
             matrices, up_w)
