@@ -502,10 +502,10 @@ def test_a_grouped_products_depth_split_sums_as_its_walk_apart():
 
 
 def test_a_hoppers_moe_decode_splits_its_experts_depth():
-    """A MoE decode step on an H100 (Qwen3-30B-A3B's down projection: 768 deep, 2048 wide, eight of 128
-    experts active a token, one token's slots, row 3622): its eight experts' 64 tiles leave half the wave's
-    multiprocessors idle, so the derived tile splits its depth over them (`MosaicGmm._decode_split`),
-    legally; a prefill's rows keep it unsplit."""
+    """A MoE decode step on an H100 (Qwen3-30B-A3B's down projection: 768 deep, 2048 wide, row 3622):
+    with 2 resident programs/SM, 8 active experts already emit enough tiles to stay unsplit, while 4
+    active experts leave half the GPU idle and split their depth (`_decode_split`), and a prefill's rows
+    keep it unsplit."""
     launch = grouped_matmul.MosaicGmm()
 
     def derived(rows):
@@ -519,7 +519,55 @@ def test_a_hoppers_moe_decode_splits_its_experts_depth():
         return tile
 
     with generation.assumed("sm90"):
-        assert derived(8).splits > 1 and derived(8192).splits == 1
+        assert derived(4).splits > 1
+        eight = derived(8)
+        assert eight.programs == 2 and eight.splits == 1, eight
+        assert derived(8192).splits == 1
+
+
+def test_hopper_decode_derives_two_resident_programs_per_sm_and_compiles():
+    """Hopper 1-consumer decode (`rows < 64`, DeepSeek-V3 / Qwen3-30B-A3B 1-token MoE down & plain dense
+    M=16, rows 3622, 483) derives `programs == 2` resident CTAs/SM (`M-NS-17b-gh200`) and compiles spill-free
+    on `sm90`, while prefill (`rows >= 64`) keeps `programs == 1`."""
+    import functools
+
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    i32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.int32)
+    with generation.assumed("sm90"):
+        sm90 = generation.gpu_target("sm90")
+        moe_ba = launch.bind(bf16((8, 2048)), bf16((256, 2048, 7168)), i32((256,)),
+                             out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=False)
+        moe_tile = launch.derived(moe_ba, sm90)
+        assert moe_tile is not None and moe_tile.warpgroups == 1 and moe_tile.programs == 2, moe_tile
+        assert launch.legal(moe_ba, moe_tile, sm90)
+        qwen_ba = launch.bind(bf16((8, 768)), bf16((128, 768, 2048)), i32((128,)),
+                              out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=False)
+        qwen_tile = launch.derived(qwen_ba, sm90)
+        assert qwen_tile is not None and qwen_tile.warpgroups == 1 and qwen_tile.programs == 2, qwen_tile
+        assert launch.legal(qwen_ba, qwen_tile, sm90)
+        dense_ba = launch.bind(bf16((16, 4096)), bf16((1, 4096, 14336)), i32((1,)),
+                               out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        dense_tile = launch._derived(dense_ba, sm90)
+        assert dense_tile is not None and dense_tile.warpgroups == 1 and dense_tile.programs == 2, dense_tile
+        prefill_ba = launch.bind(bf16((2048, 4096)), bf16((1, 4096, 14336)), i32((1,)),
+                                 out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        prefill_tile = launch.derived(prefill_ba, sm90)
+        assert prefill_tile is not None and prefill_tile.programs == 1, prefill_tile
+        if generation.compile_only_gpus("sm90"):
+            cases = [
+                KernelCase("sm90_decode_moe_2prog", lambda: launch.lowering(moe_ba, moe_tile)),
+                KernelCase("sm90_decode_qwen_2prog", lambda: launch.lowering(qwen_ba, qwen_tile)),
+                KernelCase("sm90_decode_dense_2prog", lambda: launch.lowering(dense_ba, dense_tile)),
+            ]
+            records = compile_mosaic_kernels(cases, "sm90")
+            for rec in records:
+                assert not rec.get("error"), rec
+                assert rec["kernels"], rec
+                assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
 
 
 def test_a_kernel_gradient_no_launch_reads_through_its_tables_runs_a_launch_on_its_gathered_rows():
