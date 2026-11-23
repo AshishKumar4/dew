@@ -54,8 +54,10 @@ INTERPRETED = interprets()
 """The template interprets off a GPU, by the wgmma bundle, whose rings and barriers the interpreter models;
 a GPU tier part's prepare states it as the node's GPU runs it (`generation_support.interprets`)."""
 
-SHAPES = {"interpreted": (1, 70, 256, 16), "falcon-mamba-7b": (2, 2048, 8192, 16)}
-"""Each case's rows, tokens, channels and states: a ragged chunk over two channel blocks, and Falcon Mamba
+SHAPES = {"interpreted": (1, 70, 256, 16), "planned": (1, 512, 128, 16),
+          "falcon-mamba-7b": (2, 2048, 8192, 16)}
+"""Each case's rows, tokens, channels and states: a ragged chunk over two channel blocks, a channel block of
+512 tokens whose backward blocks the tuner's token counts set apart (`PLANNED_VARIANTS`), and Falcon Mamba
 7B's widths."""
 
 
@@ -691,37 +693,71 @@ def test_the_tuners_variants_lead_with_the_derived_config_each_legal(target):
         assert all(selective.SELECTIVE.legal(bound, tiles, facts) for tiles in variants)
 
 
-VARIANT_KINDS = ('1 token', '2 tokens', '4 tokens', '8 tokens', '16 tokens', 'a program fewer',
-                 'chunk doubled')
-"""The configs the opt-in tuner may pick for the interpreted shape (`Selective.neighbours`), each a check-1
-site of its own: its backward at each token count, its derived tokens at a program fewer, its chunk doubled
-(its derived chunk the shortest, 32, none halved)."""
+def _planned_variants() -> list[selective.Tiles]:
+    """The configs the opt-in tuner may pick (`Selective.variants`) for the planned shape (`SHAPES['planned']`,
+    512 tokens: blocks of 128, 256 and 512 tokens at 1, 2 and 4 tokens a thread, 8 and 16 clamped to 512's),
+    one of each the scan runs apart: its backward's block, residency and forward chunk."""
+    rows, length, channels, states = SHAPES["planned"]
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+    found = {}
+    for tiles in selective.SELECTIVE.variants(selective.SELECTIVE.bind(*operands, interpret=True)):
+        planned = (selective.block_positions(length, tiles.positions), tiles.resident, tiles.chunk)
+        found.setdefault(planned, tiles)
+    return list(found.values())
 
 
-def _variant(kind: str) -> selective.Tiles:
-    """The interpreted shape's tuner variant `kind` (`VARIANT_KINDS`) among `Selective.variants`: its backward
-    at that many tokens, its derived tokens at a program fewer, or its chunk doubled."""
-    bound = _bound(SHAPES["interpreted"][1])
-    derived, *neighbours = selective.SELECTIVE.variants(bound)
-    if kind.endswith(('token', 'tokens')):
-        positions = int(kind.split()[0])
-        return next(tiles for tiles in (derived, *neighbours)
-                    if tiles.positions == positions and tiles.chunk == derived.chunk
-                    and (tiles.resident == derived.resident or positions != derived.positions))
-    if kind == 'a program fewer':
-        return next(tiles for tiles in neighbours
-                    if tiles.positions == derived.positions and tiles.resident == derived.resident - 1)
-    return next(tiles for tiles in neighbours if tiles.chunk == 2 * derived.chunk)
+PLANNED_VARIANTS = _planned_variants()
+"""`_planned_variants`, each a check-1 site of its own (`test_every_tuner_variant_is_as_exact_interpreted`)."""
 
 
-@pytest.mark.parametrize('kind', VARIANT_KINDS)
+@pytest.mark.parametrize('tiles', PLANNED_VARIANTS, ids=lambda tiles: (
+    f'{tiles.positions} tokens, {tiles.resident} programs, chunk {tiles.chunk}'))
 @pytest.mark.check1_shards(seeds=8, per_task=4)
-def test_every_tuner_variant_is_as_exact_interpreted(kind):
+def test_every_tuner_variant_is_as_exact_interpreted(tiles):
     """Each config the opt-in tuner may pick (`Selective.variants`, `kernel-templates.md`: every config a
-    tuning run may pick held to the gate), interpreted: the scan's output and every input's gradient on par
-    from float64 with the portable scan's (check 1), its backward's tokens a thread, residency and the
-    forward's chunk each changing which thread and block computes a token (row 12343)."""
-    the_template_is_as_exact_as_its_reference("interpreted", packed=False, tiles=_variant(kind))
+    tuning run may pick held to the gate) that the scan runs apart, interpreted at 512 tokens: the scan's
+    output and every input's gradient on par from float64 with the portable scan's (check 1), its backward's
+    block, residency and forward chunk each changing which thread and block computes a token (row 12343; at
+    70 tokens every token count clamped to one block). Native arithmetic (FMAs, approximate exp2) is the GPU
+    tier's to judge."""
+    the_template_is_as_exact_as_its_reference("planned", packed=False, tiles=tiles)
+
+
+def test_a_step_past_float32s_range_times_a_small_rate_decays_as_the_recurrence_interpreted():
+    """A token whose step is `3 2^126` (finite in float32) decaying a live entering state with no write, its
+    rates `-2^-126` and 0: each state `exp(-3)` and 1 times what entered, through the template and the
+    portable scan alike, on par from float64 with the recurrence stepped by hand (check 1, every draw the
+    same): the step taken to base 2 before its rate, `dt log2(e)` overflowed, decaying to 0 and NaN
+    (mamba1b's review)."""
+    rows, length, channels, states = 1, 32, 128, 16
+    rates = np.where(np.arange(channels)[:, None] % 2 == 0, -2.0 ** -126, 0.0) * np.ones((1, states))
+
+    def draws(seed):
+        del seed
+        dt = np.zeros((rows, length, channels), np.float32)
+        dt[:, 0] = 3 * 2.0 ** 126
+        zeros = np.zeros((rows, length, channels), np.float32)
+        ones = np.ones((rows, length, states), np.float32)
+        rows_of = functools.partial(jnp.asarray, dtype=jnp.bfloat16)
+        return (rows_of(zeros), rows_of(dt), jnp.asarray(rates, jnp.float32), rows_of(ones), rows_of(ones),
+                jnp.zeros((channels,), jnp.float32), jnp.ones((rows, channels, states), jnp.float32))
+
+    def stepped(x, dt, A, B, C, D, state):
+        del x, B, D
+        h = np.asarray(state, np.float64)
+        outputs = []
+        for t in range(length):
+            h = np.exp(np.asarray(dt, np.float64)[:, t, :, None] * np.asarray(A, np.float64)) * h
+            outputs.append(np.einsum('rdn,rn->rd', h, np.asarray(C, np.float64)[:, t]))
+        return np.stack(outputs, axis=1), h
+
+    template = functools.partial(selective.selective_scan, family=taken_family(jnp.bfloat16),
+                                 interpret=INTERPRETED)
+    assert_as_exact(jax.jit(template), jax.jit(portable), draws, "a step past float32's range, small rates",
+                    seeds=FEWEST_SEEDS, truth_fn=as_given(stepped))
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=4)

@@ -621,14 +621,15 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
 
             skip = parameters_ref[states, channel]
             dx_init, dx_step, dx_inv = algebra.selective_dx_scale(skip, dys, dts)
-            stepped = dts * xs  # every state's write and B gradient read it: formed once a block
             def state(n, sums):
                 # Rolled: unrolled, the states spilled 12 KB/thread (scanbwd-ptxas-sm90 at 5de7abaa0).
                 dx, ddt = sums
                 rate = parameters_ref[n, channel]
                 bs, cs = load(b_ref.at[row, n, span]), load(c_ref.at[row, n, span])
                 a = algebra.selective_decay(dts, rate, kept)
-                written = stepped * bs
+                # `dt x` formed in the loop: held across it, its 8 words took the GH200's backward past its
+                # three-program cap at 8 tokens, stepping it to 4 (6.25 ms against 6.03, M-JS-243).
+                written = dts * xs * bs
                 entering = entered_ref[row, k, n, channel]
                 read = cs * dys
                 before, after, carried[0, n] = (
