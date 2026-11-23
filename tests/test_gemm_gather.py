@@ -902,29 +902,35 @@ def test_gathered_prologued_negative_indices_and_sm80_forced_mosaic():
                     "sm80 forced-mosaic paired+scatter", seeds=SEEDS, truth_fn=pair_truth)
 
 
-def test_producers_rungs_keeps_top_after_stated_cap_start(monkeypatch):
+def test_producers_rungs_keeps_top_after_stated_cap_start():
     """When `producers.started` picks a `stated` cap below `top` on a tensor-memory family, `producers.rungs`
     passes that same `stated` cap into `Producers.stepped` so the first spill rung visits `top` instead of
     skipping it (Train 1231 F2)."""
-    from dew.nn.kernels.templates import resources
+    from dew.nn.kernels.templates import report, resources
     from dew.nn.kernels.templates.gemm import producers
 
-    op = grouped_matmul.MosaicGmm()
+    @dataclasses.dataclass(frozen=True)
+    class _HighRegGmm(grouped_matmul.MosaicGmm):
+        need: int = 160
+
+        def registers(self, ba, config, target=None) -> int:
+            del ba, config, target
+            return self.need
+
+    op = _HighRegGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     ba = op.bind(bf16((128, 64)), bf16((2, 64, 128)), jax.ShapeDtypeStruct((2,), jnp.int32),
                  (), (), None, None, jax.ShapeDtypeStruct((128,), jnp.int32),
                  out_dtype="bfloat16", trans_rhs=False, interpret=False)
     tile = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=1, cluster=1, family="tcgen05", programs=2)
-    with generation.assumed("sm100"):
+    with generation.assumed("sm100"), report.refusals():
         sm100 = generation.gpu_target()
         top = producers._top(op, ba, tile, sm100)
-        assert top is not None
-        # Force consumer registers above `top` so `started` begins at `stated_producer(...) < top`.
-        monkeypatch.setattr(grouped_matmul.MosaicGmm, "registers", lambda *a, **kw: top + 32)
-        monkeypatch.setattr(producers, "_spilled", lambda *a, **kw: True)
+        assert top is not None and op.need > top
         started = producers.started(op, ba, tile, sm100)
         start_cap = started.producers.of(op.KERNEL)
         assert start_cap is not None and start_cap < top
+        report.refuse([(report._identity(op, ba, sm100), started, (op.KERNEL,))])
         ladder = [rung.producers.of(op.KERNEL) for rung in producers.rungs(op, ba, started, sm100)]
         assert ladder[0] == resources.facts().raises().below(top), (start_cap, top, ladder)
         assert start_cap not in ladder, (start_cap, ladder)
