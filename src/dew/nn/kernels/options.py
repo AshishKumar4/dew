@@ -756,12 +756,7 @@ class OuterProgram:
         ready = self._ready.get(key)
         if ready is None:
             ready = self._shaped_for(key, args, kwargs) or self._kept(key, args, kwargs)
-        with _ran(self, ready, args, kwargs):
-            outputs = ready(*dynamic, **named)
-        # Its first run's completion taken as its run (`dew.communicators.completed`), never its dispatch,
-        # which an asynchronous one returns before the run loads it.
-        communicators.completed(ready, outputs)
-        return outputs
+        return self.invoked(ready, args, kwargs, *dynamic, **named)
 
     def _shaped_for(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
         """The executable a compile within `collecting` made for a call alike in its abstract signature
@@ -837,14 +832,14 @@ class OuterProgram:
         ready = self._ready.get(key)
         return self._kept(key, args, kwargs) if ready is None else ready
 
-    def ran(self, executable: jax.stages.Compiled, args: tuple, kwargs: dict
-            ) -> contextlib.AbstractContextManager:
-        """The contexts a call of `executable`, fetched for these arguments (`executable`), runs inside:
-        every enclosing `running` block's, entered here, as a call through the program enters them
+    def invoked(self, executable: jax.stages.Compiled, args: tuple, kwargs: dict, *dynamic, **named):
+        """Call `executable`, fetched for these arguments (`executable`), on `dynamic` and `named` inside
+        every enclosing `running` block's contexts, entered here, as a call through the program enters them
         (row 8480: a rollout's executables fetched once and called each step, `dew.rl.simulator`, `Fetched`,
-        a server's `dispatched`, ran past its admission and a trial's record). Its caller runs the
-        executable within it, each call."""
-        return _ran(self, executable, args, kwargs)
+        a server's `dispatched`, ran past its admission and a trial's record), its first run taken as run
+        once it completes (`dew.communicators.called`): the one call of a fetched executable."""
+        with _ran(self, executable, args, kwargs):
+            return communicators.called(executable, lambda: executable(*dynamic, **named))
 
     def _reserved(self, key: Hashable) -> tuple[Future[jax.stages.Compiled], bool]:
         """The compile kept under `key` and whether this caller owns it: a future its owner settles
@@ -1274,8 +1269,7 @@ class Fetched:
         executable = self._executables.get(context)
         if executable is None:
             executable = self._executables[context] = self.program.executable(*args, **kwargs)
-        with self.program.ran(executable, args, kwargs):
-            return executable(*args, **kwargs)
+        return self.program.invoked(executable, args, kwargs, *args, **kwargs)
 
 
 _Structure = tuple[jax.tree_util.PyTreeDef]

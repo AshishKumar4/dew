@@ -414,6 +414,23 @@ def free_until_placed(monkeypatch, room):
 
 
 
+def test_a_search_handed_to_a_compile_that_refuses_is_released_with_no_winner(monkeypatch):
+    """A search made off the loop for the step a compile plans next (a later phase's,
+    `dew.training.ahead.LaterPlans`) is handed to the compile (`StepCompiler.settle_with`): a compile whose
+    plan is refused releases it with no winner (its every program dropped), never leaving it held with the
+    run's executables and their admission (review of row 12131's P0: a boundary's refusal leaked it)."""
+    from dew.training.planning import PlanRefused
+
+    trainer = lm()
+    state, _, _ = trainer.place()
+    released: list[object] = []
+    trainer._compiler.settle_with(released.append)
+    free(monkeypatch, 1 << 10)
+    with pytest.raises(PlanRefused):
+        trainer.compile(state, BATCH)
+    assert released == [None], released
+
+
 def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refused_unplaced(monkeypatch):
     """A fresh fit on devices with room for its state and for no plan of its step is refused as its search
     before the state was placed found it, every candidate short by more than placing the state can free: its

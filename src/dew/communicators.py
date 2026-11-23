@@ -658,25 +658,34 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
     _RESIDENT.admit(made, _HELD.needs, _HELD.room, free, Loaded(gpus, id(executable)))
 
 
-def completed(executable: jax.stages.Compiled, outputs) -> None:
-    """Take `executable`'s first run as run once it is seen to complete (`Resident.dispatched`): its
-    outputs, the call's, waited for where it is admitted and not run, never its dispatch alone, which an
-    asynchronous one returns before the run loads the program and makes its communicators
-    (`PJRT_GPU_ENABLE_ASYNC_DISPATCH`); a run that fails raises here, leaving it charged as not run. Called
-    past each call through Dew's compile point (`dew.nn.kernels.options.OuterProgram`)."""
+def called[T](executable: jax.stages.Compiled, call: Callable[[], T]) -> T:
+    """`call()`, a call of `executable`, its first run taken as run once it is seen to complete
+    (`Resident.ran`), never at its dispatch, which an asynchronous one returns before the run loads the
+    program and makes its communicators (`PJRT_GPU_ENABLE_ASYNC_DISPATCH`): where it is admitted and not
+    run, its outputs waited for, and what each of its GPUs lost outside XLA's pool over it, past the pool's
+    growth, measured as what loading it took. A run that fails raises here, leaving it charged as not run.
+    The one boundary every executable Dew runs is called through (`dew.nn.kernels.options.OuterProgram.
+    invoked`, a step's runner, `dew.training.compiler.StepCompiler.runner`)."""
     if _HELD is None or id(executable) not in _RESIDENT.pending:
-        return
+        return call()
+    program = loaded_program(executable)
+    devices = () if program is None else tuple(device for device in program.devices
+                                               if device.platform == "gpu")
+
+    def read() -> tuple[dict[int, int], dict[int, int]]:
+        free = {ordinal(device): answered for device in devices
+                if (answered := gpu_free_bytes(device.local_hardware_id)) is not None}
+        pools = {ordinal(device): pool for device in devices
+                 if isinstance(pool := (device.memory_stats() or {}).get("pool_bytes"), int)}
+        return free, pools
+
+    before, pooled = read()
+    outputs = call()
     jax.block_until_ready(outputs)
-    _RESIDENT.dispatched(id(executable))
-
-
-def first_ran(executable: jax.stages.Compiled, before: Mapping[int, int], after: Mapping[int, int],
-              grown: Mapping[int, int]) -> None:
-    """Take `executable`'s first run, seen to complete (`Resident.ran`): each of its GPUs' bytes free outside
-    XLA's pool `before` it and `after`, and its pool's growth over it (`grown`), by GPU ordinal (`ordinal`).
-    A trainer's newly compiled step's (`dew.training.memory.first_run`)."""
-    if _HELD is not None:
-        _RESIDENT.ran(id(executable), before, after, grown)
+    after, grown = read()
+    _RESIDENT.ran(id(executable), before, after,
+                  {gpu: grown[gpu] - pooled[gpu] for gpu in grown if gpu in pooled})
+    return outputs
 
 
 type Run = tuple[int, int, Mapping[int, int]]

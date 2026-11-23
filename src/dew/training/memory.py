@@ -524,14 +524,11 @@ class FirstRunFailed(RuntimeError):
             "the kernels loaded, and a lower fraction leaves them more")
 
 
-def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh,
-              executable: jax.stages.Compiled | None = None) -> dict[str, dict[int, int]]:
+def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str, dict[int, int]]:
     """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's
     (`FirstRunFailed`). A first run that succeeds returns, and logs, each GPU's bytes free outside XLA's
     pool as the fit check read them (`fitted`) and now: what the devices took there since, every
-    process's and a pool's growth counted, the step's collectives' communicators (NCCL) among it; what it
-    took past those communicators and the pool's growth is what loading the step's `executable` took
-    there, which every program admitted after it is charged (`dew.communicators.first_ran`)."""
+    process's and a pool's growth counted, the step's collectives' communicators (NCCL) among it."""
     devices = local_devices(mesh)
     try:
         loss.block_until_ready()
@@ -548,16 +545,6 @@ def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh,
     current = {device.id: free for device in devices
                if device.id in checked and (free := outside_pool(device)) is not None}
     observed = {"checked": {device: checked[device] for device in current}, "now": current}
-    if executable is not None:
-        pools = {integer(device["id"], "id"): pool for device in read
-                 if isinstance(pool := device.get("pool_bytes"), int)}
-        by_id = {device.id: device for device in devices}
-        grown = {device: (by_id[device].memory_stats() or {}).get("pool_bytes", pools[device]) - pools[device]
-                 for device in current if device in pools}
-        named = {device: communicators.ordinal(by_id[device]) for device in current}
-        communicators.first_ran(executable, {named[device]: checked[device] for device in current},
-                                {named[device]: free for device, free in current.items()},
-                                {named[device]: growth for device, growth in grown.items()})
     if current:
         _log.info("the GPUs' free bytes outside XLA's pool: %s as the step's fit check read them, %s after "
                   "its first run, which takes its collectives' communicators there", observed["checked"],

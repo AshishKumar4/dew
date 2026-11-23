@@ -689,6 +689,54 @@ def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(
         communicators.hold(held)
 
 
+@pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
+def test_an_inspected_runs_sampled_step_is_taken_as_run_once_it_completes():
+    """A run inspecting every other step runs its plain step on its first step and its sampled step, a
+    program of its own, on its second: each is taken as run as its own first run completes, at the runner
+    that calls it (`dew.communicators.called`), so neither is charged ahead of a later program once both
+    ran (review of row 12131's P0: the sampled step, run after the fit's one first-run wait, stayed
+    charged for ever)."""
+    import gc
+
+    import optax
+    from affine_run import Replaying
+    from test_plan import BATCH, ROWS
+
+    from dew.data.dataset import Loader
+    from dew.nn.kernels import options
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Trainer
+    from dew.training.inspection import Inspection
+
+    options.release()
+    gc.collect()
+    gpu = communicators.ordinal(jax.devices()[0])
+    roomy = communicators.Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={gpu: 0},
+                                seconds=1.0)
+    probe = jax.jit(lambda x: x * 2.0).lower(jnp.ones(2)).compile()
+
+    def charged(program) -> int:
+        with pytest.raises(CommunicatorRoom) as refused:
+            communicators.admit(program, free=lambda gpu: 0)
+        return refused.value.needed[gpu]
+
+    held = communicators.held()
+    communicators.hold(communicators.Sizing(roomy, 0.95, 0.9, {gpu: 0}, {gpu: 1 << 40}))
+    try:
+        model = models.build("causal_transformer", vocab_size=64, emb_features=16, num_layers=1, num_heads=2,
+                             mlp_features=32, max_seq_len=16)
+        trainer = Trainer(LMObjective(model, seq_len=16), optax.sgd(0.1), key=jax.random.key(0),
+                          inspection=Inspection(every=2))
+        rows = Replaying(lambda position: {"text": jax.device_get(BATCH["text"])})
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=2)
+        gc.collect()
+        measured = communicators._RESIDENT.cost.get(gpu, communicators.PROGRAM_FLOOR)
+        assert charged(probe) == measured, measured
+    finally:
+        communicators.hold(held)
+
+
 def test_a_process_prepared_again_keeps_the_sizing_its_pool_was_made_with():
     """Once the backend has opened, the pool keeps the share its first preparation sized, so a second
     preparation (a sweep's next run, a profile after a run) keeps that sizing and admits every later

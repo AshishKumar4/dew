@@ -19,6 +19,7 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
+from dew import communicators
 from dew._coordination import agreed, agreed_count, from_every_process
 from dew._records import JSON, boolean, integer, json_value, listed, record
 from dew.batch import CLOSES_WINDOW, LOOP_PASSES, Batch, Variables, at_path, placed_at
@@ -865,6 +866,18 @@ class StepCompiler[L, E]:
 
     def compile(self, stepping: Stepping, state: TrainState, batch: Batch,
                 trials: Trials | None = None) -> Compiled:
+        """`_compiled`, every search off the loop it was handed (`settle_with`) released with no winner where
+        it raises (a boundary's placed search refused), so none outlives a compile that took no plan."""
+        try:
+            return self._compiled(stepping, state, batch, trials)
+        except BaseException:
+            settles, self._settles = self._settles, []
+            for settle in settles:
+                settle(None)
+            raise
+
+    def _compiled(self, stepping: Stepping, state: TrainState, batch: Batch,
+                  trials: Trials | None = None) -> Compiled:
         """Compile a transaction over the state and one already-produced global batch (`Trainer.compile`),
         the step and what its compile found (`Compiled`).
 
@@ -1266,7 +1279,8 @@ class StepCompiler[L, E]:
                 outputs = []
                 moving, frozen = apart(current)
                 for part, executable in zip(parts, executables, strict=True):
-                    moving, *output = executable(moving, frozen, batch, part)
+                    moving, *output = communicators.called(
+                        executable, functools.partial(executable, moving, frozen, batch, part))
                     outputs.append(tuple(output))
                 stepped = together(moving, frozen)
                 returned[0] = stepped.window_size
