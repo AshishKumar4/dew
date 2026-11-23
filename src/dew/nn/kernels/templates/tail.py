@@ -12,6 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
+from dew.nn.kernels.templates import cost
+
 
 @dataclasses.dataclass(frozen=True)
 class Tail:
@@ -86,7 +88,7 @@ class Traffic:
 
     def issued(self, programs: int) -> float:
         """The seconds `programs` programs' one MMA step each takes, sharing the multiprocessors."""
-        return self.step_seconds * -(-programs // self.multiprocessors)
+        return self.step_seconds * cost.spread(programs, self.multiprocessors)
 
 
 def balanced(tiles: int, steps: int, programs: int, traffic: Traffic, *, handoff_steps: float,
@@ -175,7 +177,7 @@ def _rounds(tail: Tail, rows: np.ndarray, columns: np.ndarray, traffic: Traffic)
         first[1:] = (block[1:] != block[:-1]) | (read[1:] - read[:-1] > window)
         missed += np.bincount(read[first], minlength=rounds) * size
     active = np.bincount(turn, minlength=rounds)
-    issued = traffic.step_seconds * -(-active // traffic.multiprocessors)
+    issued = traffic.step_seconds * cost.spread(active, traffic.multiprocessors)
     return float(np.maximum(issued, missed / traffic.bandwidth).sum())
 
 
