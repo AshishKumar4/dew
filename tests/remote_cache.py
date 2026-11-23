@@ -564,27 +564,34 @@ def chunk(key: str, index: int) -> str:
     return key if index == 0 else f"{key}/={index}"
 
 
-HEADER = struct.Struct(">IQ")
-"""A bundle entry's key's and value's lengths."""
+HEADER = struct.Struct(">IQ32s")
+"""A bundle entry's key's and value's lengths and its value's sha256."""
+FORMAT = "digested"
+"""The bundles' format, the first part of their keys (`prefix`): each entry's value digested in its header
+(row 9797), so no bundle written without one is read."""
 
 
 def packed(entries: list[tuple[str, bytes]]) -> bytes:
-    """`entries` as one bundle: each key's and value's length, then the key and the value."""
-    return b"".join(HEADER.pack(len(key.encode()), len(value)) + key.encode() + value
-                    for key, value in entries)
+    """`entries` as one bundle: each key's and value's length and the value's sha256, then the key and the
+    value."""
+    return b"".join(HEADER.pack(len(key.encode()), len(value), hashlib.sha256(value).digest()) + key.encode()
+                    + value for key, value in entries)
 
 
 def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
     """The `(key, value)` entries of a `packed` bundle, or ValueError where it is not one whole: more
     than `MAX_BYTES`, an entry its lengths run past, or a key that is no file name in one directory
-    (empty, `.` or `..`, a separator or NUL in it, or too long for its `-cache` file's name)."""
+    (empty, `.` or `..`, a separator or NUL in it, or too long for its `-cache` file's name). An entry whose
+    value is not the bytes its digest was taken of is dropped and said, its program compiled again: JAX's
+    values carry no checksum, and XLA loads wrong bytes within an intact frame as they are (row 9797: a
+    train's base run aborted in jaxlib reading back a cached program's result)."""
     if len(bundle) > MAX_BYTES:
         raise ValueError(f"a bundle of more than {MAX_BYTES} bytes")
     entries, at = [], 0
     while at < len(bundle):
         if at + HEADER.size > len(bundle):
             raise ValueError(f"a bundle's entry header at {at} runs past its {len(bundle)} bytes")
-        keyed, sized = HEADER.unpack_from(bundle, at)
+        keyed, sized, digest = HEADER.unpack_from(bundle, at)
         at += HEADER.size
         if at + keyed + sized > len(bundle):
             raise ValueError(f"a bundle's entry at {at} runs past its {len(bundle)} bytes")
@@ -592,24 +599,28 @@ def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
         if (key in ("", ".", "..") or any(character in key for character in "/\\\0")
                 or len(f"{key}{SUFFIX}".encode()) > 255):
             raise ValueError(f"a bundle's key {key[:80]!r} is no file name")
-        entries.append((key, bundle[at + keyed:at + keyed + sized]))
+        value = bundle[at + keyed:at + keyed + sized]
         at += keyed + sized
+        if hashlib.sha256(value).digest() != digest:
+            logger.warning("the shared XLA cache's program %s is not the bytes it was written with; it is "
+                           "dropped and compiled again", key)
+            continue
+        entries.append((key, value))
     return entries
 
 
 def prefix(kind: str | None = None, backend: str | None = None) -> str:
-    """The bundles' leading parts (the device's `kind` and the `backend` this process's first device's, or
-    those a prepare names for its node's GPU, which it cannot see): what a cached executable is only valid
-    for beside JAX's own key,
-    and the device's kind, whose programs are another file's on another GPU. jax's own version is
-    not among them: JAX's key holds the program and jaxlib's version
-    (jax/_src/cache_key.py), so a release of jax alone that lowers a program differently keys it
-    anew, and one that does not (a post-release of Dew's patch stack) keeps every file's programs.
-    The Python minor is among them because jax 0.11.2 names 3.14's stdlib zstd codec "zlib" in its
-    key (`dew._cache.default_compilation_cache_dir`); and the host's CPU class (`HOST.cpu_class`),
-    on every backend, as XLA:CPU compiles for the features of the host that compiles and a GPU lane's
-    bundles hold CPU executables too (its host-side computations): armada's hosts span classes, and a
-    program from another class need not link here, after which the process compiles nothing more."""
+    """The bundles' leading parts (their `FORMAT`; the device's `kind` and the `backend` this process's first
+    device's, or those a prepare names for its node's GPU, which it cannot see): what a cached executable is
+    only valid for beside JAX's own key, and the device's kind, whose programs are another file's on another
+    GPU. jax's own version is not among them: JAX's key holds the program and jaxlib's version
+    (jax/_src/cache_key.py), so a release of jax alone that lowers a program differently keys it anew, and
+    one that does not (a post-release of Dew's patch stack) keeps every file's programs. The Python minor is
+    among them because jax 0.11.2 names 3.14's stdlib zstd codec "zlib" in its key
+    (`dew._cache.default_compilation_cache_dir`); and the host's CPU class (`HOST.cpu_class`), on every
+    backend, as XLA:CPU compiles for the features of the host that compiles and a GPU lane's bundles hold
+    CPU executables too (its host-side computations): armada's hosts span classes, and a program from
+    another class need not link here, after which the process compiles nothing more."""
     import jax
     import jaxlib
 
@@ -617,7 +628,7 @@ def prefix(kind: str | None = None, backend: str | None = None) -> str:
                    for character in (kind or jax.devices()[0].device_kind))
     backend = backend or jax.default_backend()
     minor = f"py{sys.version_info.major}.{sys.version_info.minor}"
-    return f"jaxlib{jaxlib.__version__}/{backend}/{minor}/{kind}/{HOST.cpu_class()}"
+    return f"{FORMAT}/jaxlib{jaxlib.__version__}/{backend}/{minor}/{kind}/{HOST.cpu_class()}"
 
 
 def install(url: str, token: str) -> RemoteCache | None:

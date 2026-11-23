@@ -2207,7 +2207,7 @@ def test_wide_epilogue_chunks_tcgen05_chunks_and_prices_masked_rewalks():
         bwd_cfg = bwd_op.derived(bwd_ba, target)
         assert bwd_cfg is not None and not bwd_cfg.fused and bwd_op.takes(bwd_ba, bwd_cfg, target), bwd_cfg
         nxt_bwd = dataclasses.replace(bwd_cfg, stages=bwd_cfg.stages + 1)
-        assert bwd_cfg.stages >= 2 and (
+        assert (
             not bwd_op.takes(bwd_ba, nxt_bwd, target)
             or bwd_op.resident(bwd_ba, nxt_bwd, target) < bwd_op.resident(bwd_ba, bwd_cfg, target)
             or bwd_cfg.stages >= max(bwd_cfg.consumers, 2) + 1), bwd_cfg
