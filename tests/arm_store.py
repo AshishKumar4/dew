@@ -48,9 +48,9 @@ def _arm_compile(compile: Callable, written: dict | None) -> Callable:
     with the `written` options where they are a twin's (`arm_forms._written_twin`), its products held
     (`arm_arithmetic.products_held`)."""
     def compiled(function, *, out_shardings):
-        # An arm held whole (`_Whole`) is a jit of its own compiler options, lowered as itself: no other jit
+        # An arm held whole (`Whole`) is a jit of its own compiler options, lowered as itself: no other jit
         # may hold it.
-        if isinstance(function, _Whole):
+        if isinstance(function, Whole):
             return function
         return compile(function if written is None else products_held(function), out_shardings=out_shardings,
                        compiler_options=written)
@@ -135,7 +135,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
     if getattr(fn, "without_ynn", False) and hasattr(fn, "trace"):
         # A jit of its own compiler options (`without_ynn`'s: a library arm's cuBLAS,
         # `generation_support.cublas_compiled`), which JAX lowers only as a top-level program: held whole
-        # (`_Whole`), never traced inside another, as the gate runs it as it is (`arm_forms._compiled`), a
+        # (`Whole`), never traced inside another, as the gate runs it as it is (`arm_forms._compiled`), a
         # reference's trace and lowering unrewritten as its call is (`Unrewritten`'s).
         leaves = jax.tree.leaves(inputs)
         if list(inputs) != leaves:
@@ -145,7 +145,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
             out = traced_fn.trace(*inputs).out_info
         held[name] = {"constants": [], "tree": jax.tree.structure(out), "routes": list(reported),
                       "launches": launched.held()}
-        programs[name] = (_Whole(traced_fn, held[name]), [*map(jax.typeof, leaves)])
+        programs[name] = (Whole(traced_fn, held[name]), [*map(jax.typeof, leaves)])
         return out
     with generation.routes() as reported, tuning.seen() as launched:
         closed, shapes = jax.make_jaxpr(traced_fn, return_shape=True)(*inputs)
@@ -177,7 +177,7 @@ def _arm_program(programs: dict, held: dict, role: str, fn, inputs, *, reference
 
 
 @dataclasses.dataclass(frozen=True)
-class _Whole:
+class Whole:
     """An arm's program held whole (`_arm_program`): `fn`, a jit of its own compiler options, which the
     store's compile lowers as itself (`_arm_compile`) over its inputs' leaves, each lowering's launches into
     its `record` (`lower`): its run reports the kept lowering's, as an arm's relowering does (`again`)."""
@@ -187,6 +187,12 @@ class _Whole:
 
     def __call__(self, *leaves):
         return self.fn(*leaves)
+
+    def trace(self, *args):
+        """Its program traced as itself, a top-level jit's trace (what the store reads of its program before
+        compiling it: `truths_ahead._calls_the_host`), never inside another trace, which its compiler
+        options refuse (row 12062, #8613's receipt)."""
+        return self.fn.trace(*args)
 
     def lower(self, *args, **options):
         from dew.nn.kernels import tuning
