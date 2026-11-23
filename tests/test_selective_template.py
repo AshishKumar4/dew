@@ -691,10 +691,11 @@ def test_the_tuners_variants_lead_with_the_derived_config_each_legal(target):
         assert all(selective.SELECTIVE.legal(bound, tiles, facts) for tiles in variants)
 
 
-VARIANT_KINDS = ('1 token', '2 tokens', '4 tokens', '8 tokens', '16 tokens', 'a program fewer', 'chunk doubled')
-"""The configs the opt-in tuner may pick for the interpreted shape (`Selective.neighbours`), each a check-1 site
-of its own: its backward at each token count, its derived tokens at a program fewer, its chunk doubled (its
-derived chunk the shortest, 32, none halved)."""
+VARIANT_KINDS = ('1 token', '2 tokens', '4 tokens', '8 tokens', '16 tokens', 'a program fewer',
+                 'chunk doubled')
+"""The configs the opt-in tuner may pick for the interpreted shape (`Selective.neighbours`), each a check-1
+site of its own: its backward at each token count, its derived tokens at a program fewer, its chunk doubled
+(its derived chunk the shortest, 32, none halved)."""
 
 
 def _variant(kind: str) -> selective.Tiles:
