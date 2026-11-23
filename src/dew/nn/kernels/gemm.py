@@ -272,7 +272,7 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
                                              prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
                                              epilogue_axes, cotangents, dtypes, compute, acc_shape,
                                              {**held, 'gather': gather},
-                                             dict(zip(call.named, saved, strict=True)))
+                                             dict(zip(call.named, saved, strict=True)), scatter=scatter)
     # Each accumulator's cotangent meets the forward's rounded operands as the portable program's
     # derivative has it: in `lhs`'s dtype where that holds it exactly (a cotangent no wider, passed
     # through), wide otherwise, each product rounding once.
@@ -318,7 +318,17 @@ def _scattered_cotangent(cotangent, scatter, *, epilogue, first) -> tuple:
     reads it row by row, or a stack's layer's input gradient, whose launch reads no slots, no table then."""
     if scatter is None or (epilogue is None and first is None):
         return cotangent, scatter
-    return jax.tree.map(lambda d: d[scatter], cotangent), None
+    return jax.tree.map(lambda d: rows_permuted(d, scatter), cotangent), None
+
+
+def rows_permuted(x: jax.Array, permutation: jax.Array, axis: int = 0) -> jax.Array:
+    """`x`'s rows along `axis` at `permutation`'s order, placed as `x` is where an Explicit axis splits it
+    (a permutation of its rows, whose placement its own is): JAX takes no gather of a split axis without its
+    output's placement."""
+    placed = explicit_spec(x)
+    if placed is None:
+        return jnp.take(x, permutation, axis=axis)
+    return x.at[(slice(None),) * axis + (permutation,)].get(out_sharding=placed)
 
 
 def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, lhs,
@@ -1657,7 +1667,7 @@ def _worked(d_accs: tuple, narrow: tuple, compute) -> tuple[tuple, tuple]:
 
 def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
                 epilogue_arrays, epilogue_axes, cotangents: tuple, dtypes: tuple, compute, acc_shape: tuple,
-                plain: dict, saved: dict | None = None) -> tuple[tuple, tuple, tuple]:
+                plain: dict, saved: dict | None = None, scatter=None) -> tuple[tuple, tuple, tuple]:
     """Each accumulator's cotangent (one a matrix of `matrices`: the product's, and its `paired`'s), the
     epilogue side operands' and whether each accumulator's passes an output's through in `compute`'s dtype
     (`_passes_cotangent`): the outputs' own without an epilogue (None for an output no reverse pass
@@ -1689,10 +1699,10 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     # typed the same on every device, the VJP of an epilogue adding a side each device reads its own of
     # summed the devices' cotangents into it (the add's broadcast transposed to a psum), every device's
     # gradient then their sum (row 10526).
-    # Its gather table too (`plain`'s): a table each device holds its own of routes rows that vary with
-    # it, as the forward's accumulator is typed (`fused_gemm._product`'s).
+    # Its routing too (its group sizes, `plain`'s gather table, its `scatter`): a table each device holds its
+    # own of routes rows that vary with it, as the forward's accumulator is typed (`fused_gemm._product`'s).
     operands = (lhs, *matrices, *jax.tree.leaves(prologue_arrays),
-                *(() if plain.get('gather') is None else (plain['gather'],)))
+                *(table for table in (group_sizes, plain.get('gather'), scatter) if table is not None))
 
     def zero() -> jax.Array:
         return varying_like(jnp.zeros(acc_shape, at_least_fp32(compute)), *operands)

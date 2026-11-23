@@ -737,25 +737,32 @@ def test_a_gathered_products_consumer_reads_it_as_varying_as_its_routing_table()
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_gathered_products_reverse_pass_reads_it_as_varying_as_its_routing_table():
+@pytest.mark.parametrize("routed", ["gather", "scatter"])
+def test_a_routed_products_reverse_pass_reads_it_as_varying_as_its_routing_table(routed):
     """A fused product's VJP in a checked `shard_map`, its tokens, weight and sizes every device's and its
-    routing table each device's own, under a consumer of no sides (`-y`): its reverse pass types the
-    product varying as its table does, as its forward did, its tokens' gradient the unfused program's
-    (row 9808)."""
-    tokens = jnp.asarray(np.random.default_rng(98080).integers(-3, 4, (4, 8)), jnp.bfloat16)
+    routing table (a gather, or a scatter's permutation) each device's own, under a consumer of no sides
+    (`-y`): its reverse pass types the product varying as its table does, as its forward did, its tokens'
+    gradient the unfused program's (row 9808)."""
+    tokens = jnp.asarray(np.random.default_rng(98080).integers(-3, 4, (8, 8)), jnp.bfloat16)
     weight = jnp.eye(8, dtype=jnp.bfloat16)[None]
-    tables = jnp.asarray([0, 1, 2, 3, 3, 2, 1, 0], jnp.int32)
+    tables = jnp.asarray([0, 1, 2, 3, 4, 5, 6, 7, 7, 6, 5, 4, 3, 2, 1, 0], jnp.int32)
     mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
     data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
-    sizes = jnp.asarray([4], jnp.int32)
+    sizes = jnp.asarray([8], jnp.int32)
 
     def each_device(x, w, table, *, fused):
+        tables = {routed: table}
+
         def region(x, w):
-            y = (fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, gather=table, interpret_on_cpu=True)
-                 if fused else jax.lax.ragged_dot(x[table], w, sizes, preferred_element_type=jnp.float32))
+            if fused:
+                y = fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True, **tables)
+            else:
+                rows = x[table] if routed == "gather" else x
+                y = jax.lax.ragged_dot(rows, w, sizes, preferred_element_type=jnp.float32)
+                y = y if routed == "gather" else jnp.empty_like(y).at[table].set(y)
             return -y
         program = functools.partial(fused_gemm.fused, region) if fused else region
-        return jax.grad(lambda x: jnp.sum(program(x, w)))(x)
+        return jax.grad(lambda x: jnp.sum(program(x, w) * jnp.arange(8, dtype=jnp.float32)))(x)
 
     def mapped(*, fused):
         return jax.jit(jax.shard_map(functools.partial(each_device, fused=fused), mesh=mesh,
@@ -771,7 +778,8 @@ def test_a_gathered_products_reverse_pass_reads_it_as_varying_as_its_routing_tab
 def test_a_scattered_products_consumer_reads_an_explicitly_placed_side_in_its_rows_order():
     """A fused scattered product under an Explicit mesh, its tokens, weight and permutation whole and its
     residual's rows split over two CPU devices: its consumer reads the residual permuted to the product's
-    rows, placed as the residual is, and adds it as the unfused program does (row 5391)."""
+    rows, placed as the residual is, and its value and gradients are the product's unfused (`gemm.gemm`,
+    then the add), forward and backward (row 5391)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
@@ -781,17 +789,19 @@ def test_a_scattered_products_consumer_reads_an_explicitly_placed_side_in_its_ro
     sizes = jnp.asarray([8], jnp.int32)
 
     def region(x, w, side, *, fused):
-        if fused:
-            y = fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, scatter=scatter, interpret_on_cpu=True)
-        else:
-            y = jax.lax.ragged_dot(x, w, sizes, preferred_element_type=jnp.float32)
-            y = jnp.empty_like(y).at[scatter].set(y)
-        return y + side
+        call = fused_gemm.product if fused else gemm.gemm
+        return call(x, w, sizes, out_dtype=jnp.float32, scatter=scatter, interpret_on_cpu=True) + side
 
-    with jax.set_mesh(mesh), generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+    def both(side, *, fused):
+        program = (functools.partial(fused_gemm.fused, functools.partial(region, fused=True)) if fused
+                   else functools.partial(region, fused=False))
+        out, pull = jax.vjp(program, tokens, weight, side)
+        return out, pull(jnp.ones_like(out))
+
+    with jax.set_mesh(mesh), generation.assumed("sm90"):
         side = jax.device_put(jnp.arange(64, dtype=jnp.float32).reshape(8, 8),
                               NamedSharding(mesh, PartitionSpec("data")))
-        got = jax.jit(lambda *a: fused_gemm.fused(functools.partial(region, fused=True), *a))(
-            tokens, weight, side)
-        want = jax.jit(functools.partial(region, fused=False))(tokens, weight, side)
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        got = jax.jit(functools.partial(both, fused=True))(side)
+        want = jax.jit(functools.partial(both, fused=False))(side)
+    for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        np.testing.assert_array_equal(np.asarray(g, np.float32), np.asarray(w, np.float32))
