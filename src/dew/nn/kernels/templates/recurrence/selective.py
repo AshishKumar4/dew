@@ -627,9 +627,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan, t
                 rate = parameters_ref[n, channel]
                 bs, cs = load(b_ref.at[row, n, span]), load(c_ref.at[row, n, span])
                 a = algebra.selective_decay(dts, rate, kept)
-                # `dt x` formed in the loop: held across it, its 8 words took the GH200's backward past its
-                # three-program cap at 8 tokens, stepping it to 4 (6.25 ms against 6.03, M-JS-243).
-                written = dts * xs * bs
+                written = dts * xs * bs  # dt x held across the loop spilled 8 tokens to 4 (M-JS-243)
                 entering = entered_ref[row, k, n, channel]
                 read = cs * dys
                 before, after, carried[0, n] = (
