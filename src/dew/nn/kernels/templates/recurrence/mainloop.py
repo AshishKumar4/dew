@@ -1708,15 +1708,13 @@ def _weighted_swizzles(call: Call, keyed: int) -> dict:
 
 
 def _weighted_split(call: Call, keyed: int, once: tuple[str, ...]) -> tuple[dict, dict]:
-    """`_weighted`'s streams' blocks at key block `keyed` (`_weighted_streamed`) split into those its walk
-    steps through and those loaded `once`; a once stream the launch has not refused, as a name matching none
-    of its parts left every step reloading it unseen (#3771's review: 'inverse' named none of its parts)."""
-    streamed = _weighted_streamed(call, keyed)
-    if missing := set(once) - set(streamed):
-        raise ValueError(f"_weighted's once streams {sorted(missing)} are none of its streams "
-                         f"{sorted(streamed)}")
-    return ({name: block for name, block in streamed.items() if name not in once},
-            {name: block for name, block in streamed.items() if name in once})
+    """`_weighted`'s streams' blocks at key block `keyed` (`_weighted_streamed`) split by name in one pass
+    into those its walk steps through and those loaded `once` (`_weighted_once`, its names the streams' own
+    parts': `part_names` and `vector_blocks`, as `_weighted_streamed` names them)."""
+    stepped, held = {}, {}
+    for name, block in _weighted_streamed(call, keyed).items():
+        (held if name in once else stepped)[name] = block
+    return stepped, held
 
 
 def _weighted_once(call: Call) -> tuple[str, ...]:

@@ -41,3 +41,22 @@ def test_a_turned_training_step_certifies_the_launch_it_runs_once():
         jax.jit(formed('fast', gradients)).trace(shaped).lower(lowering_platforms=('cuda',))
     pulled = [each.config for each in report.certifications() if id(each) not in before and each.pulled]
     assert pulled and len(set(pulled)) == len(pulled), pulled
+
+
+def test_a_forked_turned_call_binds_its_rotation_in_its_frames_dtype():
+    """A forked turned call's documents' load rotation, as its selector binds the launch
+    (`recurrence_chunk._turned_shapes`), is in its frames' dtype (`turned.frames`, its turns' at least fp32):
+    fp64 turns under x64 bind an fp64 rotation, fp32 and 16-bit turns an fp32 one, where a rotation bound
+    fp32 whatever the turns certified a launch an fp64 call never ran (row 12402)."""
+    from dew.nn.kernels.chunked_launch import Forked
+    from dew.nn.kernels.recurrence_chunk import _turned_shapes
+    from dew.nn.kernels.templates.recurrence import turned
+
+    with jax.enable_x64(new_val=True):
+        for dtype in (jnp.float64, jnp.float32, jnp.bfloat16):
+            turn = jnp.zeros((1, 8, 2, 4), dtype)
+            heads = jax.ShapeDtypeStruct((1, 8, 2, 16), jnp.float32)
+            documents = jnp.zeros((1, 2), jnp.int32)
+            forked = Forked(documents, documents, documents, None, 1)
+            _, _, bound = _turned_shapes(heads, heads, heads, forked, turn)
+            assert bound.turning[0].dtype == turned.frames(turn)[0].dtype, (dtype, bound.turning[0].dtype)
