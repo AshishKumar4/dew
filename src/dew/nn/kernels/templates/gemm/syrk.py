@@ -690,3 +690,19 @@ class MosaicSyrk(TilesTemplate):
 
 MOSAIC_SYRK = MosaicSyrk()
 """The singleton Mosaic SYRK launch on the shared `Template`/`KernelOp` certification path."""
+
+
+def measured_gram(target: generation.GpuTarget, shape: tuple[int, int, int], transpose: bool) -> bool:
+    """Whether symmetric Gram `shape` (`[batch, d0, d1]`) is admitted on `target` by real GPU receipts:
+    `M-NG-45-a100` (1.66-1.80x XLA, 10/10 digests equal) and `M-NG-45b-gh200` (1.52-1.91x XLA, 8/8 digests
+    equal) proved whole-tile stacked `mma.sync`/`wgmma` Gram beats XLA, while ragged shapes lost 1.54-2.53x
+    from pad+slice launches (row 11941)."""
+    if generation.tpu(target):
+        return False
+    _, d0, d1 = shape
+    m, k = (d1, d0) if transpose else (d0, d1)
+    if target.family == "mma.sync":
+        return m >= 256 and m % 128 == 0 and k % 32 == 0
+    if target.family == "wgmma":
+        return m >= 256 and m % 256 == 0 and k % 64 == 0
+    return False

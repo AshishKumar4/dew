@@ -174,12 +174,14 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
     """Native Hopper `cluster=2` dense forward with a verified nonempty balanced `Tail` holds check 1
     against XLA dot_general from float64 truth at Qwen3.5-4B q dX outlier shape (row 10151)."""
     from dew.nn.kernels import gemm, grouped_matmul, tuning
-    from dew.nn.kernels.templates.gemm import pricing, tiling
+    from dew.nn.kernels.templates.gemm import tiling
     tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
     target = generation.gpu_target()
-    assert pricing.dense_tail(tile, jnp.bfloat16, (2048, 2560, 8192), (2, 2), target,
-                              target.multiprocessors or 132) is not None
-
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    ba = launch.bind(bf16((2048, 8192)), bf16((1, 8192, 2560)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                     out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+    assert launch.legal(ba, tile, target) and launch._tail(ba, tile, target)[1] is not None
     def draw(seed):
         rng = np.random.default_rng(10151 + seed)
         return ((rng.normal(size=(2048, 8192)) / np.sqrt(8192)).astype(jnp.bfloat16),

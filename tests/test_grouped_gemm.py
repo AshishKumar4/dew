@@ -1513,11 +1513,10 @@ def test_sm80_prefetch_registers_and_tgmm_prefetch_predicate():
         assert not gmm.legal(ba_fwd, t320, sm80)
         assert gmm.legal(ba_fwd, t128, sm80)
         fam = pricing.family_of(t128, jnp.bfloat16)
-        assert mosaic_gpu.tgmm_prefetches(fam, unstaged=True, rewritten=False, k_major=False,
-                                          interpret=False, scaled=False, summed=False)
+        assert not mosaic_gpu.tgmm_prefetches(fam, unstaged=True, rewritten=False, k_major=False,
+                                              interpret=False, scaled=False, summed=False)
         assert not mosaic_gpu.tgmm_prefetches(fam, unstaged=False, rewritten=False, k_major=False,
                                               interpret=False, scaled=False, summed=False)
-        assert tgmm.legal(ba_dw, t128, sm80) and tgmm.legal(ba_dw, t128_k64, sm80)
         cases = [
             KernelCase("sm80_fwd_128x128x32", lambda: gmm.lowering(ba_fwd, t128)),
             KernelCase("sm80_dw_128x128x32", lambda: tgmm.lowering(ba_dw, t128)),
@@ -1946,9 +1945,10 @@ def test_underfilled_dense_gemm_derives_depth_split_and_holds_check_1():
         assert dx_tile is not None and dx_tile.splits > 1, dx_tile
 
 
-def test_sm80_transposed_dx_enables_fragment_prefetch_with_granule_registers():
-    """Ampere `CpAsync` `gmm` enables cross-step fragment prefetch for transposed `dX` (`trans_rhs=True`)
-    and prices its extra transposed rhs granule in `pricing.prefetch_registers` (row 5271)."""
+def test_sm80_transposed_dx_and_tgmm_skip_regressing_fragment_prefetch():
+    """Ampere `CpAsync` skips cross-step fragment prefetch on transposed `dX` (`M-FS-53-a100`, `M-NG-2-a100`:
+    gate_up dX +32-34% slower) and `tgmm` (`M-NG-45-a100`: dW geomean 1.019x, 4B key +11.6%), keeping forward
+    untransposed prefetch active with its +16/+32 register cost (row 5271)."""
     from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
 
     launch = grouped_matmul.MosaicGmm()
@@ -1959,7 +1959,9 @@ def test_sm80_transposed_dx_enables_fragment_prefetch_with_granule_registers():
         tile = tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
         fam = pricing.family_of(tile, jnp.bfloat16, target)
         assert mosaic_gpu.prefetches(fam, matrices=1, prologue=None, scaled=False, chained=False,
-                                     interpret=False, transposed=(False, True), summed=False)
+                                     interpret=False, transposed=(False, False), summed=False)
+        assert not mosaic_gpu.prefetches(fam, matrices=1, prologue=None, scaled=False, chained=False,
+                                         interpret=False, transposed=(False, True), summed=False)
         fwd_ba = launch.bind(bf16((1024, 1024)), bf16((1, 1024, 1024)), one, out_dtype="bfloat16",
                              trans_rhs=False, interpret=False, dense=True)
         dx_ba = launch.bind(bf16((1024, 1024)), bf16((1, 1024, 1024)), one, out_dtype="bfloat16",
@@ -1968,4 +1970,30 @@ def test_sm80_transposed_dx_enables_fragment_prefetch_with_granule_registers():
                                               rewritten=False)
         dx_regs = pricing.prefetch_registers(fam, tile, ba=dx_ba, staged_rows=False, unstaged=False,
                                              rewritten=False)
-        assert fwd_regs == 16 and dx_regs > fwd_regs, (fwd_regs, dx_regs)
+        assert fwd_regs == 16 and dx_regs == 0, (fwd_regs, dx_regs)
+
+
+def test_explicit_target_b200_gathered_settles_under_ambient_sm80():
+    """Deriving and settling a B200 (`sm100`) gathered tile under ambient `sm80` binds `sm100`'s
+    register/raise facts via `generation.as_target(target)` instead of crashing on Ampere's `None` raises
+    (row 12098)."""
+    from dew.nn.kernels.templates import resources
+    from dew.nn.kernels.templates.gemm import producers
+
+    launch = grouped_matmul.MosaicGmm()
+    sm100 = generation.gpu_target("sm100")
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    gather = jax.ShapeDtypeStruct((256,), jnp.int32)
+    ba = launch.bind(bf16((256, 256)), bf16((2, 256, 256)), sizes, (), (), None, None, gather,
+                     out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=False)
+    # Cold cache under ambient sm80 first so `_DERIVED` cannot mask derivation or producer settlement.
+    with generation.assumed("sm80"):
+        got = launch.derived(ba, sm100)
+        assert got is not None and got.producers.of(launch.KERNEL) is not None
+        unsettled = dataclasses.replace(got, producers=resources.Producers())
+        assert not launch._refused(ba, unsettled, sm100)
+        assert producers.settled(launch, ba, unsettled, sm100) == got
+    with generation.assumed("sm100"):
+        want = producers.settled(launch, ba, unsettled, sm100)
+    assert got == want

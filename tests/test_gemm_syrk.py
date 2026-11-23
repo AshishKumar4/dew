@@ -154,13 +154,13 @@ def test_syrk_polynomial_pinned_ragged_tile_and_skew_cotangent():
 
 @lowers("sm90")
 def test_unforced_syrk_skips_mosaic_certification_while_forced_certifies():
-    """Default (unforced) BF16 SYRK declines on `measured` before certifying `MosaicSyrk`, while forced
+    """Default (unforced) ragged BF16 SYRK declines on `measured` before certifying `MosaicSyrk`, while forced
     `grouped_matmul='mosaic'` certifies `MosaicSyrk` on the compile-only device (row 11941)."""
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.templates import report
 
-    x = jax.ShapeDtypeStruct((2, 256, 256), jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((4, 150, 200), jnp.bfloat16)
     before_default = {id(c) for c in report.certifications()}
     with report.refusals(), report.certifying(generation.compile_only_gpus("sm90")[0]):
         lowered_for(lambda operand: gemm.symmetric_gram(operand), (x,), "sm90")
@@ -173,6 +173,23 @@ def test_unforced_syrk_skips_mosaic_certification_while_forced_certifies():
         lowered_for(lambda operand: gemm.symmetric_gram(operand), (x,), "sm90")
     assert any(id(c) not in before_forced and c.op == type(syrk.MOSAIC_SYRK).__name__
                for c in report.certifications())
+
+
+def test_syrk_measured_gate_admits_whole_tile_ampere_and_hopper_gram_only():
+    """`M-NG-45-a100` & `M-NG-45b-gh200` admit whole-tile `mma.sync`/`wgmma` symmetric Gram (1.52-1.91x XLA)
+    while keeping ragged shapes, polynomials (pending native Check 1), and unmeasured `sm100` on XLA."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    for gpu in ("sm80", "sm90"):
+        with generation.assumed(gpu):
+            assert gemm._syrk_select(bf16((28, 2560, 4096)), has_poly=False, transpose=False,
+                                     precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+            assert not gemm._syrk_select(bf16((4, 150, 200)), has_poly=False, transpose=False,
+                                         precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+            assert not gemm._syrk_select(bf16((28, 2560, 2560)), has_poly=True, transpose=False,
+                                         precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+    with generation.assumed("sm100"):
+        assert not gemm._syrk_select(bf16((28, 2560, 4096)), has_poly=False, transpose=False,
+                                     precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
 
 
 @INTERPRETS
