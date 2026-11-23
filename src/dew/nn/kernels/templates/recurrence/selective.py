@@ -370,15 +370,24 @@ def backward_plan(target: generation.GpuTarget) -> tuple[int, int]:
     at 8x2048x5120 in 6.43 ms, 16 at two 6.48, 4 at four 7.48, and fewer programs than the registers hold
     longer at each (8 at two 8.10, 4 at three 8.53): ptxas filled the registers a cap left it, and the step
     slowed (sel-sweep-sxm at f3040b154)."""
-    plans = []
+    def steps(fit):
+        positions, programs = fit
+        return (2 * positions + 2 * SCAN_STEPS) / (positions * programs), -programs
+
+    return min(backward_fits(target), key=steps)
+
+
+def backward_fits(target: generation.GpuTarget) -> list[tuple[int, int]]:
+    """Each backward token count a thread of `target` holds the registers of, from one doubling
+    (`backward_registers`), with the programs a multiprocessor holds of it (`backward_programs`), those
+    holding one at least: the plans `backward_plan` weighs and the tuner times (`Selective.neighbours`)."""
+    fits = []
     positions = 1
     while backward_registers(positions) <= target.multiprocessor.thread_registers:
-        programs = backward_programs(backward_registers(positions), target)
-        if programs:
-            plans.append(((2 * positions + 2 * SCAN_STEPS) / (positions * programs), -programs, positions))
+        if programs := backward_programs(backward_registers(positions), target):
+            fits.append((positions, programs))
         positions *= 2
-    _, programs, positions = min(plans)
-    return positions, -programs
+    return fits
 
 
 def block_positions(length: int, positions: int) -> int:
@@ -875,6 +884,9 @@ class Selective(base.Template[Tiles]):
     name: ClassVar[str] = "mosaic_gpu"
     config_cls: ClassVar[type[Tiles]] = Tiles
     GENERATES: ClassVar[bool] = True
+    # 2: the backward's exp2, its token-only products and its scans' fused joins (row 1300) change its speed
+    # at every config, so a pick measured before them stops matching (`tuning.KernelOp.revision`).
+    revision: int = 2
 
     def _fwd(self, x, dt, A, B, C, D, state=None, starts=None, *, forked: Forked | None = None,
              interpret: bool = False, config: Tiles, return_residuals: bool = False):
@@ -921,14 +933,11 @@ class Selective(base.Template[Tiles]):
         ones): the backward at every other token count a thread's registers hold, each at its own residency
         (`backward_programs`), and the derived tokens at one program a multiprocessor fewer, as the H100's
         sweep timed them (8 tokens at three programs 6.43 ms, at two 8.10, 16 at two 6.48, sel-sweep-sxm at
-        f3040b154); and the forward's chunk halved and doubled. On an A100 the plan took the fewest tokens of
-        its model's ties, 119 registers at four programs (occupancy 24.9%): its backward 14.33 ms beside
-        mamba_ssm's 9.91, about 1.6 times the instructions issued (M-JS-240)."""
+        f3040b154); and the forward's chunk halved and doubled. An A100 ran 4 tokens at four programs (119
+        registers, occupancy 24.9%), its backward 14.33 ms beside mamba_ssm's 9.91 (M-JS-240, M-JS-241)."""
         facts = self._facts(ba, self.launch_target())
-        held = facts.multiprocessor.thread_registers
-        counts = [1 << power for power in range(8) if backward_registers(1 << power) <= held]
-        stepped = [Tiles(config.chunk, positions, backward_programs(backward_registers(positions), facts))
-                   for positions in counts if positions != config.positions]
+        stepped = [Tiles(config.chunk, positions, programs) for positions, programs in backward_fits(facts)
+                   if positions != config.positions]
         fewer = [dataclasses.replace(config, resident=config.resident - 1)] if config.resident > 1 else []
         chunks = [dataclasses.replace(config, chunk=chunk) for chunk in (config.chunk // 2, 2 * config.chunk)
                   if CHUNK <= chunk <= block_scan.THREADS]

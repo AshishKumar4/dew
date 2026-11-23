@@ -691,6 +691,58 @@ def test_the_tuners_variants_lead_with_the_derived_config_each_legal(target):
         assert all(selective.SELECTIVE.legal(bound, tiles, facts) for tiles in variants)
 
 
+VARIANT_KINDS = ('1 token', '2 tokens', '4 tokens', '8 tokens', '16 tokens', 'a program fewer', 'chunk doubled')
+"""The configs the opt-in tuner may pick for the interpreted shape (`Selective.neighbours`), each a check-1 site
+of its own: its backward at each token count, its derived tokens at a program fewer, its chunk doubled (its
+derived chunk the shortest, 32, none halved)."""
+
+
+def _variant(kind: str) -> selective.Tiles:
+    """The interpreted shape's tuner variant `kind` (`VARIANT_KINDS`) among `Selective.variants`: its backward
+    at that many tokens, its derived tokens at a program fewer, or its chunk doubled."""
+    bound = _bound(SHAPES["interpreted"][1])
+    derived, *neighbours = selective.SELECTIVE.variants(bound)
+    if kind.endswith(('token', 'tokens')):
+        positions = int(kind.split()[0])
+        return next(tiles for tiles in (derived, *neighbours)
+                    if tiles.positions == positions and tiles.chunk == derived.chunk
+                    and (tiles.resident == derived.resident or positions != derived.positions))
+    if kind == 'a program fewer':
+        return next(tiles for tiles in neighbours
+                    if tiles.positions == derived.positions and tiles.resident == derived.resident - 1)
+    return next(tiles for tiles in neighbours if tiles.chunk == 2 * derived.chunk)
+
+
+@pytest.mark.parametrize('kind', VARIANT_KINDS)
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_every_tuner_variant_is_as_exact_interpreted(kind):
+    """Each config the opt-in tuner may pick (`Selective.variants`, `kernel-templates.md`: every config a
+    tuning run may pick held to the gate), interpreted: the scan's output and every input's gradient on par
+    from float64 with the portable scan's (check 1), its backward's tokens a thread, residency and the
+    forward's chunk each changing which thread and block computes a token (row 12343)."""
+    the_template_is_as_exact_as_its_reference("interpreted", packed=False, tiles=_variant(kind))
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+def test_a_pullback_takes_each_operands_gradient_in_its_own_dtype_interpreted():
+    """The template's scan with `x` in fp16 and the step `dt` in fp32, interpreted: its pullback's
+    gradients in their operands' dtypes, the backward storing `dx` and `ddt` each in its own (row 1300: a
+    custom derivative's cotangent of another dtype is refused), every gradient on par from float64 with the
+    portable scan's (check 1)."""
+    rows, length, channels, states = SHAPES["interpreted"]
+    template = functools.partial(selective.selective_scan, family=taken_family(jnp.float16),
+                                 interpret=INTERPRETED)
+
+    def draws(seed):
+        (x, dt, *rest), _, dy = draw(jnp.float16, seed, rows, length, channels, states, False)
+        return (x, dt.astype(jnp.float32), *rest, dy)
+
+    templated = jax.jit(with_gradients(scanned(template, None)))
+    reference = jax.jit(with_gradients(scanned(portable, None)))
+    assert_as_exact(run_to_run(templated, ATOMIC), reference, draws, "the selective template, mixed dtypes",
+                    seeds=FEWEST_SEEDS, truth_fn=reference)
+
+
 @pytest.mark.parametrize('length', [129, 2048], ids=['129 tokens', '2048 tokens'])
 def test_a_chunk_walks_no_more_padding_than_the_shortest(length):
     """The forward's derived chunk on an H100's facts walks the call's tokens padded to the shortest chunk's
