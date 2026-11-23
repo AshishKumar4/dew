@@ -1000,9 +1000,11 @@ class RunConfig:
         parsed = tyro.cli(tyro.conf.CascadeSubcommandArgs[parser], args=given, default=held)
         if parsed is None:
             raise ValueError("the command line built no run config")
-        return cls(**{field.name: value.recorded()
-                      if isinstance(value := vars(parsed)[field.name], Registered) else value
-                      for field in dataclasses.fields(cls)})
+        values = {field.name: vars(parsed)[field.name] for field in dataclasses.fields(cls)}
+        for name, value in values.items():
+            if isinstance(value, Registered):
+                values[name] = value.recorded()
+        return cls(**values)
 
     @classmethod
     def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
