@@ -553,6 +553,7 @@ def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
     (rows 3733, 8548)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
+    from low_precision_support import decoded_weight_dot
 
     def draw(seed):
         rng = np.random.default_rng(8548 + seed)
@@ -561,18 +562,13 @@ def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
         scale = jnp.asarray(rng.uniform(0.5, 2.5, size=(64,)), jnp.float32)
         return x, formats.Fp8Weights.of(w, fmt=fmt, scale=scale)
 
-    def plain(x, weights, *, dtype=jnp.float32):
-        w_dec = (weights.decoded(jnp.float64) if dtype == jnp.float64
-                 else weights.decoded(jnp.bfloat16).astype(dtype))
-        return jax.lax.dot(x.astype(dtype), w_dec, preferred_element_type=dtype)
-
     for interpret in (False, True):
         def dew_fn(x, weights, *, interpret=interpret):
             return gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32, interpret_on_cpu=interpret)
 
-        assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, f"fp8_weight_product {fmt} interp={interpret}",
-                        seeds=8, truth_fn=functools.partial(plain, dtype=jnp.float64))
-
+        assert_as_exact(jax.jit(dew_fn), jax.jit(decoded_weight_dot), draw,
+                        f"fp8_weight_product {fmt} interp={interpret}",
+                        seeds=8, truth_fn=functools.partial(decoded_weight_dot, dtype=jnp.float64))
     # Exact single-scale check on default XLA and interpreted Mosaic routes (scale = 2.0 must apply once).
     ones = jnp.ones((64, 64), jnp.bfloat16)
     scaled_w = formats.Fp8Weights.of(jnp.full((64, 64), 2.0, jnp.float32), fmt=fmt, scale=2.0)
@@ -640,17 +636,10 @@ def test_stage_decoded_fp8_preserves_nonfinite_codewords(fmt: str):
     staged_codes = codes[formats.fp8_staged_rows(64), :]
     packed_words = bits.fp8_packed(jnp.asarray(staged_codes.T, jnp.uint32), minifloat)
 
-    class _Ref:
-        def __init__(self, arr):
-            self.arr = np.asarray(arr)
-        def __getitem__(self, key):
-            return jnp.asarray(self.arr) if key is Ellipsis else jnp.asarray(self.arr[key])
-        def __setitem__(self, key, val):
-            rows, sl = key
-            self.arr[rows, sl.start:sl.start + sl.size] = np.asarray(val)
+    from low_precision_support import StageRef
 
-    out = _Ref(np.zeros((64, 64), dtype=jnp.bfloat16))
-    packed.stage_decoded_fp8([_Ref(packed_words)], out, fmt, interpret=True)
+    out = StageRef(np.zeros((64, 64), dtype=jnp.bfloat16))
+    packed.stage_decoded_fp8([StageRef(packed_words)], out, fmt, interpret=True)
     inv = np.argsort(formats.fp8_staged_rows(64))
     expected = bits.fp8_codes(packed_words.T, minifloat, jnp.bfloat16)[inv].T
     np.testing.assert_array_equal(

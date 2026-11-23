@@ -424,6 +424,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         if tile is None:
             return None
         return producers.settled(self, ba, tile, target)
+
     def _tile(self, ba, target) -> tiling.Tiles | None:
         return self._derived(ba, target)
 
@@ -446,6 +447,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         from .templates import report
         from .templates.gemm import producers
         return report.refused(self, ba, producers.settled(self, ba, config, target), target)
+
     def _derived(self, ba, target, admits=None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole
@@ -1476,6 +1478,7 @@ class MosaicFp8PackedGmm(MosaicGmm):
     """`MosaicGmm` of free-layout FP8 weights (`formats.Fp8Weights`, `gemm.fp8_weight_product`, row 8548):
     bfloat16 rows times staged uint32 FP8 words decoded inline via `bits.E4M3_BFLOAT16_FORM`/`E5M2`."""
     STEPS: ClassVar[tuple[int, ...] | None] = (packed.FP8_STEP, 2 * packed.FP8_STEP)
+    WEIGHT_BYTES: ClassVar[float] = 1.0
 
     def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
         del trans_rhs
@@ -1506,7 +1509,8 @@ class MosaicFp8PackedGmm(MosaicGmm):
     def _operand_bytes(self, ba, tile: tiling.Tiles) -> tuple[tuple[float, float], tuple]:
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
         copies = 1 if packed.shared_decode(tile, interpret=False) else tile.warpgroups
-        return (jnp.dtype(tokens.dtype).itemsize, 1.0), (None, (jnp.dtype(kernel.dtype).itemsize, copies))
+        return (jnp.dtype(tokens.dtype).itemsize, self.WEIGHT_BYTES), (
+            None, (jnp.dtype(kernel.dtype).itemsize, copies))
 
     def _registers(self, ba, config: tiling.Tiles, *, merging: bool, target) -> int | None:
         from ...algebra import bits

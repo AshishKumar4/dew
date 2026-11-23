@@ -130,28 +130,15 @@ def xla_flag(name: str) -> str | None:
     return _flag(os.environ.get('XLA_FLAGS', ''), name)
 
 
-def xla_flag_values(name: str) -> list[str]:
-    """Each value `--<name>` carries in XLA_FLAGS, in order, a bare `--<name>` 'true': a flag XLA's parser
-    reads occurrence by occurrence (a list of kinds amended by `+KIND`s and `-KIND`s,
-    `dew.telemetry.benchmark.graphs`), where `xla_flag` reads its last."""
-    return _flags(os.environ.get('XLA_FLAGS', ''), name)
-
-
-def _flags(flags: str, name: str) -> list[str]:
-    """Each value `--<name>` carries in `flags`, in order (`xla_flag_values`)."""
-    values = []
+def _flag(flags: str, name: str) -> str | None:
+    """The value `--<name>` carries in `flags`, as `xla_flag` reads it."""
+    value = None
     for token in flags.split():
         if token == f"--{name}":
-            values.append('true')
+            value = 'true'
         elif token.startswith(f"--{name}="):
-            values.append(token.split('=', 1)[1])
-    return values
-
-
-def _flag(flags: str, name: str) -> str | None:
-    """The value `--<name>` carries in `flags`, as `xla_flag` reads it: its last occurrence's."""
-    values = _flags(flags, name)
-    return values[-1] if values else None
+            value = token.split('=', 1)[1]
+    return value
 
 
 def keep_roundings() -> None:
