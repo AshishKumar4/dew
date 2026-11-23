@@ -21,10 +21,12 @@ TILE = 64
 INTERPRETED = plgpu.InterpretGPUParams()
 
 
-def _together(a, b, c, d, issued, *, interpret, predicated: bool = True):
+def _together(a, b, c, d, issued, *, interpret, guard: str = "predicated"):
     """`a @ b` doubled and `c @ d`, both products a warpgroup MMA's (`mosaic_sm90.FED`, one warpgroup),
-    summed together, the first doubled where it is read (`then`); `predicated`, the second issued where
-    `issued[0]` (an int32 a run reads) is nonzero, its accumulator zero elsewhere."""
+    summed together, the first doubled where it is read (`then`); the second issued as `guard` says:
+    "plain", always; "predicated", where `issued[0]` (an int32 a run reads) is nonzero, its accumulator zero
+    elsewhere; "chosen", as the one case of a choice (`Issuer.issued_one_of`) whose products are so
+    predicated within it."""
     family = mosaic_sm90.FED
     widest = resources.copied_rows(TILE, jnp.float32)
 
@@ -34,9 +36,12 @@ def _together(a, b, c, d, issued, *, interpret, predicated: bool = True):
                 swizzling.copied(source, staged)
             mosaic.synced(interpret)
             def second(acc):
-                def issued():
-                    return family.products(acc, c_smem, d_smem)
-                return family.issued_when(issued_gmem[0] != 0, acc, issued) if predicated else issued()
+                def predicated(acc):
+                    return family.issued_when(issued_gmem[0] != 0, acc,
+                                              lambda: family.products(acc, c_smem, d_smem))
+                if guard == "chosen":
+                    return family.issued_one_of(jnp.int32(0), (acc,), lambda case, acc: predicated(acc))[0]
+                return predicated(acc) if guard == "predicated" else family.products(acc, c_smem, d_smem)
 
             readers = family.summed_together(
                 ((TILE, TILE), (TILE, TILE)), (lambda acc: family.products(acc, a_smem, b_smem), second),
@@ -63,13 +68,16 @@ def _operands():
 
 
 @INTERPRETS
+@pytest.mark.parametrize("guard", ["predicated", "chosen"])
 @pytest.mark.parametrize("issued", [1, 0])
-def test_groups_summed_together_are_each_read_into_what_their_caller_makes_of_them(issued):
+def test_groups_summed_together_are_each_read_into_what_their_caller_makes_of_them(issued, guard):
     """Interpreted: two groups of a warpgroup MMA's products summed together, the first read doubled (its
-    `then`), the second issued or not as a run decides: exactly `2 a @ b`, and `c @ d` or zero."""
+    `then`), the second issued or not as a run decides, alone or as a choice's case: exactly `2 a @ b`, and
+    `c @ d` or zero."""
     a, b, c, d = _operands()
     with generation.assumed("sm90"):
-        found = np.asarray(_together(a, b, c, d, jnp.array([issued], jnp.int32), interpret=INTERPRETED))
+        found = np.asarray(_together(a, b, c, d, jnp.array([issued], jnp.int32), interpret=INTERPRETED,
+                                     guard=guard))
     f32 = [np.asarray(x, np.float32) for x in (a, b, c, d)]
     np.testing.assert_array_equal(found, np.stack([2 * f32[0] @ f32[1], issued * (f32[2] @ f32[3])]))
 
@@ -99,17 +107,19 @@ def _groups_and_waits(module: bytes) -> list[str]:
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("predicated", [False, True])
-def test_a_warpgroup_mmas_groups_summed_together_are_each_read_as_their_own_complete(predicated):
+@pytest.mark.parametrize("guard", ["plain", "predicated", "chosen"])
+def test_a_warpgroup_mmas_groups_summed_together_are_each_read_as_their_own_complete(guard):
     """Lowered for an H100: both groups committed before either is read, the first read once its own group
     is done with the second still in flight (a wait leaving one group in flight), then the second; where
-    the second is issued under a predicate a run decides, the first's wait leaves none in flight, as a run
-    that skips the second would read the first unfinished (row 10734; theme K01-e's review P0)."""
+    the second is issued under a predicate a run decides, alone or within the one case of a choice, the
+    first's wait leaves none in flight, as a run that skips the second would read the first unfinished (row
+    10734; theme K01-e's reviews' P0s: a choice's case read as committing its inner predicate's groups)."""
     shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in _operands()] + [
         jax.ShapeDtypeStruct((1,), jnp.int32)]
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        run = jax.jit(lambda *operands: _together(*operands, interpret=False, predicated=predicated))
+        run = jax.jit(lambda *operands: _together(*operands, interpret=False, guard=guard))
         lowered = run.trace(*shapes).lower(lowering_platforms=("cuda",))
     (call,) = [call for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
-    assert _groups_and_waits(call.ir) == ["commit", "commit", "wait 0" if predicated else "wait 1", "wait 0"]
+    first_read = "wait 1" if guard == "plain" else "wait 0"
+    assert _groups_and_waits(call.ir) == ["commit", "commit", first_read, "wait 0"]

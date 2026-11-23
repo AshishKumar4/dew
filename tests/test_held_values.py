@@ -122,5 +122,30 @@ def test_a_program_whose_trace_a_refusal_follows_runs_a_trace_past_it_after():
 
     run, x = owned_program(chosen), jnp.zeros((), jnp.float32)
     with report.refusals():
-        run(x)
-        assert float(run(x)) == 1.0
+        assert float(run(x)) == float(run(x)) == 1.0
+    # Kept by the refusals it traced past alone: a scope of none traces its own (theme K01-e's review P0:
+    # the executable kept under the reservation's refusals too).
+    with report.refusals():
+        assert float(run(x)) == 0.0
+
+
+def test_a_scope_after_another_takes_its_own_trace_again():
+    """A program traced in a scope of no refusals, then in one refusing a launch, then in one of none again,
+    traces its function once a scope's refusals: each holds its own jit, so a scope after another's takes
+    the trace it made (theme K01-e's review P0: a smaller scope's jit lost to a larger one's)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    traced = []
+
+    def chosen(x):
+        traced.append(bool(report.refusals_of("a launch")))
+        return x
+
+    run, x = owned_program(chosen), jnp.zeros((), jnp.float32)
+    for refused in (False, True, False):
+        with report.refusals():
+            if refused:
+                report.refuse([("a launch", 1, ("its kernel",))])
+            run.trace(x)
+    assert traced == [False, True], traced
