@@ -1574,8 +1574,9 @@ def test_a_replicas_holder_whose_read_fails_ends_every_process_of_the_resume(tmp
     step = local_committed(directory, 0, LOCAL_KILL_AFTER).parent
     for written in [*step.rglob("_CHECKPOINT_METADATA"), *step.rglob("_METADATA")]:
         written.write_text("not a checkpoint's metadata")
-    with pytest.raises(AssertionError):
-        run_pool("fit", tmp_path / "resumed", 2, timeout=240, **local_flags(directory))
+    reports = run_pool("fit_refused", tmp_path / "resumed", 2, timeout=240, **local_flags(directory))
+    raised = [report["raised"] for report in reports]
+    assert raised[0] not in (None, "PeerFailure") and raised[1] == "PeerFailure", raised
 
 
 @pytest.fixture(scope="module")
