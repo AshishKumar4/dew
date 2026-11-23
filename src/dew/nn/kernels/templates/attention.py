@@ -2055,15 +2055,23 @@ def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     return arrays, params, (call, starts, cotangent)
 
 
-def cotangent_shift(dout: jax.Array, value: jax.Array) -> jax.Array:
-    """The power of two `gradients` takes the cotangent beneath, int32: 0 wherever `|dO| |V|` summed over a
-    row's channels stays within fp32 (two binades of headroom, `D`'s difference with `dP` included), else
-    the binades it passes by, so `dP = dO V^T` and `D = dO . O` form finite (values at fp32's largest: each
-    2^130, their difference `inf - inf` where its truth is 0)."""
-    def peak(x: jax.Array) -> jax.Array:
-        return binade_of(jnp.max(jnp.abs(x.astype(jnp.float32)), initial=0.0))
+def value_shift(dout: jax.Array, value: jax.Array, initial: Initial | None) -> jax.Array:
+    """The power of two `gradients` takes the values beneath, int32: 0 wherever `sum_d max|dO_d| max|V_d|`
+    (the largest `|dP|` and `|D|` a call can form, its channels' maxima paired, an initial state's mean among
+    the values) stays under fp32's `2^127`, else the binades it passes by, so `dP = dO V^T`, `D = dO . O` and
+    their difference form finite. Its sum taken at each factor's own largest binade, finite whatever their
+    product."""
+    def channels(x: jax.Array) -> jax.Array:
+        return jnp.max(jnp.abs(x.astype(jnp.float32)).reshape(-1, x.shape[-1]), axis=0, initial=0.0)
 
-    reach = peak(dout) + peak(value) + value.shape[-1].bit_length() + 2
+    cotangents, values = channels(dout), channels(value)
+    if initial is not None and not initial.valueless:
+        total = initial.total.astype(jnp.float32)[..., None]
+        mean = initial.acc.astype(jnp.float32) / jnp.where(total > 0, total, 1)
+        values = jnp.maximum(values, channels(mean))
+    lead_o, lead_v = binade_of(jnp.max(cotangents)), binade_of(jnp.max(values))
+    held = jnp.sum(power2(cotangents, -lead_o) * power2(values, -lead_v))
+    reach = binade_of(held) + lead_o + lead_v
     return jax.lax.stop_gradient(jnp.maximum(reach - 126, 0)).astype(jnp.int32)
 
 
@@ -2094,11 +2102,19 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
-    # The cotangent at an exact power of two beneath it (`cotangent_shift`), every gradient raised by it last:
-    # each is linear in the cotangent, so a call whose `dO V` stays within fp32 shifts by 0 and rounds as it
-    # did, and one past it forms `dP`, D and their difference finite (row 12450).
-    shift = cotangent_shift(dout, value)
-    dout = power2(dout, -shift).astype(dout.dtype)
+    # The values at an exact power of two beneath them (`value_shift`), with the split sums and the initial
+    # state's sums they weigh, and each gradient linear in them (dQ, dK, the hooks' and the state's maximum
+    # and denominator) raised by it last; dV and the state's sums' gradients read no value and move not. A
+    # call whose `dO V` stays within fp32 shifts by 0 and rounds as it did; one past it forms `dP`, D and
+    # their difference finite (values at fp32's largest: each 2^130, `inf - inf` where its truth is 0).
+    shift = value_shift(dout, value, hooks.initial)
+    value = power2(value, -shift).astype(value.dtype)
+    maxima, totals, anchors, split = residuals
+    residuals = (maxima, totals, anchors,
+                 split._replace(others=power2(split.others, -shift).astype(split.others.dtype)))
+    if hooks.initial is not None:
+        hooks = dataclasses.replace(hooks, initial=dataclasses.replace(
+            hooks.initial, acc=power2(hooks.initial.acc, -shift).astype(hooks.initial.acc.dtype)))
 
     def raised(grad: jax.Array) -> jax.Array:
         return power2(grad, shift).astype(grad.dtype)
@@ -2112,9 +2128,10 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     kinds = params["score_kinds"]
     outputs = launch(*arrays, **params)
     dq, softmax = raised(outputs[0]), outputs[1:7]
-    grads_out = [raised(grad) for grad in outputs[8:]]
-    dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
+    grads_out = list(outputs[8:])
+    dq_grads = [raised(grads_out.pop(0)) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
+    dk, key_grads = raised(dk), [raised(grad) for grad in key_grads]
     delta, anchor, peak, total, mass, lost = (array[:, :, :queries] for array in softmax)
     # D and what its two roundings lost, its refinement's (`lost`, `gradient.dq_finish`) and its anchor's sum.
     delta, low = two_sum(anchor, delta)
@@ -2184,7 +2201,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         initial = dataclasses.replace(
             state, m=raised(jnp.where(mass > 0, moved, 0.0)).astype(state.m.dtype),
             total=raised(-weighed).astype(state.total.dtype),
-            acc=raised((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
+            acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
     # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
     key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded
