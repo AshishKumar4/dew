@@ -18,7 +18,13 @@ from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, dew_path
 from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, emission, merged
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    emission,
+    merged,
+    merged_mosaic,
+)
 
 SPECS = {"natural": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True)),
          "fold": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=0.125, natural=False,
@@ -295,7 +301,7 @@ def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
 @pytest.mark.parametrize("cases", ["widths-narrow", "widths-wide", "shapes-finished", "shapes-long"])
 @pytest.mark.parametrize("name", ["sm80", "sm90", "sm100"])
 def test_a_padded_merge_compiles_as_one_launch(name, cases):
-    """The padded merge's one Mosaic GPU launch (`merged._launch_mosaic`, row 9795) compiles spill-free for
+    """The padded merge's one Mosaic GPU launch (`merged_mosaic.launch`, row 9795) compiles spill-free for
     compile-only Ampere, Hopper and Blackwell GPUs in one process per GPU across: value widths 80, 96, 100,
     128 and 192 (predicated coalesced GMEM loads/stores); a `jax.vmap` batch of three splits (beside nothing
     but the one transpose that folds it, every launch typed by `assembled.launched_thunks`); `merged_finished`
@@ -392,7 +398,7 @@ def test_padded_merge_routes_nvidia_mosaic_and_keeps_triton_fallback():
 
 
 def test_replicated_channel_merge_matches_value_with_subnormal_initial_mass():
-    """Rows 9795, 11857: replicating row stats across `[chunk, block]` (the layout `_launch_mosaic` uses
+    """Rows 9795, 11857: replicating row stats across `[chunk, block]` (the layout `merged_mosaic.launch` uses
     for zero-SMEM Mosaic GPU lowering) matches `merged._value` bit-for-bit on regular and subnormal
     (`2^-127`) initial-mass merges."""
     from dew.algebra import windows
@@ -580,10 +586,10 @@ def _mosaic_kernel_body(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDt
                         out_dtype=None, out_heads: int | None = None, output_mod=None,
                         output_kinds: tuple[template.Kind, ...] = (),
                         output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()):
-    """Trace `_launch_mosaic` and return its kernel equation and body jaxpr."""
+    """Trace `merged_mosaic.launch` and return its kernel equation and body jaxpr."""
     family = generation.family(target.generation) or "mma.sync"
     launch = functools.partial(
-        merged._launch_mosaic, units=algebra.units_of(spec), queries=queries, width=width, block=block,
+        merged_mosaic.launch, units=algebra.units_of(spec), queries=queries, width=width, block=block,
         out_dtype=out_dtype, out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds,
         family=family)
     with generation.as_target(target):
