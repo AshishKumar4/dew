@@ -137,7 +137,8 @@ def test_a_prepared_sites_reference_as_written_is_prepared_and_fails_dews_arm_in
     assert not (tmp_path / UNPREPARED).exists()
 
 
-def test_a_compile_only_gpu_prepare_holds_a_reference_of_its_own_compiler_options_whole(tmp_path, monkeypatch):
+def test_a_compile_only_gpu_prepare_holds_a_reference_of_its_own_compiler_options_whole(tmp_path,
+                                                                                         monkeypatch):
     """A reference compiled with its own compiler options (`without_ynn`'s, as cuBLASLt's is,
     `generation_support.cublas_compiled`) prepared by a compile-only sm90 GPU-tier part
     (`truths_ahead.prepared`): held whole and read as itself, it prepares, where the store's read of whether
