@@ -238,8 +238,8 @@ def cotangents(operands: Chunk, seed: int) -> tuple[jax.Array, jax.Array]:
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
          value_heads: int = VALUE_HEADS, value_width: int | None = None) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed` (`hosted`), its keys' and values' dimensions each
-    permuted by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
-    and values (`NORMED_WIDTH` wide under the norm), a log decay a head or a key dimension in (-1, 0),
+    permuted by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries (of unit
+    norm where the hooks declare them), keys (`NORMED_WIDTH` wide under the norm), a log decay a head or a key dimension in (-1, 0),
     a gate in (0, 1), a skip, a memory entering, `length` tokens over `value_heads` value heads, the values
     `value_width` wide where given, and with
     `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
@@ -257,7 +257,9 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
                                     2 * hooks.turns + rng.permutation(KEY_WIDTH - 2 * hooks.turns)])
         turn = rng.uniform(-3.0, 3.0, (ROWS, length, value_heads, hooks.turns))
         turned = {'turn': hosted(turn[..., pairs])}
-    query = normal((ROWS, length, KEY_HEADS, KEY_WIDTH))[..., key_order]
+    query = normal((ROWS, length, KEY_HEADS, KEY_WIDTH))
+    # Unit queries where the hooks declare them (`recurrence.Hooks.unit_queries`, Kimi Linear's l2-normed).
+    query = (unit(query) if hooks.unit_queries else query)[..., key_order]
     key = unit(normal((ROWS, length, KEY_HEADS, KEY_WIDTH)))[..., key_order]
     value = normal((ROWS, length, value_heads, width))[..., value_order]
     vector = hooks.decay == 'vector'

@@ -200,8 +200,8 @@ FLOOR_GATES = "kda/tiny gates at the floor/gradient"
 
 
 def _floor_gate_sites() -> dict[str, Site]:
-    """Kimi delta attention under unit keys (test_recurrence_stability's 'vector delta', `write_bound`
-    declared) with every token's log decay near Kimi Linear's floor ((-5, -4.5) a key dimension) and write
+    """Kimi delta attention under unit keys and queries (test_recurrence_stability's 'vector delta',
+    `write_bound` and `unit_queries` declared, its own pairs folded as Kimi Linear's layer runs them) with every token's log decay near Kimi Linear's floor ((-5, -4.5) a key dimension) and write
     gates `2^U(-60, 0)`, in 16 bits with their cotangents: a chunk's own pairs and its system's rows into
     fp32's subnormals at once, which no stability regime draws (row 7906)."""
     import test_recurrence_chunk as chunked
