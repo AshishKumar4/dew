@@ -167,7 +167,12 @@ def _kept(precision: PrecisionLike) -> PrecisionLike:
     unless the dot algorithm it names keeps fewer of an fp32 operand's digits than fp32's
     (`programs.dot_arithmetic`'s `digits`: an F16, BF16 or TF32 preset, or a `jax.lax.DotAlgorithm` of
     such types), which would round them back to those, then `HIGHEST`."""
-    arithmetic = dot_arithmetic(effective_precision(precision), jnp.float32, jnp.float32)
+    try:
+        arithmetic = dot_arithmetic(effective_precision(precision), jnp.float32, jnp.float32)
+    except ValueError:
+        # JAX's own refusal of fp32 operands for the algorithm (an FP8 preset takes FP8 operands alone): it
+        # multiplies narrower ones than fp32's.
+        return jax.lax.Precision.HIGHEST
     narrow = arithmetic is not None and arithmetic.digits < jnp.finfo(jnp.float32).nmant + 1
     return jax.lax.Precision.HIGHEST if narrow else precision
 

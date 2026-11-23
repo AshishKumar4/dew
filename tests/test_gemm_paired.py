@@ -1439,3 +1439,19 @@ def test_an_adapted_products_replicated_gradient_sums_before_it_rounds():
     want = np.zeros((8, 8), np.float16)
     want[0, 0] = 32.0
     np.testing.assert_array_equal(np.asarray(d_kernel), want)
+
+
+def test_an_adapted_products_backward_under_an_fp8_preset_traces():
+    """An adapted product's reverse pass under the `ANY_F8_ANY_F8_F32` preset, which JAX takes for FP8
+    operands alone: its fp32 factor products take `HIGHEST` (`low_rank._kept`) rather than asking JAX the
+    preset's arithmetic for fp32 operands, which it refuses (row 12394)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    x = jax.ShapeDtypeStruct((8, 16), jnp.float8_e4m3fn)
+    kernel, a, b = (jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn) for shape in ((16, 8), (16, 4), (4, 8)))
+
+    def loss(x, kernel, a, b):
+        return jnp.sum(low_rank(x, kernel, a, b, 1.0, out_dtype=jnp.float32,
+                                precision=jax.lax.DotAlgorithmPreset.ANY_F8_ANY_F8_F32))
+
+    jax.make_jaxpr(jax.grad(loss, argnums=(2, 3)))(x, kernel, a, b)
