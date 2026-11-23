@@ -385,8 +385,8 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
 
 
 def _carried_summed(call: Call, issue: Issuer, carried) -> Callable[..., jax.Array]:
-    """A walk's sum onto `carried`, the sum its earlier steps left (None: a step's own, `Issuer.summed`'s): its
-    products issued into it in place where the family's accumulators are values it carries (mma.sync's,
+    """A walk's sum onto `carried`, the sum its earlier steps left (None: a step's own, `Issuer.summed`'s):
+    its products issued into it in place where the family's accumulators are values it carries (mma.sync's,
     `mainloop.product_results` 'fragments'), else into a fresh accumulator added onto it (a warpgroup's or
     tensor memory's accumulator is no value a loop carries)."""
     if carried is None:
