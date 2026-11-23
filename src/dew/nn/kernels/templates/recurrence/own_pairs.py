@@ -524,10 +524,9 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                 (zero, zero), zero)
             column = h * width + index * keys
             start = family.columns_of(ending_ref.at[n, pl.ds(column, keys)])
-            floor = None
-            if clamp_ref:
-                (view,) = square.views(clamp_ref[0], row, chunk, column, keys)
-                floor = family.tile_of(view)
+            # The clamp's log decays' view, read once the sums are formed (`_suffix_summed`): read here, its
+            # tile lived through the queries' and keys' stores, an sm100's launch spilling 8 bytes a thread.
+            floor = square.views(clamp_ref[0], row, chunk, column, keys)[0] if clamp_ref else None
             d_betas = d_betas + pairs_back_stored(
                 call, (dq_ref, dk_ref, dg_ref), (row, column), keys,
                 (landing.get("summed", landing["block"]),) * 2 + (landing["block"],), (query, key, betas),
@@ -593,10 +592,10 @@ def _key_own_staged(call: Call, keys: int, *, summed: Operand) -> tuple:
 
 def _suffix_summed(call: Call, suffix: list, start, floor, terms: jax.Array) -> jax.Array:
     """A key block's decay gradient `terms` `[C, keys]` summed back over its chunk, each column started at
-    `start` (`key_pairs_own`'s), and where `floor` gives its log decays `[C, keys]` (a clamped call's) the
-    clamp's derivative applied (`clamped_gradient`): natively through the staged tile `suffix` (its terms'
-    rows, then the starts' row, `scan.suffix_columns`), read back in the terms' layout (`Family.tile_of`);
-    interpreted, as a tile (`algebra.suffix_summed`)."""
+    `start` (`key_pairs_own`'s), and where `floor` views its log decays `[C, keys]` (a clamped call's) the
+    clamp's derivative applied (`clamped_gradient`), read once the sums are: natively through the staged tile
+    `suffix` (its terms' rows, then the starts' row, `scan.suffix_columns`), read back in the terms' layout
+    (`Family.tile_of`); interpreted, as a tile (`algebra.suffix_summed`)."""
     if call.interpret:
         summed = algebra.suffix_summed(terms, start)
     else:
@@ -606,7 +605,7 @@ def _suffix_summed(call: Call, suffix: list, start, floor, terms: jax.Array) -> 
         mosaic.synced(call.interpret)
         scan.suffix_columns(tile)
         summed = call.family.tile_of(tile.at[pl.ds(0, chunk)])
-    return summed if floor is None else clamped_gradient(floor, summed)
+    return summed if floor is None else clamped_gradient(call.family.tile_of(floor), summed)
 
 
 def _key_own_held(call: Call, keys: int) -> Held:
