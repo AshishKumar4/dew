@@ -1316,6 +1316,36 @@ def test_a_resumed_run_continues_its_admitted_plan_without_timing(tmp_path, monk
     assert (resumed.plan["split"], resumed.plan["remat"]) == (first.plan["split"], first.plan["remat"])
 
 
+def test_a_checkpoint_whose_step_climbed_to_recompute_its_layers_resumes_at_that_rung(tmp_path, monkeypatch):
+    """A run whose devices hold its step only recomputing its layers (`remat`) climbs to that rung and
+    checkpoints there, its model's record stating the recompute; a run resuming that checkpoint on devices
+    that hold either computes the same step, a recompute saying how layers execute and not what they compute
+    (`RunConfig.EXECUTED`), so it resumes, at the rung its checkpoint holds (`Trainer.plan`'s first probe;
+    a resume was refused as another computation, `model.fields.remat`)."""
+    corpus = token_files(tmp_path)
+
+    def run():
+        return windowed(tmp_path / "climbed", 1)
+
+    def fitted(trainer, steps):
+        trainer.fit(windows(corpus), steps=steps, log_every=100, checkpoint_every=1)
+        options.unhold()
+        return trainer
+
+    free(monkeypatch, LIMIT)
+    own = LIMIT - fitted(windowed(tmp_path / "own", 1), 1).plan["probes"][0]["headroom"]
+    free(monkeypatch, LIMIT)
+    full = LIMIT - fitted(windowed(tmp_path / "full", 1, remat="full"), 1).plan["probes"][0]["headroom"]
+    assert full < own, (full, own)
+    free(monkeypatch, (own + full) // 2)
+    climbed = fitted(run(), 1)
+    assert climbed.plan["remat"] is not None, climbed.plan
+    free(monkeypatch, LIMIT)
+    resumed = fitted(run(), 2)
+    first = resumed.plan["probes"][0]
+    assert first["remat"] == climbed.plan["remat"] and first["fits"], (first, climbed.plan)
+
+
 def test_a_split_plan_does_not_compile_or_time_an_optional_faster_sibling(monkeypatch):
     """A batch that needs two microbatches keeps the first fitting plan, without compiling a
     different remat to ask whether it is faster. Even explicitly supplied timing trials are not run:
