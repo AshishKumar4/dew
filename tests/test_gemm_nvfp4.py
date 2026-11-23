@@ -725,3 +725,31 @@ def test_gemm_quantized_nvfp4_block_matches_bits_nvfp4_coded_and_lowers(gpu: str
           generation.chosen(grouped_matmul="mosaic")):
         jax.jit(lambda a, b, s: gemm.gemm_quantized(a, b, minifloat=bits.E2M1, tensor_scale=s)).trace(
             x_s, w_s, s_s).lower(lowering_platforms=("cuda",))
+
+
+def test_fp8_and_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_path):
+    """Checkpoint restore (`dew.checkpoints._packed_checked`) restores matching `Fp8Weights` and
+    `TernaryWeights` banks and refuses mismatched form versions or invalid scale shapes (row 12161)."""
+    from dew.checkpoints import Checkpoints
+
+    where = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+
+    def template(of):
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where), of)
+
+    bad_form = np.frombuffer(bytes.fromhex("0" * 16), np.uint8).copy()
+    fp8_ok = formats.Fp8Weights.of(np.ones((64, 64), np.float32), fmt="e4m3", scale=2.0)
+    tern_ok = formats.TernaryWeights.of(np.ones((256, 64), np.float32), scale=2.0)
+    for label, good in (("fp8", fp8_ok), ("ternary", tern_ok)):
+        ok_ckpt = Checkpoints(str(tmp_path / f"{label}_ok"))
+        ok_ckpt.save(1, {"w": good})
+        ok_ckpt.wait()
+        restored = Checkpoints(str(tmp_path / f"{label}_ok")).restore(template({"w": good}))[0]["w"]
+        np.testing.assert_array_equal(np.asarray(restored.words), np.asarray(good.words))
+        for tag, bad in (("form", dataclasses.replace(good, form=bad_form)),
+                         ("scale", dataclasses.replace(good, scale=jnp.ones((3,), jnp.float32)))):
+            bad_ckpt = Checkpoints(str(tmp_path / f"{label}_{tag}"))
+            bad_ckpt.save(1, {"w": bad})
+            bad_ckpt.wait()
+            with pytest.raises(ValueError):
+                Checkpoints(str(tmp_path / f"{label}_{tag}")).restore(template({"w": bad}))
