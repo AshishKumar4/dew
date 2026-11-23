@@ -10,19 +10,13 @@ at the default, lightning attention's fp32 forward rounds as its bf16 one, and s
 fewer), held whatever a run's environment sets."""
 
 IDENTITY_COVER = {
-    'sm80': ('qwen3.5-27b-gdn-bfloat16-forward', 'qwen3.5-27b-gdn-bfloat16-forward-variant-0',
-             'qwen3.5-27b-gdn-bfloat16-training', 'qwen3.5-27b-gdn-bfloat16-forward-packed',
-             'kimi-linear-kda-bfloat16-forward', 'kimi-linear-kda-bfloat16-training',
-             'nemotron-h-4b-ssd-bfloat16-forward', 'nemotron-h-4b-ssd-bfloat16-training',
-             'nemotron-h-4b-ssd-float32-forward', 'minimax-text-01-lightning-bfloat16-forward',
-             'minimax-text-01-lightning-bfloat16-training', 'a write gate-bfloat16-forward'),
-    **dict.fromkeys(('sm86', 'sm89'), (
+    **dict.fromkeys(('sm80', 'sm86', 'sm89'), (
         'qwen3.5-27b-gdn-bfloat16-forward', 'qwen3.5-27b-gdn-bfloat16-forward-variant-0',
         'qwen3.5-27b-gdn-bfloat16-training', 'qwen3.5-27b-gdn-bfloat16-forward-packed',
-        'kimi-linear-kda-bfloat16-forward', 'nemotron-h-4b-ssd-bfloat16-forward',
-        'nemotron-h-4b-ssd-bfloat16-training', 'nemotron-h-4b-ssd-float32-forward',
-        'minimax-text-01-lightning-bfloat16-forward', 'minimax-text-01-lightning-bfloat16-training',
-        'a write gate-bfloat16-forward')),
+        'kimi-linear-kda-bfloat16-forward', 'kimi-linear-kda-bfloat16-training',
+        'nemotron-h-4b-ssd-bfloat16-forward', 'nemotron-h-4b-ssd-bfloat16-training',
+        'nemotron-h-4b-ssd-float32-forward', 'minimax-text-01-lightning-bfloat16-forward',
+        'minimax-text-01-lightning-bfloat16-training', 'a write gate-bfloat16-forward')),
     'sm90': ('qwen3.5-27b-gdn-bfloat16-forward', 'qwen3.5-27b-gdn-bfloat16-forward-variant-0',
              'qwen3.5-27b-gdn-bfloat16-training', 'qwen3.5-27b-gdn-bfloat16-training-variant-two roles',
              'qwen3.5-27b-gdn-bfloat16-forward-packed', 'qwen3.5-27b-gdn-float32-forward',

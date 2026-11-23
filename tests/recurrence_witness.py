@@ -24,7 +24,8 @@ row of the memory decayed by its own.
 
 Each enclosure is `interval_certificates`' outward interval arithmetic under the native contracts; this
 module adds each log decay's base-2 prefix within `EXPONENT_BOUND` of its exact value (XLA's compensated
-scan, `recurrence_algebra.prefix`), then the kernel's own roundings of its differences."""
+scan, `recurrence_algebra.prefix`; under a decay a key dimension the template's scan's high half alone, half
+an fp32 unit further, `Exponents.of`), then the kernel's own roundings of its differences."""
 
 import dataclasses
 import functools
@@ -91,21 +92,27 @@ zero exponent bits, `float_bits.exact_power2`)."""
 @dataclasses.dataclass(frozen=True)
 class Exponents:
     """A chunk's positions' base-2 log decays from its start, `log2(e) cumsum(g)` (`exact`, float64 within
-    2^-50 of it), and how far the kernel's prefix may lie from each (`bound`, `EXPONENT_BOUND`)."""
+    2^-50 of it), and how far the kernel's prefix may lie from each (`bound`: `EXPONENT_BOUND`, and a key
+    dimension's rounding)."""
     exact: np.ndarray
     bound: np.ndarray
 
     @classmethod
-    def of(cls, g) -> "Exponents":
+    def of(cls, g, *, rounded: bool = False) -> "Exponents":
         """A chunk's exponents of its log decays `g` `[C]` (a head's) or `[C, Dk]` (a key dimension's, each
-        column its own prefix: the intra launch's scan of the same exact terms, `algebra.scanned_prefix`,
-        its doubling's adds as many as the associative scan's)."""
+        column its own prefix: the prefix launch's scan of the same exact terms, `intra._prefix`, a running
+        compensated sum or a doubling, its adds within the associative scan's bound). A `rounded` prefix
+        (`Lane.rounded_prefix`, `mainloop.prefix_limbs`) is the scan's sum rounded to one fp32, its
+        high half alone: half an fp32 unit of the sum further, a subnormal one's at least."""
         g = np.asarray(g, np.float64)
         columns = g.reshape(len(g), -1)
         exact = np.array([[math.fsum(columns[:s + 1, j]) for j in range(columns.shape[1])]
                           for s in range(len(g))]).reshape(g.shape) * LOG2E
         spanned = np.cumsum(np.abs(g), axis=0) * LOG2E * (1 + 2.0 ** -40)
-        return cls(exact, EXPONENT_BOUND * spanned + 2.0 ** -50 * np.abs(exact))
+        bound = EXPONENT_BOUND * spanned + 2.0 ** -50 * np.abs(exact)
+        if rounded:
+            bound = bound + 2.0 ** -24 * (np.abs(exact) + bound) + 2.0 ** -150
+        return cls(exact, bound)
 
     def raised(self, lane: Lane) -> Iv:
         """`algebra.raised(hi, lo)` at each position: the decay from the chunk's start."""
@@ -265,7 +272,7 @@ def keys_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str, I
     each key column scaled by its write gate before the scores round, `chunk_output`). The scores' tile is a
     derived form (`algebra.derived_tile`), its products, decays and gates multiplied in either association:
     their enclosure is both's hull. Its output reads the memory the chunk enters as stored (`h`)."""
-    exponents = Exponents.of(step.g)
+    exponents = Exponents.of(step.g, rounded=lane.rounded_prefix)
     entering = point(step.h)
     gate = fp32(mul(exponents.gated(lane), point(step.beta)), lane)
     keys = staged(fp32(mul(point(step.k), Iv(gate.lo[:, None], gate.hi[:, None])), lane), lane)
@@ -293,7 +300,7 @@ def values_gated_enclosures(step: "Step", scale: float, lane: Lane) -> dict[str,
     in parts, `Lane.held`: an fp32 call's, or a 16-bit one's under the accurate forms, Lightning's or the
     SSD's): its corrected values, the values times their write gate as stored (`algebra.weighted`'s
     identity inverse, `corrected` with no weighted keys), the memory it leaves (`carried`), and its output."""
-    exponents = Exponents.of(step.g)
+    exponents = Exponents.of(step.g, rounded=lane.rounded_prefix)
     written = fp32(mul(point(step.v), point(np.asarray(step.beta)[:, None])), lane)
     values = meet(written, held_cell(step.c, lane))
     return {"c": staged(written, lane), "h": carried(step.carry, values, step.k, exponents, lane),
@@ -331,7 +338,7 @@ def enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     its launch reads (the module's docstring)."""
     if np.ndim(step.g) == 2:
         return key_enclosures(step, scale, lane)
-    exponents = Exponents.of(step.g)
+    exponents = Exponents.of(step.g, rounded=lane.rounded_prefix)
     w, c, values = solved_step(step, exponents.raised(lane), lane)
     stored = staged(inverse(step.k, step.beta, exponents, lane), lane)
     return {"a": stored, "w": w, "c": c,
@@ -418,7 +425,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     to the chunk's end (`algebra.key_decayed_write`, stored), the memory each key row decays by its own,
     and the output's one sum of the gated queries against the memory and the scores against the values
     (`algebra.key_gated`, `key_decayed_output`)."""
-    exponents = Exponents.of(step.g)
+    exponents = Exponents.of(step.g, rounded=lane.rounded_prefix)
     raised = exponents.raised(lane)
     size = np.shape(step.k)[0]
     zeros = point(np.zeros((size, size)))
@@ -435,7 +442,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     system = where(_lags(size) > 0, pairs(writes), zeros)
     w, c, values = solved_step(step, raised, lane)
     exact, bound = exponents.exact, exponents.bound
-    # `range_decay`: the difference of the compensated prefixes, then `raised`'s fraction.
+    # `range_decay`: the prefixes' difference, compensated, then `raised`'s fraction.
     spread = bound[-1][None, :] + bound + 2.0 ** -46 * (np.abs(exact[-1])[None, :] + np.abs(exact)) + FRACTION
     reach = exp2(outward(exact[-1][None, :] - exact - spread, exact[-1][None, :] - exact + spread), lane)
     written = staged(fp32(mul(point(step.k), reach), lane), lane)
@@ -546,6 +553,9 @@ class Run:
     unit_keys: bool
     """Whether its own pairs fold each decay into the row before the key (`Lane.unit_keys`): a delta rule's
     unit keys, as the draws' layers declare them."""
+    rounded_prefix: bool
+    """Whether its decay a key dimension's prefix is its rounded sum alone (`Lane.rounded_prefix`,
+    `mainloop.prefix_limbs`)."""
 
     @property
     def chunks(self) -> int:
@@ -628,9 +638,9 @@ def _route_forward(route, operands: tuple, form: str, *, inference: bool = False
 def witnessed_route(delta: bool, *, scale: float, rounded: bool, starts=None,
                     max_segments: int | None = None):
     """The route a witnessed call runs: under the `delta` rule the chunked op over the draws' unit keys,
-    their sigmoid write gates bounded by 1 (`recurrence.Hooks.write_bound`) as layers declare; without it the
-    template's op as the SSD's route calls it (`recurrence_chunk.template_rule`, its output in the operands'
-    dtype)."""
+    their sigmoid write gates bounded by 1 (`recurrence.Hooks.write_bound`) and a decay a key dimension's by
+    `FLOOR` (`Hooks.decay_bound`) as layers declare; without it the template's op as the SSD's route calls it
+    (`recurrence_chunk.template_rule`, its output in the operands' dtype)."""
     from dew.nn.kernels import recurrence_chunk
 
     def route(*x):
@@ -638,7 +648,8 @@ def witnessed_route(delta: bool, *, scale: float, rounded: bool, starts=None,
             return recurrence_chunk.template_rule(*x, starts, max_segments=max_segments, scale=scale,
                                                   delta=False, wide=False, rounded=rounded)
         return recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts, max_segments=max_segments,
-                                                       write_bound=1.0)
+                                                       write_bound=1.0,
+                                                       decay_bound=FLOOR if np.ndim(x[3]) == 4 else None)
 
     return route
 
@@ -745,6 +756,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         o, final, tiles, trained, bound = _route_forward(route, operands, form, inference=inference)
         # Whether the call's own pairs fold each decay into the row first, as the op took it.
         unit_keys = bound.arguments.get("unit_keys", False)
+        decay_bound = bound.arguments.get("decay_bound")
         # The tiles the route's forward ran at: a training forward's own, or an inference forward's
         # (`Tiles.forward`, the template's primal), which a call its fast backward takes narrows apart.
         tiles = tiles if trained and not inference else tiles.forward or tiles
@@ -755,7 +767,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         program = jax.jit(lambda *x: chunk_forward.kept_forward(
             *x[:6], tiles=tiles, starts=x[6], max_segments=max_segments, scale=scale, delta=delta,
             rounded=rounded, family=mainloop.issued(jnp.result_type(*x[:3]))[0],
-            interpret=generation.backend() != "gpu", unit_keys=unit_keys))
+            interpret=generation.backend() != "gpu", unit_keys=unit_keys, decay_bound=decay_bound))
 
         def kept(*x, starts):
             return launched(program, (*x, starts), f"kept forward of {x[0].shape[1]} tokens, {form}",
@@ -805,6 +817,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                pairing=intra.pairing_parts(held),
                merged=mainloop.merge_parts(family, jnp.float32 if wide else dtype, held=held, ranged=False),
                tf32=tf32_conversion(family), trained=bool(trained), unit_keys=unit_keys,
+               rounded_prefix=mainloop.prefix_limbs(np.ndim(g) == 4, decay_bound, chunk, dtype) == 1,
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
@@ -864,8 +877,8 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
     enclose = writes[run.write]
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32,
-                               unit_keys=run.unit_keys)
+                               merged=run.merged, tf32=run.tf32, unit_keys=run.unit_keys,
+                               rounded_prefix=run.rounded_prefix)
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
@@ -1220,7 +1233,7 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
     - the delta rule's `d_l`: `-(X^T tril(dX, -1) X^T)` decayed, `dX = dw (k beta exp2 E)^T + du (v beta)^T`,
       `X = I + a` (`algebra.system_gradient`); `values`: `(X^T du) beta` (`algebra.values_gradient`); and
       `keys`: `(X^T dw) exp2(E) beta + (d_l k) beta + (beta d_l)^T k` (`algebra.keys_gradient`)."""
-    exponents = Exponents.of(step.g)
+    exponents = Exponents.of(step.g, rounded=lane.rounded_prefix)
     raised, gated, pairs = exponents.raised(lane), exponents.gated(lane), exponents.pairs(lane)
     given, held = lane.given, lane.held
     factor = point(np.float32(scale))
@@ -1361,18 +1374,18 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
                                     f"training backward of seed {seed}, delta {delta}, rounded {rounded}")
         [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
                             zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
-        unit_keys = bound.arguments.get("unit_keys", False)
+        unit_keys, decay_bound = bound.arguments.get("unit_keys", False), bound.arguments.get("decay_bound")
 
         def kept(*x):
             # Its family read from its operands, a family no identity states (`launched`'s statement).
             family = mainloop.issued(jnp.result_type(*x[:3]))[0]
             _, _, (inverse, held) = chunk_forward.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
                                                          delta=delta, family=family, interpret=interpret,
-                                                         unit_keys=unit_keys)
+                                                         unit_keys=unit_keys, decay_bound=decay_bound)
             grads, saved = mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale,
                                                            rounded=rounded, delta=delta, family=family,
                                                            interpret=interpret, inverse=inverse, kept=held,
-                                                           unit_keys=unit_keys)
+                                                           unit_keys=unit_keys, decay_bound=decay_bound)
             # The prepared run stays inside the program; the witness reads its records from `Run`.
             return grads, saved._replace(run=None), extras(saved.run)
 
@@ -1426,8 +1439,8 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     it (the initial memory's, `dh0`, for the first)."""
     run = back.run
     lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
-                               merged=run.merged, tf32=run.tf32,
-                               unit_keys=run.unit_keys)
+                               merged=run.merged, tf32=run.tf32, unit_keys=run.unit_keys,
+                               rounded_prefix=run.rounded_prefix)
 
     def stored(iv: Iv, dtype, name: str) -> Iv:
         """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where
@@ -1636,7 +1649,7 @@ def key_back_enclosures(step: KeyBackStep, scale: float, lane: Lane) -> dict[str
       beta)^T - dw (k exp2(E) beta)^T` (the memory launch's part, `key_memory_block`'s, beside the values');
     - `_key_pairs_back`: the pairs' transpose of the scores' gradient scaled (`key_pairs_back`) for `dq_p`,
       and of the system's for `dk_p`."""
-    exponents = Exponents.of(step.g)
+    exponents = Exponents.of(step.g, rounded=lane.rounded_prefix)
     raised = exponents.raised(lane)
     factor = point(np.float32(scale))
     size = np.shape(step.q)[0]
@@ -1711,6 +1724,7 @@ def key_back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     """`back_witnessed` under a decay a key dimension (`key_back_enclosures`): whether each record lies
     within its launch's enclosure as stored."""
     run, records = back.run, back.records
+    lane = dataclasses.replace(lane, rounded_prefix=run.rounded_prefix)
 
     def stored(iv: Iv, dtype) -> Iv:
         return iv if dtype == np.float32 else cast(iv, {"bfloat16": BFLOAT16, "float16": FLOAT16}[str(dtype)])

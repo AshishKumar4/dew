@@ -232,7 +232,8 @@ class KimiDeltaAttention(nn.Module):
                 query, key, value, g if kept is None else jnp.where(kept[:, :, None, None], g, 0.0),
                 beta if kept is None else jnp.where(kept[:, :, None], beta, 0.0), held, self.chunk_size,
                 starts=starts, max_segments=tokens.max_segments, write_bound=1.0,
-                firsts=tokens.firsts if forked is None else None, loads=loads, stores=stores, held=table)
+                decay_bound=self.lower_bound, firsts=tokens.firsts if forked is None else None, loads=loads,
+                stores=stores, held=table)
 
         # The decode state is GatedDeltaNet's pair, here in fp32 (`cache_spec`). The conv
         # normalises the queries and keys (`l2norm`) and rounds once, to the
@@ -240,12 +241,14 @@ class KimiDeltaAttention(nn.Module):
         # fla's layer hands them over, the wide one for the math.
         rows, keys, values = (split(part) for part in jnp.split(projected, 3, axis=-1))
         # beta a sigmoid's, of the queries and keys the conv l2-normalized (`causal_conv1d`'s pieces).
-        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, write_bound=1.0)
+        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, write_bound=1.0,
+                                         decay_bound=self.lower_bound)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         shards = sequence_split(decode, tokens)
         if shards > 1:
             rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
-                                     max_segments=tokens.max_segments, write_bound=1.0)
+                                     max_segments=tokens.max_segments, write_bound=1.0,
+                                     decay_bound=self.lower_bound)
             out = sequence_delta_rule(projected, taps, g, beta, tokens, valid, shards=shards,
                                       key_heads=self.num_heads, widths=(self.head_dim,) * 3, parts=heads,
                                       dtype=projected.dtype if ported else wide, rule=rule)

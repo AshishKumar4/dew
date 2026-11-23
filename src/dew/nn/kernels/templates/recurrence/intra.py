@@ -33,6 +33,9 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     held_tile,
     key_block,
     launch_kernel,
+    limb_blocks,
+    limb_tiles,
+    limb_views,
     lowered_once,
     masks,
     product_fragments,
@@ -88,22 +91,22 @@ def _intra_solve(system, taken, call: Call):
         system, taken)
 
 
-@building(lambda launch: ("recurrence_intra", "recurrence_intra_scores", "recurrence_prefix_halves"))
-def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool, halves=None):
-    """`(Aqk [R, HV * C], A [R, HV * C] where the call `solves`, hi, lo [R, HV * Dk])` of each chunk and value
-    head under a decay a key dimension: the decay's prefix halves (`call.gates`, `algebra.prefix`'s pair)
-    from the laid decay `g` `[R, HV * Dk]` fp32, which every later launch reads (`_prefix_halves`; `halves`
-    where given, a training forward's kept for its backward, `chunk_forward.kept_forward`), then the
+@building(lambda launch: ("recurrence_intra", "recurrence_intra_scores", "recurrence_prefix"))
+def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool, prefix=None):
+    """`(Aqk [R, HV * C], A [R, HV * C] where the call `solves`, prefix [R, HV * Dk])` of each chunk and value
+    head under a decay a key dimension: the decay's prefix (`call.gates`, `_prefix`'s) from the laid decay
+    `g` `[R, HV * Dk]` fp32, its limbs a tuple (`Call.prefix_limbs`), which every later launch reads
+    (`prefix` where given, a training forward's kept for its backward, `chunk_forward.kept_forward`), then the
     scores as `call.held` and the keys' system where it `solves` (`systems`' form, the write-gated keys'
     pairs, strict), which `_intra_solve` inverts, in one walk sharing every factor (`_sub_chunk_walk`): each
     pair of sub-chunks' decay factored (`algebra.key_block_pairs`), their products on the tensor cores
     (fla_kda's intra rows), each sub-chunk's own pairs zero (a launch of their own, `own_pairs.intra_own`)."""
     products = ("scores", "system") if solves else ("scores",)
-    # The decay's prefix halves a launch of their own on the call's bundle (fla_kda's chunk_local_cumsum), the
-    # walk of the pairs reading them on the sub-chunk's (`_sub_chunk_walk`).
-    hi, lo = _prefix_halves(g, taken, call) if halves is None else halves
-    return (*_sub_chunk_walk(q, k, hi, lo, beta, taken, sub_chunked(call), scale=scale, products=products),
-            hi, lo)
+    # The decay's prefix a launch of its own on the call's bundle (fla_kda's chunk_local_cumsum), the walk of
+    # the pairs reading it on the sub-chunk's (`_sub_chunk_walk`).
+    prefix = _prefix(g, taken, call) if prefix is None else prefix
+    return (*_sub_chunk_walk(q, k, prefix, beta, taken, sub_chunked(call), scale=scale, products=products),
+            prefix)
 
 
 def sub_chunked(call: Call) -> Call:
@@ -207,20 +210,27 @@ def _sum_index(call: Call, output: int, later: int) -> int:
 
 
 @lowered_once
-def _prefix_halves(g, taken, call: Call):
-    """`(hi, lo) [R, HV * Dk]` fp32: the laid decay `g`'s prefix halves within each chunk (`algebra.prefix`'s
-    pair, `call.gates`), a program a chunk, value head and key block (`_running`), each its block's one
-    load, scan and store: a running compensated sum down each column where the block fills the warpgroup's
-    threads (`_running_prefix`), else the doubling scan (`_intra_prefix`). fla_kda's chunk_local_cumsum, a
-    launch the sub-chunk walk and every later launch read (`_sub_chunk_walk`)."""
+def _prefix(g, taken, call: Call):
+    """`[R, HV * Dk]` fp32: the laid decay `g`'s prefix within each chunk (`call.gates`), the compensated
+    sum's high half (`algebra.prefix`'s pair rounded to one fp32), a program a chunk, value head and key block
+    (`_running`), each its block's one load, scan and store: a running compensated sum down each column where
+    the block fills the warpgroup's threads (`_running_prefix`), else the doubling scan (`_intra_prefix`).
+    fla_kda's chunk_local_cumsum, a launch the sub-chunk walk and every later launch read (`_sub_chunk_walk`):
+    a tuple of the halves its call keeps (`Call.prefix_limbs`), each `[R, HV * Dk]`. Where its layer bounds
+    its decays, the high half alone, as fla_kda stores one fp32 cumulative sum: both halves stored, every
+    launch reading the decay read twice fla's bytes of it, where the rounded sum alone holds check 1 against
+    fla at every Kimi delta attention cell and stability regime (scratch jsf-prefixC); a plain fp32
+    cumulative sum, no compensation, does not (its final memory 9.4 to 9.9 times fla's distance from float64
+    at the stability regimes, scratch jsf-prefixA)."""
     chunk, width, gates, family = call.chunk, call.width, call.gates, call.family
     running = _running(call)
     keys = scan.THREADS if running else math.gcd(width, 2 * algebra.SUB)
     # The running sum's rows a block at a time, its running pairs carried between (`_running_prefix`).
     rows_a_step = _running_rows(chunk) if running else chunk
     steps = chunk // rows_a_step
+    limbs = call.prefix_limbs
 
-    def program(at, g_ref, taken_ref, hi_ref, lo_ref, *, streams, staging, landing):
+    def program(at, g_ref, taken_ref, *prefix_refs, streams, staging, landing):
         del taken_ref
         n, h, b = at["chunks"], at["heads"], at["blocks"]
         row, column = n * chunk, h * width + b * keys
@@ -245,28 +255,26 @@ def _prefix_halves(g, taken, call: Call):
             else:
                 _scan_zeroed(call, rows, keys)
                 found = _intra_prefix(call, rows, tile.value(), keys)
-            for i, ref in enumerate((hi_ref, lo_ref)):
+            for i, ref in enumerate(prefix_refs):
                 # A running sum's halves read as each is stored, one tile held at a time: both at once
                 # spilled the program's 128 registers at two programs a multiprocessor (M-JS-145g). Row-major,
                 # as a step's rows are fewer than a warpgroup accumulator's tile takes, and stored through
                 # their own plain rows (fp32, the gates' form: a family's swizzled slot took no row-major
                 # tile, an sm100's); the doubling's through their own landings.
                 half = _rows_of(rows.at[i], keys) if found is None else found[i]
-                smem = rows.at[i] if running else landing[f"prefix{i}"]
                 gates.store(ref, half, row + index * rows_a_step, rows_a_step, column, keys, family=family,
-                            smem=smem)
+                            smem=rows.at[i] if running else landing[f"prefix{i}"])
             return carry, accumulators
 
         return mosaic.Walk(views, step, steps=steps, prologue=zeroed if running else None)
 
     blocks = stream_blocks(decays=((rows_a_step, keys), gates))
-    landings = () if running else (0, 1)
-    landing = {f"prefix{i}": gates.landing(rows_a_step, keys) for i in landings}
+    landing = {} if running else {f"prefix{i}": gates.landing(rows_a_step, keys) for i in range(limbs)}
     # The running sum's tiles: a block's decays, then a sub-chunk's rows of them and their terms; the
     # doubling's five.
     held = (Held(phases=([f32(rows_a_step, keys)], [f32(algebra.SUB, keys)] * 3)) if running
             else Held(phases=([f32(chunk, keys)] * 5,)))
-    return launch_kernel(program, call, out_type=(gates.shape(call.heads * width),) * 2,
+    return launch_kernel(program, call, out_type=(gates.shape(call.heads * width),) * limbs,
                          grid=(call.chunks, call.heads, width // keys),
                          grid_names=("chunks", "heads", "blocks"), blocks=blocks, stages=1,
                          live=chunk_liveness(1), steps=steps, model=chunk * keys, held=held,
@@ -282,7 +290,7 @@ def _plain_decays(*, running: bool) -> dict[str, int] | None:
 
 
 def _running_rows(chunk: int) -> int:
-    """The rows `_prefix_halves`' running sum takes a step: half a chunk's, a whole number of sub-chunks,
+    """The rows `_prefix`'s running sum takes a step: half a chunk's, a whole number of sub-chunks,
     its running pairs carried between. A chunk's rows at once staged 98 KB a program, two programs an
     emulated GH200's multiprocessor, the launch latency-bound (54% of its warp time a long scoreboard, its
     DRAM 40% busy, M-JS-170), one an A100's."""
@@ -290,7 +298,7 @@ def _running_rows(chunk: int) -> int:
 
 
 def _running(call: Call) -> bool:
-    """Whether `_prefix_halves` sums a key block a column a thread (`_running_prefix`): where the width takes
+    """Whether `_prefix` sums a key block a column a thread (`_running_prefix`): where the width takes
     the warpgroup's threads' worth of keys and the program's shared memory as its launch lays it (its
     decays' ring slot, which a TMA store lands through, else a landing of its own, the two halves' rows and
     their barriers, `shared_allocation`) fits the target's, else the doubling scan at two sub-chunks' worth of
@@ -306,7 +314,7 @@ def _running(call: Call) -> bool:
 
 
 def _prefix_staging(chunk: int, keys: int, *, running: bool) -> tuple:
-    """`_prefix_halves`' staging: the running sum's two halves' rows a step's `(2, _running_rows, keys)` and
+    """`_prefix`'s staging: the running sum's two halves' rows a step's `(2, _running_rows, keys)` and
     each column's running pair `(2, keys)`, or the doubling scan's, each half's zero rows before its own
     (`_scan_zeroed`)."""
     if running:
@@ -354,15 +362,15 @@ def _running_prefix(call: Call, rows, running, decays: jax.Array, keys: int) -> 
         scan.compensated_columns(rows, running)
 
 
-def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: tuple[str, ...]):
+def _sub_chunk_walk(q, k, prefix, beta, taken, call: Call, *, scale: float, products: tuple[str, ...]):
     """The intra walk on a bundle whose products take a sub-chunk's rows (`sub_chunked`), each
-    chunk's key blocks from the prefix halves `hi`, `lo` stored (`_prefix_halves`), no scan of its own:
+    chunk's key blocks from the prefix stored (`_prefix`), no scan of its own:
     each step the block's separated prefix (`algebra.separated`) staged for its sub-chunks' references, each
     output's rows gated down and each sub-chunk's keys gated up (`algebra.key_block_pairs`), and
     its products `[SUB, keys] @ [keys, C]` issued into each output's and sub-chunk's sum (`_sum_index`), read
     and stored a sub-chunk's rows at a time once the walk is done (`intra_block_stored`): fla_kda's
     inter-sub-chunk blocks (chunk_kda_fwd_kernel_inter_solve_fused, fla-core 0.5.2 ops/kda/chunk_intra.py)."""
-    chunk, width, gates, family = call.chunk, call.width, call.gates, call.family
+    chunk, width, family = call.chunk, call.width, call.family
     scored, outputs, later = "scores" in products, len(products), _later(call)
     keys = key_block(call, functools.partial(_sub_chunk_held, call, outputs=outputs),
                      functools.partial(_sub_chunk_staged, call, products=products),
@@ -371,14 +379,13 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
     shrinking = min(abs(scale), 1.0)
     growing = math.copysign(max(abs(scale), 1.0), scale)
 
-    def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, taken_ref, *sums, streams, staging, landing):
-        del taken_ref
+    def program(at, q_ref, k_ref, *refs, streams, staging, landing):
+        prefix_refs, (beta_ref, _taken_ref, *sums) = refs[:len(prefix)], refs[len(prefix):]
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         keyed = h // call.group * width
         views = stream_views(lambda i: (0, i), keys=call.given.views(k_ref, row, chunk, keyed, width),
-                             highs=gates.views(hi_ref, row, chunk, h * width, width),
-                             lows=gates.views(lo_ref, row, chunk, h * width, width),
+                             **limb_views(call, prefix_refs, row, chunk, h * width, width),
                              **({"queries": call.given.views(q_ref, row, chunk, keyed, width)} if scored
                                 else {}))
         lefts, raised, separated = staging
@@ -386,9 +393,8 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
         def step(index, slots, carry, accumulators):
             del index
             slots.acquire_all()
-            # Each half laid in the family's layout (`Family.tile_of`), as the scan lays them.
-            whole = algebra.separated(*(family.tile_of(stream_tile(slots, name, gates).refs[0])
-                                        for name in ("highs", "lows")))
+            # Laid in the family's layout (`Family.tile_of`), as the scan lays it.
+            whole = algebra.separated(*(family.tile_of(tile.refs[0]) for tile in limb_tiles(call, slots)))
             mosaic.synced(call.interpret)
             for half, value in enumerate(whole):
                 plgpu.store(separated.at[half], value, optimized=False)
@@ -452,14 +458,15 @@ def _sub_chunk_walk(q, k, hi, lo, beta, taken, call: Call, *, scale: float, prod
     formed = [dataclasses.replace(call.held, rows=call.rows) if name == "scores" else systems(call)
               for name in products]
     staging, landing = _sub_chunk_staged(call, keys, products=products)
+    inputs = (q, k, *prefix, beta, taken)
     return launch_kernel(program, call, out_type=tuple(form.shape(call.heads * chunk) for form in formed),
                          grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=blocks,
-                         stages=(1, 2), live=chunk_liveness(5), steps=steps,
+                         stages=(1, 2), live=chunk_liveness(len(inputs) - 1), steps=steps,
                          model=outputs * 2 * later * algebra.SUB * chunk * width,
                          held=_sub_chunk_held(call, keys, outputs), staging=staging, landing=landing,
                          name=_named("recurrence_intra", products), sums=(chunk,) * (outputs * later),
                          swizzles={name: resources.widest_swizzle(dtype, keys)
-                                   for name, (_, dtype) in blocks.items()})(q, k, hi, lo, beta, taken)
+                                   for name, (_, dtype) in blocks.items()})(*inputs)
 
 
 def _sub_chunk_held(call: Call, block: int, outputs: int = 1) -> Held:
@@ -479,11 +486,10 @@ def _sub_chunk_held(call: Call, block: int, outputs: int = 1) -> Held:
 
 def pair_streams(call: Call, keys: int, *, queries: bool) -> dict:
     """The walked streams of a launch forming a chunk's pairs at key block `keys` (`_sub_chunk_walk`'s,
-    `own_pairs.intra_own`'s): the keys and both prefix halves a block at a time, and the queries where it
-    forms the scores."""
+    `own_pairs.intra_own`'s): the keys and the prefix a block at a time, and the queries where it forms the
+    scores."""
     chunk = call.chunk
-    return stream_blocks(keys=((chunk, keys), call.given), highs=((chunk, keys), call.gates),
-                         lows=((chunk, keys), call.gates),
+    return stream_blocks(keys=((chunk, keys), call.given), **limb_blocks(call, chunk, keys),
                          **({"queries": ((chunk, keys), call.given)} if queries else {}))
 
 

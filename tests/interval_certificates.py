@@ -127,6 +127,9 @@ class Lane:
     first (`key_diagonal`)."""
     merged: int = 0
     """The parts the doubling's merges take in fp32 (`mainloop._merged`): zero for fp16, else `merged`."""
+    rounded_prefix: bool = False
+    """Whether a decay a key dimension's prefix is its rounded sum alone (`mainloop.Call.prefix_limbs`), its
+    exponents half an fp32 unit further (`recurrence_witness.Exponents.of`)."""
     tf32: Literal["plain", "rna", "read"] = "read"
     """How a one-part fp32 operand reaches its product (`operand`), the issuer's: 'plain', as itself (an
     interpreted product, a plain fp32 dot: mosaic_sm80.py's and mosaic_sm90.py's interpreted branches);
