@@ -984,7 +984,11 @@ class OuterProgram:
         abstract = self.abstract_of(args, kwargs)
         with self._compiling:
             held = self._shaped.get(abstract)
-            if held is None or not _holds(reads := self._reads.get(held[0], {}), refusals):
+        # Judged outside the lock, whose fact readers may call the program (its review's P0).
+        if held is None or not _holds(reads := self._reads.get(held[0], {}), refusals):
+            return None
+        with self._compiling:
+            if self._shaped.get(abstract) is not held:
                 return None
             self._shaped.move_to_end(abstract)
             executable = held[0]
@@ -1085,23 +1089,26 @@ class OuterProgram:
         owns it: a future its owner settles (`_keep`, `_released`), reserved where none is, or where the one
         settled holds no longer under them (`_holds`: a fact its trace read answering otherwise), let go with
         the executable it kept; the bound `CACHED` held over everything it keeps (`_bounded`); the map alone
-        held, so calls of other keys compile at once."""
-        with self._compiling:
-            pending = self._executables.get(key)
-            if (pending is not None and pending.done() and pending.exception() is None
-                    and not _holds(self._reads.get(pending.result(), {}), key[1])):
-                self._executables.pop(key)
-                self._let_go(key)
-                pending = None
-            owner = pending is None
-            if owner:
-                pending = self._executables[key] = Future()
-            self._executables.move_to_end(key)
-            if owner:
-                # One bound over every executable it holds, kept and compiled over shapes (`_bounded`):
-                # this key, the most recently used, is never the one it lets go.
-                self._bounded()
-        return pending, owner
+        held, so calls of other keys compile at once. A settled compile is judged outside the lock, whose fact
+        readers may call the program (its review's P0), and let go where it is still the reservation."""
+        while True:
+            with self._compiling:
+                pending = self._executables.get(key)
+                if pending is None:
+                    pending = self._executables[key] = Future()
+                    self._executables.move_to_end(key)
+                    # One bound over every executable it holds, kept and compiled over shapes (`_bounded`):
+                    # this key, the most recently used, is never the one it lets go.
+                    self._bounded()
+                    return pending, True
+                self._executables.move_to_end(key)
+            if not (pending.done() and pending.exception() is None) or _holds(
+                    self._reads.get(pending.result(), {}), key[1]):
+                return pending, False
+            with self._compiling:
+                if self._executables.get(key) is pending:
+                    self._executables.pop(key)
+                    self._let_go(key)
 
     def _kept(self, key: Hashable, args: tuple, kwargs: dict, refusals: tuple) -> jax.stages.Compiled:
         """The executable a call of `key` under `refusals` runs, compiled where none is (`compiled`), by the
@@ -1169,13 +1176,24 @@ class OuterProgram:
         its lowering kept for the block's compile where it owns the reservation; the
         shapes of a compile another owns, once it is done; one this block lowered, its lowering's."""
         if (lowering := together.get((id(self), key))) is not None:
-            return shapes_of(lowering.lowered.out_info)
+            if _holds(lowering.reads, key[1]):
+                _facts.replay(lowering.reads)
+                return shapes_of(lowering.lowered.out_info)
+            # A fact its lowering's trace read answers otherwise now (its review's P0): the call lowered
+            # afresh, the lowering the block compiles under its reservation.
+            traced, refused, reads = self._snapshot_trace(args, kwargs)
+            lowered = traced.lower()
+            together[id(self), key] = dataclasses.replace(
+                lowering, lowered=lowered, args=args, kwargs=kwargs, refused=refused, reads=reads,
+                relowered=[], kept_from=[])
+            return shapes_of(lowered.out_info)
         pending, owner = self._reserved(key)
         if not owner:
             # Another's compile, done or not: its shapes as the call traces, none waited for; a done one's
-            # executable's facts read again.
-            if pending.done() and pending.exception() is None:
-                _facts.replay(self._reads.get(pending.result(), {}))
+            # where its trace's facts hold (`_holds`), read again.
+            if pending.done() and pending.exception() is None and _holds(
+                    reads := self._reads.get(pending.result(), {}), key[1]):
+                _facts.replay(reads)
                 return shapes_of(pending.result().out_info)
             return shapes_of(self.trace(*args, **kwargs).out_info)
         try:
