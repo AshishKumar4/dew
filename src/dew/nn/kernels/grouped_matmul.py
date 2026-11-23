@@ -2123,9 +2123,7 @@ def _takes_tables(name: str, case: GroupedCase) -> bool:
     if name != MosaicGmm.name or bound is None:
         return False
     op, ba = bound
-    dtype = ba.arguments['tokens'].dtype
-    return any(f.gathers_rows and f.gathers_alone for f in op._families(ba, case.call.target)
-               if f.operand_dtypes is None or jnp.dtype(dtype) in f.operand_dtypes)
+    return isinstance(op, _Mosaic) and bool(op._families(ba, case.call.target))
 
 
 class Apart:
