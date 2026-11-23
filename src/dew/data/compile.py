@@ -2296,10 +2296,42 @@ def fitted[Entry](
                              "its chain")
     if named is None:
         return loader, None
-    return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed, widths=widths,
-                               measured=scored[name])
-                    if isinstance(entry, Dataset) else entry
-                    for name, entry in named.items()}
+    return loader, _one_bound({name: held(entry, objective=objective, batch=loader.batch, seed=seed,
+                                          widths=widths, measured=scored[name])
+                               if isinstance(entry, Dataset) else entry
+                               for name, entry in named.items()})
+
+
+def _one_bound[Entry](readers: Mapping[str, Reader | Entry]) -> dict[str, Reader | Entry]:
+    """A run's held readers each declaring, for every packed field, the most documents a window of any of
+    them holds (`Coordinates.max_segments`, `_coordinated`'s bound over them all), so every split of one
+    shape lays its windows out to one static bound and its evaluation compiles once, where each split's
+    own most, 14 documents in one and 15 in the next, compiled a program apiece (row 12474); a split that
+    cannot see its windows' packing declares its window's length, and so does every split then. A reader
+    that is not one of `held`'s (a reader of the caller's, an evaluation suite) is passed on as it is."""
+    # Each held reader `validation` compiled (`_validation_reader`).
+    compiled = {name: entry for name, entry in readers.items()
+                if isinstance(entry, functools.partial) and entry.func is _validation_reader}
+    most: dict[str, int | None] = {}
+    for entry in compiled.values():
+        for step in _packed_steps(entry):
+            ids = step.fields[0]
+            bounds = (most.get(ids, 0), step.max_segments)
+            most[ids] = None if None in bounds else max(bounds)
+    return {name: _held_bounded(compiled[name], most) if name in compiled else entry
+            for name, entry in readers.items()}
+
+
+def _packed_steps(reader: functools.partial) -> tuple[Coordinated, ...]:
+    """The packed fields' steps (`Coordinated`) a held reader runs on the host."""
+    return tuple(step for step in reader.keywords["host"] if isinstance(step, Coordinated))
+
+
+def _held_bounded(reader: functools.partial, most: Mapping[str, int | None]) -> functools.partial:
+    """`reader` with each packed field's step declaring `most`'s bound for its field."""
+    host = tuple(Coordinated.laid(step.fields, most[step.fields[0]], step.laid_out)
+                 if isinstance(step, Coordinated) else step for step in reader.keywords["host"])
+    return functools.partial(reader.func, *reader.args, **{**reader.keywords, "host": host})
 
 
 def _endless(chain: Pipeline) -> Pipeline:

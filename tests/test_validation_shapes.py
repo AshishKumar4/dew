@@ -114,3 +114,36 @@ def test_a_scoring_rules_total_reads_its_answered_rows_alone():
         kept = rule(Decisions(np.where(fewer[..., None], probabilities, np.nan), options, labels, targets,
                               ordinal, fewer), {})
         assert alone == kept
+
+
+def test_packed_validation_splits_read_in_one_shape_and_one_bound():
+    """Packed validation splits whose windows hold 1 to 4 documents each, of 1 to 7 windows, read in the
+    run's batch of 4 every batch the same: each marks its rows (`VALID_ROWS`), a split's whole batches and
+    its short last one alike, and declares the most documents a window of any split holds
+    (`Coordinates.max_segments`), so a run's evaluation compiles one program for them all, where each
+    split's own most and its short batch's unmarked rows compiled one apiece (row 12474)."""
+    from dew.batch import VALID_ROWS
+    from dew.data.pipeline import ObjectiveData, Pipeline
+
+    def split(windows: int, per_window: int) -> Pipeline:
+        size = 9 // per_window
+        return Pipeline(Memory(tuple({"text": np.arange(size, dtype=np.int32)}
+                                     for _ in range(windows * per_window)))).pack(9)
+
+    train = Pipeline(Memory(tuple({"text": np.arange(9, dtype=np.int32)} for _ in range(16)))).pack(9)
+    train = train.batch(4)
+    shapes = {(1, 1), (3, 2), (7, 3), (4, 4), (5, 1)}
+    _, readers = fitted(train, {f"{windows}x{per}": split(windows, per) for windows, per in shapes},
+                        objective=ObjectiveData(), steps=2)
+    assert readers is not None
+    seen = set()
+    for reader in readers.values():
+        opened = reader(DataPartition())
+        try:
+            for batch in opened:
+                laid = batch["text_coordinates"]
+                seen.add((tuple(sorted(batch)), np.shape(batch["text"]), laid.max_segments))
+                assert VALID_ROWS in batch, sorted(batch)
+        finally:
+            opened.close()
+    assert len(seen) == 1 and next(iter(seen))[2] == 4, seen
