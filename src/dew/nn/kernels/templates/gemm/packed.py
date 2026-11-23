@@ -65,12 +65,10 @@ def ternary_staged_depth(group, word, code):
 
 
 def fp8_minifloat(fmt: str) -> bits.Minifloat:
-    """Resolve `'e4m3'` / `'e5m2'` to its `bits.Minifloat` descriptor."""
-    if fmt == "e4m3":
-        return bits.E4M3
-    if fmt == "e5m2":
-        return bits.E5M2
-    raise ValueError(f"packed FP8 format must be 'e4m3' or 'e5m2', got {fmt!r}")
+    """Resolve `'e4m3'` / `'e5m2'` to its `bits.Minifloat` descriptor via `formats.fp8_minifloat`."""
+    from dew.nn.kernels import formats
+
+    return formats.fp8_minifloat(fmt)[0]
 
 
 def _decode_fp8_lanes(fmt: str, loaded: jax.Array, active) -> list[jax.Array]:
@@ -82,15 +80,11 @@ def _decode_fp8_lanes(fmt: str, loaded: jax.Array, active) -> list[jax.Array]:
 
 
 def _decode_ternary_lanes(loaded: jax.Array, active) -> list[jax.Array]:
+    from dew.nn.kernels import formats
+
     del active
-    out = []
-    for code in range(16):
-        code2 = (loaded >> jnp.uint32(2 * code)) & jnp.uint32(3)
-        nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
-        neg = (code2 >> jnp.uint32(1)) & nz
-        f32_bits = (neg << jnp.uint32(31)) | (nz * jnp.uint32(0x3F800000))
-        out.append(jax.lax.bitcast_convert_type(f32_bits, jnp.float32).astype(jnp.bfloat16))
-    return out
+    return [formats.ternary_code_value((loaded >> jnp.uint32(2 * code)) & jnp.uint32(3), jnp.bfloat16)
+            for code in range(16)]
 
 
 @dataclasses.dataclass(frozen=True)

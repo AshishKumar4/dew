@@ -294,7 +294,9 @@ def fp8_staged_rows(depth: int) -> np.ndarray:
     bfloat16 slices per group (row 8548)."""
     return _staged_rows(depth, packed.FP8_GROUP, bits.E4M3.width, packed.fp8_staged_depth, "FP8 weight")
 
-def _fp8_minifloat(fmt: str) -> tuple[bits.Minifloat, jnp.dtype]:
+
+def fp8_minifloat(fmt: str) -> tuple[bits.Minifloat, jnp.dtype]:
+    """Resolve `'e4m3'` / `'e5m2'` to its `(bits.Minifloat, jnp.dtype)` pair (single source of truth)."""
     if fmt == "e4m3":
         return bits.E4M3, jnp.dtype(jnp.float8_e4m3fn)
     if fmt == "e5m2":
@@ -304,7 +306,7 @@ def _fp8_minifloat(fmt: str) -> tuple[bits.Minifloat, jnp.dtype]:
 
 def fp8_form_version(fmt: str) -> np.ndarray:
     """8-byte digest identifying the free-layout encoder and staged order for `Fp8Weights` (`fmt`)."""
-    minifloat, _ = _fp8_minifloat(fmt)
+    minifloat, _ = fp8_minifloat(fmt)
     form, _ = bits.fp8_form(minifloat)
     return form_version(form.version, fp8_staged_rows(FP8_STAGE))
 
@@ -380,7 +382,7 @@ class Fp8Weights(_ScaledWeights):
     def of(cls, weights: jax.Array | np.ndarray, *, fmt: str = "e4m3",
            scale: jax.Array | np.ndarray | float = 1.0) -> "Fp8Weights":
         """Quantize/pack `weights` (`[..., depth, width]`, `depth % 64 == 0`) into staged `Fp8Weights`."""
-        minifloat, fp8_dtype = _fp8_minifloat(fmt)
+        minifloat, fp8_dtype = fp8_minifloat(fmt)
         source = jnp.asarray(weights)
         if source.ndim < 2 or source.shape[-2] % FP8_STAGE != 0:
             raise ValueError(f"Fp8Weights expects depth divisible by {FP8_STAGE}, got {source.shape}")
@@ -415,7 +417,7 @@ class Fp8Weights(_ScaledWeights):
 
     def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:
         """Decode `words` back to `[..., depth, width]` in `dtype` without applying `self.scale`."""
-        minifloat, _ = _fp8_minifloat(self.fmt)
+        minifloat, _ = fp8_minifloat(self.fmt)
         return self._unscaled_words(4, fp8_staged_rows,
                                     lambda w: bits.fp8_codes(w, minifloat, jnp.float32), dtype)
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
@@ -485,15 +487,19 @@ def ternary_packed(codes: jax.Array) -> jax.Array:
     return jnp.sum((grouped & jnp.uint32(3)) << shifts, axis=-1, dtype=jnp.uint32)
 
 
+def ternary_code_value(code2: jax.Array, dtype=jnp.float32) -> jax.Array:
+    """Decode 2-bit BitNet b1.58 code (`0 -> 0`, `1 -> +1`, `2 -> -1`, `3 -> 0`) to `dtype`."""
+    nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
+    neg = (code2 >> jnp.uint32(1)) & nz
+    f32_bits = (neg << jnp.uint32(31)) | (nz * jnp.uint32(0x3F800000))
+    return jax.lax.bitcast_convert_type(f32_bits, jnp.float32).astype(dtype)
+
+
 def ternary_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
     """Decode 2-bit packed ternary `words` (`[depth / 16, columns]` uint32) to `[depth, columns]`."""
     shifts = jnp.arange(16, dtype=jnp.uint32) * jnp.uint32(2)
     code2 = (words[:, None, :] >> shifts[None, :, None]) & jnp.uint32(3)
-    nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
-    neg = (code2 >> jnp.uint32(1)) & nz
-    f32_bits = (neg << jnp.uint32(31)) | (nz * jnp.uint32(0x3F800000))
-    values = jax.lax.bitcast_convert_type(f32_bits, jnp.float32).reshape(words.shape[0] * 16, words.shape[-1])
-    return values.astype(dtype)
+    return ternary_code_value(code2, dtype).reshape(words.shape[0] * 16, words.shape[-1])
 
 
 @jax.tree_util.register_dataclass
