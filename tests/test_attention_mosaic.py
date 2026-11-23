@@ -1352,10 +1352,9 @@ def test_a_refused_forward_config_is_derived_no_more(residuals):
 @COMPILES_ON_CPU
 def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program():
     """A run's compile (`report.kept`) whose kernel spills, and whose relowering launches the refused config
-    again (a derivation that does not read its refusal), keeps the program it compiled: no second compile
-    of the same program, the spill recorded as a miss not stepped down and no refusal committed (PF03: a
-    B200's 4B step compiled the same program twice, 150 s), and the lowering it reports kept is the one it
-    compiled (`kept_from`)."""
+    again (a derivation that does not read its refusal), keeps the program it compiled, as its kept lowering
+    (`kept_from`): no second compile of the same program, the spill a miss not stepped down and no refusal
+    committed (PF03: a B200's 4B step compiled the same program twice, 150 s)."""
     import kernel_compile
     from jax.sharding import NamedSharding, PartitionSpec
 
@@ -1377,15 +1376,11 @@ def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program()
     # Every compile's kernels read as spilling, as a B200's ptxas read the 4B forward's.
     spilled = [assembled.Binary(assembled.kernel_of(call.name)[0], call.launch, 255, 8, kind="mosaic_gpu",
                              caller=call.caller) for call in calls]
-    kept_from: list = []
     with generation.assumed("sm100"), report.refusals():
-        report.kept(first, relower=lambda: again, read=lambda executable: spilled, kept_from=kept_from)
+        report.kept(first, relower=lambda: again, read=lambda _: spilled, kept_from=(kept_from := []))
         misses = report.misses()
         assert misses and not any(miss.stepped for miss in misses), misses
-        assert report.refused_launches() == ()
-    # The program kept is the one compiled, never the relowering it discarded (theme K01-e's review P0: a
-    # caller keyed its executable by the discarded relowering's refusals).
-    assert len(kept_from) == 1 and kept_from[0] is first
+        assert report.refused_launches() == () and len(kept_from) == 1 and kept_from[0] is first
 
 
 @COMPILES_ON_CPU
