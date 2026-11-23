@@ -80,7 +80,7 @@ from dew.nn.precision import (
     twice_scaled,
 )
 from dew.nn.programs import called, read_by
-from dew.nn.sharding import automatic_axes, varying_like
+from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
 
 if TYPE_CHECKING:
     from .templates import base
@@ -493,7 +493,9 @@ def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: boo
                    precision: PrecisionLike, out_dtype) -> jax.Array:
     """Portable XLA Gram (`x @ x^H` / `x^H @ x` / `x @ x^T` / `x^T @ x`) or symmetric polynomial
     `c0 * I + c1 * a + c2 * (a @ a)`. Polynomials accumulate in `at_least_fp32` and round once to
-    `out_dtype`, matching native SYRK (row 12025; bit-equal for fp32/complex64)."""
+    `out_dtype`, matching native SYRK (row 12025; bit-equal for fp32/complex64). Narrow batched outputs
+    chunk the fp32 square over the batch axis so widening keeps peak temporary memory within the narrow
+    batch (Muon's grouped Newton-Schulz, `test_plan.py`)."""
     out_dtype = jnp.dtype(out_dtype)
     last = operand.ndim - 1
     batch = tuple(range(operand.ndim - 2))
@@ -507,16 +509,29 @@ def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: boo
             return jax.lax.dot_general(left, right, gram_dims, precision=precision)
         return jax.lax.dot_general(left, right, gram_dims, precision=precision,
                                    preferred_element_type=wide).astype(out_dtype)
-    sq_dims = (((last,), (last - 1,)), (batch, batch))
     c = poly if poly.dtype == wide else poly.astype(wide)
-    sq = (jax.lax.dot_general(operand, operand, sq_dims, precision=precision)
-          if operand.dtype == wide
-          else jax.lax.dot_general(operand, operand, sq_dims, precision=precision,
-                                   preferred_element_type=wide))
-    eye = jnp.eye(operand.shape[-1], dtype=wide)
-    op_wide = operand if operand.dtype == wide else operand.astype(wide)
-    summed = c[0] * eye + c[1] * op_wide + c[2] * sq
-    return summed if out_dtype == wide else summed.astype(out_dtype)
+    side = operand.shape[-1]
+
+    def _poly(block: jax.Array) -> jax.Array:
+        b_last = block.ndim - 1
+        b_batch = tuple(range(block.ndim - 2))
+        sq_dims = (((b_last,), (b_last - 1,)), (b_batch, b_batch))
+        sq = (jax.lax.dot_general(block, block, sq_dims, precision=precision)
+              if block.dtype == wide
+              else jax.lax.dot_general(block, block, sq_dims, precision=precision,
+                                       preferred_element_type=wide))
+        eye = jnp.eye(side, dtype=wide)
+        op_wide = block if block.dtype == wide else block.astype(wide)
+        summed = c[0] * eye + c[1] * op_wide + c[2] * sq
+        return summed if out_dtype == wide else summed.astype(out_dtype)
+
+    count = int(np.prod(operand.shape[:-2], dtype=np.int64)) if batch else 1
+    placed = explicit_spec(operand)
+    batch_sharded = placed is not None and any(entry is not None for entry in placed.spec[:len(batch)])
+    if out_dtype.itemsize < wide.itemsize and count > 1 and not batch_sharded:
+        return jax.lax.map(_poly, operand.reshape(count, side, side), batch_size=max(1, count // 4)).reshape(
+            operand.shape)
+    return _poly(operand)
 
 
 def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,

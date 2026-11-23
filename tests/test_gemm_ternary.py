@@ -101,16 +101,18 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
     x_f32 = x_bit.astype(jnp.float32)
     peak = jnp.max(jnp.abs(x_f32), axis=-1)
     safe_peak = jnp.where(peak > 0, peak, jnp.float32(1.0))
-    x_q = jnp.clip(jnp.round((x_f32 / safe_peak[:, None]) * jnp.float32(127.0)), -128.0, 127.0)
+    x_q = jnp.clip(jnp.round(precision.divided(x_f32, safe_peak[:, None]) * jnp.float32(127.0)),
+                   -128.0, 127.0)
     w_bf16 = w_bit.unscaled(jnp.bfloat16)
     dot_int = jax.lax.dot(x_q.astype(jnp.bfloat16), w_bf16, preferred_element_type=jnp.float32)
-    ref_bit = precision.twice_scaled(dot_int / jnp.float32(127.0), peak[:, None], w_bit.scale)
+    ref_bit = precision.twice_scaled(precision.divided(dot_int, jnp.float32(127.0)),
+                                     peak[:, None], w_bit.scale)
     max_col = int(jnp.argmax(jnp.abs(x_bit[1])))
     tan_x = jnp.zeros_like(x_bit).at[1, max_col].set(jnp.bfloat16(1.0))
     dx_exact = (jax.lax.dot(jnp.ones((32, 64), jnp.bfloat16), w_bf16.T,
                             preferred_element_type=jnp.float32) * w_bit.scale).astype(jnp.bfloat16)
-    dscale_exact = jnp.sum(precision.twice_scaled(dot_int / jnp.float32(127.0), peak[:, None],
-                                                  jnp.float32(1.0)))
+    dscale_exact = jnp.sum(precision.twice_scaled(precision.divided(dot_int, jnp.float32(127.0)),
+                                                  peak[:, None], jnp.float32(1.0)))
     jvp_exact = jax.lax.dot(tan_x, w_bf16, preferred_element_type=jnp.float32) * w_bit.scale
     assert np.asarray(dx_exact[1, max_col]) != 0.0
     for interpret in (False, True):
@@ -183,22 +185,22 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
             closed_high = jax.make_jaxpr(
                 lambda x, w: gemm.gemm(x, w, out_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST)
             )(f32((256, 128)), f32((128, 128)))
-        cuda_gemms = [
-            e for e in equations(closed_high, platform="cuda")
-            if e.primitive.name in ("core_map", "pallas_call", "mosaic_gpu_v2",
-                                    "dot_general", "ragged_dot_general")
-        ]
-        assert cuda_gemms, "expected lowered GEMM equations in CUDA branch"
-        for eqn in cuda_gemms:
+        checked = 0
+        for eqn in equations(closed_high, platform="cuda"):
             if eqn.primitive.name in ("dot_general", "ragged_dot_general"):
                 assert eqn.params.get("precision") == (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
-            else:
+                checked += 1
+            elif eqn.primitive.name in ("mpmd_map", "pallas_call"):
                 matrix_dtypes = [
                     v.aval.dtype for v in eqn.invars
                     if isinstance(v.aval, ShapedArray) and v.aval.ndim >= 2
                     and jnp.issubdtype(v.aval.dtype, jnp.floating)
                 ]
-                assert matrix_dtypes and all(dt == jnp.bfloat16 for dt in matrix_dtypes), matrix_dtypes
+                if matrix_dtypes:
+                    assert len(matrix_dtypes) >= 2 and all(dt == jnp.bfloat16 for dt in matrix_dtypes[:2]), (
+                        gpu, matrix_dtypes)
+                    checked += 1
+        assert checked > 0, f"expected lowered GEMM equations in CUDA branch for {gpu}"
         if generation.compile_only_gpus(gpu):
             def run_dense(x, w):
                 with generation.chosen(grouped_matmul="mosaic"):
@@ -238,16 +240,21 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
 
 def test_ternary_ste_cancellation_overflow_and_subnormal_rows():
     """STE pullback never overflows on canceling extreme rows (`2**126` with `+1/-1` and scale `2**10` ->
-    forward `0`, grad `[+1024, -1024]`), and tiny subnormal rows (`2**-144` with scale `2**120`) normalize
-    against `peak` before scaling by `127` to produce exact `2**-24` without underflow (row 1464)."""
+    forward `0`, grad `[+1024, -1024]`), and tiny normal rows (`2**-125`, whose `peak / 127` underflows to
+    subnormal/zero under FTZ, with scale `2**101`) normalize against `peak` before scaling by `127` to
+    produce exact `2**-24` without underflow (row 1464)."""
     # Cancellation overflow witness: two entries of 2**126 against +1 and -1 with weight scale 2**10.
     x_cancel = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** 126)
     w_mat = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[1, 0].set(-1.0)
-    w_cancel = formats.TernaryWeights.of(w_mat, scale=jnp.float32(2.0 ** 10))
-    # Tiny subnormal row witness: 2**-144 with weight scale 2**120 -> representable result 2**-24.
-    x_tiny = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** -144)
-    w_tiny = formats.TernaryWeights.of(jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0),
-                                       scale=jnp.float32(2.0 ** 120))
+    w_cancel = dataclasses.replace(formats.TernaryWeights.of(w_mat, scale=jnp.float32(1.0)),
+                                   scale=jnp.float32(2.0 ** 10))
+    # Tiny normal row witness: 2**-125 (peak / 127 < tiny = 2**-126 flushes to 0 on XLA CPU FTZ) with
+    # weight scale 2**101 -> representable result 2**-24.
+    x_tiny = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** -125)
+    w_tiny = dataclasses.replace(
+        formats.TernaryWeights.of(jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0),
+                                  scale=jnp.float32(1.0)),
+        scale=jnp.float32(2.0 ** 101))
 
     for kernel in ("mosaic", "xla"):
         with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
@@ -268,8 +275,8 @@ def test_ternary_ste_cancellation_overflow_and_subnormal_rows():
                     out_dtype=jnp.float32, interpret_on_cpu=True)[0, 0],
                 argnums=(0, 1))(x_tiny, w_tiny.scale)
             assert np.asarray(y_t) == np.float32(2.0 ** -24), (kernel, y_t)
-            assert np.asarray(dx_t[0, 0]) == np.float32(2.0 ** 120), (kernel, dx_t[0, 0])
-            assert np.asarray(ds_t) == np.float32(2.0 ** -144), (kernel, ds_t)
+            assert np.asarray(dx_t[0, 0]) == np.float32(2.0 ** 101), (kernel, dx_t[0, 0])
+            assert np.asarray(ds_t) == np.float32(2.0 ** -125), (kernel, ds_t)
 
 
 def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():

@@ -1059,13 +1059,14 @@ def test_a_ternary_weight_product_holds_every_order(edge):
     x_f32 = x.astype(jnp.float32)
     peak = jnp.max(jnp.abs(x_f32), axis=-1)
     safe_peak = jnp.where(peak > 0, peak, jnp.float32(1.0))
-    x_int = jnp.clip(jnp.round((x_f32 / safe_peak[:, None]) * jnp.float32(127.0)),
+    x_int = jnp.clip(jnp.round(prec.divided(x_f32, safe_peak[:, None]) * jnp.float32(127.0)),
                      -128.0, 127.0).astype(jnp.bfloat16)
     dot_int = jax.lax.dot(x_int, w_bf16, preferred_element_type=jnp.float32)
-    fwd_oracle = prec.twice_scaled(dot_int / jnp.float32(127.0), peak[:, None], weights.scale)
+    prod_int = prec.divided(dot_int, jnp.float32(127.0))
+    fwd_oracle = prec.twice_scaled(prod_int, peak[:, None], weights.scale)
     x_tan_oracle = jax.lax.dot(dx.astype(jnp.bfloat16), w_bf16,
                                preferred_element_type=jnp.float32) * weights.scale
-    s_tan_oracle = prec.twice_scaled(dot_int / jnp.float32(127.0), peak[:, None], jnp.float32(1.0))
+    s_tan_oracle = prec.twice_scaled(prod_int, peak[:, None], jnp.float32(1.0))
     for kernel in ("mosaic", "xla"):
         with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
               generation.routes() as seen):
