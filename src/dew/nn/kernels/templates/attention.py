@@ -1479,33 +1479,18 @@ def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
     return (significand & (2 * half - 1)) == half
 
 
-QUOTIENT_REACH = 63
-"""The binades either side of one a total's quotient is differentiated plainly within (`held_mean`): its
-derivative forms `total^-2`, which past 2^126 either way leaves fp32 (a mass of 2^100 moved by itself: its
-keys' gradient 0 where it is -2^28)."""
-
-
 def held_mean(acc: jax.Array, total: jax.Array, dtype, law) -> jax.Array:
     """The reference's mean `acc / total` (zero where `total` is) saturated (`saturated`): its value, and its
-    derivative at every order the quotient's where its sums are finite and its total within
-    `2^+-QUOTIENT_REACH`, else `law`'s (`_scaled_mean`), whose every order is one contraction formed apart
-    from its binades (`scaled_contraction`): no sum, product or quotient of it a float past the format
-    beside the factor that brings it back. It runs only where some row needs it (`lax.cond`). The
-    overflowing sums are held out of the differentiated graph whole: a quotient of an infinite sum left in it
-    took a zero cotangent into its divisor's derivative, `0 * inf` (two values of 2^127: the value tangent 0
-    where the mean's is 1, a score gradient's tangent NaN)."""
+    derivative at every order `law`'s (`_scaled_mean`), one contraction formed apart from its binades
+    (`scaled_contraction`) whose every order is that contraction again: no sum, product or quotient of it a
+    float past the format beside the factor that brings it back, where the quotient's own derivative
+    multiplied its sums by the total's tangent first (a value of 2^126 over a total of 2^62 moved by 2^62:
+    2^188, infinite, where the derivative is -2^64) or formed `total^-2` (2^-200 at a mass of 2^100, zero)."""
     finite = jnp.abs(jax.lax.stop_gradient(acc)) < jnp.inf
     held = jax.lax.stop_gradient(total)[..., None]
-    reached = (held == 0) | ((held >= 2.0 ** -QUOTIENT_REACH) & (held <= 2.0 ** QUOTIENT_REACH))
-    plain = finite & reached
     seen = held > 0
     out = jnp.where(seen, jax.lax.stop_gradient(acc) / jnp.where(seen, held, 1), 0)
-    # A total past the reach is none of the quotient's operands, so its derivative there forms no
-    # `total^-2` for a masked cotangent of zero to meet (`0 * inf`).
-    quotient = jnp.where(seen, jnp.where(finite, acc, 0) / jnp.where(seen & reached, total[..., None], 1), 0)
-    differentiated = jax.lax.cond(jnp.all(plain), lambda: quotient,
-                                  lambda: jnp.where(plain, quotient, law()))
-    return saturated(out, finite, dtype) + derivative_of(differentiated)
+    return saturated(out, finite, dtype) + derivative_of(law())
 
 
 def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax.Array) -> jax.Array:
@@ -1523,7 +1508,7 @@ def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax
     carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - shift), 0)
     total = jnp.sum(masses, axis=-1) + total0 * carried
     divisor = jnp.where(total > 0, total, 1)
-    form = scaled_contraction.Form(((("bhgqk", 1), ("bhgq", -1)), (("bkhd", 1),)), "bhgqd")
+    form = scaled_contraction.Form(("bhgqk", "bhgq", "bkhd"), ((1, (((0, 1), (1, -1)), ((2, 1),))),), "bhgqd")
     mean = scaled_contraction.contract(form, masses.reshape(*grouped, keys), divisor.reshape(grouped), value)
     return jnp.where(total[..., None] > 0, mean.reshape(batch, heads, queries, width), 0)
 
