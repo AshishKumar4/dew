@@ -968,13 +968,12 @@ class RunConfig:
         `trust` names the packages outside Dew the record may import."""
         path = epath.Path(directory)
         named_file = str(directory).endswith(".json")
-        # A record an intermediate Dew rewrote beside its mark, as its run trained (`unmarked`).
-        directory = path.parent if named_file else path
         record = json.loads((path if named_file else path / RUN_FILE).read_text())
         # A record an intermediate Dew rewrote beside its mark, as its run trained (`unmarked`), but where
         # the step a resume restores is that Dew's own, saved under the record it rewrote, read as it is.
-        mark = directory / MASKED_DECAY_MARK
-        if mark.exists() and not typed_since(record, directory):
+        held = path.parent if named_file else path
+        mark = held / MASKED_DECAY_MARK
+        if mark.exists() and not typed_since(record, held):
             record = unmarked(record, json.loads(mark.read_text()))
         # The packages trusted first, so the record's earlier shapes are read with its classes imported.
         registry.import_trusted(record, trust)

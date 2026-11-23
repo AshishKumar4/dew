@@ -401,10 +401,10 @@ def unmarked(record: Mapping[str, object], mark: Mapping[str, object]) -> Mappin
     tagged = _records.class_record(optim) if isinstance(optim, Mapping) else None
     config = dict(_records.record(tagged[1] if tagged is not None else optim, "optim"))
 
-    def masked(part: Mapping[str, _records.JSON], decay_of) -> dict[str, _records.JSON]:
+    def masked(part: Mapping[str, object], decay_of) -> dict[str, object]:
         return {**decay_of(part), "decay_mask": False, "spared": False}
 
-    def decayed(fields_: Mapping[str, _records.JSON]) -> dict[str, _records.JSON]:
+    def decayed(fields_: Mapping[str, object]) -> dict[str, object]:
         return {**fields_, "weight_decay": fields_.get("weight_decay") or INERT_DECAY}
 
     if mark.get("unmasked_all") is True:
