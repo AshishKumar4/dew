@@ -421,11 +421,10 @@ def _runs(case) -> bool:
     return generation.triton_runs()
 
 
-def _placed(axes, operands, *, whole_last: bool) -> bool:
+def _placed(operands, spec: jax.sharding.PartitionSpec | None, *, whole_last: bool) -> bool:
     """Whether the kernel can run on its `operands`' shards: on a split mesh
-    the caller names the first one's logical axes (`axes`), which with
-    `whole_last` leave its last axis whole, or every axis splitting it is
-    explicit, its type its placement (`_shard_spec`). In a `shard_map` checking varying
+    `spec` places them (`_shard_spec` or `_packed_specs`), with `whole_last`
+    leaving the first operand's last axis whole. In a `shard_map` checking varying
     axes, each shard its own, the launch states its outputs' varying type
     (`sharding.varied_alike`) where a GPU compiles it; Pallas's interpreter evaluates the
     kernel's body on the shards' varying values, whose gathers by unvarying
@@ -435,43 +434,36 @@ def _placed(axes, operands, *, whole_last: bool) -> bool:
         return False
     if not automatic_axes():
         return True
-    spec = _shard_spec(axes, operands[0])
     return spec is not None and (not whole_last or len(spec) < operands[0].ndim or spec[-1] is None)
 
 
 def _shard_spec(axes, first) -> jax.sharding.PartitionSpec | None:
-    """How a split mesh places the `first` operand: as the logical `axes` the caller names, else as its
-    own type states where every axis splitting it is explicit (`jax.typeof(first).sharding`), None where
-    neither tells (an automatic axis XLA's partitioner places)."""
-    if axes is not None:
-        return logical_spec(axes, first.shape)
-    mesh = jax.sharding.get_abstract_mesh()
-    if any(mesh.axis_types[mesh.axis_names.index(name)] != jax.sharding.AxisType.Explicit
-           for name in automatic_axes()):
+    """How a split mesh places the `first` operand: as its own type states where every axis splitting it is
+    explicit (`jax.typeof(first).sharding`), else as the logical `axes` the caller names, None where no
+    mesh splits it or an automatic axis XLA's partitioner places leaves it unplaced."""
+    split = automatic_axes()
+    if not split:
         return None
-    return jax.typeof(first).sharding.spec
+    mesh = jax.sharding.get_abstract_mesh()
+    if all(mesh.axis_types[mesh.axis_names.index(name)] == jax.sharding.AxisType.Explicit for name in split):
+        return jax.typeof(first).sharding.spec
+    return None if axes is None else logical_spec(axes, first.shape)
 
 
 def _packed_specs(axes, gate_up) -> tuple[jax.sharding.PartitionSpec, jax.sharding.PartitionSpec] | None:
-    """`(in_spec, out_spec)` for `packed_swiglu` (`[..., 2, H]` -> `[..., H]`) on a split mesh from logical
-    `axes` or from `gate_up`'s explicit sharding, or None if unplaced or the pair axis `-2` is split
-    (row 822)."""
-    placed = explicit_spec(gate_up)
-    if placed is not None:
-        padded = (*placed.spec, *(None,) * (gate_up.ndim - len(placed.spec)))
-        if padded[-2] is not None:
-            return None
-    in_spec = _shard_spec(None, gate_up)
-    if in_spec is None:
-        if axes is None:
-            return None
-        shape = gate_up.shape[:-2] + gate_up.shape[-1:]
-        out_spec = logical_spec(axes, shape)
-        entries = (*out_spec, *(None,) * (len(shape) - len(out_spec)))
-        return jax.sharding.PartitionSpec(*entries[:-1], None, entries[-1]), out_spec
-    entries = (*in_spec, *(None,) * (gate_up.ndim - len(in_spec)))
-    if entries[-2] is not None:
+    """`(in_spec, out_spec)` for `packed_swiglu` (`[..., 2, H]` -> `[..., H]`) on a split mesh from
+    `gate_up`'s explicit sharding or logical `axes` (`_shard_spec`), or None if unplaced, rank < 2, or an
+    explicit axis splits the pair axis `-2` (row 822)."""
+    if gate_up.ndim < 2:
         return None
+    placed = explicit_spec(gate_up)
+    if placed is not None and placed.spec[-2] is not None:
+        return None
+    packed_axes = None if not axes else (*axes[:-1], None, axes[-1])
+    in_spec = _shard_spec(packed_axes, gate_up)
+    if in_spec is None:
+        return None
+    entries = (*in_spec, *(None,) * (gate_up.ndim - len(in_spec)))
     return in_spec, jax.sharding.PartitionSpec(*entries[:-2], entries[-1])
 
 
@@ -540,7 +532,7 @@ def norm_case(x, scale, dtype, axes, *, branch=None, gate=None, epilogue=None, f
         scale_fits=scale is None or scale.shape == x.shape[-1:],
         branch_fits=branch is None or (branch.shape == x.shape and branch.dtype == x.dtype),
         gate_fits=gate is None or gate.shape == x.shape,
-        placed=_placed(axes, (x, scale, branch, gate), whole_last=True),
+        placed=_placed((x, scale, branch, gate), _shard_spec(axes, x), whole_last=True),
         activated=epilogue is not None and not elementwise(epilogue, x.shape),
         fp32_statistics=fp32_statistics, activation=activation)
 
@@ -697,7 +689,7 @@ def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
     case = SwigluCase(dtypes=(jnp.dtype(gate.dtype), jnp.dtype(up.dtype)),
                       promotes=jnp.dtype(jnp.result_type(gate, up)),
                       shape_fits=gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
-                      placed=_placed(axes, (gate, up), whole_last=False))
+                      placed=_placed((gate, up), _shard_spec(axes, gate), whole_last=False))
     return _selected(SWIGLU, case, implementation)
 
 
@@ -705,12 +697,10 @@ def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
     """Resolve the SiLU product of one packed projection's `[..., 2, H]` output (`packed_swiglu`),
     through the SwiGLU selector (`SWIGLU`), whose kernel reads the halves where the projection wrote them.
     `axes` are the product's logical axes, `[..., H]`'s."""
-    varying_blocked = not generation.triton_runs() and bool(jax.typeof(gate_up).mat.varying)
-    placed = (not varying_blocked
-              and (not automatic_axes() or (gate_up.ndim >= 2 and _packed_specs(axes, gate_up) is not None)))
+    specs = _packed_specs(axes, gate_up)
     case = SwigluCase(dtypes=(jnp.dtype(gate_up.dtype),), promotes=jnp.dtype(gate_up.dtype),
                       shape_fits=gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,
-                      placed=placed)
+                      placed=_placed((gate_up,), None if specs is None else specs[0], whole_last=False))
     return _selected(SWIGLU, case, implementation)
 
 
