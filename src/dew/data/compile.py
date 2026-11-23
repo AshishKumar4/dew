@@ -2100,18 +2100,19 @@ class _Whole:
         self.read = int(state)
 
 
-def _share(batch: Batch, partition: DataPartition, *, held: bool) -> Batch:
+def _share(batch: Batch, partition: DataPartition, *, held: bool, nominal: int = 0) -> Batch:
     """`partition`'s share of `batch` (`DataPartition`: rows `index :: count`); `held`, a validation
-    share, filled out to every share's rows, a whole number of its row shards, its repeats marked
-    (`DataPartition.held`, `FilledBatch`), so every share reads a batch its devices split where any
-    does and every real row scores once."""
+    share, filled out to every share's rows of the pass's `nominal` batch (its largest, its first) or of
+    this one where larger, a whole number of its row shards, every row marked (`DataPartition.held`,
+    `FilledBatch`), so every share reads a batch its devices split where any does, a pass's short last
+    batch in its whole ones' shape and tree, and every real row scores once (row 12474)."""
     rows = rows_of(batch)
     if not held:
         return batch if partition.count == 1 else take_batch(batch, np.arange(rows)[partition.cut()])
     mine, real = partition.held(rows) if partition.count > 1 else (slice(None), True)
     shards = partition.count * partition.row_multiple
-    filled = -(-rows // shards) * partition.row_multiple
-    return FilledBatch(filled, real=real).map(take_batch(batch, np.arange(rows)[mine]))
+    filled = -(-max(rows, nominal) // shards) * partition.row_multiple
+    return FilledBatch(filled, real=real, marked=True).map(take_batch(batch, np.arange(rows)[mine]))
 
 
 class _Shared(Forwarding):
@@ -2122,6 +2123,8 @@ class _Shared(Forwarding):
     def __init__(self, batches: pygrain.DatasetIterator | _Whole | Replayed, partition: DataPartition, *,
                  held: bool, endless: bool = False):
         self._source, self.partition, self.held, self._endless = batches, partition, held, endless
+        # A held pass's batch, its first, which its short last one is filled out to (`_share`).
+        self._nominal = 0
 
     @property
     def ends(self) -> Ends:
@@ -2131,7 +2134,9 @@ class _Shared(Forwarding):
         return self
 
     def __next__(self) -> Batch:
-        return _share(next(self._source), self.partition, held=self.held)
+        batch = next(self._source)
+        self._nominal = max(self._nominal, rows_of(batch))
+        return _share(batch, self.partition, held=self.held, nominal=self._nominal)
 
     def get_state(self):
         return self._source.get_state()

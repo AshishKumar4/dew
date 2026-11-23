@@ -7,6 +7,7 @@ where indexing the answered rows first compiled a program a count of them (a run
 sized validation splits compiled 1,999 programs before and 12 after)."""
 
 import numpy as np
+import pytest
 
 from dew.artifacts import Decisions
 from dew.data import Memory
@@ -116,7 +117,9 @@ def test_a_scoring_rules_total_reads_its_answered_rows_alone():
         assert alone == kept
 
 
-def test_packed_validation_splits_read_in_one_shape_and_one_bound():
+@pytest.mark.parametrize("partition", [DataPartition(), DataPartition(row_multiple=2)],
+                         ids=["one-device", "two-row-shards"])
+def test_packed_validation_splits_read_in_one_shape_and_one_bound(partition):
     """Packed validation splits whose windows hold 1 to 4 documents each, of 1 to 7 windows, read in the
     run's batch of 4 every batch the same: each marks its rows (`VALID_ROWS`), a split's whole batches and
     its short last one alike, and declares the most documents a window of any split holds
@@ -138,7 +141,7 @@ def test_packed_validation_splits_read_in_one_shape_and_one_bound():
     assert readers is not None
     seen = set()
     for reader in readers.values():
-        opened = reader(DataPartition())
+        opened = reader(partition)
         try:
             for batch in opened:
                 laid = batch["text_coordinates"]
@@ -147,3 +150,19 @@ def test_packed_validation_splits_read_in_one_shape_and_one_bound():
         finally:
             opened.close()
     assert len(seen) == 1 and next(iter(seen))[2] == 4, seen
+
+
+def test_a_handed_validation_passs_short_last_batch_reads_in_its_whole_ones_shape():
+    """A validation split handed as Grain batches (`native`) of 4 rows over 7 examples reads its short last
+    batch of 3 filled out to 4, its fourth row marked a repeat, and its whole batch marked too: one tree
+    and one shape a pass, so its evaluation compiles once (row 12474: a 4 + 3 split compiled its tail)."""
+    import grain.python as grain
+
+    from dew.batch import VALID_ROWS
+    from dew.data.compile import native
+
+    rows = grain.MapDataset.source([{"x": np.full(3, index, np.float32)} for index in range(7)]).batch(4)
+    opened = native(rows, training=False)(DataPartition())
+    batches = list(opened)
+    assert [np.shape(batch["x"]) for batch in batches] == [(4, 3), (4, 3)], batches
+    assert [np.asarray(batch[VALID_ROWS]).tolist() for batch in batches] == [[True] * 4, [True] * 3 + [False]]
