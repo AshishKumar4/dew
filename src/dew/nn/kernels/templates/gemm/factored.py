@@ -152,14 +152,17 @@ class _Transpose:
 
     def guarded(self, partial, tiny, reached, excess=()):
         """`partial` (a moved pullback), NaN at an entry a product the move flushed reaches (`reach`, through
-        the matrix's magnitudes) where it lies within fp32's significand of the flushed products' floor:
+        the matrix's magnitudes) where it lies within fp32's significand of their summed bound:
         there their loss may be all it holds (+1, -1, +1 under 2**126, 2**126, 2**-126 at a factor of 2**126
         sums 0, its 2**-8 flushed), as the plain transpose's is NaN; exact elsewhere."""
         assert self.reach is not None, "a rescue reads which entries its flushed products reach"
+        # Each flushed product below fp32's least normal: what they reach, times the matrix's magnitudes and
+        # however many reach an entry, bounds their loss there; within fp32's significand of it, refused.
         hit = self.reach(jnp.where(tiny, 1.0, 0.0), *reached).astype(jnp.float32)
         hit = self.summed(hit, excess) if excess else hit
-        floor = 2.0 ** (jnp.finfo(jnp.float32).minexp + jnp.finfo(jnp.float32).nmant + 1)
-        return jnp.where((hit > 0) & (jnp.abs(partial) < floor), jnp.nan, partial)
+        limits = jnp.finfo(jnp.float32)
+        bound = power2(hit, limits.minexp + limits.nmant + 1)
+        return jnp.where((hit > 0) & (jnp.abs(partial) < bound), jnp.nan, partial)
 
     def routed_moved(self, near, lift, routes, tiny, reached):
         """A gathered product's rescue: each route pulled back wide at its own power (`lift`, so what cancels
