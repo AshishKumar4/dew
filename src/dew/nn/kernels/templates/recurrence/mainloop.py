@@ -1626,15 +1626,10 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
     model = 2 * chunk * chunk * (width + values) if call.delta else 0
     staging, landing = _weighted_staged(call, keyed)
     inputs = (k, v, k if a is None else a, *prefix, beta, taken)
-    streamed = _weighted_streamed(call, keyed)
-    # A once stream the launch has not is a silent no-op (#3771's review: 'inverse' named none of its parts).
-    if missing := set(once) - set(streamed):
-        raise ValueError(f"_weighted's once streams {sorted(missing)} are none of its streams "
-                         f"{sorted(streamed)}")
+    walked, held_once = _weighted_split(call, keyed, once)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"),
-                         blocks={name: block for name, block in streamed.items() if name not in once},
-                         once={name: block for name, block in streamed.items() if name in once} or None,
+                         blocks=walked, once=held_once or None,
                          stages=(1, 2) if call.per_key else 1, live=chunk_liveness(len(inputs) - 1),
                          steps=steps, model=model, held=_weighted_held(call, keyed),
                          staging=staging, landing=landing,
@@ -1708,6 +1703,18 @@ def _weighted_swizzles(call: Call, keyed: int) -> dict:
     return {part: resources.widest_swizzle(operand.stored, keyed)
             for name, (_, operand) in _weighted_blocks(call, keyed).items()
             if name in ("keys", *PREFIX_STREAMS) for part in part_names(name, operand.parts)}
+
+
+def _weighted_split(call: Call, keyed: int, once: tuple[str, ...]) -> tuple[dict, dict]:
+    """`_weighted`'s streams' blocks at key block `keyed` (`_weighted_streamed`) split into those its walk
+    steps through and those loaded `once`; a once stream the launch has not refused, as a name matching none
+    of its parts left every step reloading it unseen (#3771's review: 'inverse' named none of its parts)."""
+    streamed = _weighted_streamed(call, keyed)
+    if missing := set(once) - set(streamed):
+        raise ValueError(f"_weighted's once streams {sorted(missing)} are none of its streams "
+                         f"{sorted(streamed)}")
+    return ({name: block for name, block in streamed.items() if name not in once},
+            {name: block for name, block in streamed.items() if name in once})
 
 
 def _weighted_once(call: Call) -> tuple[str, ...]:

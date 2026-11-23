@@ -27,6 +27,7 @@ from dew.nn.mixers.lightning import LightningAttention
 from dew.nn.mixers.mamba import Mamba
 from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.mixers.mamba3 import Mamba3
+from dew.parity import FEWEST_SEEDS
 from dew.training import MeshSpec
 
 WIDTH = 32
@@ -457,14 +458,34 @@ def test_a_slices_transfer_stays_finite_where_its_chain_in_order_does():
     """`recurrence_chunk.transferred` over four one-token chunks of a key dimension of one, keys 0, 0, 2^34,
     2^34, write gates 0, 0, 1/2, 1/2 and log decays -64, 0, 0, 0: transitions exp(-64), 1, 1 - 2^67 and
     1 - 2^67, their product in order about 3.5e12, where the later pair's alone, (1 - 2^67)^2, is past
-    fp32's range: joined pairwise without its powers of two apart, inf (#3771's review)."""
-    from dew.nn.kernels.recurrence_chunk import transferred
+    fp32's range: joined pairwise without its powers of two apart, inf (#3771's review). On par from float64
+    with the rule's final memory from the identity, which walks them in order (check 1, every draw the
+    same)."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, recurrent_delta_rule, transferred
 
     def column(*values):
-        return jnp.asarray(values, jnp.float32).reshape(1, len(values), 1)
+        return np.asarray(values, np.float32).reshape(1, len(values), 1)
 
-    key = column(0.0, 0.0, 2.0 ** 34, 2.0 ** 34)[..., None]
-    found = transferred(key, key, jnp.zeros_like(key), column(-64.0, 0.0, 0.0, 0.0),
-                        column(0.0, 0.0, 0.5, 0.5), chunk_size=1)
-    expected = np.exp(-64.0) * (1 - 2.0 ** 67) ** 2
-    np.testing.assert_allclose(np.asarray(found).reshape(()), expected, rtol=1e-5)
+    def draw(seed):
+        del seed
+        key = column(0.0, 0.0, 2.0 ** 34, 2.0 ** 34)[..., None]
+        return key, column(-64.0, 0.0, 0.0, 0.0), column(0.0, 0.0, 0.5, 0.5)
+
+    def chained(key, g, beta):
+        return transferred(key, key, jnp.zeros_like(key), g, beta, chunk_size=1)
+
+    def ruled(key, g, beta):
+        identity = jnp.ones((1, 1, 1, 1), key.dtype)
+        with generation.chosen(gated_delta_rule="xla"):
+            return chunk_gated_delta_rule(key, key, jnp.zeros_like(key), g, beta, identity, chunk_size=1)[1]
+
+    @as_given
+    def truth(*drawn):
+        with jax.enable_x64(new_val=True):
+            key, g, beta = widened(drawn)
+            return recurrent_delta_rule(key, key, jnp.zeros_like(key), g[..., None], beta,
+                                        jnp.ones((1, 1, 1, 1), key.dtype))[1]
+
+    assert_as_exact(jax.jit(chained), jax.jit(ruled), draw, "a transfer past fp32's range in its later pair",
+                    seeds=FEWEST_SEEDS, truth_fn=truth)
