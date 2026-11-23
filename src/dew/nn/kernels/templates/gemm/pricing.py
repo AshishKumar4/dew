@@ -342,7 +342,7 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
     if step_seconds is None or bandwidth is None or output == 0:
         return None
     held = groups * depth if partial_rows is None else partial_rows
-    return SplitWalk(output, multiprocessors * tiles.programs, steps, multiprocessors,
+    return SplitWalk(output, unit_cost.wave(multiprocessors, tiles.programs), steps, multiprocessors,
                      rows * (depth * itemsizes[0] + width * itemsizes[1]), bandwidth, step_seconds,
                      held * width * 4 / bandwidth / step_seconds,
                      0.0 if launch_seconds is None else launch_seconds / step_seconds,
