@@ -219,7 +219,8 @@ def test_an_offline_view_builds_a_configured_optimizer():
 
 
 def test_a_recorded_run_inspects_what_its_command_line_names(tmp_path):
-    """`dew train --set trainer.inspection=...` over a run.json samples what it names at its cadence."""
+    """A run.json whose `trainer.inspection` is set (`RunConfig.override`), trained by `dew train`, samples
+    what it names at its cadence."""
     inspection = {"class": "dew.training.inspection:Inspection",
                   "fields": {"paths": ["*q_proj*"], "every": 2}}
     run = trained_record(saved_record(lm(tmp_path, drawn=False), tmp_path, "inspected"), cli_settings(

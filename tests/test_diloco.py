@@ -268,9 +268,9 @@ def test_a_diloco_mesh_holds_each_replicas_rows_and_inner_copy_on_its_own_device
 
 @pytest.mark.mesh(devices=2)
 def test_a_configured_run_trains_two_diloco_groups_from_its_command_line(tmp_path):
-    """`dew train` with `--set trainer.mesh.diloco=2` and a DiLoCo of one window between meetings trains
-    two groups: its checkpoint holds each group's inner copy, stacked over the groups, beside the outer
-    model they met in."""
+    """`dew train` over a run whose `trainer.mesh.diloco` is 2 (`RunConfig.override`), a DiLoCo of one window
+    between meetings, trains two groups: its checkpoint holds each group's inner copy, stacked over the
+    groups, beside the outer model they met in."""
     from run_kinds import lm, trained_by_cli
 
     from dew.checkpoints import Checkpoints as Saved
