@@ -447,6 +447,8 @@ def test_a_slices_transfer_is_on_par_with_the_rule_from_the_identity(per_key):
     def truth(query, key, g, beta):
         with jax.enable_x64(new_val=True):
             query, key, g, beta = widened((query, key, g, beta))
+            # The token recurrence's decay a key dimension: a head's, each key's alike.
+            g = g if per_key else jnp.broadcast_to(g[..., None], (*g.shape, width))
             return recurrent_delta_rule(query, key, unread(key), g, beta, identity(key), starts=starts)[1]
 
     assert_as_exact(jax.jit(chained), jax.jit(ruled), draw, f"a slice's transfer, per_key {per_key}",
