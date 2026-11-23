@@ -274,6 +274,16 @@ class DistillationObjective(Objective[Loss, Effects], Generic[Loss, Effects]):
         return tuple(program._replace(head_fused=False)
                      for program in (*self.student.program_key(), *teacher))
 
+    @property
+    def reads_pass_counts(self) -> bool:
+        """Its loss runs the student and a looped teacher at a microbatch's count, as each model's own loss
+        does (`predict`), the two holding one count as a phase's passes hold them (`PhasePasses`)."""
+        return self.student.reads_pass_counts and self.teacher.reads_pass_counts
+
+    def counted_forward(self, module: nn.Module) -> str | None:
+        """The method the student's or the teacher's loss reads `module` by, which takes a call's count."""
+        return self.student.counted_forward(module) or self.teacher.counted_forward(module)
+
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         count = len(self.student.program_key())
         self.student.substitute(modules[:count])

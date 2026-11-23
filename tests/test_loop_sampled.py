@@ -710,20 +710,95 @@ class _Drawing:
         return batch
 
 
+class UncountedLM(LMObjective):
+    """A language model's loss of its own that hands its model no count of passes (a custom objective's)."""
+
+    @property
+    def reads_pass_counts(self) -> bool:
+        return False
+
+
 def test_a_pass_count_drawn_per_microbatch_for_an_objective_that_reads_none_is_refused():
     """A run drawing its pass count per microbatch hands each microbatch its count in its batch
-    (`LOOP_PASSES`), which an objective whose loss reads no count (`Objective.reads_pass_counts`), a
-    preference objective's over a looped decoder, would leave unread, running every pass at the cap whatever
-    was drawn: such a trainer is refused as it is built, and the same objective at a phase's count is not."""
-    from dew.objectives.rl.preference import DPOObjective
+    (`LOOP_PASSES`), which an objective whose loss reads no count (`Objective.reads_pass_counts`), a custom
+    one's over a looped decoder, would leave unread, running every pass at the cap whatever was drawn: such a
+    trainer is refused as it is built, and the same objective at a phase's count is not."""
     from dew.training import Layout, Trainer
 
-    objective = DPOObjective(looped(steps=CAP), 16)
-    with pytest.raises(ValueError):
+    objective = UncountedLM(looped(steps=CAP), 16)
+    with pytest.raises(ValueError, match="reads_pass_counts"):
         Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
                 sampled_passes=TRAINED)
     Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
             phase_passes=(CAP,))
+
+
+def counted_objective(name: str, at) -> tuple:
+    """The objective `name` over the trainer cells' looped decoder at its cap (`at`, each looped model it
+    reads made at a count), its one batch, and whether its step reads its frozen reference (`Step.ema`)."""
+    from dew.diffusion.discrete import MDLM
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.objectives.distillation import DistillationObjective
+    from dew.objectives.lm.adaptation import ChunkAdaptation
+    from dew.objectives.rl.preference import DPOObjective
+
+    tokens = jnp.asarray(np.random.default_rng(0).integers(0, 255, (2, 17)), jnp.int32)
+    if name == "dpo":
+        from test_dpo import WIDTH, pair_batch
+
+        return DPOObjective(at(looped(steps=CAP)), WIDTH - 1, beta=0.5), pair_batch(), True
+    if name == "masked-diffusion":
+        model = at(looped(steps=CAP).clone(causal=False))
+        return (MaskedDiffusionObjective(model, MDLM(mask_id=255)(), seq_len=16, ema_decay=None),
+                {"text": tokens[:, :16]}, False)
+    if name == "distillation":
+        student, teacher = (LMObjective(at(looped(steps=CAP)), 16, ema_decay=None) for _ in range(2))
+        return DistillationObjective(student, teacher, alpha=0.5), {"text": tokens}, False
+    assert name == "stacked-adaptation"
+    adaptation = ChunkAdaptation(window=(3, 6), rate=0.05, layers=(0,))
+    return LMObjective(at(looped(steps=CAP)), 16, adaptation=adaptation), {"text": tokens}, False
+
+
+@pytest.mark.parametrize("count", range(1, CAP + 1))
+@pytest.mark.parametrize("name", ["dpo", "masked-diffusion", "distillation", "stacked-adaptation"])
+def test_an_objectives_cap_program_at_a_drawn_count_is_that_counts_objective(name, count):
+    """Every objective a sampled run trains over a looped decoder runs its cap's one program at the count its
+    microbatch drew (`LOOP_PASSES`, traced), as a language model's does: a preference pair's policy and
+    reference, a masked diffusion's denoiser, a distillation's student and teacher, and a decoder stepping
+    its own blocks in context chunk by chunk, each loss and every parameter's gradient on par from float64
+    with the objective over the models of that count's own (`with_passes`; review of row 11951: each was
+    refused, which main trained at every count)."""
+    capped, batch, referenced = counted_objective(name, lambda model: model)
+    fixed, _, _ = counted_objective(name, lambda model: model.with_passes(count))
+    rows = len(next(iter(jax.tree.leaves(batch))))
+    passes = np.full((rows,), count, np.int32)
+    initial = drawn(capped.init)
+
+    def gradient(objective, given_passes=None):
+        given = batch if given_passes is None else {**batch, LOOP_PASSES: given_passes}
+
+        def run(variables):
+            # The reference a preference loss reads is the drawn variables, frozen for both sides alike.
+            step = Step(jnp.asarray(0), jax.random.key(0), variables if referenced else None)
+
+            def loss(params):
+                return objective.scalar_loss({**variables, "params": params}, given, step)[0]
+            return jax.value_and_grad(loss)(variables["params"])
+        return run
+
+    def counted(variables):
+        return gradient(capped, passes)(variables)
+
+    def own(variables):
+        return gradient(fixed)(variables)
+
+    def own_in_float64(variables):
+        twin, _, _ = counted_objective(name, lambda model: float64_twin(model.with_passes(count)))
+        return gradient(twin)(variables)
+
+    assert_as_exact(jax.jit(counted), dew_path(jax.jit(own)), initial,
+                    f"{name}'s cap program at {count} passes", seeds=PASS_SEEDS,
+                    truth_fn=jax.jit(own_in_float64))
 
 
 def decision_loss_at(model, weighed):

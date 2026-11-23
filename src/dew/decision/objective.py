@@ -13,7 +13,7 @@ from flax import linen as nn
 
 from dew._records import record
 from dew.artifacts import Decisions
-from dew.batch import FROZEN, Batch, Variables, dicts, loop_passes_given, part, thaw, unboxed
+from dew.batch import FROZEN, Batch, Variables, counted_passes, dicts, loop_passes_given, part, thaw, unboxed
 from dew.data.pipeline import Configured, ObjectiveData
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
@@ -98,13 +98,6 @@ def tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
         case _:
             return None
 
-
-
-def _counted_passes(batch: Batch) -> dict[str, jax.Array]:
-    """The pass count a looped backbone runs over `batch`'s rows where the call gives one (`LOOP_PASSES`,
-    `loop_passes_given`), as its forward's keyword; none where it gives none, every pass run."""
-    counted = loop_passes_given(batch)
-    return {} if counted is None else {"loop_passes": counted}
 
 class DecisionObjective(Objective[Ratio | Weighted]):
     """Trains a decision model on questions with known answers.
@@ -654,7 +647,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                            right_padded=True)
         read = final_read(backbone, held, tokens[:, :-1], train=step.training, coordinates=laid,
                           rngs=model_rngs(step.key, training=step.training),
-                          **progressed(backbone, self.progress(step)), **_counted_passes(batch))
+                          **progressed(backbone, self.progress(step)), **counted_passes(batch))
         # A token's successor in its own row, as a language model scores its targets (`scored_targets`): none
         # after a row's last token or on the padding.
         scored = scored_targets(jnp, tokens, None, None, segments).astype(jnp.float32)
@@ -681,7 +674,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         laid = batch_inputs.coordinates()
         read = final_read(backbone, held, tokens, train=step.training, coordinates=laid,
                           rngs=model_rngs(step.key, training=step.training),
-                          **progressed(backbone, self.progress(step)), **_counted_passes(batch))
+                          **progressed(backbone, self.progress(step)), **counted_passes(batch))
         before = laid.predecessors()
         states = jnp.take_along_axis(read, jnp.maximum(before, 0)[:, :, None], axis=1)
         rows = jnp.take_along_axis(asked_over(documents, parents, batch_inputs.fork_depth),

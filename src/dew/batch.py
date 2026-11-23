@@ -99,6 +99,13 @@ def loop_passes_given(batch: Mapping[str, object]) -> jax.Array | None:
     return None if passes is None else jnp.max(jnp.asarray(passes, jnp.int32))
 
 
+def counted_passes(batch: Mapping[str, object]) -> dict[str, jax.Array]:
+    """The pass count `batch`'s microbatch runs a looped model's block (`loop_passes_given`) as its forward's
+    keyword (`loop_passes`); none where the batch gives none, every pass run."""
+    counted = loop_passes_given(batch)
+    return {} if counted is None else {"loop_passes": counted}
+
+
 EXAMPLES_CONSUMED = "examples_consumed"
 """A training batch's column of the source examples each row is the last of, int32, in a run bounded in
 examples (`dew.data.pipeline.CONSUMED`): the batch's sum over its real rows is the examples its dispatch
