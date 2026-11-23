@@ -257,29 +257,27 @@ def test_a_scattered_regions_fused_price_counts_its_sides_permutation():
 
 
 def test_a_scattered_regions_permutation_prices_each_sides_bytes_and_table():
-    """A scattered region's fused arm pays its permutation pass a second one-column bf16 row-indexed side's
-    bytes read and written and the int32 scatter table read again: the scattered arm's price from one side to
-    two less the gathered arm's (which reads its sides where they lie) is exactly that traffic at the H100's
-    device memory rate, the pass's fixed cost and every other charge cancelling (row 12419)."""
+    """The region `fused` prices for a scattered product whose consumer adds an fp32 residual of its rows
+    holds its permutation pass's every byte: the residual read and written and the int32 scatter table
+    read, exactly (row 12419)."""
     sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
     x = jax.ShapeDtypeStruct((8192, 4096), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((4, 4096, 4096), jnp.bfloat16)
     rows = jax.ShapeDtypeStruct((8192,), jnp.int32)
-    side = jax.ShapeDtypeStruct((8192, 1), jnp.bfloat16)
+    residual = jax.ShapeDtypeStruct((8192, 4096), jnp.float32)
 
-    def priced(table, count):
-        def region(x, w, sizes, rows, *sides):
-            product = fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, **{table: rows})
-            return functools.reduce(jnp.add, sides, product).astype(jnp.bfloat16)
-        return fused_gemm.analysis(region, x, w, sizes, rows, *(side,) * count).fused_seconds
+    def region(x, w, sizes, rows, residual):
+        product = fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, scatter=rows)
+        return (product + residual).astype(jnp.bfloat16)
 
-    with generation.assumed("sm90"):
-        seconds = {(table, count): priced(table, count)
-                   for table in ("scatter", "gather") for count in (1, 2)}
-        rate = generation.gpu_target().memory_rate
-    added = (seconds["scatter", 2] - seconds["scatter", 1]) - (seconds["gather", 2] - seconds["gather", 1])
-    traffic = (2 * 8192 * 1 * 2 + 8192 * 4) / rate
-    assert abs(added - traffic) <= 1e-6 * traffic, (added, traffic, seconds)
+    regions: list = []
+    token = fused_gemm._PRICED.set(regions)
+    try:
+        with generation.assumed("sm90"), gemm.unbuilt():
+            jax.eval_shape(functools.partial(fused_gemm.fused, region), x, w, sizes, rows, residual)
+    finally:
+        fused_gemm._PRICED.reset(token)
+    assert regions[-1].permuted_bytes == 2 * 8192 * 4096 * 4 + 8192 * 4, regions[-1]
 
 
 def _chained(function, wide):
