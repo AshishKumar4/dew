@@ -1049,9 +1049,12 @@ def _assemblers(kinds: Iterable[str]) -> list[tuple[str, ...]] | None:
     where JAX gives XLA a CUDA directory Mosaic GPU does not search. A relock or a system CUDA that moves
     either certifies again, where the seal, which holds the CUDA plugins alone, kept a verdict another
     assembler judged (row 7309). None where one is unknown: its verdict is not stored."""
-    named = [(_mosaic_assembler if kind == "mosaic_gpu" else _triton_assembler)()
-             for kind in sorted(set(kinds))]
-    return None if None in named else named
+    named = []
+    for kind in sorted(set(kinds)):
+        if (assembler := (_mosaic_assembler if kind == "mosaic_gpu" else _triton_assembler)()) is None:
+            return None
+        named.append(assembler)
+    return named
 
 
 @functools.cache
