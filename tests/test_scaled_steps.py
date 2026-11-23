@@ -10,7 +10,7 @@ import pytest
 from dew.data import Memory
 from dew.data.pipeline import Pipeline
 from dew.objectives.base import Aux, EMASpec, Objective
-from dew.training import Trainer
+from dew.training import FitPolicy, Trainer, UpdateBatch
 
 
 class ScaledObjective(Objective):
@@ -35,7 +35,8 @@ def unscaled_weights(accum: int, microsteps: int):
     """The weights and their average after `microsteps` good microbatches of the same trainer with no
     dynamic scale: what a scaled run's accepted steps must equal bit for bit, its scale a power of two
     that multiplies the loss and divides the gradients exactly."""
-    trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0), accumulation=accum)
+    trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0),
+                      update=UpdateBatch(batches=accum))
     state = trainer.initial_state()
     good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
     step = trainer.compile(state, good)
@@ -85,7 +86,7 @@ def test_a_scaled_steps_state_report_names_the_leaf_its_committed_state_holds(sp
     from dew.training.transaction import checked
 
     trainer = Trainer(ScaledObjective(), optax.sgd(1e30), key=jax.random.key(0), dynamic_scale=True,
-                      split=split)
+                      fit=FitPolicy(split=split))
     state = trainer.initial_state()
     huge = {"scale": jnp.full((split * jax.device_count(),), 5e9, jnp.float32)}
     state, _, _, _, accepted, committed = trainer.compile(state, huge)(state, huge)
@@ -99,7 +100,7 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     """A dynamic scale's accepted steps are the unscaled run's, bit for bit, and a rejected one leaves
     no trace: after it, the run steps on as the unscaled run of its accepted microbatches alone."""
     trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0),
-                      accumulation=accum, dynamic_scale=True)
+                      update=UpdateBatch(batches=accum), dynamic_scale=True)
     state = trainer.initial_state()
     good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
     bad = {"scale": jnp.full((jax.device_count(),), 1e35, jnp.float32)}

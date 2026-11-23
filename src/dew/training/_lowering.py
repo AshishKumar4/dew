@@ -3,7 +3,7 @@
 Dew's Pallas GPU kernels lower to Triton only for a GPU: on a CPU the suite
 interprets them, so a kernel whose Triton lowering fails passes every CPU
 test and fails the run's first compile on the GPU (c58 and c57, an A100 and
-a G4 session, both ended there). `TrainerConfig.lower_for` names a CUDA
+a G4 session, both ended there). `dew.training.ahead.Lowered` names a CUDA
 generation, and the run then builds as it would and lowers its first step as
 on that GPU: every kernel choice and refusal reads the generation
 (`dew.nn.kernels.generation.assumed`), the step traces on an abstract mesh of
@@ -162,7 +162,7 @@ class Lowered(SystemExit):
     """Raised by `Trainer.fit` under `lower_for` once the run's first step has lowered for its target.
 
     Lowering was the whole run, so uncaught it ends the program with status 0
-    and no traceback, the step's kernels logged (`--trainer.lower-for`'s dry run). `programs` are the
+    and no traceback, the step's kernels logged (`dew lower` target:check's dry run). `programs` are the
     step's programs, each lowered with its name: a device step's one, a host step's each (the CPU's and the
     accelerator's, `dew.training.compiler.HostRun`, as its steady steps call them); `kernels` is their
     kernel report (`KernelReport`: the dispatches' routes and the lowered launches). A step for devices

@@ -301,7 +301,8 @@ def test_automatic_workers_read_each_run_length_as_a_read_in_none_does_within_th
         found, workers = read(compile(chain, seed=5, loading=auto, **length), "train", 12)
         assert found == expected and len(workers) <= TWO_CPUS.cpus
     expected, _ = read(compile(traced.repeat(), seed=5, loading=none, steps=9), "train", 6)
-    found, workers = read(compile(traced.repeat().threads(2), seed=5, steps=9), "train", 6)
+    threaded = traced.repeat().loading(Loading(workers="auto", threads=2))
+    found, workers = read(compile(threaded, seed=5, steps=9), "train", 6)
     assert found == expected and len(workers) <= Host.current().cpus
     held = Pipeline(Memory(_Indexed(8))).map(_Where()).batch(4)
     expected, _ = read(compile(traced.repeat(), validation=held, seed=5, steps=10, loading=none), "val", 2)
@@ -1571,3 +1572,19 @@ def test_a_ramps_smaller_first_step_keeps_a_step_wide_field():
 
     assert [batch["index"].tolist() for batch in steps] == [[0, 1, 2, 3], [4, 5, 6, 7], list(range(8, 16))]
     assert [batch["scale"] for batch in steps] == [1.0, 1.0, 1.0]
+
+
+def test_a_finite_pass_reads_a_chain_as_the_chain_says(tmp_path):
+    """A finite pass (`iterate`, as an export or a publication reads) reads a chain as its own `read`
+    says where the pass names none, as `compile` does: a store read by index then shuffled whole is
+    shuffled, every record once, where reading it streamed refused the whole shuffle (row 11936)."""
+    from dew.data import Files
+    from dew.data.compile import iterate
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(32)))
+    chain = Files(str(path)).read("indexed").shuffle(seed=0)
+    read = [int(row["id"]) for row in iterate(chain, provision=True)]
+    assert sorted(read) == list(range(32)) and read != list(range(32))
+    with pytest.raises(ValueError):
+        list(iterate(chain, read="streamed", provision=True))

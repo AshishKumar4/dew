@@ -36,9 +36,10 @@ from pool_records import (
 from process_support import refusal, serve_mode, worker_parser
 from rl_support import pooled_rollout, rollout_prompts
 
-from dew.data import Loading
+from dew.data import Loading, Phase, Tokens, phases
 from dew.data.dataset import Loader
 from dew.telemetry.records import RECORD_TYPES
+from dew.training import FitPolicy, UpdateBatch
 from dew.training.evaluation import Evaluation
 
 # The test model's parameters are far below the production shard threshold, so
@@ -524,10 +525,10 @@ def mode_token_budget(args) -> dict:
 
 def mode_schedule_fit(args) -> dict:
     """`--steps` of `token_trainer` on a schedule of `--tokens` read in two orders, the first stage for
-    60 committed tokens (`dew.data.schedule`): the step the run reached, the record its first stage
+    60 committed tokens (`dew.data.phases` on `Tokens`): the step the run reached, the record its first stage
     ended at in the saved position, and the parameters beside the report."""
     from dew import _position
-    from dew.data import presets, schedule
+    from dew.data import presets
     from dew.data.sources.tokens import TokenFiles
 
     def ordered(seed: int):
@@ -535,7 +536,8 @@ def mode_schedule_fit(args) -> dict:
         return windows.pipe(presets.token_windows, seq_len=args.seq_len, batch=None)
 
     trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=args.seq_len)
-    state = trainer.fit(schedule([(ordered(0), 60), (ordered(1), None)]).batch(BATCH), steps=args.steps)
+    state = trainer.fit(phases(Phase(ordered(0), Tokens(60)), Phase(ordered(1))).batch(BATCH),
+                        steps=args.steps)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     _, saved = restored_state(trainer)
     completed = [] if saved is None else _position.read(saved.encode()).completed
@@ -1031,7 +1033,7 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
     model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
                          num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                   mesh=MeshSpec(fsdp=fsdp, stage=stage), microbatches=microbatches,
+                   mesh=MeshSpec(fsdp=fsdp, stage=stage), fit=FitPolicy(microbatches=microbatches),
                    layout=Layout(min_shard=TINY), checkpoints=None, tracker=None)
 
 
@@ -1058,6 +1060,7 @@ def mode_pipeline(args) -> dict:
 
     rows = BATCH // args.processes
     mine = token_batch()[args.process_id * rows:(args.process_id + 1) * rows]
+    # The step's split where the command names one, else the planner's.
     trainer = pipeline_trainer(args.stage_size, args.microbatches, args.fsdp_size)
     losses, state = pipeline_losses(trainer, mine, args.steps)
     dump_params(args.out.with_suffix(".npz"), state.variables)
@@ -1372,9 +1375,8 @@ def mode_training_contract(args) -> dict:
 
     checkpoints = Checkpoints(args.run_dir)
     def build():
-        return Trainer(Rows(composite=True), optax.adamw(.03, weight_decay=.1),
-                       key=jax.random.PRNGKey(9), accumulation=2,
-                       dynamic_scale=SHORT_SCALE, checkpoints=checkpoints)
+        return Trainer(Rows(composite=True), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
+                       update=UpdateBatch(batches=2), dynamic_scale=SHORT_SCALE, checkpoints=checkpoints)
     trainer = build()
     state, _, _ = trainer.place()
     rank, processes = jax.process_index(), jax.process_count()

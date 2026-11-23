@@ -38,9 +38,10 @@ from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading, presets, t
 from dew.data.compile import iterate
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import Perplexity
-from dew.optim import Cosine, OptimConfig
+from dew.optim import AdamW, Cosine, OptimConfig
 from dew.registry import ModelConfig
 from dew.training import Evaluation, MeshSpec
+from dew.training.budget import Horizon
 
 SMOKE_TEXT = (
     "The cat sat on the warm mat and watched the rain.\n",
@@ -115,9 +116,9 @@ def main(config: Config) -> Path:
     whole = held.pipe(presets.lm, None, seq_len=window, batch=config.batch_size, pack=None).read("memory")
     name = f"mdlm-{config.dataset.rsplit('/', 1)[-1].lower()}"
     trainer = TrainerConfig(name=name, checkpoint_dir=str(config.out / "checkpoints"), keep=1,
-                            steps=config.steps,
-                            log_every=1 if config.smoke else 100, eval_every=config.eval_every,
-                            checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1), multi_host=False)
+                            horizon=Horizon(steps=config.steps), log_every=1 if config.smoke else 100,
+                            eval_every=config.eval_every, checkpoint_every=config.eval_every,
+                            mesh=MeshSpec(fsdp=1), multi_host=False)
     # The mask is the id past the tokenizer's, so no text can contain it.
     run = LMRunConfig(
         model=ModelConfig("causal_transformer", {
@@ -127,7 +128,7 @@ def main(config: Config) -> Path:
         objective=ObjectiveConfig("masked_diffusion", {
             "steps": config.sample_steps, "ema_decay": 0.9 if config.smoke else 0.999,
             "eos_token_ids": () if tokenizer.eos_id is None else (tokenizer.eos_id,)}),
-        optim=OptimConfig(weight_decay=0.03, clip_grads=1.0, learning_rate=Cosine(
+        optim=OptimConfig(optimizer=AdamW(weight_decay=0.03), clip_grads=1.0, learning_rate=Cosine(
             peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
             end_value=config.learning_rate / 10)),
         trainer=replace(trainer, compilation_cache_dir=None) if config.smoke else trainer)

@@ -531,7 +531,7 @@ def pairing_parts(held: int) -> int:
     float64 at a sub-chunk's first tokens, where pairs across its edge cancel (M-JS-162 on a GH200's
     mma.sync, digit for digit an A100's at main, row 10382; the TF32 rounding interpreted gave the same
     digits, two parts 0.1 times fla's, p-kdavar)."""
-    return product.EXACT_PARTS if held > 1 else 2
+    return product.bf16_part_count(jnp.float32, accurate=True) if held > 1 else 2
 
 
 def _pairing_operand(call: Call) -> Operand:

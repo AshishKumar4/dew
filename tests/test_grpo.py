@@ -415,9 +415,9 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
     from dew.training import LocalTracker
 
     config = rl_support.recorded_grpo_config(
-        tmp_path, "--trainer.steps", "3", "--trainer.name", "served", "--rollout.served.slots", "8",
+        tmp_path, "--trainer.horizon.steps", "3", "--trainer.name", "served", "--rollout.served.slots", "8",
         "--rollout.served.sync-every", "2", "--rollout.served.max-lag", "2",
-        "--rollout.served.page-size", "4", "--objective.behavior-importance", "2.0", prompt="hi there")
+        "--rollout.served.page-size", "4", behavior_importance=2.0, prompt="hi there")
     state = config.run()
     assert int(state.step) == 3
     # The server and its reward pool end with the run: no engine or scorer thread outlives it.
@@ -444,13 +444,13 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
     from dew.config.lm import LMRunConfig
 
     config = rl_support.recorded_grpo_config(tmp_path, "--trainer.name", "grpo", "--rollout.method", "rloo",
-                                             "--objective.reward-kl", "0.05")
+                                             reward_kl=0.05)
     state = config.run()
     assert int(state.step) == 1 and state.ema is not None
     loaded = LMRunConfig.load(str(tmp_path / "grpo")).rollout
     assert loaded is not None and loaded.method == "rloo"
     refused = rl_support.recorded_grpo_config(tmp_path, "--trainer.name", "dapo", "--rollout.method", "dapo",
-                                              "--objective.beta", "0.1")
+                                              beta=0.1)
     with pytest.raises(ValueError):
         refused.run()
     with pytest.raises(ValueError):

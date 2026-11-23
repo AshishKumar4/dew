@@ -319,6 +319,14 @@ def test_a_tokenized_document_ends_in_one_eos_with_eos_and_none_without(tmp_path
     assert Tokenize(tokenizer, eos=None).map({"text": text})["text"].tolist() == ended
 
 
+def _exported(text: str) -> np.ndarray:
+    """`text`'s byte tokens as `dew data export` writes them, a line a document, each ended by the tokenizer's
+    EOS (`--eos`, the default)."""
+    tokenizer = ByteTokenizer()
+    return np.concatenate([np.append(tokenizer.encode(line), tokenizer.eos_id)
+                           for line in text.splitlines(keepends=True)])
+
+
 def _export_cli(input_path, destination):
     """`dew data export` of a run file whose chain reads `input_path` as text, a line a document,
     whatever its name, into `destination` as byte tokens."""
@@ -348,8 +356,7 @@ def test_data_export_leaves_every_file_it_did_not_create(tmp_path, missing):
     assert (result.returncode == 0) == (not missing), result.stderr[-2000:]
     assert sentinel.read_bytes() == before
     if not missing:
-        np.testing.assert_array_equal(TokenFiles(str(destination)).tokens[:],
-            ByteTokenizer().encode(raw.read_text()))
+        np.testing.assert_array_equal(TokenFiles(str(destination)).tokens[:], _exported(raw.read_text()))
 
 
 def test_an_input_inside_the_export_directory_is_read_and_left_alone(tmp_path):
@@ -361,7 +368,7 @@ def test_an_input_inside_the_export_directory_is_read_and_left_alone(tmp_path):
     result = _export_cli(inside, destination)
     assert result.returncode == 0, result.stderr[-2000:]
     assert inside.read_text(encoding="utf-8") == text
-    np.testing.assert_array_equal(TokenFiles(str(destination)).tokens[:], ByteTokenizer().encode(text))
+    np.testing.assert_array_equal(TokenFiles(str(destination)).tokens[:], _exported(text))
 
 
 # ---------------------------------------------------------------------------------
