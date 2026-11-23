@@ -65,6 +65,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Owner-approved Audit 4 API cleanup. [11935]
 - CI time: every test within 120 seconds. [12128]
 - A checkpoint taken after a fit's ladder climbed to recompute its layers (its model record's `remat` set by the climb) is refused on resume as 'trained another…. [12135]
+- Stage-local runs keep every layer whole on a stacked leaf whose optimizer update loops over the stack. [12266]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -107,8 +108,8 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## CI and tooling
 
+- The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404, 12273]
 - Dew's CI, test cache and compile-ahead tests. [5491, 5670]
 - The perf gate's regressions since 11-07: compile time, the 4B step's stall, a DiT's peak. [10138]
-- The JAX fork, releases and installs. [3569, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]
 - Tests/test_gpu_mesh.py and tests/test_gpu_systems.py each span three lanes' code. [6421]
 - Tools that import their siblings by putting tools/ on sys.path at import time. [11756]
