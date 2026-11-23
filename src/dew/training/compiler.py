@@ -1361,6 +1361,8 @@ class StepCompiler[L, E]:
                 # for a refit. An empty profile replaces nothing, and every kept lowering stays.
                 hold(asked, planned.executable)
                 forget(unguided)
+        # Every executable and traced step the search kept but the plan's dropped (row 12131).
+        search.released_unplanned(planned)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)

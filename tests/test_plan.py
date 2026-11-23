@@ -544,6 +544,26 @@ def needs(monkeypatch, trainer, run=None):
     return LIMIT - trainer.plan["probes"][0]["headroom"]
 
 
+def test_a_settled_plan_keeps_no_program_its_search_passed_over(monkeypatch):
+    """A search that compiled the step whole, which missed, and split, which fits, keeps the plan's program
+    alone once it settles: its executable held for the process (`options.hold`) and its traced step for a
+    refit (`_candidates.candidate_for`), each other program it compiled dropped, whose lowering keys its
+    loaded executable and, over several GPUs, its collectives' room outside XLA's pool for as long as it is
+    kept (row 12131: 24 kept beside a 4B run's step left an all-reduce no room)."""
+    from dew.training import _candidates
+
+    whole, halves = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=2))
+    assert halves < whole, (halves, whole)
+    free(monkeypatch, (whole + halves) // 2)
+    options.release()
+    trainer = lm()
+    trained(trainer, steps=0)
+    assert len(trainer.plan["probes"]) >= 2 and trainer.plan["split"] > 1, trainer.plan["probes"]
+    kept = [kept.lowered for kept in _candidates._CANDIDATES.values()]
+    assert len(kept) == 1, len(kept)
+    assert len(options._HELD) == 1, list(options._HELD)
+
+
 def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(monkeypatch):
     """With room for the step at two microbatches and not at one, the plan
     reads the batch in microbatches under no recomputation, and the run

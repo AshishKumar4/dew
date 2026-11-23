@@ -1372,7 +1372,7 @@ class Trainer(Generic[Loss, Effects]):
                     # outputs, the loss counters, so a newly compiled step's first run is awaited here,
                     # where its failure can be named.
                     self._unproven = False
-                    first_run(loss, run.current, self.memory, self.device_mesh)
+                    first_run(loss, run.current, self.memory, self.device_mesh, self.executable)
                 run.loss = loss
                 assert run.train is not None
                 position = run.train.source_state if ahead is None else ahead
