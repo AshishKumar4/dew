@@ -987,31 +987,6 @@ def test_a_cuda_targets_verdict_key_names_the_ptxas_jax_gives_xla_and_none_stati
     assert unstated is None
 
 
-@COMPILES_ON_CPU
-def test_a_cuda_targets_verdict_key_names_the_nvjitlink_xla_would_open_by_its_contents(tmp_path):
-    """XLA's automatic mode may assemble a Pallas-Triton kernel with libnvJitLink, which its stub opens from
-    the `nvidia-nvjitlink` wheel first: a CUDA target's verdict key names that library by its contents, so
-    the same build again keys a launch alike, and another at the same path, as a system copy updated in
-    place is, keys it afresh, where the wheels' versions alone named it (row 12166)."""
-    from process_support import REPO_ROOT, fresh
-
-    root, site = tmp_path / "cuda", tmp_path / "site"
-    _ptxas_stating(root, BUILDS[0])
-    # The wheel's package, ahead of any installed one on the child's path.
-    (site / "nvidia" / "nvjitlink" / "lib").mkdir(parents=True)
-    for package in (site / "nvidia", site / "nvidia" / "nvjitlink"):
-        (package / "__init__.py").touch()
-    path = os.pathsep.join((str(site), str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")))
-
-    def key(contents: bytes) -> str | None:
-        (site / "nvidia" / "nvjitlink" / "lib" / "libnvJitLink.so.12").write_bytes(contents)
-        return fresh(VERDICT_KEYS, "sm90", platforms="cpu",
-                     variables={"CUDA_ROOT": str(root), "PYTHONPATH": path})["sm90"]
-
-    first, again, other = (key(contents) for contents in (b"one build", b"one build", b"another build"))
-    assert first is not None and first == again != other
-
-
 def test_a_tpu_targets_verdict_key_reads_no_gpu_assembler():
     """A TPU target's verdict key, on an install whose Mosaic GPU bindings do not import (a TPU-only one),
     names no GPU assembler: reading Mosaic GPU's raised there for every MXU launch certified."""

@@ -580,7 +580,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
 
         @pl.when(issuing)
         def _():
-            issue()  # into tensor memory in place; its returned accumulator no branch's value
+            # Into tensor memory in place; its returned accumulator no branch's value.
+            mosaic.predicated(issue)
 
         return acc
 

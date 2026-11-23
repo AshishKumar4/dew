@@ -382,6 +382,13 @@ _COMMITTED = _cache.untraced(contextvars.ContextVar("committed", default=0))
 add to, whose differences across a walk's step are its groups (`commits`), its own value no trace's program
 reads (`dew._cache.untraced`)."""
 
+_PREDICATED = _cache.untraced(contextvars.ContextVar("predicated", default=False))
+"""Whether products are issued under a predicate a run decides (`Issuer.issued_when`)."""
+
+_UNSURE = _cache.untraced(contextvars.ContextVar("unsure", default=0))
+"""The product groups `_COMMITTED` counts that were committed under a predicate a run decides
+(`_PREDICATED`), which a run may commit none of (`sure_commits`)."""
+
 
 def then_read(read: Callable, after: Callable | None) -> Callable:
     """`read`, then `after` of its value where given (`Issuer.summed_together`'s `then`)."""
@@ -394,12 +401,31 @@ def committed() -> None:
     reading shared memory asynchronously, so refused within `Family.staged_together` (`issuing`)."""
     issuing()
     _COMMITTED.set(_COMMITTED.get() + 1)
+    if _PREDICATED.get():
+        _UNSURE.set(_UNSURE.get() + 1)
 
 
 def commits() -> int:
     """The product groups committed so far in this trace (`committed`): a walk's completion tokens, the
     difference across a step its groups."""
     return _COMMITTED.get()
+
+
+def sure_commits() -> int:
+    """The product groups `commits` counts that every run commits, none under a predicate a run decides
+    (`predicated`): a wait leaving as many of them in flight as were committed after a group waits on that
+    group, whichever predicated ones a run commits too, as groups complete in their order (theme K01-e's
+    review P0: a wait counting a predicated group a run skipped read the group before it unfinished)."""
+    return _COMMITTED.get() - _UNSURE.get()
+
+
+def predicated(issue: Callable):
+    """`issue()`, its groups committed under a predicate a run decides (`sure_commits`)."""
+    token = _PREDICATED.set(True)
+    try:
+        return issue()
+    finally:
+        _PREDICATED.reset(token)
 
 
 def workspace(shape: tuple, dtype, *, interpret) -> jax.Ref:
@@ -1239,9 +1265,9 @@ class Issuer[Accumulator](abc.ABC):
         `issued_unless`'s branch the other way, stated positively, as a warp's own code lowers a predicate
         (no boolean `not` there): a value accumulator's by a branch, one its instructions write in place by
         its issuer's own (`WgmmaIssuer`, `Tcgen05Issuer`). Its groups count as committed either way
-        (`commits`), which a walk's waits meet where no step issues them; a choice among products that
-        varies by step is `issued_one_of`'s."""
-        return lax.cond(issuing, issue, lambda: acc)
+        (`commits`), which a walk's waits meet where no step issues them, though not as committed by every
+        run (`sure_commits`); a choice among products that varies by step is `issued_one_of`'s."""
+        return lax.cond(issuing, functools.partial(predicated, issue), lambda: acc)
 
     def issued_one_of(self, which: jax.Array, accumulators: Sequence, issue: Callable) -> tuple:
         """Each of `accumulators` as `issue(case, acc)`'s products into it leave it where `which` (traced,
@@ -1250,7 +1276,7 @@ class Issuer[Accumulator](abc.ABC):
         `gemm.chained`). Its groups count as one case's (`commits`), each case committing as many: counted
         as every case traced, a walk's wait for a step's groups left a step of its ring in flight past its
         slot's release (base review of f86cb5b03, F2)."""
-        before, issued, groups = commits(), [], set()
+        before, unsure, issued, groups = commits(), _UNSURE.get(), [], set()
         for case, acc in enumerate(accumulators):
             began = commits()
             issued.append(self.issued_when(which == case, acc, functools.partial(issue, case, acc)))
@@ -1258,7 +1284,9 @@ class Issuer[Accumulator](abc.ABC):
         if len(groups) > 1:
             raise ValueError(f"a choice among products commits one count of groups whichever it issues, not "
                              f"{sorted(groups)}")
+        # One case's groups, which every run commits, as sure as the choice's own issue is.
         _COMMITTED.set(before + max(groups, default=0))
+        _UNSURE.set(unsure + (max(groups, default=0) if _PREDICATED.get() else 0))
         return tuple(issued)
 
     def added_onto(self, acc, adds: jax.Array):

@@ -86,8 +86,8 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
     def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False,
                         then: tuple[Callable | None, ...] | None = None) -> tuple[Callable, ...]:
         # Every group issued into its own scoped accumulator, then each read as its own groups complete,
-        # the later ones running on (`read`'s `pending`, counted by the groups each committed), `then[i]` of
-        # it run there, interpreted alike (the interpreter's own MMA, as `product`'s); `apart`, each summed
+        # the later ones running on (`read`'s `pending`, counted by the groups every run commits), `then[i]`
+        # of it run there, interpreted alike (the interpreter's own MMA, as `product`'s); `apart`, each summed
         # in turn.
         if apart:
             return super().summed_together(shapes, issues, apart=apart, then=then)
@@ -97,10 +97,12 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
             ends = []
             for issue, acc in zip(issues, accumulators, strict=True):
                 issue(acc)
-                ends.append(mosaic.commits())
+                ends.append(mosaic.sure_commits())
             values = []
             for acc, end, each in zip(accumulators, ends, after, strict=True):
-                value = self.read(acc, pending=mosaic.commits() - end)
+                # In flight past the group read: the groups after it every run commits, which complete
+                # after it, whichever predicated groups a run commits too (`mosaic.sure_commits`).
+                value = self.read(acc, pending=mosaic.sure_commits() - end)
                 values.append(value if each is None else each(value))
             return tuple(values)
 
@@ -136,7 +138,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
 
         @pl.when(issuing)
         def _():
-            issue()  # into `acc` in place; its returned ref no branch's value
+            mosaic.predicated(issue)  # into `acc` in place; its returned ref no branch's value
 
         return acc
     def read(self, acc, *, first: int = 0, columns: int | None = None, pending: int = 0) -> jax.Array:
