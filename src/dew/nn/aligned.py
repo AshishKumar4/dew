@@ -40,11 +40,12 @@ def aligned_sum(terms: Sequence[Sequence[jax.Array]], axis: int | tuple[int, ...
     return _aligned_terms(terms, ((axis, None),) * len(terms))
 
 
-def aligned_segment_sum(terms: Sequence[Sequence[jax.Array]], segments: jax.Array, count: int,
+def aligned_segment_sum(terms: Sequence[Sequence[jax.Array]], segments: jax.Array | None, count: int,
                         axes: tuple[str, ...] = ()) -> jax.Array:
     """`aligned_sum`'s exact sum of `terms`' products, each product's rows (its first axis) summed into the
     row `segments` names among `count` (int32, one a row: a gather's table, its transpose summing each route
-    into its token), then over the manual axes `axes` names where its products vary over them (each
+    into its token; each row its own, placed as it is, where None), then over the manual axes `axes` names
+    where its products vary over them (each
     device's routes of a token every device holds), rounded once to nearest, ties to even: routes of +-2^140
     from two devices sum to 0 beside a 2^-38 one, which no order of floats summed keeps. Its value alone: a
     caller declares its derivative. Every device of `axes` walks the same digits, their bounds agreed
@@ -69,12 +70,15 @@ def _segmented(segments: jax.Array, count: int, axes: tuple[str, ...]) -> Callab
             assert op is jnp.sum, "a segment's digits are summed"
             x = jnp.asarray(x, options.get("dtype", jnp.asarray(x).dtype))
             x = jnp.broadcast_to(x, shape)
-            zeros = varying_like(jnp.zeros((count, *shape[1:]), x.dtype), x, segments)
-            summed = zeros.at[segments].add(x)
+            if segments is None:
+                summed = x
+            else:
+                zeros = varying_like(jnp.zeros((count, *shape[1:]), x.dtype), x, segments)
+                summed = zeros.at[segments].add(x)
             over = tuple(axis for axis in axes if axis in jax.typeof(summed).mat.varying)
             return jax.lax.psum(summed, over) if over else summed
 
-        return reduced, shape[0] * devices
+        return reduced, (1 if segments is None else shape[0]) * devices
 
     return reduction
 

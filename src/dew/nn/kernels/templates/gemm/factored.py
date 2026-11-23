@@ -105,6 +105,9 @@ class _Transpose:
         """The plain transpose, the cotangent times its factor pulled back; where an entry of it is not
         finite, the moved one's (`moved`)."""
         plain = self.summed(*self.pulled(cotangent * scale, ran))
+        if 0 in self.shape:
+            # No row or no depth: the plain transpose's empty or zero gradient is the whole of it.
+            return plain
 
         def moved():
             # Summed before its pullback where the operands are every device's; the axes its partials will
@@ -149,46 +152,44 @@ class _Transpose:
             sums_top = jax.lax.pmax(token_top, axes) if axes else token_top
             rows_top = sums_top[gather]
         matrix, *rest = self.prepared(*wide_operands)
-        segments = jnp.arange(self.shape[0], dtype=jnp.int32) if gather is None else gather
         depth = self.shape[-1]
         chunk = math.gcd(depth, FACTORED_CHUNK)
         # Each band's highest binade, moved to 2**0, and its products in (2**-FACTORED_BAND, 4), formed once a
         # chunk of the depth (no band of the whole cotangent held at once).
-        highs = rows_top - FACTORED_BAND * jnp.arange(FACTORED_BANDS, dtype=rows_top.dtype)  # [rows, bands]
-        # Each band's power as three factors each a normal float's, a row's per band, band by band.
-        powers, rest_power = [], highs
-        for _ in range(3):
-            powers.append(jnp.clip(rest_power, -126, 127))
-            rest_power = rest_power - powers[-1]
-        factors = [float_bits.exact_power2(each).T.reshape(-1, 1) for each in powers]
-        table = jnp.tile(segments, FACTORED_BANDS)
+        highs = [rows_top - FACTORED_BAND * index for index in range(FACTORED_BANDS)]
+        # Each band's power as three factors each a normal float's, a row's.
+        factors = []
+        for high in highs:
+            parts, left = [], high
+            for _ in range(3):
+                parts.append(jnp.clip(left, -126, 127))
+                left = left - parts[-1]
+            factors.append([float_bits.exact_power2(part) for part in parts])
+        stacked = jnp.stack(highs)
 
         def pulled_chunk(at, out):
-            # Every band's pullback over this chunk of the depth, its rows and bands summed into their
-            # segments (tokens, gathered) over every device exactly and rounded once (`aligned_segment_sum`).
+            # Every band's pullback over this chunk of the depth (`lax.map`, placed as the partials are), its
+            # bands' rows summed into their segments (tokens, gathered; each row its own, dense) over every
+            # device exactly and rounded once (`aligned_segment_sum`).
             columns = jax.lax.dynamic_slice_in_dim(matrix, at * chunk, chunk, axis=-2)
 
-            def band(index, partials):
-                high = jax.lax.dynamic_index_in_dim(highs, index, axis=-1)
+            def band(high):
                 held = (binade <= high) & (binade > high - FACTORED_BAND)
                 near = jnp.where(held, power2(significands, binade - high), 0.0)
                 near = jax.lax.psum(near, before) if before else near
-                partial = self.wide(near, columns, *rest).astype(jnp.float32)
-                return jax.lax.dynamic_update_index_in_dim(partials, partial, index, axis=0)
+                return self.wide(near, columns, *rest).astype(jnp.float32)
 
-            rows = segments.shape[0]
-            partials = varying_like(jnp.zeros((FACTORED_BANDS, rows, chunk), jnp.float32),
-                                    near_typed, *jax.tree.leaves((matrix, rest)))
-            partials = jax.lax.fori_loop(0, FACTORED_BANDS, band, partials).reshape(-1, chunk)
+            partials = jax.lax.map(band, stacked)
+            terms = [(partials[index], *factors[index]) for index in range(FACTORED_BANDS)]
             axes = tuple(sorted(frozenset().union(
-                *(jax.typeof(v).mat.varying for v in (partials, table))) - self.held))
-            summed = aligned_segment_sum([(partials, *factors)], table, self.shape[0], axes)
+                *(jax.typeof(v).mat.varying for v in (partials, *(() if gather is None else (gather,)))))
+                - self.held))
+            summed = aligned_segment_sum(terms, gather, self.shape[0], axes)
             return jax.lax.dynamic_update_slice_in_dim(out, varying_like(summed, out), at * chunk, axis=-1)
 
-        near_typed = jax.lax.psum(cotangent, before) if before else cotangent
-        # The rows' gradient, typed as the plain transpose's is (its devices' sums taken, as each chunk's
-        # are), so the loop's carry and the branch it returns from keep its type.
-        out = varying_like(jnp.zeros(self.shape, jnp.float32), plain)
+        # The rows' gradient, typed and placed as the plain transpose's is (its devices' sums taken, as each
+        # chunk's are), so the loop's carry and the branch it returns from keep its type.
+        out = varying_like(jnp.zeros(self.shape, jnp.float32, out_sharding=explicit_spec(plain)), plain)
         return jax.lax.fori_loop(0, depth // chunk, pulled_chunk, out)
 
     def tangent(self, ran, routed, primals, tangents):
