@@ -60,6 +60,7 @@ from dew.nn.kernels import gemm, generation, grouped_matmul, launches, tuning
 from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost, emission
+from dew.nn.kernels.templates.gemm import rows_permuted
 from dew.nn.sharding import computed_from
 
 FUSION_ROW = 'ledger 1295'
@@ -83,13 +84,17 @@ def fusible_gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None =
 
 def product(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *,
             transpose_rhs: bool = False, precision: PrecisionLike = None, out_dtype=None,
+            gather: jax.Array | None = None, scatter: jax.Array | None = None,
             interpret_on_cpu: bool = False) -> jax.Array:
     """The fusible product of each group's rows of `lhs` and its matrix of `rhs` (one matrix where
     `group_sizes` is None, a dense dot), declared as the dot it stands for declares itself: its `precision`
     (`gemm.gemm`'s) and its result dtype (`out_dtype`, `lhs`'s where None; a `preferred_element_type`'s).
     Its products sum in fp32 at least and round once to `out_dtype`, the dot's own rounding, so its
     consumers, fused into the template's epilogue under `fuser.fuse`, read the product exactly as the
-    program they came from does: the accumulator tile rounded to `out_dtype`, their first operation."""
+    program they came from does: the accumulator tile rounded to `out_dtype`, their first operation.
+    Grouped calls may also pass `gather` and `scatter` index tables (`gemm.gemm`'s, rows 1376, 5391)."""
+    if (gather is not None or scatter is not None) and group_sizes is None:
+        raise ValueError("gathered or scattered rows are a grouped call's")
     declared = (precision, jnp.dtype(lhs.dtype if out_dtype is None else out_dtype))
     floating = all(jnp.issubdtype(operand.dtype, jnp.inexact) for operand in (lhs, rhs))
     made = _FUSIBLES.get()
@@ -104,12 +109,17 @@ def product(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None
             return jax.lax.dot_general(lhs, rhs, (((1,), (1 if transpose_rhs else 0,)), ((), ())),
                                        precision=precision, preferred_element_type=declared[1])
         matrices = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
-        return jax.lax.ragged_dot(lhs, matrices, group_sizes, precision=precision,
-                                  preferred_element_type=declared[1])
+        values = lhs if gather is None else lhs[gather]
+        out = jax.lax.ragged_dot(values, matrices, group_sizes, precision=precision,
+                                 preferred_element_type=declared[1])
+        return gemm.scattered(out, scatter)
     fusible = fuser.fusible(output_fusion_prefix=True)(
-        functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None, declared))
+        functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None,
+                          gather is not None, scatter is not None, declared))
+    args = (lhs, rhs, *(() if group_sizes is None else (group_sizes,)),
+            *(() if gather is None else (gather,)), *(() if scatter is None else (scatter,)))
     with gemm.unbuilt() if _FUSING.get() else contextlib.nullcontext():
-        return fusible(lhs, rhs) if group_sizes is None else fusible(lhs, rhs, group_sizes)
+        return fusible(*args)
 
 
 def fused(region, *inputs):
@@ -307,28 +317,42 @@ def _written(program: algebra_cost.Seconds, written: float, xla: algebra_cost.Fu
     return xla(program.work + cost.Work(device_bytes=written)) + program.extra
 
 
-def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared: tuple, *fusions):
+def _indexed_rows(operands: tuple, table: jax.Array) -> tuple:
+    """Each `(side, axes)` side operand's rows along its `'rows'` axis at `table`'s order (`scatter`), placed
+    as it was (`templates.gemm.rows_permuted`)."""
+    return tuple((rows_permuted(side, table, axes.index('rows')) if 'rows' in axes else side, axes)
+                 for side, axes in operands)
+
+
+def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, has_gather: bool, has_scatter: bool,
+             declared: tuple, *fusions):
     """The fusible product: its operands from their fusions, its consumers (`fusions`' last) as the
     template's epilogue where the kernels take them tile by tile, after its product in XLA otherwise,
     reading it as `declared` (its precision and result dtype, `product`)."""
     precision, out_dtype = declared
     *operand_fusions, out_fusion = fusions
     lhs_fusion, *rest_fusions = operand_fusions
-    lhs, prologue, formed = _prologue(lhs_fusion)
+    lhs, prologue, formed = _prologue(lhs_fusion, gathered=has_gather)
     rhs, *rest = (fusion() for fusion in rest_fusions)
-    group_sizes = None if dense else rest[0]
+    it = iter(rest)
+    group_sizes = None if dense else next(it)
+    gather = next(it) if has_gather else None
+    scatter = next(it) if has_scatter else None
+    rows_count = lhs.shape[0] if gather is None else gather.shape[0]
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
     # Typed as the launch's result is (`dew.nn.sharding.computed_from`, row 9808): a consumer reading it
     # beside a value each device holds its own of is traced as the program wrote it.
-    acc = computed_from(jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype), lhs, rhs, group_sizes,
-                        [side for side, _ in prologue.get('prologue_operands', ())])
-    operand_bytes = float(sum(operand.size * operand.dtype.itemsize for operand in (lhs, rhs)))
+    # The routing tables too: a table each device holds its own of routes rows that vary with it.
+    acc = computed_from(jax.ShapeDtypeStruct((rows_count, width), out_dtype), lhs, rhs, group_sizes, gather,
+                        scatter, [side for side, _ in prologue.get('prologue_operands', ())])
+    operand_bytes = float(rows_count * lhs.shape[-1] * lhs.dtype.itemsize + rhs.size * rhs.dtype.itemsize)
     collected = _PRICED.get()
 
     def bare(**hooks):
         # The product as its unfused path launches it, at its declared result, with `hooks`.
         return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
-                         precision=precision, interpret_on_cpu=interpret_on_cpu, **hooks)
+                         precision=precision, gather=gather, scatter=scatter,
+                         interpret_on_cpu=interpret_on_cpu, **hooks)
 
     def weighed(call):
         # `call()`'s value, whether its launch keeps the residency of the same launch of the bare product
@@ -354,7 +378,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
         if collected is None or formed is None:
             return bare(**prologue)
         value, resident, forms = weighed(functools.partial(bare, **prologue))
-        collected.append(Region(lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype),
+        collected.append(Region(rows_count, lhs.shape[-1], width, jnp.dtype(lhs.dtype),
                                 jnp.dtype(out_dtype), precision, operand_bytes, None, 0.0,
                                 float(math.prod(acc.shape) * acc.dtype.itemsize), formed, forms=forms,
                                 resident=resident))
@@ -386,12 +410,17 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
     # Each value the program names (`checkpoint_name`) an output of the launch's, a residual of its
     # derivative under that name (`gemm`'s `named`), the consumer's outputs then the named values (`_named`).
     outputs = len(out_leaves) - len(names)
+    epilogue_ops = tuple(zip(leaves, axes, strict=True))
+    if scatter is not None:
+        # Epilogue runs before scatter: align post-scatter `'rows'` sides to pre-scatter row order.
+        epilogue_ops = _indexed_rows(epilogue_ops, scatter)
 
     def hooked():
         return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
-                         epilogue_operands=tuple(zip(leaves, axes, strict=True)),
-                         out_dtype=dtypes[0], out_dtypes=dtypes if several else None, precision=precision,
-                         interpret_on_cpu=interpret_on_cpu, named=(None,) * outputs + names, **prologue)
+                         epilogue_operands=epilogue_ops, out_dtype=dtypes[0],
+                         out_dtypes=dtypes if several else None, precision=precision,
+                         gather=gather, scatter=scatter, interpret_on_cpu=interpret_on_cpu,
+                         named=(None,) * outputs + names, **prologue)
 
     if collected is None:
         consumed = hooked()
@@ -400,7 +429,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared:
         # body counts it, and its launch's residency weighed against the bare product's.
         consumed, resident, forms = weighed(hooked)
         collected.append(Region(
-            lhs.shape[0], lhs.shape[-1], width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype), precision,
+            rows_count, lhs.shape[-1], width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype), precision,
             operand_bytes, jax.make_jaxpr(consumer)(values, acc).jaxpr,
             float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
             float(sum(math.prod(out.shape) * out.dtype.itemsize for out in out_leaves)), formed, forms=forms,
@@ -449,13 +478,19 @@ PROLOGUE_AXES = ('rows', 'depth')
 """The prologue's launch axes, in a tile's order."""
 
 
-def _prologue(fusion) -> tuple[jax.Array, dict, Formed | None]:
+def _prologue(fusion, gathered: bool = False) -> tuple[jax.Array, dict, Formed | None]:
     """The left operand's base array, the template's prologue arguments that give the operand from it (the
     module's docstring) and its producer as priced (`Formed`), or the operand itself, none and None where the
-    kernels cannot take its producer, each reported ('gemm_prologue')."""
+    kernels cannot take its producer, each reported ('gemm_prologue'). A `gathered` product's producer runs
+    in XLA, in its tokens' order: its derivative then sums each token's routes' cotangents before the
+    producer's, as the program it came from does, where the gathered rows' prologue would pull each route
+    back through the producer apart (cotangents of 2**126 and -2**126 at a producer's 4, inf - inf)."""
     producer, values, prefetch = fuser.get_fusion_values(fusion)
     split = (Refusal('scalar_prefetch', "the producer reads scalar prefetch") if prefetch
              else _split(producer, values))
+    if gathered and not (isinstance(split, Refusal) and split.code == 'no_producer'):
+        split = Refusal('gathered', "a gathered product's producer runs in its tokens' order, its derivative "
+                                    "the tokens' routes summed")
     # An operand as given has no producer to fuse, and no stage to choose.
     if isinstance(split, Refusal) and split.code == 'no_producer':
         return fusion(), {}, None
