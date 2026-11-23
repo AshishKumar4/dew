@@ -156,7 +156,9 @@ def batched_gemm(dispatch_fn: Callable, run_gemm: Callable, portable_fn: Callabl
                 return batched_out, jax.tree.map(lambda _: True, batched_out)
         return _unfolded_vmap(dispatch_fn, portable_fn, in_batched, args, interpret_on_cpu=interpret_on_cpu)
 
-    return _wrap_dispatched(dispatched, dispatch_fn, committed_device, interpret_on_cpu)
+    if committed_device is None:
+        return dispatched
+    return lambda *args: _with_committed(dispatched, committed_device, *args)
 
 
 def batched_gemm_t(dispatch_fn: Callable, run_gemm_t: Callable, portable_fn: Callable, *, dense: bool,
@@ -187,29 +189,6 @@ def batched_gemm_t(dispatch_fn: Callable, run_gemm_t: Callable, portable_fn: Cal
                 return grouped_out[:, None, :, :], True
         return _unfolded_vmap(dispatch_fn, portable_fn, in_batched, args, interpret_on_cpu=interpret_on_cpu)
 
-    return _wrap_dispatched(dispatched, dispatch_fn, committed_device, interpret_on_cpu)
-
-
-def _batched_tracer(value) -> bool:
-    while value is not None:
-        if type(value).__name__ == 'BatchTracer':
-            return True
-        value = getattr(value, 'primal', None)
-    return False
-
-
-def _wrap_dispatched(dispatched: Callable, dispatch_fn: Callable, committed_device: Callable | None,
-                     interpret_on_cpu: bool) -> Callable:
-    """Bypass `custom_vmap` for non-vmapped CPU-interpreted calls so inner `OrderedIOEffect` tokens lower
-    inside control flow (`lax.cond`, `scan`) without JAX's `custom_vmap_call` dropping effects."""
-    def call(*args):
-        from dew.nn.kernels import xla_products
-
-        if (xla_products.interpreted(interpret_on_cpu)
-                and not any(_batched_tracer(leaf) for leaf in jax.tree.leaves(args))):
-            return dispatch_fn(*args)
-        return dispatched(*args)
-
     if committed_device is None:
-        return call
-    return lambda *args: _with_committed(call, committed_device, *args)
+        return dispatched
+    return lambda *args: _with_committed(dispatched, committed_device, *args)
