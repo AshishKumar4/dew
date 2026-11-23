@@ -1,13 +1,15 @@
 """LoRA's adapted product as one GEMM template product over the depth the rank extends (`low_rank`, Appendix C
-row 26, ledger 1304), and its selector (`LOW_RANK`)."""
+row 26, ledger 1304), supporting both dense and grouped MoE adapters, and its selector (`LOW_RANK`)."""
 
+from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
+from jax.custom_derivatives import zero_from_primal
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative, with_gradients_formed
-from dew.nn.kernels import generation, selection
+from dew.nn.kernels import generation, selection, xla_products
 from dew.nn.kernels.gemm import gemm_t, joined_depths
 from dew.nn.precision import at_least_fp32, refuse_recipe
 
@@ -25,97 +27,134 @@ measured requirement no receipt has met yet; else its base product and its updat
 program."""
 
 
-def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scale, *, out_dtype,
-             precision: PrecisionLike = None, interpret_on_cpu: bool = False) -> jax.Array:
-    """`lhs · kernel + scale · (lhs · a) · b`, LoRA's adapted product (Appendix C row 26, strategy (b)), as
-    one template product over the depth the rank extends: `[lhs | t] · [kernel ; b]`, where `t = scale ·
-    (lhs · a)` is summed in fp32 and rounded once to `lhs`'s dtype, so the update accumulates into the base
-    product's accumulator and no output-sized pass adds it. `lhs` is `[rows, depth]`, `kernel` `[depth,
-    width]`, `a` `[depth, rank]` and `b` `[rank, width]`; `scale` a scalar.
-
-    Its reverse mode (first order): the input gradient is one product too, `[dy | u] · [kernel | a]ᵀ` with
-    `u = scale · (dy · bᵀ)` rounded once; the factors' gradients are `lhsᵀ · (scale · (dy · bᵀ))` and `tᵀ ·
-    dy`, the rank-wide kernel gradients; each operand's only where it is differentiated (a frozen kernel's,
-    `lhsᵀ · dy`, never). Each joined product is `gemm.joined_depths`': one `gemm` over the operands joined
-    along the depth, a materialized strategy (b). A projection the run's low-precision recipe takes (its
-    role and its widths, `refuse_recipe`) is refused: the adapted product does not take the recipe."""
-    refuse_recipe("an adapter's fused product (`gemm.low_rank`)", *kernel.shape)
-    return _low_rank(lhs, kernel, a, b, jnp.asarray(scale, jnp.float32), out_dtype, precision,
-                     interpret_on_cpu)
+def low_rank(lhs: jax.Array, kernel: jax.Array, a: jax.Array, b: jax.Array, scale,
+             group_sizes: jax.Array | None = None, *, out_dtype, precision: PrecisionLike = None,
+             interpret_on_cpu: bool = False) -> jax.Array:
+    """`lhs · kernel + scale · (lhs · a) · b`, LoRA's adapted product (Appendix C row 26, strategy (b)), for
+    both dense (`group_sizes=None`: `kernel [depth, width]`, `a [depth, rank]`, `b [rank, width]`) and
+    grouped MoE (`group_sizes [G]`: `kernel [G, depth, width]`, `a [G, depth, rank]`, `b [G, rank, width]`):
+    one template product over the extended depth via `gemm.joined_depths` (zero-copy `chained` walk when
+    Mosaic takes it, row 1304), forward and reverse, computing a frozen kernel's gradient only when
+    perturbed."""
+    refuse_recipe("an adapter's fused product (`gemm.low_rank`)", *kernel.shape[-2:])
+    scale_arr = jnp.asarray(scale, jnp.float32)
+    if group_sizes is None:
+        return _low_rank_dense(lhs, kernel, a, b, scale_arr, out_dtype, precision, interpret_on_cpu)
+    return _low_rank_grouped(lhs, kernel, a, b, scale_arr, group_sizes.astype(jnp.int32), out_dtype,
+                             precision, interpret_on_cpu)
 
 
-def _rank_product(lhs: jax.Array, factor: jax.Array, scale: jax.Array, precision: PrecisionLike) -> jax.Array:
-    """`scale · (lhs · factor)`, summed and kept in at least fp32: the rank-wide operand an adapted product
-    appends to its depth, rounded once to `lhs`'s dtype where it is appended (`_appended`)."""
+def _rank_product(lhs: jax.Array, factor: jax.Array, scale: jax.Array, precision: PrecisionLike,
+                  group_sizes: jax.Array | None = None) -> jax.Array:
+    """`scale · (lhs · factor)`, summed and kept in at least fp32 (dense or grouped by `group_sizes`)."""
     wide = at_least_fp32(lhs.dtype)
-    summed = jnp.dot(lhs, factor.astype(lhs.dtype), precision=precision, preferred_element_type=wide)
+    if group_sizes is None:
+        summed = jnp.dot(lhs, factor.astype(lhs.dtype), precision=precision, preferred_element_type=wide)
+    else:
+        summed = xla_products.xla_ragged_dot(lhs, factor.astype(lhs.dtype), group_sizes, precision=precision,
+                                             preferred_element_type=wide)
     return scale.astype(wide) * summed
 
 
-def _extended(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu):
-    """`low_rank`'s value and its appended operand `t`, in at least fp32: `[lhs | t] · [kernel ; b]`, `t`
-    rounded once to `lhs`'s dtype where it joins the depth (`gemm.joined_depths`)."""
-    t = _rank_product(lhs, a, scale, precision)
-    out = joined_depths(((lhs, kernel), (t.astype(lhs.dtype), b)), out_dtype=out_dtype, precision=precision,
-                        interpret_on_cpu=interpret_on_cpu)
+def _extended(lhs, kernel, a, b, scale, group_sizes, out_dtype, precision, interpret_on_cpu):
+    """`low_rank`'s value and its appended operand `t`, in at least fp32: `[lhs | t] · [kernel ; b]`."""
+    t = _rank_product(lhs, a, scale, precision, group_sizes)
+    out = joined_depths(((lhs, kernel), (t.astype(lhs.dtype), b)), group_sizes, out_dtype=out_dtype,
+                        precision=precision, interpret_on_cpu=interpret_on_cpu)
     return out, t
 
 
-def _low_rank_value(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu):
-    return _extended(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu)[0]
+def _dense_value(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu):
+    return _extended(lhs, kernel, a, b, scale, None, out_dtype, precision, interpret_on_cpu)[0]
 
 
-def _low_rank_forward(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu):
+def _dense_forward(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu):
     primals = (lhs, kernel, a, b, scale)
     values = (lhs.value, kernel.value, a.value, b.value, scale.value)
-    out, t = _extended(*values, out_dtype, precision, interpret_on_cpu)
-    # Which operands are differentiated, as the residuals' static shapes: a frozen kernel's gradient is
-    # never computed.
+    out, t = _extended(*values, None, out_dtype, precision, interpret_on_cpu)
     perturbed = jnp.zeros(tuple(int(primal.perturbed) for primal in primals), jnp.int8)
     return out, (*values, t, perturbed)
 
 
-def _low_rank_backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
-    del out_dtype
-    lhs, kernel, a, b, scale, t, perturbed = residuals
+def _grouped_value(lhs, kernel, a, b, scale, group_sizes, out_dtype, precision, interpret_on_cpu):
+    return _extended(lhs, kernel, a, b, scale, group_sizes, out_dtype, precision, interpret_on_cpu)[0]
+
+
+def _grouped_forward(lhs, kernel, a, b, scale, group_sizes, out_dtype, precision, interpret_on_cpu):
+    primals = (lhs, kernel, a, b, scale)
+    values = (lhs.value, kernel.value, a.value, b.value, scale.value)
+    sizes = group_sizes.value
+    out, t = _extended(*values, sizes, out_dtype, precision, interpret_on_cpu)
+    perturbed = jnp.zeros(tuple(int(primal.perturbed) for primal in primals), jnp.int8)
+    return out, (*values, sizes, t, perturbed)
+
+
+def _backward_core(lhs, kernel, a, b, scale, group_sizes, t, perturbed, cotangent, *, precision,
+                   interpret_on_cpu):
     wants_lhs, wants_kernel, wants_a, wants_b, wants_scale = map(bool, perturbed.shape)
-    # The input gradient's product takes the cotangent in the rows' dtype, as the forward's operands; the
-    # wide gradients (the kernel's, the factors' and the scale's) take it at its own precision where it is
-    # wider (an fp32 output's), the rows widened to it, as the plain product's kernel gradient
-    # (`_kernel_gradient`'s `work`).
     work = jnp.promote_types(cotangent.dtype, lhs.dtype)
     dy, wide_dy = cotangent.astype(lhs.dtype), cotangent.astype(work)
     wide = at_least_fp32(lhs.dtype)
-    # The cotangent of `t` before its scale, dy · bᵀ (b as the forward multiplied it, in the rows' dtype),
-    # summed wide, and after it: the scale taken before any product with it, as the adapter's own program
-    # takes it (a product near float32's largest that the scale brings back in range never overflows first).
-    through = jnp.dot(wide_dy, b.astype(lhs.dtype).astype(work).T, precision=precision,
-                      preferred_element_type=wide)
+    if group_sizes is None:
+        through = jnp.dot(wide_dy, b.astype(lhs.dtype).astype(work).T, precision=precision,
+                          preferred_element_type=wide)
+    else:
+        through = xla_products.xla_ragged_dot(
+            wide_dy, jnp.swapaxes(b.astype(lhs.dtype).astype(work), 1, 2), group_sizes,
+            precision=precision, preferred_element_type=wide)
     scaled = scale.astype(wide) * through
     d_lhs = d_kernel = d_a = d_b = d_scale = None
     if wants_lhs:
-        d_lhs = joined_depths(((dy, kernel), (scaled.astype(lhs.dtype), a)), transpose_rhs=True,
+        d_lhs = joined_depths(((dy, kernel), (scaled.astype(lhs.dtype), a)), group_sizes, transpose_rhs=True,
                               out_dtype=lhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
     if wants_kernel:
-        d_kernel = gemm_t(lhs.astype(work), wide_dy, None, out_dtype=kernel.dtype, precision=precision,
-                          interpret_on_cpu=interpret_on_cpu)[0]
-    # The factors' gradients from the wide `scaled` and `t` (the rank-wide products' sums, unrounded), as
-    # the adapter's own program differentiates its fp32 low-rank products.
+        grad_k = gemm_t(lhs.astype(work), wide_dy, group_sizes, out_dtype=kernel.dtype, precision=precision,
+                        interpret_on_cpu=interpret_on_cpu)
+        d_kernel = grad_k[0] if group_sizes is None else grad_k
     if wants_a:
-        d_a = jnp.dot(lhs.T.astype(wide), scaled, precision=precision,
-                      preferred_element_type=wide).astype(a.dtype)
+        if group_sizes is None:
+            d_a = jnp.dot(lhs.T.astype(wide), scaled, precision=precision,
+                          preferred_element_type=wide).astype(a.dtype)
+        else:
+            d_a = gemm_t(lhs.astype(wide), scaled, group_sizes, out_dtype=a.dtype, precision=precision,
+                         interpret_on_cpu=interpret_on_cpu)
     if wants_b:
-        # `t` holds the scale already: tᵀ · dy is the factor's gradient whole.
-        d_b = jnp.dot(t.T, wide_dy.astype(wide), precision=precision,
-                      preferred_element_type=wide).astype(b.dtype)
+        if group_sizes is None:
+            d_b = jnp.dot(t.T, wide_dy.astype(wide), precision=precision,
+                          preferred_element_type=wide).astype(b.dtype)
+        else:
+            d_b = gemm_t(t.astype(wide), wide_dy.astype(wide), group_sizes, out_dtype=b.dtype,
+                         precision=precision, interpret_on_cpu=interpret_on_cpu)
     if wants_scale:
-        unscaled = jnp.dot(lhs, a.astype(lhs.dtype), precision=precision, preferred_element_type=wide)
+        if group_sizes is None:
+            unscaled = jnp.dot(lhs, a.astype(lhs.dtype), precision=precision, preferred_element_type=wide)
+        else:
+            unscaled = xla_products.xla_ragged_dot(lhs, a.astype(lhs.dtype), group_sizes, precision=precision,
+                                                   preferred_element_type=wide)
         d_scale = jnp.sum(through * unscaled).astype(scale.dtype)
     d_lhs, (d_kernel, d_a, d_b, d_scale) = with_gradients_formed(d_lhs, (d_kernel, d_a, d_b, d_scale))
     return d_lhs, d_kernel, d_a, d_b, d_scale
 
-# The launches' derivative glue (`derivatives.KernelGlue`): an operand no reverse pass reaches is a symbolic
-# zero, whose gradient is never formed.
-_low_rank = contracted("test_an_adapted_product_holds_every_reverse_order")(
-    declared_derivative(KernelGlue(), _low_rank_value, _low_rank_forward, _low_rank_backward,
+
+def _dense_backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
+    del out_dtype
+    lhs, kernel, a, b, scale, t, perturbed = residuals
+    return _backward_core(lhs, kernel, a, b, scale, None, t, perturbed, cotangent, precision=precision,
+                          interpret_on_cpu=interpret_on_cpu)
+
+
+def _grouped_backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
+    del out_dtype
+    lhs, kernel, a, b, scale, group_sizes, t, perturbed = residuals
+    grads = _backward_core(lhs, kernel, a, b, scale, group_sizes, t, perturbed, cotangent,
+                           precision=precision, interpret_on_cpu=interpret_on_cpu)
+    return (*grads, zero_from_primal(group_sizes))
+
+
+_low_rank_dense = contracted("test_an_adapted_product_holds_every_reverse_order")(
+    declared_derivative(KernelGlue(), _dense_value, _dense_forward, _dense_backward,
                         nondiff_argnums=(5, 6, 7), symbolic_zeros=True))
+
+_low_rank_grouped = contracted("test_an_adapted_product_holds_every_reverse_order")(
+    declared_derivative(KernelGlue(), _grouped_value, _grouped_forward, _grouped_backward,
+                        nondiff_argnums=(6, 7, 8), symbolic_zeros=True))

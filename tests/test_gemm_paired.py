@@ -1216,3 +1216,93 @@ def test_joined_depths_walks_lora_in_place_without_concatenating_base():
 
     assert_as_exact(dew_vjp, jax.jit(ref_vjp), draw, "zero-copy chained low_rank", seeds=8,
                     truth_fn=functools.partial(ref_vjp, dtype=jnp.float64))
+
+
+
+def test_grouped_low_rank_walks_in_place_and_holds_check_1_and_compiles():
+    """Grouped MoE `low_rank.low_rank` (`group_sizes` given, row 1304) walks base experts `(x, W)` and LoRA
+    `(t, B)` in place via `mosaic_gpu.gmm`'s grouped `chained` launch without concatenating base weights,
+    holds check 1 forward + VJP (full and frozen-base) with an empty expert group, and compiles spill-free on
+    `sm90`."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    from dew.nn.kernels.low_rank import low_rank
+    from dew.nn.programs import equations
+
+    groups, rows, depth, width, rank = 3, 128, 256, 128, 16
+    sizes = jnp.asarray([48, 0, 80], jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(13040 + seed)
+        x = jnp.asarray(rng.standard_normal((rows, depth)) / np.sqrt(depth), jnp.bfloat16)
+        w = jnp.asarray(rng.standard_normal((groups, depth, width)) / np.sqrt(depth), jnp.bfloat16)
+        a = jnp.asarray(rng.standard_normal((groups, depth, rank)) / np.sqrt(depth), jnp.bfloat16)
+        b = jnp.asarray(rng.standard_normal((groups, rank, width)) / np.sqrt(rank), jnp.bfloat16)
+        cot = jnp.asarray(rng.standard_normal((rows, width)), jnp.bfloat16)
+        return x, w, a, b, cot
+
+    from jax.core import ShapedArray
+
+    x0, w0, a0, b0, c0 = draw(0)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        traced = jax.make_jaxpr(
+            lambda x, w, a, b: low_rank(x, w, a, b, 0.5, sizes, out_dtype=jnp.bfloat16,
+                                        interpret_on_cpu=True)
+        )(x0, w0, a0, b0)
+        assert not any(
+            eqn.primitive.name == "concatenate"
+            and any(isinstance(v.aval, ShapedArray)
+                    and v.aval.shape in ((rows, depth), (groups, depth, width))
+                    for v in eqn.invars)
+            for eqn in equations(traced.jaxpr)
+        )
+        # Frozen-kernel VJP (differentiating x, a, b only) produces valid adapter gradients.
+        _, pull_frozen = jax.vjp(
+            lambda xi, ai, bi: low_rank(xi, w0, ai, bi, 0.5, sizes, out_dtype=jnp.bfloat16,
+                                        interpret_on_cpu=True),
+            x0, a0, b0)
+        dx_f, da_f, db_f = pull_frozen(c0)
+        assert dx_f.shape == x0.shape and da_f.shape == a0.shape and db_f.shape == b0.shape
+
+    def dew_vjp(x, w, a, b, cot):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            out, pull = jax.vjp(
+                lambda xi, wi, ai, bi: low_rank(xi, wi, ai, bi, 0.5, sizes, out_dtype=jnp.bfloat16,
+                                                interpret_on_cpu=True),
+                x, w, a, b)
+            return out, pull(cot)
+
+    def ref_vjp(x, w, a, b, cot, *, dtype=jnp.float32):
+        def fwd(xi, wi, ai, bi):
+            t = (0.5 * jax.lax.ragged_dot(xi, ai, sizes, preferred_element_type=dtype)).astype(
+                jnp.bfloat16 if dtype == jnp.float32 else dtype)
+            y = (jax.lax.ragged_dot(xi, wi, sizes, preferred_element_type=dtype)
+                 + jax.lax.ragged_dot(t, bi, sizes, preferred_element_type=dtype))
+            return y.astype(jnp.bfloat16 if dtype == jnp.float32 else dtype)
+
+        if dtype == jnp.float64:
+            out, pull = jax.vjp(fwd, x.astype(dtype), w.astype(dtype), a.astype(dtype), b.astype(dtype))
+            return out, pull(cot.astype(dtype))
+        out, pull = jax.vjp(fwd, x, w, a, b)
+        return out, pull(cot)
+
+    assert_as_exact(dew_vjp, jax.jit(ref_vjp), draw, "grouped zero-copy chained low_rank", seeds=8,
+                    truth_fn=functools.partial(ref_vjp, dtype=jnp.float64))
+
+    if generation.compile_only_gpus("sm90"):
+        bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+        specs = (bf16((rows, depth)), bf16((groups, depth, width)), bf16((groups, depth, rank)),
+                 bf16((groups, rank, width)), jax.ShapeDtypeStruct((groups,), jnp.int32))
+
+        def compiled_moe_lora(x, w, a, b, s):
+            with generation.chosen(grouped_matmul="mosaic"):
+                return low_rank(x, w, a, b, 0.5, s, out_dtype=jnp.bfloat16)
+
+        with generation.assumed("sm90"):
+            records = compile_mosaic_kernels(
+                [KernelCase("grouped_low_rank_sm90", lambda: (compiled_moe_lora, specs))], "sm90")
+        for rec in records:
+            assert not rec.get("error"), rec
+            assert rec["kernels"], rec
+            assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
