@@ -1126,7 +1126,8 @@ class FitSearch[LossT, EffectsT]:
                     # (`handed`), which its target compiles none of.
                     with handed(ahead):
                         sampled = candidate.sampled()
-                    loaded = admitted_or_missed(lambda: ahead.sampled.taken(sampled, jax.devices()),
+                    sampled_ahead = ahead.sampled
+                    loaded = admitted_or_missed(lambda: sampled_ahead.taken(sampled, jax.devices()),
                                                 self.refusals)
                     self.sampled = None if loaded is None else SampledStep(sampled, loaded)
                 else:

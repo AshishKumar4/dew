@@ -292,7 +292,8 @@ def test_a_program_released_before_it_ran_leaves_its_communicators_unmade_and_ch
     resident.admit(every, FOUR, room, lambda gpu: 2 * GIB + floor,
                    communicators.Loaded((0, 1, 2, 3), id(loser)))
     ran = communicators.Loaded((1,), 7)
-    resident.admit(Collectives(), FOUR, room, lambda gpu: floor, ran)
+    # GPU 1's room past the loser's communicators and load, which it has not made: its own load besides.
+    resident.admit(Collectives(), FOUR, room, lambda gpu: 2 * GIB + 2 * floor, ran)
     probe = communicators.Loaded((0, 1), 9)
     with pytest.raises(CommunicatorRoom) as both:
         resident.admit(Collectives(), FOUR, room, lambda gpu: 0, probe)

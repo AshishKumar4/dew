@@ -446,8 +446,10 @@ class Resident:
                                      self.held)
             needed = needs.needed(every | made, room, runtime=True)
             # Its communicators and those of every program not yet run on its GPUs that no program that ran
-            # made, each counted once, beside their loads.
+            # made, each counted once, beside their loads: on its own GPUs, which it alone loads on.
             communicating = needs.needed(waiting | made, room, runtime=False, made=self.held)
+            if loaded is not None:
+                communicating = {gpu: bytes_ for gpu, bytes_ in communicating.items() if gpu in loaded.gpus}
             added = {gpu: communicating.get(gpu, 0) + loads.get(gpu, 0) for gpu in {*communicating, *loads}}
             now = {gpu: answered for gpu in room if (answered := free(gpu)) is not None}
             new = made.beyond(self.held)

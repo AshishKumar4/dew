@@ -697,7 +697,9 @@ class StepCompiler[L, E]:
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
         # The last search's release of what it kept but a plan taken in its place (`Unplaced.release`).
-        self._settle: Callable[[Planned], None] = lambda planned: None
+        # A provisional search's release of what it kept but the plan taken in its place, until the plan made
+        # before the state was placed takes it (`Unplaced.release`); none past that, so no search outlives it.
+        self._settle: Callable[[Planned], None] | None = None
         # Where that search found none, its refusal, which the placed state may not cover (`refuse_unplaced`).
         self._refused: tuple[Hashable, PlanRefused] | None = None
         # The fit's interval its host steps count their misses in (`counting`), None outside a fit.
@@ -1016,7 +1018,9 @@ class StepCompiler[L, E]:
             _log.info(UNPLACED_REFUSED, refused)
             self._unplaced, self._refused = None, (signature, refused)
             return signature
-        self._unplaced = Unplaced(signature, planned, compiled, keep, self._settle)
+        settle, self._settle = self._settle, None
+        assert settle is not None, "a plan made before the state was placed is a provisional search's"
+        self._unplaced = Unplaced(signature, planned, compiled, keep, settle)
         return signature
 
     def refuse_unplaced(self, signature: Hashable, freed: Callable[[], int | None], mesh: Mesh,
@@ -1376,7 +1380,8 @@ class StepCompiler[L, E]:
         # Every executable and traced step the search kept but the plan's dropped (row 12131); a provisional
         # search's once a plan is taken in its place (`Unplaced.release`).
         search.released_unplanned(planned)
-        self._settle = functools.partial(search.released_unplanned, settled=True)
+        if search.provisional:
+            self._settle = functools.partial(search.released_unplanned, settled=True)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)
