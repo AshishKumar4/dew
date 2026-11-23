@@ -1426,19 +1426,8 @@ class StepCompiler[L, E]:
         planned.at.put(self.objective)
         self._xla_defaults, self._narrow = planned.at.xla_defaults, planned.at.narrow
         self._ns_group = planned.at.ns_group
-        if runs := pgle_runs():
-            trials = Trials(state, batch, owned=False) if trials is None else trials
-            run = self.runner(stepping, planned, mesh)
-            relower = functools.partial(lower, planned.split, planned.at.narrow, planned.at.ns_group)
-            unguided, replaced = planned.candidate.lowered, planned.executable
-            asked = search.compiled_key(unguided, planned.options)
-            planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
-            if planned.executable is not replaced:
-                # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
-                # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
-                # for a refit. An empty profile replaces nothing, and every kept lowering stays.
-                hold(asked, planned.executable)
-                forget(unguided)
+        trials = Trials(state, batch, owned=False) if trials is None else trials
+        planned = self._guided(stepping, planned, mesh, search, trials, lower)
         # Every executable and traced step the search kept but the plan's dropped (row 12131); a provisional
         # search's once a plan is taken in its place (`Unplaced.release`).
         search.released_unplanned(planned)
@@ -1461,6 +1450,25 @@ class StepCompiler[L, E]:
         if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", plan)
         return planned, flops, plan, validation, keep
+
+    def _guided(self, stepping: Stepping, planned: Planned, mesh: Mesh, search: FitSearch, trials: Trials,
+                lower: Callable[[int, bool, int | None], Candidate]) -> Planned:
+        """`planned` guided under AutoPGLE where the process asks it (`pgle_runs`, `Planned.guided`): its
+        profiled runs over `trials` and the step lowered again (`lower`), as it is otherwise."""
+        if not (runs := pgle_runs()):
+            return planned
+        run = self.runner(stepping, planned, mesh)
+        relower = functools.partial(lower, planned.split, planned.at.narrow, planned.at.ns_group)
+        unguided, replaced = planned.candidate.lowered, planned.executable
+        asked = search.compiled_key(unguided, planned.options)
+        planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
+        if planned.executable is not replaced:
+            # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
+            # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
+            # for a refit. An empty profile replaces nothing, and every kept lowering stays.
+            hold(asked, planned.executable)
+            forget(unguided)
+        return planned
 
     def counting(self, interval: Interval, *, host: bool) -> Interval:
         """`interval`, a fit's first, which its host steps (`host`) count the programs they compile past
