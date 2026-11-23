@@ -173,16 +173,19 @@ def test_a_split_whose_packing_the_read_cannot_see_widens_no_known_splits_bound(
     packed already, whose documents the read cannot count: the known splits share their tightest common
     bound, 4, and the unknown one declares its window's length, 9, apart, never widening theirs to it, as a
     sequence kernel's chunk grid follows the bound (row 12474's review)."""
-    from dew.data.pipeline import ObjectiveData, Pipeline
+    from dew.data.pipeline import ObjectiveData, Pipeline, mix
 
     def split(windows: int, per_window: int) -> Pipeline:
         return Pipeline(Memory(tuple({"text": np.arange(9 // per_window, dtype=np.int32)}
                                      for _ in range(windows * per_window)))).pack(9)
 
-    ready = Pipeline(Memory(tuple({"text": np.arange(9, dtype=np.int32),
-                                   "text_segment_ids": np.asarray([1, 1, 2, 2, 3, 3, 4, 4, 0], np.int32),
-                                   "text_positions": np.asarray([0, 1, 0, 1, 0, 1, 0, 1, 0], np.int32)}
-                                  for _ in range(4))))
+    # Windows a pack makes mixed with windows a corpus holds packed already, which the read cannot count.
+    held = Memory(tuple({"text": np.arange(9, dtype=np.int32),
+                         "text_segment_ids": np.asarray([1, 1, 2, 2, 3, 3, 4, 4, 0], np.int32),
+                         "text_positions": np.asarray([0, 1, 0, 1, 0, 1, 0, 1, 0], np.int32)}
+                        for _ in range(4))).named("ready")
+    packed = Memory(tuple({"text": np.arange(8, dtype=np.int32)} for _ in range(4))).named("packed")
+    ready = mix([packed.pack(9), held])
     train = Pipeline(Memory(tuple({"text": np.arange(9, dtype=np.int32)} for _ in range(16)))).pack(9)
     _, readers = fitted(train.batch(4), {"two": split(3, 2), "four": split(4, 4), "ready": ready},
                         objective=ObjectiveData(), steps=2)
