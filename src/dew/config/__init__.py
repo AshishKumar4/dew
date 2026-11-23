@@ -624,20 +624,20 @@ def _names(held: "DataclassInstance | type[DataclassInstance]") -> set[str]:
 _RANDOM_SEARCH = RandomSearch()
 
 
-def _declared(field: dataclasses.Field) -> object:
+def _declared(field: dataclasses.Field) -> Configured:
     """A dataclass field's declared default, its factory's value where it has one."""
     if field.default_factory is not dataclasses.MISSING:
         return field.default_factory()
     return field.default
 
 
-def _flagged(value: object) -> object:
+def _flagged(value: Configured) -> Configured:
     """`value` as a command line's parser holds it: a record of a kind chosen by subcommands its
     subcommand's (`Registered.flagged`), any other value as it is."""
     return value.flagged() if isinstance(value, Registered) else value
 
 
-def _recorded(value: object) -> object:
+def _recorded(value: Configured) -> Configured:
     """`value` as a parsed run holds it: a subcommand's record its kind's own (`Registered.recorded`), any
     other value as it is."""
     return value.recorded() if isinstance(value, Registered) else value

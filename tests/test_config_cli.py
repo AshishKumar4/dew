@@ -519,7 +519,7 @@ def test_param_groups_on_the_command_line_read_their_schedules_as_records():
                       "fields": {"peak_value": 0.85, "init_value": 0.95, "end_value": 0.95}}}]
     config = parse(RunConfig, ["--optim.param-groups", json.dumps(groups), "--optim.lr", "5e-3",
                                "optim.schedule:one-cycle", "--optim.schedule.every", "40"])
-    assert (config.optim.lr, config.optim.schedule) == (5e-3, OneCycle(peak_value=5e-3, every=40))
+    assert (config.optim.lr, config.optim.rate) == (5e-3, OneCycle(peak_value=5e-3, every=40))
     assert parse(RunConfig, ["--optim.lr", "3e-4"]).optim.rate == 3e-4
     assert config.optim.param_groups == (
         ParamGroup("delays", ("*/delay",), schedule=Cosine(peak_value=0.1, warmup_steps=0, every=40),

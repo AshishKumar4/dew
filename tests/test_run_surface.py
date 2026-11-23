@@ -59,7 +59,7 @@ def test_each_choice_of_a_run_is_a_subcommand_of_plain_flags():
                               "--trainer.steps", "100", "--trainer.accumulation", "2"])
     assert chosen.optim.optimizer == Muon(consistent_rms=0.2), chosen.optim
     assert isinstance(chosen.optim.schedule, Cosine) and chosen.optim.schedule.warmup_steps == 10
-    assert chosen.optim.schedule.peak_value == chosen.optim.lr, chosen.optim
+    assert chosen.optim.rate == dataclasses.replace(chosen.optim.schedule, peak_value=chosen.optim.lr)
     assert chosen.trainer.precision == numerics_of("bf16-true"), chosen.trainer.precision
     assert (chosen.trainer.keep, chosen.trainer.best) == (Keep(latest=3), Best("val/accuracy", mode="max"))
     assert chosen.diagnostics.kernels == Kernels(attention="xla")
