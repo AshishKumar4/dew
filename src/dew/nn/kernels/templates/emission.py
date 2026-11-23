@@ -145,9 +145,13 @@ class _Barrier:
 
 
 def _barrier(var: jax_core.Var) -> _Barrier | None:
-    """`var` as a count holds it where it is a barrier array (`_Barrier`), None for any other ref."""
-    dtype = getattr(getattr(var.aval, "inner_aval", var.aval), "dtype", None)
-    return _Barrier(var) if isinstance(dtype, gpu_core.BarrierType | gpu_core.ClusterBarrierType) else None
+    """`var` as a count holds it where it is a barrier array (`_Barrier`: a ref of a barrier type), None for
+    any other operand."""
+    aval = var.aval
+    if isinstance(aval, state_types.AbstractRef) and isinstance(
+            aval.inner_aval.dtype, gpu_core.BarrierType | gpu_core.ClusterBarrierType):
+        return _Barrier(var)
+    return None
 
 
 class _Arrivals:
