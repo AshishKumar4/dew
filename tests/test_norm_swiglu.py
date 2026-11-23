@@ -966,9 +966,11 @@ def test_a_packed_mlp_model_trains_on_an_explicit_data_mesh():
             prediction = jnp.asarray(self.model.apply(variables, batch["x"]), jnp.float32)
             return jnp.mean((prediction - jnp.asarray(batch["y"], jnp.float32)) ** 2), Aux({})
 
+    batch = jax.device_count()
+
     def draw(seed: int = 0):
-        return (jax.random.normal(drawn_key(35, seed), (4, 8, 16)),
-                jax.random.normal(drawn_key(36, seed), (4, 8, 16)))
+        return (jax.random.normal(drawn_key(35, seed), (batch, 8, 16)),
+                jax.random.normal(drawn_key(36, seed), (batch, 8, 16)))
 
     def make_trainer(mesh):
         objective = PackedMlpObjective()
@@ -977,7 +979,7 @@ def test_a_packed_mlp_model_trains_on_an_explicit_data_mesh():
 
     x0, y0 = draw(0)
     rows = Memory([{"x": np.asarray(x0[i]), "y": np.asarray(y0[i])}
-                   for i in range(4)]).read("streamed").batch(4)
+                   for i in range(batch)]).read("streamed").batch(batch)
     _, fit_trainer = make_trainer(MeshSpec(explicit=("data",)))
     fitted = fit_trainer.fit(rows, steps=1, log_every=1, checkpoint_final=False)
     assert int(fitted.step) == 1
