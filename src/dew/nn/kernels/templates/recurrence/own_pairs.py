@@ -414,13 +414,15 @@ def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, prefix_refs: tuple) 
 
 
 def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, operands: tuple, grads: tuple,
-                      diagonal=None, added: tuple = ((), (), ()), forms: tuple | None = None):
+                      diagonal=None, added: tuple = ((), (), ()), forms: tuple | None = None,
+                      finished: tuple = (None, None, None)):
     """A key block's gradients through a chunk's pairs stored at `at` (its row and column) into `refs`
     (`dq`, `dk`, `dg`): the queries', the keys' through the gated keys (`beta k`) and their own, and the log
     decay's (`q dq + k (beta dk' - dk)`); returns the write gates' terms, each row's `sum(dk' k)`. Each
     gradient has the fp32 tiles of `added`'s refs at its own place added in turn before it is stored in its
     form (`forms`, fp32 each where None) through its landing (`smem`, one a gradient): the other launches'
-    parts of a gradient it finishes (`key_backward._key_pairs_back`). Where
+    parts of a gradient it finishes (`key_backward._key_pairs_back`), then `finished`'s function of it where
+    one is given (`key_pairs_own`'s decay gradient's suffix sums). Where
     `diagonal` gives a token's own scores pair's gradient `[C, 1]` (scaled), `grads` were summed without
     it and it joins the queries' and keys' gradients alone: the log decay's terms never take it, a token's
     write read by its own query undecayed, its two halves `q (dS k)` and `k (dS q)` equal, each the size of
@@ -432,16 +434,18 @@ def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, opera
     forms = (square,) * 3 if forms is None else forms
     grads = (d_query + own_query, d_keyed * betas[:, None] + d_key + own_key,
              query * d_query + key * (d_keyed * betas[:, None] - d_key))
-    for ref, grad, others, form, landing in zip(refs, grads, added, forms, smem, strict=True):
+    for ref, grad, others, form, landing, finish in zip(refs, grads, added, forms, smem, finished,
+                                                         strict=True):
         for other in others:
             (view,) = square.views(other, row, call.chunk, column, keys)
             grad = grad + call.family.tile_of(view)
+        grad = grad if finish is None else finish(grad)
         form.store(ref, grad, row, call.chunk, column, keys, family=call.family, smem=landing)
     return jnp.sum(d_keyed * key, axis=1)
 
 
-def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memory, call: Call, *,
-                  scale: float):
+def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memory, decays: tuple, ending,
+                  call: Call, *, scale: float):
     """`(dq, dk, dg [R, HV * Dk], dbeta [HV, R])`: each chunk and value head's gradients through its
     sub-chunks' own pairs, each its own decay (`algebra.key_diagonal_pairs_back`), given the pairs'
     gradients `d_scores` and `d_system` `[R, HV * C]`: a launch of their own, no products on the tensor
@@ -455,7 +459,13 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     has one value head, nothing summed after); the log decay's and beta's
     fp32. Added in XLA, the three fp32 parts were read again and rounded apart, 343 us of Kimi Linear's
     training on an A100 (M-JS-217); added in the factored pairs' launch, its reads cost it 187 of them, a
-    tensor cores' walk two programs a multiprocessor, where this one holds four and issues no products."""
+    tensor cores' walk two programs a multiprocessor, where this one holds four and issues no products.
+    The log decay's it finishes too, summed back over its chunk: the factored pairs' and the memory's terms
+    (`decays`, `[R, HV * Dk]` fp32 each) added to its own, then each column's suffix sums from the chunk's
+    last token down, each started at its memory decay's term `ending` `[chunks, HV * Dk]` (the last token's,
+    `sum(h dh) exp2(g_last)`), compensated (`scan.suffix_columns`; interpreted, `algebra.suffix_summed`).
+    In XLA, the terms' sum and the last token's term were a pass over them and the suffix sums a batched
+    fp32 product, 197 and 209 us of Kimi Linear's training on an A100 (M-JS-222)."""
     chunk, width, family = call.chunk, call.width, call.family
     given, square = call.given, fp32_operand(call)
     # The block a multiprocessor holds most programs of, at its registers and its shared memory: by its
@@ -471,8 +481,8 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     def program(at, q_ref, k_ref, *refs, streams, staging, landing):
         prefix_refs, refs = refs[:len(prefix)], refs[len(prefix):]
         (beta_ref, ds_ref, da_ref, _taken_ref, factored_q_ref, factored_k_ref, memory_q_ref, memory_k_ref,
-         dq_ref, dk_ref, dg_ref, db_ref) = refs
-        shifts, = staging
+         factored_g_ref, memory_g_ref, ending_ref, dq_ref, dk_ref, dg_ref, db_ref) = refs
+        shifts, *suffix = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         # The pairs' own bands' gradients once, the same tile every step, an offset a row
@@ -509,12 +519,16 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                 [functools.partial(rows, "queries"), lambda: algebra.write_gated(rows("keys"), betas)],
                 shifted_keys(call, shifts, key, limbs), functools.partial(shifted_up, call),
                 (zero, zero), zero)
+            column = h * width + index * keys
+            start = family.columns_of(ending_ref.at[n, pl.ds(column, keys)])
             d_betas = d_betas + pairs_back_stored(
-                call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys,
+                call, (dq_ref, dk_ref, dg_ref), (row, column), keys,
                 (landing.get("summed", landing["block"]),) * 2 + (landing["block"],), (query, key, betas),
                 (d_query, d_keyed, d_key), diagonal=strip("scores", scale, 0)[:, None],
-                added=((factored_q_ref, memory_q_ref), (factored_k_ref, memory_k_ref), ()),
-                forms=(summed, summed, square))
+                added=((factored_q_ref, memory_q_ref), (factored_k_ref, memory_k_ref),
+                       (factored_g_ref, memory_g_ref)),
+                forms=(summed, summed, square),
+                finished=(None, None, functools.partial(_suffix_summed, call, suffix, start)))
 
             @pl.when(index == steps - 1)
             def _():
@@ -540,7 +554,8 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                          name="recurrence_key_pairs_own", issues=False,
                          # The bands read a row at a time, at a traced offset: staged plain.
                          swizzles={f"{name}{p}": swizzling.UNSWIZZLED for name in ("scores", "system")
-                                   for p in range(fp32_operand(call).parts)})(*inputs, *factored, *memory)
+                                   for p in range(fp32_operand(call).parts)})(
+        *inputs, *factored, *memory, *decays, ending)
 
 
 def _keypair_streams(call: Call, keys: int) -> dict:
@@ -558,12 +573,30 @@ def _key_own_staged(call: Call, keys: int, *, summed: Operand) -> tuple:
     gradients shifted in registers, `shifted_up`), and a key block's landings: the fp32 one every gradient
     but the finished queries' and keys' lands in, and theirs in their form `summed` where it is narrower
     (the fp32 one where it is not, each store waiting before the landing's next), what the launch allocates
-    being what `key_block` fits (row 11953)."""
+    being what `key_block` fits (row 11953); natively, the decay gradient's suffix sums' tile."""
     square = fp32_operand(call)
     landing = {"block": square.landing(call.chunk, keys)}
     if summed.stored != square.stored:
         landing["summed"] = summed.landing(call.chunk, keys)
-    return own_staging(call, keys), landing
+    # The decay gradient's suffix sums' tile natively, its terms' rows and each column's start
+    # (`scan.suffix_columns`).
+    suffix = () if call.interpret else (swizzling.plain((call.chunk + 1, keys), jnp.float32),)
+    return (*own_staging(call, keys), *suffix), landing
+
+
+def _suffix_summed(call: Call, suffix: list, start, terms: jax.Array) -> jax.Array:
+    """A key block's decay gradient `terms` `[C, keys]` summed back over its chunk, each column started at
+    `start` (`key_pairs_own`'s): natively through the staged tile `suffix` (its terms' rows, then the starts'
+    row, `scan.suffix_columns`), read back row-major (`intra.plain_rows`); interpreted, as a tile
+    (`algebra.suffix_summed`)."""
+    if call.interpret:
+        return algebra.suffix_summed(terms, start)
+    (tile,), chunk = suffix, call.chunk
+    plgpu.store(tile.at[pl.ds(0, chunk)], terms, optimized=False)
+    tile[chunk, :] = start
+    mosaic.synced(call.interpret)
+    scan.suffix_columns(tile)
+    return plain_rows(tile.at[pl.ds(0, chunk)], terms.shape[1])
 
 
 def _key_own_held(call: Call, keys: int) -> Held:

@@ -305,7 +305,7 @@ def _halves(query, key, phi, value, d_out, log, beta, ids, teams, *, scale: floa
         k_inv = jnp.where(jax.lax.stop_gradient(jnp.abs(k_earlier) <= limit), k_earlier * inv_k, k_earlier)
         k_side = (jnp.einsum('...ij,...jk->...ik', p_small_k, k_earlier)
                   + jnp.einsum('...ij,...jk->...ik', p_big, k_inv))
-        later = suffix_sums(_crossed(q_later, k_side) * inv_q, scanned=True)
+        later = suffix_sums(_crossed(q_later, k_side) * inv_q)
         p_small_q = jnp.where(small_p, pairs * inv_q, 0.0)
         q_inv = jnp.where(jax.lax.stop_gradient(jnp.abs(q_later) <= limit), q_later * inv_q, q_later)
         q_side = (jnp.einsum('...ij,...ik->...jk', p_small_q, q_later)
@@ -353,7 +353,7 @@ def turn_gradient(query, key, value, d_out, g, beta, state, d_final, turn, start
     read_mat, read_post = _scaled_einsum(memories, read_out, rem_q * mem_scales)
     # Scanned: a token's sum meets no term of the tokens before it, a nonfinite one among them (an entering
     # memory of 2^126 times its cotangent) left out, where a triangle's dot multiplied it by zero.
-    entered = suffix_sums(_crossed(readers, read_mat) * read_post, scanned=True)
+    entered = suffix_sums(_crossed(readers, read_mat) * read_post)
     write_mat, write_post = _scaled_einsum(leaving, written_in, rem_k * cot_scales)
     terms = -(_crossed(writers, write_mat) * write_post)
     left = sums_before(terms)

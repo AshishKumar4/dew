@@ -75,28 +75,32 @@ def portable_einsum(subscripts: str, *operands):
     return float32_einsum(subscripts, *operands, precision=STATE_PRECISION)
 
 
-def suffix_sums(x: jax.Array, *, scanned: bool = False) -> jax.Array:
+def suffix_sums(x: jax.Array) -> jax.Array:
     """Each position's sum over its chunk's positions at and after it, along `x`'s second-last axis (a chunk's
-    tokens), in at least float32 (a float64 truth's own): a product with the chunk's upper triangle of ones
-    (`portable_einsum`, its ones exact in every form a product splits `x` into), one dot batched over `x`'s
-    leading axes, a chunk's triangle against its own tokens: one triangle against every chunk's tokens
-    contracted a middle axis XLA transposed `x` for, 134 of Kimi delta attention's training's 1723 MB of XLA
-    traffic on an A100 (row 5260). As a reversed cumulative sum, XLA's GPU reduce-window summed each
-    position's window apart: Kimi delta attention's decay gradient's, the one cumulative sum its training
-    traces, took 0.336 ms of its 5.806 ms on a B200 (M-JS-114). Where `scanned`, that reversed cumulative sum:
-    a term no position's sum takes meets no arithmetic of it, where the dot multiplies it by zero, a nonfinite
-    one NaN in every sum (a turned gradient's entering-memory term of 2^126 times its cotangent,
-    `templates.recurrence.turned`)."""
+    tokens), in at least float32 (a float64 truth's own): a reversed cumulative sum, a term no position's sum
+    takes meeting no arithmetic of it, where a product with the chunk's upper triangle of ones multiplied it
+    by zero, a nonfinite one NaN in every sum (a turned gradient's entering-memory term of 2^126 times its
+    cotangent, `templates.recurrence.turned`). Kimi delta attention's decay gradient's sums run in its own
+    pairs' launch (`suffix_summed`)."""
     x = _wide(x)
-    if scanned:
-        return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
-    upper = jnp.triu(jnp.ones((x.shape[-2],) * 2, x.dtype))
-    return portable_einsum('...ij,...jt->...it', jnp.broadcast_to(upper, (*x.shape[:-2], *upper.shape)), x)
+    return jnp.flip(jnp.cumsum(jnp.flip(x, -2), axis=-2), -2)
+
+
+def suffix_summed(terms: jax.Array, start: jax.Array) -> jax.Array:
+    """Each position's sum over its tile's positions at and after it along `terms`' first axis (a chunk's
+    tokens), each column's `start` added, a running compensated pair down each column from its last position
+    (`precision.compensated_add`), each sum rounded once: the arithmetic `templates.scan.suffix_columns` runs
+    natively, a column a thread (Kimi delta attention's decay gradient finished in its own pairs' launch,
+    `own_pairs.key_pairs_own`)."""
+    terms = _wide(terms)
+    pairs = (terms, jnp.zeros_like(terms))
+    hi, lo = jax.lax.associative_scan(compensated_add, pairs, reverse=True, axis=0)
+    return compensated_add((hi, lo), (_wide(start)[None], jnp.zeros_like(hi[:1])))[0]
 
 
 def sums_before(x: jax.Array) -> jax.Array:
     """Each position's sum over its chunk's positions before it, along `x`'s second-last axis, in at least
-    float32 (`suffix_sums`' exclusive prefix twin, as `scanned`): a cumulative sum shifted a position, each
+    float32 (`suffix_sums`' exclusive prefix twin): a cumulative sum shifted a position, each
     sum of the earlier terms alone, a later term meeting none of its arithmetic, where an inclusive sum less
     its own term lost a small sum beside a large term to its rounding (a chunk's last writer's whole weight
     beside its earlier ones' exp(-30) each, Mamba-3's turns' gradient's worst row 3.75 from float64 over its
