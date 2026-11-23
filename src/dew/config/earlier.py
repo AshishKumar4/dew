@@ -341,8 +341,9 @@ def _unmasked(mask: _records.JSON, settings: _Fields, config: _Fields) -> tuple[
                          "set OptimConfig.spared or its param groups' (ParamGroup.spared) in its place")
     if not groups:
         return {**settings, "weight_decay": 0.0}, config
-    unmasked: list[_records.JSON] = [{**group, "weight_decay": 0.0} if group in read else group
-                                     for group in groups]
+    unmasked: list[_records.JSON] = [
+        {**group, "weight_decay": 0.0} if isinstance(group, Mapping) and group in read else group
+        for group in groups]
     return settings, {**config, "param_groups": unmasked}
 
 
