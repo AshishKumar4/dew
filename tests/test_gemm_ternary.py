@@ -239,8 +239,10 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
 
 def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
     """Skinny decode products (`M=13`) for `Fp8Weights` (`e4m3`/`e5m2`) and `TernaryWeights` decode
-    directly into `wgmma` register operand A (`packed_rows=True`, zero SMEM staging), matching float64
-    truth bitwise and compiling spill-free on sm90 (row 5387)."""
+    directly into `wgmma` register operand A (`packed_rows=True`, zero SMEM staging), matching the decoded
+    fp32 dot bitwise under forced `mosaic`, matching staged decode bit-for-bit on raw E4M3 NaN and E5M2
+    Inf/NaN codes, rejecting `splits=2` on swapped packed tiles, and compiling spill-free on sm90
+    (row 5387)."""
     from dew.nn.kernels import tuning
     from dew.nn.kernels.templates.gemm import ternary, tiling
 
@@ -248,26 +250,63 @@ def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
     x = jnp.asarray(rng.integers(-3, 4, size=(13, 256)), jnp.bfloat16)
     w_raw = jnp.asarray(rng.integers(-2, 3, size=(256, 128)), jnp.float32)
     with generation.assumed("sm90"):
+        sm90 = generation.gpu_target("sm90")
         swapped_fp8 = tiling.Tiles(128, 64, 64, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
         for fmt in ("e4m3", "e5m2"):
             fp8_w = formats.Fp8Weights.of(w_raw, fmt=fmt, scale=0.5)
-            with tuning.pinned({grouped_matmul.MosaicFp8PackedGmm: swapped_fp8}):
+            with (generation.chosen(grouped_matmul="mosaic"),
+                  tuning.pinned({grouped_matmul.MosaicFp8PackedGmm: swapped_fp8})):
                 got = gemm.fp8_weight_product(x, fp8_w, out_dtype=jnp.float32, interpret_on_cpu=True)
             want = jax.lax.dot(x.astype(jnp.float32), fp8_w.decoded(jnp.float32),
                                preferred_element_type=jnp.float32)
             np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+            fp8_launch = grouped_matmul.MosaicFp8PackedGmm()
+            sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+            ba_skinny = fp8_launch.bind(
+                jax.ShapeDtypeStruct((16, 4096), jnp.bfloat16),
+                jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype),
+                             formats.Fp8Weights.of(np.ones((1, 4096, 128), np.float32), fmt=fmt)),
+                sizes, (), (), None, None, None, out_dtype="float32", trans_rhs=False, interpret=False,
+                dense=True, exact_sums=False)
+            assert not fp8_launch.legal(ba_skinny, dataclasses.replace(swapped_fp8, splits=2), sm90)
+            derived = fp8_launch.derived(ba_skinny, sm90)
+            assert derived is None or derived.splits == 1, derived
         tern_w = formats.TernaryWeights.of(w_raw, scale=0.5)
         swapped_t = tiling.Tiles(128, 64, 256, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
-        with tuning.pinned({ternary.MosaicTernaryPackedGmm: swapped_t}):
+        with (generation.chosen(grouped_matmul="mosaic"),
+              tuning.pinned({ternary.MosaicTernaryPackedGmm: swapped_t})):
             got_t = gemm.ternary_weight_product(x, tern_w, quantize_activations=False,
                                                 out_dtype=jnp.float32, interpret_on_cpu=True)
         want_t = jax.lax.dot(x.astype(jnp.float32), tern_w.decoded(jnp.float32),
                              preferred_element_type=jnp.float32)
         np.testing.assert_array_equal(np.asarray(got_t), np.asarray(want_t))
+        t_launch = ternary.MosaicTernaryPackedGmm()
+        ba_t = t_launch.bind(
+            jax.ShapeDtypeStruct((16, 4096), jnp.bfloat16),
+            jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype),
+                         formats.TernaryWeights.of(np.ones((1, 4096, 128), np.float32))),
+            jax.ShapeDtypeStruct((1,), jnp.int32), (), (), None, None, None, out_dtype="float32",
+            trans_rhs=False, interpret=False, dense=True, exact_sums=False)
+        assert not t_launch.legal(ba_t, dataclasses.replace(swapped_t, splits=2), sm90)
+        derived_t = t_launch.derived(ba_t, sm90)
+        assert derived_t is None or derived_t.splits == 1, derived_t
+        special_words = {
+            "e4m3": np.full((64, 16), np.uint32(0xFF7F0038), dtype=np.uint32),
+            "e5m2": np.full((64, 16), np.uint32(0xFFFDFC7C), dtype=np.uint32),
+        }
+        for fmt, raw_words in special_words.items():
+            reg_out = packed.rows_decoded([StageRef(raw_words)], None, interpret=True, fmt=fmt)
+            stg_out = StageRef(np.zeros((64, 64), dtype=jnp.bfloat16))
+            packed.stage_decoded_words([StageRef(raw_words)], stg_out, packed.weight_format(fmt),
+                                       interpret=True)
+            np.testing.assert_array_equal(np.asarray(reg_out).view(np.uint16),
+                                          np.asarray(stg_out.arr).view(np.uint16))
         if generation.compile_only_gpus("sm90"):
             x_s = jax.ShapeDtypeStruct((13, 256), jnp.bfloat16)
-            fp8_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype),
-                                    formats.Fp8Weights.of(np.ones((256, 128), np.float32), fmt="e4m3"))
+            e4_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype),
+                                   formats.Fp8Weights.of(np.ones((256, 128), np.float32), fmt="e4m3"))
+            e5_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype),
+                                   formats.Fp8Weights.of(np.ones((256, 128), np.float32), fmt="e5m2"))
             t_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype), tern_w)
 
             def c_fp8(a, w):
@@ -282,7 +321,8 @@ def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
                                                        out_dtype=jnp.bfloat16)
 
             records = compile_mosaic_kernels(
-                [KernelCase("swapped_fp8_sm90", lambda: (c_fp8, (x_s, fp8_spec))),
+                [KernelCase("swapped_fp8_e4m3_sm90", lambda: (c_fp8, (x_s, e4_spec))),
+                 KernelCase("swapped_fp8_e5m2_sm90", lambda: (c_fp8, (x_s, e5_spec))),
                  KernelCase("swapped_ternary_sm90", lambda: (c_tern, (x_s, t_spec)))], "sm90")
             for rec in records:
                 assert not rec.get("error"), rec

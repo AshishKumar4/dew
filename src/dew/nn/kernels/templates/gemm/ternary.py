@@ -24,17 +24,11 @@ TERNARY_WEIGHT_ROW = "ledger 1464"
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicTernaryPackedGmm(grouped_matmul.MosaicFp8PackedGmm):
-    """`MosaicFp8PackedGmm` of 2-bit BitNet b1.58 ternary weights (`formats.TernaryWeights`, rows 1464,
+class MosaicTernaryPackedGmm(grouped_matmul.MosaicWordPackedGmm):
+    """`MosaicWordPackedGmm` of 2-bit BitNet b1.58 ternary weights (`formats.TernaryWeights`, rows 1464,
     5387), supporting both staged decode and direct in-register swapped decode at skinny rows."""
     STEPS: ClassVar[tuple[int, ...] | None] = (packed.TERNARY_STEP,)
-    WEIGHT_BYTES: ClassVar[float] = 0.25
     DEFAULT_FMT: ClassVar[str] = "ternary"
-
-    def _decode_live(self, ba) -> int:
-        del ba
-        return 4
-
 
 class TernaryWeightCase(NamedTuple):
     """Facts deciding whether `ternary_weight_product` runs the inline-decoding Mosaic GEMM mainloop."""

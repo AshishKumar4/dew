@@ -41,7 +41,7 @@ FP8_GROUP = 64
 words a column (a 64-byte cp.async/TMA row), each word's four codes decoding into sixteen-depth slices."""
 
 FP8_STEP = 64
-"""Minimum depth step for inline FP8 weight decode in the GEMM mainloop (`mosaic_gpu.gmm`'s `packed_fp8`,
+"""Minimum depth step for inline FP8 weight decode in the GEMM mainloop (`mosaic_gpu.gmm`'s `packed_format`,
 row 8548): one 64-depth group of sixteen uint32 words per column, fitting sm80 `mma.sync`'s 64-deep steps."""
 
 
@@ -56,7 +56,7 @@ row 1464): sixteen uint32 words a column (a 64-byte row), each word's sixteen 2-
 sixteen-depth slices."""
 
 TERNARY_STEP = 256
-"""Depth step for inline BitNet b1.58 ternary weight decode (`mosaic_gpu.gmm`'s `packed_fp8='ternary'`)."""
+"""Depth step for inline BitNet b1.58 ternary weight decode (`mosaic_gpu.gmm`'s `packed_format='ternary'`)."""
 
 
 def ternary_staged_depth(group, word, code):
@@ -143,46 +143,46 @@ def taken(rhs, scales, tiles, *, transpose_rhs: bool, hooked: tuple, transpose_l
                          f"{tiles}")
 
 
-def fp8_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, transpose_lhs: bool,
-              depth: int, width: int, lhs=None, family=None, dense: bool = False,
-              packed_rows: bool = False) -> None:
-    """Refuse a packed FP8 or ternary weight call (`gmm`'s `packed_fp8`, rows 8548, 1464, 5387) its decode
-    cannot take: staged as matrix (`rhs` `[G, width, depth // per]`) or swapped directly into `wgmma`
+def word_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, transpose_lhs: bool,
+               depth: int, width: int, lhs=None, family=None, dense: bool = False,
+               packed_rows: bool = False) -> None:
+    """Refuse a scale-free word-packed weight call (`gmm`'s `packed_format`, rows 8548, 1464, 5387) its
+    decode cannot take: staged as matrix (`rhs` `[G, width, depth // per]`) or swapped directly into `wgmma`
     register operand A (`packed_rows=True`, `lhs` `[rows, depth // per]`, dense, 64 rows/consumer)."""
-    if fmt != "ternary":
-        fp8_minifloat(fmt)
-    per_word = packed_codes_per_word(fmt)
-    group = packed_group_depth(fmt)
+    desc = weight_format(fmt)
     if packed_rows:
         if (not dense or lhs is None or lhs.dtype != jnp.uint32 or not transpose_rhs
-                or tiles.block_k % group or tiles.block_m // tiles.warpgroups != 64
+                or tiles.block_k % desc.group_depth or tiles.block_m // tiles.warpgroups != 64
                 or family is None or not rows_supported(family)
                 or prologue is not None or paired is not None or transpose_lhs
                 or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
             raise ValueError(f"packed({fmt}) swapped rows require dense uint32 lhs, transpose_rhs, "
-                             f"{group}-deep steps, 64 rows/consumer on wgmma, not {tiles}")
+                             f"{desc.group_depth}-deep steps, 64 rows/consumer on wgmma, not {tiles}")
         return
-    if (not transpose_rhs or rhs.dtype != jnp.uint32 or rhs.shape[1:] != (width, depth // per_word)
-            or depth % group or tiles.block_k % group or tiles.block_n % 64
+    if (not transpose_rhs or rhs.dtype != jnp.uint32
+            or rhs.shape[1:] != (width, depth // desc.codes_per_word)
+            or depth % desc.group_depth or tiles.block_k % desc.group_depth or tiles.block_n % 64
             or prologue is not None or paired is not None or transpose_lhs
             or tiles.cluster > 1 or tiles.splits > 1 or tiles.swapped):
         raise ValueError(f"a packed({fmt}) matrix {rhs.shape} is read transposed in {desc.group_depth}-deep "
                          f"steps and 64-col tiles with no prologue, pair, cluster or split, not {tiles}")
 
+
 def packed_depth(k: int, k2: int, n: int, rhs, tiles, *, packed_rows: bool, scales,
-                 packed_fp8: str | None, transpose_rhs: bool, prologue, paired,
+                 packed_format: str | None, transpose_rhs: bool, prologue, paired,
                  transpose_lhs: bool, lhs=None, family=None, dense: bool = False) -> tuple[int, int]:
     """Resolve logical contraction depth `(k, k2)` for packed NVFP4/FP8/ternary calls and validate."""
-    per = packed_codes_per_word(packed_fp8) if packed_fp8 is not None else 8
+    per = packed_codes_per_word(packed_format) if packed_format is not None else 8
     k, k2 = ((per * k, k2) if packed_rows
-             else (k, 8 * k2 if scales is not None else (per if packed_fp8 is not None else 1) * k2))
-    if packed_fp8 is not None:
+             else (k, 8 * k2 if scales is not None else (per if packed_format is not None else 1) * k2))
+    if packed_format is not None:
         if scales is not None:
-            raise ValueError("packed_fp8 cannot combine with NVFP4 scales")
-        fp8_taken(rhs, packed_fp8, tiles, transpose_rhs=transpose_rhs, prologue=prologue,
-                  paired=paired, transpose_lhs=transpose_lhs, depth=k2, width=n,
-                  lhs=lhs, family=family, dense=dense, packed_rows=packed_rows)
+            raise ValueError("packed_format cannot combine with NVFP4 scales")
+        word_taken(rhs, packed_format, tiles, transpose_rhs=transpose_rhs, prologue=prologue,
+                   paired=paired, transpose_lhs=transpose_lhs, depth=k2, width=n,
+                   lhs=lhs, family=family, dense=dense, packed_rows=packed_rows)
     return k, k2
+
 
 def rows_supported(family) -> bool:
     """Whether `family`'s products read an NVFP4 matrix decoded in registers (`rows_decoded`): its register
@@ -240,7 +240,7 @@ def shared_decode(tiles, *, interpret) -> bool:
 class Decoding:
     """Dew: a consumer's decode of a packed matrix's stages (`_gmm_step`'s): its `buffers` (`[stages,
     columns, depth]` bfloat16), and with `consumers` sharing them, its own share of the columns (`wg`'s),
-    after which they meet (`met`). Decodes NVFP4 when `fp8_fmt` is None, or free-layout FP8 (`'e4m3'` /
+    after which they meet (`met`). Decodes NVFP4 when `weight_fmt` is None, or free-layout FP8 (`'e4m3'` /
     `'e5m2'`) when set (row 8548)."""
 
     buffers: Any
@@ -332,47 +332,30 @@ def _nvfp4_lanes(words: jax.Array, layout) -> list[jax.Array]:
             for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
 
 
-def _ternary_lane(loaded: jax.Array, code: int) -> jax.Array:
-    code2 = (loaded >> jnp.uint32(2 * code)) & jnp.uint32(3)
-    nz = (code2 ^ (code2 >> jnp.uint32(1))) & jnp.uint32(1)
-    neg = (code2 >> jnp.uint32(1)) & nz
-    f32_bits = (neg << jnp.uint32(31)) | (nz * jnp.uint32(0x3F800000))
-    return jax.lax.bitcast_convert_type(f32_bits, jnp.float32).astype(jnp.bfloat16)
-
-
-def packed_lanes(words, fmt: str, interpret: bool, *, layout=None):
-    """Yield `(group, code, lane)` (`[columns, 16]` bfloat16) for free-layout FP8 (`e4m3`/`e5m2`) or
-    BitNet b1.58 `ternary` words (`stage_decoded_fp8`, `stage_decoded_ternary`, `rows_decoded_packed`)."""
+def packed_lanes(words, desc: PackedWeightFormat | str, interpret: bool, *, layout=None):
+    """Yield `(group, code, lane)` (`[columns, 16]` bfloat16) for a scale-free word-packed weight format
+    (`PackedWeightFormat` or its name), shared by staged and direct in-register decoders (rows 8548, 1464,
+    5387)."""
+    resolved = weight_format(desc) if isinstance(desc, str) else desc
     active = None if interpret else layout
-    if fmt == "ternary":
-        for group, group_words in enumerate(words):
-            loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
-                                                                        optimized=False)
-            for code in range(16):
-                yield group, code, _ternary_lane(loaded, code)
-        return
-    minifloat = fp8_minifloat(fmt)
-    form, _ = bits.fp8_form(minifloat)
     for group, group_words in enumerate(words):
         loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
                                                                     optimized=False)
-        decoded = form.traced(loaded) if active is None else inline_forms.registers(form, loaded, active)
-        lanes_bf16 = [bits.fp8_restored(half, minifloat, jnp.bfloat16) for register in decoded
-                      for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
-        for code, lane in enumerate(lanes_bf16):
+        for code, lane in enumerate(resolved.decode_lanes(loaded, active)):
             yield group, code, lane
 
 
+def stage_decoded_words(words, out, desc: PackedWeightFormat, interpret: bool, *, layout=None) -> None:
+    """Decode a stage of word-packed weight groups (`desc`) into `out` (`[columns, depth]` bfloat16)."""
+    for group, code, lane in packed_lanes(words, desc, interpret, layout=layout):
+        out[:, pl.ds(desc.group_depth * group + 16 * code, 16)] = lane
+
+
 def stage_decoded_fp8(words, out, fmt: str, interpret: bool, *, layout=None) -> None:
-    """Decode a stage of free-layout FP8 words (`[columns, 16]` uint32 per 64-depth group) into `out`
-    (`[columns, depth]` bfloat16) via `bits.E4M3_BFLOAT16_FORM` / `bits.E5M2_BFLOAT16_FORM` (row 8548)."""
-    for group, code, lane in packed_lanes(words, fmt, interpret, layout=layout):
-        out[:, pl.ds(fp8_staged_depth(group, 0, code), 16)] = lane
+    """Decode a stage of free-layout FP8 words (`'e4m3'` / `'e5m2'`) into `out` (row 8548)."""
+    stage_decoded_words(words, out, weight_format(fmt), interpret, layout=layout)
 
 
 def stage_decoded_ternary(words, out, interpret: bool, *, layout=None) -> None:
-    """Decode a stage of 2-bit packed BitNet b1.58 ternary words (`[columns, 16]` uint32 per 256-depth group)
-    into `out` (`[columns, depth]` bfloat16, exact `{-1, 0, +1}`, row 1464)."""
-    for group, code, lane in packed_lanes(words, "ternary", interpret, layout=layout):
-        out[:, pl.ds(ternary_staged_depth(group, 0, code), 16)] = lane
-
+    """Decode a stage of 2-bit packed BitNet b1.58 ternary words into `out` (row 1464)."""
+    stage_decoded_words(words, out, weight_format("ternary"), interpret, layout=layout)

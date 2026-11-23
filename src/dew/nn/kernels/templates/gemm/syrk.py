@@ -699,6 +699,13 @@ MEASURED_GRAM_SHAPES = frozenset({(2560, 2560), (2560, 4096), (4096, 4096), (409
 """Matrix `(d0, d1)` geometries measured faster than XLA with bitwise-equal digests in `M-NG-45`."""
 
 
+MEASURED_GRAM_GENERATIONS = frozenset({"sm80", "sm90"})
+"""GPU generations with real symmetric Gram receipts (`M-NG-45-a100`, `M-NG-45b-gh200`)."""
+
+MEASURED_GRAM_SHAPES = frozenset({(2560, 2560), (2560, 4096), (4096, 4096), (4096, 14336)})
+"""Matrix `(d0, d1)` geometries measured faster than XLA with bitwise-equal digests in `M-NG-45`."""
+
+
 def measured_gram(target: generation.GpuTarget, shape: tuple[int, int, int], dtype, *,
                   transpose: bool) -> bool:
     """Whether symmetric Gram `(shape, dtype, transpose)` is admitted on `target` by real GPU receipts:
