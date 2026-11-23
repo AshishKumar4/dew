@@ -278,11 +278,11 @@ def test_a_held_jits_trace_refusing_again_what_its_scope_refused_runs_past_it():
 
 
 def test_a_program_within_a_held_jits_trace_that_refuses_a_launch_leaves_it_to_its_holder():
-    """A program run in a scope of no refusal whose trace calls another, JAX's caches cleared and both
-    released, run in another such scope where the inner one's trace records an inline refusal: the outer's
-    held jit traces it, the refusal ends that trace, and the outer traces again past it (1.0), where the
-    inner, its reading frozen as the outer's, retried past the outer's snapshot without end; a third scope of
-    none then runs its own (theme K01-e's review P0)."""
+    """A program run in a scope of no refusal whose trace traces another (`trace`), JAX's caches cleared and
+    both released, run in another such scope where the inner one's trace records an inline refusal: the
+    outer's held jit traces it, the refusal ends that trace, and the outer traces again past it (1.0), where
+    the inner, its reading frozen as the outer's, retried past the outer's snapshot without end; a third
+    scope of none then runs its own (theme K01-e's review P0)."""
     import threading
 
     from dew.nn.kernels.options import owned_program
@@ -290,14 +290,20 @@ def test_a_program_within_a_held_jits_trace_that_refuses_a_launch_leaves_it_to_i
 
     armed: list[bool] = []
 
-    def chosen(x):
+    def refusing(x):
         if armed == [True]:
             armed.append(True)
             report.refuse([("a launch", 1, ("k",))])
+        return x
+
+    inner = owned_program(refusing)
+
+    def chosen(x):
+        # The inner program's own trace (`trace`, through its `_stable_trace`), not a nested call's.
+        inner.trace(jax.ShapeDtypeStruct(x.shape, x.dtype))
         return x + (1.0 if report.refusals_of("a launch") else 0.0)
 
-    inner = owned_program(chosen)
-    outer, x = owned_program(lambda x: inner(x) * 1.0), jnp.zeros((), jnp.float32)
+    outer, x = owned_program(chosen), jnp.zeros((), jnp.float32)
     with report.refusals():
         assert float(outer(x)) == 0.0
     jax.clear_caches()
