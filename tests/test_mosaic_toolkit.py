@@ -3,6 +3,7 @@ operand across persistent tiles of their own trip counts, one consumer or two sh
 interpreter is coverage, not proof (it treats wgmma_wait as a no-op); each kernel also lowers for an H100
 here, and runs on one in the GPU gate."""
 
+import contextlib
 import dataclasses
 import functools
 from collections.abc import Callable
@@ -1645,6 +1646,62 @@ def test_an_accumulator_feeds_the_next_product_on_any_warp_split(rows, m_warps):
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
     with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(functools.partial(_chained, m_warps=m_warps, interpret=False)).trace(*shapes).lower(
+            lowering_platforms=("cuda",))
+
+
+def _bounded(a, b, bound, *, m_warps: int, interpret):
+    """`a @ b` by mma.sync on `m_warps` warps along its rows, both operands staged, its products issued within
+    the row bound `bound` holds (`Issuer.issued_within`, read at run time), stored through registers."""
+    from dew.nn.kernels.templates import mosaic_sm80, resources
+
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16), m_warps=m_warps)
+    rows = a.shape[0]
+
+    def body(a_gmem, b_gmem, bound_gmem, out_gmem):
+        def scoped(a_smem, b_smem, out_smem):
+            for source, staged in ((a_gmem, a_smem), (b_gmem, b_smem)):
+                swizzling.copied(source, staged)
+            mosaic.synced(interpret)
+            zeros = family.zeros((rows, RELAYED))
+            out = family.issued_within(bound_gmem[0], zeros, lambda: family.products(zeros, a_smem, b_smem))
+            plgpu.store(out_smem, out, optimized=False)
+            mosaic.synced(interpret)
+            stores.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
+                              widest=resources.copied_rows(RELAYED, jnp.float32))
+
+        swizzle = resources.widest_swizzle(jnp.bfloat16, RELAYED)
+        pl.run_scoped(scoped, *(swizzling.staged(shape, jnp.bfloat16, swizzle)
+                                for shape in ((rows, RELAYED), (RELAYED, RELAYED))),
+                      swizzling.plain((rows, RELAYED), jnp.float32))
+
+    out = jax.ShapeDtypeStruct((rows, RELAYED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="bounded")(a, b, bound)
+
+
+@pytest.mark.parametrize("m_warps", [1, 2, 4])
+def test_mma_sync_products_within_a_row_bound_keep_the_accumulator_past_it(m_warps):
+    """mma.sync's products within a tile's row bound (`Issuer.issued_within`: a ragged group's rows in its
+    last tile, read at run time) issue for the 16-row blocks that begin before it alone, the accumulator kept
+    in the rest (Mosaic GPU's `mma` with `rows`, the fork's from 0.12.0.1.post125, exact on an A100 in
+    M-FS-56b): interpreted and lowered for an A100 on any host, and exact on a GPU (row 7091)."""
+    keys = jax.random.split(jax.random.key(9))
+    a = jax.random.randint(keys[0], (64, RELAYED), -2, 3).astype(jnp.bfloat16)
+    b = jax.random.randint(keys[1], (RELAYED, RELAYED), -1, 2).astype(jnp.bfloat16)
+    full = np.asarray(a, np.float32) @ np.asarray(b, np.float32)
+    on_gpu = jax.default_backend() == "gpu"
+    for bound in (0, 1, 16, 17, 47, 64):
+        with contextlib.nullcontext() if on_gpu else generation.assumed("sm80"):
+            got = _bounded(a, b, jnp.array([bound], jnp.int32), m_warps=m_warps,
+                           interpret=False if on_gpu else INTERPRETED)
+        expected = np.where(np.arange(64)[:, None] // 16 * 16 < bound, full, 0.0)
+        np.testing.assert_array_equal(np.asarray(got), expected)
+    if on_gpu:
+        return
+    shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (a, b, jnp.zeros((1,), jnp.int32))]
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+    with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_bounded, m_warps=m_warps, interpret=False)).trace(*shapes).lower(
             lowering_platforms=("cuda",))
 
 
