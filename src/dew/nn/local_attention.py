@@ -26,7 +26,16 @@ from .documents import with_documents
 from .inputs import sequence_blocks
 from .kernels.templates import attention as template
 from .residuals import Residual
-from .sharding import HEADS, KV_HEADS, explicit_spec, manual_map, rows_like, rows_spec, sequence_shards
+from .sharding import (
+    HEADS,
+    KV_HEADS,
+    explicit_spec,
+    manual_map,
+    rows_like,
+    rows_spec,
+    sequence_shards,
+    whole_along,
+)
 from .visibility import same_chunk, visible
 
 
@@ -226,11 +235,11 @@ def compacted(attend, query, key, value, places, segment_ids, valid, key_valid=N
     compacted slot, its rank among the row's tokens. The padding's outputs
     come back unspecified. The moves sort along the sequence, which JAX
     refuses over an Explicit axis that splits it, so each operand is moved
-    with its sequence whole and placed back as it came (`_whole_sequence`):
+    with its sequence whole and placed back as it came (`whole_along`):
     a sequence axis still runs the band on its own slices, its halo of
     compacted tokens. The keys' validity a call states (`key_valid`) moves with its tokens where given."""
     batch, length = valid.shape
-    real = _whole_sequence(jnp.asarray(valid, bool))
+    real = whole_along(jnp.asarray(valid, bool), 1)
     order, count = valid_order(real)
     # Each slot's column in that order: a real token's rank among the real, a padding slot's after them.
     column = jnp.where(real, prefix_sum(real, dtype=jnp.int32) - 1,
@@ -238,7 +247,7 @@ def compacted(attend, query, key, value, places, segment_ids, valid, key_valid=N
 
     def moved(x, to):
         x = jnp.asarray(x)
-        taken = jnp.take_along_axis(_whole_sequence(x), to.reshape(*to.shape, *(1,) * (x.ndim - 2)), axis=1,
+        taken = jnp.take_along_axis(whole_along(x, 1), to.reshape(*to.shape, *(1,) * (x.ndim - 2)), axis=1,
                                     mode='promise_in_bounds')
         placed = explicit_spec(x)
         return taken if placed is None else jax.sharding.reshard(taken, placed)
@@ -249,16 +258,6 @@ def compacted(attend, query, key, value, places, segment_ids, valid, key_valid=N
                  segment_ids=None if segment_ids is None else moved(segment_ids, order),
                  valid=moved(jnp.asarray(valid, bool), order), **hidden)
     return moved(out, column)
-
-
-def _whole_sequence(x: jax.Array) -> jax.Array:
-    """`x` with its sequence (its second dimension) whole on each device where an Explicit axis
-    splits it, its other dimensions placed as they were."""
-    placed = explicit_spec(x)
-    if placed is None:
-        return x
-    spec = (placed.spec[0], None, *placed.spec[2:])
-    return jax.sharding.reshard(x, jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(*spec)))
 
 
 def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chunk, places,

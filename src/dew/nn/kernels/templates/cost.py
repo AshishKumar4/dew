@@ -328,20 +328,51 @@ def seconds(work: Work, target: generation.GpuTarget) -> float:
     return worked + work.kernels * launch
 
 
+def wave(target: generation.GpuTarget, resident: int) -> int:
+    """The programs one wave of a launch runs at once on `target`: `resident` on each multiprocessor, its
+    multiprocessors one where no fact states them."""
+    return (target.multiprocessors or 1) * max(resident, 1)
+
+
+def sharing(programs: int, resident: int, target: generation.GpuTarget) -> int:
+    """The programs of a launch of `programs`, `resident` a multiprocessor at most, each multiprocessor of
+    `target` runs at once: no more than its programs spread over the multiprocessors where it knows them,
+    as a launch's blocks go to its multiprocessors in turn; `resident` where it knows none."""
+    if target.multiprocessors is None:
+        return resident
+    return min(resident, -(-programs // target.multiprocessors))
+
+
+def busiest_programs(programs: int, wave: int, multiprocessors: int) -> int:
+    """The programs the busiest of `multiprocessors` runs over a launch of `programs`, `wave` of them at once:
+    each wave's share of a full wave (`ceil(min(n, wave) / SMs)`), the last priced at a full wave's sharing.
+    Priced at `ceil(n / SMs)` instead, four sm80 kernel gradients' split counts halved and ran 0.6-11.5%
+    slower (M-FS-60, row 10865), where this one's ran as priced (M-EM-45b)."""
+    count = max(programs, 1)
+    return -(-count // wave) * -(-min(count, wave) // multiprocessors)
+
+
+def streamed(per_program_bytes: float, busiest: int, bandwidth: float, multiprocessors: int) -> float:
+    """The seconds the busiest multiprocessor streams its `busiest` programs' `per_program_bytes` each from
+    device memory at its share of `bandwidth`, its programs' shares in turn: a launch of fewer programs
+    than multiprocessors streams each at its multiprocessor's share, not the device's whole rate
+    (M-EM-45b-a100: priced at the whole rate, an A100's decode product took a split that ran 1.14x slower)."""
+    return busiest * per_program_bytes * multiprocessors / bandwidth
+
+
 def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
                    resident: int = 1) -> float:
     """One kernel launch's seconds on `target` for `programs` programs at `resident` programs per
     multiprocessor: the longer of the busiest multiprocessor's throughput work (`ceil(n / SMs)` programs
-    sharing one multiprocessor's units), its overlapped latency waves (`ceil(n / (SMs * resident))` waves of
-    `path`), plus launch latency, against the whole launch's device bound (`seconds`). Co-resident programs
-    share one multiprocessor's throughput units rather than multiplying its peak by `resident`, while
-    overlapping their dependent paths (rows 6216, 10809, 10810)."""
+    sharing one multiprocessor's units), its overlapped latency waves (`ceil(n / wave)` waves of `path`),
+    plus launch latency, against the whole launch's device bound (`seconds`). Co-resident programs share one
+    multiprocessor's throughput units rather than multiplying its peak by `resident`, while overlapping
+    their dependent paths (rows 6216, 10809, 10810)."""
     count = max(programs, 1)
     shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
     per_program = dataclasses.replace(work, **shared, kernels=0)
-    processors = target.multiprocessors or 1
-    per_sm = math.ceil(count / processors)
-    waves = math.ceil(count / (processors * max(resident, 1)))
+    per_sm = math.ceil(count / (target.multiprocessors or 1))
+    waves = -(-count // wave(target, resident))
     unit_seconds = max(units(per_program, rates(target, device=False))[0])
     wave_seconds = max(per_sm * unit_seconds, waves * path(per_program, target))
     return max(wave_seconds + (target.launch_seconds or 0.0), seconds(work, target))

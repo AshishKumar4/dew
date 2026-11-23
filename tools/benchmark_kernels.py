@@ -12,7 +12,7 @@ mark, so a row is one process.
   (`dew.telemetry.benchmark.compared`), each call at the next of a pool of
   routings, with its own A/A, which is the comparison to read across arms.
 - `adam`: one AdamW update over the lm-dense parameter tree, fp32, bf16 or
-  8-bit moment storage (`OptimConfig.state_dtype`).
+  8-bit moment storage (`dew.optim.Adam.state_dtype`).
 - `step`: a whole training step of `lm-dense` (359.8M) or `lm-moe` (321.8M,
   8 experts top-2), through `tools/benchmark_step.py`'s trainer, with the
   grouped matmul, the state dtype and the vocabulary head chosen.
@@ -43,7 +43,7 @@ from dew._records import integer, record
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import program
 from dew.nn.moe import expert_projection
-from dew.optim import OptimConfig
+from dew.optim import Adam, AdamW, OptimConfig
 from dew.telemetry.benchmark import compared, samples
 from dew.telemetry.profile import Profiler
 
@@ -170,8 +170,8 @@ def adam(args: argparse.Namespace) -> dict[str, object]:
     keys = jax.random.split(jax.random.key(1), len(params))
     grads = {name: jax.random.normal(key, leaf.shape, jnp.float32) * 1e-3
              for key, (name, leaf) in zip(keys, params.items(), strict=True)}
-    solver = OptimConfig(optimizer="adamw", learning_rate=1e-4, weight_decay=0.1,
-                                         state_dtype=args.state_dtype).build(1000)
+    solver = OptimConfig(optimizer=AdamW(weight_decay=0.1, state_dtype=args.state_dtype),
+                         learning_rate=1e-4).build(1000)
 
     def update(params, state, grads):
         updates, state = solver.update(grads, state, params)
@@ -216,8 +216,8 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
 
 def step(args: argparse.Namespace) -> dict[str, object]:
     case = case_for(args.path, args.batch, args)
-    trainer = build_trainer(case, optimizer=OptimConfig(
-        optimizer="adam", learning_rate=1e-4, state_dtype=args.state_dtype).build(1000))
+    trainer = build_trainer(case, optimizer=OptimConfig(optimizer=Adam(state_dtype=args.state_dtype),
+                                                        learning_rate=1e-4).build(1000))
     with compiled_step(case, trainer) as compiled:
         state, loss, _, _ = timed_steps(compiled.step, compiled.state, 5)
         losses = [float(loss)]

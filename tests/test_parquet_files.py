@@ -14,7 +14,8 @@ from dew.data import Loading
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
-from dew.data.sources import Concatenate, Files
+from dew.data.sources import Files
+from dew.data.sources.concatenate import Concatenate
 from dew.data.storage import Store
 
 READ = Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)

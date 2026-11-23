@@ -205,7 +205,7 @@ def test_an_inpainting_run_validates_through_its_held_out_images_masks(inpaintin
                                  data=masked_images(), validation=masked_images(rejects=False, ratio=ratio),
                                  val_metrics=(), **fields)
         directory = trained_record(saved_record(run, tmp_path, name), cli_settings(tmp_path, name, {
-            "trainer.steps": "2", "trainer.log_every": "1", "trainer.eval_every": "1",
+            "trainer.horizon.steps": "2", "trainer.log_every": "1", "trainer.eval_every": "1",
             "trainer.checkpoint_final": "False", "optim.learning_rate": "0.05"}))
         from dew.training import LocalTracker
 

@@ -24,6 +24,7 @@ from dew.objectives.lm import LMObjective
 from dew.quantization import QUANTIZATION, InputQuantization, Quantization
 from dew.registry import ModelConfig
 from dew.training import Checkpoints, Trainer
+from dew.training.budget import Horizon
 from dew.training.quantization import quantize_trunk
 
 pytestmark = pytest.mark.mesh
@@ -41,7 +42,7 @@ def stream(vocab: int) -> Replaying:
 
 def trained_run(directory, objective, vocab, quantization=None):
     """Train `objective` one step as a run under `directory` and load the run back as `dew.pipeline` does."""
-    config = LMRunConfig(trainer=TrainerConfig(checkpoint_dir=str(directory), steps=1,
+    config = LMRunConfig(trainer=TrainerConfig(checkpoint_dir=str(directory), horizon=Horizon(steps=1),
                                                eval_every=None, checkpoint_every=1,
                                                compilation_cache_dir=None, quantization=quantization))
     state = config.train(objective, Loader(lambda partition: stream(vocab), None, None, BATCH), name="run")
@@ -111,7 +112,7 @@ def test_a_quantized_run_trains_on_from_its_own_record(tmp_path):
                   "mlp_features": 32, "max_seq_len": 16, "attention_impl": "reference"}
         config = config or LMRunConfig(
             model=ModelConfig("causal_transformer", fields),
-            trainer=TrainerConfig(checkpoint_dir=str(directory), steps=steps,
+            trainer=TrainerConfig(checkpoint_dir=str(directory), horizon=Horizon(steps=steps),
                                   eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                                   quantization=Quantization()))
         objective = LMObjective(config.model.build(), SEQ)
@@ -124,7 +125,7 @@ def test_a_quantized_run_trains_on_from_its_own_record(tmp_path):
     record = RunConfig.load(str(tmp_path / "stopped" / "run"))
     assert isinstance(record, LMRunConfig) and record.model.wrappers == ()
     resumed = run(tmp_path / "stopped", 2, dataclasses.replace(
-        record, trainer=dataclasses.replace(record.trainer, steps=2)))
+        record, trainer=dataclasses.replace(record.trainer, horizon=Horizon(steps=2))))
     assert int(resumed.step) == int(whole.step) == 2
     for before, after in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables),
                              strict=True):
@@ -165,9 +166,12 @@ def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_en
                              attention_impl="reference")
 
     def run(directory, steps, record=None):
-        config = record or LMRunConfig(model=ModelConfig.from_model(source.model), trainer=TrainerConfig(
-            checkpoint_dir=str(directory), steps=steps, eval_every=None,
-            checkpoint_every=1, compilation_cache_dir=None))
+        config = record or LMRunConfig(model=ModelConfig.from_model(source.model),
+                                       trainer=TrainerConfig(checkpoint_dir=str(directory),
+                                                                                                         horizon=Horizon(steps=steps),
+                                                                                                         eval_every=None,
+                                                                                                         checkpoint_every=1,
+                                                                                                         compilation_cache_dir=None))
         objective = (LMObjective(record.model.build(), SEQ) if record
                      else LMObjective(source.model, SEQ, variables=source.variables))
         state = config.train(objective, Loader(lambda partition: stream(96), None, None, BATCH), name="run")
@@ -179,7 +183,7 @@ def test_an_input_quantized_run_resumes_from_its_record_where_two_steps_would_en
     record = RunConfig.load(str(tmp_path / "stopped" / "run"))
     assert isinstance(record, LMRunConfig) and isinstance(record.model.wrappers[0], InputQuantization)
     resumed = run(tmp_path / "stopped", 2, dataclasses.replace(
-        record, trainer=dataclasses.replace(record.trainer, steps=2)))
+        record, trainer=dataclasses.replace(record.trainer, horizon=Horizon(steps=2))))
     assert int(resumed.step) == int(whole.step) == 2
     assert jax.tree.leaves(resumed.variables[QUANTIZATION])
     for before, after in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables),

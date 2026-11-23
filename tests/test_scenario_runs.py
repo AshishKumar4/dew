@@ -21,7 +21,7 @@ import scenario_called
 from flax import linen as nn
 from interop_support import extract_fixture
 from placement_parity import layouts_agree
-from run_kinds import blockwise, cli_settings, lm, saved_record, scalars
+from run_kinds import blockwise, cli_settings, lm, saved_record, scalars, settled
 from scenario_called import CODECS, DIFFUSION_RL, GGUF, STEPS, quantized_loaded
 from scenario_contract import (
     Called,
@@ -94,7 +94,7 @@ class Scenario:
 def settings(cell: Mapping, root: Path, more: Mapping[str, str] | None = None) -> dict[str, str]:
     """A cell's `dew train` settings (`run_kinds.cli_settings`): a short run logging every step, at the cell's
     precision over its devices' fsdp split, small leaves sharded, and `more`."""
-    return cli_settings(root, "cell", {"trainer.steps": str(STEPS), "trainer.log_every": "1",
+    return cli_settings(root, "cell", {"trainer.horizon.steps": str(STEPS), "trainer.log_every": "1",
                                        "trainer.precision": cell.get("precision", "32-true"),
                                        "trainer.mesh.fsdp": str(cell.get("devices", 1)),
                                        "trainer.layout.min_shard": "64", **(more or {})})
@@ -887,10 +887,10 @@ def test_a_scenarios_first_step_is_the_same_however_its_rows_are_laid(name, cell
     (`placement_parity.layouts_agree`) over the site's declared seeds (`LAID_SEEDS`)."""
     recorded = SCENARIOS[name].trained(cell, tmp_path)
     run = RunConfig.load(str(recorded.record))
-    given = [f"{path}={value}" for path, value in {**recorded.settings, **Phase().settings()}.items()]
+    given = settled({**recorded.settings, **Phase().settings()})
 
     def objective_of(wide: bool):
-        return run.assigned([*given, f"model.dtype={'float64' if wide else 'float32'}"]).prepare().objective
+        return run.override({**given, "model.dtype": "float64" if wide else "float32"}).prepare().objective
 
     stated, arm, reference = LAID[claim]
     layouts_agree(first_steps(objective_of, laid, 64, reference), lambda seed: (np.int32(seed),),

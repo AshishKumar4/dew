@@ -200,11 +200,12 @@ class ActivityRun(RunConfig):
 TRAIN_RUN = '''
 import dataclasses, sys
 from dew.config import TrainerConfig
+from dew.training import Horizon
 from dew.registry import ModelConfig
 from toypackage.models import ActivityRun
 default = ActivityRun().trainer
 run = ActivityRun(model=ModelConfig("toypackage.models:Population", {"neurons": 64}),
-                  trainer=dataclasses.replace(default, steps=4, eval_every=4, log_every=1,
+                  trainer=dataclasses.replace(default, horizon=Horizon(steps=4), eval_every=4, log_every=1,
                                               checkpoint_dir=sys.argv[1], name="activity",
                                               compilation_cache_dir=None, multi_host=False))
 state = run.run()
@@ -241,8 +242,13 @@ def test_a_packages_own_run_artifact_metric_and_axis_train_from_its_record_in_a_
     assert len(scalars(tmp_path / "first", "train/loss")) == 4
     assert 0.0 < scalars(tmp_path / "first", "val/mean_rate")[-1] < 1.0
 
-    record = str(tmp_path / "first" / "activity" / "run.json")
-    again = ("-m", "dew._cli.main", "train", record, "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
+    # The run's record as a user edits it, its checkpoints elsewhere, read by a command that imports nothing
+    # the record names before it trusts it.
+    written = json.loads((tmp_path / "first" / "activity" / "run.json").read_text())
+    written["fields"]["trainer"]["checkpoint_dir"] = str(tmp_path / "again")
+    (tmp_path / "again-record").mkdir()
+    (tmp_path / "again-record" / "run.json").write_text(json.dumps(written))
+    again = ("-m", "dew._cli.main", "train", str(tmp_path / "again-record" / "run.json"))
     refused = run(*again)
     # Refused before anything trains: the run writes nothing of its own.
     assert refused.returncode != 0 and not (tmp_path / "again").exists()

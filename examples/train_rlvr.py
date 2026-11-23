@@ -90,10 +90,10 @@ from dew.objectives.rl import (
     Task,
     prompt_tasks,
 )
-from dew.optim import OptimConfig
+from dew.optim import AdamW, OptimConfig
 from dew.rl.sandbox import ContainerRunner, ProcessRunner, Program, SandboxFleet, SandboxLimits, outputs_match
 from dew.sampling import Sampling
-from dew.training import Trainer, share_pool
+from dew.training import Trainer, UpdateBatch, share_pool
 
 FEEDBACK_TOKENS = 32
 """The longest test report a failed attempt gets back, in ids."""
@@ -597,9 +597,10 @@ def main(config: Config) -> dict:
         Asynchronous(sessions, server, objective, width=width, rows=config.prompts * config.groups,
                      max_lag=config.max_lag, ahead=config.max_lag),
         tasks=prompt_tasks, groups=config.groups, truncation="score", log=history.append)
-    optimizer = OptimConfig(learning_rate=config.learning_rate, b2=0.99, weight_decay=0.0, clip_grads=1.0)
+    optimizer = OptimConfig(learning_rate=config.learning_rate, optimizer=AdamW(b2=0.99, weight_decay=0.0),
+                            clip_grads=1.0)
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed), rollout=rollout,
-                      accumulation=config.accumulation)
+                      update=UpdateBatch(batches=config.accumulation))
     began = time.perf_counter()
     try:
         state = trainer.fit(rollout.tasks(data), steps=config.steps, log_every=1)

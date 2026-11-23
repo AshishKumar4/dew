@@ -673,6 +673,24 @@ def test_a_spill_steps_the_kernel_that_spilled():
     the_template_is_as_exact_as_its_reference("interpreted", packed=False, tiles=stepped)
 
 
+@pytest.mark.parametrize('target', ['sm80', 'sm90'])
+def test_the_tuners_variants_lead_with_the_derived_config_each_legal(target):
+    """`Selective.variants` on an A100's and an H100's facts for Mamba-1 2.8B's bf16 scan: the derived config
+    first, then its neighbours (`Selective.neighbours`), distinct and each legal there, so an opt-in tuning
+    run has more than the derivation to time (row 1300: an A100's backward 14.35 ms beside mamba_ssm's 9.9,
+    M-JS-237)."""
+    operands = (jax.ShapeDtypeStruct((1, 2048, 5120), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((5120, 16), jnp.float32),
+        *(jax.ShapeDtypeStruct((1, 2048, 16), jnp.bfloat16),) * 2, jax.ShapeDtypeStruct((5120,), jnp.float32))
+    facts = generation.gpu_target(target)
+    with generation.assumed(facts):
+        bound = selective.SELECTIVE.bind(*operands)
+        variants = selective.SELECTIVE.variants(bound)
+        assert variants[0] == selective.SELECTIVE.derived(bound, facts)
+        assert len(set(variants)) == len(variants) > 1
+        assert all(selective.SELECTIVE.legal(bound, tiles, facts) for tiles in variants)
+
+
 @pytest.mark.parametrize('length', [129, 2048], ids=['129 tokens', '2048 tokens'])
 def test_a_chunk_walks_no_more_padding_than_the_shortest(length):
     """The forward's derived chunk on an H100's facts walks the call's tokens padded to the shortest chunk's

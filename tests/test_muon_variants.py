@@ -14,6 +14,7 @@ from test_optim import UPDATE_SEEDS, assert_updates_as, muon_solver, stacked_dra
 from torch_layout import node
 
 from dew.newton_schulz import NEWTON_SCHULZ, POLAR_EXPRESS_TABLE, ns_operands, orthogonalized, polar_express
+from dew.optim import Muon
 
 QUERY = ('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')
 """The decoder's first query projection, `[embed 32, heads 2 * head_dim 16]`."""
@@ -36,7 +37,7 @@ def test_per_head_muon_orthogonalizes_each_head_alone():
         # `[embed, heads * head_dim]` as `[embed, head_dim, heads]`: each head's block one matrix.
         return value.reshape(32, 2, 16).transpose(0, 2, 1) if path == QUERY else value
 
-    assert_updates_as(muon_solver(optimizer_opts={"per_head": HEADS}),
+    assert_updates_as(muon_solver(per_head=HEADS),
                       optax.contrib.muon(LR, muon_weight_dimension_numbers=one_matrix), decoder_params(),
                       [QUERY], "Muon per head", flatten=heads)
 
@@ -51,7 +52,7 @@ def test_per_head_muonclip_clips_each_head_after_its_own_update():
 
     stats = qk_stats(values=[[200.0, 150.0, 10.0, 5.0], [10.0] * 4, [10.0] * 4])
     per_head = {"*q_proj/kernel": 8, "*k_proj/kernel": 8}
-    applied = clip_step(muon_solver(optimizer="muonclip", optimizer_opts={"per_head": per_head}), stats)
+    applied = clip_step(muon_solver(optimizer="muonclip", per_head=per_head), stats)
     def paper(muon):
         def clipped(params, grads):
             updates, _ = muon.update(grads, muon.init(params), params)
@@ -66,9 +67,9 @@ def test_per_head_muonclip_clips_each_head_after_its_own_update():
         return clipped
 
     # The truth's Muon keeps its moments in the parameters' float64 and iterates in it.
-    assert_as_exact(applied, paper(muon_solver(optimizer_opts={"per_head": per_head})),
+    assert_as_exact(applied, paper(muon_solver(per_head=per_head)),
                     lambda seed: qk_tree(seed=seed), "MuonClip per head", seeds=CLIP_SEEDS,
-                    truth_fn=paper(muon_solver(wide=True, optimizer_opts={"per_head": per_head})))
+                    truth_fn=paper(muon_solver(wide=True, per_head=per_head)))
 
 
 def test_per_head_muon_orthogonalizes_each_latent_attention_head_alone():
@@ -92,7 +93,7 @@ def test_per_head_muon_orthogonalizes_each_latent_attention_head_alone():
         return leaf.reshape(leaf.shape[0], 2, widths[path]).transpose(0, 2, 1)
 
     per_head = {"*q_b_proj/kernel": 12, "*kv_b_proj/kernel": 16}
-    assert_updates_as(muon_solver(optimizer_opts={"per_head": per_head}),
+    assert_updates_as(muon_solver(per_head=per_head),
                       optax.contrib.muon(LR, muon_weight_dimension_numbers=one_matrix), params,
                       [query, value], "latent attention per head", flatten=heads)
 
@@ -101,7 +102,7 @@ def test_per_head_muon_refuses_heads_its_output_side_does_not_hold():
     """A head width that does not divide the projection's output side names no stack of heads: refused
     by name."""
     params = decoder_params()
-    solver = muon_solver(optimizer_opts={"per_head": {"*q_proj/kernel": 12}})
+    solver = muon_solver(per_head={"*q_proj/kernel": 12})
     with pytest.raises(ValueError):
         solver.update(jax.tree.map(jnp.ones_like, params), solver.init(params), params)
 
@@ -155,7 +156,7 @@ def test_polar_express_orthogonalizes_as_its_paper_does(steps):
 def test_polar_express_is_a_muon_preset(steps):
     """`ns_coeffs="polar_express"` names Polar Express's coefficients to Muon: its update is optax's Muon
     at those coefficients (`polar_express`), its momentum and shape scaling Muon's (check 1)."""
-    assert_updates_as(muon_solver(optimizer_opts={"ns_coeffs": "polar_express", "ns_steps": steps}),
+    assert_updates_as(muon_solver(ns_coeffs="polar_express", ns_steps=steps),
                       optax.contrib.muon(LR, ns_coeffs=polar_express(steps), ns_steps=steps),
                       decoder_params(), [QUERY, ('params', 'layers_1', 'mlp', 'down_proj', 'kernel')],
                       f"Polar Express {steps}")
@@ -185,7 +186,7 @@ def test_normuon_normalizes_each_neuron_as_its_paper_does():
         return tuple(node(grad, path) for grad in grads)
 
     def dew(*grads):
-        solver = muon_solver(optimizer_opts={"neuron_beta2": 0.95})
+        solver = muon_solver(neuron_beta2=0.95)
         tree = jax.tree.map(np.zeros_like, params)
         state, updates = solver.init(tree), tree
         for grad in grads:
@@ -239,7 +240,7 @@ def test_a_flat_attentions_projections_are_the_matrices_muon_steps():
         # The run's table of the draw's axes, which a trainer holds while its optimizer steps.
         with boxed(boxed_axes(drawn)):
             split = muon_partition(params)
-            solver = OptimConfig(optimizer="muon", learning_rate=1e-3).build(4)
+            solver = OptimConfig(optimizer=Muon(), learning_rate=1e-3).build(4)
             state = solver.init(params)
             gradients = jax.tree.map(lambda leaf: jnp.ones_like(leaf) / leaf.size, params)
             updates, _ = solver.update(gradients, state, params)
@@ -304,7 +305,7 @@ def test_muons_reported_update_work_is_its_compiled_updates_matrix_work(per_head
     params = decoder_params()
     opts = {**({} if per_head is None else {"per_head": per_head}),
             **({} if group is None else {"ns_group": group})}
-    config = OptimConfig(optimizer="muon", learning_rate=LR, optimizer_opts=opts)
+    config = OptimConfig(optimizer=Muon(**opts), learning_rate=LR)
     solver = config.build(10)
     _, grads = drawn_tree(params, 0)
     with drawn_axes(decoder_draw()):

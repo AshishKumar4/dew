@@ -22,21 +22,28 @@ if TYPE_CHECKING:
     from dew.data.dataset import DataPartition
 
 
+TYPED_OPTIMIZER = "typed_optimizer"
+"""A step's metadata naming its optimizer state this Dew's (`step_record`), each optimizer a spec of its own
+(`dew.optim.OptimizerSpec`, row 11933): a step an earlier Dew wrote holds none, which alone a restore reads
+across a masked decay step (`dew.checkpoints._state_trees.masked_decay_unsaved`). Deleted at 1.0 with it."""
+
+
 def step_record(deltas: Mapping[str, list[str]], control: dict | None, rung: JSON, artifact: JSON,
                 training: JSON, boxed: Mapping[tuple[str, ...], LogicalAxes] | None,
                 tree: Mapping[str, object] | None = None) -> dict:
     """What a persistent and a local save both record of a step: the leaves of each average it stores as
     their differences from their weights, by the average's name, its control state, its rung, its inference
     artifact, what its objective's loss computes (`training`, `Objective.training_record`), its boxed axes,
-    the implementation of each key its `tree` holds (`key_record`), and, where it holds a data position,
-    the code and machine that wrote it (`running_environment`), which the position itself holds none of
-    (row 5862)."""
+    the implementation of each key its `tree` holds (`key_record`), that its optimizer state is this Dew's,
+    each decay step as its optimizer's spec builds it (`TYPED_OPTIMIZER`), and, where it holds a data
+    position, the code and machine that wrote it (`running_environment`), which the position itself holds
+    none of (row 5862)."""
     from dew.data.plan import running_environment
 
     held = tree is not None and "position" in tree
     return {"deltas": dict(deltas), "control": copy.deepcopy(control or {}), "rung": rung,
             "artifact": artifact, "training": training, "boxed": boxed_record(boxed),
-            "keys": key_record(tree),
+            "keys": key_record(tree), TYPED_OPTIMIZER: True,
             **({"environment": running_environment()} if held else {})}
 
 

@@ -13,6 +13,7 @@ import jax
 import numpy as np
 import optax
 from recording import RecordingTracker
+from run_kinds import settled
 from scenario_contract import CELL, Phase, assert_steps_finite
 
 from dew.checkpoints import Checkpoints
@@ -21,6 +22,7 @@ from dew.distributed.placement import Layout, MeshSpec
 from dew.nn.kernels.generation import run_precision
 from dew.nn.precision import numerics_of
 from dew.training import Trainer
+from dew.training.budget import Horizon
 
 STEPS = 3
 """A scenario run's steps, every scenario's (tests/test_scenario_runs.py's `settings`)."""
@@ -43,8 +45,8 @@ def diffusion_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, flo
     fields = {name: value for name, value in config.model.fields.items() if name != "dtype"}
     config = dataclasses.replace(
         config, model=dataclasses.replace(config.model, fields={**fields, "remat": cell["memory"]}),
-        trainer=dataclasses.replace(config.trainer, steps=STEPS, checkpoint_final=True))
-    config = config.assigned([f"{path}={value}" for path, value in phase.settings().items()])
+        trainer=dataclasses.replace(config.trainer, horizon=Horizon(steps=STEPS), checkpoint_final=True))
+    config = config.override(settled(phase.settings()))
     images = np.random.RandomState(0).randint(0, 256, (4 * RUN_BATCH, RES, RES, 3), np.uint8)
     config.train(config.build(), Memory([{"image": image} for image in images]).batch(RUN_BATCH),
                  name=phase.name)
@@ -85,8 +87,8 @@ def diffusion_rl_trained(cell: Mapping, root: str, phase: Mapping) -> dict[str, 
         config, model=dataclasses.replace(config.model, fields=fields), preset=Flow(),
         objective=ObjectiveConfig(method, {**DIFFUSION_RL[method], "solver": Euler(), "steps": 2}),
         rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3, train_steps=2),
-        trainer=dataclasses.replace(config.trainer, steps=STEPS, checkpoint_final=True))
-    config = config.assigned([f"{path}={value}" for path, value in phase.settings().items()])
+        trainer=dataclasses.replace(config.trainer, horizon=Horizon(steps=STEPS), checkpoint_final=True))
+    config = config.override(settled(phase.settings()))
     objective = config.build()
     images = np.random.RandomState(0).randint(0, 256, (4 * RUN_BATCH, RES, RES, 3), np.uint8)
     config.train(objective, Memory([{"image": image} for image in images]).batch(RUN_BATCH), name=phase.name,

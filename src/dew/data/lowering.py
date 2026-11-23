@@ -156,7 +156,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
-from dew.data.shards import _Sequential, bounded as shards_bounded, bounded_places, cut, streamed
+from dew.data.shards import _Sequential, bounded as shards_bounded, bounded_places, cut, fills, streamed
 from dew.data.sources import base
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
@@ -1688,10 +1688,11 @@ class _Build:
         shards = base.stream_manifest(source, positioned=last >= 0 and (cache is None or last < cache))
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
-            shards = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
-            reader = filled.streamed(shards.reader, manifest, transform=prefix, pool=prefix.pool,
-                                     source=source, transparent=transparent, shard_count=len(shards.shards))
-            shards = dataclasses.replace(shards, reader=reader)
+            cut_for = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
+            # A stream cut finer than its store for its readers fills none (`fills`, row 11948's review).
+            shards = dataclasses.replace(cut_for, reader=filled.streamed(
+                cut_for.reader, manifest, transform=prefix, pool=prefix.pool, source=source,
+                transparent=transparent, shard_count=len(cut_for.shards), writes=fills(shards, cut_for)))
         shards = _positioned(shards, partition, self.stream_loading) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
         local = tuple(stage for stage in written if isinstance(stage, _LOCAL))
