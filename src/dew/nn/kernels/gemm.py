@@ -529,7 +529,8 @@ def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: boo
     placed = explicit_spec(operand)
     batch_sharded = placed is not None and any(entry is not None for entry in placed.spec[:len(batch)])
     if out_dtype.itemsize < wide.itemsize and count > 1 and not batch_sharded:
-        return jax.lax.map(_poly, operand.reshape(count, side, side), batch_size=max(1, count // 4)).reshape(
+        batch_size = max(1, count * out_dtype.itemsize // (2 * wide.itemsize))
+        return jax.lax.map(_poly, operand.reshape(count, side, side), batch_size=batch_size).reshape(
             operand.shape)
     return _poly(operand)
 
