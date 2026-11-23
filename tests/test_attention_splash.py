@@ -465,26 +465,39 @@ def test_splash_span_mask_matches_key_spans_without_dense_numpy_mask():
         q, k, v, implementation="tpu", key_runs=runs))(query, key, value)
     np.testing.assert_array_equal(np.asarray(jitted_public), np.asarray(direct_ref))
 
-    # Broadcastable `[Q, 1]` concrete mask combined with static spans and `softcap` stays on Splash
-    # without falling through to Flash (preserving mask broadcasting and prebuilt descriptor semantics).
-    q_mask = (np.arange(128) % 2 == 0)[:, None]
+    # Broadcastable `[Q, 1]` and `[1, K]` concrete masks combined with static spans and `softcap` stay on
+    # Splash without falling through to Flash, matching an independently materialized span-and-mask oracle.
     softcap = 30.0
-    combined_desc = splash_mask_descriptor(128, 128, 2, causal=False, sliding_window=None, mask=q_mask,
-                                           spans=run_spans)
-    assert combined_desc is not None
     assert splash_mask_descriptor(4096, 4096, 1, causal=False, sliding_window=None,
                                   mask=np.ones((4096, 1), bool)) is None
-    masked_got = scaled_dot_product_attention(query, key, value, mask=q_mask, implementation="tpu",
-                                              key_runs=runs, softcap=softcap)
-    jitted_masked = jax.jit(lambda q, k, v: scaled_dot_product_attention(
-        q, k, v, mask=q_mask, implementation="tpu", key_runs=runs, softcap=softcap))(query, key, value)
-    masked_ref = splash_attention(query, key, value, combined_desc, softcap=softcap, sinks=None,
-                                  segment_ids=None, interpret=True)
-    masked_ref = jnp.where(jnp.asarray(q_mask)[None, :, None, :], masked_ref, 0.0)
-    np.testing.assert_array_equal(np.asarray(masked_got), np.asarray(masked_ref))
-    np.testing.assert_array_equal(np.asarray(jitted_masked), np.asarray(masked_ref))
-    direct_prebuilt = tpu_attention(query, key, value, None, None, causal=False, sliding_window=None,
-                                    softcap=softcap, sinks=None, segment_ids=None, interpret=True,
-                                    descriptor=combined_desc)
-    direct_prebuilt = jnp.where(jnp.asarray(q_mask)[None, :, None, :], direct_prebuilt, 0.0)
-    np.testing.assert_array_equal(np.asarray(direct_prebuilt), np.asarray(masked_ref))
+    dense_runs = np.asarray(template.dense(run_spans)[0])
+    q_mask = (np.arange(128) % 2 == 0)[:, None]
+    k_mask = (np.arange(128) % 3 != 0)[None, :]
+    for bcast_mask, row_keep in ((q_mask, q_mask), (k_mask, None)):
+        combined_desc = splash_mask_descriptor(128, 128, 2, causal=False, sliding_window=None,
+                                               mask=bcast_mask, spans=run_spans)
+        assert combined_desc is not None
+        oracle_dense = dense_runs & np.broadcast_to(bcast_mask, (128, 128))
+        oracle_desc = splash_attention_mask.MultiHeadMask([splash_attention_mask.NumpyMask(oracle_dense)] * 2)
+        oracle_ref = splash_attention(query, key, value, oracle_desc, softcap=softcap, sinks=None,
+                                      segment_ids=None, interpret=True)
+        if row_keep is not None:
+            oracle_ref = jnp.where(jnp.asarray(row_keep)[None, :, None, :], oracle_ref, 0.0)
+        masked_got = scaled_dot_product_attention(query, key, value, mask=bcast_mask, implementation="tpu",
+                                                  key_runs=runs, softcap=softcap)
+        jitted_masked = jax.jit(lambda q, k, v, m=bcast_mask: scaled_dot_product_attention(
+            q, k, v, mask=m, implementation="tpu", key_runs=runs, softcap=softcap))(query, key, value)
+        np.testing.assert_array_equal(np.asarray(masked_got), np.asarray(oracle_ref))
+        np.testing.assert_array_equal(np.asarray(jitted_masked), np.asarray(oracle_ref))
+        direct_prebuilt = tpu_attention(query, key, value, None, None, causal=False, sliding_window=None,
+                                        softcap=softcap, sinks=None, segment_ids=None, interpret=True,
+                                        descriptor=combined_desc)
+        if row_keep is not None:
+            direct_prebuilt = jnp.where(jnp.asarray(row_keep)[None, :, None, :], direct_prebuilt, 0.0)
+        np.testing.assert_array_equal(np.asarray(direct_prebuilt), np.asarray(oracle_ref))
+    # Confirm `[1, K]` genuinely alters visible rows' outputs relative to unmasked `key_runs`.
+    unmasked_sc = scaled_dot_product_attention(query, key, value, implementation="tpu", key_runs=runs,
+                                               softcap=softcap)
+    k_masked_sc = scaled_dot_product_attention(query, key, value, mask=k_mask, implementation="tpu",
+                                               key_runs=runs, softcap=softcap)
+    assert not np.array_equal(np.asarray(k_masked_sc), np.asarray(unmasked_sc))

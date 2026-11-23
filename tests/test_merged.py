@@ -612,10 +612,73 @@ def _jaxpr_has_inline_load(jaxpr, kinds: dict[int, str]) -> bool:
     return False
 
 
+def _stats_store_gated_on_block_zero(mgpu_fn) -> bool:
+    """Verify the lowered Mosaic MLIR body guards every `llvm.store` inside an `scf.if` whose condition
+    conjoins `arith.cmpi eq(c_block, 0)`."""
+    from jax.extend.mlir import ir as mgpu_ir
+    from jax.extend.mlir.dialects import arith as mgpu_arith, func as mgpu_func
+    from jax.interpreters import mlir as jax_mlir
+
+    class _Arg:
+        def __init__(self, regs: np.ndarray):
+            self.registers = regs
+
+    with jax_mlir.make_ir_context(), mgpu_ir.Location.unknown():
+        f32 = mgpu_ir.F32Type.get()
+        i32 = mgpu_ir.IntegerType.get_signless(32)
+        ref_ty = mgpu_ir.MemRefType.get((1, 1, 1), f32, mgpu_ir.StridedLayoutAttr.get(0, [1, 1, 1]))
+        vec_ty = mgpu_ir.VectorType.get((1,), f32)
+        module = mgpu_ir.Module.create()
+        with mgpu_ir.InsertionPoint(module.body):
+            fn_op = mgpu_func.FuncOp("check", ([ref_ty, ref_ty, vec_ty, vec_ty, i32, i32, i32, i32], []))
+            block = fn_op.add_entry_block()
+            args = list(block.arguments)
+            with mgpu_ir.InsertionPoint(block):
+                mgpu_fn(None, args[0], args[1], _Arg(np.array([args[2]], dtype=object)),
+                        _Arg(np.array([args[3]], dtype=object)),
+                        *(_Arg(np.array(a, dtype=object)) for a in args[4:]))
+        cb_arg = args[7]
+
+        def has_cb_eq_zero(cond) -> bool:
+            owner = cond.owner
+            if not isinstance(owner, (mgpu_ir.Operation, mgpu_ir.OpView)):
+                return False
+            op_obj = owner.operation
+            if op_obj.name == "arith.andi":
+                return any(has_cb_eq_zero(operand) for operand in op_obj.operands)
+            if op_obj.name != "arith.cmpi":
+                return False
+            pred = mgpu_ir.IntegerAttr(op_obj.attributes["predicate"]).value
+            if pred != int(mgpu_arith.CmpIPredicate.eq):
+                return False
+            lhs, rhs = op_obj.operands[0], op_obj.operands[1]
+            for candidate, other in ((lhs, rhs), (rhs, lhs)):
+                other_owner = other.owner
+                if (candidate == cb_arg
+                        and isinstance(other_owner, (mgpu_ir.Operation, mgpu_ir.OpView))
+                        and other_owner.operation.name == "arith.constant"
+                        and mgpu_ir.IntegerAttr(other_owner.operation.attributes["value"]).value == 0):
+                    return True
+            return False
+
+        guarded_stores = 0
+        for op in block.operations:
+            if op.operation.name == "llvm.store":
+                return False
+            if op.operation.name == "scf.if":
+                then_ops = list(op.operation.regions[0].blocks[0].operations)
+                stores = sum(1 for inner in then_ops if inner.operation.name == "llvm.store")
+                if stores:
+                    if not has_cb_eq_zero(op.operation.operands[0]):
+                        return False
+                    guarded_stores += stores
+        return guarded_stores >= 2
+
+
 def _emitted_mosaic_device_bytes(body, *, rows: int, blocks: int, slices: int, width: int) -> float:
     """Device bytes transferred on the common one-window path of a traced Mosaic `merged_padded` body
     (`kernel.params['jaxprs'][0]`), reading clipped channel bounds directly from each emitted `inline_mgpu`
-    load/store and verifying row-stat stores are gated on `axis_index('block')` (single stats writer)."""
+    load/store and verifying row-stat stores are gated on `axis_index('block') == 0` in the lowered MLIR."""
     from jax import lax
 
     chunk = windows.chunk_width(slices)
@@ -641,7 +704,8 @@ def _emitted_mosaic_device_bytes(body, *, rows: int, blocks: int, slices: int, w
         if k0 == "merged":
             return nonlocals["block"] * eq.invars[0].aval.dtype.itemsize * (nonlocals["width"] / channels)
         if k0 == "max" and k1 == "tot":
-            gated = id(eq.invars[-1]) in block_vars
+            gated = (id(eq.invars[-1]) in block_vars
+                     and _stats_store_gated_on_block_zero(eq.params["mgpu_fn"]))
             stat_bytes = eq.invars[0].aval.dtype.itemsize + eq.invars[1].aval.dtype.itemsize
             return stat_bytes / (blocks if gated else 1)
         return 0.0
@@ -732,15 +796,20 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
     triton_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, sm75)
     assert triton_work.device_bytes == _traced_merge_bytes(spec, pad_p, pad_s, 4, 80, triton_block)
     assert mosaic_work.device_bytes < triton_work.device_bytes, (mosaic_work, triton_work)
-    # The 1-row 128-wide case splits across multiple channel blocks on an H100 (row 8439), exercising the
-    # single-stat-writer accounting on the emitted Mosaic body directly.
+    # Explicit multi-block schedule (`block=64`, 2 blocks for `width=128`) vs single-block (`block=128`):
+    # verifies single-stats-writer (`c_block == 0`) accounting directly on the emitted Mosaic MLIR body
+    # without asserting a derived block choice.
     small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
     small_s = jax.ShapeDtypeStruct((2, 1, 1, 8, 8), jnp.float32)
-    small_block = merged._channel_block(spec, small_p, small_s, 1, 128, sm90)
-    assert small_block < 128
-    assert merged.launch_work(spec, small_p, small_s, 1, 128, sm90).device_bytes == (
-        _traced_mosaic_merge_bytes(spec, small_p, small_s, 1, 128, small_block, target=sm90))
-
+    units = algebra.units_of(spec)
+    work_1blk, _ = merged._launch_for_block(units, small_p, small_s, 1, 128, 128, sm90, family="wgmma")
+    work_2blk, _ = merged._launch_for_block(units, small_p, small_s, 1, 128, 64, sm90, family="wgmma")
+    assert work_1blk.device_bytes == _traced_mosaic_merge_bytes(spec, small_p, small_s, 1, 128, 128,
+                                                                target=sm90)
+    assert work_2blk.device_bytes == _traced_mosaic_merge_bytes(spec, small_p, small_s, 1, 128, 64,
+                                                                target=sm90)
+    # Second block adds only one extra pass of 3 * 8 * 2 * 4 stat reads (192 B), zero extra stat-store bytes.
+    assert work_2blk.device_bytes - work_1blk.device_bytes == float(3 * 8 * 2 * 4)
 
 def test_a_split_merge_with_initial_state_uses_one_merged_padded_launch():
     """A split decode merge with a sink or resumed `Initial` state (`merged.merged_split`, row 9804) lowers

@@ -1375,7 +1375,28 @@ def test_a_quotient_narrows_to_16_bits_as_its_exact_value_does(dtype):
     held = algebra.narrowing_settled(jnp.float32(jnp.finfo(narrow).max), jnp.float32(65522.0),
                                      jnp.float32(1.0), narrow)
     assert held == jnp.finfo(narrow).max
-
+    if narrow == jnp.bfloat16:
+        settle_jit = jax.jit(lambda q, a, d: algebra.narrowing_settled(q, a, d, jnp.bfloat16))
+        # Subnormal accumulator at exact BF16 tie (`divisor=2^-126`, `q=511/512`, `acc=511*2^-135`):
+        # bit-based scaling keeps the remainder zero (even tie -> 1.0) rather than flushing `acc` to 0.
+        sub_div = jnp.asarray([2.0 ** -126] * 3, jnp.float32)
+        sub_q = jnp.asarray([511.0 / 512.0] * 3, jnp.float32)
+        exact_sub_acc = np.float32(511.0 * 2.0 ** -135)
+        sub_acc = jnp.asarray([np.nextafter(exact_sub_acc, np.float32(0.0)),
+                               exact_sub_acc,
+                               np.nextafter(exact_sub_acc, np.float32(np.inf))], jnp.float32)
+        sub_out = np.asarray(settle_jit(sub_q, sub_acc, sub_div).astype(jnp.bfloat16), np.float32)
+        np.testing.assert_array_equal(sub_out, np.asarray([255.0 / 256.0, 1.0, 1.0], np.float32))
+        # Recovered subnormal BF16 half-least-subnormal tie (`q=2^-134`, `divisor=1.0`): exact tie rounds
+        # even to 0, while 1 fp32 ulp above nudges up to `2^-133`.
+        tiny_tie = np.float32(2.0 ** -134)
+        tiny_q = jnp.asarray([tiny_tie] * 3, jnp.float32)
+        tiny_div = jnp.ones((3,), jnp.float32)
+        tiny_acc = jnp.asarray([np.nextafter(tiny_tie, np.float32(0.0)),
+                                tiny_tie,
+                                np.nextafter(tiny_tie, np.float32(np.inf))], jnp.float32)
+        tiny_out = np.asarray(settle_jit(tiny_q, tiny_acc, tiny_div).astype(jnp.bfloat16), np.float32)
+        np.testing.assert_array_equal(tiny_out, np.asarray([0.0, 0.0, 2.0 ** -133], np.float32))
 
 @pytest.mark.parametrize("training", [False, True], ids=["inference", "training"])
 def test_a_quantized_calls_codes_past_fp16s_largest_are_no_mean(training):

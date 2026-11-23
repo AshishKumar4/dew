@@ -39,7 +39,7 @@ from jax.typing import DTypeLike
 
 from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted, surrogate
-from dew.nn.float_bits import binade_of, raised_exactly
+from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
 from dew.nn.precision import (
     at_least_fp32,
@@ -1387,7 +1387,9 @@ def _narrowing_settled(out: jax.Array, acc: jax.Array, divisor: jax.Array, dtype
     if out.dtype != jnp.float32:
         return out
     above = _remainder_sign(acc, out, divisor)
-    positive = jax.lax.broadcast_in_dim(divisor > 0, acc.shape, tuple(range(divisor.ndim)))
+    div_bits = jax.lax.bitcast_convert_type(divisor, jnp.int32)
+    positive = jax.lax.broadcast_in_dim((div_bits > 0) & (div_bits < 0x7F800000), acc.shape,
+                                        tuple(range(divisor.ndim)))
     bits = jax.lax.bitcast_convert_type(out, jnp.int32)
     # One fp32 ulp toward the exact quotient: up in magnitude where it lies past the rounded one's side, its
     # side read from its sign bit (a subnormal's comparison with zero reads it as zero where the CPU treats
@@ -1416,31 +1418,48 @@ do, so an exact output within their rounding of a boundary may narrow past it.""
 def _remainder_sign(acc: jax.Array, quotient: jax.Array, divisor: jax.Array) -> jax.Array:
     """A value of the sign of `acc - quotient * divisor` (fp32, finite) at every 16-bit narrowing tie
     (`_between`), exact with row-hoisted divisor scaling and splitting: `divisor` is scaled once per row into
-    `[1/4, 1/2)` by two exact power-of-two factors `(s1, s2)` and split into two exact 12-bit halves
-    `(d_hi, d_lo)`. Every 16-bit tie `quotient` has at most 12 significant bits (9 for bf16, 12 for fp16), so
-    `q_scaled * d_hi` and `q_scaled * d_lo` are exact in fp32 with no per-element bit splitting or exponent
-    normalization; tiny `|quotient| < 2^-100` is scaled up by `2^52` so every intermediate stays normal down
-    to fp32's least subnormal (`2^-149`), avoiding Triton register spills across `[block_q, Dv]` (row
+    `[1/4, 1/2)` and split into two exact 12-bit halves `(d_hi, d_lo)`. Every 16-bit tie `quotient` has at
+    most 12 significant bits (9 for bf16, 12 for fp16), so `q_scaled * d_hi` and `q_scaled * d_lo` are exact
+    in fp32 with no per-element bit splitting; tiny `|quotient| < 2^-100` is scaled up by `2^52` so every
+    intermediate stays normal down to `2^-149`. Flushing paths (`bodies.subnormals`) scale through bit
+    arithmetic (`raised_exactly`, `lowered_rounded`) so subnormal accumulators and quotients never flush,
+    while non-flushing GPU kernels use two power-of-two multiplies to avoid Triton register spills (row
     11648)."""
+    from dew.nn.kernels.templates import bodies
+
     shift = jnp.clip(binade_of(divisor), -149, 127) + 2
-    first = jnp.right_shift(shift + 1, 1)
-    second = shift - first
-    s1 = jax.lax.bitcast_convert_type(jnp.left_shift(127 - first, 23).astype(jnp.int32), jnp.float32)
-    s2 = jax.lax.bitcast_convert_type(jnp.left_shift(127 - second, 23).astype(jnp.int32), jnp.float32)
-    (scaled,) = uncontracted((divisor * s1) * s2)
-    unsigned, mask, _ = split_bits(np.float32)
-    d_hi = jax.lax.bitcast_convert_type(
-        jax.lax.bitcast_convert_type(scaled, unsigned) & np.array(mask, unsigned), jnp.float32)
-    d_lo = scaled - d_hi
     dims = tuple(range(divisor.ndim))
 
     def expand(x: jax.Array) -> jax.Array:
         return jax.lax.broadcast_in_dim(x, acc.shape, dims)
+    def scale_bits(x: jax.Array, power: jax.Array) -> jax.Array:
+        return jnp.where(power >= 0, raised_exactly(x, jnp.maximum(power, 0)),
+                         lowered_rounded(x, jnp.maximum(-power, 0)))
 
-    bump = jnp.where(jnp.abs(quotient) < np.float32(2.0 ** -100), np.float32(2.0 ** 52), np.float32(1.0))
-    q_scaled = quotient * bump
-    acc_scaled = (acc * (expand(s1) * bump)) * expand(s2)
-    return (acc_scaled - q_scaled * expand(d_hi)) - q_scaled * expand(d_lo)
+    def compute(*, flushing: bool) -> jax.Array:
+        if flushing:
+            scaled = scale_bits(divisor, -shift)
+            bump = jnp.where(binade_of(quotient) < -100, jnp.int32(52), jnp.int32(0))
+            q_scaled = raised_exactly(quotient, bump)
+            acc_scaled = scale_bits(acc, bump - expand(shift))
+        else:
+            first = jnp.right_shift(shift + 1, 1)
+            second = shift - first
+            s1 = jax.lax.bitcast_convert_type(jnp.left_shift(127 - first, 23).astype(jnp.int32), jnp.float32)
+            s2 = jax.lax.bitcast_convert_type(jnp.left_shift(127 - second, 23).astype(jnp.int32), jnp.float32)
+            scaled = (divisor * s1) * s2
+            bump = jnp.where(jnp.abs(quotient) < np.float32(2.0 ** -100),
+                             np.float32(2.0 ** 52), np.float32(1.0))
+            q_scaled = quotient * bump
+            acc_scaled = (acc * (expand(s1) * bump)) * expand(s2)
+        (scaled,) = uncontracted(scaled)
+        unsigned, mask, _ = split_bits(np.float32)
+        d_hi = jax.lax.bitcast_convert_type(
+            jax.lax.bitcast_convert_type(scaled, unsigned) & np.array(mask, unsigned), jnp.float32)
+        d_lo = scaled - d_hi
+        return (acc_scaled - q_scaled * expand(d_hi)) - q_scaled * expand(d_lo)
+
+    return bodies.subnormals(compute, acc.dtype)
 
 def _between(bits: jax.Array, dtype: DTypeLike) -> jax.Array:
     """Whether each fp32 value of `bits` (its int32 bits) lies exactly between two neighbouring values of the
