@@ -146,12 +146,14 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     whole = rows >= family.role_rows if grouped else ragged or rows % (family.role_rows * most) == 0
     # balanced side, and with it each operand's reads a FLOP, at least one consumer's (CUTLASS's split, 2-7%
     # faster on every H100 scoreboard row); where no tile of theirs holds, one. Each at the most programs
-    # that hold its tile.
-    for consumers in dict.fromkeys((most if whole else 1, 1)):
-        held = [tiled(consumers, programs) for programs in range(family.programs(consumers), 0, -1)]
-        tile = next((tile for tile, balanced in held if balanced), None)
-        if tile := tile or next((tile for tile, _ in held if tile is not None), None):
-            return tile
+    from dew.nn.kernels import generation
+
+    with generation.as_target(target):
+        for consumers in dict.fromkeys((most if whole else 1, 1)):
+            held = [tiled(consumers, programs) for programs in range(family.programs(consumers), 0, -1)]
+            tile = next((tile for tile, balanced in held if balanced), None)
+            if tile := tile or next((tile for tile, _ in held if tile is not None), None):
+                return tile
     return None
 
 
