@@ -343,19 +343,25 @@ and whether its flags hold for every runtime XLA loads (`dew._devices.flags_hold
     ({"JAX_PLATFORMS": "tpu,cpu"}, "", True), ({"JAX_PLATFORMS": "tpu"}, "", True),
     ({"JAX_FORCE_TPU_INIT": "1"}, "", True), ({}, "tpu,cpu", True),
     ({"JAX_PLATFORMS": "cuda,cpu"}, "", False), ({"JAX_PLATFORMS": "cpu"}, "", False),
-    ({"TPU_LIBRARY_PATH": "libtpu"}, "", False)],
+    ({"TPU_LIBRARY_PATH": "libtpu"}, "", None)],
     ids=["tpu-and-cpu", "tpu", "forced-tpu-vm", "tpu-on-jax-config", "cuda", "cpu-compiling-for-cuda",
-         "libtpu-and-no-tpu-chip"])
+         "libtpu-detected-on-the-bus"])
 def test_importing_dew_asks_exact_division_of_the_cuda_compiler_alone(tmp_path, platforms, configured, tpu):
     """`import dew` passes XLA's backend options its GPU fp32 division (`-nvptx-prec-divf32=2`,
     `dew._devices.divide_exactly`) where the CUDA plugin is installed and compiles the process's programs:
-    a GPU's, a CPU process's compiling ahead for compile-only GPUs, and one with libtpu but no TPU chip on its
-    bus, Cloud TPU's detection read from the hardware without importing JAX, so the flags it passes hold for
-    every runtime (rows 12069, 12071); never where a TPU opens, its platforms named in the environment or on
+    a GPU's, a CPU process's compiling ahead for compile-only GPUs, and one with libtpu where no TPU chip is
+    on this host's bus (None: whether one is, read as the process reads it, row 12084), Cloud TPU's
+    detection read from the hardware without importing JAX, so the flags it passes hold for every runtime
+    (rows 12069, 12071); never where a TPU opens, its platforms named in the environment or on
     JAX's live config (row 12070), or forced, whose LLVM has no NVPTX backend and exits the process on the
     unknown option as it compiles a host-offloaded step (row 12017: main's v5e and v6e tiers died there, no
     traceback). Without the CUDA plugin (an install off Linux x86_64) it asks none anywhere."""
     from dew._devices import cuda_plugin
+
+    if tpu is None:
+        from dew.clusters import tpu_chips
+
+        tpu = tpu_chips() > 0
 
     environ = {name: value for name, value in os.environ.items()
                if name not in ("JAX_PLATFORMS", "JAX_FORCE_TPU_INIT", "TPU_LIBRARY_PATH", "XLA_FLAGS")}
