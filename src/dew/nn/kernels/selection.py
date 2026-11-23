@@ -276,7 +276,9 @@ def select[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple
     for the target raises (`Unlowerable`)."""
     from . import generation
 
-    return generation.published(decided(op, case, named, preference=preference))
+    route = decided(op, case, named, preference=preference)
+    # A draw's dispatch is none of the run's (`generation.drawing`): reported nowhere.
+    return route if generation.draws() else generation.published(route)
 
 
 def decided[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple[str, ...] = ()) -> Route:
@@ -311,7 +313,16 @@ def _decided[C](op: Op[C], case: C, named: str | None, preference: tuple[str, ..
                 reported: bool = True) -> tuple[Kernel[C], str, Refusal | None, str | None]:
     """`select`'s kernel for `case`, the kernel preferred, the preferred one's refusal and the kernel that
     forced the choice (the call, its own `chosen`, then `named_from`), None where nothing did; a declared
-    cell's preference only where `reported` (`selected` reads the kernel alone)."""
+    cell's preference only where `reported` (`selected` reads the kernel alone). Within a model's draw of
+    its variables, the op's first generic kernel capable of the case (`generation.drawing`): its measured
+    requirements, a device's memory and speed, are no draw's, which runs nothing (a compile-only GPU's
+    memory read raised where it was asked)."""
+    from . import generation
+
+    capable = (kernel for kernel in op.kernels
+               if kernel.generic and kernel.refused(case, forced=True) is None)
+    if generation.draws() and (generic := next(capable, None)) is not None:
+        return generic, generic.name, None, None
     insisted = _named(op, named)
     soft = insisted is None and bool(preference)
     if soft:

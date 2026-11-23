@@ -14,11 +14,13 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import importlib
 import importlib.metadata
-import importlib.util
 import json
 import logging
+import os
 import re
+import subprocess
 import threading
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -35,7 +37,15 @@ from dew import _cache, communicators
 from dew._code import op_provenance, provenance_code
 from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates.assembled import MOSAIC_TARGET, SERIALIZED, Binary, binaries, carried, kernel_of
+from dew.nn.kernels.templates.assembled import (
+    MOSAIC_TARGET,
+    SERIALIZED,
+    Binary,
+    binaries,
+    carried,
+    kernel_of,
+    launch_name,
+)
 
 if TYPE_CHECKING:
     from dew.nn.kernels.lowered import KernelCall
@@ -209,8 +219,11 @@ _RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = _cache.untraced(conte
 _PROCESS = _Registry()
 """The process's registry, every thread's. A shared executable cache does not share these decisions:
 only an explicitly handed plan seeds them, after validating its program and target."""
-_SCOPE: contextvars.ContextVar[_Registry | None] = contextvars.ContextVar("refusals_scope", default=None)
-"""A `refusals` scope's own registry, in its context alone."""
+_SCOPE: contextvars.ContextVar[_Registry | None] = _cache.untraced(
+    contextvars.ContextVar("refusals_scope", default=None))
+"""A `refusals` scope's own registry, in its context alone: a trace reads it through its facts alone
+(`refusals_of`, `refusal_entries`, under `_GUARD`), so a held trace's key leaves it out (`_cache.untraced`),
+where its records' walk raced a compile worker filling them and a first lookup made the key stale."""
 _GUARD = threading.RLock()
 """Serializes the registries' reads and updates between threads."""
 
@@ -369,14 +382,6 @@ def launch_metadata() -> bytes:
     return b"" if digest is None else digest.encode()
 
 
-def launch_name(kernel: str, launch: str | None, index: str | None = None) -> str:
-    """`kernel`'s name carrying the digest `launch` (`assembled.LAUNCH_SUFFIX`) and optional XLA
-    uniquification `index`, as is where None: the lossless key a kernel's evidence goes by beside its
-    launch."""
-    named = kernel if launch is None else f"{kernel}__l{launch}"
-    return named if index is None else f"{named}__{index}"
-
-
 class KernelsOfOneName(ValueError):
     """Two kernels of one name and launch (`kernel_bodies`), whose evidence would be one's."""
 
@@ -484,6 +489,22 @@ def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]
         return found
 
 
+def refusals_at(op, arguments: tokamax.BoundArguments, target: "generation.GpuTarget | None"
+                ) -> frozenset[tuple[Hashable, frozenset[Refused]]]:
+    """Each config a compile of this process refused `op`'s launch of `arguments` on `target` at, with the
+    kernels refused there and their roles (`refusals_of` of its identity, its cached snapshot as is): the one
+    reading of a launch's refusals, which `refused`, `refused_at` and `spilled_in` read at a config
+    (`_refused_kernels`), and a launch none of whose configs is refused reads as empty (row 6999: a fifth
+    reader asked that alone)."""
+    return refusals_of(_identity(op, arguments, target))
+
+
+def _refused_kernels(found: frozenset[tuple[Hashable, frozenset[Refused]]], config: Hashable
+                     ) -> frozenset[Refused]:
+    """The kernels a launch's refusals (`refusals_at`) refused at `config`, none where it refused none."""
+    return next((kernels for refused_config, kernels in found if refused_config == config), frozenset())
+
+
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable,
             target: "generation.GpuTarget | None") -> bool:
     """Whether a compile of this process refused `op`'s launch of `arguments` at `config` on `target`: a
@@ -492,18 +513,12 @@ def refused(op, arguments: tokamax.BoundArguments, config: Hashable,
     return bool(refused_at(op, arguments, config, target))
 
 
-def refused_any(op, arguments: tokamax.BoundArguments, target: "generation.GpuTarget | None") -> bool:
-    """Whether a compile of this process refused any config of `op`'s launch of `arguments` on `target`
-    (`refused`)."""
-    return bool(refusals_of(_identity(op, arguments, target)))
-
-
 def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable,
                target: "generation.GpuTarget | None") -> frozenset[str]:
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments` on `target`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
     recurrence's forward and backward walks) steps the one refused."""
-    return names(dict(refusals_of(_identity(op, arguments, target))).get(config, ()))
+    return names(_refused_kernels(refusals_at(op, arguments, target), config))
 
 
 def names(kernels: Iterable[Refused]) -> frozenset[str]:
@@ -517,7 +532,7 @@ def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable,
     refusal states them (`Refused`), by kernel name: what a launch's ladder steps it by (row 6744). A kernel
     whose roles its compile left unread is absent; one read and spilling none (its warpgroup MMAs serialized
     alone) states `()`."""
-    found = dict(refusals_of(_identity(op, arguments, target))).get(config, ())
+    found = _refused_kernels(refusals_at(op, arguments, target), config)
     return {kernel: roles for kernel, roles in found if roles is not None}
 
 
@@ -528,9 +543,16 @@ def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kerne
     compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727). `spilled_in`, the
     roles each kernel's spill stood in where the compile read them (`Binary.spilled_in`), kept with it
     (`Refused`) for its ladder (`spilled_in`)."""
+    _refused_launch(_identity(op, arguments, generation.gpu_target()), config, kernels, spilled_in)
+
+
+def _refused_launch(identity: str, config: Hashable, kernels,
+                    spilled_in: Mapping[str, tuple[str, ...] | None] | None) -> None:
+    """The launch of `identity` (`_identity`: its op, arguments and target) refused at `config`, as
+    `refuse_launch` refuses it: what a settle of launches certified aside records by the identity it queued
+    each under, whatever GPU is in effect as it drains (row 12031)."""
     roles = spilled_in or {}
-    _record((_identity(op, arguments, generation.gpu_target()), config), None,
-            frozenset((kernel, roles.get(kernel)) for kernel in kernels))
+    _record((identity, config), None, frozenset((kernel, roles.get(kernel)) for kernel in kernels))
 
 
 _CERTIFYING: contextvars.ContextVar = contextvars.ContextVar("certifying_device", default=None)
@@ -606,15 +628,17 @@ def certifying(device) -> Iterator[None]:
 
 @dataclasses.dataclass(frozen=True)
 class _AsideLaunch:
-    """A launch certified aside (`certifying_aside`): what `certified` read of it, the reporting scope it was
-    queued in (`_reporting`), and its replay's kernels to come once its call was reached (`capture`)."""
+    """A launch certified aside (`certifying_aside`): what `certified` read of it, each reporting scope it
+    was taken in (`_reporting`; the first its queueing's, another for each scope that took it again, which
+    its one replay's verdict is recorded in too, row 12007), and its replay's kernels to come once its call
+    was reached (`capture`)."""
     op: "KernelOp"
     arguments: tokamax.BoundArguments
     config: Hashable
     reverse: bool
     device: Hashable
     stored: str | None
-    reporting: tuple
+    reporting: list[tuple]
     kernels: Future | None = None
 
 
@@ -636,15 +660,27 @@ _ASIDE: contextvars.ContextVar[Aside | None] = _cache.untraced(
 
 
 @contextlib.contextmanager
-def certifying_aside() -> Iterator[Aside]:
+def certifying_aside() -> Iterator[None]:
     """Within the block, a launch whose derivation has refused none of its configs is certified aside
     (`certified`): lowered as the trace reaches it, Python that holds the GIL, and compiled on
     `compile_threads` threads while the trace runs on, XLA and the GPU's assembler releasing it, its config
-    taken as holding until `settled_aside` reads its compile; the block's end waits for every compile. A
-    launch with a refusal certifies in turn, its ladder read as it climbs (`tuning.KernelOp._certified`). A
-    cold start's 47 launches certified in turn took 48 s, 18 of them compiling (M-MC-21b), and every config
-    the gates derive holds (FS-DECISION: an attention forward's 68 and a backward's 45 on sm90), so a
-    refusal's relowering is rare."""
+    taken as holding until the block's end reads its compile (`_settled_aside`), within a settle that records
+    its misses (`settling`), every compile waited for. A launch with a refusal certifies in turn, its ladder
+    read as it climbs (`tuning.KernelOp._certified`). A cold start's 47 launches certified in turn took 48 s,
+    18 of them compiling (M-MC-21b), and every config the gates derive holds (FS-DECISION: an attention
+    forward's 68 and a backward's 45 on sm90), so a refusal's relowering is rare. The one way a caller
+    certifies aside, its steps in order (row 12015); a lowering that relowers past a refusal settles wider
+    (`lowered_aside`)."""
+    with settling():
+        with _aside_block() as aside:
+            yield
+        _settled_aside(aside)
+
+
+@contextlib.contextmanager
+def _aside_block() -> Iterator[Aside]:
+    """A block certifying aside (`certifying_aside`) whose launches its caller settles (`_settled_aside`):
+    its compiles' pool, each compile waited for as it ends."""
     with ThreadPoolExecutor(compile_threads(), thread_name_prefix="dew-certify") as pool:
         aside = Aside(pool)
         token = _ASIDE.set(aside)
@@ -654,14 +690,13 @@ def certifying_aside() -> Iterator[Aside]:
             _ASIDE.reset(token)
 
 
-def settled_aside(aside: Aside) -> frozenset[tuple]:
+def _settled_aside(aside: Aside) -> frozenset[tuple]:
     """Each launch `aside` certified, kept as `certified` keeps one and dropped from the block's pending: a
     launch whose kernels the assembler refuses refused (`refuse_launch`), so a trace that took its config is
     traced afresh (`settled_trace`) and a program lowered at it lowered afresh (`refused_in`), its misses kept
-    for that retry to record (`settling`). The keys of those refused."""
+    for that retry to record (`settling`, which every caller settles within). The keys of those refused."""
     settlement = _SETTLING.get()
-    if settlement is None:
-        raise ValueError("a block certifying aside is settled within `settling`, which records its misses")
+    assert settlement is not None
     refused = set()
     for key, each in list(aside.pending.items()):
         # A launch a derivation certified (a route's eligibility) and no trace called: no program holds it.
@@ -683,19 +718,23 @@ def settled_aside(aside: Aside) -> frozenset[tuple]:
                                        read=read).refused
         if spilling:
             refused.add(key)
-            # Refused in the scope its call was queued in, whatever scope drains it.
-            with _reported_in(each.reporting):
-                refuse_launch(each.op, each.arguments, each.config, {binary.kernel for binary in spilling},
-                              {binary.kernel: binary.spilled_in for binary in spilling})
-            # Held by the settle (`settling`) until a retry, under its own context, steps past it (row 11786).
-            settlement.deferred.append((key, Launch(key[0], type(each.op).__name__, each.config),
-                                        tuple(spilling), each.reporting))
+            with _GUARD:
+                scopes = tuple(each.reporting)
+            for reporting in scopes:
+                # Refused in each scope its call was taken in, whatever scope drains it.
+                with _reported_in(reporting):
+                    _refused_launch(key[0], each.config, {binary.kernel for binary in spilling},
+                                    {binary.kernel: binary.spilled_in for binary in spilling})
+                # Held by the settle (`settling`) until a retry, under its own context, steps past it (row
+                # 11786).
+                settlement.deferred.append((key, Launch(key[0], type(each.op).__name__, each.config),
+                                            tuple(spilling), reporting))
     return frozenset(refused)
 
 
 def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
     """`trace()`'s value, within a block certifying aside the launches it reached settled before it lowers
-    (`settled_aside`, within `settling`), and traced afresh (`retrace()`, past any trace cache) while they
+    (`_settled_aside`, within `settling`), and traced afresh (`retrace()`, past any trace cache) while they
     refuse a config it took: it lowers once, at the configs its certification settled (FS-ASIDE-SM100C).
     Each trace runs in the caller's context, which JAX's trace cache keys on, so a program compiled ahead is
     found by its trace (row 11766); an abandoned trace's routes are withdrawn (`generation.withdrawn`), a
@@ -708,7 +747,7 @@ def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
         marks = generation.route_marks()
         value = trace()
         seen: set = set()
-        while (refused := settled_aside(aside)) and not refused <= seen:
+        while (refused := _settled_aside(aside)) and not refused <= seen:
             seen |= refused
             generation.withdrawn(marks)
             value = retrace()
@@ -718,7 +757,7 @@ def settled_trace[T](trace: Callable[[], T], retrace: Callable[[], T]) -> T:
 def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
                      program: Callable[[T], jax.stages.Lowered | None]) -> T:
     """`lower()`'s value, the launches its trace reaches certified aside (`certifying_aside`, settled before
-    it lowers where it traces through `settled_trace`, else as it ends: `settled_aside`), and `relower()`'s
+    it lowers where it traces through `settled_trace`, else as it ends: `_settled_aside`), and `relower()`'s
     afresh for as long as its program (`program`, None where it holds none) launches a refused config
     (`refused_in`), each refused launch's derivation stepping past its config and certifying the next in
     turn: its own certifications' refusals, or another caller's committed after its trace took the config
@@ -729,22 +768,22 @@ def lowered_aside[T](lower: Callable[[], T], relower: Callable[[], T],
     64 of an sm90 plan's 82 seconds (FS-P5324-MAIN, row 5324); a program's trace alone certifies aside too
     (`OuterProgram.trace`)."""
     with settling():
-        with certifying_aside() as aside:
+        with _aside_block() as aside:
             value = lower()
-        settled_aside(aside)
+        _settled_aside(aside)
         seen: set = set()
         while ((lowered := program(value)) is not None and (refused := refused_in(lowered))
                and not refused & seen):
             seen |= refused
-            with certifying_aside() as aside:
+            with _aside_block() as aside:
                 value = relower()
-            settled_aside(aside)
+            _settled_aside(aside)
     return value
 
 
 @dataclasses.dataclass
 class _Settlement:
-    """A settle's misses (`settled_aside`) by certification key and queueing scope, held until the launch
+    """A settle's misses (`_settled_aside`) by certification key and queueing scope, held until the launch
     holds at another config in that scope's registry (stepped) or the settle ends, recorded in their own
     scope either way (row 11786)."""
 
@@ -865,23 +904,30 @@ def certified(op, arguments: tokamax.BoundArguments, config: Hashable) -> tuple[
             _progressed(key)
         return held.refused
     provenance = op_provenance(op, arguments.arguments)
-    stored = _verdict_key(_identity(op, arguments, generation.gpu_target()), config, reverse, provenance)
-    verdict = None if stored is None else tuning.stored_verdict(verdict_target(device), stored)
+    target = verdict_target(device)
+    stored = _verdict_key(key[0], config, reverse, provenance, target)
+    verdict = None if stored is None else tuning.stored_verdict(target, stored)
     if isinstance(verdict, dict):
         return _kept_certification(key, op, config, reverse, verdict, (), device, read=True).refused
     aside = _ASIDE.get()
-    if aside is not None and key in aside.pending:
+    reporting = _reporting()
+    with _GUARD:
+        taken = None if aside is None else aside.pending.get(key)
+        if taken is not None and not any(held[0] is reporting[0] and held[1] is reporting[1]
+                                         for held in taken.reporting):
+            taken.reporting.append(reporting)
+    if taken is not None:
         return ()
     if aside is not None and not _refused_before(op, arguments) and _traced_for(device):
         # Taken as holding, nothing lowered here: the block's trace's own call of the launch is replayed and
-        # compiled aside (`capture`), the block's end settling it (`settled_aside`), once a block.
-        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, _reporting())
+        # compiled aside (`capture`), the block's end settling it (`_settled_aside`), once a block.
+        aside.pending[key] = _AsideLaunch(op, arguments, config, reverse, device, stored, [reporting])
         aside.awaiting[(_launched(key[0], config, reverse), reverse)] = key
         return ()
     # Its verdict where its kernels' was stored however their Dew tree named it (`_lowered_verdict_key`),
     # stored by this tree's key too, so its next start reads it tracing nothing.
     lowered, modules, lowered_key = _lowered_launch(op, arguments, config, device, reverse)
-    verdict = None if lowered_key is None else tuning.stored_verdict(verdict_target(device), lowered_key)
+    verdict = None if lowered_key is None else tuning.stored_verdict(target, lowered_key)
     if isinstance(verdict, dict):
         return _kept_certification(key, op, config, reverse, verdict, (stored,), device, read=True).refused
     unstored = (stored, lowered_key)
@@ -955,51 +1001,70 @@ def _lowered_verdict_key(calls) -> str | None:
     """What decides a lowered launch's certification on a GPU model, as its stored verdict's key once it has
     lowered (`tuning.stored_verdict`): each Mosaic GPU and Pallas-Triton kernel it compiles, by its name, its
     IR's digest and its config, the installed JAX, jaxlib and CUDA plugins, whose compiler assembles them (the
-    Pallas lowering cache's seal), the ptxas that assembles them (`_assemblers`, as `_verdict_key` names it:
-    another ptxas's spills and serialized products are another verdict, row 10782), and the environment a
+    Pallas lowering cache's seal), the assemblers of its kernels' kinds (`_assemblers`: another ptxas's spills
+    and serialized products are another verdict, row 10782), and the environment a
     kernel's compile reads (that cache's policy); the store's file names the GPU model. Its kernels decide its
     verdict, not the Dew tree that lowered them: a tree whose own key (`_verdict_key`) finds none, an edit's
     anywhere outside them, lowers the launch and reads its verdict, compiling nothing (row 8650: 23 of an
     edited tree's 51 seconds certifying a hybrid decoder's step ahead, FS-8650-SPLIT). None where the
-    installation has no seal."""
-    kernels = sorted((call.kind, call.name, hashlib.sha256(call.ir).hexdigest(), call.config)
-                     for call in calls if call.kind in ("mosaic_gpu", "triton"))
-    return _sealed_key("lowered", _assemblers(), _verdict_fields(), kernels)
+    installation has no seal, its kernels' IR read and hashed for none (row 12009), or an assembler is
+    unknown."""
+    def stated() -> tuple | None:
+        kernels = sorted((call.kind, call.name, hashlib.sha256(call.ir).hexdigest(), call.config)
+                         for call in calls if call.kind in ("mosaic_gpu", "triton"))
+        if (assemblers := _assemblers({kind for kind, *_ in kernels})) is None:
+            return None
+        return "lowered", assemblers, _verdict_fields(), kernels
+
+    return _sealed_key(stated)
 
 
 def stored_key(provenance: frozenset[str] | None, *fields) -> str | None:
-    """What decides a stored launch decision (`_verdict_key`, `attention_mosaic._choice_key`) for a compile
+    """What decides a stored launch decision (`attention_mosaic._choice_key`) for a compile
     target before it traces: its code (`dew._code.provenance_code`: an edit of it invalidates the stored
     entry), the installed JAX, jaxlib and CUDA plugins, whose Mosaic GPU and XLA lower and compile it (the
     Pallas lowering cache's seal of them), caller-specific `fields`, and the environment a kernel's lowering
     and compile read (that cache's policy). None where the installation has no seal (an edited or a source
     install of JAX), whose code no key states: decisions are not stored."""
-    return _sealed_key(provenance_code(__name__, provenance), *fields)
+    return _sealed_key(lambda: (provenance_code(__name__, provenance), *fields))
 
 
-def _sealed_key(head, *fields) -> str | None:
+def _sealed_key(stated: Callable[[], tuple | None]) -> str | None:
     """A stored decision's key in the installation's sealed frame, the one owner of it (`stored_key`'s, a
-    lowered verdict's, row 11653): `head` (its code's provenance, or what names its kind), the installed JAX,
-    jaxlib and CUDA plugins (the Pallas lowering cache's seal of them), `fields`, and the environment a
-    kernel's lowering and compile read (that cache's policy); None where the installation has no seal."""
+    verdict's, row 11653): what `stated()` gives (its head, its code's provenance or what names its kind,
+    then its fields) beside the installed JAX, jaxlib and CUDA plugins (the Pallas lowering cache's seal of
+    them) and the environment a kernel's lowering and compile read (that cache's policy); None where the
+    installation has no seal, `stated` called only where it has one (row 12009), or where `stated` gives
+    None."""
     from jax._src.pallas.mosaic_gpu.lowering_cache import _keyed_environment
     from jax._src.pallas.mosaic_gpu.lowering_cache_seal import seal
 
     installed = seal().digest
-    if installed is None:
+    if installed is None or (state := stated()) is None:
         return None
-    stated = [head, installed.hex(), *fields, _keyed_environment()]
-    return hashlib.sha256(json.dumps(stated, sort_keys=True).encode()).hexdigest()
+    head, *fields = state
+    keyed = [head, installed.hex(), *fields, _keyed_environment()]
+    return hashlib.sha256(json.dumps(keyed, sort_keys=True).encode()).hexdigest()
 
 
-def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: frozenset[str] | None
-                 ) -> str | None:
-    """What decides a launch's certification for a compile target (`stored_key`, `verdict_target`,
-    `tuning.stored_verdict`) before it traces, including the ptxas that assembles it (`_assemblers`) and what
-    a stored verdict states (`_verdict_fields`)."""
+def _verdict_key(identity: str, config: Hashable, reverse: bool, provenance: frozenset[str] | None,
+                 target: str) -> str | None:
+    """What decides a launch's certification for a compile target (`verdict_target`'s `target`,
+    `tuning.stored_verdict`) before it traces: its code's provenance, as a stored decision's
+    (`stored_key`), what a stored verdict states (`_verdict_fields`), and a CUDA target's assemblers of
+    either kind of kernel its launch may compile (`_assemblers`); another target's names none, a TPU's read
+    on an install with no Mosaic GPU binding. Each is read only where the installation is sealed; None where
+    it is not or an assembler is unknown."""
     from dew.nn.kernels.tuning import encoded
 
-    return stored_key(provenance, _assemblers(), _verdict_fields(), identity, encoded(config), reverse)
+    def stated() -> tuple | None:
+        kinds = ("mosaic_gpu", "triton") if generation.capability(target) else ()
+        if (assemblers := _assemblers(kinds)) is None:
+            return None
+        return (provenance_code(__name__, provenance), assemblers, _verdict_fields(), identity,
+                encoded(config), reverse)
+
+    return _sealed_key(stated)
 
 
 def _verdict_fields() -> list[str]:
@@ -1008,17 +1073,75 @@ def _verdict_fields() -> list[str]:
     return [field.name for field in dataclasses.fields(Binary)]
 
 
+def _assemblers(kinds: Iterable[str]) -> list[tuple[str, ...]] | None:
+    """What assembles a launch's kernels of `kinds`, each kind's as its assembler is named: a Mosaic GPU
+    kernel's (`_mosaic_assembler`) and a Pallas-Triton kernel's, XLA's (`_triton_assembler`), which differ
+    where JAX gives XLA a CUDA directory Mosaic GPU does not search. A relock or a system CUDA that moves
+    either certifies again, where the seal, which holds the CUDA plugins alone, kept a verdict another
+    assembler judged (row 7309). None where one is unknown: its verdict is not stored."""
+    named = []
+    for kind in sorted(set(kinds)):
+        if (assembler := (_mosaic_assembler if kind == "mosaic_gpu" else _triton_assembler)()) is None:
+            return None
+        named.append(assembler)
+    return named
+
+
 @functools.cache
-def _assemblers() -> list[str]:
-    """The installed distributions holding the ptxas a kernel's PTX is assembled with, CUDA's nvcc wheels
-    (`nvidia-cuda-nvcc`, `nvidia-cuda-nvcc-cu12`), each as `name==version`: a relock that moves one
-    certifies again, where the seal, which holds the CUDA plugins alone, kept a verdict another ptxas
-    judged. A system CUDA's ptxas, outside every wheel, none names (row 7309: the ptxas Mosaic GPU's own
-    assembler names, `_get_assembler`, with its version, once Dew's JAX build states it)."""
+def _mosaic_assembler() -> tuple[str, ...] | None:
+    """The assembler Mosaic GPU assembles a kernel's PTX with, as it names it (`_get_assembler`, Dew's JAX
+    build from post124): its provider's kind and, where that runs a ptxas, the ptxas's build
+    (`_ptxas_build`), its path aside, which differs host to host where the build does not. Mosaic GPU finds
+    its ptxas in a CUDA directory of its own (`./cuda_sdk_lib`, `CUDA_HOME`, a system CUDA's, the nvcc
+    wheel's). Read once a process: neither moves while it runs."""
+    # JAX's own module of the extension, which loads it from whichever build provides it: its native
+    # attributes are read off the module, which no stub states.
+    extension = importlib.import_module("jax._src.lib.mosaic_gpu")._mosaic_gpu_ext
+    provider = extension._get_assembler()
+    kind = provider.split("(", 1)[0]
+    if "ptxas" not in provider:
+        return (kind,)
+    # The ptxas's path runs to the nvlink the provider names after it, or to the name's end.
+    if (ptxas := re.fullmatch(r"[^(]*\(ptxas: (.*?)(?:, nvlink: .*)?\)", provider)) is None:
+        _log.warning("certification stores no verdict: no ptxas path read in %s", provider)
+        return None
+    build = _ptxas_build(ptxas.group(1))
+    return None if build is None else (kind, build)
+
+
+@functools.cache
+def _triton_assembler() -> tuple[str, ...] | None:
+    """The assembler XLA assembles a Pallas-Triton kernel's PTX with: the ptxas in the CUDA directory JAX
+    gives each compile (`jax._src.lib.cuda_path`: `CUDA_ROOT`'s, else the nvcc wheel's), by its build
+    (`_ptxas_build`), beside the nvJitLink wheels XLA's automatic mode assembles with instead where one
+    loads. None where JAX names no directory: XLA's own search finds its ptxas, which no key states. Read
+    once a process."""
+    from jax._src.lib import cuda_path
+
+    if cuda_path is None:
+        _log.info("certification stores no Pallas-Triton kernel's verdict: JAX names XLA no CUDA directory")
+        return None
+    if (build := _ptxas_build(os.path.join(cuda_path, "bin", "ptxas"))) is None:
+        return None
     named = (((distribution.metadata.get("Name") or "").lower(), distribution)
              for distribution in importlib.metadata.distributions())
-    return sorted(f"{name}=={distribution.version}" for name, distribution in named
-                  if re.fullmatch(r"nvidia-cuda-nvcc(-cu\d+)?", name))
+    return build, *sorted(f"{name}=={distribution.version}" for name, distribution in named
+                          if re.fullmatch(r"nvidia-nvjitlink(-cu\d+)?", name))
+
+
+def _ptxas_build(ptxas: str) -> str | None:
+    """The build `ptxas` states of itself (`--version`'s last line), or None, why logged, where it states
+    none: a launch it assembles stores no verdict, its certification run as before."""
+    try:
+        ran = subprocess.run([ptxas, "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        _log.warning("certification stores no verdict: %s --version did not run: %s", ptxas, error)
+        return None
+    if ran.returncode or not (lines := ran.stdout.strip().splitlines()):
+        _log.warning("certification stores no verdict: %s --version exited %d stating no build: %s", ptxas,
+                     ran.returncode, ran.stderr.strip())
+        return None
+    return lines[-1]
 
 
 def certifications() -> tuple[Certification, ...]:
@@ -1061,8 +1184,11 @@ def _certifying_device():
     if placed.empty:
         placed = _TARGETED.get()
     if placed is None:
+        # JAX's own default for a plain call: the device named, else this process's first of the platform
+        # named (`jax.local_devices`), never another process's (rows 7211, 7224: rank k certified on
+        # process 0's device, which it cannot address).
         default = jax.config.jax_default_device
-        devices = [default if isinstance(default, jax.Device) else jax.devices(default)[0]]
+        devices = [default] if isinstance(default, jax.Device) else jax.local_devices(backend=default)[:1]
     else:
         devices = [device for device in placed.devices.flat if device.process_index == jax.process_index()]
     # A device of another generation (a CPU's, an A100's under an assumed sm90) certifies nothing.
@@ -2043,9 +2169,10 @@ def _held(found: list, program: jax.stages.Lowered) -> None:
         name = launch_name(binary.kernel, binary.launch)
         verdicts.setdefault((identity, config, launch.reverse, launch.provenance), {})[name] = (
             modules.get(name, ""), binary)
+    target = verdict_target(device)
     for (identity, config, reverse, provenance), kernels in verdicts.items():
-        if (key := _verdict_key(identity, config, reverse, provenance)) is not None:
-            tuning.store_verdict(verdict_target(device), key, kernels)
+        if (key := _verdict_key(identity, config, reverse, provenance, target)) is not None:
+            tuning.store_verdict(target, key, kernels)
 
 
 def _launches(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:

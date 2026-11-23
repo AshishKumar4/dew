@@ -278,11 +278,13 @@ def uncached() -> Iterator[None]:
             compilation_cache.reset_cache()
 
 
+@functools.cache
 def plugin_builds() -> str:
     """The build of each CUDA PJRT plugin installed, in order of the builds' names (an order any other reader
     of the installed wheels can take): `-<build>-<version>` each. The GPU compile, XLA's, Triton's and Mosaic
     GPU's, runs in the plugin, and Dew builds its plugins again under one jax and jaxlib, a version each
-    (row 3560)."""
+    (row 3560). Read once: a process installs none while it runs, and each read scans the installed
+    distributions' metadata (row 11803: a kernel pick's every store and read named its file through it)."""
     return "".join(f"-{build}-{importlib.metadata.version(f'jax-{build}-pjrt')}"
                    for build in sorted(cuda_builds()))
 
@@ -326,7 +328,13 @@ def autotune_dir(path: str) -> str:
     jaxlib and the build of each CUDA PJRT plugin installed beside it (`plugin_builds`): XLA's
     per fusion, and Dew's kernels' beside them (`kernel_picks_path`), each pick's speed the plugin's
     compile's."""
-    return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}{plugin_builds()}")
+    return os.path.join(path, 'autotune', f"jaxlib-{_jaxlib()}{plugin_builds()}")
+
+
+@functools.cache
+def _jaxlib() -> str:
+    """The installed jaxlib's version, read once (`plugin_builds`)."""
+    return importlib.metadata.version('jaxlib')
 
 
 def kernel_picks_path(device_kind: str) -> str:
@@ -438,6 +446,11 @@ KERNEL_CHOICES = _context(())
 """The `(choice, kernel)` pairs `dew.nn.kernels.generation.chosen` holds in
 this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
 choice traces again within it."""
+
+DRAWING = _context(0)
+"""1 where this thread traces a draw of a model's variables (`dew.nn.kernels.generation.drawing`), else 0,
+keyed on as `KERNEL_CHOICES` is: a draw selects no kernel, so its trace is never another's, and one draw's
+trace within another's is that draw's (row 12092)."""
 
 NUMERICS = _context(None)
 """The run's numerics `dew.nn.kernels.generation.run_precision` holds in this thread

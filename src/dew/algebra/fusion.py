@@ -52,7 +52,6 @@ from jax._src import core as jax_core
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
-from dew import _cache
 from dew.nn import derivatives
 from dew.nn.kernels import generation
 from dew.nn.nested import nested
@@ -496,7 +495,7 @@ class RegionDecision(NamedTuple):
     launched: bool
 
 
-_held: collections.OrderedDict[Hashable, RegionDecision] = collections.OrderedDict()
+_held: collections.OrderedDict[Hashable, tuple[RegionDecision, dict]] = collections.OrderedDict()
 
 
 def choice_context() -> Hashable:
@@ -522,12 +521,12 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
 
 def _decided(identity: Hashable, decide: Callable[[], RegionDecision]) -> RegionDecision:
     """A region's decision (`decide`), weighed once for its structure (`_identity`) in the context a kernel
-    is chosen in (`choice_context`), held (`holding`)."""
+    is chosen in (`choice_context`), held with the facts its probes read (`generation.held_trace`)."""
     def weighed() -> RegionDecision:
         # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
         with generation.routes(alone=True):
             return decide()
-    return _cache.holding(_held, (identity, choice_context()), weighed, DECISIONS_HELD)
+    return generation.held_trace(_held, (identity, choice_context()), weighed, DECISIONS_HELD)
 
 
 def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
@@ -577,38 +576,33 @@ def _xla_whatever_its_prologue(launch) -> bool:
 
 
 class Recorded(NamedTuple):
-    """What a trace of Dew's reported as it ran (`recorded`): the routes it took, the launches it made (each
-    its op and keyed arguments, and the config it took, `tuning.Seen.held`) and the facts it read
-    (`generation.recording`). A program written from that trace again, never traced again, reports them
-    again (`replay`), so a recording around the program that writes it holds them as one around the trace
-    did (row 6708), and is reused only while each fact answers alike (`still`)."""
+    """What a trace of Dew's reported as it ran (`recorded`): the routes it took and the launches it made
+    (each its op and keyed arguments, and the config it took, `tuning.Seen.held`). A program written from
+    that trace again, never traced again, reports them again (`replay`), so a report around the program
+    that writes it holds them as one around the trace did; the facts the trace read go with its held value
+    (`generation.held_trace`, their one owner: Train 1205's review F1)."""
 
     routes: tuple
     launches: tuning.Seen
-    reads: dict
-
-    def still(self) -> bool:
-        """Whether each fact the trace read answers alike now (`generation.still`)."""
-        return generation.still(self.reads)
 
     def replay(self) -> None:
-        """The trace's routes and launches reported, and its facts read, where its program is written."""
+        """The trace's routes and launches reported where its program is written."""
         from dew.nn.kernels.tuning import noted
 
         generation.reported(self.routes)
         noted(self.launches)
-        generation.replay(self.reads)
 
 
 def recorded[Made](make: Callable[[], Made]) -> tuple[Made, Recorded]:
     """`make()`, a trace of Dew's, and what it reported (`Recorded`): the one record-and-replay of a held
-    trace, a region's (`_traced`) and a nested body's (`dew.algebra.program._closed`)."""
+    trace's reports, a region's (`_traced`), a nested body's (`dew.algebra.program._closed`) and a marked
+    span's (`dew.nn.derivatives._traced_span`), each held through `generation.held_trace`."""
     # Imported where used: tuning imports the algebra's terms, which this module's package imports.
     from dew.nn.kernels.tuning import seen as launched
 
-    with (generation.routes(alone=True) as routes, launched() as seen, generation.recording() as reads):
+    with generation.routes(alone=True) as routes, launched() as seen:
         made = make()
-    return made, Recorded(tuple(routes), seen.held(), reads)
+    return made, Recorded(tuple(routes), seen.held())
 
 
 class _Trace(NamedTuple):
@@ -620,23 +614,22 @@ class _Trace(NamedTuple):
     record: Recorded
 
 
-_traces: collections.OrderedDict[Hashable, _Trace] = collections.OrderedDict()
+_traces: collections.OrderedDict[Hashable, tuple[_Trace, dict]] = collections.OrderedDict()
 
 
 def _traced(region: Written) -> _Trace | None:
     """`region`'s call traced as one nested program over its inputs' types (`nested`), once a process for
-    its identity (`Written.key`) in the context a kernel is chosen in (`choice_context`), held
-    (`_cache.holding`) while each fact its trace read answers alike (`generation.still`); its routes and
-    launches reported where it is written, as its trace reported them (`generation.reported`,
-    `tuning.noted`), and the facts it read read again there (`generation.replay`), so a recording around the
-    program that writes it holds them as one around its trace did (row 6708)."""
+    its identity (`Written.key`) in the context a kernel is chosen in (`choice_context`), held with the
+    facts its trace read while each answers alike, those read again wherever it is taken
+    (`generation.held_trace`); its routes and launches reported where it is written, as its trace reported
+    them (`generation.reported`, `tuning.noted`), so a report around the program that writes it holds them
+    as one around its trace did (row 6708)."""
     def traced_once() -> _Trace:
         traced, record = recorded(lambda: jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs)))
         (equation,) = traced.jaxpr.eqns
         return _Trace(equation, tuple(traced.jaxpr.invars), record)
 
-    held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD,
-                          still=lambda trace: trace.record.still())
+    held = generation.held_trace(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD)
     # Its outputs the very types the region made (`jax_core.typematch`: shape, dtype, sharding, the manual
     # axes they vary over), else it is not written, a value of another type in its place a program JAX
     # refuses, and its routes reported refused (`_unwritten`).

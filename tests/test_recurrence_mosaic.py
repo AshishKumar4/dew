@@ -1219,10 +1219,9 @@ def _model(launch: mainloop.Launch, family: mosaic.Family,
     its schedule lowers it (`Launch.producer`), bounded by the launch's shared-memory allocation, and moving
     registers where its plan's residency does (`Launch.resident`, `RegisterModel.moves`)."""
     facts = generation.gpu_target() if target is None else target
-    with generation.assumed(facts):
-        model = resources.register_model(launch.family or family, launch.consumers, launch.registers,
-                                         producer=launch.producer, shared=launch.shared, target=facts,
-                                         programs=launch.resident or 1)
+    model = resources.register_model(launch.family or family, launch.consumers, launch.registers,
+                                     producer=launch.producer, shared=launch.shared, target=facts,
+                                     programs=launch.resident or 1)
     # The plan reserves an upper bound, including reduction scratch a lowering can omit.
     # `planned_failures` checks that bound; RegisterModel.shared declares an exact allocation.
     return dataclasses.replace(model, shared=None)
@@ -1684,8 +1683,8 @@ def test_a_launchs_call_and_its_gradients_product_are_two_launches_in_either_ord
     assert digests[False] != digests[True]
     launches = {reverse: report.traced(found) for reverse, found in digests.items()}
     assert {reverse: launch.reverse for reverse, launch in launches.items()} == {False: False, True: True}
-    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse, launch.provenance)
-            for launch in launches.values()}
+    keys = {report._verdict_key(launch.identity, launch.config, launch.reverse, launch.provenance,
+                                generation.gpu_target().generation) for launch in launches.values()}
     assert len(keys) == 2 or keys == {None}, keys
 
 
@@ -2193,13 +2192,14 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
         programs.append(lowered_for(program if pulled else traced, tuple(shapes), target))
     first, second = (set(report.kernel_modules(kernel_calls(program, unrun=True))) for program in programs)
     binary = next(binary for binary in assembled.binaries(programs[1].compile())
-                  if report.launch_name(binary.kernel, binary.launch) in first & second)
+                  if assembled.launch_name(binary.kernel, binary.launch) in first & second)
     # The second rung's program refuses a kernel whose name the first rung's shares.
     found = report._misses_of([dataclasses.replace(binary, spilled=8)])
     report._held(found, programs[1])
     (identity, _), _, refused = found[0]
-    keys = [report._verdict_key(identity, rung, refused.reverse, refused.provenance) for rung in rungs]
-    verdicts = [tuning.stored_verdict(report.verdict_target(device), key) for key in keys]
+    where = report.verdict_target(device)
+    keys = [report._verdict_key(identity, rung, refused.reverse, refused.provenance, where) for rung in rungs]
+    verdicts = [tuning.stored_verdict(where, key) for key in keys]
 print(json.dumps({"stored": [v is not None for v in verdicts],
                   "refused": [v is not None and any(b.refused for _, b in v.values()) for v in verdicts]}))
 """

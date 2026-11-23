@@ -101,13 +101,13 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post123,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post125,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, carrying the Mosaic GPU fixes below that live in them, and the index serves them too.
 
 <!-- BEGIN Dew's JAX builds (site/scripts/gen_install.py) -->
-Dew's CUDA and PJRT plugins are post120's on x86_64 and aarch64 (a GH200's Grace) alike, and the `kernel-compile` extra's (x86_64 only) are post120's. On Linux x86_64 and aarch64 jaxlib is Dew's build too, `jaxlib==0.12.0.1.post120`, whose client of a plugin reads that metadata, and libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock `jaxlib==0.12.0.1`.
+Dew's CUDA and PJRT plugins are post125's on x86_64 and aarch64 (a GH200's Grace) alike, and the `kernel-compile` extra's (x86_64 only) are post125's. On Linux x86_64 and aarch64 jaxlib is Dew's build too, `jaxlib==0.12.0.1.post125`, whose client of a plugin reads that metadata, and libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock `jaxlib==0.12.0.1`.
 <!-- END Dew's JAX builds -->
 
 Each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pins under its markers, so a GH200 installs the same file. Every other package comes from PyPI. The fixes:
@@ -242,6 +242,8 @@ Each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pi
 - Under `checkify`, a loop's body or a cond's branch carries the scalar error it was given: a `shard_map` in it, whose errors are one a shard, failed the loop's carry check.
 - XLA's deviceless cuDNN description states the global memory bus width cuDNN 9.27 requires of one, so cuDNN's fused attention compiles for a host's own GPUs with none attached, and a convolution compiled with no algorithm runs the first engine cuDNN's heuristics give it that needs no workspace, where it refused to compile deviceless.
 - jax declares the protobuf its HLO reader parses a module with.
+- Mosaic GPU's warp-level `mma` takes a row bound (`rows`, and `plgpu.mma(..., rows=)`): a warp issues no `mma.sync` for a 16-row block past it, its accumulator's registers kept, so an Ampere ragged GEMM spends no tensor-core cycles on a group's idle rows. From post125 on; dropped when upstream's `mgpu.mma` takes a row bound.
+- A Mosaic GPU warpgroup's sync is a typed `nvvm.barrier` of its barrier and 128 threads (the same `bar.sync` in PTX on sm90 and sm100), not inline PTX, so a reader of a lowered module finds it as an operation. From post125 on; dropped when upstream emits the warpgroup barrier as a typed `nvvm.barrier`.
 - Under deterministic ops (`--xla_gpu_deterministic_ops`, or `--xla_gpu_exclude_nondeterministic_ops`) XLA makes its GEMM fusions as without them and its autotuner keeps the Triton backend, whatever `--xla_gpu_experimental_deterministic_ops_triton` states (it is no longer read): Triton's GEMMs take no split-k, so their sums are ordered and repeat. Upstream XLA keeps them under `--xla_gpu_experimental_deterministic_ops_triton=unchecked`: pass it beside `--xla_gpu_deterministic_ops`, as Dew's own test lane does, and a run keeps its kernels once a later build drops this change. A GEMM fusion's first compilable config is Triton's, with a device or with none, where a dot of batch dimensions not physically sequential failed to compile with no device ("No supported config found for HLO ... __triton_gemm"). A process without deterministic ops compiles as before.
 - Pallas Mosaic GPU's lowering cache keeps a lowering whose resource estimate is dumped (`MOSAIC_GPU_DUMP_RESOURCES`): the estimate travels with the module and is dumped at its custom call, of a cached lowering as of a fresh one. A lowering that dumps as it runs (its passes' IR, its layout inference's constraint system) is not cached.
 - A Mosaic GPU array's rows shift within their groups by its layout's own lane permutation (`FragmentedArray.row_shifted`), a register tile read at a traced row offset with no shared memory.

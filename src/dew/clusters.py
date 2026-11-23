@@ -185,16 +185,26 @@ class Slurm:
         return _ranked(_environ(self.environ), "SLURM_NTASKS", "SLURM_PROCID", "SLURM_LOCALID")
 
 
-def _tpu_chips() -> int:
+@functools.cache
+def tpu_chips() -> int:
     """How many TPU chips this host's PCI bus holds, as JAX's startup counts them
-    (`jax._src.hardware_utils.num_available_tpu_chips_and_device_id`: one per PCI function 0)."""
-    from jax._src import hardware_utils
-
+    (`jax._src.hardware_utils.num_available_tpu_chips_and_device_id`: one per PCI function 0, JAX's own
+    table of TPU device ids). Its module, which imports nothing past the standard library, is loaded by its
+    file, so asking imports neither JAX nor jaxlib: `import dew` asks it before it passes XLA its flags
+    (`dew._devices.opens_tpu`), which a runtime parses once jaxlib loads (row 12069). Counted once a process:
+    the bus holds the chips it held, and each `opens_tpu` read it again (row 12085)."""
+    found = importlib.util.find_spec("jax")
+    assert found is not None and found.submodule_search_locations, "JAX is installed beside Dew"
+    path = Path(next(iter(found.submodule_search_locations))) / "_src" / "hardware_utils.py"
+    spec = importlib.util.spec_from_file_location("dew_tpu_hardware", path)
+    assert spec is not None and spec.loader is not None
+    hardware_utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hardware_utils)
     chips, _ = hardware_utils.num_available_tpu_chips_and_device_id()
     return chips
 
 
-def _in_cloud_tpu_vm(environ: Mapping[str, str]) -> bool:
+def cloud_tpu_vm(environ: Mapping[str, str]) -> bool:
     """Whether JAX runs this process as a Cloud TPU VM's: libtpu installed (TPU_LIBRARY_PATH an existing
     file, or the `libtpu` package) and a TPU chip on the bus, or JAX_FORCE_TPU_INIT set
     (`cloud_tpu_init`, jax/_src/cloud_tpu_init.py, jax-ml/jax 19a48d1de)."""
@@ -202,7 +212,7 @@ def _in_cloud_tpu_vm(environ: Mapping[str, str]) -> bool:
         return True
     library = environ.get("TPU_LIBRARY_PATH")
     installed = library is not None and os.path.isfile(library)
-    return (installed or importlib.util.find_spec("libtpu") is not None) and _tpu_chips() > 0
+    return (installed or importlib.util.find_spec("libtpu") is not None) and tpu_chips() > 0
 
 
 def _gke_workers(environ: Mapping[str, str]) -> str | None:
@@ -232,7 +242,7 @@ class CloudTPU:
         """JAX's detection of it: "gketpu" by name, "" for JAX's own order to find (GCE's metadata, then the
         rest), or None where it runs on no TPU VM JAX would join so."""
         environ = _environ(self.environ)
-        if not _in_cloud_tpu_vm(environ):
+        if not cloud_tpu_vm(environ):
             return None
         if _gke_workers(environ) is not None:
             return "gketpu"

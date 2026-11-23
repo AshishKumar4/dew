@@ -38,7 +38,7 @@ import dataclasses
 import enum
 import functools
 from collections.abc import Sequence
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
@@ -47,17 +47,26 @@ from flax.typing import PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 
-from dew.nn.derivatives import KernelGlue, contracted, declared_tangent, with_gradients_formed
+from dew.nn.derivatives import (
+    KernelGlue,
+    contracted,
+    declared_derivative,
+    declared_tangent,
+    with_gradients_formed,
+)
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block
 from dew.nn.kernels.templates import axes as side_axes_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import scattered, tiling
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
-from dew.nn.kernels.templates.product import SCALE_DEPTH, declared, formed, parts, terms
+from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
 from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import called, read_by
 from dew.nn.sharding import automatic_axes, varying_like
+
+if TYPE_CHECKING:
+    from .templates import base
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 """The launch axes each hook's side operands may follow; `groups` too beside them (`_split`), which a launch
@@ -415,6 +424,239 @@ def batched_product(a: jax.Array, b: jax.Array, contract: tuple[int, int], *,
     return out.reshape(*batches, rows, out.shape[-1])
 
 
+SYRK_ROW = 'ledger 11941'
+
+
+@dataclasses.dataclass(frozen=True)
+class SyrkCase:
+    """A symmetric Gram or polynomial product as `SYRK` reads it: operand/output dtypes, bound `Template`
+    call, and trace flags (`no_x64`, `no_auto`, `precision_ok`)."""
+
+    dtype: jnp.dtype
+    out_dtype: jnp.dtype
+    call: base.Call
+    no_x64: bool = True
+    no_auto: bool = True
+    precision_ok: bool = True
+
+
+SYRK: selection.Op[SyrkCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
+    selection.Kernel('mosaic', (
+        selection.Requirement(
+            'dtype', lambda case: case.dtype in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)),
+            lambda case: f"a symmetric product of {case.dtype} operands, where Mosaic SYRK takes 16-bit "
+            "real operands (complex or wider keeps XLA's dot)", SYRK_ROW),
+        selection.Requirement(
+            'out_dtype',
+            lambda case: jnp.issubdtype(case.out_dtype, jnp.floating) and case.out_dtype.itemsize in (2, 4),
+            lambda case: f"a symmetric product storing {case.out_dtype}, where Mosaic SYRK stores 16-bit or "
+            "32-bit floats alone", SYRK_ROW),
+        selection.Requirement(
+            'precision', lambda case: case.no_x64 and case.precision_ok,
+            "float64 mode or an explicit non-matching dot algorithm keeps XLA's dot", SYRK_ROW),
+        selection.Requirement(
+            'sharding', lambda case: case.no_auto,
+            "automatic mesh axes keep XLA's dot outside per-shard launch", SYRK_ROW),
+        selection.Requirement(
+            'measured', lambda case: False, "no receipt yet has Mosaic SYRK beat XLA's batched dot "
+            "(pending M-NG-5)", SYRK_ROW, kind='measured'),
+        selection.Requirement(
+            'launch', lambda case: case.call.eligible('mosaic'),
+            "no legal square super-tile holds this symmetric product on the target", SYRK_ROW))),
+    selection.Kernel('xla', (), generic=True)))
+"""Symmetric Gram/polynomial selector (`symmetric_gram`, `symmetric_polynomial`): Mosaic SYRK once measured
+or when chosen by name (`generation.chosen(grouped_matmul='mosaic')`), else XLA."""
+
+
+def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: bool, conjugate: bool,
+                   precision: PrecisionLike, out_dtype) -> jax.Array:
+    """Portable XLA Gram (`x @ x^H` / `x^H @ x` / `x @ x^T` / `x^T @ x`) or symmetric polynomial
+    `c0 * I + c1 * a + c2 * (a @ a)`, bit-equal to `batched_product` when `out_dtype == operand.dtype`."""
+    out_dtype = jnp.dtype(out_dtype)
+    last = operand.ndim - 1
+    batch = tuple(range(operand.ndim - 2))
+    wide = at_least_fp32(operand.dtype)
+    if poly is None:
+        axis = last - 1 if transpose else last
+        gram_dims = (((axis,), (axis,)), (batch, batch))
+        held = operand.conj() if (conjugate and jnp.iscomplexobj(operand)) else operand
+        left, right = (held, operand) if transpose else (operand, held)
+        if out_dtype == operand.dtype:
+            return jax.lax.dot_general(left, right, gram_dims, precision=precision)
+        return jax.lax.dot_general(left, right, gram_dims, precision=precision,
+                                   preferred_element_type=wide).astype(out_dtype)
+    sq_dims = (((last,), (last - 1,)), (batch, batch))
+    if out_dtype == operand.dtype:
+        c = poly if poly.dtype == operand.dtype else poly.astype(operand.dtype)
+        sq = jax.lax.dot_general(operand, operand, sq_dims, precision=precision)
+        eye = jnp.eye(operand.shape[-1], dtype=operand.dtype)
+        return c[0] * eye + c[1] * operand + c[2] * sq
+    c = poly.astype(wide)
+    sq = jax.lax.dot_general(operand, operand, sq_dims, precision=precision, preferred_element_type=wide)
+    eye = jnp.eye(operand.shape[-1], dtype=wide)
+    return (c[0] * eye + c[1] * operand.astype(wide) + c[2] * sq).astype(out_dtype)
+
+
+def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
+                 precision: PrecisionLike, out_dtype, interpret_on_cpu: bool) -> bool:
+    """Run `SYRK` kernel selection once without emitting jaxpr equations; returns True for `MosaicSyrk`."""
+    from .templates import base
+    from .templates.gemm import syrk as syrk_mod
+
+    out_dtype = jnp.dtype(out_dtype)
+    *batches, d0, d1 = operand.shape
+    count = int(np.prod(batches, dtype=np.int64))
+    op_dtype = jnp.dtype(operand.dtype)
+    flat = jax.ShapeDtypeStruct((count, d0, d1), op_dtype)
+    poly_spec = jax.ShapeDtypeStruct((3,), at_least_fp32(op_dtype)) if has_poly else None
+    interpreting = interpret_on_cpu and jax.default_backend() == 'cpu'
+    ctx = (generation.assumed(generation.interpreted_target())
+           if interpret_on_cpu and not generation.gpu_target().generation else contextlib.nullcontext())
+    with ctx:
+        call = base.call((syrk_mod.MOSAIC_SYRK,), flat, poly_spec, transpose=transpose,
+                         out_dtype=out_dtype.name, interpret=interpreting)
+        case = SyrkCase(op_dtype, out_dtype, call, no_x64=not jax.config.jax_enable_x64,
+                        no_auto=not automatic_axes(), precision_ok=exact_products(precision, op_dtype))
+        return selection.select(SYRK, case).kernel == 'mosaic'
+
+
+def _syrk_run(x: jax.Array, coeffs: jax.Array | None, *, transpose: bool, conjugate: bool,
+              precision: PrecisionLike, out_dtype, interpret_on_cpu: bool) -> jax.Array:
+    """Execute certified `MosaicSyrk` on GPU/TPU or interpreted on CPU, with XLA fallback elsewhere."""
+    out_dtype = jnp.dtype(out_dtype)
+
+    def portable(operand, poly):
+        return _syrk_portable(operand, poly, transpose=transpose, conjugate=conjugate,
+                              precision=precision, out_dtype=out_dtype)
+
+    def kernel(operand, poly, *, interpret: bool):
+        from .templates.gemm import syrk as syrk_mod
+
+        *batches, d0, d1 = operand.shape
+        m = d1 if transpose else d0
+        count = int(np.prod(batches, dtype=np.int64))
+        flat = operand.reshape(count, d0, d1)
+        ctx = (generation.assumed(generation.interpreted_target())
+               if interpret and not generation.gpu_target().generation else contextlib.nullcontext())
+        with ctx:
+            out = syrk_mod.MOSAIC_SYRK(flat, poly, transpose=transpose, out_dtype=out_dtype.name,
+                                       interpret=interpret)
+            return out.reshape(*batches, m, m)
+
+    if coeffs is None:
+        return _dispatched(lambda a, *, interpret: kernel(a, None, interpret=interpret),
+                           lambda a: portable(a, None), interpret_on_cpu, x)
+    return _dispatched(kernel, portable, interpret_on_cpu, x, coeffs)
+
+
+def _symmetric_gram_value(x: jax.Array, transpose: bool, conjugate: bool, precision: PrecisionLike,
+                          out_dtype, interpret_on_cpu: bool) -> jax.Array:
+    return _syrk_run(x, None, transpose=transpose, conjugate=conjugate, precision=precision,
+                     out_dtype=out_dtype, interpret_on_cpu=interpret_on_cpu)
+
+
+def _symmetric_gram_fwd(x: jax.Array, transpose: bool, conjugate: bool, precision: PrecisionLike,
+                        out_dtype, interpret_on_cpu: bool):
+    return _symmetric_gram_value(x, transpose, conjugate, precision, out_dtype, interpret_on_cpu), (x,)
+
+
+def _symmetric_gram_bwd(transpose: bool, conjugate: bool, precision: PrecisionLike, out_dtype,
+                        interpret_on_cpu: bool, saved, dy):
+    del out_dtype, interpret_on_cpu
+    (x,) = saved
+    last, batch = x.ndim - 1, tuple(range(x.ndim - 2))
+    wide = at_least_fp32(x.dtype)
+    dyw, xw = dy.astype(wide), x.astype(wide)
+    hermitian = conjugate and jnp.iscomplexobj(xw)
+    held = xw.conj() if hermitian else xw
+    dyt = jnp.swapaxes(dyw, -1, -2)
+    if hermitian:
+        dyt = dyt.conj()
+    dims = (((last,), (last - 1,)), (batch, batch))
+    dx = (jax.lax.dot_general(held, dyw, dims, precision=precision)
+          + jax.lax.dot_general(held, dyt, dims, precision=precision) if transpose
+          else jax.lax.dot_general(dyw, held, dims, precision=precision)
+          + jax.lax.dot_general(dyt, held, dims, precision=precision))
+    return (dx.astype(x.dtype),)
+
+
+_symmetric_gram_vjp = contracted("test_a_symmetric_gram_and_polynomial_hold_every_reverse_order")(
+    declared_derivative(KernelGlue(), _symmetric_gram_value, _symmetric_gram_fwd, _symmetric_gram_bwd,
+                        nondiff_argnums=(1, 2, 3, 4, 5)))
+
+
+def symmetric_gram(x: jax.Array, *, transpose: bool = False, conjugate: bool = True,
+                   precision: PrecisionLike = None, out_dtype=None,
+                   interpret_on_cpu: bool = False) -> jax.Array:
+    """Symmetric/Hermitian Gram product `x @ x^H` (`transpose=False`, `[..., m, k] -> [..., m, m]`) or
+    `x^H @ x` (`transpose=True`, `[..., k, m] -> [..., m, m]`): upper-triangle Mosaic SYRK + mirror when
+    selected on real 16-bit inputs, else XLA at `precision` (rows 11941, 11981)."""
+    if x.ndim < 2:
+        raise ValueError(f"symmetric_gram expects at least 2D input, got {x.shape}")
+    out = x.dtype if out_dtype is None else jnp.dtype(out_dtype)
+    if not _syrk_select(x, has_poly=False, transpose=transpose, precision=precision, out_dtype=out,
+                        interpret_on_cpu=interpret_on_cpu):
+        return _syrk_portable(x, None, transpose=transpose, conjugate=conjugate, precision=precision,
+                              out_dtype=out)
+    return _symmetric_gram_vjp(x, transpose, conjugate, precision, out, interpret_on_cpu)
+
+
+def _symmetric_poly_value(a: jax.Array, coeffs: jax.Array, precision: PrecisionLike, out_dtype,
+                          interpret_on_cpu: bool) -> jax.Array:
+    return _syrk_run(a, coeffs, transpose=False, conjugate=False, precision=precision,
+                     out_dtype=out_dtype, interpret_on_cpu=interpret_on_cpu)
+
+
+def _symmetric_poly_fwd(a: jax.Array, coeffs: jax.Array, precision: PrecisionLike, out_dtype,
+                        interpret_on_cpu: bool):
+    return _symmetric_poly_value(a, coeffs, precision, out_dtype, interpret_on_cpu), (a, coeffs)
+
+
+def _symmetric_poly_bwd(precision: PrecisionLike, out_dtype, interpret_on_cpu: bool, saved, dy):
+    del out_dtype, interpret_on_cpu
+    a, coeffs = saved
+    last, batch = a.ndim - 1, tuple(range(a.ndim - 2))
+    wide = at_least_fp32(a.dtype)
+    aw, dpw, cw = a.astype(wide), dy.astype(wide), coeffs.astype(wide)
+    dims = (((last,), (last - 1,)), (batch, batch))
+    sq = jax.lax.dot_general(aw, aw, dims, precision=precision)
+    dc0 = jnp.sum(jnp.diagonal(dpw, axis1=-2, axis2=-1))
+    dc1 = jnp.sum(dpw * aw)
+    dc2 = jnp.sum(dpw * sq)
+    at = jnp.swapaxes(aw, -1, -2)
+    da = cw[1] * dpw + cw[2] * (jax.lax.dot_general(dpw, at, dims, precision=precision)
+                                + jax.lax.dot_general(at, dpw, dims, precision=precision))
+    return da.astype(a.dtype), jnp.stack([dc0, dc1, dc2]).astype(coeffs.dtype)
+
+
+_symmetric_poly_vjp = contracted("test_a_symmetric_gram_and_polynomial_hold_every_reverse_order")(
+    declared_derivative(KernelGlue(), _symmetric_poly_value, _symmetric_poly_fwd, _symmetric_poly_bwd,
+                        nondiff_argnums=(2, 3, 4)))
+
+
+def symmetric_polynomial(a: jax.Array, coeffs, *, precision: PrecisionLike = None, out_dtype=None,
+                         interpret_on_cpu: bool = False) -> jax.Array:
+    """Symmetric matrix polynomial `c0 * I + c1 * a + c2 * (a @ a)` for square `[..., m, m]` and 3-element
+    `coeffs` `(c0, c1, c2)`. Both the portable XLA path and the reverse-mode pullback differentiate
+    `c0 * I + c1 * a + c2 * (a @ a)` at `precision`; the native Mosaic SYRK launch assumes symmetric real
+    16-bit `a == a^T` so `a @ a^T == a @ a` and upper-triangle mirror stores match `a` (rows 11941,
+    11981)."""
+    if a.ndim < 2 or a.shape[-2] != a.shape[-1]:
+        raise ValueError(f"symmetric_polynomial expects square [..., m, m], got {a.shape}")
+    out = a.dtype if out_dtype is None else jnp.dtype(out_dtype)
+    c = jnp.asarray(coeffs).reshape(3)
+    if not _syrk_select(a, has_poly=True, transpose=False, precision=precision, out_dtype=out,
+                        interpret_on_cpu=interpret_on_cpu):
+        return _syrk_portable(a, c, transpose=False, conjugate=False, precision=precision, out_dtype=out)
+    return _symmetric_poly_vjp(a, c.astype(at_least_fp32(a.dtype)), precision, out, interpret_on_cpu)
+
+
+def quantize_epilogue(minifloat):
+    """GEMM epilogue encoding fp32 accumulators to `minifloat` codes via `bits.encode_form` (row 8547)."""
+    from .templates.gemm import packed
+
+    return packed.quantize_epilogue(minifloat)
+
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,
            prologue_operands: tuple = (), out_dtype, precision: PrecisionLike = None,
            interpret_on_cpu: bool = False, gather: tuple | None = None) -> jax.Array:
@@ -715,7 +957,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         del saved
         rows, words, scales, sizes, gather, first = operands
         matrices = decoded(words, scales, first)
-        parts = _bf16_parts(cotangent, _bf16_part_count(jnp.float32))
+        parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
         d_rows = functools.reduce(jnp.add, [
             gemm(part, matrices, None if dense else sizes, transpose_rhs=True, out_dtype=jnp.float32,
                  precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
@@ -1502,45 +1744,19 @@ def _prologue_keeps_launch(lhs, rhs, group_sizes, prologue, prologue_arrays, pro
     return kernels[0] == kernels[1]
 
 
-_BF16_PARTS: dict[str | None, int] = {}
-
-
-def _bf16_part_count(dtype) -> int:
-    """bf16 parts for `dtype` in an exact fp32 GEMM from `dew.algebra.error.product_precision` (row 5473)."""
-    if jnp.dtype(dtype) != jnp.float32:
-        return parts(dtype)
-    import math
-
-    from dew.algebra.error import product_precision
-    from dew.nn import programs
-
-    target = generation.gpu_target()
-    key = target.generation if target is not None else generation.placed_platform()
-    if key not in _BF16_PARTS:
-        chosen = product_precision(
-            64, 64, 64, jnp.float32,
-            stated=programs.dot_algorithms(jnp.float32),
-            admits=lambda p: (a := programs.dot_arithmetic(p, jnp.float32, jnp.float32)) is not None
-            and a.operand_bits == (16, 16) and not a.tf32 and a.accumulation_bits == 32
-            and not a.imprecise and a.operations >= 6)
-        arith = programs.dot_arithmetic(chosen, jnp.float32, jnp.float32)
-        assert arith is not None, chosen
-        _BF16_PARTS[key] = (math.isqrt(1 + 8 * arith.operations) - 1) // 2
-    return _BF16_PARTS[key]
-
-
 def _part_counts(lhs_dtype, rhs_dtype, precision) -> tuple[int, int] | None:
     """The bf16 parts each operand of a product is multiplied as on a family's launch, its operands' values
     `lhs_dtype`'s and `rhs_dtype`'s: where the product is fp32's and asked whole above the default precision,
-    which the families' tensor cores multiply only in TF32, each operand's bf16 parts (`_bf16_part_count`:
-    derived via `error.product_precision` for fp32, `product.parts` for 16-bit), each pair's product exact
-    and their sums fp32's (`_in_parts`); None where the product is the operands' own (a 16-bit one's, an
-    fp32 one at the default precision TF32's, a declared algorithm's a portable route's)."""
+    which the families' tensor cores multiply only in TF32, each operand's bf16 parts
+    (`product.bf16_part_count`: derived via `error.product_precision` for fp32, `product.parts` for 16-bit),
+    each pair's product exact and their sums fp32's (`_in_parts`); None where the product is the operands'
+    own (a 16-bit one's, an fp32 one at the default precision TF32's, a declared algorithm's a portable
+    route's)."""
     if (jnp.promote_types(lhs_dtype, rhs_dtype) != jnp.float32
             or asks_default_precision(precision, configured=True)
             or not exact_products(precision, jnp.float32)):
         return None
-    return _bf16_part_count(lhs_dtype), _bf16_part_count(rhs_dtype)
+    return bf16_part_count(lhs_dtype), bf16_part_count(rhs_dtype)
 
 
 def _in_dtype(prologue, dtype, rows, *sides):

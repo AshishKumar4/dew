@@ -11,6 +11,7 @@ generations.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
@@ -92,6 +93,29 @@ def replay(reads: Mapping[Hashable, tuple[Callable[[], Hashable], Hashable]]) ->
         recorded.update(reads)
 
 
+def held_trace[Key: Hashable, Value](cache: collections.OrderedDict[Key, tuple[Value, dict]], key: Key,
+                                     made: Callable[[], Value], held: int) -> Value:
+    """`cache`'s value at `key` (`_cache.holding`, `held` the most it keeps), made within a recording of the
+    facts it reads (`recording`) and held with them while each answers alike (`still`: a hit whose facts
+    answer otherwise now is made again), and those facts read again wherever it is returned (`replay`), so a
+    recording around its reader holds them as one around its making did: the one owner of a held trace's
+    facts (Train 1205's review F1). A held probe decision goes through here (the algebra's region decisions,
+    recognitions and attention probes), and so does a held trace a program is written from (a region's
+    written program, a marked span, a rewritten body), whose routes and launches its holder reports again
+    where it writes it (`dew.algebra.fusion.Recorded`). Row 7167: only the second kept their facts, so a
+    warm lowering's recording lacked those its declined regions' probes read (row 6708's defect)."""
+    from dew import _cache
+
+    def making() -> tuple[Value, dict]:
+        with recording() as reads:
+            value = made()
+        return value, reads
+
+    value, reads = _cache.holding(cache, key, making, held, still=lambda entry: still(entry[1]))
+    replay(reads)
+    return value
+
+
 def traced_fact[**Question, Answer](reader: Callable[Question, Answer]) -> Callable[Question, Answer]:
     """Declare `reader` a fact a trace reads of the process or its host (the memory a device holds, a wheel's
     presence, a launch config a compile refused), where it is defined: a program compiled under one answer
@@ -162,6 +186,14 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False,
         yield
 
 
+def as_target(target: GpuTarget) -> contextlib.AbstractContextManager:
+    """Within the block, the GPU in effect is `target` (`assumed` of it, where it is not the one in effect
+    already): what a model asked for a given target reads, whatever target the call is made under (a
+    register model's, `resources.register_model`; a launch's register proposal, `templates.base.Template`,
+    rows 11987 and 12000)."""
+    return contextlib.nullcontext() if target == gpu_target() else assumed(target)
+
+
 def _cross_compiled(value: Assumption | None) -> contextlib.AbstractContextManager:
     """tokamax's kernels lowered for an assumed GPU on any host: tokamax checks the device a kernel runs on
     against this host's (its Triton attention raised "Not supported on cpu" for a step traced for a
@@ -210,6 +242,12 @@ class Choice(enum.StrEnum):
 CHOICES = frozenset(choice.value for choice in Choice)
 """The choices' names (`Choice`), those `chosen` may name (`dew.kernels.choices`)."""
 
+SITE_KERNELS: dict[Choice, frozenset[str]] = {Choice.NARROW_COPIES: frozenset({'on', 'off'})}
+"""The kernels of each choice a site decides without a selector (`chosen_kernel`), which `chosen` names
+among: a selector's are its op's own, which its selection refuses a name outside of (`selection.select`);
+one of these a site reads by name alone, a misspelt name read as not its kernel (`narrow_copies="of"`,
+off)."""
+
 
 @contextlib.contextmanager
 def chosen(**kernels: str) -> Iterator[None]:
@@ -223,9 +261,33 @@ def chosen(**kernels: str) -> Iterator[None]:
     if unknown := set(kernels) - CHOICES:
         raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
                          f"the choices are {', '.join(sorted(CHOICES))}")
+    for choice, kernel in kernels.items():
+        if (known := SITE_KERNELS.get(Choice(choice))) is not None and kernel not in known:
+            raise ValueError(f"{choice} has no kernel {kernel!r}; its kernels are {', '.join(sorted(known))}")
     named = {str(choice): kernel for choice, kernel in kernels.items()}
     with _cache.KERNEL_CHOICES(tuple(sorted({**dict(_cache.KERNEL_CHOICES.value), **named}.items()))):
         yield
+
+
+@contextlib.contextmanager
+def drawing() -> Iterator[None]:
+    """Within the block, a model's draw of its variables (`dew.objectives.base.Objective.init`): its forward
+    runs for the variables its modules make, and none of its values reaches the variables drawn, so every
+    selector takes its op's generic program and reports no route (`selection.select`): no launch is derived,
+    traced or certified at the draw's shapes, a dummy batch no step runs (row 11803: an every-template
+    decoder's ahead compile certified its one-row draw's kernels, 29% of its main thread). JAX keys its
+    trace and compile caches on it (`dew._cache.DRAWING`)."""
+    from dew import _cache
+
+    with _cache.DRAWING(1):
+        yield
+
+
+def draws() -> bool:
+    """Whether this thread traces a model's draw of its variables (`drawing`)."""
+    from dew import _cache
+
+    return _cache.DRAWING.value > 0
 
 
 def numerics() -> Numerics:
@@ -374,6 +436,12 @@ class Architecture:
     precision of 'highest' asks of a kernel's fp32 weights and bf16 values: a v5e's MXU does not (row 6994,
     7228). Measured False on a v5e and True on a v6e as `float16` is; the default True unmeasured
     elsewhere."""
+    accurate_exp: bool = True
+    """Whether its default fp32 exp is within fp32's rounding, as the recurrences' decays need
+    (`dew.nn.precision.accurate_exp`, row 7375): a v5e's is 1.6e-6 from float64, its exp of a reduced
+    argument alike, measured False (M-JS-135, M-JS-138); a GH200's default is `AccuracyMode.HIGHEST`'s bit
+    for bit (M-JS-135), a CPU's float32 exp alike. Unmeasured on a v6e, stated False as the v5e's, as every
+    TPU no rule states takes it (`GpuTarget.accurate_exp`)."""
 
     @property
     def family(self) -> str | None:
@@ -483,10 +551,10 @@ _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20, vector_per_clock=1.67e12 / (197e12 / 131072),
                              exponentials_per_clock=1.54e12 / (197e12 / 131072), float16=False,
-                             fp32_by_bf16_precise=False),
+                             fp32_by_bf16_precise=False, accurate_exp=False),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20, vector_per_clock=2.83e12 / (918e12 / 524288),
-                             exponentials_per_clock=1.79e12 / (918e12 / 524288))}
+                             exponentials_per_clock=1.79e12 / (918e12 / 524288), accurate_exp=False)}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -664,6 +732,15 @@ class GpuTarget:
     def float16(self) -> bool:
         """Whether the device computes in float16 (`Architecture.float16`)."""
         return self.architecture.float16
+
+    @property
+    def accurate_exp(self) -> bool:
+        """Whether its default fp32 exp is within fp32's rounding (`Architecture.accurate_exp`): a TPU no
+        rule states, its kind's or a generic one assumed (`assumed('tpu')`), takes the v5e's measured
+        False."""
+        if architecture(self.generation) is None and (tpu(self) or self.generation == 'tpu'):
+            return False
+        return self.architecture.accurate_exp
 
     @property
     def fp32_by_bf16_precise(self) -> bool:
@@ -1425,9 +1502,10 @@ def _resolved(device, generation: str, real: bool) -> GpuTarget:
 
 def chosen_kernel(choice: Choice, default: str) -> str:
     """The kernel `chosen` names for `choice` within its block, else `default`: a choice a site decides
-    without a selector (a step's narrow copies)."""
+    without a selector (a step's narrow copies), its kernels `SITE_KERNELS`' (`default` among them)."""
     from dew import _cache
 
+    assert default in SITE_KERNELS[choice], (choice, default)
     return dict(_cache.KERNEL_CHOICES.value).get(choice, default)
 
 

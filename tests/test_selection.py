@@ -94,3 +94,16 @@ def test_an_ops_preference_naming_no_kernel_for_a_case_routes_it_as_an_op_with_n
     assert (with_preference.kernel, with_preference.preferred, with_preference.refusal) == (
         without.kernel, without.preferred, without.refusal)
     assert select(Op(generation.Choice.RMS_NORM, kernels, preferred=stated), Call(1)).kernel == 'xla'
+
+
+@pytest.mark.parametrize("kernel", ["of", "On", ""])
+def test_a_choice_decided_without_a_selector_refuses_a_kernel_it_does_not_have(kernel):
+    """`chosen` refuses naming a kernel a choice a site decides by name alone does not have
+    (`generation.SITE_KERNELS`: a step's narrow copies, `on` or `off`), where its site read a misspelt name
+    as not its kernel (`narrow_copies="of"` turned the copies off) and nothing said so; each kernel it has
+    is taken."""
+    with pytest.raises(ValueError), generation.chosen(narrow_copies=kernel):
+        pass
+    for known in ("on", "off"):
+        with generation.chosen(narrow_copies=known):
+            assert generation.chosen_kernel(generation.Choice.NARROW_COPIES, "off") == known

@@ -146,17 +146,16 @@ def traced_draw[Tree, Built, Rest, Picked](function: Callable[[Tree, jax.Array],
     (`held_context`) over arguments of the same paths and shapes in this process is read
     (`dew._cache.holding`, `held_signature`): a trainer's refit traces its start once (PF03)."""
     def made() -> TracedDraw[Tree, Built, Rest]:
+        from dew.nn.kernels import generation
         from dew.nn.kernels.templates import report
 
         traced, through = passed_through(function, lambda built: parts.split(built)[1])
-        # The launches its trace reaches certified aside and settled as it ends (`report.certifying_aside`,
-        # within the settle that records their misses, `report.settling`): certified in turn they took a
-        # start's tracing thread before its step's lowering (row 5324); a launch the settling refused leaves
-        # the start's lowering to step past it.
-        with report.settling():
-            with report.certifying_aside() as aside:
-                trace = owned_program(traced).trace(held, key)
-            report.settled_aside(aside)
+        # The launches its trace reaches certified aside and settled as it ends (`report.certifying_aside`):
+        # certified in turn they took a start's tracing thread before its step's lowering (row 5324); a
+        # launch the settling refused leaves the start's lowering to step past it.
+        # A draw selects no kernel (`generation.drawing`): its forward's values reach none of the variables.
+        with report.certifying_aside(), generation.drawing():
+            trace = owned_program(traced).trace(held, key)
         abstract = trace.out_info
         leaves = jax.tree.structure(parts.split(abstract)[1]).num_leaves
         built = tuple(index for index in range(leaves) if index not in through)

@@ -6,6 +6,7 @@ wave (`balanced_tail`, `handoff_steps`, `fixes_up`)."""
 
 import dataclasses
 import math
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
@@ -53,8 +54,17 @@ def step_seconds(tiles: "Tiles", target, itemsizes: tuple[float, float],
     if tensor is None:
         return None
     family = family_of(tiles, jnp.bfloat16)
-    products = 2 * tiles.block_m * tile_columns(tiles, family) * tiles.block_k / tensor
+    columns = tile_columns(tiles, family)
+    products = 2 * tiles.block_m * columns * tiles.block_k / tensor
     moved = step_shared_bytes(tiles, family, itemsizes, decoded)
+    if generation.tpu(target):
+        # A TPU core (`multiprocessors == 1`, no inter-SM L2) DMAs each step's operand blocks from HBM into
+        # VMEM, moves its fp32 accumulator through VMEM beside the operands, and pays per-step loop overhead.
+        left, right = itemsizes
+        dma_bytes = (tiles.block_m * left + columns * right) * tiles.block_k
+        dma = dma_bytes / target.memory_rate if target.memory_rate else 0.0
+        vmem = (moved + 2 * tiles.block_m * columns * 4) / shared if shared is not None else 0.0
+        return max(products, dma, vmem) + (target.kernel_step_seconds or 0.0)
     return products if shared is None else max(products, moved / shared)
 
 
@@ -90,9 +100,11 @@ def step_shared_bytes(tiles: "Tiles", family: mosaic.Family, itemsizes: tuple[fl
 def merges(tiles: "Tiles", dtype, *, dense: bool) -> bool:
     """Whether a launch at `tiles` would balance its last wave over the programs, each adding another's
     partial (`tail.balanced`), where its registers hold the merge (`grouped_matmul._Mosaic.balanced`): a dense
-    call of one product (`dense`), its tile alone on its multiprocessor and its depth unsplit, on a family
-    that fixes a tile up across programs (`fixes_up`)."""
-    return dense and tiles.cluster == 1 and tiles.splits == 1 and fixes_up(tiles, dtype)
+    call of one product (`dense`), its products on one CTA (`not family.pairs_product`: Hopper's 2-CTA
+    multicast cluster pairs two independent tiles and balances across cluster pairs), and its depth unsplit,
+    on a family that fixes a tile up across programs (`fixes_up`)."""
+    family = family_of(tiles, dtype)
+    return dense and tiles.splits == 1 and not family.pairs_product and fixes_up(tiles, dtype)
 
 
 def fixes_up(tiles: "Tiles", dtype) -> bool:
@@ -106,22 +118,38 @@ def fixes_up(tiles: "Tiles", dtype) -> bool:
 
 
 def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: tuple[int, int], target,
-                  programs: int) -> tail_of.Tail | None:
-    """A dense product's last wave balanced over `programs` (`tail.balanced`, the launch's: its
-    multiprocessors times `tiles.programs`) at `tiles` over its output tiles' `grid` and `steps` a tile,
-    priced from the target's facts: its MMA step (`step_seconds`), its
-    memory's rate and L2 (`GpuTarget.memory_rate`, `l2_bytes`), its operands' blocks a step (`itemsizes`,
-    the left's and the right's) and its hand-off (`handoff_steps`); walked where the target states no
-    rate."""
+                  programs: int, *, dtype=jnp.bfloat16) -> tail_of.Tail | None:
+    """A dense product's last wave balanced over `programs // tiles.cluster` cluster pairs (`tail.balanced`)
+    at `tiles` over its output tiles' `grid` and `steps` a tile, priced from the target's facts: its MMA step
+    (`step_seconds`), its memory's rate and L2 (`GpuTarget.memory_rate`, `l2_bytes`), its operands' blocks a
+    step (`itemsizes`, each CTA's row block and the cluster's multicast column block), its semaphore hand-off
+    (`handoff_steps`), its `fixed_up` partials' bytes (each tile's fp32 block) and whether its family's walk
+    is scoped to its block, which a balanced tail launches persistent (`mosaic.Family.walks_scoped`), each
+    priced by `tail.balanced`; None where the target states no rate or walking beats balancing."""
     step, rate = step_seconds(tiles, target, itemsizes), target.memory_rate
-    if step is None or rate is None:
+    pairs = programs // tiles.cluster
+    if step is None or rate is None or pairs <= 0:
         return None
+    family = family_of(tiles, dtype)
     left, right = itemsizes
-    traffic = tail_of.Traffic(grid, tiles.grid_block_n, tiles.block_m * tiles.block_k * left,
-                              tiles.block_n * tiles.block_k * right, step,
-                              target.multiprocessors or programs, rate, target.l2_bytes)
-    return tail_of.balanced(grid[0] * grid[1], steps, programs, traffic,
-                            handoff_steps=handoff_steps(tiles, target, itemsizes))
+    mp = (target.multiprocessors // tiles.cluster) if target.multiprocessors else pairs
+    traffic = tail_of.Traffic(grid, tiles.grid_block_n, tile_rows(tiles, family) * tiles.block_k * left,
+                              tiles.block_n * tiles.block_k * right, step, mp, rate, target.l2_bytes)
+    return tail_of.balanced(grid[0] * grid[1], steps, pairs, traffic,
+                            handoff_steps=handoff_steps(tiles, target, itemsizes), scoped=family.walks_scoped,
+                            partial_bytes=tile_rows(tiles, family) * tile_columns(tiles, family) * 4)
+
+
+def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: tuple[int, int],
+               target, programs: int, *, dense: bool = True) -> tail_of.Tail | None:
+    """The one balanced-tail decision for a dense GEMM over `(m, n, k)` `extents` at `tiles` on `target`:
+    shared by planner (`grouped_matmul._Mosaic`) and kernel (`mosaic_gpu._dense_tail`, row 11945)."""
+    if not merges(tiles, dtype, dense=dense):
+        return None
+    family = family_of(tiles, dtype)
+    m, n, k = extents
+    grid = (-(-m // tile_rows(tiles, family)), -(-n // tile_columns(tiles, family)))
+    return balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, target, programs, dtype=dtype)
 
 
 def handoff_steps(tiles: "Tiles", target, itemsizes: tuple[int, int]) -> float:
@@ -169,6 +197,80 @@ def best_splits(walk: "SplitWalk | None", stages: int) -> int:
     steps = walk.steps
     counts = sorted({-(-steps // -(-steps // count)) for count in range(1, steps // (stages + 1) + 1)})
     return min([1, *counts], key=walk.seconds)
+
+
+def epilogue_registers(family: mosaic.Family, share: int, columns: int, stored: tuple, *,
+                       vectors: int = 0, tile_count: int = 0, has_hook: bool = False) -> int:
+    """Extra consumer-thread registers held across epilogue hook evaluation and staged stores:
+    the single owner shared by `_Mosaic._epilogue_registers` and `syrk_registers` (row 11982)."""
+    from dew.nn.kernels.templates import resources, stores
+
+    scalar = family.scalar_registers()
+    def _staging(dtype) -> int:
+        if family.stores_through_registers:
+            return 0
+        chunk = stores.output_staging(columns, (dtype,))[0]
+        return (-(-share * chunk * jnp.dtype(dtype).itemsize // (4 * resources.THREADS))
+                + resources.CONTROL_REGISTERS)
+
+    if not has_hook:
+        return max(0, max((_staging(dtype) for dtype in stored), default=0) - scalar)
+    accumulator = -(-share * family.chunk_columns(columns) // resources.THREADS)
+    tiles = tile_count * accumulator
+    live = [-(-accumulator * jnp.dtype(dtype).itemsize // 4) for dtype in stored]
+    hook = max(0, resources.CONTROL_REGISTERS + vectors + tiles - scalar) + sum(live[1:])
+    staged = max((max(0, _staging(dtype) - scalar) + sum(live[i + 1:])
+                  for i, dtype in enumerate(stored)), default=0)
+    return max(hook, staged)
+
+
+def granular_tile(family: mosaic.Family, config: "Tiles", dtype, *, target,
+                  steps: tuple[int, ...] | None = None, accumulators: int = 1, exact_sums: bool = False,
+                  stream_blocks: Callable[[], dict[str, tuple[tuple[int, ...], object]]] | None = None
+                  ) -> bool:
+    """Whether `config` satisfies `family`'s granularity, register-program residency, fixed accumulator rows,
+    and tensor-memory column budget (shared by `_Mosaic` and `MosaicSyrk`, row 11982)."""
+    from dew.nn.kernels.templates.gemm.tiling import CONSUMERS
+
+    if (config.warpgroups > min(family.consumers, CONSUMERS)
+            or config.programs > family.programs(config.warpgroups) or config.stages < 2
+            or config.block_m % (family.role_rows * config.sharing)
+            or config.block_n % family.column_unit(dtype)
+            or config.block_k not in (steps or family.depths(dtype))
+            or family.accumulator_rows not in (None, config.share)):
+        return False
+    tensor = family.tensor_columns(tile_columns(config, family), accumulators, exact_sums)
+    if tensor and stream_blocks is not None:
+        tensor += family.stream_tensor_columns(stream_blocks(), config.stages)
+    return tensor <= (target.tmem_columns or 0)
+
+
+def prefetch_registers(family: mosaic.Family, config: "Tiles", *, ba, staged_rows: bool, unstaged: bool,
+                       rewritten: bool) -> int:
+    """Extra registers held across a prefetching `mma.sync` step boundary (`products_across`): +16 regs at
+    32-deep steps, or +32 regs at 64-deep steps (rows 5271, 11986)."""
+    from . import mosaic_gpu
+
+    if not family.prefetches_fragments:
+        return 0
+    interpret = bool(ba.arguments['interpret'])
+    summed = bool(ba.arguments.get('exact_sums')) and not family.sums_in_persist
+    scaled = bool(ba.arguments.get('scales')) or bool(ba.arguments.get('step_scales'))
+    if staged_rows:
+        active = mosaic_gpu.tgmm_prefetches(
+            family, unstaged=unstaged, rewritten=rewritten, k_major=scaled, interpret=interpret,
+            scaled=scaled, summed=summed)
+        return (32 if config.block_k > 32 else 16) if active else 0
+    hooks = ba.arguments['hooks']
+    trans_lhs = (bool(ba.arguments.get('packed_rows')) or bool(ba.arguments.get('trans_lhs'))
+                 or config.swapped)
+    transposed = (trans_lhs, bool(ba.arguments.get('trans_rhs')) or config.swapped)
+    active = mosaic_gpu.prefetches(
+        family, matrices=1 + (ba.arguments.get('paired') is not None), prologue=hooks.prologue,
+        scaled=scaled, chained=bool(ba.arguments.get('chained')), interpret=interpret,
+        transposed=transposed, summed=summed)
+    return (32 if config.block_k > 32 else 16) if active else 0
+
 
 @dataclasses.dataclass(frozen=True)
 class SplitWalk:

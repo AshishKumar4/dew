@@ -42,7 +42,7 @@ from dew._builds import generation_builds
 from dew._devices import cuda_builds, nvidia_gpus
 from dew.nn.kernels import grouped_matmul
 from dew.nn.kernels.generation import assumed, capability, compile_only_gpus, gpu_target
-from dew.nn.kernels.lowered import kernel_calls, triton_kernels
+from dew.nn.kernels.lowered import kernel_calls, triton_kernels, unsynced_commits
 from dew.nn.kernels.templates import assembled, report, resources
 
 MOSAIC_REFUSED = re.compile(r"smem_bytes=(\d+) > max_smem_bytes=\d+")
@@ -129,13 +129,18 @@ class Report:
     Triton kernel's launch states none."""
     kind: str = "mosaic_gpu"
     """The compiler that produced the binary (`assembled.Binary.kind`: `mosaic_gpu` or `triton`)."""
+    planned: bool = True
+    """Whether a launch plan states the kernel's resources, which the gate holds its binary to: its register
+    cap, its planner's shared bytes and its producer's registers, and the PTX the gate compiles it from (a
+    Mosaic GPU kernel's); a Pallas-Triton kernel's compile picks them, its cubin's own its whole evidence,
+    read as `reports` makes it (row 9719: each consumer branched on `kind`)."""
     index: str | None = None
     """XLA uniquification suffix (`assembled.Binary.index`) where a second cubin shares `(kernel, launch)`."""
 
     @property
     def traced(self) -> str:
-        """The kernel's name with its launch's (`report.launch_name`), which keys its evidence."""
-        return report.launch_name(self.kernel, self.launch)
+        """The kernel's name with its launch's (`assembled.launch_name`), which keys its evidence."""
+        return assembled.launch_name(self.kernel, self.launch)
 
     def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
         """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
@@ -152,9 +157,9 @@ class Report:
                  else "serializes its warpgroup MMAs") + f" ({code})" for code in self.losses)
         if self.sass:
             return "its machine code holds " + "; ".join(self.sass)
-        if self.registers is not None and self.cap is None and self.kind != "triton":
-            # A Mosaic kernel's with no thread count and no raise: its allocation judged against nothing (row
-            # 6670). A Triton kernel's launch states no register bound to judge it by: its compile picks them.
+        if self.registers is not None and self.cap is None and self.planned:
+            # A planned kernel's with no thread count and no raise: its allocation judged against nothing (row
+            # 6670).
             return f"its reports state no register cap its launch runs at for its {self.registers} registers"
         if self.registers is not None and self.cap is not None and self.registers > self.cap:
             return f"{self.registers} registers a thread, above its launch's {self.cap}"
@@ -169,7 +174,7 @@ def reports(estimates: dict[str, str], binaries: list[assembled.Binary],
             modules: dict[str, str] | None = None) -> list[Report]:
     """Each kernel's `Report` of its total shared memory from its binary (`binaries`, `assembled.binaries`)
     and tensor memory from its resource estimate (`estimates`, Pallas's printed `Resources`, its module's,
-    `_estimates`), paired by the kernel's name and launch (`report.launch_name`), with its module
+    `_estimates`), paired by the kernel's name and launch (`assembled.launch_name`), with its module
     (`modules`, its kernel hash): its registers and spills are its PTX's as the GPU compiles it
     (`inherited`), or, for a Pallas-Triton template binary (`Binary.kind == "triton"`), its cubin's own
     shared memory, registers and stack frame (row 7263: Triton prints no Mosaic resource estimate or PTX;
@@ -180,11 +185,11 @@ def reports(estimates: dict[str, str], binaries: list[assembled.Binary],
     triton_found: dict[str, assembled.Binary] = {}
     for binary in binaries:
         if binary.kind == "triton":
-            key = report.launch_name(binary.kernel, binary.launch, binary.index)
+            key = assembled.launch_name(binary.kernel, binary.launch, binary.index)
             if triton_found.setdefault(key, binary) != binary:
                 raise ValueError(f"two binaries of {key}")
         else:
-            key = report.launch_name(binary.kernel, binary.launch)
+            key = assembled.launch_name(binary.kernel, binary.launch)
             if mosaic_found.setdefault(key, binary) != binary:
                 raise ValueError(f"two binaries of {key}")
     found_reports = []
@@ -229,7 +234,7 @@ def reports(estimates: dict[str, str], binaries: list[assembled.Binary],
             sass=tuple(binary.sass or ()), launched=binary.launched,
             binary_registers=binary.registers, binary_spilled=binary.spills,
             threads=binary.threads, decreased=binary.decreased, raised=binary.raised,
-            kind="triton", index=binary.index))
+            kind="triton", planned=False, index=binary.index))
     return found_reports
 
 
@@ -418,6 +423,7 @@ def _compiled(case, generation: str, record: dict,
     # find its spills only as its whole program compiles.
     record["uncertified"] = _uncertified_since(uncertified)
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
+    record["unsynced"] = [found for call in calls for found in unsynced_commits(call.ir)]
     modules = report.kernel_modules(calls)
     record["modules"] = modules
     # Each kernel certification compiled alone in this process, by name and launch: its module.
@@ -453,15 +459,15 @@ def _compiled(case, generation: str, record: dict,
 
 
 def _estimates(calls: list, printed: str) -> dict[str, str]:
-    """Each Mosaic GPU call's resource estimate by its kernel's name and launch (`report.launch_name`), from
-    what its lowering printed: Mosaic prints one each time it builds a kernel's module, beside the hash that
-    names its kernel (`<name> <hash> Resources(...)`), which a call's `config` holds (its first 16 hex
+    """Each Mosaic GPU call's resource estimate by its kernel's name and launch (`assembled.launch_name`),
+    from what its lowering printed: Mosaic prints one each time it builds a kernel's module, beside the hash
+    that names its kernel (`<name> <hash> Resources(...)`), which a call's `config` holds (its first 16 hex
     digits). A module built once and reused (a lowering JAX cached, a launch certified as it traced,
     `report.certified`) prints one, its estimate kept by its module (`ESTIMATES`)."""
     for name, hashed, estimate in PRINTED_ESTIMATE.findall(printed):
         del name
         ESTIMATES[hashed[:16]] = estimate
-    return {report.launch_name(call.name, call.launch): ESTIMATES[call.config] for call in calls
+    return {assembled.launch_name(call.name, call.launch): ESTIMATES[call.config] for call in calls
             if call.config in ESTIMATES}
 
 
@@ -475,7 +481,7 @@ ESTIMATES: dict[str, str] = {}
 
 
 def write_modules(lowering: str, compiling: str, directory: str, kernels: Collection[str]) -> None:
-    """Each PTX module of the program's `kernels` (by name and launch, `report.launch_name`) Mosaic printed
+    """Each PTX module of the program's `kernels` (by name and launch, `assembled.launch_name`) Mosaic printed
     (`PTX_MODULE`) into `directory` as `<kernel>.ptx`, its kernel's name and launch its entry's
     (`assembled.kernel_of`): one certification assembled as the program lowered (`report.certified`), which
     its compile reuses, or one its compile assembled. A module the compile assembled supersedes
@@ -489,7 +495,7 @@ def write_modules(lowering: str, compiling: str, directory: str, kernels: Collec
             entry = PTX_ENTRY.search(part)
             if entry is None:
                 raise ValueError(f"a printed PTX module names no entry: {part[:200]}")
-            name = report.launch_name(*assembled.kernel_of(entry.group(1)))
+            name = assembled.launch_name(*assembled.kernel_of(entry.group(1)))
             if name in printed_modules:
                 raise ValueError(f"two PTX modules of {name}")
             printed_modules[name] = part
@@ -738,14 +744,14 @@ module: Mosaic compiles a module once a process, so a later case of the same mod
 
 def inherited(kernel: dict, compiled: dict[str, dict], generation: str) -> dict:
     """`kernel`'s record (`mosaic_kernels`) with its registers and spills, their only source: as the GPU
-    compiles its PTX, this compile's (`compiled`, by its name and launch, `report.launch_name`), which this
+    compiles its PTX, this compile's (`compiled`, by its name and launch, `assembled.launch_name`), which this
     process keeps by its module (`COMPILED`), or, where Mosaic compiled the same module before in this process
     and so printed no PTX, that compile's. A kernel neither covers takes its executable's binary's where this
     process's builds are every build `generation`'s GPUs run (`_assembles_for`), its verdict then theirs;
     elsewhere it keeps them unread, another compiler's verdict no evidence of the GPU's."""
-    if kernel.get("kind") == "triton" and kernel["registers"] is not None and kernel["spilled"] is not None:
+    if not kernel["planned"] and kernel["registers"] is not None and kernel["spilled"] is not None:
         return {**kernel, "ptxas": "its executable's binary"}
-    name = report.launch_name(kernel["kernel"], kernel["launch"])
+    name = assembled.launch_name(kernel["kernel"], kernel["launch"])
     if name in compiled:
         if kernel["module"] is not None:
             COMPILED[kernel["module"]] = compiled[name]
@@ -873,9 +879,9 @@ def ptxas_notes(ptx: str, generation: str) -> str:
 
 def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
     """Each kernel's registers a thread and spilled bytes as the GPU compiles the PTX Mosaic printed into
-    `directory` (`_ptxas_text`, at its own entry), by its name and launch (`report.launch_name`), the most of
-    each under every CUDA build the gate judges the generation under (`assemblers`) and every build's notes:
-    its binary is its compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
+    `directory` (`_ptxas_text`, at its own entry), by its name and launch (`assembled.launch_name`), the most
+    of each under every CUDA build the gate judges the generation under (`assemblers`) and every build's
+    notes: its binary is its compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
         reads = []
@@ -911,19 +917,20 @@ def _compiled_here(cases, generation: str) -> list[dict]:
             # Each kernel's model its launch stated as it traced (`report.Launch.kernels`), whose producer
             # its schedule lowers to (`producer_failures`).
             record["stated_models"] = {
-                report.launch_name(kernel["kernel"], kernel["launch"]): stated.record() for kernel in kernels
-                if kernel.get("kind") != "triton" and kernel["launched"] is not None
+                assembled.launch_name(kernel["kernel"], kernel["launch"]): stated.record()
+                for kernel in kernels if kernel["planned"] and kernel["launched"] is not None
                 and (launch := report.traced(kernel["launched"])) is not None
                 and (stated := launch.kernels.get(kernel["kernel"])) is not None}
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [inherited(kernel, compiled, generation) for kernel in kernels]
             printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
             for kernel in record["kernels"]:
-                if kernel.get("kind") == "triton":
+                if not kernel["planned"]:
+                    # Its cubin its evidence, read as it was made: no PTX of it to dump.
                     kernel["dumped"] = True
                     programs = 1
                 else:
-                    name = report.launch_name(kernel["kernel"], kernel["launch"])
+                    name = assembled.launch_name(kernel["kernel"], kernel["launch"])
                     if kernel["module"] is not None and name in printed:
                         PTX[kernel["module"]] = printed[name]
                     ptx = printed.get(name, PTX.get(kernel["module"], ""))
@@ -942,7 +949,8 @@ def _compiled_here(cases, generation: str) -> list[dict]:
 
 def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[str]:
     """Compile errors, spills, missing or excessive shared/TMEM allocations, a launch its lowering did not
-    certify (`report.certified`), and a producer its schedule lowers to other registers than its model
+    certify (`report.certified`), a tensor-core commit after a wait at its barrier with no warpgroup sync
+    between (`lowered.unsynced_commits`), and a producer its schedule lowers to other registers than its model
     states (`setmaxnreg.dec` against `RegisterModel.producer`: a launch's plan and its emission one fact).
     Whether a launch's registers hold is its certification's alone: the gate judges no register model. A
     kernel's planned shared bytes are its case's model's, or with `traced_models`, where its case states
@@ -960,11 +968,11 @@ def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[s
             if (why := found_kernel.failure(record["limit"], record["tmem_limit"])) is not None:
                 failed.append(f"{record['name']} {found_kernel.kernel}: {why}")
             cased = record.get("models", {}).get(found_kernel.kernel)
-            stated = (None if found_kernel.kind == "triton"
+            stated = (None if not found_kernel.planned
                       else cased if cased is not None or not traced_models
                       else record.get("stated_models", {}).get(found_kernel.traced))
             unplanned = stated is None or stated["shared"] is None
-            if traced_models and found_kernel.kind != "triton" and unplanned:
+            if traced_models and found_kernel.planned and unplanned:
                 # A settled case plans its shared bytes by its launch's traced model alone: none, or one
                 # stating no shared bytes, is no evidence its allocation is the plan's.
                 failed.append(f"{record['name']}: {found_kernel.kernel} states no traced model's shared "
@@ -972,6 +980,7 @@ def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[s
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
                               f"bytes of shared memory, the kernel asks for {found_kernel.shared}")
+        failed += [f"{record['name']}: {unsynced}" for unsynced in record.get("unsynced", ())]
     return failed + producer_failures(found)
 
 
@@ -984,7 +993,7 @@ def producer_failures(found: list[dict]) -> list[str]:
     for record in found:
         for kernel in record.get("kernels", ()):
             found_kernel = _report(kernel)
-            if found_kernel.kind == "triton":
+            if not found_kernel.planned:
                 continue
             stated = record.get("stated_models", {}).get(found_kernel.traced,
                                                           record.get("models", {}).get(found_kernel.kernel))

@@ -324,6 +324,60 @@ def test_a_lazy_packages_listing_names_what_it_exports(package):
                    env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
 
 
+DIVIDED = """
+import os, sys
+if sys.argv[1]:
+    # A program naming its platforms on JAX's live config before it imports Dew (row 12070).
+    import jax
+    jax.config.update("jax_platforms", sys.argv[1])
+import dew
+from dew._devices import flags_hold
+flags = os.environ.get("XLA_FLAGS", "")
+print("-nvptx-prec-divf32=2" in flags, flags_hold(flags) if flags else None)
+"""
+"""`import dew` in a process of its own, printing whether XLA's backend options ask exact GPU fp32 division
+and whether its flags hold for every runtime XLA loads (`dew._devices.flags_hold`)."""
+
+
+@pytest.mark.parametrize(("platforms", "configured", "tpu"), [
+    ({"JAX_PLATFORMS": "tpu,cpu"}, "", True), ({"JAX_PLATFORMS": "tpu"}, "", True),
+    ({"JAX_FORCE_TPU_INIT": "1"}, "", True), ({}, "tpu,cpu", True),
+    ({"JAX_PLATFORMS": "cuda,cpu"}, "", False), ({"JAX_PLATFORMS": "cpu"}, "", False),
+    ({"TPU_LIBRARY_PATH": "libtpu"}, "", None)],
+    ids=["tpu-and-cpu", "tpu", "forced-tpu-vm", "tpu-on-jax-config", "cuda", "cpu-compiling-for-cuda",
+         "libtpu-detected-on-the-bus"])
+def test_importing_dew_asks_exact_division_of_the_cuda_compiler_alone(tmp_path, platforms, configured, tpu):
+    """`import dew` passes XLA's backend options its GPU fp32 division (`-nvptx-prec-divf32=2`,
+    `dew._devices.divide_exactly`) where the CUDA plugin is installed and compiles the process's programs:
+    a GPU's, a CPU process's compiling ahead for compile-only GPUs, and one with libtpu where no TPU chip is
+    on this host's bus (None: whether one is, read as the process reads it, row 12084), Cloud TPU's
+    detection read from the hardware without importing JAX, so the flags it passes hold for every runtime
+    (rows 12069, 12071); never where a TPU opens, its platforms named in the environment or on
+    JAX's live config (row 12070), or forced, whose LLVM has no NVPTX backend and exits the process on the
+    unknown option as it compiles a host-offloaded step (row 12017: main's v5e and v6e tiers died there, no
+    traceback). Without the CUDA plugin (an install off Linux x86_64) it asks none anywhere."""
+    from dew._devices import cuda_plugin
+
+    if tpu is None:
+        from dew.clusters import tpu_chips
+
+        tpu = tpu_chips() > 0
+
+    environ = {name: value for name, value in os.environ.items()
+               if name not in ("JAX_PLATFORMS", "JAX_FORCE_TPU_INIT", "TPU_LIBRARY_PATH", "XLA_FLAGS")}
+    if "TPU_LIBRARY_PATH" in platforms:
+        library = tmp_path / "libtpu.so"
+        library.write_bytes(b"")
+        platforms = {"TPU_LIBRARY_PATH": str(library)}
+    run = subprocess.run([sys.executable, "-c", DIVIDED, configured], capture_output=True, text=True,
+                         timeout=120, env={**environ, **platforms, "PYTHONPATH": str(SOURCE)})
+    assert run.returncode == 0, run.stderr
+    divided, held = run.stdout.split()[-2:]
+    assert divided == str(cuda_plugin() and not tpu), run.stdout
+    if divided == "True" and not configured:
+        assert held == "True", run.stdout
+
+
 def test_the_release_version_is_read_from_a_module_import_dew_does_not_run():
     """`dew.__version__` comes from `dew._version`, imported when the version is first read, and the package
     metadata takes it from there: a release's bump then changes no module `import dew` executes, whose top

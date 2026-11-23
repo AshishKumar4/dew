@@ -65,6 +65,7 @@ from dew.batch import (
 from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.inspection import INSPECTED, QK, Watched, watching
+from dew.nn.kernels.generation import drawing
 from dew.nn.kernels.options import Option, compiler_options, owned_program
 from dew.nn.precision import (
     ROUNDING_STREAM,
@@ -1319,7 +1320,18 @@ class Objective(ABC, Generic[Loss, Effects]):
         compilation, and the call always goes through the public `init`.
         """
         held = self.held_variables()
-        return Partial(self.init) if held is None else Partial(self.init, variables=held)
+        return Partial(self._drawn) if held is None else Partial(self._drawn, variables=held)
+
+    def _drawn(self, key: jax.Array, variables: Variables | None = None) -> Variables:
+        """`init` within `generation.drawing`: its forward runs for the variables its modules make, none of
+        its values reaching them, so every selector takes its op's generic program and no launch is derived,
+        traced or certified at the draw's shapes (row 11803). The one way a draw runs (`initializer`,
+        `drawn.traced_draw`, `parameter_axes`, row 12090), so every objective's passes through it once, its
+        own `init` whole: a critic's, an encoder and predictor's, a feature probe's (Train 1205's review
+        F2)."""
+        with drawing():
+            # An override may take its variables by keyword alone, as the base names them.
+            return self.init(key) if variables is None else self.init(key, variables=variables)
 
     _held_parts: ClassVar[bool] = False
     """Whether the held tree may be parts a fresh draw goes beside (a
@@ -1406,7 +1418,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         if held is None and (drawn_axes := self.__dict__.get("_drawn_axes")) is not None:
             return {**self.tower_axes(), **drawn_axes}
         try:
-            drawn = abstract(functools.partial(self.init, variables={}), jax.random.key(0))
+            drawn = abstract(functools.partial(self._drawn, variables={}), jax.random.key(0))
         except NotImplementedError:
             return self.tower_axes()
         if held is not None and "params" in held:

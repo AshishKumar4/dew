@@ -16,6 +16,16 @@ the algebra pass's fusion on ("pass") or off ("nopass").
     {"builder": "tools/timing_cases.py:fused", "cells": [{"shape": "qwen3.5-4b up"}],
      "arms": [{"name": "pass", "implementation": "pass"}, {"name": "nopass", "implementation": "nopass"}]}
 
+`gated`: a gated MLP's three products at a model's MLP shape (`cell["model"]`, its `DENSE` down projection's
+widths), SwiGLU, fused on the GEMM template's hooks (`dew.nn.gated_mlp.fused_products`: the gated product
+the paired product's epilogue, the down product's prologue; `implementation` "fused") or apart, each product
+the template's launch with a gated MLP's gated product between (`activations.gated_product`, "apart"), its
+forward (`cell["kind"]` "forward") or its forward and the gradients of its input and three kernels
+("train"): the fused MLP's receipt a `gated_mlp.FUSED_CELLS` cell is declared from (row 1958).
+
+    {"builder": "tools/timing_cases.py:gated", "cells": [{"model": "qwen3.5-4b", "kind": "train"}],
+     "arms": [{"name": "fused", "implementation": "fused"}, {"name": "apart", "implementation": "apart"}]}
+
 `stepped`: a perf gate step case's training step (tools/perf_gate.py's `STEP_CASES`), compiled and run as a
 run's step is, under the algebra pass with every registered rule set ("every") or without one ("without
 <set>"): a rule set's measured receipt (docs/design/algebra.md §1.6).
@@ -132,6 +142,42 @@ def fused(cell: dict, implementation: str) -> tuple:
 
     jax.block_until_ready(call(*inputs))
     return call, lambda index: inputs
+
+
+def gated(cell: dict, implementation: str) -> tuple:
+    """A gated MLP of `cell["model"]`'s MLP widths (`DENSE`'s "<model> down"), SwiGLU, its products fused
+    (`implementation` "fused") or apart ("apart"), its forward or its training products (`cell["kind"]`),
+    compiled under the GEMM template's launch (grouped_matmul "mosaic"), and its one draw of inputs (seed
+    0)."""
+    from dew.nn import activations
+    from dew.nn.gated_mlp import fused_products
+    from dew.nn.kernels import gemm, generation
+
+    hidden, width = DENSE[f"{cell['model']} down"]
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.normal(size=(TOKENS, width)), jnp.bfloat16)
+    kernels = tuple(jnp.asarray(rng.normal(size=shape) / np.sqrt(shape[0]), jnp.bfloat16)
+                    for shape in ((width, hidden), (width, hidden), (hidden, width)))
+    dy = jnp.asarray(rng.normal(size=(TOKENS, width)), jnp.bfloat16)
+    # The gated product apart as a gated MLP takes it (`dew.nn.mlp`): the generation's measured kernel, a
+    # Pallas SwiGLU where one is (row 12030: XLA's hook timed an arm no model runs).
+    product = activations.gated_product("swiglu")
+
+    def mlp(x, gate, up, down):
+        if implementation == "fused":
+            return fused_products(x, (gate, up, down), "swiglu")
+        projected = [gemm.gemm(x, kernel, None, out_dtype=jnp.bfloat16) for kernel in (gate, up)]
+        return gemm.gemm(product(*projected), down, None, out_dtype=jnp.bfloat16)
+
+    def trained(x, gate, up, down, dy):
+        out, pulled = jax.vjp(mlp, x, gate, up, down)
+        return out, pulled(dy)
+
+    function = (lambda x, gate, up, down, dy: mlp(x, gate, up, down)) if cell["kind"] == "forward" else (
+        trained)
+    with generation.chosen(grouped_matmul="mosaic"):
+        compiled = jax.jit(function).lower(x, *kernels, dy).compile()
+    return compiled, lambda index: (x, *kernels, dy)
 
 
 def stepped(cell: dict, implementation: str) -> tuple:

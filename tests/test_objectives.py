@@ -81,24 +81,32 @@ def test_compiled_scores_follow_substituted_modules_and_head_tiles():
 def test_the_initializer_dispatches_through_the_public_init():
     """The trainer reaches an objective's initialization the way any caller
     does. An override of `init` decides what the state holds, whether it is
-    called directly or through the initializer the trainer compiles."""
+    called directly or through the initializer the trainer compiles, one
+    taking its variables by keyword alone, as the base names them, among
+    them, with a held tree and without (row 12091)."""
     from dew.objectives.lm import LMObjective
 
     class Zeroed(LMObjective):
         def init(self, key, variables=None):
             return jax.tree.map(jnp.zeros_like, LMObjective.init(self, key, variables))
 
+    class KeywordZeroed(LMObjective):
+        def init(self, key, *, variables=None):
+            return jax.tree.map(jnp.zeros_like, LMObjective.init(self, key, variables))
+
     tiny = lm_objective()
     weights = jax.jit(tiny.init)(jax.random.key(0))
-    objective = Zeroed(tiny.model, seq_len=4, variables=weights)
     key = jax.random.key(0)
 
-    for tree in (objective.init(key), objective.initializer(key),
-                 jax.jit(objective.initializer)(key),
-                 jax.jit(lambda i, k: i(k))(objective.initializer, key)):
-        nonzero = sum(int(np.count_nonzero(np.asarray(leaf)))
-                      for leaf in jax.tree.leaves(tree))
-        assert nonzero == 0, f"the override was bypassed; {nonzero} values are nonzero"
+    for override in (Zeroed, KeywordZeroed):
+        for held in (weights, None):
+            objective = override(tiny.model, seq_len=4, variables=held)
+            for tree in (objective.init(key), objective.initializer(key),
+                         jax.jit(objective.initializer)(key),
+                         jax.jit(lambda i, k: i(k))(objective.initializer, key)):
+                nonzero = sum(int(np.count_nonzero(np.asarray(leaf)))
+                              for leaf in jax.tree.leaves(tree))
+                assert nonzero == 0, f"the override was bypassed; {nonzero} values are nonzero"
 
 
 def test_the_initializer_and_init_return_the_same_tree():

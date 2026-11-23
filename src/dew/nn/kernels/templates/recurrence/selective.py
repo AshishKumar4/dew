@@ -355,7 +355,7 @@ def backward_programs(registers: int, target: generation.GpuTarget) -> int:
     held = target.multiprocessor
     threads = held.resident_threads // block_scan.THREADS
     model = resources.RegisterModel(registers, held.thread_registers, 1, min(held.resident_blocks, threads),
-                                    held.register_step, 0, file=held.registers)
+                                    held.register_step, 0, target=target)
     return model.resident(registers)
 
 

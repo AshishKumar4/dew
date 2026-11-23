@@ -141,29 +141,44 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         128 x 128 mma.sync tile, 280 registers a thread merging past the 255 and 216 unbalanced, ran
         1.07-1.09x cuBLAS's time on four dense products where the 192 x 64 tile the merge left its derivation
         ran 1.32-2.37x (M-FS-36, row 5271)."""
-        return self._tail(ba, config, generation.gpu_target() if target is None else target)[1]
+        return self._tail(ba, config, generation.gpu_target() if target is None else target)[1] is not None
 
-    def _tail(self, ba, config: tiling.Tiles, target) -> tuple[int | None, bool]:
-        """A consumer thread's registers at `config` and whether its last wave is balanced (`balanced`)."""
+    def _tail(self, ba, config: tiling.Tiles, target) -> tuple[int | None, object]:
+        """A consumer thread's registers at `config` and its balanced `Tail` plan (or None)."""
         ran, tile = self._ran(ba, config, target)
-        return self._ran_tail(ran, tile, target, merges=self._merges(ba, config))
-    def _merges(self, ba, config: tiling.Tiles) -> bool:
-        """Whether the call and tile as given would merge their last wave (`pricing.merges`): read before
-        `_ran` normalizes a split's runs unsplit."""
+        plan = None if config.splits > 1 or config.swapped else self._tail_plan(ran, tile, target)
+        if plan is not None:
+            merging = self._registers(ran, tile, merging=True, target=target)
+            if self._holds(ran, tile, merging):
+                return merging, plan
+        return self._registers(ran, tile, merging=False, target=target), None
+
+    def _tail_programs(self, ba, config: tiling.Tiles, target) -> int:
+        return (self._programs(config, target) if self.STAGED_ROWS
+                else self._launched(config, bool(ba.arguments['interpret']), target))
+
+    def _tail_plan(self, ran, config: tiling.Tiles, target):
         from .templates.gemm import pricing
 
-        call = ba.arguments
-        dense = bool(call.get('dense')) and call.get('paired') is None and not call.get('beside')
-        return pricing.merges(config, call['tokens'].dtype, dense=dense)
+        call = ran.arguments
+        dense = (bool(call.get('dense')) and call.get('paired') is None
+                 and not call.get('beside') and not self._scaled)
+        dtype = call['tokens'].dtype
+        if not pricing.merges(config, dtype, dense=dense) or config.swapped:
+            return None
+        m, depth, n = self._generated_extents(ran)
+        tokens = call['tokens']
+        rhs = call['cotangent' if self.STAGED_ROWS else 'kernel']
+        k = tokens.shape[0] if self.STAGED_ROWS else depth
+        assert k is not None
+        itemsizes = (jnp.dtype(tokens.dtype).itemsize, jnp.dtype(rhs.dtype).itemsize)
+        return pricing.dense_tail(config, dtype, (m, n, k), itemsizes, target,
+                                  self._tail_programs(ran, config, target), dense=dense)
 
-    def _ran_tail(self, ba, config: tiling.Tiles, target, *, merges: bool) -> tuple[int | None, bool]:
-        """`_tail` of the call as it runs (`_ran`: a swapped call's packed rows, the overrides' terms), its
-        schedule merging where `merges`: the registers each estimated once."""
-        if merges:
-            merging = self._registers(ba, config, merging=True, target=target)
-            if self._holds(ba, config, merging):
-                return merging, True
-        return self._registers(ba, config, merging=False, target=target), False
+    def _merges(self, ba, config: tiling.Tiles, target) -> bool:
+        ran, tile = self._ran(ba, config, target)
+        return config.splits == 1 and not config.swapped and self._tail_plan(ran, tile, target) is not None
+
     def _holds(self, ba, config: tiling.Tiles, registers: int | None) -> bool:
         """Whether a consumer thread's `registers` hold at `config`, the call as it runs (`_ran`), as its
         placement holds them (`resources.plan`): within its family's cap at its consumer roles and producer,
@@ -187,7 +202,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         # compile gate tests the actual
         # launch and residency caps: ptxas's spill decisions are not monotone, so a least spill-free cap
         # cannot decide a launch.
-        from .templates import across, resources, swizzling
+        from .templates import across, resources, stores, swizzling
         from .templates.gemm import pricing
 
         dtype = ba.arguments['tokens'].dtype
@@ -204,7 +219,8 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         plain = resources.tile_registers(family, config.sharing, block, dtype, stored=stored,
                                         rhs_transposed=self._matrix_transposed(ba),
                                         lhs_retained=ba.arguments.get('paired') is not None)
-        # A consumer's accumulators: its share of the tile's rows (the whole tile's under ping-pong).
+        plain += pricing.prefetch_registers(family, config, ba=ba, staged_rows=self.STAGED_ROWS,
+                                            unstaged=self.unstaged(ba), rewritten=self.rewritten(ba, family))
         accumulator = -(-config.share * columns // resources.THREADS)
         # A kernel gradient's consumer prepares its depth half of each step's rows stage in registers (the
         # neighbouring groups' rows zeroed: `mosaic_gpu._staged_halves`), apart from the products, which
@@ -215,9 +231,10 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         # rows atom past it, and the cotangent's atom it loads and stores (`_staged_halves`; 3117's census,
         # 8 registers at 256 x 64 exact normed).
         staged = rewritten = 0
-        if self.STAGED_ROWS and not family.operands_in_registers:
-            # wgmma `dew_tgmm` holds extra indexing scalars across phases (+8/consumer, row 8723).
-            plain += 8 * config.warpgroups
+        if self.STAGED_ROWS and not family.operands_in_registers and not family.tensor_columns(columns, 1):
+            chunk = stores.staged_columns(columns, stored)
+            tgmm_tiles = [((1,), jnp.int32)] * 6 + [((config.share, chunk), stored[0])]
+            plain += family.scalar_registers(tgmm_tiles) - family.scalar_registers()
         if self.STAGED_ROWS and not family.operands_in_registers and not self.unstaged(ba):
             words = -(-config.block_k * config.block_m // config.warpgroups * jnp.dtype(dtype).itemsize
                       // 4 // resources.THREADS)
@@ -289,45 +306,24 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
 
     @staticmethod
     def _epilogue_registers(ba, config: tiling.Tiles, stored: tuple) -> int:
-        """The epilogue's values beyond the mainloop's held set: a family that stages its stores through
-        shared memory holds one staged chunk of the output converted (`stores.output_staging`) and the
-        store's control (`resources.CONTROL_REGISTERS`); then its side vectors, each side tile of the
-        accumulator's shape in fp32 (a residual's: +94 at a 96-word accumulator, HOOKS1) and each output but
-        the last held in its stored dtype while the next is computed (a second output: +45..57 at 128
-        words)."""
-        from .templates import resources, stores
+        """The epilogue's values beyond the mainloop's held set, delegated to `pricing.epilogue_registers`
+        (row 11982)."""
         from .templates.axes import held as held_axes
         from .templates.gemm import pricing
 
         hooks = ba.arguments['hooks']
         family = pricing.family_of(config, ba.arguments['tokens'].dtype)
-        share, columns = config.share, pricing.tile_columns(config, family)
-        staging = 0
-        if not family.stores_through_registers:
-            chunk, _ = stores.output_staging(columns, stored)
-            widest = max(jnp.dtype(dtype).itemsize for dtype in stored)
-            staging = -(-share * chunk * widest // (4 * resources.THREADS)) + resources.CONTROL_REGISTERS
+        columns = pricing.tile_columns(config, family)
         if hooks.epilogue is None:
-            return max(0, staging - family.scalar_registers())
-        # Column vectors beside the accumulator, in its column layout (`Family.column_registers`), and a
-        # paired product's combination of its two accumulators, which holds a row of its results, one fp32
-        # column vector's worth (its SwiGLU spilled 32 bytes at 128 x 192 at 232, PAIRED-9, and fit 224 at
-        # 384 x 64, PAIRED-11): each with the walk's control alone (`resources.CONTROL_REGISTERS`), their
-        # excess over the mainloop's held set.
+            return pricing.epilogue_registers(family, config.share, columns, stored, has_hook=False)
         vectors = sum(family.column_registers(columns, side.dtype)
                       for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
                                             strict=True) if held_axes(axes) == ('columns',))
         vectors += family.column_registers(columns, jnp.float32) if hooks.accumulators > 1 else 0
-        # A side tile and an output held beside the next are an epilogue chunk's (`Issuer.chunk_columns`: the
-        # whole accumulator's where its registers hold it, tensor memory's chunk on tcgen05).
-        accumulator = -(-config.share * family.chunk_columns(columns) // resources.THREADS)
-        # Epilogue hooks and output staging run sequentially sharing freed mainloop `scalar_registers`;
-        # while output `i` stages, remaining outputs `i+1..` stay live beside staging (peak at `i = 0`).
-        tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes) * accumulator
-        held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
-                   for dtype in (hooks.out_dtypes or ())[1:])
-        hook = resources.CONTROL_REGISTERS + vectors + tiles
-        return max(0, max(staging, hook) - family.scalar_registers()) + held
+        tile_count = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes)
+        out_dtypes = hooks.out_dtypes or stored
+        return pricing.epilogue_registers(family, config.share, columns, out_dtypes,
+                                          vectors=vectors, tile_count=tile_count, has_hook=True)
 
     def register_budget(self, config: tiling.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`); none on a
@@ -337,17 +333,16 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         family = pricing.family_of(config, jnp.bfloat16)
         return family.registers(config.warpgroups) if family.budgets_registers else 0
 
-    def _granular(self, ba, config: tiling.Tiles, family: mosaic.Family) -> bool:
-        """Whether `config` is in `family`'s granularity (`candidate`): at most its consumers, at most the
-        programs its registers hold, a ring of two stages at least, whole roles of rows for each consumer
-        that shares a tile's rows (`Tiles.sharing`: one under ping-pong, whose consumers take whole tiles),
-        whole column units, and one of its depths."""
-        dtype = ba.arguments['tokens'].dtype
-        return not (config.warpgroups > min(family.consumers, tiling.CONSUMERS)
-                    or config.programs > family.programs(config.warpgroups) or config.stages < 2
-                    or config.block_m % (family.role_rows * config.sharing)
-                    or config.block_n % family.column_unit(dtype)
-                    or config.block_k not in (self.STEPS or family.depths(dtype)))
+    def _granular(self, ba, config: tiling.Tiles, family: mosaic.Family, target) -> bool:
+        """Whether `config` meets `family`'s granularity, residency, and TMEM budget (`pricing.granular_tile`,
+        row 11982)."""
+        from .templates.gemm import pricing
+
+        return pricing.granular_tile(
+            family, config, ba.arguments['tokens'].dtype, target=target, steps=self.STEPS,
+            accumulators=1 if ba.arguments.get('paired') is None else 2,
+            exact_sums=bool(ba.arguments.get('exact_sums')),
+            stream_blocks=lambda: self._allocations(ba, config, family).blocks)
 
     def _matrix_transposed(self, ba) -> bool:
         """Whether the matrix's blocks lie transposed, `[width, depth]` (`trans_rhs`), as its stream reads
@@ -420,7 +415,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         tile = self._tile(ba, target)
         if tile is None:
             return None
-        with self._with_target(target):
+        with generation.as_target(target):
             return producers.settled(self, ba, tile)
 
     def _tile(self, ba, target) -> tiling.Tiles | None:
@@ -429,12 +424,6 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
     def completed(self, ba, config):
         from .templates.gemm import producers
         return producers.started(self, ba, config) if isinstance(config, tiling.Tiles) else config
-
-    def proposes(self, ba, config: tiling.Tiles, target, *, held=None) -> bool:
-        if held is None:
-            return super().proposes(ba, config, target,
-                                    held=lambda: self.within(self.registers(ba, config, target), config))
-        return super().proposes(ba, config, target, held=held)
 
     def rungs(self, ba, config):
         from .templates.gemm import producers
@@ -445,21 +434,12 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
 
         return super().pinnable(ba, config) and not report.refused(self, ba, config, self.launch_target())
 
-    @staticmethod
-    @contextlib.contextmanager
-    def _with_target(target):
-        if target == generation.gpu_target():
-            yield
-            return
-        with generation.assumed(target):
-            yield
-
     def _refused(self, ba, config: tiling.Tiles, target) -> bool:
         # Refused on `target` past its producer's ladder: spilling at the rung it settles on
         # (`producers.settled`, settled under `target` until it takes one, row 11885).
         from .templates import report
         from .templates.gemm import producers
-        with self._with_target(target):
+        with generation.as_target(target):
             return report.refused(self, ba, producers.settled(self, ba, config), target)
 
     def _derived(self, ba, target, admits=None) -> tiling.Tiles | None:
@@ -561,10 +541,9 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         return resources.plan([launch], family, target, programs=tile.programs) is not None
 
     def _stated(self, ba, config: tiling.Tiles, target) -> dict:
-        """The register model a launch at `config` states its mainloop: `registers`, `shared` bytes staged,
-        and whether its last wave is `balanced`."""
-        registers = self.registers(ba, config, target)
-        return {'registers': registers, 'balanced': self.balanced(ba, config, target),
+        """The register model and planned balanced tail (`Tail` or False) a launch states its mainloop."""
+        registers, plan = self._tail(ba, config, target)
+        return {'registers': registers, 'balanced': False if plan is None else plan,
                 'shared': registers and self.staged_bytes(ba, config, target)}
 
     def launch_of(self, ba, config: tiling.Tiles, target=None) -> resources.Launch:
@@ -643,8 +622,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         from .templates.axes import held as held_axes
-        from .templates.gemm import mosaic_gpu, pricing
-
+        from .templates.gemm import mosaic_gpu
         family = next((bundle for group in self._groups(ba, target) for bundle in group
                        if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
@@ -652,20 +630,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
                 or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)
                 or not self._divides(ba, config, target) or self._refused(ba, config, target)):
             return False
-        # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
-        # accumulators in tensor memory a tile whose accumulators it holds (a paired product's two).
-        # Its tensor memory is every allocation live in the kernel's one scope: the accumulators and its
-        # streams' (an MX product's block-scale rings, B7: a 128 x 256 MXFP8 tile's 512 columns of
-        # accumulators passed beside its rings' 24 more, which the allocator refused).
-        accumulators = 1 if ba.arguments.get('paired') is None else 2
-        tensor = family.tensor_columns(pricing.tile_columns(config, family), accumulators,
-                                       bool(ba.arguments.get('exact_sums')))
-        if tensor:
-            blocks = self._allocations(ba, config, family).blocks
-            tensor += family.stream_tensor_columns(blocks, config.stages)
-        if family.accumulator_rows not in (None, config.share) or tensor > (target.tmem_columns or 0):
-            return False
-        if not self._granular(ba, config, family):
+        if not self._granular(ba, config, family, target):
             return False
         hooks = ba.arguments['hooks']
         sides = (('prologue_operands', hooks.prologue_axes), ('epilogue_operands', hooks.epilogue_axes))
@@ -1469,9 +1434,8 @@ class MosaicPackedGmm(MosaicGmm):
         # on a family whose products take a left operand from registers in the decode's layout
         # (`packed.rows_taken`: the warpgroup MMA's fragment).
         from .templates.gemm import packed
-
         del dtype
-        return family.layout == packed.FRAGMENT
+        return packed.rows_supported(family)
 
     def _launched_call(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
                        gather, scatter, joined=None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
@@ -1587,41 +1551,28 @@ class MosaicTgmm(_Mosaic):
         return tile
 
     def _split_tile(self, ba, target, below: int | None = None) -> tiling.Tiles | None:
-        return self._split_plan(ba, target, below)[0]
-
-    def _split_plan(self, ba, target, below: int | None = None):
-        """`_split_tile` and the `pricing.SplitWalk` used to price its split at `ba`'s final dtype."""
+        """The derived tile for `ba` at `target`, split across depth where unsplit underfills a wave and the
+        single-pass split walk (`pricing.best_splits`) prices cheaper."""
         from .templates.gemm import pricing
+
         admits = None if below is None else (lambda tile: tile.block_n < below)
         tile = self._derived(ba, target, admits)
         if tile is None or self._balances(ba, tile, target) or self._splits(ba, tile, target) == 1:
-            return tile, None
+            return tile
         partials, d = self._partials(ba), ba.arguments['tokens'].dtype
         sliced = self._derived(partials, target, lambda each: (admits is None or admits(each)) and not (
             self._pair_refuses(partials, dataclasses.replace(each, splits=2), pricing.family_of(each, d))))
         if sliced is None:
-            return tile, None
+            return tile
         walk = self._walk(ba, sliced, target)
         if (splits := pricing.best_splits(walk, sliced.stages)) == 1:
-            return tile, walk
+            return tile
         split = dataclasses.replace(sliced, splits=splits)
-        return (tile if self._refused(ba, split, target) else split), walk
+        return tile if self._refused(ba, split, target) else split
 
     def _balances(self, ba, tile: tiling.Tiles, target) -> bool:
-        """Whether the call's last wave runs balanced over the programs (`tail.balanced`), which it
-        takes no split beside: a dense one whose launch balances it (`balanced`: its exact partials added
-        by IEEE adds, `mosaic_gpu.tgmm`), its tail balanced."""
-        from .templates.gemm import pricing
-
-        if not self.balanced(ba, tile, target):
-            return False
-        ba = self._aligned(ba, target)
-        depth, _, width = self._generated_extents(ba)
-        tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
-        steps = -(-tokens.shape[0] // tile.block_k)
-        return pricing.balanced_tail(tile, (-(-depth // tile.block_m), width // tile.block_n), steps,
-                                        (tokens.dtype.itemsize, cotangent.dtype.itemsize), target,
-                                        _multiprocessors(target) * tile.programs) is not None
+        """Whether the call's last wave runs balanced (`balanced`: `pricing.dense_tail` + register fit)."""
+        return self.balanced(ba, tile, target)
 
     def _splits(self, ba, tile: tiling.Tiles, target) -> int:
         from .templates.gemm import pricing

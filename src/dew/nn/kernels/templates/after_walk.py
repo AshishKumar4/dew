@@ -123,5 +123,16 @@ def verdicts(consumers: int) -> dict:
 
 
 rare = derivatives.marked(derivatives.Rare(), lambda verdict: verdict)
-"""A verdict a kernel's rare span runs by, marked so (`derivatives.Rare`): a decided walk's second, a
-step's move of its sums (`placed.Tcgen05Placed.accumulating`)."""
+"""A verdict a kernel's rare span runs by, marked so (`derivatives.Rare`): a decided walk's second, every
+role's at once."""
+
+
+class Stepwise(derivatives.Rare):
+    """A rare decision one role makes alone at a step (`stepwise`), where `rare`'s verdict is every role's at
+    once: a role's own order of them is its own, a consumer moving its sums at a step its partner keeps
+    them, or after a step it kept them (row 8814)."""
+
+
+stepwise = derivatives.marked(Stepwise(), lambda decision: decision)
+"""A role's own rare decision at a step, marked so (`Stepwise`): a step's move of its sums
+(`placed.Tcgen05Placed.accumulating`), which a count of the kernel's work reads as not taken, as `rare`."""

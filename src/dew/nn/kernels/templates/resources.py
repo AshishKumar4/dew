@@ -700,10 +700,11 @@ class RegisterModel:
     states only its budget), the family's budget for them at its consumers (`Family.registers`), its
     consumer warpgroups, the most programs its family runs a multiprocessor (`Family.programs`), the
     allocator's step (`Family.register_step`), a producer warpgroup's registers a thread (0 without one),
-    the scratch its planner sized (`scratch_bytes`, None where unstated) and the registers of the
-    multiprocessor it runs on (`file`, `Multiprocessor.registers`), its own fact: no residency it states
-    reads another device's; and whether its program moves registers between its roles (`moves`,
-    `moves_registers`), every warpgroup at the program's entry share where it does not."""
+    the scratch its planner sized (`scratch_bytes`, None where unstated) and the GPU it runs on (`target`),
+    whose multiprocessor every residency and cap it states reads, whatever GPU is in effect where it is
+    asked (row 12028: a cap asked after `register_model` returned read the GPU in effect then); and whether
+    its program moves registers between its roles (`moves`, `moves_registers`), every warpgroup at the
+    program's entry share where it does not."""
     registers: int | None
     budget: int
     consumers: int
@@ -712,7 +713,7 @@ class RegisterModel:
     producer: int
     shared: int | None = None
     family: "Family | None" = dataclasses.field(default=None, compare=False, repr=False)
-    file: int = dataclasses.field(kw_only=True)
+    target: generation.GpuTarget = dataclasses.field(kw_only=True, compare=False, repr=False)
     moves: bool = dataclasses.field(default=True, kw_only=True)
     joined: Joined = dataclasses.field(default=(), kw_only=True)
     """Its raised roles beside its consumers (`Joined`: a correction warpgroup's weight and count), each
@@ -722,7 +723,7 @@ class RegisterModel:
         """Residency at this consumer allocation, bounded by the launch's other resources."""
         producer = self.producer if (honored and self.moves) or not self.producer else registers
         allocated = _register_allocation(registers, self.consumers, producer, self.step, self.joined)
-        return min(self.most, self.file // allocated) if allocated else self.most
+        return min(self.most, self.target.multiprocessor.registers // allocated) if allocated else self.most
 
     def cap(self, programs: int, *, honored: bool = RAISES_HONORED) -> int:
         """The consumer cap that leaves room for `programs` copies of this launch: the registers the launch
@@ -730,17 +731,19 @@ class RegisterModel:
         the program moves them (`moves`), its program's entry share otherwise (`entry_registers`, every
         warpgroup's alike), and without a producer its consumers' share. A cap of the multiprocessor's share
         less the producer's passed a kernel past its launch's raise (144 against 136, one consumer at three
-        programs)."""
-        if not self.producer:
-            return entry_registers(self.consumers + joined_warpgroups(self.joined), programs)
-        if honored and self.moves:
-            return raised_registers(self.consumers, programs, self.producer, self.joined)
-        return entry_registers(self.consumers + joined_warpgroups(self.joined) + 1, programs)
+        programs). On its own GPU (`target`)."""
+        with generation.as_target(self.target):
+            if not self.producer:
+                return entry_registers(self.consumers + joined_warpgroups(self.joined), programs)
+            if honored and self.moves:
+                return raised_registers(self.consumers, programs, self.producer, self.joined)
+            return entry_registers(self.consumers + joined_warpgroups(self.joined) + 1, programs)
 
     def record(self) -> dict:
-        """The model's numeric facts; its live family supplies rules, not serialized state."""
+        """The model's numeric facts (the compile gate's record of a launch's stated models); its live family
+        supplies rules and its target the GPU, neither serialized state."""
         return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
-                if field.name != "family"}
+                if field.name not in ("family", "target")}
 
 
 def stated_producer(registers: int | None, warpgroups: int, consumers: int, programs: int = 1) -> int | None:
@@ -779,26 +782,34 @@ def moves_registers(registers: int | None, warpgroups: int, consumers: int, prog
     return registers is None or registers > entry_registers(warpgroups, programs)
 
 
-def register_model(family: "Family", consumers: int, registers: int | None, *,
-                   shared: int | None = None, target: "GpuTarget | None" = None,
-                   tmem: int = 0, producer: int | None = None, programs: int = 1,
+def register_model(family: "Family", consumers: int, registers: int | None, *, target: "GpuTarget",
+                   shared: int | None = None, tmem: int = 0, producer: int | None = None, programs: int = 1,
                    moves: bool | None = None, joined: tuple = ()) -> RegisterModel:
-    """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
-    (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), lowered to
-    `producer` (`producer_floor` where None), and the most programs a multiprocessor holds of it at those
-    registers (`register_programs`), its `shared` bytes and its `tmem` columns (`tensor_memory_columns`), as
-    its plan's: on `target`,
-    else the target its launches derive for (`facts`'). A residency its staging forbids is no launch's (a
-    B200's gathered input gradient staging 230,580 bytes runs one program, where its registers held three
-    and its gathering producer spilled at three's raise, row 5523); and whether its program moves registers
-    at its plan's residency, `programs` (`moves_registers`), or as its launch states (`moves`, if given).
-    Its `joined` roles (`Family.role_schedule`'s: a correction warpgroup) take their share beside its
-    consumers."""
+    """`family`'s register decision on `target` for a launch of `consumers` whose consumer thread holds
+    `registers` (`RegisterModel`): its producer's registers where its layout has one
+    (`Family.warpgroups`), lowered to `producer` (`producer_floor` where None), and the most programs a
+    multiprocessor holds of it at those registers (`register_programs`), its `shared` bytes and its `tmem`
+    columns (`tensor_memory_columns`), as its plan's. Every term reads `target`'s multiprocessor (`facts`),
+    whatever target the call is made under (a derivation for one generation's GPU under another's read the
+    file and setmaxnreg steps of the one in effect, which an sm80 has none of, and raised). A residency its
+    staging forbids is no launch's (a B200's gathered input gradient staging 230,580 bytes runs one
+    program, where its registers held three and its gathering producer spilled at three's raise, row 5523);
+    and whether its program moves registers at its plan's residency, `programs` (`moves_registers`), or as
+    its launch states (`moves`, if given). Its `joined` roles (`Family.role_schedule`'s: a correction
+    warpgroup) take their share beside its consumers."""
+    with generation.as_target(target):
+        return _register_model(family, consumers, registers, target, shared, tmem, producer, programs, moves,
+                               joined)
+
+
+def _register_model(family: "Family", consumers: int, registers: int | None, target: "GpuTarget",
+                    shared: int | None, tmem: int, producer: int | None, programs: int, moves: bool | None,
+                    joined: tuple) -> RegisterModel:
+    """`register_model`'s decision, under `target`."""
     warpgroups = family.warpgroups(consumers, joined=joined)
     shares = family.joined_shares(joined)
     most = family.programs(consumers, registers, producer, joined=joined)
     if shared is not None or tmem:
-        target = generation.gpu_target() if target is None else target
         if shared is not None:
             most = shared_programs(most, shared, generation.shared_budget(target))
         if tmem:
@@ -810,7 +821,7 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
                          most, family.register_step,
                          producer_registers(consumers, producer=producer, joined=shares)
                          if warpgroups > raised else 0,
-                         shared, family, file=facts().registers,
+                         shared, family, target=target,
                          moves=(moves_registers(registers, warpgroups, raised, programs) if moves is None
                                 else moves),
                          joined=shares)

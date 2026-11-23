@@ -4,16 +4,16 @@ FP8, MXFP8 and NVFP4 recipes, each quantizing its operands and differentiated by
 of the quantized product's derivative), else through the template's dense product (`gemm.gemm`) where a
 launch takes any of its products, else XLA's own program."""
 
+import collections
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
 
-from dew import _cache
 from dew.mesh import mesh_axes
 from dew.nn.derivatives import (
     Protected,
@@ -449,9 +449,7 @@ def mapped_shards(lhs: jax.Array, matrices: tuple[jax.Array, ...], paths: tuple,
     split, gathered, rows = placement
     matrix = jax.ShapeDtypeStruct((lhs.shape[-1], sum(each.shape[1] for each in matrices)), matrices[0].dtype)
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
-    taken, _ = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole=True,
-                        target=generation.gpu_target(), choices=_cache.KERNEL_CHOICES.value,
-                        pins=_cache.KERNEL_PINS.value)
+    taken, _ = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole=True)
     return (split, gathered) if taken else None
 
 
@@ -547,24 +545,36 @@ def launches(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype
     automatic mesh axis splits them): a product formed later in the call (a fused MLP's down product,
     `dew.nn.gated_mlp`)."""
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
-    taken, found = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole, generation.gpu_target(),
-                            _cache.KERNEL_CHOICES.value, _cache.KERNEL_PINS.value)
+    taken, found = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole)
     generation.reported(found)
     return taken
 
 
-@functools.lru_cache(maxsize=1024)
+DECISIONS_HELD = 1024
+"""The product launch decisions `_decided` holds, the least recently taken dropped past it."""
+
+_DECISIONS: collections.OrderedDict[Hashable, tuple[tuple[bool, tuple[generation.Route, ...]], dict]] = (
+    collections.OrderedDict())
+
+
 def _decided(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype: jnp.dtype, product,
-             whole: bool, target: generation.GpuTarget, choices: tuple, pins: tuple
-             ) -> tuple[bool, tuple[generation.Route, ...]]:
-    """`launched`'s decision and the routes it found, once a key, the most recent keys kept: the operands'
-    shapes and dtypes, the product, whether each is seen whole, and the target and the kernels a block names
-    or pins, which the decision reads from its context, so they key it alone. Its routes are collected apart
-    (`generation.routes`' `alone`), `launched` reporting them at every call."""
-    del target, choices, pins
-    with generation.routes(alone=True) as found:
-        taken = _launched_once(rows, matrix, out_dtype, product, whole)
-    return taken, tuple(found)
+             whole: bool) -> tuple[bool, tuple[generation.Route, ...]]:
+    """`launched`'s decision and the routes it found, held as every held kernel decision is
+    (`generation.held_trace`, `DECISIONS_HELD` of them): by the operands' shapes and dtypes, the product and
+    whether each is seen whole, in the context a kernel is chosen in (`fusion.choice_context`: the target,
+    the kernels a block names or pins, a draw's, the refused launches), the facts it read recorded again
+    wherever it is taken (row 12134: a hand-kept subset of that context missed a draw's, Train 1209's red
+    main). Its routes are collected apart (`generation.routes`' `alone`), `launched` reporting them at every
+    call."""
+    from dew.algebra.fusion import choice_context
+
+    def made() -> tuple[bool, tuple[generation.Route, ...]]:
+        with generation.routes(alone=True) as found:
+            taken = _launched_once(rows, matrix, out_dtype, product, whole)
+        return taken, tuple(found)
+
+    key = (rows, matrix, out_dtype, product, whole, choice_context())
+    return generation.held_trace(_DECISIONS, key, made, DECISIONS_HELD)
 
 
 def _launched_once(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype, product,
