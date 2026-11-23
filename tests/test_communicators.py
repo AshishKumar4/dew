@@ -630,6 +630,13 @@ def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search
     assert isinstance(refused.value.__cause__, CommunicatorRoom), refused.value.__cause__
 
 
+def _charged(program, gpu: int) -> int:
+    """What admitting `program` charges on `gpu` past its free bytes, none free: the refusal's need."""
+    with pytest.raises(CommunicatorRoom) as refused:
+        communicators.admit(program, free=lambda gpu: 0)
+    return refused.value.needed[gpu]
+
+
 @pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
 def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(monkeypatch):
     """A fit whose search compiled the step whole, which missed, and split, which fits, and ran the split
@@ -657,23 +664,18 @@ def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(
     def compiled(scale: float):
         return jax.jit(lambda x: x * scale).lower(jnp.ones(2)).compile()
 
-    def charged(program) -> int:
-        with pytest.raises(CommunicatorRoom) as refused:
-            communicators.admit(program, free=lambda gpu: 0)
-        return refused.value.needed[gpu]
-
     probe = compiled(2.0)
     held = communicators.held()
     communicators.hold(communicators.Sizing(roomy, 0.95, 0.9, {gpu: 0}, {gpu: 1 << 40}))
     try:
-        alone = charged(probe)
+        alone = _charged(probe, gpu)
         # One program admitted and not run: the charge each such program adds to a later admission.
         pending = compiled(3.0)
         communicators.admit(pending, free=lambda gpu: 1 << 40)
-        each = charged(probe) - alone
+        each = _charged(probe, gpu) - alone
         del pending
         gc.collect()
-        assert charged(probe) == alone
+        assert _charged(probe, gpu) == alone
         # A fit whose search compiles the step whole, which misses, and split, which fits, its first run's
         # completion seen (`dew.training.memory.first_run`): its passed-over rung released, its plan's run, so
         # nothing is charged ahead of a later program, which is charged its own load alone, what that first
@@ -684,7 +686,7 @@ def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(
         assert len(trainer.plan["probes"]) >= 2 and trainer.plan["split"] > 1, trainer.plan["probes"]
         gc.collect()
         measured = communicators._RESIDENT.cost.get(gpu, communicators.PROGRAM_FLOOR)
-        assert charged(probe) == measured, (alone, each, measured)
+        assert _charged(probe, gpu) == measured, (alone, each, measured)
     finally:
         communicators.hold(held)
 
@@ -716,11 +718,6 @@ def test_an_inspected_runs_sampled_step_is_taken_as_run_once_it_completes():
                                 seconds=1.0)
     probe = jax.jit(lambda x: x * 2.0).lower(jnp.ones(2)).compile()
 
-    def charged(program) -> int:
-        with pytest.raises(CommunicatorRoom) as refused:
-            communicators.admit(program, free=lambda gpu: 0)
-        return refused.value.needed[gpu]
-
     held = communicators.held()
     communicators.hold(communicators.Sizing(roomy, 0.95, 0.9, {gpu: 0}, {gpu: 1 << 40}))
     try:
@@ -732,7 +729,7 @@ def test_an_inspected_runs_sampled_step_is_taken_as_run_once_it_completes():
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=2)
         gc.collect()
         measured = communicators._RESIDENT.cost.get(gpu, communicators.PROGRAM_FLOOR)
-        assert charged(probe) == measured, measured
+        assert _charged(probe, gpu) == measured, measured
     finally:
         communicators.hold(held)
 
