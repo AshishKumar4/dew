@@ -623,3 +623,68 @@ def test_a_normed_projection_takes_the_template_where_a_receipt_timed_it(hidden,
         jax.jit(algebra.rewritten(normed, kernels=True)).trace(x, scale, w)
     found = {(route.choice, route.kernel) for route in routes}
     assert (("grouped_matmul", "mosaic") in found) == (gpu in taken), found
+
+
+def test_fused_product_fuses_prologue_and_epilogue_with_gather_and_scatter():
+    """`fused_gemm.product(..., gather=..., scatter=...)` fuses both a token-order RMSNorm producer into the
+    prologue (even with top-k `M_routed != M_tok`) and a post-scatter bias+residual consumer into the
+    epilogue, holding check 1 forward and VJP against float64 truth (rows 5391, 12306)."""
+    tokens_n, rows, depth, width, groups = 32, 64, 64, 64, 4
+    rng = np.random.default_rng(53910)
+    sizes = jnp.asarray([16, 0, 24, 24], jnp.int32)
+    gather = jnp.asarray(rng.integers(0, tokens_n, size=(rows,)), jnp.int32)
+    scatter = jnp.asarray(rng.permutation(rows), jnp.int32)
+
+    with pytest.raises(ValueError):
+        fused_gemm.product(jnp.zeros((tokens_n, depth), jnp.bfloat16),
+                           jnp.zeros((depth, width), jnp.bfloat16), gather=gather)
+
+    def draw(seed):
+        r = np.random.default_rng(53911 + seed)
+        return (jnp.asarray(r.normal(size=(tokens_n, depth)) / 4, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(depth,)) / 4 + 1.0, jnp.float32),
+                jnp.asarray(r.normal(size=(groups, depth, width)) / 8, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(width,)) / 8, jnp.float32),
+                jnp.asarray(r.normal(size=(rows, width)) / 8, jnp.bfloat16),
+                jnp.asarray(r.normal(size=(rows, width)) / 8, jnp.bfloat16))
+
+    def normed(x, scale, *, wide_dtype=jnp.float32):
+        w = x.astype(wide_dtype)
+        inv = jax.lax.rsqrt(jnp.mean(w * w, axis=-1, keepdims=True) + 1e-5)
+        out_d = x.dtype if wide_dtype == jnp.float32 else wide_dtype
+        return (w * inv * scale.astype(wide_dtype)).astype(out_d)
+
+    def region(x, scale, weight, bias, residual):
+        y = fused_gemm.product(normed(x, scale), weight, sizes, out_dtype=jnp.float32,
+                               gather=gather, scatter=scatter, interpret_on_cpu=True)
+        return (y + bias + residual.astype(jnp.float32)).astype(jnp.bfloat16)
+
+    def ref_fwd(x, scale, weight, bias, residual, *, dtype=jnp.float32):
+        out_d = jnp.bfloat16 if dtype == jnp.float32 else dtype
+        y = jax.lax.ragged_dot(normed(x, scale, wide_dtype=dtype)[gather], weight, sizes,
+                               preferred_element_type=dtype)
+        y = jnp.empty_like(y).at[scatter].set(y)
+        return (y + bias.astype(dtype) + residual.astype(dtype)).astype(out_d)
+
+    def truth(x, scale, weight, bias, residual, dy):
+        out, pull = jax.vjp(lambda *a: ref_fwd(*a, dtype=jnp.float64),
+                            *(a.astype(jnp.float64) for a in (x, scale, weight, bias, residual)))
+        return out, pull(dy.astype(jnp.float64))
+
+    def plain_vjp(x, scale, weight, bias, residual, dy):
+        out, pull = jax.vjp(ref_fwd, x, scale, weight, bias, residual)
+        return out, pull(dy)
+
+    def dew_vjp(x, scale, weight, bias, residual, dy):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            out, pull = jax.vjp(lambda *a: fused_gemm.fused(region, *a), x, scale, weight, bias, residual)
+            return out, pull(dy)
+
+    sample = draw(0)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), generation.routes() as seen:
+        fused_gemm.fused(region, *sample[:-1])
+    choices = {r.choice: r.kernel for r in seen}
+    assert choices.get("gemm_prologue") == "fused", choices
+    assert choices.get("gemm_epilogue") == "fused", choices
+    assert_as_exact(jax.jit(dew_vjp), jax.jit(plain_vjp), draw,
+                    "fused_gemm gather+scatter+prologue+epilogue", seeds=8, truth_fn=truth)

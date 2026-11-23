@@ -325,7 +325,7 @@ def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, l
                   beside: tuple = ()) -> None:
     """`gemm`'s refusal of a call it does not take: gathered rows but a grouped call's, or beside a formed
     operand (`applied`, a producer's rows already in the product's order), scattered rows but a grouped
-    call's, a prologue beside a named `compute`, a formed operand but a prologue's, of `lhs`'s shape and
+    call's, a formed operand but a prologue's, of `lhs`'s shape and `compute`
     dtype, and matrices side by side beside any of the call's parts `beside` holds (its hooks, pair, tables,
     formed operand, named `compute`, layer, several dtypes and names, None where the call has none)."""
     if any(part not in (None, ()) for part in beside):
