@@ -1132,7 +1132,8 @@ def test_a_ladder_holds_no_rung_its_assembler_caps_otherwise():
             dq, dkv = op._launch_registers(ba, tiles)
             launches = ((tiles.dkv, dkv),) if tiles.fused else ((tiles, dq), (tiles.dkv, dkv))
             return [(model.cap(1), model.moves) for model in (
-                resources.register_model(attention_mosaic.bundle_of(each, dtype), each.consumers, registers)
+                resources.register_model(attention_mosaic.bundle_of(each, dtype), each.consumers, registers,
+                                         target=generation.gpu_target())
                 for each, registers in launches)]
 
         assert stated(dataclasses.replace(config, block_q=64)) != stated(config)

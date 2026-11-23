@@ -701,7 +701,7 @@ def _model(launch, ba, config) -> resources.RegisterModel:
     shared = resources.shared_bytes(family, planned.scope(config.stages))
     return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared,
                                     producer=planned.producer, programs=config.programs,
-                                    moves=mosaic_gpu.MOVES)
+                                    moves=mosaic_gpu.MOVES, target=generation.gpu_target())
 
 
 def _emitted_forms(family) -> set[str]:

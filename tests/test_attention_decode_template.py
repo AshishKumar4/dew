@@ -995,10 +995,12 @@ def test_a_split_launchs_span_is_its_longest_slice(form, queries, keys, consumer
     walk's tensor products and exponentials its unsplit launch's by their ratio to its steps
     (`attention_mosaic_program.walks`), and every other unit its body issues (`cost.ISSUED_UNITS`, its
     integer work among them, row 10793) no less than that share, each slice its own epilogue, staging and
-    index arithmetic beside its walk."""
+    index arithmetic beside its walk; a causal launch's integer work, its diagonal's masks, counted at all
+    (row 12008: a share of none holds of none)."""
     split = _split_work(form, queries, keys, consumers, family, splits)
     unsplit = _split_work(form, queries, keys, consumers, family, 1)
     assert split.span == span
+    assert form != "causal" or split.integer_operations > 0
     for unit in cost.ISSUED_UNITS:
         shares = getattr(split, unit) * steps[1], getattr(unsplit, unit) * steps[0]
         assert shares[0] == shares[1] if unit in ("flops", "exponentials") else shares[0] >= shares[1], unit

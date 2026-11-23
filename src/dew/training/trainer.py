@@ -903,9 +903,15 @@ class Trainer(Generic[Loss, Effects]):
     def _loss_shape(self, state: TrainState, batch: Batch, window: int, split: int = 1, *,
                     objective: Objective[Loss, Effects]):
         """The loss's program (`dew.training.transaction.traced_loss`, which narrow copies read) and its
-        shapes."""
+        shapes, drawn (`generation.drawing`): every selector its generic program, so no launch is derived,
+        traced or certified here that the step's own trace makes again, the parameters read as a templated
+        trace reads them (tests/test_narrow.py; row 11803: the loss's trace was a third of an every-template
+        ahead compile's main thread, its compile 264 s to 112 s drawn, FS-11803-LOSSDRAWN)."""
+        from dew.nn.kernels.generation import drawing
+
         loss, (variables, *rest) = traced_loss(objective, state, window, split)
-        return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
+        with drawing():
+            return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
 
     def _builds_window(self, state: TrainState, candidate: Candidate, window: int) -> bool:
         """Whether a step of `window` microbatches over `state` builds its window first (`_window_of`): a

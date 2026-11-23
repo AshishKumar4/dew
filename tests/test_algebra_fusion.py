@@ -746,6 +746,37 @@ def test_a_written_region_records_the_facts_its_trace_read_wherever_it_is_writte
     assert cold and set(warm) >= set(cold), (cold, warm)
 
 
+def attended(query, key, value):
+    """Attention written by hand, its scores in fp32: a region recognition weighs (`recognize`)."""
+    scores = jnp.einsum("bqhd,bkhd->bhqk", query, key) * 0.125
+    weights = jax.nn.softmax(scores.astype(jnp.float32), -1).astype(query.dtype)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights, value)
+
+
+@pytest.mark.parametrize("case", ["declined products", "attention by hand"])
+def test_a_declined_region_records_the_facts_its_probes_read_wherever_it_is_weighed(case):
+    """A step lowered twice in one process on an H100 (`dew.jit`), each within a recording, whose regions
+    the pass weighs and declines (its products XLA's where no call names the template; attention written by
+    hand, which recognition weighs and leaves): the second reads its decisions from those the first held
+    (`generation.held_trace`), and its recording holds the facts their probes read (a launch's legality,
+    `report.refusals_of`; FlashAttention's lowering and the device a call is placed on) as the first's did,
+    and so does one around it (row 7167: a declined region's held decision dropped them, so a warm
+    lowering's recording could not tell when they no longer held)."""
+    import dew
+
+    rng = np.random.default_rng(0)
+    function, operands = ((chained, draw()) if case == "declined products" else
+                          (attended, tuple(rng.normal(size=(1, 256, 2, 64)).astype(jnp.bfloat16)
+                                           for _ in range(3))))
+    step = dew.jit(function)
+    with generation.assumed("sm90"):
+        with generation.recording() as cold:
+            step.trace(*operands)
+        with generation.recording() as outer, generation.recording() as warm:
+            step.trace(*operands)
+    assert cold and set(warm) >= set(cold) and set(outer) >= set(cold), (cold, warm)
+
+
 def _template_routes(trace) -> list:
     """The grouped matmul's routes `trace()` reports that run the template."""
     with generation.routes() as found:
