@@ -19,6 +19,7 @@ import pytest
 from generation_support import COMPILES_ON_CPU, here, interprets, lowers
 from reference_error import (
     FEWEST_SEEDS,
+    ahead_arm,
     as_given,
     assert_as_exact,
     declared_seeds,
@@ -42,7 +43,7 @@ from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation, recurrence_chunk
 from dew.nn.kernels.chunked_launch import Forked
-from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm90, report
+from dew.nn.kernels.templates import bundles, mosaic_sm90, report
 from dew.nn.kernels.templates.recurrence import selective
 from dew.nn.mixers.mamba import Mamba, selective_scan as portable
 from dew.parity import MOST_SEEDS
@@ -66,19 +67,25 @@ C's gradients atomically by default, each run within check 1 (row 4448's declare
 
 
 def draw(dtype, seed: int, rows: int, length: int, channels: int, states: int, packed: bool):
-    """A draw's inputs, their outputs' cotangents last: steps after a softplus, decays `-exp(N(0, 1/4))`,
-    input and readout gates normal, `x`, `dt`, `B`, `C` and the cotangents in `dtype`, documents starting at a
-    third and two thirds of each row where `packed`."""
-    keys = jax.random.split(jax.random.key(seed), 7)
-    x = jax.random.normal(keys[0], (rows, length, channels)).astype(dtype)
-    dt = jax.nn.softplus(jax.random.normal(keys[1], (rows, length, channels)) - 3.0).astype(dtype)
-    a = -jnp.exp(0.5 * jax.random.normal(keys[2], (channels, states)))
-    b, c = (jax.random.normal(key, (rows, length, states)).astype(dtype) for key in keys[3:5])
-    skip = jax.random.normal(keys[5], (channels,))
+    """A draw's inputs, their outputs' cotangents last, host arrays (NumPy's: a GPU tier part's prepare
+    computes nothing on its compile-only device, where JAX's draws raised before a site, rows 8242-10588):
+    steps after a softplus, decays `-exp(N(0, 1/4))`, input and readout gates normal, `x`, `dt`, `B`, `C` and
+    the cotangents in `dtype`, documents starting at a third and two thirds of each row where `packed`."""
+    rng = np.random.default_rng([4448, seed])
+
+    def normal(*shape):
+        return rng.standard_normal(shape).astype(np.float32)
+
+    x = normal(rows, length, channels).astype(dtype)
+    dt = np.logaddexp(0.0, normal(rows, length, channels) - 3.0).astype(dtype)
+    a = -np.exp(0.5 * normal(channels, states))
+    b, c = (normal(rows, length, states).astype(dtype) for _ in range(2))
+    skip = normal(channels)
     starts = None
     if packed:
-        starts = jnp.zeros((rows, length), bool).at[:, (0, length // 3, 2 * length // 3)].set(True)
-    dy = jax.random.normal(keys[6], (rows, length, channels)).astype(dtype)
+        starts = np.zeros((rows, length), bool)
+        starts[:, (0, length // 3, 2 * length // 3)] = True
+    dy = normal(rows, length, channels).astype(dtype)
     return (x, dt, a, b, c, skip), starts, dy
 
 
@@ -93,9 +100,11 @@ def regime_draw(regime: str, dtype, seed: int, rows: int, length: int, channels:
     (x, dt, a, b, c, skip), _, dy = draw(dtype, seed, rows, length, channels, states, packed=False)
     starts = None
     if regime == "decays near zero":
-        dt = jax.nn.softplus(jax.random.normal(jax.random.key(seed + 1), dt.shape) + 3.0).astype(dtype)
+        stepped = np.random.default_rng([4448, seed, 1]).standard_normal(dt.shape).astype(np.float32)
+        dt = np.logaddexp(0.0, stepped + 3.0).astype(dtype)
     else:
-        starts = jnp.zeros((rows, length), bool).at[:, ::selective.CHUNK].set(True)
+        starts = np.zeros((rows, length), bool)
+        starts[:, ::selective.CHUNK] = True
     return (x, dt, a, b, c, skip), starts, dy
 
 
@@ -133,8 +142,7 @@ def test_a_rate_past_float32s_range_scans_as_the_recurrence_interpreted(case):
     float32's range over a ragged chunk (`selective_support.rate_past_the_range`, both vanishing decays and
     `e^-3` decays at subnormal `dt = 2^-126`) on par from float64 with the recurrence a token at a time
     (`selective_support.stepwise`, check 1; rows 8491, 8722)."""
-    template = functools.partial(selective.selective_scan, family=taken_family(jnp.float32),
-                                 interpret=INTERPRETED)
+    template = taken_scan(jnp.float32)
     exact = jax.jit(with_gradients(stepwise))
     assert_as_exact(jax.jit(with_gradients(template)), exact,
                     functools.partial(rate_past_the_range, case),
@@ -210,12 +218,21 @@ def test_large_input_gates_with_normal_or_zero_steps_keep_dx_finite_interpreted(
                     f"the selective template at large B, {case}", seeds=FEWEST_SEEDS, truth_fn=exact)
 
 
-def taken_family(dtype) -> mosaic.Family:
-    """The bundle the template takes here (`Selective._fwd`'s): the interpreted target's off a GPU, the
-    device's on one (a GPU tier part's prepare the node's, `generation_support.here`), so no launch runs a
-    family the host's multiprocessor does not (an A100 interpreting wgmma's raised its consumers' registers
-    past what it takes, the promotion tier's row 5413)."""
-    return bundles.of(generation.interpreted_target().generation if INTERPRETED else here(), dtype)
+def taken_scan(dtype, **options):
+    """The template's scan with `options` at the bundle it takes here (`Selective._fwd`'s): the interpreted
+    target's off a GPU, interpreted, the device's on one (a GPU tier part's prepare the node's,
+    `generation_support.here`), so no launch runs a family the host's multiprocessor does not (an A100
+    interpreting wgmma's raised its consumers' registers past what it takes, the promotion tier's row 5413).
+    An arm stated by the bundle's generation and dtype, the family built where it runs: a family object has
+    no form an identity can state (`dew._stated`), and an arm closing over one ran unprepared on a GPU tier
+    (rows 8491, 8722's 'its dew arm has no statement of what it computes')."""
+    taken = generation.interpreted_target().generation if INTERPRETED else here()
+
+    def scan(*operands, **given):
+        return selective.selective_scan(*operands, family=bundles.of(taken, dtype), interpret=INTERPRETED,
+                                        **options, **given)
+
+    return scan
 
 
 def the_template_is_as_exact_as_its_reference(case: str, packed: bool, dtype=jnp.bfloat16,
@@ -224,9 +241,8 @@ def the_template_is_as_exact_as_its_reference(case: str, packed: bool, dtype=jnp
     device's plan), on par from float64 with its reference's (`held_to`: mamba_ssm's on a GPU, the portable
     scan's interpreted), over check 1's fewest draws."""
     shape = SHAPES[case]
-    family = taken_family(dtype)
     planned = {} if tiles is None else {"chunk": tiles.chunk, "plan": (tiles.positions, tiles.resident)}
-    template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED, **planned)
+    template = taken_scan(dtype, **planned)
 
     def draws(seed):
         inputs, _, dy = draw(dtype, seed, *shape, packed)
@@ -265,8 +281,7 @@ def the_template_is_as_exact_over_a_forked_call(layout: str, dtype=jnp.bfloat16,
     _, length, shaped, states = SHAPES["interpreted"]
     channels = shaped if channels is None else channels
     rows = forked.firsts.shape[0]
-    template = functools.partial(selective.selective_scan, family=taken_family(dtype), interpret=INTERPRETED,
-                                 forked=forked)
+    template = taken_scan(dtype, forked=forked)
 
     def draws(seed):
         inputs, _, dy = draw(dtype, seed, rows, length, channels, states, packed=False)
@@ -321,8 +336,7 @@ def test_the_template_holds_its_hardest_regimes_interpreted(regime):
     at every chunk (`selective.PARTIALS`), which no CPU test held once the regime cases went to the GPU flow
     alone (row 3133)."""
     shape = SHAPES["interpreted"]
-    template = functools.partial(selective.selective_scan, family=taken_family(jnp.float32),
-                                 interpret=INTERPRETED)
+    template = taken_scan(jnp.float32)
 
     def draws(seed):
         inputs, _, dy = regime_draw(regime, jnp.float32, seed, *shape)
@@ -355,10 +369,11 @@ def test_the_backward_repeats_its_state_gradients_bit_for_bit_where_reductions_a
     family = bundles.of(here(), jnp.float32)
     template = functools.partial(selective.selective_scan, family=family)
     inputs, starts, dy = draw(jnp.float32, 0, *shape, packed=False)
-    step = jax.jit(with_gradients(scanned(template, starts)))
-    first = jax.block_until_ready(step(*inputs, dy))
+    # The step as an arm of no site (`ahead_arm`): a GPU tier's prepare compiles it, its run calls it.
+    step = ahead_arm(jax.jit(with_gradients(scanned(template, starts))), "the ordered backward, repeated")
+    first = step(*inputs, dy)
     for _ in range(4):
-        again = jax.block_until_ready(step(*inputs, dy))
+        again = step(*inputs, dy)
         pairs = zip(jax.tree.leaves(first), jax.tree.leaves(again), strict=True)
         for leaf, (one, other) in enumerate(pairs):
             assert np.array_equal(np.asarray(one), np.asarray(other)), leaf
@@ -402,8 +417,7 @@ def test_the_training_forward_keeps_a_state_a_backward_block():
         jax.ShapeDtypeStruct((channels, states), jnp.float32),
         *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
         jax.ShapeDtypeStruct((channels,), jnp.float32))
-    template = functools.partial(selective.selective_scan, family=taken_family(jnp.bfloat16),
-                                 interpret=INTERPRETED)
+    template = taken_scan(jnp.bfloat16)
     kept = jax.eval_shape(lambda *operands: jax.vjp(template, *operands)[1], *operands)
     beyond = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(kept)) - sum(
         operand.size * operand.dtype.itemsize for operand in operands)
@@ -572,8 +586,10 @@ def test_a_named_template_refuses_a_state_row_no_bulk_copy_takes(states):
     layout, where the same call with an fp32 C (16 or 48 bytes) is taken (row 4304)."""
     from dew.nn.kernels.selection import KernelRefused
 
-    shape = (1, selective.CHUNK, selective.block_scan.THREADS, states)
-    inputs, _, _ = draw(jnp.float32, 0, *shape, packed=False)
+    rows, length, channels = 1, selective.CHUNK, selective.block_scan.THREADS
+    inputs = tuple(jax.ShapeDtypeStruct(shape, jnp.float32) for shape in (
+        (rows, length, channels), (rows, length, channels), (channels, states), (rows, length, states),
+        (rows, length, states), (channels,)))
     jax.eval_shape(dispatched("fast", named=True, c_dtype=jnp.float32, target="sm90"), *inputs)
     with pytest.raises(KernelRefused) as refused:
         jax.eval_shape(dispatched("fast", named=True, c_dtype=jnp.bfloat16, target="sm90"), *inputs)
@@ -671,6 +687,24 @@ def test_a_spill_steps_the_kernel_that_spilled():
         assert stepped is not None and stepped != derived
         assert selective.SELECTIVE.legal(bound, stepped, target)
     the_template_is_as_exact_as_its_reference("interpreted", packed=False, tiles=stepped)
+
+
+@pytest.mark.parametrize('target', ['sm80', 'sm90'])
+def test_the_tuners_variants_lead_with_the_derived_config_each_legal(target):
+    """`Selective.variants` on an A100's and an H100's facts for Mamba-1 2.8B's bf16 scan: the derived config
+    first, then its neighbours (`Selective.neighbours`), distinct and each legal there, so an opt-in tuning
+    run has more than the derivation to time (row 1300: an A100's backward 14.35 ms beside mamba_ssm's 9.9,
+    M-JS-237)."""
+    operands = (jax.ShapeDtypeStruct((1, 2048, 5120), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((5120, 16), jnp.float32),
+        *(jax.ShapeDtypeStruct((1, 2048, 16), jnp.bfloat16),) * 2, jax.ShapeDtypeStruct((5120,), jnp.float32))
+    facts = generation.gpu_target(target)
+    with generation.assumed(facts):
+        bound = selective.SELECTIVE.bind(*operands)
+        variants = selective.SELECTIVE.variants(bound)
+        assert variants[0] == selective.SELECTIVE.derived(bound, facts)
+        assert len(set(variants)) == len(variants) > 1
+        assert all(selective.SELECTIVE.legal(bound, tiles, facts) for tiles in variants)
 
 
 @pytest.mark.parametrize('length', [129, 2048], ids=['129 tokens', '2048 tokens'])

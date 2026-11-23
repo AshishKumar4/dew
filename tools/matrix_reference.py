@@ -12,8 +12,8 @@ of draws a call), sized on the recording alone where the cell's kernel is a TPU'
 
 `<upstream>` `fla` or `mamba_ssm`, each case its axis values joined by `-`
 (`recurrence_matrix._on_par_recorded`'s site), on a GPU, `<python>` the upstream's cohort's interpreter
-(tools/reference_releases.py, `COHORTS`; mamba_ssm's its tier release, `recurrence_matrix.tier_release`,
-refused otherwise). What lands is the upstream's file (`recurrence_matrix.RECORDED`, `DESTINATIONS`), or past
+(tools/reference_releases.py, `COHORTS`), serving the tier's release (`recurrence_matrix.tier_release`),
+refused otherwise. What lands is the upstream's file (`recurrence_matrix.RECORDED`, `DESTINATIONS`), or past
 `fetched_fixtures.IN_GIT` its pin beside the store's copy (tests/fixtures/fetched/), uploaded by
 `fetched_fixtures.upload`.
 """
@@ -119,17 +119,15 @@ def mamba_answers(named: dict, starts):
     """mamba_ssm's scan on a cell's draws (`recurrence_matrix.UPSTREAMS`) as `recorded`'s answer of a cell:
     the live cells' block arm (`upstream_support.UpstreamBlocks`), `BLOCK` draws a call from the draw asked,
     one block's answers held at a time, its `draw` the cell's own (`recurrence_matrix._inputs`)."""
-    import numpy as np
     import recurrence_matrix as matrix
     from upstream_support import UpstreamBlocks
 
     def run_block(drawn: list) -> list:
+        # A recording's draw is its cell's inputs, the cotangents among them (`recurrence_matrix._inputs`).
         inputs = [each for (each,) in drawn]
-        names = [name for name in inputs[0] if name not in ("d_out", "d_final")]
-        cotangents = tuple(np.stack([each[name] for each in inputs]) for name in ("d_out", "d_final"))
-        found = matrix.UPSTREAMS["mamba_ssm"](
-            named, {name: np.stack([each[name] for each in inputs]) for name in names}, cotangents, starts)
-        return [{name: value[index] for name, value in found.items()} for index in range(len(inputs))]
+        return matrix.upstream_block(
+            named, starts, [{name: value for name, value in each.items() if name not in ("d_out", "d_final")}
+                            for each in inputs], [(each["d_out"], each["d_final"]) for each in inputs])
 
     return BlockAnswers(UpstreamBlocks(run_block, lambda seed: (matrix._inputs(named, seed),), BLOCK,
                                        bounded=True))
@@ -171,7 +169,7 @@ def main() -> None:
     from delta_rule_support import FLA_LAYER_SIDE
     from fetched_fixtures import save
     from recorded_references import provenance
-    from recurrence_matrix import RECORDED
+    from recurrence_matrix import RECORDED, tier_release
     from reference_worker import session
 
     upstream, python, *labels = sys.argv[1:]
@@ -182,14 +180,16 @@ def main() -> None:
             source.write_text(FLA_LAYER_SIDE)
             with session([python, __file__, "--serve", str(source)]) as worker:
                 version, device = worker.started.split(maxsplit=1)
+                # The release a replay holds the recording to, checked before any GPU time is spent.
+                if version != tier_release(upstream):
+                    raise SystemExit(f"{python} serves fla-core {version}; the tier's reference is "
+                                     f"{tier_release(upstream)}")
                 for label in labels:
                     began = time.perf_counter()
                     stored.update(recorded(fla_answers(worker), label))
                     print(f"{label}: recorded in {time.perf_counter() - began:.0f} s", flush=True)
         reference, license = f"fla-core-{version}", "MIT"
     elif upstream == "mamba_ssm":
-        from recurrence_matrix import tier_release
-
         os.environ["DEW_MAMBA_PYTHON"] = python
         version, device = subprocess.run([python, "-c", MAMBA_RELEASE], check=True, capture_output=True,
                                          text=True).stdout.split(maxsplit=1)
