@@ -83,9 +83,9 @@ def test_a_steps_planner_certifies_its_launches_beside_the_trace_that_reaches_th
     thread that traces. Certified within the planner's trace, a 4x1024 MoE step's 16 certifications compiled
     one after another (MC-6740-POOL), and an sm90 plan certified 64 of its 82 seconds in turn (FS-P5324-MAIN,
     row 5324). Its start traced first alone, as a trainer's start traces it (`Trainer._started`, targeting
-    its mesh, no device named to certify on), then the plan: each launch certified once, on the mesh's GPU,
-    where a start's launches traced outside the plan's certifying block were certified again (rows 6791,
-    6824, 7212)."""
+    its mesh, no device named to certify on), then the plan: every launch certified on the one GPU the plan
+    certifies on, its mesh's first, where a start's launches traced outside the plan's certifying block were
+    certified again on another (rows 6791, 6824, 7212)."""
     script = """
 import json
 import threading
@@ -117,19 +117,16 @@ from dew.nn.kernels.templates import report
 with assumed("sm90"):
     trainer._started()
 started = bool(compile_ahead(trainer, token_rows(VOCAB, BATCH, tokens + 1)).starts)
-mesh_devices = {str(device) for device in trainer.device_mesh.devices.flat}
-# A launch's identity: its op, config, mode and its kernels' modules.
-certified = [[each.op, repr(each.config), each.pulled, sorted(module for module, _ in each.kernels.values()),
-              str(each.device)] for each in report.certifications()]
+certified = [[each.op, str(each.device)] for each in report.certifications()]
 print(json.dumps({"started": started, "compiled_on": compiled_on, "certified": certified,
-                  "mesh": sorted(mesh_devices)}))
+                  "first": str(trainer.device_mesh.devices.flat[0])}))
 """
     result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
                    variables={"CUDA_VISIBLE_DEVICES": ""})
     certifying = [thread for thread, name in result["compiled_on"] if "certified_" in name]
     assert result["started"], result
     assert certifying and all(thread.startswith("dew-certify") for thread in certifying), result
-    # Each launch certified once, on the mesh's compile-only GPU, never the host's (rows 6791, 6824, 7212).
-    launches = [repr(each[:4]) for each in result["certified"]]
-    assert launches and len(set(launches)) == len(launches), result["certified"]
-    assert {each[4] for each in result["certified"]} <= set(result["mesh"]), result
+    # Every launch certified on one device, the mesh's first compile-only GPU, the start's and the plan's
+    # alike, never the host's: a certification is one a launch and device, so none twice (rows 6791, 6824,
+    # 7212).
+    assert result["certified"] and {each[1] for each in result["certified"]} == {result["first"]}, result

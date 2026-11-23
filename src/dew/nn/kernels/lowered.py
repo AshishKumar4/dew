@@ -514,7 +514,7 @@ class _Walk:
         while pending:
             index = pending.pop()
             left = self.block(blocks[index], entries[index])
-            terminator = blocks[index].operations[-1]
+            terminator = blocks[index].operations[-1].operation
             successors = list(terminator.successors)
             if not successors:
                 exits |= left
