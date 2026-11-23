@@ -356,7 +356,7 @@ def test_a_decode_token_on_the_fused_step_is_the_layers_own():
 
 @pytest.mark.parametrize('dtype', [pytest.param(jnp.bfloat16, id='bf16'),
                                    pytest.param(jnp.float32, id='fp32')])
-@pytest.mark.check1_shards(seeds=16, per_task=8)
+@pytest.mark.check1_shards(seeds=40, per_task=8)
 def test_an_unbounded_steep_decay_keeps_the_mild_pairs_after_it_interpreted(dtype):
     """Kimi delta attention without a decay bound (`KimiDeltaAttention(lower_bound=None)`, Kimi Linear's
     config) on the recurrence template under the run's fast forms, interpreted, a key dimension's log decay

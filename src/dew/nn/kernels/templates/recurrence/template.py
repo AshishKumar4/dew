@@ -280,14 +280,15 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                   f"{generation.family(generation.device_generation())!r} family")
     run = {"family": issuing, "interpret": interpret, "tiles": tiles,
            "ranged": ranged(dtype, delta, bound)}
-    # The call's forms every launch it plans or runs reads, beside its geometry.
-    forms = {"max_segments": max_segments, "delta": delta, "wide": wide, "rounded": rounded, "apart": apart,
-             "values_gated": values_gated, "unit_keys": unit_keys, "decay_bound": decay_bound}
     table = None
     if forked is not None:
         batch, length = query.shape[:2]
         table, starts, firsts, max_segments = forked_table(state, forked, batch, length, tiles.chunk)
         state = None
+    # The call's forms every launch it plans or runs reads, beside its geometry (a forked call's documents'
+    # bound its table's).
+    forms = {"max_segments": max_segments, "delta": delta, "wide": wide, "rounded": rounded, "apart": apart,
+             "values_gated": values_gated, "unit_keys": unit_keys, "decay_bound": decay_bound}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
     fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, per_key=g.ndim == 4, wide=wide)
             and backward_holds(query, key, value, g, beta, state, tiles=tiles, family=issuing,
