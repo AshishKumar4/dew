@@ -355,6 +355,7 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
         assert "error" not in record, record
         expected = (["thunk", "wrapped_transpose"] if record["name"] == "batched" else ["thunk"])
         assert sorted(record["thunks"]) == expected, record
+        assert record["modules"] and record["modules"].items() <= record["certified"].items(), record
         kernels = record["kernels"]
         assert len(kernels) == 1 and kernels[0]["kernel"] == "merged_padded", record
         assert kernels[0]["spilled"] == 0 and kernels[0]["shared"] == 0, record

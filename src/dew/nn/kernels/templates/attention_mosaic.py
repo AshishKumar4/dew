@@ -73,7 +73,12 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     logits_ahead,
     rewalks_in_place,
 )
-from dew.nn.kernels.templates.attention_mosaic_fused import fused_staging, staged_parts, streamed_statistics
+from dew.nn.kernels.templates.attention_mosaic_fused import (
+    fused_reduces,
+    fused_staging,
+    staged_parts,
+    streamed_statistics,
+)
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BACKWARD_CONSUMERS,
     ROUNDED,
@@ -2204,7 +2209,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 allocs = fused_staging(family, config, width, dtype, q_stages, reduced=reduced,
                                        grouped=query.shape[2] != key.shape[2], rounded=self.rounded,
                                        anchored=ba.arguments["drop"] is not None, target=target).allocations
-            launches = [(family, config, allocs, config.shared_keys, False, True)]
+            launches = [(family, config, allocs, config.shared_keys or fused_reduces(family, reduced),
+                         False, True)]
         else:
             dkv_stages = min(config.stages, padded_q // config.dkv.block_q)
             launches = [(dkv_family, config.dkv, _dkv_allocations(

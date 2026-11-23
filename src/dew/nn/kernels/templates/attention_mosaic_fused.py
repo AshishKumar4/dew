@@ -66,13 +66,22 @@ class FusedStaging:
     allocations: tuple[list, dict, list]
 
 
+def fused_reduces(family: mosaic.Family, reduced: int) -> bool:
+    """Whether a fused backward launch passes `reduces=True` to `Family.kernel`: `False` when the family
+    budgets implicit reductions via `warpgroup_reduction_scratch` (so `mma.sync.fed` does not double-charge
+    `reduction_scratch` + `warpgroup_reduction_scratch`), and `bool(reduced)` on single-warpgroup `mma.sync`
+    whose `warpgroup_reduction_scratch` is zero."""
+    return bool(reduced) and not family.warpgroup_reduction_scratch
+
+
 def _fit_streamed[A: tuple](family: mosaic.Family, limit: int | None, reduced: int, max_streamed: int,
                             allocate: Callable[[int], A]) -> tuple[int, A]:
     """Largest `streamed` count in `max_streamed..0` whose `allocate(streamed)` fits `limit` (row 11996)."""
+    reduces = fused_reduces(family, reduced)
     for count in range(max_streamed, 0, -1):
         allocs = allocate(count)
         if limit is None or resources.shared_bytes(
-                family, launch_scope(family, allocs, reduced, reduces=False)) <= limit:
+                family, launch_scope(family, allocs, reduced, reduces=reduces)) <= limit:
             return count, allocs
     return 0, allocate(0)
 
@@ -85,11 +94,11 @@ def fused_staging(family: mosaic.Family, config: BackwardTiles, width: int, dtyp
     still fit, else the most streamed statistics that fit at single-buffered staging, and typed dK/dV
     stores when ungrouped, rounded, and fitting within the same limit (rows 5272, 11996)."""
     limit = (generation.gpu_target() if target is None else target).shared_limit
+    reduces = fused_reduces(family, reduced)
 
     def fits(allocs: tuple[list, dict, list]) -> bool:
         return limit is None or resources.shared_bytes(
-            family, launch_scope(family, allocs, reduced, reduces=False)) <= limit
-
+            family, launch_scope(family, allocs, reduced, reduces=reduces)) <= limit
     active = streamed_statistics_order(anchored=anchored) if family.copies_vectors else ()
     held = family.adds_through_shared
     stage_width = stores.staged_columns(width, (jnp.float32,)) if held and width <= 128 else width
@@ -447,8 +456,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         grid=(heads, batch, keys_padded // pair),
         grid_names=("heads", "batch", "k_tiles"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_fused", reducing_warpgroups=reduced,
-        registers=walk.registers(dq=False),
-        # Its walk's statement, its work its emission's (`stated`); the model's products it owns
+        reduces=fused_reduces(family, reduced), registers=walk.registers(dq=False),
         # (`modelled`): dQ's, dK's, dV's and dP's.
         cost=stated(walk.spec, batch, heads, query, key, value, dout,
                     tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), consumers, keyed=True,

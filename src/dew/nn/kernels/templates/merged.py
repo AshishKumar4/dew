@@ -22,6 +22,7 @@ the law's path (`merged_split`)."""
 import dataclasses
 import functools
 from collections.abc import Callable, Sequence
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -42,8 +43,8 @@ from jax.interpreters import batching, mlir
 from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
-from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import attention_algebra as algebra, cost, emission, mosaic
+from dew.nn.kernels import generation, launches, tuning
+from dew.nn.kernels.templates import attention_algebra as algebra, cost, emission, mosaic, report
 from dew.nn.kernels.templates.attention import Initial, ungrouped_rows
 
 
@@ -257,6 +258,14 @@ def _launch_for_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacke
     return total, launched
 
 
+def _candidate_blocks(width: int, total_slices: int) -> tuple[int, ...]:
+    """Legal power-of-two channel blocks for `width` and `total_slices`, largest first."""
+    channels = 1 << (width - 1).bit_length()
+    blocks = tuple(block for block in (channels >> shift for shift in range(channels.bit_length()))
+                   if block * windows.chunk_width(total_slices) >= THREADS)
+    return blocks or (channels,)
+
+
 @functools.cache
 def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
                    queries: int, width: int, target: generation.GpuTarget, has_initial: bool = False,
@@ -267,10 +276,8 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
     once for the selected backend (`_uses_mosaic(target)`)."""
     _, slices, _, _, _ = padded.shape
     total_slices = slices + int(has_initial)
-    channels = 1 << (width - 1).bit_length()
     family = generation.family(target.generation) if _uses_mosaic(target) else None
-    blocks = [block for block in (channels >> shift for shift in range(channels.bit_length()))
-              if block * windows.chunk_width(total_slices) >= THREADS] or [channels]
+    blocks = _candidate_blocks(width, total_slices)
 
     candidates = {block: _launch_for_block(units, padded, stacked, queries, width, block, target, has_initial,
                                            raw_scale, out_dtype, out_heads, family=family)
@@ -282,6 +289,8 @@ def _planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct, stacked: 
 
     chosen = min(blocks, key=lambda block: (seconds(block), -block))
     return chosen, candidates[chosen][0]
+
+
 def _channel_block(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeStruct,
                    stacked: jax.ShapeDtypeStruct, queries: int, width: int, target: generation.GpuTarget,
                    has_initial: bool = False, raw_scale: float | None = None, out_dtype=None,
@@ -313,23 +322,92 @@ def _uses_mosaic(target: generation.GpuTarget) -> bool:
     return family is not None and family != "tpu"
 
 
+@dataclasses.dataclass(frozen=True)
+class MergeConfig:
+    """One Mosaic GPU merge launch's configuration: the channels a program merges."""
+
+    block: int
+
+
+@dataclasses.dataclass(frozen=True)
+class MergedPadded(tuning.KernelOp):
+    """A split walk's Mosaic GPU merge (`_launch_mosaic`, row 9795) as a certified launch: its channel block
+    derived by `_planned_block` and certified before its program lowers (`report.certified`)."""
+
+    units: windows.Units = dataclasses.field(default_factory=windows.Units)
+    queries: int = 1
+    width: int = 1
+    raw_scale: float | None = None
+    out_dtype: np.dtype | None = None
+    out_heads: int | None = None
+    family: str = "mma.sync"
+
+    config_cls: ClassVar[type[MergeConfig]] = MergeConfig
+
+    def _get_heuristics_config(self, ba) -> MergeConfig:
+        padded, stacked = ba.arguments["padded"], ba.arguments["stacked"]
+        extra = ba.arguments.get("extra", ())
+        padded_s = jax.ShapeDtypeStruct(padded.shape, padded.dtype)
+        stacked_s = jax.ShapeDtypeStruct(stacked.shape, stacked.dtype)
+        block = _channel_block(self.units, padded_s, stacked_s, self.queries, self.width,
+                               generation.gpu_target(), bool(extra), self.raw_scale, self.out_dtype,
+                               self.out_heads)
+        return MergeConfig(block)
+
+    def remaining(self, ba) -> MergeConfig | None:
+        target = generation.gpu_target()
+        derived = self._get_heuristics_config(ba)
+        if not report.refused(self, ba, derived, target):
+            return derived
+        total_slices = ba.arguments["padded"].shape[1] + int(bool(ba.arguments.get("extra", ())))
+        for block in _candidate_blocks(self.width, total_slices):
+            candidate = MergeConfig(block)
+            if not report.refused(self, ba, candidate, target):
+                return candidate
+        return None
+
+    def pinnable(self, ba, config) -> bool:
+        del ba
+        if not isinstance(config, MergeConfig) or config.block <= 0:
+            return False
+        channels = 1 << (self.width - 1).bit_length()
+        return (config.block & (config.block - 1)) == 0 and config.block <= channels
+
+    def unpinnable(self, ba, config) -> str:
+        del ba
+        if not isinstance(config, MergeConfig):
+            return f"it is no {self.config_cls.__name__}"
+        channels = 1 << (self.width - 1).bit_length()
+        return f"block {config.block} is not a positive power of two <= {channels}"
+
+    def _fwd(self, padded: jax.Array, stacked: jax.Array, extra: tuple[jax.Array, ...] = (), *,
+             config: MergeConfig, return_residuals: bool = False):
+        del return_residuals
+        return _launch_mosaic(
+            padded, stacked, *extra, units=self.units, queries=self.queries, width=self.width,
+            block=config.block, raw_scale=self.raw_scale, out_dtype=self.out_dtype,
+            out_heads=self.out_heads, family=self.family), None
+
+
 def _kernel(padded, stacked, *extra, units: windows.Units, queries: int, width: int,
             raw_scale: float | None = None, out_dtype=None, out_heads: int | None = None):
-    """`_value` as one CUDA launch (`_launch_mosaic` on sm80+ Mosaic GPU families, `_launch` Triton fallback
+    """`_value` as one CUDA launch (`MergedPadded` on sm80+ Mosaic GPU families, `_launch` Triton fallback
     on pre-Ampere CUDA GPUs), a program a row's block of channels (`_channel_block`)."""
     batch, _, _, heads, _ = padded.shape
     if batch == 0 or queries == 0 or heads == 0:
         return _value(padded, stacked, *extra, units=units, queries=queries, width=width,
                       raw_scale=raw_scale, out_dtype=out_dtype, out_heads=out_heads)
+    target = generation.gpu_target()
+    if _uses_mosaic(target):
+        dtype = None if out_dtype is None else jnp.dtype(out_dtype)
+        family = generation.family(target.generation) or "mma.sync"
+        return MergedPadded(
+            units=units, queries=queries, width=width, raw_scale=raw_scale, out_dtype=dtype,
+            out_heads=out_heads, family=family)(padded, stacked, tuple(extra))
     padded_s, stacked_s = (jax.ShapeDtypeStruct(operand.shape, operand.dtype)
                            for operand in (padded, stacked))
-    target = generation.gpu_target()
     block = _channel_block(units, padded_s, stacked_s, queries, width, target, bool(extra),
                            raw_scale, out_dtype, out_heads)
-    if _uses_mosaic(target):
-        return _launch_mosaic(padded, stacked, *extra, units=units, queries=queries, width=width,
-                              block=block, raw_scale=raw_scale, out_dtype=out_dtype, out_heads=out_heads,
-                              family=generation.family(target.generation) or "mma.sync")
     return _launch(padded, stacked, *extra, units=units, queries=queries, width=width, block=block,
                    raw_scale=raw_scale, out_dtype=out_dtype, out_heads=out_heads)
 
