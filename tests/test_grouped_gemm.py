@@ -1513,10 +1513,10 @@ def test_sm80_prefetch_registers_and_tgmm_prefetch_predicate():
         assert not gmm.legal(ba_fwd, t320, sm80)
         assert gmm.legal(ba_fwd, t128, sm80)
         fam = pricing.family_of(t128, jnp.bfloat16)
-        assert not mosaic_gpu.tgmm_prefetches(fam, unstaged=True, rewritten=False, k_major=False,
-                                              interpret=False, scaled=False, summed=False)
-        assert not mosaic_gpu.tgmm_prefetches(fam, unstaged=False, rewritten=False, k_major=False,
-                                              interpret=False, scaled=False, summed=False)
+        assert pricing.prefetch_registers(fam, t128, ba=ba_dw, staged_rows=True, unstaged=True,
+                                          rewritten=False) == 0
+        assert pricing.prefetch_registers(fam, t128, ba=ba_dw, staged_rows=True, unstaged=False,
+                                          rewritten=False) == 0
         cases = [
             KernelCase("sm80_fwd_128x128x32", lambda: gmm.lowering(ba_fwd, t128)),
             KernelCase("sm80_dw_128x128x32", lambda: tgmm.lowering(ba_dw, t128)),
@@ -1827,6 +1827,52 @@ def test_gemm_named_compute_beside_prologue_and_applied_holds_check_1():
     assert dw.dtype == jnp.float32
 
 
+def test_gemm_named_compute_prologue_preserves_compute_precision_in_vjp():
+    """`gemm.gemm` with `compute` + `prologue` keeps the operand cotangent in `compute` precision before
+    pulling back through the prologue VJP for both wider (`bf16 -> fp32`) and narrower (`fp32 -> bf16`)
+    compute dtypes (row 1958)."""
+    from dew.nn.precision import rounded_operand
+
+    def scale_pro(x, s):
+        return x * s[None, :]
+
+    def scaled_gemm(a, s, b, *, compute_dtype):
+        return gemm.gemm(a, b, prologue=scale_pro, prologue_operands=((s, ("depth",)),),
+                         compute=compute_dtype, out_dtype=compute_dtype)
+
+    # Exact wider-compute witness: bf16 lhs, fp32 rhs = 1 + 2^-9, compute=out_dtype=fp32.
+    # Rounding d_operand to bf16 before prologue VJP would collapse d_scale to 1.0 instead of 1 + 2^-9.
+    lhs = jnp.ones((4, 1), jnp.bfloat16)
+    rhs = jnp.full((1, 1), 1.0 + 2.0 ** -9, jnp.float32)
+    scale = jnp.ones((1,), jnp.float32)
+    cot = jnp.ones((4, 1), jnp.float32)
+    _, pull = jax.vjp(functools.partial(scaled_gemm, compute_dtype=jnp.float32), lhs, scale, rhs)
+    d_lhs, d_scale, _ = pull(cot)
+    assert d_lhs.dtype == jnp.bfloat16
+    assert d_scale.dtype == jnp.float32
+    expected = np.asarray([4.0 * (1.0 + 2.0 ** -9)], np.float32)
+    np.testing.assert_array_equal(np.asarray(d_scale), expected)
+
+    # Narrower compute (`fp32` lhs/rhs, `compute=out_dtype=bf16`) matches portable XLA forward and VJP.
+    rng = np.random.default_rng(19581)
+    x_f32 = jnp.asarray(rng.standard_normal((16, 32)), jnp.float32)
+    s_f32 = jnp.asarray(rng.uniform(0.5, 1.5, (32,)), jnp.float32)
+    w_f32 = jnp.asarray(rng.standard_normal((32, 16)), jnp.float32)
+    dy_bf16 = jnp.asarray(rng.standard_normal((16, 16)), jnp.bfloat16)
+
+    def narrow_ref(a, s, b):
+        y = scale_pro(a.astype(jnp.bfloat16), s).astype(jnp.bfloat16)
+        return jax.lax.dot(y, rounded_operand(b, jnp.bfloat16),
+                           preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+
+    out_d, pull_d = jax.vjp(functools.partial(scaled_gemm, compute_dtype=jnp.bfloat16), x_f32, s_f32, w_f32)
+    out_r, pull_r = jax.vjp(narrow_ref, x_f32, s_f32, w_f32)
+    np.testing.assert_array_equal(np.asarray(out_d), np.asarray(out_r))
+    for gd, gr in zip(pull_d(dy_bf16), pull_r(dy_bf16), strict=True):
+        assert gd.dtype == gr.dtype
+        np.testing.assert_array_equal(np.asarray(gd), np.asarray(gr))
+
+
 def test_vmap_folds_batch_dimensions_into_single_gemm_launch():
     """`jax.vmap` of `gemm.gemm` folds `[B, M, K] @ [K, N]` into one `[B*M, K] @ [K, N]` dense launch and
     `[B, M, K] @ [B, K, N]` into one grouped launch with `group_sizes=[M]*B`; forward, `vmap(grad)`,
@@ -1914,6 +1960,88 @@ def test_vmap_folds_batch_dimensions_into_single_gemm_launch():
     assert_as_exact(grad_of_vmap_batched, jax.jit(grad_of_vmap_batched_ref), draw_batched_w,
                     "grad(vmap(gemm)) batched W", seeds=8,
                     truth_fn=functools.partial(grad_of_vmap_batched_ref, dtype=jnp.float64))
+
+
+def test_vmap_folds_singleton_group_sides_and_preserves_named_dispatch():
+    """Vmapped dense `gemm` and `gemm_t` fold both unmapped `(1, N)` and mapped `(B, 1, N)` singleton
+    `('groups', ...)` sides cleanly without crashing, and unfoldable vmapped calls preserve named dispatch
+    (`cutlass`/`xla`) while raising `selection.KernelRefused` for forced Pallas kernels
+    (row 6104)."""
+    from dew.nn.kernels import selection
+
+    rng = np.random.default_rng(61042)
+    b, m, k, n = 3, 64, 64, 64
+    xs = jnp.asarray(rng.standard_normal((b, m, k)) / np.sqrt(k), jnp.bfloat16)
+    ws = jnp.asarray(rng.standard_normal((b, k, n)) / np.sqrt(k), jnp.bfloat16)
+    shared_bias = jnp.asarray(rng.standard_normal((1, n)), jnp.float32)
+    mapped_bias = jnp.asarray(rng.standard_normal((b, 1, n)), jnp.float32)
+    shared_scale = jnp.asarray(rng.uniform(0.5, 1.5, (1, k)), jnp.bfloat16)
+    mapped_scale = jnp.asarray(rng.uniform(0.5, 1.5, (b, 1, k)), jnp.bfloat16)
+    dys = jnp.asarray(rng.standard_normal((b, m, n)) / np.sqrt(n), jnp.bfloat16)
+
+    def add_bias(acc, bias):
+        return acc + bias
+
+    def mul_scale(rows, scale):
+        return rows * scale
+
+    # Unmapped (1, N) and mapped (B, 1, N) ('groups', 'columns') epilogue under batched rhs.
+    y_shared = jax.vmap(
+        lambda x, w: gemm.gemm(x, w, epilogue=add_bias,
+                               epilogue_operands=((shared_bias, ("groups", "columns")),),
+                               out_dtype=jnp.bfloat16),
+        in_axes=(0, 0))(xs, ws)
+    y_mapped = jax.vmap(
+        lambda x, w, bias: gemm.gemm(x, w, epilogue=add_bias,
+                                     epilogue_operands=((bias, ("groups", "columns")),),
+                                     out_dtype=jnp.bfloat16),
+        in_axes=(0, 0, 0))(xs, ws, mapped_bias)
+    ref_shared = jnp.stack([
+        gemm.gemm(xs[i], ws[i], epilogue=add_bias, epilogue_operands=((shared_bias, ("groups", "columns")),),
+                  out_dtype=jnp.bfloat16) for i in range(b)])
+    ref_mapped = jnp.stack([
+        gemm.gemm(xs[i], ws[i], epilogue=add_bias,
+                  epilogue_operands=((mapped_bias[i], ("groups", "columns")),),
+                  out_dtype=jnp.bfloat16) for i in range(b)])
+    np.testing.assert_array_equal(np.asarray(y_shared), np.asarray(ref_shared))
+    np.testing.assert_array_equal(np.asarray(y_mapped), np.asarray(ref_mapped))
+
+    # Unmapped (1, K) and mapped (B, 1, K) ('groups', 'depth') prologue in vmapped dense gemm_t.
+    dw_shared = jax.vmap(
+        lambda x, dy: gemm.gemm_t(x, dy, None, prologue=mul_scale,
+                                  prologue_operands=((shared_scale, ("groups", "depth")),),
+                                  out_dtype=jnp.float32),
+        in_axes=(0, 0))(xs, dys)
+    dw_mapped = jax.vmap(
+        lambda x, dy, sc: gemm.gemm_t(x, dy, None, prologue=mul_scale,
+                                      prologue_operands=((sc, ("groups", "depth")),),
+                                      out_dtype=jnp.float32),
+        in_axes=(0, 0, 0))(xs, dys, mapped_scale)
+    ref_dw_shared = jnp.stack([
+        gemm.gemm_t(xs[i], dys[i], None, prologue=mul_scale,
+                    prologue_operands=((shared_scale, ("groups", "depth")),), out_dtype=jnp.float32)
+        for i in range(b)])
+    ref_dw_mapped = jnp.stack([
+        gemm.gemm_t(xs[i], dys[i], None, prologue=mul_scale,
+                    prologue_operands=((mapped_scale[i], ("groups", "depth")),), out_dtype=jnp.float32)
+        for i in range(b)])
+    np.testing.assert_array_equal(np.asarray(dw_shared), np.asarray(ref_dw_shared))
+    np.testing.assert_array_equal(np.asarray(dw_mapped), np.asarray(ref_dw_mapped))
+
+    # Unfoldable grouped vmap: forced mosaic raises KernelRefused; xla/cutlass route via selection.
+    gs = jnp.asarray([32, 32], jnp.int32)
+    gw = jnp.asarray(rng.standard_normal((b, 2, k, n)) / np.sqrt(k), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        with generation.chosen(grouped_matmul="mosaic"), pytest.raises(selection.KernelRefused):
+            jax.vmap(lambda x, w: gemm.gemm(x, w, gs, out_dtype=jnp.bfloat16, interpret_on_cpu=True))(xs, gw)
+        with generation.chosen(grouped_matmul="xla"), generation.routes() as seen:
+            jax.jit(jax.vmap(lambda x, w: gemm.gemm(x, w, gs, out_dtype=jnp.bfloat16,
+                                                    interpret_on_cpu=True)))(xs, gw)
+        assert any(r.kernel == "xla" for r in seen), seen
+        if grouped_matmul.cutlass_built_for("sm90") is None:
+            with generation.chosen(grouped_matmul="cutlass"), pytest.raises(selection.KernelRefused):
+                jax.jit(jax.vmap(lambda x, w: gemm.gemm(x, w, gs, out_dtype=jnp.bfloat16,
+                                                        interpret_on_cpu=True)))(xs, gw)
 
 
 def test_underfilled_dense_gemm_derives_depth_split_and_holds_check_1():

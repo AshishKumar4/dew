@@ -701,13 +701,8 @@ def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, 
     tensor-core summed."""
     return (family.prefetches_fragments and matrices == 1 and prologue is None and not scaled and not chained
             and not interpret and not any(transposed) and not summed)
-def tgmm_prefetches(family: mosaic.Family, *, unstaged: bool, rewritten: bool, k_major: bool,
-                    interpret: bool, scaled: bool, summed: bool) -> bool:
-    """Dew: whether an unstaged `tgmm` walk prefetches a step's first fragments across steps: disabled on
-    `mma.sync` (`M-NG-45-a100` 20261123T015937Z: dW geomean 1.019x, 9/13 slower, 4B key +11.6%, confirming
-    `FS-DENSE-AB1`)."""
-    del family, unstaged, rewritten, k_major, interpret, scaled, summed
-    return False
+# `tgmm` does not prefetch fragments across steps on `mma.sync` (`M-NG-45-a100` 20261123T015937Z: dW
+# geomean 1.019x, 9/13 slower, 4B key +11.6%, confirming `FS-DENSE-AB1`).
 
 
 def _gmm_streamed(paired, scales, joined, bounded: "Chained | None" = None) -> tuple[dict, tuple, int]:
@@ -2450,18 +2445,14 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
         running, _ = walk(exact_step, family.zeros(shape), ())
         return running
 
-    def step(index, slots, nothing, accumulators, prefetched=None, boundary: Callable | None = None):
+    del unstaged
+
+    def step(index, slots, nothing, accumulators):
         (acc,) = accumulators
         lhs, rhs = staged(index, slots)
-        if boundary is not None:
-            acc, following = family.products_across(acc, lhs, rhs, prefetched, boundary)
-            return (nothing, (acc,)), following
         return nothing, (family.products(acc, lhs, rhs),)
 
-    prefetch = tgmm_prefetches(family, unstaged=unstaged, rewritten=False, k_major=False, interpret=interpret,
-                               scaled=scaling is not None, summed=exact_sums and not family.sums_in_persist)
-    extra = {'prefetch': lambda slots: family.first_fragments(*staged(0, slots))} if prefetch else {}
-    _, (summed,) = walk(step, None, (shape,), **extra)
+    _, (summed,) = walk(step, None, (shape,))
     return summed
 
 
