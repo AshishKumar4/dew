@@ -2171,7 +2171,7 @@ class OptimConfig:
             if self.lr is not None:
                 raise ValueError(f"{type(self.schedule).__name__} holds its rates in its own fields, which "
                                  f"lr {self.lr} is none of")
-        elif self.lr is not None and named is not None:
+        elif self.lr is not None and named is not None and isinstance(self.schedule, Peaked):
             # Named twice alike, held once: as `lr`, which the schedule then climbs to.
             object.__setattr__(self, 'schedule', dataclasses.replace(self.schedule, peak_value=None))
         elif self.lr is None and named is None:
