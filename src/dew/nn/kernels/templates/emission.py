@@ -111,17 +111,78 @@ def emitted(body: jax_core.Jaxpr, warpgroups: int, axis: str | None, *, device: 
     mma.sync family's). Its operands at the indices `device` are refs in device memory, each read and write
     of them its bytes' device traffic (a Triton launch's blocks, which its loads and stores move: the decode
     merge's, `merged._channel_block`). Its special functions in `forms` where given (a Mosaic GPU kernel's,
-    `forms_of`), else one MUFU an element each (`operation_work`)."""
-    roles = []
-    for index in range(warpgroups):
-        counted = _Counting(axis, index, forms=forms)
-        counted.run(body, [_DEVICE if at in device else None for at in range(len(body.invars))])
-        roles.append(Role(counted.fixed, tuple(counted.walks)))
-    return Emitted(tuple(roles))
+    `forms_of`), else one MUFU an element each (`operation_work`). A wait on a barrier no landing of its own
+    answers waits for what another warpgroup or an earlier trip of a loop lands on it (a producer's copies, a
+    pipelined walk's next step's, `_Arrivals`), its roles counted again where a first count found any (row
+    4123)."""
+    values = [_DEVICE if at in device else _barrier(var) for at, var in enumerate(body.invars)]
+    arrivals = _Arrivals()
+
+    def counted() -> list[Role]:
+        roles = []
+        for index in range(warpgroups):
+            counting = _Counting(axis, index, forms=forms, arrivals=arrivals)
+            counting.run(body, values)
+            roles.append(Role(counting.fixed, tuple(counting.walks)))
+        return roles
+
+    roles = counted()
+    return Emitted(tuple(counted() if arrivals.collected() else roles))
 
 
 _DEVICE = object()
 """A ref in device memory, as `emitted`'s walk holds it (`_Counting.equation` prices its reads and writes)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Barrier:
+    """A barrier array a kernel allocates (an operand of its own or its scope's, `run_scoped`), as every
+    warpgroup's count holds it: one allocation however each role's branch names it, so what one warpgroup
+    lands on it another's wait reads (`_Arrivals`)."""
+
+    allocated: jax_core.Var
+
+
+def _barrier(var: jax_core.Var) -> _Barrier | None:
+    """`var` as a count holds it where it is a barrier array (`_Barrier`: a ref of a barrier type), None for
+    any other operand."""
+    aval = var.aval
+    inner = aval.inner_aval if isinstance(aval, state_types.AbstractRef) else None
+    if isinstance(inner, jax_core.ShapedArray) and isinstance(
+            inner.dtype, gpu_core.BarrierType | gpu_core.ClusterBarrierType):
+        return _Barrier(var)
+    return None
+
+
+class _Arrivals:
+    """What a loop's trips land on each barrier a kernel allocates (`_Barrier`) that their count never waits
+    on: a producer warpgroup's copies, a pipelined walk's next step's, collected as a count of the kernel's
+    roles runs (`left`); and read as the next count prices a wait no landing of its own answers
+    (`arriving`): its paths, each one no other outlasts (`Work.__add__`). What lands outside a loop's trip
+    arrives for none, its wait a round trip as before: a program's one load onto a barrier of one slot held a
+    walk's whole path to one stage, and a scan's trips, counted in one count, chained their copies into one
+    arrival (M-FS-65, this head's first form re-read on its own code: a gated delta net's states launch
+    priced at 1.34 of its time, KDA's weighted at 3.69)."""
+
+    def __init__(self):
+        self.landed: dict[_Barrier, tuple[Chain, ...]] = {}
+        self.arrived: dict[_Barrier, tuple[Chain, ...]] = {}
+
+    def left(self, landing: Mapping) -> None:
+        """Collect what a loop's trip left unwaited (`landing`)."""
+        for barrier, chain in landing.items():
+            if isinstance(barrier, _Barrier):
+                held = Work(chains=self.landed.get(barrier, ()))
+                self.landed[barrier] = (held + Work(chains=(chain,))).chains
+
+    def collected(self) -> bool:
+        """Take what the count left as what arrives on each barrier; whether anything does."""
+        self.arrived = dict(self.landed)
+        return bool(self.arrived)
+
+    def arriving(self, barrier) -> tuple[Chain, ...]:
+        """The paths that arrive on `barrier`, none where the count took none."""
+        return self.arrived.get(barrier, ())
 
 
 _OPERATIONS = frozenset({
@@ -441,15 +502,17 @@ class _Counting:
     of its warpgroup's warps where it is one's (`warps`)."""
 
     def __init__(self, axis: str | None, index: int, loops: int = 0, warp: tuple | None = None,
-                 forms: Mapping | None = None):
+                 forms: Mapping | None = None, arrivals: _Arrivals | None = None):
         self.axis, self.index, self.warp, self.forms = axis, index, warp, forms
+        self.arrivals = _Arrivals() if arrivals is None else arrivals
         self.fixed = Work()
         self.walks: list[Work] = []
         self.loops = [_Loop() for _ in range(loops)]
         # The products it issued and has not waited on (each one's columns, `_columns`), and what lands on
-        # each barrier it will wait on: products committed to it, copies arriving on it (`waited`).
+        # each barrier it will wait on: products committed to it, copies arriving on it (`waited`), by the
+        # barrier's allocation where the count holds it (`_Barrier`).
         self.issued: list[float] = []
-        self.landing: dict[jax_core.Var, Chain] = {}
+        self.landing: dict[_Barrier | jax_core.Var, Chain] = {}
 
     def add(self, work: Work) -> None:
         # The warpgroup's work in its order: its paths followed one by the next (`_then`).
@@ -458,12 +521,17 @@ class _Counting:
         else:
             self.fixed = _then(self.fixed, work)
 
-    def waited(self, equation) -> None:
+    def waited(self, equation, values: list) -> None:
         """A wait the warpgroup's path runs through: products drained (`wgmma_wait`, the oldest past the `n`
-        it lets fly), a barrier's phase (its committed products, its copies, else another warpgroup's
-        arrival, a round trip); what lands on a barrier recorded as it is committed or copied to it. A
-        product waited a trip after it issued (a pipelined walk's) waits no path here: its trip's work hid
+        it lets fly), a barrier's phase (its committed products, its copies; else what another warpgroup or
+        an earlier trip lands on it, `_Arrivals`; else another warpgroup's arrival, a round trip); what lands
+        on a barrier recorded as it is committed or copied to it, by its allocation (`_Barrier`, `values`'s).
+        A product waited a trip after it issued (a pipelined walk's) waits no path here: its trip's work hid
         it."""
+
+        def barrier(at: int):
+            return values[at] if isinstance(values[at], _Barrier) else equation.invars[at]
+
         primitive = equation.primitive
         if primitive in _PRODUCTS:
             self.issued.append(_columns(equation))
@@ -473,17 +541,16 @@ class _Counting:
             if drained:
                 self.add(Work(chains=(Chain(products=len(drained), columns=sum(drained)),)))
         elif primitive is gpu.tcgen05_commit_arrive_p:
-            barrier = equation.invars[0]
             committed = Chain(products=len(self.issued), columns=sum(self.issued))
-            self.landing[barrier] = self.landing.get(barrier, Chain()).then(committed)
+            self.landing[barrier(0)] = self.landing.get(barrier(0), Chain()).then(committed)
             self.issued = []
         elif primitive is gpu.copy_gmem_to_smem_p and equation.params.get("has_barrier"):
-            barrier = equation.invars[2]
-            copied = Chain(copies=1, copy_bytes=_copied(equation), stages=_ring_depth(barrier))
-            self.landing[barrier] = self.landing.get(barrier, Chain()).then(copied)
+            copied = Chain(copies=1, copy_bytes=_copied(equation), stages=_ring_depth(equation.invars[2]))
+            self.landing[barrier(2)] = self.landing.get(barrier(2), Chain()).then(copied)
         elif primitive is gpu.barrier_wait_p:
-            landed = self.landing.pop(equation.invars[0], None)
-            self.add(Work(chains=(landed if landed is not None else Chain(barriers=1),)))
+            landed = self.landing.pop(barrier(0), None)
+            arrived = () if landed is not None else self.arrivals.arriving(barrier(0))
+            self.add(Work(chains=(landed,) if landed is not None else arrived or (Chain(barriers=1),)))
 
     def run(self, jaxpr: jax_core.Jaxpr, values: list, constants: Sequence = ()) -> list:
         """Count `jaxpr` given its inputs' concrete `values` (None where unknown), and its constants'
@@ -526,7 +593,7 @@ class _Counting:
     def equation(self, equation, values: list) -> list:
         primitive, params = equation.primitive, equation.params
         unknown = [None] * len(equation.outvars)
-        self.waited(equation)
+        self.waited(equation, values)
         if primitive is lax.axis_index_p:
             return [self.place(params["axis_name"])]
         if (primitive in programs.SCALAR_FOLDED and values and (operands := programs.admitted(
@@ -614,7 +681,7 @@ class _Counting:
         """A scope (`run_scoped`): its operands its body's constants, its body's inputs the refs it
         allocates."""
         body = equation.params["jaxpr"]
-        return self.run(body, [None] * len(body.invars), values)
+        return self.run(body, [_barrier(var) for var in body.invars], values)
 
     def loop(self, equation, values: list) -> None:
         """A loop whose trips its data decides (a while's): the outermost such loop that runs walk steps
@@ -638,8 +705,9 @@ class _Counting:
                 inputs[len(consts) + counter] = _Place(at, start, stop, parity)
                 inputs[len(consts) + bound] = stop
             trial = _Counting(self.axis, self.index, loops=len(self.loops) + 1, warp=self.warp,
-                              forms=self.forms)
+                              forms=self.forms, arrivals=self.arrivals)
             trial.run(body, inputs)
+            self.arrivals.left(trial.landing)
             return trial
 
         steady, odd = trip("steady", 0), trip("steady", 1)
@@ -657,15 +725,19 @@ class _Counting:
         """A warpgroup's warps each running its role (`plgpu.warp_map`'s `mpmd_map`: tcgen05's load and
         product warps): each warp's body counted with its warp's index concrete, so its role's branch is the
         one it takes; the warpgroup's work theirs together, a step of its walk each warp's step summed, and
-        the steps its warps take together its enclosing loop's (the most any warp marks)."""
+        the steps its warps take together its enclosing loop's (the most any warp marks). The barriers its
+        body takes are allocations every warp's count holds alike (`_Barrier`)."""
         del values
         (mesh,), (inner,) = equation.params["meshes"], equation.params["jaxprs"]
         ((name, count),) = mesh.shape.items()
         steps, marks = [], 0.0
+        barriers = [_barrier(var) for var in inner.invars]
         for warp in range(count):
             counted = _Counting(self.axis, self.index, loops=len(self.loops), warp=(name, warp),
-                                forms=self.forms)
-            counted.run(inner, [None] * len(inner.invars))
+                                forms=self.forms, arrivals=self.arrivals)
+            counted.run(inner, barriers)
+            if self.loops:
+                self.arrivals.left(counted.landing)
             self.fixed = self.fixed + counted.fixed
             if counted.walks:
                 steps.append(_mean(counted.walks))
@@ -712,8 +784,10 @@ class _Counting:
         trials = []
         for branch in branches:
             trial = _Counting(self.axis, self.index, loops=len(self.loops), warp=self.warp,
-                              forms=self.forms)
+                              forms=self.forms, arrivals=self.arrivals)
             trial.run(branch, operands)
+            if self.loops:
+                self.arrivals.left(trial.landing)
             trials.append(trial)
         self.fixed = self.fixed + _envelope(trial.fixed for trial in trials)
         if any(trial.walks for trial in trials):
