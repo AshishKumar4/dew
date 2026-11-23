@@ -8,6 +8,7 @@ import dataclasses
 import functools
 import hashlib
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -334,13 +335,26 @@ def fp8_factor(scale: jax.Array, sizes: jax.Array, count: int, weights_shape: tu
     if scale.shape[0] == 1:
         return scale[0]
     return jnp.repeat(scale[:, 0, :], sizes, axis=0, total_repeat_length=count)
+class _ScaledWeights:
+    """Shared single-scale decode for free-layout packed weight formats (`Fp8Weights`, `TernaryWeights`)."""
+    if TYPE_CHECKING:
+        scale: jax.Array | np.ndarray
+        @property
+        def shape(self) -> tuple[int, ...]: ...
+        def unscaled(self, dtype=jnp.bfloat16) -> jax.Array: ...
+
+    def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
+        """Decode `words` back to `[..., depth, width]` in `dtype`, scaled once in `at_least_fp32`."""
+        fp8_scale_checked(jnp.shape(self.scale), self.shape)
+        wide = jnp.promote_types(dtype, jnp.float32)
+        return (self.unscaled(wide) * jnp.asarray(self.scale, wide)).astype(dtype)
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class Fp8Weights:
+class Fp8Weights(_ScaledWeights):
     """Free-layout FP8 weight matrix `[..., depth, width]` packed 4 codes per `uint32` word in the GEMM
     staged depth order (`fp8_staged_rows`) via `bits.E4M3_BFLOAT16_FORM` or `bits.E5M2_BFLOAT16_FORM` for
-    sm80 GEMM mainloop decode (row 8548): `words` `[..., width, depth // 4]` uint32, per-tensor/per-column
     `scale` fp32, encoder `form` version bytes, and `fmt` static metadata."""
 
     words: jax.Array | np.ndarray
@@ -394,13 +408,6 @@ class Fp8Weights:
         inv = np.argsort(fp8_staged_rows(wdepth * 4))
         decoded = jax.vmap(lambda w: bits.fp8_codes(w.T, minifloat, jnp.float32)[inv])(flat)
         return decoded.reshape(*batches, wdepth * 4, width).astype(dtype)
-
-    def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
-        """Decode `words` back to `[..., depth, width]` in `dtype`, scaled in `at_least_fp32`."""
-        fp8_scale_checked(jnp.shape(self.scale), self.shape)
-        wide = jnp.promote_types(dtype, jnp.float32)
-        return (self.unscaled(wide) * jnp.asarray(self.scale, wide)).astype(dtype)
-
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
     """Block-scaled codes' values in `dtype`: each code times its `block` depths' E4M3 scale, read by the one
     decode of a block scale's (`bits.scales_decoded`, row 8675), exact in float32 (an E2M1 code times an E4M3
@@ -481,11 +488,10 @@ def ternary_codes(words: jax.Array, dtype=jnp.float32) -> jax.Array:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class TernaryWeights:
+class TernaryWeights(_ScaledWeights):
     """BitNet b1.58 ternary weight matrix `[..., depth, width]` packed 16 2-bit codes per `uint32` word in
     staged depth order (`ternary_staged_rows`, row 1464): `words` `[..., width, depth // 16]` uint32,
     absmean/per-column/per-group `scale` fp32, and `form` digest."""
-
     words: jax.Array | np.ndarray
     scale: jax.Array | np.ndarray
     form: jax.Array | np.ndarray
@@ -540,9 +546,3 @@ class TernaryWeights:
         inv = np.argsort(ternary_staged_rows(wdepth * 16))
         decoded = jax.vmap(lambda w: ternary_codes(w.T, jnp.float32)[inv])(flat)
         return decoded.reshape(*batches, wdepth * 16, width).astype(dtype)
-
-    def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
-        """Decode `words` back to `[..., depth, width]` in `dtype`, scaled once in `at_least_fp32`."""
-        fp8_scale_checked(jnp.shape(self.scale), self.shape)
-        wide = jnp.promote_types(dtype, jnp.float32)
-        return (self.unscaled(wide) * jnp.asarray(self.scale, wide)).astype(dtype)
