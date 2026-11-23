@@ -370,7 +370,7 @@ def unmarked(record: Mapping[str, object], mark: Mapping[str, object]) -> Mappin
     which that Dew wrote in its place, given `INERT_DECAY`, so its optimizer holds the masked decay step its
     checkpoints hold. The decay it trained at is not recorded: one of 0 held no step, so a checkpoint of
     such a run is refused at its restore, its tree another, never read across (Main, review of d22)."""
-    named = _records.class_record(record)
+    named = _records.class_record({key: value for key, value in record.items() if key not in MARKERS})
     if named is None:
         return record
     fields = dict(_records.record(named[1], "run fields"))
