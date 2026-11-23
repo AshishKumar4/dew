@@ -238,8 +238,7 @@ def granular_tile(family: mosaic.Family, config: "Tiles", dtype, *, target,
     return tensor <= (target.tmem_columns or 0)
 
 
-def prefetch_registers(family: mosaic.Family, config: "Tiles", *, ba, staged_rows: bool, unstaged: bool,
-                       rewritten: bool) -> int:
+def prefetch_registers(family: mosaic.Family, config: "Tiles", *, ba) -> int:
     """Extra registers held across a prefetching `mma.sync` step boundary (`products_across`): +16 regs at
     32-deep steps, or +32 regs at 64-deep steps (rows 5271, 11986)."""
     from . import mosaic_gpu
@@ -249,10 +248,6 @@ def prefetch_registers(family: mosaic.Family, config: "Tiles", *, ba, staged_row
     interpret = bool(ba.arguments['interpret'])
     summed = bool(ba.arguments.get('exact_sums')) and not family.sums_in_persist
     scaled = bool(ba.arguments.get('scales')) or bool(ba.arguments.get('step_scales'))
-    if staged_rows:
-        # `tgmm` does not prefetch across steps (`M-NG-45-a100`, `FS-DENSE-AB1`).
-        del unstaged, rewritten
-        return 0
     hooks = ba.arguments['hooks']
     trans_lhs = (bool(ba.arguments.get('packed_rows')) or bool(ba.arguments.get('trans_lhs'))
                  or config.swapped)

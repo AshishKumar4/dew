@@ -542,7 +542,7 @@ def _syrk_select(operand: jax.Array, *, has_poly: bool, transpose: bool,
                              out_dtype=out_dtype.name, interpret=interpreting)
             admitted = (not has_poly and not interpreting
                         and syrk_mod.measured_gram(generation.gpu_target(), flat.shape, op_dtype,
-                                                   transpose=transpose))
+                                                   transpose=transpose, out_dtype=out_dtype))
             case = SyrkCase(op_dtype, out_dtype, call, no_x64=not jax.config.jax_enable_x64,
                             no_auto=not automatic_axes(), precision_ok=exact_products(precision, op_dtype),
                             measured=admitted)
@@ -1017,7 +1017,8 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         lambda lf, rf, s, pa, px, *, dense: _gemm_t(lf, rf, None if dense else s, prologue, pa, px,
                                                     out_dtype=out_dtype, precision=precision,
                                                     interpret_on_cpu=interpret_on_cpu),
-        portable, dense=dense, prologue_axes=prologue_axes, committed_device=_committed_device)
+        portable, dense=dense, prologue_axes=prologue_axes, committed_device=_committed_device,
+        interpret_on_cpu=interpret_on_cpu)
     return _differentiable_gemm_t(call, portable, lhs, rhs, group_sizes, prologue_arrays, tables)
 
 
@@ -1592,7 +1593,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
             transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu, precision=precision,
             dense=dense, summed_as=summed_as, selected=selected),
         portable, dense=dense, prologue_axes=prologue_axes, epilogue_axes=epilogue_axes,
-        committed_device=_committed_device)
+        committed_device=_committed_device, interpret_on_cpu=interpret_on_cpu)
     return call(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
                 joined, beside, chained)
 

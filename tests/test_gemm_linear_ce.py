@@ -209,25 +209,17 @@ def test_linear_cross_entropy_derives_on_tpu_and_clamps_shared_budget():
     from dew.nn.kernels.templates.gemm import derivation
 
     with generation.assumed("v5e"):
-        target = generation.gpu_target()
-        tile = linear_ce.derive_linear_ce((256, 4096, 256), jnp.bfloat16, target)
-        assert tile is not None
-        assert tile.family == "mxu"
-        layouts = bundles.groups("v5e", jnp.bfloat16, stated=True, tpu=True)[0]
-        clamped = derivation.derived(
-            layouts, rows=256, depth=256, width=4096, dtype=jnp.bfloat16, multiprocessors=1,
-            target=target, candidate=lambda c: True,
-            launch_of=lambda c: linear_ce.linear_ce_launch_of(
-                c, (256, 4096, 256), jnp.bfloat16, transpose_rhs=True, has_bias=False, target=target),
-            grouped=False, dense=True, shared_budget=1024)
-        assert clamped is None
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        layouts = bundles.groups("sm90", jnp.bfloat16, stated=True)[0]
-        clamped = derivation.derived(
-            layouts, rows=256, depth=256, width=256, dtype=jnp.bfloat16, multiprocessors=132,
-            target=target, candidate=lambda c: True,
-            launch_of=lambda c: linear_ce.linear_ce_launch_of(
-                c, (256, 256, 256), jnp.bfloat16, transpose_rhs=True, has_bias=False, target=target),
-            grouped=False, dense=True, shared_budget=1024)
-        assert clamped is None
+        tile = linear_ce.derive_linear_ce((256, 4096, 256), jnp.bfloat16, generation.gpu_target())
+        assert tile is not None and tile.family == "mxu"
+    for gen, width, mps, is_tpu in (("v5e", 4096, 1, True), ("sm90", 256, 132, False)):
+        with generation.assumed(gen):
+            target = generation.gpu_target()
+            layouts = bundles.groups(gen, jnp.bfloat16, stated=True, tpu=is_tpu)[0]
+            for budget in (0, 1024):
+                clamped = derivation.derived(
+                    layouts, rows=256, depth=256, width=width, dtype=jnp.bfloat16, multiprocessors=mps,
+                    target=target, candidate=lambda c: True,
+                    launch_of=lambda c, w=width, t=target: linear_ce.linear_ce_launch_of(
+                        c, (256, w, 256), jnp.bfloat16, transpose_rhs=True, has_bias=False, target=t),
+                    grouped=False, dense=True, shared_budget=budget)
+                assert clamped is None, (gen, budget)

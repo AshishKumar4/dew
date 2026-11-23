@@ -82,18 +82,22 @@ def _expand_groups(arrays: tuple, axes_of: tuple, axis_size: int) -> tuple:
         for array, axes in zip(arrays, axes_of, strict=True))
 
 
-def _unfolded_vmap(dispatch_fn: Callable, portable_fn: Callable, in_batched, args: tuple):
+def _unfolded_vmap(dispatch_fn: Callable, portable_fn: Callable, in_batched, args: tuple, *,
+                   interpret_on_cpu: bool = False):
     """Execute an unfoldable vmapped GEMM preserving named dispatch:
-    - Named `cutlass` / `xla` run through `dispatch_fn` so CUTLASS FFI sequential batching (row 4389) and
-      route selection stay active (raising `KernelRefused` when CUTLASS refuses the call).
-    - Forced Pallas kernels (`mosaic`, `triton`) cannot lower inside an unfolded `vmap`, raising typed
+    - Named `cutlass` / `xla` and native (non-interpreted) `triton` run through `dispatch_fn` so CUTLASS FFI
+      sequential batching (row 4389), Triton `pallas_call` batching, and route selection stay active
+      (raising `KernelRefused` when the named route refuses the call).
+    - Non-batchable forced kernels (`mosaic`, or CPU-interpreted `triton`) raise typed
       `selection.KernelRefused` rather than silently falling back to XLA.
     - Auto selection (`forced is None`) maps `portable_fn` cleanly."""
-    from dew.nn.kernels import generation, selection
+    from dew.nn.kernels import generation, selection, xla_products
 
     in_axes = jax.tree.map(lambda batched: 0 if batched else None, tuple(in_batched))
     chosen = selection.forced(generation.Choice.GROUPED_MATMUL)
-    if chosen in ('cutlass', 'xla'):
+    batchable = (chosen in ('cutlass', 'xla')
+                 or (chosen == 'triton' and not xla_products.interpreted(interpret_on_cpu)))
+    if batchable:
         mapped = jax.vmap(dispatch_fn, in_axes=in_axes)(*args)
     elif chosen is not None:
         raise selection.KernelRefused(
@@ -109,10 +113,9 @@ def _unfolded_vmap(dispatch_fn: Callable, portable_fn: Callable, in_batched, arg
 
 def batched_gemm(dispatch_fn: Callable, run_gemm: Callable, portable_fn: Callable, *, dense: bool,
                  prologue_axes: tuple, epilogue_axes: tuple,
-                 committed_device: Callable | None = None) -> Callable:
+                 committed_device: Callable | None = None, interpret_on_cpu: bool = False) -> Callable:
     """Wrap `_gemm`'s dispatched call with `custom_vmap` so dense `vmap` folds into one dense or grouped
     GEMM launch (row 6104)."""
-
     @jax.custom_batching.custom_vmap
     def dispatched(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter,
                    joined, beside, chained):
@@ -151,7 +154,7 @@ def batched_gemm(dispatch_fn: Callable, run_gemm: Callable, portable_fn: Callabl
                                     dense=not grouped)
                 batched_out = jax.tree.map(lambda y: y.reshape(axis_size, rows_each, *y.shape[1:]), flat_out)
                 return batched_out, jax.tree.map(lambda _: True, batched_out)
-        return _unfolded_vmap(dispatch_fn, portable_fn, in_batched, args)
+        return _unfolded_vmap(dispatch_fn, portable_fn, in_batched, args, interpret_on_cpu=interpret_on_cpu)
 
     if committed_device is None:
         return dispatched
@@ -159,10 +162,10 @@ def batched_gemm(dispatch_fn: Callable, run_gemm: Callable, portable_fn: Callabl
 
 
 def batched_gemm_t(dispatch_fn: Callable, run_gemm_t: Callable, portable_fn: Callable, *, dense: bool,
-                   prologue_axes: tuple, committed_device: Callable | None = None) -> Callable:
+                   prologue_axes: tuple, committed_device: Callable | None = None,
+                   interpret_on_cpu: bool = False) -> Callable:
     """Wrap `_gemm_t`'s dispatched call with `custom_vmap` so vmapped dense kernel gradients fold into one
     grouped `gemm_t` launch (row 6104)."""
-
     @jax.custom_batching.custom_vmap
     def dispatched(lhs, rhs, group_sizes, prologue_arrays, tables):
         return dispatch_fn(lhs, rhs, group_sizes, prologue_arrays, tables)
@@ -184,7 +187,7 @@ def batched_gemm_t(dispatch_fn: Callable, run_gemm_t: Callable, portable_fn: Cal
                 sizes_in = jnp.full((axis_size,), rows_each, jnp.int32)
                 grouped_out = run_gemm_t(lhs_flat, rhs_flat, sizes_in, pro_arrs, pro_ax, dense=False)
                 return grouped_out[:, None, :, :], True
-        return _unfolded_vmap(dispatch_fn, portable_fn, in_batched, args)
+        return _unfolded_vmap(dispatch_fn, portable_fn, in_batched, args, interpret_on_cpu=interpret_on_cpu)
 
     if committed_device is None:
         return dispatched
