@@ -18,7 +18,8 @@ from dew.nn.precision import power2
 from dew.nn.sharding import explicit_spec, varying_like
 
 
-def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array) -> jax.Array:
+def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array, *,
+             routes: tuple = ()) -> jax.Array:
     """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows, each output
     row its own input row's (no gather), and `factor` a packed matrix's fp32 scales broadcast against its
     output (`formats.fp8_factor`). Its transpose is the plain one, the cotangent times its factor through
@@ -27,22 +28,27 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
     after the pullback's sum, so a scale of 2**126 under cotangents that cancel pulls back 0, not inf - inf
     (ledger 1464), each value otherwise the plain transpose's, rounded where it rounds; a replicated factor
     joins after a checked `shard_map`'s devices sum their partials. A factor of each column, which the
-    transpose sums over, stays with the cotangent, as the plain transpose has it."""
+    transpose sums over, stays with the cotangent, as the plain transpose has it. `routes`, where `run`
+    reads `rows` through a gather table (`gemm`'s `gather`, among `operands`), is that table and the
+    operands of `run` over the rows it reads (`(gather, routed_operands)`): the plain transpose sums each
+    route's fp32 partial into its token before rounding, as `run`'s own pullback does, and the moved one
+    pulls each route back at its own power, summed into its token in fp32 after (a route whose products
+    cancel past fp32's largest keeps another route's small one)."""
     if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
         return run(rows.astype(jnp.bfloat16), *operands) * factor
     transpose = _Transpose(run, rows.shape, rows.dtype, frozenset(jax.typeof(rows).mat.varying),
                            explicit_spec(rows))
 
     def apply(residuals, moving):
-        scale, ran = residuals
+        scale, ran, _ = residuals
         return run(moving.astype(jnp.bfloat16), *ran) * scale
 
     def pullback(residuals, cotangent):
-        scale, ran = residuals
-        return transpose.declared(cotangent.astype(jnp.float32), scale.astype(jnp.float32), ran
+        scale, ran, routed = residuals
+        return transpose.declared(cotangent.astype(jnp.float32), scale.astype(jnp.float32), ran, routed
                                   ).astype(rows.dtype)
 
-    return generation.linear_map(apply, pullback, (factor, operands), rows)
+    return generation.linear_map(apply, pullback, (factor, operands, routes), rows)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,7 +65,7 @@ class _Transpose:
     def declared(self) -> Callable:
         """`value`, its derivative the plain transpose's (`tangent`)."""
         return contracted("test_a_ternary_weight_product_holds_every_order")(
-            declared_tangent(KernelGlue(), self.value, self.tangent, nondiff_argnums=(2,),
+            declared_tangent(KernelGlue(), self.value, self.tangent, nondiff_argnums=(2, 3),
                              symbolic_zeros=True))
 
     def operand_axes(self, ran) -> frozenset:
@@ -73,13 +79,15 @@ class _Transpose:
         return tuple(sorted(frozenset().union(*(jax.typeof(value).mat.varying for value in values))
                             - self.operand_axes(ran)))
 
-    def pulled(self, near, ran) -> tuple:
-        """`near` pulled back through `run`, summed first over the axes it alone varies over, and the axes
-        the partial varies over and the rows do not (each device's to sum after)."""
+    def pulled(self, near, ran, shape=None) -> tuple:
+        """`near` pulled back through `run` (at rows of `shape`, the rows' where None), summed first over the
+        axes it alone varies over, and the axes the partial varies over and the rows do not (each device's
+        to sum after)."""
         before = self.alone(ran, near)
         near = jax.lax.psum(near, before) if before else near
         # The pullback at zeros typed as the rows are: placed, and varying as the cotangent's partials do.
-        zeros = jnp.zeros(self.shape, jnp.bfloat16, out_sharding=self.placed)
+        zeros = jnp.zeros(self.shape if shape is None else shape, jnp.bfloat16,
+                          out_sharding=self.placed if shape is None else None)
         at = varying_like(zeros, near, *jax.tree.leaves(ran))
         (partial,) = jax.vjp(lambda each: self.run(each, *ran), at)[1](near)
         partial = partial.astype(jnp.float32)
@@ -89,7 +97,7 @@ class _Transpose:
     def summed(partial, excess):
         return jax.lax.psum(partial, excess) if excess else partial
 
-    def value(self, cotangent, scale, ran):
+    def value(self, cotangent, scale, ran, routed):
         """The plain transpose, the cotangent times its factor pulled back; where an entry of it is not
         finite, the moved one's (`moved`)."""
         plain = self.summed(*self.pulled(cotangent * scale, ran))
@@ -99,14 +107,14 @@ class _Transpose:
             # vary over that the rows do not, the operands', from types alone.
             before = self.alone(ran, cotangent, scale)
             excess = tuple(sorted(self.operand_axes(ran) - self.held))
-            rescued = self.moved(cotangent, scale, ran, before, excess)
+            rescued = self.moved(cotangent, scale, ran, routed, before, excess)
             return jnp.where(jnp.isfinite(plain), plain, rescued)
 
         # The moved pullback where the plain one is not finite alone: each device of a sum decides alike,
         # the plain transpose summed over its axes.
         return jax.lax.cond(jnp.all(jnp.isfinite(plain)), lambda: plain, moved)
 
-    def moved(self, cotangent, scale, ran, before, excess):
+    def moved(self, cotangent, scale, ran, routed, before, excess):
         """The transpose with each row moved by a power of two (`precision.power2`) so its largest
         cotangent-times-factor product's binade is `FACTORED_RESCUE` (a row's power shared by a sum's
         devices), and moved back after the sum, so what cancels leaves a remainder its bf16 rows hold. Each
@@ -123,16 +131,23 @@ class _Transpose:
         lift = jnp.where(top > -1024, FACTORED_RESCUE - top, 0)
         near = power2(power2(cotangent, -e_c) * power2(f, -e_f), e_c + e_f + lift)
         near = jax.lax.psum(near, before) if before else near
-        partial, excess = self.pulled(near, ran)
-        return power2(self.summed(partial, excess), -lift)
+        if not routed:
+            partial, excess = self.pulled(near, ran)
+            return power2(self.summed(partial, excess), -lift)
+        # Each route pulled back over the rows it reads, moved back by its own power, summed into its token
+        # in fp32 (`take`'s transpose, wide).
+        gather, routed_operands = routed
+        partial, excess = self.pulled(near, routed_operands, (gather.shape[0], self.shape[-1]))
+        moved_back = power2(self.summed(partial, excess), -lift)
+        return jnp.zeros(self.shape, jnp.float32).at[gather].add(moved_back)
 
-    def tangent(self, ran, primals, tangents):
+    def tangent(self, ran, routed, primals, tangents):
         """The plain transpose's derivative, `cotangent * scale` pulled back, every term of a perturbed
         operand alone (a scale held still meets no cotangent of its own: an infinite one is no NaN)."""
         (cotangent, scale), (d_cotangent, d_scale) = primals, tangents
         terms = [*(() if isinstance(d_cotangent, SymbolicZero) else (d_cotangent * scale,)),
                  *(() if isinstance(d_scale, SymbolicZero) else (cotangent * d_scale,))]
-        value = self.declared(cotangent, scale, ran)
+        value = self.declared(cotangent, scale, ran, routed)
         if not terms:
             return value, jnp.zeros_like(value)
         return value, self.summed(*self.pulled(functools.reduce(jnp.add, terms), ran))
