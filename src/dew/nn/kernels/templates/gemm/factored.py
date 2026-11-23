@@ -1,5 +1,5 @@
 """A packed matrix's product times its scales, `run(rows) * factor` (`factored`), its transpose range-safe:
-the fp8 and ternary products' (`gemm.fp8_weight_product`, `ternary.ternary_weight_product`), ledger 1464."""
+the NVFP4 and ternary products' (`gemm.nvfp4_product`, `ternary.ternary_weight_product`), ledger 1464."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
              gather: jax.Array | None = None) -> jax.Array:
     """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows (those
     `gather` reads where given, `gemm`'s `gather`, among `operands`), and `factor` a packed matrix's fp32
-    scales broadcast against its output (`formats.fp8_factor`), one a row's or one for all (a column's,
+    scales broadcast against its output (`formats.scale_factor`), one a row's or one for all (a column's,
     which the transpose sums over, is the plain product's). Its transpose is the plain one, the cotangent
     times its factor through `run`'s pullback, wherever that is finite; where it is not (a product past
     fp32's largest), the moved one (`_Transpose.moved`): each product formed from its cotangent's and
