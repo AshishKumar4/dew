@@ -490,3 +490,14 @@ def test_a_program_called_under_disable_jit_within_a_trace_stages_its_operations
         staged = jax.make_jaxpr(run)(jax.ShapeDtypeStruct((), jnp.float32))
     names = [equation.primitive.name for equation in staged.jaxpr.eqns]
     assert "sin" in names and "jit" not in names, names
+
+
+def test_a_program_of_a_static_argument_counted_from_the_end_binds_its_dynamic_operands_alone():
+    """A program whose static argument is named by a negative position (`static_argnums=-1`), called within
+    another jit: the program its trace made is bound to its one array, the static argument read as written,
+    no operand of it (row 12296's review P0: the negative position kept the static string among the operands
+    bound)."""
+    from dew.nn.kernels.options import owned_program
+
+    run = owned_program(lambda x, mode: x * 2.0 if mode == "double" else x, static_argnums=-1)
+    assert float(jax.jit(lambda y: run(y, "double"))(jnp.ones(()))) == 2.0
