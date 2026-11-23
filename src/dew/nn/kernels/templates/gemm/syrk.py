@@ -699,10 +699,12 @@ def measured_gram(target: generation.GpuTarget, shape: tuple[int, int, int], tra
     from pad+slice launches (row 11941)."""
     if generation.tpu(target):
         return False
+    arch = generation.architecture(target.generation)
+    family = None if arch is None else arch.family
     _, d0, d1 = shape
     m, k = (d1, d0) if transpose else (d0, d1)
-    if target.family == "mma.sync":
+    if family == "mma.sync":
         return m >= 256 and m % 128 == 0 and k % 32 == 0
-    if target.family == "wgmma":
+    if family == "wgmma":
         return m >= 256 and m % 256 == 0 and k % 64 == 0
     return False
