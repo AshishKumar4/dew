@@ -877,12 +877,12 @@ def test_a_count_of_passes_given_per_call_sows_whether_each_router_ran(rng):
     # The looped layers' routers are called once a pass, three; the others once, and ran.
     ran = {path: [bool(jnp.all(each)) for each in node] for path, node in leaves_by_path(sown).items()
            if path[-1] == ROUTER_RAN}
-    passed = {path: calls for path, calls in ran.items() if len(calls) == 3}
-    assert passed and all(calls == [True, True, False] for calls in passed.values()), ran
-    assert all(all(calls) for path, calls in ran.items() if path not in passed), ran
+    per_pass = {path: calls for path, calls in ran.items() if len(calls) == 3}
+    assert per_pass and all(calls == [True, True, False] for calls in per_pass.values()), ran
+    assert all(all(calls) for path, calls in ran.items() if path not in per_pass), ran
     indices = {path[:-1]: len(node) for path, node in leaves_by_path(sown).items()
                if path[-1] == ROUTER_INDICES}
-    assert all(indices[path[:-1]] == 3 for path in passed), indices
+    assert all(indices[path[:-1]] == 3 for path in per_pass), indices
 
 
 def test_a_count_of_passes_given_per_call_counts_and_weighs_the_routers_as_a_loop_of_that_many(rng):
