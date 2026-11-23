@@ -82,7 +82,10 @@ def test_a_steps_planner_certifies_its_launches_beside_the_trace_that_reaches_th
     launch's own compile, a `certified_` program, runs on a certification thread (`dew-certify`), none on a
     thread that traces. Certified within the planner's trace, a 4x1024 MoE step's 16 certifications compiled
     one after another (MC-6740-POOL), and an sm90 plan certified 64 of its 82 seconds in turn (FS-P5324-MAIN,
-    row 5324); each launch on the mesh's GPU (rows 6791, 7212)."""
+    row 5324). Its start traced first alone, as a trainer's start traces it (`Trainer._started`, targeting
+    its mesh, no device named to certify on), then the plan: each launch certified once, on the mesh's GPU,
+    where a start's launches traced outside the plan's certifying block were certified again (rows 6791,
+    6824, 7212)."""
     script = """
 import json
 import threading
@@ -109,10 +112,15 @@ model = models.build("causal_transformer", vocab_size=VOCAB,
 trainer = Trainer(LMObjective(model, tokens), optax.adam(1e-3), key=jax.random.key(0),
                   mesh=MeshSpec().build(gpus("sm90")), layout=Layout(min_shard=TINY_SHARD))
 jax.monitoring.register_event_duration_secs_listener(heard)
-started = bool(compile_ahead(trainer, token_rows(VOCAB, BATCH, tokens + 1)).starts)
+from dew.nn.kernels.generation import assumed
 from dew.nn.kernels.templates import report
+with assumed("sm90"):
+    trainer._started()
+started = bool(compile_ahead(trainer, token_rows(VOCAB, BATCH, tokens + 1)).starts)
 mesh_devices = {str(device) for device in trainer.device_mesh.devices.flat}
-certified = [[each.op, str(each.device)] for each in report.certifications()]
+# A launch's identity: its op, config, mode and its kernels' modules.
+certified = [[each.op, repr(each.config), each.pulled, sorted(module for module, _ in each.kernels.values()),
+              str(each.device)] for each in report.certifications()]
 print(json.dumps({"started": started, "compiled_on": compiled_on, "certified": certified,
                   "mesh": sorted(mesh_devices)}))
 """
@@ -121,5 +129,7 @@ print(json.dumps({"started": started, "compiled_on": compiled_on, "certified": c
     certifying = [thread for thread, name in result["compiled_on"] if "certified_" in name]
     assert result["started"], result
     assert certifying and all(thread.startswith("dew-certify") for thread in certifying), result
-    # Each launch certified on the mesh's compile-only GPU, never the host's (rows 6791, 7212).
-    assert result["certified"] and {each[1] for each in result["certified"]} <= set(result["mesh"]), result
+    # Each launch certified once, on the mesh's compile-only GPU, never the host's (rows 6791, 6824, 7212).
+    launches = [repr(each[:4]) for each in result["certified"]]
+    assert launches and len(set(launches)) == len(launches), result["certified"]
+    assert {each[4] for each in result["certified"]} <= set(result["mesh"]), result

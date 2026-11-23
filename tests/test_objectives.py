@@ -109,17 +109,39 @@ def test_the_initializer_dispatches_through_the_public_init():
                 assert nonzero == 0, f"the override was bypassed; {nonzero} values are nonzero"
 
 
-def test_an_objectives_drawn_shapes_and_axes_compute_nothing():
-    """An objective's drawn shapes (`drawn_shapes`) and its parameters' axes (`parameter_axes`), read on a
-    compile-only GPU as the default device, on which nothing computes (a GPU tier's prepare): each traces its
-    draw for shapes alone, its key made within the trace, where its key made outside raised on such a
-    device and the tier ran the test unprepared (rows 12147-12150)."""
+@pytest.mark.parametrize("read", ["drawn shapes", "parameter axes", "held parameter axes"])
+def test_an_objectives_drawn_shapes_and_axes_compute_nothing(read):
+    """An objective's drawn shapes (`drawn_shapes`) and its parameters' axes (`parameter_axes`: a fresh
+    objective's draw, and a held tree's, which redraws), each read alone on a compile-only GPU as the
+    default device, on which nothing computes (a GPU tier's prepare): each traces its draw for shapes alone,
+    its key made within the trace, where its key made outside raised on such a device and the tier ran the
+    test unprepared (rows 12147-12150)."""
     from dew.nn.kernels.generation import compile_only_gpus
 
-    objective = lm_objective()
+    held = jax.eval_shape(lm_objective().init, jax.random.key(0)) if read.startswith("held") else None
+    objective = lm_objective(held)
     with jax.default_device(compile_only_gpus("sm80")[0]):
-        shapes, axes = objective.drawn_shapes(), objective.parameter_axes
-    assert jax.tree.leaves(shapes) and axes
+        found = objective.drawn_shapes() if read == "drawn shapes" else objective.parameter_axes
+    assert jax.tree.leaves(found) or found
+
+
+def test_an_objectives_drawn_shapes_trace_its_held_tree_as_the_arrays_it_stands_for():
+    """An objective holding a tree of shapes (`jax.ShapeDtypeStruct`s: a resumed run's base) whose `init`
+    reads its held leaves as arrays (a head's start transposing the base's vocabulary table): its drawn
+    shapes trace the held tree as the draw's arguments, the arrays it stands for, where closed over it was
+    handed to `init` as the structs themselves, which have no array's methods (row 12147's review, row
+    7386)."""
+    from dew.batch import unboxed
+    from dew.objectives.lm import LMObjective
+
+    class Transposing(LMObjective):
+        def init(self, key, variables=None):
+            return jax.tree.map(lambda leaf: leaf.T.T, LMObjective.init(self, key, variables))
+
+    tiny = lm_objective()
+    held = jax.eval_shape(tiny.init, jax.random.key(0))
+    shapes = Transposing(tiny.model, seq_len=4, variables=held).drawn_shapes()
+    assert jax.tree.map(np.shape, shapes) == jax.tree.map(np.shape, unboxed(held))
 
 
 def test_the_initializer_and_init_return_the_same_tree():
