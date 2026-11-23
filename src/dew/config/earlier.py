@@ -233,7 +233,13 @@ def _update_and_fit(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     tokens, batches = fields.get("update_tokens"), fields.get("accumulation", 1)
     # Under a mesh of stages the step's split is the microbatches its stages feed (`microbatches`), which
     # its outer split never was; elsewhere it is the split.
-    split = fields.get("microbatches") if _staged(kept.get("mesh")) else fields.get("split")
+    staged = _staged(kept.get("mesh"))
+    if staged and fields.get("split") not in (None, 1):
+        raise ValueError(f"an earlier run split its pipeline's step in {fields['split']} beside the "
+                         "microbatches its stages fed, which this Dew's fit does not hold apart "
+                         "(`FitPolicy.split` is the microbatches a pipeline feeds): resume it under the Dew "
+                         "that saved it")
+    split = fields.get("microbatches") if staged else fields.get("split")
     if tokens is not None:
         kept["update"] = {"tokens": tokens}
     elif batches != 1:
@@ -291,7 +297,7 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     given = fields.get("optimizer_opts") or {}
     assert isinstance(given, Mapping), given
     opts: dict[str, _records.JSON] = dict(given)
-    masked = _decay_mask(opts.pop("mask", None), bool(fields.get("spared", True)))
+    mask = opts.pop("mask", None)
     assert isinstance(named, str), named
     named = EARLIER_OPTIMIZER_PATHS.get(named, named)
     stated = {key: fields[key] for key in ("b1", "b2", "weight_decay") if fields.get(key) is not None}
@@ -303,26 +309,56 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
             stated["state_dtype"] = "params"
         elif moments != ("float32", "float32"):
             stated["state_dtype"] = list(moments)
-    settings = {**opts, **stated, **masked}
+    settings = {**opts, **stated}
+    kept = {key: value for key, value in fields.items() if key not in EARLIER_OPTIMIZER_FIELDS}
     if named in registry.optimizers.paths and named != "optax":
+        settings, kept = _decay_mask(mask, registry.optimizers[named], settings, kept)
         optimizer = {"class": named, "fields": settings}
     else:
-        optimizer = {"class": "optax", "fields": {"path": named, "settings": settings}}
-    kept = {key: value for key, value in fields.items() if key not in EARLIER_OPTIMIZER_FIELDS}
+        # An Optax factory takes its mask as it took it, the config's sparing writing its own over it alike.
+        masked = {} if mask is None else {"mask": mask}
+        optimizer = {"class": "optax", "fields": {"path": named, "settings": {**settings, **masked}}}
     return {**kept, "optimizer": optimizer}
 
 
-def _decay_mask(mask: _records.JSON, spared: bool) -> dict[str, _records.JSON]:
-    """An earlier optimizer's `mask` among its options (`optimizer_opts`) as its spec's settings: its
-    config's sparing (`OptimConfig.spared`, on by default) wrote its own mask over it, so it decayed as it
-    spared; unspared, a mask of False decayed no parameter, its decay none (`weight_decay` 0), and one of
-    True or None every parameter, as unspared. Any other mask named a tree no record rebuilds, refused."""
-    if spared or mask is None or mask is True:
-        return {}
-    if mask is False:
-        return {"weight_decay": 0.0}
-    raise ValueError(f"an earlier run masked its decay by {mask!r}, which no record of this Dew states: set "
-                     "OptimConfig.spared or its param groups' (ParamGroup.spared) in its place")
+type _Fields = dict[str, _records.JSON]
+
+
+def _decay_mask(mask: _records.JSON, spec: type, settings: _Fields,
+                config: _Fields) -> tuple[_Fields, _Fields]:
+    """An earlier optimizer's `mask` among its options (`optimizer_opts`) as its spec's `settings` and its
+    config's param groups (`config`'s `param_groups`), each returned. Where the config spared its decay
+    (`OptimConfig.spared`, on by default) its own mask was written over it, as a group's that spared
+    (`ParamGroup.spared`, off by default) was, every group reading it alike whatever the config said. A mask
+    of True or None decayed every parameter, as unspared; one of False decayed none where it was read: its
+    decay 0 there, the config's ungrouped, each unspared group's grouped. Refused where that is not the same
+    optimizer state: Adam's coupled decay (`Adam.COUPLED`) kept a decay step of its own while it decayed,
+    which a decay of 0 drops; and a mask naming a tree, which no record rebuilds."""
+    groups = config.get("param_groups") or []
+    assert isinstance(groups, list), groups
+    if mask is None or mask is True:
+        return settings, config
+    held = [group for group in groups if isinstance(group, Mapping) and not group.get("spared", False)]
+    read = held if groups else ([] if config.get("spared", True) else [config])
+    if not read:
+        return settings, config
+    if mask is not False:
+        raise ValueError(f"an earlier run masked its decay by {mask!r}, which no record of this Dew states: "
+                         "set OptimConfig.spared or its param groups' (ParamGroup.spared) in its place")
+    default = next((field.default for field in dataclasses.fields(spec) if field.name == "weight_decay"), 0.0)
+    decays = [group.get("weight_decay") if group.get("weight_decay") is not None
+              else settings.get("weight_decay", default) for group in read]
+    from dew.optim import Adam
+
+    if issubclass(spec, Adam) and spec.COUPLED and any(decays):
+        raise ValueError("an earlier run masked off Adam's coupled weight decay, whose state held a decay "
+                         "step that this Dew's Adam holds only where it decays: resume it under the Dew that "
+                         "saved it, or start it afresh with weight_decay 0")
+    if not groups:
+        return {**settings, "weight_decay": 0.0}, config
+    unmasked: list[_records.JSON] = [{**group, "weight_decay": 0.0} if group in held else group
+                                     for group in groups]
+    return settings, {**config, "param_groups": unmasked}
 
 
 def _recorded_class(name: str) -> type | None:
