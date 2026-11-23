@@ -1522,18 +1522,24 @@ def transferred(query, key, value, g, beta, starts=None, *, chunk_size: int = CH
                              forms.init(jax.tree.map(lambda x: x[0], chunks)))
         prepared = jax.vmap(functools.partial(forms.prepare, transition=True))(chunks)
         walks = jax.vmap(lambda chunk: forms.step(start, chunk))(prepared)
-        count = jax.tree.leaves(chunks)[0].shape[0]
-        while count > 1:
-            pairs, odd = count // 2, count % 2
-            first, later = (jax.tree.map(lambda x, at=at: x[at:2 * pairs:2], walks) for at in (0, 1))
-            joined = jax.vmap(lambda a, b: forms.merge(a, b, None))(first, later)
-            if odd:
-                joined = jax.tree.map(lambda j, x: jnp.concatenate([j, x[-1:]]), joined, walks)
-            walks = joined
-            count = pairs + odd
-        return walks.transfer[0]
+        return _joined(walks, lambda a, b: forms.merge(a, b, None)).transfer
 
     return jax.vmap(jax.vmap(walked))(operands)
+
+
+def _joined(walks, merge):
+    """Consecutive walks `[n, ...]` (a pytree along its leading axis) joined into one by an associative
+    `merge(earlier, later)`, pairwise a level at a time, an odd one carried to the next level: log2(n)
+    levels of batched merges."""
+    count = jax.tree.leaves(walks)[0].shape[0]
+    while count > 1:
+        stop, odd = 2 * (count // 2), count % 2
+        first, later = (jax.tree.map(lambda x, at=at, stop=stop: x[at:stop:2], walks) for at in (0, 1))
+        joined = jax.vmap(merge)(first, later)
+        if odd:
+            joined = jax.tree.map(lambda j, x: jnp.concatenate([j, x[-1:]]), joined, walks)
+        walks, count = joined, count // 2 + odd
+    return jax.tree.map(lambda x: x[0], walks)
 
 
 def _unit_pairs(hooks: recurrence.Hooks) -> bool:

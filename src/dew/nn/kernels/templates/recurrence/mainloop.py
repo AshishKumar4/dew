@@ -1608,17 +1608,10 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
                                smem=landing["keyed" if call.per_key else "block"])
             return carry, accumulators
 
-        # Both rows' blocks a step while both have one, then the longer row's alone.
-        both = min(key_steps, value_steps)
-        alone = functools.partial(step, keys=False) if value_steps > key_steps else functools.partial(
-            step, values=False)
-        segments = ((step, 0, both), (alone, both, steps)) if both < steps else ((step, 0, steps),)
-        segments = segments if value_steps else ()
-        return mosaic.Walk(walked, step, steps=steps, segments=segments,
+        return mosaic.Walk(walked, step, steps=steps, segments=_paired_segments(step, key_steps, value_steps),
                            once={name: view for name, view in views.items() if name in once},
                            prologue=None if streamed else lambda: read(None))
 
-    given = _weighted_blocks(call, keyed)
     values = value_width if call.delta else 0
     out_type = ((held.shape(call.heads * width), held.shape(call.heads * value_width)) * call.delta
                 + (held.shape(call.heads * width),) * call.per_key)
@@ -1641,11 +1634,7 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
                          name=None if call.delta else "recurrence_decayed_keys",
                          # A key block's walk a program a tile; a decay a head's one step a tile, persistent.
                          persistent=not call.per_key,
-                         # A key block's streams staged at its row: a tile slices only whole swizzle rows.
-                         swizzles={f"{name}{p}": resources.widest_swizzle(operand.stored, keyed)
-                                   for name, (_, operand) in given.items()
-                                   if name in ("keys", *PREFIX_STREAMS)
-                                   for p in range(operand.parts)})(*inputs)
+                         swizzles=_weighted_swizzles(call, keyed))(*inputs)
 
 
 def _weighted_views(call: Call, refs: tuple, n, h, steps: tuple[int, int]) -> tuple[dict, Callable]:
@@ -1688,6 +1677,27 @@ def _weighted_views(call: Call, refs: tuple, n, h, steps: tuple[int, int]) -> tu
         return rows.get("write"), None if call.per_key else (rows["gate"], rows["low"])
 
     return views, read
+
+
+def _paired_segments(step: Callable, key_steps: int, value_steps: int) -> tuple:
+    """`_weighted`'s walk's segments where it walks a value row beside its key row (`value_steps`): both
+    rows' blocks a step while both have one, then the longer row's alone (`step`'s `keys` or `values`
+    false); none where it walks no values."""
+    steps, both = max(key_steps, value_steps), min(key_steps, value_steps)
+    if not value_steps:
+        return ()
+    if both == steps:
+        return ((step, 0, steps),)
+    alone = functools.partial(step, **{"keys" if value_steps > key_steps else "values": False})
+    return ((step, 0, both), (alone, both, steps))
+
+
+def _weighted_swizzles(call: Call, keyed: int) -> dict:
+    """`_weighted`'s key-block streams staged at their row (a tile slices only whole swizzle rows): the keys
+    and a decay a key dimension's prefix, each part's widest swizzle at `keyed` columns."""
+    return {f"{name}{p}": resources.widest_swizzle(operand.stored, keyed)
+            for name, (_, operand) in _weighted_blocks(call, keyed).items()
+            if name in ("keys", *PREFIX_STREAMS) for p in range(operand.parts)}
 
 
 def _weighted_once(call: Call) -> tuple[str, ...]:
