@@ -424,27 +424,41 @@ def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
         np.testing.assert_array_equal(new, old)
 
 
+DECISION_SEEDS = 32
+"""Check 1's declared seeds for a decision step over a scanned backbone against its ordinary backward: the
+two arms share each draw's state and batch."""
+
+
 @pytest.mark.parametrize("grouped, input_lm, context_backbone", [
-    (False, 0.0, False),
-    (True, 0.0, False),
-    (False, 0.25, False),
-    (False, 0.0, True),
-], ids=["decision", "decision-grouped", "decision-input-lm", "decision-context-backbone"])
-def test_a_decision_step_over_a_scanned_backbone_trains(grouped, input_lm, context_backbone):
+    pytest.param(False, 0.0, False, id="decision", marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
+    pytest.param(True, 0.0, False, id="decision-grouped",
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
+    pytest.param(False, 0.25, False, id="decision-input-lm",
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
+    pytest.param(False, 0.0, True, id="decision-context-backbone",
+                 marks=pytest.mark.check1_shards(seeds=32, per_task=32)),
+])
+def test_a_decision_step_over_a_scanned_backbone_trains_as_its_ordinary_backward(grouped, input_lm,
+                                                                                   context_backbone):
     """A decision objective's scanned backbone, which its step updates in its backward
     (`dew.nn.in_backward`), runs inside `component('backbone')`, so its plan keys its run under
-    `backbone/stages/...` and two steps train every parameter to finite values (row 12076: the run's path
-    lacked `backbone`, raising `KeyError: 'stages'`), its parameters grouped or not. With `input_lm` or a
+    `backbone/stages/...` (row 12076: the run's path lacked `backbone`, raising `KeyError: 'stages'`), and two
+    steps leave every parameter on par with the same steps through the ordinary backward of an unscanned
+    backbone (check 1, against one device's float64), its parameters grouped or not. With `input_lm` or a
     context the backbone encodes in its own pass, the loss differentiates the backbone twice a step, so the
     step updates none in its backward (`Objective._updates_in_backward`) and trains as the ordinary scan
-    does; a loss that differentiated a run twice and said nothing is refused
+    does, on par alike (review of row 12076's fix: finite values alone were checked); a loss that
+    differentiated a run twice and said nothing is refused
     (`test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the_backward`)."""
+    from arm_forms import as_given
     from decision_support import decision_rows
+    from test_stage_local import wide
 
-    from dew.data.dataset import DataPartition, Loader
+    from dew.data.dataset import DataPartition
     from dew.data.text import ByteTokenizer
     from dew.decision import Choice, DecisionObjective, Example, Specials
     from dew.decision.layout import SegmentLayout
+    from dew.distributed.batches import shard_batch
     from dew.nn.cross_attention import CrossAttention
 
     team = Choice("Which team?", ["billing", "technical"])
@@ -452,8 +466,9 @@ def test_a_decision_step_over_a_scanned_backbone_trains(grouped, input_lm, conte
         Example(text, {"team": team}, {"team": label}, context={"plan": "pro"} if context_backbone else None)
         for text, label in (("charged twice", 0), ("site down", 1))
     ] * 2
-    def backbone(*, scan: bool):
-        model = decoder(scan=scan, vocab_size=256, max_seq_len=32, num_layers=3)
+
+    def backbone(*, scan: bool, dtype: str = "float32"):
+        model = decoder(scan=scan, dtype=dtype, vocab_size=256, max_seq_len=32, num_layers=3)
         return model.with_cross_attention(CrossAttention(layer_ids=(0,), context_length=16)) if (
             context_backbone) else model
     # eps=1e-4 keeps AdamW from magnifying 1e-8 rounding noise on DecisionHead's shift-invariant k_proj.bias.
@@ -469,24 +484,51 @@ def test_a_decision_step_over_a_scanned_backbone_trains(grouped, input_lm, conte
             "layout": layout, "input_lm": input_lm,
             "context_encoder": "backbone" if context_backbone else "table"}
     seed = DecisionObjective(backbone(scan=True), **opts)
-    variables = nn.unbox(seed.init(jax.random.key(0)))
     batch = next(decision_rows(examples, 2, objective=seed.data()).train(DataPartition()))
 
-    def run_once(*, scan: bool):
-        objective = DecisionObjective(backbone(scan=scan), variables=variables, **opts)
-        data = Loader(train=lambda partition, b=batch: iter([b, b]), val=None, records=2, batch=2)
-        run = Trainer(objective, optimizer, key=jax.random.key(0), mesh=MeshSpec(),
+    def built(*, scan: bool, exact: bool = False) -> Trainer:
+        model = backbone(scan=scan, dtype="float64" if exact else "float32")
+        run = Trainer(DecisionObjective(model, **opts), optimizer, key=jax.random.key(0), mesh=MeshSpec(),
                       layout=Layout(min_shard=2**30), fit=FitPolicy(split=1), checkpoints=None, tracker=None)
         run.device_mesh = MeshSpec().build(jax.devices()[:1])
-        return run.fit(data, steps=2, log_every=2)
+        run.validate(steps=2)
+        return run
 
-    trained = run_once(scan=True)
-    assert int(jax.device_get(trained.updates)) == 2
-    before = jax.tree.leaves(variables["params"])
-    after = jax.tree.leaves(jax.device_get(trained.variables["params"]))
-    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in after)
-    assert any(not np.array_equal(np.asarray(old), np.asarray(new)) for old, new in zip(before, after,
-                                                                                         strict=True))
+    with jax.enable_x64(new_val=False):
+        start = built(scan=False).initial_state()
+    init, made = jax.jit(seed.init), {}
+
+    def initial(drawn: int):
+        # Each seed's own variables, the optimizer state every draw starts from.
+        if drawn not in made:
+            with jax.enable_x64(new_val=False):
+                variables = nn.unbox(init(jax.random.key(drawn)))
+                variables = jax.tree.map(lambda held, new: jnp.asarray(new, held.dtype), start.variables,
+                                         variables)
+                made[drawn] = dataclasses.replace(start, variables=variables)
+        return made[drawn]
+
+    def stepped(*, scan: bool, exact: bool = False):
+        compiled = []
+
+        @as_given
+        def run(drawn):
+            if not compiled:
+                compiled.append(built(scan=scan, exact=exact))
+            steps = compiled[0]
+            first = initial(int(drawn))
+            state = steps.staged(wide(first) if exact else jax.tree.map(jnp.copy, first))
+            placed = shard_batch(steps.device_mesh, batch)
+            if len(compiled) == 1:
+                compiled.append(steps.compile(state, placed))
+            for _ in range(2):
+                state, *_ = compiled[1](state, placed)
+            return jax.device_get(steps.stored(state).variables["params"])
+        return run
+
+    assert_as_exact(stepped(scan=True), stepped(scan=False), lambda drawn: (np.int64(drawn),),
+                    "a decision step over a scanned backbone", seeds=DECISION_SEEDS,
+                    truth_fn=stepped(scan=False, exact=True))
 
 
 def test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the_backward():

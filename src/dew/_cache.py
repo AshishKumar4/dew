@@ -173,7 +173,8 @@ def read_kept(path: Path) -> JSON | None:
     partial or truncated file), in which case its maker makes it again, that miss logged."""
     try:
         text = path.read_text()
-    except OSError:
+    except OSError as unopened:
+        _log.debug("no record kept at %s to read (%s)", path, unopened)
         return None
     try:
         return json.loads(text)
