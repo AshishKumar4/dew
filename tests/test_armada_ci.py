@@ -2356,8 +2356,9 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base_and_shows
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    # The step that maps the gates onto armada, by what it runs, whatever it is titled.
     [step] = [step for step in workflow["jobs"]["lint"]["steps"]
-              if step.get("name") == "Every cheap gate (tools/check.sh), each on armada"]
+              if "armada map" in step.get("run", "") and "gates_told.py" in step.get("run", "")]
     gates = [line.split("\t")[0] for line in (ROOT / "tools/check_gates").read_text().splitlines()
              if line and not line.startswith("#")]
     # A checkout whose main moved on past its merge-base, as CI's (fetch-depth 0) holds it.
@@ -2396,13 +2397,16 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base_and_shows
         ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
                              env=environment)
         assert ran.returncode == (1 if red else 0), ran.stdout + ran.stderr
-        # The last gate's line, and under it, when red, what it printed.
-        assert ran.stdout.splitlines()[-3 if red else -1:] == (
-            [f"{red}: exit 1 in 1 s", "  | ==src/a.py:[1:8]", "  | ==src/b.py:[3:10]"] if red
-            else [f"{gates[-1]}: exit 0 in 1 s"]), ran.stdout
-        assert (tmp_path / "items").read_text().splitlines() == gates
+        # Each gate's verdict as armada gave it (RUNNER_TEMP/lint.jsonl, which gates_told.py reads), and a red
+        # one's tail, which the job shows under its name.
+        told = [json.loads(line) for line in (tmp_path / "lint.jsonl").read_text().splitlines()]
+        assert {each["item"]: each["exitCode"] for each in told} == {gate: int(gate == red) for gate in gates}
+        assert {each["item"]: each["tail"] for each in told if each["exitCode"]} == (
+            {red: "==src/a.py:[1:8]\n==src/b.py:[3:10]"} if red else {})
+        assert all(line in ran.stdout for line in ("==src/a.py:[1:8]", "==src/b.py:[3:10]")) == bool(red)
+        assert set((tmp_path / "items").read_text().split()) == set(gates)
         words = (tmp_path / "words").read_text().split()
-        assert words[:2] == ["map", f"--commit={'a' * 40}"] and words[-2:] == [base, "{item}"]
+        assert {f"--commit={'a' * 40}", base} <= set(words)
         assert [word for word in words if word.startswith("--priority")] == priority
 
 

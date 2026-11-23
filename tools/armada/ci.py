@@ -197,12 +197,13 @@ row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_plac
 grouped_rows = rows.grouped_rows
 # The test cache's records (records.py), by the names this file and its tests read them.
 (store, record_key, green_key, main_key, baseline_key, epoch_key, Unread, UNREAD, epoch, begun, standing,
- recorded, record_of, written, listed, CACHE_PREFIX, RECORD_TRIES, MAINLINE, mainline, merge_base,
- given_mainline) = (
+ recorded, record_of, written, listed, CACHE_PREFIX, RECORD_TRIES, epochs_of, EPOCH_SECONDS, MAINLINE,
+ mainline, merge_base, given_mainline) = (
     records.store, records.record_key, records.green_key, records.main_key, records.baseline_key,
     records.epoch_key, records.Unread, records.UNREAD, records.epoch, records.begun, records.standing,
     records.recorded, records.record_of, records.written, records.listed, records.CACHE_PREFIX,
-    records.RECORD_TRIES, records.MAINLINE, records.mainline, records.merge_base, records.given_mainline)
+    records.RECORD_TRIES, records.epochs_of, records.EPOCH_SECONDS, records.MAINLINE, records.mainline,
+    records.merge_base, records.given_mainline)
 VARIED, varied, cut_of, place_variant = rows.VARIED, rows.varied, rows.cut_of, rows.place_variant
 shares, collection = (_loaded(HERE / f"{name}.py") for name in ("shares", "collection"))
 gpu_measures = _loaded(HERE / "measures.py")
@@ -507,10 +508,8 @@ def head_commit() -> str | None:
 
 
 def baselined(python: str, place: str, held: str, token: str, ran: Mapping) -> bool:
-    """Whether a dry prepare's green row (`ran`, `place`, graded) on class `held` has this commit's baseline,
-    the cells it left unprepared (`baseline_key`), written now, tried once; True where none is due (a row
-    that is no green dry prepare, or no commit). A green row with none stands stale (`unbaselined`): main
-    landed with its baseline lost would let the next train read a new omission as main's first run."""
+    """Whether a dry prepare's green row (`ran`) on class `held` has this commit's baseline (`baseline_key`)
+    written now, tried once, or none is due; a green row with none stands stale (`unbaselined`)."""
     if (commit := head_commit()) is None or ran.get("exitCode") != 0 or "unprepared" not in ran:
         return True
     return written(baseline_key(commit, python, place, held), token,
@@ -518,11 +517,8 @@ def baselined(python: str, place: str, held: str, token: str, ran: Mapping) -> b
 
 
 def named_at_commit(python: str, place: str, held: str, key: str, token: str) -> None:
-    """Row `place`'s green run of `key` on class `held` named this commit's own (`main_key`), tried once: a
-    name lost costs a later lookup that row's rerun, never this task its deadline (review: a kept task of 120
-    rows retrying each write against an unavailable Worker would wait past its 1,800 s). A dry prepare's row
-    is named only once its baseline is written (`baselined`): a name with no baseline beside is a baseline
-    lost, which prepares.py's `before` reads as unread, never as main's first run of the file."""
+    """Row `place`'s green run of `key` on class `held` named this commit's own (`main_key`), tried once; a
+    dry prepare's only once its baseline is written (`baselined`), so a name alone is a baseline lost."""
     if (commit := head_commit()) is not None:
         written(main_key(commit, python, place, held), token, json.dumps({"key": key}).encode(), tries=1)
 
@@ -1225,12 +1221,13 @@ def stale_row(python: str, name: str, group: str, why: str) -> dict:
             **grading.red_as(grading.STALE, [])}
 
 
-def unbaselined(python: str, found: dict) -> dict:
-    """A dry prepare's green row whose baseline the CI store did not take (`baselined`), said stale: it
-    runs again rather than stand green with no baseline main's next prepare is held to."""
-    _, name, group = parsed_row(found["name"])
-    return stale_row(python, name, group,
-                     "its prepare's baseline was not written to the CI store; it runs again")
+def unbaselined(python: str, rows: list[dict], unnamed: Container[str]) -> list[dict]:
+    """`rows`, each dry prepare's green row whose baseline the CI store did not take (`unnamed`,
+    `baselined`) said stale: it runs again rather than stand green with no baseline."""
+    why = "its prepare's baseline was not written to the CI store; it runs again"
+    named = {found["name"]: parsed_row(found["name"]) for found in rows if found["name"] in unnamed}
+    return [stale_row(python, named[found["name"]][1], named[found["name"]][2], why) if found["name"] in named
+            else found for found in rows]
 
 
 def stale_cost(name: str, group: str, reading: Reading) -> float:
@@ -1543,11 +1540,8 @@ def watched_pytest(command: list[str], environment: dict[str, str], deadline: fl
 def unrun(python: str, tests: list[str], group: str, site: re.Match[str] | None, cache: str, common: str,
           network: bool, kept: Mapping[str, tuple[str, str]] | None,
           judged: Callable[[list[dict]], list[dict]] | None, deadline: float) -> tuple[list[dict], list[str]]:
-    """`tested`'s rows it need not run, and the tests it must: a green row reused as the cache's policy allows
-    (never a check-1 site's map task, its draws its judge's), a kept row afforded within `deadline`
-    (`afforded`, its stale rows among them), graded by `judged` first. A reused row's run is named the
-    commit's (`named_at_commit`) only as its grade leaves it green, its baseline the cells it keeps then
-    (review: named before its grade, a reuse graded red had published its cells as main's)."""
+    """`tested`'s rows it need not run (reused, no site's map task; kept, `afforded`), graded by `judged`,
+    and the tests it must; a reused row named the commit's only as its grade leaves it green."""
     began = time.monotonic()
     named: dict[str, tuple[str, str]] = {}
     rows = ([] if cache == "off" or (site is not None and site["start"] is not None)
@@ -1563,8 +1557,24 @@ def unrun(python: str, tests: list[str], group: str, site: re.Match[str] | None,
         for found in rows:
             if found["name"] in named and found["exitCode"] == 0 and found["name"] not in unnamed:
                 named_at_commit(python, found["name"], *named[found["name"]], token)
-        rows = [unbaselined(python, found) if found["name"] in unnamed else found for found in rows]
+        rows = unbaselined(python, rows, unnamed)
     return rows, tests
+
+
+def unstarted(out: Path, rows: list[dict], python: str, tests: list[str], group: str) -> int:
+    """`rows`, and each of `tests` stale (never red for time not given), where the task's time went first."""
+    why = "its task's time was spent before pytest began (its reuse and epochs read), so it ran no test"
+    out.write_text(json.dumps({"rows": rows + [stale_row(python, name, group, why) for name in tests]}))
+    return 0
+
+
+def epochs_first(python: str, tests: list[str], group: str, common: str, network: bool, ends: float,
+                 recording: bool) -> Mapping[str, str | None] | None:
+    """A recording run's rows' epochs (`epochs_of`) within EPOCH_SECONDS and its task's end (`ends`)."""
+    if not recording:
+        return None
+    return epochs_of(python, [row(python, name, group) for name in tests], common, device_class(network),
+                     min(time.monotonic() + EPOCH_SECONDS, ends))
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
@@ -1579,6 +1589,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     process of the files under other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the
     same cut of them, its rows and their records named apart (`varied`); `judged` grades its rows first."""
     began = time.monotonic()
+    ends = began + deadline  # The task's one end: its reuse's lookups, its epochs and its pytest within it.
     group = varied(split, variant)
     site = session.SITE.fullmatch(group)
     rows, tests = unrun(python, tests, group, site, cache, common, network, kept, judged, deadline)
@@ -1598,8 +1609,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     resumes = recorded and site is None and coverage is None and not variant.startswith(prepares.PREPARE)
     done_before, cold_before, peak_before = (progress.resumed(tests, grading.owning) if resumes
                                              else ({}, set(), None))
-    aside = out.with_name(f"{out.name}.set-aside.json")
-    aside.write_text(json.dumps(sorted(done_before)))
+    (aside := out.with_name(f"{out.name}.set-aside.json")).write_text(json.dumps(sorted(done_before)))
+    # A traced run's rows, timed under tracing, are no rows to reuse, nor the census's, nor a resumed one's,
+    # whose earlier attempt's opens no record holds; no other read their epochs (`epochs_first`).
+    recording = (recorded and coverage is None and not (environ and check1_wire().CENSUS in environ)
+                 and not done_before)
+    began_in = epochs_first(python, tests, group, common, network, ends, recording)
     command = [*session.pytest_command(run, tests, split), *(["-p", "progress"] if resumes else [])]
     with temp_roots.temp_root() as root:
         environment = session.pytest_environment({
@@ -1609,8 +1624,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
             **({session.SPLIT_EVENLY: "1"} if prepares.prepared_group(group, VARIED) else {})})
         if network:
             environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
+        # What is left of the task's end, read once as its pytest starts (`unstarted` where none is).
+        if (left := ends - time.monotonic()) <= 0:
+            return unstarted(out, rows, python, tests, group)
         returncode, output, expired, dump, opened, wrote, evidence = watched_pytest(
-            command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
+            command, environment, left, grace, pid, python, evidence_name(python, tests, group), began)
     # This attempt's peak, and an earlier attempt's where it ran tests this row carries (`progress.resumed`).
     peaks = [found for found in (progress.task_peak(host), peak_before) if found is not None]
     peak = max(peaks, default=None)
@@ -1627,8 +1645,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # exit the interrupt's, not its; and one with none is not graded but run again (`grading.STALE`), never
     # a red of its tests (Main, 2026-11-09: train 745 filed six files packed beside a hung one as reds
     # "at 0.0 s").
-    # A task stalled before any test started (its collection) has no such file: each of its rows is the
-    # deadline's.
+    # A task stalled before any test started (its collection) has no such file: each row is the deadline's.
     # A row named by a test node (`file::test`) is graded by its own cases (`grading.of`), its file's
     # collection and visits its own: a GPU lane runs each such row in a task of its own (`lane_units`).
     running = stood[-1] if stood else None
@@ -1675,15 +1692,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      **later_judged(site)})
     ran = judged(ran) if judged else ran
     out.write_text(json.dumps({"rows": rows + ran}))
-    if (recorded and coverage is None and not (environ and check1_wire().CENSUS in environ)
-            and not done_before):
-        # A traced run's rows, timed under tracing, are no rows to reuse, nor the census's, nor a resumed
-        # one's, whose earlier attempt's opens no record holds, nor a prepare's, which ran no test to its end.
-        unnamed = record(python, ran, log, common, network, opened,
-                         set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), wrote)
-        if unnamed:
-            ran = [unbaselined(python, found) if found["name"] in unnamed else found for found in ran]
-            out.write_text(json.dumps({"rows": rows + ran}))
+    unlisted = set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set()
+    if recording and (unnamed := record(python, ran, log, common, network, opened, unlisted, wrote,
+                                        began_in)):
+        out.write_text(json.dumps({"rows": rows + unbaselined(python, ran, unnamed)}))
     return 0
 
 
@@ -1775,7 +1787,7 @@ def drawn_whole(spans: Sequence[tuple[int, ...]], start: int, stop: int) -> bool
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
            opened: set[str] | None = None, unkeyed: Container[str] = (),
-           changed: Collection[str] = ()) -> set[str]:
+           changed: Collection[str] = (), began_in: Mapping[str, str | None] | None = None) -> set[str]:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
     they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
@@ -1783,9 +1795,10 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
     row has none, so a later run never reuses an earlier green row of its file; nor has one that read a file
     the task's processes wrote (`changed`, `watched.changed`), whose key would hash the bytes they left, not
     those it read (row 2559). A check-1 site's judge keeps its map tasks' inputs with its own
-    (`site_inputs`). A row whose key keeps no inputs keeps what its run read (`read`, reach.py's). Returns
-    the green rows whose baseline the store did not take (`baselined`), which stand stale
-    (`unbaselined`)."""
+    (`site_inputs`). A row whose key keeps no inputs keeps what its run read (`read`, reach.py's). A green
+    row is written only within the epoch it began in (`began_in`, `epochs_of`): one a red run rotated while
+    it ran is an older verdict, and is kept nowhere (row 12180). Returns the green rows whose baseline the
+    store did not take (`baselined`), which stand stale (`unbaselined`)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return set()
@@ -1797,8 +1810,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         recorded = {read for ran in executed.values() for read in ran["depends"] or ()}
         opened = opened | native_inputs(opened, recorded)
     for row_ in rows:
-        # A green dry prepare's baseline, whatever of its record below is kept: its admission to reuse (a
-        # record written, a key, its epoch) is apart from main's baseline, which a later prepare is held to.
+        # A green dry prepare's baseline, whatever of its admission to reuse below (record, key, epoch).
         if not baselined(python, row_["name"], held, token, row_):
             unnamed.add(row_["name"])
         name = parsed_row(row_["name"])[1]
@@ -1842,6 +1854,10 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             if current == UNREAD or begun(python, row_["name"], held, common, token, after=tag) == UNREAD:
                 continue
             current = None
+        elif began_in is not None and (began_in.get(row_["name"], UNREAD) == UNREAD
+                                       or began_in[row_["name"]] != current):
+            # Not the epoch it began in (a red's rotation while it ran, or one unread): no green of it stands.
+            continue
         elif current is None:
             current = begun(python, row_["name"], held, common, token, fresh_only=True)
         stated = (why or None) if key is None and row_["exitCode"] == 0 else None

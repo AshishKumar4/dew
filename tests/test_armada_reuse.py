@@ -11,6 +11,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import types
 from collections.abc import Callable
 from pathlib import Path
 
@@ -691,6 +693,107 @@ def test_a_lookup_whose_epoch_is_unread_or_gone_reuses_nothing(ci, tmp_path, mon
     for key in [key for key in stored if "-epochs/" in key]:
         del stored[key]
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+
+
+def test_a_green_run_whose_epoch_a_red_rotated_while_it_ran_is_kept_nowhere(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A green run records its verdict only within the epoch it began in (`epochs_of`, read before its
+    pytest): where a red run of the row began the next epoch while it ran, its older verdict is kept nowhere,
+    so no plan reuses it (row 12180: a delayed green stamped with the red's new epoch stood as current); a run
+    that began in the epoch it ends in is kept."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    with monkeypatch.context() as patched:
+        patched.setattr(ci, "epochs_of", lambda python, names, common, held, until: dict.fromkeys(
+            names, "an-epoch-a-red-replaced"))
+        armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+
+def test_a_run_reads_its_epochs_only_where_it_records_its_rows_and_an_unread_one_publishes_no_green(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A run reads its rows' epochs before its pytest only where it records them (`tested`'s `recording`),
+    within EPOCH_SECONDS: the census's reads none and records none. An epoch the Worker did not give in time
+    is `UNREAD`, and the row it ran is kept nowhere, published green by no run (row 12180)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    unreused = ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+    asked: list[float] = []
+    epochs = ci.epochs_of
+
+    def counted(python, names, common, held, until):
+        asked.append(until - time.monotonic())
+        return epochs(python, names, common, held, until)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(ci, "EPOCH_SECONDS", 0.0)
+        armada_task(ci, monkeypatch, verdict)
+    assert planned() == unreused
+    with monkeypatch.context() as patched:
+        patched.setattr(ci, "epochs_of", counted)
+        armada_task(ci, monkeypatch, verdict, census=True)
+        assert asked == [] and planned() == unreused
+        armada_task(ci, monkeypatch, verdict)
+        assert asked and all(0 < left <= ci.EPOCH_SECONDS for left in asked)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+
+def test_a_run_with_no_time_left_after_its_epochs_runs_no_pytest_and_its_rows_are_stale(ci, tmp_path,
+                                                                                       monkeypatch):
+    """A late group whose task's time is spent reading its epochs (each read within what is left of its
+    time, never EPOCH_SECONDS past it) starts no pytest: its rows are stale, run again, never red for a time
+    they were not given (row 12180's review)."""
+    asked: list[float] = []
+
+    def slow(python, names, common, held, until):
+        asked.append(until - time.monotonic())
+        time.sleep(max(0.0, until - time.monotonic()))
+        return dict.fromkeys(names, ci.UNREAD)
+
+    monkeypatch.setattr(ci, "epochs_of", slow)
+    monkeypatch.setattr(ci, "watched_pytest", lambda *args: pytest.fail("pytest ran with no time left"))
+    out = tmp_path / "rows.json"
+    assert ci.tested("3.12", ["tests/test_a.py"], "", out, 0.3, "off", 5.0, "common", {}) == 0
+    rows = json.loads(out.read_text())["rows"]
+    assert asked and all(left <= 0.3 for left in asked)
+    assert [row["kind"] for row in rows] == [ci.STALE]
+
+
+def test_a_runs_pytest_is_given_what_is_left_of_its_task_after_its_epochs(ci, tmp_path, monkeypatch):
+    """The time a run spends reading its epochs, and everything before them, is its task's: its pytest is
+    given what is left of the task's one end, read as it starts, charged once (row 12180's review)."""
+    given: list[float] = []
+    clock = [100.0]
+
+    class Started(Exception):
+        pass
+
+    def slow(python, names, common, held, until):
+        clock[0] += 0.5
+        return dict.fromkeys(names, ci.UNREAD)
+
+    def started(command, environment, left, *args):
+        given.append(left)
+        raise Started
+
+    faked = types.SimpleNamespace(monotonic=lambda: clock[0], time=time.time, sleep=time.sleep)
+    monkeypatch.setattr(ci, "time", faked)
+    monkeypatch.setattr(ci, "epochs_of", slow)
+    monkeypatch.setattr(ci, "watched_pytest", started)
+    with pytest.raises(Started):
+        ci.tested("3.12", ["tests/test_a.py"], "", tmp_path / "rows.json", 3.0, "off", 5.0, "common", {})
+    assert given == [2.5]
+
+
+@pytest.mark.parametrize("found", [b"null", b"[]", b'{"epoch": 3}', b'{"name": "e"}'])
+def test_an_epoch_record_that_is_no_epoch_is_unread(ci, monkeypatch, cache_worker, found):
+    """An epoch's record that is no object naming its epoch (null, a list, a name no string) is `Unread`,
+    never a crash before the run's pytest: the run goes on, publishing no green under it."""
+    url, stored, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    stored["/" + ci.records.epoch_key("3.12", "3.12:tests/test_a.py", "cls", "common")] = found
+    with pytest.raises(ci.records.Unread):
+        ci.records.epoch("3.12", "3.12:tests/test_a.py", "cls", "common", "token")
 
 
 def test_a_red_runs_epoch_write_sent_again_after_a_later_one_never_puts_it_back(

@@ -52,6 +52,37 @@ def test_a_task_past_its_deadline_is_interrupted_its_hung_file_red_and_the_rest_
     assert "spent in tests/test_hangs.py" in rows["3.12:tests/test_zlast.py"]["output"]
 
 
+def test_a_file_cut_short_by_another_files_deadline_is_run_again_not_green(ci):
+    """Where tests of two files interleave (A[0], B[0], A[1]) and the deadline falls in B[0], file A has a
+    case, but not every test its collection selected reported: it is not graded green but said stale and run
+    again (`grading.graded`, row 12179); with every selected test reported (its set-aside ones among the
+    deselected) it is green, and a failed case is still its red."""
+    import xml.etree.ElementTree as ET
+
+    def case(name: str, failed: bool = False) -> ET.Element:
+        found = ET.Element("testcase", classname="tests.test_a", name=name, file="tests/test_a.py")
+        if failed:
+            ET.SubElement(found, "failure", message="assert 1 == 2")
+        return found
+
+    def grade(own: list, collected: int, deselected: int = 0) -> tuple:
+        counted = {"collected": collected, "deselected": deselected}
+        red, _, cause = ci.grading.graded("tests/test_a.py", own, own, counted, reported=True, returncode=-2,
+                                          expired=3.0, running="tests/test_b.py")
+        return bool(red), cause.get("kind")
+
+    assert grade([case("test_0")], collected=2) == (True, ci.STALE)
+    assert grade([case("test_0")], collected=3, deselected=2) == (False, None)
+    assert grade([case("test_0", failed=True)], collected=2) == (True, "nodes")
+    # A case skipped on a missing import says the file red whole, cut short or not.
+    skipped = case("test_0")
+    ET.SubElement(skipped, "skipped", message="could not import 'absent'")
+    red, _, cause = ci.grading.graded("tests/test_a.py", [skipped], [skipped],
+                                      {"collected": 2, "deselected": 0}, reported=True, returncode=-2,
+                                      expired=3.0, running="tests/test_b.py")
+    assert red and cause["kind"] == "whole"
+
+
 STALLS = {
     "in the interpreter": ("import time\n\n\ndef stalled_reading():\n    time.sleep(60)\n\n\n"
                            "stalled_reading()\n", "stalled_reading"),

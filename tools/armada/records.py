@@ -150,7 +150,8 @@ UNREAD = "unread"
 stands (`standing`)."""
 
 
-def epoch(python: str, row_name: str, held: str, common: str, token: str) -> tuple[str | None, str | None]:
+def epoch(python: str, row_name: str, held: str, common: str, token: str,
+          until: float | None = None) -> tuple[str | None, str | None]:
     """The name of row `row_name`'s epoch on class `held` on these shared inputs (`epoch_key`) and its ETag,
     the Worker's version of it; (None, None) where it has none; `Unread` where the Worker did not answer. A
     red run begins a new epoch, a fresh name each, and a green run records the epoch it ran in, beginning one
@@ -160,15 +161,41 @@ def epoch(python: str, row_name: str, held: str, common: str, token: str) -> tup
     2026-11-12: a flaky red's set differs from its green's, so its own key revoked nothing). A name is never
     reused, and no green run stands where a row has no epoch, so neither a green written after a red it read
     nothing of nor an epoch the bucket's expiry took lets an earlier green run stand again: each costs a miss.
+    Read whole within `until` (a `time.monotonic` instant) where one is given, or `Unread`.
     """
     try:
-        with store(token).request("GET", epoch_key(python, row_name, held, common)) as reply:
+        with store(token).request("GET", epoch_key(python, row_name, held, common), until=until) as reply:
             if reply.body is None:
                 return None, None
             tag = {name.lower(): value for name, value in reply.headers.items()}.get("etag")
-            return json.loads(reply.body.whole()).get("epoch"), tag
+            found = json.loads(reply.body.whole())
     except (r2.R2Error, ValueError) as error:
         raise Unread(f"the epoch of {row_name} on {held} was not read: {error}") from error
+    # A record that is no object of an epoch's name (null, a list, a name no string) is none read.
+    if not isinstance(found, dict) or not isinstance(found.get("epoch"), str):
+        raise Unread(f"the epoch of {row_name} on {held} is no epoch: {found!r:.80}")
+    return found["epoch"], tag
+
+
+EPOCH_SECONDS = 30.0
+"""The longest a recording run reads its rows' epochs before its pytest (`epochs_of`): what is left past it is
+read as `UNREAD`, its rows published green by no run."""
+
+
+def epochs_of(python: str, names: list[str], common: str, held: str, until: float) -> dict[str, str | None]:
+    """Each row of `names`' epoch on class `held` as read now (`epoch`), all within `until` (a
+    `time.monotonic` instant); `UNREAD` where the Worker gave no answer in time, which publishes the row green
+    under no epoch; none where no record is written."""
+    token = os.environ.get("DEW_XLA_CACHE_TOKEN")
+    if not token or "DEW_XLA_CACHE_URL" not in os.environ:
+        return {}
+    found: dict[str, str | None] = {}
+    for name in names:
+        try:
+            found[name] = epoch(python, name, held, common, token, until)[0]
+        except Unread:
+            found[name] = UNREAD
+    return found
 
 
 def begun(python: str, row_name: str, held: str, common: str, token: str, after: str | None = None,
