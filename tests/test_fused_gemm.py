@@ -695,16 +695,16 @@ def test_a_gathered_products_producer_pulls_back_each_tokens_routes_summed():
     -2**126: their sum, 0, meets the producer's derivative, as the program written does, not each route's
     4 * 2**126 (inf - inf) (row 5391)."""
     gather, sizes = jnp.asarray([0, 0], jnp.int32), jnp.asarray([2], jnp.int32)
-    weight = jnp.eye(8, dtype=jnp.float32)[None]
+    weight = jnp.eye(8, dtype=jnp.bfloat16)[None]
 
     def region(x, w):
         return fused_gemm.product(x * 4, w, sizes, out_dtype=jnp.float32, gather=gather,
                                   interpret_on_cpu=True)
 
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        _, pull = jax.vjp(lambda x: fused_gemm.fused(region, x, weight), jnp.ones((1, 8), jnp.float32))
+        _, pull = jax.vjp(lambda x: fused_gemm.fused(region, x, weight), jnp.ones((1, 8), jnp.bfloat16))
         (d_x,) = pull(jnp.zeros((2, 8), jnp.float32).at[0, 0].set(2.0 ** 126).at[1, 0].set(-(2.0 ** 126)))
-    np.testing.assert_array_equal(np.asarray(d_x), np.zeros((1, 8), np.float32))
+    np.testing.assert_array_equal(np.asarray(d_x, np.float32), np.zeros((1, 8), np.float32))
 
 
 @pytest.mark.mesh(devices=2)
