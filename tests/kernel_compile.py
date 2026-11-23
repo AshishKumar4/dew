@@ -423,7 +423,11 @@ def _compiled(case, generation: str, record: dict,
     # find its spills only as its whole program compiles.
     record["uncertified"] = _uncertified_since(uncertified)
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
-    record["unsynced"] = [found for call in calls for found in unsynced_commits(call.ir)]
+    # A tensor-core commit past another warp's wait wedges the launch where it runs: the case fails as one
+    # that does not compile, in every gate reading its records (`failures`, row 12144).
+    if unsynced := [found for call in calls for found in unsynced_commits(call.ir)]:
+        record["error"] = "its tensor-core commits pass another warp's wait: " + "; ".join(unsynced)
+        return None
     modules = report.kernel_modules(calls)
     record["modules"] = modules
     # Each kernel certification compiled alone in this process, by name and launch: its module.
@@ -949,8 +953,7 @@ def _compiled_here(cases, generation: str) -> list[dict]:
 
 def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[str]:
     """Compile errors, spills, missing or excessive shared/TMEM allocations, a launch its lowering did not
-    certify (`report.certified`), a tensor-core commit after a wait at its barrier with no warpgroup sync
-    between (`lowered.unsynced_commits`), and a producer its schedule lowers to other registers than its model
+    certify (`report.certified`), and a producer its schedule lowers to other registers than its model
     states (`setmaxnreg.dec` against `RegisterModel.producer`: a launch's plan and its emission one fact).
     Whether a launch's registers hold is its certification's alone: the gate judges no register model. A
     kernel's planned shared bytes are its case's model's, or with `traced_models`, where its case states
@@ -980,7 +983,6 @@ def mosaic_failures(found: list[dict], *, traced_models: bool = False) -> list[s
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
                               f"bytes of shared memory, the kernel asks for {found_kernel.shared}")
-        failed += [f"{record['name']}: {unsynced}" for unsynced in record.get("unsynced", ())]
     return failed + producer_failures(found)
 
 

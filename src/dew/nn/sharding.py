@@ -752,12 +752,18 @@ def varying_like(x: jax.Array, *operands) -> jax.Array:
 
 def varied_alike(operands: Sequence) -> list:
     """`operands` (None where a call has none, kept) each varying over every manual axis any of them varies
-    over (`varying_like`), as JAX's own operations make theirs before they compute: a kernel's or a
-    primitive's computation then reads operands that vary alike (a launch's, `norm_swiglu`; the algebra's
-    primitives, `dew.algebra.scaled`), where a quotient of a replicated value by each device's own was
-    refused as it lowered."""
-    present = [operand for operand in operands if operand is not None]
-    return [None if operand is None else varying_like(operand, *present) for operand in operands]
+    over (their union read once, `varying`), each cast where it misses an axis alone, as JAX's own operations
+    make theirs before they compute: a kernel's or a primitive's computation then reads operands that vary
+    alike (a launch's, `norm_swiglu`; the algebra's primitives, `dew.algebra.scaled`; a chunked delta rule's
+    contraction, `dew.algebra.scan`), where a quotient of a replicated value by each device's own was refused
+    as it lowered (row 12152)."""
+    axes = varying(*operands)
+
+    def alike(operand):
+        missing = tuple(sorted(axes - jax.typeof(operand).mat.varying))
+        return jax.lax.pcast(operand, missing, to="varying") if missing else operand
+
+    return [None if operand is None else alike(operand) for operand in operands]
 
 
 def excess_axes(value: jax.Array, of: jax.Array) -> tuple[str, ...]:
