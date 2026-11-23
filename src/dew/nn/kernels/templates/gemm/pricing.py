@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import bundles, cost as unit_cost, mosaic, resources, tail as tail_of
+from dew.nn.kernels.templates import bundles, cost as unit_cost, mosaic, tail as tail_of
 from dew.nn.kernels.templates.gemm.tiling import TilesTemplate as TilesTemplate
 
 if TYPE_CHECKING:

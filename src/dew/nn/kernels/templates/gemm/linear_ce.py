@@ -48,6 +48,7 @@ from dew.nn.kernels.templates.gemm.pricing import (
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 from dew.nn.precision import exact_products
 from dew.nn.sharding import automatic_axes
+
 LINEAR_CE = "dew_linear_ce"
 """Kernel name for GEMM-fused linear cross-entropy launches."""
 
@@ -488,8 +489,9 @@ def mosaic_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array,
 
     dtype_ok = supports_dtype(x.dtype) and jnp.dtype(x.dtype) == jnp.dtype(weight.dtype)
     exact = exact_products(precision, x.dtype) if dtype_ok else False
-    with xla_products.committed_context((x, weight, targets)), xla_products.interpreted_context(True):
-        interpreting = xla_products.interpreted(True)
+    with (xla_products.committed_context((x, weight, targets)),
+          xla_products.interpreted_context(interpret_on_cpu=True)):
+        interpreting = xla_products.interpreted(interpret_on_cpu=True)
         if not dtype_ok:
             tile = None
         elif interpreting:

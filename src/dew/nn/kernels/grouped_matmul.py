@@ -66,7 +66,8 @@ if TYPE_CHECKING:
     import tokamax
 
     from .templates import mosaic, resources
-    from .templates.gemm import mosaic_gpu
+    from .templates.gemm import mosaic_gpu, pricing
+
 
 def _stored_bytes(ba, rows: int, width: int) -> float:
     """The bytes a product's epilogue moves an element of its `rows` x `width` output
