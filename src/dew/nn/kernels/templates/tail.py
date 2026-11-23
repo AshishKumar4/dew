@@ -31,12 +31,10 @@ class Tail:
         return np.arange(self.partitions + 1) * self.iterations // self.partitions
 
     def partials(self) -> int:
-        """The partials past each tile's first that the tail's programs leave (`mosaic.Family.fixed_up`):
-        a tile `n` ranges reach into leaves `n - 1` more for its last program to add."""
-        bounds, tiles = self.bounds(), np.arange(self.iterations // self.steps)
-        reaching = (np.searchsorted(bounds, (tiles + 1) * self.steps, side="left")
-                    - (np.searchsorted(bounds, tiles * self.steps, side="right") - 1))
-        return int(np.maximum(reaching - 1, 0).sum())
+        """The partials past each tile's first that the tail's programs leave (`mosaic.Family.fixed_up`): a
+        range's end inside a tile, not at its edge, leaves one more for the tile's last program to add, so
+        they are its interior bounds off a tile's edge (row 12075; the bounds `_rounds` reads)."""
+        return int(np.count_nonzero(self.bounds()[1:-1] % self.steps))
 
     @property
     def segments(self) -> int:
