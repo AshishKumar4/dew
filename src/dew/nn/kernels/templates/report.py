@@ -15,7 +15,7 @@ import dataclasses
 import functools
 import hashlib
 import importlib
-import importlib.metadata
+import importlib.util
 import json
 import logging
 import os
@@ -1109,9 +1109,9 @@ def _mosaic_assembler() -> tuple[str, ...] | None:
 def _triton_assembler() -> tuple[str, ...] | None:
     """The assembler XLA assembles a Pallas-Triton kernel's PTX with: the ptxas in the CUDA directory JAX
     gives each compile (`jax._src.lib.cuda_path`: `CUDA_ROOT`'s, else the nvcc wheel's), by its build
-    (`_ptxas_build`), beside the nvJitLink wheels XLA's automatic mode assembles with instead where one
-    loads. None where JAX names no directory: XLA's own search finds its ptxas, which no key states. Read
-    once a process."""
+    (`_ptxas_build`), beside the libnvJitLink XLA's automatic mode assembles with instead where one loads,
+    by its file's digest (`_nvjitlink`). None where JAX names no directory: XLA's own search finds its
+    ptxas, which no key states. Read once a process."""
     from jax._src.lib import cuda_path
 
     if cuda_path is None:
@@ -1119,10 +1119,45 @@ def _triton_assembler() -> tuple[str, ...] | None:
         return None
     if (build := _ptxas_build(os.path.join(cuda_path, "bin", "ptxas"))) is None:
         return None
-    named = (((distribution.metadata.get("Name") or "").lower(), distribution)
-             for distribution in importlib.metadata.distributions())
-    return build, *sorted(f"{name}=={distribution.version}" for name, distribution in named
-                          if re.fullmatch(r"nvidia-nvjitlink(-cu\d+)?", name))
+    return build, _nvjitlink()
+
+
+NVJITLINK_SONAMES = ("libnvJitLink.so.12", "libnvJitLink.so.13")
+"""The libraries XLA's nvJitLink stub opens, in turn (tsl's `GetNvJitLinkDsoHandle`, a CUDA 12 build's)."""
+
+
+def _nvjitlink() -> str:
+    """The libnvJitLink XLA assembles with, by its file's digest, its path aside: the one this process has
+    mapped (XLA's own, once it opened it), else the one XLA's search finds first, the `nvidia-nvjitlink`
+    wheel's (the CUDA plugin's RUNPATH), else the loader's (`LD_LIBRARY_PATH`, its cache); 'none' where none
+    loads. A system copy updated in place is another assembler, which its wheels' versions never named (row
+    12166)."""
+    import ctypes
+    import hashlib
+
+    def mapped() -> str | None:
+        with open("/proc/self/maps") as maps:
+            return next((line.split(maxsplit=5)[-1].strip() for line in maps
+                         if "/libnvJitLink.so" in line), None)
+
+    found = mapped()
+    if found is None and (wheel := importlib.util.find_spec("nvidia.nvjitlink")) is not None:
+        lib = [os.path.join(place, "lib", name) for place in wheel.submodule_search_locations or ()
+               for name in NVJITLINK_SONAMES]
+        found = next((path for path in lib if os.path.exists(path)), None)
+    if found is None:
+        # No wheel's: the loader's, as XLA's search finds it past the plugin's RUNPATH.
+        for name in NVJITLINK_SONAMES:
+            try:
+                ctypes.CDLL(name)
+            except OSError:
+                continue
+            found = mapped()
+            break
+    if found is None:
+        return "none"
+    with open(found, "rb") as library:
+        return hashlib.file_digest(library, "sha256").hexdigest()
 
 
 def _ptxas_build(ptxas: str) -> str | None:
