@@ -7,7 +7,6 @@ where indexing the answered rows first compiled a program a count of them (a run
 sized validation splits compiled 1,999 programs before and 12 after)."""
 
 import numpy as np
-import pytest
 
 from dew.artifacts import Decisions
 from dew.data import Memory
@@ -117,9 +116,7 @@ def test_a_scoring_rules_total_reads_its_answered_rows_alone():
         assert alone == kept
 
 
-@pytest.mark.parametrize("partition", [DataPartition(), DataPartition(row_multiple=2)],
-                         ids=["one-device", "two-row-shards"])
-def test_packed_validation_splits_read_in_one_shape_and_one_bound(partition):
+def test_packed_validation_splits_read_in_one_shape_and_one_bound():
     """Packed validation splits whose windows hold 1 to 4 documents each, of 1 to 7 windows, read in the
     run's batch of 4 every batch the same as an evaluation reads it (its rows marked, `VALID_ROWS`, where
     the reader marked none): a split's short last batch filled out, and each declaring the most documents
@@ -139,17 +136,19 @@ def test_packed_validation_splits_read_in_one_shape_and_one_bound(partition):
     _, readers = fitted(train, {f"{windows}x{per}": split(windows, per) for windows, per in shapes},
                         objective=ObjectiveData(), steps=2)
     assert readers is not None
-    seen = set()
-    for reader in readers.values():
-        opened = reader(partition)
-        try:
-            for batch in opened:
-                laid = batch["text_coordinates"]
-                seen.add((tuple(sorted({*batch, VALID_ROWS})), np.shape(batch["text"]), laid.max_segments))
-        finally:
-            if isinstance(opened, Closeable):
-                opened.close()
-    assert len(seen) == 1 and next(iter(seen))[2] == 4, seen
+    # On one device, and over two row shards a share.
+    for partition in (DataPartition(), DataPartition(row_multiple=2)):
+        seen = set()
+        for reader in readers.values():
+            opened = reader(partition)
+            try:
+                for batch in opened:
+                    bound = batch["text_coordinates"].max_segments
+                    seen.add((tuple(sorted({*batch, VALID_ROWS})), np.shape(batch["text"]), bound))
+            finally:
+                if isinstance(opened, Closeable):
+                    opened.close()
+        assert len(seen) == 1 and next(iter(seen))[2] == 4, (partition, seen)
 
 
 def test_a_handed_validation_passs_short_last_batch_reads_in_its_whole_ones_shape():
