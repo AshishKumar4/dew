@@ -25,7 +25,7 @@ import functools
 import math
 import operator
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any, NamedTuple, Self
+from typing import Any, NamedTuple, Self, overload
 
 import jax
 from jax import lax, numpy as jnp
@@ -1160,12 +1160,17 @@ class Issuer[Accumulator](abc.ABC):
         return vector
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
-        """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
-        product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum).
-        `pending` is the count of this warpgroup's later product groups left in flight when `product` reads
-        its value (issued by `then()` before the read); synchronous issuers take `pending=0` only and raise
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
+        """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, running `between()` while the product runs
+        and returning `(between(), product)` out of the accumulator's scope (`WgmmaIssuer`). `pending` is
+        the count of this warpgroup's later product groups left in flight when the accumulator is read
+        (issued by `between()` before the read); synchronous issuers take `pending=0` only and raise
         `ValueError` otherwise."""
+
+    def product(self, lhs, rhs, shape: tuple[int, int], *, pending: int = 0) -> jax.Array:
+        """`lhs @ rhs` into a fresh fp32 accumulator of `shape` (`product_with` with no overlapped work)."""
+        return self.product_with(lhs, rhs, shape, lambda: None, pending=pending)[1]
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
@@ -1255,12 +1260,23 @@ class Issuer[Accumulator](abc.ABC):
         fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
         return self.products(acc, lhs, rhs, accumulate=accumulate)
 
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
-                     between: Callable = lambda value: value) -> tuple:
+    @overload
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+        ...
+
+    @overload
+    def product_pair[T](self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
+                        between: Callable[[jax.Array], T]) -> tuple[T, jax.Array]:
+        ...
+
+    def product_pair[T](self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
+                        between: Callable[[jax.Array], T] | None = None
+                        ) -> tuple[T | jax.Array, jax.Array]:
         """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
         (`WgmmaIssuer`), else in turn (`product`). `between` runs on the first product's value while the
         second is in flight, where the issuer pipelines them, returning `(between(first), second)`."""
-        return between(self.product(lhs1, rhs1, shape)), self.product(lhs2, rhs2, shape)
+        first = self.product(lhs1, rhs1, shape)
+        return (first if between is None else between(first)), self.product(lhs2, rhs2, shape)
 
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""

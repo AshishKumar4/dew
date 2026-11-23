@@ -510,13 +510,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         plgpu.store(buffer, cast, optimized=False)
         mosaic.synced(interpret=False)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
         if pending:
-            raise ValueError(f"{type(self).__name__}.product is synchronous (pending={pending})")
+            raise ValueError(f"{type(self).__name__}.product_with is synchronous (pending={pending})")
         out = self.products(self.zeros(shape), lhs, rhs)
-        if then is not None:
-            then()
-        return out
+        return between(), out
 
     def products(self, acc, lhs, rhs, *, accumulate: bool = True):
         interpret = launches.interpreting()  # the launch's (`launches.interpreting`)

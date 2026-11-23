@@ -1445,14 +1445,19 @@ def may_scale(value: jax.Array, *, keys_axis: int, initial: jax.Array | None = N
               ) -> jax.Array:
     """Whether some row of a call over `value` (its keys along `keys_axis`, its columns the last axis), from
     the weighted values `initial` of its initial state where it has one, can be scaled (`SCALED_WALK`): a
-    row's bound is at most the sum over its keys of each one's largest value magnitude (a weight is at most
-    1), times a dropping call's largest multiplier (`amplified`), beside its initial sums' largest
-    (`resumed`), so where the largest such sum of any key head is below `2^(HEADROOM - 1)` (a binade for the
-    bound's own rounding) no row's is past `2^HEADROOM`, and the unscaled walk is the scaled one bit for bit:
-    a call there launches its mainloop's unscaled kernels, one pass over its values before them."""
-    # Each key's largest finite one (`magnitudes`). A call of no keys or rows reads no value: its bound is 0.
-    largest = magnitudes(value) if value.shape[-1] else jnp.zeros(value.shape[:-1], jnp.float32)
-    return _bounded_past(largest, keys_axis=keys_axis, initial=initial, amplified=amplified)
+    row's bound is at most `K * max(|v|)` (bounding the sum over its `K` keys of each key's largest finite
+    value magnitude), times a dropping call's largest multiplier (`amplified`), beside its initial sums'
+    largest (`resumed`). Reduced in one native-dtype max pass instead of five per-key fp32 fusions so dense
+    decode and compute-bound prefill guards pay one scalar reduction (rows 5272, 5274)."""
+    keys = value.shape[keys_axis]
+    if value.size == 0:
+        bound = jnp.float32(0.0)
+    else:
+        peak = jnp.max(finite_magnitude(value), initial=jnp.zeros((), value.dtype)).astype(jnp.float32)
+        bound = ((peak * BOUND_SCALE) * np.float32(keys)) * np.float32(amplified)
+    if initial is not None:
+        bound = bound_initial(bound, initial, axis=None)
+    return bound_exceeds(bound)
 
 
 BOUND_SCALE = np.float32(2.0 ** -BOUND_UNIT)

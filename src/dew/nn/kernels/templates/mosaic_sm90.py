@@ -4,6 +4,7 @@ warpgroup MMA reads its right operand from shared memory and its left from share
 accumulates in a warpgroup's registers in the WGMMA layout, and runs asynchronously until waited for."""
 
 from collections.abc import Callable
+from typing import overload
 
 import jax
 import jax.numpy as jnp
@@ -71,20 +72,32 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         accumulator = min(widest, self.widest_product or widest) * self.rows // resources.THREADS
         return accumulator + self.assembled if widest else 0
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
 
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
             mosaic.committed()
-            if then is not None:
-                then()
-            return acc_ref[...] if pending == 0 else self.read(acc_ref, pending=pending)
+            value = between()
+            return value, (acc_ref[...] if pending == 0 else self.read(acc_ref, pending=pending))
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
-                     between: Callable = lambda value: value) -> tuple:
+    @overload
+    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int]) -> tuple[jax.Array, jax.Array]:
+        ...
+
+    @overload
+    def product_pair[T](self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
+                        between: Callable[[jax.Array], T]) -> tuple[T, jax.Array]:
+        ...
+
+    def product_pair[T](self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
+                        between: Callable[[jax.Array], T] | None = None
+                        ) -> tuple[T | jax.Array, jax.Array]:
         if launches.interpreting():
+            if between is None:
+                return super().product_pair(lhs1, rhs1, lhs2, rhs2, shape)
             return super().product_pair(lhs1, rhs1, lhs2, rhs2, shape, between=between)
 
         def both(acc1, acc2):
@@ -92,7 +105,8 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
             mosaic.committed()
             plgpu.wgmma(acc2, lhs2, rhs2)
             mosaic.committed()
-            return between(self.read(acc1, pending=1)), self.read(acc2)
+            first = self.read(acc1, pending=1)
+            return (first if between is None else between(first)), self.read(acc2)
 
         return pl.run_scoped(both, plgpu.WGMMAAccumulatorRef(shape, jnp.float32),
                              plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
