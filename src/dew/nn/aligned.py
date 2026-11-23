@@ -207,7 +207,7 @@ def _exact_sum(terms, spec, dtype, segments: tuple | None = None) -> jax.Array:
     limits = jnp.finfo(dtype)
     ints = jnp.dtype(f"int{limits.bits}")
     factors = max(map(len, terms))
-    parts, nan, positive, negative, live = [], False, False, False, False
+    parts, nan, positive, negative, live, held = [], False, False, False, False, False
     for term, (axis, laid) in zip(terms, spec, strict=True):
         product = _product(term, ints)
         reduced, extent = reduction(product.place.shape, axis, laid)
@@ -217,8 +217,13 @@ def _exact_sum(terms, spec, dtype, segments: tuple | None = None) -> jax.Array:
                  ~(product.zero & product.negative))
         nan, positive, negative, live = (p | (reduced(f.astype(ints), jnp.sum, dtype=ints) != 0)
                                          for p, f in zip((nan, positive, negative, live), flags, strict=True))
+        if segments is not None:
+            # Whether a segment holds any product: one that holds none sums to +0, as an empty sum does.
+            held = held | (reduced(jnp.ones(product.place.shape, ints), jnp.sum, dtype=ints) != 0)
     count = sum(extent for _, _, extent in parts)
     live = True if not count else live
+    if segments is not None:
+        live = live | ~held
     # The widest digit whose one term's sum `widest (2^w - 1)` the integers hold, its quotient carried apart
     # as it adds (`_nearest`, row 8757).
     widest, most = max(extent for _, _, extent in parts), (1 << (limits.bits - 1)) - 1

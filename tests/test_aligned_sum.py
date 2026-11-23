@@ -743,8 +743,8 @@ def test_an_aligned_sum_along_an_axis_sums_each_rows_terms():
 def test_an_aligned_segment_sum_sums_each_segments_rows_exactly():
     """`aligned_segment_sum` sums each row's product into the segment its table names, exactly, rounded
     once: 2**240 and -2**240 beside 2**-28 in one segment give 2**-28; 2**128 (as 2**127 times 2) and
-    -2**105 give their finite difference, not inf; 256 and -255.5 times 2**-8 give 2**-9; an empty segment
-    gives 0 (row 1464)."""
+    -2**105 give their finite difference, not inf; 256 and -255.5 times 2**-8 give 2**-9; a segment no row
+    names gives +0, one of -0 products alone -0 (row 1464)."""
     big = jnp.float32(2.0 ** 120)
     values = jnp.asarray([[1.0], [-1.0], [2.0 ** -28], [2.0], [-(2.0 ** -22)], [256.0], [-255.5]],
                          jnp.float32)
@@ -755,6 +755,10 @@ def test_an_aligned_segment_sum_sums_each_segments_rows_exactly():
     got = jax.jit(lambda: aligned_segment_sum([(values, scales, lifts)], table, 4))()
     want = np.asarray([[2.0 ** -28], [np.float32(2.0 ** 128 - 2.0 ** 105)], [2.0 ** -9], [0.0]], np.float32)
     np.testing.assert_array_equal(np.asarray(got), want)
+    # The segment no row names sums to +0, an empty sum's; one holding only -0 products to -0.
+    assert np.copysign(1.0, np.asarray(got)[3, 0]) == 1.0
+    negative = aligned_segment_sum([(jnp.asarray([[-0.0]], jnp.float32),)], jnp.asarray([0], jnp.int32), 2)
+    assert [np.copysign(1.0, value) for value in np.asarray(negative)[:, 0]] == [-1.0, 1.0]
 
 
 @pytest.mark.mesh(devices=2)
