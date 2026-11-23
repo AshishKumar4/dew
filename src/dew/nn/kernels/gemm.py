@@ -555,8 +555,10 @@ def _syrk_portable(operand: jax.Array, poly: jax.Array | None, *, transpose: boo
     if out_dtype.itemsize < wide.itemsize and count > 1 and not batch_sharded:
         batch_size = max(1, count * out_dtype.itemsize // (2 * wide.itemsize))
         step_fn = _poly_rows if batch_size == 1 else _poly_whole
-        return jax.lax.map(step_fn, operand.reshape(count, side, side), batch_size=batch_size).reshape(
-            operand.shape)
+        return jax.lax.map(
+            step_fn, operand.reshape(count, side, side),
+            batch_size=None if batch_size == 1 else batch_size,
+        ).reshape(operand.shape)
     return _poly_rows(operand)
 
 
