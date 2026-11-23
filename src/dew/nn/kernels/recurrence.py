@@ -19,6 +19,7 @@ stage every row of it shares, the decay's prefix within each chunk (`cumulated`)
 
 import dataclasses
 import functools
+import math
 from typing import Literal
 
 import jax
@@ -107,7 +108,10 @@ class Hooks:
     its callers hold and a port may take as given (mamba_ssm's kernels clamp each decay to at most
     one); a skip `D v`, and the epilogue; and `write_bound`, the largest write gate
     a layer declares of l2-normalized keys (its config's: 1 for a sigmoid's, 2 for twice a sigmoid's, the
-    negative-eigenvalue delta rule's), which bounds the delta rule's chunk inverse (`inverse_bound`). The
+    negative-eigenvalue delta rule's), which bounds the delta rule's chunk inverse (`inverse_bound`).
+    `decay_bound`, a finite negative number where given, is the least log decay a token a layer proves
+    (Kimi delta attention's `lower_bound` times a sigmoid), which a decay a key dimension's template prefix
+    reads (`templates.recurrence.mainloop.Call.prefix_limbs`); None where it proves none. The
     readout reads the state after the token's update (`reads` 'after'), the state entering it ('before',
     RWKV6's, `o = q^T S`), or the state after the update less the token's own write ('apart', `o = (g
     q)^T S`, mamba_ssm's Mamba-3, whose own write its caller weighs apart: its intra-chunk scores strictly
@@ -138,6 +142,7 @@ class Hooks:
     skip: bool = False
     output: OutputNorm | None = None
     write_bound: float | None = None
+    decay_bound: float | None = None
     reads: Reads = 'after'
     own_weight: bool = False
     ranks: int = 1
@@ -204,6 +209,7 @@ class Hooks:
                              "write is its corrected value, which reads the state its readout does not")
         if self.decay not in ('none', 'scalar', 'vector'):
             raise ValueError(f"a decay is 'none', 'scalar' or 'vector', not {self.decay!r}")
+        decay_bound(self.decay_bound)
         if self.gates is not None and self.decay != 'scalar':
             raise ValueError('the gates form one log decay a head: their decay is scalar')
         if self.rated and (self.decay != 'scalar' or self.gates is not None):
@@ -233,6 +239,15 @@ class Hooks:
             raise ValueError(f"a state turns its key pairs under a decay a head's, unrated, without the "
                              f"delta rule or an own write's weight, read after its token's turn, a count of "
                              f"none or more: not {self.turns} under {self}")
+
+
+def decay_bound(bound: float | None) -> float | None:
+    """`bound`, a least log decay a token (`Hooks.decay_bound`), where it is one: None, or a finite negative
+    number; else ValueError, so no misstated bound (positive, zero, NaN or infinite) reads as a proof."""
+    if bound is not None and not (math.isfinite(bound) and bound < 0):
+        raise ValueError(f"a decay bound is the least log decay a token, finite and negative, or None where "
+                         f"none is proven: not {bound!r}")
+    return bound
 
 
 def round_to_bf16(state, key, value):

@@ -16,6 +16,7 @@ from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence import own_pairs
 from dew.nn.kernels.templates.recurrence.intra import _intra, _intra_solve
 from dew.nn.kernels.templates.recurrence.mainloop import (
+    LOG2_DECAY_FLOOR,
     Call,
     Operand,
     Tiles,
@@ -139,6 +140,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             scale: float | None = None, delta: bool = True, wide: bool = False,
             family: mosaic.Family | None = None, interpret: bool = False,
             rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_keys: bool = False,
+            decay_bound: float | None = None,
                 ranged: bool = False, skip=None,
             forked: ForkedTable | None = None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
@@ -170,7 +172,8 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, keeps=False,
                                  rounded=rounded, apart=apart, values_gated=values_gated,
-                                 unit_keys=unit_keys, ranged=ranged, skip=skip, forked=forked)
+                                 unit_keys=unit_keys,
+                                 decay_bound=decay_bound, ranged=ranged, skip=skip, forked=forked)
     return out, final
 
 
@@ -180,6 +183,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  family: mosaic.Family | None = None, interpret: bool = False,
                  keeps: bool = True,
                  rounded: bool = False, apart: int = 0, values_gated: bool = False, unit_keys: bool = False,
+                 decay_bound: float | None = None,
                      ranged: bool = False,
                  skip=None, forked: ForkedTable | None = None) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
@@ -193,6 +197,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
                    rounded=rounded, apart=apart, values_gated=values_gated, unit_keys=unit_keys,
+                   decay_bound=decay_bound,
                        ranged=ranged, forked=forked,
                    out_dtype=jnp.float32 if wide else None, skipped=skip is not None)
     call, tiles, out_dtype = run.call, run.tiles, run.landed
@@ -206,7 +211,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     if fused is None and skip is not None:
         o = recurrence.skip_added(o, skip, v, jnp.float32).astype(jnp.float32 if wide else run.dtype)
     assert final is not None, "a forward runs its states launch"
-    prefix = run.prefix[0] if call.per_key else None
+    prefix = run.prefix if call.per_key else None
     return o, final, (run.a, (run.w, run.h, run.corrected, run.stored, prefix))
 
 
@@ -227,8 +232,8 @@ class _Run:
     v: jax.Array
     prefix: tuple
     """The decay's prefix within each chunk: under a decay a head its compensated halves, a head's row of
-    vectors each `[HV, R]` (`algebra.prefix`'s pair); under one a key dimension its rounded sum `[R, HV * Dk]`
-    alone (`intra._prefix`'s), a 1-tuple."""
+    vectors each `[HV, R]` (`algebra.prefix`'s pair); under one a key dimension its limbs `[R, HV * Dk]` each
+    (`intra._prefix`'s, `Call.prefix_limbs`: its rounded sum alone where its decays are bounded)."""
     beta: jax.Array
     a: jax.Array | None
     w: jax.Array | None
@@ -297,7 +302,8 @@ def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool,
 
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None, inverse=None, kept=None, keeps: bool = True, rounded: bool = False, apart: int = 0,
-             values_gated: bool = False, unit_keys: bool = False, ranged: bool = False, forked=None,
+             values_gated: bool = False, unit_keys: bool = False,
+             decay_bound: float | None = None, ranged: bool = False, forked=None,
              out_dtype=None, skipped: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
@@ -350,7 +356,8 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     target = generation.interpreted_target() if interpret else generation.gpu_target()
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, target, tiles.chunk, ranged=ranged, apart=apart,
-                values_gated=values_gated, unit_keys=unit_keys, producers=tiles.producers,
+                values_gated=values_gated, unit_keys=unit_keys,
+                decay_bound=decay_bound, producers=tiles.producers,
                 residents=tiles.residents, alone=not keeps)
     table = None if forked is None else tabled(forked, width, columns)
     # A skip reads the values a launch holds as given (`Call.gated_keys`); else it is added after them.
@@ -359,13 +366,16 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
     a, w, u, keys, scores, system = None, None, v, k, None, []
     decays = laid(g).reshape(rows, -1)
+    if call.clamped:
+        # A 16-bit call's unbounded log decays clamped where every pair across a token decays to zero
+        # (`mainloop.LOG2_DECAY_FLOOR`), its rounded prefix's reach held (`Call.prefix_limbs`).
+        decays = jnp.maximum(decays, LOG2_DECAY_FLOOR / algebra.LOG2_E)
     if per_key:
-        # A decay a key dimension's prefix `[R, HV * Dk]` and its scores, and its system where the call
-        # solves it (no inverse given), one launch's (`_intra`).
+        # A decay a key dimension's prefix's limbs `[R, HV * Dk]` and its scores, and its system where the
+        # call solves it (no inverse given), one launch's (`_intra`).
         solves = delta and kept is None and inverse is None
-        scores, *system, found = _paired(q, k, decays, beta, taken, call, scale=scale, solves=solves,
-                                         prefix=None if kept is None else kept[4])
-        prefix = (found,)
+        scores, *system, prefix = _paired(q, k, decays, beta, taken, call, scale=scale, solves=solves,
+                                          prefix=None if kept is None else kept[4])
     else:
         # A decay a head's halves, a head's row of vectors `[HV, R]` each.
         halves = algebra.prefix(decays.reshape(chunks, call.chunk, -1))

@@ -34,6 +34,9 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     key_block,
     launch_kernel,
     masks,
+    prefix_blocks,
+    prefix_tiles,
+    prefix_views,
     stream_blocks,
     stream_tile,
     stream_views,
@@ -65,7 +68,7 @@ def own_zeroed(call: Call, staged) -> None:
 
 def shifted_keys(call: Call, staged, keys: jax.Array, prefix: tuple):
     """A key block's keys and its tokens' own decays (`algebra.token_decays` of its separated prefix, the
-    prefix `prefix` (`intra._prefix`'s, a 1-tuple), each row against the row before, shifted in registers
+    prefix `prefix` (`intra._prefix`'s limbs), each row against the row before, shifted in registers
     once a block), each
     offset's reads of them shifted by it (a sub-chunk a group: the pairs a sub-chunk's own), any value where a
     row's source precedes its sub-chunk (masked): stored once in `staged` (`own_staging`) and read at the
@@ -262,20 +265,20 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
     output's bands and storing them at its last step. In the walk, they held an H100's Kimi Linear intra
     launch at 248 registers, 1982 us against 492 (M-JS-50d); placed `[C, C]` at its last step (`banded`'s
     selects an offset at a time), each output wrote its chunk's square for its bands' `SUB` columns."""
-    chunk, width, gates, family = call.chunk, call.width, call.gates, call.family
+    chunk, width, family = call.chunk, call.width, call.family
     scored = "scores" in products
     keys = key_block(call, functools.partial(_own_held, call, outputs=len(products)),
                      functools.partial(_own_staged, call, products=products),
                      functools.partial(pair_streams, call, queries=scored), contracted=True)
     steps = width // keys
 
-    def program(at, q_ref, k_ref, prefix_ref, beta_ref, taken_ref, *sums, streams, staging, landing):
-        del taken_ref
+    def program(at, q_ref, k_ref, *refs, streams, staging, landing):
+        prefix_refs, (beta_ref, _taken_ref, *sums) = refs[:len(prefix)], refs[len(prefix):]
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         keyed = h // call.group * width
         views = stream_views(lambda i: (0, i), keys=call.given.views(k_ref, row, chunk, keyed, width),
-                             gates=gates.views(prefix_ref, row, chunk, h * width, width),
+                             **prefix_views(call, prefix_refs, row, chunk, h * width, width),
                              **({"queries": call.given.views(q_ref, row, chunk, keyed, width)}
                                 if scored else {}))
         shifts, *threaded = staging
@@ -286,8 +289,8 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
             def operand(name):
                 return stream_tile(slots, name, call.given).value().astype(jnp.float32)
 
-            prefix = (stream_tile(slots, "gates", gates).value(),)
-            shifted = shifted_keys(call, shifts, operand("keys"), prefix)
+            limbs = tuple(tile.value() for tile in prefix_tiles(call, slots))
+            shifted = shifted_keys(call, shifts, operand("keys"), limbs)
             if not by_thread(call):
                 found = algebra.key_diagonal_bands(
                     [intra_rows(call, name, operand, beta_ref.at[h, span]) for name in products], shifted,
@@ -331,14 +334,15 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
     # Each output's pairs a key a term, a sub-chunk's offsets: the model's.
     model = len(products) * 3 * chunk * algebra.SUB * width
     staging, landing = _own_staged(call, keys, products=products)
+    inputs = (q, k, *prefix, beta, taken)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=blocks, stages=(1, 2),
-                         live=chunk_liveness(4), steps=steps, model=model,
+                         live=chunk_liveness(len(inputs) - 1), steps=steps, model=model,
                          held=_own_held(call, keys, len(products)),
                          staging=staging, landing=landing, name=_named("recurrence_intra_own", products),
                          issues=False,
                          swizzles={name: resources.widest_swizzle(dtype, keys)
-                                   for name, (_, dtype) in blocks.items()})(q, k, prefix, beta, taken)
+                                   for name, (_, dtype) in blocks.items()})(*inputs)
 
 
 def _band_form(call: Call, name: str):
@@ -397,17 +401,16 @@ def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
         [f32(chunk, algebra.SUB)] * 2))
 
 
-def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, prefix_ref) -> dict:
+def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, prefix_refs: tuple) -> dict:
     """The key-block streams of a key pairs backward's program at chunk `row` and value head `h`
     (`key_pairs_own`'s, `key_backward._key_pairs_back`'s): the queries, keys and the prefix (`intra._prefix`)
     a key block a step."""
-    chunk, width = call.chunk, call.width
-    given, gates = call.given, call.gates
+    chunk, width, given = call.chunk, call.width, call.given
     keyed = h // call.group * width
     return stream_views(lambda i: (0, i),
                         queries=given.views(q_ref, row, chunk, keyed, width),
                         keys=given.views(k_ref, row, chunk, keyed, width),
-                        gates=gates.views(prefix_ref, row, chunk, h * width, width))
+                        **prefix_views(call, prefix_refs, row, chunk, h * width, width))
 
 
 def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, operands: tuple, grads: tuple,
@@ -454,7 +457,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     training on an A100 (M-JS-217); added in the factored pairs' launch, its reads cost it 187 of them, a
     tensor cores' walk two programs a multiprocessor, where this one holds four and issues no products."""
     chunk, width, family = call.chunk, call.width, call.family
-    given, gates, square = call.given, call.gates, fp32_operand(call)
+    given, square = call.given, fp32_operand(call)
     # The block a multiprocessor holds most programs of, at its registers and its shared memory: by its
     # registers alone, an sm86's 99 KB held none of its 32-key block's 106 KB (row 5282). It issues no
     # products, so a product's depth steps it (`key_block`'s `contracted`), as the forward's.
@@ -465,10 +468,10 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
                      functools.partial(_keypair_streams, call), contracted=True)
     steps = width // keys
 
-    def program(at, q_ref, k_ref, prefix_ref, beta_ref, ds_ref, da_ref, taken_ref, factored_q_ref,
-                factored_k_ref, memory_q_ref, memory_k_ref, dq_ref, dk_ref, dg_ref, db_ref, *, streams,
-                staging, landing):
-        del taken_ref
+    def program(at, q_ref, k_ref, *refs, streams, staging, landing):
+        prefix_refs, refs = refs[:len(prefix)], refs[len(prefix):]
+        (beta_ref, ds_ref, da_ref, _taken_ref, factored_q_ref, factored_k_ref, memory_q_ref, memory_k_ref,
+         dq_ref, dk_ref, dg_ref, db_ref) = refs
         shifts, = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
@@ -477,14 +480,14 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
         views = {**stream_views(lambda i: (0, 0),
                                 scores=square.views(ds_ref, h * algebra.SUB, algebra.SUB, row, chunk),
                                 system=square.views(da_ref, h * algebra.SUB, algebra.SUB, row, chunk)),
-                 **pairs_back_views(call, row, h, q_ref, k_ref, prefix_ref)}
+                 **pairs_back_views(call, row, h, q_ref, k_ref, prefix_refs)}
 
         def step(index, slots, d_betas, accumulators):
             slots.acquire_all()
             betas = family.rows_of(beta_ref.at[h, span])
             query = stream_tile(slots, "queries", given).value().astype(jnp.float32)
             key = stream_tile(slots, "keys", given).value().astype(jnp.float32)
-            prefix = (stream_tile(slots, "gates", gates).value(),)
+            limbs = tuple(tile.value() for tile in prefix_tiles(call, slots))
             # Each pairs' gradient's band read at each offset, its row (every token's pair `e` back) as a
             # row's vector, the scores' scaled as their pairs were.
             def strip(name, scaled, e):
@@ -504,7 +507,7 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
             (d_query, d_keyed), d_key = algebra.key_diagonal_pairs_back(
                 strips,
                 [functools.partial(rows, "queries"), lambda: algebra.write_gated(rows("keys"), betas)],
-                shifted_keys(call, shifts, key, prefix), functools.partial(shifted_up, call),
+                shifted_keys(call, shifts, key, limbs), functools.partial(shifted_up, call),
                 (zero, zero), zero)
             d_betas = d_betas + pairs_back_stored(
                 call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys,
@@ -529,26 +532,25 @@ def key_pairs_own(q, k, prefix, beta, d_scores, d_system, taken, factored, memor
     out_type = (summed_rows, summed_rows, fp32_rows, betas)
     # Each offset's two pairs' terms a key, forward and moved up: the model's.
     terms = 2 * 2 * 3 * chunk * algebra.SUB * width
+    inputs = (q, k, *prefix, beta, *(algebra.own_bands(d, chunk=chunk) for d in (d_scores, d_system)), taken)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                         grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2), live=chunk_liveness(6),
-                         steps=steps, model=terms,
+                         grid_names=("chunks", "heads"), blocks=tiles, stages=(1, 2),
+                         live=chunk_liveness(len(inputs) - 1), steps=steps, model=terms,
                          held=_key_own_held(call, keys), staging=staging, landing=landing,
                          name="recurrence_key_pairs_own", issues=False,
                          # The bands read a row at a time, at a traced offset: staged plain.
                          swizzles={f"{name}{p}": swizzling.UNSWIZZLED for name in ("scores", "system")
-                                   for p in range(fp32_operand(call).parts)})(
-        q, k, prefix, beta, *(algebra.own_bands(d, chunk=chunk) for d in (d_scores, d_system)), taken,
-        *factored, *memory)
+                                   for p in range(fp32_operand(call).parts)})(*inputs, *factored, *memory)
 
 
 def _keypair_streams(call: Call, keys: int) -> dict:
     """`key_pairs_own`'s streams at key block `keys`: the pairs' gradients' own bands once, an offset a row
     (`algebra.own_bands`), the queries, keys and prefix a block at a time."""
-    chunk, given, gates, square = call.chunk, call.given, call.gates, fp32_operand(call)
+    chunk, given, square = call.chunk, call.given, fp32_operand(call)
     bands = ((algebra.SUB, chunk), square)
     return stream_blocks(scores=bands, system=bands,
                          queries=((chunk, keys), given), keys=((chunk, keys), given),
-                         gates=((chunk, keys), gates))
+                         **prefix_blocks(call, chunk, keys))
 
 
 def _key_own_staged(call: Call, keys: int, *, summed: Operand) -> tuple:

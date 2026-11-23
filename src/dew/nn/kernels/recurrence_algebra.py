@@ -41,6 +41,7 @@ from dew.nn.precision import (
     float32_matmul,
     power2,
     two_product,
+    two_sum,
 )
 
 Issue = Callable[[str, "Operand", "Operand"], jax.Array]
@@ -205,21 +206,24 @@ def decayed(rows, rows_lo, columns, columns_lo):
                    (column_whole[None, :], column_fraction[None, :]))
 
 
-def halves(prefix: tuple) -> tuple:
-    """A decay's prefix `(hi, lo)` as its two halves: a compensated pair as given (a decay a head's,
-    `prefix`), a rounded sum `(hi,)` with a zero low half (a decay a key dimension's, the template's
-    `intra._prefix`)."""
-    return prefix if len(prefix) == 2 else (*prefix, 0.0)
+def prefix_difference(later: tuple, earlier: tuple) -> tuple:
+    """`later - earlier` of a decay's prefix at two positions (broadcasting), each its limbs (`(hi, lo)` a
+    compensated pair's, `(hi,)` a decay a key dimension's rounded sum alone, `Call.prefix_limbs`), as a pair
+    whose sum it is exactly: one limb's difference rounded and what the rounding dropped (`two_sum`), a
+    pair's compensated (`compensated_add`), so no rounding of the difference reaches what it raises."""
+    if len(later) == 1:
+        (left,), (right,) = later, earlier
+        return two_sum(left, -right)
+    return compensated_add(later, tuple(-half for half in earlier))
 
 
-def range_decay(later, later_low, earlier, earlier_low):
-    """`exp2(later - earlier)` of a compensated prefix's halves at two positions (broadcasting): `raised` of
-    their difference, compensated (`compensated_add`), so no rounding of the halves' difference reaches
-    it: a range's decay, which from the difference rounded to one fp32 lost a fraction's last bits at the
-    prefix's size (1e-6 of the decay near -43). The template's ranges, on its halves' vectors; separating
-    both sides for `between` held more registers, one of sm80's training launches spilling 48 bytes (a
-    port's prefix, stored separated, takes `between`)."""
-    return raised(*compensated_add((later, later_low), (-earlier, -earlier_low)))
+def range_decay(later: tuple, earlier: tuple):
+    """`exp2(later - earlier)` of a decay's prefix at two positions (broadcasting), each its limbs: `raised`
+    of their difference, exact (`prefix_difference`): a range's decay, which from the difference rounded to
+    one fp32 lost a fraction's last bits at the prefix's size (1e-6 of the decay near -43). The template's
+    ranges, on its limbs' vectors; separating both sides for `between` held more registers, one of sm80's
+    training launches spilling 48 bytes (a port's prefix, stored separated, takes `between`)."""
+    return raised(*prefix_difference(later, earlier))
 
 
 PAIR_CEILING = 120.0
@@ -657,7 +661,7 @@ def keys_gated_carried(state, keys: TileLoad, values, gate, decay, dtype, issue:
 
 def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
     """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves."""
-    return corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
+    return corrected_values * range_decay((last, last_lo), (gate, gate_lo))[:, None]
 
 
 def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issue: Issue, *,
@@ -883,14 +887,14 @@ def band_masked(band: jax.Array, *, strict: bool, scale: float) -> jax.Array:
 
 def key_decayed_write(key, gates: tuple, last: tuple):
     """A chunk's keys gated to its end under a decay a key dimension, `k exp2(g_last - g)` of its prefix
-    `gates` and the chunk's last token's `last` (each its halves, `halves`), their difference exact
-    (`range_decay`), in the keys' arithmetic: the write the memory takes (`carried`)."""
-    return key * range_decay(*halves(last), *halves(gates))
+    `gates` and the chunk's last token's `last` (each its limbs), their difference exact (`range_decay`), in
+    the keys' arithmetic: the write the memory takes (`carried`)."""
+    return key * range_decay(last, gates)
 
 
 def key_gated(query, gates: tuple, scale: float):
     """A key block's queries gated by their decays to the chunk's start and scaled, `scale q exp2(g)`
-    (`gates` the prefix's halves, `raised`; the template's one, `intra._prefix`), rounded to the queries'
+    (`gates` the prefix's limbs, `raised`; `Call.prefix_limbs`), rounded to the queries'
     dtype: `key_decayed_output`'s left operand, as fla's chunk_gla output kernel scales its gated queries."""
     return (query * raised(*gates) * scale).astype(query.dtype)
 
@@ -948,7 +952,7 @@ def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad | None, querie
     (`weights` None) nothing was corrected, and the memory entered takes no `w^T dv`."""
     dv = functools.reduce(jnp.add, (issue("values_dv", keys(i), part.astype(dtype))
                                     for i, part in enumerate(grad)))
-    dv = dv * range_decay(last, last_low, gate, low)[:, None] + local
+    dv = dv * range_decay((last, last_low), (gate, low))[:, None] + local
     read = out_grad.astype(jnp.float32) * raised(gate, low)[:, None]
 
     def slice_entered(i, part):
@@ -1032,22 +1036,22 @@ def key_memory_block(query: Tile, key: Tile, gates: tuple, last: tuple, out_grad
                      columns: Callable[[jax.Array], jax.Array] | None = None) -> tuple[jax.Array, jax.Array]:
     """One key block's part of a decay a key dimension's backward (`templates.recurrence.key_backward`), its
     queries `query` and keys `key` `[C, BK]`, their prefix from the chunk's start `gates` `[C, BK]` and the
-    chunk's last token's `last` as a row's vectors (each its halves, `halves`; the template's one,
-    `intra._prefix`), and each value block `j`'s memory entered `entered(j)` and its gradient leaving
-    `leaving(j)` `[BK, BV]`: over the value blocks `dq = scale exp2(g) do h^T`, `dk =
-    exp2(g_last - g) v_new dh^T`, the weights' `dw = -dv h^T` ('memory_dq', 'memory_dk', 'memory_dw'); then
-    `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`, `emit('dk', ...)` and the log decay's
-    terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's `sum(k dk)` on its last token, and `(dA,
-    dbeta)`: the inverse's gradient over the key blocks so far `system` `[C, C]` with this block's part `-dw
-    (kg beta)^T` added as its product forms, so the part is held no longer, and the write gates' `sum(kg d(kg
-    beta))`, fp32. The last prefix's other term, the memory's decay across the chunk (`key_memory_decay`), is
-    the caller's: a key block's memory tiles' rows met the keys' columns here, which Mosaic GPU's layout
-    inference ran out of fuel laying (kda-lower5-sm90 at 6e03eb57e). Each sum over the value blocks issued
-    into one accumulator (`summed`, `memory_gradients`'): a list of each block's products, their accumulators
-    at once, spilled 744 bytes a thread on an H100 (kda-gate3 at ee3734584). `columns`, where given, sums a
-    tile's columns (the mainloop's, `summed_pairs`')."""
+    chunk's last token's `last` as a row's vectors (each its limbs, `Call.prefix_limbs`), and each value block
+    `j`'s memory entered `entered(j)` and its gradient leaving `leaving(j)` `[BK, BV]`: over the value blocks
+    `dq = scale exp2(g) do h^T`, `dk = exp2(g_last - g) v_new dh^T`, the weights' `dw = -dv h^T` ('memory_dq',
+    'memory_dk', 'memory_dw'); then `d(kg beta) = (I + L)^T dw` ('weights_merge'): `emit('dq', ...)`,
+    `emit('dk', ...)` and the log decay's terms `emit('dg', ...)` `[C, BK]` fp32, the chunk's last prefix's
+    `sum(k dk)` on its last token, and `(dA, dbeta)`: the inverse's gradient over the key blocks so far
+    `system` `[C, C]` with this block's part `-dw (kg beta)^T` added as its product forms, so the part is held
+    no longer, and the write gates' `sum(kg d(kg beta))`, fp32. The last prefix's other term, the memory's
+    decay across the chunk (`key_memory_decay`), is the caller's: a key block's memory tiles' rows met the
+    keys' columns here, which Mosaic GPU's layout inference ran out of fuel laying (kda-lower5-sm90 at
+    6e03eb57e). Each sum over the value blocks issued into one accumulator (`summed`, `memory_gradients`'): a
+    list of each block's products, their accumulators at once, spilled 744 bytes a thread on an H100
+    (kda-gate3 at ee3734584). `columns`, where given, sums a tile's columns (the mainloop's,
+    `summed_pairs`')."""
     decays = raised(*gates)
-    to_last = range_decay(*halves(tuple(half[None, :] for half in last)), *halves(gates))
+    to_last = range_decay(tuple(limb[None, :] for limb in last), gates)
     # Each sum in turn, the log decay's terms gathered as each one's term is formed, so one sum and its
     # terms are live at a time: the three sums at once, beside the terms every one fed, spilled 240 bytes a
     # thread on an H100 (kda-gate5 at db546905d); the weights' first, 232 (kda-gate8 at b1e1fcb9b).
@@ -1248,7 +1252,7 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
     for all, each read where it is used: a reader a sum), each issued where it is read where not."""
     row_decay = raised(gate, low)[:, None]
     gathered = summed_all or (lambda groups: tuple(functools.partial(summed, group) for group in groups))
-    leaving_decay = range_decay(last, last_low, gate, low)[:, None]
+    leaving_decay = range_decay((last, last_low), (gate, low))[:, None]
     leaving_terms, after = [], []
     for c in range(columns):
         groups = [[("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks)],

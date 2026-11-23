@@ -122,7 +122,7 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
         values = [f32(chunk, bv), *held_tile(held, chunk, bv), f32(chunk, chunk),
                   *held_tile(held, chunk, chunk),
                   *products]
-        return Held(phases=(values, [f32(chunk, call.block)] * 3))
+        return Held(phases=(values, [f32(chunk, call.block)] * (2 + call.prefix_limbs)))
     # Accurate three-part products each take a fresh accumulator (`Issuer.apart`), the memory's output
     # beside the local product's sums: two stated, an unrounded fp32 write gate's output was admitted where
     # ptxas serialized its warpgroup MMAs (C7512, sm90; armada output-values-fresh-sums). Two parts issue
