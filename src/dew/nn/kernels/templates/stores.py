@@ -78,7 +78,7 @@ def staging_refusal(columns: int, dtypes, staging: tuple[int, int] | None = None
     output's chunk of 4 columns, 8 bytes a row, is refused here rather than by the tensor map it lowers
     to."""
     chunk, buffers = (staged_columns(columns, dtypes), OUTPUT_BUFFERS) if staging is None else staging
-    if columns % chunk or (piece or columns) % chunk or buffers < 1:
+    if chunk < 1 or columns % chunk or (piece or columns) % chunk or buffers < 1:
         return (f"a {columns}-column output tile emitted {piece or columns} columns at once stages in no "
                 f"{buffers} buffers of {chunk} columns")
     row_bits = 8 * TMA_STORE_BYTES
