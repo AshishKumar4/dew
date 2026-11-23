@@ -1206,7 +1206,9 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
 def _most_segments(h, added: bool, turned: bool):
     """A forked walk's most segments over its rows and heads (`_forked_steps`'), each chunk's first token
     and each document's, from its loads `[rows, heads, chunks, C]` (`_taken_up`); None for an unforked
-    walk."""
+    walk. The skip it bounds runs where the fork's layout is the same for the whole map: under an outer
+    vmap over differing layouts it is batched there, and the walk's conditional runs both branches, as the
+    scan before it did (correct, its saving gone)."""
     _, forked = _taken_up(h, added, turned)
     if forked is None:
         return None
