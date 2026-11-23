@@ -96,12 +96,13 @@ MEAN = Form(("k", "kd"), ((1, (((0, 1),), ((1, 1),))),), "d", divisor=((1, (((0,
 
 def test_a_means_gradient_lands_its_parts_in_one_sum():
     """The gradient of a mean's channels' sum along its masses, values near fp32's largest over eight
-    channels: each mass's part through the values (`8 v / T`, 2^130) and through the total (`-8 mean / T`)
-    cancel within one sum to `8 (v_k - mean) / T`, where formed apart they met as `inf - inf`."""
+    channels: each mass's part through the values (`8 v / T`, 2^129 and 1.5 x 2^129) and through the total
+    (`-8 mean / T`, 1.25 x 2^129) cancel within one sum to `8 (v_k - mean) / T`, `-+2^127`, where formed
+    apart they met as `inf - inf`."""
     masses = jnp.asarray([1.0, 1.0], jnp.float32)
     values = jnp.stack([jnp.full(8, 2.0 ** 127), jnp.full(8, 1.5 * 2.0 ** 127)]).astype(jnp.float32)
-    found = jax.grad(lambda m: jnp.sum(contract(MEAN, m, values) * 2.0 ** -127))(masses)
-    np.testing.assert_array_equal(np.asarray(found), np.asarray([-2.0, 2.0], np.float32))
+    found = jax.grad(lambda m: jnp.sum(contract(MEAN, m, values)))(masses)
+    np.testing.assert_array_equal(np.asarray(found), np.asarray([-(2.0 ** 127), 2.0 ** 127], np.float32))
 
 
 def test_a_means_value_and_second_derivatives_are_its_own():
