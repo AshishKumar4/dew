@@ -885,18 +885,35 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
             operands = (weights.unscaled(jnp.bfloat16), group_sizes)
         factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape,
                             dense)
-        scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs)
+        scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs,
+                          wide=interpreted_wide(interpret_on_cpu),
+                          wide_operands=(weights, group_sizes), prepared=decoded_operands)
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
 
-def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None, *,
-                    interpret_on_cpu: bool) -> jax.Array:
-    """A packed matrix's portable product: bf16 `rows` times its decoded bf16 `matrix` (grouped by
-    `group_sizes`, or dense), each product exact and summed in fp32."""
+def decoded_operands(matrix, group_sizes: jax.Array | None) -> tuple:
+    """A packed matrix (`Fp8Weights`, `TernaryWeights`, `NvFp4`) decoded to bf16, beside its group sizes:
+    `factored`'s `prepared`, decoded once a rescue, where it runs."""
+    decoded = matrix.decoded() if isinstance(matrix, NvFp4) else matrix.unscaled(jnp.bfloat16)
+    return decoded, group_sizes
+
+
+def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None,
+                    gather: jax.Array | None = None, *, interpret_on_cpu: bool) -> jax.Array:
+    """A packed matrix's portable product: bf16 `rows` (those `gather` reads, where given, read where they
+    lie: `gemm`'s `gather`) times its decoded bf16 `matrix` (grouped by `group_sizes`, or dense), each
+    product exact and summed in fp32."""
     summed = gemm(rows, matrix, group_sizes, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT,
-                  interpret_on_cpu=interpret_on_cpu)
+                  interpret_on_cpu=interpret_on_cpu, gather=gather)
     assert isinstance(summed, jax.Array), "an unpaired product has one output"
     return summed
+
+
+def interpreted_wide(interpret_on_cpu: bool) -> Callable:
+    """`wide_transpose` as `factored`'s `wide`, interpreted where `interpret_on_cpu` asks, as the product's
+    own pullback is (`_interpreted`), wherever the rescue traces it."""
+    wide = functools.partial(wide_transpose, interpret_on_cpu=interpret_on_cpu)
+    return functools.partial(_interpreted, wide, interpret_on_cpu)
 
 
 def _interpreted(product: Callable, interpret_on_cpu: bool, *operands) -> jax.Array:
@@ -1170,17 +1187,38 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     tile = _planned(launch, bound)
     if selection.select(NVFP4, PackedCase(tile, count, whole=not automatic_axes())).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
-        summed = _packed(rows, words, scales, sizes, gather, first, launch, interpret_on_cpu,
-                         dense=group_sizes is None)
+
+        def packed(r, words, scales, sizes, gather, first):
+            return _packed(r, words, scales, sizes, gather, first, launch, interpret_on_cpu,
+                           dense=group_sizes is None)
+
+        product: Callable[..., jax.Array] = packed
+        operands = (words, scales, sizes, gather, first)
     else:
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
-        # product's, whatever precision the program defaults to.
-        summed = gemm(rows, bank.decoded(), group_sizes, out_dtype=jnp.float32,
-                      precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu, gather=gather)
-        assert isinstance(summed, jax.Array), "an unpaired product has one output"
+        # product's, whatever precision the program defaults to (`decoded_product`).
+        product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
+        operands = (bank.decoded(), group_sizes, gather)
     factor = bank.factor if group_sizes is None else jnp.repeat(
         bank.factor, sizes, total_repeat_length=count)[:, None]
-    return (summed * factor).astype(out_dtype)
+    # Each row's (its group's) factor joins the sum as `factored` takes a row's: a cancelling cotangent
+    # under a factor past fp32's largest pulls back its finite sum, the bank decoded only where it does.
+    return factored(product, operands, factor, lhs, gather=gather,
+                    wide=interpreted_wide(interpret_on_cpu),
+                    wide_operands=(bank, group_sizes), prepared=decoded_operands).astype(out_dtype)
+
+
+def wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array | None, *,
+                    interpret_on_cpu: bool) -> jax.Array:
+    """The rows' transpose of a product with decoded bf16 `matrices` (grouped by `sizes`, or one), in fp32:
+    the cotangent as its bf16 parts (`_bf16_parts`), each part's product exact and summed in fp32, the
+    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding."""
+    parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
+    return functools.reduce(jnp.add, [
+        jnp.asarray(gemm(part, matrices, sizes, transpose_rhs=True, out_dtype=jnp.float32,
+                         precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu))
+        for part in parts])
+
 
 
 def _undeferred(words, scales) -> NvFp4:
@@ -1231,10 +1269,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         del saved
         rows, words, scales, sizes, gather, first = operands
         matrices = decoded(words, scales, first)
-        parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
-        d_rows = functools.reduce(jnp.add, [
-            gemm(part, matrices, None if dense else sizes, transpose_rhs=True, out_dtype=jnp.float32,
-                 precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
+        d_rows = wide_transpose(cotangent, matrices, None if dense else sizes, interpret_on_cpu=interpret)
         if gather is not None:
             d_rows = jnp.zeros(rows.shape, d_rows.dtype).at[gather].add(d_rows)
         leaves = (d_rows.astype(rows.dtype), zero_from_primal(words), zero_from_primal(scales),
