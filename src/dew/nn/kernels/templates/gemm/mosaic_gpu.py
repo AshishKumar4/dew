@@ -1174,6 +1174,8 @@ def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, den
     plain loads, which no TMA bounds (a gathered product's last tile read past an unextended table on a
     GH200, CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
     row_axis = 1 if transpose_lhs else 0
+    if gather is not None:
+        gather = _normalized_gather(gather, lhs.shape[row_axis])
     walked, axis = (lhs, row_axis) if gather is None else (gather, 0)
     walked = rows_padded(walked, axis, unit)
     walked = rows_extended(walked, axis, max(walked.shape[axis], least))
@@ -1188,15 +1190,23 @@ def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, den
     return (walked, None, scatter, m, extent) if gather is None else (lhs, walked, scatter, m, extent)
 
 
+def _normalized_gather(table: jax.Array, rows: int) -> jax.Array:
+    """Normalize signed gather indices to `[0, rows - 1]` (`lhs[gather]` semantics) before native
+    row loads (`gathered.row_copies` sign-extends int32 indices to int64, row 5391)."""
+    indices = table.astype(jnp.int32)
+    return jnp.clip(jnp.where(indices < 0, indices + rows, indices), 0, max(rows - 1, 0)).astype(jnp.int32)
+
+
 def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, prologue, dense: bool,
                     transpose_lhs: bool) -> None:
     """Dew: `gmm`'s refusal of a gathered product (`gather`) but on a family that gathers rows beside the
-    matrix's whole loads (`Family.gathers_rows`, `gathers_alone`), of no prologue, transposed rows or dense
-    call, and of a scattered one
-    (`scatter`) but a grouped call's on such a family (its stores `stores.staged_rows`')."""
+    matrix's whole loads (`Family.gathers_rows`, `gathers_alone`), of no transposed rows or dense call (a
+    prologue runs fused on the gathered rows in the mainloop, row 5391), and of a scattered one (`scatter`)
+    but a grouped call's on such a family (its stores `stores.staged_rows`')."""
+    del prologue
     gathers = family.gathers_rows and family.gathers_alone
-    if gather is not None and (prologue is not None or dense or transpose_lhs or not gathers):
-        raise ValueError(f"a gathered product's rows are a ring family's gather, with no prologue, "
+    if gather is not None and (dense or transpose_lhs or not gathers):
+        raise ValueError(f"a gathered product's rows are a ring family's gather, with no "
                          f"transposed rows or dense call, not {tiles}'s")
     if scatter is not None and (dense or not gathers):
         raise ValueError(f"scattered rows are a grouped call's on a ring family, not {tiles}'s")
@@ -1205,13 +1215,14 @@ def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, pro
 def _tgmm_tables_refused(tables: tuple, tiles: Tiles, family: mosaic.Family, *, prologue, dense: bool,
                          k_major: bool, step_scaled: bool) -> None:
     """Dew: `tgmm`'s refusal of a gathered operand (`tables`, each operand's) but on a family that gathers
-    rows, of no rows-contiguous layout, step scales or dense call, and the rows' table of no prologue (which
-    `gmm`'s refuses alike, `_tables_refused`)."""
+    rows, of no rows-contiguous layout, step scales or dense call, and of a prologue on a family whose
+    consumers do not issue products (`not family.issues_in_consumers`; row 5391)."""
+    if prologue is not None and not family.issues_in_consumers:
+        raise ValueError(f"a kernel gradient's prologue requires consumer-issued products, not {tiles}'s")
     if any(table is not None for table in tables) and (
-            dense or k_major or step_scaled or not (family.gathers_rows and family.gathers_alone)
-            or (tables[0] is not None and prologue is not None)):
-        raise ValueError(f"a gathered kernel gradient's rows are a ring family's gather, with no prologue on "
-                         f"gathered rows, rows-contiguous layout, step scales or dense call, not {tiles}'s")
+            dense or k_major or step_scaled or not (family.gathers_rows and family.gathers_alone)):
+        raise ValueError(f"a gathered kernel gradient's rows are a ring family's gather, with no "
+                         f"rows-contiguous layout, step scales or dense call, not {tiles}'s")
 
 
 def depth_masked(prologue, tile, *sides):
@@ -1574,13 +1585,7 @@ def _summed(family: mosaic.Family, tiles: Tiles, exact_sums: bool) -> dict:
 
 def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int, exact_sums: bool,
                      prefetch: Callable | None = None) -> tuple:
-    """Dew: a cooperative `gmm` consumer's `count` products over its steps (`walk`, `step` a `_gmm_step`
-    whose operands it reads), each into an fp32 tile of `shape`: as the tensor cores add, or with
-    `exact_sums` each step's product summed apart and added into the running sum by an IEEE add, as
-    `_walked_gradient`'s: an FP8 product's running sum promoted into fp32 every step, Hopper's FP8 tensor
-    cores summing within one in a narrower accumulator (testing.md, FP8 products). A family whose persist
-    sums the windows itself (`mosaic.Family.sums_in_persist`, `_summed`) walks the steps plainly, with
-    `prefetch` where given (`_gmm_stepped_at`)."""
+    """Walk `count` products (`_gmm_step`), summed in fp32 or via `exact_sums` IEEE running sums."""
     if not exact_sums or family.sums_in_persist:
         _, accs = walk(step, None, (shape,) * count, **({} if prefetch is None else {'prefetch': prefetch}))
         return accs
@@ -1594,11 +1599,7 @@ def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int
 
 
 def _idle(tiles: Tiles, group: "row_tiles.GroupInfo", row_start, consumer) -> jax.Array | None:
-    """Dew: whether consumer `consumer`'s share of the tile at `row_start` (`Tiles.share_row`) lies wholly
-    outside its group's rows (`GroupInfo`'s actual ones: a ragged group's last tile past its end, a tile its
-    group starts within before its start), so its products multiply nothing (`Issuer.issued_unless`); None
-    where one consumer takes the tile's rows (`Tiles.sharing`: mma.sync's, ping-pong's, tcgen05's), whose
-    tile a walk takes only where its group holds rows."""
+    """Whether `consumer`'s share lies outside its group's rows (`issued_unless`); None if sharing == 1."""
     if tiles.sharing == 1:
         return None
     first = row_start + tiles.share_row(consumer)
@@ -1947,8 +1948,10 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     row_axis = 1 if k_major else 0
     lhs, rhs = (rows_padded(operand, row_axis, multiple) if table is None else operand
                 for operand, table in zip((lhs, rhs), tables, strict=True))
-    tables = tuple(None if table is None else rows_padded(table.astype(jnp.int32), 0, math.lcm(8, block_k))
-                   for table in tables)
+    tables = tuple(
+        None if table is None else rows_padded(_normalized_gather(table, operand.shape[row_axis]),
+                                               0, math.lcm(8, block_k))
+        for operand, table in zip((lhs, rhs), tables, strict=True))
     k = -(-k // multiple) * multiple
     prologue_operands = sides_padded(prologue_operands, prologue_axes, multiple)
     bounded = family_of(tiles, lhs.dtype).bounded_loads and not interpret and tables[0] is None
@@ -2027,11 +2030,9 @@ def prologue_rewritten(family: mosaic.Family, prologue) -> bool:
 def rewrites(family: mosaic.Family, k_major: bool, unstaged: bool) -> bool:
     """Dew: whether `tgmm`'s stage is rewritten by its family's own role (`mosaic.Family.rewrites_in_persist`,
     a role beside its consumers): its loads' rows, gathered by its load warp's tables or not
-    (`gathered.Committed`, whose slots hand off as any ring's), never a k-major launch's whole steps of one
-    group, nor a stage read as loaded (`rows_unstaged`); its products' warp reads no tile, so a gathered
-    stage's neighbouring groups' rows are masked there (row 1376: masked in the products' warp, a gathered
-    B200 gradient failed to lower). The one decision: the kernel's role and its planning's
-    (`grouped_matmul._Mosaic.rewritten`)."""
+    (`gathered.Committed`), never a k-major launch's whole steps of one group or a stage read as loaded
+    (`rows_unstaged`); its products' warp reads no tile, so a gathered stage's neighbouring groups' rows are
+    masked there (row 1376). The one decision: the kernel's role and its planning's (`_Mosaic.rewritten`)."""
     return family.rewrites_in_persist and not k_major and not unstaged
 
 

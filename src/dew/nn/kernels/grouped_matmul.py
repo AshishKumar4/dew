@@ -249,7 +249,10 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         # A last wave balanced over the programs (`balanced`) merges a slice of another program's partial at a
         # time beside its own (`mosaic.Family.fixed_up`, `across.merge_spans`).
         merged = min(accumulator, across.MERGED_REGISTERS) if merging else 0
-        phases = [staged, prologue, merged, self._epilogue_registers(ba, config, stored)]
+        rewrite_role = self._prologue_rewritten(ba, family)
+        phases = [staged, 0 if rewrite_role else prologue, merged,
+                  self._epilogue_registers(ba, config, stored)]
+        rewrite_need = family.scalar_registers() + prologue if rewrite_role else 0
         # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`): in
         # registers its whole share, in tensor memory the epilogue chunk read beside the first's
         # (`Issuer.chunk_columns`).
@@ -263,7 +266,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
             # accumulators: a 128 x 128 tile 2 x 64 words and the walk's control (B6, where two whole
             # accumulators charged 272 refused it past 248).
             chunk = -(-config.share * family.chunk_columns(columns) // resources.THREADS)
-            return max(2 * chunk + resources.CONTROL_REGISTERS, plain + max(phases))
+            return max(2 * chunk + resources.CONTROL_REGISTERS, plain + max(phases), rewrite_need)
         if ba.arguments.get('exact_sums'):
             # Each product's running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is
             # carried as a loop value beside its step's product (`mosaic.Issuer.summed_apart`), awaited before
@@ -274,8 +277,9 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
             # family whose products read registers holds each step's fragments beside both (mma.sync's, one
             # step's product at a time: 201 at its 128 x 128 forward tile, NSDBG-5).
             held = plain + (accumulator if family.operands_in_registers else 0)
-            return max(2 * (accumulator + second) + resources.CONTROL_REGISTERS, held + max(phases))
-        return plain + max(phases)
+            return max(2 * (accumulator + second) + resources.CONTROL_REGISTERS, held + max(phases),
+                       rewrite_need)
+        return max(plain + max(phases), rewrite_need)
 
     def _prologue_registers(self, ba, config: tiling.Tiles) -> int:
         """A prologue's transform of a consumer's share of the rows' stage: that share and each side tile of
@@ -394,14 +398,12 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         prepared = ((ba.arguments['hooks'].prologue is not None and not self._prologue_rewritten(ba, family))
                     or (self.STAGED_ROWS and not self.unstaged(ba) and not self.rewritten(ba, family))
                     or (summed and not family.sums_in_persist))
-        # Gathered rows (`gmm_call`'s `gather`) are a ring family's producer's gather, no prologue rewriting
-        # them (`mosaic_gpu._gather_refused`).
+        # Gathered/scattered rows (`gmm_call`'s `gather`/`scatter`) require a ring family's gather/scatter.
         gathered = ba.arguments.get('gather') is not None
         tabled = gathered or ba.arguments.get('scatter') is not None
         multiplied = family.operand_dtypes is None or jnp.dtype(dtype) in family.operand_dtypes
         return (((jnp.dtype(dtype).itemsize == 2 and multiplied) or self._fp8(ba, dtype, family))
                 and (not tabled or (family.gathers_rows and family.gathers_alone))
-                and (not gathered or ba.arguments['hooks'].prologue is None)
                 and (family.issues_in_consumers or not prepared)
                 and (family.takes_prologue_tiles or not _prologue_tiled(ba))
                 and (family.takes_pairs or ba.arguments.get('paired') is None))
@@ -789,7 +791,6 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
     def extents(cls, tile: tiling.Tiles) -> dict:
         """The block each launch axis takes at `tile`."""
         return {axis: getattr(tile, block) for axis, block in cls.BLOCKS.items()}
-
 
     def program_shared(self, config: tiling.Tiles, target) -> int:
         # The programs a multiprocessor runs at once share its shared memory.
@@ -2044,14 +2045,15 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
         'pair', lambda case: not case.paired or _takes_pair(name, case),
         lambda case: f"the {name} launches take no paired product on {case.call.target.generation}, whose "
                      "two products then run apart", row='ledger 2100', kind='handoff'), _Need(
-        # A paired call's capability is the pairing launch's alone: every other hands it on (`pair`).
+        'tables', lambda case: not (case.gathered or case.scattered) or _takes_tables(name, case),
+        lambda case: f"the {name} launches read and write no rows through a table on "
+                     f"{case.call.target.generation}", row='ledger 1376', kind='handoff'), _Need(
+        # Paired or tabled calls no bundle of `name` takes hand on (`pair`, `tables`) before `launch`.
         'launch', lambda case: ((case.paired and not _takes_pair(name, case))
+                                or ((case.gathered or case.scattered) and not _takes_tables(name, case))
                                 or case.call.eligible(name)),
         lambda case: f"the {name} launches take no call of these dtypes, widths, side operands or hooks on "
-                     f"{case.call.target.generation}", row='ledger 1295'), _Need(
-        'tables', lambda case: not (case.gathered or case.scattered) or name == MosaicGmm.name,
-        lambda case: f"the {name} launches read and write no rows through a table: Mosaic GPU's gathers and "
-                     "scatters them", row='ledger 1376'), *measured))
+                     f"{case.call.target.generation}", row='ledger 1295'), *measured))
 
 
 DECLARED_ONLY = _Need('declared', lambda case: DECLARED.get(case.cell, (None,))[0] is CUTLASS,
@@ -2085,6 +2087,17 @@ def _takes_pair(name: str, case: GroupedCase) -> bool:
     if name != MosaicGmm.name or bound is None:
         return False
     return bool(MosaicGmm()._families(bound[1], case.call.target))
+
+
+def _takes_tables(name: str, case: GroupedCase) -> bool:
+    """Whether the launches `name` read/write rows through gather/scatter tables on `case`'s target."""
+    bound = case.call.bound.get(name)
+    if name != MosaicGmm.name or bound is None:
+        return False
+    op, ba = bound
+    dtype = ba.arguments['tokens'].dtype
+    return any(f.gathers_rows and f.gathers_alone for f in op._families(ba, case.call.target)
+               if f.operand_dtypes is None or jnp.dtype(dtype) in f.operand_dtypes)
 
 
 class Apart:
