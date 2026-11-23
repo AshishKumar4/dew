@@ -26,7 +26,7 @@ from map_judge import marked_seeds
 from ssd_support import stepwise_scan
 
 from dew.algebra import SATURATION, scan
-from dew.nn.kernels import diagonal_scan, generation, recurrence, recurrence_chunk, short_conv, ssd
+from dew.nn.kernels import diagonal, generation, recurrence, recurrence_chunk, short_conv, ssd
 from dew.nn.kernels.templates.recurrence import turned
 from dew.nn.linear import causal_conv1d
 from dew.nn.mixers.mamba2 import chunk_ssd
@@ -682,7 +682,7 @@ def test_the_short_conv_holds_every_order(edge):
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_diagonal_scan_holds_its_orders(edge):
     """The diagonal scan on the template's kernels (`templates.recurrence.diagonal`, a custom VJP over its
-    launches, interpreted off a GPU) as every caller reaches it (`diagonal_scan.diagonal_scan` with the
+    launches, interpreted off a GPU) as every caller reaches it (`kernels.diagonal.diagonal_scan` with the
     kernels named, whose products' wrapper takes every order through the portable math, `_per_product`),
     over three spans of 64 tokens at an interpreted H100's facts from a state: each token's output and the
     final state finite at every order wherever float64 is a normal float32 and the recurrence a token at a
@@ -700,7 +700,7 @@ def test_the_diagonal_scan_holds_its_orders(edge):
     def kernel(x, g, state):
         with (generation.assumed("sm90" if INTERPRETED else None, interpreted=INTERPRETED),
               generation.chosen(diagonal_scan="mosaic_gpu")):
-            return joined(*diagonal_scan.diagonal_scan(x, g, state))
+            return joined(*diagonal.diagonal_scan(x, g, state))
 
     def plain(x, g, state):
         def step(h, token):

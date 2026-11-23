@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from dew._exports import lookup as _lookup
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew.nn.kernels.diagonal import diagonal_scan
     from dew.nn.kernels.generation import (
         PALLAS_CHOICES,
         TARGETS,
@@ -49,6 +50,7 @@ _EXPORTS = {
     "triton_runs": "dew.nn.kernels.generation",
     "ssd_kernel_platform": "dew.nn.kernels.ssd",
     "ssd_kernel_runs": "dew.nn.kernels.ssd",
+    "diagonal_scan": "dew.nn.kernels.diagonal",
 }
 
 __getattr__, __dir__ = _lookup(__name__, _EXPORTS)
@@ -63,6 +65,7 @@ __all__ = [
     "chosen_kernel",
     "compile_only_gpus",
     "device_generation",
+    "diagonal_scan",
     "gpu_mesh",
     "gpu_target",
     "ssd_kernel_platform",

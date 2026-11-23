@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import grouped_heads, manual_map
 
 from . import generation, recurrence
@@ -18,7 +19,6 @@ from .generation import INHERENT, Choice
 from .recurrence_chunk import _VARYING, CHUNK_SIZE, Chunk, _per_product, chunk
 from .selection import Kernel, Op, Requirement, select
 from .templates import scan as block_scan
-
 
 DIAGONAL = recurrence.Hooks(decay='none', delta=False, value_decay=True, scale=1.0)
 """A diagonal recurrence's form (`diagonal_scan`): a key width of one, its decay along the values, no delta
@@ -83,12 +83,16 @@ def diagonal_scan(x, g, state=None, *, chunk_size: int = CHUNK_SIZE, starts=None
     `x`'s dtype, final state [B, D] in at least fp32)`, on the kernel its selector gives each product
     (`DIAGONAL_SCAN`, `_per_product`): the recurrence template's walk (`templates.recurrence.diagonal`),
     interpreted off a GPU where a call names it, per shard of rows on a mesh (`manual_map`); or the portable
-    math (`_diagonal_portable`)."""
+    math (`_diagonal_portable`). A call of no tokens walks none: its final state is the one entering."""
+    if x.shape[1] == 0:
+        wide = at_least_fp32(x.dtype)
+        return x, jnp.zeros((x.shape[0], x.shape[-1]), wide) if state is None else state.astype(wide)
+
     def template(x, g, state, *given):
-        from .templates.recurrence import diagonal, mainloop
+        from .templates.recurrence import diagonal as launches, mainloop
 
         family, interpreted = mainloop.issued(jnp.float32)
-        return diagonal.diagonal_scan(x, g, state, given[0] if given else None, family=family,
+        return launches.diagonal_scan(x, g, state, given[0] if given else None, family=family,
                                       interpret=interpreted)
 
     def run(kernel, x, g, state):

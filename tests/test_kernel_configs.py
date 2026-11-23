@@ -181,7 +181,7 @@ def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
-def _diagonal_case(packed: bool) -> support.KernelCase:
+def _diagonal_case(*, packed: bool) -> support.KernelCase:
     """The diagonal scan's training step through its VJP (`templates.recurrence.diagonal`, its four launches:
     16 spans a row) over bf16 writes at HGRN 1.3B's 2048 channels, eight rows of 4096 tokens, whole or
     packed."""
@@ -214,7 +214,7 @@ def test_the_diagonal_scans_kernels_compile_within_each_gpus_resources(target):
     spilled."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    found = compile_mosaic_kernels([_diagonal_case(False), _diagonal_case(True)], target)
+    found = compile_mosaic_kernels([_diagonal_case(packed=False), _diagonal_case(packed=True)], target)
     assert len(found) == 2
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 

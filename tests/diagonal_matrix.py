@@ -1,11 +1,11 @@
 """The diagonal scan's check-1 matrix (tests/kernel_matrix.py): HGRN's recurrence on the template's kernels on
 par with the portable math.
 
-Its cells run generation.CHOICES' `diagonal_scan`: `diagonal_scan.diagonal_scan` over bf16 or fp32 writes
+Its cells run generation.CHOICES' `diagonal_scan`: `kernels.diagonal.diagonal_scan` over bf16 or fp32 writes
 from a state, whole rows or packed ones, its kernel named (`generation.chosen`). Its output, final state and
 the gradients of its writes, gates and state are held to the same call on the portable math ('xla', check 1),
 the token recurrence in float64 the truth (test_diagonal_scan's `token_by_token`). What it serves is its
-selector's (`diagonal_scan.DIAGONAL_SCAN`, as the call asks it).
+selector's (`diagonal.DIAGONAL_SCAN`, as the call asks it).
 """
 
 import functools
@@ -17,25 +17,25 @@ import pytest
 from gpu_flow import cell
 from kernel_matrix import AXES
 from reference_error import assert_as_exact
-from test_diagonal_scan import draws, token_by_token, with_gradients
+from test_diagonal_scan import differentiated, draws, token_by_token
 
-from dew.nn.kernels import diagonal_scan, generation
+from dew.nn.kernels import diagonal, generation
 from dew.nn.kernels.selection import KernelRefused
 
-CHOICES = frozenset({diagonal_scan.DIAGONAL_SCAN.choice})
+CHOICES = frozenset({diagonal.DIAGONAL_SCAN.choice})
 """The generation.CHOICES entries the family's cells run (row 184): the diagonal scan's selector's."""
 
-KERNELS = {diagonal_scan.DIAGONAL_SCAN.choice: frozenset(
-    kernel.name for kernel in diagonal_scan.DIAGONAL_SCAN.kernels if not kernel.generic)}
+KERNELS = {diagonal.DIAGONAL_SCAN.choice: frozenset(
+    kernel.name for kernel in diagonal.DIAGONAL_SCAN.kernels if not kernel.generic)}
 """The kernels each choice's cells run under test (row 4513), its selector's every kernel but the generic
 one each is held to: the recurrence template's walk."""
 
-(KERNEL,) = KERNELS[diagonal_scan.DIAGONAL_SCAN.choice]
+(KERNEL,) = KERNELS[diagonal.DIAGONAL_SCAN.choice]
 """The kernel each cell holds to the portable math: the recurrence template's walk
 (`templates.recurrence.diagonal`)."""
 
 LENGTH = 300
-"""A cell's tokens: several spans a row at every generation's facts (`diagonal.walk`)."""
+"""A cell's tokens: several spans a row at every generation's facts (`templates.recurrence.diagonal.walk`)."""
 
 SEEDS = 8
 """A cell's declared draws against the portable math (check 1)."""
@@ -45,9 +45,9 @@ def _step(kernel: str):
     """The diagonal scan on `kernel` (`generation.chosen`): its output, final state and gradients."""
     def scan(x, g, state, starts):
         with generation.chosen(diagonal_scan=kernel):
-            return diagonal_scan.diagonal_scan(x, g, state, starts=starts)
+            return diagonal.diagonal_scan(x, g, state, starts=starts)
 
-    return with_gradients(scan)
+    return differentiated(scan)
 
 
 def _drawn(case: dict[str, str]):
@@ -92,5 +92,5 @@ def a_diagonal_scans_training_step_is_on_par(case: tuple[str, ...]) -> None:
     named = dict(zip(AXES["diagonal_scan"], case, strict=True))
     with generation.routes() as found:
         assert_as_exact(_step(KERNEL), _step("xla"), _drawn(named), "-".join(case), seeds=SEEDS,
-                        truth_fn=jax.jit(with_gradients(token_by_token)))
+                        truth_fn=jax.jit(differentiated(token_by_token)))
     assert {route.choice for route in found} <= CHOICES
