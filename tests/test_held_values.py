@@ -75,7 +75,7 @@ def test_a_held_trace_made_again_past_its_bound_records_its_facts_afresh():
 def test_a_refusal_scopes_lookup_leaves_a_held_traces_key_as_it_was():
     """Within a refusal scope (`report.refusals`), a lookup of a launch's refusals (`report.refusals_of`,
     which fills the scope's index of them) leaves the key a held trace is kept by (`options.held_context`)
-    as it was: the scope's registry enters it by its refusals alone (`report.refusal_entries`, read under
+    as it was: the scope's registry enters it by its refusals alone (`report.refusal_snapshot`, read under
     its lock), not by its mutable records, where a first probe made its own key stale and a compile worker
     filling it raced the key's walk of its dicts (row 12134's review)."""
     from dew.nn.kernels import options
@@ -331,3 +331,29 @@ def test_a_program_within_a_held_jits_trace_that_refuses_a_launch_leaves_it_to_i
     inner.released()
     with report.refusals():
         assert float(outer(x)) == 0.0
+
+
+def test_a_held_value_stands_past_a_refusal_of_a_launch_it_read_none_of():
+    """A value held whose making ran a program reading one launch's refusals (`report.refusals_of`) stands
+    after another launch is refused, and is made again once its own is: a trace reads the refusals of the
+    launches it reads alone, the whole registry no fact of it (row 12296: any refusal made every held value
+    again, the registry read whole as a program keyed its executables)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    run, x = owned_program(lambda x: x + (1.0 if report.refusals_of("a launch") else 0.0)), jnp.zeros(())
+    cache: collections.OrderedDict = collections.OrderedDict()
+    made: list[float] = []
+
+    def making() -> float:
+        made.append(float(run(x)))
+        return made[-1]
+
+    with report.refusals():
+        assert _cache.holding(cache, "held", making, 4) == 0.0
+        report.refuse([("another launch", 1, ("k",))])
+        assert _cache.holding(cache, "held", making, 4) == 0.0
+        assert made == [0.0]
+        report.refuse([("a launch", 1, ("k",))])
+        assert _cache.holding(cache, "held", making, 4) == 1.0
+        assert made == [0.0, 1.0]
