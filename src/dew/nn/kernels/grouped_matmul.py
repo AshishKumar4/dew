@@ -600,9 +600,10 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)
                 or not self._divides(ba, config, target) or self._refused(ba, config, target)):
             return False
-        if not self._granular(ba, config, family, target):
-            return False
         hooks = ba.arguments['hooks']
+        if (not self._granular(ba, config, family, target)
+                or not config.staged_whole(hooks.out_dtypes or (ba.arguments['out_dtype'],))):
+            return False
         sides = (('prologue_operands', hooks.prologue_axes), ('epilogue_operands', hooks.epilogue_axes))
         vectors = {(axis, jnp.dtype(side.dtype)) for name, axes_of in sides
                    for side, side_axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)

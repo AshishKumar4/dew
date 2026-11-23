@@ -109,8 +109,30 @@ class Tiles:
             if chunk <= 0 or buffers < 1:
                 raise ValueError(f"{self}: output staging needs positive (chunk, buffers), "
                                  f"got {self.staging}")
+            # Its chunks' columns against the tile's and its issuer's pieces, which no dtype changes; a
+            # chunk's bytes in the call's output dtypes are its launch's to judge (`staged_whole`).
             columns = self.block_n * (self.cluster if family.pairs_product else 1)
             family.output_staging((((self.share, columns), jnp.bfloat16),), self.warpgroups, self.staging)
+
+    def stated(self, outputs) -> tuple[int, int] | None:
+        """The output staging this tile states for a kernel storing `outputs` (`(shape, dtype)` each,
+        `persist`'s `chunks`), refused where a chunk is no whole TMA store in an output's dtype
+        (`staged_whole`), as the launch's candidate refuses it: `gmm` or `tgmm` called directly at a pin."""
+        if not self.staged_whole(dtype for _, dtype in outputs):
+            raise ValueError(f"{self}: a staged chunk of its outputs is no whole {TMA_STORE_BYTES}-byte TMA "
+                             "store in their dtypes")
+        return self.staging
+
+    def staged_whole(self, dtypes) -> bool:
+        """Whether each output chunk this tile states (`staging`) is whole TMA store quanta in every one of
+        the call's output `dtypes` (`TMA_STORE_BYTES`); a tile stating none stages at its family's own."""
+        return self.staging is None or all(
+            self.staging[0] * jnp.dtype(dtype).itemsize % TMA_STORE_BYTES == 0 for dtype in dtypes)
+
+
+TMA_STORE_BYTES = 16
+"""The bytes a TMA store's box row steps by (128 bits): a staged output chunk's row is whole multiples of it
+in its dtype, so a bf16 chunk is a multiple of 8 columns and an fp32 one of 4 (`Tiles.staged_whole`)."""
 
 
 CONSUMERS = 2
@@ -168,10 +190,11 @@ class TilesTemplate(base.Template[Tiles]):
 
     def _legal(self, ba, config: Tiles, target) -> bool:
         """`legal`'s judgment under `target`: a candidate whose ring of `config.stages` and registers the
-        planner holds at its programs (`resources.plan`)."""
+        planner holds at its programs (`resources.plan`), staging its output at its family's own chunks (a
+        stated `staging` is the grouped launch's alone, `grouped_matmul._Mosaic`)."""
         from . import pricing
 
-        if not self.candidate(ba, config, target):
+        if config.staging is not None or not self.candidate(ba, config, target):
             return False
         family = pricing.family_of(config, self._operand_dtype(ba), target)
         launch = dataclasses.replace(self.launch_of(ba, config, target),

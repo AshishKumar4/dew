@@ -2411,6 +2411,13 @@ def test_sm120_output_staging_admits_three_stage_128x256_and_compiles():
         assert gmm.legal(ba, arm_32x2, sm120)
         assert gmm.staged_bytes(ba, base, sm120) - gmm.staged_bytes(ba, arm_64x1, sm120) == 16384
         assert gmm.staged_bytes(ba, arm_64x1, sm120) == gmm.staged_bytes(ba, arm_32x2, sm120)
+        # Four bf16 columns are 8 bytes a chunk's row: no whole 16-byte TMA store, which the launch refuses
+        # and its kernel too where called at that pin; four fp32 columns are one store.
+        narrow = dataclasses.replace(base, staging=(4, 1))
+        assert not gmm.legal(ba, narrow, sm120)
+        with pytest.raises(ValueError):
+            narrow.stated((((64, 256), jnp.bfloat16),))
+        assert narrow.stated((((64, 256), jnp.float32),)) == (4, 1)
 
     def ref_fn(x, w, *, dtype=jnp.float32):
         return jax.lax.dot(x.astype(dtype), w.astype(dtype), preferred_element_type=dtype).astype(
@@ -2446,3 +2453,30 @@ def test_sm120_output_staging_admits_three_stage_128x256_and_compiles():
             assert not rec.get("error"), rec
             assert rec["kernels"], rec
             assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+def test_stated_output_staging_narrows_with_a_chained_replay_and_stays_off_syrk_and_linear_ce():
+    """A Hopper 128-column tile staging its output in one 128-column chunk replays a chained launch of two
+    products at 64 columns, its chunk narrowed alike, rather than at a tile its staging no longer divides; and
+    linear CE's launch and kernel, which stage at their family's own chunks, take no stated staging (row
+    5634)."""
+    from dew.nn.kernels.templates.gemm import chained, linear_ce, pricing
+
+    tile = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family="wgmma", staging=(128, 1))
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        family = pricing.family_of(tile, jnp.bfloat16, target)
+        assert chained.replay_refusal(tile, 2, family, jnp.bfloat16) is None
+        replay = chained.replay_tile(tile, 2)
+        assert (replay.block_n, replay.staging) == (64, (64, 1))
+
+        ce, bf16 = linear_ce.MOSAIC_LINEAR_CE, functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+        ba = ce.bind(bf16((128, 128)), bf16((256, 128)), jax.ShapeDtypeStruct((128,), jnp.int32), None,
+                     transpose_rhs=True, softcap=None, interpret=False)
+        derived = ce.derived(ba, target)
+        assert derived is not None and ce.legal(ba, derived, target)
+        staged = dataclasses.replace(derived, staging=(derived.block_n, 1))
+        assert not ce.legal(ba, staged, target)
+    with pytest.raises(ValueError):
+        linear_ce.linear_ce(jnp.zeros((128, 128), jnp.bfloat16), jnp.zeros((256, 128), jnp.bfloat16),
+                            jnp.zeros((128,), jnp.int32), tiles=staged, multiprocessors=1, interpret=True)
