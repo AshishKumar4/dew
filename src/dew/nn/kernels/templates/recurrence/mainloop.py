@@ -218,7 +218,7 @@ def _parts(dtype, family: mosaic.Family, fast: bool = False) -> int:
     `_fast_parts` under the run's fast forms (`fast`), else three."""
     if jnp.dtype(dtype) != jnp.float32:
         return 1
-    return _fast_parts(family) if fast else product.EXACT_PARTS
+    return _fast_parts(family) if fast else product.bf16_part_count(jnp.float32, accurate=True)
 
 
 def diagonal(size: int, family: mosaic.Family) -> jax.Array:
@@ -641,8 +641,9 @@ def summing_staging(call: Call) -> tuple:
     the parts' 24 KB put the scores' backward at keys 256 wide past its block (174080 bytes against 166912,
     wide-bwd at b3de8f293)."""
     chunk = call.chunk
+    exact_parts = product.bf16_part_count(jnp.float32, accurate=True)
     staged = (() if call.family.operands_in_registers
-              else staging_tiles(Operand(chunk, product.EXACT_PARTS, jnp.dtype(jnp.float32)), (chunk, chunk)))
+              else staging_tiles(Operand(chunk, exact_parts, jnp.dtype(jnp.float32)), (chunk, chunk)))
     return (*staged, (plgpu.SMEM((chunk, chunk), jnp.bfloat16),), column_sums_scratch(call))
 
 
@@ -663,7 +664,8 @@ def summed_issuer(staging: tuple, call: Call) -> tuple:
     """`algebra.summed_pairs`' issuer and column sums on `summing_staging`'s staging: its fp32 operand's parts
     staged, or held in registers where the family's products read them there."""
     *staged, exact, scratch = staging
-    parts = product.EXACT_PARTS if call.family.operands_in_registers else staged[0]
+    parts = (product.bf16_part_count(jnp.float32, accurate=True)
+             if call.family.operands_in_registers else staged[0])
     return Issuer(call, {"summed": parts, "summed.exact": exact}), column_sums(call, scratch)
 
 

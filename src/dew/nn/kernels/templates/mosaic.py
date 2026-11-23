@@ -1209,12 +1209,17 @@ class Issuer[Accumulator](abc.ABC):
         return vector
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
-        """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
-        product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum).
-        `pending` is the count of this warpgroup's later product groups left in flight when `product` reads
-        its value (issued by `then()` before the read); synchronous issuers take `pending=0` only and raise
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
+        """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, running `between()` while the product runs
+        and returning `(between(), product)` out of the accumulator's scope (`WgmmaIssuer`). `pending` is
+        the count of this warpgroup's later product groups left in flight when the accumulator is read
+        (issued by `between()` before the read); synchronous issuers take `pending=0` only and raise
         `ValueError` otherwise."""
+
+    def product(self, lhs, rhs, shape: tuple[int, int], *, pending: int = 0) -> jax.Array:
+        """`lhs @ rhs` into a fresh fp32 accumulator of `shape` (`product_with` with no overlapped work)."""
+        return self.product_with(lhs, rhs, shape, lambda: None, pending=pending)[1]
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:

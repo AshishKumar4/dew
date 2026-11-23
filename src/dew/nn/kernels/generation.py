@@ -433,9 +433,10 @@ class Architecture:
     the v5e refused it, unmeasured on v2, v3, v4, v5p and the GPUs."""
     fp32_by_bf16_precise: bool = True
     """Whether its matrix unit takes an fp32 by bf16 product at fp32 precision, which a default matmul
-    precision of 'highest' asks of a kernel's fp32 weights and bf16 values: a v5e's MXU does not (row 6994,
-    7228). Measured False on a v5e and True on a v6e as `float16` is; the default True unmeasured
-    elsewhere."""
+    precision of 'highest' asks of a kernel's fp32 weights and bf16 values: neither a v5e's nor a v6e's MXU
+    does (`paged_attention` at 'highest' fails Mosaic lowering with `Bad rhs type: 128, 128` on v5e, rows
+    6994, 7228, and `Bad rhs type: 256, 256` on v6e, NA-PROBE-12040, row 12040). Measured False on both v5e
+    and v6e; the default True unmeasured elsewhere."""
     accurate_exp: bool = True
     """Whether its default fp32 exp is within fp32's rounding, as the recurrences' decays need
     (`dew.nn.precision.accurate_exp`, row 7375): a v5e's is 1.6e-6 from float64, its exp of a reduced
@@ -554,7 +555,8 @@ _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 *
                              fp32_by_bf16_precise=False, accurate_exp=False),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20, vector_per_clock=2.83e12 / (918e12 / 524288),
-                             exponentials_per_clock=1.79e12 / (918e12 / 524288), accurate_exp=False)}
+                             exponentials_per_clock=1.79e12 / (918e12 / 524288),
+                             fp32_by_bf16_precise=False, accurate_exp=False)}
 
 
 def architecture(generation: str) -> Architecture | None:
