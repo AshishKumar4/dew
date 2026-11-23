@@ -252,6 +252,12 @@ def test_a_steps_count_reads_as_the_bound_it_is():
             f"{mark}2.0", f"{mark}25.0", "20.0"]
 
 
+SMOKE_CASE = ("--preset", "cpu-smoke", "--architectures", "causal_transformer", "--dtype", "float32",
+              "--mesh", "{}")
+"""The causal_transformer smoke case's arguments to tools/benchmark_step.py: its row's (`peak_row`) and a
+prepare's that compiles the same case's program ahead (tests/test_attribute_step.py)."""
+
+
 def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] | None = None) -> dict:
     """The causal_transformer smoke case's row, the tool run as a person runs it on one device of
     `platform` with `arguments` and the environment's `settings`, the case measured in processes of its
@@ -259,9 +265,8 @@ def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] 
     out = tmp_path / "rows.json"
     environment = outside_suite(os.environ) | (settings or {})
     tool = str(REPO_ROOT / "tools/benchmark_step.py")
-    done = subprocess.run([sys.executable, tool, "--preset", "cpu-smoke",
-                           "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
-                           "--dtype", "float32", "--mesh", "{}", "--json-out", str(out), *arguments],
+    done = subprocess.run([sys.executable, tool, *SMOKE_CASE, "--warmup", "1", "--steps", "2",
+                           "--json-out", str(out), *arguments],
                           env={**environment, "JAX_PLATFORMS": platform,
                                "PYTHONPATH": os.pathsep.join((str(REPO_ROOT / "src"), str(tmp_path)))},
                           capture_output=True, text=True, timeout=900)

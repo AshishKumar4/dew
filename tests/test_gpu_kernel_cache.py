@@ -10,6 +10,8 @@ from test_kernel_spills import (
 pytestmark = pytest.mark.gpu(reason="three H100 training processes share a native compilation cache")
 
 
+@pytest.mark.compiles_at_run(reason="three training processes compile and step down over one native cache, "
+                                   "no check-1 site")
 @lowers("sm90")
 def test_a_training_restart_steps_down_from_its_cached_program(tmp_path, nonce):
     a_cached_spilling_run_trains_its_stepped_program(tmp_path, nonce)

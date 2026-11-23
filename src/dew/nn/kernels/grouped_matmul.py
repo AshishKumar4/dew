@@ -425,12 +425,6 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         from .templates.gemm import producers
         return producers.started(self, ba, config) if isinstance(config, tiling.Tiles) else config
 
-    def proposes(self, ba, config: tiling.Tiles, target, *, held=None) -> bool:
-        if held is None:
-            return super().proposes(ba, config, target,
-                                    held=lambda: self.within(self.registers(ba, config, target), config))
-        return super().proposes(ba, config, target, held=held)
-
     def rungs(self, ba, config):
         from .templates.gemm import producers
         return producers.rungs(self, ba, config) if isinstance(config, tiling.Tiles) else iter(())

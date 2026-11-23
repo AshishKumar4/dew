@@ -1648,7 +1648,7 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
 
     from dew.nn.kernels import grouped_launch, grouped_triton
     from dew.nn.kernels.lowered import KernelCall
-    from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program, report
+    from dew.nn.kernels.templates import assembled, attention_mosaic, attention_mosaic_program, report
 
     def spec(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.bfloat16)
@@ -1675,7 +1675,7 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
 
     # A Triton kernel states no launch of its call; its name carries the launch that traced it.
     with report.launching(gemm, dense, tile):
-        named = report.launch_name("gmm_triton", report.launch_digest())
+        named = assembled.launch_name("gmm_triton", report.launch_digest())
     triton = KernelCall("triton", named, b"", "c", None)
     calls = ((call(gemm, dense, tile), 3.0), (call(attention, scores, tiles), 1.0),
              (call(gemm, grouped, tile), 2.0), (KernelCall("triton", "plain", b"", "c", None), 1.0),

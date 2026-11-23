@@ -1360,14 +1360,16 @@ class Objective(ABC, Generic[Loss, Effects]):
 
             tree = stored_layers(self, held)
         elif not held or self._held_parts:
-            # None or an empty tree draws afresh: `parameter_axes` traces the objective's draw so. Its
-            # forward runs for the variables its modules make, so it selects no kernel (`drawing`).
+            # None or an empty tree draws afresh: `parameter_axes` traces the objective's draw so.
             with drawing():
                 tree = self.fresh_variables(key, held or None)
         else:
             raise ValueError("variables is the variables dict ({'params': ...}) that "
                              "Pretrained.load and model.init return")
-        tree = self.complete_variables(key, tree)
+        # The parts the tree lacks drawn too (a decision model's backbone and head). A draw's forward runs
+        # for the variables its modules make, so it selects no kernel (`drawing`, row 12029).
+        with drawing():
+            tree = self.complete_variables(key, tree)
         # What a pass observes is that pass's own, never the state's: a module that sows its maxima or its
         # watched activations as it initializes leaves none for a step to read before its own (`OBSERVED`).
         tree = with_projected({name: part for name, part in tree.items() if name not in OBSERVED},

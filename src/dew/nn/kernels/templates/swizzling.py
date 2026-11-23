@@ -5,6 +5,7 @@ block (`staged`) and read back from a ref (`swizzle_of`); the copies between sha
 or global memory that read that layout (`copied`, `coalesced`, `copied_swizzle`); and a narrow tile's read
 into an accumulator's column vector (`rows_read`)."""
 
+import dataclasses
 import math
 from collections.abc import Callable, Sequence
 
@@ -81,6 +82,58 @@ def staged_address(row: int, column_bytes: int, row_bytes: int, swizzle: int) ->
     tile = ((row // TILE_ROWS) * (row_bytes // swizzle) + column_bytes // swizzle) * TILE_ROWS * swizzle
     offset = tile + (row % TILE_ROWS) * swizzle + column_bytes % swizzle
     return offset ^ (((offset >> 7) & (swizzle // 16 - 1)) << 4)
+
+
+@dataclasses.dataclass(frozen=True)
+class TracedStaging:
+    """`staged_address` traced in a kernel's Mosaic GPU MLIR, of a block whose rows are `row_bytes` long
+    staged at `swizzle` bytes: the one traced form of the rule, its row's part apart (`anchor`, loop-invariant
+    where a loop walks the rows below one) from a row's place below it (`address`), as a drain reads a staged
+    tile row by row (`gathered.row_pieces`, the GEMM's transposed drain; train 1204's review F3: three
+    copies of the rule agreed only because each kept within one tile)."""
+
+    row_bytes: int
+    swizzle: int
+
+    def anchor(self, row, column_bytes) -> tuple:
+        """The loop-invariant part of the address of `row` (an i32) at `column_bytes` (an i32): its tile's
+        base and the column's place within a swizzle's row, with the row's place in its `TILE_ROWS`-row tile;
+        the plain address where `UNSWIZZLED`."""
+        from jax.experimental.mosaic.gpu import utils as mgpu_utils
+        from jax.extend.mlir import ir
+        from jax.extend.mlir.dialects import arith
+
+        i32 = ir.IntegerType.get_signless(32)
+        if self.swizzle == UNSWIZZLED:
+            return arith.addi(arith.muli(row, mgpu_utils.c(self.row_bytes, i32)), column_bytes), None, None
+        tiles = arith.addi(arith.muli(arith.divui(row, mgpu_utils.c(TILE_ROWS, i32)),
+                                      mgpu_utils.c(self.row_bytes // self.swizzle, i32)),
+                           arith.divui(column_bytes, mgpu_utils.c(self.swizzle, i32)))
+        return (arith.muli(tiles, mgpu_utils.c(TILE_ROWS * self.swizzle, i32)),
+                arith.remui(column_bytes, mgpu_utils.c(self.swizzle, i32)),
+                arith.remui(row, mgpu_utils.c(TILE_ROWS, i32)))
+
+    def address(self, anchor: tuple, below=None):
+        """The byte offset of the row `below` (an i32; none, the anchor's own) the anchor's row at its
+        column (`anchor`), within the anchor's `TILE_ROWS`-row tile: each 16-byte chunk XORed by the row's
+        place in the swizzle's span, as `staged_address` states it."""
+        from jax.experimental.mosaic.gpu import utils as mgpu_utils
+        from jax.extend.mlir import ir
+        from jax.extend.mlir.dialects import arith
+
+        i32 = ir.IntegerType.get_signless(32)
+        base, within, in_tile = anchor
+        if self.swizzle == UNSWIZZLED:
+            if below is None:
+                return base
+            return arith.addi(base, arith.muli(below, mgpu_utils.c(self.row_bytes, i32)))
+        if below is not None:
+            in_tile = arith.addi(in_tile, below)
+        # A row's place in the swizzle's span: its place in the tile less the bits the swizzle's row spans.
+        span = arith.shrui(in_tile, mgpu_utils.c((SWIZZLE_BYTES // self.swizzle).bit_length() - 1, i32))
+        chunk = arith.shli(arith.andi(span, mgpu_utils.c(self.swizzle // 16 - 1, i32)), mgpu_utils.c(4, i32))
+        return arith.addi(arith.addi(base, arith.muli(in_tile, mgpu_utils.c(self.swizzle, i32))),
+                          arith.xori(within, chunk))
 
 
 def wavefronts(addresses: Sequence[int], width: int) -> int:

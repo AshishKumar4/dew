@@ -8,7 +8,7 @@ from fla_gdn_support import KernelCase
 from generation_support import lowers
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import assembled, report
+from dew.nn.kernels.templates import assembled
 
 SERIALIZING = ("ptxas info    : (C7512) Potential Performance Loss: wgmma.mma_async instructions are "
                "serialized due to insufficient register resources for the function "
@@ -145,7 +145,7 @@ def test_a_triton_template_binary_in_compile_mosaic_kernels_reports_shared_regis
     assert assembled.kernel_of("probe__l0123456789__1") == ("probe", "0123456789", "1")
     assert assembled.kernel_of("probe__1__l0123456789") == ("probe__1", "0123456789", None)
     for name in ("probe", "probe__l0123456789", "probe__l0123456789__1", "probe__1__l0123456789"):
-        assert report.launch_name(*assembled.kernel_of(name)) == name
+        assert assembled.launch_name(*assembled.kernel_of(name)) == name
 
     clean = assembled.Binary("attention_forward", "0123456789", 64, 0, "triton",
                           shared=16384, sass=(), uses_tmem=False)
@@ -160,7 +160,7 @@ def test_a_triton_template_binary_in_compile_mosaic_kernels_reports_shared_regis
 
     found = [kc.inherited(dataclasses.asdict(r), {}, "sm80")
              for r in kc.reports({}, [clean, uniquified_spill, distinct_stem, tmem_using, undecoded], {})]
-    by_key = {report.launch_name(item["kernel"], item["launch"], item["index"]): item for item in found}
+    by_key = {assembled.launch_name(item["kernel"], item["launch"], item["index"]): item for item in found}
     assert len(by_key) == 5, by_key
     clean_item = by_key["attention_forward__l0123456789"]
     assert clean_item["unread"] == ()
