@@ -1146,25 +1146,25 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
     # Each segment's first token, in token order: each document's first, and a chunk's first where its
     # document continues; past the row's segments, a sentinel past its tokens.
     marks = (starts | (place == 0)).reshape(-1)
-    events = chunks + documents
-    origins = jnp.nonzero(marks, size=events, fill_value=chunks * count)[0]
-    following = jnp.concatenate([origins[1:], jnp.full((1,), chunks * count, origins.dtype)])
+    # One place past the segments' most: the walk stops at its first sentinel, each segment's end the next
+    # origin (the row's end at its last).
+    origins = jnp.nonzero(marks, size=chunks + documents + 1, fill_value=chunks * count)[0]
     # Every carry typed as each operand that reaches it varies (a checked `shard_map`'s manual axes): the
     # table's given memories, the chunks' operands (a laid erase's corrections among them) and the fork's.
     reaching = (given, *jax.tree.leaves(operands), *jax.tree.leaves(forked))
     decayed = varying_like(decayed, *reaching)
     zero_decay, zero = jnp.zeros_like(decayed), varying_like(jnp.zeros_like(given[0]), *reaching)
 
-    def segment(carried, at):
+    def segment(carried, first, after):
+        """The walk past the segment from token place `first` up to `after` (the next segment's origin, or
+        the row's end), a real one: the loop stops at the first sentinel."""
         (chunk_in, held_chunk, leaving), table, outputs, entering = carried
-        first, after = at
-        real = first < chunks * count
-        chunk, origin = jnp.minimum(first // count, chunks - 1), first % count
+        chunk, origin = first // count, first % count
         through = jnp.where(after // count == chunk, after % count - 1, count - 1)
         # Entering a new chunk, its memory is the one the chunk before left.
         new = chunk != held_chunk
         memory_in = jax.tree.map(lambda a, b: jnp.where(new, a, b), leaving, chunk_in)
-        entering = entering.at[chunk].set(jnp.where(real & new, memory_in[1], entering[chunk]))
+        entering = entering.at[chunk].set(jnp.where(new, memory_in[1], entering[chunk]))
         continuing = ~starts[chunk, origin]
         memory = jnp.where(continuing, memory_in[1],
                            _opened(given, table, loads[chunk, origin], adds, entry, begun[chunk, origin],
@@ -1173,12 +1173,12 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
         decay = jnp.where(continuing, memory_in[0], zero_decay)
         left = forms.step((decay, memory), window)
         out = forms.mapped(window, (decay, memory))
-        rows = (place >= origin) & (place <= through) & real
+        rows = (place >= origin) & (place <= through)
         outputs = outputs.at[chunk].set(jnp.where(rows[:, None], out, outputs[chunk]))
-        table = table_stored(table, jnp.where(real, stores[chunk, through], 0), left[1])
-        ends = real & (through == count - 1)
+        table = table_stored(table, stores[chunk, through], left[1])
+        ends = through == count - 1
         leaving = jax.tree.map(lambda a, b: jnp.where(ends, a, b), left, leaving)
-        return ((memory_in, jnp.where(real, chunk, held_chunk), leaving), table, outputs, entering), None
+        return (memory_in, chunk, leaving), table, outputs, entering
 
     shaped = jax.eval_shape(lambda chunk: forms.mapped(forms.prepare(chunk), (decayed, zero)),
                             jax.tree.map(lambda x: x[0], operands))
@@ -1186,15 +1186,15 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
     start = (((decayed, zero), varying_like(jnp.asarray(-1), origins), (decayed, zero)), table,
              varying_like(jnp.zeros((chunks, *shaped.shape), shaped.dtype), *reaching),
              varying_like(jnp.zeros((chunks, *zero.shape), zero.dtype), *reaching))
-    segments = jnp.minimum(jnp.sum(marks), events)
-
     def walked(state):
         at, carried = state
-        carried, _ = segment(carried, (origins[at], following[at]))
-        return at + 1, carried
+        return at + 1, segment(carried, origins[at], origins[at + 1])
+
+    def real(state):
+        return origins[state[0]] < chunks * count
 
     _, ((_, _, last), table, outputs, entering) = jax.lax.while_loop(
-        lambda state: state[0] < segments, walked, (varying_like(jnp.asarray(0), origins), start))
+        real, walked, (varying_like(jnp.asarray(0), origins), start))
     return outputs, entering, last[1], table
 
 
