@@ -1379,12 +1379,19 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     rounded = chunk_rounding(delta, dtype) if rounded is None else rounded
     call, shards = None, (None, key, value)
     if not transition:
-        # A transition of its own binds no template call: no kernel but the portable math forms it.
+        # A transition of its own binds no template call: no kernel but the portable math forms it. A turned
+        # call's as its launch binds (`_turned_shapes`).
+        launched = _turned_shapes(query, key, value, forked, turns) if turns else (query, key, forked)
         call, shards = template_bind(
-            query, key, value, g, beta, state, starts, firsts, skip, forked, max_segments=max_segments,
-            scale=scale, delta=delta, wide=wide, bound=bound, rounded=rounded, apart=apart,
-            values_gated=values_gated, unit_pairs=unit_pairs, decay_bound=decay_bound)
+            launched[0], launched[1], value, g, beta, state, starts, firsts, skip, launched[2],
+            max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound, rounded=rounded,
+            apart=apart, values_gated=values_gated, unit_pairs=unit_pairs, decay_bound=decay_bound)
     _, shard_key, shard_value, *_ = shards
+    if turns and call is not None:
+        # The port's case reads the call's own key heads a shard: a turned launch's are a value head's each.
+        grouped = shard_value.shape[-2] * key.shape[2] // value.shape[2]
+        shard_key = jax.ShapeDtypeStruct((*shard_key.shape[:-2], grouped, shard_key.shape[-1]),
+                                         shard_key.dtype)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying), dtype=dtype,
                     key_width=key.shape[-1], heads=(shard_key.shape[-2], *shard_value.shape[-2:]),
@@ -1394,6 +1401,26 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
                     per_key=g.ndim == 4, forked=forked is not None, readout=readout, apart=apart, turns=turns,
                     transition=transition)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
+
+
+def _turned_shapes(query, key, value, forked: Forked | None, turns: int) -> tuple:
+    """A turned call's operands as its launch binds them (`_turned_or_plain`, `turned.call`): its queries and
+    keys a value head's each, a forked call's entry keys with them and its documents' load rotation `(cos,
+    sin)` `[B, D, Hv, turns]` (`Forked.turning`, at least fp32 as its frames are), as shapes: the call a
+    selector certifies (`template_bind`) is then the launch that runs. Bound to the unturned call, its key
+    heads grouped and its forked call's rotation none, the selector certified a launch the step never ran
+    (row 7976)."""
+    heads = value.shape[2]
+
+    def repeated(x, axis: int) -> jax.ShapeDtypeStruct:
+        return jax.ShapeDtypeStruct((*x.shape[:axis], heads, *x.shape[axis + 1:]), x.dtype)
+
+    query, key = (repeated(x, 2) for x in (query, key))
+    if forked is not None:
+        entry = forked.entry if forked.entry is None else (repeated(forked.entry[0], 3), *forked.entry[1:])
+        rotation = jax.ShapeDtypeStruct((*forked.loads.shape, heads, turns), jnp.float32)
+        forked = dataclasses.replace(forked, entry=entry, turning=(rotation, rotation))
+    return query, key, forked
 
 
 def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, starts, firsts, *,
