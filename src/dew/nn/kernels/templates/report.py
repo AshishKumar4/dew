@@ -237,9 +237,20 @@ class Reading:
     """The refusals a trace reads (`reading`): those in effect as it began, and those it records itself
     since (a launch it certifies inline, its derivation stepping past its own refusal), never another
     thread's, recorded into the registry it shares as it traces (theme K01-e's review P0: a held jit's
-    trace at a new shape read another scope's refusal, which JAX's trace cache then held for its own)."""
+    trace at a new shape read another scope's refusal, which JAX's trace cache then held for its own).
+    A `frozen` one takes none of its own: a refusal recorded within it ends its trace (`ReadingRefused`)."""
     refused: dict[tuple[str, Hashable], frozenset[Refused]]
+    frozen: bool = False
     by_launch: dict[str, frozenset] = dataclasses.field(default_factory=dict)
+
+
+class ReadingRefused(BaseException):
+    """A refusal recorded within a frozen reading (`reading`'s `frozen`: a held jit's trace), recorded into
+    the registry: the trace ends here, before JAX's trace cache takes the program the refusal would make
+    under the refusals its jit is held for, and its caller traces afresh by a jit of its own (theme K01-e's
+    review P0: a held jit's trace, its cached program dropped, recorded an inline refusal, read it, and its
+    cache kept the refusal's program for every call it answered). Not an `Exception`: no handler on the way
+    takes it for a launch's failure."""
 
 
 _READING: contextvars.ContextVar[Reading | None] = _cache.untraced(
@@ -248,10 +259,11 @@ _READING: contextvars.ContextVar[Reading | None] = _cache.untraced(
 
 
 @contextlib.contextmanager
-def reading(entries: tuple) -> Iterator[Reading]:
+def reading(entries: tuple, *, frozen: bool = False) -> Iterator[Reading]:
     """A trace's reads of the refusals (`refusals_of`, `refusal_entries`) answered from `entries` (a
-    `refusal_entries` snapshot) and those it records itself within, for as long as it traces."""
-    held = Reading({(identity, config): kernels for identity, config, kernels in entries})
+    `refusal_entries` snapshot) and those it records itself within, for as long as it traces; `frozen`, none
+    of its own, a refusal recorded within it ending its trace (`ReadingRefused`)."""
+    held = Reading({(identity, config): kernels for identity, config, kernels in entries}, frozen)
     token = _READING.set(held)
     try:
         yield held
@@ -1521,19 +1533,20 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
     eligibility, then its call, `tuning.KernelOp.taken`) reads its certification back and finds the same
     misses, and a recording opened since the first (a later plan's admission, `planning.admitted`) holds
     the misses its own trace meets, those the process met before among them."""
-    registry = _registry()
+    registry, read = _registry(), _READING.get()
     with _GUARD:
         if refusal is not None:
             # Into the registry, and the reading a trace here reads, which reads its own (`reading`).
-            for held in (registry, _READING.get()):
+            for held in (registry, None if read is None or read.frozen else read):
                 if held is not None:
                     held.refused[refusal] = _joined(held.refused.get(refusal, frozenset()) | kernels)
                     held.by_launch.pop(refusal[0], None)
-        if miss is None:
-            return False
-        new = miss not in registry.missed
-        _add(missed=(miss,))
-        return new
+        new = miss is not None and miss not in registry.missed
+        if miss is not None:
+            _add(missed=(miss,))
+    if refusal is not None and read is not None and read.frozen:
+        raise ReadingRefused(refusal)
+    return new
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,

@@ -720,7 +720,7 @@ class OuterProgram:
             if self._jits.get(key) is held:
                 del self._jits[key]
 
-    def _traced(self, held: tuple[jax.stages.Wrapped, tuple], args: tuple, kwargs: dict
+    def _traced(self, held: tuple[jax.stages.Wrapped, tuple], args: tuple, kwargs: dict, *, frozen: bool
                 ) -> tuple[jax.stages.Traced, tuple[jax.stages.Wrapped, tuple]]:
         """`jitted`'s trace of a call, its program the algebra pass's (`algebra.rewritten_program`), so its
         lowering, its trace, its executable and every relowering read one program (docs/design/algebra.md
@@ -734,24 +734,25 @@ class OuterProgram:
         capture traces it) settles nothing mid-trace. Beside its trace, the jit that made it and the launches
         refused as it traced (`held`'s, or a settle's own retrace's). Each trace reads those refusals alone
         and its own (`report.reading`), never another thread's recorded as it traces, so the program a jit's
-        trace cache keeps is the one they make."""
+        trace cache keeps is the one they make; `held`'s, where it is a held jit (`frozen`), none of its own
+        (`report.ReadingRefused`), its cache only ever its key's."""
         from dew.nn.kernels.templates import report
 
         outermost = not _PASSING.get()
         token = _PASSING.set(True)
         made = held
 
-        def traced_by(by: tuple[jax.stages.Wrapped, tuple]) -> jax.stages.Traced:
-            with report.reading(by[1]):
+        def traced_by(by: tuple[jax.stages.Wrapped, tuple], *, frozen: bool) -> jax.stages.Traced:
+            with report.reading(by[1], frozen=frozen):
                 return by[0].trace(*args, **kwargs)
 
         def retraced() -> jax.stages.Traced:
             nonlocal made
             made = (self._jitted(), report.refusal_entries())
-            return traced_by(made)
+            return traced_by(made, frozen=False)
 
         try:
-            trace = functools.partial(traced_by, held)
+            trace = functools.partial(traced_by, held, frozen=frozen)
             traced = report.settled_trace(trace, retraced) if outermost else trace()
             rewritten = algebra.rewritten_program(traced.jaxpr)
             if rewritten is traced.jaxpr:
@@ -1199,7 +1200,8 @@ class OuterProgram:
         finitely many; a settle's retrace's (`_traced`) its own. Its jit the one validated for this call
         under the snapshot (`_held_jit`), else one of its own, which `fresh` takes always (a relowering's,
         past JAX's trace cache). A raced trace's routes are withdrawn (`withdrawn`), and a validated jit
-        whose trace read other refusals let go (`_invalidated`)."""
+        whose trace read other refusals let go (`_invalidated`); a held jit's trace that records a refusal
+        ends taking nothing (`report.ReadingRefused`), traced again by a jit of its own."""
         from dew.nn.kernels.templates import report
 
         while True:
@@ -1207,7 +1209,14 @@ class OuterProgram:
             key = None if fresh else self._held_key(args, kwargs, refusals)
             held = None if key is None else self._held_jit(key)
             marks = route_marks()
-            traced, (made, under) = self._traced((held or self._jitted(), refusals), args, kwargs)
+            try:
+                traced, (made, under) = self._traced((held or self._jitted(), refusals), args, kwargs,
+                                                     frozen=held is not None)
+            except report.ReadingRefused:
+                # A held jit's trace recorded a refusal (its cached program dropped): it took nothing, and
+                # the next trace, under the refusals with it, takes a jit of its own.
+                withdrawn(marks)
+                continue
             raced = report.refusal_entries() != under
             if held is not None and (raced or under != refusals):
                 self._invalidated(key, held)
