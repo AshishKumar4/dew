@@ -85,6 +85,7 @@ from dew._coordination import broadcast_from_process_zero, from_every_process, s
 from dew._files import is_uri, write_atomically
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
+from dew.checkpoints import _step_records
 from dew.checkpoints._integrity import _digest
 from dew.checkpoints._payloads import (
     _NEEDS,
@@ -1021,7 +1022,7 @@ class Checkpoints:
         self._recovery: tuple[int, frozenset[int], tuple[Grid, ...]] | None = None
         # Whether the run's record was an earlier run's whose optimizer read a mask of False, read before a
         # run writes its record in its translation (`earlier_unmasked`).
-        self._unmasked, self._unmasked_steps = earlier_unmasked(self.directory, RUN_FILE)
+        self._unmasked = earlier_unmasked(self.directory, RUN_FILE)
         # The digests the save still in flight records, which no kept step lists yet.
         self._frozen_pending: set[str] = set()
 
@@ -2208,7 +2209,7 @@ class Checkpoints:
         template = _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata)
         # An earlier run's masked decay step read across, its record's alone (`earlier_unmasked`).
         form = None
-        if self._unmasked and step in self._unmasked_steps:
+        if self._unmasked and not (snapshot.custom_metadata or {}).get(_step_records.TYPED_OPTIMIZER):
             template, form = masked_decay_unsaved(template, metadata, _OPTIMIZERS, self._unmasked)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
