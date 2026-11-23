@@ -5,6 +5,7 @@ import collections
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from dew import _cache, _facts
 
@@ -333,11 +334,16 @@ def test_a_program_within_a_held_jits_trace_that_refuses_a_launch_leaves_it_to_i
         assert float(outer(x)) == 0.0
 
 
-def test_a_held_value_stands_past_a_refusal_of_a_launch_it_read_none_of():
-    """A value held whose making ran a program reading one launch's refusals (`report.refusals_of`) stands
-    after another launch is refused, and is made again once its own is: a trace reads the refusals of the
-    launches it reads alone, the whole registry no fact of it (row 12296: any refusal made every held value
-    again, the registry read whole as a program keyed its executables)."""
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+@pytest.mark.parametrize("taken", ["called", "traced"])
+def test_a_held_value_stands_past_a_refusal_of_a_launch_it_read_none_of(taken, warm):
+    """A value held whose making ran a program reading one launch's refusals (`report.refusals_of`), called
+    or traced, stands after another launch is refused, and is made again once its own is: a trace reads the
+    refusals of the launches it reads alone, the whole registry no fact of it (row 12296: any refusal made
+    every held value again, the registry read whole as a program keyed its executables). Run or traced once
+    before, its executable or its held jit answering the making with no trace, it holds the facts its trace
+    read as a trace does (row 12296's review P0: a warm call recorded none, and the value stood past its own
+    launch's refusal)."""
     from dew.nn.kernels.options import owned_program
     from dew.nn.kernels.templates import report
 
@@ -345,11 +351,16 @@ def test_a_held_value_stands_past_a_refusal_of_a_launch_it_read_none_of():
     cache: collections.OrderedDict = collections.OrderedDict()
     made: list[float] = []
 
+    def taking() -> float:
+        return float(run(x) if taken == "called" else run.trace(x).lower().compile()(x))
+
     def making() -> float:
-        made.append(float(run(x)))
+        made.append(taking())
         return made[-1]
 
     with report.refusals():
+        if warm:
+            assert taking() == 0.0
         assert _cache.holding(cache, "held", making, 4) == 0.0
         report.refuse([("another launch", 1, ("k",))])
         assert _cache.holding(cache, "held", making, 4) == 0.0
