@@ -441,8 +441,9 @@ def _indexed_manifest(source: Source, uri: str, rows: int, reader: ShardOpener |
     each named alike by the record it starts at (docs/design/data.md: a store of fewer shards than its
     readers × workers is cut into that many)."""
     count = len(source.records("indexed")) if count is None else count
+    subdivide = functools.partial(_even_ranges, uri, count, lambda start, end: f"records:{start}")
     return ShardManifest(_ranges(uri, count, rows), _IndexedSlice(source) if reader is None else reader,
-                         subdivide=functools.partial(_subdivided, uri, count) if subdivides else None,
+                         subdivide=subdivide if subdivides else None,
                          index_ordered=True)
 
 
@@ -452,9 +453,16 @@ def _ranges(uri: str, count: int, size: int) -> tuple[Shard, ...]:
                  for start in range(0, count, size))
 
 
-def _subdivided(uri: str, count: int, required: int) -> tuple[Shard, ...]:
-    """`count` records at `uri` cut into at least `required` ranges, none where it holds fewer records."""
-    return _ranges(uri, count, count // required) if count >= required else ()
+def _even_ranges(uri: str, count: int, name: Callable[[int, int], str], required: int) -> tuple[Shard, ...]:
+    """`count` records at `uri` cut into exactly `required` consecutive ranges, their sizes differing by one
+    at most, each named by `name(start, end)` (`ShardManifest.subdivide`); none where it holds fewer
+    records than ranges."""
+    if count < required:
+        return ()
+    step, remainder = divmod(count, required)
+    bounds = [index * step + min(index, remainder) for index in range(required + 1)]
+    return tuple(Shard(name(start, end), uri, start, end, end - start)
+                 for start, end in itertools.pairwise(bounds))
 
 
 @runtime_checkable
@@ -500,28 +508,10 @@ def _single_indexed_manifest(source: Source, uri: str) -> ShardManifest:
     """One whole-store shard `(0..count)` for a single-reader stream, preserving the single-shard
     positions earlier runs saved, with row-wise `subdivide` when readers × workers exceed one."""
     count = len(source.records("indexed"))
-
-    def subdivide(required: int) -> tuple[Shard, ...]:
-        parts = min(required, count)
-        if parts < required:
-            return ()
-        step, remainder = divmod(count, parts)
-        bounds = [index * step + min(index, remainder) for index in range(parts + 1)]
-        return tuple(
-            Shard(
-                f"{uri}:{bounds[index]}:{bounds[index + 1]}",
-                uri,
-                bounds[index],
-                bounds[index + 1],
-                bounds[index + 1] - bounds[index],
-            )
-            for index in range(parts)
-        )
-
     return ShardManifest(
         (Shard(uri, uri, 0, count, count),),
         _IndexedSlice(source),
-        subdivide=subdivide,
+        subdivide=functools.partial(_even_ranges, uri, count, lambda start, end: f"{uri}:{start}:{end}"),
         index_ordered=True,
     )
 

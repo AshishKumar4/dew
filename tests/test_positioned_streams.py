@@ -191,9 +191,10 @@ def test_a_positioned_streams_store_is_cut_into_as_many_shards_as_its_records_al
 
 def test_a_positioned_streams_store_is_cut_into_as_many_shards_as_its_readers_and_workers_read(tmp_path):
     """A positioned stream's store of 130 records, held in 65 ranges, read by 40 shares of two workers each
-    is cut into ranges of whole records in order, at least one for each of its 80 readers, every record
-    read once (docs/design/data.md: a store of fewer shards than its readers × workers is cut into that
-    many; train 1192's review: it was refused past 64 readers)."""
+    is cut into exactly 80 ranges of whole records in order, one for each of its readers, their sizes
+    differing by one record at most, every record read once (docs/design/data.md: a store of fewer shards
+    than its readers × workers is cut into that many; train 1192's review: it was refused past 64 readers;
+    Train 1240's: 1000 records for 128 readers were cut into 143, one reader dealt twice another's)."""
     from dew.data.shards import cut
 
     path = tmp_path / "rows.jsonl"
@@ -202,9 +203,10 @@ def test_a_positioned_streams_store_is_cut_into_as_many_shards_as_its_readers_an
     files.provision()
     shards = cut(files.positioned_manifest(), partition=DataPartition(index=0, count=40),
                  loading=Loading(workers=2)).shards
-    assert len(shards) >= 80, len(shards)
-    assert [(shard.start, shard.stop) for shard in shards] == [
-        (start, min(start + shards[0].rows, 130)) for start in range(0, 130, shards[0].rows)]
+    assert len(shards) == 80, len(shards)
+    assert [shard.start for shard in shards[1:]] == [shard.stop for shard in shards[:-1]]
+    assert (shards[0].start, shards[-1].stop) == (0, 130)
+    assert {shard.stop - shard.start for shard in shards} == {1, 2}
 
 
 def test_a_positioned_read_cut_finer_than_its_store_fills_no_cache_another_topology_publishes(tmp_path):
