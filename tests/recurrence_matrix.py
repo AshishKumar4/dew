@@ -100,24 +100,9 @@ UPSTREAMS = {"fla": _fla, "mamba_ssm": _mamba}
 """Each upstream library a form's family has a release of (`FORM_RELEASES`), run on a cell's stacked draws in
 its GPU tier reference interpreter."""
 
-RECORDED = {"fla": Path(__file__).resolve().parent / "fixtures" / "fla" / "matrix_seeded.npz",
-            "mamba_ssm": Path(__file__).resolve().parent / "fixtures" / "mamba2" / "matrix_seeded.npz"}
+RECORDED = {"fla": Path(__file__).resolve().parent / "fixtures" / "fla" / "matrix_seeded.npz"}
 """Each upstream's recording of the cells a host without its GPU tier reference judges (a CPU lane's
-interpreted cells, a TPU's; tools/matrix_reference.py), the same upstream at its pinned release as a live
-run's."""
-
-PINS = {"fla": ("fla", "fla-core"), "mamba_ssm": ("mamba-ssm", "mamba-ssm")}
-"""Each upstream's pin in tools/reference_releases.py's `RELEASES`: its cohort and its distribution."""
-
-
-def pinned(upstream: str) -> str:
-    """The release the tier pins `upstream` at, as its recording states it: a version, or a git pin's
-    commit (`git+<url>@<commit>`, tools/matrix_reference.py's `MAMBA_RELEASE`)."""
-    from tool_support import load
-
-    cohort, distribution = PINS[upstream]
-    pin = load("reference_releases").RELEASES[cohort][distribution]
-    return pin.rsplit("@", 1)[-1] if pin.startswith("git+") else pin
+interpreted cells; tools/matrix_reference.py), the same upstream at its pinned release as a live run's."""
 
 INTERPRETERS = {"fla": "DEW_FLA_PYTHON", "mamba_ssm": "DEW_MAMBA_PYTHON"}
 """The variable naming each upstream's GPU tier reference interpreter, where a host holds one."""
@@ -367,14 +352,16 @@ def _on_par_recorded(named: dict[str, str], step, truth, upstream: str, seeds: i
     `indexed_recording` refuses short of), its draws drawn again on this host (`_inputs`, NumPy's) and Dew's
     float64 truth held to the recorded truth's sketch; a recording of another release than the tier's pin
     is stale, refused."""
+    from tool_support import load
+
     site = "-".join(named.values())
     # Only the recorded upstreams' cells are held here: another's is its GPU tier's alone.
     assert upstream in RECORDED, (f"{site}: no recording of {upstream}; its cells run where "
                                   f"{INTERPRETERS[upstream]} names its reference interpreter")
     stored = recording(RECORDED[upstream])
     recorded = json.loads(str(stored["provenance"]))["revision"]
-    pin = pinned(upstream)
-    assert recorded == pin, f"{site}: recorded on {upstream} {recorded}, the tier pins {pin}: stale"
+    pinned = load("reference_releases").RELEASES[upstream][f"{upstream}-core"]
+    assert recorded == pinned, f"{site}: recorded on {upstream} {recorded}, the tier pins {pinned}: stale"
     drawn, reference, recorded_truth = indexed_recording(
         stored, site, seeds, inputs_of=functools.partial(_inputs, named),
         truth_fn=lambda inputs: _leaves(truth(*_split(named, inputs))))

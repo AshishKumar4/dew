@@ -4,15 +4,16 @@ interpreted cells, a TPU's): an upstream's own computation on a CUDA GPU over th
 NumPy's and the test draws again (`recurrence_matrix._inputs`), Dew's float64 token recurrence on the GPU the
 truth, recorded as a summary (`record_case(..., summary=True)`): fla's own layer
 (tests/delta_rule_support.py's `FLA_LAYER_SIDE`, a draw a request, served by `--serve`), sized paired with
-the cell's own kernel; or
-mamba_ssm's scan (`recurrence_matrix.UPSTREAMS`, `ssd_support.mamba_side`, a block of draws a call), sized on
-the recording alone where the cell's kernel is a TPU's, which no GPU runs (row 12126).
+the cell's own kernel; or mamba_ssm's scan (`recurrence_matrix.UPSTREAMS`, `ssd_support.mamba_side`, a block
+of draws a call), sized on the recording alone where the cell's kernel is a TPU's, which no GPU runs (row
+12126).
 
     PYTHONPATH=src:tests:tools python tools/matrix_reference.py <upstream> <python> <case>...
 
-`<upstream>` `fla` or `mamba_ssm` (`recurrence_matrix.RECORDED`), each case its axis values joined by `-`
+`<upstream>` `fla` or `mamba_ssm`, each case its axis values joined by `-`
 (`recurrence_matrix._on_par_recorded`'s site), on a GPU, `<python>` the upstream's cohort's interpreter
-(tools/reference_releases.py, `COHORTS`). What lands is the upstream's `RECORDED` file, or past
+(tools/reference_releases.py, `COHORTS`; mamba_ssm's its tier release, `ssd_support.MAMBA_SSM`, refused
+otherwise). What lands is the upstream's file (`recurrence_matrix.RECORDED`, `DESTINATIONS`), or past
 `fetched_fixtures.IN_GIT` its pin beside the store's copy (tests/fixtures/fetched/), uploaded by
 `fetched_fixtures.upload`.
 """
@@ -117,7 +118,9 @@ def fla_answers(worker):
 class MambaAnswers:
     """mamba_ssm's scan on a cell's draws (`recurrence_matrix.UPSTREAMS`), `BLOCK` draws a call from the
     first a draw not yet answered asks: `recorded`'s answer of a cell, its `draw` the cell's own
-    (`recurrence_matrix._inputs`), each draw found by its digest (`upstream_support.digest`)."""
+    (`recurrence_matrix._inputs`), each draw found by its digest (`upstream_support.digest`). One block's
+    answers held at a time, and the seeds of draws not yet answered, as `record_case` streams a summary's
+    draws in order: every block's held, a cell's sizing draws held every output whole."""
 
     def __init__(self, named: dict, starts):
         self.named, self.starts, self.seeds, self.held = named, starts, {}, {}
@@ -138,23 +141,26 @@ class MambaAnswers:
         key = digest(inputs)
         if key not in self.held:
             first = self.seeds[key]
+            self.seeds = {each: seed for each, seed in self.seeds.items() if seed >= first}
             drawn = [matrix._inputs(self.named, seed) for seed in range(first, first + BLOCK)]
             names = [name for name in drawn[0] if name not in ("d_out", "d_final")]
             cotangents = tuple(np.stack([each[name] for each in drawn]) for name in ("d_out", "d_final"))
             found = matrix.UPSTREAMS["mamba_ssm"](
                 self.named, {name: np.stack([each[name] for each in drawn]) for name in names}, cotangents,
                 self.starts)
-            for index, each in enumerate(drawn):
-                self.held[digest(each)] = {name: value[index] for name, value in found.items()}
+            self.held = {digest(each): {name: value[index] for name, value in found.items()}
+                         for index, each in enumerate(drawn)}
         return self.held[key]
 
 
-MAMBA_RELEASE = (
-    "import importlib.metadata as m, json, torch\n"
-    "found = json.loads(m.distribution('mamba_ssm').read_text('direct_url.json') or '{}')\n"
-    "release = found.get('vcs_info', {}).get('commit_id') or m.version('mamba_ssm')\n"
-    "print(release, torch.cuda.get_device_name())")
-"""The torch side's mamba_ssm release (its installed commit, else its version) and its device, a line."""
+MAMBA_RELEASE = ("import importlib.metadata as m, torch\n"
+                 "print(m.version('mamba_ssm'), torch.cuda.get_device_name())")
+"""The torch side's mamba_ssm release (its installed version) and its device, a line."""
+
+DESTINATIONS = {"mamba_ssm": Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba2" /
+                "matrix_seeded.npz"}
+"""Where an upstream's recording lands that tests/recurrence_matrix.py's `RECORDED` does not register yet
+(registered beside its fetched manifest once uploaded)."""
 
 
 def main() -> None:
@@ -186,9 +192,14 @@ def main() -> None:
                     print(f"{label}: recorded in {time.perf_counter() - began:.0f} s", flush=True)
         reference, license = f"fla-core-{version}", "MIT"
     elif upstream == "mamba_ssm":
+        from ssd_support import MAMBA_SSM
+
         os.environ["DEW_MAMBA_PYTHON"] = python
         version, device = subprocess.run([python, "-c", MAMBA_RELEASE], check=True, capture_output=True,
                                          text=True).stdout.split(maxsplit=1)
+        # The release a replay holds the recording to, checked before any GPU time is spent.
+        if version != MAMBA_SSM:
+            raise SystemExit(f"{python} serves mamba_ssm {version}; the tier's reference is {MAMBA_SSM}")
         for label in labels:
             began = time.perf_counter()
             stored.update(recorded(MambaAnswers, label))
@@ -200,7 +211,8 @@ def main() -> None:
         upstream, version, device.strip(),
         f"PYTHONPATH=src:tests:tools python tools/matrix_reference.py {upstream} <python> <case>...",
         truth="Dew's token recurrence in float64 on the GPU")
-    written = save(RECORDED[upstream], stored, reference=reference, license=license)
+    written = save(RECORDED.get(upstream, DESTINATIONS.get(upstream)), stored, reference=reference,
+                   license=license)
     print(f"wrote {written}", flush=True)
 
 

@@ -446,6 +446,12 @@ the write gate the step `dt`, the rate `A`, the skip `D` and the memory, keys by
 transposed), each leaf in its own dtype; a row's documents mamba_ssm's `seq_idx`."""
 
 
+MAMBA_SSM = "2.3.2.post1"
+"""The mamba_ssm release the GPU tier's reference interpreter (DEW_MAMBA_PYTHON) installs, its release wheel:
+what a recording of mamba_ssm states (tools/matrix_reference.py refuses another) and is held to.
+"""
+
+
 def mamba_side(leaves: dict, cotangents: tuple, starts, chunk: int) -> dict:
     """mamba_ssm's scan (`MAMBA_SIDE`) on draws stacked on a leading axis, `leaves` Dew's operands by name
     `[N, B, S, ...]` and `cotangents` of its output and final memory: its outputs and every leaf's gradient
