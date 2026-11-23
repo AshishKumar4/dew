@@ -102,7 +102,7 @@ def one_launch(width: int, step_operands: tuple) -> TILES:
                                                scale=None, natural=attention_mosaic.NATURAL,
                                                accurate=attention_mosaic.ACCURATE)
     ba, target = op.bind(*args, interpret=False), generation.gpu_target()
-    fed = bundles.named("wgmma.fed", query.dtype)
+    fed = bundles.named("wgmma.fed", query.dtype, None)
 
     def fed_fused(rows: int, walked: int, consumers: int) -> TILES:
         return TILES(walked, rows, 2, consumers, fused=True, family=fed.name)

@@ -17,7 +17,7 @@ import jax
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
-from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates import assembled
 from dew.telemetry.instrumentation import MODEL_FLOPS, call_weights, counted_trips, custom_call_kind
 
 
@@ -53,7 +53,7 @@ class KernelCall:
     def launched(self) -> str | None:
         """The digest of the launch that traced the call's kernel: its caller's, else its name's, which is its
         launch's where the launch states no kernel's part (`report.named`; a Triton kernel's name whole)."""
-        return self.caller or self.launch or report.kernel_of(self.name)[1]
+        return self.caller or self.launch or assembled.kernel_of(self.name)[1]
 
 
 @dataclass(frozen=True)
@@ -379,14 +379,14 @@ def _model_flops(attributes) -> float | None:
 
 
 def _kernel_name(location: ir.Location) -> tuple[str, str | None] | None:
-    """A Mosaic GPU call's kernel name and the launch it carries (`report.kernel_of`): its location's name
+    """A Mosaic GPU call's kernel name and the launch it carries (`assembled.kernel_of`): its location's name
     stack (`_named`) ends `<kernel>/mpmd_map`; None where its location carries no name."""
     named = _named(location)
     if named is None:
         return None
     stack = named.split("/")
     # Less the launch the kernel's name carries (`report.named`), so a kernel reads as itself in every call.
-    return report.kernel_of(stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1])[:2]
+    return assembled.kernel_of(stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1])[:2]
 
 
 def _named(location: ir.Location) -> str | None:

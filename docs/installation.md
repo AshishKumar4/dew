@@ -101,13 +101,13 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post123,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post124,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, carrying the Mosaic GPU fixes below that live in them, and the index serves them too.
 
 <!-- BEGIN Dew's JAX builds (site/scripts/gen_install.py) -->
-Dew's CUDA and PJRT plugins are post120's on x86_64 and aarch64 (a GH200's Grace) alike, and the `kernel-compile` extra's (x86_64 only) are post120's. On Linux x86_64 and aarch64 jaxlib is Dew's build too, `jaxlib==0.12.0.1.post120`, whose client of a plugin reads that metadata, and libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock `jaxlib==0.12.0.1`.
+Dew's CUDA and PJRT plugins are post124's on x86_64 and aarch64 (a GH200's Grace) alike, and the `kernel-compile` extra's (x86_64 only) are post124's. On Linux x86_64 and aarch64 jaxlib is Dew's build too, `jaxlib==0.12.0.1.post124`, whose client of a plugin reads that metadata, and libtpu 0.0.50 loads into it as into the stock one; elsewhere it is the stock `jaxlib==0.12.0.1`.
 <!-- END Dew's JAX builds -->
 
 Each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pins under its markers, so a GH200 installs the same file. Every other package comes from PyPI. The fixes:
@@ -220,7 +220,7 @@ Each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pi
 - `jax.device_put(..., may_alias=False)` copies a source it reshards, where a replicated array placed on one of its devices took that device's buffer.
 - Pallas Mosaic GPU lowers `is_finite`, and exports its shared-memory allocator's alignment (`plgpu.SMEM_ALIGNMENT`).
 - `jax.extend.mosaic_gpu.kernel_record` reads a compiled Mosaic GPU kernel's record through the plugin's own schema, generated from the `.proto` the plugin is built from.
-- A compiled Mosaic GPU kernel's record keeps what ptxas noted of a loss of performance as it assembled the kernel (`assembler_notes`, each a code and its message: a warpgroup MMA it serialized, C7510 to C7515 and C7519, a register reallocation it ignored, `setmaxnreg`'s C7507), which ptxas states only as text in its report. Dew's certification refuses a kernel whose warpgroup MMAs ptxas serialized as it refuses a spilling one (`report.SERIALIZED`). This fix lives in the PJRT plugin.
+- A compiled Mosaic GPU kernel's record keeps what ptxas noted of a loss of performance as it assembled the kernel (`assembler_notes`, each a code and its message: a warpgroup MMA it serialized, C7510 to C7515 and C7519, a register reallocation it ignored, `setmaxnreg`'s C7507), which ptxas states only as text in its report. Dew's certification refuses a kernel whose warpgroup MMAs ptxas serialized as it refuses a spilling one (`assembled.SERIALIZED`). This fix lives in the PJRT plugin.
 - A GPU compile stops after buffer assignment where it is asked to (`xla_gpu_experimental_early_exit=EARLY_EXIT_POINT_AFTER_BUFFER_ASSIGNMENT`): it emits no code and assembles no kernel, states the memory and buffer assignment its whole compile does, and its executable runs nowhere. This fix lives in the CUDA plugin.
 - The CUDA plugin serves its executables' metadata, and jaxlib's client of a plugin reads their buffer assignment from it, so a GPU program's `memory_analysis().serialized_buffer_assignment_proto` holds XLA's assignment, where it was empty; `Compiled.peak_live()` reads the buffers live at each allocation's peak from it (each one's bytes, shape as compiled, dtype, whether a parameter, an output or a temporary, the instruction defining it, its `op_name` and source), and is None where a backend states no assignment (libtpu). This fix lives in the CUDA plugin and in jaxlib, which Dew's build of it carries.
 - A GPU compile over `xla_gpu_memory_limit_early_exit_bytes` stops after buffer assignment: its executable states the memory and buffer assignment a whole compile does and refuses to run, and within the limit the compile finishes, so one compile tells whether a program fits a device's memory. This fix lives in the CUDA plugin.

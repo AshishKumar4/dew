@@ -373,6 +373,15 @@ def walk_roles(family: mosaic.Family) -> int:
     return min(family.consumers, 2) if family.warpgroups(1) > 1 else 1
 
 
+def _spread(held: int, programs: int, target: generation.GpuTarget) -> int:
+    """The programs of a launch holding `held` a multiprocessor of `target` runs at once: no more than its
+    `programs` spread over the device's multiprocessors where it knows them, as a launch's blocks go to its
+    multiprocessors in turn (`Mosaic._running`'s states launch, `Mosaic._output_hides`' output)."""
+    if target.multiprocessors is None:
+        return held
+    return min(held, -(-programs // target.multiprocessors))
+
+
 @dataclasses.dataclass(frozen=True)
 class Mosaic(base.Template[mainloop.Tiles]):
     """The chunked rule on the recurrence template's mainloop (`mosaic_rule`), its config
@@ -561,7 +570,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         walk = [base, *self.rungs(ba, base)]
         if config not in walk:
             return frozenset()
-        refused = [report.refused_at(self, ba, rung) for rung in walk[:walk.index(config) + 1]]
+        refused = [report.refused_at(self, ba, rung, target) for rung in walk[:walk.index(config) + 1]]
         return frozenset(kernel for kernel in terminal if all(kernel in at for at in refused))
 
     def _exhausted(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
@@ -569,7 +578,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """Whether a compile refused `tiles` past what its derivation's raise answers: a kernel spilled
         (`report.refused_at`), of the product `training` names where it names one (`_refused`), whose
         launch's producer can rise no further, or would leave its tiles unheld (`_raised`)."""
-        spilled = frozenset(kernel for kernel in report.refused_at(self, ba, tiles) if _of(kernel, training))
+        spilled = frozenset(kernel for kernel in report.refused_at(self, ba, tiles, target)
+                            if _of(kernel, training))
         return bool(spilled) and self._raised(ba, tiles, spilled, target) is None
 
     def _plans(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
@@ -670,7 +680,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             forward = trained if alone in (None, trained) else alone
             joined = self._settled(ba, trained if forward is trained
                                    else dataclasses.replace(trained, forward=alone), target)
-            if not _refused_kernels(self, ba, joined):
+            if not _refused_kernels(self, ba, joined, target):
                 return joined
             # Each product's tiles refused where a kernel it runs spilled past the last raise: the training
             # call's launches at its tiles, a forward alone's at its own (`Tiles.forward`, the training call's
@@ -679,15 +689,15 @@ class Mosaic(base.Template[mainloop.Tiles]):
             # (Nemotron-H 4B's on sm100).
             # A forward alone's launches are named apart from a training call's (`mainloop.Call.alone`), so a
             # refused kernel's name says which product ran it: each product steps its own tiles.
-            spilled = report.refused_at(self, ba, joined)
+            spilled = report.refused_at(self, ba, joined, target)
             products = ((refused[True], trained, self.launches(ba, joined, target, backward=True), spilled),
                         (refused[False], forward,
                          self.launches(ba, joined.forward or joined, target, backward=False),
-                         _refused_kernels(self, ba, joined)))
+                         _refused_kernels(self, ba, joined, target)))
             ran = [(tiles_refused, tiles) for tiles_refused, tiles, launches, kernels in products
                    if _owners(kernels, launches)]
-            assert ran, (f"the spilled kernels {sorted(_refused_kernels(self, ba, joined))} are none of the "
-                         "call's launches")
+            refused_here = sorted(_refused_kernels(self, ba, joined, target))
+            assert ran, f"the spilled kernels {refused_here} are none of the call's launches"
             for tiles_refused, tiles in ran:
                 tiles_refused.add(tiles)
 
@@ -705,7 +715,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         certifications of an H100's start to its share from the top down, two from the least through its
         statement's share (row 6743). Past its ladder's foot, a launch takes a program fewer a
         multiprocessor, its producer at the least and its ladder run again there (`_stepped`)."""
-        while (spilled := _refused_kernels(self, ba, tiles)) and (
+        while (spilled := _refused_kernels(self, ba, tiles, target)) and (
                 stepped := self._stepped(ba, tiles, spilled, target)) is not None:
             tiles = stepped
         return tiles
@@ -732,7 +742,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         (`tuning.KernelOp._climbed`)."""
         if not self._typed(config):
             return
-        target, spilled, rung = generation.gpu_target(), _refused_kernels(self, ba, config), config
+        target = generation.gpu_target()
+        spilled, rung = _refused_kernels(self, ba, config, target), config
         while spilled and (stepped := self._stepped(ba, rung, spilled, target)) is not None:
             rung = stepped
             yield rung
@@ -756,8 +767,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         ladder has left raises the producer, giving the consumers less, which a program fewer gives more (row
         6744: a write-gated H100 scores' backward spilled 16 bytes in its consumers at the least, and its
         ladder compiled a hundred rungs from the top down, each spilling more, before the program fewer)."""
-        roles = report.spilled_in(self, ba, joined) | (
-            report.spilled_in(self, ba, joined.forward) if joined.forward else {})
+        roles = report.spilled_in(self, ba, joined, target) | (
+            report.spilled_in(self, ba, joined.forward, target) if joined.forward else {})
         if any(roles.get(kernel) != (sass.CONSUMERS,) for kernel in spilled):
             return False
         family = bundle(target, _dtype(ba))
@@ -958,8 +969,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget, chunk: int, *,
                 walkers: int = 1, wide: int | None = None, training: bool = False,
                 refused: Set[mainloop.Tiles] = frozenset()) -> mainloop.Tiles | None:
-        """`block`'s tiles at `chunk` and `walkers` walk roles (`Tiles.walkers`) with the widest output block
-        legal beside it (`Tiles.block_o`; `wide` where given), at the ring of the states launch's steps,
+        """`block`'s tiles at `chunk` and `walkers` walk roles (`Tiles.walkers`) with the output block legal
+        beside it whose output launch hides any latency, the widest where none does (`Tiles.block_o`,
+        `_output_hides`; `wide` where given), at the ring of the states launch's steps,
         within the GPU's block (`generation.shared_budget`) over a step's bytes, whose plan hides the most
         latency, its programs a multiprocessor running at once (`_running`) and its depth one choice
         (`resources.hidden`), past the tiles a compile `refused` (`_chunked`'s); None where no output block is
@@ -970,10 +982,17 @@ class Mosaic(base.Template[mainloop.Tiles]):
         def held(tiles: mainloop.Tiles) -> bool:
             return tiles not in refused and self._product_holds(ba, tiles, target, training=training)
 
-        shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if width == block else width,
-                                                              walkers, chunk=chunk)
-                                               for width in widths)
-                           if held(tiles)), None)
+        # Widest first: the first legal width whose output launch hides latency, else the first legal.
+        widest = shallowest = None
+        for width in widths:
+            tiles = mainloop.Tiles(block, 1, None if width == block else width, walkers, chunk=chunk)
+            if not held(tiles):
+                continue
+            widest = widest or tiles
+            if self._output_hides(ba, tiles, target, training=training):
+                shallowest = tiles
+                break
+        shallowest = shallowest or widest
         if shallowest is None:
             return None
         states = self._states(ba, shallowest, target, training=training)
@@ -986,6 +1005,20 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return max(rings, key=lambda tiles: order(self._running(ba, tiles, target, training=training),
                                                   tiles.stages))
 
+    def _output_hides(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget,
+                      *, training: bool) -> bool:
+        """Whether the output launch at `tiles` hides any latency on `target`: more than one program a
+        multiprocessor running at once (as `_running` counts the states launch's) or a ring more than one
+        deep, in the product's plan `_product_fits` reads (a training call's forward where `training`). One
+        program one deep, the widest legal block held Kimi Linear's output on an A100 latency-bound:
+        375.0 us of its training against 287.6 at a block of 64, two programs (the 27B gated delta net's
+        257.1 against 205.6); on a GH200 the 27B's one program two deep at 128 ran 84.2 us against 89.9 at
+        64's two one deep, a narrower block hiding no more (M-JS-219)."""
+        [output] = [launch for launch in self.launches(ba, tiles, target, backward=False,
+                                                       training_forward=training)
+                    if launch.name.split("__")[0].endswith("output")]
+        return _spread(output.resident, output.programs, target) > 1 or output.stages > 1
+
     def _running(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget, *,
                  training: bool = False) -> int:
         """The programs of the states launch at `tiles` a multiprocessor of `target` runs at once: those it
@@ -996,10 +1029,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         deep (the 27B's 0.943 against 0.916), where the one deep ring narrowed the block to 16 at 0.752
         (1.193, gdn-pins-a100-3b0d2267d)."""
         held = self.states_held(ba, tiles, target, training=training)
-        if target.multiprocessors is None:
-            return held
-        programs = self._states(ba, tiles, target, training=training).programs
-        return min(held, -(-programs // target.multiprocessors))
+        return _spread(held, self._states(ba, tiles, target, training=training).programs, target)
 
     def neighbours(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> list[mainloop.Tiles]:
         """The tiles the opt-in tuner times beside the derived `config` (`variants`; the gate holds at each):
@@ -1070,11 +1100,12 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
 
 
-def _refused_kernels(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles) -> frozenset[str]:
-    """The kernels a compile refused at `tiles` (`report.refused_at`): its training call's and its forward
-    alone's, at its own tiles where it has them (`Tiles.forward`)."""
-    return report.refused_at(op, ba, tiles) | (report.refused_at(op, ba, tiles.forward) if tiles.forward
-                                               else frozenset())
+def _refused_kernels(op, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
+                     ) -> frozenset[str]:
+    """The kernels a compile refused at `tiles` on `target` (`report.refused_at`): its training call's and its
+    forward alone's, at its own tiles where it has them (`Tiles.forward`)."""
+    return report.refused_at(op, ba, tiles, target) | (report.refused_at(op, ba, tiles.forward, target)
+                                                       if tiles.forward else frozenset())
 
 
 def _of(kernel: str, training: bool | None) -> bool:

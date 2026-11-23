@@ -432,12 +432,15 @@ def the_layer_is_as_exact_under_the_template(packed: bool, held: str | None, *, 
     tokens leaves, the second call's tokens alone compared, the template on the first call, the second or
     both)."""
     layer = Mamba(**LAYER, dtype=dtype)
-    variables = layer.init(jax.random.key(1), jnp.zeros((2, length, LAYER["emb_features"]), dtype))
-    metadata = None
-    if packed:
-        starts = jnp.zeros((2, length), jnp.int32).at[:, (length // 3, 2 * length // 3)].set(1)
-        metadata = AttentionMetadata(coordinates=coordinates(segments=jnp.cumsum(starts, axis=1)))
-    call = MixerCall(metadata, decode=held is not None)
+
+    def called() -> MixerCall:
+        # Formed in the programs that read it, as the parameters in the draw: formed before the site, a GPU
+        # tier's prepare ran them on its compile-only device, which runs no program (row 8098).
+        metadata = None
+        if packed:
+            starts = jnp.zeros((2, length), jnp.int32).at[:, (length // 3, 2 * length // 3)].set(1)
+            metadata = AttentionMetadata(coordinates=coordinates(segments=jnp.cumsum(starts, axis=1)))
+        return MixerCall(metadata, decode=held is not None)
 
     def template_chosen():
         return generation.chosen(selective_scan="mosaic_gpu")
@@ -452,6 +455,7 @@ def the_layer_is_as_exact_under_the_template(packed: bool, held: str | None, *, 
         leaving, starting = (template_chosen if each else portable_chosen for each in taken)
 
         def mixed(variables, x):
+            call = called()
             if held is None:
                 with starting():
                     return module.apply(variables, x, call)
@@ -468,6 +472,7 @@ def the_layer_is_as_exact_under_the_template(packed: bool, held: str | None, *, 
         keys = jax.random.split(jax.random.key(seed))
         x = jax.random.normal(keys[0], (2, length, LAYER["emb_features"])).astype(dtype)
         out = (2, length if held is None else length - length // 2, LAYER["emb_features"])
+        variables = layer.init(jax.random.key(1), jnp.zeros((2, length, LAYER["emb_features"]), dtype))
         return variables, x, jax.random.normal(keys[1], out).astype(dtype)
 
     truth = layer.clone(dtype=jnp.float64)
@@ -656,7 +661,7 @@ def test_a_spill_steps_the_kernel_that_spilled():
     target = generation.gpu_target('sm90')
     with generation.assumed(target):
         derived = selective.SELECTIVE.derived(bound, target)
-        identity = report._identity(selective.SELECTIVE, bound)
+        identity = report._identity(selective.SELECTIVE, bound, generation.gpu_target())
         with report.refusals():
             report.refuse([(identity, derived, {'selective_scan_backward'})])
             stepped = selective.SELECTIVE.derived(bound, target)

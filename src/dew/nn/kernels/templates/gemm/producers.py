@@ -68,7 +68,8 @@ def settled(op, ba, config: tiling.Tiles) -> tiling.Tiles:
 
 def _spilled(op, ba, config: tiling.Tiles) -> bool:
     """Whether a compile of this process refused `config`, `op`'s kernel spilling (`report.refused_at`)."""
-    return any(kernel.startswith(op.KERNEL) for kernel in report.refused_at(op, ba, config))
+    refused = report.refused_at(op, ba, config, op.launch_target())
+    return any(kernel.startswith(op.KERNEL) for kernel in refused)
 
 
 def _tables(gather) -> tuple:

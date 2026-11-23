@@ -29,7 +29,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import Fetched, compiled_with, owned_program, program
-from dew.nn.kernels.templates import report, sass
+from dew.nn.kernels.templates import assembled, report, sass
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
@@ -184,7 +184,9 @@ trainer = Trainer(LMObjective(model, 12288), optax.adam(1e-3), key=jax.random.ke
                   mesh=MeshSpec().build(devices))
 compile_ahead(trainer, token_rows(64, 1, 12289))
 print(json.dumps({"events": events, "modules": modules, "kind": devices[0].device_kind,
-                  "stored": [certification.stored for certification in report.certifications()]}))
+                  "stored": [certification.stored for certification in report.certifications()],
+                  "misses": [[miss.kernel, miss.op, repr(miss.config), miss.stepped]
+                             for miss in report.misses()]}))
 """
 """A one-layer decoder of Qwen3.5-4B's gated delta net compiled ahead for a compile-only GPU of the generation
 or the kind argv[1] names (`compile_only_gpus`): each program it lowered by name, each Mosaic GPU kernel
@@ -222,6 +224,12 @@ def test_a_recurrent_step_is_lowered_once_cold_and_once_warm(tmp_path, target, d
     certified = [name for name in cold if name.startswith("jit(certified_")]
     assert certified and len(set(certified)) == len(certified), certified
     assert not [name for name in warm if name.startswith("jit(certified_")], warm
+    # Each launch certification refused, within the settle that refused it, is recorded once a refused config
+    # and stepped: the retry certified it past the rung (`report.settling`), as a B200's reverse launch at its
+    # first was (FS-ASIDE-SM100C).
+    misses = runs[0]["misses"]
+    assert all(stepped for *_, stepped in misses), misses
+    assert len({tuple(miss) for miss in misses}) == len(misses), misses
 
 
 @lowers("sm90")
@@ -584,13 +592,18 @@ def _cubin(registers: int, frame: int) -> bytes:
 
 def _kernel_proto(name: str, registers: int, frame: int, notes: tuple[tuple[str, str], ...] = (),
                   spilled: int | None = None) -> bytes:
-    """A `MosaicGpuKernelProto`: its version, binary, kernel name, launch's shared memory, what ptxas noted
-    of a loss of performance (each a code and a message) and the bytes it spilled, where measured."""
-    return (_field(1, 4) + _field(8, _cubin(registers, frame))
-            + _field(9, f"{name}_mosaic_gpu_kernel".encode()) + _field(10, 1024)
-            + b"".join(_field(13, _field(1, code.encode()) + _field(2, message.encode()))
-                       for code, message in notes)
-            + (b"" if spilled is None else _field(report.SPILLED_BYTES, spilled)))
+    """A `MosaicGpuKernelProto`, built through the plugin's own schema (`jax.extend.mosaic_gpu`'s
+    `kernel_record_class`): its binary, kernel name, launch's shared memory, what ptxas noted of a loss of
+    performance (each a code and a message) and the bytes it spilled, where measured."""
+    from jax.extend import mosaic_gpu
+
+    record = mosaic_gpu.kernel_record_class()(version=4, gpu_binary=_cubin(registers, frame),
+                                              kernel_name=f"{name}_mosaic_gpu_kernel", smem_bytes=1024)
+    for code, message in notes:
+        record.assembler_notes.add(code=code, message=message)
+    if spilled is not None:
+        record.spilled_bytes = spilled
+    return record.SerializeToString()
 
 
 def _thunk(calls: int, kernels: list[bytes]) -> bytes:
@@ -599,25 +612,48 @@ def _thunk(calls: int, kernels: list[bytes]) -> bytes:
         _field(3, _field(5, kernel)) for kernel in kernels)
 
 
+def test_a_models_draw_of_its_variables_selects_no_kernel():
+    """A model's draw of its variables (`Objective.init`) runs its forward over a one-row batch no step runs,
+    for the variables its modules make, none of its values drawn: within it every selector takes its op's
+    generic program and reports no route (`generation.drawing`), so no launch is derived, traced or
+    certified at the draw's shapes (row 11803: an every-template decoder's ahead compile certified its
+    draw's kernels, 29% of its main thread), where the model's forward over the same variables selects and
+    reports its kernels."""
+    from dew.nn.kernels.generation import routes
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+
+    model = models.build("causal_transformer", vocab_size=64, emb_features=128, num_layers=1, num_heads=2,
+                         num_kv_heads=1, head_dim=64, mlp_features=256, max_seq_len=128, dtype="bfloat16",
+                         attention_impl="template")
+    objective = LMObjective(model, 128)
+    with routes() as drawn_routes:
+        drawn = jax.eval_shape(objective.init, jax.random.key(0))
+    with routes() as applied_routes:
+        jax.eval_shape(model.apply, drawn, jax.ShapeDtypeStruct((2, 128), jnp.int32))
+    assert not drawn_routes, drawn_routes
+    assert applied_routes, "the model's forward selects no kernel, so its draw's selecting none says nothing"
+
+
 def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
-    """Each Mosaic GPU call a thunk names has its binary (`report.thunk_kernels`): two calls and two kernel
+    """Each Mosaic GPU call a thunk names has its binary (`assembled.thunk_kernels`): two calls and two kernel
     protos read as two kernels, their registers and frames their cubins'; two calls and one is refused, as a
     missing binary would read as a kernel that does not spill (row 2851)."""
 
-    both = report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm__l0123456789", 168, 0),
+    both = assembled.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm__l0123456789", 168, 0),
                                            _kernel_proto("dew_tgmm", 255, 344)]))
     read = [(kernel.kernel, kernel.launch, kernel.registers, kernel.frame, kernel.shared) for kernel in both]
     assert read == [("dew_gmm", "0123456789", 168, 0, 1024), ("dew_tgmm", None, 255, 344, 1024)]
     with pytest.raises(ValueError):
-        report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm", 168, 0)]))
+        assembled.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm", 168, 0)]))
 
 
 def test_a_kernel_is_refused_for_what_ptxas_spilled_not_for_its_stack_frame():
     """A kernel whose stack frame holds its own locals and nothing spilled (a prologue's sine: libdevice's
-    range reduction keeps a 32-byte array, row 9649), as ptxas measured it (`report.SPILLED_BYTES`), is
+    range reduction keeps a 32-byte array, row 9649), as ptxas measured it (its record's `spilled_bytes`), is
     certified; one that spilled is refused; one a build measured nothing of is held to its frame, which
     holds every byte it spills."""
-    kernels = report.thunk_kernels(_thunk(3, [_kernel_proto("dew_gmm", 168, 32, spilled=0),
+    kernels = assembled.thunk_kernels(_thunk(3, [_kernel_proto("dew_gmm", 168, 32, spilled=0),
                                               _kernel_proto("dew_tgmm", 255, 96, spilled=64),
                                               _kernel_proto("dew_added", 168, 32)]))
     assert [(kernel.spills, kernel.refused) for kernel in kernels] == [(0, False), (64, True), (32, True)]
@@ -625,16 +661,16 @@ def test_a_kernel_is_refused_for_what_ptxas_spilled_not_for_its_stack_frame():
 
 def test_a_kernels_assembler_notes_are_read_from_its_compiled_call():
     """What ptxas noted of a loss of performance as it assembled a kernel (Dew's JAX build keeps each note's
-    code and message in its compiled call, `report.ASSEMBLER_NOTES`) is read with its binary, in order: an
-    sm90 attention backward's warpgroup products serialized for want of registers, where nothing spills,
+    code and message in its compiled call, its record's `assembler_notes`) is read with its binary, in order:
+    an sm90 attention backward's warpgroup products serialized for want of registers, where nothing spills,
     is data a certification refuses by, not text a process printed. A kernel noted nothing reads none."""
     serialized = ("C7512", "wgmma.mma_async instructions are serialized due to insufficient register "
                   "resources for the function 'attention_dkv'")
     ignored = ("C7507", "'setmaxnreg' ignored to maintain minimum register requirements")
     kernels = [_kernel_proto("attention_dkv", 168, 0, (serialized, ignored)),
                _kernel_proto("attention_dq", 128, 0)]
-    noted, plain = report.thunk_kernels(_thunk(2, kernels))
-    assert noted.notes == (report.AssemblerNote(*serialized), report.AssemblerNote(*ignored))
+    noted, plain = assembled.thunk_kernels(_thunk(2, kernels))
+    assert noted.notes == (assembled.AssemblerNote(*serialized), assembled.AssemblerNote(*ignored))
     assert plain.notes == ()
 
 
@@ -763,6 +799,80 @@ def test_a_program_lowered_before_another_compile_refused_its_config_is_relowere
         report.compiled(second, relower=lowered)
         misses = report.misses()
     assert misses and all(miss.stepped for miss in misses), misses
+
+
+def _aside(devices, lowered_first, relowered):
+    """`report.lowered_aside` of a lowering's first call `lowered_first` and its retry `relowered` over
+    `devices`, its launches certified aside on a compile-only H100 within a `refusals` scope of its own: its
+    misses, its refused launches and the retries it made."""
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    retries: list[int] = []
+
+    def retried():
+        retries.append(1)
+        return relowered()
+
+    with (report.refusals(), generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        report.lowered_aside(lowered_first, retried, lambda value: value)
+        return report.misses(), report.refused_launches(), retries
+
+
+@lowers("sm90")
+def test_an_aside_miss_is_recorded_stepped_in_the_recording_that_queued_its_launch():
+    """A program whose launch spills at its first tile (`Uncounted`), lowered with its launches certified
+    aside (`report.lowered_aside`), its first lowering within a recording of its own: the launch's miss is
+    recorded once, stepped by its retry's certification past the tile, in the recording its launch was queued
+    in though the block settles outside it (row 11786's review: misses went to the draining context's)."""
+    devices, lowered = _paired_step(Uncounted())
+    queued: list[report.Recorded] = []
+
+    def first():
+        with report.recording() as recorded:
+            queued.append(recorded)
+            return lowered()
+
+    misses, _, retries = _aside(devices, first, lowered)
+    assert misses and all(miss.stepped for miss in misses) and retries, (misses, retries)
+    assert tuple(queued[0].missed) == misses, (queued[0].missed, misses)
+
+
+@lowers("sm90")
+def test_an_aside_refusal_stays_in_the_refusals_scope_that_queued_its_launch():
+    """The same program's first lowering within a `refusals` scope of its own: the launch it queued refuses
+    its tile in that scope as the block settles outside it, so the enclosing scope holds no refusal and no
+    miss and retries nothing (row 11786's review: the refusal went to the draining context's registry, which
+    retried the lowering past it)."""
+    devices, lowered = _paired_step(Uncounted())
+
+    def first():
+        with report.refusals():
+            return lowered()
+
+    misses, refused, retries = _aside(devices, first, lowered)
+    assert not misses and not refused and not retries, (misses, refused, retries)
+
+
+@lowers("sm90")
+def test_a_launch_taken_in_two_recordings_of_one_aside_block_records_its_miss_in_each():
+    """The same program lowered twice within one block certifying aside, each lowering within a recording of
+    its own: the launch the second takes is the one the first queued, its one replay, and its miss is
+    recorded in both recordings, stepped by the retry's certification past the tile (row 12007: the second
+    scope took the queued launch and its recording held no miss)."""
+    devices, lowered = _paired_step(Uncounted())
+    queued: list[report.Recorded] = []
+
+    def twice():
+        for _ in range(2):
+            with report.recording() as recorded:
+                queued.append(recorded)
+                value = lowered()
+        return value
+
+    misses, _, retries = _aside(devices, twice, lowered)
+    assert misses and all(miss.stepped for miss in misses) and retries, (misses, retries)
+    assert [tuple(recorded.missed) for recorded in queued] == [misses, misses], queued
 
 
 class SpillingOnly(Uncounted):
@@ -970,7 +1080,7 @@ def test_one_kernel_called_from_two_places_compiles_alone_once():
 @pytest.mark.parametrize("constant", [False, True], ids=["no-constant", "a-constant"])
 def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(constant):
     """A program of a Pallas-Triton launch feeding a Mosaic GPU kernel and an XLA fusion, compiled for an
-    H100, with or without a constant: `report.binaries` reads the launch once, its cubin from its custom
+    H100, with or without a constant: `assembled.binaries` reads the launch once, its cubin from its custom
     kernel's proto (a program holding a constant gives every thunk that constant's module alone as its
     binary, which states no registers: row 3858), and the Mosaic kernel once, from its kernel proto, each
     stating its registers; the fusion, whose thunk carries its cubin too, names no launch and is no
@@ -999,7 +1109,7 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(consta
     spec = jax.ShapeDtypeStruct((128, 128), jnp.float32, sharding=NamedSharding(devices, PartitionSpec()))
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
         compiled = jax.jit(program).trace(spec, spec).lower().compile()
-    found = report.binaries(compiled)
+    found = assembled.binaries(compiled)
     assert len(found) == 2 and all(binary.registers > 0 and not binary.spills for binary in found)
     launched = [(binary.kernel, binary.launch) for binary in found if binary.launch]
     assert launched == [("dew_added", "0123456789")]
@@ -1231,7 +1341,7 @@ def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read
     import kernel_compile as kc
 
     assert sass.disassembler() is not None
-    unread = report.Binary("gemm_mosaic_gpu_kernel", None, 168, 0, "mosaic_gpu", 1024, sass=None)
+    unread = assembled.Binary("gemm_mosaic_gpu_kernel", None, 168, 0, "mosaic_gpu", 1024, sass=None)
     (found,) = kc.reports({}, [unread])
     assert "machine code" in found.unread
     assert found.failure(232448, 0) is not None
@@ -1302,14 +1412,15 @@ PRODUCER:
 def test_a_binary_states_its_threads_and_the_registers_its_roles_reconfigure_to(tmp_path):
     """A kernel of 384 threads whose producer lowers to 40 registers and whose consumers raise to 232
     (`setmaxnreg`), assembled for an H100 by the gate's ptxas (`kernel_compile.assemblers`): its binary
-    (`report._binary`, decoded) states its threads from its `.nv.info` and the two counts from its machine
-    code (USETMAXREG), the facts the compile gate reads where no PTX of a kernel was dumped (row 7105)."""
+    (`assembled.binary_of`, decoded) states its threads from its `.nv.info` and the two counts from its
+    machine code (USETMAXREG), the facts the compile gate reads where no PTX of a kernel was dumped (row
+    7105)."""
     from kernel_compile import assemblers
 
     source = tmp_path / "reconfiguring.ptx"
     source.write_text(RECONFIGURING_PTX)
     cubin = tmp_path / "reconfiguring.cubin"
     subprocess.run([str(assemblers("sm90")[0]), "-arch=sm_90a", str(source), "-o", str(cubin)], check=True)
-    binary = report._binary("reconfiguring", cubin.read_bytes(), decoded=True)
+    binary = assembled.binary_of("reconfiguring", cubin.read_bytes(), decoded=True)
     assert (binary.threads, binary.decreased, binary.raised) == (384, 40, 232), binary
 

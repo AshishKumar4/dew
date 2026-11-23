@@ -101,8 +101,12 @@ def _lowers(hook, tiles: tuple, sides, rules) -> bool:
     takes. A marked span (`derivatives.marked_call_p`) lowers as its body, whose primitives are read."""
     if hook is None:
         return True
+    from dew.nn.kernels.templates.gemm import packed
+
     # Traced as a launch's body traces it, on tiles (`launches.tracing_body`).
-    with launches.tracing_body(interpret=False):
+    layout = packed.consumer_layout() if rules is mosaic_gpu_lowering.mosaic_lowering_rules[
+        plgpu_core.WGxWG_SEMANTICS] else None
+    with launches.tracing_body(interpret=False), packed.epilogue_layout(layout):
         traced = jax.make_jaxpr(hook)(*tiles, *sides)
     return all(equation.primitive in rules or equation.primitive is marked_call_p
                for equation in equations(traced.jaxpr))

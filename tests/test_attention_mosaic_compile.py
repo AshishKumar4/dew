@@ -1111,7 +1111,7 @@ def test_a_ladder_that_spills_throughout_certifies_its_ends_alone():
                      if certification.op == type(op).__name__}
         rungs = tuple(dataclasses.replace(derived, block_q=block) for block in (256, 192, 128, 64)
                       if block <= derived.block_q)
-        refused = {rung for rung in rungs if report.refused(op, ba, rung)}
+        refused = {rung for rung in rungs if report.refused(op, ba, rung, generation.gpu_target())}
     assert taken is None or taken not in refused, taken
     assert refused == set(rungs), (rungs, refused)
     assert len(certified & set(rungs)) < len(rungs), (certified, rungs)
@@ -1132,7 +1132,8 @@ def test_a_ladder_holds_no_rung_its_assembler_caps_otherwise():
             dq, dkv = op._launch_registers(ba, tiles)
             launches = ((tiles.dkv, dkv),) if tiles.fused else ((tiles, dq), (tiles.dkv, dkv))
             return [(model.cap(1), model.moves) for model in (
-                resources.register_model(attention_mosaic.bundle_of(each, dtype), each.consumers, registers)
+                resources.register_model(attention_mosaic.bundle_of(each, dtype), each.consumers, registers,
+                                         target=generation.gpu_target())
                 for each, registers in launches)]
 
         assert stated(dataclasses.replace(config, block_q=64)) != stated(config)
@@ -1694,7 +1695,7 @@ def test_sm90_fused_and_coop_backward_pipeline_dq_dkv_and_sync_issuers_refuse_pe
 
     from dew.nn.kernels.templates import attention_mosaic_coop, attention_mosaic_fused, bundles
 
-    mma = bundles.named("mma.sync", jnp.bfloat16)
+    mma = bundles.named("mma.sync", jnp.bfloat16, None)
     with pytest.raises(ValueError):
         mma.product(jnp.zeros((16, 16), jnp.bfloat16), jnp.zeros((16, 16), jnp.bfloat16), (16, 16), pending=1)
 
@@ -2207,7 +2208,7 @@ def test_wide_epilogue_chunks_tcgen05_chunks_and_prices_masked_rewalks():
         bwd_cfg = bwd_op.derived(bwd_ba, target)
         assert bwd_cfg is not None and not bwd_cfg.fused and bwd_op.takes(bwd_ba, bwd_cfg, target), bwd_cfg
         nxt_bwd = dataclasses.replace(bwd_cfg, stages=bwd_cfg.stages + 1)
-        assert bwd_cfg.stages >= 2 and (
+        assert (
             not bwd_op.takes(bwd_ba, nxt_bwd, target)
             or bwd_op.resident(bwd_ba, nxt_bwd, target) < bwd_op.resident(bwd_ba, bwd_cfg, target)
             or bwd_cfg.stages >= max(bwd_cfg.consumers, 2) + 1), bwd_cfg

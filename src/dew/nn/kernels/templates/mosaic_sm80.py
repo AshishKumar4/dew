@@ -720,8 +720,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
 
-    adds_through_shared = False
-    stages_vectors = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
+    adds_through_shared = False  # `added`'s atomic adds go from registers (`red.global`), its `smem` unread
+    stages_vectors = False
 
     @property
     @abc.abstractmethod
@@ -761,8 +761,9 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                 interpret=bodies.interpreted(interpret),
                                 kernel_name=report.named(
                                     name, model=(None if registers is None
-                                                 else resources.register_model(self, consumers, registers,
-                                                                               shared=shared))),
+                                                 else resources.register_model(
+                                                     self, consumers, registers, shared=shared,
+                                                     target=generation.gpu_target()))),
                                 cost_estimate=emission.built_with(cost))
         return mosaic.checked(emission.costed(built, cost), name or self.name, resident, model_flops,
                               out_type=out_type)
@@ -794,7 +795,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             return (), ((),)
         if streams.gathered:
             return (), (_gathered_slots(streams, steps),)
-        return (), (_pipelined(_pipeline_key(streams), steps),)
+        # Keyed by its slots, `steps` only where fewer than its stages (`emit_pipeline` allocates
+        # min(stages, steps)): a call's every depth past them plans one walk, not one each (row 11639).
+        slots = steps if steps is not None and steps < streams.stages else None
+        return (), (_pipelined(_pipeline_key(streams), slots),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:

@@ -98,6 +98,15 @@ Scope is per rule, because the rules are not all about the same thing:
   `precision.logistic_value`):
   a v5e's logistic is approximate even at HIGHEST, which held Mamba-2's layer
   at 3.5 times its CPU float32 (row 7062).
+- SLOP032 is about every file: no thread pool compiles programs by their own
+  `compile` at a width of its own: a `concurrent.futures.ThreadPoolExecutor`
+  handed such work takes one worker or a width `compile_threads()` of
+  `dew.nn.kernels.templates.report` caps (its module excepted), the process's
+  compile width, which every compile pool shares (owner, 2026-11-22: a test's
+  own pool of compiles oversubscribed a task's CPUs). A compile through
+  `xla_compiled` waits for a compile slot, whatever its pool's width.
+- SLOP033 is about tests (tools/lint_assertions.py): no test pins a choice Dew
+  derives to a literal (CONTRIBUTING's banned assertion 2).
 - SLOP029 is about `tests`: no test's every assertion is that a process
   failed, read from its exit status alone (a `returncode`, `subprocess.call`
   or `os.system` unequal to 0, equal to 1, an uncaught error's, or tested for
@@ -2280,9 +2289,78 @@ def derivative_contracts(module: Module) -> Iterator[Finding]:
         yield Finding(module.relative, line, col, "SLOP028", message)
 
 
+COMPILE_WIDTH_OWNER = "nn/kernels/templates/report.py"
+"""The module of the process's compile width, `compile_threads()` (SLOP032)."""
+POOL_WORK = frozenset({"submit", "map"})
+"""An executor's methods that hand it work (SLOP032): their first argument."""
+
+
+def compile_pools(module: Module) -> Iterator[Finding]:
+    """SLOP032: a thread pool (`concurrent.futures.ThreadPoolExecutor`, by any name it is imported under)
+    handed work (`POOL_WORK`) that compiles a program by its own `compile` (a JAX stage's, not `re`'s): the
+    bound method itself, or a lambda, a `functools.partial` or a function of the module whose body reaches
+    one, whose width is neither 1 nor capped by the process's compile width (`compile_threads()`, or a `min`
+    it is among). A compile through Dew's compile point (`xla_compiled`) waits for one of the process's
+    compile slots whatever the pool's width, and is not read; nor is the width's own module."""
+    if module.relative == f"src/{module.package}/{COMPILE_WIDTH_OWNER}":
+        return
+    executors = {"ThreadPoolExecutor"} | {
+        alias.asname for node in ast.walk(module.tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "concurrent.futures"
+        for alias in node.names if alias.name == "ThreadPoolExecutor" and alias.asname}
+    functions = {node.name: node for node in ast.walk(module.tree)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def compiles(work: ast.AST, seen: frozenset[str] = frozenset()) -> bool:
+        for node in ast.walk(work):
+            if (isinstance(node, ast.Attribute) and node.attr == "compile"
+                    and scopes.dotted(node) != "re.compile"):
+                return True
+            if isinstance(node, ast.Name) and node.id in functions.keys() - seen and compiles(
+                    functions[node.id], seen | {node.id}):
+                return True
+        return False
+
+    def capped(width: ast.expr) -> bool:
+        return ((isinstance(width, ast.Constant) and width.value == 1)
+                or scopes.called(width) == "compile_threads"
+                or (isinstance(width, ast.Call) and scopes.called(width) == "min"
+                    and any(capped(each) for each in width.args)))
+
+    for scope in [module.tree, *functions.values()]:
+        nodes = list(scopes.own(scope))
+        pools = {id(node): node for node in nodes
+                 if isinstance(node, ast.Call) and scopes.called(node) in executors}
+        named: dict[str, ast.Call] = {}
+        for node in nodes:
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                named |= {item.optional_vars.id: pools[id(item.context_expr)] for item in node.items
+                          if id(item.context_expr) in pools and isinstance(item.optional_vars, ast.Name)}
+            elif isinstance(node, ast.Assign) and id(node.value) in pools and len(node.targets) == 1 \
+                    and isinstance(node.targets[0], ast.Name):
+                named[node.targets[0].id] = pools[id(node.value)]
+        handed: dict[int, list[ast.expr]] = {}
+        for node in nodes:
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in POOL_WORK and node.args):
+                continue
+            owner = node.func.value
+            pool = named.get(owner.id) if isinstance(owner, ast.Name) else pools.get(id(owner))
+            if pool is not None:
+                handed.setdefault(id(pool), []).append(node.args[0])
+        for key, works in handed.items():
+            pool = pools[key]
+            widths = [*pool.args[:1], *(keyword.value for keyword in pool.keywords
+                                        if keyword.arg == "max_workers")]
+            if any(compiles(work) for work in works) and not any(capped(width) for width in widths):
+                yield Finding(module.relative, pool.lineno, pool.col_offset + 1, "SLOP032",
+                              "a pool of compiles at a width of its own; take report.compile_threads() as "
+                              "its width, or compile through report.xla_compiled, which waits for a slot")
+
+
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections, compile_points,
                   pallas_launches, owned_constructs, derivative_contracts)
-UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
+UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private, compile_pools)
 
 
 def assertions(module: Module) -> Iterator[Finding]:

@@ -147,7 +147,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from costs import Cost
+    from costs import Cost, Mark
     from session import Entry
 
 
@@ -188,6 +188,9 @@ progress = _loaded(HERE / "progress.py")
 natives, digests, grading = (_loaded(HERE / f"{name}.py") for name in ("natives", "digests", "grading"))
 host, stalls, temp_roots = (_loaded(HERE / f"{name}.py") for name in ("host", "stalls", "temp_roots"))
 costs, cuts, partition = (_loaded(HERE / f"{name}.py") for name in ("costs", "cuts", "partition"))
+# A site's mark and the map tasks its units are cut into (costs.py), as this file and its tests name them.
+MAX_INPUTS, stages_of, draws_of, cut_draws, refused_sites = (
+    costs.MAX_INPUTS, costs.stages_of, costs.draws_of, costs.cut_draws, costs.refused_sites)
 fold = _loaded(HERE / "fold.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
@@ -920,37 +923,13 @@ next plan reads to draw them in the first wave (`eager_sites`)."""
 INPUTS = "/armada/inputs"
 """Where a judge's task finds its map tasks' artifacts (armada's `{inputs}`), each task's under
 `<job>/<index>`, where armada names none (`armada_dir`)."""
-MAX_INPUTS = 1000
-"""The most tasks' artifacts one armada job takes as its inputs (armada's MAX_INPUT_RUNS,
-src/protocol.ts): armada cuts the judges of one environment and size into as many judges' jobs as keep
-each within it (its `judgeChunks`), so a site's own map tasks, which one judge reads in one job, stay
-within it (`refused_sites`)."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Mark:
-    """A site's mark (`session.SHARDS`): the units its map tasks together take, 0 to `units`, the most of them
-    a map task takes, the line of its test's source that holds the mark, and the units a whole run of its test
-    takes at least, over which its recorded seconds weigh one (`site_entries`): a check-1 site's declared
-    seeds, of (1 + REDRAW) times as many its map tasks draw; a `shards` test's units, every one. A check-1
-    site's weighed check (`conditioning`) draws `weighed` units more, `units` to `units + weighed`, at most
-    `weighed_per_task` a map task: its draws cost their own, apart from the unweighted check's."""
-
-    units: int
-    per_task: int
-    line: int
-    timed: int
-    weighed: int = 0
-    weighed_per_task: int = 0
-
-
 def armada_dir(variable: str, default: str) -> Path:
     """The directory armada names to a task by `variable` (ARMADA_ARTIFACTS, ARMADA_INPUTS), which every task
     it starts holds, else where its container keeps it (`default`)."""
     return Path(os.environ.get(variable) or default)
 
 
-def sites(name: str) -> dict[str, Mark]:
+def sites(name: str) -> "dict[str, Mark]":
     """Test file `name`'s tests marked one of `session.SHARDS`, each by its name in the file (a class's
     method's `Class.test_name`) with its mark (`Mark`). Read from the source, as `gangs` reads its models: the
     plan runs under a Python with no pytest (`pinned`) and imports no test, so it reads the mark on the test's
@@ -967,71 +946,15 @@ def sites(name: str) -> dict[str, Mark]:
 
 
 @functools.cache
-def marked_sites(name: str, text: str) -> dict[str, Mark]:
+def marked_sites(name: str, text: str) -> "dict[str, Mark]":
     """`sites` of test file `name`, whose source is `text`, read once a text: each site's mark as its source
     declares it (`session.declared_marks`), its units staged as check 1 draws them (`PARITY_STAGES`)."""
     staged = _loaded(PARITY_STAGES).staged_units
-    return {site: Mark(staged(declared) if kind == "check1_shards" else declared, counts["per_task"],
+    return {site: costs.Mark(staged(declared) if kind == "check1_shards" else declared, counts["per_task"],
                        line, declared, staged(counts.get("conditioning", 0)),
                        counts.get("conditioning_per_task", 0))
             for site, (kind, counts, line) in session.declared_marks(name, text).items()
             for declared in [counts[session.SHARDS[kind]]]}
-
-
-def draws_of(mark: Mark, per_task: int | None = None, weighed_per_task: int | None = None
-             ) -> list[tuple[int, int]]:
-    """The units each map task of a site marked `mark` takes, at most its per_task each (`per_task` where
-    given, as `cut_draws` cuts finer): together 0 to its units, every seed both of check 1's stages draw, or
-    every unit of a `shards` test's work; a check-1 site's first stage (0 to its declared seeds, `timed`) and
-    its second each in tasks of their own, the second's `later` (`site_entries`); and its weighed check's
-    units past them (`Mark.weighed`), at most `weighed_per_task` a task, every one later."""
-    each = per_task or mark.per_task
-    stages = [(0, mark.timed), (mark.timed, mark.units)] if mark.units > mark.timed else [(0, mark.units)]
-    spans = [(start, min(start + each, stop)) for first, stop in stages for start in range(first, stop, each)]
-    if not mark.weighed:
-        return spans
-    end, weighed = mark.units + mark.weighed, weighed_per_task or mark.weighed_per_task
-    return spans + [(start, min(start + weighed, end)) for start in range(mark.units, end, weighed)]
-
-
-def cut_draws(mark: Mark, rates: Mapping[bool, "Cost | None"], target: float) -> list[tuple[int, int]]:
-    """The spans of a site's map tasks (`draws_of`): its declared per_task each, or fewer where its measured
-    cost (`site_rate`, the unweighted check's and the weighed check's apart, `rates` by whether weighed) puts
-    a task of its declared cut past `costs.SITE_TARGETS` of `target`: as many as they hold past its setup
-    (`Cost.fitting`), at least one, so no map task is the run's longest for its mark's cut (row 4376: a
-    64-seed shard ran 966 s where every other group took 256 s or less), and none is cut down to one target,
-    each task paying the site's setup again. Its tasks' starts are among what the cost measures, so a cut
-    converges from above on the one that fills them. A kind whose finer cut would pass what its judges' job
-    takes (`MAX_INPUTS`, the two kinds' tasks together) keeps the finest of its own within it."""
-    most = target * costs.SITE_TARGETS
-
-    def fitting(units: int, declared: int, cost: "Cost | None") -> int:
-        return declared if cost is None else max(1, min(units, cost.fitting(declared, most)))
-
-    per_task = fitting(mark.units, mark.per_task, rates[False])
-    weighed = fitting(mark.weighed, mark.weighed_per_task, rates[True]) if mark.weighed else None
-    while per_task < mark.per_task and len(
-            draws_of(mark, per_task, mark.weighed_per_task or None)) > MAX_INPUTS:
-        per_task += 1
-    while weighed is not None and weighed < mark.weighed_per_task and len(
-            draws_of(mark, per_task, weighed)) > MAX_INPUTS:
-        weighed += 1
-    return draws_of(mark, per_task, weighed)
-
-
-def refused_sites(marked: Mapping[str, Mapping[str, Mark]]) -> None:
-    """Refuse the marks of `marked` (each test file's sites, `sites`) whose own map tasks pass what one
-    judges' job takes (`MAX_INPUTS`): its judge reads them all in one job, which armada would refuse after
-    every map task ran, and the run would go ungraded; marks within it pass it together, armada cutting
-    their judges into jobs. A mark is refused on the run that adds it, naming its line."""
-    over = {(name, test): count for name, held in marked.items() for test, mark in held.items()
-            if (count := len(draws_of(mark))) > MAX_INPUTS}
-    if over:
-        each = "; ".join(f"{name}, line {marked[name][test].line}: {test}, {count} map tasks"
-                         for (name, test), count in sorted(over.items()))
-        raise SystemExit(f"a site marked check1_shards or shards plans more map tasks than the {MAX_INPUTS} "
-                         "tasks' artifacts its judges' job takes; give a map task more units (per_task): "
-                         f"{each}")
 
 
 def site_task(python: str, name: str, test: str, span: tuple[int, int] | None = None) -> str:
@@ -1059,7 +982,7 @@ def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]], me
                                   if (seconds := measured.get(site_task(python, name, test, (start, stop))))])
 
 
-def site_rate(python: str, name: str, test: str, mark: Mark, timings: Mapping[str, Mapping[str, float]], *,
+def site_rate(python: str, name: str, test: str, mark: "Mark", timings: Mapping[str, Mapping[str, float]], *,
               weighed: bool) -> "Cost | None":
     """What a map task of test file `name`'s site `test` takes under `python` (`rate`), by its judge's records
     of its map tasks (`timings`' files), else over its map tasks of any cut armada measured, by their names
@@ -1092,7 +1015,7 @@ def site_costs(python: str, name: str, test: str) -> dict[str, float]:
     return costs.timed(site_task(python, name, test), records, held[test].units)
 
 
-def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
+def site_entries(python: str, marked: "Mapping[str, Mapping[str, Mark]]",
                  kept: Mapping[tuple[str, str], str], timings: dict, target: float,
                  eager: Container[tuple[str, str]] = ()) -> list[dict]:
     """The plan's entries for each site of `marked` (`sites`, by its file) under `python`: a map task each
@@ -1130,7 +1053,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                 # A weighed check's units cost their own, as those of them armada measured did.
                 cost = rates[start >= mark.units]
                 weight = measured.get(task_name) or (
-                    cost.seconds(stop - start) if cost is not None else target)
+                    cost.seconds(start, stop) if cost is not None else target)
                 # A check-1 site's second-stage seeds, drawn only where its judge's first stage asks for
                 # them (armada's `later`), or at once where its last judgement needed them (`eager`).
                 maps.append({"name": task_name, "python": python, "tests": name, "split": group,

@@ -157,7 +157,9 @@ def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     if on is None:
         return
     draws = functools.partial(drawn, dtype, **geometry(case))
-    (sample,) = draw(dtype, 0, **geometry(case))
+    # Drawn on the host: a GPU tier's prepare runs no program on its device (row 7869).
+    with jax.default_device(jax.devices("cpu")[0]):
+        (sample,) = draw(dtype, 0, **geometry(case))
     # Judged under the forms the call runs (`on_the_mainloop`'s fast ones): an fp32 call's rounding reads the
     # product precision they set (`recurrence_chunk.fast_rounding`).
     if not formed('fast', trained)(sample, hooks):
@@ -555,7 +557,8 @@ def test_one_products_spent_ladder_leaves_the_others_launches(kernel):
     with report.refusals(), generation.assumed('sm90'):
         target = template.Mosaic.launched()
         first = template.MOSAIC.derived(bound, target)
-        base, identity = template._base(first), report._identity(template.MOSAIC, bound)
+        base = template._base(first)
+        identity = report._identity(template.MOSAIC, bound, generation.gpu_target())
         # The base refused first, whose ladder its rungs then are (`rungs` walks a refused config's).
         report.refuse([(identity, base, {kernel})])
         rungs = list(template.MOSAIC.rungs(bound, base))

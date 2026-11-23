@@ -79,7 +79,7 @@ from dew.nn.kernels.templates.gemm import (
     sides_padded,
 )
 from dew.nn.kernels.templates.gemm.chained import Chained, Partition, flag_row, flags_declared, guarded_walk
-from dew.nn.kernels.templates.gemm.pricing import balanced_tail, family_of, merges, tile_columns, tile_rows
+from dew.nn.kernels.templates.gemm.pricing import dense_tail, family_of, tile_columns, tile_rows
 from dew.nn.kernels.templates.gemm.row_tiles import TMA_ROWS
 from dew.nn.kernels.templates.gemm.tiling import GMM, GUARDED_GMM, TGMM, Tiles
 from dew.nn.kernels.templates.product import SCALE_DEPTH, block_format
@@ -291,7 +291,8 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         transpose_lhs: bool = False, first: jax.Array | None = None,
         scales: jax.Array | None = None, step_scales: tuple | None = None, mx_scales: tuple | None = None,
         gather: jax.Array | None = None, scatter: jax.Array | None = None, packed_rows: bool = False,
-        registers: int | None = None, shared: int | None = None, balanced: bool = True, beside: tuple = (),
+        registers: int | None = None, shared: int | None = None,
+        balanced: bool | tail_of.Tail = True, beside: tuple = (),
         chained: tuple = ()) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or with
     `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the routed ones
@@ -381,8 +382,9 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     step_scales, per = _step_scales_walked(step_scales, n, block_n, extent)
     prologue_operands = sides_extended(prologue_operands, prologue_axes, extent)
     epilogue_operands = sides_extended(epilogue_operands, epilogue_axes, extent)
+    can_balance = dense and paired is None and not beside and scales is None and tiles.splits == 1
     tail = _dense_tail(tiles, dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize), multiprocessors,
-                       balanced=balanced and dense and paired is None and not beside)
+                       balanced=balanced if can_balance else False)
     walked = (-(-m // row_tile) + (0 if dense else g)) * -(-n // block_n) * tiles.cluster * tiles.splits
     programs = launched(family_of(tiles, dtype), multiprocessors, walked, tail)
     walk = functools.partial(
@@ -448,29 +450,19 @@ def _joined_refused(joined, lhs, paired, *, parts: tuple, transpose_lhs: bool, p
 
 
 def _dense_tail(tiles: Tiles, dtype, extents: tuple, itemsizes: tuple, multiprocessors: int, *,
-                balanced: bool):
-    """Dew: a dense `gmm`'s last wave balanced over the programs (`tail.balanced`), as the kernel gradient's:
-    one matrix, one accumulator (`balanced`), a tile a program, its programs' exact partials added by IEEE
-    adds; none for a depth split, which already shares its depth over the wave, its runs a schedule of their
-    own (`_gmm_scheduled`), each into its own slice of the outputs, which no tail shares."""
-    m, n, k = extents
-    if not merges(tiles, dtype, dense=balanced):
+                balanced: bool | tail_of.Tail):
+    """Dew: a dense `gmm` or `tgmm` launch's last wave balanced over the programs (`pricing.dense_tail`),
+    reusing the planner's `Tail` when passed so planner and emitter make one decision (row 11945)."""
+    if isinstance(balanced, tail_of.Tail):
+        return balanced
+    if not balanced:
         return None
-    family = family_of(tiles, dtype)
-    columns = tile_columns(tiles, family)
-    grid = (-(-m // tiles.block_m), -(-n // columns))
-    # On a scoped-pipeline family (`walks_scoped`, e.g. mma.sync), a balanced tail forces persistent mode
-    # (`launched`), whose CTAs drift across K over multiple waves and thrash L2 (row 5363; NS-P8-WALK2-a100:
-    # non-persistent ran 0.63x on Qwen3-32B gate_up dX). Keep tail balance for <=1 full wave only.
-    if family.walks_scoped and grid[0] * grid[1] >= 2 * multiprocessors:
-        return None
-    return balanced_tail(tiles, grid, -(-k // tiles.block_k), itemsizes, generation.gpu_target(),
-                         multiprocessors)
+    return dense_tail(tiles, dtype, extents, itemsizes, generation.gpu_target(), multiprocessors, dense=True)
+
 
 def _of_no_depth(shape: tuple, group_sizes, accumulators: int, epilogue, epilogue_operands: tuple,
                  epilogue_axes: tuple, dtypes: tuple) -> tuple:
     """Dew: `gmm`'s outputs of a product of no depth, which sums nothing, or of no rows, which has no tile to
-    walk (a packed bank's launch of an empty call, which no router's extents refuse first): its rows zeros
     through the epilogue on whole arrays (its hooks are a tile's elementwise arithmetic), with no launch (a
     walk of no steps has no block of the matrix to view: JAX 0.12 refuses a zero-extent slice; a block of no
     rows none to tile: the interpreter's padding divided by it); its side operands by group read at each row
@@ -534,7 +526,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     (prologue, prologue_axes, epilogue, epilogue_axes), (prologue_operands, epilogue_operands) = hooks, sides
     (m, n, k, g), block_m, block_n, block_k = shape, tiles.block_m, tile_columns(tiles, family), tiles.block_k
     consumers, pair, part = tiles.warpgroups, tiles.cluster, (tiles.share, block_n)
-    # The side operands streamed with the steps, read from global memory, or loaded once a tile (`_stepped`).
+    pairs = multiprocessors // pair
     stepped, read, fixed = _stepped(family, prologue_axes, 'depth')
     rewritten = prologue_rewritten(family, prologue)
     allocations = _gmm_allocated(tiles, family, (lhs, rhs, paired, scales, step_scales, mx_scales, gather),
@@ -552,12 +544,12 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             dense=dense, beside=beside, tail=tail, interpret=bool(interpret), chained=chained,
             guarded=(when is not None, into is not None, flagged))
         prologue_gmems, side_gmems, workspace, out, (chained_gmems, when_gmem, flags_gmem) = refs
-        ready = None if tail is None else family.partials_ready((multiprocessors, consumers), bool(interpret))
+        ready = None if tail is None else family.partials_ready((pair, pairs, consumers), bool(interpret))
 
         schedule = functools.partial(
             _gmm_scheduled, table_gmem=table_gmem, lhs_gmem=lhs_gmem, splits=tiles.splits, grid=grid,
             matrix_gmems=dict(zip(streamed, matrix_gmems, strict=True)), prologue_gmems=prologue_gmems,
-            shape=(m, pl.cdiv(k, block_k), g), tiles=tiles, dense=dense, tail=tail, programs=multiprocessors,
+            shape=(m, pl.cdiv(k, block_k), g), tiles=tiles, dense=dense, tail=tail, programs=pairs,
             transpose_rhs=transpose_rhs, axes_of={i: prologue_axes[i] for i in stepped}, traced=exact_sums,
             interpreted=bool(interpret), transpose_lhs=transpose_lhs, packed_rows=packed_rows,
             scale_gmems=scale_gmems, scale_per=scale_per, mx_gmems=mx_gmems, gather_gmem=gather_gmem,
@@ -595,7 +587,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     partials=None if tail is None else (workspace, ready))
                 _stored(finished, tile, out, beside)
 
-            walks = (tiles.splits * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
+            walks = (tiles.splits * grid[0] * grid[1],) if tail is None else (tail.segments, pairs)
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=_unrolled(prologue, packed_rows, exact_sums),
@@ -628,7 +620,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          dense=dense, parts=(tail, scales, mx_scales, gather, chained),
                                          beside=beside))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
-                  *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))
+                  *_workspace(tail, (pair, pairs, 2, consumers, *part), interpret))
 
 
 def _gmm_of_no_depth(beside: "Beside | None", shape: tuple, group_sizes, paired, scatter, dtypes: tuple,
@@ -693,11 +685,19 @@ def prefetches(family: mosaic.Family, *, matrices: int, prologue, scaled: bool, 
     """Dew: whether a `gmm` walk of these facts reads a step's first fragments under the step before's last
     product (`_gmm_prefetch`, `Transport.prefetches_fragments`): a plain step's, one matrix of rows as staged
     (no prologue), unscaled and undecoded, no chained products, compiled, its rows and its matrix read
-    untransposed (transposed-RHS prefetch requires accounting for the 32-deep granule overlap in
-    `operand_live_depth`), its products summed by the tensor cores (no running sum of its own), as its walk
-    decides (`_gmm_stepped_at`)."""
+    untransposed, its products summed by the tensor cores (no running sum of its own), as its walk decides
+    (`_gmm_stepped_at`)."""
     return (family.prefetches_fragments and matrices == 1 and prologue is None and not scaled and not chained
             and not interpret and not any(transposed) and not summed)
+
+
+def tgmm_prefetches(family: mosaic.Family, *, unstaged: bool, rewritten: bool, k_major: bool,
+                    interpret: bool, scaled: bool, summed: bool) -> bool:
+    """Dew: whether an unstaged `tgmm` walk prefetches a step's first fragments under the previous step's
+    last product (`Transport.prefetches_fragments`): compiled, unstaged dense steps, not rewritten or
+    k-major, unscaled, and summed by the tensor cores."""
+    return (family.prefetches_fragments and unstaged and not rewritten and not k_major and not interpret
+            and not scaled and not summed)
 def _gmm_streamed(paired, scales, joined, bounded: "Chained | None" = None) -> tuple[dict, tuple, int]:
     """Dew: `_gmm_mainloop`'s matrices (its own, a paired one), each to the stream of the rows it multiplies
     (the rows', the joined rows' for a joined pair's paired matrix), the streams beyond the rows in its
@@ -815,8 +815,9 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
         return
     workspace, ready = partials
     first, gathered = gathered
-    family.fixed_up(accs[0], workspace.at[:, 0, wg], None if ready is None else ready.at[:, wg], program,
-                    first, gathered, finished, firsts=workspace.at[:, 1, wg])
+    cta = mosaic.cluster_index(pair)
+    family.fixed_up(accs[0], workspace.at[cta, :, 0, wg], None if ready is None else ready.at[cta, :, wg],
+                    program, first, gathered, finished, firsts=workspace.at[cta, :, 1, wg])
 
 
 def _stored_rows(group, part_row, rows: int, m: int, *, dense: bool, row_tile: int) -> tuple:
@@ -901,12 +902,14 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     rows = origins['rows'].size
     row_start, first, stored, column, *ladder = place
     seen = jnp.zeros((), jnp.bool_)
+    layout = family.layout if family.budgets_registers else None
     for start, chunk in family.chunks(accs):
         columns = {'columns': slice(start, start + chunk[0].shape[-1])}
-        values = chunk if epilogue is None else epilogue(*chunk, *(
-            axes.by_rows(family.side_tile(smem.at[wg].at[axes.placed(axes.held(side_axes), columns)],
-                                          axes.held(side_axes)), side_axes, rows)
-            for _, side_axes, smem, _ in sides))
+        with packing.epilogue_layout(layout):
+            values = chunk if epilogue is None else epilogue(*chunk, *(
+                axes.by_rows(family.side_tile(smem.at[wg].at[axes.placed(axes.held(side_axes), columns)],
+                                              axes.held(side_axes)), side_axes, rows)
+                for _, side_axes, smem, _ in sides))
         values = values if isinstance(values, tuple) else (values,)
         for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
             value = value.astype(_stored_dtype(o_gmem))
@@ -1865,7 +1868,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
          prologue_operands: tuple = (), prologue_axes: tuple = (), exact_sums: bool = False,
          dense: bool = False, k_major: bool = False, step_scales: tuple | None = None,
          gather: tuple | None = None, whole_steps: bool = False, registers: int | None = None,
-         shared: int | None = None, balanced: bool = True) -> jax.Array:
+         shared: int | None = None, balanced: bool | tail_of.Tail = True) -> jax.Array:
     """Each group's rows of `lhs` `[rows, depth]` transposed times its rows of `rhs` `[rows, width]`:
     `[groups, depth, width]` in `out_dtype`, an empty group's zero. The depth must divide by
     `tiles.block_m` and the width by `tiles.block_n`, and the tile takes one multiprocessor;
@@ -1951,7 +1954,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     order = jnp.argsort(-group_num_blocks).astype(jnp.int32)
     # A tile summed across programs adds their exact partials by IEEE adds (`Family.fixed_up`), as a split's.
     tail = _dense_tail(tiles, lhs.dtype, (m, n, k), (lhs.dtype.itemsize, rhs.dtype.itemsize), multiprocessors,
-                       balanced=balanced and dense)
+                       balanced=balanced if dense else False)
     walked = g * -(-m // tile_rows(tiles, family)) * (n // tile_columns(tiles, family))
     programs = launched(family, multiprocessors, walked, tail)
     return _tgmm_streamed(
@@ -2117,9 +2120,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     # A consumer's accumulators: its share of the rows by its columns (`tile_columns`); a cluster's tiles.
     part = (depth_half, tile_columns(tiles, family))
     grid = (-(-m // tile_rows(tiles, family)), n // tile_columns(tiles, family))
-    pair = tiles.cluster
-    # A stream for each side operand with rows, but a vector a family does not copy, which its step reads
-    # from global memory.
+    pair, pairs = tiles.cluster, multiprocessors // tiles.cluster
     stepped, read, fixed = _stepped(family, prologue_axes, 'rows')
     allocations = tgmm_allocations(tiles, family, lhs_dtype=lhs.dtype, rhs_dtype=rhs.dtype,
                                    gathered=tuple(table is not None for table in tables),
@@ -2135,11 +2136,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
         *side_gmems, o_gmem = refs
         side_gmems, workspace = (side_gmems, None) if tail is None else (side_gmems[:-1], side_gmems[-1])
         scale_gmems, side_gmems = _scales_apart(side_gmems, step_scales is not None)
-        ready = None if tail is None else family.partials_ready((multiprocessors, consumers), bool(interpret))
-
+        ready = None if tail is None else family.partials_ready((pair, pairs, consumers), bool(interpret))
         schedule = functools.partial(
             _tgmm_scheduled, groups=(sizes_gmem, blocks_gmem, block_starts_gmem, order_gmem),
-            operands=(lhs_gmem, rhs_gmem, side_gmems), tail=tail, programs=multiprocessors, grid=grid,
+            operands=(lhs_gmem, rhs_gmem, side_gmems), tail=tail, programs=pairs, grid=grid,
             tiles=tiles, stepped=stepped, prologue_axes=prologue_axes, interpreted=bool(interpret),
             k_major=k_major, scale_gmems=scale_gmems, table_gmems=table_gmems)
 
@@ -2178,14 +2178,14 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                     return _staged_halves(family, [slots[name] for name in names], (index, *group),
                                           (mine_depth, mine_columns), hook, halves)
 
-                # An empty group's tile reads none and stores zeros.
                 scaling = _tgmm_scaling(step_scales is not None, mine_depth)
                 return _walked_gradient(family, walk, staged_at, part, exact_sums, bool(interpret), scaling,
-                                        family.summed_window(tiles.block_k))
+                                        family.summed_window(tiles.block_k),
+                                        unstaged and not rewritten and not k_major)
 
             finish = functools.partial(_tgmm_finished, family=family, tiles=tiles, m=m, o_gmem=o_gmem,
                                        partials=None if tail is None else (workspace, ready))
-            walks = (g * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
+            walks = (g * grid[0] * grid[1],) if tail is None else (tail.segments, pairs)
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=unrolled, accumulators=(part,),
@@ -2199,15 +2199,14 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                              **_tgmm_gathered(tables, allocations.blocks, bool(interpret))))
 
     out_type = _tgmm_declared(lhs, rhs, groups[0], (g, m, n), out_dtype, k_major)
-    kernel = family.kernel(body, out_type=out_type,
-                           grid=(1 if interpret else multiprocessors // pair,), grid_names=("programs",),
-                           consumers=consumers + rewritten, interpret=interpret, approx_math=APPROX_MATH,
-                           name=TGMM, cluster=pair, registers=registers, producer=tiles.producers.of(TGMM),
-                           shared=shared, moves=MOVES, resident=tiles.programs, scalars=len(groups),
+    kernel = family.kernel(body, out_type=out_type, grid=(1 if interpret else pairs,),
+                           grid_names=("programs",), consumers=consumers + rewritten, interpret=interpret,
+                           approx_math=APPROX_MATH, name=TGMM, cluster=pair, registers=registers,
+                           producer=tiles.producers.of(TGMM), shared=shared, moves=MOVES,
+                           resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
-                  *prologue_operands, *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))
-
+                  *prologue_operands, *_workspace(tail, (pair, pairs, 2, consumers, *part), interpret))
 
 def _tgmm_finished(wg, tile: tuple, summed, store, *, active, family: mosaic.Family, tiles: Tiles, m: int,
                    o_gmem, partials) -> None:
@@ -2224,9 +2223,10 @@ def _tgmm_finished(wg, tile: tuple, summed, store, *, active, family: mosaic.Fam
         return
     workspace, ready = partials
     first, gathered = gathered
-    family.fixed_up(summed, workspace.at[:, 0, wg], None if ready is None else ready.at[:, wg], program,
-                    first, gathered, lambda value: store(0, value, out_gmem, place),
-                    firsts=workspace.at[:, 1, wg])
+    cta = mosaic.cluster_index(tiles.cluster)
+    family.fixed_up(summed, workspace.at[cta, :, 0, wg], None if ready is None else ready.at[cta, :, wg],
+                    program, first, gathered, lambda value: store(0, value, out_gmem, place),
+                    firsts=workspace.at[cta, :, 1, wg])
 
 
 def ragged_rows(m: int, *, prologue, k_major: bool) -> bool:
@@ -2404,7 +2404,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
 
 
 def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_sums: bool, interpret: bool,
-                     scaling=None, window: int = 1):
+                     scaling=None, window: int = 1, unstaged: bool = False):
     """Dew: a streamed kernel gradient tile's steps (`walk`, a tile's of `mosaic.Family.persist`;
     `staged(index, slots)` their operands), summed into an fp32 tile of `shape`: as the tensor cores add, or
     with `exact_sums` each step's product summed apart and added into the running sum by an IEEE add (a
@@ -2437,12 +2437,18 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
         running, _ = walk(exact_step, family.zeros(shape), ())
         return running
 
-    def step(index, slots, nothing, accumulators):
+    def step(index, slots, nothing, accumulators, prefetched=None, boundary: Callable | None = None):
         (acc,) = accumulators
         lhs, rhs = staged(index, slots)
+        if boundary is not None:
+            acc, following = family.products_across(acc, lhs, rhs, prefetched, boundary)
+            return (nothing, (acc,)), following
         return nothing, (family.products(acc, lhs, rhs),)
 
-    _, (summed,) = walk(step, None, (shape,))
+    prefetch = tgmm_prefetches(family, unstaged=unstaged, rewritten=False, k_major=False, interpret=interpret,
+                               scaled=scaling is not None, summed=exact_sums and not family.sums_in_persist)
+    extra = {'prefetch': lambda slots: family.first_fragments(*staged(0, slots))} if prefetch else {}
+    _, (summed,) = walk(step, None, (shape,), **extra)
     return summed
 
 

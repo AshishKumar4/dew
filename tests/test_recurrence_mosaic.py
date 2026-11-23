@@ -52,7 +52,7 @@ from test_recurrence_chunk import (
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, chunk_rounding, fast_rounding
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.kernels.templates import bundles, mosaic, product, report, resources, sass
+from dew.nn.kernels.templates import assembled, bundles, mosaic, product, report, resources, sass
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
@@ -319,8 +319,9 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     the mainloop's rule refuses the call too (checked): an fp32 call's decay a key dimension at exact
     products (the accurate forms, `mainloop.per_key_refusal`); and on a GPU where its launches at those
     tiles pass the device's shared memory (an fp32 call's solve on an A100's block), whose arithmetic the
-    CPU interprets."""
-    (operands,) = draw(dtype, 0, **geometry(case))
+    CPU interprets. Drawn on the host: a GPU tier's prepare runs no program on its device (row 7869)."""
+    with jax.default_device(jax.devices("cpu")[0]):
+        (operands,) = draw(dtype, 0, **geometry(case))
     if formed(forms, taken)(operands, hooks):
         return formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks))
     with pytest.raises(REFUSED):
@@ -334,10 +335,9 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
         return None
     narrowest = mainloop.Tiles(family.narrowest_columns(jnp.bfloat16), 1, chunk=64)
     if mainloop.family_of() is not None:
-        shapes = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype)
-                  for x in (operands.query, operands.key, operands.value, operands.log_decay, operands.beta,
-                            operands.state, operands.starts)]
-        *given, starts = shapes
+        *given, starts = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (
+            operands.query, operands.key, operands.value, operands.log_decay, operands.beta, operands.state,
+            operands.starts)]
         launches = template.planned(*given, tiles=narrowest, family=family, starts=starts)
         if max(launch.shared for launch in launches) > generation.shared_budget(template.Mosaic.launched()):
             return None
@@ -1082,7 +1082,7 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     with report.refusals(), generation.assumed('sm90'):
         target = template.Mosaic.launched()
         first = template.MOSAIC.derived(bound, target)
-        report.refuse([(report._identity(template.MOSAIC, bound), first, {kernel})])
+        report.refuse([(report._identity(template.MOSAIC, bound, generation.gpu_target()), first, {kernel})])
         stepped = template.MOSAIC.derived(bound, target)
         taken = template.MOSAIC.fits(bound, target)
         legal = stepped is not None and template.MOSAIC.legal(bound, stepped, target)
@@ -1145,7 +1145,7 @@ def test_a_launch_spilling_at_every_rung_refuses_the_tiles_that_plan_it_alike():
         tiles = template.MOSAIC.derived(bound, target)
         shallower = dataclasses.replace(tiles, stages=tiles.stages - 1)
         assert not template.MOSAIC._refused(bound, shallower, target)
-        spilled, identity = {'recurrence_reverse'}, report._identity(template.MOSAIC, bound)
+        spilled, identity = {'recurrence_reverse'}, report._identity(template.MOSAIC, bound, target)
         report.refuse([(identity, tiles, spilled)])
         held, *upper, foot = template.MOSAIC.rungs(bound, tiles)
         # Its foot refused alone (a config pinned there) leaves the rungs above it unasked: nothing spent.
@@ -1194,7 +1194,7 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
         # The run's launch bound as the run binds it, its identity the lowering's.
         bound = template.MOSAIC.bind(*operands, None, None, firsts=None, skip=None, recomputed=True,
                                      **options)
-        assert report._identity(template.MOSAIC, bound) == identity
+        assert report._identity(template.MOSAIC, bound, generation.gpu_target()) == identity
         # Each derived tiles refused with every rung of its ladder at once (`Mosaic.rungs`): refused a rung a
         # derivation, the walk derived 355 times, 281 s (row 6551), 598 s once a ladder's foot took a program
         # fewer (row 6855).
@@ -1216,10 +1216,9 @@ def _model(launch: mainloop.Launch, family: mosaic.Family,
     its schedule lowers it (`Launch.producer`), bounded by the launch's shared-memory allocation, and moving
     registers where its plan's residency does (`Launch.resident`, `RegisterModel.moves`)."""
     facts = generation.gpu_target() if target is None else target
-    with generation.assumed(facts):
-        model = resources.register_model(launch.family or family, launch.consumers, launch.registers,
-                                         producer=launch.producer, shared=launch.shared, target=facts,
-                                         programs=launch.resident or 1)
+    model = resources.register_model(launch.family or family, launch.consumers, launch.registers,
+                                     producer=launch.producer, shared=launch.shared, target=facts,
+                                     programs=launch.resident or 1)
     # The plan reserves an upper bound, including reduction scratch a lowering can omit.
     # `planned_failures` checks that bound; RegisterModel.shared declares an exact allocation.
     return dataclasses.replace(model, shared=None)
@@ -1505,7 +1504,7 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
     without them stood for either)."""
     bound = template.MOSAIC.bind(*resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256), None, bound=1.0)
     tiles, kernel = mainloop.Tiles(32, 3, 128, 2, chunk=64), 'recurrence_output'
-    keys = []
+    target, keys = generation.gpu_target('sm90'), []
     for roles in ((sass.CONSUMERS,), (sass.PRODUCER,)):
         with report.refusals(), generation.assumed('sm90'):
             report.refuse_launch(template.MOSAIC, bound, tiles, {kernel}, {kernel: roles})
@@ -1513,7 +1512,7 @@ def test_a_refusals_roles_travel_with_it_into_derivations_and_handed_plans():
             handed = report.refusal_entries()
         with report.refusals(), generation.assumed('sm90'):
             report.refuse(handed)
-            assert report.spilled_in(template.MOSAIC, bound, tiles) == {kernel: roles}
+            assert report.spilled_in(template.MOSAIC, bound, tiles, target) == {kernel: roles}
     assert keys[0] != keys[1]
 
 
@@ -1615,8 +1614,8 @@ def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blac
 
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
     """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
-    long as a required launch spills or serializes its warpgroup MMAs (`report.refuses`, which a run's
-    certification reads too, `report.Binary.refused`) at a config not refused before, its launch refused
+    long as a required launch spills or serializes its warpgroup MMAs (`assembled.refuses`, which a run's
+    certification reads too, `assembled.Binary.refused`) at a config not refused before, its launch refused
     (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps such a
     launch down through its derivation's configs (`report.settled`): a launch whose every config spills
     derives none and leaves the template. `refused` holds the calls the template refuses, at its first
@@ -1629,7 +1628,7 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     stepped: set = set()
     while True:
         spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
-                                if report.refuses(kernel.get("spilled") or 0, kernel.get("losses", ()))
+                                if assembled.refuses(kernel.get("spilled") or 0, kernel.get("losses", ()))
                                 and kernel["kernel"] not in
                                 refused_kernels(record, apart.get(case.name, set()))}
                     for case, record in zip(cases, found, strict=True) if case.required}
@@ -2166,7 +2165,7 @@ from kernel_compile import _device, lowered_for
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.lowered import kernel_calls
-from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates import assembled, report
 from dew.nn.kernels.templates.recurrence import template
 
 target = "sm90"
@@ -2189,7 +2188,7 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
 
         programs.append(lowered_for(program if pulled else traced, tuple(shapes), target))
     first, second = (set(report.kernel_modules(kernel_calls(program, unrun=True))) for program in programs)
-    binary = next(binary for binary in report.binaries(programs[1].compile())
+    binary = next(binary for binary in assembled.binaries(programs[1].compile())
                   if report.launch_name(binary.kernel, binary.launch) in first & second)
     # The second rung's program refuses a kernel whose name the first rung's shares.
     found = report._misses_of([dataclasses.replace(binary, spilled=8)])

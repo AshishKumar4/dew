@@ -104,11 +104,15 @@ def trains_on_its_port(make):
     every parameter under a drawn cotangent on its port (`PORT_KERNELS`, named), on par from float64 with
     the portable rule's (check 1, the layer in float64 the truth)."""
     layer = make()
-    packed = MixerCall(AttentionMetadata(coordinates=coordinates(
-        segments=jnp.asarray([[1] * 150 + [2] * 106, [1] * 90 + [2] * 166]), max_segments=2)))
+
+    def packed():
+        # Formed in the programs that read it: formed before the site, a GPU tier's prepare ran it on its
+        # compile-only device, which runs no program, and left the site unprepared (rows 8057, 11633).
+        return MixerCall(AttentionMetadata(coordinates=coordinates(
+            segments=jnp.asarray([[1] * 150 + [2] * 106, [1] * 90 + [2] * 166]), max_segments=2)))
 
     def apply(params, x):
-        return layer.apply(params, x, packed)
+        return layer.apply(params, x, packed())
 
     def draw(seed):
         x = jax.random.normal(jax.random.key(seed), (ROWS, TOKENS, WIDTH)).astype(jnp.bfloat16)
@@ -118,7 +122,7 @@ def trains_on_its_port(make):
 
     def truth(params, x, cotangent):
         wide = layer.clone(dtype=jnp.float64)
-        return with_gradients(lambda params, x: wide.apply(params, x, packed))(params, x, cotangent)
+        return with_gradients(lambda params, x: wide.apply(params, x, packed()))(params, x, cotangent)
 
     assert_as_exact(named(with_gradients(apply), gated_delta_rule="fla"),
                     named(with_gradients(apply), gated_delta_rule="xla"), draw,
@@ -303,6 +307,11 @@ def selective_cells() -> list[Cell]:
     ]
 
 
+BITWISE = ("a bitwise check of its programs' runs on its GPU, no check-1 site: a GPU tier's prepare ran "
+           "them on its compile-only device, which runs no program (rows 8057, 11633)")
+"""Why a cell compiles at its run (`Cell.at_run`): its property its programs' bits on its GPU."""
+
+
 def port_training_cells() -> list[Cell]:
     """Each recurrence layer trained on its port's kernels, its step repeating bit for bit, and the ports
     against fla's own."""
@@ -315,7 +324,7 @@ def port_training_cells() -> list[Cell]:
         # Kimi delta attention trains on its port alone: the template's fast backward takes no decay a key
         # dimension.
         *(Cell(f"a {make.__name__} training step on {kernel} repeats bit for bit",
-               functools.partial(repeats_bit_for_bit, make, kernel), fault=RACES)
+               functools.partial(repeats_bit_for_bit, make, kernel), fault=RACES, at_run=BITWISE)
           for make, kernels in ((gated_delta_net, ("fla", "mosaic_gpu")), (kimi_delta_attention, ("fla",)))
           for kernel in kernels),
         *(Cell(f"the port is as exact as fla's own: {'kda' if per_key else 'gdn'} {dtypes}",
@@ -377,9 +386,10 @@ def decode_cells() -> list[Cell]:
     """The decode launches as a server runs them."""
     return [
         Cell("the decode kernel leaves an idle row alone", the_decode_kernel_leaves_an_idle_row_alone,
-             native={"launch": "decode step"}),
+             native={"launch": "decode step"}, at_run=BITWISE),
         Cell("the fused decode step gives the same bits however its launches are timed",
-             the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed, fault=RACES),
+             the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed, fault=RACES,
+             at_run=BITWISE),
         *(Cell(f"a layer choosing the fused step decodes on a mesh as on one device: {axis}",
                when(jax.device_count() >= 2, "needs two GPUs", functools.partial(
                    a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device, axis)),

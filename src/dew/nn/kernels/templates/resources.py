@@ -51,8 +51,8 @@ def producer_floor() -> int:
 
 @dataclasses.dataclass(frozen=True)
 class ByLaunch:
-    """A config's caps on some of its launches, by launch (a kernel's name, `report.Binary.kernel`), where a
-    compile found one spilling: every other launch's its derivation's own. A dimension of the config its
+    """A config's caps on some of its launches, by launch (a kernel's name, `assembled.Binary.kernel`), where
+    a compile found one spilling: every other launch's its derivation's own. A dimension of the config its
     launches derive, refused and stepped as a compile or its certification refuses a spilling config."""
 
     caps: tuple[tuple[str, int], ...] = ()
@@ -546,6 +546,12 @@ def _barrier(leaf) -> bool:
     return isinstance(leaf, (plgpu.Barrier, plgpu.ClusterBarrier))
 
 
+def _named_barrier(leaf) -> bool:
+    """Whether a scope's `leaf` is a named CTA barrier (`plgpu.CtaBarrier`, `bar.arrive` and `bar.sync`): the
+    block's hardware barrier, no byte of its shared memory."""
+    return isinstance(leaf, plgpu.CtaBarrier)
+
+
 def _semaphore(leaf) -> bool:
     """Whether a scope's `leaf` is a semaphore (a TPU core's DMA or regular one, `pltpu.SemaphoreType`): an
     extended dtype held in the core's semaphore memory, no byte of its VMEM."""
@@ -569,19 +575,20 @@ def stored_bytes(shape: tuple, dtype) -> int:
 
 
 def scratch_bytes(family: "Family", scope: Scope) -> int:
-    """The shared memory a program of `scope` asks for besides its barriers and semaphores (`_semaphore`),
-    as Mosaic GPU's resource estimate counts it (its `smem_scratch_bytes`): every array rounded up to
-    `SMEM_ALIGNMENT` (`allocated`), a `plgpu.RefUnion` as large as its largest member (`after_walk`, row
-    8800), the walks the largest of them, the tiles scoped after the walks the larger of them and the walks
-    on a family that scopes its walks apart (`Family.walks_scoped`), and beside the program's otherwise, and
-    the family's reduction scratch where the program reduces (`Family.reduction_scratch`) and its
-    warpgroups' shares where they reduce implicitly (`Family.warpgroup_reduction_scratch`)."""
+    """The shared memory a program of `scope` asks for besides its barriers (`_named_barrier`'s none) and
+    semaphores (`_semaphore`), as Mosaic GPU's resource estimate counts it (its `smem_scratch_bytes`): every
+    array rounded up to `SMEM_ALIGNMENT` (`allocated`), a `plgpu.RefUnion` as large as its largest member
+    (`after_walk`, row 8800), the walks the largest of them, the tiles scoped after the walks the larger of
+    them and the walks on a family that scopes its walks apart (`Family.walks_scoped`), and beside the
+    program's otherwise, and the family's reduction scratch where the program reduces
+    (`Family.reduction_scratch`) and its warpgroups' shares where they reduce implicitly
+    (`Family.warpgroup_reduction_scratch`)."""
     def arrays(tree) -> list[int]:
         sizes = []
         for leaf in jax.tree.leaves(tree, is_leaf=lambda x: isinstance(x, plgpu.RefUnion)):
             if isinstance(leaf, plgpu.RefUnion):
                 sizes.append(max(allocated(*arrays(member)) for member in leaf.refs))
-            elif not _barrier(leaf) and not _semaphore(leaf):
+            elif not _barrier(leaf) and not _named_barrier(leaf) and not _semaphore(leaf):
                 sizes.append(stored_bytes(leaf.shape, leaf.dtype))
         return sizes
 
@@ -772,26 +779,37 @@ def moves_registers(registers: int | None, warpgroups: int, consumers: int, prog
     return registers is None or registers > entry_registers(warpgroups, programs)
 
 
-def register_model(family: "Family", consumers: int, registers: int | None, *,
-                   shared: int | None = None, target: "GpuTarget | None" = None,
-                   tmem: int = 0, producer: int | None = None, programs: int = 1,
+def register_model(family: "Family", consumers: int, registers: int | None, *, target: "GpuTarget",
+                   shared: int | None = None, tmem: int = 0, producer: int | None = None, programs: int = 1,
                    moves: bool | None = None, joined: tuple = ()) -> RegisterModel:
-    """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
-    (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), lowered to
-    `producer` (`producer_floor` where None), and the most programs a multiprocessor holds of it at those
-    registers (`register_programs`), its `shared` bytes and its `tmem` columns (`tensor_memory_columns`), as
-    its plan's: on `target`,
-    else the target its launches derive for (`facts`'). A residency its staging forbids is no launch's (a
-    B200's gathered input gradient staging 230,580 bytes runs one program, where its registers held three
-    and its gathering producer spilled at three's raise, row 5523); and whether its program moves registers
-    at its plan's residency, `programs` (`moves_registers`), or as its launch states (`moves`, if given).
-    Its `joined` roles (`Family.role_schedule`'s: a correction warpgroup) take their share beside its
-    consumers."""
+    """`family`'s register decision on `target` for a launch of `consumers` whose consumer thread holds
+    `registers` (`RegisterModel`): its producer's registers where its layout has one
+    (`Family.warpgroups`), lowered to `producer` (`producer_floor` where None), and the most programs a
+    multiprocessor holds of it at those registers (`register_programs`), its `shared` bytes and its `tmem`
+    columns (`tensor_memory_columns`), as its plan's. Every term reads `target`'s multiprocessor (`facts`),
+    whatever target the call is made under (a derivation for one generation's GPU under another's read the
+    file and setmaxnreg steps of the one in effect, which an sm80 has none of, and raised). A residency its
+    staging forbids is no launch's (a B200's gathered input gradient staging 230,580 bytes runs one
+    program, where its registers held three and its gathering producer spilled at three's raise, row 5523);
+    and whether its program moves registers at its plan's residency, `programs` (`moves_registers`), or as
+    its launch states (`moves`, if given). Its `joined` roles (`Family.role_schedule`'s: a correction
+    warpgroup) take their share beside its consumers."""
+    if target == generation.gpu_target():
+        return _register_model(family, consumers, registers, target, shared, tmem, producer, programs, moves,
+                               joined)
+    with generation.assumed(target):
+        return _register_model(family, consumers, registers, target, shared, tmem, producer, programs, moves,
+                               joined)
+
+
+def _register_model(family: "Family", consumers: int, registers: int | None, target: "GpuTarget",
+                    shared: int | None, tmem: int, producer: int | None, programs: int, moves: bool | None,
+                    joined: tuple) -> RegisterModel:
+    """`register_model`'s decision, under `target`."""
     warpgroups = family.warpgroups(consumers, joined=joined)
     shares = family.joined_shares(joined)
     most = family.programs(consumers, registers, producer, joined=joined)
     if shared is not None or tmem:
-        target = generation.gpu_target() if target is None else target
         if shared is not None:
             most = shared_programs(most, shared, generation.shared_budget(target))
         if tmem:

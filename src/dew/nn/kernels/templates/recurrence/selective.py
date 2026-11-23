@@ -698,7 +698,8 @@ def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfin
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, programs),
                              grid_names=("rows", "channels"),
                              warpgroups=1, interpret=interpret, family=scan.family.name,
-                             name="selective_scan_backward", resident=scan.resident, scratch=scratch)
+                             compiled=mosaic.compiler_params(resident=scan.resident),
+                             name="selective_scan_backward", scratch=scratch)
 
     def accumulated(refs):
         """The launch's outputs written to `refs`, B's and C's gradients added to theirs from zero, one ref
@@ -899,7 +900,7 @@ class Selective(base.Template[Tiles]):
         # A launch whose compile found a kernel spilling steps the tile that sets that kernel's registers: the
         # backward's tokens. The forward's registers no tile sets (its chunk's loop is rolled, `UNROLLED`), so
         # a forward spill, or a backward's at one token, leaves no config.
-        while spilled := report.refused_at(self, ba, tiles):
+        while spilled := report.refused_at(self, ba, tiles, target):
             backward = all(name.startswith("selective_scan_backward") for name in spilled)
             if not backward or tiles.positions == 1:
                 return None

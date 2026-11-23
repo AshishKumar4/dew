@@ -30,6 +30,7 @@ before it to the room left (`admit`), so a program that would fail to connect is
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import itertools
@@ -47,6 +48,7 @@ from jaxlib.xla_client import LoadedExecutable
 
 from dew import _pool
 from dew._builds import dew_cache_dir
+from dew._cache import default_compilation_cache_dir
 from dew._code import code_digest
 from dew._devices import (
     backend_open,
@@ -469,16 +471,26 @@ def held() -> Sizing | None:
 def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...],
                      program: Callable[[], str | jax.stages.Compiled]) -> Collectives:
     """The communicators an executable makes on `gpus` (`collectives_of`), read from its `program` once per
-    executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, below
-    the digest of the code that reads it (`dew._code.code_digest`), so a warm start that loads it from the
-    compilation cache reads no module, and those another code of it kept are read again."""
-    kept = Path(dew_cache_dir()) / "communicators" / "programs" / code_digest(__name__)
-    path = kept / f"{fingerprint.hex()}.json"
-    if path.exists():
-        return Collectives.of(json.loads(path.read_text()), gpus)
+    executable and kept beside the compilation cache it lives in (`dew._cache.default_compilation_cache_dir`)
+    under its `fingerprint` as positions in its device assignment, below the digest of the code that reads it
+    (`dew._code.code_digest`), so a warm start that loads it from that cache reads no module, a process naming
+    another cache reads none kept for another's programs, and those another code of it kept are read again.
+    A directory that cannot be read or written (a read-only home) keeps none, a miss logged, and a bucket's
+    (gs://) is not written to: the program's text serves the process."""
+    cache = default_compilation_cache_dir()
+    path = None if "://" in cache else (
+        Path(cache) / "dew-communicators" / code_digest(__name__) / f"{fingerprint.hex()}.json")
+    if path is not None:
+        with contextlib.suppress(OSError, ValueError):
+            return Collectives.of(json.loads(path.read_text()), gpus)
     positions = collectives_of(program(), tuple(range(len(gpus))))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_atomically(path, json.dumps(positions.to_json()))
+    if path is not None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_atomically(path, json.dumps(positions.to_json()))
+        except OSError as refused:
+            _log.warning("a program's communicators are not kept (%s): a later start reads its text again",
+                         refused)
     return Collectives.of(positions.to_json(), gpus)
 
 

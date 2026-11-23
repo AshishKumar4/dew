@@ -7,11 +7,12 @@ from generation_support import COMPILES_ON_CPU
 from process_support import fresh
 
 
-def test_a_build_for_compile_only_gpus_certifies_its_starts_launches(tmp_path):
+def test_a_build_for_compile_only_gpus_starts_with_no_launch_to_certify(tmp_path):
     """A step built for a compile-only GPU in a process that sees none traces its start (`Trainer._started`)
-    for that GPU, as the run on it does: the initializer's norm and SwiGLU launches are certified in the
-    build, so the run reads their verdicts and certifies nothing on its GPU (rows 7322, 8299: five init-shape
-    launches certified at the run)."""
+    for that GPU, as the run on it does: its model's draw of its variables selects no kernel
+    (`generation.drawing`), so neither the build nor the run on its GPU certifies a launch at the draw's
+    shapes, which no step runs (rows 7322, 8299: five init-shape launches certified at the run; row 11803:
+    the draw's certifications were 29% of an every-template build's main thread)."""
     script = """
 import json
 from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune
@@ -30,8 +31,7 @@ print(json.dumps({"ops": ops}))
 """
     result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
                    variables={"CUDA_VISIBLE_DEVICES": ""})
-    ops = result["ops"]
-    assert "RmsForward" in ops and "SwigluForward" in ops, ops
+    assert result["ops"] == [], result["ops"]
 
 
 def test_a_program_lowered_while_its_launches_certify_aside_lowers_as_a_warm_one(tmp_path):
@@ -60,12 +60,14 @@ def two_layers(x, w):
     return rms_normalized(y, w, 1e-6, jnp.bfloat16, False, False, True)
 
 with assumed(stated, portable=True), report.certifying(gpu), jax.set_mesh(mesh):
-    with report.certifying_aside() as aside:
-        cold = owned_program(two_layers).trace(x, w).lower()
-    report.settled_aside(aside)
-    with report.certifying_aside() as aside2:
-        warm = owned_program(two_layers).trace(x, w).lower()
-    report.settled_aside(aside2)
+    with report.settling():
+        with report.certifying_aside() as aside:
+            cold = owned_program(two_layers).trace(x, w).lower()
+        report.settled_aside(aside)
+    with report.settling():
+        with report.certifying_aside() as aside2:
+            warm = owned_program(two_layers).trace(x, w).lower()
+        report.settled_aside(aside2)
 
 print(json.dumps({"cold_digest": program_digest(cold), "warm_digest": program_digest(warm),
                   "certified": len(report.certifications())}))

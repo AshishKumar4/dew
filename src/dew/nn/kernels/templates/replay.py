@@ -66,10 +66,12 @@ def replayed(closed, mesh: jax.sharding.Mesh, reverse: bool, device, name: str
     from dew.nn.kernels.options import owned_program
     from dew.nn.programs import meshless
 
-    # In the context its capture copied, of no launch tracing and no block's aside: a replayed derivative's
-    # launches name their own and certify in turn, the block's pending none of theirs.
+    # In the context its capture copied, of no launch tracing, no block's aside and no settle: a replayed
+    # derivative's launches name their own and certify in turn, the block's pending none of theirs, and its
+    # certifications step past none of the settle's misses, which its own thread reads.
     report._TRACING.set(None)
     report._ASIDE.set(None)
+    report._SETTLING.set(None)
     # Its constants (a hook's closed-over operand) its arguments, a closed program of none (`type(closed)`).
     launch = jax_core.jaxpr_as_fun(type(closed)(pe.convert_constvars_jaxpr(closed.jaxpr), ()))
     operands = [*map(jax.typeof, closed.consts), *closed.in_avals]
@@ -104,10 +106,13 @@ def replayed(closed, mesh: jax.sharding.Mesh, reverse: bool, device, name: str
     specs = [jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=NamedSharding(
         mesh, PartitionSpec() if manual or getattr(aval, "sharding", None) is None else aval.sharding.spec))
         for aval in operands]
-    # Lowered for `device`, its default device too: a Triton kernel's lowering reads an abstract GPU's
-    # architecture off it (`pallas.triton.gpu_info`), and the pool's thread holds no default of the trace's
-    # (JAX's config is each thread's own; the capture's context copies its context variables alone).
-    with meshless(mesh), jax.default_device(device):
+    # Under the trace's own JAX settings, its default device among them, which its capture carried
+    # (`_cache.carried`): a Triton kernel's lowering reads an abstract GPU's architecture off the default
+    # device (`pallas.triton.gpu_info`), and the Mosaic GPU lowering cache keys every setting, so the
+    # program's lowering on the trace's thread reads the replay's kernels back (row 11803: a replay set its
+    # device as the default the trace left unset, and 44 of an every-template decoder's kernels lowered
+    # twice).
+    with meshless(mesh):
         lowered = owned_program(certified).trace(*specs).lower()
     modules, lowered_key = report._lowered_kernels(lowered)
     target = report.verdict_target(device)

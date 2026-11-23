@@ -47,13 +47,13 @@ def _sizes(groups: int) -> np.ndarray:
 
 def _operands(case: dict[str, str], seed: int) -> tuple:
     """`case`'s rows and matrices as FP8 codes, their row scales `[depth / 128, rows]` and column scales
-    `[groups, depth / 128, width / per]` (powers of two times a uniform draw)."""
+    `[groups, depth / 128, width / per]` (host NumPy arrays so GPU-tier prepare computes on no device)."""
     groups, per = int(case["groups"]), int(case["columns"])
     rng = np.random.default_rng(seed)
-    rows = jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.float8_e4m3fn)
-    matrices = jnp.asarray(rng.normal(size=(groups, WIDTH, DEPTH)), jnp.float8_e4m3fn)
-    row_scales = jnp.asarray(rng.uniform(0.5, 2.0, size=(DEPTH // 128, ROWS)), jnp.float32)
-    column_scales = jnp.asarray(rng.uniform(0.5, 2.0, size=(groups, DEPTH // 128, WIDTH // per)), jnp.float32)
+    rows = rng.normal(size=(ROWS, DEPTH)).astype(jnp.float8_e4m3fn)
+    matrices = rng.normal(size=(groups, WIDTH, DEPTH)).astype(jnp.float8_e4m3fn)
+    row_scales = rng.uniform(0.5, 2.0, size=(DEPTH // 128, ROWS)).astype(np.float32)
+    column_scales = rng.uniform(0.5, 2.0, size=(groups, DEPTH // 128, WIDTH // per)).astype(np.float32)
     return rows, matrices, row_scales, column_scales
 
 
@@ -154,14 +154,15 @@ def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["blockwise_fp8"], case, strict=True))
     groups, out_dtype = int(combination["groups"]), combination["out_dtype"]
     draw = functools.partial(_operands, combination)
-    reference = cublaslt_arm(cublaslt(_sizes(groups), out_dtype), jax.eval_shape(lambda: draw(0)))
+    reference = jax.jit(_product(groups, out_dtype, "xla"))
+    library = cublaslt_arm(cublaslt(_sizes(groups), out_dtype), draw(0))
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_product(groups, out_dtype, "mosaic")), reference, draw, "-".join(case),
-                        seeds=SEEDS, truth_fn=truth(_sizes(groups)))
+                        seeds=SEEDS, truth_fn=truth(_sizes(groups)),
+                        library_fn=library, library_row=4518, library_leaves=("",))
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
     assert ("blockwise_fp8", "mosaic") in recorded and not unnamed, (sorted(recorded), unnamed)
-
 
 def grouped(group_blocks, lhs, matrices):
     """Each group's rows of `lhs` (`group_blocks` 128-row blocks a group) times its matrix of `matrices`, in

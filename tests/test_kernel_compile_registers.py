@@ -8,7 +8,7 @@ from fla_gdn_support import KernelCase
 from generation_support import lowers
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates import assembled, report
 
 SERIALIZING = ("ptxas info    : (C7512) Potential Performance Loss: wgmma.mma_async instructions are "
                "serialized due to insufficient register resources for the function "
@@ -118,14 +118,14 @@ def _register_bound_product(depth: int):
 @pytest.mark.parametrize("depth", [128, 64])
 def test_a_kernel_ptxas_serializes_carries_ptxas_own_notes_in_its_binary(depth):
     """A warpgroup product ptxas serializes, compiled by Dew's JAX build for a compile-only H100: the notes
-    its binary carries (`report.Binary.notes`, the native compile's own) are ptxas's of its PTX, the gate's
+    its binary carries (`assembled.Binary.notes`, the native compile's own) are ptxas's of its PTX, the gate's
     read of it, a serialization among them, so a run's certification refuses it on its binary's word (row
     6456: the notes once read none, a serialized kernel passing `Binary.refused`)."""
     shapes = (jax.ShapeDtypeStruct((64, depth), jnp.float16), jax.ShapeDtypeStruct((depth, 128), jnp.float16))
     (record,) = kc.compile_mosaic_kernels(
         [KernelCase("register_bound", lambda: (_register_bound_product(depth), shapes))], "sm90")
     (kernel,) = record["kernels"]
-    assert set(kernel["losses"]) & report.SERIALIZED, kernel
+    assert set(kernel["losses"]) & assembled.SERIALIZED, kernel
     assert tuple(kernel["binary_losses"]) == tuple(kernel["losses"]), kernel
 
 
@@ -140,22 +140,22 @@ def test_a_triton_template_binary_in_compile_mosaic_kernels_reports_shared_regis
     and mark TMEM unread when `uses_tmem` is True or None."""
     import dataclasses
 
-    assert report.kernel_of("probe") == ("probe", None, None)
-    assert report.kernel_of("probe__l0123456789") == ("probe", "0123456789", None)
-    assert report.kernel_of("probe__l0123456789__1") == ("probe", "0123456789", "1")
-    assert report.kernel_of("probe__1__l0123456789") == ("probe__1", "0123456789", None)
+    assert assembled.kernel_of("probe") == ("probe", None, None)
+    assert assembled.kernel_of("probe__l0123456789") == ("probe", "0123456789", None)
+    assert assembled.kernel_of("probe__l0123456789__1") == ("probe", "0123456789", "1")
+    assert assembled.kernel_of("probe__1__l0123456789") == ("probe__1", "0123456789", None)
     for name in ("probe", "probe__l0123456789", "probe__l0123456789__1", "probe__1__l0123456789"):
-        assert report.launch_name(*report.kernel_of(name)) == name
+        assert report.launch_name(*assembled.kernel_of(name)) == name
 
-    clean = report.Binary("attention_forward", "0123456789", 64, 0, "triton",
+    clean = assembled.Binary("attention_forward", "0123456789", 64, 0, "triton",
                           shared=16384, sass=(), uses_tmem=False)
-    uniquified_spill = report.Binary("attention_forward", "0123456789", 96, 24, "triton",
+    uniquified_spill = assembled.Binary("attention_forward", "0123456789", 96, 24, "triton",
                                      shared=16384, sass=(), uses_tmem=False, index="1")
-    distinct_stem = report.Binary("attention_forward__1", "0123456789", 48, 0, "triton",
+    distinct_stem = assembled.Binary("attention_forward__1", "0123456789", 48, 0, "triton",
                                   shared=8192, sass=(), uses_tmem=False)
-    tmem_using = report.Binary("tmem_triton", "0123456789", 64, 0, "triton",
+    tmem_using = assembled.Binary("tmem_triton", "0123456789", 64, 0, "triton",
                                shared=16384, sass=(), uses_tmem=True)
-    undecoded = report.Binary("undecoded_triton", "0123456789", 64, 0, "triton",
+    undecoded = assembled.Binary("undecoded_triton", "0123456789", 64, 0, "triton",
                               shared=16384, sass=(), uses_tmem=None)
 
     found = [kc.inherited(dataclasses.asdict(r), {}, "sm80")
@@ -194,7 +194,8 @@ def test_a_triton_template_binary_in_compile_mosaic_kernels_reports_shared_regis
     assert len(mixed) == 2, mixed
     assert any(r.kind == "mosaic_gpu" and "binary" in r.unread for r in mixed), mixed
     assert any(r.kind == "triton" and not r.unread for r in mixed), mixed
-    mosaic_bin = report.Binary("attention_forward", "0123456789", 64, 0, "mosaic_gpu", shared=1024, sass=())
+    mosaic_bin = assembled.Binary("attention_forward", "0123456789", 64, 0, "mosaic_gpu", shared=1024,
+                                  sass=())
     both = kc.reports(mosaic_est, [clean, mosaic_bin], {})
     assert {r.kind for r in both} == {"mosaic_gpu", "triton"}, both
     # A Mosaic model with a moving producer applies only to the Mosaic kernel, not its clean Triton sibling.
@@ -243,7 +244,7 @@ def test_compile_mosaic_kernels_reports_both_xla_uniquified_triton_cubins():
 
 @lowers("sm100")
 def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_triton_cubins():
-    """Row 7263: `report.binaries(..., decoded=True)` sets `uses_tmem=True` on an sm100 Mosaic GPU TMEM
+    """Row 7263: `assembled.binaries(..., decoded=True)` sets `uses_tmem=True` on an sm100 Mosaic GPU TMEM
     cubin, `uses_tmem=False` on an sm100 fp32 Triton cubin that allocates no TMEM, and `uses_tmem=None` when
     `decoded=False`."""
     import jax.numpy as jnp
@@ -256,8 +257,8 @@ def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_tr
     with generation.assumed("sm100"):
         exe_m = kc.lowered_for(lambda q, k, v: attention_mosaic.forward(q, k, v, spans_m),
                                (q_m, q_m, q_m), "sm100").compile()
-    mosaic_decoded = [b for b in report.binaries(exe_m, decoded=True) if b.kind == "mosaic_gpu"]
-    mosaic_raw = [b for b in report.binaries(exe_m, decoded=False) if b.kind == "mosaic_gpu"]
+    mosaic_decoded = [b for b in assembled.binaries(exe_m, decoded=True) if b.kind == "mosaic_gpu"]
+    mosaic_raw = [b for b in assembled.binaries(exe_m, decoded=False) if b.kind == "mosaic_gpu"]
     assert mosaic_decoded and any(b.uses_tmem is True for b in mosaic_decoded), mosaic_decoded
     assert mosaic_raw and all(b.uses_tmem is None for b in mosaic_raw), mosaic_raw
 
@@ -267,7 +268,7 @@ def test_report_binaries_distinguishes_sm100_tmem_mosaic_cubins_from_non_tmem_tr
     with generation.assumed("sm100"):
         exe_t = kc.lowered_for(lambda q, k, v: attention_route.attend(q, k, v, spans_t, natural=False),
                                (q_t, k_t, k_t), "sm100").compile()
-    triton_decoded = [b for b in report.binaries(exe_t, decoded=True) if b.kind == "triton"]
-    triton_raw = [b for b in report.binaries(exe_t, decoded=False) if b.kind == "triton"]
+    triton_decoded = [b for b in assembled.binaries(exe_t, decoded=True) if b.kind == "triton"]
+    triton_raw = [b for b in assembled.binaries(exe_t, decoded=False) if b.kind == "triton"]
     assert triton_decoded and all(b.uses_tmem is False for b in triton_decoded), triton_decoded
     assert triton_raw and all(b.uses_tmem is None for b in triton_raw), triton_raw

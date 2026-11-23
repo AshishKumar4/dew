@@ -183,7 +183,7 @@ class Hooks:
         template forms (`mainloop.Call.apart`: a decay a head or none, no delta rule, no own weight), zero
         where it reads the whole state or the portable math alone forms it."""
         formed = self.reads == 'apart' and not self.own_weight and self.decay != 'vector' and not self.delta
-        return self.ranks if formed else 0
+        return self.group if formed else 0
 
     @property
     def gated_write(self) -> bool:

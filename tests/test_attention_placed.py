@@ -26,7 +26,7 @@ from test_attention_template import CASES, arguments, geometry as core_geometry
 
 from dew.nn import programs
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention as template, attention_mosaic
+from dew.nn.kernels.templates import assembled, attention as template, attention_mosaic
 
 pytestmark = pytest.mark.kernel
 
@@ -378,7 +378,7 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
         for eq in programs.equations(jaxpr):
             name = eq.params.get("name")
             if isinstance(name, str):
-                kernel, launch, _ = report.kernel_of(name)
+                kernel, launch, _ = assembled.kernel_of(name)
                 if (launch is not None and (record := report.traced(launch)) is not None
                         and getattr(record.config, "family", None) == "tcgen05.rows"
                         and kernel in record.kernels):
@@ -418,7 +418,7 @@ def test_placed_forward_uses_rounded_tmem_residency_for_query_placement():
                 has_tmem_copy(sub) for sub in jax.extend.core.jaxprs_in_params(eq.params))
             for eq in programs.equations(jaxpr)
             if (isinstance(name := eq.params.get("name"), str)
-                and (launch := report.kernel_of(name)[1]) is not None
+                and (launch := assembled.kernel_of(name)[1]) is not None
                 and (record := report.traced(launch)) is not None
                 and getattr(record.config, "family", None) == "tcgen05.rows")}
 
@@ -483,7 +483,7 @@ def test_split_output_hook_forward_plans_and_emits_fp32_block_smem_residency():
     emitted = [record.kernels[kernel]
                for eq in programs.equations(traced)
                if isinstance(name := eq.params.get("name"), str)
-               for kernel, launch in [report.kernel_of(name)[:2]]
+               for kernel, launch in [assembled.kernel_of(name)[:2]]
                if launch is not None and (record := report.traced(launch)) is not None
                and kernel in record.kernels]
     assert emitted and all(model.most == 1 for model in emitted), emitted
@@ -521,7 +521,7 @@ def test_split_output_hook_forward_plans_and_emits_fp32_block_smem_residency():
     cert_models = [record.kernels[kernel]
                    for eq in programs.equations(cert_traced)
                    if isinstance(name := eq.params.get("name"), str)
-                   for kernel, launch in [report.kernel_of(name)[:2]]
+                   for kernel, launch in [assembled.kernel_of(name)[:2]]
                    if launch is not None and (record := report.traced(launch)) is not None
                    and kernel in record.kernels]
     assert cert_models and all(model.registers == planned_regs for model in cert_models), (

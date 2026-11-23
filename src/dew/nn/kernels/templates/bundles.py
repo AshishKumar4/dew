@@ -45,13 +45,6 @@ class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
 
     name = "mma.sync.fed"
     consumers = 2
-    held_registers: int = 65
-    """mma.sync's measured whole (`MmaIssuer`'s 40) and what its consumer-fed launches held past it, on the
-    device its composition is for (`for_generation`, `HELD_ON`); the largest of them where a family is named
-    outside a device's composition (`named`), which no device's launch exceeds: the ring each consumer fills,
-    its slots, barrier phases and copy coordinates live in its own registers, warpgroup MMA's producer's
-    uniform ones."""
-
     HELD_ON: ClassVar[Mapping[str, int]] = types.MappingProxyType({"sm100": 65, "sm120": 60})
     """Its held registers by device, ptxas's least register cap less the model at mma.sync's bare 40 over
     every recurrence gate launch: a B200's at most +25 (key_values_back; +24 states, +22 keys_back and
@@ -59,6 +52,13 @@ class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
     Nemotron-H SSD backward's local launch at an output block of 80 (+8 GDN keys_back, +4 local_back and SSD
     scores_back, every other launch 4-150 under; main 92d830f84, FS-CENSUSFED-120-TRAIN), at which its SSD
     backward derives at value blocks of 16 and 32 (row 11810), where 65 held none."""
+
+    held_registers: int = max(HELD_ON.values())
+    """mma.sync's measured whole (`MmaIssuer`'s 40) and what its consumer-fed launches held past it, on the
+    device its composition is for (`for_generation`, `HELD_ON`); the largest of them where a family is named
+    outside a device's composition (`named`), which no device's launch exceeds: the ring each consumer fills,
+    its slots, barrier phases and copy coordinates live in its own registers, warpgroup MMA's producer's
+    uniform ones."""
 
     def for_generation(self, generation_name: str) -> "MmaFed":
         held = self.HELD_ON.get(generation_name, self.held_registers)
@@ -217,12 +217,14 @@ def layouts(generation_name: str, dtype, rows: int | None = None, *, stated: boo
     return tuple(sorted(flat, key=lambda family: -useful_rows(family, rows)))
 
 
-def named(name: str, dtype) -> mosaic.Family:
+def named(name: str, dtype, target: generation.GpuTarget | None) -> mosaic.Family:
     """The bundle named `name` (`mosaic.Family.name`, a launch's tile's) for operands of `dtype`: the
-    composition declared so (`COMPOSITIONS`), as no one device runs it (`mosaic.Family.for_generation`: a
-    term measured per device at the largest any holds, `MmaFed.held_registers`)."""
+    composition declared so (`COMPOSITIONS`), as a device of `target` runs it (`mosaic.Family.for_generation`,
+    as `groups` composes it there), or as no one device runs it where None (a term measured per device at the
+    largest any holds, `MmaFed.held_registers`): a caller reading a register term names its target, so a tile
+    its search proposed for a device is held to that device's (row 11885)."""
     for compositions in COMPOSITIONS.values():
         for composition in compositions:
             if (family := composition.build(jnp.dtype(dtype))).name == name:
-                return family
+                return family if target is None else family.for_generation(target.generation)
     raise ValueError(f"no Mosaic GPU bundle is named {name!r}")

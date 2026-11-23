@@ -207,13 +207,25 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             operands, (out, final) = cotangents(hooks, regime, seed)
             return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
-    operands = restarting(lambda given: given, regime)(draws(0)[0])
+    import tier_wire
+
+    # Drawn before its site on the host's CPU: a GPU tier's prepare runs no program on its compile-only
+    # device, and drawn there it left every site of the case unprepared (rows 8054, 11010).
+    host = jax.default_device(jax.devices("cpu")[0])
+    with host:
+        operands = restarting(lambda given: given, regime)(draws(0)[0])
     mosaic = _arms(name, _arms_regime(regime), 'forward', forms)[0]
     dew, reference, truth, portable = _arms(name, _arms_regime(regime), product, forms)
     with under(forms):
-        if not runs(dew, hooks, operands, draws(0), product):
+        with host:
+            taken_here = runs(dew, hooks, operands, draws(0), product)
+        if not taken_here:
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
         label = f'the template, {name} under {regime}, its {product}'
+        # The finite draws and the distance against the portable math run the case's programs outside its
+        # sites: a GPU tier's prepare, whose device runs none, reaches its sites past them, its run checking
+        # them.
+        preparing = tier_wire.preparing()
 
         def finite(start: int, stop: int) -> None:
             for seed in range(start, stop):
@@ -222,12 +234,13 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
         # Its first draws held finite once a site: by the map task that draws them, the judge pooling its
         # word (`sharded`), where every map task and the judge held them again, each a compile and two runs
         # of every case's arms, Kimi delta attention's about 8 s a run interpreted (row 5906).
-        sharded(f'{label}, finite', finite, FINITE_SEEDS, upto=FINITE_SEEDS)
+        if not preparing:
+            sharded(f'{label}, finite', finite, FINITE_SEEDS, upto=FINITE_SEEDS)
         if fla_recorded(hooks):
             the_template_is_as_exact_as_fla(mosaic, f"stability/{name}/{regime}/{product}",
                                             ('out', 'final') if product == 'forward' else LEAVES, label)
             return
-        if oracle(hooks, jnp.bfloat16) is None and (distance := against_the_portable_math(
+        if not preparing and oracle(hooks, jnp.bfloat16) is None and (distance := against_the_portable_math(
                 label, dew, portable, draws, truth, FEWEST_SEEDS)) is not None:
             print(f"{label}: its distance against the portable math's: {distance}", flush=True)
         assert_as_exact(dew, reference, draws, label, seeds=seeds, truth_fn=truth)

@@ -34,7 +34,7 @@ from dew.nn.kernels import (
     recurrence,
     tuning,
 )
-from dew.nn.kernels.templates import bundles, report, resources, swizzling
+from dew.nn.kernels.templates import assembled, bundles, report, resources, swizzling
 from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, tiling
 from dew.nn.kernels.templates.gemm.hooks import Hooks
 
@@ -278,9 +278,9 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
         assert "error" not in record, record["error"]
         (ptx,) = Path(directory).glob("*.ptx")
         notes = ptxas_notes(ptx.read_text(), "sm90")
-    assembled = ptxas_read(notes)
+    read = ptxas_read(notes)
     # A report that states the kernel's registers was read; none of its serialization codes is there.
-    assert assembled.registers > 0 and assembled.losses == (), notes
+    assert read.registers > 0 and read.losses == (), notes
 
 
 def _spilling_forward(launch, rows: int, devices):
@@ -701,7 +701,7 @@ def _model(launch, ba, config) -> resources.RegisterModel:
     shared = resources.shared_bytes(family, planned.scope(config.stages))
     return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared,
                                     producer=planned.producer, programs=config.programs,
-                                    moves=mosaic_gpu.MOVES)
+                                    moves=mosaic_gpu.MOVES, target=generation.gpu_target())
 
 
 def _emitted_forms(family) -> set[str]:
@@ -1445,9 +1445,9 @@ def test_a_blackwells_nvfp4_product_runs_the_template_named_for_it():
 
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
-    A100: with every custom kernel its executable launches (`report.launched_kernels`), the gate reads their
-    shared bytes; without one of the two `probe` launches, or without `probe_headroom`'s, it has no evidence
-    (row 1381), where matching a launch by a name's prefix took one launch for both calls."""
+    A100: with every custom kernel its executable launches (`assembled.launched_kernels`), the gate reads
+    their shared bytes; without one of the two `probe` launches, or without `probe_headroom`'s, it has no
+    evidence (row 1381), where matching a launch by a name's prefix took one launch for both calls."""
     from jax.experimental import pallas as pl
     from kernel_compile import _compiled, triton_evidence
 
@@ -1557,8 +1557,8 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     compiled = {"a": {"registers": 168, "spilled": 0}, "b": {"registers": 255, "spilled": 40}}
     a, b, c = (inherited(dataclasses.asdict(found), compiled, "sm90") for found in reports(
         {"a": complete, "c": "Resources(smem_scratch_bytes=1024)"},
-        [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024),
-         report.Binary("b", None, 255, 40, "mosaic_gpu", shared=1024)]))
+        [assembled.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024),
+         assembled.Binary("b", None, 255, 40, "mosaic_gpu", shared=1024)]))
     assert not a["unread"]
     assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
     assert set(c["unread"]) == {"shared bytes", "tensor memory columns", "binary", "registers", "spills"}
@@ -1566,7 +1566,7 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert len(mosaic_failures([{**record, "kernels": [{**each, "cap": 255} for each in (a, b, c)]}])) == 2
     # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
     with pytest.raises(ValueError):
-        reports({"a": complete}, [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=512)])
+        reports({"a": complete}, [assembled.Binary("a", None, 168, 0, "mosaic_gpu", shared=512)])
     # A complete estimate and its PTX's compile without a binary: no compiled kernel, read as missing.
     (unbound,) = (inherited(dataclasses.asdict(found), compiled, "sm90")
                   for found in reports({"a": complete}, []))
@@ -1585,7 +1585,7 @@ def test_a_kernel_no_ptx_covers_takes_its_binarys_figures_only_under_every_build
     from kernel_compile import inherited, reports
 
     complete = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
-    (found,) = reports({"a": complete}, [report.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024)])
+    (found,) = reports({"a": complete}, [assembled.Binary("a", None, 168, 0, "mosaic_gpu", shared=1024)])
     judged = {}
     for builds, gpu in ((["cuda13"], "sm100"), (["cuda12"], "sm90"), (["cuda12"], "sm100")):
         monkeypatch.setattr(kernel_compile, "cuda_builds", lambda builds=builds: builds)
@@ -1607,7 +1607,7 @@ def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     assert report.kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
     with pytest.raises(report.KernelsOfOneName):
         report.kernel_modules(calls)
-    binaries = [report.Binary("k", "0123456789", registers, 0, "mosaic_gpu") for registers in (168, 200)]
+    binaries = [assembled.Binary("k", "0123456789", registers, 0, "mosaic_gpu") for registers in (168, 200)]
     assert len(reports({}, binaries[:1])) == 1
     with pytest.raises(ValueError):
         reports({}, binaries)
@@ -1660,6 +1660,14 @@ def test_splash_compiles_for_a_v5e_with_libtpu():
     assert not [record for record in found if "error" in record], found
 
 
+def _grouped_call(launch, *, width: int = 4096):
+    """`launch` bound to a grouped GEMM of 8 experts' 2048 x `width` bf16 matrices over 4096 tokens."""
+    x = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
+    weights = jax.ShapeDtypeStruct((8, 2048, width), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
+    return launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+
+
 def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kernel():
     """The same operand shapes and tile can lower for different device capacities in one process. A
     refusal belongs to the target that generated it; rate-only differences do not change that tile's code."""
@@ -1668,21 +1676,18 @@ def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kern
     from dew.nn.kernels.templates import report
 
     launch = grouped_matmul.MosaicGmm()
-    x = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
-    weights = jax.ShapeDtypeStruct((8, 2048, 4096), jnp.bfloat16)
-    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
-    arguments = launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    arguments = _grouped_call(launch)
     target = generation.TARGETS["sm90"]
     with report.refusals(), generation.assumed(target):
         tile = launch.derived(arguments, target)
-        report.refuse([(report._identity(launch, arguments), tile, {"dew_gmm"})])
-        assert report.refused(launch, arguments, tile)
+        report.refuse([(report._identity(launch, arguments, generation.gpu_target()), tile, {"dew_gmm"})])
+        assert report.refused(launch, arguments, tile, generation.gpu_target())
         with generation.assumed(dataclasses.replace(target, clock_hz=1.98e9)):
-            assert report.refused(launch, arguments, tile)
+            assert report.refused(launch, arguments, tile, generation.gpu_target())
         with generation.assumed(dataclasses.replace(target, multiprocessors=64)):
-            assert not report.refused(launch, arguments, tile)
+            assert not report.refused(launch, arguments, tile, generation.gpu_target())
         with generation.assumed(dataclasses.replace(target, shared_limit=128 * 1024)):
-            assert not report.refused(launch, arguments, tile)
+            assert not report.refused(launch, arguments, tile, generation.gpu_target())
 
 
 def test_a_trace_held_by_its_state_is_held_in_any_recordings_scope():
@@ -1698,6 +1703,26 @@ def test_a_trace_held_by_its_state_is_held_in_any_recordings_scope():
     assert first == second
 
 
+def test_a_derivation_for_a_target_reads_that_targets_refusals():
+    """A grouped GEMM launch derived for a B200 within a block assuming an H100 steps past the tile a B200's
+    compile refused: its derivation reads the refusals of the target it derives for
+    (`report.derivation_inputs`, `report.refused`), where it read the assumed GPU's and derived the refused
+    tile again (row 10986). Shapes only."""
+    from dew.nn.kernels.templates import report
+
+    launch = grouped_matmul.MosaicGmm()
+    arguments = _grouped_call(launch)
+    b200 = generation.TARGETS["sm100"]
+    with report.refusals():
+        # The B200's identity of the launch, as a B200's certification records its refusal.
+        with generation.assumed(b200):
+            identity, *_ = report.derivation_inputs(launch, arguments, b200)
+        with generation.assumed(generation.TARGETS["sm90"]):
+            tile = launch.derived(arguments, b200)
+            report.refuse([(identity, tile, {"dew_gmm"})])
+            assert launch.derived(arguments, b200) != tile, tile
+
+
 def test_a_recording_holds_while_the_refusals_its_trace_read_answer_alike():
     """A trace's read of a launch's refusals (its legality's, `report.refused`) is recorded with its answer
     (`generation.recording`): the record holds while that launch's refusals stay as they were, a refusal of
@@ -1705,21 +1730,17 @@ def test_a_recording_holds_while_the_refusals_its_trace_read_answer_alike():
     from dew.nn.kernels.templates import report
 
     launch = grouped_matmul.MosaicGmm()
-    x = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
-    weights = jax.ShapeDtypeStruct((8, 2048, 4096), jnp.bfloat16)
-    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
-    arguments = launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
-    other = launch.bind(x, jax.ShapeDtypeStruct((8, 2048, 2048), jnp.bfloat16), sizes, out_dtype="bfloat16",
-                        trans_rhs=False, interpret=False)
+    arguments = _grouped_call(launch)
+    other = _grouped_call(launch, width=2048)
     target = generation.TARGETS["sm90"]
     with report.refusals(), generation.assumed(target):
         tile = launch.derived(arguments, target)
         with generation.recording() as reads:
-            assert not report.refused(launch, arguments, tile)
+            assert not report.refused(launch, arguments, tile, target)
         assert reads and generation.still(reads)
-        report.refuse([(report._identity(launch, other), launch.derived(other, target), {"dew_gmm"})])
+        report.refuse([(report._identity(launch, other, target), launch.derived(other, target), {"dew_gmm"})])
         assert generation.still(reads)
-        report.refuse([(report._identity(launch, arguments), tile, {"dew_gmm"})])
+        report.refuse([(report._identity(launch, arguments, target), tile, {"dew_gmm"})])
         assert not generation.still(reads)
 
 

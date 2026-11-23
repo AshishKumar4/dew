@@ -20,6 +20,7 @@ from kernel_compile import gate_generations, stated_outputs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
     across,
+    assembled,
     bundles,
     emission,
     handoffs,
@@ -284,7 +285,9 @@ def test_consumers_staging_over_their_rings_write_only_past_every_consumers_read
     p, x = _fed_operands()
     # A race is recorded and the kernel runs on (`on_race="warn"`), so each arm reads the detector's verdict.
     races = plgpu.InterpretGPUParams(detect_races=True, on_race="warn")
-    (parts,) = _fed_staged_over_rings(p, x, interpret=races, ordered=True)
+    # Each arm is run whole before its verdict is read: a dispatch returns before the kernel ran, and the
+    # detector's state is the last kernel's.
+    (parts,) = jax.block_until_ready(_fed_staged_over_rings(p, x, interpret=races, ordered=True))
     assert not interpreter.get_races().races_found
     np.testing.assert_array_equal(np.asarray(parts).sum(axis=0), _fed_expected(p, x)[0])
     jax.block_until_ready(_fed_staged_over_rings(p, x, interpret=races, ordered=False))
@@ -410,7 +413,8 @@ def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_c
             assert roles["consumer"] == WGMMA.registers(consumers, producer=stated)
             assert roles["consumer"] <= WGMMA.registers(consumers)
             assert WGMMA.roles(consumers).registers()["producer"] == least
-            model = resources.register_model(WGMMA, consumers, roles["consumer"], producer=stated)
+            model = resources.register_model(WGMMA, consumers, roles["consumer"], producer=stated,
+                                             target=generation.gpu_target())
             assert (model.producer, model.budget) == (stated, roles["consumer"])
             assert handoffs.Schedule(WGMMA.roles(consumers).roles, floor=stated).registers() == roles
 
@@ -466,7 +470,7 @@ def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budg
         assert plan.programs == WGMMA.programs(1, budget, stated)
         over = dataclasses.replace(launch, registers=budget + WGMMA.register_step)
         assert resources.plan([over], WGMMA, generation.gpu_target(generation_name)) is None
-        model = resources.register_model(WGMMA, 1, budget, producer=stated)
+        model = resources.register_model(WGMMA, 1, budget, producer=stated, target=generation.gpu_target())
         assert (model.budget, model.producer) == (budget, stated)
 
 
@@ -486,8 +490,9 @@ def test_a_launch_with_a_joined_correction_warpgroup_counts_its_registers_in_its
         assert family.warpgroups(2, joined=joined) == family.warpgroups(2) + 1
         assert family.registers(2, joined=joined) == held["consumer"] < family.registers(2)
         assert 0 < held["correction"] < held["consumer"]
-        model = resources.register_model(family, 2, held["consumer"], joined=joined)
-        alone = resources.register_model(family, 2, held["consumer"])
+        model = resources.register_model(family, 2, held["consumer"], joined=joined,
+                                         target=generation.gpu_target())
+        alone = resources.register_model(family, 2, held["consumer"], target=generation.gpu_target())
         assert model.resident(held["consumer"]) <= alone.resident(held["consumer"])
         assert model.most == family.programs(2, held["consumer"], joined=joined)
 
@@ -511,7 +516,7 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
     pair = mosaic_sm100.PAIR
     assert (pair.cluster, pair.pairs_product, pair.widest_product) == (2, True, 128)
     assert (mosaic_sm100.RINGS.cluster, mosaic_sm100.RINGS.pairs_product) == (1, False)
-    assert bundles.named("tcgen05.pair", jnp.bfloat16) is pair
+    assert bundles.named("tcgen05.pair", jnp.bfloat16, None) is pair
     assert pair in bundles.groups("sm100", jnp.bfloat16, stated=True)[0]
     assert pair not in [family for group in bundles.groups("sm90", jnp.bfloat16, stated=True)
                         for family in group]
@@ -519,17 +524,32 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
 
 def test_a_launchs_register_model_runs_the_programs_its_shared_memory_holds():
     """A launch's register model states the programs its plan runs: its registers' residency bounded by the
-    programs its staged bytes hold on the target it derives for, named or not (row 5523: a B200's gathered
-    input gradient staging 230,580 bytes was stated three programs, which its registers held, and ran one)."""
+    programs its staged bytes hold on the target it derives for (row 5523: a B200's gathered input gradient
+    staging 230,580 bytes was stated three programs, which its registers held, and ran one)."""
     from dew.nn.kernels.templates import resources
     from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
 
     with generation.assumed("sm90"):
-        unstaged = resources.register_model(WGMMA, 1, 112)
-        staged = resources.register_model(WGMMA, 1, 112, shared=200 * 1024)
-        named = resources.register_model(WGMMA, 1, 112, shared=200 * 1024, target=generation.gpu_target())
+        unstaged = resources.register_model(WGMMA, 1, 112, target=generation.gpu_target())
+        staged = resources.register_model(WGMMA, 1, 112, shared=200 * 1024, target=generation.gpu_target())
     assert unstaged.most > 1
-    assert staged.most == named.most == 1
+    assert staged.most == 1
+
+
+def test_a_register_model_decides_on_its_target_whatever_target_is_in_effect():
+    """A register model asked for an H100 (`register_model`'s `target`) under an A100's derivation, whose
+    multiprocessor has no setmaxnreg steps, decides as it does under the H100's own: its producer, file,
+    residency and shared memory each its target's (row 11987's cross-generation checks raised reading the
+    A100's setmaxnreg steps for an H100's producer)."""
+    from dew.nn.kernels.templates import resources
+    from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
+
+    h100 = generation.gpu_target("sm90")
+    with generation.assumed("sm90"):
+        own = resources.register_model(WGMMA, 2, 168, shared=100 * 1024, target=h100)
+    with generation.assumed("sm80"):
+        asked = resources.register_model(WGMMA, 2, 168, shared=100 * 1024, target=h100)
+    assert asked == own
 
 
 def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
@@ -547,10 +567,10 @@ def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
     bound = op.bind(q, q, q, starts, starts, None, None, (), (), None, residuals=attention.Kept.NONE,
                     interpret=True)
     with generation.assumed("sm90"):
-        stated = resources.register_model(WGMMA, 2, 168)
+        stated = resources.register_model(WGMMA, 2, 168, target=generation.gpu_target())
         with report.launching(op, bound, Tiles(16, 16, 2, 1, family="wgmma")):
             name = report.named("attention", model=stated)
-        kernel, launch, _ = report.kernel_of(name)
+        kernel, launch, _ = assembled.kernel_of(name)
         assert kernel == "attention" and report.traced(launch).kernels == {"attention": stated}
         assert report.named("attention", model=stated) == "attention"
 
@@ -612,12 +632,14 @@ def test_a_joined_warpgroup_role_takes_its_weights_share_of_the_raised_registers
 
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     """A program's shared memory (`resources.shared_bytes`): each array rounded up to 1 KiB, its walks the
-    largest of them, every barrier 8 bytes; a tile scoped after its walks beside the program's on a family
-    whose walks share a scope (warpgroup MMA), the larger of it and the walks on one that scopes each walk
-    apart (mma.sync's emit_pipeline)."""
+    largest of them, every barrier 8 bytes, a named CTA barrier none (the block's hardware barrier,
+    `plgpu.CtaBarrier`, a packed decode's consumers' meet); a tile scoped after its walks beside the program's
+    on a family whose walks share a scope (warpgroup MMA), the larger of it and the walks on one that scopes
+    each walk apart (mma.sync's emit_pipeline)."""
     from dew.nn.kernels.templates import mosaic_sm80, mosaic_sm90, resources
 
-    program = (plgpu.SMEM((100,), jnp.float32), plgpu.Barrier(num_barriers=3))
+    program = (plgpu.SMEM((100,), jnp.float32), plgpu.Barrier(num_barriers=3),
+               plgpu.CtaBarrier(num_arrivals=2))
     walks = ((plgpu.SMEM((2, 1024), jnp.bfloat16),), (plgpu.SMEM((4, 1024), jnp.bfloat16),))
     scope = resources.Scope(program=program, walks=walks, after=(((512,), jnp.float32),))
     # 400 bytes -> 1 KiB; walks 4 KiB and 8 KiB -> 8 KiB; 3 barriers; the after tile's 2 KiB.
@@ -1446,7 +1468,7 @@ def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_g
 
     with generation.assumed("sm90"):
         family = bundles.of("sm90", jnp.bfloat16)
-        model = resources.register_model(family, 1, None)
+        model = resources.register_model(family, 1, None, target=generation.gpu_target())
     x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
     for programs in range(1, model.most + 1):
         call = functools.partial(_persisted_products, family=family, interpret=False, resident=programs)
@@ -2052,7 +2074,7 @@ def test_an_mma_sync_walks_shared_memory_is_what_its_pipeline_scopes_for_its_cop
     as many slots as steps, also planned inside a jit's trace over a mesh of its own. That the plan is the
     kernel's own allocation the compile gate checks of every launch (`kernel_compile.mosaic_failures`: its
     planned shared bytes against those the compiled kernel asks for)."""
-    family = bundles.named("mma.sync", jnp.bfloat16)
+    family = bundles.named("mma.sync", jnp.bfloat16, None)
     streams = family.streams({"lhs": ((64, 32), jnp.bfloat16), "rhs": ((32, 64), jnp.bfloat16)}, 3, 1)
 
     def walked(steps: int | None = None) -> tuple[list, list]:

@@ -83,7 +83,7 @@ from dew.nn.kernels import options
 from dew.nn.kernels.options import UNGRAPHED_OPTIONS, owned_program
 
 from . import generation
-from .templates import report
+from .templates import assembled, report
 
 _log = logging.getLogger(__name__)
 
@@ -1058,8 +1058,8 @@ def lowered_once(static: tuple[str, ...], *, configured: tuple[str, ...] = (), a
 
                     with report.naming() as named, generation.recording() as reads:
                         program = owned_program(traced).trace(*leaves)
-                    strays = {report.kernel_of(took)[0] for _, _, took in named if took is not None
-                              and builds is not None and report.kernel_of(took)[0] not in builds}
+                    strays = {assembled.kernel_of(took)[0] for _, _, took in named if took is not None
+                              and builds is not None and assembled.kernel_of(took)[0] not in builds}
                     if strays:
                         raise ValueError(f"{launch.__qualname__} builds {sorted(strays)}, which it does not "
                                          f"say it builds ({sorted(builds or ())}): it was given none of "
@@ -1452,7 +1452,7 @@ def _stored_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, va
 
 
 def _store_entry(cache: dict[str, dict[str, _records.JSON]], key_field: str, value_field: str,
-                 target: str, key: str, value: Hashable | dict[str, tuple[str, report.Binary]]) -> None:
+                 target: str, key: str, value: Hashable | dict[str, tuple[str, assembled.Binary]]) -> None:
     """Atomically write `{key_field: key, value_field: encoded(value)}` to `_verdicts_path(target)`."""
     written = encoded(value)
     dest = _verdicts_path(target)
@@ -1473,7 +1473,7 @@ def stored_verdict(target: str, key: str) -> Rebuilt | None:
     return _stored_entry(_VERDICTS, "certified", "verdict", target, key, "certification verdict")
 
 
-def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, report.Binary]]) -> None:
+def store_verdict(target: str, key: str, verdict: dict[str, tuple[str, assembled.Binary]]) -> None:
     """`verdict` stored for the launch `key` names, its kernels assembled for `target` (`_verdicts_path`), as
     the picks are (`encoded`), one writer at a time, the file replaced whole."""
     _store_entry(_VERDICTS, "certified", "verdict", target, key, verdict)
@@ -1583,12 +1583,11 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
 
 def _foreign_kernels(lowered: jax.stages.Lowered) -> tuple[str, ...]:
     """The Triton kernels `lowered` launches that no launch of Dew's traced (their names carry no launch's
-    digest, `report.kernel_of`): another library's, outside the tuner."""
+    digest, `assembled.kernel_of`): another library's, outside the tuner."""
     from dew.nn.kernels.lowered import kernel_calls
-    from dew.nn.kernels.templates import report
 
     return tuple(dict.fromkeys(call.name for call in kernel_calls(lowered, unrun=True)
-                               if call.kind == "triton" and report.kernel_of(call.name)[1] is None))
+                               if call.kind == "triton" and assembled.kernel_of(call.name)[1] is None))
 
 
 def _distinct(found: list[Launch]) -> list[Launch]:

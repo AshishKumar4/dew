@@ -34,7 +34,7 @@ import functools
 import math
 import os
 from collections.abc import Callable, Hashable, Sequence
-from typing import Literal, overload
+from typing import Literal, Protocol, Self, overload
 
 import jax
 import jax.numpy as jnp
@@ -1440,7 +1440,16 @@ def two_sum(left, right):
         return _two_sum(*uncontracted(left, right))
 
 
-def _two_sum(left, right):
+class _Summed(Protocol):
+    """A value whose `+` and `-` with one of its own kind give its kind (an array, a native kernel's word,
+    `templates.native.Word`): what an error-free transform's arithmetic reads (`renormalized_sum`)."""
+
+    def __add__(self, other: Self, /) -> Self: ...
+
+    def __sub__(self, other: Self, /) -> Self: ...
+
+
+def _two_sum[V: _Summed](left: V, right: V) -> tuple[V, V]:
     """`two_sum`'s arithmetic over operands no multiply makes in the same fusion: a compensated pair's
     halves, made by additions alone, and values read as one value each (`uncontracted`)."""
     total = left + right
@@ -1816,12 +1825,15 @@ def renormalized_add(left, right):
     return renormalized_sum(left, right)
 
 
-def renormalized_sum(left, right):
+def renormalized_sum[V: _Summed](left: tuple[V, V], right: tuple[V, V]) -> tuple[V, V]:
     """Two `(hi, lo)` pairs' renormalized sum, over any values `+` and `-` add and subtract (arrays, or a
-    Mosaic GPU kernel's own arithmetic, `templates.scan.compensated_columns`'): the his' TwoSum, then the
-    pair's own over the dropped part and the los in that order, whose operands are additions' (`_two_sum`, no
-    barrier of its own: one in a reduction's computation splits the fusions around the program, row 7953). A
-    lo is read once, so a multiply contracted into its addition reads it once too."""
+    Mosaic GPU kernel's words, `templates.native.Word`, `templates.scan.compensated_columns`'): the his'
+    TwoSum, then the pair's own over the dropped part and the los in that order, whose operands are
+    additions' (`_two_sum`, no barrier of its own: one in a reduction's computation splits the fusions around
+    the program, row 7953). A lo is read once, so a multiply contracted into its addition reads it once too.
+    Its caller supplies his each rounded alone, no multiply contracted into them (a native kernel's words, or
+    pairs made by additions alone); a JAX program whose his a multiply may make takes them as one span the
+    algebra pass keeps, through `renormalized_add`, or read as one value each, `compensated_add`."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
     total, dropped = _two_sum(left_hi, right_hi)
     return _two_sum(total, dropped + left_lo + right_lo)

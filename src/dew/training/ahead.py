@@ -96,7 +96,7 @@ from dew.nn.kernels.options import (
     taking,
 )
 from dew.nn.kernels.selection import Unlowerable
-from dew.nn.kernels.templates import report
+from dew.nn.kernels.templates import assembled, report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import CompiledMemory, StepFlops, compiled_memory, step_flops
 from dew.training.profiling import pgle_runs
@@ -200,11 +200,11 @@ def topology_memory(serialized: bytes) -> int | None:
     it. None where the topology states none."""
     message = serialized
     for field in (9, 2, 8, 1):
-        found = report.proto_fields(message).get(field, [])
+        found = assembled.proto_fields(message).get(field, [])
         if len(found) != 1 or not isinstance(found[0], bytes):
             return None
         message = found[0]
-    stated = report.proto_fields(message).get(14, [])
+    stated = assembled.proto_fields(message).get(14, [])
     return stated[0] if len(stated) == 1 and isinstance(stated[0], int) and stated[0] > 0 else None
 
 
