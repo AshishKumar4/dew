@@ -26,7 +26,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - The row-indexed hooked attention backward compile nodes (test_attention_mosaic_compile spill-free, sm80/sm86/sm89 accurate, row-indexed hook) take 209-295 s…. [7360]
 - Tests/test_mamba3.py::test_the_chunked_form_is_as_exact_as_the_recurrence passes vacuously on main. [7401]
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
-- The recurrence suite's wall: every case within CI's group target. [12045, 12088]
+- The recurrence suite's wall: every case within CI's group target. [12088]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
