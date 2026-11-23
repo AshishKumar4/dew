@@ -95,31 +95,23 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
                                               out_dtype=jnp.float32, interpret_on_cpu=interpret)
             np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
-    # BitNet b1.58 per-token int8 activation quantization + zero-row safety + STE gradient.
+    # BitNet b1.58 per-token int8 activation quantization + zero-row safety + unquantized STE gradient.
     x_bit = jnp.asarray(rng.standard_normal((32, 256)), jnp.bfloat16).at[0].set(0.0)
     w_bit = formats.TernaryWeights.of(jnp.asarray(rng.standard_normal((256, 64)), jnp.float32))
-    absmax = jnp.max(jnp.abs(x_bit.astype(jnp.float32)), axis=-1)
-    act_scale = jnp.where(absmax > 0, precision.divided(absmax, jnp.float32(127.0)), jnp.float32(1.0))
-    x_q = jnp.clip(jnp.round(x_bit.astype(jnp.float32) / act_scale[:, None]), -128.0, 127.0)
+    x_f32 = x_bit.astype(jnp.float32)
+    peak = jnp.max(jnp.abs(x_f32), axis=-1)
+    safe_peak = jnp.where(peak > 0, peak, jnp.float32(1.0))
+    x_q = jnp.clip(jnp.round((x_f32 / safe_peak[:, None]) * jnp.float32(127.0)), -128.0, 127.0)
     w_bf16 = w_bit.unscaled(jnp.bfloat16)
-    ref_bit = precision.twice_scaled(
-        jax.lax.dot(x_q.astype(jnp.bfloat16), w_bf16, preferred_element_type=jnp.float32),
-        act_scale[:, None], w_bit.scale)
-    # P0 #1: STE JVP & VJP match straight-through oracle (incl. at row maxima) and weight scale (0 SLOP020).
+    dot_int = jax.lax.dot(x_q.astype(jnp.bfloat16), w_bf16, preferred_element_type=jnp.float32)
+    ref_bit = precision.twice_scaled(dot_int / jnp.float32(127.0), peak[:, None], w_bit.scale)
     max_col = int(jnp.argmax(jnp.abs(x_bit[1])))
     tan_x = jnp.zeros_like(x_bit).at[1, max_col].set(jnp.bfloat16(1.0))
-    stopped = jax.lax.stop_gradient(act_scale)[:, None]
-
-    def ste_oracle(a, s):
-        scaled = a.astype(jnp.float32) / stopped
-        rows = (scaled + jax.lax.stop_gradient(x_q - scaled)).astype(jnp.bfloat16)
-        return precision.twice_scaled(
-            gemm.gemm(rows, w_bf16, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT),
-            stopped, s)
-
-    _, (dx_exact, dscale_exact) = jax.value_and_grad(
-        lambda a, s: jnp.sum(ste_oracle(a, s)), argnums=(0, 1))(x_bit, w_bit.scale)
-    _, jvp_exact = jax.jvp(lambda a: ste_oracle(a, w_bit.scale), (x_bit,), (tan_x,))
+    dx_exact = (jax.lax.dot(jnp.ones((32, 64), jnp.bfloat16), w_bf16.T,
+                            preferred_element_type=jnp.float32) * w_bit.scale).astype(jnp.bfloat16)
+    dscale_exact = jnp.sum(precision.twice_scaled(dot_int / jnp.float32(127.0), peak[:, None],
+                                                  jnp.float32(1.0)))
+    jvp_exact = jax.lax.dot(tan_x, w_bf16, preferred_element_type=jnp.float32) * w_bit.scale
     assert np.asarray(dx_exact[1, max_col]) != 0.0
     for interpret in (False, True):
         got_bit = gemm.ternary_weight_product(x_bit, w_bit, quantize_activations=True,
@@ -138,14 +130,6 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
                 a, w_bit, quantize_activations=True, out_dtype=jnp.float32, interpret_on_cpu=interpret),
             (x_bit,), (tan_x,))
         np.testing.assert_array_equal(np.asarray(y_tan[1]), np.asarray(jvp_exact[1]))
-
-    # P0 #2: two-scale product overflowing fp32 on zero integer dot must stay 0.0 (never 0 * inf = NaN).
-    x_huge = jnp.full((16, 256), jnp.bfloat16(2.0 ** 126))
-    w_zero = formats.TernaryWeights.of(jnp.zeros((256, 64), jnp.float32),
-                                       scale=jnp.full((64,), jnp.float32(2.0 ** 10)))
-    got_zero = gemm.ternary_weight_product(x_huge, w_zero, quantize_activations=True,
-                                           out_dtype=jnp.float32, interpret_on_cpu=False)
-    np.testing.assert_array_equal(np.asarray(got_zero), np.zeros((16, 64), np.float32))
     for gpu in ("sm80", "sm90"):
         if not generation.compile_only_gpus(gpu):
             continue
@@ -193,16 +177,28 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
                                   trans_rhs=(gpu == "sm90"), interpret=False, dense=False, exact_sums=True)
         assert gmm_launch.derived(high_ba, target) is None
         from jax.core import ShapedArray
-
-        from dew.nn import programs
+        from reference_error import equations
 
         with generation.chosen(grouped_matmul="mosaic"):
             closed_high = jax.make_jaxpr(
                 lambda x, w: gemm.gemm(x, w, out_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST)
             )(f32((256, 128)), f32((128, 128)))
-        assert any(any(isinstance(v.aval, ShapedArray) and v.aval.dtype == jnp.bfloat16
-                       for v in e.outvars)
-                   for e in programs.equations(closed_high.jaxpr))
+        cuda_gemms = [
+            e for e in equations(closed_high, platform="cuda")
+            if e.primitive.name in ("core_map", "pallas_call", "mosaic_gpu_v2",
+                                    "dot_general", "ragged_dot_general")
+        ]
+        assert cuda_gemms, "expected lowered GEMM equations in CUDA branch"
+        for eqn in cuda_gemms:
+            if eqn.primitive.name in ("dot_general", "ragged_dot_general"):
+                assert eqn.params.get("precision") == (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+            else:
+                matrix_dtypes = [
+                    v.aval.dtype for v in eqn.invars
+                    if isinstance(v.aval, ShapedArray) and v.aval.ndim >= 2
+                    and jnp.issubdtype(v.aval.dtype, jnp.floating)
+                ]
+                assert matrix_dtypes and all(dt == jnp.bfloat16 for dt in matrix_dtypes), matrix_dtypes
         if generation.compile_only_gpus(gpu):
             def run_dense(x, w):
                 with generation.chosen(grouped_matmul="mosaic"):
@@ -240,12 +236,49 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
                 assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
 
 
+def test_ternary_ste_cancellation_overflow_and_subnormal_rows():
+    """STE pullback never overflows on canceling extreme rows (`2**126` with `+1/-1` and scale `2**10` ->
+    forward `0`, grad `[+1024, -1024]`), and tiny subnormal rows (`2**-144` with scale `2**120`) normalize
+    against `peak` before scaling by `127` to produce exact `2**-24` without underflow (row 1464)."""
+    # Cancellation overflow witness: two entries of 2**126 against +1 and -1 with weight scale 2**10.
+    x_cancel = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** 126)
+    w_mat = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[1, 0].set(-1.0)
+    w_cancel = formats.TernaryWeights.of(w_mat, scale=jnp.float32(2.0 ** 10))
+    # Tiny subnormal row witness: 2**-144 with weight scale 2**120 -> representable result 2**-24.
+    x_tiny = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** -144)
+    w_tiny = formats.TernaryWeights.of(jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0),
+                                       scale=jnp.float32(2.0 ** 120))
+
+    for kernel in ("mosaic", "xla"):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
+            y_c, (dx_c, ds_c) = jax.value_and_grad(
+                lambda a, s: gemm.ternary_weight_product(
+                    a, dataclasses.replace(w_cancel, scale=s), quantize_activations=True,
+                    out_dtype=jnp.float32, interpret_on_cpu=True)[0, 0],
+                argnums=(0, 1))(x_cancel, w_cancel.scale)
+            assert np.asarray(y_c) == np.float32(0.0), (kernel, y_c)
+            assert np.asarray(dx_c[0, 0]) == np.float32(1024.0), (kernel, dx_c[0, 0])
+            assert np.asarray(dx_c[0, 1]) == np.float32(-1024.0), (kernel, dx_c[0, 1])
+            assert np.all(np.isfinite(np.asarray(dx_c))), kernel
+            assert np.asarray(ds_c) == np.float32(0.0), (kernel, ds_c)
+
+            y_t, (dx_t, ds_t) = jax.value_and_grad(
+                lambda a, s: gemm.ternary_weight_product(
+                    a, dataclasses.replace(w_tiny, scale=s), quantize_activations=True,
+                    out_dtype=jnp.float32, interpret_on_cpu=True)[0, 0],
+                argnums=(0, 1))(x_tiny, w_tiny.scale)
+            assert np.asarray(y_t) == np.float32(2.0 ** -24), (kernel, y_t)
+            assert np.asarray(dx_t[0, 0]) == np.float32(2.0 ** 120), (kernel, dx_t[0, 0])
+            assert np.asarray(ds_t) == np.float32(2.0 ** -144), (kernel, ds_t)
+
+
 def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
     """Skinny decode products (`M=13`) for `Fp8Weights` (`e4m3`/`e5m2`) and `TernaryWeights` decode
     directly into `wgmma` register operand A (`packed_rows=True`, zero SMEM staging), matching the decoded
-    fp32 dot bitwise under forced `mosaic`, matching staged decode bit-for-bit on raw E4M3 NaN and E5M2
-    Inf/NaN codes, rejecting `splits=2` on swapped packed tiles, and compiling spill-free on sm90
+    fp32 dot bitwise under forced `mosaic`, matching staged decode bit-for-bit on encoded E4M3 NaN and E5M2
+    Inf/NaN codes with independent mask checks, rejecting `splits=2`, and compiling spill-free on sm90
     (row 5387)."""
+    from dew.algebra import bits
     from dew.nn.kernels import tuning
     from dew.nn.kernels.templates.gemm import ternary, tiling
 
@@ -293,17 +326,26 @@ def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
         assert not t_launch.legal(ba_t, dataclasses.replace(swapped_t, splits=2), sm90)
         derived_t = t_launch.derived(ba_t, sm90)
         assert derived_t is None or derived_t.splits == 1, derived_t
+        e4_codes = np.broadcast_to(np.asarray([0x38, 0x00, 0x7F, 0xFF], np.uint32), (64, 16, 4))
+        e5_codes = np.broadcast_to(np.asarray([0x7C, 0xFC, 0x7D, 0xFF], np.uint32), (64, 16, 4))
         special_words = {
-            "e4m3": np.full((64, 16), np.uint32(0xFF7F0038), dtype=np.uint32),
-            "e5m2": np.full((64, 16), np.uint32(0xFFFDFC7C), dtype=np.uint32),
+            "e4m3": np.asarray(bits.fp8_packed(jnp.asarray(e4_codes.reshape(64, 64)), bits.E4M3)),
+            "e5m2": np.asarray(bits.fp8_packed(jnp.asarray(e5_codes.reshape(64, 64)), bits.E5M2)),
         }
         for fmt, raw_words in special_words.items():
             reg_out = packed.rows_decoded([StageRef(raw_words)], None, interpret=True, fmt=fmt)
             stg_out = StageRef(np.zeros((64, 64), dtype=jnp.bfloat16))
             packed.stage_decoded_words([StageRef(raw_words)], stg_out, packed.weight_format(fmt),
                                        interpret=True)
-            np.testing.assert_array_equal(np.asarray(reg_out).view(np.uint16),
-                                          np.asarray(stg_out.arr).view(np.uint16))
+            reg_arr, stg_arr = np.asarray(reg_out), np.asarray(stg_out.arr)
+            np.testing.assert_array_equal(reg_arr.view(np.uint16), stg_arr.view(np.uint16))
+            f32 = reg_arr.astype(np.float32)
+            if fmt == "e4m3":
+                assert np.all(f32[:, 0:16] == 1.0) and np.all(f32[:, 16:32] == 0.0)
+                assert np.all(np.isnan(f32[:, 32:48])) and np.all(np.isnan(f32[:, 48:64]))
+            else:
+                assert np.all(np.isposinf(f32[:, 0:16])) and np.all(np.isneginf(f32[:, 16:32]))
+                assert np.all(np.isnan(f32[:, 32:48])) and np.all(np.isnan(f32[:, 48:64]))
         if generation.compile_only_gpus("sm90"):
             x_s = jax.ShapeDtypeStruct((13, 256), jnp.bfloat16)
             e4_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype),

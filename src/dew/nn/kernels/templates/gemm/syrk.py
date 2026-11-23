@@ -703,13 +703,6 @@ than XLA with bitwise-equal digests in `M-NG-45-a100` (sm80, 8/8) and `M-NG-45b-
 row 11941)."""
 
 
-MEASURED_GRAM_GENERATIONS = frozenset({"sm80", "sm90"})
-"""GPU generations with real symmetric Gram receipts (`M-NG-45-a100`, `M-NG-45b-gh200`)."""
-
-MEASURED_GRAM_SHAPES = frozenset({(2560, 2560), (2560, 4096), (4096, 4096), (4096, 14336)})
-"""Matrix `(d0, d1)` geometries measured faster than XLA with bitwise-equal digests in `M-NG-45`."""
-
-
 def measured_gram(target: generation.GpuTarget, shape: tuple[int, int, int], dtype, *,
                   transpose: bool, out_dtype=None) -> bool:
     """Whether symmetric Gram `(target, shape, transpose, dtype, out_dtype)` is admitted by real GPU
