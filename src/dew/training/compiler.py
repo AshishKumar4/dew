@@ -19,6 +19,7 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
+from dew import communicators
 from dew._coordination import agreed, agreed_count, from_every_process
 from dew._records import JSON, boolean, integer, json_value, listed, record
 from dew.batch import CLOSES_WINDOW, LOOP_PASSES, Batch, Variables, at_path, placed_at
@@ -524,6 +525,9 @@ class Unplaced(NamedTuple):
     planned: Planned
     compiled: Compiled
     keep: Callable[[], None]
+    release: Callable[[Planned | None], None]
+    """Drop what its search kept but the plan a compile takes, its own or one searched on the placed devices
+    (`FitSearch.released_unplanned`)."""
 
     def probes(self) -> tuple[tuple[Mapping[str, object], ...], int]:
         """Its search's probes (`dew.training.planning.Probe.record`) and the index of its own: the last that
@@ -692,6 +696,13 @@ class StepCompiler[L, E]:
         # A fresh run's first step planned over its state's shapes before the state is placed
         # (`planned_unplaced`), by the signature of the batch it was planned over: its first compile's.
         self._unplaced: Unplaced | None = None
+        # The last search's release of what it kept but a plan taken in its place (`Unplaced.release`).
+        # A provisional search's release of what it kept but the plan taken in its place, until the plan made
+        # before the state was placed takes it (`Unplaced.release`); none past that, so no search outlives it.
+        self._settle: Callable[[Planned | None], None] | None = None
+        # The releases of searches off the loop whose plan the next compile takes in their place
+        # (`settle_with`).
+        self._settles: list[Callable[[Planned | None], None]] = []
         # Where that search found none, its refusal, which the placed state may not cover (`refuse_unplaced`).
         self._refused: tuple[Hashable, PlanRefused] | None = None
         # The fit's interval its host steps count their misses in (`counting`), None outside a fit.
@@ -855,6 +866,26 @@ class StepCompiler[L, E]:
 
     def compile(self, stepping: Stepping, state: TrainState, batch: Batch,
                 trials: Trials | None = None) -> Compiled:
+        """`_compiled`, every search this compile's plan is taken in place of (`_settles`: the plan made
+        before the state was placed, `Unplaced`, and each off the loop, `settle_with`) released by it, with
+        the plan it takes, or with no winner where it raises (its placed search refused), so none outlives
+        it."""
+        if self._unplaced is not None:
+            self._settles.append(self._unplaced.release)
+        try:
+            return self._compiled(stepping, state, batch, trials)
+        except BaseException:
+            self._settled(None)
+            raise
+
+    def _settled(self, planned: Planned | None) -> None:
+        """Release every search `_settles` holds, with `planned`, the plan taken in their place, or none."""
+        settles, self._settles = self._settles, []
+        for settle in settles:
+            settle(planned)
+
+    def _compiled(self, stepping: Stepping, state: TrainState, batch: Batch,
+                  trials: Trials | None = None) -> Compiled:
         """Compile a transaction over the state and one already-produced global batch (`Trainer.compile`),
         the step and what its compile found (`Compiled`).
 
@@ -904,6 +935,7 @@ class StepCompiler[L, E]:
             # Its startup's record, AutoPGLE's outcome among it, the fit's compile report's plan
             # (`StepCompiled.plan`): a host step plans no rung, and its startup is what its compile did.
             assert self.host_startup is not None, "a host step's compile runs its startup pass"
+            self._settled(None)
             return Compiled(stepping.shape.split, plan={"startup": self.host_startup.record()}, step=run)
         held, self._unplaced = self._unplaced, None
         mesh = settings.device_mesh
@@ -964,9 +996,39 @@ class StepCompiler[L, E]:
             # Where the devices, the state placed, hold no block for it, the plan's search runs here, on them.
             planned, compiled, keep = self._plan(stepping, state, batch, trials)
             keep()
+        return self._taken(stepping, planned, compiled)
+
+    def _taken(self, stepping: Stepping[L, E], planned: Planned, compiled: Compiled) -> Compiled:
+        """`compiled` stepping by the plan `compile` took: every search it was made in place of released
+        while the plan's programs are still read (the plan made before the state was placed, `Unplaced`, and
+        each off the loop, `settle_with`), then the plan's own lowerings let go (`Planned.released`)."""
+        self._settled(planned)
         kept = planned.released()
-        return dataclasses.replace(compiled, step=self.runner(stepping, kept, settings.device_mesh),
+        return dataclasses.replace(compiled, step=self.runner(stepping, kept, stepping.settings.device_mesh),
                                    planned=kept)
+
+    def abandoned(self) -> None:
+        """Release every search this compiler holds for a plan no compile will take (`_settles`, the plan
+        made before the state was placed, a provisional search's), with no winner: a layout its run turned
+        from (`dew.training.streaming.laid_start`), whose programs and admission charges are held no more."""
+        if self._unplaced is not None:
+            self._settles.append(self._unplaced.release)
+            self._unplaced = None
+        if (settle := self._provisional()) is not None:
+            self._settles.append(settle)
+        self._settled(None)
+
+    def _provisional(self) -> Callable[[Planned | None], None] | None:
+        """The release of the provisional search the last plan was made in (`_settle`), handed to its one
+        owner and held here no more."""
+        settle, self._settle = self._settle, None
+        return settle
+
+    def settle_with(self, release: Callable[[Planned | None], None]) -> None:
+        """Release a search made off the loop for the step the next compile plans (a later phase's,
+        `dew.training.ahead.LaterPlans.waited`) once that compile takes its plan, every program it kept but
+        the plan's dropped (`FitSearch.released_unplanned`), before the plan's own programs are let go."""
+        self._settles.append(release)
 
     def anew(self) -> StepCompiler[L, E]:
         """A compiler of this one's objective, links, step compiled ahead and pass counts, nothing planned:
@@ -1002,11 +1064,18 @@ class StepCompiler[L, E]:
         try:
             planned, compiled, keep = self._plan(stepping, state, batch, None, unplaced=unplaced,
                                                  placed=placed)
-        except PlanRefused as refused:
-            _log.info(UNPLACED_REFUSED, refused)
-            self._unplaced, self._refused = None, (signature, refused)
+        except BaseException as raised:
+            # Its search's programs dropped where it took no plan, refused or not (`_provisional`).
+            if (settle := self._provisional()) is not None:
+                settle(None)
+            if not isinstance(raised, PlanRefused):
+                raise
+            _log.info(UNPLACED_REFUSED, raised)
+            self._unplaced, self._refused = None, (signature, raised)
             return signature
-        self._unplaced = Unplaced(signature, planned, compiled, keep)
+        settle = self._provisional()
+        assert settle is not None, "a plan made before the state was placed is a provisional search's"
+        self._unplaced = Unplaced(signature, planned, compiled, keep, settle)
         return signature
 
     def refuse_unplaced(self, signature: Hashable, freed: Callable[[], int | None], mesh: Mesh,
@@ -1234,7 +1303,8 @@ class StepCompiler[L, E]:
                 outputs = []
                 moving, frozen = apart(current)
                 for part, executable in zip(parts, executables, strict=True):
-                    moving, *output = executable(moving, frozen, batch, part)
+                    moving, *output = communicators.called(
+                        executable, functools.partial(executable, moving, frozen, batch, part))
                     outputs.append(tuple(output))
                 stepped = together(moving, frozen)
                 returned[0] = stepped.window_size
@@ -1327,12 +1397,20 @@ class StepCompiler[L, E]:
             None if self._base_rung is None
             else self._base_rung[1], resumed, remat=self.remat, ahead=self.ahead,
             provisional=provisional, unplaced=unplaced)
+        if search.provisional:
+            # Its programs held until a plan is taken in its place, or its run abandons it, even where it
+            # refuses (`Unplaced.release`, `dew.training.ahead.LaterPlans`).
+            self._settle = functools.partial(search.released_unplanned, settled=True)
         try:
             planned, probes = search.admitted(
                 candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         except PlanRefused as refused:
             # Begun where a record or a checkpoint named, which a search of other shardings may not read.
             refused.recorded_start = recorded is not None or resumed is not None
+            if not search.provisional:
+                # A placed search that took no plan keeps none of what it compiled; a provisional one's
+                # is released by its owner (`_provisional`).
+                search.released_unplanned(None)
             raise
         # The rungs above the plan are read for their memory alone, no device ever running them: offline
         # within a prepare too, as no device run has tuned their programs (`report.read_offline`).
@@ -1348,19 +1426,11 @@ class StepCompiler[L, E]:
         planned.at.put(self.objective)
         self._xla_defaults, self._narrow = planned.at.xla_defaults, planned.at.narrow
         self._ns_group = planned.at.ns_group
-        if runs := pgle_runs():
-            trials = Trials(state, batch, owned=False) if trials is None else trials
-            run = self.runner(stepping, planned, mesh)
-            relower = functools.partial(lower, planned.split, planned.at.narrow, planned.at.ns_group)
-            unguided, replaced = planned.candidate.lowered, planned.executable
-            asked = search.compiled_key(unguided, planned.options)
-            planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
-            if planned.executable is not replaced:
-                # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
-                # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
-                # for a refit. An empty profile replaces nothing, and every kept lowering stays.
-                hold(asked, planned.executable)
-                forget(unguided)
+        trials = Trials(state, batch, owned=False) if trials is None else trials
+        planned = self._guided(stepping, planned, mesh, search, trials, lower)
+        # Every executable and traced step the search kept but the plan's dropped (row 12131); a provisional
+        # search's once a plan is taken in its place (`Unplaced.release`).
+        search.released_unplanned(planned)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         validation = stepping.validation(planned.candidate.prepared)
@@ -1380,6 +1450,25 @@ class StepCompiler[L, E]:
         if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", plan)
         return planned, flops, plan, validation, keep
+
+    def _guided(self, stepping: Stepping, planned: Planned, mesh: Mesh, search: FitSearch, trials: Trials,
+                lower: Callable[[int, bool, int | None], Candidate]) -> Planned:
+        """`planned` guided under AutoPGLE where the process asks it (`pgle_runs`, `Planned.guided`): its
+        profiled runs over `trials` and the step lowered again (`lower`), as it is otherwise."""
+        if not (runs := pgle_runs()):
+            return planned
+        run = self.runner(stepping, planned, mesh)
+        relower = functools.partial(lower, planned.split, planned.at.narrow, planned.at.ns_group)
+        unguided, replaced = planned.candidate.lowered, planned.executable
+        asked = search.compiled_key(unguided, planned.options)
+        planned = planned.guided(trials.profiled(run, planned, mesh, runs), runs, mesh, relower)
+        if planned.executable is not replaced:
+            # The guided executable in the unguided one's place, as JAX's jit keeps its program's under
+            # AutoPGLE: the one the run steps, the unguided one freed with the search and the step kept
+            # for a refit. An empty profile replaces nothing, and every kept lowering stays.
+            hold(asked, planned.executable)
+            forget(unguided)
+        return planned
 
     def counting(self, interval: Interval, *, host: bool) -> Interval:
         """`interval`, a fit's first, which its host steps (`host`) count the programs they compile past

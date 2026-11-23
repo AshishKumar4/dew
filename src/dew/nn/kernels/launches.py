@@ -29,6 +29,15 @@ def _register_triton_lowerings() -> None:
     scaled.triton_lowerings()
 
 
+def _register_mosaic_gpu_lowerings() -> None:
+    """Register Dew's primitive owners' Pallas Mosaic GPU lowerings on first `kernel` (row 9795)."""
+    from dew.algebra import scaled
+    from dew.nn import precision
+
+    precision.mosaic_gpu_lowerings()
+    scaled.mosaic_gpu_lowerings()
+
+
 def pallas_call(kernel: Callable, *, name: str, **params) -> Callable:
     """`jax.experimental.pallas.pallas_call(kernel, name=name, **params)` held per shard (`_held`), named by
     its `name`, which its profile names it by, its body traced as a launch's (`_traced`), its outputs typed
@@ -53,6 +62,7 @@ def kernel(entry: Callable, *, name: str, out_type, **params) -> Callable:
     """`jax.experimental.pallas.mosaic_gpu.kernel(entry, out_type=out_type, **params)` held per shard
     (`_held`), named by `name`, its body traced as a launch's (`_traced`), its outputs typed as its operands
     make them (`_typed`)."""
+    _register_mosaic_gpu_lowerings()
     traced = _traced(entry, params.get("interpret"))
     return _typed(lambda typed: plgpu.kernel(traced, out_type=typed, **params), out_type, name)
 

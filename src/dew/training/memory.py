@@ -180,8 +180,23 @@ def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, 
     return options or None
 
 
+def admitted_or_missed(take: Callable[[], jax.stages.Compiled],
+                       refusals: list[Exception]) -> jax.stages.Compiled | None:
+    """`take()`'s executable, a program compiled or loaded at a fit candidate (`compiled_if_it_fits`,
+    `dew.training.ahead.Executable.taken`), or None where its admission refuses it
+    (`dew.communicators.CommunicatorRoom`: its communicators and load have no room outside XLA's pool), the
+    refusal kept: the search asks the next candidate, as for a step that misses, and a search that finds
+    none raises naming it (row 12131's review: a losing rung's admission ended the search)."""
+    try:
+        return take()
+    except communicators.CommunicatorRoom as room:
+        _log.info("the step's communicators and load have no room outside XLA's pool: %s", room)
+        refusals.append(room)
+        return None
+
+
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-                        refusals: list[RuntimeError], *, relower: Callable[[], jax.stages.Lowered],
+                        refusals: list[Exception], *, relower: Callable[[], jax.stages.Lowered],
                         first: report.Attempt | None = None) -> jax.stages.Compiled | None:
     """Return `program` compiled under `options`, or None if XLA refuses it for memory (`refused_for_memory`).
 
@@ -191,11 +206,13 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
     program's temporaries against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
     returning an executable whose memory `step_fits` could read, so the refusal means the step does
     not fit. For example, on a v6e, Qwen3-0.6B at 16 x 1024
-    tokens asked for 38.47G of temporaries next to 31.24G of HBM. Any other
-    compile error is raised. `first` is its first compile where another thread made it (`report.attempts`).
+    tokens asked for 38.47G of temporaries next to 31.24G of HBM. A program its admission refuses is a miss
+    too (`admitted_or_missed`). Any other compile error is raised. `first` is its first compile where
+    another thread made it (`report.attempts`).
     """
     try:
-        return report.compiled(program, options, relower=relower, first=first)
+        return admitted_or_missed(lambda: report.compiled(program, options, relower=relower, first=first),
+                                  refusals)
     except jax.errors.JaxRuntimeError as error:
         if not refused_for_memory(error.error_code_string, str(error)):
             raise
@@ -507,6 +524,19 @@ class FirstRunFailed(RuntimeError):
             "the kernels loaded, and a lower fraction leaves them more")
 
 
+def first_run_failed(error: BaseException, step: int, fitted: JSON,
+                     mesh: Mesh) -> FirstRunFailed:
+    """A newly compiled step's first run's `error` on its devices, as the step's (`FirstRunFailed`): with
+    the record of the check that said it fits (`fitted`) and what each device holds now, wherever the step
+    raised it, at its own wait (`first_run`) or at a program's that waits on it before
+    (`dew.communicators.called`)."""
+    now: list[JSON] = [{"id": device.id, "outside": outside_pool(device),
+                        **{key: value for key, value in (device.memory_stats() or {}).items()
+                           if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
+                       for device in local_devices(mesh)]
+    return FirstRunFailed(step, error, fitted, now)
+
+
 def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str, dict[int, int]]:
     """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's
     (`FirstRunFailed`). A first run that succeeds returns, and logs, each GPU's bytes free outside XLA's
@@ -516,11 +546,7 @@ def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> dict[str,
     try:
         loss.block_until_ready()
     except jax.errors.JaxRuntimeError as error:
-        now: list[JSON] = [{"id": device.id, "outside": outside_pool(device),
-                            **{key: value for key, value in (device.memory_stats() or {}).items()
-                               if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
-                           for device in devices]
-        raise FirstRunFailed(step, error, fitted, now) from error
+        raise first_run_failed(error, step, fitted, mesh) from error
     read = () if fitted is None else listed(record(fitted, "fitted")["devices"], "devices", read=record,
                                             what="each device's memory as the fit check read it")
     checked = {integer(device["id"], "id"): outside for device in read

@@ -349,6 +349,13 @@ def _shape(equation) -> tuple[int, int, int]:
     return m, n, k
 
 
+def _ring_depth(barrier: jax_core.Var) -> int:
+    """The stages of the ring a copy lands in: the barriers of the array it arrives on (`barrier`, one a slot
+    of a ring's), whose S - 1 slots ahead hide what of its copy a step outlasts; one where it arrives on a
+    barrier of its own. Priced with none, every waited copy a ring hid read as waited whole (row 4123)."""
+    return max(1, math.prod(getattr(barrier.aval, "shape", ()) or (1,)))
+
+
 def _copied(equation) -> int:
     """A copy's bytes between memories: its shared-memory side's, as its transforms slice it (a ring's slot,
     a tile's rows), the operands after its source and destination its barrier (`has_barrier`), then its
@@ -472,7 +479,7 @@ class _Counting:
             self.issued = []
         elif primitive is gpu.copy_gmem_to_smem_p and equation.params.get("has_barrier"):
             barrier = equation.invars[2]
-            copied = Chain(copies=1, copy_bytes=_copied(equation))
+            copied = Chain(copies=1, copy_bytes=_copied(equation), stages=_ring_depth(barrier))
             self.landing[barrier] = self.landing.get(barrier, Chain()).then(copied)
         elif primitive is gpu.barrier_wait_p:
             landed = self.landing.pop(equation.invars[0], None)

@@ -793,8 +793,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   infinity. So a gate at least IEEE fp32's refuses BF16x6 and x9, whose digits match, by their bfloat16
   parts' range, and TF32x3 on both counts: its digits (two parts of 11) and its range, TF32's largest
   `(2 - 2^-10) 2^127` beneath float32's `(2 - 2^-23) 2^127` for all their exponents' width. It serves the sites whose kernel lowers the algorithm itself: the Triton ports, each at
-  least fla's own (`fla_gdn._precision` over `TRITON_ALGORITHMS`), and the TPU SSD's Mosaic kernel
-  (`ssd._exact`, its precisions named back). A product XLA compiles states a `Precision` instead
+  least its upstream's via `error.at_least` (`programs.triton_dot_precision`), and Mosaic TPU fp32 products
+  (`programs.mosaic_tpu_fp32_precision`, its precisions named back). A product XLA compiles states a `Precision` instead
   (`recurrence_algebra.STATE_PRECISION`'s HIGHEST): XLA routes a dot to an emitter by its shape, and its
   CPU's elemental emitter took no named algorithm at a `[1, 1]` dot (F64 and BF16x6 alike, M-JS-159), where
   HIGHEST is one every routing takes.

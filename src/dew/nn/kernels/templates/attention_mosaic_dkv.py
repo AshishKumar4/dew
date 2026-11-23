@@ -5,7 +5,6 @@ gradients; the fused fast form's keys-first launch adds each tile's dQ too."""
 import dataclasses
 import functools
 from collections.abc import Callable
-from types import MappingProxyType
 from typing import Any
 
 import jax
@@ -38,8 +37,10 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _streamed,
     _views_of,
     column_share,
+    head_first,
     head_layout,
     head_slice,
+    head_unlayout,
     held_params,
     holders,
     issued_into,
@@ -57,6 +58,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     transposed_swizzles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
+    KEY_ROWS,
     _Backward,
     _dq_added,
     _relay_tiles,
@@ -202,13 +204,17 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
             _, weights, slopes, seen = _score_weights(walk, coords, (), s, rows[0], rows[1], masked=masked)
             return weights, slopes, seen
 
-        (weights, slopes, seen), dp = family.product_pair(
-            k_smem, logits_slot.transpose((1, 0)), v_smem, do_slot.transpose((1, 0)), shape, between=between)
+        # S and dP issued together, S's weights made as dP runs on (`Issuer.summed_together`'s `then`).
+        (weights, slopes, seen), dp = (read() for read in family.summed_together(
+            (shape, shape), (lambda acc: family.products(acc, k_smem, logits_slot.transpose((1, 0))),
+                             lambda acc: family.products(acc, v_smem, do_slot.transpose((1, 0)))),
+            then=(between, None)))
         cotangents = _score_cotangents(coords, weights, dp, rows[2], rows[3], seen)
         scored = (weights, weights, cotangents, slopes, seen)
     else:
-        s, dp = family.product_pair(k_smem, logits_slot.transpose((1, 0)),
-                                    v_smem, do_slot.transpose((1, 0)), shape)
+        s, dp = (read() for read in family.summed_together(
+            (shape, shape), (lambda acc: family.products(acc, k_smem, logits_slot.transpose((1, 0))),
+                             lambda acc: family.products(acc, v_smem, do_slot.transpose((1, 0))))))
         if logits_stage is not None:
             # Staged queries read (products waited): next step's stage may be written.
             walk.program.family.turn(logits_stage[2], walk.consumers, wait=False)
@@ -484,10 +490,6 @@ def _grading(shares: tuple) -> bool:
     whole."""
     return shares[0][0] == 0
 
-KEY_ROWS = MappingProxyType({Kind.KEY: lambda entries: entries.sum(axis=-1)})
-"""`gradient.pulled`'s sums of a dK/dV tile, its keys its rows (`_dkv_step`): a key's over its row; the dK/dV
-program writes no head's or query's gradient (`DKV_GRADS`)."""
-
 
 def _tiles_added(family: mosaic.Family, refs, stage, place: tuple, k_first, index, interpret: bool, first,
                  pieces) -> None:
@@ -640,7 +642,7 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
     # Each a query head's (`outputs.Output`): the query's batch rows and heads, the key's padded keys, a share
     # of the columns.
     rows, keys, heads_of = outputs.axis(query, 0), outputs.axis(key, 1), outputs.axis(query, 2)
-    dkv_shape = (rows, heads_of, keys) if family.copies_tiled_rows else (rows, keys, heads_of)
+    dkv_shape = (rows, heads_of, keys) if head_first(family, jnp.float32) else (rows, keys, heads_of)
     dk, dv = (outputs.output(jnp.float32, *dkv_shape, column_share(array, share))
               for array, (_, share) in zip((key, value), shares, strict=True))
     return family.kernel(
@@ -732,16 +734,13 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             rest, relayed=family.relay_bytes(block_k, count) > 0, tiled=tiled,
             fused=(4 if placing else 2) if walk.fused else 0)
         row, head = family.program_index("batch"), family.program_index("heads")
-
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
-        views, streams = _query_streams(family, streams, named, (score_refs, kinds), row, head)
+        views, streams = _query_streams(family, streams, named, (score_refs, kinds), row, head, heads=heads)
         pair_first = family.program_index("k_tiles") * pair
         streamed = _streamed([program.readers(pair_first + index * block_k, q_steps, spans_of, row)[:2]
                               for index in range(holders(family, consumers))])
-
         rows_of = functools.partial(_statistics_of, family, stat_refs, (row, head))
         ring = _PlacedDq(walk, dq_ref, tuple(fused_stages), (row, head)) if placing and walk.fused else None
-
         def consumer(index):
             holder = 0 if split or placing else index
             k_first = pair_first + holder * block_k
@@ -776,14 +775,14 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                 family.turn(stage[2], consumers, arrive=False)
             if split or (placing and index):
                 return (dk, dv, *key_sums) if split else None
-            out = head_slice(family, row, head, pl.ds(k_first, block_k))
-            key_views = tuple(ref.at[*shared_place(ref.shape, row, head), pl.ds(k_first, block_k)]
-                              for ref in key_refs)
-            _keys_stored(family, (dk, dv, *key_sums), (dk_ref.at[out], dv_ref.at[out], *key_views),
+            span = pl.ds(k_first, block_k)
+            outs = tuple(ref.at[head_slice(family, row, head, span, ref.dtype, width=val.shape[1])]
+                         for ref, val in ((dk_ref, dk), (dv_ref, dv)))
+            key_views = tuple(ref.at[*shared_place(ref.shape, row, head), span] for ref in key_refs)
+            _keys_stored(family, (dk, dv, *key_sums), (*outs, *key_views),
                          (out_smem, dv_smem, rows_smem), after, index=index, widths=value_width == width,
                          interpret=walk.interpret)
             return None
-
         reached = functools.partial(program.readers, pair_first, q_steps, spans_of, row)
         return scheduled_roles(family, consumers, consumer, functools.partial(
             family.stream, streams, views, *streamed), functools.partial(
@@ -794,10 +793,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     scoped, rings, after = _dkv_allocations(family, program.tiles, width, value_width, query.dtype,
                                             stages=stages, columns=program.tiles.columns, tiled=tiled,
                                             params=param_types(map(Param, score_params, kinds)))
-
     products = placed_scratch(family, block_q, query.dtype, dq_halves(width) if walk.fused else (),
                               tuple(share for _, share in shares))
-
     def entry(*refs):
         summed = family.scoped(functools.partial(body, *refs), *scoped, streams=rings,
                                after_walks=tuple(after), **products)
@@ -810,9 +807,10 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
     query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
     grads = _dkv_launched(walk, launch, (query, key, value, dout, peak, total, anchor, delta, key_index,
-                                         *leaves), graded, buffers, groups)
+                                         *leaves), graded, buffers, groups,
+                          dq_shape=(query.shape[0], queries, heads, width))
     swapped = 3 if walk.fused else 2
-    return (*(head_layout(family, grad) for grad in grads[:swapped]), *grads[swapped:])
+    return (*(head_unlayout(family, grad, heads) for grad in grads[:swapped]), *grads[swapped:])
 
 def _held_stages(rest: list, *, relayed: bool, tiled: bool, fused: int) -> tuple:
     """A dK/dV program's stages past its resident blocks and output stages, as `_dkv_allocations` lays them:
@@ -829,9 +827,10 @@ def _block_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: tuple
     head (`place`) copied into its `smem` (`Family.loaded`, each awaited on its `loaded` barrier), the
     copies issued where `issued` (one consumer's for every consumer that shares them)."""
     row, kv_head = place
-    view = head_slice(family, row, kv_head, pl.ds(k_first, block_k))
-    family.loaded(tuple((ref.at[view], tile.at[holder], barrier.at[holder])
-                        for ref, tile, barrier in zip(refs, smem, loaded, strict=True)), issued=issued)
+    family.loaded(tuple(
+        (ref.at[head_slice(family, row, kv_head, pl.ds(k_first, block_k), ref.dtype, width=tile.shape[-1])],
+         tile.at[holder], barrier.at[holder])
+        for ref, tile, barrier in zip(refs, smem, loaded, strict=True)), issued=issued)
 
 
 def _placed_step_of(walk: _Backward, rows_of, spans_of, place: tuple, k_first, dq_ref, fused_stages
@@ -860,12 +859,13 @@ def _keys_first_issued(walk: _Backward, streams, reached: Callable, walked: plac
                    shares={placed.DK: shares[0], placed.DV: shares[1]})
 
 
-def _query_streams(family: mosaic.Family, streams, named: dict, score: tuple, row, head) -> tuple[dict, dict]:
+def _query_streams(family: mosaic.Family, streams, named: dict, score: tuple, row, head, *,
+                   heads: int) -> tuple[dict, dict]:
     """A dK/dV program's views of its query streams (`named`'s refs, `_views_of`) beside those of its score
     hook's parameters that ride them (`score`, their refs and kinds: `score_views`, at the program's key
     tile), and its streams opened with them."""
     refs, kinds = score
-    views = _views_of(family, named, row, head)
+    views = _views_of(family, named, row, head, heads=heads)
     if riding(family, kinds, "queries"):
         views |= score_views(family, refs, kinds, "queries", row, head, family.program_index("k_tiles"))
     return views, family.opened(streams, views)
@@ -910,7 +910,7 @@ def _statistics_of(family: mosaic.Family, stat_refs: list, place: tuple, q_first
 
 
 def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], buffers: list,
-                  groups: tuple) -> tuple[jax.Array, ...]:
+                  groups: tuple, *, dq_shape: tuple[int, int, int, int]) -> tuple[jax.Array, ...]:
     """The dK/dV launch `launch` over `operands`: dK, dV and the hook's key and tile gradients in kind order,
     each parameter's (`buffers`, its own batch rows and heads, `[B or 1, H or 1, ...]`) added into zeros in
     place by every program that reads it, the tiles' keys first `[., ., Kp, Qp]` (row 2577: a bias every row
@@ -921,13 +921,13 @@ def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], 
     (`Family.added`). A key gradient where the launch's family adds no vector (`Family.adds_vectors`) its
     program's own place too, written, the shared rows summed after (`_grad_buffers`). The gradients of one
     shape (`groups`) are one ref, a leading axis of them (`stacked.zeros`, row 3180)."""
-    batch, queries, heads, _ = operands[0].shape
     grads = stacked.zeros(buffers, groups, *operands[:4])
     if not walk.fused:
         dk, dv = launch(*operands, *grads)
         return dk, dv, *_keys_last(stacked.read(grads, groups), graded)
-    width = operands[0].shape[3]
+    batch, queries, heads, width = dq_shape
     copies = walk.consumers if walk.interpret else 1
-    dq = jax.new_ref(launches.filled((copies, batch, queries, heads, width), jnp.float32, *operands[:4]))
+    dq_axes = head_slice(walk.program.family, batch, heads, queries, jnp.float32)
+    dq = jax.new_ref(launches.filled((copies, *dq_axes, width), jnp.float32, *operands[:4]))
     dk, dv = launch(*operands, dq, *grads)
     return stacked.added(dq), dk, dv

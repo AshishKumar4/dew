@@ -16,6 +16,7 @@ import threading
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import pytest
 from process_support import device_flags
 
@@ -237,27 +238,117 @@ def test_what_a_gpu_has_spent_already_is_not_charged_to_a_program_again():
     assert resident.held == Collectives(groups=frozenset({(0, 1, 2, 3), (0, 1), (2, 3)}))
 
 
-def test_a_programs_code_is_held_to_what_is_free_beside_its_new_communicators():
-    """A program's code takes its GPUs' memory outside XLA's pool as it first runs and leaves as its
-    executable is released, neither of which a process sees: at every admission, a program whose new
-    communicators fit what its GPUs have free now but not with its code is refused, naming the bytes its code
-    and communicators need and the bytes free, an executable admitted again (loaded again, perhaps) charged
-    its code again; the room, which holds what stays made, never holds code."""
-    room = dict.fromkeys(range(4), 4 * GIB)
+def test_a_program_not_yet_run_is_charged_its_load_beside_every_other_not_yet_run_and_their_communicators():
+    """A program loads on its GPUs outside XLA's pool as it first runs, which what is free now counts only
+    once it has run: a program admitted is charged, beside its new communicators, its load
+    (`PROGRAM_FLOOR`), and for each other program admitted on its GPUs that has not run, that one's load and
+    the communicators it makes as it runs, never those twice where both make the same (row 12131: 24
+    executables left an all-reduce no room on a 2xH100; review: a later admission took an earlier one's
+    communicators as made). A program that ran is charged nothing again, its communicators made, and its
+    GPUs' others are refused only past what is free."""
+    room = dict.fromkeys(range(4), 8 * GIB)
     every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
-    pair = Collectives(groups=frozenset({(0, 1)}))
     resident = communicators.Resident()
-    step = communicators.Loaded((0, 1, 2, 3), GIB)
-    resident.admit(every, FOUR, room, lambda gpu: 3 * GIB, step)
-    with pytest.raises(CommunicatorRoom) as again:
-        resident.admit(every, FOUR, room, lambda gpu: GIB // 2, step)
-    assert again.value.needed == dict.fromkeys(range(4), GIB)
-    assert again.value.room == dict.fromkeys(range(4), GIB // 2)
-    resident.admit(every, FOUR, room, lambda gpu: GIB, step)
-    evaluation = communicators.Loaded((0, 1), GIB // 2)
+    step, twin, evaluation = (communicators.Loaded((0, 1, 2, 3), 1), communicators.Loaded((0, 1, 2, 3), 2),
+                              communicators.Loaded((0, 1), 3))
+    floor = communicators.PROGRAM_FLOOR
+    # The step's communicators (2 GiB each, `FOUR`'s every-GPU group) and its own load.
+    with pytest.raises(CommunicatorRoom) as tight:
+        resident.admit(every, FOUR, room, lambda gpu: 2 * GIB + floor - 1, step)
+    assert tight.value.needed == dict.fromkeys(range(4), 2 * GIB + floor)
+    resident.admit(every, FOUR, room, lambda gpu: 2 * GIB + floor, step)
+    # A second program of the same communicators before the step ran: charged them once, beside both loads.
+    with pytest.raises(CommunicatorRoom) as shared:
+        resident.admit(every, FOUR, room, lambda gpu: 0, twin)
+    assert shared.value.needed == dict.fromkeys(range(4), 2 * GIB + 2 * floor)
+    # An evaluation of none: its own load, the step's load and its communicators.
+    ahead = 2 * floor + 2 * GIB
+    with pytest.raises(CommunicatorRoom) as pending:
+        resident.admit(Collectives(), FOUR, room, lambda gpu: ahead - 1, evaluation)
+    assert pending.value.needed == {0: ahead, 1: ahead, 2: 0, 3: 0}
+    resident.dispatched(step.key)
+    assert resident.held == every
+    # The step ran: charged nothing again; the evaluation its own load alone, the communicators made.
+    resident.admit(every, FOUR, room, lambda gpu: 0, step)
     with pytest.raises(CommunicatorRoom):
-        resident.admit(pair, FOUR, room, lambda gpu: GIB, evaluation)
-    resident.admit(pair, FOUR, room, lambda gpu: GIB + GIB // 2, evaluation)
+        resident.admit(Collectives(), FOUR, room, lambda gpu: floor - 1, evaluation)
+    resident.admit(Collectives(), FOUR, room, lambda gpu: floor, evaluation)
+
+
+def test_a_first_runs_measured_load_is_what_each_later_program_not_yet_run_is_charged():
+    """What a program's first run, seen to complete, took on its GPUs outside XLA's pool past the
+    communicators its admission charged and the pool's growth is what loading it took (`Resident.ran`):
+    every later program not yet run is charged the most a first run took there, never the floor once a
+    heavier load was measured (review of row 12131's P0: the measure was dropped, a 96 MiB load charged 8
+    MiB for ever); a pool that gave regions back over the run hid as much of the load, which the measure
+    adds back (a 48 MiB load beside a 32 MiB give-back read 16 MiB)."""
+    room = dict.fromkeys(range(4), 8 * GIB)
+    every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+    resident = communicators.Resident()
+    step, evaluation = communicators.Loaded((0, 1, 2, 3), 1), communicators.Loaded((0, 1), 2)
+    resident.admit(every, FOUR, room, lambda gpu: 4 * GIB, step)
+    # Its first run: the GPU lost its communicators (2 GiB), 96 MiB of load and 32 MiB of pool growth.
+    took = 96 << 20
+    before, after = dict.fromkeys(range(4), 6 * GIB), dict.fromkeys(range(4), 4 * GIB - took - (32 << 20))
+    resident.ran(step.key, before, after, dict.fromkeys(range(4), 32 << 20))
+    assert resident.cost == dict.fromkeys(range(4), took) and resident.held == every
+    with pytest.raises(CommunicatorRoom) as charged:
+        resident.admit(Collectives(), FOUR, room, lambda gpu: took - 1, evaluation)
+    assert charged.value.needed == {0: took, 1: took, 2: 0, 3: 0}
+    # A pool that gave 32 MiB back over a 48 MiB load: the GPU lost 16 MiB.
+    gave = communicators.Resident()
+    alone = communicators.Loaded((0,), 3)
+    gave.admit(Collectives(), FOUR, {0: 8 * GIB}, lambda gpu: GIB, alone)
+    gave.ran(alone.key, {0: GIB}, {0: GIB - (16 << 20)}, {0: -(32 << 20)})
+    assert gave.cost == {0: 48 << 20}
+
+
+def test_a_program_of_no_identity_is_admitted_by_its_communicators_alone_and_held_as_made():
+    """A program whose runtime states no fingerprint, which no run of it is taken by (`admit`'s
+    `loaded=None`), is admitted by its communicators alone, no load charged for it, and holds them as made at
+    once: a later program of the same communicators is charged none of them, never one held pending for
+    ever (review of row 12131's P0)."""
+    room = dict.fromkeys(range(4), 8 * GIB)
+    every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+    resident = communicators.Resident()
+    with pytest.raises(CommunicatorRoom) as tight:
+        resident.admit(every, FOUR, room, lambda gpu: 2 * GIB - 1)
+    assert tight.value.needed == dict.fromkeys(range(4), 2 * GIB)
+    resident.admit(every, FOUR, room, lambda gpu: 2 * GIB)
+    assert resident.held == every and not resident.pending
+    resident.admit(every, FOUR, room, lambda gpu: 0)
+
+
+def test_a_program_released_before_it_ran_leaves_its_communicators_unmade_and_charged_to_no_other():
+    """A program admitted that never runs is charged ahead of every later one only while it lives: its
+    executable released (a search's passed-over rung), what it would have loaded and connected is no
+    other's charge, never taken as made, and its identity anyone's again; one run through Dew's compile
+    point (`Resident.dispatched`) is free memory's to read from then on, its communicators made (review of
+    row 12131: both stayed charged for ever, and a loser's communicators were taken as made)."""
+    import gc
+
+    floor = communicators.PROGRAM_FLOOR
+    room = dict.fromkeys(range(4), 8 * GIB)
+    every = Collectives(groups=frozenset({(0, 1, 2, 3)}))
+    resident = communicators.Resident()
+    loser = jax.jit(lambda x: x + 1).lower(jnp.ones(2)).compile()
+    resident.watch(id(loser), loser)
+    resident.admit(every, FOUR, room, lambda gpu: 2 * GIB + floor,
+                   communicators.Loaded((0, 1, 2, 3), id(loser)))
+    ran = communicators.Loaded((1,), 7)
+    # GPU 1's room past the loser's communicators and load, which it has not made: its own load besides.
+    resident.admit(Collectives(), FOUR, room, lambda gpu: 2 * GIB + 2 * floor, ran)
+    probe = communicators.Loaded((0, 1), 9)
+    with pytest.raises(CommunicatorRoom) as both:
+        resident.admit(Collectives(), FOUR, room, lambda gpu: 0, probe)
+    assert both.value.needed == {0: 2 * floor + 2 * GIB, 1: 3 * floor + 2 * GIB, 2: 0, 3: 0}
+    del loser
+    gc.collect()
+    resident.dispatched(ran.key)
+    with pytest.raises(CommunicatorRoom) as alone:
+        resident.admit(Collectives(), FOUR, room, lambda gpu: 0, probe)
+    assert alone.value.needed == {0: floor, 1: floor, 2: 0, 3: 0}
+    assert resident.held == Collectives()
 
 
 STEP = ("HloModule step\n\n%add (lhs: f32[], rhs: f32[]) -> f32[] {\n  %lhs = f32[] parameter(0)\n"
@@ -503,6 +594,191 @@ def test_a_program_compiled_ahead_for_absent_gpus_is_not_admitted_here():
     done = subprocess.run([sys.executable, "-c", AHEAD], capture_output=True, text=True, check=True,
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
     assert done.stdout.strip().splitlines()[-1] == "compiled ahead"
+
+
+@pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
+def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search_naming_it():
+    """A fit search whose every candidate's admission refuses it (`dew.communicators.CommunicatorRoom`: the
+    runtime's need past the room the pool left) asks each candidate as a step that misses, and refuses the
+    step naming that admission, never ending at the first candidate's (row 12131's review: a losing rung's
+    admission ended the search)."""
+    import numpy as np
+    import optax
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Trainer
+    from dew.training.planning import PlanRefused
+
+    device = jax.devices()[0]
+    gpu = communicators.ordinal(device)
+    starved = communicators.Needs(collective={}, exchanged={}, permuted={}, connections={},
+                                  runtime={gpu: 2 * GIB}, seconds=1.0)
+    model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
+                         mlp_features=64, max_seq_len=8)
+    trainer = Trainer(LMObjective(model, seq_len=8), optax.sgd(0.1), key=jax.random.key(0))
+    trainer.device_mesh = jax.sharding.Mesh(np.array([device]), ("data",))
+    # Its state placed under the process's own sizing: the starved one holds the step's search alone.
+    state, _, _ = trainer.place()
+    held = communicators.held()
+    communicators.hold(communicators.Sizing(starved, 0.95, 0.9, {gpu: 2 * GIB}, {gpu: GIB}))
+    try:
+        with pytest.raises(PlanRefused) as refused:
+            trainer.compile(state, {"text": np.zeros((2, 9), np.int32)})
+    finally:
+        communicators.hold(held)
+    assert isinstance(refused.value.__cause__, CommunicatorRoom), refused.value.__cause__
+
+
+@pytest.mark.parametrize("fetched", [False, True], ids=["called", "fetched"])
+def test_a_program_whose_keywords_are_named_as_its_own_call_runs(fetched):
+    """A function whose keyword arguments are named `args`, `kwargs` and `executable`, run through Dew's
+    compile point, called or its executable fetched and called (`OuterProgram.invoked`), takes them as its
+    own, never as the call's (review of row 12131's P0: `invoked`'s named parameters took them, a
+    TypeError before dispatch)."""
+    from dew.nn.kernels import options
+
+    def named(x, *, args, kwargs, executable):
+        return x * args + kwargs - executable
+
+    compiled = options.program(named)
+    given = {"args": jnp.float32(2.0), "kwargs": jnp.float32(3.0), "executable": jnp.float32(1.0)}
+    x = jnp.arange(3.0)
+    ran = options.Fetched(compiled)(x, **given) if fetched else compiled(x, **given)
+    assert jax.device_get(ran).tolist() == jax.device_get(x * 2.0 + 3.0 - 1.0).tolist()
+
+
+@pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
+def test_a_first_run_that_fails_raises_to_its_caller_and_stays_charged_as_not_run():
+    """A program's first run that fails on its devices, as an asynchronous one does where its outputs are
+    awaited, raises its error to its caller (`communicators.called`), whoever calls it, never swallowed,
+    and the program stays charged as not run (review of row 12131's P0: the error was handed back as
+    outputs, a caller discarding them never told)."""
+    class Refused:
+        """Outputs whose run the devices refused, as a GPU reports it once they are awaited."""
+
+        def block_until_ready(self):
+            raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: the devices refused the run")
+
+    gpu = communicators.ordinal(jax.devices()[0])
+    roomy = communicators.Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={gpu: 0},
+                                seconds=1.0)
+    probe = jax.jit(lambda x: x * 3.0).lower(jnp.ones(2)).compile()
+    program = jax.jit(lambda x: x * 2.0).lower(jnp.ones(2)).compile()
+    held = communicators.held()
+    communicators.hold(communicators.Sizing(roomy, 0.95, 0.9, {gpu: 0}, {gpu: 1 << 40}))
+    try:
+        communicators.admit(program, free=lambda gpu: 1 << 40)
+        ahead = _charged(probe, gpu)
+        with pytest.raises(jax.errors.JaxRuntimeError):
+            communicators.called(program, Refused)
+        assert _charged(probe, gpu) == ahead
+    finally:
+        communicators.hold(held)
+
+
+def _charged(program, gpu: int) -> int:
+    """What admitting `program` charges on `gpu` past its free bytes, none free: the refusal's need."""
+    with pytest.raises(CommunicatorRoom) as refused:
+        communicators.admit(program, free=lambda gpu: 0)
+    return refused.value.needed[gpu]
+
+
+@pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
+def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(monkeypatch):
+    """A fit whose search compiled the step whole, which missed, and split, which fits, and ran the split
+    step charges every later program its own load alone, what the step's first run measured: never the
+    passed-over rung's, released with its executable, nor the step's or the programs its state was placed
+    by, which ran (row 12131: 24 kept beside a 4B run's step left an all-reduce no room; review: losers and
+    programs that ran stayed charged for ever)."""
+    import gc
+
+    from affine_run import Replaying
+    from test_plan import BATCH, ROWS, free, lm, needs
+
+    from dew.data.dataset import Loader
+    from dew.nn.kernels import options
+
+    whole, halves = needs(monkeypatch, lm(split=1)), needs(monkeypatch, lm(split=2))
+    assert halves < whole, (halves, whole)
+    free(monkeypatch, (whole + halves) // 2)
+    options.release()
+    gc.collect()
+    gpu = communicators.ordinal(jax.devices()[0])
+    roomy = communicators.Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={gpu: 0},
+                                seconds=1.0)
+
+    def compiled(scale: float):
+        return jax.jit(lambda x: x * scale).lower(jnp.ones(2)).compile()
+
+    probe = compiled(2.0)
+    held = communicators.held()
+    communicators.hold(communicators.Sizing(roomy, 0.95, 0.9, {gpu: 0}, {gpu: 1 << 40}))
+    try:
+        alone = _charged(probe, gpu)
+        # One program admitted and not run: the charge each such program adds to a later admission.
+        pending = compiled(3.0)
+        communicators.admit(pending, free=lambda gpu: 1 << 40)
+        each = _charged(probe, gpu) - alone
+        del pending
+        gc.collect()
+        assert _charged(probe, gpu) == alone
+        # A fit whose search compiles the step whole, which misses, and split, which fits, its first run's
+        # completion seen (`dew.training.memory.first_run`): its passed-over rung released, its plan's run, so
+        # nothing is charged ahead of a later program, which is charged its own load alone, what that first
+        # run measured.
+        trainer = lm()
+        rows = Replaying(lambda position: {"text": jax.device_get(BATCH["text"])})
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
+        assert len(trainer.plan["probes"]) >= 2 and trainer.plan["split"] > 1, trainer.plan["probes"]
+        gc.collect()
+        measured = communicators._RESIDENT.cost.get(gpu, communicators.PROGRAM_FLOOR)
+        assert _charged(probe, gpu) == measured, (alone, each, measured)
+    finally:
+        communicators.hold(held)
+
+
+@pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
+def test_an_inspected_runs_sampled_step_is_taken_as_run_once_it_completes():
+    """A run inspecting every other step runs its plain step on its first step and its sampled step, a
+    program of its own, on its second: each is taken as run as its own first run completes, at the runner
+    that calls it (`dew.communicators.called`), so neither is charged ahead of a later program once both
+    ran (review of row 12131's P0: the sampled step, run after the fit's one first-run wait, stayed
+    charged for ever)."""
+    import gc
+
+    import optax
+    from affine_run import Replaying
+    from test_plan import BATCH, ROWS
+
+    from dew.data.dataset import Loader
+    from dew.nn.kernels import options
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Trainer
+    from dew.training.inspection import Inspection
+
+    options.release()
+    gc.collect()
+    gpu = communicators.ordinal(jax.devices()[0])
+    roomy = communicators.Needs(collective={}, exchanged={}, permuted={}, connections={}, runtime={gpu: 0},
+                                seconds=1.0)
+    probe = jax.jit(lambda x: x * 2.0).lower(jnp.ones(2)).compile()
+
+    held = communicators.held()
+    communicators.hold(communicators.Sizing(roomy, 0.95, 0.9, {gpu: 0}, {gpu: 1 << 40}))
+    try:
+        model = models.build("causal_transformer", vocab_size=64, emb_features=16, num_layers=1, num_heads=2,
+                             mlp_features=32, max_seq_len=16)
+        trainer = Trainer(LMObjective(model, seq_len=16), optax.sgd(0.1), key=jax.random.key(0),
+                          inspection=Inspection(every=2))
+        rows = Replaying(lambda position: {"text": jax.device_get(BATCH["text"])})
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=2)
+        gc.collect()
+        measured = communicators._RESIDENT.cost.get(gpu, communicators.PROGRAM_FLOOR)
+        assert _charged(probe, gpu) == measured, measured
+    finally:
+        communicators.hold(held)
 
 
 def test_a_process_prepared_again_keeps_the_sizing_its_pool_was_made_with():
