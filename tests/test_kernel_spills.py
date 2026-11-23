@@ -37,7 +37,7 @@ from dew.nn.kernels.templates.gemm.hooks import Hooks
 from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
 from dew.telemetry.compiles import Compiles
-from dew.training import Trainer
+from dew.training import Layout as StepLayout, Trainer
 
 ROWS, FEATURES, WIDTH, EXPERTS = 2048, 1024, 2048, 8
 """The experts layer's step and paired product (`Experts`, `_paired_step`): its first derived tile, an H100's
@@ -77,8 +77,12 @@ def squared(outputs, batch):
 
 
 def experts(mesh, nonce: float, ahead=None) -> Trainer:
+    """A trainer of the experts layer (`Experts`) on `mesh`, its layout stated (`dew.training.Layout()`):
+    its step a device step, which its launch's step-down is a subject of, on any GPU, where a fresh run left
+    to choose streamed its parameters from a GH200's host, its loss traced on the CPU companion, where the
+    layer's launch, called without a selector, holds no config (rows 8093, 8095)."""
     return Trainer(Supervised(Experts(nonce), squared, inputs=InputSpec(Field("x", (FEATURES,)))),
-                   optax.adam(1e-3), key=0, mesh=mesh, ahead=ahead)
+                   optax.adam(1e-3), key=0, mesh=mesh, ahead=ahead, layout=StepLayout())
 
 
 BATCH = {"x": np.zeros((ROWS, FEATURES), np.float32)}
@@ -734,10 +738,12 @@ def test_an_objectives_draw_of_its_variables_selects_no_kernel(kind):
     assert applied_routes, "the decoder selects no kernel, so its draw's selecting none says nothing"
 
 
+@ALIKE_ON_EVERY_BACKEND
 def test_a_draw_within_a_draw_takes_the_draws_program():
     """A draw traced within another (`generation.drawing` nested: `drawn.traced_draw` around an objective's
     own draw) is that draw to JAX's trace and compile caches, which key on whether a thread draws, not how
-    deep: a probe's draw and a trainer start's of one objective take one program (row 12092)."""
+    deep: a probe's draw and a trainer start's of one objective take one program (row 12092). A program's
+    mechanics, its run the CPU lane's (row 12256: computed on a GPU tier part, unprepared)."""
     from dew.nn.kernels.generation import drawing
     from dew.telemetry import compiles
 

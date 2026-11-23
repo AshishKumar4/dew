@@ -394,6 +394,12 @@ _ONCE_PREDICATED = _cache.untraced(contextvars.ContextVar("once_predicated", def
 own)."""
 
 
+def refuse_staging(family, chunks: tuple[int, int] | None) -> None:
+    """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole."""
+    if chunks is not None:
+        raise ValueError(f"{family.name} stages each output tile whole, in no chunks: {chunks}")
+
+
 def then_read(read: Callable, after: Callable | None) -> Callable:
     """`read`, then `after` of its value where given (`Issuer.summed_together`'s `then`)."""
     return read if after is None else lambda: after(read())
@@ -1640,13 +1646,13 @@ class Transport[Allocated, Opened](abc.ABC):
 
     @abc.abstractmethod
     def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
-                  joined: tuple = ()) -> int:
+                  joined: handoffs.Joined = ()) -> int:
         """The registers a thread of each of `consumers` consumer roles may hold, `programs` programs a
         multiprocessor at once, beside a producer role lowered to `producer` where the family has one
         (`roles`; setmaxnreg's least where None) and the `joined` roles (`role_schedule`); asked of a family
         that budgets them alone (`budgets_registers`)."""
 
-    def role_schedule(self, consumers: int, producer: int | None = None, joined: tuple = ()
+    def role_schedule(self, consumers: int, producer: int | None = None, joined: handoffs.Joined = ()
                       ) -> handoffs.Schedule:
         """The family's roles (`roles`) with `joined`'s, each `(role, count)` (`handoffs.Schedule.joined`: a
         correction warpgroup beside the consumers, a launch's reducing warps)."""
@@ -1654,12 +1660,12 @@ class Transport[Allocated, Opened](abc.ABC):
                                 self.roles(consumers, producer))
 
     @staticmethod
-    def joined_shares(joined: tuple) -> "resources.Joined":
+    def joined_shares(joined: handoffs.Joined) -> "resources.JoinedShares":
         """`joined`'s raised warpgroup roles as the register model reads them, each its weight and count
-        (`resources.Joined`); its warp roles share the last warpgroup's least."""
+        (`resources.JoinedShares`); its warp roles share the last warpgroup's least."""
         return tuple((role.weight, count) for role, count in joined if not role.warp)
 
-    def warpgroups(self, consumers: int, joined: tuple = ()) -> int:
+    def warpgroups(self, consumers: int, joined: handoffs.Joined = ()) -> int:
         """The warpgroups a program of `consumers` compute roles runs: theirs, a producer's where the
         family streams from a role of its own (`roles`), and its `joined` roles' (`role_schedule`)."""
         return self.role_schedule(consumers, joined=joined).warpgroups()
@@ -1680,7 +1686,7 @@ class Transport[Allocated, Opened](abc.ABC):
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None, tmem: int = 0,
-               moves: bool | None = None, joined: tuple = ()) -> Callable:
+               moves: bool | None = None, joined: handoffs.Joined = ()) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own and its
         `joined` roles (`role_schedule`: their warpgroups among its threads, their registers in its model),
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
@@ -1729,15 +1735,22 @@ class Transport[Allocated, Opened](abc.ABC):
 
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
                   exclusive: bool = False, static_consumers: bool = False, issuer: Callable | None = None,
-                  joined: tuple = ()):
+                  joined: handoffs.Joined = (), bodies: Mapping[str, Callable] | None = None):
         """The family's roles run (`role_schedule`, its producer at `floor`): `consumer(index)`, `producer()`,
-        `issuer()` where it issues on a role (`Issuer.places_on_role`), each `joined` role's body at its index
-        (`(role, count, body)`: a correction warpgroup's, a launch's reducing warps'), a switch's branches
-        where `exclusive`, a consumer's at a static index where `static_consumers`; the consumers' value."""
-        schedule = self.role_schedule(consumers, floor, tuple((role, count) for role, count, _ in joined))
+        `issuer()` where it issues on a role (`Issuer.places_on_role`), each `joined` role's body by its name
+        at its index (`bodies`: a correction warpgroup's, a launch's reducing warps'), `joined` the value its
+        launch was sized by (`kernel`), a switch's branches where `exclusive`, a consumer's at a static index
+        where `static_consumers`; the consumers' value. A joined role with no body, or a body of no joined
+        role, is refused as it traces (row 9785: a warpgroup launched beside no body hung its hand-offs)."""
+        bodies = {} if bodies is None else bodies
+        named = {role.name for role, _ in joined}
+        if named != set(bodies):
+            raise ValueError(f"{self.name}'s joined roles {sorted(named)} and their bodies {sorted(bodies)} "
+                             "differ: each role its launch was sized by runs its own body")
+        schedule = self.role_schedule(consumers, floor, joined)
         # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
         units = {"producer": producer, "issuer": issuer}
-        bodies = {"consumer": consumer, **{role.name: body for role, _, body in joined},
+        bodies = {"consumer": consumer, **bodies,
                   **{name: lambda index, body=body: body() for name, body in units.items()}}
         return schedule.run(exclusive=exclusive, static="consumer" if static_consumers else None,
                             **{role.name: bodies[role.name] for role in schedule.roles})
@@ -1872,7 +1885,7 @@ class Transport[Allocated, Opened](abc.ABC):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, chunks: tuple[int, int] | None = None) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
@@ -1981,11 +1994,12 @@ class Transport[Allocated, Opened](abc.ABC):
         tiles' and its reads' (`schedule`)."""
         return [self.schedule(consumers), self.schedule(consumers)]
 
-    def output_staging(self, outputs: tuple, consumers: int) -> list:
+    def output_staging(self, outputs: tuple, consumers: int, chunks: tuple[int, int] | None = None) -> list:
         """The shared memory `persist` stages each of `outputs` (`(shape, dtype)`, a tile's) in, which a
         template's allocations count as its own (`resources.Scope`): the whole tile, where a family stages
-        it whole."""
+        it whole, which takes no `chunks` (chunk columns and buffers, `stores.output_staging`'s `staging`)."""
         del consumers
+        refuse_staging(self, chunks)
         return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
 
     def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = (), *,
@@ -2167,7 +2181,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         return into
 
     def programs(self, consumers: int, registers: int | None = None, producer: int | None = None,
-                 joined: tuple = ()) -> int:
+                 joined: handoffs.Joined = ()) -> int:
         """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
         consumer roles holding `registers` (None: the family's budget, `registers`) beside a producer
         lowered to `producer`: at warpgroup MMA's budget, one, its consumers raised to the register file's

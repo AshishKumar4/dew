@@ -682,11 +682,6 @@ class OuterProgram:
     """The jits it holds, each the one call's it was validated for (`_validated`), the least recently taken
     let go past it."""
 
-    @property
-    def jitted(self) -> jax.stages.Wrapped:
-        """A jit of its own, past every jit it holds (`_held_jit`), each its one call's."""
-        return self._jitted()
-
     def _held_jit(self, key: Hashable) -> jax.stages.Wrapped | None:
         """The jit whose trace was validated for the call of abstract key `key` (`_validated`), None where
         none was: read, never claimed, so a call at another key traces by a jit of its own and a held jit
@@ -724,21 +719,21 @@ class OuterProgram:
 
     def _traced(self, held: tuple[jax.stages.Wrapped, tuple], args: tuple, kwargs: dict, *, frozen: bool
                 ) -> tuple[jax.stages.Traced, tuple[jax.stages.Wrapped, tuple]] | ReadingRefused:
-        """`jitted`'s trace of a call, its program the algebra pass's (`algebra.rewritten_program`), so its
-        lowering, its trace, its executable and every relowering read one program (docs/design/algebra.md
-        §6.7): the pass reads the trace jit made, which lowers as it is where no rule changes it; a program
-        a rule changes lowers from its rewritten program, never traced again (`program.traced_as`). Its
-        switch is in JAX's trace context, so a held program traces afresh as it changes. A program called
-        within the trace is part of this one, which the pass reads whole (`_nested`). Within a block
-        certifying aside, the launches an outermost program's trace reaches settle before it is lowered, the
-        program traced afresh past a refused config by a jit of its own, past JAX's trace cache (`_jitted`;
-        `report.settled_trace`), so it lowers once; a program traced within another's (a launch's own, as its
-        capture traces it) settles nothing mid-trace. Beside its trace, the jit that made it and the launches
-        refused as it traced (`held`'s, or a settle's own retrace's). Each trace reads those refusals alone
-        and its own (`report.reading`), never another thread's recorded as it traces, so the program a jit's
-        trace cache keeps is the one they make; `held`'s, where it is a held jit (`frozen`), none of its own,
-        its cache only ever its key's: where its trace recorded one, the refusal that ended it taking nothing
-        (`report.ReadingRefused`)."""
+        """Its trace of a call by `held`'s jit, its program the algebra pass's (`algebra.rewritten_program`),
+        so its lowering, its trace, its executable and every relowering read one program
+        (docs/design/algebra.md §6.7): the pass reads the trace jit made, which lowers as it is where no
+        rule changes it; a program a rule changes lowers from its rewritten program, never traced again
+        (`program.traced_as`). Its switch is in JAX's trace context, so a held program traces afresh as it
+        changes. A program called within the trace is part of this one, which the pass reads whole
+        (`_nested`). Within a block certifying aside, the launches an outermost program's trace reaches
+        settle before it is lowered, the program traced afresh past a refused config by a jit of its own,
+        past JAX's trace cache (`_jitted`; `report.settled_trace`), so it lowers once; a program traced
+        within another's (a launch's own, as its capture traces it) settles nothing mid-trace. Beside its
+        trace, the jit that made it and the launches refused as it traced (`held`'s, or a settle's own
+        retrace's). Each trace reads those refusals alone and its own (`report.reading`), never another
+        thread's recorded as it traces, so the program a jit's trace cache keeps is the one they make;
+        `held`'s, where it is a held jit (`frozen`), none of its own, its cache only ever its key's: where
+        its trace recorded one, the refusal that ended it taking nothing (`report.ReadingRefused`)."""
         from dew.nn.kernels.templates import report
 
         outermost = not _PASSING.get()

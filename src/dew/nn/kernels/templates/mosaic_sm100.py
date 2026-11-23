@@ -737,7 +737,7 @@ class Tcgen05Rings(Tcgen05Issuer, ring_family.RingFamily[Accumulator]):
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), summed: int = 0,
                 prepared: Callable | None = None, producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, chunks: tuple[int, int] | None = None) -> None:
         """`mosaic.Family.persist`, its tiles' accumulators turning in tensor memory, no ping-pong
         (`takes_pingpong`). With `prepared`, `prepared(tile, index, slots)` rewrites each step's slots before
         its products read them (a kernel gradient's neighbouring groups' rows zeroed), run by a role of its
@@ -764,7 +764,7 @@ class Tcgen05Rings(Tcgen05Issuer, ring_family.RingFamily[Accumulator]):
         opened = self.opened(streams)
         for ring in opened.values():
             ring.initialized()
-        staging = self.output_staging(outputs, consumers)
+        staging = self.output_staging(outputs, consumers, chunks)
         rewrites = () if prepared is None else tuple(ring.stages for ring in opened.values())
         width = sum(shape[1] for shape in accumulators)
         offsets = [sum(shape[1] for shape in accumulators[:index]) for index in range(len(accumulators))]

@@ -332,10 +332,11 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         del steps
         return tuple(ring['slots'] for ring in streams.values()), ()
 
-    def output_staging(self, outputs: tuple, consumers: int) -> list:
+    def output_staging(self, outputs: tuple, consumers: int, chunks: tuple[int, int] | None = None) -> list:
         # Each output's tile staged in VMEM twice its rows: a store's window shifted back to the output's
-        # last rows holds the tile at the shift (`persist`'s `store`).
+        # last rows holds the tile at the shift (`persist`'s `store`), whole, in no chunks.
         _one(consumers)
+        mosaic.refuse_staging(self, chunks)
         return [pltpu.VMEM((2 * shape[0], *shape[1:]), dtype) for shape, dtype in outputs]
 
     def opened(self, allocated, views: dict | None = None):
@@ -353,7 +354,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, chunks: tuple[int, int] | None = None) -> None:
         del producer  # no producer role of its own
         self.pingponged(pingpong)
         # A launch's tiles round-robin over its programs, each tile's outputs staged in VMEM and copied out
@@ -402,7 +403,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
             lax.fori_loop(0, (total - program + programs - 1) // programs, visit, 0)
 
-        pl.run_scoped(run, *self.output_staging(outputs, consumers))
+        pl.run_scoped(run, *self.output_staging(outputs, consumers, chunks))
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
