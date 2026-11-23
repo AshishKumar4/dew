@@ -1129,13 +1129,13 @@ def _typed(step) -> None:
 
 
 def _marked_resume(run, rewritten: OptimConfig) -> OptimConfig:
-    """The optimizer a resume of `run` reads (`RunConfig.resumed`), its record `rewritten` by an intermediate
-    Dew beside its mark of its whole config (`earlier-masked-decay.json`)."""
+    """The optimizer a whole resume of `run` reads (`RunConfig.resumed`, every field it resolves), its record
+    `rewritten` by an intermediate Dew beside its mark of its whole config (`earlier-masked-decay.json`)."""
     from dew.config.lm import LMRunConfig
 
     LMRunConfig(optim=rewritten, trainer=_named(run)).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json.dumps({"unmasked_all": True}))
-    return LMRunConfig.load(str(run)).resumed(()).optim
+    return LMRunConfig.load(str(run)).resumed().optim
 
 
 def _checkpointed(directory, optimizer, steps, local=None, persistent: bool = True):
@@ -1264,7 +1264,7 @@ def test_a_run_an_intermediate_dew_rewrote_beside_its_mark_resumes_as_it_trained
     rewritten = OptimConfig(optimizer=spec(weight_decay=0.0), learning_rate=1e-2, spared=False)
     LMRunConfig(optim=rewritten, trainer=_named(run)).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
-    loaded = LMRunConfig.load(str(run)).resumed(()).optim
+    loaded = LMRunConfig.load(str(run)).resumed().optim
     assert type(loaded.optimizer) is spec, loaded
     assert (loaded.decay_mask, loaded.spared) == (False, False) and isinstance(loaded.optimizer, Adam), loaded
     assert loaded.optimizer.weight_decay > 0, loaded
@@ -1325,7 +1325,7 @@ def test_an_intermediate_dews_newer_local_step_decides_its_mark_once_and_for_goo
     mark.write_text(json_.dumps({"unmasked_all": True}))
     # Read as written, opening nothing: the mark is decided where the run resumes, its process joined.
     assert LMRunConfig.load(str(run)) == config
-    loaded = LMRunConfig.load(str(run)).resumed(())
+    loaded = LMRunConfig.load(str(run)).resumed()
     assert isinstance(loaded.optim.optimizer, AdamW), loaded.optim
     assert (loaded.optim.decay_mask, loaded.optim.optimizer.weight_decay) == (None, 0.0), loaded.optim
     loaded.save(str(run))

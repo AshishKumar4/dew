@@ -1031,8 +1031,8 @@ class RunConfig:
             recorded = None if saved is None else self._saved_as(saved)
             # A field of a record the saved run held none of (a teacher it had not) takes nothing.
             if recorded is not None:
-                run = self.override({path: _recorded_at(recorded, path) for path in unset
-                                     if _holds(recorded, path)})
+                run = run.override({path: _recorded_at(recorded, path) for path in unset
+                                    if _holds(recorded, path)})
                 run = run._defaulted_as(recorded) if defaulting else run
         # A relaxed resume of a run saved under a version this Dew reads none of reads by this Dew's, its
         # data started again (`dew.training.Trainer._data_resumed`); an exact one is refused by it.
@@ -1052,13 +1052,16 @@ class RunConfig:
         name = self.trainer.name
         assert name is not None, "a run resumes under its name"
         mark = epath.Path(self.trainer.directory(name)) / MASKED_DECAY_MARK
-        if not mark.exists():
+        # Read alike by every process, or refused on all, before the checkpoints' choice agrees across them.
+        marked = agreed_same("a run's masked-decay mark",
+                             lambda: json.loads(mark.read_text()) if mark.exists() else None)
+        if marked is None:
             return self
         with self.trainer.checkpoints(name) as checkpoints:
             step = checkpoints.latest
             if step is not None and checkpoints.saved_with(step, "typed_optimizer") is True:
                 return self
-        earlier = unmarked(self.record(), json.loads(mark.read_text()))
+        earlier = unmarked(self.record(), _records.record(marked, MASKED_DECAY_MARK))
         fields = _records.record(earlier["fields"], "run fields")
         return dataclasses.replace(self, optim=from_record(OptimConfig, _records.json_value(fields["optim"],
                                                                                            "optim")))
