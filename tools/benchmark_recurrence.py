@@ -94,13 +94,17 @@ SHAPES = {
     'log-linear-mamba2': Shape('loglinear', 1, 64, 128, 64),
     # tests/fixtures/hf/minimax-text-01/config.json: its lightning layers' 64 heads of 128 (M1's alike).
     'minimax-text-01-lightning': Shape('lightning', 64, 64, 128, 128),
+    # Mamba-1 2.8B (mamba_ssm's mamba-2.8b: d_model 2560, expand 2, d_state 16): its selective scan over
+    # 5120 channels of state 16, 8 rows of 2048 tokens (row 1300's H100 and A100 cells).
+    'mamba-2.8b-selective': Shape('selective', 1, 1, 16, 5120, batch=8, length=2048),
 }
 """The real shapes. Dory 1.0 4B has none: its layers are attention and MLP (its config.json)."""
 
 ARMS = {'gdn': ('template', 'mosaic', 'hand', 'xla', 'fla', 'flashqla'),
         'kda': ('template', 'mosaic', 'hand', 'xla', 'fla'),
         'ssd': ('template', 'mosaic', 'hand', 'xla', 'mamba_ssm'), 'conv': ('hand', 'xla', 'fla'),
-        'loglinear': ('template', 'mosaic', 'xla', 'fla'), 'lightning': ('template', 'mosaic', 'xla', 'fla')}
+        'loglinear': ('template', 'mosaic', 'xla', 'fla'), 'lightning': ('template', 'mosaic', 'xla', 'fla'),
+        'selective': ('template', 'mosaic', 'xla', 'mamba_ssm')}
 
 JAX_ARMS = ('template', 'mosaic', 'hand', 'xla')
 """The arms `jax` mode runs (`jax_arms`), each on the shapes whose `ARMS` list it."""
@@ -118,6 +122,9 @@ def flops(shape: Shape) -> float:
         return model.conv_flops(lengths, channels, channels, shape.taps, groups=channels)
     if shape.kind in ('ssd', 'lightning'):
         return model.ssd_flops(lengths, shape.value_heads, shape.key_width, shape.value_width)
+    if shape.kind == 'selective':
+        # Each channel a head of one value column: its state's write and read, `4 D N` a token.
+        return model.ssd_flops(lengths, shape.value_width, shape.key_width, 1)
     if shape.kind == 'loglinear':
         return model.log_linear_flops(lengths, shape.value_heads, shape.key_width, shape.value_width,
                                       _levels(shape.length))
@@ -139,6 +146,13 @@ def operands(shape: Shape, seed: int = 0) -> dict[str, np.ndarray]:
         channels = 2 * shape.key_heads * shape.key_width + shape.value_heads * shape.value_width
         return {'x': normal(batch, length, channels), 'taps': 0.5 * normal(channels, shape.taps),
                 'dy': normal(batch, length, channels)}
+    if shape.kind == 'selective':
+        channels, state = shape.value_width, shape.key_width
+        return {'x': normal(batch, length, channels),
+                'dt': np.log1p(np.exp(normal(batch, length, channels) - 2.0)),
+                'A': -np.exp(rng.uniform(0.0, np.log(16.0), (channels, state))).astype(np.float32),
+                'B': normal(batch, length, state), 'C': normal(batch, length, state), 'D': normal(channels),
+                'dy': normal(batch, length, channels), 'dfinal': normal(batch, channels, state)}
     if shape.kind == 'ssd':
         heads, groups = shape.value_heads, shape.key_heads
         return {'x': normal(batch, length, heads, shape.value_width),
@@ -187,17 +201,18 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
                 'xla': lambda x, taps: linear.xla_conv1d(x, taps, activation=True)}
         inputs, cotangents = (x, taps), given['dy'].astype(bf16)
     else:
-        builder = {'ssd': _ssd_parts, 'loglinear': _loglinear_parts, 'lightning': _lightning_parts}.get(
-            shape.kind, _gated_parts)
+        builder = {'ssd': _ssd_parts, 'loglinear': _loglinear_parts, 'lightning': _lightning_parts,
+                   'selective': _selective_parts}.get(shape.kind, _gated_parts)
         inputs, template, hands, refusals, cotangents = builder(shape, given)
 
         def xla(*args):
-            with generation.chosen(gated_delta_rule='xla', ssd='xla'):
+            with generation.chosen(gated_delta_rule='xla', ssd='xla', selective_scan='xla'):
                 return template(*args)
 
         def mosaic(*args):
             # The template named, on the cells its route gives a port (`recurrence_chunk.PORT_CELLS`).
-            with generation.chosen(gated_delta_rule='mosaic_gpu', ssd='mosaic_gpu'):
+            with generation.chosen(gated_delta_rule='mosaic_gpu', ssd='mosaic_gpu',
+                                   selective_scan='mosaic_gpu'):
                 return template(*args)
 
         arms = {'template': template, 'mosaic': mosaic, **hands, 'xla': xla}
@@ -232,6 +247,24 @@ def _ssd_parts(shape: Shape, given: dict) -> tuple:
     case = scan_case(x, B, shape.chunk)
     refusals = {'hand': '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').refusals(case))}
     return inputs, template, {'hand': hand}, refusals, (given['dy'].astype(jnp.bfloat16), given['dfinal'])
+
+
+def _selective_parts(shape: Shape, given: dict) -> tuple:
+    """A Mamba-1 shape's (`_ssd_parts`'s): its selective scan as its layer runs it (`mixers.mamba.
+    selective_scan`, its step already through softplus), `x`, the step, `B` and `C` in bf16 as mamba_ssm's
+    bf16 training takes them, `A` and `D` fp32."""
+    import jax.numpy as jnp
+
+    from dew.nn.mixers.mamba import selective_scan
+
+    bf16 = jnp.bfloat16
+    inputs = (given['x'].astype(bf16), given['dt'].astype(bf16), given['A'], given['B'].astype(bf16),
+              given['C'].astype(bf16), given['D'])
+
+    def template(x, dt, A, B, C, D):
+        return selective_scan(x, dt, A, B, C, D, chunk_size=shape.chunk)
+
+    return inputs, template, {}, {}, (given['dy'].astype(bf16), given['dfinal'])
 
 
 def _loglinear_parts(shape: Shape, given: dict) -> tuple:
@@ -404,7 +437,7 @@ def _torch_case(shape: Shape, arm: str, given: dict, bf16, torch) -> tuple | str
     """`torch_arm`'s leaves, call and cotangents for `arm` on `shape`, or its kernels' refusal of this GPU;
     each arm's package imported by name, an optional one no environment but its own holds."""
     if arm == 'mamba_ssm':
-        return _mamba_ssm_case(shape, given, bf16)
+        return (_mamba_selective_case if shape.kind == 'selective' else _mamba_ssm_case)(shape, given, bf16)
     if arm == 'flashqla':
         return _flashqla_case(shape, given, bf16, torch)
     cases = {'loglinear': _fla_loglinear_case, 'lightning': _fla_lightning_case, 'conv': _fla_conv_case}
@@ -420,6 +453,23 @@ def _mamba_ssm_case(shape: Shape, given: dict, bf16) -> tuple:
         return combined(x, dt, A, B, C, shape.chunk, D=D, return_final_states=True)
 
     return leaves, run, (given['dy'].to(bf16), given['dfinal'])
+
+
+def _mamba_selective_case(shape: Shape, given: dict, bf16) -> tuple:
+    """mamba_ssm's `selective_scan_fn` (its CUDA kernels) on a Mamba-1 shape, laid as it takes them before the
+    timed call (`u` and `delta` `[B, D, S]`, `B` and `C` `[B, N, S]`), its step already through softplus."""
+    scan = importlib.import_module('mamba_ssm.ops.selective_scan_interface').selective_scan_fn
+
+    def laid(name, dtype=None):
+        value = given[name].transpose(1, 2).contiguous()
+        return value if dtype is None else value.to(dtype)
+
+    leaves = [laid('x', bf16), laid('dt', bf16), given['A'], laid('B', bf16), laid('C', bf16), given['D']]
+
+    def run(x, dt, A, B, C, D):
+        return scan(x, dt, A, B, C, D, return_last_state=True)
+
+    return leaves, run, (laid('dy', bf16), given['dfinal'])
 
 
 def _flashqla_case(shape: Shape, given: dict, bf16, torch) -> tuple | str:

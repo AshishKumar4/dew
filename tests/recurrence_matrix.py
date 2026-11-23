@@ -298,23 +298,33 @@ TPU_CASES = (
 """The TPU cells' cases (`kernel_matrix.covering("recurrence_tpu")`)."""
 
 
+def upstream_block(named: dict[str, str], starts, operands: list[dict],
+                   cotangents: list[tuple]) -> list[dict]:
+    """The upstream's own computation of `named`'s cell (its form's release's, `FORM_RELEASES`,
+    `UPSTREAMS`) on a block of draws as one call, each draw's operands by name and its cotangents stacked:
+    each draw's results by name (`out`, `final`, `d_<operand>`), host arrays. The live arm's (`_upstream`)
+    and a recording's (tools/matrix_reference.py), one conversion."""
+    run = UPSTREAMS[FORM_RELEASES[named["form"]]]
+    found = run(named, {name: np.stack([each[name] for each in operands]) for name in operands[0]},
+                tuple(np.stack(parts) for parts in zip(*cotangents, strict=True)), starts)
+    return [{name: value[index] for name, value in found.items()} for index in range(len(operands))]
+
+
 def _upstream(named: dict[str, str], block: int, *, first: int = 0):
-    """The upstream's own computation of `named`'s cell at its dtype (`upstream_support.upstream_arm`): its
-    form's release's (`FORM_RELEASES`, `UPSTREAMS`) on the cell's stacked draws, read back a draw at a time,
-    the same tree as the cell's own step, up to `UPSTREAM_SEEDS` past `first`."""
-    run, starts = UPSTREAMS[FORM_RELEASES[named["form"]]], _starts(named)
+    """The upstream's own computation of `named`'s cell at its dtype (`upstream_support.upstream_arm`,
+    `upstream_block`) on the cell's draws, read back a draw at a time, the same tree as the cell's own step,
+    up to `UPSTREAM_SEEDS` past `first`."""
+    starts = _starts(named)
 
     def run_block(drawn):
         # The draw's arrays alone: a static field (`Chunk.held`) is no operand of the upstream's.
         names = [path[0].name for path, _ in jax.tree_util.tree_leaves_with_path(drawn[0][0])]
-        found = run(named, {name: np.stack([getattr(operands, name) for operands, _ in drawn])
-                            for name in names},
-                    tuple(np.stack(parts) for parts in zip(*(c for _, c in drawn), strict=True)), starts)
-        return [((jnp.asarray(found["out"][index]), jnp.asarray(found["final"][index])),
-                 dataclasses.replace(operands, **{name: jnp.asarray(found[f"d_{name}"][index],
-                                                                    getattr(operands, name).dtype)
-                                                  for name in names}))
-                for index, (operands, _) in enumerate(drawn)]
+        found = upstream_block(named, starts, [{name: getattr(operands, name) for name in names}
+                                               for operands, _ in drawn], [c for _, c in drawn])
+        return [((jnp.asarray(each["out"]), jnp.asarray(each["final"])),
+                 dataclasses.replace(operands, **{
+                     name: jnp.asarray(each[f"d_{name}"], getattr(operands, name).dtype) for name in names}))
+                for each, (operands, _) in zip(found, drawn, strict=True)]
 
     return upstream_arm(run_block, functools.partial(_drawn, named), block, most=UPSTREAM_SEEDS, first=first,
                         keyed=lambda operands, cotangents: operands)

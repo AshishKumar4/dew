@@ -1465,28 +1465,54 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
     Dv]` in at least fp32, inside a `shard_map` that holds `axis` manual: fla's context-parallel
     summary-then-states (fla/ops/cp/chunk_delta_h.py, fla-core 0.5.2). A delta rule's slice is affine in
     the memory it enters, `S = F S_0 + Z` (each token's transition on the left, `recurrence.update`), so
-    each shard's summary is `rule`'s final memory over its slice from `[0 | I]` with values `[v | 0]`, in
-    at least fp32 (rounding the identity block's products to the operands' dtype would round the
-    transfer): `Z` the write its last document leaves from zero, `F` its transfer, zero where that document
-    starts inside the slice. The summaries are each shard's span (`recurrence_algebra.Span`), whose exclusive
-    prefix over `axis` (`recurrence_algebra.entering`) from the row's `state` (zero where None) on the first
-    shard is the memory each enters, `E_r = F_{r-1} E_{r-1} + Z_{r-1}`; a slice that starts a document (its
-    first token's `starts`) enters from zero. `rule(query, key, value, g, beta, state, *, starts)` returns
-    `(output, final memory)`."""
+    each shard's summary is its slice's affine map: `Z` the write its last document leaves from zero,
+    `rule`'s final memory over its slice from zero in the layer's own operands (at the pass's own distance
+    from float64), and `F` its transfer (`transferred`), zero where that document starts inside the slice.
+    The summaries are each shard's span (`recurrence_algebra.Span`), whose exclusive prefix over `axis`
+    (`recurrence_algebra.entering`) from the row's `state` (zero where None) on the first shard is the memory
+    each enters, `E_r = F_{r-1} E_{r-1} + Z_{r-1}`; a slice that starts a document (its first token's
+    `starts`) enters from zero. `rule(query, key, value, g, beta, state, *, starts)` returns `(output, final
+    memory)`. Taken as `rule`'s final memory from `[0 | I]` with values `[v | 0]` in fp32 operands, the
+    summary cost 6.2 to 6.7 times its pass (M-JS-142) and the 27B's 9.99 ms on a GH200 at 4096 tokens against
+    2.15 for the layer's bf16 operands, whose transfer, though, rounded its identity block's products to
+    bf16 at 3.5 times the pass's distance from float64 (M-JS-143c)."""
     batch, _, heads, columns = value.shape
     width = key.shape[-1]
     wide = at_least_fp32(value.dtype)
     shard = jax.lax.axis_index(axis)
     begins = (jnp.zeros((batch,), bool) if starts is None else jnp.asarray(starts[:, 0], bool)) & (shard > 0)
     zero = rows_like(jnp.zeros((batch, heads, width, columns), wide), value)
-    identity = jnp.where(begins[:, None, None, None], 0.0,
-                         jnp.broadcast_to(jnp.eye(width, dtype=wide), (batch, heads, width, width)))
-    widened = jnp.concatenate([value.astype(wide), jnp.zeros((*value.shape[:-1], width), wide)], axis=-1)
-    _, summary = rule(query.astype(wide), key.astype(wide), widened, g, beta.astype(wide),
-                      jnp.concatenate([zero, identity], axis=-1), starts=starts)
-    span = algebra.Span(summary[..., columns:], summary[..., :columns])
+    _, write = rule(query, key, value, g, beta, zero, starts=starts)
+    span = algebra.Span(transferred(query, key, value, g, beta, starts), write.astype(wide))
     memory = algebra.entering(span, axis, None if state is None else state.astype(wide))
     return jnp.where(begins[:, None, None, None], 0.0, memory)
+
+
+def transferred(query, key, value, g, beta, starts=None, *, chunk_size: int = CHUNK_SIZE) -> jax.Array:
+    """The delta rule's transfer over a slice of its tokens, `[B, Hv, Dk, Dk]` in at least fp32: the linear
+    map `F` the slice's tokens apply to the memory entering it (`S_out = F S_in + Z`), zero where a document
+    starts in it (`starts`), each chunk's transition chained onto the chunks' before it in fp32 from the
+    operands as they are given (`scan.derive_scan`'s walk carrying its transfer: `prepare(...,
+    transition=True)`, `step`), as fla-core 0.5.2's context parallelism chains its transfer from bf16
+    `k^T w` (ops/cp/chunk_delta_h.py:304-315), no product's result rounded on the way. The forms' memory is
+    one value column wide and zero: the transfer reads no value."""
+    _, work, _, key = _grouped(query, key, value, None)
+    width = key.shape[-1]
+    forms = _delta_forms(delta=True, scale=1.0, per_key=g.ndim == 4, width=width, columns=1,
+                         work=jnp.dtype(work), reset=starts is not None, bound=None)
+    unread = jnp.zeros((*value.shape[:3], 1), work)
+    operands = _chunked({"q": key, "k": key, "v": unread, "g": g, "beta": beta}, starts, chunk_size, work)
+    varying = (key, g, beta, starts)
+
+    def walked(chunks: dict) -> jax.Array:
+        """One row's and head's transfer over its chunks `[chunks, C, ...]`."""
+        start = jax.tree.map(lambda x: varying_like(x, *varying),
+                             forms.init(jax.tree.map(lambda x: x[0], chunks)))
+        prepared = jax.vmap(functools.partial(forms.prepare, transition=True))(chunks)
+        last, _ = jax.lax.scan(lambda walk, chunk: (forms.step(walk, chunk), None), start, prepared)
+        return last.transfer
+
+    return jax.vmap(jax.vmap(walked))(operands)
 
 
 def _unit_pairs(hooks: recurrence.Hooks) -> bool:
