@@ -343,12 +343,16 @@ class _PerShare(Forwarding):
         version wrote it (`written`, its `grain` rule): a state that Grain's iterators read otherwise
         than this Grain's is refused, naming both, where its restore refuses its form; one they read alike
         resumes. The read opened before it, its failure (a file it cannot open) is its own, never a version's
-        (row 12178)."""
+        (row 12178), as a cursor of Dew's own that holds no position is (`MalformedPosition`)."""
         if written == GRAIN or self._saved is None:
             return
         read = self._open()
         try:
             read.set_state(self._saved)
+        except _position.MalformedPosition:
+            # A corrupt cursor of Dew's own, whatever Grain wrote beside it: refused as it is.
+            read.close()
+            raise
         except (KeyError, TypeError, ValueError, IndexError) as error:
             read.close()
             raise PlanChanged(("rules.grain",),

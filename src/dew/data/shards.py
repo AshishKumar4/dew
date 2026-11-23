@@ -10,6 +10,7 @@ from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 import grain.experimental as experimental
 import grain.python as grain
 
+from dew import _position
 from dew._records import boolean, integer, integers, listed, record
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
@@ -268,6 +269,9 @@ class _SequentialIterator(grain.DatasetIterator):
     def set_state(self, state: Mapping[str, object]) -> None:
         self.close()
         position = _sequential_position(state)
+        if not {"place", "rows"} <= position.keys():
+            raise _position.MalformedPosition(
+                f"a sequential shard pass's saved position holds no place and rows: {sorted(position)}")
         self.place = integer(position["place"], "sequential shard pass's place")
         rows = position["rows"]
         if rows is not None:

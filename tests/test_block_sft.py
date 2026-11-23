@@ -551,10 +551,11 @@ def image_run(inputs):
     return batch, data, jax.random.key(2)
 
 
-@pytest.mark.check1_shards(seeds=512, per_task=180)
+@pytest.mark.check1_shards(seeds=512, per_task=64)
 def test_an_image_sft_trainers_gradient_is_the_objectives(image_source):
     """The image SFT trainer's gradient is the objective's at the step's draws, the float64 twin of the
-    loaded multimodal fixture the truth (`assert_the_objectives_gradient`)."""
+    loaded multimodal fixture the truth (`assert_the_objectives_gradient`), its 512 draws in map tasks of
+    64 (row 12128: tasks of 180 took 515-615 s, past a CI group's bound)."""
     _, inputs, obj, variables, _ = image_source
     batch, _, run_key = image_run(inputs)
     with jax.enable_x64(new_val=True):
@@ -576,8 +577,7 @@ def test_image_sft_trainer_resumes_where_its_uninterrupted_run_lands(image_sourc
     """Native lifecycle evidence, not an official image-conditioned SFT oracle: an image-conditioned block
     SFT run trains its conditioner, and resumed from its checkpoint lands bit for bit where the same run
     uninterrupted does. Its publication is its own cell
-    (`test_image_sft_run_published_reads_back_and_generates_as_its_run`; row 12128: the two in one took
-    710 s of a 692 s group)."""
+    (`test_image_sft_run_published_reads_back_and_generates_as_its_run`)."""
     _, inputs, obj, variables, _ = image_source
     _, data, run_key = image_run(inputs)
     checkpoints = Checkpoints(str(tmp_path / "run"))

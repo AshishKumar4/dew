@@ -258,6 +258,44 @@ def test_a_position_another_grain_wrote_whose_read_fails_to_open_raises_that_fai
         stream.close()
 
 
+def test_a_position_whose_own_cursor_holds_no_rows_is_refused_as_corrupt_never_restarted():
+    """A saved position another Grain wrote whose own sequential cursor, Dew's, holds no `rows` is refused
+    as corrupt (`MalformedPosition`), never as the other Grain's (`PlanChanged`), which a relaxed resume
+    would answer by reading the data afresh (review of row 12178: every error the restore raised was
+    taken as a version's, so a corrupt cursor restarted a run's data)."""
+    from dew._position import MalformedPosition
+    from dew.data.plan import PlanChanged
+
+    chain = Pipeline(Memory({"id": np.arange(1, 25, dtype=np.int32)}, identity="ids")).repeat().batch(2)
+    saved, _ = _saved(chain)
+    cut = []
+
+    def corrupt(node):
+        if isinstance(node, dict):
+            if {"place", "rows"} <= node.keys():
+                del node["rows"]
+                cut.append(node)
+            for value in list(node.values()):
+                corrupt(value)
+        elif isinstance(node, list):
+            for value in node:
+                corrupt(value)
+
+    def other_grain_corrupt(decoded):
+        decoded["dew_data_plan"]["rules"]["grain"] = "0.0.1"
+        corrupt(decoded)
+
+    edited = _edited(saved, other_grain_corrupt)
+    assert cut, "the saved position holds a sequential cursor"
+    stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    try:
+        with pytest.raises(MalformedPosition) as raised:
+            stream.set_state(edited)
+        assert not isinstance(raised.value, PlanChanged)
+    finally:
+        stream.close()
+
+
 @dataclasses.dataclass(frozen=True)
 class Recut(Memory):
     """A store of the same content and options as `Memory`'s, cut into its shards in reverse: a store a

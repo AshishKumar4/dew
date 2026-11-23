@@ -136,14 +136,7 @@ def _from_replicas(tree, grids: Sequence[Grid], holders: frozenset[int]):
         held = values.sharding
         assert isinstance(held, jax.sharding.NamedSharding), "a key's data lies where its key does"
         mask = masks[_placed_on(mesh), split]
-        if jnp.issubdtype(values.dtype, jnp.complexfloating):
-            # A complex value's two lanes each summed as their words, its real and imaginary parts, as no
-            # word holds a complex number's bits whole (row 12177).
-            value = jax.lax.complex(_summed(jnp.real(values), mask, mesh, along),
-                                    _summed(jnp.imag(values), mask, mesh, along))
-        else:
-            value = _summed(values, mask, mesh, along)
-        value = jax.device_put(value, held)
+        value = jax.device_put(_summed(values, mask, mesh, along), held)
         return jax.random.wrap_key_data(value, impl=jax.random.key_impl(leaf)) if typed else value
 
     return jax.tree.map(recovered, tree)
@@ -151,19 +144,31 @@ def _from_replicas(tree, grids: Sequence[Grid], holders: frozenset[int]):
 
 def _summed(values: jax.Array, mask: jax.Array, mesh: jax.sharding.Mesh, along: tuple[str, ...]) -> jax.Array:
     """`values`' every shard as its source holds it (`mask` true on the source), summed over `along` as its
-    words: the source's bits and the others' zeros, the source's bits exactly (`_from_replicas`)."""
+    words: the source's bits and the others' zeros, the source's bits exactly (`_from_replicas`). A complex
+    value's real and imaginary parts are its two lanes, side by side on a trailing axis, each summed as its
+    words, as no word holds a complex number's bits whole (row 12177), in the one program."""
     held = values.sharding
     assert isinstance(held, jax.sharding.NamedSharding), "a covered save places by name (`Grid.each`)"
-    words = _UNSIGNED[max(values.dtype.itemsize, 1)]
+    lanes = jnp.issubdtype(values.dtype, jnp.complexfloating)
+    lane = jnp.finfo(values.dtype).dtype if lanes else values.dtype
+    words = _UNSIGNED[max(lane.itemsize, 1)]
 
     def sum_of_sources(value, source):
+        if lanes:
+            value = jnp.stack([jnp.real(value), jnp.imag(value)], axis=-1)
         bits = (value.astype(np.uint8) if value.dtype == np.bool_
                 else jax.lax.bitcast_convert_type(value, words))
-        return jax.lax.psum(jnp.where(source.reshape(()), bits, jnp.zeros_like(bits)), along)
+        summed = jax.lax.psum(jnp.where(source.reshape(()), bits, jnp.zeros_like(bits)), along)
+        if not lanes:
+            return summed
+        parts = jax.lax.bitcast_convert_type(summed, lane)
+        return jax.lax.complex(parts[..., 0], parts[..., 1])
 
     summing = jax.shard_map(sum_of_sources, mesh=mesh, out_specs=held.spec,
                             in_specs=(held.spec, jax.sharding.PartitionSpec(*mesh.axis_names)))
     summed = owned_program(summing)(jax.device_put(values, held.with_memory_kind("device")), mask)
+    if lanes:
+        return summed
     return summed != 0 if values.dtype == np.bool_ else jax.lax.bitcast_convert_type(summed, values.dtype)
 
 
