@@ -422,3 +422,92 @@ def test_a_scanned_step_whose_collection_is_not_finite_moves_no_weight():
     for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(jax.device_get(moved.variables["params"])),
                         strict=True):
         np.testing.assert_array_equal(new, old)
+
+
+@pytest.mark.parametrize("grouped, input_lm, context_backbone", [
+    (False, 0.0, False),
+    (True, 0.0, False),
+    (False, 0.25, False),
+    (False, 0.0, True),
+], ids=["decision", "decision-grouped", "decision-input-lm", "decision-context-backbone"])
+def test_a_decision_step_over_a_scanned_backbone_trains(grouped, input_lm, context_backbone):
+    """A decision objective's scanned backbone, which its step updates in its backward
+    (`dew.nn.in_backward`), runs inside `component('backbone')`, so its plan keys its run under
+    `backbone/stages/...` and two steps train every parameter to finite values (row 12076: the run's path
+    lacked `backbone`, raising `KeyError: 'stages'`), its parameters grouped or not. With `input_lm` or a
+    context the backbone encodes in its own pass, the loss differentiates the backbone twice a step, so the
+    step updates none in its backward (`Objective._updates_in_backward`) and trains as the ordinary scan
+    does; a loss that differentiated a run twice and said nothing is refused
+    (`test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the_backward`)."""
+    from decision_support import decision_rows
+
+    from dew.data.dataset import DataPartition, Loader
+    from dew.data.text import ByteTokenizer
+    from dew.decision import Choice, DecisionObjective, Example, Specials
+    from dew.decision.layout import SegmentLayout
+    from dew.nn.cross_attention import CrossAttention
+
+    team = Choice("Which team?", ["billing", "technical"])
+    examples = [
+        Example(text, {"team": team}, {"team": label}, context={"plan": "pro"} if context_backbone else None)
+        for text, label in (("charged twice", 0), ("site down", 1))
+    ] * 2
+    def backbone(*, scan: bool):
+        model = decoder(scan=scan, vocab_size=256, max_seq_len=32, num_layers=3)
+        return model.with_cross_attention(CrossAttention(layer_ids=(0,), context_length=16)) if (
+            context_backbone) else model
+    # eps=1e-4 keeps AdamW from magnifying 1e-8 rounding noise on DecisionHead's shift-invariant k_proj.bias.
+    adamw = AdamW(weight_decay=0.1, eps=1e-4)
+    optimizer = (
+        OptimConfig(optimizer=adamw, learning_rate=1e-2,
+                    param_groups=(ParamGroup("backbone", ("*backbone*",), learning_rate_multiplier=2.0),
+                                  ParamGroup("rest", ("*",))))
+        if grouped else OptimConfig(optimizer=adamw, learning_rate=1e-2)
+    )
+    layout = SegmentLayout.state_first_row(max_len=32, head_max_len=24, option_tokens=6)
+    opts = {"tokenizer": ByteTokenizer(), "specials": Specials(None, 10, 0, "\x00", 255),
+            "layout": layout, "input_lm": input_lm,
+            "context_encoder": "backbone" if context_backbone else "table"}
+    seed = DecisionObjective(backbone(scan=True), **opts)
+    variables = nn.unbox(seed.init(jax.random.key(0)))
+    batch = next(decision_rows(examples, 2, objective=seed.data()).train(DataPartition()))
+
+    def run_once(*, scan: bool):
+        objective = DecisionObjective(backbone(scan=scan), variables=variables, **opts)
+        data = Loader(train=lambda partition, b=batch: iter([b, b]), val=None, records=2, batch=2)
+        run = Trainer(objective, optimizer, key=jax.random.key(0), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30), fit=FitPolicy(split=1), checkpoints=None, tracker=None)
+        run.device_mesh = MeshSpec().build(jax.devices()[:1])
+        return run.fit(data, steps=2, log_every=2)
+
+    trained = run_once(scan=True)
+    assert int(jax.device_get(trained.updates)) == 2
+    before = jax.tree.leaves(variables["params"])
+    after = jax.tree.leaves(jax.device_get(trained.variables["params"]))
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in after)
+    assert any(not np.array_equal(np.asarray(old), np.asarray(new)) for old, new in zip(before, after,
+                                                                                         strict=True))
+
+
+def test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the_backward():
+    """A loss that runs a scanned stack twice and differentiates both (a language model's loss counted
+    twice) would take the sum of two updates as its weights were its step to update the stack in its
+    backward (`dew.nn.in_backward`): its plan, handling the run twice, is refused by name
+    (`Objective._updates_in_backward`), never trained silently (row 12076's review)."""
+    from dew.data.dataset import Loader
+
+    class Twice(LMObjective):
+        def loss(self, variables, batch, step):
+            stats, aux = super().loss(variables, batch, step)
+            again, _ = super().loss(variables, batch, step)
+            return jax.tree.map(lambda first, second: first + second, stats, again), aux
+
+    objective = Twice(decoder(scan=True), SEQ)
+    tokens = token_rows(VOCAB, 2, SEQ + 1)
+    data = Loader(train=lambda partition: iter([tokens, tokens]), val=None, records=2, batch=2)
+    run = Trainer(objective, OptimConfig(optimizer=AdamW(), learning_rate=1e-2), key=jax.random.key(0),
+                  mesh=MeshSpec(), layout=Layout(min_shard=2**30), fit=FitPolicy(split=1), checkpoints=None,
+                  tracker=None)
+    run.device_mesh = MeshSpec().build(jax.devices()[:1])
+    with pytest.raises(ValueError):
+        run.fit(data, steps=1, log_every=1)

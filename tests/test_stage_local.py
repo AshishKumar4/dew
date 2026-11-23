@@ -956,3 +956,33 @@ def test_a_local_saves_rows_on_each_stages_mesh_are_recovered_where_its_holders_
     assert _covered(grids, frozenset({0}), interleaved) and _covered(grids, frozenset({1}), interleaved)
     apart = {device.id: 0 if index < 2 else 1 for index, device in enumerate(devices)}
     assert not _covered(grids, frozenset({0}), apart)
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("devices", [1, 8], ids=["1dev", "8dev"])
+def test_a_one_stage_scanned_fit_keeps_shared_frozen_arrays_alive(devices):
+    """A one-stage scanned fit's state returned on its stored layers (`StageLocal.stored`, consumed) donates
+    its stacked `stages` arrays alone, its unstacked collections (`FROZEN`) untouched, so the arrays it
+    shares with the objective's held tree and its initial state stay readable and a second fit reads them
+    (row 12079: the frozen base was donated and deleted)."""
+    model = decoder(scan_layers=True)
+    base = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32)))
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
+    objective = LMObjective(adapter.model, SEQ, variables=adapter.variables, ema_decay=None)
+    run = Trainer(objective, optax.sgd(0.1), key=jax.random.key(2), mesh=MeshSpec(),
+                  layout=Layout(min_shard=2**30), checkpoints=None, tracker=None)
+    run.device_mesh = MeshSpec().build(jax.devices()[:devices])
+    initial = run.initial_state()
+    batch = token_rows(VOCAB, BATCH, SEQ + 1)
+    data = Loader(train=lambda partition: iter([batch, batch]), val=None, records=BATCH, batch=BATCH)
+    state = run.fit(data, steps=2, log_every=2)
+    for held, before, after in zip(jax.tree.leaves(adapter.variables[FROZEN]),
+                                   jax.tree.leaves(initial.variables[FROZEN]),
+                                   jax.tree.leaves(state.variables[FROZEN]), strict=True):
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(after))
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    # Fitting again over the same adapter variables must still read the live frozen base.
+    again = run.fit(data, steps=1, log_every=1)
+    for held, after in zip(jax.tree.leaves(adapter.variables[FROZEN]),
+                           jax.tree.leaves(again.variables[FROZEN]), strict=True):
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(after))

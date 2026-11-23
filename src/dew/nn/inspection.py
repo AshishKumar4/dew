@@ -95,6 +95,11 @@ def current_positions() -> jax.Array | None:
 _COMPONENT: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("watched_component", default=())
 
 
+def current_component() -> tuple[str, ...]:
+    """The path of enclosing `component` blocks in the model's variables, empty outside."""
+    return _COMPONENT.get()
+
+
 @contextlib.contextmanager
 def component(name: str) -> Iterator[None]:
     """Within the block, one part of a model applied in parts, each over its own part of the variables

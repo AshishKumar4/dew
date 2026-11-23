@@ -1582,7 +1582,8 @@ class Transaction:
         window of one under no loss scale (`consumed_where_made` refuses `TrainState.scale`) commits every
         attempt it takes, so what the backward wrote is what the commit keeps (`Applied.onto`), on the
         state the window leaves as on the one it commits."""
-        if self.size != 1 or self.split != 1 or self.inspection is not None:
+        if (self.size != 1 or self.split != 1 or self.inspection is not None
+                or not self.objective._updates_in_backward()):
             return None
         if self.aux_shape.effects is not None or FROZEN in state.variables:
             return None
@@ -1690,7 +1691,13 @@ class Transaction:
         if planned is None:
             return self._realized(realize, read, batch, step_info, factor), None
         with in_backward.planned(planned.plan):
-            return self._realized(self.realize_planned(planned), read, batch, step_info, factor), planned
+            realized = self._realized(self.realize_planned(planned), read, batch, step_info, factor)
+        if len(planned.plan.handled) != len(set(planned.plan.handled)):
+            # A run its loss differentiated twice would take the sum of two updates as its weights.
+            raise ValueError(f"{type(self.objective).__name__} differentiates a stacked layer run more than "
+                             "once in one loss, which no backward may update in place: its "
+                             "_updates_in_backward must say so")
+        return realized, planned
 
     def _pulled(self, realized: Realization, cotangent, planned: _Planned | None, *, whole: bool,
                 masters: bool) -> tuple[Variables, Variables | None, Applied | None]:

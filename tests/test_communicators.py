@@ -301,6 +301,49 @@ def test_a_programs_communicators_are_kept_under_the_digest_of_their_readers_cod
         groups=frozenset({(0, 1), (2, 3)}))
 
 
+def test_a_record_kept_beside_a_cache_it_cannot_write_is_made_again_and_its_miss_logged(
+        compilation_cache, tmp_path, monkeypatch, caplog):
+    """Every record Dew keeps beside its caches (`dew._cache.kept_beside`, `keep`): a program's
+    communicators, the host's measured ones and a step's rung, where a file stands in its directory's place
+    (a read-only home, refused whatever the process's user) keeps none: each is made again and serves the
+    process, one miss logged a keep, none raised (row 12018: a rung's keep raised); and a bucket's cache
+    (gs://) keeps nothing beside it, its records made in each process."""
+    from dew import _cache
+    from dew.training import rungs
+
+    compilation_cache.mkdir()
+    for name in ("dew-communicators", "dew-rungs"):
+        (compilation_cache / name).write_text("a file, no directory")
+    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / "dew").write_text("a file, no directory")
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("DEW_RUNG_RECORDS", raising=False)
+    read, measured = [], []
+
+    def text():
+        read.append(1)
+        return STEP
+
+    def measure(configured):
+        measured.append(1)
+        return NEEDS
+
+    with caplog.at_level(logging.WARNING, logger="dew._cache"):
+        for _ in range(2):
+            assert communicators.collectives_kept(b"step", (0, 1, 2, 3), text) == Collectives(
+                groups=frozenset({(0, 1), (2, 3)}))
+            assert communicators.measured({"gpus": ["held"]}, measure=measure) == NEEDS
+            directory = rungs.rung_records()
+            assert directory == compilation_cache / "dew-rungs"
+            rungs.keep_rung(directory / "step.json", {"step": 1}, {"split": 2})
+    assert len(read) == len(measured) == 2
+    assert len([entry for entry in caplog.records if "is not kept" in entry.getMessage()]) == 6, caplog.text
+    jax.config.update("jax_compilation_cache_dir", "gs://bucket/xla")
+    assert _cache.kept_beside("dew-communicators") is None and rungs.rung_records() is None
+    assert communicators.collectives_kept(b"step", (0, 1, 2, 3), text).groups == frozenset({(0, 1), (2, 3)})
+    assert len(read) == 3
+
+
 def test_a_programs_communicators_are_read_once_per_executable(compilation_cache):
     """A program's communicators are read from its text once per executable, kept beside the compilation
     cache by its fingerprint as positions in its device assignment, so a warm start that loads it from that
@@ -337,10 +380,10 @@ def test_communicators_kept_beside_one_cache_are_not_anothers_and_an_unwritable_
     assert read == [1, 1]
     (compilation_cache.parent / "file").write_text("")
     jax.config.update("jax_compilation_cache_dir", str(compilation_cache.parent / "file" / "xla"))
-    with caplog.at_level(logging.WARNING, logger="dew.communicators"):
+    with caplog.at_level(logging.WARNING, logger="dew._cache"):
         assert communicators.collectives_kept(b"step", (0, 1, 2, 3), text) == expected
     assert read == [1, 1, 1]
-    said = [record.levelname for record in caplog.records if record.name == "dew.communicators"]
+    said = [record.levelname for record in caplog.records if record.name == "dew._cache"]
     assert said == ["WARNING"]
 
 

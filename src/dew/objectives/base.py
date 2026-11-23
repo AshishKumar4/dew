@@ -1307,6 +1307,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return ()
 
+    def _updates_in_backward(self) -> bool:
+        """Whether each stacked layer run this objective's loss differentiates is differentiated once,
+        so its backward may update it in place (`dew.nn.in_backward`)."""
+        return True
+
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """Where the runs a pipeline over `stages` stages stacks lie in `store`, the variables a
         stage-local state is made from: the trainer keeps each stacked by stage on the stage's own

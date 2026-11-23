@@ -206,6 +206,12 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def counted_forward(self, module: nn.Module) -> str | None:
         """The method its loss reads its backbone by (`HeadedModel.states_method`); its head runs no loop."""
         return self.model.states_method if module is self.model.backbone else None
+
+    def _updates_in_backward(self) -> bool:
+        """`False` where the loss differentiates the backbone more than once (`input_lm`, or a context
+        the backbone encodes in its own pass), whose cotangents would add across passes."""
+        return not self.input_lm and not (self.context_length is not None
+                                          and self.model.own_pass(self.spans_in_context))
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Each packed row's own length, not its window's."""
         return _rows(batch, self.spans_in_context)[0]

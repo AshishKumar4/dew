@@ -427,11 +427,36 @@ class StageLocal:
         (`Trainer.stored`'s), their stacked arrays donated where they are `consumed`. It costs what a
         state that held every layer on every device held throughout; variables that hold no stacked run are
         returned as they are."""
-        if not self.holds(variables):
+        entries: list[tuple[DecoderBank, Mapping]] = []
+
+        def collect(site: DecoderBank, where: str, node: Mapping) -> Mapping:
+            if self._stacks(site, where) and "stages" in node:
+                entries.append((site, node["stages"]))
+            return node
+
+        _walked(variables, self.sites, collect)
+        if not entries:
             return variables
-        placement = self.rows_placement(jax.tree.map(lambda leaf: leaf.sharding, variables))
-        return program(_layered_arrays, static_argnums=0, out_shardings=placement,
-                       donate_argnums=(1,) if consumed else ())(self, variables)
+        sites, stacked = tuple(site for site, _ in entries), tuple(held for _, held in entries)
+        placements = tuple(
+            site.view.layer_form(
+                {"stages": jax.tree.map(lambda leaf: leaf.sharding, held)},
+                lambda path, sharding, shape: [
+                    _sharded(sharding, self.mesh, sharding.spec[len(shape):])] * math.prod(shape),
+            )
+            for site, held in entries
+        )
+        unstacked = iter(
+            program(_layered_entries, static_argnums=0, out_shardings=placements,
+                    donate_argnums=(1,) if consumed else ())(sites, stacked)
+            if jax.tree.leaves(stacked) else _layered_entries(sites, stacked))
+
+        def placed(site: DecoderBank, where: str, node: Mapping) -> Mapping:
+            if not (self._stacks(site, where) and "stages" in node):
+                return node
+            return {**{key: value for key, value in node.items() if key != "stages"}, **next(unstacked)}
+
+        return _walked(variables, self.sites, placed)
 
 
 _MIRRORS = ("variables", "opt_state", "ema", "compute")
@@ -448,8 +473,9 @@ def _stacked_piece(rows: list[jax.Array], *, within: tuple[int, ...]) -> jax.Arr
     return _stacked_rows(rows, (1, *within))
 
 
-def _layered_arrays(local: StageLocal, tree):
-    return local.layered(tree)
+def _layered_entries(sites: tuple[DecoderBank, ...], stacked: tuple[Mapping, ...]) -> tuple[dict, ...]:
+    return tuple(site.view.layer_form({"stages": held}, _layer_rows)
+                 for site, held in zip(sites, stacked, strict=True))
 
 
 def whole_reading(optimizer: optax.GradientTransformation | None, shapes, local: StageLocal) -> list[str]:
