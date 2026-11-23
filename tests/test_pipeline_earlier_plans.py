@@ -221,14 +221,14 @@ def test_a_position_another_grain_wrote_resumes_where_its_iterators_read_it():
 
 @dataclasses.dataclass(frozen=True)
 class Unopened(Memory):
-    """A store whose records refuse to open once `refused` holds a reason (a store whose manifest a later
+    """A store whose records refuse to open once `refused` holds the error (a store whose manifest a later
     write left unreadable), an error of its own whatever position is restored."""
 
-    refused: list[str] = dataclasses.field(default_factory=list, compare=False)
+    refused: list[ValueError] = dataclasses.field(default_factory=list, compare=False)
 
     def records(self, read):
         if self.refused:
-            raise ValueError(self.refused[0])
+            raise self.refused[0]
         return super().records(read)
 
 
@@ -238,7 +238,7 @@ def test_a_position_another_grain_wrote_whose_read_fails_to_open_raises_that_fai
     naming Grains that read alike (row 12178: every open's failure was refused as the other Grain's)."""
     from dew.data.plan import PlanChanged
 
-    refused: list[str] = []
+    refused: list[ValueError] = []
     chain = Pipeline(Unopened({"id": np.arange(1, 25, dtype=np.int32)}, identity="ids", refused=refused)
                      ).repeat().batch(2)
     saved, _ = _saved(chain)
@@ -247,11 +247,12 @@ def test_a_position_another_grain_wrote_whose_read_fails_to_open_raises_that_fai
         decoded["dew_data_plan"]["rules"]["grain"] = "0.0.1"
 
     stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
-    refused.append("the store's manifest is unreadable")
+    unreadable = ValueError("the store's manifest is unreadable")
+    refused.append(unreadable)
     try:
-        with pytest.raises(ValueError, match="manifest is unreadable") as raised:
+        with pytest.raises(ValueError) as raised:
             stream.set_state(_edited(saved, other_grain))
-        assert not isinstance(raised.value, PlanChanged), raised.value
+        assert raised.value is unreadable and not isinstance(raised.value, PlanChanged), raised.value
     finally:
         stream.close()
 
