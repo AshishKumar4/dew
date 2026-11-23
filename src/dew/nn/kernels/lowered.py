@@ -440,8 +440,9 @@ def unsynced_commits(module: bytes) -> list[str]:
     may still wait at the phase its arrival completes past (row 5671: a B200's tcgen05 chunk issuer). A warp
     alone in its role's waits (a warp-specialized issuer's) passes no other warp's. Each warp's path is its
     own (`_Walk`): a branch on the thread's index takes the warp's case, any other branch every case, the
-    union after; a loop to its fixed point, a while loop left past its condition; a region's blocks along
-    their successor edges; a call through its callee, its barrier arguments its caller's. A barrier is its
+    union after; a loop to its fixed point, a for loop left past its last turn where constants make it turn,
+    a while loop past its condition; a region's blocks along their successor edges, a block's arguments what
+    each edge passes; a call through its callee, its barrier arguments its caller's. A barrier is its
     array in shared memory and its slot (`_barrier`), slots a run's value picks maybe one (`_aliases`). Each
     finding names its function, warp and barrier (row 12144)."""
     kernel = mgpu.deserialized(module)
@@ -473,8 +474,6 @@ def unsynced_commits(module: bytes) -> list[str]:
                               for barrier in sorted(walk.unsynced, key=str)
                               if any(_aliases(barrier, each) for each in shared)]
     return found
-
-
 
 
 @dataclass(frozen=True)
@@ -515,12 +514,19 @@ class _Walk:
         while pending:
             index = pending.pop()
             left = self.block(blocks[index], entries[index])
-            successors = list(blocks[index].operations[-1].successors)
+            terminator = blocks[index].operations[-1]
+            successors = list(terminator.successors)
             if not successors:
                 exits |= left
-            for successor in successors:
+            for successor, passed in zip(successors, _edge_operands(terminator), strict=True):
                 at = next(place for place, each in enumerate(blocks) if each == successor)
-                if at not in entries or not left <= entries[at]:
+                # A successor's arguments are what each edge into it passes, merged at a join.
+                bound = False
+                for argument, value in zip(successor.arguments, passed, strict=True):
+                    incoming = self.arguments.setdefault(argument, set())
+                    bound |= value not in incoming
+                    incoming.add(value)
+                if at not in entries or not left <= entries[at] or bound:
                     entries[at] = entries.get(at, frozenset()) | left
                     pending.append(at)
         return exits
@@ -548,7 +554,9 @@ class _Walk:
             callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
             if (called := self.functions.get(callee)) is None:
                 return waited
-            bound = dict(zip(called.regions[0].blocks[0].arguments, operation.operands, strict=True))
+            bound = {argument: {value}
+                     for argument, value in zip(called.regions[0].blocks[0].arguments, operation.operands,
+                                                strict=True)}
             self.arguments.update(bound)
             try:
                 return self.region(called.regions[0], waited)
@@ -557,18 +565,28 @@ class _Walk:
                     del self.arguments[argument]
         if name in ("scf.for", "scf.while"):
             # A loop's turn starts where the last left it (a while's condition, then its body): to the fixed
-            # point, none run too. A for loop leaves from its head, a while loop past its condition.
+            # point, none run too. A for loop leaves from its head, past its last turn where constants make
+            # it turn at least once; a while loop past its condition.
             entry = waited
             while True:
                 turned = entry
                 for each in operation.regions:
                     turned = self.region(each, turned)
                 if (entry | turned) == entry:
-                    return entry if name == "scf.for" else self.region(operation.regions[0], entry)
+                    break
                 entry |= turned
+            if name == "scf.while":
+                return self.region(operation.regions[0], entry)
+            return turned if self.turns(operation) else entry
         if name in ("scf.if", "scf.index_switch"):
             return frozenset().union(*(self.region(each, waited) for each in self.taken(operation)))
         return frozenset().union(waited, *(self.region(each, waited) for each in operation.regions))
+
+    def turns(self, loop: ir.Operation) -> bool:
+        """Whether an `scf.for` turns at least once: its bounds constants (`_value`), its lower below its
+        upper."""
+        lower, upper = (_value(bound, self.thread) for bound in loop.operands[:2])
+        return lower is not None and upper is not None and lower < upper
 
     def syncs(self, operation: ir.Operation) -> bool:
         """Whether `operation` syncs every warp of the walk's warpgroup: the block's barrier (`gpu.barrier`,
@@ -667,19 +685,27 @@ def _launches(operation: ir.Operation) -> Iterator[gpu.LaunchOp]:
                 yield from _launches(inner.operation)
 
 
-def _barrier(value: ir.Value, arguments: dict) -> tuple[int | str, int | None]:
-    """The barrier a barrier operand addresses: its array, the byte offset in the kernel's dynamic shared
-    memory of the view its address is computed from (each step its first operand: a cast, a pointer's
-    arithmetic, a struct's field; a callee's argument its caller's operand, `arguments`), else the operand's
-    own text; and its slot in it, the index its address takes (`llvm.getelementptr`'s) where a constant
-    gives it, 0 where it takes none, None where a run's value does (`_aliases`)."""
+def _barrier(value: ir.Value, arguments: dict, seen: frozenset = frozenset()
+             ) -> tuple[frozenset, int | None]:
+    """The barrier a barrier operand addresses: the arrays it may be one of, each the byte offset in the
+    kernel's dynamic shared memory of the view its address is computed from (each step its first operand: a
+    cast, a pointer's arithmetic, a struct's field; a block's or callee's argument each value passed to it,
+    `arguments`), else the operand's own text; and its slot in them, the index its address takes
+    (`llvm.getelementptr`'s) where constants give it alike on every path, 0 where it takes none, None where
+    a run's value does (`_aliases`)."""
     slot: int | None = 0
     while True:
         if (operation := _result_of(value)) is None:
-            if value in arguments:
-                value = arguments[value]
-                continue
-            return str(value), slot
+            if value in seen:
+                # A loop's argument fed by itself: what its other edges pass, at a slot a run's value moves.
+                return frozenset(), None
+            if not (incoming := arguments.get(value)):
+                return frozenset({str(value)}), slot
+            found = [_barrier(each, arguments, seen | {value}) for each in incoming]
+            slots = {each_slot for _, each_slot in found}
+            joined = slots.pop() if len(slots) == 1 else None
+            return (frozenset().union(*(arrays for arrays, _ in found)),
+                    None if joined is None or slot is None else slot + joined)
         if operation.name == "llvm.getelementptr":
             index = _gep_index(operation)
             slot = None if index is None or slot is None else slot + index
@@ -687,10 +713,23 @@ def _barrier(value: ir.Value, arguments: dict) -> tuple[int | str, int | None]:
                 (memory := _result_of(operation.operands[0])) is not None
                 and memory.name == "gpu.dynamic_shared_memory"
                 and (offset := _result_of(operation.operands[1])) is not None):
-            return ir.IntegerAttr(offset.attributes["value"]).value, slot
+            return frozenset({ir.IntegerAttr(offset.attributes["value"]).value}), slot
         if not operation.operands:
-            return str(value), slot
+            return frozenset({str(value)}), slot
         value = operation.operands[0]
+
+
+def _edge_operands(terminator: ir.Operation) -> list[list[ir.Value]]:
+    """What a branch passes each of its successors' arguments: its trailing operands, in its successors'
+    order, as many each as its block takes (`cf.br`, `cf.cond_br`, `llvm.br`, `llvm.cond_br`)."""
+    counts = [len(successor.arguments) for successor in terminator.successors]
+    operands = list(terminator.operands)
+    passed = operands[len(operands) - sum(counts):]
+    edges, start = [], 0
+    for count in counts:
+        edges.append(passed[start:start + count])
+        start += count
+    return edges
 
 
 DYNAMIC_INDEX = -2**31
@@ -707,6 +746,6 @@ def _gep_index(operation: ir.Operation) -> int | None:
 
 
 def _aliases(one: tuple, other: tuple) -> bool:
-    """Whether two barriers (`_barrier`) may be one: one array's, and one slot unless constants give
-    each another."""
-    return one[0] == other[0] and (one[1] is None or other[1] is None or one[1] == other[1])
+    """Whether two barriers (`_barrier`) may be one: an array both may be of, and one slot unless constants
+    give each another."""
+    return bool(one[0] & other[0]) and (one[1] is None or other[1] is None or one[1] == other[1])

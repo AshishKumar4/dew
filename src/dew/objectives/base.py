@@ -1397,8 +1397,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         16 s its start traced."""
         found = self.__dict__.get("_drawn_shapes")
         if found is None:
-            # Its key made within the trace: nothing computed, on any device (rows 12147-12150).
-            drawn = abstract(lambda: self.initializer(jax.random.key(0)))
+            # Its key made within the trace, nothing computed on any device (rows 12147-12150); the
+            # initializer an argument, its held tree traced as the arrays it stands for (`abstract`, 7386).
+            drawn = abstract(lambda initializer: initializer(jax.random.key(0)), self.initializer)
             found = self.__dict__.setdefault("_drawn_shapes", _shapes_of(drawn))
         return found
 
