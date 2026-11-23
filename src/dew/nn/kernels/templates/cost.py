@@ -328,6 +328,15 @@ def seconds(work: Work, target: generation.GpuTarget) -> float:
     return worked + work.kernels * launch
 
 
+def busiest(programs: int, multiprocessors: int) -> int:
+    """The programs a launch of `programs` runs on its busiest multiprocessor, of `multiprocessors`, each its
+    share of that multiprocessor's units: co-resident programs share them rather than multiplying its peak,
+    and a wave past the first adds its own share, so a launch of 1.1 waves' programs runs two on some (rows
+    6216, 10809, 10810; M-EM-45b, M-FS-9). The one wave model a launch's price (`launch_seconds`) and a
+    contraction's split walk (`gemm.pricing.SplitWalk.walk`) read (row 10865)."""
+    return -(-max(programs, 1) // max(multiprocessors, 1))
+
+
 def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
                    resident: int = 1) -> float:
     """One kernel launch's seconds on `target` for `programs` programs at `resident` programs per
@@ -340,7 +349,7 @@ def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
     shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
     per_program = dataclasses.replace(work, **shared, kernels=0)
     processors = target.multiprocessors or 1
-    per_sm = math.ceil(count / processors)
+    per_sm = busiest(count, processors)
     waves = math.ceil(count / (processors * max(resident, 1)))
     unit_seconds = max(units(per_program, rates(target, device=False))[0])
     wave_seconds = max(per_sm * unit_seconds, waves * path(per_program, target))
