@@ -314,7 +314,7 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     settings = {**opts, **stated}
     kept = {key: value for key, value in fields.items() if key not in EARLIER_OPTIMIZER_FIELDS}
     if typed:
-        settings, kept = _unmasked(mask, registry.optimizers[named], settings, kept)
+        settings, kept = _unmasked(mask, settings, kept)
         optimizer = {"class": named, "fields": settings}
     else:
         optimizer = {"class": "optax", "fields": {"path": named, "settings": settings}}
@@ -324,17 +324,17 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
 type _Fields = dict[str, _records.JSON]
 
 
-def _unmasked(mask: _records.JSON, spec: type, settings: _Fields, config: _Fields) -> tuple[_Fields, _Fields]:
+def _unmasked(mask: _records.JSON, settings: _Fields, config: _Fields) -> tuple[_Fields, _Fields]:
     """An earlier optimizer's `mask` among its options (`optimizer_opts`), which Dew's own optimizers take no
     longer, as its spec's `settings` and its config's param groups (`config`'s `param_groups`), each
     returned. Where the config spared its decay (`OptimConfig.spared`, on by default) its own mask was
     written over it, as a group's that spared (`ParamGroup.spared`, off by default) was, every group reading
     it alike: it changed nothing, as a mask of True or None did not. A mask of False read decayed nothing
-    there: its decay 0, the config's ungrouped, each unspared group's grouped, as it trained; the empty
-    state its masked decay step held, which a decay of 0 holds bare, a restore takes as it is
-    (`dew.checkpoints._masked_decay_unsaved`). Refused where no decay of this Dew's is that optimizer: Adam's
-    coupled decay (`Adam.COUPLED`) kept a decay step ahead of its moments while it decayed, which its decay
-    of 0 drops; and a mask naming a tree, which no record rebuilds."""
+    there: its decay 0, the config's ungrouped, each unspared group's grouped, as it trained. The empty
+    state its masked decay step held, which a decay of 0 holds bare, and Adam's coupled decay step ahead of
+    its moments, which a decay of 0 holds none of (`Adam.COUPLED`), a restore takes as they are
+    (`dew.checkpoints._state_trees.masked_decay_unsaved`). Refused where it masked by a tree, which no record
+    rebuilds."""
     groups = config.get("param_groups") or []
     assert isinstance(groups, list), groups
     if mask is None or mask is True:
@@ -346,15 +346,6 @@ def _unmasked(mask: _records.JSON, spec: type, settings: _Fields, config: _Field
     if mask is not False:
         raise ValueError(f"an earlier run masked its decay by {mask!r}, which no record of this Dew states: "
                          "set OptimConfig.spared or its param groups' (ParamGroup.spared) in its place")
-    from dew.optim import Adam
-
-    default = next((field.default for field in dataclasses.fields(spec) if field.name == "weight_decay"), 0.0)
-    decays = [group.get("weight_decay") if group.get("weight_decay") is not None
-              else settings.get("weight_decay", default) for group in read]
-    if issubclass(spec, Adam) and spec.COUPLED and any(decays):
-        raise ValueError("an earlier run masked off Adam's coupled weight decay, whose state held a decay "
-                         "step ahead of its moments that this Dew's Adam holds only where it decays: resume "
-                         "it under the Dew that saved it, or start it afresh with weight_decay 0")
     if not groups:
         return {**settings, "weight_decay": 0.0}, config
     unmasked: list[_records.JSON] = [{**group, "weight_decay": 0.0} if group in held else group
