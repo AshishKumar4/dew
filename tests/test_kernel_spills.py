@@ -897,7 +897,8 @@ def _paired_step(launch):
     """A compile-only H100's mesh, and a lowering of one paired SwiGLU step through `launch` over it, traced
     afresh at each call (a compile's `relower`)."""
     devices, stepped, operands = _paired(launch)
-    return devices, lambda: jax.jit(stepped).trace(*operands).lower()
+    # A function of its own each call, which JAX's trace cache keys anew.
+    return devices, lambda: jax.jit(lambda *values: stepped(*values)).trace(*operands).lower()
 
 
 def _rejected_instruction(ctx) -> None:
@@ -911,7 +912,7 @@ class AssemblerRejected(grouped_matmul.MosaicGmm):
 
     @functools.wraps(grouped_matmul.MosaicGmm._fwd)  # its binding reads its forward's signature
     def _fwd(self, tokens, kernel, sizes, *args, **kwargs):
-        out, residuals = super()._fwd(tokens, kernel, sizes, *args, **kwargs)
+        outputs, residuals = super()._fwd(tokens, kernel, sizes, *args, **kwargs)
 
         def rejected(x_ref, o_ref):
             plgpu.inline_mgpu()(_rejected_instruction)()
@@ -919,7 +920,7 @@ class AssemblerRejected(grouped_matmul.MosaicGmm):
 
         flag = plgpu.kernel(rejected, out_type=jax.ShapeDtypeStruct((128,), jnp.float32))(
             jnp.zeros((128,), jnp.float32))
-        return out + flag[0].astype(out.dtype), residuals
+        return jax.tree.map(lambda out: out + flag[0].astype(out.dtype), outputs), residuals
 
 
 @COMPILE_ONLY
