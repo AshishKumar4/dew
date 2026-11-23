@@ -1846,6 +1846,9 @@ class Registered(ABC):
 
     _recorded: ClassVar[bool] = True
     _aliases: ClassVar[Aliases | None] = None
+    _flags: ClassVar[Mapping[str, Annotation]] = {}
+    """A command line's subcommand's flags (`record_flags`), each by its flat annotation (`_flat`); none on
+    a record of no subcommand."""
     """The kind's aliases (`envs`), which name its command line's subcommands (`flagged`); None for a kind
     no command line chooses."""
 
@@ -1892,12 +1895,13 @@ class Registered(ABC):
             return self
         made = record_flags(type(self), self.member, self.name, named[self.name])
         own = {each.name for each in dataclasses.fields(type(self))}
-        flat = {field.name: field.type for field in dataclasses.fields(made) if field.name not in own}
         held = {name: value for name, value in self.fields.items()
-                if name in flat and _fits(value, flat[name])}
+                if name in made._flags and _fits(value, made._flags[name])}
         settings = {name: vars(self)[name] for name in own if name not in ("name", "fields")}
         rest = {name: value for name, value in self.fields.items() if name not in held}
-        return made(**settings, fields=rest, **held)
+        # Its flags and settings stated over the subcommand's defaults, its `fields` the rest (its
+        # `__post_init__` adding the flags set apart from their defaults).
+        return dataclasses.replace(made(self.name, fields=rest), **settings, **held)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2015,15 +2019,19 @@ def record_flags(record: type[Registered], member: type | Callable[..., Configur
     settings flags as the record declares them; its `fields` the flags set apart from their defaults, over
     any it was given. Its `_alias` names the subcommand it is (`implied_subcommand`)."""
     reserved = {field.name for field in dataclasses.fields(record)} | set(dir(record))
-    flags: list[tuple[str, Annotation, dataclasses.Field]] = []
+    # Each flag's annotation, `make_dataclass`'s field type, and its flat part (`_flat`), which `flagged`
+    # reads a value by.
+    flags: list[tuple[str, object, object]] = []
+    flats: dict[str, Annotation] = {}
+    stated_defaults: dict[str, Configured] = {}
     for name, declared, annotation in member_fields(member):
         flat = None if annotation is None or name in reserved else _flat(annotation)
         if flat is None:
             continue
         held = declared is not dataclasses.MISSING and _fits(declared, flat)
         default = declared if held else None
+        flats[name], stated_defaults[name] = flat, default
         flags.append((name, flat if held else flat | None, dataclasses.field(default=default)))
-    stated_defaults = {name: field.default for name, _, field in flags}
     suppressed = [("name", tyro.conf.Suppress[str], dataclasses.field(default=path)),
                   ("fields", tyro.conf.Suppress[JsonDict], dataclasses.field(default_factory=dict)),
                   ("defaults", tyro.conf.Suppress[JsonRecords], dataclasses.field(default_factory=dict))]
@@ -2036,7 +2044,7 @@ def record_flags(record: type[Registered], member: type | Callable[..., Configur
         record.__post_init__(self)
 
     namespace = {"__post_init__": __post_init__, "__module__": __name__, "_alias": alias.replace("_", "-"),
-                 "__doc__": (member.__doc__ or "").split("\n\n")[0]}
+                 "_flags": flats, "__doc__": (member.__doc__ or "").split("\n\n")[0]}
     title = "".join(part.title() for part in alias.split("_"))
     return dataclasses.make_dataclass(f"{record.__name__}{title}", [*suppressed, *flags], bases=(record,),
                                       frozen=True, namespace=namespace)
