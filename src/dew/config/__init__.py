@@ -637,10 +637,6 @@ def _flagged(value: Configured) -> Configured:
     return value.flagged() if isinstance(value, Registered) else value
 
 
-def _recorded(value: Configured) -> Configured:
-    """`value` as a parsed run holds it: a subcommand's record its kind's own (`Registered.recorded`), any
-    other value as it is."""
-    return value.recorded() if isinstance(value, Registered) else value
 
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
@@ -1004,7 +1000,8 @@ class RunConfig:
         parsed = tyro.cli(tyro.conf.CascadeSubcommandArgs[parser], args=given, default=held)
         if parsed is None:
             raise ValueError("the command line built no run config")
-        return cls(**{field.name: _recorded(getattr(parsed, field.name))
+        return cls(**{field.name: value.recorded()
+                      if isinstance(value := vars(parsed)[field.name], Registered) else value
                       for field in dataclasses.fields(cls)})
 
     @classmethod
