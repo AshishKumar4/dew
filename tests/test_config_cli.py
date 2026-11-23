@@ -20,56 +20,61 @@ from dew.config.lm import LMRunConfig
 from dew.data import Files
 from dew.data.dataset import Loader
 from dew.diffusion.presets import CosineContinuous, CosineGeneral, Exp, Flow
-from dew.optim import ScheduleSpec
-from dew.registry import import_path, record_argument
+from dew.optim import Adam, ScheduleSpec
+from dew.registry import ModelConfig, import_path, record_argument
 from dew.sampling import Heun
-from dew.training import LocalTracker, MeshSpec
+from dew.training import LocalTracker, MeshSpec, UpdateBatch
+from dew.training.budget import Horizon
 
 pytestmark = pytest.mark.mesh
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def parse(cls, args):
-    return cls.cli(args)
+def parse(cls, args, default=None):
+    return cls.cli(args, default=default)
 
 
-def test_the_flags_pick_a_preset_and_a_solver_and_set_sets_the_chains_settings():
-    config = parse(DiffusionRunConfig, [
-        "preset:flow", "--preset.shift", "3.0", "--objective.solver", '{"class": "heun"}',
-        "--objective.guidance", '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 2.5}}',
-        "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
-        "--model", "simple_dit", "--model.scan_order", "hilbert"])
-
+def test_the_flags_set_a_runs_own_settings_and_none_of_what_it_trains():
+    """The command line sets a run's own settings (`RunConfig.cli`): its preset and its trainer's; what it
+    trains, its model and its objective, is built in Python, and their flags are refused, the run kept as
+    its default holds them."""
+    default = DiffusionRunConfig(model=ModelConfig("simple_dit", {"scan_order": "hilbert"}))
+    config = parse(DiffusionRunConfig, ["preset:flow", "--preset.shift", "3.0", "--trainer.horizon.steps",
+                                        "10",
+                                        "--trainer.mesh.fsdp", "2"], default=default)
     assert config.preset == Flow(shift=3.0)
-    assert config.objective.fields["solver"]["class"] == import_path(Heun)
-    assert config.objective.fields["guidance"]["fields"]["scale"] == 2.5
     assert config.trainer.mesh == MeshSpec(fsdp=2)
-    assert config.model.fields["scan_order"] == "hilbert"
+    assert config.model == default.model and config.objective == default.objective
+    for flags in (["--model.scan_order", "raster"], ["--objective.solver", '{"class": "heun"}'],
+                  ["--set", "trainer.steps=2"]):
+        with pytest.raises(SystemExit):
+            parse(DiffusionRunConfig, flags, default=default)
+    solved = default.override({"objective.solver": {"class": "heun"}})
+    assert solved.objective.fields["solver"]["class"] == import_path(Heun)
     # The data's settings are its chain's calls', set by name (`dew.data.records.override`).
     chained = dataclasses.replace(config, data=images_of("tfds://oxford_flowers102", 32, batch=16))
-    set_ = chained.assigned(["data.images.size=64", "data.images.batch=8"])
+    set_ = chained.override({"data.images.size": 64, "data.images.batch": 8})
     assert set_.data.facts()["fields"]["image"] == [64, 64, 3] and set_.data.facts()["batch"] == 8
 
 
-def test_set_points_a_recipes_chain_at_another_store():
-    """`--set data.source.<field>` sets a field of the chain's store, as a recipe's command line points
-    its default chain at the caller's own data: a token store's URL, and a TFDS store's path through
-    the holdout it is read under; a field the store does not have is refused."""
+def test_a_path_points_a_recipes_chain_at_another_store():
+    """A path `data.source.<field>` sets a field of the chain's store (`RunConfig.override`), as a run file
+    points a recipe's default chain at the caller's own data: a token store's URL, and a TFDS store's path
+    through the holdout it is read under; a field the store does not have is refused."""
     from dew.data import presets
     from dew.data.sources import source
     from dew.data.sources.tokens import TokenFiles
 
     windows = TokenFiles("data/shakespeare-byte").pipe(presets.lm, None, seq_len=8, batch=2, pack=None)
-    config = LMRunConfig.cli(["--set", "data.source.url=data/mine", "--set", "data.lm.seq_len=16"],
-                             default=LMRunConfig(data=windows))
+    config = LMRunConfig(data=windows).override({"data.source.url": "data/mine", "data.lm.seq_len": 16})
     assert config.data.source.url == "data/mine" and config.data.facts()["seq_len"] == 16
     train, _ = source("tfds://oxford_flowers102").holdout(records=128)
     flowers = DiffusionRunConfig(data=train.pipe(presets.images, 32, batch=16))
-    moved = flowers.assigned(["data.source.path=/data/tfds"])
+    moved = flowers.override({"data.source.path": "/data/tfds"})
     assert moved.data.source.source.path == "/data/tfds"
     with pytest.raises(ValueError):
-        flowers.assigned(["data.source.colour=red"])
+        flowers.override({"data.source.colour": "red"})
 
 
 def test_a_chains_settings_are_set_together():
@@ -80,8 +85,8 @@ def test_a_chains_settings_are_set_together():
 
     flowers = source("tfds://oxford_flowers102").pipe(presets.images, 64, staging_size=64, augment=True,
                                                      batch=8)
-    moved = DiffusionRunConfig(data=flowers).assigned(["data.images.size=128",
-                                                        "data.images.staging_size=128"])
+    moved = DiffusionRunConfig(data=flowers).override({"data.images.size": 128,
+                                                       "data.images.staging_size": 128})
     assert moved.data.facts()["fields"]["image"] == [128, 128, 3]
 
 
@@ -98,13 +103,13 @@ def test_an_image_size_override_derives_the_flow_shift_and_the_edm_space_afresh(
 
     flowers = source("tfds://oxford_flowers102").pipe(presets.images, 256, batch=8)
     run = DiffusionRunConfig(data=flowers, preset=Flow(resolution_shift=ResolutionShift()))
-    moved = run.assigned(["data.images.size=512"])
+    moved = run.override({"data.images.size": 512})
     assert run.derived_preset().resolution_shift.tokens == 256
     assert moved.derived_preset().resolution_shift.tokens == 1024
     assert moved.derived_preset().resolution_shift.shift() == ResolutionShift(tokens=1024).shift()
     assert moved.preset.resolution_shift.tokens is None
     stated = DiffusionRunConfig(data=flowers, preset=Flow(resolution_shift=ResolutionShift(tokens=64)))
-    assert stated.assigned(["data.images.size=512"]).derived_preset().resolution_shift.tokens == 64
+    assert stated.override({"data.images.size": 512}).derived_preset().resolution_shift.tokens == 64
     edm = DiffusionRunConfig(data=flowers, preset=EDM())
     assert edm.derived_preset().regime == "pixel" and edm.preset.regime is None
 
@@ -134,10 +139,11 @@ def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
         "from dew.data import Memory\n"
         "rows = [{'x': np.full((FEATURES,), index / 32, np.float32)} for index in range(32)]\n"
         "run = dataclasses.replace(experiment(), validation=None,\n"
-        "                          data=Memory(rows).map(lambda row: row).shuffle().repeat().batch(8))\n")
-    assert main(["train", str(tmp_path / "unrecorded_run.py"), "--set", "trainer.steps=1",
-                 "--set", f"trainer.checkpoint_dir={tmp_path / 'runs'}", "--set", "trainer.eval_every=None",
-                 "--set", "trainer.checkpoint_every=1"]) == 0
+        "                          data=Memory(rows).map(lambda row: row).shuffle().repeat().batch(8))\n"
+        f"run = run.override({{'trainer.horizon.steps': 1,\n"
+        f"                     'trainer.checkpoint_dir': {str(tmp_path / 'runs')!r},\n"
+        "                     'trainer.eval_every': None, 'trainer.checkpoint_every': 1})\n")
+    assert main(["train", str(tmp_path / "unrecorded_run.py")]) == 0
     record = json.loads((tmp_path / "runs" / "unrecorded_run" / "run.json").read_text())
     assert set(record["fields"]["data"]) == {"unrecorded"}
     with pytest.raises(ValueError):
@@ -218,10 +224,9 @@ def test_dew_profile_with_no_output_prepares_its_process_before_naming_its_direc
     (tmp_path / "dumped.py").write_text(
         "import dataclasses\n"
         "from autoencoder_experiment import run as experiment\n"
+        "from dew.config import Diagnostics\n"
         "def run():\n"
-        "    built = experiment()\n"
-        f"    trainer = dataclasses.replace(built.trainer, xla_flags={flags!r})\n"
-        "    return dataclasses.replace(built, trainer=trainer)\n")
+        f"    return dataclasses.replace(experiment(), diagnostics=Diagnostics(xla_flags={flags!r}))\n")
     root = Path(__file__).resolve().parents[1]
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
     done = subprocess.run([sys.executable, "-m", "dew._cli.main", "profile", str(tmp_path / "dumped.py"),
@@ -267,7 +272,7 @@ def test_a_run_trainer_fit_trains_directly_says_why_no_record_rebuilds_it(tmp_pa
 
     (x,) = records(0)
     optimizer, key = ((optax.adam(0.1), jax.random.key(0)) if built == "in Python"
-                      else (OptimConfig(optimizer="adam", learning_rate=0.1), 0))
+                      else (OptimConfig(optimizer=Adam(), learning_rate=0.1), 0))
     Trainer(Pulled(), optimizer, key=key, checkpoints=Checkpoints(str(tmp_path))).fit(
         chain(x), steps=1, checkpoint_every=1)
     record = json.loads((tmp_path / "run.json").read_text())
@@ -293,13 +298,14 @@ def test_a_run_config_round_trips_through_its_json_record(name):
     from dew.data.sources.tokens import TokenFiles
 
     cls = {"diffusion": DiffusionRunConfig, "lm": LMRunConfig, "jepa": JepaRunConfig}[name]
-    args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6",
-                          "--objective.unconditional-prob", "0.2"],
-            "lm": ["--max-new-tokens", "4", "--objective.ema-decay", "0.9"],
-            "jepa": ["--probe-classes", "7", "--objective.momentum", "0.9", "0.99"]}[name]
+    args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6"],
+            "lm": ["--max-new-tokens", "4"], "jepa": ["--probe-classes", "7"]}[name]
+    objective = {"diffusion": {"objective.unconditional_prob": 0.2}, "lm": {"objective.ema_decay": 0.9},
+                 "jepa": {"objective.momentum": [0.9, 0.99]}}[name]
     data = (TokenFiles("d").pipe(presets.lm, None, seq_len=64, batch=8, pack=None) if name == "lm"
             else images_of("tfds://oxford_flowers102", 32))
-    config = dataclasses.replace(parse(cls, [*args, "--trainer.steps", "5"]), data=data)
+    config = dataclasses.replace(parse(cls, [*args, "--trainer.horizon.steps", "5"]).override(objective),
+                                 data=data)
 
     record = json.loads(json.dumps(config.record()))
 
@@ -317,7 +323,7 @@ def test_flaxdiffs_schedules_are_a_runs_presets_rebuilt_from_its_record(args, pr
     """FlaxDiff's tangent grid, continuous cosine and exponential table are a configured run's presets
     (row 1928): named on the command line, their arguments in the run's record, and the run read back
     from that record holds the preset they describe, which builds its process (`Preset`)."""
-    config = dataclasses.replace(parse(DiffusionRunConfig, [*args, "--trainer.steps", "5"]),
+    config = dataclasses.replace(parse(DiffusionRunConfig, [*args, "--trainer.horizon.steps", "5"]),
                                  data=images_of("tfds://oxford_flowers102", 32))
     record = json.loads(json.dumps(config.record()))
     rebuilt = RunConfig.read(record)
@@ -341,8 +347,8 @@ def test_a_run_over_url_datasets_round_trips_through_its_json_record():
 
 def test_steps_and_epochs_are_one_choice():
     with pytest.raises(SystemExit):
-        parse(RunConfig, ["--trainer.steps", "5", "--trainer.epochs", "1"])
-    config = parse(RunConfig, ["--trainer.epochs", "2"])
+        parse(RunConfig, ["--trainer.horizon.steps", "5", "--trainer.horizon.epochs", "1"])
+    config = parse(RunConfig, ["--trainer.horizon.epochs", "2"])
     data = Loader(train=lambda partition: iter(()), val=None, records=100, batch=10)
     assert config.trainer.total_steps(data) == 20
     with pytest.raises(ValueError):
@@ -358,12 +364,12 @@ def test_a_runs_updates_are_its_microsteps_over_its_accumulation():
     from dew.data.dataset import Loader
 
     loader = Loader(lambda partition: iter(()), None, batch=8, records=64)
-    assert TrainerConfig(epochs=1, accumulation=4).total_updates(loader) == 2
+    assert TrainerConfig(horizon=Horizon(epochs=1), update=UpdateBatch(batches=4)).total_updates(loader) == 2
 
 
 def test_the_cli_sets_a_token_budget_the_datas_token_batches_divide():
-    config = parse(RunConfig, ["--trainer.update-tokens", "98304", "--trainer.steps", "1"])
-    assert config.trainer.update_tokens == 98304
+    config = parse(RunConfig, ["--trainer.update.tokens", "98304", "--trainer.horizon.steps", "1"])
+    assert config.trainer.update.tokens == 98304
     assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
 
 
@@ -391,7 +397,7 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
                                            "attention_impl": "xla"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         data=prepared(train), validation=prepared(held),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, log_every=1,
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=1), log_every=1,
                               eval_every=1, checkpoint_every=None))
     trained = run.prepare().train("jepa-loss")
     assert int(trained.updates) == 1
@@ -420,7 +426,7 @@ def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the
                                            "num_heads": 2, "mlp_ratio": 2, "attention_impl": "xla"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         data=TFDS("dew_images", path=str(root), split="all").pipe(presets.images, 16, batch=8),
-        trainer=TrainerConfig(precision=numerics_of(precision), steps=1))
+        trainer=TrainerConfig(precision=numerics_of(precision), horizon=Horizon(steps=1)))
     objective = run.build_run().objective
     expected = {"bf16-mixed": jnp.bfloat16, "16-mixed": jnp.float16}[precision]
     assert jnp.dtype(objective.encoder.dtype) == jnp.dtype(expected)
@@ -456,8 +462,9 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
         lora=LoRA(rank=2, modules=("up_proj",)),
         data=images.pipe(presets.images, 16, batch=8).read("memory").loading(Loading(workers=0)),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=4, accumulation=2, log_every=1,
-                              eval_every=None, checkpoint_every=None))
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=4),
+                              update=UpdateBatch(batches=2), log_every=1, eval_every=None,
+                              checkpoint_every=None))
     trained = run.prepare().train("jepa-lora")
     assert int(trained.updates) == 2
     factors = trained.variables["params"]["context_encoder"]
@@ -474,10 +481,10 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
 
 
 def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_progress(tmp_path):
-    """A JEPA run of `--trainer.epochs` over a streamed read, whose order counts no updates ahead, is bounded
-    in examples once its data compiles (`Loader.examples`), so the target's momentum ramps over the run's
-    progress, as a run given `--trainer.examples` does, rather than being refused as a run bounded by tokens
-    alone (row 3430)."""
+    """A JEPA run of `--trainer.horizon.epochs` over a streamed read, whose order counts no updates ahead, is
+    bounded in examples once its data compiles (`Loader.examples`), so the target's momentum ramps over the
+    run's progress, as a run given `--trainer.horizon.examples` does, rather than being refused as a run
+    bounded by tokens alone (row 3430)."""
     from dew.config import TrainerConfig
     from dew.data import TFDS, Loading, presets
     from dew.registry import ModelConfig
@@ -492,7 +499,7 @@ def test_a_jepa_run_of_epochs_over_a_streamed_read_ramps_its_momentum_over_its_p
         # Every image decodes (no rejecting step), so a pass's source examples are its shards' rows.
         data=images.pipe(presets.images, 16, batch=8, rejects=False).read("streamed")
         .loading(Loading(workers=0)),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=None, epochs=2, log_every=1,
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(epochs=2), log_every=1,
                               eval_every=None, checkpoint_every=None))
     prepared = run.prepare()
     # Bounded to the passes' 40 examples, whose steps its per-share order counts none of ahead.

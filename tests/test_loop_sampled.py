@@ -19,6 +19,8 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.objectives.base import Ratio
 from dew.objectives.lm.objective import LMObjective
+from dew.optim import MuonClip
+from dew.training import FitPolicy, UpdateBatch
 from dew.training.compiler import DrawingStep
 from dew.training.interval import DISPATCHED_MICROBATCHES, Interval
 from dew.training.phase_passes import SampledPasses
@@ -212,13 +214,13 @@ def test_each_microbatch_of_a_sampled_run_steps_as_a_run_of_its_drawn_count(trai
     model = looped(steps=CAP).with_passes(CAP, backprop_steps=trained)
     assert model is not None
     batch = token_batch()
-    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, accumulation=2)
+    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, update=UpdateBatch(batches=2))
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep)
     interval = Interval(time.time(), None, microbatches=0)
     alone = {count: phased_trainer(model.with_passes(count, backprop_steps=trained and min(trained, count)),
-                                   0, None, accumulation=2) for count in range(1, CAP + 1)}
+                                   0, None, update=UpdateBatch(batches=2)) for count in range(1, CAP + 1)}
     programs: dict = {}
     drawn = []
     for index in range(8):
@@ -258,7 +260,7 @@ def test_a_sampled_run_of_an_implicit_loop_in_bf16_reads_its_caps_narrow_copies_
     batch = token_batch()
     law = dataclasses.replace(TRAINED, cap=cap)
     with chosen(narrow_copies="on"):
-        sampled = phased_trainer(model, 0, None, sampled_passes=law, accumulation=2)
+        sampled = phased_trainer(model, 0, None, sampled_passes=law, update=UpdateBatch(batches=2))
         state, _, _ = sampled.place()
         step = sampled.compile(state, batch)
         interval = Interval(time.time(), None, microbatches=0)
@@ -269,7 +271,7 @@ def test_a_sampled_run_of_an_implicit_loop_in_bf16_reads_its_caps_narrow_copies_
             state, loss, *_ = step(state, batch)
             assert np.isfinite(float(loss)), (index, step.counts)
         # The copies a run of the cap's passes alone reads, the loop's layers whole among them.
-        alone = phased_trainer(model, 0, None, accumulation=2)
+        alone = phased_trainer(model, 0, None, update=UpdateBatch(batches=2))
         start, _, _ = alone.place()
         stepped, *_ = alone.compile(start, batch)(start, batch)
 
@@ -316,7 +318,8 @@ def test_a_sampled_step_admits_each_count_on_its_loop_as_its_draws_first_ask_it(
     from dew.telemetry.compiles import Compiles
 
     batch = token_batch()
-    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, accumulation=2)
+    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED,
+                             update=UpdateBatch(batches=2))
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep) and set(step.plans) == {CAP}
@@ -346,7 +349,7 @@ def test_a_sampled_step_called_by_hand_draws_each_calls_counts_itself():
     from dew.telemetry.compiles import Compiles
 
     batch = token_batch()
-    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, split=2)
+    sampled = phased_trainer(looped(steps=CAP), 0, None, sampled_passes=TRAINED, fit=FitPolicy(split=2))
     state, _, _ = sampled.place()
     step = sampled.compile(state, batch)
     assert isinstance(step, DrawingStep) and step.split == 2
@@ -450,8 +453,8 @@ def test_a_sampled_run_under_qk_clip_pools_its_counts_logit_maxima_in_one_window
 
     tokens, _ = phased_draw(0)
     trainer = Trainer(LMObjective(unnormed(), 16), optax.chain(scale_by_qk_clip(1.0), optax.sgd(0.1)),
-                      key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0), accumulation=2,
-                      sampled_passes=TRAINED)
+                      key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+                      update=UpdateBatch(batches=2), sampled_passes=TRAINED)
     assert int(trainer.fit(phased_loader(tokens), steps=4, log_every=100).step) == 4
 
 
@@ -465,12 +468,13 @@ def test_a_fixed_and_a_sampled_run_of_one_config_each_trace_their_own_window(sam
     from dew.optim import OptimConfig
     from dew.training import Layout, Trainer
 
-    config = OptimConfig(optimizer="muonclip", learning_rate=0.01)
+    config = OptimConfig(optimizer=MuonClip(), learning_rate=0.01)
     batch = token_batch()
 
     def stepped(**sampling) -> None:
         trainer = Trainer(LMObjective(unnormed(), 16), config, key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0), accumulation=2, **sampling)
+                          layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=2),
+                          **sampling)
         trainer.scheduled(1)
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
@@ -516,7 +520,7 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
 
     model = looped(steps=CAP)
     host = {"text": token_draw()}
-    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, split=2)
+    sampled = phased_trainer(model, 0, None, sampled_passes=TRAINED, fit=FitPolicy(split=2))
     counted = prepare_counts(sampled.objective, host, count_model=True,
                              counts=sampled.phase_passes.counted())
     for count in range(1, CAP + 1):
@@ -536,7 +540,7 @@ def test_a_sampled_steps_work_is_its_microbatches_at_their_counts():
     np.testing.assert_array_equal(np.asarray(metrics[TRAINING_FLOPS]), np.asarray(expected))
     own = {}
     for count in set(step.counts):
-        alone = phased_trainer(model.with_passes(count), 0, None, split=2)
+        alone = phased_trainer(model.with_passes(count), 0, None, fit=FitPolicy(split=2))
         start, _, _ = alone.place()
         alone.compile(start, batch)
         own[count] = alone.step_flops
@@ -558,7 +562,7 @@ def test_each_count_of_a_sampled_run_steps_at_its_caps_plan(monkeypatch):
 
     def needed(model, split):
         free(monkeypatch, LIMIT)
-        trainer = phased_trainer(model, 0, None, split=split)
+        trainer = phased_trainer(model, 0, None, fit=FitPolicy(split=split))
         state, _, _ = trainer.place()
         trainer.compile(state, batch)
         options.unhold()
@@ -634,8 +638,8 @@ def test_a_sampled_run_whose_window_replays_its_microbatches_is_refused(grouped)
     def trainer(split):
         grouping = {"diloco": DiLoCo(every=2, rate=0.7, momentum=0.9)} if grouped else {}
         return Trainer(Replayed(looped(steps=CAP), 16), optax.sgd(0.1), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED, split=split,
-                       **grouping)
+                       layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED,
+                       fit=FitPolicy(split=split), **grouping)
 
     batch = token_batch()
     replayed = trainer(2)

@@ -16,15 +16,15 @@ executable (`jax.experimental.serialize_executable`), for a host of that topolog
     ahead.peak_bytes, ahead.flops.hardware
     ahead.save("step.dew-aot")
 
-A configured run does both ends: `--trainer.compile-ahead.generation sm90 --trainer.compile-ahead.devices
-8 --trainer.compile-ahead.path step.dew-aot` compiles its first step for eight H100s and exits
-(`AheadTarget`), and `--trainer.ahead step.dew-aot` on a host of that topology runs it in place of
+A configured run does both ends: `dew lower run.json target:ahead --target.generation sm90 --target.devices 8
+--target.path step.dew-aot` compiles its first step for eight H100s and exits (`AheadTarget`,
+`RunConfig.lower`), and `--trainer.ahead step.dew-aot` on a host of that topology runs it in place of
 compiling its first step, where it is the very program the run compiles first (`AheadOfTime.taken`).
 
 A run's plan is the fewest microbatches that fit at the first rung its search admits (the remat rungs at
 its own head first, a tight cold start's second compile: docs/design/training.md), which memory decides; which
 plan steps fastest, a rung that recomputes more at fewer microbatches or the plan's own, the GPUs alone
-tell. `--trainer.compile-ahead.frontier`, with each GPU's memory stated, lists past the plan each rung
+tell. `--target.frontier`, with each GPU's memory stated, lists past the plan each rung
 above it that fits at fewer microbatches than every plan before it, at the fewest that fit there, and,
 where the ladder's top ('full') is reached, its sibling that offloads the residuals 'minimal' saves
 ('minimal_offloaded') at the same split (`compile_ahead`'s `frontier`, `FitSearch.above`), and below the
@@ -32,7 +32,7 @@ plan each lighter rung the run's remat-first search passed over that fits, at th
 (the plan's `lighter`, `FitSearch.below`: a head's tile, XLA's defaults or no copies at less recomputation);
 tools/benchmark_step.py times each on the GPUs, a case at its remat and head tile, a plan of s
 microbatches as its microbatch's rows accumulated s times (`accumulation`), the time it reports a
-microbatch's, s of them an update; and the run names the fastest by its model's remat, `--trainer.split`
+microbatch's, s of them an update; and the run names the fastest by its model's remat, `--trainer.fit.split`
 and `LMObjective.head_tile`. No run times plans itself.
 """
 
@@ -100,6 +100,7 @@ from dew.nn.kernels.templates import assembled, report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import CompiledMemory, StepFlops, compiled_memory, step_flops
 from dew.training.profiling import pgle_runs
+from dew.training.targets import AheadTarget
 
 if TYPE_CHECKING:
     from jaxlib._jax import Traceback
@@ -120,7 +121,7 @@ UNTUNED = ("this step was compiled ahead into a file for %s GPUs without their t
            "untuned program, whose products ran up to 48 times slower on a GH200 (UB-4792-AHEAD-TIME): a run "
            "handed it compiles its step on its GPUs as a run without a file does, and keeps their tuned "
            "choices beside its compilation cache. To train from a file, compile it ahead over the GPU host's "
-           "own topology (--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY) with that host's compilation "
+           "own topology (--target.topology $DEW_NODE_TOPOLOGY) with that host's compilation "
            "cache, once a run there has tuned the step")
 """What a step file compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is said as, where it
 is saved and where a run is handed it (`dew.training.trainer.Trainer`)."""
@@ -535,7 +536,7 @@ class AheadOfTime:
         if stated_digest(lowered) != self.program:
             raise NotTheStepCompiledAhead(
                 "the step compiled ahead is another program than the one this run compiles first: compile it "
-                "ahead from this run's config and data (--trainer.compile-ahead), with this Dew, and no plan "
+                "ahead from this run's config and data (dew lower, target:ahead), with this Dew, and no plan "
                 "recorded for another rung")
         return self.loaded()
 
@@ -1100,159 +1101,109 @@ def handed(ahead: AheadOfTime | None) -> Iterator[None]:
         yield
 
 
-@dataclasses.dataclass(frozen=True)
-class AheadTarget:
-    """Where a configured run compiles its first step ahead and saves it, then exits, training nothing
-    (`TrainerConfig.compile_ahead`): for `devices` GPUs of the CUDA `generation` (`compile_only_gpus`),
-    or the `devices` TPUs of the TPU topology it names ('v5e:4x4', `compile_only_tpus`), which this host
-    need not have, written to `path` (`AheadOfTime.save`). `capacity_gib` states each GPU's memory, its
-    total as the GPU states it, once: the run's own plan there is made and reported against the
-    allocator's limit derived from it (`compile_ahead`), the offline answer to what fits, a run with its
-    remat set told of no rung but its own. A host's own `topology` states its GPUs' memory instead, and a
-    TPU topology its own. The links it compiles with are the run's (`TrainerConfig.links`), which no
-    compile-only device measures."""
+def target_devices(target: AheadTarget) -> tuple:
+    """The compile-only devices the run's mesh is built over: the host's own GPUs where it names their
+    `topology` (`host_gpus`), the TPU topology's, which must hold `devices`, or `devices` GPUs of the
+    generation at the stated capacity."""
+    if target.topology is not None:
+        if target.multiprocessors is not None or target.capacity_gib is not None:
+            raise ValueError("a host's topology states its GPUs' memory and multiprocessors; set neither "
+                             "capacity_gib nor multiprocessors with it")
+        return host_gpus(target.generation, target.topology, target.devices, target.share)
+    if ":" not in target.generation:
+        return compile_only_gpus(target.generation, target.devices, target.memory, target.multiprocessors,
+                                 target.share)
+    if target.multiprocessors is not None:
+        raise ValueError(f"a TPU topology ({target.generation}) states its own cores; set no "
+                         "multiprocessors")
+    if target.capacity_gib is not None:
+        raise ValueError(f"a TPU topology ({target.generation}) states its own memory; set no capacity")
+    devices = compile_only_tpus(target.generation)
+    if len(devices) != target.devices:
+        raise ValueError(f"the TPU topology {target.generation} holds {len(devices)} devices, not "
+                         f"{target.devices}")
+    return devices
 
-    generation: str
-    devices: int
-    path: str | None = None
-    """Where the step is saved (`AheadOfTime.save`). None keeps it in the run's persistent compilation
-    cache alone, with every later data phase's step (`later_phases`), where the run's compiles find them:
-    a job's prepare for its node's run (`--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY`, row 5460);
-    or where `phases` names the steps."""
-    capacity_gib: float | None = None
-    frontier: bool = False
-    """Whether the report lists each rung above the plan that fits at fewer microbatches than every plan
-    before it (`compile_ahead`, `FitSearch.above`), and each lighter rung below it that the run's search
-    passed over and that fits (`lighter`, `FitSearch.below`)."""
-    multiprocessors: int | None = None
-    """The multiprocessors of the GPU of `generation` it compiles for (an H100 PCIe's 114, an L40S's 142),
-    where it is not the generation's own (`built_target`): what the step's launches derive for and a GPU
-    loading it must have (`BuildTarget`). A TPU topology states its own."""
-    topology: str | None = None
-    """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole: their
-    memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A GPU node's prepare
-    is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
-    phases: tuple[int, ...] = ()
-    """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
-    (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the
-    run finds them: none, the first step's alone."""
-    share: float = DEW_SHARE
-    """The share of each GPU XLA's pool takes in the run that loads the step (`dew._devices.pool_share`):
-    Dew's own as Dew prepares a training process, or the run's named one. Its plan is admitted against the
-    limit it derives (`StatedGpu.share`), not this process's own share, which a prepare packed beside
-    another job holds of its own GPU alone (row 7644: 6.78 GiB of an 80 GiB target)."""
 
-    def __post_init__(self) -> None:
-        if not 0 < self.share <= 1:
-            raise ValueError(f"a pool's share of a GPU is in (0, 1], not {self.share!r}")
-
-    @property
-    def memory(self) -> int | None:
-        """Each GPU's stated memory in bytes, which its compile-only devices carry (`compile_only_gpus`)."""
-        return None if self.capacity_gib is None else int(self.capacity_gib * 2**30)
-
-    def compile_only(self) -> tuple:
-        """The compile-only devices the run's mesh is built over: the host's own GPUs where it names their
-        `topology` (`host_gpus`), the TPU topology's, which must hold `devices`, or `devices` GPUs of the
-        generation at the stated capacity."""
-        if self.topology is not None:
-            if self.multiprocessors is not None or self.capacity_gib is not None:
-                raise ValueError("a host's topology states its GPUs' memory and multiprocessors; set neither "
-                                 "capacity_gib nor multiprocessors with it")
-            return host_gpus(self.generation, self.topology, self.devices, self.share)
-        if ":" not in self.generation:
-            return compile_only_gpus(self.generation, self.devices, self.memory, self.multiprocessors,
-                                     self.share)
-        if self.multiprocessors is not None:
-            raise ValueError(f"a TPU topology ({self.generation}) states its own cores; set no "
-                             "multiprocessors")
-        if self.capacity_gib is not None:
-            raise ValueError(f"a TPU topology ({self.generation}) states its own memory; set no capacity")
-        devices = compile_only_tpus(self.generation)
-        if len(devices) != self.devices:
-            raise ValueError(f"the TPU topology {self.generation} holds {len(devices)} devices, not "
-                             f"{self.devices}")
-        return devices
-
-    def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
+def compiled_for[LossT, EffectsT](target: AheadTarget, trainer: Trainer[LossT, EffectsT], loader: Loader,
                                   steps: int | None, examples: int | None = None,
                                   resume: Resume = "auto", plan: FitPlan | None = None) -> CompiledAhead:
-        """`trainer`, built over this target's devices (`compile_only`), its first step compiled ahead
-        (`compile_ahead`) and saved, as what ends the run, over the batch `fit` would start it on
-        (`first_step_batch`), at the rung the checkpoint a run resumes under `resume` left it, with its
-        evaluations' programs where `plan` is what its `fit` is asked for (`Trainer._fit_plan`). A run whose
-        step reads a rollout's batches, which it makes as it trains, is refused. A run that keeps its
-        variables on the host (`Layout(host=("variables",))`) compiles each program its step calls into the
-        persistent cache its run's startup reads (`prepare_host_step`): many programs, saved to no file
-        (row 8380: the configured run reached none of them)."""
-        if trainer.rollout is not None:
-            raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
-                             "its rollout's, which it makes only as it trains")
-        if (self.path is None or self.phases) and self.topology is None and ":" not in self.generation:
-            # A canonical target keys another entry than a host's run (`host_gpus`): no run reads it.
-            raise ValueError(f"steps compiled ahead for {self.generation} GPUs into the persistent cache are "
-                             "keyed as a host's run reads them only over that host's own topology: name it "
-                             "(--trainer.compile-ahead.topology $DEW_NODE_TOPOLOGY), or save the step to a "
-                             "file (--trainer.compile-ahead.path)")
-        if trainer.host_master and (self.path is not None or self.phases):
-            raise ValueError("a step that keeps its variables on the host compiles its programs into the "
-                             "persistent cache its run reads, whole: name no path and no phases")
-        # Refused before its first batch is read and its state traced, where its GPUs state no memory.
-        stated_limit(list(trainer.device_mesh.devices.flat))
-        batch = first_step_batch(trainer, loader, steps, examples, resume)
-        if trainer.host_master:
-            # Into a cache a device run reads as tuned, as a device step's (below): a program no device run
-            # has tuned is counted, its run compiling it on its GPU, never a traceback (row 9693).
+    """`trainer`, built over this target's devices (`compile_only`), its first step compiled ahead
+    (`compile_ahead`) and saved, as what ends the run, over the batch `fit` would start it on
+    (`first_step_batch`), at the rung the checkpoint a run resumes under `resume` left it, with its
+    evaluations' programs where `plan` is what its `fit` is asked for (`Trainer._fit_plan`). A run whose
+    step reads a rollout's batches, which it makes as it trains, is refused. A run that keeps its
+    variables on the host (`Layout(host=("variables",))`) compiles each program its step calls into the
+    persistent cache its run's startup reads (`prepare_host_step`): many programs, saved to no file
+    (row 8380: the configured run reached none of them)."""
+    if trainer.rollout is not None:
+        raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
+                         "its rollout's, which it makes only as it trains")
+    if (target.path is None or target.phases) and target.topology is None and ":" not in target.generation:
+        # A canonical target keys another entry than a host's run (`host_gpus`): no run reads it.
+        raise ValueError(f"steps compiled ahead for {target.generation} GPUs into the persistent cache are "
+                         "keyed as a host's run reads them only over that host's own topology: name it "
+                         "(--target.topology $DEW_NODE_TOPOLOGY), or save the step to a "
+                         "file (--target.path)")
+    if trainer.host_master and (target.path is not None or target.phases):
+        raise ValueError("a step that keeps its variables on the host compiles its programs into the "
+                         "persistent cache its run reads, whole: name no path and no phases")
+    # Refused before its first batch is read and its state traced, where its GPUs state no memory.
+    stated_limit(list(trainer.device_mesh.devices.flat))
+    batch = first_step_batch(trainer, loader, steps, examples, resume)
+    if trainer.host_master:
+        # Into a cache a device run reads as tuned, as a device step's (below): a program no device run
+        # has tuned is counted, its run compiling it on its GPU, never a traceback (row 9693).
+        try:
+            return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
+        except report.Untuned as refused:
+            # Named as every untuned program is (`program_name`), a host step's VJP results stating no
+            # form.
+            _log.warning("a host step is not preparable here: %s", refused)
+            return CompiledAhead(None, None, (program_name(refused.lowered),))
+    topology = None if target.topology is None else Path(target.topology).read_bytes()
+    if target.path is not None and not target.phases:
+        # Over a host's own GPUs (`topology`), as its run compiles it: every tuned choice the GPU kind's
+        # runs left beside the compilation cache, all or none (`report.for_devices`), so its run takes
+        # it. Over a generation's canonical GPUs, XLA's untuned program, read for its plan and its
+        # kernels, which its record and its save say and a run compiles in its place (`runnable`).
+        with report.for_devices() if target.topology is not None else contextlib.nullcontext():
             try:
-                return CompiledAhead(None, None, startup=prepare_host_step(trainer, batch))
-            except report.Untuned as refused:
-                # Named as every untuned program is (`program_name`), a host step's VJP results stating no
-                # form.
-                _log.warning("a host step is not preparable here: %s", refused)
-                return CompiledAhead(None, None, (program_name(refused.lowered),))
-        topology = None if self.topology is None else Path(self.topology).read_bytes()
-        if self.path is not None and not self.phases:
-            # Over a host's own GPUs (`topology`), as its run compiles it: every tuned choice the GPU kind's
-            # runs left beside the compilation cache, all or none (`report.for_devices`), so its run takes
-            # it. Over a generation's canonical GPUs, XLA's untuned program, read for its plan and its
-            # kernels, which its record and its save say and a run compiles in its place (`runnable`).
-            with report.for_devices() if self.topology is not None else contextlib.nullcontext():
-                try:
-                    ahead = _compiled_ahead(trainer, batch, frontier=self.frontier, plan=plan,
-                                            topology=topology)
-                except report.CompiledOnDevice as refused:
-                    raise ValueError(f"this step is compiled on its GPU, not ahead: {refused}") from refused
-                except report.Untuned as untuned:
-                    raise ValueError(
-                        "this step is not preparable on this host until a run on such a GPU has tuned it, "
-                        "leaving its choices beside the compilation cache: run it there once, then compile "
-                        f"it ahead again ({untuned})") from untuned
-            ahead.save(self.path)
-            return CompiledAhead(self.path, ahead)
-        # Into the persistent cache the run reads alone: the steps of the phases named, or the first step
-        # and each later phase's, as a job's prepare compiles its node's run (`topology`, row 5460). A
-        # phase's step is planned afresh at the split the run was given, as its run plans it at its
-        # boundary; the evaluations' programs compile with the first step's.
-        batches = ([phase_batch(trainer, batch, phase) for phase in self.phases] if self.phases else
-                   [batch, *(phase_batch(trainer, batch, phase) for phase in later_phases(trainer, batch))])
-        ahead, untuned = None, []
-        for index, stepped in enumerate(batches):
-            first = not index and not self.phases
-            if not first:
-                trainer._planned_afresh()
-            try:
-                # Into a cache a device run reads as tuned: every choice the GPU kind's runs tuned, or none.
-                with report.for_devices():
-                    ahead = _compiled_ahead(trainer, stepped, frontier=False, plan=plan if first else None,
-                                            topology=topology)
-            except report.Untuned as refused:
-                # Its run compiles it on the device, which tunes it (and the next prepare finds it), or makes
-                # the choice a compile without it cannot (`report.CompiledOnDevice`).
-                _log.warning("a step is not preparable here: %s", refused)
-                untuned.append(program_name(refused.lowered))
-                continue
-            _log.info("a step compiled ahead into the cache in %.1f s", ahead.planned_seconds)
-        return CompiledAhead(None, ahead, tuple(untuned))
+                ahead = _compiled_ahead(trainer, batch, frontier=target.frontier, plan=plan,
+                                        topology=topology)
+            except report.CompiledOnDevice as refused:
+                raise ValueError(f"this step is compiled on its GPU, not ahead: {refused}") from refused
+            except report.Untuned as untuned:
+                raise ValueError(
+                    "this step is not preparable on this host until a run on such a GPU has tuned it, "
+                    "leaving its choices beside the compilation cache: run it there once, then compile "
+                    f"it ahead again ({untuned})") from untuned
+        ahead.save(target.path)
+        return CompiledAhead(target.path, ahead)
+    # Into the persistent cache the run reads alone: the steps of the phases named, or the first step
+    # and each later phase's, as a job's prepare compiles its node's run (`topology`, row 5460). A
+    # phase's step is planned afresh at the split the run was given, as its run plans it at its
+    # boundary; the evaluations' programs compile with the first step's.
+    batches = ([phase_batch(trainer, batch, phase) for phase in target.phases] if target.phases else
+               [batch, *(phase_batch(trainer, batch, phase) for phase in later_phases(trainer, batch))])
+    ahead, untuned = None, []
+    for index, stepped in enumerate(batches):
+        first = not index and not target.phases
+        if not first:
+            trainer._planned_afresh()
+        try:
+            # Into a cache a device run reads as tuned: every choice the GPU kind's runs tuned, or none.
+            with report.for_devices():
+                ahead = _compiled_ahead(trainer, stepped, frontier=False, plan=plan if first else None,
+                                        topology=topology)
+        except report.Untuned as refused:
+            # Its run compiles it on the device, which tunes it (and the next prepare finds it), or makes
+            # the choice a compile without it cannot (`report.CompiledOnDevice`).
+            _log.warning("a step is not preparable here: %s", refused)
+            untuned.append(program_name(refused.lowered))
+            continue
+        _log.info("a step compiled ahead into the cache in %.1f s", ahead.planned_seconds)
+    return CompiledAhead(None, ahead, tuple(untuned))
 
 
 def stated_limit(devices: Sequence) -> int | None:
@@ -1266,8 +1217,8 @@ def stated_limit(devices: Sequence) -> int | None:
         generation = gpu_target(devices[0].device_kind).generation
         raise ValueError(f"the {generation} GPUs this step compiles for state no memory, which every plan "
                          "for them is made against: state it once, with each GPU's memory "
-                         "(--trainer.compile-ahead.capacity-gib, compile_only_gpus' memory), or a host's own "
-                         "serialized topology (--trainer.compile-ahead.topology), which states its GPUs' own")
+                         "(--target.capacity-gib, compile_only_gpus' memory), or a host's own "
+                         "serialized topology (--target.topology), which states its GPUs' own")
     return min(limit for limit in limits if limit is not None)
 
 
@@ -1539,7 +1490,8 @@ def _phase_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Train
     from dew.training.planning import PlanRefused
 
     phases = trainer.phase_passes.apart(passes)
-    compiler = StepCompiler(phases.base, trainer._compiler.links(trainer.device_mesh), None, phases)
+    compiler = StepCompiler(phases.base, trainer._compiler.links(trainer.device_mesh), None, phases,
+                            trainer.fit_policy.remat)
     stepping = dataclasses.replace(trainer._stepping(phases.base, compiler), shape=trainer._afresh_shape())
     try:
         compiler._plan(stepping, state, batch, None, provisional=True)

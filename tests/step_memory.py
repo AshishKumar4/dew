@@ -13,6 +13,8 @@ from flax import linen as nn
 from dew.distributed.placement import Layout
 from dew.mesh import DEFAULT_RULES
 from dew.nn.kernels import generation
+from dew.optim import AdamW
+from dew.training import FitPolicy
 
 MIXER_ROWS, MIXER_LENGTH, MIXER_WIDTH, MIXER_HEAD = 2, 2048, 512, 64
 
@@ -59,9 +61,9 @@ def step_bytes(kind: str, layers: int, feature: str = "plain", copies: bool = Tr
                                  "remat": REMAT_POLICIES["full"], "mixer": mixers.build(kind, **fields),
                                  **overrides, **features()[feature]})
     trainer = Trainer(LMObjective(model, MIXER_LENGTH),
-                      OptimConfig(optimizer="adamw", learning_rate=1e-3).build(None), key=jax.random.key(0),
+                      OptimConfig(optimizer=AdamW(), learning_rate=1e-3).build(None), key=jax.random.key(0),
                       mesh=MeshSpec().build(compile_only_gpus("sm90", devices, 2**36)), layout=STEP_LAYOUT,
-                      split=1)
+                      fit=FitPolicy(split=1))
     with generation.chosen(**({} if copies else {"narrow_copies": "off"})):
         ahead = compile_ahead(trainer, token_rows(512, MIXER_ROWS, MIXER_LENGTH + 1))
     tokens = jnp.zeros((MIXER_ROWS, MIXER_LENGTH), jnp.int32)

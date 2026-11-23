@@ -32,7 +32,7 @@ class JepaRunConfig(RunConfig):
     RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "probe_classes", "knn_k")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("jepa"))
-    """The JEPA objective and its arguments (`--objective.momentum 0.996 1.0`).
+    """The JEPA objective and its arguments (its `momentum` field, `[0.996, 1.0]`).
     Its EMA ramps over the whole run unless it names `momentum_steps`."""
     # bf16 compute over float32 parameters, as the LM recipe's (`dew.config.lm`).
     model: ModelConfig = dataclasses.field(
@@ -66,8 +66,8 @@ class JepaRunConfig(RunConfig):
         video = sample.key == "video"
         encoder = self.model.build(**self.numerics_fields())
         if video != (isinstance(encoder, ReadsClips) and encoder.reads_clips):
-            raise ValueError("a video dataset and an encoder that reads clips (--model jepa_video_encoder) "
-                             "go together")
+            raise ValueError("a video dataset and an encoder that reads clips (the model "
+                             "`jepa_video_encoder`) go together")
         # A frame is [height, width, channels], an image's or each of a clip's.
         grid = (sample.shape[-3] // encoder.patch_size, sample.shape[-2] // encoder.patch_size)
         # The encoder's settings as it was built, read off the built module: its class's defaults and what
@@ -89,7 +89,7 @@ class JepaRunConfig(RunConfig):
             # records ahead (`Loader.examples`), the run reads its progress.
             if updates is None and dataset.examples is None:
                 raise ValueError("a run bounded by tokens alone counts no updates ahead for the target "
-                                 "encoder's momentum to ramp over; set --objective.momentum_steps")
+                                 "encoder's momentum to ramp over; set the objective's momentum_steps")
             # A run bounded in examples that counts no updates ahead ramps it over its progress.
             ramp = {"momentum_steps": updates}
         adapted = {}

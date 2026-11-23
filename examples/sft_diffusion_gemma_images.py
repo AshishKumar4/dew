@@ -36,15 +36,16 @@ import tyro
 import dew
 from dew.batch import VALID_ROWS
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
-from dew.data import ByteTokenizer, Concatenate, Dataset, Files, Hub, Loading, Source, images, presets
+from dew.data import ByteTokenizer, Dataset, Files, Hub, Loading, Source, concat, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import Perplexity
-from dew.optim import Cosine, OptimConfig
+from dew.optim import AdamW, Cosine, OptimConfig
 from dew.registry import ModelConfig
 from dew.training import MeshSpec, prepare_process
+from dew.training.budget import Horizon
 
 EOS, PAD, IMAGE = 256, 257, 258
 """The ids past the 256 bytes: end of caption, padding and the image placeholder."""
@@ -212,7 +213,7 @@ def image_data(config: Config, parts: dict[str, Source]) -> tuple[Dataset, Datas
     run on the host, before the caption layout reads their pixels into the model's inputs; a device
     augment would run after it, on the batch the layout already made."""
     crop = images.RandomCrop(config.image_size, scale=(0.6, 1.0), flip=True, jitter=True)
-    train = (Concatenate((parts["train"], parts["validation"])).shuffle(seed=0).repeat()
+    train = (concat((parts["train"], parts["validation"])).shuffle(seed=0).repeat()
              .pipe(presets.images, config.image_size, batch=config.batch_size,
                    staging_size=config.staging_size, augment=crop, rejects=False))
     # rejects=False: an image that does not decode stops the run, so every epoch reads every record.
@@ -253,16 +254,15 @@ def main(config: Config) -> Path:
         model=ModelConfig.from_model(model), data=train, validation=test,
         objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
                                                       "pad_token_id": PAD, "eos_token_ids": (EOS,)}),
-        optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, learning_rate=Cosine(
+        optim=OptimConfig(optimizer=AdamW(weight_decay=0.05), clip_grads=1.0, learning_rate=Cosine(
             peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
             end_value=config.learning_rate / 20)),
         # A smoke run keeps both of its checkpoints, so what training moved between them can be read.
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=2 if config.smoke else 1,
-                              steps=config.steps,
-                              log_every=1 if config.smoke else 100, eval_every=config.eval_every,
-                              checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1),
-                              multi_host=False, compilation_cache_dir=None))
-    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
+                              horizon=Horizon(steps=config.steps), log_every=1 if config.smoke else 100,
+                              eval_every=config.eval_every, checkpoint_every=config.eval_every,
+                              mesh=MeshSpec(fsdp=1), multi_host=False, compilation_cache_dir=None))
+    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.diagnostics.xla_flags,
                     run.trainer.compilation_cache_dir)
     objective = run.objective.build(model=model)
     data = caption_data(config, parts, labels)

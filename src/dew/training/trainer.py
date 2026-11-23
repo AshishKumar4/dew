@@ -36,7 +36,7 @@ from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON
 from dew.batch import Batch, at_path, owned_dicts, placed_at, select, unboxed
-from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume
+from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume, _Laid
 from dew.data.compile import Handed
 from dew.data.dataset import (
     Checkpointable,
@@ -82,7 +82,7 @@ from dew.objectives.base import (
     taken_record,
 )
 from dew.objectives.drawn import drawn_once, traced_draw
-from dew.optim import STACKED_OPTIMIZERS, declaring, with_bounds
+from dew.optim import declaring, with_bounds
 from dew.optim_schedules import (
     ScheduleBase,
     held_rates,
@@ -146,7 +146,7 @@ from dew.training._fit import (
 )
 from dew.training._lowering import Lowered
 from dew.training._windows import Windowing, empty_window
-from dew.training.budget import Pause, Plateau
+from dew.training.budget import Horizon, Pause, Plateau
 from dew.training.cadence import Counted
 from dew.training.compiler import Compiled, CompiledStep, StepCompiler, freshly_held, planned_over
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
@@ -169,11 +169,12 @@ from dew.training.distributed import (
 from dew.training.evaluation import EvalSuite, Evaluator, episodic
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
-from dew.training.memory import first_run, recompute_record, refuse_wide_floats, split_share
+from dew.training.memory import first_run, recompute_record, refuse_wide_floats, remat_stated, split_share
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepare_counts, uncounted
 from dew.training.observe import Observe
 from dew.training.phase_passes import PhasePasses, SampledPasses
 from dew.training.planning import Candidate, Planned, Trials, read_whole, released, splits
+from dew.training.policy import FitPolicy, UpdateBatch
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process, signal_wake
@@ -208,6 +209,7 @@ Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
 
 _DEFAULT_MESH = MeshSpec()
+_ONE_BATCH, _PLANNED = UpdateBatch(), FitPolicy()
 
 
 def _closer(stream: Iterator[Batch]) -> Callable[[], None] | None:
@@ -227,6 +229,14 @@ def signature_digest(signature: Hashable) -> str:
     computed once a compile."""
     return hashlib.sha256(repr(signature).encode()).hexdigest()[:16]
 
+
+
+def _refuse_two_remats[L, E](objective: Objective[L, E], fit: FitPolicy) -> None:
+    """Refuse a run's remat (`FitPolicy.remat`) beside a model that states its own, as configured, before any
+    climb: one states the step's recomputation, which a later phase's planner then takes as climbed."""
+    if fit.remat != "auto" and remat_stated(objective):
+        raise ValueError(f"a model that states its own remat trains at it; a run's remat {fit.remat!r} "
+                         "states it for every module (FitPolicy.remat): state one")
 
 
 def _custom_step_refusal(step, record: bool, inspection, rollout: Rollout | None,
@@ -262,9 +272,8 @@ class Trainer(Generic[Loss, Effects]):
         key: int | jax.Array,
         mesh: MeshSpec | Mesh = _DEFAULT_MESH,
         layout: Layout | None = None,
-        microbatches: int | None = None,
-        accumulation: int = 1,
-        split: int | None = None,
+        update: UpdateBatch = _ONE_BATCH,
+        fit: FitPolicy = _PLANNED,
         dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False,
         checkpoints: Checkpoints | None = None,
         tracker: Tracker | None = None,
@@ -289,18 +298,19 @@ class Trainer(Generic[Loss, Effects]):
         The mesh, the compiled step and the capabilities' resources come into being in `fit`, so constructing
         a Trainer allocates nothing.
 
-        `accumulation` is how many steps pool into one optimizer commit, and `split` how many microbatches
-        each step's batch is read in, its rows split evenly; None plans it, the fewest that fit the devices
-        before any recomputation (`compile`). `optimizer` is an optax transformation, or an `OptimConfig` each
-        `fit` builds over its `steps // accumulation` updates; the run steps the objective's
+        `update` is one optimizer commit's size (`UpdateBatch`): the steps it pools, or the tokens it trains
+        on, which `fit` reads its steps from. `fit` is how the step fits the devices (`FitPolicy`): the
+        microbatches each step's batch is read in, its rows split evenly, and what it recomputes, each "auto",
+        the planner's (`compile`), by default; under a mesh of pipeline stages its split is the microbatches
+        the stages feed, a multiple of them, "auto" one a stage. `optimizer` is an optax transformation, or an
+        `OptimConfig` each `fit` builds over its updates; the run steps the objective's
         (`Objective.optimizer`), made from it. `step` replaces the built-in transaction. A custom step then
         owns the clocks, the scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
         attempted-step counter; it passes a model that reads the run's progress it (`PassesProgress`).
         `rollout` runs once per batch read, before the step and outside replay. `skip_nonfinite` skips a step
         not finite, which a run otherwise takes and stops at (training.md, a step that is not finite).
         `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of
-        any axes, which `layout`'s rules name (`Layout.data_axes` its rows'). `microbatches` is how many a
-        pipelined step feeds through the mesh's stage axis, a multiple of its size; None feeds one a stage.
+        any axes, which `layout`'s rules name (`Layout.data_axes` its rows').
         `lower_for`, a CUDA generation, lowers the first step for it in place of compiling it
         (`dew.training._lowering.Lowered`); `ahead`, a step compiled ahead (`dew.training.ahead`), runs as
         the first step where it is that program, and one compiled without its GPU kind's tuned choices
@@ -329,18 +339,21 @@ class Trainer(Generic[Loss, Effects]):
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
         self.mesh = mesh
-        self.accumulation = accumulation
-        self.split = split
+        # An update's steps are its batches, or one until `fit` reads its tokens' (`UpdateBatch.of_tokens`).
+        self.update, self.fit_policy, self.accumulation = update, fit, update.stated_batches
+        self._update_read = update.tokens is None
+        self.split = split = fit.stated_split
         # How a resume treats its data (`DataResume`): relaxed starts it again where its plan differs.
         self.data_resume: DataResume = data_resume
         self.skip_nonfinite = skip_nonfinite
-        self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
+        self._microbatches, self._loss_scale = fit.microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
         self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
         _custom_step_refusal(step, record, inspection, rollout, sampled_passes)
+        _refuse_two_remats(objective, fit)
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
@@ -356,7 +369,7 @@ class Trainer(Generic[Loss, Effects]):
         # A step compiled ahead is taken once the process is readied (`_handed_ahead`): constructing a trainer
         # opens no backend.
         self._ahead_handed = ahead
-        self._compiler = StepCompiler(objective, links, None, self.phase_passes)
+        self._compiler = StepCompiler(objective, links, None, self.phase_passes, fit.remat)
         self._compiled: Compiled | None = None
         # Whether a step has run since the last compile proved its plan fits (`memory`).
         self._unproven = False
@@ -398,8 +411,10 @@ class Trainer(Generic[Loss, Effects]):
         Both inputs default to the run's own, and `place` passes them explicitly so that what it compiles
         takes them as arguments. A held checkpoint then reaches the device as an argument instead of a
         constant embedded in the executable. This is the only implementation of the state, so a subclass
-        overrides it here and every path sees the override.
+        overrides it here and every path sees the override. An update of tokens is refused before a loader
+        states its batches, which size the state's window (`_update_known`).
         """
+        self._update_known()
         initializer = self.objective.initializer if initializer is None else initializer
         from dew.nn.inputs import request_key
         ready_process()  # A key given here opens the backend as the run's does (`key`).
@@ -484,6 +499,10 @@ class Trainer(Generic[Loss, Effects]):
         phase's (`Loader.batches`), which every split a plan takes cuts (`splits`), as fit and compile-ahead
         do."""
         progress = self._config is not None and self._config.reads_progress()
+        # An update of tokens pools as many of the loader's token batches (`UpdateBatch.of_tokens`), known
+        # from here on, for every step a fit or a caller's own compile takes.
+        self.accumulation = self.update.of_tokens(loader.each_token_batch)
+        self._update_read = True
         # Unstaged until its stream is read (`staged`): a ramp of a fit before is none of this one's, nor
         # its batches read whole.
         self._shape = dataclasses.replace(
@@ -580,7 +599,7 @@ class Trainer(Generic[Loss, Effects]):
     def _staging(self) -> StageLocal:
         """Where the step keeps each pipelined run stacked by stage (`StageLocal.of`); none for a CPU-owned
         state, which streams its stack's banks, nor a DiLoCo run, whose groups' copies stack apart."""
-        built = self._config is not None and self._config.optimizer in STACKED_OPTIMIZERS
+        built = self._config is not None and self._config.optimizer.STACKED
         return StageLocal.of(self.objective, self.device_mesh, optimizer=None if built else self.optimizer,
                              local=self.layout.stage_local and self.diloco is None and not self.host_master)
 
@@ -993,6 +1012,13 @@ class Trainer(Generic[Loss, Effects]):
         the split given kept for a later fit."""
         return dataclasses.replace(self._shape, split=1 if self._shape.ramp else self._given_split)
 
+    def _update_known(self) -> None:
+        """Refuse a state or a step of an update of tokens before a loader states the token batches it pools
+        (`reading`, which `fit` calls): its window would hold one batch, its step commit every batch."""
+        if not self._update_read:
+            raise ValueError(f"an update of {self.update.tokens} tokens pools the data's token batches, "
+                             "which no loader has stated yet: read one first (Trainer.reading), as fit does")
+
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep:
         """Compile a transaction over the state and one produced global batch (`StepCompiler.compile`).
@@ -1003,6 +1029,7 @@ class Trainer(Generic[Loss, Effects]):
         prioritized keys nor a concurrent transfer limit. The loader's batch is not donated. The plan takes
         the fewest microbatches at least recomputation, a compile-only GPU holding the memory stated for it,
         at the pass count of the phase its batch was read in (`PhasePasses.scoped`)."""
+        self._update_known()
         self._handed_ahead()
         with self.phase_passes.scoped(self, self._compiler):
             compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials))
@@ -1104,11 +1131,12 @@ class Trainer(Generic[Loss, Effects]):
         starts at the position `dataset` supplies.
 
         Every `log_every` steps, the tracker receives the loss, the objective's metrics and the throughput.
-        `tokens` stops at the first microbatch that reaches this real-token budget, the tokens committed
-        updates trained on (`train/committed_tokens`), persisted in checkpoints. Padding never counts.
-        With both caps the first reached ends the run; with `steps=None`, a decaying schedule needs its own
-        step horizon. `examples` trains on the chain's first source examples, each once with all its rows
-        (`Loader.example_steps`).
+        The run's length is one of `steps`, `epochs`, `tokens` and `examples` (`Horizon`). `tokens` stops at
+        the first microbatch that reaches this real-token budget, the tokens committed updates trained on
+        (`train/committed_tokens`), persisted in checkpoints; padding never counts; with `steps=None`, a
+        decaying schedule needs its own step horizon. `max_tokens` caps a run of another length at tokens
+        so counted, the first reached ending it. `examples` trains on the chain's first source examples,
+        each once with all its rows (`Loader.example_steps`).
 
         Every `eval_every` steps, and at the end, the validation split is scored. The objective's
         artifacts go to the tracker and to `metrics`, whose reductions are logged as `val/<name>`.
@@ -1193,6 +1221,7 @@ class Trainer(Generic[Loss, Effects]):
         epochs: int | None = None,
         tokens: int | None = None,
         examples: int | None = None,
+        max_tokens: int | None = None,
         log_every: int | str | Counted = 100,
         eval_every: int | str | Counted | None = None,
         checkpoint_every: int | str | Counted | datetime.timedelta | None = None,
@@ -1214,9 +1243,12 @@ class Trainer(Generic[Loss, Effects]):
         cadences, scores and policies (`FitPlan`). Its defaults are `fit`'s, stated here alone, which a run
         compiled ahead plans its evaluations by too (`dew.training.ahead.fit_plan`)."""
         startup = Startup()
-        loader, held, tokens, steps, examples = run_data(
-            self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
-            examples=examples, accumulation=self.accumulation, startup=startup, resume=self.data_resume)
+        loader, held, tokens, steps, examples, self.accumulation = run_data(
+            self.objective, dataset, handed_splits(validation),
+            horizon=Horizon(steps=steps, epochs=epochs, tokens=tokens, examples=examples,
+                            max_tokens=max_tokens),
+            update=self.update,
+            startup=startup, resume=self.data_resume)
         self.reading(loader, device_prefetch, examples=examples, steps=steps)
         self.scheduled(None if steps is None else steps // self.accumulation)
         # Its cadences resolved against the run's length, its scores declared, its best and stop policies,
@@ -2283,12 +2315,13 @@ class Trainer(Generic[Loss, Effects]):
         """What a checkpoint of `state` holds on every tier, each tier's save adding its own metadata: one
         envelope a persistent and a local save submit (row 4126)."""
         control, share = {**run.stop_control, **interval.token_control}, DataPartition.of(self.device_mesh)
+        # The rung beside the layout's host fields, which a resume lays out alike (`resumed_layout`).
+        laid = _Laid(rung={**self._compiler.checkpoint_rung(), "host": list(self.layout.host)},
+                     training=self.phase_passes.training_record(self.objective), boxed=self._boxed_axes(),
+                     held_apart=self._staging.apart)
         return {"state": self._staging.saved(state), "saved": position, "share": share, "control": control,
-                # The rung beside the layout's host fields, which a resume lays out alike (`resumed_layout`).
-                "rung": {**self._compiler.checkpoint_rung(), "host": list(self.layout.host)},
-                "artifact": self._artifact(), "training": self.phase_passes.training_record(self.objective),
-                "boxed": self._boxed_axes(), "held_apart": self._staging.apart,
-                "rollout": None if weights_only else _rollout_saved(self.rollout)}
+                "artifact": self._artifact(),
+                "rollout": None if weights_only else _rollout_saved(self.rollout), "_laid": laid}
 
     def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
                                 position: bytes | None, interval: Interval, run: FitRun) -> float:

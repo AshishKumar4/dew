@@ -65,7 +65,7 @@ def build_process(convention: Process | Preset) -> Process:
         raise ValueError(
             f"preset {name!r} builds a {type(process).__name__}; "
             "image diffusion needs a Gaussian Process. Masked diffusion trains "
-            "through LMRunConfig's --objective masked_diffusion")
+            "through LMRunConfig's objective masked_diffusion")
     return process
 
 

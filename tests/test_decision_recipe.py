@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from run_kinds import stated
 
 from dew.config import RunConfig
 from dew.data import Files, Loading, Memory
@@ -20,6 +21,7 @@ from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
 from dew.scores import Summary
 from dew.training import LocalTracker
+from dew.training.budget import Horizon
 
 pytestmark = pytest.mark.mesh
 
@@ -41,16 +43,20 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     def asked(rows):
         return rows.pipe(decisions, question="team").read("memory").batch(8).loading(Loading(workers=0))
 
-    config = DecisionRunConfig.cli([
-        "--pretrained", str(TINY), "--objective.loss", json.dumps(
-            {"class": "dew.decision.scoring:Combined",
-             "fields": {"terms": [[1.0, {"class": "log_loss"}], [0.5, {"class": "brier"}]]}}),
-        "--trainer.name", "tickets", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-        "--trainer.steps", "2", "--trainer.eval-every", "2",
-        "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
-        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32",
-        "--trainer.scored-to", str(tmp_path / "scored")],
-        default=DecisionRunConfig(data=asked(train), validation=asked(held)))
+    config = DecisionRunConfig.cli(["--pretrained", str(TINY), "--trainer.name", "tickets",
+                                    "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                                    "--trainer.horizon.steps",
+                                    "2", "--trainer.eval-every", "2", "--trainer.checkpoint-every", "2",
+                                    "--trainer.log-every", "1", "--trainer.multi-host", "False",
+                                    "--trainer.compilation-cache-dir", "None", "--trainer.scored-to",
+                                    str(tmp_path / "scored")],
+                                   default=stated(
+                                       DecisionRunConfig(data=asked(train), validation=asked(held)),
+                                       model_fields={"dtype": "float32"},
+                                       objective_fields={"loss": {
+                                           "class": "dew.decision.scoring:Combined",
+                                           "fields": {"terms": [[1.0, {"class": "log_loss"}],
+                                                                [0.5, {"class": "brier"}]]}}}))
     assert config.data.facts()["batch"] == 8
     assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier"
     config.run()
@@ -66,10 +72,10 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
 
 
 def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_their_summary(tmp_path):
-    """A decision run names its validation splits and each one's metrics (`--val-metrics`): accuracy on
-    every split and the Brier score on `test` alone, in place of the task's own suite. A summary weighs
-    both splits' accuracy into one (`--val-summaries`), formed at each evaluation, which scores both, and
-    the run ranks its checkpoints by it (`--trainer.best evaluation/summary/board`)."""
+    """A decision run names its validation splits and what they score (`--val-metrics`, `--suites`): accuracy
+    on every split and the Brier score beside it on `test` alone, in place of the task's own. A summary weighs
+    both splits' accuracy into one (`--val-summaries`), formed at each evaluation, which scores both, and the
+    run ranks its checkpoints by it (`--trainer.best evaluation/summary/board`)."""
     board = f"{Summary.SPLIT}/board"
     table = tmp_path / "tickets.csv"
     tickets = [("charged twice for March", "billing"), ("the site is down", "technical"),
@@ -83,17 +89,21 @@ def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_thei
     def asked(rows):
         return rows.pipe(decisions, question="team").read("memory").batch(8).loading(Loading(workers=0))
 
-    config = DecisionRunConfig.cli([
-        "--pretrained", str(TINY), "--trainer.name", "splits",
-        "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-        "--trainer.steps", "2", "--trainer.eval-every", "1", "--trainer.checkpoint-every", "1",
-        "--trainer.log-every", "1", "--trainer.multi-host", "False",
-        "--trainer.compilation-cache-dir", "None",
-        "--model.dtype", "float32", "--trainer.best", board,
-        "--val-metrics", '[{"name": "accuracy"}, {"name": "brier", "split": "test"}]',
-        "--val-summaries", json.dumps([{"name": "board", "weights": {"val/accuracy": 1, "test/accuracy": 3},
-                                        "better": "higher"}])],
-        default=DecisionRunConfig(data=asked(train), validation={"val": asked(held), "test": asked(held)}))
+    config = DecisionRunConfig.cli(["--pretrained", str(TINY), "--trainer.name", "splits",
+                                    "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                                    "--trainer.horizon.steps",
+                                    "2", "--trainer.eval-every", "1", "--trainer.checkpoint-every", "1",
+                                    "--trainer.log-every", "1", "--trainer.multi-host", "False",
+                                    "--trainer.compilation-cache-dir", "None", "--trainer.best", board,
+                                    "--val-metrics", '[{"name": "accuracy"}]', "--suites",
+                                    '{"test": {"metrics": [{"name": "accuracy"}, {"name": "brier"}]}}',
+                                    "--val-summaries",
+                                    json.dumps([{"name": "board", "better": "higher",
+                                                 "weights": {"val/accuracy": 1, "test/accuracy": 3}}])],
+                                   default=stated(DecisionRunConfig(data=asked(train),
+                                                                    validation={"val": asked(held),
+                                                                                "test": asked(held)}),
+                                                  model_fields={"dtype": "float32"}))
     config.run()
     run = tmp_path / "runs" / "splits"
     scores = {}
@@ -104,7 +114,8 @@ def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_thei
         assert names == {"val/loss", "val/accuracy", "test/loss", "test/accuracy", "test/brier", board}
         assert scores[step][board] == (scores[step]["val/accuracy"] + 3 * scores[step]["test/accuracy"]) / 4
     recorded = RunConfig.load(str(run))
-    assert (recorded.val_metrics, recorded.val_summaries) == (config.val_metrics, config.val_summaries)
+    assert (recorded.val_metrics, recorded.suites, recorded.val_summaries) == (
+        config.val_metrics, config.suites, config.val_summaries)
 
 
 def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_path):
@@ -296,13 +307,15 @@ def test_a_decision_run_fine_tunes_on_a_mixture_by_the_weights_its_descriptor_an
     def loaded(rows):
         return rows.read("memory").batch(8).loading(Loading(workers=0))
 
-    config = DecisionRunConfig.cli([
-        "--pretrained", str(TINY), "--trainer.name", "mixed",
-        "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-        "--trainer.steps", "2", "--trainer.eval-every", "2", "--trainer.checkpoint-every", "2",
-        "--trainer.log-every", "1", "--trainer.multi-host", "False",
-        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
-        default=DecisionRunConfig(data=loaded(train), validation=loaded(held)))
+    config = DecisionRunConfig.cli(["--pretrained", str(TINY), "--trainer.name", "mixed",
+                                    "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                                    "--trainer.horizon.steps",
+                                    "2", "--trainer.eval-every", "2", "--trainer.checkpoint-every", "2",
+                                    "--trainer.log-every", "1", "--trainer.multi-host", "False",
+                                    "--trainer.compilation-cache-dir", "None"],
+                                   default=stated(DecisionRunConfig(data=loaded(train),
+                                                                    validation=loaded(held)),
+                                                  model_fields={"dtype": "float32"}))
     config.run()
     tracking = tmp_path / "runs" / "mixed" / "tracking"
     recorded = [json.loads(line) for line in (tracking / "records.jsonl").read_text().splitlines()]
@@ -453,13 +466,14 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
             trainer={"name": "mixed", "checkpoint_final": True})
     directory = tmp_path / "runs" / "mixed"
     loaded = RunConfig.load(str(directory))
-    trained(loaded, tmp_path, "mixed", trainer={"name": "mixed", "steps": 2, "checkpoint_final": True})
+    trained(loaded, tmp_path, "mixed", trainer={"name": "mixed", "horizon": Horizon(steps=2),
+                                                "checkpoint_final": True})
     assert "2" in {path.name for path in directory.iterdir()}
     saved = directory / "run.json"
     record, written = saved.read_bytes(), saved.stat()
     with pytest.raises(PlanOrderChanged) as refused:
         trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed",
-                trainer={"name": "mixed", "steps": 3, "data_resume": "exact"})
+                trainer={"name": "mixed", "horizon": Horizon(steps=3), "data_resume": "exact"})
     routes = refused.value.routes
     assert len(routes) == 3 and (routes[0], routes[-1]) == (RECORD, REBUILD) and SCHEDULE not in routes
     assert routes[1] == DecisionRunConfig.UNSEEDED
@@ -468,7 +482,7 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     assert saved.read_bytes() == record
     assert (saved.stat().st_ino, saved.stat().st_mtime_ns) == (written.st_ino, written.st_mtime_ns)
     trained(RunConfig.load(str(directory)), tmp_path, "mixed",
-            trainer={"name": "mixed", "steps": 3, "checkpoint_final": True})
+            trainer={"name": "mixed", "horizon": Horizon(steps=3), "checkpoint_final": True})
     assert "3" in {path.name for path in directory.iterdir()}
 
 
@@ -490,7 +504,7 @@ def test_a_changed_command_names_no_record_route_where_the_record_would_not_rebu
     saved.write_text(json.dumps(unrebuilt))
     with pytest.raises(PlanOrderChanged) as refused:
         trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed",
-                trainer={"name": "mixed", "steps": 2, "data_resume": "exact"})
+                trainer={"name": "mixed", "horizon": Horizon(steps=2), "data_resume": "exact"})
     assert RECORD not in refused.value.routes
 
 
@@ -1050,9 +1064,9 @@ def test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to
     head = {"joint": JointShape(width=16, routing_layers=1, layers=1, heads=2, feedforward=32),
             "letters": base.head, "untied": dataclasses.replace(base.head, untied=True)}[name]
     run = dataclasses.replace(base, head=head, calibrate=False)
-    trainer = dataclasses.replace(run.trainer, name=name, checkpoint_dir=str(tmp_path / "runs"), steps=4,
-                                  checkpoint_every=1, eval_every=None, log_every=1, multi_host=False,
-                                  compilation_cache_dir=None, stop=Pause(0.5))
+    trainer = dataclasses.replace(run.trainer, name=name, checkpoint_dir=str(tmp_path / "runs"),
+                                  horizon=Horizon(steps=4), checkpoint_every=1, eval_every=None, log_every=1,
+                                  multi_host=False, compilation_cache_dir=None, stop=Pause(0.5))
     paused = dataclasses.replace(run, trainer=trainer).run()
     resumed = dataclasses.replace(run, trainer=dataclasses.replace(trainer, stop=None,
                                                                    resume="require")).run()

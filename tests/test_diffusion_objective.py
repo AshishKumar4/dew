@@ -26,7 +26,7 @@ from diffusion_support import (
 from flax import linen as nn
 from reference_error import as_given
 
-from dew.data import Memory
+from dew.data import Memory, Phase, Steps
 from dew.data.compile import fitted
 from dew.data.dataset import DataPartition, Loader
 from dew.data.pipeline import phases
@@ -48,7 +48,7 @@ from dew.sampling import (
     MultiStepDPM,
     UniPC,
 )
-from dew.training import Trainer
+from dew.training import Trainer, UpdateBatch
 
 _DEFAULT_MAKE_OBJECTIVE_GUIDANCE = CFG(2.0)
 
@@ -581,7 +581,7 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     whole = make_batch_of(2 * rows)
     halves = [jax.tree.map(lambda value, part=part: value[part * rows:(part + 1) * rows], whole)
               for part in (0, 1)]
-    trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3), accumulation=2)
+    trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3), update=UpdateBatch(batches=2))
     initial = trainer.initial_state()
     template = jax.tree.map(jnp.copy, initial)
     run = trainer.compile(initial, halves[0])
@@ -682,7 +682,7 @@ def test_a_validation_set_beside_phases_that_batch_their_own_is_read_in_their_ba
     phases' batch of 8, every record once, each batch's captions encoded after its batch by the
     objective's own steps (rows 2085, 2178)."""
 
-    training = phases((Memory(captioned(8)).batch(8), 1), (Memory(captioned(16)).batch(8), None))
+    training = phases(Phase(Memory(captioned(8)).batch(8), Steps(1)), Phase(Memory(captioned(16)).batch(8)))
     loader, readers = fitted(training, Memory(captioned(16)), objective=make_objective(guidance=None).data())
     assert loader.batch == 8
     reader = readers["val"](DataPartition())

@@ -58,6 +58,8 @@ from dew.training.memory import (
     local_devices,
     memory_record,
     placed_beside,
+    remat_admits,
+    remat_topmost,
     rung_record,
     step_fits,
     step_options,
@@ -81,6 +83,7 @@ from dew.training.planning import (
     splits,
     whole_step_program,
 )
+from dew.training.policy import Remat
 from dew.training.profiling import pgle_runs
 from dew.training.rungs import keep_rung, plan_flops, recorded_rung
 from dew.training.transaction import Transaction, outcome_of
@@ -736,8 +739,11 @@ class StepCompiler[L, E]:
     (`ahead`), until a compile takes it. Everything else a compile reads is its call's."""
 
     def __init__(self, objective: Objective[L, E], links: Mapping[str, Link] | None,
-                 ahead: AheadOfTime | None, phase_passes: PhasePasses[L, E]):
+                 ahead: AheadOfTime | None, phase_passes: PhasePasses[L, E], remat: Remat = "auto"):
         self.objective = objective
+        # What the step may recompute (`FitPolicy.remat`), which each search climbs its ladder within; a
+        # later phase's planner takes the objective as a climb left it (`dew.training.ahead`).
+        self.remat: Remat = remat
         self.phase_passes = phase_passes
         self.ahead = ahead
         # The step compiled ahead a run was handed, whose counts' family a run that draws its pass count per
@@ -818,13 +824,23 @@ class StepCompiler[L, E]:
         """Take a checkpoint's rung (`checkpoint_rung`): the objective climbs
         to the run's own rung, and each shape the checkpoint names climbs to
         its own when it is compiled (`at_base_rung`). A rung recorded before
-        shapes had their own names none, so every shape starts at it."""
+        shapes had their own names none, so every shape starts at it. A rung the run's remat contradicts
+        (`remat_admits`: its fit policy changed since), the run's own or a shape's, each judged against the
+        objective as the run authored it, is not climbed to, the run or that shape searching its own."""
+        if rung is not None and not remat_admits(self.objective, record(rung, 'rung'), self.remat):
+            _log.warning("the checkpoint's rung recomputes otherwise than the run's remat %r asks; searching "
+                         "its own", self.remat)
+            rung = None
+        shapes = {} if rung is None else record(record(rung, 'rung').get('shapes', {}), 'rung shapes')
+        admitted = {name: json_value(shape, f'rung of {name}') for name, shape in shapes.items()
+                    if remat_admits(self.objective, record(shape, f'rung of {name}'), self.remat)}
+        if len(admitted) < len(shapes):
+            _log.warning("the checkpoint's rungs of %s recompute otherwise than the run's remat %r asks; "
+                         "those shapes search their own", sorted(set(shapes) - set(admitted)), self.remat)
         self.climb_to(rung)
         self._resumed_links = {} if rung is None else resumed_link_figures(rung)
-        if rung is not None:
-            shapes = record(record(rung, 'rung').get('shapes', {}), 'rung shapes')
-            self._plans.update({(name, None): Plan(json_value(shape, f'rung of {name}'), None, resumed=True)
-                                for name, shape in shapes.items()})
+        self._plans.update({(name, None): Plan(shape, None, resumed=True)
+                            for name, shape in admitted.items()})
 
     def at_base_rung(self, batch: Batch) -> JSON:
         """Put the objective at the rung a newly met shape starts from, and
@@ -934,6 +950,8 @@ class StepCompiler[L, E]:
             if settings.host_master:
                 raise Lowered(target, *routed(lambda: self._lowered_host(stepping, state, batch, target)))
             self.at_base_rung(batch)
+            # The rung the run's policy starts its step at, which its search would compile (`FitSearch`).
+            self.unsearched_rung(self.objective)
             raise Lowered(target, *routed(
                 lambda: [("step", lowered_for(stepping, state, batch, target, self.narrow))]))
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
@@ -1024,7 +1042,7 @@ class StepCompiler[L, E]:
         """A compiler of this one's objective, links, step compiled ahead and pass counts, nothing planned:
         where a run lays its state out otherwise than the plans this one made were for
         (`dew.training.streaming.laid_start`), whose ladder climbs and plans read no step of that layout."""
-        return StepCompiler(self.objective, self._stated_links, self.ahead, self.phase_passes)
+        return StepCompiler(self.objective, self._stated_links, self.ahead, self.phase_passes, self.remat)
 
     @property
     def unplaced(self) -> Planned | None:
@@ -1377,6 +1395,14 @@ class StepCompiler[L, E]:
         return planned, Compiled(split, plan, memory, planned.executable, flops and split * flops, links,
                                  validation), keep
 
+    def unsearched_rung(self, objective: Objective[L, E]) -> None:
+        """Put `objective` at the rung the run's remat policy starts a step at where no fit search climbs it
+        (`FitPolicy.remat`): a host step's, which streams, priced and compiled alike
+        (`dew.training.streaming`), and a lowering's for another GPU: every module recomputed whole under
+        "full" (`remat_topmost`), its own otherwise, which "none" and "selective" admit."""
+        if self.remat == "full":
+            remat_topmost(objective)
+
     def _plan_key(self, batch: Batch) -> tuple[str, int | None]:
         """The step a plan is kept for (`_plans`): its batch's layout and the pass count it runs
         (`PhasePasses.current`), a phase of other passes another program."""
@@ -1477,9 +1503,10 @@ class StepCompiler[L, E]:
                                                                                  ns_group=ns_group))
             return candidate_for(grouped, state, batch, schedule, placement, replicated, split, narrow)
 
-        # Read before anything traces, so a recorded rung is the first one lowered.
+        # Read before anything traces, so a recorded rung is the first one lowered: a record of a run of this
+        # policy alone (`rung_key`).
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
-                                                   mesh, settings.step)
+                                                   mesh, settings.step, self.remat)
         source = record_path
         if self.ahead is not None and self.ahead.plan is not None:
             recorded, source = self.ahead.plan, "the ahead step"
@@ -1489,6 +1516,12 @@ class StepCompiler[L, E]:
         before = self.rung()
         # Where the run was configured, before a record moves it: the ladder a frontier reads below its plan.
         origin = Rung.of(self.objective, self._xla_defaults, self._narrow, self._ns_group)
+        if recorded is not None and not remat_admits(self.objective, record(recorded, 'plan'), self.remat):
+            # A plan saved by a run of another policy (an ahead step's, a checkpoint's), which this one's
+            # recomputation contradicts: searched afresh from where the run was configured.
+            _log.warning("the saved plan, from %s, recomputes otherwise than the run's remat %r asks; "
+                         "searching its own", source, self.remat)
+            recorded = None
         self.climb_to(recorded)
         self._resumed_rung = None
         if self.rung() != before:
@@ -1504,7 +1537,7 @@ class StepCompiler[L, E]:
                 self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
             self.objective, mesh, self._xla_defaults, self._narrow, self._ns_group,
             None if self._base_rung is None
-            else self._base_rung[1], resumed, ahead=self.ahead,
+            else self._base_rung[1], resumed, remat=self.remat, ahead=self.ahead,
             provisional=provisional, unplaced=unplaced)
         try:
             planned, probes = search.admitted(
@@ -1654,8 +1687,12 @@ class StepCompiler[L, E]:
                   moved: Callable) -> tuple[HostRun, TrainState, Batch]:
         """The host step over `state` and `batch`, its realizations on `accelerator`: the run, the state its
         startup steps from (with the window its first step builds) and the batch on its CPU companion, placed
-        there by `moved` (`transfer`, or `PLACED_AS_CALLED` for a batch of shapes, a lowering's)."""
+        there by `moved` (`transfer`, or `PLACED_AS_CALLED` for a batch of shapes, a lowering's). It runs at
+        the rung its remat policy starts a step at, no search climbing it (`FitPolicy.remat`): every module
+        recomputed whole under "full" (`remat_topmost`), the run's own otherwise, which "none" and "selective"
+        admit."""
         settings = stepping.settings
+        self.unsearched_rung(self.objective)
         from dew.training.execution import HostExecution, frozen_trees, stack_sites
         cpu = settings.state_mesh
         sites = stack_sites(self.objective, state.variables)

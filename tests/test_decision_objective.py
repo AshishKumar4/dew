@@ -18,6 +18,7 @@ from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bou
 from dew.artifacts import Decisions
 from dew.batch import FROZEN, VALID_ROWS
 from dew.checkpoints import Checkpoints
+from dew.data import Phase, Steps
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
@@ -918,7 +919,8 @@ def test_a_phased_runs_phases_and_validation_read_in_one_width():
         return Memory([{"example": example} for example in examples]).pipe(decisions).batch(2)
 
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data, readers = fitted(phases((chain(3), 2), (chain(5), None)), chain(7), objective=objective.data())
+    data, readers = fitted(phases(Phase(chain(3), Steps(2)), Phase(chain(5))), chain(7),
+                           objective=objective.data())
     stream = data.train(DataPartition())
     held = readers["val"](DataPartition())
     try:

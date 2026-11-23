@@ -54,7 +54,7 @@ from dew.interop.harness import HarnessSource
 from dew.objectives.rl import Asynchronous, GRPOObjective, RolloutScheduler, SchedulerRecord
 from dew.objectives.rl.scheduler import task_ids
 from dew.objectives.rl.sessions import Task
-from dew.optim import OptimConfig
+from dew.optim import AdamW, OptimConfig
 from dew.sampling import Sampling
 from dew.training import Trainer
 
@@ -140,7 +140,8 @@ def main(config: Config) -> dict:
     data = Loader(train=lambda partition: iter(
                        lambda: {"task_id": draw.integers(0, len(tasks), config.prompts, np.int32)}, None),
                    val=None, records=len(tasks), batch=config.prompts)
-    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate, b2=0.99, weight_decay=0.0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate,
+                                             optimizer=AdamW(b2=0.99, weight_decay=0.0)),
                       key=jax.random.key(config.seed), rollout=rollout)
     try:
         with trials:

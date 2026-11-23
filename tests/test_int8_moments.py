@@ -1,4 +1,4 @@
-"""8-bit optimizer state (`dew._moments.int8_moments`, `OptimConfig(state_dtype='int8')`): Adam's moments
+"""8-bit optimizer state (`dew._moments.int8_moments`, `AdamW(state_dtype='int8')`): Adam's moments
 stored blockwise in 8 bits, against fp32 Adam."""
 
 import jax
@@ -9,14 +9,14 @@ import pytest
 from learning_gate import assert_learns
 
 from dew._moments import QUANTIZED_SIZE, QuantizedMoments, dequantized, dynamic_map, quantized
-from dew.optim import OPTIMIZER_MAP, OptimConfig
+from dew.optim import AdamW, OptimConfig
 
 LR = 1e-2
 BLOCK = 256
 
 
 def solver(**kwargs):
-    return OptimConfig(optimizer='adamw', learning_rate=LR, weight_decay=0.0, state_dtype='int8',
+    return OptimConfig(optimizer=AdamW(weight_decay=0.0, state_dtype='int8'), learning_rate=LR,
                        **kwargs).build(100)
 
 
@@ -90,12 +90,12 @@ def test_a_values_code_is_the_one_a_search_of_the_whole_map_gives(signed):
 
 def test_int8_state_takes_optax_adamw_steps_from_the_fp32_moments():
     """The update is computed from the moments dequantized to fp32, so the first, from zero moments, which
-    8 bits hold exactly, is fp32 AdamW's (`OPTIMIZER_MAP`), bit for bit. A leaf of `QUANTIZED_SIZE`
+    8 bits hold exactly, is fp32 AdamW's (`AdamW`), bit for bit. A leaf of `QUANTIZED_SIZE`
     values or more whose last axis the block divides keeps 8-bit codes and float32 block scales, a smaller
     one float32 moments; the state is a quarter of float32's and its blocks' scales."""
     params = {"big": jnp.zeros((16, 2 * BLOCK), jnp.float32), "small": jnp.zeros((8, 8), jnp.float32)}
     grads = jax.tree.map(lambda leaf: jax.random.normal(jax.random.key(1), leaf.shape) * 1e-2, params)
-    reference, int8 = OPTIMIZER_MAP['adamw'](LR, weight_decay=0.0), solver()
+    reference, int8 = AdamW(weight_decay=0.0, state_dtype="params").transform(LR), solver()
     expected, _ = reference.update(grads, reference.init(params), params)
     update, state = int8.update(grads, int8.init(params), params)
     jax.tree.map(np.testing.assert_array_equal, update, expected)
@@ -119,7 +119,7 @@ def test_int8_state_trains_as_fp32_adam_does():
     what the fp32 run does (the learning gate, `assert_learns`): its improvement twice over less the fp32
     run's, in units of the fp32 run's improvement, which each unit's fp32 run makes. Each layer holds 4096
     values or more, so its moments are 8-bit."""
-    int8, reference = solver(), OPTIMIZER_MAP['adamw'](LR, weight_decay=0.0)
+    int8, reference = solver(), AdamW(weight_decay=0.0, state_dtype="params").transform(LR)
 
     def loss(params, x, y):
         hidden = jnp.tanh(x @ params["w1"])

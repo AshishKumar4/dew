@@ -2029,18 +2029,20 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
 def iterate(
     pipeline: Pipeline,
     *,
-    read: Read = "streamed",
+    read: Read | None = None,
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
     seed: int | None = None,
 ) -> pygrain.IterDataset:
-    """A finite record pass through the same lowering, for publication and export, in the process:
+    """A finite record pass through the same lowering, for publication and export, in the process, read as
+    `read` says, else as the chain does (`Pipeline.read`), else streamed, as `compile` honors a chain's read:
     automatic workers (`Loading.unsized`) and those the chain names (row 5735), whose turns would
     interleave the records out of the order the pass publishes. A pass that seals what it makes (a
     snapshot's, `seed` given) draws its random steps' values under `seed`, which the rows it seals keep
     (row 9056: a video's clips drawn once and sealed); publication, whose cache a later pass writes
     through, holds no draw."""
     loading = loading.unsized()
+    read = read or pipeline._chain().mode or "streamed"
     pipeline = _in_process(pipeline)
     if (seed is None and draws(pipeline)) or any(isinstance(stage, (BatchStage, MapBatch, Repeat))
                                                  for stage in _steps(pipeline)):

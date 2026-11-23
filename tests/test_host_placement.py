@@ -44,7 +44,7 @@ from dew.nn.kv_cache import row_axis
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
-from dew.training import Checkpoints, Layout, Trainer
+from dew.training import Checkpoints, Layout, Trainer, UpdateBatch
 
 DEVICE = Layout(min_shard=1, tolerance=1.0)
 HOST = Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema"))
@@ -108,8 +108,8 @@ def test_host_resident_state_trains_the_same_model_over_a_scaled_window(tmp_path
     on the finiteness of the whole committed state: each reads every leaf of the host-resident state at
     once, which its commit then stages as one chunk (`dew.training.staging`), and a clipped Adam's run
     trains the model, moments and average the device-resident run trains, by check 1 over drawn starts."""
-    options = {"optimizer": optax.chain(optax.clip_by_global_norm(1.0), optax.adam(0.1)), "accumulation": 2,
-               "dynamic_scale": True}
+    options = {"optimizer": optax.chain(optax.clip_by_global_norm(1.0), optax.adam(0.1)),
+               "update": UpdateBatch(batches=2), "dynamic_scale": True}
     layouts_agree(lambda layout, seed: trained(layout, seed, 4, **options), lambda seed: (np.int32(seed),),
                   "a scaled window of two microbatches with the state in host memory", HOST, DEVICE)
     on_host = fit(HOST, tmp_path / "host", 4, **options)

@@ -6,7 +6,7 @@ data and its metrics from `RunConfig`'s fields (`prepare`), and trains through `
 alone the trainer, `fit`'s arguments, the checkpoints and the tracker are built from its
 `TrainerConfig`. Each kind here, a language model's, a decision's, a diffusion model's and a JEPA's, is
 set these and observed where each acts, in the scalars and checkpoints its run writes and the state it
-ends on: on the command line, its name and checkpoint directory, steps, accumulation, cadences of logs,
+ends on: in its record, its name and checkpoint directory, steps, accumulation, cadences of logs,
 evaluations and checkpoints, checkpoints kept, dynamic loss scale, learning rate, validation metrics and
 summaries; from Python, its key, data seed, mesh, layout and adapter. An option a kind builds nothing
 from (source options of a fresh model, a model name its source decides, process options its process
@@ -42,10 +42,11 @@ from run_kinds import (
 )
 
 from dew.batch import FROZEN
-from dew.config import SourceOptions, TrainerConfig
+from dew.config import Diagnostics, SourceOptions, TrainerConfig
 from dew.lora import LoRA
 from dew.registry import ModelConfig, objectives
 from dew.scores import Summary
+from dew.training.budget import Horizon
 
 pytestmark = pytest.mark.mesh
 
@@ -54,15 +55,15 @@ pytestmark = pytest.mark.mesh
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(kind, tmp_path):
-    """`dew train` over a kind's run.json with its options set (`--set`): four steps pooled two to an
-    update commit at the second's and the fourth's end (`train/grad_norm`), under a dynamic loss
-    scale (`train/loss_scale`) and the learning rate set (`train/learning_rate`); every step is
+    """`dew train` over a kind's run.json with its options set in it (`run_kinds.set_record`): four steps
+    pooled two to an update commit at the second's and the fourth's end (`train/grad_norm`), under a dynamic
+    loss scale (`train/loss_scale`) and the learning rate set (`train/learning_rate`); every step is
     logged and scored on the held split, with no metric the kind would score by default and the
     summary named formed from the scores; and every step's checkpoint is kept, four, where the
     default keeps the latest two and the best, in the directory named."""
     record = saved_record(KINDS[kind](tmp_path, drawn=False), tmp_path, "set")
     run = trained_record(record, cli_settings(tmp_path, "set", {
-        "trainer.steps": "4", "trainer.accumulation": "2", "trainer.log_every": "1",
+        "trainer.horizon.steps": "4", "trainer.update.batches": "2", "trainer.log_every": "1",
         "trainer.eval_every": "1", "trainer.checkpoint_every": "1", "trainer.keep": "4",
         "model.dtype": "float16",
         "optim.learning_rate": str(RATE), "val_metrics": "[]",
@@ -88,9 +89,9 @@ def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(
 
 @pytest.mark.mesh(devices=8)
 def test_a_runs_kernel_choices_reach_the_programs_it_traces_and_its_record(tmp_path):
-    """`kernels` names the kernel a run runs for an op (`dew.kernels.use`, row 4649), in every program it
-    traces: one its devices cannot run for its attention is refused as its step traces, the portable one
-    trains, and the run's record keeps the choice, which its resume reads."""
+    """`diagnostics.kernels` names the kernel a run runs for an op (`dew.kernels.use`, row 4649), in every
+    program it traces: one its devices cannot run for its attention is refused as its step traces, the
+    portable one trains, and the run's record keeps the choice, which its resume reads."""
     from run_kinds import lm
 
     from dew.config import RunConfig
@@ -98,9 +99,11 @@ def test_a_runs_kernel_choices_reach_the_programs_it_traces_and_its_record(tmp_p
 
     run = lm(tmp_path, drawn=False)
     with pytest.raises(KernelRefused):
-        trained(dataclasses.replace(run, kernels={"attention": "cudnn"}), tmp_path, "refused")
-    trained(dataclasses.replace(run, kernels={"attention": "xla"}), tmp_path, "chosen")
-    assert RunConfig.load(str(tmp_path / "runs" / "chosen")).kernels == {"attention": "xla"}
+        trained(dataclasses.replace(run, diagnostics=Diagnostics(kernels={"attention": "cudnn"})), tmp_path,
+                "refused")
+    trained(dataclasses.replace(run, diagnostics=Diagnostics(kernels={"attention": "xla"})), tmp_path,
+            "chosen")
+    assert RunConfig.load(str(tmp_path / "runs" / "chosen")).diagnostics.kernels == {"attention": "xla"}
 
 
 @pytest.mark.mesh(devices=8)
@@ -163,9 +166,11 @@ def test_a_process_option_the_process_does_not_carry_is_refused_before_training(
     stated = {"xla_flags": "--xla_dump_hlo_pass_re=run-options-1901",
               "compilation_cache_dir": str(tmp_path / "cache"), "multi_host": True}[option]
     run = KINDS[kind](tmp_path, drawn=False)
-    trainer = TrainerConfig(**{"checkpoint_dir": str(tmp_path / "runs"), "steps": 1, "eval_every": None,
-                               "multi_host": False, option: stated})
-    prepared = dataclasses.replace(run, trainer=trainer).prepare()
+    trainer = TrainerConfig(**{"checkpoint_dir": str(tmp_path / "runs"), "horizon": Horizon(steps=1),
+                               "eval_every": None, "multi_host": False,
+                               **({} if option == "xla_flags" else {option: stated})})
+    diagnostics = Diagnostics(xla_flags=stated) if option == "xla_flags" else Diagnostics()
+    prepared = dataclasses.replace(run, trainer=trainer, diagnostics=diagnostics).prepare()
     with pytest.raises(ValueError):
         prepared.train("refused")
     assert not (tmp_path / "runs" / "refused").exists()
