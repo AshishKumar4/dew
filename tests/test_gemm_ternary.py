@@ -589,6 +589,45 @@ def test_a_packed_products_rescue_keeps_an_explicit_meshs_row_placement():
             np.testing.assert_array_equal(np.asarray(d_rows), want)
 
 
+def test_a_packed_products_rescue_keeps_a_subnormal_remainder():
+    """Codes +1, -1 and +1 at a scale of 4 under cotangents 2**126, 2**126 and 2**-149: the first two
+    cancel past fp32's largest and the remainder, 2**-147, is subnormal; the rescue rounds it in integers,
+    so a process whose float32 arithmetic flushes subnormals still returns it (rows 1464, 12403)."""
+    codes = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0).at[0, 2].set(1.0)
+    weights = dataclasses.replace(formats.TernaryWeights.of(codes, scale=jnp.float32(1.0)),
+                                  scale=jnp.float32(4.0))
+    _, pull = jax.vjp(lambda x: gemm.ternary_weight_product(x, weights, quantize_activations=False,
+                                                            out_dtype=jnp.float32),
+                      jnp.zeros((16, 256), jnp.float32))
+    cotangent = jnp.zeros((16, 64), jnp.float32).at[0, :3].set(
+        jnp.asarray([2.0 ** 126, 2.0 ** 126, 2.0 ** -149], jnp.float32))
+    (d_rows,) = pull(cotangent)
+    want = np.zeros((16, 256), np.float32)
+    want[0, 0] = np.float32(2.0 ** -147)
+    np.testing.assert_array_equal(np.asarray(d_rows).view(np.uint32), want.view(np.uint32))
+
+
+def test_an_fp8_products_rescue_leaves_an_infinite_coefficient_to_its_own_coordinate():
+    """An E5M2 bank with codes +1, -1 and +1 at input coordinate 0 and +inf at coordinate 1, a scale of 4,
+    under cotangents 2**126, 2**126 and 1: coordinate 0's gradient is 4 (the infinity leaves the exact
+    sums' grid alone), coordinate 1's IEEE's, +inf where the product is 4 * 2**126 and NaN where it is 0
+    (rows 1464, 12403)."""
+    matrix = jnp.zeros((64, 64), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
+    matrix = matrix.at[1, 0].set(jnp.inf)
+    weights = dataclasses.replace(formats.Fp8Weights.of(matrix, fmt="e5m2", scale=jnp.float32(1.0)),
+                                  scale=jnp.float32(4.0))
+    _, pull = jax.vjp(lambda x: gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32),
+                      jnp.zeros((16, 64), jnp.float32))
+    (d_rows,) = pull(jnp.zeros((16, 64), jnp.float32).at[0, :3].set(
+        jnp.asarray([2.0 ** 126, 2.0 ** 126, 1.0], jnp.float32)))
+    got = np.asarray(d_rows)
+    assert got[0, 0] == 4.0 and np.isposinf(got[0, 1]), got[0, :2]
+    assert np.isnan(got[1:, 1]).all(), got[1:, 1]
+    rest = np.delete(got, 1, axis=1)
+    rest[0, 0] = 0.0
+    np.testing.assert_array_equal(rest, np.zeros_like(rest))
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_packed_products_rescue_is_exact_within_a_row_and_across_replicas():
     """A ternary product's rescue sums its products exactly before one rounding (rows 12392, 12403): within

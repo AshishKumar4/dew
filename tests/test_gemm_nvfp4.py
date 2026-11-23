@@ -756,6 +756,44 @@ def test_fp8_and_ternary_weights_checkpoint_restore_verifies_form_and_scale(tmp_
 
 
 @INTERPRETS
+def test_an_nvfp4_products_rescue_leaves_a_nan_block_scale_to_its_own_coordinates(monkeypatch):
+    """Codes +1, -1 and +1 at input coordinate 0 beside a NaN block scale at coordinates 16 to 31 of
+    another column, a factor of 4, under cotangents 2**126, 2**126 and 1: coordinate 0's gradient is 4 and
+    the NaN block's coordinates are IEEE's NaN, every other zero; routed twice into one token with the
+    rescue's fan-in cut to one route a carry, the token's gradient is the routes' exact sum, 2**-38
+    (rows 1464, 12403)."""
+    from dew.nn.kernels.templates.gemm import factored
+
+    codes = jnp.zeros((512, 128), jnp.float32).at[0, :3].set(jnp.asarray([1.0, -1.0, 1.0]))
+    scales = jnp.ones((32, 128), jnp.float8_e4m3fn).at[1, 3].set(jnp.nan)
+    matrix = formats.NvFp4.of(codes, scales, jnp.float32(4.0 / 256.0))
+    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32),
+                      jnp.zeros((4, 512), jnp.float32))
+    (d_x,) = pull(jnp.zeros((4, 128), jnp.float32).at[0, :3].set(
+        jnp.asarray([2.0 ** 126, 2.0 ** 126, 1.0], jnp.float32)))
+    got = np.asarray(d_x)
+    assert np.isnan(got[:, 16:32]).all(), got[:, 16:32]
+    want = np.zeros((4, 512), np.float32)
+    want[0, 0] = 4.0
+    got[:, 16:32] = 0.0
+    np.testing.assert_array_equal(got, want)
+
+    monkeypatch.setattr(factored, "FACTORED_FAN_IN", 1)
+    one = jnp.ones((32, 128), jnp.float8_e4m3fn)
+    first = jnp.zeros((512, 128), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
+    second = jnp.zeros((512, 128), jnp.float32).at[0, 2].set(1.0)
+    bank = formats.NvFp4.of(jnp.stack([first, second]), jnp.stack([one, one]),
+                            jnp.asarray([2.0 ** 110, 2.0 ** -8], jnp.float32))
+    _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, bank, jnp.asarray([1, 1], jnp.int32),
+                                                      jnp.asarray([0, 0], jnp.int32), out_dtype=jnp.float32),
+                      jnp.zeros((1, 512), jnp.float32).at[0, 0].set(1.0))
+    (d_token,) = pull(jnp.zeros((2, 128), jnp.float32).at[0, :2].set(2.0 ** 100).at[1, 2].set(2.0 ** -30))
+    want = np.zeros((1, 512), np.float32)
+    want[0, 0] = 2.0 ** -38
+    np.testing.assert_array_equal(np.asarray(d_token), want)
+
+
+@INTERPRETS
 def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
     """An NVFP4 product's input gradient where each cotangent times the matrix's factor (2**8 owed times a
     tensor scale of 2**110) passes fp32's largest, against codes +1 and -1 that cancel: 0, not inf - inf;
