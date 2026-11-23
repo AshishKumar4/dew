@@ -779,8 +779,9 @@ def test_a_routed_products_reverse_pass_reads_it_as_varying_as_its_routing_table
 def test_a_scattered_products_consumer_reads_an_explicitly_placed_side_in_its_rows_order():
     """A fused scattered product under an Explicit mesh, its tokens, weight and permutation whole and its
     residual's rows split over two CPU devices: its consumer reads the residual permuted to the product's
-    rows, placed as the residual is, and its value and gradients are the product's unfused (`gemm.gemm`,
-    then the add), forward and backward (row 5391)."""
+    rows, placed as the residual is, its sum named (`checkpoint_name`) and read back in the product's rows'
+    order, and its value and gradients are the product's unfused (`gemm.gemm`, then the add), forward and
+    backward (row 5391)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
@@ -791,7 +792,9 @@ def test_a_scattered_products_consumer_reads_an_explicitly_placed_side_in_its_ro
 
     def region(x, w, side, *, fused):
         call = fused_gemm.product if fused else gemm.gemm
-        return call(x, w, sizes, out_dtype=jnp.float32, scatter=scatter, interpret_on_cpu=True) + side
+        y = call(x, w, sizes, out_dtype=jnp.float32, scatter=scatter, interpret_on_cpu=True)
+        # Named, a residual of the derivative under its name (`gemm`'s `named`), read back in row order.
+        return jax.ad_checkpoint.checkpoint_name(y + side, "saved") * side
 
     def both(side, *, fused):
         program = (functools.partial(fused_gemm.fused, functools.partial(region, fused=True)) if fused
