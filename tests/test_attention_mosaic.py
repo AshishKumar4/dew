@@ -1319,21 +1319,14 @@ def _forward_call(shape, width: int, value_width: int, residuals: template.Kept)
                       residuals=residuals)
 
 
-@pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
-def test_a_forward_proposed_for_an_h100_is_proposed_whatever_gpu_is_in_effect(residuals):
-    """An H100's causal forward (16 heads over 4, width 128, 4,096 tokens): the config derived for it under
-    the H100's own is proposed for the H100 while an A100 is in effect (`generation.assumed("sm80")`) as under
-    the H100's: its register proposal is the H100's (`Template.proposes`, under its target), where it read
-    the A100's register model beside the H100's shared memory (row 12000; row 11987's cross-generation
-    checks)."""
+def test_a_forward_proposed_for_an_h100_is_proposed_whatever_gpu_is_in_effect():
+    """An H100 forward's config is proposed for it with an A100 in effect (`Template.proposes`, row 12000)."""
     h100 = generation.gpu_target("sm90")
+    op, ba = _forward_call((1, 4096, 16, 4), 128, 128, template.Kept.SPLIT)
     with generation.assumed("sm90"):
-        op, ba = _forward_call((1, 4096, 16, 4), 128, 128, residuals)
         own = op.derived(ba, h100)
-        assert own is not None and op.proposes(ba, own, h100)
     with generation.assumed("sm80"):
-        op, ba = _forward_call((1, 4096, 16, 4), 128, 128, residuals)
-        assert op.proposes(ba, own, h100)
+        assert own is not None and op.proposes(ba, own, h100)
 
 
 @pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])

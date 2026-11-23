@@ -531,7 +531,7 @@ def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kerne
     _refused_launch(_identity(op, arguments, generation.gpu_target()), config, kernels, spilled_in)
 
 
-def _refused_launch(identity: Hashable, config: Hashable, kernels,
+def _refused_launch(identity: str, config: Hashable, kernels,
                     spilled_in: Mapping[str, tuple[str, ...] | None] | None) -> None:
     """The launch of `identity` (`_identity`: its op, arguments and target) refused at `config`, as
     `refuse_launch` refuses it: what a settle of launches certified aside records by the identity it queued
