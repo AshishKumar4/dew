@@ -816,11 +816,11 @@ class FitSearch[LossT, EffectsT]:
     live set (`LiveSet`), from which the split asked next at that rung is computed (`MemoryMiss`). The plan
     is the first rung of that order that fits, at the coarsest split seen to fit there: a head's tile or
     XLA's defaults, which recompute nothing, can fit below the remat rung settled, which a run states by
-    its rung (`--trainer.remat`, a head tile) or plans offline at each (`told`). What a rung keeps orders its
-    residuals, not XLA's allocated peak (a scanned delta decoder at four microbatches needed 31.71 MB
-    recomputing all but its scans and convolutions and 32.14 MB recomputing them too, a heavier rung needing
-    more), so no rung is passed over for one above or below it on a figure; the log names every rung asked
-    with what it needed.
+    its rung (`--trainer.fit.remat`, a head tile) or plans offline at each (`told`). What a rung keeps
+    orders its residuals, not XLA's allocated peak (a scanned delta decoder at four microbatches needed
+    31.71 MB recomputing all but its scans and convolutions and 32.14 MB recomputing them too, a heavier
+    rung needing more), so no rung is passed over for one above or below it on a figure; the log names every
+    rung asked with what it needed.
     Each compile that misses names the split asked next (`after`); `resumed`, a checkpoint's rung, is
     warned of where it misses; where nothing fits it raises with the closest candidate's numbers. The
     objective is left at the plan's rung. A miss read from JAX's persistent cache states its live set as
