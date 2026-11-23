@@ -2428,7 +2428,7 @@ def test_sm120_output_staging_admits_three_stage_128x256_and_compiles():
                   tuning.pinned({grouped_matmul.MosaicGmm: arm})):
                 return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
-        assert_as_exact(jax.jit(dew_fn), jax.jit(ref_fn), draw, f"sm120 staging {tag}", seeds=4,
+        assert_as_exact(jax.jit(dew_fn), jax.jit(ref_fn), draw, f"sm120 staging {tag}", seeds=8,
                         truth_fn=functools.partial(ref_fn, dtype=jnp.float64))
 
     if generation.compile_only_gpus("sm120"):
