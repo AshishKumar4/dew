@@ -31,6 +31,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     column_tile,
     f32,
     finished_form,
+    fitting_block,
     fp32_operand,
     held_tile,
     key_block,
@@ -57,10 +58,11 @@ def _parted(call: Call) -> Operand:
     return Operand(call.rows, FAST_PARTS, jnp.dtype(jnp.float32))
 
 
-def _value_blocks(form: Operand, ref, row, column, call: Call, smem) -> Callable[[int, jax.Array], None]:
-    """A store of a chunk's value tile `j` `[C, Call.value_block]` into `ref` in `form` at `row`, its columns
-    from `column` on (`algebra.key_scores_back`'s and `key_values_back`'s `emit`)."""
-    vb = call.value_block
+def _value_blocks(form: Operand, ref, row, column, call: Call, smem,
+                  vb: int | None = None) -> Callable[[int, jax.Array], None]:
+    """A store of a chunk's value tile `j` `[C, vb]` (`Call.value_block` where None) into `ref` in `form` at
+    `row`, its columns from `column` on (`algebra.key_scores_back`'s and `key_values_back`'s `emit`)."""
+    vb = call.value_block if vb is None else vb
 
     def stored(j, value):
         form.store(ref, value, row, call.chunk, column + j * vb, vb, family=call.family, smem=smem)
@@ -256,7 +258,7 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
     value_width, family = call.value_width, call.family
     held, given, grads, square = dataclasses.replace(call.held, rows=call.rows), call.given, _value_grads(
         call), fp32_operand(call)
-    vb = call.value_block
+    vb = _key_values_block(call)
     blocks = value_width // vb
     # The values' gradient whole, stored once, nothing added to it after.
     values_out = finished_form(call, once=True)
@@ -277,7 +279,7 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
             lower = stream_tile(slots, "lower", held)
             issue = Issuer(call, {"values_merge": values, "system_merge": system})
 
-            stored = _value_blocks(values_out, dv_out_ref, row, h * value_width, call, landing["values"])
+            stored = _value_blocks(values_out, dv_out_ref, row, h * value_width, call, landing["values"], vb)
             summed, beta_terms = algebra.key_values_back(
                 functools.partial(column, "value_grads", grads), functools.partial(column, "values", given),
                 blocks, lower, family.rows_of(beta_ref.at[h, span]), held.dtype, issue, issue.summed,
@@ -296,23 +298,39 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
                 jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     # The values' two products a value block, then the system's two: the model's.
     model = 2 * 2 * chunk * chunk * value_width + 2 * 2 * chunk ** 3
-    landing = {"values": values_out.landing(chunk, vb), "square": square.landing(chunk, chunk)}
+    staging, landing = _key_values_staged(call, vb)
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(5),
-                         steps=1, model=model,
-                         held=_key_values_held(call),
-                         staging=(staging_tiles(held, (chunk, vb))[0],
-                                  staging_tiles(held, (chunk, chunk))[0]),
+                         steps=1, model=model, held=_key_values_held(call, vb), staging=staging,
                          landing=landing, persistent=not family.operands_in_registers)(
         dv, v, a, beta, d_system, taken)
 
 
-def _key_values_held(call: Call) -> Held:
-    """`_key_values_back`'s consumer thread: the system's gradient summed over the value blocks beside a
-    value block's values, their gradient and the gated values' (`algebra.key_values_back`); then the system's
-    gradient and its two products through the inverse, their mask and a product's narrow operand
-    (`algebra.key_system_back`)."""
-    chunk, vb = call.chunk, call.value_block
+def _key_values_block(call: Call) -> int:
+    """`_key_values_back`'s value block: the widest whole number of 16 columns dividing `Call.value_block`
+    whose register model fits a consumer thread's (`mainloop.fitting_block`): an RTX PRO 6000's fed
+    mma.sync, 20 registers a thread held past mma.sync's 40 (`bundles.MmaFed.HELD_ON`), took Kimi Linear's
+    at 64 to 260 of its 255 and refused its fast backward (row 10153, scratch jsf-sm120diag)."""
+    return fitting_block(call, functools.partial(_key_values_held, call),
+                         functools.partial(_key_values_staged, call), call.value_block, 16)
+
+
+def _key_values_staged(call: Call, vb: int) -> tuple:
+    """`_key_values_back`'s staging at value block `vb` (a value block's and the square's operand tiles) and
+    its landings (the values' gradient's a value block wide, the system's)."""
+    chunk, held = call.chunk, dataclasses.replace(call.held, rows=call.rows)
+    staging = (staging_tiles(held, (chunk, vb))[0], staging_tiles(held, (chunk, chunk))[0])
+    landing = {"values": finished_form(call, once=True).landing(chunk, vb),
+               "square": fp32_operand(call).landing(chunk, chunk)}
+    return staging, landing
+
+
+def _key_values_held(call: Call, vb: int) -> Held:
+    """`_key_values_back`'s consumer thread at value block `vb`: the system's gradient summed over the value
+    blocks beside a value block's values, their gradient and the gated values' (`algebra.key_values_back`);
+    then the system's gradient and its two products through the inverse, their mask and a product's narrow
+    operand (`algebra.key_system_back`)."""
+    chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
     # In turn: the inverse (read transposed) against a value block's gradient, that gradient against the
     # gated values read transposed ('values_merge'); then the system's gradient against the inverse read
