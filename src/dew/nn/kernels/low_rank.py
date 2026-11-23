@@ -105,7 +105,11 @@ def _backward(out_dtype, precision, interpret_on_cpu, residuals, cotangent):
     d_lhs = d_kernel = d_a = d_b = d_scale = None
     if wants_lhs:
         # The matrices as the forward multiplied them, in the rows' dtype, then at the cotangent's width.
-        d_lhs = joined_depths(((dy, kernel.astype(lhs.dtype)), (scaled.astype(work), a.astype(lhs.dtype))),
+        # Joined at a width whose range holds the scaled update's cotangent (`scaled`, wide): the
+        # cotangent's own, unless that is fp16's, whose largest a scale's 2**16 passes.
+        joined = work if jnp.finfo(work).maxexp >= jnp.finfo(wide).maxexp else wide
+        d_lhs = joined_depths(((dy.astype(joined), kernel.astype(lhs.dtype)),
+                               (scaled.astype(joined), a.astype(lhs.dtype))),
                               group_sizes, transpose_rhs=True, out_dtype=lhs.dtype, precision=precision,
                               interpret_on_cpu=interpret_on_cpu)
 
