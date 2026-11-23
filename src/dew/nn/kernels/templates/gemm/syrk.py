@@ -681,7 +681,7 @@ class MosaicSyrk(TilesTemplate):
         del return_residuals
         target = generation.gpu_target()
         bound = self.bind(x, poly_coeffs, transpose=transpose, out_dtype=out_dtype, interpret=interpret)
-        mp = config.cluster if interpret else unit_cost.wave(target, config.programs)
+        mp = config.cluster if interpret else unit_cost.wave(target.multiprocessors, config.programs)
         regs = self.registers(bound, config, target)
         shared = regs and self.staged_bytes(bound, config, target)
         out = syrk(x, tiles=config, transpose=transpose, out_dtype=out_dtype, multiprocessors=mp,
