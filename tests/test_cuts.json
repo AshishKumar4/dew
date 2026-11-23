@@ -583,8 +583,8 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-64-OUTPUT-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-64-OUTPUT-bfloat16-softcap-sinks-alibi]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-64-SPLIT-bfloat16-custom-vjp]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-64-SPLIT-bfloat16-sinks]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-64-SPLIT-bfloat16-temperature]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-64-SPLIT-bfloat16-row-indexed]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm120-64-SPLIT-bfloat16-softcap]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm80-128-NONE-bfloat16-alibi]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm80-128-NONE-bfloat16-none]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm80-128-NONE-bfloat16-sinks]",
@@ -659,10 +659,10 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-64-OUTPUT-bfloat16-temperature]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-64-SPLIT-bfloat16-key-bias]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-64-SPLIT-bfloat16-row-indexed]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-64-SPLIT-bfloat16-softcap-sinks-alibi]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-64-SPLIT-float16-none]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm90-128-NONE-bfloat16-key-bias]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm90-128-NONE-bfloat16-sinks]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-64-SPLIT-bfloat16-temperature]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm90-128-NONE-bfloat16-alibi]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm90-128-NONE-bfloat16-none]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm90-128-NONE-bfloat16-temperature]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm90-128-NONE-bfloat16-tile-bias]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm90-128-OUTPUT-bfloat16-key-bias]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm90-128-OUTPUT-bfloat16-sinks]",
@@ -702,20 +702,20 @@
 ],
 "tests/test_attention_placed.py": [
 "tests/test_attention_placed.py::test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_interleaving[causal]",
-"tests/test_attention_placed.py::test_a_fused_walks_dq_ring_and_its_reducer_hold_every_property_in_every_interleaving[full]",
 "tests/test_attention_placed.py::test_a_tcgen05_devices_backward_derives_its_walked_launches[sm90]",
 "tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[fused-full-128]",
-"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[two launches-causal-64]",
-"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[walked dq-causal-128]",
-"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[walked dq-full-128]",
-"tests/test_attention_placed.py::test_the_correction_warpgroup_at_d256_holds_protocol_in_every_interleaving[full-moved]",
-"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_at_two_consumers_holds_check_1_interpreted[full-320]",
-"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted[full-folded-256]",
-"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_over_short_walks_interpreted[64]",
+"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[two launches-full-128]",
+"tests/test_attention_placed.py::test_the_backward_keys_first_on_tcgen05_holds_check_1_interpreted[walked dq-causal-64]",
+"tests/test_attention_placed.py::test_the_correction_warpgroup_at_d256_holds_protocol_in_every_interleaving[causal-kept]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_at_two_consumers_holds_check_1_interpreted[causal-192]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_interpreted[causal-natural-64]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_check_1_over_documents_interpreted",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving[two-causal-kept]",
+"tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving[two-full-kept]",
 "tests/test_attention_placed.py::test_the_forward_on_tcgen05s_rows_holds_every_property_in_every_interleaving[two-full-moved]",
-"tests/test_attention_placed.py::test_the_walked_backward_at_width_256_holds_check_1_interpreted[causal]",
+"tests/test_attention_placed.py::test_the_rows_forward_states_each_product_its_issuer_walks[3]",
 "tests/test_attention_placed.py::test_the_walked_backward_at_width_256_holds_check_1_interpreted[full]",
-"tests/test_attention_placed.py::test_the_walked_backward_states_each_product_its_issuers_walk[two launches]"
+"tests/test_attention_placed.py::test_the_walked_backward_states_each_product_its_issuers_walk[walked dq]"
 ],
 "tests/test_attention_prologues.py": [
 "tests/test_attention_prologues.py::test_a_prologued_forward_compiles_spill_free_at_its_derived_config[4b-b200-inference-rounded]",
@@ -848,15 +848,15 @@
 "tests/test_attention_triton.py::test_a_forward_at_its_own_config_compiles_within_an_a100s_block[NONE]",
 "tests/test_attention_triton.py::test_a_forward_at_its_own_config_compiles_within_an_a100s_block[OUTPUT]",
 "tests/test_attention_triton.py::test_a_forward_at_its_own_config_compiles_within_an_a100s_block[SPLIT]",
-"tests/test_attention_triton.py::test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler[sm80]",
+"tests/test_attention_triton.py::test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-128x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-step-128x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-fp16-forward-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-key-forward-64x128]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-forward-64x128]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-bf16-128-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-fp32-forward-128x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-softcap-forward-32x32]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[a100-tile-forward-128x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-alibi-forward-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-forward-64x128]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-alibi-step-128x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-bf16-forward-64x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-fp32-step-32x32]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-bf16-forward-64x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp32-step-64x64]",
@@ -1033,8 +1033,8 @@
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_one_a_head[running prefix]",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_a_decay_a_key_dimensions_fast_backward",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_a_packed_call[inside a chunk]",
-"tests/test_check2.py::test_the_recurrence_step_witness_holds_a_write_gate_on_the_keys_side_and_refuses_one_dropped",
-"tests/test_check2.py::test_the_recurrence_step_witness_holds_the_fast_backward[fp32 under the delta rule]",
+"tests/test_check2.py::test_the_recurrence_step_witness_holds_an_unbounded_steep_column[bf16 clamped]",
+"tests/test_check2.py::test_the_recurrence_step_witness_holds_the_fast_backward[bf16 under the delta rule]",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_the_interpreted_mainloop[slow]",
 "tests/test_check2.py::test_the_recurrence_step_witness_holds_values_passed_in_parts_and_refuses_them_rounded",
 "tests/test_check2.py::test_the_recurrence_step_witness_refuses_a_backward_that_read_other_gradients",
@@ -1420,6 +1420,9 @@
 "tests/test_decision_workflow.py::test_a_cell_of_the_workflow_holds_the_conservation_contract[question-plain-0.0-share]",
 "tests/test_decision_workflow.py::test_the_workflows_resumed_run_ends_on_its_uninterrupted_run_from_its_compiled_programs",
 "tests/test_decision_workflow.py::test_the_workflows_task_answers_from_its_compiled_programs"
+],
+"tests/test_declared_cells_memory.py": [
+"tests/test_declared_cells_memory.py::test_a_gated_stacks_backward_holds_no_layers_outputs_past_its_layer[sm90-one device]"
 ],
 "tests/test_decode_attention.py": [
 "tests/test_decode_attention.py::test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config[bfloat16-both-fold-16]",
@@ -1869,9 +1872,6 @@
 "tests/test_fresh_rate.py::test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one",
 "tests/test_fresh_rate.py::test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_groups_rate[a fresh group]"
 ],
-"tests/test_gated_mlp.py": [
-"tests/test_gated_mlp.py::test_the_fused_mlp_holds_check_1_with_its_gradients[swiglu-1.5-sm90]"
-],
 "tests/test_gemm_degenerate.py": [
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[depth no step divides-hooked]",
 "tests/test_gemm_degenerate.py::test_a_degenerate_call_is_xlas[depth no step divides-paired]",
@@ -1983,9 +1983,6 @@
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-all-empty]",
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-tile-boundaries]"
 ],
-"tests/test_grpo.py": [
-"tests/test_grpo.py::test_a_recorded_grpo_run_trains_on_the_rollout_it_records"
-],
 "tests/test_guidance_distillation.py": [
 "tests/test_guidance_distillation.py::test_a_saved_student_samples_one_branch_at_its_conditioners_guidance[flow]",
 "tests/test_guidance_distillation.py::test_a_student_whose_process_reads_raw_outputs_otherwise_is_refused[edm]",
@@ -2094,8 +2091,8 @@
 "tests/test_host_training.py::test_a_fit_whose_devices_hold_neither_step_searches_the_devices_once_before_placing",
 "tests/test_host_training.py::test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone",
 "tests/test_host_training.py::test_a_host_distillation_steps_as_the_device_layout_does",
-"tests/test_host_training.py::test_a_host_fits_misses_are_its_own_record_never_another_fits",
-"tests/test_host_training.py::test_a_host_step_read_in_a_stated_split_is_on_par_with_the_devices_split_step",
+"tests/test_host_training.py::test_a_host_runs_rollout_samples_from_a_copy_of_its_weights_on_its_devices",
+"tests/test_host_training.py::test_a_host_step_prepared_for_gpus_compiles_their_programs_and_its_companions_here",
 "tests/test_host_training.py::test_a_part_stating_no_host_link_prices_no_streamed_step",
 "tests/test_host_training.py::test_a_resumed_run_continues_on_the_programs_its_first_process_compiled[device]",
 "tests/test_host_training.py::test_a_run_that_chose_to_stream_resumes_streamed_where_it_would_have_stood",
@@ -2429,8 +2426,12 @@
 "tests/test_local_attention.py::test_a_windowed_kind_counts_a_rows_tokens_not_its_slots[banded]"
 ],
 "tests/test_loop.py": [
+"tests/test_loop.py::test_a_count_of_passes_given_per_call_runs_as_a_loop_of_that_many[a block, its last two passes trained-1]",
+"tests/test_loop.py::test_a_count_of_passes_given_per_call_runs_as_a_loop_of_that_many[whole stack, gated-2]",
+"tests/test_loop.py::test_a_count_of_passes_given_per_call_sows_whether_each_router_ran",
 "tests/test_loop.py::test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all",
-"tests/test_loop.py::test_a_looped_router_moves_its_bias_by_the_load_of_every_pass[False]",
+"tests/test_loop.py::test_a_loop_without_its_norm_is_the_stack_repeated_cache_and_all",
+"tests/test_loop.py::test_a_shared_cache_keeps_each_passs_coda_entries_as_the_coda_wrote_them",
 "tests/test_loop.py::test_an_implicit_loop_at_drawn_theta_takes_the_theta_method[the last trained]",
 "tests/test_loop.py::test_an_implicit_loop_at_drawn_theta_takes_the_theta_method[three passes]",
 "tests/test_loop.py::test_an_implicit_loop_at_drawn_theta_takes_the_theta_method[two passes]",
@@ -2448,11 +2449,7 @@
 "tests/test_loop.py::test_decoding_a_loop_matches_its_prefill[False]",
 "tests/test_loop.py::test_decoding_a_loop_that_exits_through_each_passs_coda_matches_its_prefill",
 "tests/test_loop.py::test_each_pass_of_a_shared_cache_step_starts_from_the_cache_the_step_found",
-"tests/test_loop.py::test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy[coda]",
-"tests/test_loop.py::test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy[the last trained]",
-"tests/test_loop.py::test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy[threshold]",
-"tests/test_loop.py::test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy[whole stack]",
-"tests/test_loop.py::test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy[z-loss]"
+"tests/test_loop.py::test_the_exit_objective_is_the_expected_cross_entropy_less_its_entropy[whole stack]"
 ],
 "tests/test_loop_compositions.py": [
 "tests/test_loop_compositions.py::test_a_looped_decoders_features_composed_plan_and_step[off-off-off-off]"
@@ -3147,10 +3144,10 @@
 "tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-minimax-text-01-lightning-True]",
 "tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-nemotron-h-4b-ssd-True]",
 "tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm100-qwen3.5-27b-gdn-True]",
-"tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm80-minimax-text-01-lightning-True]",
+"tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm80-nemotron-h-4b-ssd-False]",
 "tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm90-a write gate-True]",
 "tests/test_recurrence_mosaic.py::test_a_forked_calls_walks_keep_its_table_spilling_none[sm90-minimax-text-01-lightning-True]",
-"tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm100-0]",
+"tests/test_recurrence_mosaic.py::test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_begins_its_own",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm100-11]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm100-12]",
 "tests/test_recurrence_mosaic.py::test_a_kernels_name_is_its_body_at_every_config_its_gate_group_takes[sm100-14]",
@@ -3278,7 +3275,7 @@
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[rated-steep then mild-accurate]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[rated-the decay bound-fast]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar delta-saturated gates-None]",
-"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar delta-the decay bound-None]",
+"tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar delta-steep then mild-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar write-resets on chunk edges-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[scalar write-spread gates-None]",
 "tests/test_recurrence_template_stability.py::test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted[vector delta-saturated gates-None]",
@@ -3776,6 +3773,9 @@
 "tests/test_ssd_kernel.py::test_an_entry_writes_gradient_lowers_for_a_tpu",
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[default-chunk]",
 "tests/test_ssd_kernel.py::test_the_kernel_is_as_exact_as_the_xla_scan[fixture-one-chunk]"
+],
+"tests/test_stage_blocks.py": [
+"tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[hybrid_dit-fsdp2_stage2]"
 ],
 "tests/test_stage_local.py": [
 "tests/test_stage_local.py::test_a_one_stage_scan_holds_layers_adapted_otherwise_as_runs_of_their_own",
