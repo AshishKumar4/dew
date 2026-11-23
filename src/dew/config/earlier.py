@@ -380,7 +380,10 @@ def typed_since(record: Mapping[str, object], directory) -> bool:
     tagged = _records.class_record(held) if isinstance(held, Mapping) else None
     trainer = tagged[1] if tagged is not None else held
     local = trainer.get("local_directory") if isinstance(trainer, Mapping) else None
-    roots = [directory, *([epath.Path(local) / directory.name] if isinstance(local, str) else [])]
+    # The host's own tier holds each process's steps apart (`Checkpoints`: `<local>/<name>/process<i>`).
+    tier = epath.Path(local) / directory.name if isinstance(local, str) else None
+    roots = [directory, *(() if tier is None or not tier.exists() else
+                          (entry for entry in tier.iterdir() if entry.name.startswith("process")))]
     steps = [entry for root in roots if root.exists() for entry in root.iterdir() if entry.name.isdigit()
              and (entry / "_CHECKPOINT_METADATA").exists()]
     if not steps:

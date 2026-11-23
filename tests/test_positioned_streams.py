@@ -293,13 +293,16 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
     resumed = opened()
     try:
         if shares > 1:
+            # Refused where the share restores its rows, as it first reads.
             with pytest.raises(PlanChanged) as refused:
                 resumed.set_state(json.dumps(earlier).encode())
+                next(iter(resumed))
             assert "shards.cut" in refused.value.differs, refused.value.differs
             # Written by another Grain too: the cut refused as itself, never as that Grain's.
             earlier["dew_data_plan"]["rules"]["grain"] = "0.0.1"
             with pytest.raises(PlanChanged) as other:
                 resumed.set_state(json.dumps(earlier).encode())
+                next(iter(resumed))
             assert "shards.cut" in other.value.differs, other.value.differs
         else:
             resumed.set_state(json.dumps(earlier).encode())
