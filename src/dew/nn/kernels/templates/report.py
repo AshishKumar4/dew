@@ -14,11 +14,10 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
-import importlib.metadata
-import importlib.util
 import json
 import logging
 import re
+import subprocess
 import threading
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -1027,16 +1026,23 @@ def _verdict_fields() -> list[str]:
 
 
 @functools.cache
-def _assemblers() -> list[str]:
-    """The installed distributions holding the ptxas a kernel's PTX is assembled with, CUDA's nvcc wheels
-    (`nvidia-cuda-nvcc`, `nvidia-cuda-nvcc-cu12`), each as `name==version`: a relock that moves one
-    certifies again, where the seal, which holds the CUDA plugins alone, kept a verdict another ptxas
-    judged. A system CUDA's ptxas, outside every wheel, none names (row 7309: the ptxas Mosaic GPU's own
-    assembler names, `_get_assembler`, with its version, once Dew's JAX build states it)."""
-    named = (((distribution.metadata.get("Name") or "").lower(), distribution)
-             for distribution in importlib.metadata.distributions())
-    return sorted(f"{name}=={distribution.version}" for name, distribution in named
-                  if re.fullmatch(r"nvidia-cuda-nvcc(-cu\d+)?", name))
+@functools.cache
+def _assemblers() -> tuple[str, ...]:
+    """The assembler Mosaic GPU assembles a kernel's PTX with, as it names it (`_get_assembler`, Dew's JAX
+    build from post124): its provider's kind, and where that runs a ptxas, the ptxas's own build
+    (`ptxas --version`'s last line), its path aside, which differs host to host where the build does not. A
+    relock or a system CUDA that moves the ptxas certifies again, where the seal, which holds the CUDA plugins
+    alone, kept a verdict another ptxas judged; the nvcc wheels named it before, and no system CUDA's (row
+    7309). Read once a process: neither moves while it runs."""
+    from jax._src.lib.mosaic_gpu import _mosaic_gpu_ext
+
+    provider = _mosaic_gpu_ext._get_assembler()
+    kind = provider.split("(", 1)[0]
+    if (ptxas := re.search(r"ptxas: ([^,)]+)", provider)) is None:
+        return (kind,)
+    version = subprocess.run([ptxas.group(1).strip(), "--version"], capture_output=True, text=True,
+                             check=True, timeout=60).stdout.strip().splitlines()
+    return kind, version[-1]
 
 
 def certifications() -> tuple[Certification, ...]:
