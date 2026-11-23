@@ -4,6 +4,7 @@ span a range of binades (`spread`), as the MX and NVFP4 block-scaled products' t
 them, and a float format's values at every edge of its bits (`edge_values`), as a reading or a scaling of
 them is tested."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -51,3 +52,24 @@ def edge_values(dtype) -> np.ndarray:
                     *([5 << (width - 3)] if width >= 3 else []), one, three + 1], word)])
     values = bits.view(dtype)
     return np.concatenate([values, -values])
+
+
+class StageRef:
+    """Mutable host-backed Pallas ref stub for bitwise stage-decode tests (`stage_decoded_fp8`/`ternary`)."""
+
+    def __init__(self, arr):
+        self.arr = np.asarray(arr)
+
+    def __getitem__(self, key):
+        return jnp.asarray(self.arr) if key is Ellipsis else jnp.asarray(self.arr[key])
+
+    def __setitem__(self, key, val):
+        rows, sl = key
+        self.arr[rows, sl.start:sl.start + sl.size] = np.asarray(val)
+
+
+def decoded_weight_dot(x, weights, *, dtype=jnp.float32):
+    """Plain reference dot against a decoded packed weight bank (`Fp8Weights`, `TernaryWeights`)."""
+    w_dec = (weights.decoded(jnp.float64) if dtype == jnp.float64
+             else weights.decoded(jnp.bfloat16).astype(dtype))
+    return jax.lax.dot(x.astype(dtype), w_dec, preferred_element_type=dtype)

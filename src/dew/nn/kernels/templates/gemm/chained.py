@@ -218,3 +218,108 @@ def flags_declared(grid: tuple, tiles: "Tiles") -> jax.ShapeDtypeStruct:
 def flag_row(entry, pair: int, member):
     """Dew: the flags' row (`flags_declared`) of a pair's `member` at its walk's table `entry`."""
     return entry * pair + member
+
+
+def step_unit(dtype, target) -> int | None:
+    """Step depth of `target`'s primary source-selecting Mosaic bundle for `dtype`, or None if unsupported."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import bundles
+
+    if generation.tpu(target):
+        return None
+    for group in bundles.groups(target.generation, dtype, stated=True, tpu=False):
+        for family in group:
+            if family.selects_sources and not family.pairs_product:
+                depths = family.depths(dtype)
+                if depths:
+                    return max(depths)
+    return None
+
+
+def padded_spec(rows, matrix, step: int, *, transpose_rhs: bool
+                ) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct]:
+    """Abstract padded `(rows, matrix[None])` shapes for route probing without materializing array pads."""
+    depth = rows.shape[1] + (-rows.shape[1]) % step
+    m_shape = (1, matrix.shape[0], depth) if transpose_rhs else (1, depth, matrix.shape[1])
+    return (jax.ShapeDtypeStruct((rows.shape[0], depth), rows.dtype),
+            jax.ShapeDtypeStruct(m_shape, matrix.dtype))
+
+
+def padded_pair(rows: jax.Array, matrix: jax.Array, step: int, *, transpose_rhs: bool
+                ) -> tuple[jax.Array, jax.Array]:
+    """Pad `(rows, matrix)` along depth to a positive multiple of `step` and add a leading group axis to
+    `matrix` so small LoRA/adapter terms join a base product in place via `chained` (row 1304)."""
+    pad = (-rows.shape[1]) % step
+    if pad:
+        rows = jnp.pad(rows, ((0, 0), (0, pad)))
+        matrix = jnp.pad(matrix, ((0, 0), (0, pad)) if transpose_rhs else ((0, pad), (0, 0)))
+    return rows, matrix[None]
+
+
+def joined_in_place(pairs: list[tuple[jax.Array, jax.Array]], *, transpose_rhs: bool, out_dtype,
+                    precision, interpret_on_cpu: bool, launch_route: Callable, run_gemm: Callable,
+                    gemm_fn: Callable, gemm_t_fn: Callable) -> jax.Array | None:
+    """Walk `pairs` in place through `mosaic_gpu.gmm`'s `chained` launch without concatenating base operands,
+    padding only small unaligned trailing adapters to `step` (row 1304), or None if ineligible."""
+    from dew.nn.derivatives import KernelGlue, contracted
+    from dew.nn.kernels import generation, xla_products
+    from dew.nn.precision import at_least_fp32
+    from dew.nn.sharding import automatic_axes
+
+    dtype, out_d = pairs[0][0].dtype, jnp.dtype(out_dtype)
+    target = (generation.interpreted_target()
+              if xla_products.interpreted(interpret_on_cpu) else generation.gpu_target())
+    step = step_unit(dtype, target)
+    if step is None or pairs[0][0].shape[1] % step != 0:
+        return None
+    r0, m0 = pairs[0]
+    r0_spec = jax.ShapeDtypeStruct(r0.shape, r0.dtype)
+    m0_spec = jax.ShapeDtypeStruct((1, *m0.shape), m0.dtype)
+    rest_spec = tuple(padded_spec(r, m, step, transpose_rhs=transpose_rhs) for r, m in pairs[1:])
+    options = {'interpret_on_cpu': interpret_on_cpu, 'precision': precision, 'transpose_rhs': transpose_rhs,
+               'dense': True, 'first': None, 'gather': None}
+    route = launch_route(r0_spec, m0_spec, {'chained': rest_spec}, jax.ShapeDtypeStruct((1,), jnp.int32),
+                         out_d, None, options, whole=not automatic_axes())
+    if not route:
+        return None
+    sizes = jnp.full((1,), r0.shape[0], jnp.int32)
+    wide = at_least_fp32(dtype)
+
+    def forward(*flat):
+        terms = [(flat[2 * i], flat[2 * i + 1]) for i in range(len(pairs))]
+        padded = tuple(padded_pair(r, m, step, transpose_rhs=transpose_rhs) for r, m in terms[1:])
+        return run_gemm(terms[0][0], terms[0][1][None], sizes, None, (), (), None, (), (), (out_d,),
+                        several=False, transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu,
+                        precision=precision, dense=True, chained=padded, selected=route), ()
+
+    def portable(*flat):
+        total = functools.reduce(jnp.add, [
+            xla_products.xla_dot(flat[2 * i], flat[2 * i + 1].T if transpose_rhs else flat[2 * i + 1],
+                                 precision=precision, preferred_element_type=wide)
+            for i in range(len(pairs))])
+        return total.astype(out_d)
+
+    def backward(saved, operands, cotangent, live):
+        del saved
+        work = dtype if jnp.promote_types(cotangent.dtype, dtype) == dtype else at_least_fp32(cotangent.dtype)
+        cot = cotangent.astype(work)
+        wanted = set(live)
+        leaves = []
+        for i in range(len(pairs)):
+            ri, mi = operands[2 * i], operands[2 * i + 1]
+            dr = (None if 2 * i not in wanted else
+                  gemm_fn(cot, mi.astype(work), transpose_rhs=not transpose_rhs, out_dtype=ri.dtype,
+                          precision=precision, interpret_on_cpu=interpret_on_cpu))
+            if 2 * i + 1 not in wanted:
+                dm = None
+            else:
+                dm = gemm_t_fn(ri.astype(work), cot, None, out_dtype=mi.dtype, precision=precision,
+                               interpret_on_cpu=interpret_on_cpu)[0]
+                dm = dm.T if transpose_rhs else dm
+            leaves.extend((dr, dm))
+        return tuple(leaves[index] for index in live)
+
+    flat = tuple(operand for pair in pairs for operand in pair)
+    fn = contracted("test_an_adapted_product_holds_every_reverse_order")(
+        generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
+    return fn(*flat)

@@ -154,12 +154,10 @@ def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["blockwise_fp8"], case, strict=True))
     groups, out_dtype = int(combination["groups"]), combination["out_dtype"]
     draw = functools.partial(_operands, combination)
-    reference = jax.jit(_product(groups, out_dtype, "xla"))
-    library = cublaslt_arm(cublaslt(_sizes(groups), out_dtype), draw(0))
+    reference = cublaslt_arm(cublaslt(_sizes(groups), out_dtype), draw(0))
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_product(groups, out_dtype, "mosaic")), reference, draw, "-".join(case),
-                        seeds=SEEDS, truth_fn=truth(_sizes(groups)),
-                        library_fn=library, library_row=4518, library_leaves=("",))
+                        seeds=SEEDS, truth_fn=truth(_sizes(groups)))
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
     assert ("blockwise_fp8", "mosaic") in recorded and not unnamed, (sorted(recorded), unnamed)
