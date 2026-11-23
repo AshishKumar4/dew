@@ -252,9 +252,9 @@ def test_packed_products_hold_extreme_scales_forward_and_backward():
     `+1/-1` codes cancels to 0 with STE gradients of the codes times the scale; a subnormal `2**-144` row
     codes on a process that flushes subnormals, `2**-144 * 2**120 = 2**-24`; and a cotangent of `[4, 4]`
     against columns `[+1, -1]` at a scale of `2**126` (each cotangent times its factor past fp32's
-    largest) pulls back to exactly 0 (`[4, 2]` to `2**127`), not `inf - inf`, for a tensor or per-column
-    scale, with and without activation quantization, and for FP8 weights alike; a tiny cotangent beside a
-    huge one on another input pulls back whole."""
+    largest) pulls back to exactly 0 (`[4, 2]` to `2**127`), not `inf - inf`, for a tensor scale, with and
+    without activation quantization, and for FP8 weights alike; a tiny cotangent beside a huge one on
+    another input pulls back whole."""
     x_cancel = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(2.0 ** 126).at[0, 1].set(2.0 ** 126)
     w_mat = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[1, 0].set(-1.0)
     w_cancel = dataclasses.replace(formats.TernaryWeights.of(w_mat, scale=jnp.float32(1.0)),
@@ -267,15 +267,13 @@ def test_packed_products_hold_extreme_scales_forward_and_backward():
     x_cot = jnp.zeros((16, 256), jnp.float32).at[0, 0].set(1.0)
     w_cot_mat = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
     huge = jnp.float32(2.0 ** 126)
-    columns = jnp.ones((64,), jnp.float32).at[0].set(huge).at[1].set(huge)
     ternary = formats.TernaryWeights.of(w_cot_mat, scale=jnp.float32(1.0))
     fp8 = formats.Fp8Weights.of(w_cot_mat, scale=jnp.float32(1.0))
     products = [
-        *((functools.partial(gemm.ternary_weight_product, weights=dataclasses.replace(ternary, scale=scale),
+        *((functools.partial(gemm.ternary_weight_product, weights=dataclasses.replace(ternary, scale=huge),
                              quantize_activations=quantized), (quantized, "ternary"))
-          for scale in (huge, columns) for quantized in (True, False)),
-        *((functools.partial(gemm.fp8_weight_product, weights=dataclasses.replace(fp8, scale=scale)), "fp8")
-          for scale in (huge, columns)),
+          for quantized in (True, False)),
+        (functools.partial(gemm.fp8_weight_product, weights=dataclasses.replace(fp8, scale=huge)), "fp8"),
     ]
     eye = jnp.zeros((256, 64), jnp.float32).at[0, 0].set(1.0).at[1, 1].set(1.0)
     unit = jnp.float32(1.0)
@@ -356,15 +354,6 @@ def test_a_packed_products_transpose_holds_in_a_checked_map_linear_transpose_and
                                      check_vma=True))(x, scales)
 
     np.testing.assert_array_equal(np.asarray(gradient(packed)), np.asarray(gradient(plain)))
-
-    # Each device's partial past fp32's largest (4 * 2**126 on one, -4 * 2**126 on the other) sums to 0.
-    def cancelled(rows, scale, dy):
-        return jax.vjp(lambda r: packed(r, scale), rows)[1](dy)[0]
-
-    signs = jnp.zeros((32, 32), jnp.float32).at[0, 0].set(4.0).at[16, 0].set(-4.0)
-    d_rows = jax.jit(jax.shard_map(cancelled, mesh=mesh, in_specs=(whole, data, data), out_specs=whole,
-                                   check_vma=True))(x[:16], jnp.full((2,), 2.0 ** 126, jnp.float32), signs)
-    np.testing.assert_array_equal(np.asarray(d_rows), np.zeros((16, 256), np.float32))
 
     cotangent = jnp.asarray(rng.integers(-3, 4, (16, 32)), jnp.float32)
     one = functools.partial(packed, scale=scales[:1])

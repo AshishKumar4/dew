@@ -48,7 +48,6 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import zero_from_primal
 
 from dew.algebra import bits
-from dew.nn import float_bits
 from dew.nn.derivatives import (
     KernelGlue,
     contracted,
@@ -72,14 +71,7 @@ from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import scattered, tiling
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
-from dew.nn.precision import (
-    accumulated,
-    asks_default_precision,
-    at_least_fp32,
-    exact_products,
-    power2,
-    twice_scaled,
-)
+from dew.nn.precision import accumulated, asks_default_precision, at_least_fp32, exact_products, twice_scaled
 from dew.nn.programs import called, read_by
 from dew.nn.sharding import automatic_axes, explicit_spec, varying_like
 
@@ -915,12 +907,14 @@ def _interpreted(product: Callable, interpret_on_cpu: bool, *operands) -> jax.Ar
 def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array) -> jax.Array:
     """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows, each output
     row its own input row's (no gather), and `factor` a packed matrix's fp32 scales broadcast against its
-    output (`formats.fp8_factor`). Its transpose is the plain one, the cotangent times its factor through
-    `run`'s pullback, wherever that is finite. Where a row's largest such product passes
-    `2**FACTORED_HEADROOM`, the row is also pulled back moved down by a power of two to it and back after
-    (`precision.power2`), which serves each entry the plain transpose overflowed: a cotangent times a factor
-    past fp32's largest, whose products cancel, sums to their finite value, not inf - inf (ledger 1464).
-    Devices of a checked `shard_map` sum their plain partials, and their moved ones at one shared power."""
+    output (`formats.fp8_factor`). A factor every column of a row shares (a tensor's scale, or a group's
+    under a grouped call) is applied after the transpose's sum, as it is after the forward's: the
+    cotangent's products with the codes cancel first and the factor rounds once, so a scale of 2**126 under
+    cotangents that cancel pulls back 0, not inf - inf (ledger 1464), and the transpose overflows only where
+    its result does. A factor of each column, which the transpose sums over, multiplies the cotangent first,
+    as the plain product's transpose does. A checked `shard_map`'s devices sum their partials."""
+    if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
+        return run(rows.astype(jnp.bfloat16), *operands) * factor
     shape, dtype = rows.shape, rows.dtype
     held = frozenset(jax.typeof(rows).mat.varying)
     placed = explicit_spec(rows)
@@ -932,49 +926,15 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array)
     def pullback(residuals, cotangent):
         scale, ran = residuals
         c = cotangent.astype(jnp.float32)
-        f = jnp.broadcast_to(scale.astype(jnp.float32), c.shape)
-
-        def pulled(near):
-            # The pullback at zeros typed as the rows are: placed, and varying as the cotangent's partials do.
-            zeros = jnp.zeros(shape, jnp.bfloat16, out_sharding=placed)
-            at = varying_like(zeros, near, *jax.tree.leaves(ran))
-            (partial,) = jax.vjp(lambda each: run(each, *ran), at)[1](near)
-            partial = partial.astype(jnp.float32)
-            return partial, tuple(sorted(jax.typeof(partial).mat.varying - held))
-
-        plain, excess = pulled(c * f)
-        plain = jax.lax.psum(plain, excess) if excess else plain
-        e_c, e_f = (float_bits.binade_of(jax.lax.stop_gradient(v)) for v in (c, f))
-        # A row's largest product's binade, among entries both finite and nonzero (an infinity's binade 128).
-        counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
-        top = jnp.max(jnp.where(counted, e_c + e_f, -1024), axis=-1, keepdims=True, initial=-1024)
-        moved = jnp.maximum(top - FACTORED_HEADROOM, 0)
-        if excess:
-            moved = jax.lax.pmax(moved, excess)
-
-        def rescued(plain):
-            # The cotangent times the factor's significand (in [1, 2)), halved where the cotangent's own
-            # binade would carry it past fp32's largest, moved by the factor's exponent and the row's.
-            e = jnp.clip(e_f, -126, 127)
-            halved = e_c >= 126
-            near = power2((c * jnp.where(halved, 0.5, 1.0)) * (f * float_bits.exact_power2(-e)),
-                          e + halved - moved)
-            partial, _ = pulled(near)
-            partial = jax.lax.psum(partial, excess) if excess else partial
-            return jnp.where(jnp.isfinite(plain), plain, power2(partial, moved))
-
-        if excess:
-            # Every device of a sum pulls back alike, its collectives in step.
-            return rescued(plain).astype(dtype)
-        return jax.lax.cond(jnp.any(moved > 0), rescued, lambda plain: plain, plain).astype(dtype)
+        # The pullback at zeros typed as the rows are: placed, and varying as the cotangent's partials do.
+        at = varying_like(jnp.zeros(shape, jnp.bfloat16, out_sharding=placed), c, *jax.tree.leaves(ran))
+        (partial,) = jax.vjp(lambda each: run(each, *ran), at)[1](c)
+        # A scale of a row (`[rows, 1]`) or of all (`[1]`, `[]`) broadcasts against the rows' gradient alike.
+        partial = partial.astype(jnp.float32) * scale.astype(jnp.float32)
+        excess = tuple(sorted(jax.typeof(partial).mat.varying - held))
+        return (jax.lax.psum(partial, excess) if excess else partial).astype(dtype)
 
     return generation.linear_map(apply, pullback, (factor, operands), rows)
-
-
-FACTORED_HEADROOM = 100
-"""The binade a row's largest cotangent-times-factor product is moved down to where `factored`'s transpose
-pulls it back again: its products' sum over any width a matrix holds (a decoded FP8 entry at most 448)
-stays within fp32."""
 
 
 def ternary_weight_product(lhs: jax.Array, weights, group_sizes: jax.Array | None = None, **kw) -> jax.Array:
