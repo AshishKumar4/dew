@@ -2260,6 +2260,8 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
 
     # Verify the typed mma_p row bound derives from group metadata (`actual_end - row_start`, clipped), not a
     # constant (rows 5623, 7091).
+    from jax.extend import core as jcore
+
     bound_ops: list[set[str]] = []
 
     def _trace_mma_bounds(jaxpr, outer_defs: dict, outer_bind: dict):
@@ -2277,7 +2279,7 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
                 seen_vars, stack, ops = set(), [eqn.invars[3]], set()
                 while stack:
                     var = stack.pop()
-                    if var in seen_vars or not hasattr(var, "aval"):
+                    if not isinstance(var, jcore.Var) or var in seen_vars:
                         continue
                     seen_vars.add(var)
                     if var in outer_bind:
@@ -2286,7 +2288,8 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
                         ops.add(producer.primitive.name)
                         stack.extend(producer.invars)
                 bound_ops.append(ops)
-            if eqn.primitive.name == "cond" and eqn.invars and eqn.invars[0] in platform_idx:
+            if (eqn.primitive.name == "cond" and eqn.invars
+                    and isinstance(eqn.invars[0], jcore.Var) and eqn.invars[0] in platform_idx):
                 sub = eqn.params["branches"][platform_idx[eqn.invars[0]]]
                 inner = sub.jaxpr if hasattr(sub, "jaxpr") else sub
                 bind = {**outer_bind, **dict(zip(inner.invars, eqn.invars[1:], strict=False))}
@@ -2308,7 +2311,7 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
     _trace_mma_bounds(grouped_graph.jaxpr, {}, {})
     assert bound_ops and all(
         "sub" in ops and bool({"max", "min", "clamp"} & ops)
-        and bool({"get", "load", "gather", "dynamic_slice"} & ops)
+        and bool({"get", "load", "gather", "dynamic_slice", "ref_get"} & ops)
         for ops in bound_ops), bound_ops
     def dew_fn(x, w, sizes):
         with (generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"),
