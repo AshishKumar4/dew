@@ -629,9 +629,11 @@ class OuterProgram:
         self._shaped: collections.OrderedDict[Hashable, tuple[jax.stages.Compiled, str | None,
                                                               tuple[bool, ...]]] = (
             collections.OrderedDict())
-        # Its jits within another trace and the refusals they were made under (`_nested`).
+        # Its jits within another trace and the refusals they were made under (`_nested`); the refusals its
+        # own jit traced under, None before it traces (`trace`).
         self._nested_jits: dict[bool, jax.stages.Wrapped] = {}
         self._nested_refusals: tuple | None = None
+        self._traced_refusals: tuple | None = None
         self._compiling = threading.Lock()
         held_until_release(self)
 
@@ -743,8 +745,11 @@ class OuterProgram:
             # its collection records it as the compile recorded it in the first.
             if held is None:
                 held = self._compiled_digested(*args, **kwargs)
+                # Held too under the refusals its compile settled past (`_keyed`), which a call after it
+                # keys on (row 12165).
+                settled = self.abstract_of(args, kwargs)
                 with self._compiling:
-                    self._shaped[abstract] = held
+                    self._shaped[abstract] = self._shaped[settled] = held
                     self._bounded()
             executable, digest, weak_types = held
             if digest is not None:
@@ -758,6 +763,15 @@ class OuterProgram:
         ready = self._ready.get(key)
         if ready is None:
             ready = self._shaped_for(key, args, kwargs) or self._kept(key, args, kwargs)
+            # Kept too under the refusals its compile settled past (`_keyed`): a compile that refused a
+            # launch's config relowered past it, the program a call after it runs (row 12165).
+            if (settled := self.key_of(args, kwargs)[0]) != key:
+                kept: Future[jax.stages.Compiled] = Future()
+                kept.set_result(ready)
+                with self._compiling:
+                    if settled not in self._executables:
+                        self._executables[settled], self._ready[settled] = kept, ready
+                        self._bounded()
         with _ran(self, ready, args, kwargs):
             return ready(*dynamic, **named)
 
@@ -1043,7 +1057,16 @@ class OuterProgram:
         return self.trace(*args, **kwargs).lower()
 
     def trace(self, *args, **kwargs) -> jax.stages.Traced:
-        # A trace a settle made afresh (`_traced`) is the program's from here on, as a relowering's is.
+        # A trace a settle made afresh (`_traced`) is the program's from here on, as a relowering's is. Its
+        # jit made afresh where the launches refused differ from those it traced under, which JAX's trace
+        # cache keys on none of: a trace after a seeded refusal derives past it (row 12165).
+        from dew.nn.kernels.templates import report
+
+        refusals = report.refusal_entries()
+        with self._compiling:
+            if self._traced_refusals not in (None, refusals):
+                self.jitted = self._jitted()
+            self._traced_refusals = refusals
         traced, self.jitted = self._traced(self.jitted, args, kwargs)
         return traced
 
@@ -1062,11 +1085,16 @@ class OuterProgram:
 
     def _keyed(self, args: tuple, kwargs: dict, signature: Callable[..., Hashable]
                ) -> tuple[Hashable, tuple, dict]:
-        """`key_of`'s key with each dynamic leaf as `signature` states it."""
+        """`key_of`'s key with each dynamic leaf as `signature` states it, and the launches the compiles
+        refused (`report.refusal_entries`), which a trace's launches derive past: an executable traced before
+        a refusal is no executable a call after it runs (row 12165)."""
+        from dew.nn.kernels.templates import report
+
+        refused = report.refusal_entries()
         if not self.numbers and not self.names:
             leaves, structure = jax.tree.flatten((args, kwargs))
             return (len(args), ((), ()), structure, tuple(map(signature, leaves)),
-                    jax_config.trace_context(), jax.sharding.get_mesh()), args, kwargs
+                    jax_config.trace_context(), jax.sharding.get_mesh(), refused), args, kwargs
         numbers = {number % len(args) for number in self.numbers if -len(args) <= number < len(args)}
         dynamic = tuple(arg for number, arg in enumerate(args) if number not in numbers)
         named = {name: value for name, value in kwargs.items() if name not in self.names}
@@ -1076,7 +1104,7 @@ class OuterProgram:
                    tuple(sorted(((name, type(value), value) for name, value in kwargs.items()
                                  if name in self.names), key=lambda static: static[0])))
         return (len(args), statics, structure, tuple(map(signature, leaves)),
-                jax_config.trace_context(), jax.sharding.get_mesh()), dynamic, named
+                jax_config.trace_context(), jax.sharding.get_mesh(), refused), dynamic, named
 
 
 def _given_tuple(given) -> tuple:
