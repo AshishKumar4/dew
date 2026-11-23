@@ -3,6 +3,8 @@ and one made again where it no longer holds."""
 
 import collections
 
+import jax.numpy as jnp
+
 from dew import _cache
 
 
@@ -79,3 +81,23 @@ def test_a_refusal_scopes_lookup_leaves_a_held_traces_key_as_it_was():
         before = options.held_context()
         report.refusals_of("a launch no compile refused")
         assert options.held_context() == before
+
+
+def test_a_program_called_after_a_seeded_refusal_traces_past_it():
+    """A program (`options.owned_program`) whose trace reads a launch's refusals (`report.refusals_of`, as a
+    launch's derivation reads them), called, then called again over arrays alike after a refusal of that
+    launch is seeded (`report.refuse`, a handed plan's), runs a program traced past it: what its executables
+    are kept by and its jit holds key on the refusals as its held traces do (row 12165: the executable
+    traced before the refusal ran again)."""
+    from dew.nn.kernels.options import owned_program
+    from dew.nn.kernels.templates import report
+
+    def chosen(x):
+        return x + (1.0 if report.refusals_of("a launch") else 0.0)
+
+    run, x = owned_program(chosen), jnp.zeros((), jnp.float32)
+    with report.refusals():
+        before = float(run(x))
+        report.refuse([("a launch", 1, ("its kernel",))])
+        after = float(run(x))
+    assert (before, after) == (0.0, 1.0)
