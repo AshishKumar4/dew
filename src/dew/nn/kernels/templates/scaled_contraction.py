@@ -115,8 +115,10 @@ def _value(*arrays: jax.Array, form: Form) -> jax.Array:
     """The sum (the module's law) in its operands' format, at least float32 (`_dtype`): each term's groups
     held apart from their binades (`_held`) and contracted, the terms joined at their exponents' largest, the
     result landed by one power of two (`power2`)."""
-    _extents(arrays, form)
+    extents = _extents(arrays, form)
     dtype = _dtype(arrays)
+    if not form.terms:
+        return jnp.zeros([extents[letter] for letter in form.out], dtype)
     precision = PRECISION if dtype == jnp.float32 else jax.lax.Precision.HIGHEST
     parts = []
     for sign, groups in form.terms:
@@ -234,6 +236,9 @@ def _transpose(cotangent, *arrays, form: Form):
                 subscripts.append(unread)
                 extra = ((len(operands) - 1, 1),)
             terms.append((sign, (*(group for group in rest if group), ((pulled, 1), *extra))))
+        if not terms:
+            # An operand no term reads (a sum's operand its own transpose carried along): no cotangent.
+            continue
         landed = contract(Form(tuple(subscripts), tuple(terms), subscript), *operands)
         out[linear] = landed.astype(array.aval.dtype)
     return out

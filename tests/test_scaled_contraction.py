@@ -59,11 +59,12 @@ def test_a_batched_contraction_is_each_examples():
 
 def test_a_quotients_second_derivatives_are_its_own():
     """`sum_k a_k b_k / d` differentiated twice, reverse over reverse and forward over reverse, is the plain
-    formula's at unit operands (its every order the contraction again)."""
+    formula's, exactly at operands whose products and quotients are exact (its every order the contraction
+    again)."""
     form = Form(("k", "", "k"), ((1, (((0, 1), (1, -1)), ((2, 1),))),), "")
     a = jnp.asarray([1.0, 2.0, 3.0], jnp.float32)
     b = jnp.asarray([0.5, -1.0, 2.0], jnp.float32)
-    d = jnp.float32(3.0)
+    d = jnp.float32(4.0)
 
     def ours(x, y):
         return contract(form, x, y, b)
@@ -77,4 +78,4 @@ def test_a_quotients_second_derivatives_are_its_own():
         truth = twice(plain, argnums=(0, 1))(a, d) if twice is jax.hessian else jax.jacfwd(
             jax.grad(plain, argnums=(0, 1)), argnums=(0, 1))(a, d)
         for got, want in zip(jax.tree.leaves(found), jax.tree.leaves(truth), strict=True):
-            np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=2.0 ** -20)
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
