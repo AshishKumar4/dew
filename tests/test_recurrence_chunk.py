@@ -927,6 +927,27 @@ def test_a_forked_calls_token_maps_keep_its_rows_on_an_explicit_axis(documents):
         assert jax.typeof(got).sharding.spec[0] == 'data'
 
 
+@pytest.mark.parametrize('hooks', [HOOKS[4], ADDITIVE], ids=['the delta rule', 'an additive erase'])
+def test_a_forked_walk_is_the_same_whatever_its_documents_bound(hooks):
+    """A forked call (`Chunk.loads`) on the portable math with its table's documents bound at its own count
+    and at its row's every token, the documents past its row taking no slot, storing none and writing no
+    entry: its output and last memory bit for bit the same, the walk (`recurrence_chunk._forked_steps`)
+    stopping at the row's last segment at either bound (row 7952: a scan over the bound evaluated the chunk
+    forms at every place past them, a 2048-token row of six documents 2080 windows against 38)."""
+    operands = entering_documents(transitioned(hooks, entered_draw(hooks, 0, entries=True)[0], 0))
+    extra = operands.query.shape[1] - operands.loads.shape[1]
+
+    def bounded(x):
+        """`x` `[B, D, ...]` with `extra` documents past its row, zero."""
+        return jnp.pad(x, ((0, 0), (0, extra)) + ((0, 0),) * (x.ndim - 2))
+
+    padded = dataclasses.replace(operands, **{name: bounded(getattr(operands, name)) for name in (
+        'loads', 'stores', 'entry_key', 'entry_value', 'entry_weight')})
+    run = jax.jit(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK))
+    for found, expected in zip(jax.tree.leaves(run(padded)), jax.tree.leaves(run(operands)), strict=True):
+        np.testing.assert_array_equal(np.asarray(found), np.asarray(expected), strict=True)
+
+
 @pytest.mark.parametrize('hooks', [UNTIED, ADDITIVE], ids=['after its decay', 'before its decay'])
 def test_a_forked_erase_runs_in_a_shard_map_that_checks_varying_axes(hooks):
     """A forked call of an erase of its own (`Chunk.loads`, entry writes and given memories), its rows, tables
