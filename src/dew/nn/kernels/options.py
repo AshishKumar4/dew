@@ -649,6 +649,9 @@ class OuterProgram:
         # answered by a program whose facts are not held (another thread's, between JAX's cache taking it and
         # its trace returning) is no program a call takes (row 12296's review P0).
         self._programs: weakref.WeakKeyDictionary[jax_core.Jaxpr, Facts] = weakref.WeakKeyDictionary()
+        # Its jits within another trace and under an eager transformation, one each (`_held_call`), which
+        # every layer calling it shares: one program, lowered once.
+        self._nested_jits: dict[Hashable, jax.stages.Wrapped] = {}
         # The static positions and names as jit resolves them, the ones given and those it infers.
         numbers, names = arguments.get("static_argnums"), arguments.get("static_argnames")
         signature = api_util.fun_signature(function)
@@ -790,24 +793,51 @@ class OuterProgram:
         return traced
 
     def _eager(self) -> jax.stages.Wrapped:
-        """Its jit called under an eager transformation, which traces it where no trace of it can be read
-        first: the function rewritten as it traces (`_rewriting`), one program as its compiles'; a jit of its
-        own each call, as a nested one is (`_nested`)."""
+        """A jit of it called under an eager transformation, which traces it where no trace of it can be read
+        first: the function rewritten as it traces (`_rewriting`), one program as its compiles'."""
         return jax.jit(_fresh(self._rewriting), **self.arguments)
 
     def _nested(self, whole: bool) -> jax.stages.Wrapped:
-        """Its jit within another trace, the enclosing program's own options the ones it compiles under, as
-        JAX takes compiler options on the outermost jit alone: as written where the pass reads the enclosing
-        program whole (`_PASSING`; one of these, `_traced`); rewritten as it traces where it does not, so a
-        transformation outside it (`jax.grad` of it within a plain `jax.jit`) reads the pass's program, the
-        templates' derivatives among it (row 3450). A jit of its own each call, which JAX's trace cache
-        answers none of: its trace runs at each, its launches reading the refusals as they stand (a refused
-        config derived past, its routes reported, `report.settled_trace`'s retry, row 11783) and every fact
-        it reads recorded into the recordings open there (`_facts.recording`), where a jit held across calls
-        answered a later one from a trace whose facts were another signature's, or not yet held where a
-        second caller took it (row 12296's reviews' P0s)."""
+        """A jit of it within another trace, the enclosing program's own options the ones it compiles under,
+        as JAX takes compiler options on the outermost jit alone: as written where the pass reads the
+        enclosing program whole (`_PASSING`; one of these, `_traced`); rewritten as it traces where it does
+        not, so a transformation outside it (`jax.grad` of it within a plain `jax.jit`) reads the pass's
+        program, the templates' derivatives among it (row 3450)."""
         arguments = {name: value for name, value in self.arguments.items() if name != "compiler_options"}
         return jax.jit(_fresh(self.function if whole else self._rewriting), **arguments)
+
+    def _held_call(self, mode: Hashable, made: Callable[[], jax.stages.Wrapped], args: tuple, kwargs: dict):
+        """A call within another trace or under an eager transformation by the jit it holds for `mode`
+        (`made`'s, `_nested_jits`), so every call alike shares one program, which lowers once however many
+        layers call it. Its trace is taken first, its facts by the program it made (`_programs`): those its
+        trace read where its function ran, recorded into the recordings open there; those a trace JAX's cache
+        answered with read when it was made, read again. A program JAX's cache answers with whose facts are
+        not held (another thread's trace not yet returned) or answer otherwise now (a refusal it read moved,
+        its launches reading the enclosing trace's) is let go, the jit with it, and the call traced by a new
+        one, a trace that ran taken as it ran (a fact it read under a context of its own answers otherwise
+        outside it). A trace whose facts were another signature's, or not yet held where a second caller took
+        it, answers no call (row 12296's reviews' P0s)."""
+        with self._compiling:
+            held = self._nested_jits.get(mode)
+            if held is None:
+                held = self._nested_jits[mode] = made()
+        traced, reads = _read_by(lambda: held.trace(*args, **kwargs))
+        program = traced.jaxpr
+        if reads is None:
+            with self._compiling:
+                reads = self._programs.get(program)
+            if reads is None or not _facts.still(reads):
+                with self._compiling:
+                    if self._nested_jits.get(mode) is held:
+                        self._nested_jits[mode] = made()
+                return self._held_call(mode, made, args, kwargs)
+            _facts.replay(reads)
+        else:
+            with self._compiling:
+                self._programs[program] = reads
+        # The call its trace made, JAX's cache answering it; traced again where its caches were cleared
+        # between, its facts recorded as the trace runs.
+        return held(*args, **kwargs)
 
     def __call__(self, *args, **kwargs):
         from dew.nn.kernels.templates import report
@@ -816,9 +846,10 @@ class OuterProgram:
         # own options (`_nested`); under an eager transformation alone, or `jax.disable_jit`, its jit
         # compiles itself with its options, or runs the function as Python.
         if staged():
-            return self._nested(_PASSING.get())(*args, **kwargs)
+            whole = _PASSING.get()
+            return self._held_call(("nested", whole), lambda: self._nested(whole), args, kwargs)
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
-            return self._eager()(*args, **kwargs)
+            return self._held_call(("eager",), self._eager, args, kwargs)
         if (lowering := _LOWERING.get()) is not None:
             platforms, lowerings = lowering
             traced = self.trace(*args, **kwargs)
@@ -1239,24 +1270,24 @@ class OuterProgram:
                 unheld = True
                 continue
             traced, (made, under), program = outcome
-            answered = reads is None
-            with self._compiling:
-                if reads is None:
+            if reads is None:
+                with self._compiling:
                     reads = self._programs.get(program)
-                else:
-                    self._programs[program] = reads
-            if answered and (reads is None or not _facts.still(reads)):
-                # JAX's trace cache answered the held jit (a jit of its own traces always) with a program
-                # whose facts are not held (another thread's trace not yet returned) or answer otherwise
-                # now: let go, traced by a jit of its own. A trace that ran is taken as it ran: a fact it
-                # read under a context of its own (a GPU it assumes) answers otherwise outside it.
-                if held is not None:
-                    self._invalidated(key, held)
-                withdrawn(marks)
-                unheld = True
-                continue
-            if answered:
+                if reads is None or not _facts.still(reads):
+                    # JAX's trace cache answered the held jit (a jit of its own traces always) with a
+                    # program whose facts are not held (another thread's trace not yet returned) or answer
+                    # otherwise now: let go, traced by a jit of its own. A trace that ran is taken as it
+                    # ran: a fact it read under a context of its own (a GPU it assumes) answers otherwise
+                    # outside it.
+                    if held is not None:
+                        self._invalidated(key, held)
+                    withdrawn(marks)
+                    unheld = True
+                    continue
                 _facts.replay(reads)
+            else:
+                with self._compiling:
+                    self._programs[program] = reads
             raced = report.refusal_snapshot() != under
             if held is not None and (raced or under != refusals):
                 self._invalidated(key, held)
