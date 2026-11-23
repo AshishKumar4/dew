@@ -8,7 +8,6 @@ import functools
 import gc
 import json
 import os
-import weakref
 
 import jax
 import jax.numpy as jnp
@@ -1316,6 +1315,13 @@ def test_a_node_two_places_share_goes_to_each_places_own_target():
     assert held["params"]["kernel"] is placed["params"]["kernel"]
 
 
+def streaming_model(dtype=None) -> CausalTransformer:
+    """The decoder `streaming_decoder` trains: four scanned layers computing in `dtype`, its parameters'
+    where None."""
+    return CausalTransformer(vocab_size=256, emb_features=64, num_layers=4, num_heads=2, mlp_features=256,
+                             max_seq_len=8, scan_layers=True, dtype=dtype)
+
+
 def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | None = None,
                       dtype=None, rollout=None, optimizer: optax.GradientTransformation | None = None,
                       split: int | str = "auto", remat: str = "auto") -> Trainer:
@@ -1327,10 +1333,8 @@ def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | N
     Adam's, so two decoders key their steps apart
     (`Trainer._step_key`) and a run compared with another traces its own step; decoders handed one Adam
     key theirs alike, as a resumed run's and the run it resumes do, and read the step the first traced."""
-    model = CausalTransformer(vocab_size=256, emb_features=64, num_layers=4, num_heads=2, mlp_features=256,
-                              max_seq_len=8, scan_layers=True, dtype=dtype)
     given = {} if layout is None else {"layout": layout}
-    return Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None),
+    return Trainer(LMObjective(streaming_model(dtype), 8, head_chunks=1, ema_decay=None),
                    optax.adam(.001) if optimizer is None else optimizer, key=jax.random.key(6),
                    checkpoints=checkpoints, rollout=rollout, fit=FitPolicy(split=split, remat=remat), **given)
 
@@ -1617,64 +1621,56 @@ def test_a_fit_compiles_its_streamed_step_only_where_its_device_plan_is_dearer_t
     equal(trained.variables, expected.variables)
 
 
-def device_plan_watched(monkeypatch, price=None) -> list[weakref.ref]:
-    """Weak references to the device plan's executable and lowering a fresh fit's layout choice prices
-    (`streaming.priced`), filled as it prices it, which it prices `price` where given, else as it is."""
-    from dew.training import streaming
+def test_a_fit_that_streams_over_its_device_plans_search_keeps_none_of_what_that_search_compiled():
+    """A fresh fit whose devices hold only the step streaming its parameters from the host
+    (`streamed_only`) searched its devices' step first and streams, the layout it took in place of that
+    search's (`streaming.laid_start`): every candidate the passed-over search compiled is dropped, none
+    outliving the layout the run turned from while the run lives (`StepCompiler.abandoned`; review of row
+    12131's P0: the device plan's candidates stayed pinned)."""
+    from model_support import memory_limited_to
 
-    watched: list[weakref.ref] = []
-    real = streaming.priced
-
-    def priced(plan, dtype):
-        watched.extend((weakref.ref(plan.executable), weakref.ref(plan.candidate.lowered)))
-        return real(plan, dtype) if price is None else price
-
-    monkeypatch.setattr(streaming, "priced", priced)
-    return watched
-
-
-def test_a_fit_that_streams_over_a_device_plan_it_holds_keeps_none_of_that_plan(monkeypatch):
-    """A fresh fit whose devices hold both its device plan and its streamed step, the device plan priced
-    dearer (`streaming.chosen`), streams, and the device plan's search keeps none of what it compiled: its
-    executable and lowering are freed while the run that turned from them lives (`StepCompiler.abandoned`;
-    review of row 12131's P0: the device plan's programs stayed pinned)."""
+    from dew.training import _candidates
     from dew.training.ahead import stand_in_gpus
-    from dew.training.memory import StepPrice, host_memory_stated
 
-    watched = device_plan_watched(monkeypatch, StepPrice(compute=1.0))
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30), host_memory_stated(1e20):
-        trainer = streaming_decoder(dtype=jnp.bfloat16)
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to(streamed_only())):
+        trainer = streaming_decoder()
         trainer.fit(streaming_data(), steps=1, log_every=100)
     choice = trainer.layout_choice
-    assert choice is not None and choice.held and choice.fits and choice.streams, choice
+    assert choice is not None and choice.streams, choice
     gc.collect()
-    assert watched and not [ref for ref in watched if ref() is not None], watched
+    assert not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
 
 
-def test_a_fit_that_fails_before_its_first_compile_keeps_none_of_its_device_plan(monkeypatch):
-    """A fresh fit that keeps its device plan (`streaming.laid_start`) and fails placing its state, before
-    its first compile takes that plan, keeps none of what the plan's search compiled: its executable and
-    lowering are freed with the fit, the trainer that ran it alive (review of row 12131's P0 r7: a start
-    whose state's placement raised left its plan on the trainer's compiler)."""
+def test_a_fit_that_fails_placing_its_state_keeps_none_of_its_device_plan():
+    """A fresh fit that keeps its device plan (`streaming.laid_start`) and fails placing its state, its
+    start's program failing on its devices before the run's first compile takes that plan, keeps none of
+    it: the trainer that ran it holds no plan no compile took, and no candidate its search compiled
+    outlives the fit (`StepCompiler.abandoned`; review of row 12131's P0 r7: a start whose state's
+    placement raised left its plan on the trainer's compiler)."""
+    from dew.training import _candidates
     from dew.training.ahead import stand_in_gpus
     from dew.training.memory import host_memory_stated
 
-    class Unplaced(Exception):
-        pass
+    def refused():
+        raise RuntimeError("the devices refused the start")
 
-    def unplaced(self, *args, **kwargs):
-        raise Unplaced
+    class Unplaceable(LMObjective):
+        """An LM whose start's program fails as it runs on the devices, its variables drawn as an LM's."""
 
-    watched = device_plan_watched(monkeypatch)
-    monkeypatch.setattr(Trainer, "_placed", unplaced)
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30), host_memory_stated(1e6):
-        trainer = streaming_decoder(dtype=jnp.bfloat16)
-        with pytest.raises(Unplaced):
-            trainer.fit(streaming_data(), steps=1, log_every=100)
+        def init(self, key, variables=None):
+            drawn = super().init(key, variables)
+            jax.debug.callback(refused)
+            return drawn
+
+    trainer = Trainer(Unplaceable(streaming_model(), 8, head_chunks=1, ema_decay=None), optax.adam(.001),
+                      key=jax.random.key(6))
+    with (assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30), host_memory_stated(1e6),
+          pytest.raises(jax.errors.JaxRuntimeError)):
+        trainer.fit(streaming_data(), steps=1, log_every=100)
     choice = trainer.layout_choice
     assert choice is not None and choice.held and not choice.streams, choice
     gc.collect()
-    assert watched and not [ref for ref in watched if ref() is not None], watched
+    assert trainer._compiler.unplaced is None and not _candidates._CANDIDATES, list(_candidates._CANDIDATES)
 
 
 def streamed_priced(trainer: Trainer, data):
