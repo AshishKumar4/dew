@@ -1041,8 +1041,8 @@ class MosaicGmm(_Mosaic):
         # walks shorter, its fp32 partials' passes and their sum's launch counted (`pricing.split_count`,
         # the kernel gradient's rule; rows 1762 and 483), every run in the one launch (`mosaic_gpu.gmm`).
         tile = dataclasses.replace(tile, swapped=True)
-        splits = 1 if ba.arguments['exact_sums'] else pricing.split_count(
-            dataclasses.replace(tile, swapped=False), **self._contraction(ba, tile, target))
+        splits = (1 if ba.arguments['exact_sums'] or self._scaled else pricing.split_count(
+            dataclasses.replace(tile, swapped=False), **self._contraction(ba, tile, target)))
         split = dataclasses.replace(tile, splits=splits)
         tile = split if splits > 1 and self.takes(ba, split, target) else tile
         walked = {each: pricing.walk_seconds(each, self._contraction(ba, each, target))
@@ -1081,7 +1081,8 @@ class MosaicGmm(_Mosaic):
         hooks = ba.arguments['hooks']
         if (tile is None or ba.arguments['exact_sums'] or ba.arguments.get('paired') is not None
                 or hooks.prologue is not None or hooks.epilogue is not None or self._scaled
-                or ba.arguments.get('beside') or ba.arguments.get('chained')):
+                or ba.arguments.get('beside') or ba.arguments.get('chained')
+                or pricing.family_of(tile, ba.arguments['tokens'].dtype, target).pairs_product):
             return tile
         dense = bool(ba.arguments.get('dense'))
         if not dense and ba.arguments['tokens'].shape[0] > ba.arguments['sizes'].shape[0] * tile.block_m:
@@ -1091,6 +1092,7 @@ class MosaicGmm(_Mosaic):
         splits = pricing.split_count(tile, **self._contraction(ba, tile, target))
         split = dataclasses.replace(tile, splits=splits)
         return split if splits > 1 and self.takes(ba, split, target) else tile
+
     def _left_fits(self, ba, config: tiling.Tiles, target=None) -> bool:
         """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,
         width]` is read transposed, whose stage casts to the products' layout in whole row atoms on a family
@@ -1170,7 +1172,7 @@ class MosaicGmm(_Mosaic):
         return swapped, dataclasses.replace(config, swapped=False, splits=1)
 
     def legal(self, ba, config: tiling.Tiles, target) -> bool:
-        from .templates.gemm import mosaic_gpu
+        from .templates.gemm import mosaic_gpu, pricing
 
         if config.swapped and (self._swapped(ba, target) is None or not self._left_fits(ba, config, target)):
             return False
@@ -1181,13 +1183,16 @@ class MosaicGmm(_Mosaic):
         if ba.arguments.get('chained') and not self._takes_chained(ba, config, target):
             return False
         # A split is a decode step's (a dense call's, swapped or not, or a grouped one's), each run some
-        # steps, of no exact sums: their runs sum exactly (`mosaic_gpu.gmm`), but an A100's exact input
-        # gradient split four ways at 64 x 128 x 32 (six stages, two programs) spilled 24 bytes where its
-        # register model held 187 (the GEMM compile gate, EM-G1), its runs' traced steps beside the running
-        # sum.
+        # steps, of no exact sums or pair products (`mosaic_gpu._pair_refused`): their runs sum exactly
+        # (`mosaic_gpu.gmm`), but an A100's exact input gradient split four ways at 64 x 128 x 32 (six stages,
+        # two programs) spilled 24 bytes where its register model held 187 (the GEMM compile gate, EM-G1),
+        # its runs' traced steps beside the running sum.
         depth = ba.arguments['tokens'].shape[1]
-        if config.splits > 1 and (ba.arguments['exact_sums']
-                                  or not mosaic_gpu.split_runs(-(-depth // config.block_k), config.splits)):
+        if config.splits > 1 and (
+                ba.arguments['exact_sums'] or self._scaled or ba.arguments.get('paired') is not None
+                or ba.arguments['hooks'].prologue is not None or ba.arguments['hooks'].epilogue is not None
+                or pricing.family_of(config, ba.arguments['tokens'].dtype, target).pairs_product
+                or not mosaic_gpu.split_runs(-(-depth // config.block_k), config.splits)):
             return False
         return super().legal(ba, config, target)
 
@@ -1673,6 +1678,15 @@ class MosaicTgmm(_Mosaic):
         prologue = ba.arguments['hooks'].prologue
         return (family.bounded_loads and rows % cooperative != 0
                 and mosaic_gpu.ragged_rows(rows, prologue=prologue, k_major=self.K_MAJOR))
+
+    def legal(self, ba, config: tiling.Tiles, target) -> bool:
+        from .templates.gemm import pricing
+
+        if config.splits > 1 and (
+                self.K_MAJOR
+                or pricing.family_of(config, ba.arguments['tokens'].dtype, target).pairs_product):
+            return False
+        return super().legal(ba, config, target)
 
     def candidate(self, ba, config: tiling.Tiles, target) -> bool:
         """`_Mosaic.candidate` on a family whose products read registers loading its transposed stage in whole

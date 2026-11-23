@@ -2159,3 +2159,25 @@ def test_explicit_target_b200_gathered_settles_under_ambient_sm80():
     with generation.assumed("sm100"):
         want = producers.settled(launch, ba, unsettled, sm100)
     assert got == want
+
+
+def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
+    """Blackwell `tcgen05.pair` refuses `splits > 1` (`mosaic_gpu.pair_refuses`) in both `MosaicGmm.legal`
+    and `MosaicTgmm.legal` even though `_ran` validates the unsplit partial tile, and underfilled dense
+    `sm100` calls keep `splits == 1` on `tcgen05.pair`."""
+    gmm, tgmm = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    with generation.assumed("sm100"):
+        sm100 = generation.gpu_target()
+        fwd_ba = gmm.bind(bf16((512, 16384)), bf16((1, 16384, 1024)), one, out_dtype="bfloat16",
+                          trans_rhs=False, interpret=False, dense=True)
+        tile = gmm.derived(fwd_ba, sm100)
+        assert tile is not None and gmm.legal(fwd_ba, tile, sm100), tile
+        pair_tile = tiling.Tiles(128, 128, 64, 6, 4, warpgroups=1, cluster=2, family="tcgen05.pair")
+        assert not gmm.legal(fwd_ba, dataclasses.replace(pair_tile, splits=3), sm100)
+        if tile.family == "tcgen05.pair":
+            assert tile.splits == 1, tile
+        dw_ba = tgmm.bind(bf16((8192, 1024)), bf16((8192, 1024)), one, out_dtype="float32",
+                          interpret=False, dense=True)
+        assert not tgmm.legal(dw_ba, dataclasses.replace(pair_tile, splits=2), sm100)
