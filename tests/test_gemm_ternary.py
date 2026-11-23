@@ -4,6 +4,7 @@ TF32 grouped/dense Mosaic GEMM tests (`gemm.ternary_weight_product`, `formats.Te
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 
@@ -75,8 +76,10 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
 
     for interpret in (False, True):
         def dew_fn(x, weights, *, interpret=interpret):
-            return gemm.ternary_weight_product(x, weights, quantize_activations=False,
-                                               out_dtype=jnp.float32, interpret_on_cpu=interpret)
+            ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+            with ctx:
+                return gemm.ternary_weight_product(x, weights, quantize_activations=False,
+                                                   out_dtype=jnp.float32, interpret_on_cpu=interpret)
 
         assert_as_exact(jax.jit(dew_fn), jax.jit(decoded_weight_dot), draw,
                         f"ternary_weight interp={interpret}",
@@ -91,9 +94,13 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
         ref = jax.lax.ragged_dot(x_g.astype(jnp.float32), bank.decoded(jnp.float32), sizes,
                                  preferred_element_type=jnp.float32)
         for interpret in (False, True):
-            got = gemm.ternary_weight_product(x_g, bank, sizes, quantize_activations=False,
-                                              out_dtype=jnp.float32, interpret_on_cpu=interpret)
+            ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+            with ctx:
+                got = gemm.ternary_weight_product(x_g, bank, sizes, quantize_activations=False,
+                                                  out_dtype=jnp.float32, interpret_on_cpu=interpret)
             np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+        np.testing.assert_array_equal(np.asarray(gemm.gemm(x_g, bank, sizes, out_dtype=jnp.float32)),
+                                      np.asarray(ref))
 
     # BitNet b1.58 per-token int8 activation quantization + zero-row safety + unquantized STE gradient.
     x_bit = jnp.asarray(rng.standard_normal((32, 256)), jnp.bfloat16).at[0].set(0.0)
@@ -116,21 +123,25 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
     jvp_exact = jax.lax.dot(tan_x, w_bf16, preferred_element_type=jnp.float32) * w_bit.scale
     assert np.asarray(dx_exact[1, max_col]) != 0.0
     for interpret in (False, True):
-        got_bit = gemm.ternary_weight_product(x_bit, w_bit, quantize_activations=True,
-                                              out_dtype=jnp.float32, interpret_on_cpu=interpret)
+        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+        with ctx:
+            got_bit = gemm.ternary_weight_product(x_bit, w_bit, quantize_activations=True,
+                                                  out_dtype=jnp.float32, interpret_on_cpu=interpret)
         np.testing.assert_array_equal(np.asarray(got_bit[0]), np.zeros((64,), np.float32))
         np.testing.assert_array_equal(np.asarray(got_bit), np.asarray(ref_bit))
-        _, (dx, dscale) = jax.value_and_grad(
-            lambda a, s, interpret=interpret: jnp.sum(gemm.ternary_weight_product(
-                a, dataclasses.replace(w_bit, scale=s), quantize_activations=True,
-                out_dtype=jnp.float32, interpret_on_cpu=interpret)),
-            argnums=(0, 1))(x_bit, w_bit.scale)
+        with ctx:
+            _, (dx, dscale) = jax.value_and_grad(
+                lambda a, s, interpret=interpret: jnp.sum(gemm.ternary_weight_product(
+                    a, dataclasses.replace(w_bit, scale=s), quantize_activations=True,
+                    out_dtype=jnp.float32, interpret_on_cpu=interpret)),
+                argnums=(0, 1))(x_bit, w_bit.scale)
         np.testing.assert_array_equal(np.asarray(dx), np.asarray(dx_exact))
         np.testing.assert_array_equal(np.asarray(dscale), np.asarray(dscale_exact))
-        _, y_tan = jax.jvp(
-            lambda a, interpret=interpret: gemm.ternary_weight_product(
-                a, w_bit, quantize_activations=True, out_dtype=jnp.float32, interpret_on_cpu=interpret),
-            (x_bit,), (tan_x,))
+        with ctx:
+            _, y_tan = jax.jvp(
+                lambda a, interpret=interpret: gemm.ternary_weight_product(
+                    a, w_bit, quantize_activations=True, out_dtype=jnp.float32, interpret_on_cpu=interpret),
+                (x_bit,), (tan_x,))
         np.testing.assert_array_equal(np.asarray(y_tan[1]), np.asarray(jvp_exact[1]))
     for gpu in ("sm80", "sm90"):
         if not generation.compile_only_gpus(gpu):

@@ -56,11 +56,10 @@ def test_chunked_linear_ce_mosaic_arm_holds_check_1_value_vjp_and_normalizer(
     def _run(kernel: str, x, w, targets, bias, cot):
         with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
             def fwd(a, b, c):
-                terms = chunked.chunked_cross_entropy(
+                loss, _, log_z = chunked.chunked_cross_entropy(
                     a, OutputTable(b, vocab_major=True, bias=c), targets, chunks=2,
                     tile=(64, 64), predict=False)
-                return terms.loss, terms.log_z
-
+                return loss, log_z
             (loss, log_z), pull = jax.vjp(fwd, x, w, bias)
             grads = pull((cot, jnp.zeros_like(cot)))
             cols = chunked._Columns(bias, None)
@@ -106,32 +105,34 @@ def test_chunked_linear_ce_non_gated_cases_take_existing_path_untouched():
     scale = jnp.asarray(rng.uniform(0.8, 1.2, size=(128,)), jnp.float32)
 
     cases = [
-        ("predict", x, OutputTable(w, vocab_major=True), dict(predict=True)),
-        ("excluded", x, OutputTable(w, vocab_major=True), dict(predict=False, excluded=0)),
-        ("temperature", x, OutputTable(w, vocab_major=True), dict(predict=False, temperature=2.0)),
-        ("scaled", x, OutputTable(w, vocab_major=True, scale=scale), dict(predict=False)),
-        ("softcap", x, OutputTable(w, vocab_major=True, softcap=20.0), dict(predict=False)),
+        ("predict", x, OutputTable(w, vocab_major=True), {"predict": True}),
+        ("excluded", x, OutputTable(w, vocab_major=True), {"predict": False, "excluded": 0}),
+        ("temperature", x, OutputTable(w, vocab_major=True), {"predict": False, "temperature": 2.0}),
+        ("scaled", x, OutputTable(w, vocab_major=True, scale=scale), {"predict": False}),
+        ("softcap", x, OutputTable(w, vocab_major=True, softcap=20.0), {"predict": False}),
         ("fp32", x.astype(jnp.float32), OutputTable(w.astype(jnp.float32), vocab_major=True),
-         dict(predict=False)),
+         {"predict": False}),
     ]
     for name, hidden, head, kwargs in cases:
         with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"):
-            ref = chunked.chunked_cross_entropy(hidden, head, t, chunks=2, tile=(64, 64), **kwargs)
+            ref_loss, _, ref_log_z = chunked.chunked_cross_entropy(
+                hidden, head, t, chunks=2, tile=(64, 64), **kwargs)
         with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
               generation.routes() as seen):
-            got = chunked.chunked_cross_entropy(hidden, head, t, chunks=2, tile=(64, 64), **kwargs)
+            got_loss, _, got_log_z = chunked.chunked_cross_entropy(
+                hidden, head, t, chunks=2, tile=(64, 64), **kwargs)
         assert not any(r.kernel == "mosaic" for r in seen), (name, seen)
-        np.testing.assert_array_equal(np.asarray(got.loss), np.asarray(ref.loss))
-        np.testing.assert_array_equal(np.asarray(got.log_z), np.asarray(ref.log_z))
+        np.testing.assert_array_equal(np.asarray(got_loss), np.asarray(ref_loss))
+        np.testing.assert_array_equal(np.asarray(got_log_z), np.asarray(ref_log_z))
     # Default unselected mode also stays on XLA untouched.
     with generation.assumed("sm90"), generation.routes() as seen:
-        got_def = chunked.chunked_cross_entropy(x, OutputTable(w, vocab_major=True), t,
-                                                chunks=2, tile=(64, 64), predict=False)
+        got_def, _, _ = chunked.chunked_cross_entropy(x, OutputTable(w, vocab_major=True), t,
+                                                      chunks=2, tile=(64, 64), predict=False)
     assert not any(r.kernel == "mosaic" for r in seen), seen
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="xla"):
-        ref_def = chunked.chunked_cross_entropy(x, OutputTable(w, vocab_major=True), t,
-                                                chunks=2, tile=(64, 64), predict=False)
-    np.testing.assert_array_equal(np.asarray(got_def.loss), np.asarray(ref_def.loss))
+        ref_def, _, _ = chunked.chunked_cross_entropy(x, OutputTable(w, vocab_major=True), t,
+                                                      chunks=2, tile=(64, 64), predict=False)
+    np.testing.assert_array_equal(np.asarray(got_def), np.asarray(ref_def))
 
 
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
@@ -148,9 +149,10 @@ def test_linear_cross_entropy_compiles_spill_free(gpu: str, with_bias: bool):
     def fn(a, weight, targets, *rest):
         bias = rest[0] if rest else None
         with generation.chosen(grouped_matmul="mosaic"):
-            return chunked.chunked_cross_entropy(
+            loss, _, _ = chunked.chunked_cross_entropy(
                 a, OutputTable(weight, vocab_major=True, bias=bias), targets,
-                chunks=2, tile=(256, 256), predict=False).loss
+                chunks=2, tile=(256, 256), predict=False)
+            return loss
 
     args = (x, w, t, b) if with_bias else (x, w, t)
     with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"):

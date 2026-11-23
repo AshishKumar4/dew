@@ -1083,6 +1083,6 @@ def _check_packed_weight_product_contract(edge: str, *, kind: str) -> None:
         return jax.lax.dot(rows.astype(jnp.bfloat16), decoded, preferred_element_type=jnp.float32)
 
     without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
-    with generation.assumed("sm90"):
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         assert_contract(product, (x,), (dx,), cotangent, f"{kind} weight product {edge}",
                         truth_fn=plain, plain_fn=plain, without=without)

@@ -203,10 +203,12 @@ def test_blockwise_fp8_named_mosaic_uninterpreted_dispatches_portable_on_cpu():
     rhs_t = jnp.asarray(rng.normal(size=(128, 128)) / 4, jnp.float8_e4m3fn)
     grad_row_scales = jnp.ones((1, 128), jnp.float32)
     grad_col_scales = jnp.ones((1, 128), jnp.float32)
+    from dew.nn.kernels import xla_products
+
     cpu = jax.devices("cpu")[0]
     committed = tuple(jax.device_put(a, cpu) for a in (lhs, kernel, sizes, row_scales, col_scales))
-    assert gemm._committed_device(committed) == cpu
-    assert gemm._committed_device((np.zeros(4), jnp.zeros(4))) is None
+    assert xla_products.committed_device(committed) == cpu
+    assert xla_products.committed_device((np.zeros(4), jnp.zeros(4))) is None
     with generation.assumed("sm90"), jax.default_device(cpu):
         with generation.chosen(blockwise_fp8="mosaic"):
             got_fwd = gemm.blockwise_fp8_product(*committed, out_dtype=jnp.float32, interpret_on_cpu=False)

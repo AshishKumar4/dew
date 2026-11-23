@@ -4,8 +4,8 @@ GEMM's own portable branch (`kernels.gemm`): its products as the call's precisio
 `ragged_placement`), a step-scaled one (`step_scaled`), a projection differentiated by its own products
 (`portable_projection`), and the platform choice between a kernel and them (`_on_platform`)."""
 
+import contextlib
 import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -20,12 +20,24 @@ from .templates.product import SCALE_DEPTH, eight
 
 
 def interpreted(interpret_on_cpu: bool) -> bool:
-    """Whether a call asking `interpret_on_cpu` interprets its kernel: where the context places it on a CPU
-    (`generation.placed_platform`), not wherever this process's default backend is one. A GPU's program a
-    CPU host compiles ahead (its default device a compile-only GPU's, `dew.training.ahead`) holds no
-    interpreted branch: the interpreter's host callbacks' ordered effect, every branch's in the program, took
-    a token parameter on its CUDA executable, which its run on the GPU did not pass (row 8099)."""
-    return interpret_on_cpu and generation.placed_platform() == 'cpu'
+    """Whether a call asking `interpret_on_cpu` (or traced under `generation.assumed(..., interpreted=True)`)
+    interprets its kernel: where the context places it on a CPU (`generation.placed_platform`), not wherever
+    this process's default backend is one. A GPU's program a CPU host compiles ahead (its default device a
+    compile-only GPU's, `dew.training.ahead`) holds no interpreted branch: the interpreter's host callbacks'
+    ordered effect, every branch's in the program, took a token parameter on its CUDA executable, which its
+    run on the GPU did not pass (row 8099)."""
+    assumed = generation.assumption()
+    return ((interpret_on_cpu or (assumed is not None and assumed.interpreted))
+            and generation.placed_platform() == 'cpu')
+
+
+@contextlib.contextmanager
+def interpreted_context(interpret_on_cpu: bool):
+    """Bind `generation.assumed(generation.interpreted_target())` while `interpreted(interpret_on_cpu)` holds
+    (row 12158)."""
+    with (generation.assumed(generation.interpreted_target())
+          if interpreted(interpret_on_cpu) else contextlib.nullcontext()):
+        yield
 
 
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
@@ -65,12 +77,23 @@ def committed_device(operands):
     return local if local is not None else jax.local_devices(backend=next(iter(platforms)))[0]
 
 
+@contextlib.contextmanager
+def committed_context(operands):
+    """Bind `jax.default_device(committed_device(operands))` for concrete committed `operands` (row 12158)."""
+    from jax.core import Tracer
+
+    if any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
+        yield
+        return
+    device = committed_device(operands)
+    with jax.default_device(device) if device is not None else contextlib.nullcontext():
+        yield
+
+
 def dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
     """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
     (`_on_platform`). Resolves concrete committed placement before `_on_platform`, traces abstractly so every
     branch selects, then runs eagerly on the committed device (row 11887)."""
-    import contextlib
-
     from jax.core import Tracer
 
     def run():
@@ -82,8 +105,7 @@ def dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
         return call
 
     if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
-        device = committed_device(operands)
-        with jax.default_device(device) if device is not None else contextlib.nullcontext():
+        with committed_context(operands):
             call = run()
             jax.eval_shape(call, *operands)
             return call(*operands)

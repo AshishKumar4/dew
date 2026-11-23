@@ -7,24 +7,19 @@
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 
+from dew.nn.kernels import xla_products
 from dew.nn.kernels.templates.axes import GROUPS
 
 
-def _with_committed(fn: Callable, committed_device: Callable, *operands):
+def _with_committed(fn: Callable, *operands):
     """Resolve concrete committed placement before `custom_vmap` traces operands into an abstract jaxpr."""
-    from jax.core import Tracer
-
-    if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
-        device = committed_device(operands)
-        with jax.default_device(device) if device is not None else contextlib.nullcontext():
-            return fn(*operands)
-    return fn(*operands)
+    with xla_products.committed_context(operands):
+        return fn(*operands)
 
 
 def _broadcast_rows(array: jax.Array, axis_size: int, rows_each: int, is_batched: bool) -> jax.Array:
@@ -112,8 +107,7 @@ def _unfolded_vmap(dispatch_fn: Callable, portable_fn: Callable, in_batched, arg
 
 
 def batched_gemm(dispatch_fn: Callable, run_gemm: Callable, portable_fn: Callable, *, dense: bool,
-                 prologue_axes: tuple, epilogue_axes: tuple,
-                 committed_device: Callable | None = None, interpret_on_cpu: bool = False) -> Callable:
+                 prologue_axes: tuple, epilogue_axes: tuple, interpret_on_cpu: bool = False) -> Callable:
     """Wrap `_gemm`'s dispatched call with `custom_vmap` so dense `vmap` folds into one dense or grouped
     GEMM launch (row 6104)."""
     @jax.custom_batching.custom_vmap
@@ -156,14 +150,11 @@ def batched_gemm(dispatch_fn: Callable, run_gemm: Callable, portable_fn: Callabl
                 return batched_out, jax.tree.map(lambda _: True, batched_out)
         return _unfolded_vmap(dispatch_fn, portable_fn, in_batched, args, interpret_on_cpu=interpret_on_cpu)
 
-    if committed_device is None:
-        return dispatched
-    return lambda *args: _with_committed(dispatched, committed_device, *args)
+    return lambda *args: _with_committed(dispatched, *args)
 
 
 def batched_gemm_t(dispatch_fn: Callable, run_gemm_t: Callable, portable_fn: Callable, *, dense: bool,
-                   prologue_axes: tuple, committed_device: Callable | None = None,
-                   interpret_on_cpu: bool = False) -> Callable:
+                   prologue_axes: tuple, interpret_on_cpu: bool = False) -> Callable:
     """Wrap `_gemm_t`'s dispatched call with `custom_vmap` so vmapped dense kernel gradients fold into one
     grouped `gemm_t` launch (row 6104)."""
     @jax.custom_batching.custom_vmap
@@ -189,6 +180,4 @@ def batched_gemm_t(dispatch_fn: Callable, run_gemm_t: Callable, portable_fn: Cal
                 return grouped_out[:, None, :, :], True
         return _unfolded_vmap(dispatch_fn, portable_fn, in_batched, args, interpret_on_cpu=interpret_on_cpu)
 
-    if committed_device is None:
-        return dispatched
-    return lambda *args: _with_committed(dispatched, committed_device, *args)
+    return lambda *args: _with_committed(dispatched, *args)

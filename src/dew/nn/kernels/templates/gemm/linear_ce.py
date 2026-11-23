@@ -490,25 +490,24 @@ def mosaic_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array,
 
     dtype_ok = supports_dtype(x.dtype) and jnp.dtype(x.dtype) == jnp.dtype(weight.dtype)
     exact = exact_products(precision, x.dtype) if dtype_ok else False
-    interpreting = xla_products.interpreted(True)
-    if not dtype_ok:
-        tile = None
-    elif interpreting:
-        target = generation.interpreted_target()
-        tile = derive_linear_ce(
-            (x.shape[0], weight.shape[0] if transpose_rhs else weight.shape[1], x.shape[1]),
-            x.dtype, target, transpose_rhs=transpose_rhs, has_bias=bias is not None, interpret=True)
-    else:
-        ba = MOSAIC_LINEAR_CE.bind(
-            jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct(weight.shape, weight.dtype),
-            jax.ShapeDtypeStruct(targets.shape, jnp.int32),
-            None if bias is None else jax.ShapeDtypeStruct(bias.shape, bias.dtype),
-            transpose_rhs=transpose_rhs, softcap=None, interpret=False)
-        tile = gemm._planned(MOSAIC_LINEAR_CE, ba)
-    case = LinearCECase(tile, whole=not automatic_axes(), exact_products=exact, dtype_ok=dtype_ok)
-    if selection.select(LINEAR_CE_OP, case).kernel != "mosaic":
-        return None
-    ctx = generation.assumed(generation.interpreted_target()) if interpreting else contextlib.nullcontext()
-    with ctx:
+    with xla_products.committed_context((x, weight, targets)), xla_products.interpreted_context(True):
+        interpreting = xla_products.interpreted(True)
+        if not dtype_ok:
+            tile = None
+        elif interpreting:
+            target = generation.interpreted_target()
+            tile = derive_linear_ce(
+                (x.shape[0], weight.shape[0] if transpose_rhs else weight.shape[1], x.shape[1]),
+                x.dtype, target, transpose_rhs=transpose_rhs, has_bias=bias is not None, interpret=True)
+        else:
+            ba = MOSAIC_LINEAR_CE.bind(
+                jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct(weight.shape, weight.dtype),
+                jax.ShapeDtypeStruct(targets.shape, jnp.int32),
+                None if bias is None else jax.ShapeDtypeStruct(bias.shape, bias.dtype),
+                transpose_rhs=transpose_rhs, softcap=None, interpret=False)
+            tile = gemm._planned(MOSAIC_LINEAR_CE, ba)
+        case = LinearCECase(tile, whole=not automatic_axes(), exact_products=exact, dtype_ok=dtype_ok)
+        if selection.select(LINEAR_CE_OP, case).kernel != "mosaic":
+            return None
         return MOSAIC_LINEAR_CE(x, weight, targets, bias, transpose_rhs=transpose_rhs,
                                 softcap=None, interpret=interpreting)

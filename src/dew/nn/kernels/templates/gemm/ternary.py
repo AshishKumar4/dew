@@ -33,7 +33,6 @@ class MosaicTernaryPackedGmm(grouped_matmul.MosaicWordPackedGmm):
 class TernaryWeightCase(NamedTuple):
     tile: tiling.Tiles | None
     whole: bool
-    interpret: bool
 
 
 TERNARY_WEIGHT: selection.Op[TernaryWeightCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
@@ -45,7 +44,7 @@ TERNARY_WEIGHT: selection.Op[TernaryWeightCase] = selection.Op(generation.Choice
             "sharding", lambda case: case.whole,
             "automatic mesh axes keep decoded XLA outside per-shard launch", TERNARY_WEIGHT_ROW),
         selection.Requirement(
-            "measured", lambda case: case.interpret,
+            "measured", lambda case: False,
             "no receipt yet has Mosaic ternary-packed beat decoded GEMM (pending M-NG-8)",
             TERNARY_WEIGHT_ROW, kind="measured"),
     )),
@@ -107,14 +106,13 @@ def ternary_weight_product(lhs: jax.Array, weights: TernaryWeights, group_sizes:
     bound = launch.bind(jax.ShapeDtypeStruct(lhs.shape, jnp.bfloat16), bank_spec, _spec(sizes), (), (),
                         None, None, None, out_dtype="float32", trans_rhs=False, interpret=interpret_on_cpu,
                         dense=dense, exact_sums=False)
-    assumed = generation.interpreted_target() if xla_products.interpreted(interpret_on_cpu) else None
-    with generation.assumed(assumed) if assumed is not None else contextlib.nullcontext():
+    with xla_products.interpreted_context(interpret_on_cpu):
         tile = gemm._planned(launch, bound)
-        case = TernaryWeightCase(tile, not automatic_axes(), interpret_on_cpu)
+        case = TernaryWeightCase(tile, not automatic_axes())
         use_mosaic = selection.select(TERNARY_WEIGHT, case).kernel == "mosaic"
 
     def run_dot(rows_bf16: jax.Array) -> jax.Array:
-        with generation.assumed(assumed) if assumed is not None else contextlib.nullcontext():
+        with xla_products.interpreted_context(interpret_on_cpu):
             if use_mosaic:
                 form_bytes = jnp.zeros((8,), jnp.uint8)
                 one = jnp.ones((), jnp.float32)

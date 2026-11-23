@@ -68,8 +68,10 @@ def _quantized_epilogue(minifloat: bits.Minifloat, acc: jax.Array,
                         scale: jax.Array | None = None) -> jax.Array:
     if scale is None:
         return encode_tile(acc, minifloat)
+    from dew.nn.precision import lowered_divide
+
     s = jax.lax.broadcast_in_dim(scale, acc.shape, (0,)) if scale.ndim == 1 else scale
-    return encode_tile(acc * s, minifloat)
+    return encode_tile(lowered_divide(acc, s, jnp.int32(0)), minifloat)
 
 
 def quantize_epilogue(minifloat: bits.Minifloat):

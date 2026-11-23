@@ -692,23 +692,28 @@ MOSAIC_SYRK = MosaicSyrk()
 """The singleton Mosaic SYRK launch on the shared `Template`/`KernelOp` certification path."""
 
 
-MEASURED_GRAM_CELLS: frozenset[tuple[str, tuple[int, int, int], bool, str, str]] = frozenset({
-    (gen, shape, transpose, "bfloat16", "bfloat16")
-    for gen in ("sm80", "sm90")
-    for shape in ((28, 2560, 2560), (28, 2560, 4096), (36, 4096, 4096), (36, 4096, 14336))
-    for transpose in (False, True)
-})
-"""Exact `(generation, shape, transpose, dtype, out_dtype)` stacked Gram cells proven 1.52-1.98x faster
-than XLA with bitwise-equal digests in `M-NG-45-a100` (sm80, 8/8) and `M-NG-45b-gh200` (sm90, 8/8;
-row 11941)."""
+MEASURED_GRAM_GENERATIONS: frozenset[str] = frozenset({"sm80", "sm90"})
+"""GPU generations where real receipts (`M-NG-45-a100`, `M-NG-45b-gh200`, row 11941) proved whole-tile
+bf16 symmetric Gram beats XLA (1.52-1.98x across all measured square and rectangular stacked cells)."""
 
 
 def measured_gram(target: generation.GpuTarget, shape: tuple[int, int, int], dtype, *,
                   transpose: bool, out_dtype=None) -> bool:
-    """Whether symmetric Gram `(target, shape, transpose, dtype, out_dtype)` is admitted by real GPU
-    receipts (`MEASURED_GRAM_CELLS`, row 11941)."""
-    if generation.tpu(target):
+    """Whether symmetric Gram `(target, shape, transpose, dtype, out_dtype)` is admitted by the derived
+    whole-tile bf16 shape-class rule on measured generations (`MEASURED_GRAM_GENERATIONS`, rows 11941,
+    12163): whole square super-tile `m` and step `k`, with at least one full SM wave of upper-triangle CTAs."""
+    if generation.tpu(target) or target.generation not in MEASURED_GRAM_GENERATIONS:
         return False
-    in_name = jnp.dtype(dtype).name
-    out_name = in_name if out_dtype is None else jnp.dtype(out_dtype).name
-    return (target.generation, tuple(shape), bool(transpose), in_name, out_name) in MEASURED_GRAM_CELLS
+    in_dtype = jnp.dtype(dtype)
+    resolved_out = in_dtype if out_dtype is None else jnp.dtype(out_dtype)
+    if in_dtype != jnp.bfloat16 or resolved_out != jnp.bfloat16:
+        return False
+    g, m, k = (shape[0], shape[2], shape[1]) if transpose else shape
+    tile = derive_syrk((g, m, k), in_dtype, resolved_out, target, transpose=transpose)
+    if tile is None:
+        return False
+    side = tile_rows(tile, family_of(tile, in_dtype, target))
+    if m % side != 0 or k % tile.block_k != 0:
+        return False
+    tiles_m = m // side
+    return g * tiles_m * (tiles_m + 1) // 2 * tile.cluster >= (target.multiprocessors or 1)

@@ -2,6 +2,7 @@
 and E4M3 block scales decoded exactly (`NvFp4.decoded`, its codes in the staged order a stage decodes), the
 deferred factor applied to the fp32 accumulator before the one rounding."""
 
+import contextlib
 import dataclasses
 import faulthandler
 import functools
@@ -455,7 +456,8 @@ def test_an_nvfp4_product_over_operands_a_mesh_splits_decodes_its_matrix(group_s
                          [(bits.E4M3, jnp.float8_e4m3fn), (bits.E5M2, jnp.float8_e5m2)], ids=["e4m3", "e5m2"])
 def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
     """`gemm.gemm_quantized` encodes the GEMM accumulator via `bits.encode_form` bit-exact with
-    `bits.encoded` across E4M3 and E5M2 (rows 8547, 12037)."""
+    `bits.encoded` across E4M3 and E5M2, dividing by `tensor_scale` on encode and returning `(codes, scale)`
+    consistent with `NvFp4Block` and `Fp8Weights` (rows 8547, 12037, 12160)."""
     rng = np.random.default_rng(17)
     lhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
     rhs = jnp.asarray(rng.integers(-3, 4, size=(128, 128)), jnp.bfloat16)
@@ -463,11 +465,19 @@ def test_gemm_quantize_epilogue_matches_bits_encoded(minifloat, out_dtype):
     words = jax.lax.bitcast_convert_type(acc, jnp.uint32)
     expected_u8 = bits.encoded(words, minifloat).astype(jnp.uint8)
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        got = gemm.gemm_quantized(lhs, rhs, minifloat=minifloat, interpret_on_cpu=True)
-    assert isinstance(got, jax.Array) and got.dtype == out_dtype
+        got, scale = gemm.gemm_quantized(lhs, rhs, minifloat=minifloat, interpret_on_cpu=True)
+        got_s, scale_s = gemm.gemm_quantized(lhs, rhs, minifloat=minifloat, tensor_scale=2.0,
+                                             interpret_on_cpu=True)
+    assert isinstance(got, jax.Array) and got.dtype == out_dtype and float(scale) == 1.0
     got_u8 = jax.lax.bitcast_convert_type(got, jnp.uint8)
     np.testing.assert_array_equal(np.asarray(got_u8), np.asarray(expected_u8))
-
+    assert isinstance(got_s, jax.Array) and got_s.dtype == out_dtype and float(scale_s) == 2.0
+    scaled_u8 = bits.encoded(jax.lax.bitcast_convert_type(acc / jnp.float32(2.0), jnp.uint32),
+                             minifloat).astype(jnp.uint8)
+    np.testing.assert_array_equal(np.asarray(jax.lax.bitcast_convert_type(got_s, jnp.uint8)),
+                                  np.asarray(scaled_u8))
+    np.testing.assert_allclose(np.asarray(got_s, np.float32) * float(scale_s), np.asarray(acc), rtol=0.25,
+                               atol=0.5)
 
 @pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
                                  pytest.param("sm90", marks=lowers("sm90"))])
@@ -564,18 +574,23 @@ def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
 
     for interpret in (False, True):
         def dew_fn(x, weights, *, interpret=interpret):
-            return gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32, interpret_on_cpu=interpret)
+            ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+            with ctx:
+                return gemm.fp8_weight_product(x, weights, out_dtype=jnp.float32, interpret_on_cpu=interpret)
 
         assert_as_exact(jax.jit(dew_fn), jax.jit(decoded_weight_dot), draw,
                         f"fp8_weight_product {fmt} interp={interpret}",
                         seeds=8, truth_fn=functools.partial(decoded_weight_dot, dtype=jnp.float64))
-    # Exact single-scale check on default XLA and interpreted Mosaic routes (scale = 2.0 must apply once).
+    # Exact single-scale check on default XLA, interpreted Mosaic, and unified gemm.gemm dispatch.
     ones = jnp.ones((64, 64), jnp.bfloat16)
     scaled_w = formats.Fp8Weights.of(jnp.full((64, 64), 2.0, jnp.float32), fmt=fmt, scale=2.0)
     for interpret in (False, True):
-        got = gemm.fp8_weight_product(ones, scaled_w, out_dtype=jnp.float32, interpret_on_cpu=interpret)
+        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+        with ctx:
+            got = gemm.fp8_weight_product(ones, scaled_w, out_dtype=jnp.float32, interpret_on_cpu=interpret)
         np.testing.assert_array_equal(np.asarray(got), np.full((64, 64), 128.0, np.float32))
-    # Grouped fp8_weight_product across scalar, per-column, per-group, and per-group-per-column scales.
+    np.testing.assert_array_equal(np.asarray(gemm.gemm(ones, scaled_w, out_dtype=jnp.float32)),
+                                  np.full((64, 64), 128.0, np.float32))
     rng = np.random.default_rng(8549)
     x_g = jnp.asarray(rng.integers(-2, 3, size=(64, 64)), jnp.bfloat16)
     w_g = jnp.asarray(rng.integers(-2, 3, size=(2, 64, 64)), jnp.float32)
@@ -591,8 +606,10 @@ def test_fp8_weight_product_holds_check_1_and_compiles_on_sm80(fmt: str):
         ref = jax.lax.ragged_dot(x_g.astype(jnp.float32), bank.decoded(jnp.float32), sizes,
                                  preferred_element_type=jnp.float32)
         for interpret in (False, True):
-            got = gemm.fp8_weight_product(x_g, bank, sizes, out_dtype=jnp.float32,
-                                          interpret_on_cpu=interpret)
+            ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+            with ctx:
+                got = gemm.fp8_weight_product(x_g, bank, sizes, out_dtype=jnp.float32,
+                                              interpret_on_cpu=interpret)
             np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
     with pytest.raises(ValueError):
         formats.Fp8Weights.of(w_g, fmt=fmt, scale=jnp.ones((2,), jnp.float32))
@@ -662,8 +679,10 @@ def test_stage_decoded_fp8_preserves_nonfinite_codewords(fmt: str):
     bank = formats.Fp8Weights(col_words, jnp.ones((), jnp.float32), formats.fp8_form_version(fmt), fmt=fmt)
     sel = jnp.zeros((64, 64), jnp.bfloat16).at[:, 0].set(1.0)
     for interpret in (False, True):
-        got = np.asarray(gemm.fp8_weight_product(sel, bank, out_dtype=jnp.float32,
-                                                 interpret_on_cpu=interpret))
+        ctx = generation.chosen(grouped_matmul="mosaic") if interpret else contextlib.nullcontext()
+        with ctx:
+            got = np.asarray(gemm.fp8_weight_product(sel, bank, out_dtype=jnp.float32,
+                                                     interpret_on_cpu=interpret))
         assert np.isnan(got[0, 0]) and np.isnan(got[0, 1])
         if fmt == "e5m2":
             assert np.isposinf(got[0, 2]) and np.isneginf(got[0, 3])

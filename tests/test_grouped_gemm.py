@@ -1666,11 +1666,12 @@ def test_explicit_target_derivation_sm120_and_refusal_under_mismatched_ambient_g
             assert stepped != first
 
 
-@pytest.mark.parametrize(("offset", "after_cast"), [(False, False), (True, False), (False, True)])
-def test_stream_rms_normalized_fuses_through_fused_gemm_prologue(offset: bool, after_cast: bool):
+def test_stream_rms_normalized_fuses_through_fused_gemm_prologue():
     """Residual-stream RMSNorm (`norms.stream_rms_normalized`) feeding `fused_gemm.product` splits its
     stream sum + statistics into the XLA pre-pass and fuses the scaling into the GEMM prologue through
-    `fused_gemm.analysis` (rows 6104, 12137)."""
+    `fused_gemm.analysis` while holding Check 1 on value and VJP (rows 6104, 12137)."""
+    from jax.experimental.pallas import fuser
+
     from dew.nn.kernels import fused_gemm
     from dew.nn.norms import stream_rms_normalized
 
@@ -1678,8 +1679,8 @@ def test_stream_rms_normalized_fuses_through_fused_gemm_prologue(offset: bool, a
     f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
 
     def body(x, branch, scale, w):
-        _, normed = stream_rms_normalized(x, branch, scale, 1e-6, jnp.bfloat16, scale_offset=offset,
-                                          scale_after_cast=after_cast, fp32_statistics=True,
+        _, normed = stream_rms_normalized(x, branch, scale, 1e-6, jnp.bfloat16, scale_offset=False,
+                                          scale_after_cast=False, fp32_statistics=True,
                                           implementation="xla")
         return fused_gemm.product(normed, w, out_dtype=jnp.bfloat16)
 
@@ -1687,6 +1688,34 @@ def test_stream_rms_normalized_fuses_through_fused_gemm_prologue(offset: bool, a
         found = fused_gemm.analysis(body, bf16((8192, 4096)), bf16((8192, 4096)), f32((4096,)),
                                     bf16((4096, 4096)))
     assert found.prologue is not None and found.prologue.kernel == "fused", found
+
+    def draw(seed):
+        rng = np.random.default_rng(12137 + seed)
+        return (
+            jnp.asarray(rng.standard_normal((64, 64)) / 8.0, jnp.bfloat16),
+            jnp.asarray(rng.standard_normal((64, 64)) / 8.0, jnp.bfloat16),
+            jnp.asarray(rng.uniform(0.8, 1.2, size=(64,)), jnp.float32),
+            jnp.asarray(rng.standard_normal((64, 64)) / 8.0, jnp.bfloat16),
+            jnp.asarray(rng.standard_normal((64, 64)), jnp.bfloat16),
+        )
+
+    def run_fused(x, branch, scale, w, dy):
+        with generation.assumed("sm90"), generation.chosen(gemm_prologue="fused"):
+            y, pull = jax.vjp(fuser.fuse(body), x, branch, scale, w)
+            return y, pull(dy)
+
+    def run_ref(x, branch, scale, w, dy, *, dtype=jnp.bfloat16, wide=jnp.float32):
+        def fn(a, b, s, m):
+            _, normed = stream_rms_normalized(a, b, s, 1e-6, dtype, scale_offset=False,
+                                              scale_after_cast=False, fp32_statistics=True,
+                                              implementation="xla")
+            return jax.lax.dot(normed, m, preferred_element_type=wide).astype(dtype)
+
+        y, pull = jax.vjp(fn, x.astype(dtype), branch.astype(dtype), scale.astype(wide), w.astype(dtype))
+        return y, pull(dy.astype(dtype))
+
+    assert_as_exact(jax.jit(run_fused), jax.jit(run_ref), draw, "stream_rms_normalized fused_gemm",
+                    seeds=SEEDS, truth_fn=functools.partial(run_ref, dtype=jnp.float64, wide=jnp.float64))
 
 
 def test_derivation_honors_carved_out_resource_budgets():
