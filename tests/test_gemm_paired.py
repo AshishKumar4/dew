@@ -1443,15 +1443,18 @@ def test_an_adapted_products_replicated_gradient_sums_before_it_rounds():
 
 def test_an_adapted_products_backward_under_an_fp8_preset_traces():
     """An adapted product's reverse pass under the `ANY_F8_ANY_F8_F32` preset, which JAX takes for FP8
-    operands alone: its fp32 factor products take `HIGHEST` (`low_rank._kept`) rather than asking JAX the
-    preset's arithmetic for fp32 operands, which it refuses (row 12394)."""
+    operands alone, and an F8 X4 one, whose four products name no split of an operand: its fp32 factor
+    products take `HIGHEST` (`low_rank._kept`) rather than raising (row 12394)."""
     from dew.nn.kernels.low_rank import low_rank
 
     x = jax.ShapeDtypeStruct((8, 16), jnp.float8_e4m3fn)
     kernel, a, b = (jax.ShapeDtypeStruct(shape, jnp.float8_e4m3fn) for shape in ((16, 8), (16, 4), (4, 8)))
 
-    def loss(x, kernel, a, b):
-        return jnp.sum(low_rank(x, kernel, a, b, 1.0, out_dtype=jnp.float32,
-                                precision=jax.lax.DotAlgorithmPreset.ANY_F8_ANY_F8_F32))
+    def loss(x, kernel, a, b, precision):
+        return jnp.sum(low_rank(x, kernel, a, b, 1.0, out_dtype=jnp.float32, precision=precision))
 
-    jax.make_jaxpr(jax.grad(loss, argnums=(2, 3)))(x, kernel, a, b)
+    for preset in ("ANY_F8_ANY_F8_F32", "F8E4M3FN_F8E4M3FN_F32_X4"):
+        if hasattr(jax.lax.DotAlgorithmPreset, preset):
+            precision = getattr(jax.lax.DotAlgorithmPreset, preset)
+            jax.make_jaxpr(jax.grad(functools.partial(loss, precision=precision), argnums=(2, 3)))(
+                x, kernel, a, b)

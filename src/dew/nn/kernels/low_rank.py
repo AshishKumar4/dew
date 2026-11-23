@@ -169,11 +169,11 @@ def _kept(precision: PrecisionLike) -> PrecisionLike:
     such types), which would round them back to those, then `HIGHEST`."""
     try:
         arithmetic = dot_arithmetic(effective_precision(precision), jnp.float32, jnp.float32)
+        narrow = arithmetic is not None and arithmetic.digits < jnp.finfo(jnp.float32).nmant + 1
     except ValueError:
-        # JAX's own refusal of fp32 operands for the algorithm (an FP8 preset takes FP8 operands alone): it
-        # multiplies narrower ones than fp32's.
-        return jax.lax.Precision.HIGHEST
-    narrow = arithmetic is not None and arithmetic.digits < jnp.finfo(jnp.float32).nmant + 1
+        # JAX's own refusal of fp32 operands for the algorithm (an FP8 preset takes FP8 operands alone), or
+        # one of products no split names (`DotArithmetic.parts`: an F8 X4's): it keeps no fp32 operand whole.
+        narrow = True
     return jax.lax.Precision.HIGHEST if narrow else precision
 
 
