@@ -700,7 +700,10 @@ def _backward_launched(entry, x, dt, b, c, parameters, entered, resets, dy, dfin
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, programs),
                              grid_names=("rows", "channels"),
                              warpgroups=1, interpret=interpret, family=scan.family.name,
-                             compiled=mosaic.compiler_params(resident=scan.resident),
+                             # The forward's exp2 (`Family.kernel`'s `approx_math`, ex2.approx.ftz): exact
+                             # math's range checks and selects (FSETP, FSEL: 4.4 of an A100's 94 instructions
+                             # a token and state, mamba_ssm's none; M-JS-241) decayed apart from the forward.
+                             compiled=mosaic.compiler_params(approx_math=True, resident=scan.resident),
                              name="selective_scan_backward", scratch=scratch)
 
     def accumulated(refs):
