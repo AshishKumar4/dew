@@ -642,10 +642,13 @@ class OuterProgram:
     def __init__(self, function: Callable, **arguments):
         self.function, self.arguments = function, arguments
         # Its jits, each by the abstract key of the one call its trace was validated for (`abstract_of`: its
-        # shapes, trace context and the refusals it read), the most recent `JITS_HELD` (`_held_jit`), each
-        # with the facts that trace read (`_facts.recording`), which a trace JAX's cache answers reads again.
-        self._jits: collections.OrderedDict[Hashable, tuple[jax.stages.Wrapped, Facts]] = (
-            collections.OrderedDict())
+        # shapes, trace context and the refusals it read), the most recent `JITS_HELD` (`_held_jit`).
+        self._jits: collections.OrderedDict[Hashable, jax.stages.Wrapped] = collections.OrderedDict()
+        # The facts each program its jits traced read, by the program's jaxpr, the one JAX's trace cache
+        # answers a later trace by the jit with (`_stable_trace`): held once its trace returns, so a trace
+        # answered by a program whose facts are not held (another thread's, between JAX's cache taking it and
+        # its trace returning) is no program a call takes (row 12296's review P0).
+        self._programs: weakref.WeakKeyDictionary[jax_core.Jaxpr, Facts] = weakref.WeakKeyDictionary()
         # The static positions and names as jit resolves them, the ones given and those it infers.
         numbers, names = arguments.get("static_argnums"), arguments.get("static_argnames")
         signature = api_util.fun_signature(function)
@@ -690,12 +693,11 @@ class OuterProgram:
     """The jits it holds, each the one call's it was validated for (`_validated`), the least recently taken
     let go past it."""
 
-    def _held_jit(self, key: Hashable) -> tuple[jax.stages.Wrapped, Facts] | None:
-        """The jit whose trace was validated for the call of abstract key `key` (`_validated`) and the facts
-        that trace read, None where none was: read, never claimed, so a call at another key traces by a jit
-        of its own and a held jit only ever answers its own call, from JAX's trace cache (theme K01-e's
-        reviews' P0s: a held jit traced at a new shape cached the program another thread's refusal made, for
-        every call it answered)."""
+    def _held_jit(self, key: Hashable) -> jax.stages.Wrapped | None:
+        """The jit whose trace was validated for the call of abstract key `key` (`_validated`), None where
+        none was: read, never claimed, so a call at another key traces by a jit of its own and a held jit
+        only ever answers its own call, from JAX's trace cache (theme K01-e's reviews' P0s: a held jit traced
+        at a new shape cached the program another thread's refusal made, for every call it answered)."""
         with self._compiling:
             held = self._jits.get(key)
             if held is not None:
@@ -710,31 +712,25 @@ class OuterProgram:
             return None
         return self.abstract_of(args, kwargs, refusals)
 
-    def _validated(self, key: Hashable, made: jax.stages.Wrapped, reads: Facts) -> None:
-        """`made`, a jit whose trace of the call of `key` read its refusals alone and the facts `reads`, the
-        one that call takes from here on, where none is yet; the most recent `JITS_HELD` held."""
+    def _validated(self, key: Hashable, made: jax.stages.Wrapped) -> None:
+        """`made`, a jit whose trace of the call of `key` read its refusals alone, the one that call takes
+        from here on, where none is yet; the most recent `JITS_HELD` held."""
         with self._compiling:
-            self._jits.setdefault(key, (made, reads))
+            self._jits.setdefault(key, made)
             self._jits.move_to_end(key)
             while len(self._jits) > self.JITS_HELD:
                 self._jits.popitem(last=False)
-
-    def _retraced(self, key: Hashable, held: jax.stages.Wrapped, reads: Facts) -> None:
-        """`held`, the jit validated for `key`, traced again (JAX's caches cleared): the facts that trace read
-        (`reads`) are those its cache's trace read from here on."""
-        with self._compiling:
-            if (found := self._jits.get(key)) is not None and found[0] is held:
-                self._jits[key] = (held, reads)
 
     def _invalidated(self, key: Hashable, held: jax.stages.Wrapped) -> None:
         """`held`, the jit validated for `key`, let go where a trace by it read other refusals (JAX's trace
         cache dropped its program and its trace raced, or its settle retraced past one)."""
         with self._compiling:
-            if (found := self._jits.get(key)) is not None and found[0] is held:
+            if self._jits.get(key) is held:
                 del self._jits[key]
 
     def _traced(self, held: tuple[jax.stages.Wrapped, tuple], args: tuple, kwargs: dict, *, frozen: bool
-                ) -> tuple[jax.stages.Traced, tuple[jax.stages.Wrapped, tuple]] | ReadingRefused:
+                ) -> tuple[jax.stages.Traced, tuple[jax.stages.Wrapped, tuple], jax_core.Jaxpr] | (
+                    ReadingRefused):
         """Its trace of a call by `held`'s jit, its program the algebra pass's (`algebra.rewritten_program`),
         so its lowering, its trace, its executable and every relowering read one program
         (docs/design/algebra.md §6.7): the pass reads the trace jit made, which lowers as it is where no
@@ -746,10 +742,12 @@ class OuterProgram:
         past JAX's trace cache (`_jitted`; `report.settled_trace`), so it lowers once; a program traced
         within another's (a launch's own, as its capture traces it) settles nothing mid-trace. Beside its
         trace, the jit that made it and the launches refused as it traced (`held`'s, or a settle's own
-        retrace's). Each trace reads those refusals alone and its own (`report.reading`), never another
-        thread's recorded as it traces, so the program a jit's trace cache keeps is the one they make;
-        `held`'s, where it is a held jit (`frozen`), none of its own, its cache only ever its key's: where
-        its trace recorded one, the refusal that ended it taking nothing (`report.ReadingRefused`)."""
+        retrace's), and the program its jit traced, before the pass reads it (the one JAX's trace cache
+        answers that jit with again, `_stable_trace`). Each trace reads those refusals alone and its own
+        (`report.reading`), never another thread's recorded as it traces, so the program a jit's trace cache
+        keeps is the one they make; `held`'s, where it is a held jit (`frozen`), none of its own, its cache
+        only ever its key's: where its trace recorded one, the refusal that ended it taking nothing
+        (`report.ReadingRefused`)."""
         from dew.nn.kernels.templates import report
 
         outermost = not _PASSING.get()
@@ -770,8 +768,8 @@ class OuterProgram:
             traced = report.settled_trace(trace, retraced) if outermost else trace()
             rewritten = algebra.rewritten_program(traced.jaxpr)
             if rewritten is traced.jaxpr:
-                return traced, made
-            return algebra.program.traced_as(traced, rewritten), made
+                return traced, made, traced.jaxpr
+            return algebra.program.traced_as(traced, rewritten), made, traced.jaxpr
         except report.ReadingRefused as refused:
             # Its own freeze's alone: an enclosing held jit's, which this trace's reading inherits, is that
             # trace's to retrace past, its snapshot one this trace's retrying never moves.
@@ -1059,7 +1057,7 @@ class OuterProgram:
         the facts its kept program's trace read (`settled`'s) are read again by every call it answers."""
         fresh, refused, reads = settled
         if fresh is not None and (held := self._held_key(args, kwargs, refused)) is not None:
-            self._validated(held, fresh, reads)
+            self._validated(held, fresh)
         accepted = self.key_of(args, kwargs, refused)[0]
         kept: Future[jax.stages.Compiled] = Future()
         kept.set_result(executable)
@@ -1207,17 +1205,17 @@ class OuterProgram:
         after a seeded refusal derives past it (row 12165)."""
         traced, refused, made, reads = self._stable_trace(args, kwargs, fresh=False)
         if (key := self._held_key(args, kwargs, refused)) is not None:
-            self._validated(key, made, reads)
+            self._validated(key, made)
         return traced, refused, reads
 
     def _stable_trace(self, args: tuple, kwargs: dict, *, fresh: bool
                       ) -> tuple[jax.stages.Traced, tuple, jax.stages.Wrapped, Facts]:
         """A trace whose launches read one snapshot of the refusals, the jit that made it and the facts it
-        read beside it (a held jit's trace JAX's cache answered, which reads none anew, those its cached
-        trace read, read again into every open recording, `_facts.replay`; a held jit whose facts no longer
-        hold traces none, `_facts.still`): traced again where another thread refused a launch as it traced,
-        until none did, refusals only adding of finitely many; a settle's retrace's (`_traced`) its own.
-        Its jit the one validated for this call
+        read beside it (a held jit's trace JAX's cache answered, which reads none anew, those of the program
+        it answered with, `_programs`, read again into every open recording, `_facts.replay`; one answered
+        with a program whose facts are not held, or answer otherwise now, traced again by a jit of its own):
+        traced again where another thread refused a launch as it traced, until none did, refusals only adding
+        of finitely many; a settle's retrace's (`_traced`) its own. Its jit the one validated for this call
         under the snapshot (`_held_jit`), else one of its own, which `fresh` takes always (a relowering's,
         past JAX's trace cache). A raced trace's routes are withdrawn (`withdrawn`), and a validated jit
         whose trace read other refusals let go (`_invalidated`); a held jit's trace that records a refusal
@@ -1230,14 +1228,9 @@ class OuterProgram:
             refusals = report.refusal_snapshot()
             key = None if unheld else self._held_key(args, kwargs, refusals)
             held = None if key is None else self._held_jit(key)
-            if held is not None and not _facts.still(held[1]):
-                # A fact its trace read answers otherwise (a program its trace cache keeps was made under
-                # the answer before): let go, its call traced by a jit of its own.
-                self._invalidated(key, held[0])
-                held = None
             marks = route_marks()
             outcome, reads = _read_by(functools.partial(
-                self._traced, (self._jitted() if held is None else held[0], refusals), args, kwargs,
+                self._traced, (self._jitted() if held is None else held, refusals), args, kwargs,
                 frozen=held is not None))
             if isinstance(outcome, report.ReadingRefused):
                 # A held jit's trace recorded a refusal (its cached program dropped): it took nothing, and
@@ -1245,20 +1238,28 @@ class OuterProgram:
                 withdrawn(marks)
                 unheld = True
                 continue
-            traced, (made, under) = outcome
+            traced, (made, under), program = outcome
+            answered = reads is None
+            with self._compiling:
+                if answered:
+                    reads = self._programs.get(program)
+                else:
+                    self._programs[program] = reads
+            if reads is None or not _facts.still(reads):
+                # JAX's trace cache answered the held jit (a jit of its own traces always) with a program
+                # whose facts are not held (another thread's trace not yet returned) or answer otherwise
+                # now (or a fact moved as a trace of its own read it): let go, traced by a jit of its own.
+                if held is not None:
+                    self._invalidated(key, held)
+                withdrawn(marks)
+                unheld = True
+                continue
+            if answered:
+                _facts.replay(reads)
             raced = report.refusal_snapshot() != under
             if held is not None and (raced or under != refusals):
-                self._invalidated(key, held[0])
+                self._invalidated(key, held)
             if not raced:
-                if reads is None:
-                    # JAX's trace cache answered the held jit (a jit of its own traces always): the facts
-                    # its cached trace read.
-                    reads = {} if held is None else held[1]
-                    _facts.replay(reads)
-                elif held is not None and made is held[0]:
-                    # Traced again by the jit it holds (its cache cleared): the facts this trace read are
-                    # its cached trace's from here on.
-                    self._retraced(key, made, reads)
                 return traced, under, made, reads
             withdrawn(marks)
 
