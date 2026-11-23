@@ -12,7 +12,7 @@ import pytest
 from dew.artifacts import Decisions
 from dew.data import Memory
 from dew.data.compile import fitted
-from dew.data.dataset import DataPartition
+from dew.data.dataset import Closeable, DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, decisions
 from dew.decision.layout import SegmentLayout, Specials
@@ -148,7 +148,8 @@ def test_packed_validation_splits_read_in_one_shape_and_one_bound(partition):
                 seen.add((tuple(sorted(batch)), np.shape(batch["text"]), laid.max_segments))
                 assert VALID_ROWS in batch, sorted(batch)
         finally:
-            opened.close()
+            if isinstance(opened, Closeable):
+                opened.close()
     assert len(seen) == 1 and next(iter(seen))[2] == 4, seen
 
 
@@ -159,7 +160,7 @@ def test_a_handed_validation_passs_short_last_batch_reads_in_its_whole_ones_shap
     import grain.python as grain
 
     from dew.batch import VALID_ROWS
-    from dew.data.compile import native
+    from dew.data.handed import native
 
     rows = grain.MapDataset.source([{"x": np.full(3, index, np.float32)} for index in range(7)]).batch(4)
     opened = native(rows, training=False)(DataPartition())
@@ -196,5 +197,6 @@ def test_a_split_whose_packing_the_read_cannot_see_widens_no_known_splits_bound(
         try:
             declared[name] = {batch["text_coordinates"].max_segments for batch in opened}
         finally:
-            opened.close()
+            if isinstance(opened, Closeable):
+                opened.close()
     assert declared == {"two": {4}, "four": {4}, "ready": {9}}, declared

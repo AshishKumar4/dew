@@ -2296,8 +2296,7 @@ class _Build:
                 size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn)
             )
             if not drop and fill:
-                filled = (_FillShare(partition, batch_stage.size) if canonical
-                          else FilledBatch(size, marked=not self.training))
+                filled = _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size)
                 stream = stream.map(filled)
             return stream, after
         if self.training and self.lowering.rooted:
@@ -2316,8 +2315,6 @@ class _Build:
             # A pool's shares of a global order that ends step together, a share past the order's last
             # batch with batches of no real row (`_evened`), so each marks its rows, filled or whole.
             evened = self.training and partition.count > 1 and not self.lowering.records_unending
-            # A held pass's batches mark their rows too, filled or whole, so a split's whole batches and
-            # its short last one hold one tree and its evaluation compiles once (row 12474).
             batches = batches.map(FilledBatch(size, real=real, marked=evened or not self.training))
             if evened and len(whole):
                 batches = _evened(batches, whole, -(-len(whole) // batch_stage.size), size, batch_stage)

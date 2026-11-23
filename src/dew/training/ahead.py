@@ -106,8 +106,8 @@ if TYPE_CHECKING:
     from jaxlib._jax import Traceback
 
     from dew.checkpoints import Resume
-    from dew.data.compile import Handed
     from dew.data.dataset import DataPartition, Loader
+    from dew.data.handed import Handed
     from dew.data.pipeline import Dataset
     from dew.state import TrainState
     from dew.training._fit import FitArguments, FitPlan, Start

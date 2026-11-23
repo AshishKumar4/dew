@@ -210,7 +210,7 @@ def test_a_handed_validation_batch_is_shared_alike_by_every_reader():
     """Five rows of handed arrays read by two shares: each reads three, the one short filled with a
     repeat its `VALID_ROWS` marks, so the shares make one global batch and every real row scores once;
     read by one host of two row shards, they are six, the repeat marked."""
-    from dew.data.compile import native
+    from dew.data.handed import native
 
     columns = regression_rows(5, 0)
     read = native(columns, training=False)
