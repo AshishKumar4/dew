@@ -65,7 +65,8 @@ def _share(batch: Batch, partition: DataPartition, *, held: bool, nominal: int =
         return batch if partition.count == 1 else take_batch(batch, np.arange(rows)[partition.cut()])
     mine, real = partition.held(rows) if partition.count > 1 else (slice(None), True)
     shards = partition.count * partition.row_multiple
-    filled = -(-max(rows, nominal) // shards) * partition.row_multiple
+    # A batch of no rows has none to fill out with: passed on as it is, marked (review of row 12474).
+    filled = 0 if rows == 0 else -(-max(rows, nominal) // shards) * partition.row_multiple
     return FilledBatch(filled, real=real, marked=True).map(take_batch(batch, np.arange(rows)[mine]))
 
 

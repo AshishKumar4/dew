@@ -200,3 +200,18 @@ def test_a_split_whose_packing_the_read_cannot_see_widens_no_known_splits_bound(
             if isinstance(opened, Closeable):
                 opened.close()
     assert declared == {"two": {4}, "four": {4}, "ready": {9}}, declared
+
+
+def test_a_handed_validation_pass_passes_on_a_batch_of_no_rows_after_a_whole_one():
+    """A handed validation pass whose source yields a batch of no rows after a whole one passes it on as it
+    is, marked, with no rows to fill out with, rather than refusing it (review of row 12474)."""
+    import grain.python as grain
+
+    from dew.batch import VALID_ROWS
+    from dew.data.handed import native
+
+    batches = [{"x": np.ones((4, 3), np.float32)}, {"x": np.zeros((0, 3), np.float32)}]
+    opened = native(grain.MapDataset.source(batches), training=False)(DataPartition())
+    read = list(opened)
+    assert [np.shape(batch["x"]) for batch in read] == [(4, 3), (0, 3)], read
+    assert np.asarray(read[1][VALID_ROWS]).shape == (0,), read
