@@ -902,12 +902,11 @@ def fp8_packed[Words: (np.ndarray, jax.Array)](codes: Words, minifloat: Minifloa
     return _parities(natural, form.encoder, xp)
 
 
-def fp8_codes(words: jax.Array, minifloat: Minifloat, dtype=jnp.float32) -> jax.Array:
-    """Decode free-layout FP8 stored `words` (`[depth / 4, columns]` uint32, packed by `fp8_packed`) back to
-    `[depth, columns]` exact values in `dtype` via `fp8_form(minifloat)` and `restored`, preserving NaN on
-    E4M3 `0x7F`/`0xFF` and +/-inf/NaN on E5M2 exponent 31 (as `scales_decoded` does, row 8548)."""
-    form, shift = fp8_form(minifloat)
-    pattern = form.values(words.T, jnp.uint16).T.astype(jnp.uint32)
+def fp8_restored(pattern: jax.Array, minifloat: Minifloat, dtype=jnp.float32) -> jax.Array:
+    """Restore `pattern` (uint32 low-16 bfloat16 bits from `fp8_form(minifloat)`) to `dtype`, preserving NaN
+    on E4M3 `0x7F`/`0xFF` and +/-inf/NaN on E5M2 exponent 31 (as `scales_decoded` does, row 8548). Shared by
+    `fp8_codes` and `templates/gemm/packed.stage_decoded_fp8`."""
+    _, shift = fp8_form(minifloat)
     restored_values = restored(pattern, dtype, shift=shift)
     if minifloat == E4M3:
         return jnp.where((pattern & jnp.uint32(0x7FFF)) == jnp.uint32(0x07F0),
@@ -918,6 +917,13 @@ def fp8_codes(words: jax.Array, minifloat: Minifloat, dtype=jnp.float32) -> jax.
     special = jnp.where((pattern & jnp.uint32(0x0060)) != 0, jnp.asarray(jnp.nan, dtype), infinity)
     return jnp.where(nonfinite, special, restored_values)
 
+
+def fp8_codes(words: jax.Array, minifloat: Minifloat, dtype=jnp.float32) -> jax.Array:
+    """Decode free-layout FP8 stored `words` (`[depth / 4, columns]` uint32, packed by `fp8_packed`) back to
+    `[depth, columns]` exact values in `dtype` via `fp8_form(minifloat)` and `fp8_restored` (row 8548)."""
+    form, _ = fp8_form(minifloat)
+    pattern = form.values(words.T, jnp.uint16).T.astype(jnp.uint32)
+    return fp8_restored(pattern, minifloat, dtype)
 
 class Minifloat(NamedTuple):
     """A narrow float an encode rounds fp32 to (`encoded`): its exponent and mantissa bits, its bias, its

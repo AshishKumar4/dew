@@ -306,6 +306,34 @@ def fp8_form_version(fmt: str) -> np.ndarray:
     form, _ = bits.fp8_form(minifloat)
     return form_version(form.version, fp8_staged_rows(FP8_STAGE))
 
+def fp8_scale_checked(scale_shape: tuple[int, ...], weights_shape: tuple[int, ...]) -> None:
+    """Validate that `scale_shape` satisfies the single unambiguous broadcast contract for `Fp8Weights` of
+    `weights_shape` (`[depth, width]` or `[groups, depth, width]`): scalar `()`/`(1,)`, per-column `(width,)`
+    or `(1, width)` / `(1, 1, width)`, or grouped per-group `(groups, 1, 1)` / `(groups, 1, width)`."""
+    if len(weights_shape) not in (2, 3):
+        raise ValueError(f"Fp8Weights expects 2D [depth, width] or 3D [groups, depth, width], got "
+                         f"{weights_shape}")
+    width = weights_shape[-1]
+    if len(weights_shape) == 2:
+        allowed = {(), (1,), (width,), (1, width)}
+    else:
+        groups = weights_shape[0]
+        allowed = {(), (1,), (width,), (1, 1, width), (groups, 1, 1), (groups, 1, width)}
+    if scale_shape not in allowed:
+        raise ValueError(f"Fp8Weights scale shape {scale_shape} is invalid for weights {weights_shape}; "
+                         f"expected one of {sorted(allowed)}")
+
+def fp8_factor(scale: jax.Array, sizes: jax.Array, count: int, weights_shape: tuple[int, ...],
+               dense: bool) -> jax.Array:
+    """Broadcast `Fp8Weights.scale` to match `[count, width]` output rows under `fp8_scale_checked`."""
+    fp8_scale_checked(scale.shape, weights_shape)
+    if scale.ndim == 0 or scale.shape == (1,) or dense:
+        return scale
+    if scale.ndim == 1:
+        return scale[None, :]
+    if scale.shape[0] == 1:
+        return scale[0]
+    return jnp.repeat(scale[:, 0, :], sizes, axis=0, total_repeat_length=count)
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -329,6 +357,7 @@ class Fp8Weights:
         if source.ndim < 2 or source.shape[-2] % FP8_STAGE != 0:
             raise ValueError(f"Fp8Weights expects depth divisible by {FP8_STAGE}, got {source.shape}")
         scale_arr = jnp.asarray(scale, jnp.float32)
+        fp8_scale_checked(scale_arr.shape, source.shape)
         if source.dtype == fp8_dtype:
             codes = jax.lax.bitcast_convert_type(source, jnp.uint8).astype(jnp.uint32)
         else:
@@ -348,25 +377,29 @@ class Fp8Weights:
         return (*groups, 4 * words, width)
 
     def checked(self) -> "Fp8Weights":
-        """Verify stored `form` version matches this Dew's checked-in encoder (`fp8_form_version`)."""
+        """Verify stored `form` version and scale shape match this Dew's checked-in encoder."""
         expected = fp8_form_version(self.fmt)
         stored = np.asarray(self.form, np.uint8)
         if stored.shape[-1:] != expected.shape or not np.all(stored == expected):
             raise ValueError(f"Fp8Weights({self.fmt}) form version mismatch; repack from source weights")
+        fp8_scale_checked(jnp.shape(self.scale), self.shape)
         return self
 
-    def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
-        """Decode `words` back to `[..., depth, width]` in `dtype`, scaled in `at_least_fp32`."""
+    def unscaled(self, dtype=jnp.bfloat16) -> jax.Array:
+        """Decode `words` back to `[..., depth, width]` in `dtype` without applying `self.scale`."""
         minifloat, _ = _fp8_minifloat(self.fmt)
-        wide = jnp.promote_types(dtype, jnp.float32)
         words = jnp.asarray(self.words)
         *batches, width, wdepth = words.shape
         flat = words.reshape(-1, width, wdepth)
         inv = np.argsort(fp8_staged_rows(wdepth * 4))
         decoded = jax.vmap(lambda w: bits.fp8_codes(w.T, minifloat, jnp.float32)[inv])(flat)
-        out = decoded.reshape(*batches, wdepth * 4, width).astype(wide) * jnp.asarray(self.scale, wide)
-        return out.astype(dtype)
+        return decoded.reshape(*batches, wdepth * 4, width).astype(dtype)
 
+    def decoded(self, dtype=jnp.bfloat16) -> jax.Array:
+        """Decode `words` back to `[..., depth, width]` in `dtype`, scaled in `at_least_fp32`."""
+        fp8_scale_checked(jnp.shape(self.scale), self.shape)
+        wide = jnp.promote_types(dtype, jnp.float32)
+        return (self.unscaled(wide) * jnp.asarray(self.scale, wide)).astype(dtype)
 
 def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
     """Block-scaled codes' values in `dtype`: each code times its `block` depths' E4M3 scale, read by the one

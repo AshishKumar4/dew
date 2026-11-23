@@ -150,10 +150,65 @@ def test_linear_cross_entropy_compiles_spill_free(gpu: str, with_bias: bool):
         assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
 
 
-def test_linear_cross_entropy_derives_on_tpu():
-    """`linear_ce.derive_linear_ce` derives a legal MXU tile on TPU v5e (row 6103)."""
-    target = generation.gpu_target("v5e")
+def test_linear_cross_entropy_mixed_dtype_matches_vjp_and_refuses_native():
+    """Mixed-dtype `linear_cross_entropy` (bf16 activations, fp32 master weights) uses one promoted
+    contraction policy in both forward and backward, matching materialized VJP and finite differences, and
+    refuses native 16-bit lowering that would silently narrow weights (row 6103)."""
+    x0 = jnp.asarray([[1.0]], jnp.bfloat16)
+    w0 = jnp.asarray([[1.0 + 2.0 ** -9], [1.0]], jnp.float32)
+    t0 = jnp.asarray([0], jnp.int32)
+
+    def lce_loss(a, w):
+        return jnp.sum(gemm.linear_cross_entropy(a, w, t0, transpose_rhs=True))
+
+    def ref_loss(a, w):
+        return jnp.sum(_dense_ref(a, w, t0, None, transpose_rhs=True, softcap=None, dtype=jnp.float32))
+
+    got_val, (got_dx, got_dw) = jax.value_and_grad(lce_loss, argnums=(0, 1))(x0, w0)
+    ref_val, (ref_dx, ref_dw) = jax.value_and_grad(ref_loss, argnums=(0, 1))(x0, w0)
+    np.testing.assert_allclose(np.asarray(got_val), np.asarray(ref_val), atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(got_dx, np.float32), np.asarray(ref_dx, np.float32),
+                               atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(got_dw, np.float32), np.asarray(ref_dw, np.float32),
+                               atol=1e-6, rtol=1e-6)
+    with generation.assumed("sm90"):
+        ba = linear_ce.MOSAIC_LINEAR_CE.bind(
+            jax.ShapeDtypeStruct((64, 64), jnp.bfloat16), jax.ShapeDtypeStruct((64, 64), jnp.float32),
+            jax.ShapeDtypeStruct((64,), jnp.int32), None, transpose_rhs=True, softcap=None, interpret=True)
+        assert not linear_ce.MOSAIC_LINEAR_CE.eligible(ba, generation.gpu_target())
+        tile = linear_ce.derive_linear_ce((64, 64, 64), jnp.bfloat16, generation.gpu_target(), interpret=True)
+        assert tile is not None
+        with pytest.raises(ValueError):
+            linear_ce.linear_ce(jnp.zeros((64, 64), jnp.bfloat16), jnp.zeros((64, 64), jnp.float32),
+                                jnp.zeros((64,), jnp.int32), tiles=tile, multiprocessors=1, interpret=True)
+
+
+def test_linear_cross_entropy_derives_on_tpu_and_clamps_shared_budget():
+    """`linear_ce.derive_linear_ce` derives a legal MXU tile on TPU v5e, and `derivation.derived`'s
+    `shared_budget` clamps both GPU `shared_limit` and TPU `scoped_vmem` (rows 6103, 1762)."""
+    from dew.nn.kernels.templates import bundles
+    from dew.nn.kernels.templates.gemm import derivation
+
     with generation.assumed("v5e"):
-        tile = linear_ce.derive_linear_ce((256, 1024, 256), jnp.bfloat16, target)
-    assert tile is not None
-    assert tile.family == "mxu"
+        target = generation.gpu_target()
+        tile = linear_ce.derive_linear_ce((256, 4096, 256), jnp.bfloat16, target)
+        assert tile is not None
+        assert tile.family == "mxu"
+        layouts = bundles.groups("v5e", jnp.bfloat16, stated=True, tpu=True)[0]
+        clamped = derivation.derived(
+            layouts, rows=256, depth=256, width=4096, dtype=jnp.bfloat16, multiprocessors=1,
+            target=target, candidate=lambda c: True,
+            launch_of=lambda c: linear_ce.linear_ce_launch_of(c, (256, 4096, 256), jnp.bfloat16,
+                                                              target=target),
+            grouped=False, dense=True, shared_budget=1024)
+        assert clamped is None
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        layouts = bundles.groups("sm90", jnp.bfloat16, stated=True)[0]
+        clamped = derivation.derived(
+            layouts, rows=256, depth=256, width=256, dtype=jnp.bfloat16, multiprocessors=132,
+            target=target, candidate=lambda c: True,
+            launch_of=lambda c: linear_ce.linear_ce_launch_of(c, (256, 256, 256), jnp.bfloat16,
+                                                              target=target),
+            grouped=False, dense=True, shared_budget=1024)
+        assert clamped is None

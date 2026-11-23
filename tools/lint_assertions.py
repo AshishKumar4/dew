@@ -9,10 +9,15 @@ column, code and message (`Found`):
 - SLOP015: a test that skips when its own package fails to import.
 - SLOP029: a test whose every assertion is that a process failed, read from its exit status alone, which a
   crash passes as well as the refusal it is after (class 7).
+- SLOP033: a choice Dew derives (a config a call named for choosing returns: `derived`, `chosen`, `picked`,
+  `offered`, ...) pinned to a literal: its stages, consumers or a block size compared with a number
+  (CONTRIBUTING's banned assertion 2). A legality check (a derived tile against a budget it computes) and a
+  config the test configures itself pass.
 
 Each reads names through the imports of its own lexical scope (tools/lint_scopes.py)."""
 
 import ast
+import itertools
 import re
 import sys
 from collections.abc import Iterator, Sequence, Set
@@ -422,5 +427,70 @@ def skips(module: Parsed, parent: Sequence[str]) -> Iterator[Found]:
                    f"skips when {name} fails to import; import it, so a broken import fails")
 
 
-RULES = (mocks, wording, skips, statuses)
+DERIVERS = re.compile(r"(?:^|_)(?:choose|chosen|choice|pick|picked|derive|derived|select|selected|offered|"
+                      r"best|plan|planned|config_for|tuned|decide|decided)(?:_|s?$)")
+"""The names of the calls a test reads a derived choice from (SLOP033)."""
+DERIVED_FIELDS = ("stages", "consumers")
+"""A derived config's fields SLOP033 reads, beside every `block_*`."""
+
+
+def _bindings(function: ast.AST) -> list[tuple[tuple[int, int], str, bool]]:
+    """Each name `function`'s own scope binds (an assignment, annotated or not, a walrus, a loop's or a
+    comprehension's target): its target's position, the name, and whether a call `DERIVERS` names gave it."""
+    found = []
+    for node in scopes.own(function):
+        if isinstance(node, ast.Assign):
+            value, targets = node.value, node.targets
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+            value, targets = node.value, [node.target]
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            value, targets = node.iter, [node.target]
+        else:
+            continue
+        derived = bool(DERIVERS.search(scopes.called(value)))
+        found += [((name.lineno, name.col_offset), name.id, derived) for target in targets
+                  for name in ast.walk(target) if isinstance(name, ast.Name)]
+    return sorted(found)
+
+
+def _chosen(side: ast.expr, at: tuple[int, int], bindings: list[tuple[tuple[int, int], str, bool]]) -> str:
+    """The field `side` reads of a derived choice at `at` (`_bindings`' names), or ""."""
+    if not isinstance(side, ast.Attribute) or not (side.attr in DERIVED_FIELDS
+                                                   or side.attr.startswith("block_")):
+        return ""
+    base = side.value
+    if isinstance(base, ast.Call):
+        return side.attr if DERIVERS.search(scopes.called(base)) else ""
+    if not isinstance(base, ast.Name):
+        return ""
+    last = [derived for where, name, derived in bindings if name == base.id and where < at]
+    return side.attr if last and last[-1] else ""
+
+
+def pinned_choices(module: Parsed, parent: Sequence[str]) -> Iterator[Found]:
+    """SLOP033: an assertion comparing a derived config's stages, consumers or block size (`DERIVED_FIELDS`,
+    `block_*`) with a number literal beside it in the comparison: the config a call `DERIVERS` names, or a
+    name the test's function last bound to one before the assertion (a later binding to anything else, the
+    test's own config, frees it)."""
+    del parent
+
+    def number(node: ast.expr) -> bool:
+        return isinstance(node, ast.Constant) and type(node.value) in (int, float)
+
+    for function in (node for node in ast.walk(module.tree)
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))):
+        bindings = _bindings(function)
+        for check in (node for node in scopes.own(function) if isinstance(node, ast.Assert)):
+            at = (check.lineno, check.col_offset)
+            fields = [field for compare in ast.walk(check.test) if isinstance(compare, ast.Compare)
+                      for left, right in itertools.pairwise([compare.left, *compare.comparators])
+                      for side, other in ((left, right), (right, left))
+                      if number(other) and (field := _chosen(side, at, bindings))]
+            if fields:
+                yield (check.lineno, check.col_offset + 1, "SLOP033",
+                       f"pins a derived choice's {fields[0]} to a literal; assert the choice legal and its "
+                       "result correct, or configure the value the test needs explicitly")
+
+
+RULES = (mocks, wording, skips, statuses, pinned_choices)
 """The rules, in lint_slop's order."""

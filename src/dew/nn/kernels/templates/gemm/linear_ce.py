@@ -202,6 +202,9 @@ def linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *, tiles: Til
             f"linear_ce shape mismatch: x={x.shape}, weight={weight.shape}, targets={targets.shape}")
     if bias is not None and bias.shape != (v,):
         raise ValueError(f"linear_ce bias must have shape ({v},), got {bias.shape}")
+    if jnp.dtype(x.dtype) != jnp.dtype(weight.dtype):
+        raise ValueError(
+            f"native linear_ce requires matching x and weight dtypes, got {x.dtype} and {weight.dtype}")
 
     family = family_of(tiles, x.dtype)
     m_unit, n_unit, k_unit = tile_rows(tiles, family), tile_columns(tiles, family), tiles.block_k
@@ -376,8 +379,8 @@ class MosaicLinearCE(TilesTemplate):
     config_cls: ClassVar[type[Tiles]] = Tiles
 
     def _supports_ba(self, ba) -> bool:
-        return supports_dtype(ba.arguments["x"].dtype)
-
+        x, weight = ba.arguments["x"], ba.arguments["weight"]
+        return supports_dtype(x.dtype) and jnp.dtype(x.dtype) == jnp.dtype(weight.dtype)
     def _shape(self, ba) -> tuple[int, int, int]:
         x, w = ba.arguments["x"], ba.arguments["weight"]
         v = w.shape[0] if ba.arguments["transpose_rhs"] else w.shape[1]
@@ -396,8 +399,9 @@ class MosaicLinearCE(TilesTemplate):
                                    has_bias=ba.arguments["bias"] is not None, target=target)
 
     def candidate(self, ba, config: Tiles, target) -> bool:
-        x = ba.arguments["x"]
-        if not supports_dtype(x.dtype) or report.refused(self, ba, config, target):
+        x, weight = ba.arguments["x"], ba.arguments["weight"]
+        if (not supports_dtype(x.dtype) or jnp.dtype(x.dtype) != jnp.dtype(weight.dtype)
+                or report.refused(self, ba, config, target)):
             return False
         groups = bundles.groups(target.generation, x.dtype, stated=True, tpu=generation.tpu(target))
         family = next((b for group in groups for b in group if b.name == config.family), None)
@@ -440,6 +444,11 @@ class MosaicLinearCE(TilesTemplate):
 MOSAIC_LINEAR_CE = MosaicLinearCE()
 """The singleton Mosaic GEMM-fused linear cross-entropy launch on `TilesTemplate`/`KernelOp`."""
 
+def _contraction_dtypes(x_dtype, w_dtype) -> tuple[jnp.dtype, jnp.dtype]:
+    """Single operand and accumulation dtype policy shared across `portable_linear_ce`,
+    `linear_ce_backward`, and native `MOSAIC_LINEAR_CE` selection (row 6103)."""
+    operand = jnp.promote_types(x_dtype, w_dtype)
+    return operand, at_least_fp32(operand)
 
 def _padded_vocab(weight: jax.Array, bias: jax.Array | None, *, transpose_rhs: bool,
                   chunk_size: int | None) -> tuple[jax.Array, jax.Array | None, int, int, int]:
@@ -456,12 +465,12 @@ def _padded_vocab(weight: jax.Array, bias: jax.Array | None, *, transpose_rhs: b
 
 
 def _chunk_logits(x: jax.Array, w_pad: jax.Array, bias_pad: jax.Array | None, start, step: int, *,
-                  transpose_rhs: bool, precision: PrecisionLike, softcap: float | None, work
+                  transpose_rhs: bool, precision: PrecisionLike, softcap: float | None, operand, work
                   ) -> tuple[jax.Array, jax.Array]:
     axis = 0 if transpose_rhs else 1
     w_chunk = jax.lax.dynamic_slice_in_dim(w_pad, start, step, axis=axis)
     dims = (((1,), (1 if transpose_rhs else 0,)), ((), ()))
-    raw = jax.lax.dot_general(x, w_chunk.astype(x.dtype), dims, precision=precision,
+    raw = jax.lax.dot_general(x.astype(operand), w_chunk.astype(operand), dims, precision=precision,
                               preferred_element_type=work)
     if bias_pad is not None:
         raw = raw + jax.lax.dynamic_slice_in_dim(bias_pad, start, step, axis=0).astype(work)[None, :]
@@ -478,7 +487,7 @@ def portable_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *,
                        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Chunked-V online softmax linear cross-entropy returning `(loss, peak, mass, rest)` in `at_least_fp32`
     without ever materializing `[M, V]` logits (row 6103)."""
-    work = at_least_fp32(x.dtype)
+    operand, work = _contraction_dtypes(x.dtype, weight.dtype)
     w_pad, b_pad, v, step, n_chunks = _padded_vocab(weight, bias, transpose_rhs=transpose_rhs,
                                                     chunk_size=chunk_size)
     m = x.shape[0]
@@ -490,7 +499,7 @@ def portable_linear_ce(x: jax.Array, weight: jax.Array, targets: jax.Array, *,
         m_acc, l_acc, t_acc, r_acc = carry
         start = chunk * step
         z, _ = _chunk_logits(x, w_pad, b_pad, start, step, transpose_rhs=transpose_rhs,
-                             precision=precision, softcap=softcap, work=work)
+                             precision=precision, softcap=softcap, operand=operand, work=work)
         col = start + jnp.arange(step, dtype=jnp.int32)
         in_vocab = col < v
         z_masked = jnp.where(in_vocab[None, :], z, jnp.asarray(-jnp.inf, work))
@@ -521,7 +530,7 @@ def linear_ce_backward(x: jax.Array, weight: jax.Array, targets: jax.Array, bias
                        ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Recomputing chunked-V GEMM backward for linear cross-entropy with Barron et al. zero-sum label
     derivatives (`categorical.label_entry`), never materializing `[M, V]` logits (row 6103)."""
-    work = at_least_fp32(x.dtype)
+    operand, work = _contraction_dtypes(x.dtype, weight.dtype)
     w_pad, b_pad, v, step, n_chunks = _padded_vocab(weight, bias, transpose_rhs=transpose_rhs,
                                                     chunk_size=chunk_size)
     targets_i32 = targets.astype(jnp.int32)
@@ -529,7 +538,7 @@ def linear_ce_backward(x: jax.Array, weight: jax.Array, targets: jax.Array, bias
     peak_w, mass_w, rest_w = peak.astype(work), mass.astype(work), rest.astype(work)
     others_w = (rest_w / mass_w)[:, None]
     axis = 0 if transpose_rhs else 1
-    x_w = x.astype(work)
+    x_w = x.astype(operand).astype(work)
     d_x0 = jnp.zeros(x.shape, work)
     d_w0 = jnp.zeros(w_pad.shape, work)
     d_b0 = None if b_pad is None else jnp.zeros(b_pad.shape, work)
@@ -538,7 +547,7 @@ def linear_ce_backward(x: jax.Array, weight: jax.Array, targets: jax.Array, bias
         d_x, d_w, d_b = carry
         start = chunk * step
         z, raw = _chunk_logits(x, w_pad, b_pad, start, step, transpose_rhs=transpose_rhs,
-                               precision=precision, softcap=softcap, work=work)
+                               precision=precision, softcap=softcap, operand=operand, work=work)
         col = start + jnp.arange(step, dtype=jnp.int32)
         in_vocab = col < v
         exp_z = jnp.where(in_vocab[None, :], jnp.exp(z - peak_w[:, None]), jnp.asarray(0.0, work))
@@ -551,7 +560,7 @@ def linear_ce_backward(x: jax.Array, weight: jax.Array, targets: jax.Array, bias
             d_raw = d_z * (jnp.asarray(1.0, work) - th * th)
         else:
             d_raw = d_z
-        w_chunk = jax.lax.dynamic_slice_in_dim(w_pad, start, step, axis=axis).astype(work)
+        w_chunk = jax.lax.dynamic_slice_in_dim(w_pad, start, step, axis=axis).astype(operand).astype(work)
         dx_dims = (((1,), (0 if transpose_rhs else 1,)), ((), ()))
         d_x = d_x + jax.lax.dot_general(d_raw, w_chunk, dx_dims, precision=precision,
                                         preferred_element_type=work)

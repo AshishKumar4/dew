@@ -21,8 +21,10 @@ collect-3.14	( l=$(mktemp); trap 'rm -f "$l"' EXIT; .venv-3.14/bin/python tools/
 changelog	"$PYTHON" tools/changelog_released.py check
 # The ratchet reads the inventory's whole history, which a shallow checkout fetches first.
 ratchet	sh tools/base_history.sh && "$PYTHON" tools/lint_slop.py --ratchet --base="$BASE"
-# No forecasts in the prose and messages a change adds (the bible).
+# No forecasts in the prose and messages a change adds (the bible), nor a reviewer's internal handle.
 public-text	sh tools/base_history.sh && "$PYTHON" tools/public_text.py "$BASE"
+# No test a change touches reads an attribute its class never defines that it did not read before.
+test-types	sh tools/base_history.sh && "$PYTHON" -m tools.test_types "$BASE"
 fixtures	"$PYTHON" tools/fetched_fixtures.py check
 complexity	"$PYTHON" tools/complexity.py src/dew tools/lint_slop.py tools/lint_scopes.py examples recipes > complexity.json
 # A tutorial pinned to a commit is checked against that commit's API, which a shallow checkout fetches first.

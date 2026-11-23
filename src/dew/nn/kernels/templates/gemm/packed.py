@@ -237,13 +237,13 @@ def stage_decoded_fp8(words, out, fmt: str, interpret: bool, *, layout=None) -> 
     """Decode a stage of free-layout FP8 words (`[columns, 16]` uint32 per 64-depth group) into `out`
     (`[columns, depth]` bfloat16) via `bits.E4M3_BFLOAT16_FORM` / `bits.E5M2_BFLOAT16_FORM` (row 8548)."""
     minifloat = fp8_minifloat(fmt)
-    form, shift = bits.fp8_form(minifloat)
+    form, _ = bits.fp8_form(minifloat)
     active = None if interpret else layout
     for group, group_words in enumerate(words):
         loaded = group_words[...] if active is None else plgpu.load(group_words, layout=active,
                                                                     optimized=False)
         decoded = form.traced(loaded) if active is None else inline_forms.registers(form, loaded, active)
-        lanes_bf16 = [bits.restored(half, jnp.bfloat16, shift=shift) for register in decoded
+        lanes_bf16 = [bits.fp8_restored(half, minifloat, jnp.bfloat16) for register in decoded
                       for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
         for code, lane in enumerate(lanes_bf16):
             out[:, pl.ds(fp8_staged_depth(group, 0, code), 16)] = lane

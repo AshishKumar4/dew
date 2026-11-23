@@ -10,7 +10,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, ClassVar
 
 import jax.numpy as jnp
-import numpy as np
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import base, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
@@ -118,58 +117,15 @@ def fixes_up(tiles: "Tiles", dtype, target: generation.GpuTarget | None = None) 
     return family.fixes_up and not family.tensor_columns(tiles.block_n, 1) and not tiles.pingpong
 
 
-def _persistent_drift_steps(family: mosaic.Family, grid: tuple[int, int], steps: int, pairs: int,
-                            traffic: tail_of.Traffic) -> float:
-    """Extra whole-wave L2 drift (in MMA steps) when choosing a balanced tail forces a `walks_scoped` family
-    (`mma.sync`) into persistent mode across multiple waves instead of block-scheduler non-persistent
-    `launched()` (row 5363, train 1191 F3)."""
-    if not family.walks_scoped or steps == 0:
-        return 0.0
-    waves, rem = divmod(grid[0] * grid[1], pairs)
-    if waves <= 1 or rem == 0:
-        return 0.0
-    asked = pairs * (traffic.row_bytes + traffic.column_bytes)
-    window = 0 if traffic.l2_bytes is None else traffic.l2_bytes // asked
-    if steps <= window:
-        return 0.0
-    issued = traffic.issued(pairs)
-    drifted = steps * max(issued, asked / traffic.bandwidth)
-    drift_seconds = 0.0
-    for wave in range(1, waves):
-        rows, cols = tail_of.snaked(np.arange(wave * pairs, (wave + 1) * pairs), grid, 1, traffic.band)
-        read = len(np.unique(rows)) * traffic.row_bytes + len(np.unique(cols)) * traffic.column_bytes
-        unshared = steps * max(issued, read / traffic.bandwidth)
-        drift_seconds += max(0.0, drifted - unshared)
-    return drift_seconds / traffic.step_seconds
-
-
-def _partial_merge_steps(tiles: "Tiles", family: mosaic.Family, grid: tuple[int, int], steps: int,
-                         pairs: int, traffic: tail_of.Traffic) -> float:
-    """Device-memory time (in MMA steps) for `mosaic.Family.fixed_up` to move each peer program's fp32
-    partial across SMs through the tail workspace (`k_t - 1` peer partials written and read back per shared
-    tile, counted directly from `Tail`'s interior off-tile-boundary partition cuts without allocations,
-    row 12027)."""
-    waves, rem = divmod(grid[0] * grid[1], pairs)
-    if waves == 0 or rem == 0 or steps == 0:
-        return 0.0
-    iterations = rem * steps
-    candidate = tail_of.Tail(waves, iterations, min(pairs, iterations), steps)
-    extra_partials = sum(1 for p in range(1, candidate.partitions)
-                         if (p * candidate.iterations // candidate.partitions) % candidate.steps != 0)
-    if extra_partials == 0:
-        return 0.0
-    partial_bytes = tile_rows(tiles, family) * tile_columns(tiles, family) * 4
-    return (2 * extra_partials * partial_bytes / traffic.bandwidth) / traffic.step_seconds
-
 def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: tuple[int, int], target,
                   programs: int, *, dtype=jnp.bfloat16) -> tail_of.Tail | None:
     """A dense product's last wave balanced over `programs // tiles.cluster` cluster pairs (`tail.balanced`)
     at `tiles` over its output tiles' `grid` and `steps` a tile, priced from the target's facts: its MMA step
     (`step_seconds`), its memory's rate and L2 (`GpuTarget.memory_rate`, `l2_bytes`), its operands' blocks a
     step (`itemsizes`, each CTA's row block and the cluster's multicast column block), its semaphore hand-off
-    (`handoff_steps`), its `fixed_up` partial write/read traffic (`_partial_merge_steps`), and any multi-wave
-    persistent L2 drift (`_persistent_drift_steps`); None where the target states no rate or walking beats
-    balancing."""
+    (`handoff_steps`), its `fixed_up` partials' bytes (each tile's fp32 block) and whether its family's walk
+    is scoped to its block, which a balanced tail launches persistent (`mosaic.Family.walks_scoped`), each
+    priced by `tail.balanced`; None where the target states no rate or walking beats balancing."""
     step, rate = step_seconds(tiles, target, itemsizes), target.memory_rate
     pairs = programs // tiles.cluster
     if step is None or rate is None or pairs <= 0:
@@ -179,10 +135,9 @@ def balanced_tail(tiles: "Tiles", grid: tuple[int, int], steps: int, itemsizes: 
     mp = (target.multiprocessors // tiles.cluster) if target.multiprocessors else pairs
     traffic = tail_of.Traffic(grid, tiles.grid_block_n, tile_rows(tiles, family) * tiles.block_k * left,
                               tiles.block_n * tiles.block_k * right, step, mp, rate, target.l2_bytes)
-    drift = _persistent_drift_steps(family, grid, steps, pairs, traffic)
-    merge = _partial_merge_steps(tiles, family, grid, steps, pairs, traffic)
     return tail_of.balanced(grid[0] * grid[1], steps, pairs, traffic,
-                            handoff_steps=handoff_steps(tiles, target, itemsizes) + drift + merge)
+                            handoff_steps=handoff_steps(tiles, target, itemsizes), scoped=family.walks_scoped,
+                            partial_bytes=tile_rows(tiles, family) * tile_columns(tiles, family) * 4)
 
 
 def dense_tail(tiles: "Tiles", dtype, extents: tuple[int, int, int], itemsizes: tuple[int, int],

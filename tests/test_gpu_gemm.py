@@ -171,25 +171,29 @@ def native_syrk_holds_check_1_on_this_gpu(polynomial: bool, transpose: bool):
 
 
 def native_hopper_cluster2_balanced_tail_holds_check_1():
-    """Native Hopper `cluster=2` dense forward with balanced tail holds check 1 against XLA dot_general
-    from float64 truth at Qwen3.5-4B q dX outlier shape (row 10151)."""
-    from dew.nn.kernels import gemm
+    """Native Hopper `cluster=2` dense forward with a verified nonempty balanced `Tail` holds check 1
+    against XLA dot_general from float64 truth at Qwen3.5-4B q dX outlier shape (row 10151)."""
+    from dew.nn.kernels import gemm, grouped_matmul, tuning
+    from dew.nn.kernels.templates.gemm import pricing, tiling
+    tile = tiling.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2, family="wgmma")
+    target = generation.gpu_target()
+    assert pricing.dense_tail(tile, jnp.bfloat16, (2048, 2560, 8192), (2, 2), target,
+                              target.multiprocessors or 132) is not None
 
     def draw(seed):
         rng = np.random.default_rng(10151 + seed)
-        return ((rng.normal(size=(2048, 2560)) / np.sqrt(2560)).astype(jnp.bfloat16),
-                (rng.normal(size=(2560, 8192)) / np.sqrt(2560)).astype(jnp.bfloat16))
+        return ((rng.normal(size=(2048, 8192)) / np.sqrt(8192)).astype(jnp.bfloat16),
+                (rng.normal(size=(8192, 2560)) / np.sqrt(8192)).astype(jnp.bfloat16))
 
     def dew_fn(x, w):
-        with generation.chosen(grouped_matmul="mosaic"):
+        with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: tile}):
             return gemm.gemm(x, w, out_dtype=jnp.bfloat16)
 
     def plain(x, w, *, wide=jnp.float32, out=jnp.bfloat16):
         return jax.lax.dot(x.astype(wide), w.astype(wide), preferred_element_type=wide).astype(out)
 
-    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x2560x8192",
+    assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x2560",
                     seeds=4, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
-
 
 def _syrk_and_tail_cells():
     return [

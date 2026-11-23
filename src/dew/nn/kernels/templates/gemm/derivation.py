@@ -96,8 +96,12 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
 
     None where no tile holds."""
     if shared_budget is not None:
-        limit = min(target.shared_limit, shared_budget) if target.shared_limit else shared_budget
-        target = dataclasses.replace(target, shared_limit=limit)
+        from dew.nn.kernels import generation
+        limit = min(generation.shared_budget(target), shared_budget)
+        if generation.tpu(target) and target.scoped_vmem is not None:
+            target = dataclasses.replace(target, scoped_vmem=limit)
+        else:
+            target = dataclasses.replace(target, shared_limit=limit)
     # The facts the layouts share (their instruction family's); each layout's registers bound the shapes.
     family = layouts[0]
     columns = _derived_columns(family, width, dtype, units[1])

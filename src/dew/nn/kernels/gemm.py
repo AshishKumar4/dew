@@ -56,7 +56,17 @@ from dew.nn.derivatives import (
     with_gradients_formed,
 )
 from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
-from dew.nn.kernels.formats import Fp8Weights, MxFp8, NvFp4, NvFp4Block, _e2m1_values
+from dew.nn.kernels.formats import (
+    MX_BLOCKS,
+    NVFP4_BLOCKS,
+    Fp8Weights,
+    MxFp8,
+    NvFp4,
+    NvFp4Block,
+    _e2m1_values,
+    fp8_factor,
+    fp8_scale_checked,
+)
 from dew.nn.kernels.templates import axes as side_axes_of
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import scattered, tiling
@@ -678,37 +688,41 @@ def gemm_quantized(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None
     rows 8547, 12037)."""
     from .templates.gemm import quantized
 
+    width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
     if minifloat in (bits.E4M3, bits.E5M2):
         assert isinstance(minifloat, bits.Minifloat)
         out_dtype = jnp.float8_e4m3fn if minifloat == bits.E4M3 else jnp.float8_e5m2
-        sides = (() if tensor_scale is None
-                 else ((jnp.broadcast_to(jnp.asarray(tensor_scale, jnp.float32), (lhs.shape[0],)),
-                        ('rows',)),))
+        sides = (() if tensor_scale is None else ((jnp.broadcast_to(
+            jnp.asarray(tensor_scale, jnp.float32), (lhs.shape[0],)), ('rows',)),))
         out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
                    epilogue=quantized.quantize_epilogue(minifloat), epilogue_operands=sides,
                    out_dtype=out_dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
         assert isinstance(out, jax.Array)
         return out
     if minifloat is MxFp8:
+        if width % MX_BLOCKS.depth != 0:
+            raise ValueError(
+                f"gemm_quantized(MxFp8) requires width divisible by {MX_BLOCKS.depth}, got {width}")
         out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
-                   epilogue=quantized.quantize_mxfp8_epilogue(),
-                   out_dtype=jnp.float8_e4m3fn, out_dtypes=(jnp.float8_e4m3fn, jnp.float8_e8m0fnu),
-                   precision=precision, interpret_on_cpu=interpret_on_cpu)
+                   epilogue=quantized.quantize_mxfp8_epilogue(), out_dtype=jnp.float8_e4m3fn,
+                   out_dtypes=(jnp.float8_e4m3fn, jnp.float8_e8m0fnu), precision=precision,
+                   interpret_on_cpu=interpret_on_cpu)
         assert isinstance(out, tuple)
         codes, block_scales = out
         return MxFp8(codes, block_scales[..., ::32])
     if minifloat == bits.E2M1 or minifloat is NvFp4Block:
+        if width % NVFP4_BLOCKS.depth != 0:
+            raise ValueError(
+                f"gemm_quantized(NvFp4Block) requires width divisible by {NVFP4_BLOCKS.depth}, got {width}")
         ts = jnp.asarray(1.0 if tensor_scale is None else tensor_scale, jnp.float32)
-        ts_rows = jnp.broadcast_to(ts, (lhs.shape[0],))
         out = gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs,
                    epilogue=quantized.quantize_nvfp4_epilogue(),
-                   epilogue_operands=((ts_rows, ('rows',)),),
+                   epilogue_operands=((jnp.broadcast_to(ts, (lhs.shape[0],)), ('rows',)),),
                    out_dtype=jnp.uint8, out_dtypes=(jnp.uint8, jnp.float8_e4m3fn),
                    precision=precision, interpret_on_cpu=interpret_on_cpu)
         assert isinstance(out, tuple)
         nibbles, block_scales = out
-        codes = _e2m1_values(nibbles).astype(jnp.float4_e2m1fn)
-        return NvFp4Block(codes, block_scales[..., ::16], ts)
+        return NvFp4Block(_e2m1_values(nibbles).astype(jnp.float4_e2m1fn), block_scales[..., ::16], ts)
     raise ValueError(f"gemm_quantized supports E4M3, E5M2, E2M1, MxFp8, or NvFp4Block, got {minifloat}")
 
 @dataclasses.dataclass(frozen=True)
@@ -782,7 +796,7 @@ def _linear_ce_select(x: jax.Array, weight: jax.Array, targets: jax.Array, bias:
                       transpose_rhs: bool, precision: PrecisionLike, interpret_on_cpu: bool) -> bool:
     from .templates.gemm import linear_ce as lce
 
-    if not lce.supports_dtype(x.dtype):
+    if not lce.supports_dtype(x.dtype) or jnp.dtype(x.dtype) != jnp.dtype(weight.dtype):
         return False
     exact = exact_products(precision, x.dtype)
     if xla_products.interpreted(interpret_on_cpu):
@@ -894,22 +908,13 @@ FP8_WEIGHT: selection.Op[Fp8WeightCase] = selection.Op(generation.Choice.GROUPED
     selection.Kernel('xla', (), generic=True),
 ))
 
-def _fp8_factor(scale: jax.Array, sizes: jax.Array, count: int, dense: bool) -> jax.Array:
-    if dense or scale.ndim == 0:
-        return scale
-    if scale.ndim == 1:
-        return jnp.repeat(scale, sizes, total_repeat_length=count)[:, None]
-    return jnp.repeat(scale, sizes, axis=0, total_repeat_length=count)
-
-
 def _fp8_packed(rows: jax.Array, words: jax.Array, sizes: jax.Array, fmt: str,
                 launch: grouped_matmul.MosaicFp8PackedGmm, interpret: bool, *, dense: bool) -> jax.Array:
     """Inline-decoding FP8 weight product in fp32 (`fp8_weight_product`, row 8548), differentiable at every
     order through `generation.linear_tangent`."""
     form = Fp8Weights(words, jnp.ones((), jnp.float32), jnp.zeros((8,), jnp.uint8), fmt=fmt)
-
     def decoded(packed_words: jax.Array) -> jax.Array:
-        matrices = Fp8Weights(packed_words, jnp.ones((), jnp.float32), form.form, fmt=fmt).decoded()
+        matrices = Fp8Weights(packed_words, jnp.ones((), jnp.float32), form.form, fmt=fmt).unscaled()
         return matrices[0] if dense else matrices
 
     def kernel(r: jax.Array, w: jax.Array, s: jax.Array, *, interpret: bool) -> jax.Array:
@@ -954,8 +959,12 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
 
     if not isinstance(weights.form, Tracer):
         weights.checked()
+    else:
+        fp8_scale_checked(jnp.shape(weights.scale), weights.shape)
     rows = lhs.astype(jnp.bfloat16)
     dense = group_sizes is None
+    if (dense and len(weights.shape) != 2) or (not dense and len(weights.shape) != 3):
+        raise ValueError(f"fp8_weight_product weight rank mismatch for dense={dense}: {weights.shape}")
     words = jnp.asarray(weights.words if not dense else weights.words[None])
     sizes = jnp.asarray([rows.shape[0]], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     launch = grouped_matmul.MosaicFp8PackedGmm()
@@ -968,20 +977,18 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
     bound = launch.bind(_spec(rows), bank_spec, _spec(sizes), (), (), None, None, None,
                         out_dtype='float32', trans_rhs=False, interpret=interpret_on_cpu,
                         dense=dense, exact_sums=False)
-    assumed = (generation.interpreted_target()
-               if xla_products.interpreted(interpret_on_cpu) else None)
+    assumed = generation.interpreted_target() if xla_products.interpreted(interpret_on_cpu) else None
     with generation.assumed(assumed) if assumed is not None else contextlib.nullcontext():
         tile = _planned(launch, bound)
         case = Fp8WeightCase(tile, not automatic_axes(), interpret_on_cpu)
         if selection.select(FP8_WEIGHT, case).kernel == 'mosaic':
             summed = _fp8_packed(rows, words, sizes, weights.fmt, launch, interpret_on_cpu, dense=dense)
         else:
-            summed = gemm(rows, weights.decoded(jnp.bfloat16), group_sizes, out_dtype=jnp.float32,
+            summed = gemm(rows, weights.unscaled(jnp.bfloat16), group_sizes, out_dtype=jnp.float32,
                           precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu)
             assert isinstance(summed, jax.Array)
-    factor = _fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], dense)
-    target_dtype = lhs.dtype if out_dtype is None else out_dtype
-    return (summed * factor).astype(target_dtype)
+    factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape, dense)
+    return (summed * factor).astype(lhs.dtype if out_dtype is None else out_dtype)
 
 
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,

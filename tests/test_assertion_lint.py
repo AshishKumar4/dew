@@ -92,6 +92,32 @@ BANNED_ASSERTION_LINTS = {
             "def test_runs():\n"
             "    assert subprocess.run(['sparx']).returncode == 0\n"),
     }, "tests/test_cli.py", (3, 6, 8)),
+    "SLOP033": ({
+        "src/sparx/tiles.py": "def derived(n):\n    return n\n",
+        "tests/test_tiles.py": (
+            "from sparx import tiles\n"
+            "def test_derived_stages_pinned():\n"
+            "    chosen = tiles.derived(8)\n"
+            "    assert chosen.stages == 3\n"
+            "def test_a_block_pinned_off_the_call():\n"
+            "    assert tiles.choose(8).block_m == 128\n"
+            "def test_each_offered_pinned():\n"
+            "    for config in tiles.offered(8):\n"
+            "        assert config.consumers >= 2\n"
+            "def test_annotated_and_chained():\n"
+            "    chosen: tiles.Config = tiles.derived(8)\n"
+            "    assert tiles.budget(8) >= chosen.block_n > 16\n"
+            "def test_legal():\n"
+            "    chosen = tiles.derived(8)\n"
+            "    assert 0 < tiles.budget(8) <= chosen.stages * chosen.block_m\n"
+            "def test_rebound_to_its_own_config():\n"
+            "    config = tiles.derived(8)\n"
+            "    config = tiles.Config(stages=3)\n"
+            "    assert config.stages == 3\n"
+            "def test_another_field():\n"
+            "    chosen = tiles.derived(8)\n"
+            "    assert chosen.dtype_bits == 16\n"),
+    }, "tests/test_tiles.py", (4, 6, 9, 12)),
 }
 """Bible §7's banned assertions the slop lint enforces (owner, 2026-11-06), a case each, by code: the files
 linted, the file the findings are in, their lines. SLOP008 (class 3): a private attribute of an object the
@@ -100,7 +126,62 @@ for in captured output that a helper returns, read through its unpacked name; a 
 not.
 SLOP029 (class 7): a test whose every assertion is that a process failed, from its exit status alone (1, an
 uncaught error's, among them); one that asserts the state the refusal reports as well, a code of the process's
-own, or that a process ran (exit 0, its own checks inside it), is not."""
+own, or that a process ran (exit 0, its own checks inside it), is not.
+SLOP033 (class 2): a choice the package derives (a config a call named for choosing returns, bound,
+annotated or iterated, or the call's own) pinned to a number beside it by its stages, consumers or a block
+size; a legality bound computed against the choice, a name bound again to the test's own config, and
+another field are not."""
+
+
+COMPILE_WIDTH_LINTS = {
+    "SLOP032": ({
+        "src/sparx/build.py": (
+            "import functools\n"
+            "import re\n"
+            "from concurrent.futures import ThreadPoolExecutor as Pool\n"
+            "from sparx.report import compile_threads, xla_compiled\n"
+            "def one(program):\n"
+            "    return program.compile()\n"
+            "def wide(programs):\n"
+            "    with Pool(8) as pool:\n"
+            "        return list(pool.map(lambda program: program.compile(), programs))\n"
+            "def by_its_function(programs):\n"
+            "    with Pool(max_workers=len(programs)) as pool:\n"
+            "        return list(pool.map(one, programs))\n"
+            "def bound(lowered):\n"
+            "    pool = Pool(4)\n"
+            "    return pool.submit(lowered.compile).result()\n"
+            "def partial(programs):\n"
+            "    return list(Pool(4).map(functools.partial(one), programs))\n"
+            "def past_the_width(programs):\n"
+            "    with Pool(compile_threads() + 8) as pool:\n"
+            "        return list(pool.map(one, programs))\n"
+            "def capped(programs):\n"
+            "    with Pool(min(4, compile_threads())) as pool:\n"
+            "        return list(pool.map(one, programs))\n"
+            "def single(lowered):\n"
+            "    with Pool(1) as pool:\n"
+            "        return pool.submit(lowered.compile).result()\n"
+            "def beside_a_compile(lowered, paths):\n"
+            "    lowered.compile()\n"
+            "    pattern = re.compile('x')\n"
+            "    with Pool(8) as pool:\n"
+            "        return list(pool.map(pattern.match, paths))\n"
+            "def through_the_compile_point(lowered):\n"
+            "    with Pool(8) as pool:\n"
+            "        return pool.submit(xla_compiled, lowered, None).result()\n"),
+        "src/sparx/nn/kernels/templates/report.py": (
+            "from concurrent.futures import ThreadPoolExecutor\n"
+            "def compiled_at_once(programs):\n"
+            "    with ThreadPoolExecutor(8) as pool:\n"
+            "        return list(pool.map(lambda program: program.compile(), programs))\n"),
+    }, "src/sparx/build.py", (8, 11, 14, 17, 19)),
+}
+"""SLOP032: a pool handed work that compiles by its own `compile` (a lambda, a function of the module, a
+partial of one, the bound method), by any name the executor is imported under, at a width of its own (a
+number, the work's length, one the compile width does not cap); one capped by the compile width
+(`compile_threads()`), one worker, a pool beside a compile that hands it none, a compile through the compile
+point (`xla_compiled`), and the width's own module are not."""
 
 
 IR_TEXT_LINTS = {
@@ -154,7 +235,8 @@ package's own parser, a file of the tests' own, a name bound again to something 
 `compile` of no program (a string's case, a regular expression) are not reported."""
 
 
-CASES = [(code, *case) for table in (ROW_1878_LINTS, BANNED_ASSERTION_LINTS, IR_TEXT_LINTS)
+CASES = [(code, *case)
+         for table in (ROW_1878_LINTS, BANNED_ASSERTION_LINTS, IR_TEXT_LINTS, COMPILE_WIDTH_LINTS)
          for code, case in sorted(table.items())]
 """Every table's cases: a code may have one in each."""
 
