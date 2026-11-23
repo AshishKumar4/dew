@@ -757,9 +757,10 @@ def test_a_step_past_float32s_range_times_a_small_rate_decays_as_the_recurrence_
         dt[:, 0] = 3 * 2.0 ** 126
         zeros = np.zeros((rows, length, channels), np.float32)
         ones = np.ones((rows, length, states), np.float32)
-        rows_of = functools.partial(jnp.asarray, dtype=jnp.bfloat16)
-        return (rows_of(zeros), rows_of(dt), jnp.asarray(rates, jnp.float32), rows_of(ones), rows_of(ones),
-                jnp.zeros((channels,), jnp.float32), jnp.ones((rows, channels, states), jnp.float32))
+        # Host arrays, as `draw`'s: a GPU tier part's prepare computes nothing on its device.
+        return (zeros.astype(jnp.bfloat16), dt.astype(jnp.bfloat16), rates.astype(np.float32),
+                ones.astype(jnp.bfloat16), ones.astype(jnp.bfloat16), np.zeros((channels,), np.float32),
+                np.ones((rows, channels, states), np.float32))
 
     def stepped(x, dt, A, B, C, D, state):
         del x, B, D
@@ -770,8 +771,7 @@ def test_a_step_past_float32s_range_times_a_small_rate_decays_as_the_recurrence_
             outputs.append(np.einsum('rdn,rn->rd', h, np.asarray(C, np.float64)[:, t]))
         return np.stack(outputs, axis=1), h
 
-    template = functools.partial(selective.selective_scan, family=taken_family(jnp.bfloat16),
-                                 interpret=INTERPRETED)
+    template = taken_scan(jnp.bfloat16)
     assert_as_exact(jax.jit(template), jax.jit(portable), draws, "a step past float32's range, small rates",
                     seeds=FEWEST_SEEDS, truth_fn=as_given(stepped))
 
@@ -783,8 +783,7 @@ def test_a_pullback_takes_each_operands_gradient_in_its_own_dtype_interpreted():
     custom derivative's cotangent of another dtype is refused), every gradient on par from float64 with the
     portable scan's (check 1)."""
     rows, length, channels, states = SHAPES["interpreted"]
-    template = functools.partial(selective.selective_scan, family=taken_family(jnp.float16),
-                                 interpret=INTERPRETED)
+    template = taken_scan(jnp.float16)
 
     def draws(seed):
         (x, dt, *rest), _, dy = draw(jnp.float16, seed, rows, length, channels, states, packed=False)
