@@ -1517,14 +1517,45 @@ def transferred(query, key, value, g, beta, starts=None, *, chunk_size: int = CH
         start (its transition), joined pairwise a level at a time (`forms.merge`, associative), so the
         chunks' transitions compose in log2 of their count's batched products rather than one after
         another: walked in turn, the 27B's split summary took 10.9 ms of a GH200 at 4096 tokens against
-        the layer's bf16 pass's 2.2 (M-JS-236)."""
+        the layer's bf16 pass's 2.2 (M-JS-236). Each transfer is carried as its largest magnitude's
+        power of two apart (`_scaled`), so no pairing overflows where the chain in order does not (#3771's
+        review: transitions exp(-64), 1, 1 - 2^67, 1 - 2^67 in order stay finite, their later pair's
+        product alone overflows fp32); the powers of two exact, the products as unscaled."""
         start = jax.tree.map(lambda x: varying_like(x, *varying),
                              forms.init(jax.tree.map(lambda x: x[0], chunks)))
         prepared = jax.vmap(functools.partial(forms.prepare, transition=True))(chunks)
-        walks = jax.vmap(lambda chunk: forms.step(start, chunk))(prepared)
-        return _joined(walks, lambda a, b: forms.merge(a, b, None)).transfer
+        walks = jax.vmap(lambda chunk: _scaled(forms.step(start, chunk), 0))(prepared)
+
+        def merge(a, b):
+            (earlier, low), (later, high) = a, b
+            return _scaled(forms.merge(earlier, later, None), low + high)
+
+        joined, exponent = _joined(walks, merge)
+        return _times_power(joined.transfer, exponent)
 
     return jax.vmap(jax.vmap(walked))(operands)
+
+
+def _scaled(walk, exponent):
+    """`walk` with its transfer divided by the power of two of its largest magnitude (`jnp.frexp`'s: its
+    entries then under one), the power added to `exponent`: `(walk, exponent)`, its transfer `transfer *
+    2^exponent`; exact, a power of two's scaling, the power a constant of the derivative. A zero transfer (a
+    document starting in it) stays zero."""
+    _, power = jnp.frexp(jax.lax.stop_gradient(jnp.max(jnp.abs(walk.transfer))))
+    return walk._replace(transfer=_times_power(walk.transfer, -power)), exponent + power
+
+
+def _times_power(x: jax.Array, power) -> jax.Array:
+    """`x * 2^power`, exact where it is representable: the power in three parts of one sign, each within the
+    dtype's exponents, applied in turn, so none overflows or flushes where the whole would not (`x`'s
+    entries at most one in size)."""
+    most = jnp.finfo(x.dtype).maxexp - 1
+    power = jnp.clip(power, -3 * most, 3 * most)
+    first = power // 3
+    second = (power - first) // 2
+    for part in (first, second, power - first - second):
+        x = x * jnp.ldexp(jnp.ones((), x.dtype), part)
+    return x
 
 
 def _joined(walks, merge):

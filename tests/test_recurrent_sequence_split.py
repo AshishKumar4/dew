@@ -4,6 +4,8 @@ summary's composition over the earlier shards (`recurrence_chunk.entering_memory
 real tokens before it (`linear.sequence_conv`), and Mamba-1, Mamba-2 and lightning, checked against the same
 layer on one device (row 1437)."""
 
+import functools
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -382,39 +384,48 @@ TRANSFER_SEEDS = 16
 """The draws a slice's transfer is held on par over (its test below)."""
 
 
+@pytest.mark.parametrize("length", [16, 150, 170], ids=["one chunk", "ten chunks", "eleven chunks"])
 @pytest.mark.parametrize("per_key", [False, True], ids=["a decay a head", "a decay a key dimension"])
-def test_a_slices_transfer_is_on_par_with_the_rule_from_the_identity(per_key):
-    """A sequence shard's transfer (`recurrence_chunk.transferred`: the derived forms' walk chaining each
-    chunk's transition in fp32, row 1437) on par from float64 with the delta rule's fp32 final memory over
-    zero values from the identity, which `entering_memory` took before (check 1), both in 16-token chunks
-    (not the rule's 64; the summary took the layer's chunk, as the transfer now does) over 150 tokens, off
-    their grid: a row whose document starts inside the slice (the
-    transfer zero across it) and a row whose one document spans it, its transfer ten chunks' transitions
-    chained, 0.2 to 0.7% of the identity's norm under these gates (float64, four draws); a reset on every
-    row made every transfer zero, whatever its chunks (#3757's review). A slice of no tokens transfers the
-    identity."""
+def test_a_slices_transfer_is_on_par_with_the_rule_from_the_identity(per_key, length):
+    """A sequence shard's transfer (`recurrence_chunk.transferred`: each chunk's transition from the derived
+    forms, joined pairwise in fp32, row 1437) and its VJP along the keys, decays and write gates, on par from
+    float64 with the delta rule's fp32 final memory over zero values from the identity and its VJP, which
+    `entering_memory` took before (check 1), both in 16-token chunks (not the rule's 64; the summary took
+    the layer's chunk, as the transfer now does): one chunk, ten and eleven (the join's odd one carried),
+    off their grid but the first; a row whose document starts halfway (the transfer zero across it) and a
+    row whose one document spans the slice, its transfer 0.2 to 0.7% of the identity's norm under these
+    gates at ten chunks (float64, four draws); a reset on every row made every transfer zero, whatever its
+    chunks (#3757's review). A slice of no tokens transfers the identity."""
     from dew.nn.kernels import generation
     from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, recurrent_delta_rule, transferred
 
-    rows, length, heads, width, chunk = 2, 150, 2, 16, 16
+    rows, heads, width, chunk = 2, 2, 16, 16
     starts = np.zeros((rows, length), bool)
-    starts[0, 70] = True
+    starts[0, length // 2] = True
 
     def draw(seed):
-        generator = np.random.default_rng([1437, seed])
+        generator = np.random.default_rng([1437, seed, length])
         query, key = (generator.standard_normal((rows, length, heads, width)) for _ in range(2))
         key = key / np.linalg.norm(key, axis=-1, keepdims=True)
         decay = (rows, length, heads) + ((width,) if per_key else ())
         # Faint decays and write gates (softplus(n - 4), sigmoid(n - 2)): the spanning row's transfer kept.
         g = -np.log1p(np.exp(generator.standard_normal(decay) - 4.0))
         beta = 1 / (1 + np.exp(2.0 - generator.standard_normal((rows, length, heads))))
-        return tuple(np.asarray(x, np.float32) for x in (query, key, g, beta))
+        cotangent = generator.standard_normal((rows, heads, width, width))
+        return tuple(np.asarray(x, np.float32) for x in (query, key, g, beta, cotangent))
 
     def unread(key):
         return jnp.zeros((rows, length, heads, width), key.dtype)
 
     def identity(key):
         return jnp.broadcast_to(jnp.eye(width, dtype=key.dtype), (rows, heads, width, width))
+
+    def pulled(transfer):
+        """`transfer(query, key, g, beta)` and its VJP along the keys, decays and write gates."""
+        def run(query, key, g, beta, cotangent):
+            found, vjp = jax.vjp(functools.partial(transfer, query), key, g, beta)
+            return found, vjp(cotangent)
+        return run
 
     def chained(query, key, g, beta):
         return transferred(query, key, unread(key), g, beta, starts, chunk_size=chunk)
@@ -424,16 +435,36 @@ def test_a_slices_transfer_is_on_par_with_the_rule_from_the_identity(per_key):
             return chunk_gated_delta_rule(query, key, unread(key), g, beta, identity(key), starts=starts,
                                           chunk_size=chunk)[1]
 
-    @as_given
-    def truth(query, key, g, beta):
-        with jax.enable_x64(new_val=True):
-            query, key, g, beta = widened((query, key, g, beta))
-            # The token recurrence's decay a key dimension: a head's, each key's alike.
-            g = g if per_key else jnp.broadcast_to(g[..., None], (*g.shape, width))
-            return recurrent_delta_rule(query, key, unread(key), g, beta, identity(key), starts=starts)[1]
+    def recurred(query, key, g, beta):
+        # The token recurrence's decay a key dimension: a head's, each key's alike.
+        decays = g if per_key else jnp.broadcast_to(g[..., None], (*g.shape, width))
+        return recurrent_delta_rule(query, key, unread(key), decays, beta, identity(key), starts=starts)[1]
 
-    assert_as_exact(jax.jit(chained), jax.jit(ruled), draw, f"a slice's transfer, per_key {per_key}",
-                    seeds=TRANSFER_SEEDS, truth_fn=truth)
-    empty = tuple(x[:, :0] for x in draw(0))
+    @as_given
+    def truth(*drawn):
+        with jax.enable_x64(new_val=True):
+            return pulled(recurred)(*widened(drawn))
+
+    assert_as_exact(jax.jit(pulled(chained)), jax.jit(pulled(ruled)), draw,
+                    f"a slice's transfer, per_key {per_key}, {length} tokens", seeds=TRANSFER_SEEDS,
+                    truth_fn=truth)
+    empty = tuple(x[:, :0] for x in draw(0)[:4])
     found = transferred(*empty[:2], jnp.zeros((rows, 0, heads, width)), *empty[2:], chunk_size=chunk)
     assert np.array_equal(np.asarray(found), np.asarray(identity(jnp.zeros((), jnp.float32))))
+
+
+def test_a_slices_transfer_stays_finite_where_its_chain_in_order_does():
+    """`recurrence_chunk.transferred` over four one-token chunks of a key dimension of one, keys 0, 0, 2^34,
+    2^34, write gates 0, 0, 1/2, 1/2 and log decays -64, 0, 0, 0: transitions exp(-64), 1, 1 - 2^67 and
+    1 - 2^67, their product in order about 3.5e12, where the later pair's alone, (1 - 2^67)^2, is past
+    fp32's range: joined pairwise without its powers of two apart, inf (#3771's review)."""
+    from dew.nn.kernels.recurrence_chunk import transferred
+
+    def column(*values):
+        return jnp.asarray(values, jnp.float32).reshape(1, len(values), 1)
+
+    key = column(0.0, 0.0, 2.0 ** 34, 2.0 ** 34)[..., None]
+    found = transferred(key, key, jnp.zeros_like(key), column(-64.0, 0.0, 0.0, 0.0),
+                        column(0.0, 0.0, 0.5, 0.5), chunk_size=1)
+    expected = np.exp(-64.0) * (1 - 2.0 ** 67) ** 2
+    np.testing.assert_allclose(np.asarray(found).reshape(()), expected, rtol=1e-5)

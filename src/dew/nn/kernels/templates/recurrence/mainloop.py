@@ -457,11 +457,16 @@ class Call:
         return dataclasses.replace(self.held, rows=self.chunks * self.heads * self.width)
 
 
+def part_names(name: str, parts: int) -> tuple[str, ...]:
+    """A stream's parts' names, `name0`, `name1`, ...: every launch's blocks, views and slots by part
+    (`stream_blocks`, `stream_views`, `stream_tile`) and any set of them a launch picks out by name."""
+    return tuple(f"{name}{p}" for p in range(parts))
+
+
 def stream_blocks(**blocks) -> dict:
-    """Each named stream's parts' blocks, `name0`, `name1`, ...: `blocks[name]` its tile's shape and its
-    `Operand`."""
-    return {f"{name}{p}": (shape, operand.stored) for name, (shape, operand) in blocks.items()
-            for p in range(operand.parts)}
+    """Each named stream's parts' blocks (`part_names`): `blocks[name]` its tile's shape and its `Operand`."""
+    return {part: (shape, operand.stored) for name, (shape, operand) in blocks.items()
+            for part in part_names(name, operand.parts)}
 
 
 PREFIX_STREAMS = ("gates", "lows")
@@ -494,7 +499,7 @@ def stream_tile(slots, name: str, operand: Operand, rows=None, columns=None) -> 
             ref = ref.at[rows, :]
         return ref if columns is None else ref.at[:, columns]
 
-    return Parts((view(slots[f"{name}{p}"]) for p in range(operand.parts)), operand.dtype)
+    return Parts((view(slots[part]) for part in part_names(name, operand.parts)), operand.dtype)
 
 
 def stream_views(index_map=None, /, **parted) -> dict:
@@ -502,8 +507,8 @@ def stream_views(index_map=None, /, **parted) -> dict:
     `parted[name]` a list of an operand's parts' views: step `i` the `i`-th tile of the stream's rows down
     its view, as wide as the view (the whole view where the stream's tile is), or the tile `index_map(i)`
     names."""
-    return {f"{name}{p}": (view, _down if index_map is None else index_map) for name, views in parted.items()
-            for p, view in enumerate(views)}
+    return {part: (view, _down if index_map is None else index_map) for name, views in parted.items()
+            for part, view in zip(part_names(name, len(views)), views, strict=True)}
 
 
 def column_tile(call: Call, slots, name: str, operand: Operand, j, width: int | None = None):
@@ -543,12 +548,13 @@ def vector_views(chunk, head, **refs) -> dict:
     """The streams of a chunk's vectors (`refs[name]`, a decay a head's `[HV, R]` prefix halves or write
     gates), each its own stream `{name}0` of the head's row at the chunk (`vector_blocks`), where the
     family's copies move a one-dimensional block (`Family.copies_vectors`), none where they do not."""
-    return {f"{name}0": (ref.at[head], lambda i: (chunk,)) for name, ref in refs.items()}
+    return {part_names(name, 1)[0]: (ref.at[head], lambda i: (chunk,)) for name, ref in refs.items()}
 
 
 def vector_blocks(call: Call, *names) -> dict:
     """The streamed blocks of `vector_views`' streams, a chunk's fp32 each, where the family copies them."""
-    return {f"{name}0": ((call.chunk,), jnp.float32) for name in names} if call.family.copies_vectors else {}
+    return ({part_names(name, 1)[0]: ((call.chunk,), jnp.float32) for name in names}
+            if call.family.copies_vectors else {})
 
 
 def _down(step) -> tuple:
@@ -1621,6 +1627,10 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
     staging, landing = _weighted_staged(call, keyed)
     inputs = (k, v, k if a is None else a, *prefix, beta, taken)
     streamed = _weighted_streamed(call, keyed)
+    # A once stream the launch has not is a silent no-op (#3771's review: 'inverse' named none of its parts).
+    if missing := set(once) - set(streamed):
+        raise ValueError(f"_weighted's once streams {sorted(missing)} are none of its streams "
+                         f"{sorted(streamed)}")
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"),
                          blocks={name: block for name, block in streamed.items() if name not in once},
@@ -1695,9 +1705,9 @@ def _paired_segments(step: Callable, key_steps: int, value_steps: int) -> tuple:
 def _weighted_swizzles(call: Call, keyed: int) -> dict:
     """`_weighted`'s key-block streams staged at their row (a tile slices only whole swizzle rows): the keys
     and a decay a key dimension's prefix, each part's widest swizzle at `keyed` columns."""
-    return {f"{name}{p}": resources.widest_swizzle(operand.stored, keyed)
+    return {part: resources.widest_swizzle(operand.stored, keyed)
             for name, (_, operand) in _weighted_blocks(call, keyed).items()
-            if name in ("keys", *PREFIX_STREAMS) for p in range(operand.parts)}
+            if name in ("keys", *PREFIX_STREAMS) for part in part_names(name, operand.parts)}
 
 
 def _weighted_once(call: Call) -> tuple[str, ...]:
@@ -1706,7 +1716,8 @@ def _weighted_once(call: Call) -> tuple[str, ...]:
     every step reads alike; none else (a decay a head's launch walks one step)."""
     if not (call.per_key and call.delta and call.family.walks_once):
         return ()
-    return ("inverse", *vector_blocks(call, "write"))
+    held = dataclasses.replace(call.held, rows=call.rows)
+    return (*part_names("inverse", held.parts), *vector_blocks(call, "write"))
 
 
 def _weighted_blocks(call: Call, keyed: int) -> dict:
