@@ -1,10 +1,10 @@
 {
- "bytes": 64459761,
+ "bytes": 64448954,
  "license": "MIT",
  "origin": "github",
- "path": "a637f70353002d12e2d0770b9c8ba9cb17a1b09d99366449cf4c8026c55af9dc.npz",
+ "path": "ef5d809f7e86e4c45c5e69ce916bd750afc7c61d16ed835f41378f66f7c4fb90.npz",
  "reference": "fla-core-0.5.2+torch-2.14.1+triton-3.8.0",
  "repo": "AshishKumar4/dew-fixtures",
  "revision": "store-1",
- "sha256": "a637f70353002d12e2d0770b9c8ba9cb17a1b09d99366449cf4c8026c55af9dc"
+ "sha256": "ef5d809f7e86e4c45c5e69ce916bd750afc7c61d16ed835f41378f66f7c4fb90"
 }

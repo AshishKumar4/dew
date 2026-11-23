@@ -383,7 +383,7 @@ def test_a_served_looped_readout_reports_the_pass_each_answer_cue_exited_at(head
         [LAYOUT.rows(TOKENIZER, SPECIALS, body["state"], {name: Question.from_wire(wire)
                                                          for name, wire in body["questions"].items()})[0]
          for body in bodies], SPECIALS.pad)
-    _, gates, _ = objective.model.pass_logits(variables, batch)
+    gates = objective.model.pass_logits(variables, batch).gates
     cues = np.stack([np.take_along_axis(np.asarray(gate)[..., 0], np.asarray(batch.readout), axis=1)[:, 0]
                      for gate in gates])
     first = 1 / (1 + np.exp(-cues[0].astype(np.float64)))

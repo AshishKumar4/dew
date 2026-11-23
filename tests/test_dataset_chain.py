@@ -18,6 +18,9 @@ from dew.data import (
     Files,
     Loading,
     Memory,
+    Phase,
+    Steps,
+    Tokens,
     concat,
     from_grain,
     from_hf,
@@ -1670,14 +1673,14 @@ def test_a_later_phase_reads_a_concat_on_from_inside_the_member_the_last_stopped
     the concatenation does."""
     chain = concat([Memory(rows("a", 6)).named("a").map(Scaled(10)),
                     Memory(rows("b", 4)).named("b").map(Scaled(100))]).named("joined")
-    phased = phases((chain, 2), (chain, None))
+    phased = phases(Phase(chain, Steps(2)), Phase(chain))
     assert _trained(phased.batch(2), "memory", 8) == _trained(chain.batch(2), "memory", 8)
 
 
 def test_a_schedules_next_stage_reads_a_concat_on_from_inside_the_member_its_last_ended_in():
     """Two stages of one concatenation on the token clock, the first ended by the run inside its first
     member: the second reads the join on from there, as one read of the concatenation does."""
-    from dew.data import schedule
+    from dew.data import phases
     from dew.data.dataset import PhasedStream
 
     def tokens(origin: str, count: int) -> list[dict]:
@@ -1685,7 +1688,8 @@ def test_a_schedules_next_stage_reads_a_concat_on_from_inside_the_member_its_las
 
     chain = concat([Memory(tokens("a", 6)).named("a").map(Scaled(10)),
                     Memory(tokens("b", 4)).named("b").map(Scaled(100))]).named("joined").repeat()
-    loader = compile(schedule([(chain, 1e9), (chain, None)]).batch(2), read="memory", loading=READ)
+    loader = compile(phases(Phase(chain, Tokens(1000000000.0)), Phase(chain)).batch(2), read="memory",
+                     loading=READ)
     stream, resumed = loader.train(DataPartition()), loader.train(DataPartition())
     assert isinstance(stream, PhasedStream) and isinstance(resumed, PhasedStream)
     try:

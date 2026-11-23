@@ -713,8 +713,9 @@ def call_form(family, *, wide: bool, delta: bool, rounded: bool) -> tuple[int, i
     one of a 16-bit value; an fp32 one's three, or under the fast forms its `family`'s
     (`mainloop._fast_parts`); and what its walk writes (`Run.write`)."""
     fast = 1 if family.takes_tf32 and family.transposes_tf32 else mainloop.FAST_PARTS
-    given = (fast if rounded else product.EXACT_PARTS) if wide else 1
-    held = given if delta or rounded else product.EXACT_PARTS
+    exact_parts = product.bf16_part_count(accurate=True)
+    given = (fast if rounded else exact_parts) if wide else 1
+    held = given if delta or rounded else exact_parts
     return given, held, "delta" if delta else ("keys" if held == 1 else "values")
 
 

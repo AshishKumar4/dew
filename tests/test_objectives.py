@@ -13,6 +13,7 @@ from dew.data.compile import validation
 from dew.data.pipeline import Pipeline
 from dew.data.steps.generic import Formatting
 from dew.objectives.base import Objective, Ratio, Step
+from dew.training import UpdateBatch
 
 
 def tree():
@@ -125,6 +126,23 @@ def test_an_objectives_drawn_shapes_and_axes_compute_nothing(read):
     assert jax.tree.leaves(found) or found
 
 
+def test_a_decision_objective_is_built_computing_nothing():
+    """A decision objective over a decoder, built with a compile-only GPU the default device, on which
+    nothing computes (a GPU tier's prepare): its head's width read of its backbone's states traced for
+    shapes alone (`DecoderWrapper.head_size`), its tokens and key made within the trace, where made outside
+    they raised on such a device (row 12259)."""
+    from dew.data.text import ByteTokenizer
+    from dew.decision import DecisionObjective, Specials
+    from dew.decision.layout import SegmentLayout
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    layout = SegmentLayout.state_first_row(max_len=32, head_max_len=24, option_tokens=6)
+    with jax.default_device(compile_only_gpus("sm80")[0]):
+        objective = DecisionObjective(lm_objective().model, tokenizer=ByteTokenizer(),
+                                      specials=Specials(None, 10, 0, "\x00", 255), layout=layout)
+    assert objective.model is not None
+
+
 def test_an_objectives_drawn_shapes_trace_its_held_tree_as_the_arrays_it_stands_for():
     """An objective holding a tree of shapes (`jax.ShapeDtypeStruct`s: a resumed run's base) whose `init`
     reads its held leaves as arrays (a head's start transposing the base's vocabulary table): its drawn
@@ -189,7 +207,7 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
     assert float(value) == 1.0
     np.testing.assert_array_equal(gradient["w"], rows[0].sum(0) / 8)
 
-    trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+    trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(0), update=UpdateBatch(batches=2),
                       layout=Layout(min_shard=1, tolerance=1.0))
     stepped = trainer.fit(dataset(lambda: iter([{"x": x} for x in rows]), batch=8), steps=2).variables
     expected = -0.5 * (rows[0].sum(0) + rows[1].sum(0)) / 16

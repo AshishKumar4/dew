@@ -19,6 +19,7 @@ in a run's metrics, never its identity.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import itertools
 import logging
@@ -428,23 +429,32 @@ def materialized(source: Source) -> TypeGuard[Materialized]:
     return isinstance(source, View) and source.rows == "materialized"
 
 
-def _indexed_manifest(source: Source, uri: str, rows: int,
-                      reader: ShardOpener | None = None, count: int | None = None) -> ShardManifest:
+def _indexed_manifest(source: Source, uri: str, rows: int, reader: ShardOpener | None = None,
+                      count: int | None = None, *, subdivides: bool = False) -> ShardManifest:
     """The records `source` reads by index as a stream: consecutive ranges of
     at most `rows` records, each `Shard` named by the record it starts at,
     which no copy of the source names otherwise, wherever it is, and read at
     `uri` as that slice of its indexed records (`_IndexedSlice`), or by
     `reader`, which reads the same slice with less than `source` to pickle; `count` its records, where its
-    caller counted them."""
+    caller counted them. A manifest that `subdivides` (a positioned stream's fixed ranges) is cut, where
+    more readers × workers read it than it holds ranges, into ranges of as many records as fill them all,
+    each named alike by the record it starts at (docs/design/data.md: a store of fewer shards than its
+    readers × workers is cut into that many)."""
     count = len(source.records("indexed")) if count is None else count
-    return ShardManifest(
-        tuple(
-            Shard(f"records:{start}", uri, start, min(start + rows, count), min(rows, count - start))
-            for start in range(0, count, rows)
-        ),
-        _IndexedSlice(source) if reader is None else reader,
-        index_ordered=True,
-    )
+    return ShardManifest(_ranges(uri, count, rows), _IndexedSlice(source) if reader is None else reader,
+                         subdivide=functools.partial(_subdivided, uri, count) if subdivides else None,
+                         index_ordered=True)
+
+
+def _ranges(uri: str, count: int, size: int) -> tuple[Shard, ...]:
+    """`count` records at `uri` in consecutive ranges of `size`, each named by the record it starts at."""
+    return tuple(Shard(f"records:{start}", uri, start, min(start + size, count), min(size, count - start))
+                 for start in range(0, count, size))
+
+
+def _subdivided(uri: str, count: int, required: int) -> tuple[Shard, ...]:
+    """`count` records at `uri` cut into at least `required` ranges, none where it holds fewer records."""
+    return _ranges(uri, count, count // required) if count >= required else ()
 
 
 @runtime_checkable

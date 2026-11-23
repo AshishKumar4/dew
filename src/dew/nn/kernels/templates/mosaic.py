@@ -382,6 +382,28 @@ _COMMITTED = _cache.untraced(contextvars.ContextVar("committed", default=0))
 add to, whose differences across a walk's step are its groups (`commits`), its own value no trace's program
 reads (`dew._cache.untraced`)."""
 
+_PREDICATED = _cache.untraced(contextvars.ContextVar("predicated", default=0))
+"""How many predicates a run decides products are issued under (`Issuer.issued_when`), one within another."""
+
+_UNSURE = _cache.untraced(contextvars.ContextVar("unsure", default=0))
+"""The product groups `_COMMITTED` counts that were committed under a predicate a run decides
+(`_PREDICATED`), which a run may commit none of (`sure_commits`)."""
+
+_ONCE_PREDICATED = _cache.untraced(contextvars.ContextVar("once_predicated", default=0))
+"""The product groups committed under one predicate alone, none within it (`issued_one_of`'s cases'
+own)."""
+
+
+def refuse_staging(family, chunks: tuple[int, int] | None) -> None:
+    """Refuses `chunks` (`Family.output_staging`'s) where `family` stages each output tile whole."""
+    if chunks is not None:
+        raise ValueError(f"{family.name} stages each output tile whole, in no chunks: {chunks}")
+
+
+def then_read(read: Callable, after: Callable | None) -> Callable:
+    """`read`, then `after` of its value where given (`Issuer.summed_together`'s `then`)."""
+    return read if after is None else lambda: after(read())
+
 
 def committed() -> None:
     """One product group committed by an asynchronous issuer (a warpgroup MMA, which `Issuer.settled` waits
@@ -389,12 +411,34 @@ def committed() -> None:
     reading shared memory asynchronously, so refused within `Family.staged_together` (`issuing`)."""
     issuing()
     _COMMITTED.set(_COMMITTED.get() + 1)
+    if _PREDICATED.get():
+        _UNSURE.set(_UNSURE.get() + 1)
+    if _PREDICATED.get() == 1:
+        _ONCE_PREDICATED.set(_ONCE_PREDICATED.get() + 1)
 
 
 def commits() -> int:
     """The product groups committed so far in this trace (`committed`): a walk's completion tokens, the
     difference across a step its groups."""
     return _COMMITTED.get()
+
+
+def sure_commits() -> int:
+    """The product groups `commits` counts that every run commits, none under a predicate a run decides
+    (`predicated`): a wait leaving as many of them in flight as were committed after a group waits on that
+    group, whichever predicated ones a run commits too, as groups complete in their order (theme K01-e's
+    review P0: a wait counting a predicated group a run skipped read the group before it unfinished)."""
+    return _COMMITTED.get() - _UNSURE.get()
+
+
+def predicated(issue: Callable):
+    """`issue()`, its groups committed under a predicate a run decides, within any it is issued under
+    (`sure_commits`)."""
+    token = _PREDICATED.set(_PREDICATED.get() + 1)
+    try:
+        return issue()
+    finally:
+        _PREDICATED.reset(token)
 
 
 def workspace(shape: tuple, dtype, *, interpret) -> jax.Ref:
@@ -1091,19 +1135,24 @@ class Issuer[Accumulator](abc.ABC):
         accumulator is a ref scopes (wgmma's)."""
         return issue(self.zeros(shape))
 
-    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False
-                        ) -> tuple[Callable, ...]:
+    def summed_together(self, shapes: tuple[tuple[int, int], ...], issues: tuple, *, apart: bool = False,
+                        then: tuple[Callable | None, ...] | None = None) -> tuple[Callable, ...]:
         """Groups of products none of which reads another's sum, each `issues[i](acc) -> acc` into a fresh
-        fp32 accumulator of `shapes[i]`: a reader of each group's value, which its caller calls where it uses
-        it, so no more sums are held in registers at once than it reads together. Where the issuer awaits its
-        products (tensor memory's), every group is issued before any is awaited, one wait for them all, and a
-        reader reads its group's accumulator (`Tcgen05ChunksIssuer`'s); `apart`, each group's products
-        awaited before the next group issues, as groups that stage their operands into shared tiles need (a
-        group's staging would overwrite a tile another group's product in flight reads). Elsewhere a reader
-        sums its group where it is read (`summed`), in the caller's order, each group done before the next."""
+        fp32 accumulator of `shapes[i]`: a reader of each group's value, `then[i]` of it where given (any
+        tree), which its caller calls where it uses it, so no more sums are held in registers at once than
+        it reads together. Where the issuer awaits its products (tensor memory's), every group is issued
+        before any is awaited, one wait for them all, and a reader reads its group's accumulator
+        (`Tcgen05ChunksIssuer`'s); where it reads them as each completes (a warpgroup MMA's), every group is
+        issued, each read in turn as its own completes, `then[i]` run on it while the later groups run on
+        (`WgmmaIssuer`'s: a backward's weights made while its value products run, row 10734); `apart`, each
+        group's products awaited before the next group issues, as groups that stage their operands into
+        shared tiles need (a group's staging would overwrite a tile another group's product in flight
+        reads). Elsewhere a reader sums its group where it is read (`summed`), then `then[i]` of it, in the
+        caller's order, each group done before the next."""
         del apart
-        return tuple(functools.partial(self.summed, shape, issue)
-                     for shape, issue in zip(shapes, issues, strict=True))
+        after = (None,) * len(shapes) if then is None else then
+        return tuple(then_read(functools.partial(self.summed, shape, issue), each)
+                     for shape, issue, each in zip(shapes, issues, after, strict=True))
 
     @abc.abstractmethod
     def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:
@@ -1160,12 +1209,17 @@ class Issuer[Accumulator](abc.ABC):
         return vector
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
-        """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
-        product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum).
-        `pending` is the count of this warpgroup's later product groups left in flight when `product` reads
-        its value (issued by `then()` before the read); synchronous issuers take `pending=0` only and raise
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
+        """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, running `between()` while the product runs
+        and returning `(between(), product)` out of the accumulator's scope (`WgmmaIssuer`). `pending` is
+        the count of this warpgroup's later product groups left in flight when the accumulator is read
+        (issued by `between()` before the read); synchronous issuers take `pending=0` only and raise
         `ValueError` otherwise."""
+
+    def product(self, lhs, rhs, shape: tuple[int, int], *, pending: int = 0) -> jax.Array:
+        """`lhs @ rhs` into a fresh fp32 accumulator of `shape` (`product_with` with no overlapped work)."""
+        return self.product_with(lhs, rhs, shape, lambda: None, pending=pending)[1]
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
@@ -1229,9 +1283,9 @@ class Issuer[Accumulator](abc.ABC):
         `issued_unless`'s branch the other way, stated positively, as a warp's own code lowers a predicate
         (no boolean `not` there): a value accumulator's by a branch, one its instructions write in place by
         its issuer's own (`WgmmaIssuer`, `Tcgen05Issuer`). Its groups count as committed either way
-        (`commits`), which a walk's waits meet where no step issues them; a choice among products that
-        varies by step is `issued_one_of`'s."""
-        return lax.cond(issuing, issue, lambda: acc)
+        (`commits`), which a walk's waits meet where no step issues them, though not as committed by every
+        run (`sure_commits`); a choice among products that varies by step is `issued_one_of`'s."""
+        return lax.cond(issuing, functools.partial(predicated, issue), lambda: acc)
 
     def issued_one_of(self, which: jax.Array, accumulators: Sequence, issue: Callable) -> tuple:
         """Each of `accumulators` as `issue(case, acc)`'s products into it leave it where `which` (traced,
@@ -1240,15 +1294,23 @@ class Issuer[Accumulator](abc.ABC):
         `gemm.chained`). Its groups count as one case's (`commits`), each case committing as many: counted
         as every case traced, a walk's wait for a step's groups left a step of its ring in flight past its
         slot's release (base review of f86cb5b03, F2)."""
-        before, issued, groups = commits(), [], set()
+        before, unsure, once = commits(), _UNSURE.get(), _ONCE_PREDICATED.get()
+        issued, groups, sure = [], set(), []
         for case, acc in enumerate(accumulators):
-            began = commits()
+            began, began_once = commits(), _ONCE_PREDICATED.get()
             issued.append(self.issued_when(which == case, acc, functools.partial(issue, case, acc)))
             groups.add(commits() - began)
+            # The case's groups no predicate within it guards, which a run choosing it commits.
+            sure.append(_ONCE_PREDICATED.get() - began_once)
         if len(groups) > 1:
             raise ValueError(f"a choice among products commits one count of groups whichever it issues, not "
                              f"{sorted(groups)}")
-        _COMMITTED.set(before + max(groups, default=0))
+        # One case's groups, as sure as the choice's own issue is: those every case commits whatever a
+        # predicate within it decides (theme K01-e's review P0: an inner predicate's groups read as sure).
+        count = max(groups, default=0)
+        _COMMITTED.set(before + count)
+        _UNSURE.set(unsure + (count if _PREDICATED.get() else count - min(sure, default=0)))
+        _ONCE_PREDICATED.set(once)
         return tuple(issued)
 
     def added_onto(self, acc, adds: jax.Array):
@@ -1265,13 +1327,6 @@ class Issuer[Accumulator](abc.ABC):
         operands' fragments in registers, each step's loaded within it, so a product beside others holds no
         fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
         return self.products(acc, lhs, rhs, accumulate=accumulate)
-
-    def product_pair(self, lhs1, rhs1, lhs2, rhs2, shape: tuple[int, int], *,
-                     between: Callable = lambda value: value) -> tuple:
-        """Two fresh fp32 products of `shape`, issued together where the issuer pipelines them
-        (`WgmmaIssuer`), else in turn (`product`). `between` runs on the first product's value while the
-        second is in flight, where the issuer pipelines them, returning `(between(first), second)`."""
-        return between(self.product(lhs1, rhs1, shape)), self.product(lhs2, rhs2, shape)
 
     def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
         """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""
@@ -1596,13 +1651,13 @@ class Transport[Allocated, Opened](abc.ABC):
 
     @abc.abstractmethod
     def registers(self, consumers: int, programs: int = 1, producer: int | None = None,
-                  joined: tuple = ()) -> int:
+                  joined: handoffs.Joined = ()) -> int:
         """The registers a thread of each of `consumers` consumer roles may hold, `programs` programs a
         multiprocessor at once, beside a producer role lowered to `producer` where the family has one
         (`roles`; setmaxnreg's least where None) and the `joined` roles (`role_schedule`); asked of a family
         that budgets them alone (`budgets_registers`)."""
 
-    def role_schedule(self, consumers: int, producer: int | None = None, joined: tuple = ()
+    def role_schedule(self, consumers: int, producer: int | None = None, joined: handoffs.Joined = ()
                       ) -> handoffs.Schedule:
         """The family's roles (`roles`) with `joined`'s, each `(role, count)` (`handoffs.Schedule.joined`: a
         correction warpgroup beside the consumers, a launch's reducing warps)."""
@@ -1610,12 +1665,12 @@ class Transport[Allocated, Opened](abc.ABC):
                                 self.roles(consumers, producer))
 
     @staticmethod
-    def joined_shares(joined: tuple) -> "resources.Joined":
+    def joined_shares(joined: handoffs.Joined) -> "resources.JoinedShares":
         """`joined`'s raised warpgroup roles as the register model reads them, each its weight and count
-        (`resources.Joined`); its warp roles share the last warpgroup's least."""
+        (`resources.JoinedShares`); its warp roles share the last warpgroup's least."""
         return tuple((role.weight, count) for role, count in joined if not role.warp)
 
-    def warpgroups(self, consumers: int, joined: tuple = ()) -> int:
+    def warpgroups(self, consumers: int, joined: handoffs.Joined = ()) -> int:
         """The warpgroups a program of `consumers` compute roles runs: theirs, a producer's where the
         family streams from a role of its own (`roles`), and its `joined` roles' (`role_schedule`)."""
         return self.role_schedule(consumers, joined=joined).warpgroups()
@@ -1636,7 +1691,7 @@ class Transport[Allocated, Opened](abc.ABC):
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                prefetched: Callable | None = None, registers: int | None = None, reduces: bool = True,
                producer: int | None = None, shared: int | None = None, tmem: int = 0,
-               moves: bool | None = None, joined: tuple = ()) -> Callable:
+               moves: bool | None = None, joined: handoffs.Joined = ()) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own and its
         `joined` roles (`role_schedule`: their warpgroups among its threads, their registers in its model),
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
@@ -1685,15 +1740,22 @@ class Transport[Allocated, Opened](abc.ABC):
 
     def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
                   exclusive: bool = False, static_consumers: bool = False, issuer: Callable | None = None,
-                  joined: tuple = ()):
+                  joined: handoffs.Joined = (), bodies: Mapping[str, Callable] | None = None):
         """The family's roles run (`role_schedule`, its producer at `floor`): `consumer(index)`, `producer()`,
-        `issuer()` where it issues on a role (`Issuer.places_on_role`), each `joined` role's body at its index
-        (`(role, count, body)`: a correction warpgroup's, a launch's reducing warps'), a switch's branches
-        where `exclusive`, a consumer's at a static index where `static_consumers`; the consumers' value."""
-        schedule = self.role_schedule(consumers, floor, tuple((role, count) for role, count, _ in joined))
+        `issuer()` where it issues on a role (`Issuer.places_on_role`), each `joined` role's body by its name
+        at its index (`bodies`: a correction warpgroup's, a launch's reducing warps'), `joined` the value its
+        launch was sized by (`kernel`), a switch's branches where `exclusive`, a consumer's at a static index
+        where `static_consumers`; the consumers' value. A joined role with no body, or a body of no joined
+        role, is refused as it traces (row 9785: a warpgroup launched beside no body hung its hand-offs)."""
+        bodies = {} if bodies is None else bodies
+        named = {role.name for role, _ in joined}
+        if named != set(bodies):
+            raise ValueError(f"{self.name}'s joined roles {sorted(named)} and their bodies {sorted(bodies)} "
+                             "differ: each role its launch was sized by runs its own body")
+        schedule = self.role_schedule(consumers, floor, joined)
         # The producer and the issuer one unit each, of no index (`handoffs.Schedule.run`'s).
         units = {"producer": producer, "issuer": issuer}
-        bodies = {"consumer": consumer, **{role.name: body for role, _, body in joined},
+        bodies = {"consumer": consumer, **bodies,
                   **{name: lambda index, body=body: body() for name, body in units.items()}}
         return schedule.run(exclusive=exclusive, static="consumer" if static_consumers else None,
                             **{role.name: bodies[role.name] for role in schedule.roles})
@@ -1828,7 +1890,7 @@ class Transport[Allocated, Opened](abc.ABC):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, chunks: tuple[int, int] | None = None) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
@@ -1937,11 +1999,12 @@ class Transport[Allocated, Opened](abc.ABC):
         tiles' and its reads' (`schedule`)."""
         return [self.schedule(consumers), self.schedule(consumers)]
 
-    def output_staging(self, outputs: tuple, consumers: int) -> list:
+    def output_staging(self, outputs: tuple, consumers: int, chunks: tuple[int, int] | None = None) -> list:
         """The shared memory `persist` stages each of `outputs` (`(shape, dtype)`, a tile's) in, which a
         template's allocations count as its own (`resources.Scope`): the whole tile, where a family stages
-        it whole."""
+        it whole, which takes no `chunks` (chunk columns and buffers, `stores.output_staging`'s `staging`)."""
         del consumers
+        refuse_staging(self, chunks)
         return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
 
     def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = (), *,
@@ -2123,7 +2186,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         return into
 
     def programs(self, consumers: int, registers: int | None = None, producer: int | None = None,
-                 joined: tuple = ()) -> int:
+                 joined: handoffs.Joined = ()) -> int:
         """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
         consumer roles holding `registers` (None: the family's budget, `registers`) beside a producer
         lowered to `producer`: at warpgroup MMA's budget, one, its consumers raised to the register file's

@@ -16,6 +16,7 @@ import pytest
 
 import dew.io
 from dew.checkpoints import FROZEN_STORE, RUN_FILE, Checkpoints
+from dew.training.budget import Horizon
 
 
 class Artifact:
@@ -212,7 +213,8 @@ def test_a_published_earlier_step_of_a_decision_run_downloads_with_the_calibrati
     trained(first, tmp_path, "first", trainer={"name": "first", "checkpoint_final": True})
     run = tmp_path / "runs" / "first"
     read = SavedRun.pinned(str(run)).step
-    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2, "checkpoint_final": True})
+    trained(first, tmp_path, "first", trainer={"name": "first", "horizon": Horizon(steps=2),
+                                               "checkpoint_final": True})
     logged = dew.io.publish(Checkpoints(str(run)).path(read), "decide", tracker=Tracker())
     local = downloaded(logged, tmp_path / "download")
     task = Decide.from_run(str(local), step=read)

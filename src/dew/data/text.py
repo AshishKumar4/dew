@@ -877,7 +877,7 @@ def near_duplicates_removed(records: Callable[[], Iterator[Batch]],
 
 
 def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "text", eos: bool = True,
-                  rows_per_shard: int = 100_000, read: Read = "streamed",
+                  rows_per_shard: int = 100_000, read: Read | None = None,
                   provision: bool = False) -> Mapping[str, object]:
     """`dataset`'s documents in `field` tokenized by `tokenizer` and written to `url` as a committed
     token store (ArrayRecord shards, each record a document's ids under "text", its manifest naming

@@ -35,7 +35,7 @@ from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Objective
-from dew.optim import Cosine, OptimConfig
+from dew.optim import AdamW, Cosine, OptimConfig
 from dew.training import Trainer
 from dew.training.runtime import prepare_process
 
@@ -134,11 +134,11 @@ def compile_step(args, model, variables):
     work = measure(objective, {"tokens": rows})
     work.write(args.work)
     (b1, b2), schedule = OPTIMIZER["betas"], SCHEDULE
-    solver = OptimConfig(optimizer="adamw", b1=b1, b2=b2, optimizer_opts={"eps": OPTIMIZER["eps"]},
-                          weight_decay=OPTIMIZER["weight_decay"], clip_grads=0.0, state_dtype="float32",
-                          learning_rate=Cosine(init_value=schedule["init"], peak_value=schedule["peak"],
-                                               warmup_steps=schedule["warmup"], end_value=schedule["end"])
-                          ).build(schedule["decay_steps"])
+    solver = OptimConfig(optimizer=AdamW(eps=OPTIMIZER["eps"], b1=b1, b2=b2,
+                                         weight_decay=OPTIMIZER["weight_decay"]), clip_grads=0.0,
+                         learning_rate=Cosine(init_value=schedule["init"], peak_value=schedule["peak"],
+                                              warmup_steps=schedule["warmup"], end_value=schedule["end"])
+                         ).build(schedule["decay_steps"])
     trainer = Trainer(objective, solver, key=jax.random.key(args.seed), checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
     placed = jax.device_put({"tokens": rows})

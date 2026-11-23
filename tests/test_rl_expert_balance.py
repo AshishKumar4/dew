@@ -8,6 +8,7 @@ loss trains, and the commit applies the counts once per committed update
 and the flag reads it so.
 """
 
+import dataclasses
 import json
 
 import jax
@@ -33,7 +34,7 @@ from dew.objectives.rl.sessions import (
     SEGMENT_IDS_KEY,
 )
 from dew.objectives.routing import ExpertBalance
-from dew.training import Trainer
+from dew.training import Trainer, UpdateBatch
 
 VOCAB = BALANCED_VOCAB
 EXPERTS = BALANCED_EXPERTS
@@ -202,7 +203,7 @@ def test_a_policy_run_moves_each_balancing_bias_by_its_pooled_load_once_per_comm
     booked = rows * copies * load(FIRST)
     step_direction = np.float32(RATE) * np.array([0, 1, -1, 0], np.float32)
     obj = objective(kind, routed_by_id(), 1)
-    train = Trainer(obj, optax.sgd(0.0), key=jax.random.PRNGKey(3), accumulation=2)
+    train = Trainer(obj, optax.sgd(0.0), key=jax.random.PRNGKey(3), update=UpdateBatch(batches=2))
     state = train.initial_state()
     run = train.compile(state, designed(kind, FIRST, rows))
     for commit in range(2):
@@ -279,16 +280,18 @@ def test_a_json_record_rebuilds_a_policy_run_that_balances_its_routers(kind):
 
 @pytest.mark.parametrize("kind", KINDS)
 def test_a_policy_runs_balance_flag_builds_a_policy_that_balances_its_routers(kind):
-    """`--objective.balance` on a policy run's command line (`LMRunConfig.cli`), the expert balance as
-    its JSON spec, gives the run's objective that `ExpertBalance`, whose policy balances its routers and
+    """The objective's balance on a policy run (`ObjectiveConfig` fields), the expert balance as its JSON
+    record, gives the run's objective that `ExpertBalance`, whose policy balances its routers and
     evaluates a loss with their effects (ledger 4495)."""
-    from dew.config.lm import LMRunConfig
+    from dew.config.lm import LMRunConfig, PromptRollout
 
     balance = ExpertBalance(balance_rate=RATE, aux_loss_alpha=0.2)
     spec = json.dumps({"class": "dew.objectives.routing:ExpertBalance",
                        "fields": {"balance_rate": RATE, "aux_loss_alpha": 0.2}})
     # A GRPO run trains on what its rollout draws, which it names.
-    rollout = ["--rollout.reward", "rl_support:completion_length"] if kind == "grpo" else []
-    objective = LMRunConfig.cli(["--objective", kind, "--objective.balance", spec, *rollout]).objective
+    rollout = {"rollout": PromptRollout(reward="rl_support:completion_length")} if kind == "grpo" else {}
+    run = dataclasses.replace(LMRunConfig(), objective=ObjectiveConfig(kind, {"balance": json.loads(spec)}),
+                              **rollout)
+    objective = run.objective
     assert isinstance(objective, ObjectiveConfig)
     _balances(kind, objective, balance)

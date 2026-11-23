@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import dataclasses
 import math
-import types
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal
 
@@ -16,19 +15,17 @@ if TYPE_CHECKING:
 from dew.scores import Summary
 from dew.training.evaluation import Declared, SplitLoss
 
-type Source = Metric | TrainingScalar | Summary | SplitLoss | Callable[[Mapping], float]
-"""What a selection ranks by: a declared score, a training scalar, or a custom score of the fit's scores."""
-
 
 @dataclasses.dataclass(frozen=True, init=False)
 class Best:
-    """Keeps the `top` best evaluations by a metric, a recorded metric name, or a custom score.
+    """Keeps the `top` best evaluations by a metric, named, or by a custom `score` of the fit's scores.
 
-    A name refers to one of the metric objects passed to `fit`, or to a `Summary` as
-    `evaluation/summary/<name>`. `mode` sets the direction, 'min' or 'max'. When it is None, a custom
-    score is minimized, and a named metric or a metric object takes its direction
-    from its `Shown` declaration. An evaluation whose score is not better
-    than `threshold` is not ranked.
+    The metric is named as its scores are recorded, `<split>/<name>` (`val/accuracy`, `train/loss`,
+    `evaluation/summary/<name>` for a `Summary`), or by its bare name beside `split`, or the only split's;
+    a metric object, a training scalar or a summary given in its place is named by its own name and
+    split. `mode` sets the direction, 'min' or 'max'; where it is None, a custom score is minimized and a
+    named metric takes its direction from its `Shown` declaration. An evaluation whose score is not
+    better than `threshold` is not ranked. A custom score is code alone: a run's record names metrics.
     """
     metric: str
     top: int = 1
@@ -36,81 +33,82 @@ class Best:
     threshold: float | None = None
     weights_only: bool = False
     split: str | None = None
-    _source: Source | None = dataclasses.field(
+    score: Callable[[Mapping], float] | None = dataclasses.field(
         default=None, repr=False, compare=False, metadata={'record': False})
 
-    def __init__(self, metric: str | Metric | TrainingScalar | Summary | types.MethodType
-                 | Callable[[Mapping], float], top: int = 1, mode: Literal['min', 'max'] | None = None,
-                 threshold: float | None = None, weights_only: bool = False, split: str | None = None,
-                 *, _source: Source | None = None):
+    def __init__(self, metric: str | Metric | TrainingScalar | Summary | Callable[[Mapping], float],
+                 top: int = 1, mode: Literal['min', 'max'] | None = None, threshold: float | None = None,
+                 weights_only: bool = False, split: str | None = None, *,
+                 score: Callable[[Mapping], float] | None = None):
         if top < 1 or mode not in (None, 'min', 'max'):
             raise ValueError("Best needs integer top >= 1 and mode min or max")
         if threshold is not None and not math.isfinite(threshold):
             raise ValueError("Best.threshold must be finite")
-        name = (
-            metric
-            if isinstance(metric, str)
-            else metric.name
-            if isinstance(metric, (Metric, TrainingScalar, Summary))
-            else "<aggregate>"
-        )
-        source = _source if _source is not None else None if isinstance(metric, str) else metric
+        if isinstance(metric, TrainingScalar):
+            name, split = metric.name, "train"
+        elif isinstance(metric, Summary):
+            name, split = metric.name, Summary.SPLIT if split is None else split
+        elif isinstance(metric, (Metric, SplitLoss)):
+            name = metric.name
+        elif isinstance(metric, str):
+            name = metric
+        else:
+            name, score = AGGREGATE, metric
         for field, value in (('metric', name), ('top', top), ('mode', mode), ('threshold', threshold),
-                             ('weights_only', weights_only), ('split', split), ('_source', source)):
+                             ('weights_only', weights_only), ('split', split), ('score', score)):
             object.__setattr__(self, field, value)
 
-    def resolved(self, scored: Mapping[str, Sequence[Declared]]) -> Best:
-        """This selection bound to the split it ranks and the metric it names there: `train` for a
-        training scalar, else the split of `scored` (each split's metrics) it names, by `split` or as
-        its recorded name's prefix, or the only one, and the metric it names among that split's own,
-        so each suite's instance of one metric is its own. Its direction, where it names none, is how
-        that metric itself declares it is shown."""
+    def resolved(self, scored: Mapping[str, Sequence[Declared]],
+                 scalar: Callable[[str], TrainingScalar] | None = None) -> Best:
+        """This selection bound to the split it ranks and the bare name of its metric there: `train` for a
+        training scalar `scalar` names (the objective's, `Objective.scalars`), else the split of `scored`
+        (each split's metrics) it names, by `split` or as its name's prefix, or the only one, its metric found
+        among that split's own by name. Its direction, where it names none, is how that metric declares it is
+        shown. A custom score binds to nothing."""
+        if self.score is not None:
+            return self
         selection = self
-        metric = selection._source
-        if isinstance(metric, TrainingScalar):
-            if selection.mode is None:
-                if metric.shown.better is None:
-                    raise ValueError("training scalar has no declared direction; use Best(scalar, mode=...)")
-                selection = dataclasses.replace(
-                    selection, mode="max" if metric.shown.better == "higher" else "min"
-                )
-            return dataclasses.replace(selection, split='train')
         # A summary is ranked in its namespace, which no split can be named, so no other selection's
         # split defaults to it. A recorded name's split is all before its last '/', as a namespace is.
         splits = tuple(split for split in scored if split != Summary.SPLIT)
-        if isinstance(metric, Summary) and selection.split is None:
-            selection = dataclasses.replace(selection, split=Summary.SPLIT)
-        if metric is None and selection.split is None and selection.metric.rpartition('/')[0] in scored:
-            selection = dataclasses.replace(selection, split=selection.metric.rpartition('/')[0])
+        prefix = selection.metric.rpartition('/')[0]
+        if selection.split is None and (prefix in scored or prefix == "train"):
+            selection = dataclasses.replace(selection, split=prefix)
         if selection.split is None:
-            if len(splits) != 1 and (metric is None or isinstance(metric, Metric)):
+            if len(splits) != 1:
                 raise ValueError("Best(metric, split=...) is required with several validation splits")
-            selection = dataclasses.replace(selection, split=splits[0] if len(splits) == 1 else None)
-        elif selection.split not in scored:
+            selection = dataclasses.replace(selection, split=splits[0])
+        elif selection.split not in scored and selection.split != "train":
             raise ValueError(f"unknown validation split {selection.split!r}")
-        if metric is None:
-            assert selection.split is not None
-            name = selection.metric.removeprefix(f"{selection.split}/")
-            metric = next((declared for declared in scored[selection.split] if declared.name == name), None)
-            if metric is None:
+        split = selection.split
+        assert split is not None, "a selection is bound to its split above"
+        name = selection.metric.removeprefix(f"{split}/")
+        declared: Declared | TrainingScalar
+        if split == "train":
+            if scalar is None:
+                raise ValueError(f"best training scalar {name!r} ranks a fit's objective's own")
+            declared = scalar(name)
+        else:
+            found = next((declared for declared in scored[split] if declared.name == name), None)
+            if found is None:
                 raise ValueError(f"best metric {selection.metric!r} is not among fit's metrics")
-            selection = dataclasses.replace(selection, _source=metric)
-        if isinstance(metric, (Metric, Summary, SplitLoss)):
-            assert selection.split is not None
-            if not any(metric is declared for declared in scored[selection.split]):
-                raise ValueError("best must be a metric object passed in metrics")
-            declared = _declared_shown(metric)
-            better = None if declared is None else declared.better
-            if selection.mode is None:
-                if better not in ('higher', 'lower'):
-                    raise ValueError(
-                        "best metric has no declared direction; use Best(metric, mode='min' or 'max')"
-                    )
-                selection = dataclasses.replace(selection, mode='max' if better == 'higher' else 'min')
+            declared = found
+        selection = dataclasses.replace(selection, metric=name)
+        if selection.mode is None:
+            shown = _declared_shown(declared)
+            better = None if shown is None else shown.better
+            if better not in ('higher', 'lower'):
+                raise ValueError("best metric has no declared direction; use Best(metric, mode='min' or "
+                                 "'max')")
+            selection = dataclasses.replace(selection, mode='max' if better == 'higher' else 'min')
         return selection
 
 
-def _declared_shown(metric: Declared) -> Shown | None:
+AGGREGATE = "<aggregate>"
+"""The name a custom score ranks under (`Best.score`), which names no recorded metric."""
+
+
+def _declared_shown(metric: Declared | TrainingScalar) -> Shown | None:
     """How `metric` itself declares it is shown, which the Metric protocol leaves optional, so it is
     read at this boundary."""
     return getattr(metric, "shown", None)
@@ -132,14 +130,12 @@ def rankings(best: Sequence[Best], scores: Mapping[str, float], *, validation: s
         return (Ranking(name, scores[name]),) if name in scores else ()
     ranks = []
     for index, selection in enumerate(best):
-        metric = selection._source
-        assert metric is not None
-        if isinstance(metric, (Metric, TrainingScalar, Summary, SplitLoss)):
-            name = f'{selection.split}/{metric.name}'
+        if selection.score is None:
+            name = f'{selection.split}/{selection.metric}'
             value = scores.get(name, float('nan'))
         else:
             name = f'aggregate:{index}'
-            value = float(metric(MetricScores(declared, scores, objective)))
+            value = float(selection.score(MetricScores(declared, scores, objective)))
         mode = selection.mode or 'min'
         threshold = selection.threshold
         if threshold is not None and (value >= threshold if mode == 'min' else value <= threshold):

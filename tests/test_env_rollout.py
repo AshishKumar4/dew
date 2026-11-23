@@ -26,6 +26,8 @@ from dew.objectives.rl.control import (
 from dew.rl.env import Batched, TimeLimit, TimeStep, env_rollout, start
 from dew.rl.replay import ReplayBuffer
 from dew.rl.simulator import STACKED
+from dew.training import FitPolicy, UpdateBatch
+from dew.training.budget import Horizon
 
 
 @struct.dataclass
@@ -261,7 +263,7 @@ def test_ppo_split_step_preserves_whitening_draws_and_mid_window_resume(tmp_path
                 "terminated": np.ones((2, 1), bool), "truncated": np.zeros((2, 1), bool)}
 
     def run_two(split: int):
-        trainer = Trainer(actor_only, optax.sgd(0.2), key=jax.random.key(4), split=split,
+        trainer = Trainer(actor_only, optax.sgd(0.2), key=jax.random.key(4), fit=FitPolicy(split=split),
                           checkpoints=None, tracker=None)
         trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
         state = trainer.initial_state()
@@ -289,8 +291,8 @@ def test_ppo_split_step_preserves_whitening_draws_and_mid_window_resume(tmp_path
     def residuals(split: int) -> list:
         # What the loss's pullback saves of one microbatch of two rows, read as one of a split of four or
         # as the whole step (`traced_loss`, the step's own loss), its arguments left out.
-        state = Trainer(objective, optax.adam(1e-2), key=jax.random.key(8), split=split, checkpoints=None,
-                        tracker=None).initial_state()
+        state = Trainer(objective, optax.adam(1e-2), key=jax.random.key(8), fit=FitPolicy(split=split),
+                        checkpoints=None, tracker=None).initial_state()
         loss, (variables, *rest) = traced_loss(objective, state, split, split)
         rows = jax.tree.map(lambda leaf: leaf[:2], batch_a)
         saved = saved_residuals(lambda held: loss(held, rows, *rest)[0], variables)
@@ -358,7 +360,7 @@ def test_split_batch_statistics_refresh_on_rejection_and_replay_composite_terms(
     outputs = []
     for split in (1, 2):
         trainer = Trainer(CompositeObjective(streamed=False), optax.sgd(0.5), key=jax.random.key(5),
-                          split=split, checkpoints=None, tracker=None)
+                          fit=FitPolicy(split=split), checkpoints=None, tracker=None)
         trainer.device_mesh = mesh
         state = trainer.initial_state()
         step_fn = trainer.compile(state, plain_batch)
@@ -368,7 +370,7 @@ def test_split_batch_statistics_refresh_on_rejection_and_replay_composite_terms(
 
     scaled_obj = CompositeObjective(streamed=True)
     root_key = jax.random.key(12)
-    scaled_trainer = Trainer(scaled_obj, optax.sgd(0.5), key=root_key, split=2,
+    scaled_trainer = Trainer(scaled_obj, optax.sgd(0.5), key=root_key, fit=FitPolicy(split=2),
                              dynamic_scale=True, checkpoints=None, tracker=None)
     scaled_trainer.device_mesh = mesh
     state = scaled_trainer.initial_state()
@@ -859,8 +861,9 @@ def test_a_control_run_accumulating_two_minibatches_an_update_serves_each_collec
     objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9)
     rollout = Counted(objective, Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 16), unroll_length=8,
                       epochs=1, minibatches=2)
-    Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout, accumulation=2).fit(
-        idle(), steps=4, log_every=4)
+    trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout,
+                      update=UpdateBatch(batches=2))
+    trainer.fit(idle(), steps=4, log_every=4)
     assert len(rollout.made) == 2 and len(rollout.served) == 4
     for made, pair in zip(rollout.made, (rollout.served[:2], rollout.served[2:]), strict=True):
         rewards = np.sort(np.concatenate([np.asarray(batch["reward"]) for batch in pair]), axis=0)
@@ -1109,7 +1112,7 @@ def test_control_rollout_fuses_collection_without_warm_recompiles_and_resumes_en
 
     from dew.config import ObjectiveConfig, TrainerConfig
     from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig
-    from dew.optim import OptimConfig
+    from dew.optim import Adam, OptimConfig
     from dew.registry import ModelConfig
     from dew.rl.flight import Racing
     from dew.telemetry.compiles import Compiles
@@ -1140,19 +1143,19 @@ def test_control_rollout_fuses_collection_without_warm_recompiles_and_resumes_en
         objective=ObjectiveConfig(control_ppo, {"discount": 0.95, "entropy_cost": 0.05,
                                                 "reads": ["teacher"]}),
         rollout=RolloutConfig("control", {"unroll_length": 2, "epochs": 1, "minibatches": 1}),
-        optim=OptimConfig("adam", learning_rate=1e-3),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, checkpoint_every=1, log_every=1,
-                              eval_every=None, multi_host=False))
+        optim=OptimConfig(Adam(), learning_rate=1e-3),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=1), checkpoint_every=1,
+                              log_every=1, eval_every=None, multi_host=False))
     phase1.prepare().train("control_phase")
     phase2 = dataclasses.replace(
         phase1, objective=ObjectiveConfig(control_ppo, {"discount": 0.95, "entropy_cost": 0.0,
                                                         "reads": ["teacher"]}),
-        trainer=dataclasses.replace(phase1.trainer, steps=2))
+        trainer=dataclasses.replace(phase1.trainer, horizon=Horizon(steps=2)))
     resumed = phase2.prepare().train("control_phase")
     assert int(resumed.updates) == 2
     bad_phase = dataclasses.replace(
         phase2, objective=ObjectiveConfig(control_ppo, {"discount": 0.8, "entropy_cost": 0.0,
                                                         "reads": ["teacher"]}),
-        trainer=dataclasses.replace(phase1.trainer, steps=3))
+        trainer=dataclasses.replace(phase1.trainer, horizon=Horizon(steps=3)))
     with pytest.raises(ValueError):
         bad_phase.prepare().train("control_phase")

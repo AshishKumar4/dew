@@ -7,7 +7,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 
-from dew.optim import OptimConfig, ParamGroup
+from dew.optim import AdamW, OptimConfig, ParamGroup
 
 PARAMS = {"dense": {"kernel": jnp.ones((3, 2)), "bias": jnp.ones((2,))}}
 
@@ -24,7 +24,7 @@ def test_a_decay_spares_biases_unless_told_not_to_and_a_group_decays_what_it_cla
     (`OptimConfig.spared`), and decays it where the config says not to spare, as Optax does. A param
     group decays every parameter it claims, as a torch parameter group does, unless it spares; a run's
     default fresh groups decay as its ungrouped optimizer would (`OptimConfig.fresh_groups`)."""
-    config = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1)
+    config = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2)
     assert decayed(config) == {"kernel": True, "bias": False}
     assert decayed(dataclasses.replace(config, spared=False)) == {"kernel": True, "bias": True}
     claimed = dataclasses.replace(config, param_groups=(ParamGroup("all", ("*",)),))

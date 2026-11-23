@@ -1,22 +1,18 @@
 """A classifier written as a Python experiment and trained with `dew train`.
 
-    dew train examples/train_supervised.py --set trainer.steps=600 --set model.hidden=64
+    dew train examples/train_supervised.py
 
 This file builds the run in plain Python: its own Flax model and loss, two
 interleaved spirals it writes once as JSON lines, and `Supervised`, which
 trains any model on a loss over its outputs, with no subclass of
-`Objective`. `run` is the `RunConfig`; each `--set` changes one field of it,
-read as that field's own type reads it. `dew train` imports the file as the
-module `train_supervised`, so `run.json` names the model and the loss by
-import path (`train_supervised:MLP`), and a new process rebuilds the same
-run from that record alone:
+`Objective`. `run` is the `RunConfig`; a run file of your own changes a field of
+it at its dotted path, `run().override({"trainer.horizon.steps": 600, "model.hidden": 64})`.
+`dew train` imports the file as the module `train_supervised`, so `run.json` names the
+model and the loss by import path (`train_supervised:MLP`), and a new process rebuilds the
+same run from that record alone, continuing it from its own checkpoints:
 
-    PYTHONPATH=examples dew train checkpoints/train_supervised/run.json \\
-        --trust train_supervised --set trainer.checkpoint_dir=again
-
-Without `--set`, the record continues the run from its own checkpoints.
+    PYTHONPATH=examples dew train checkpoints/train_supervised/run.json --trust train_supervised
 """
-
 import json
 import tempfile
 from pathlib import Path
@@ -32,6 +28,7 @@ from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig
+from dew.training.budget import Horizon
 
 
 class MLP(nn.Module):
@@ -78,5 +75,4 @@ def run() -> RunConfig:
         objective=ObjectiveConfig("supervised", {
             "loss": cross_entropy, "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
         optim=OptimConfig(learning_rate=3e-3),
-        trainer=TrainerConfig(steps=300, log_every=50, eval_every=100,
-                              checkpoint_every=100))
+        trainer=TrainerConfig(horizon=Horizon(steps=300), log_every=50, eval_every=100, checkpoint_every=100))

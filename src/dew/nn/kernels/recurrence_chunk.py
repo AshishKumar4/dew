@@ -1126,7 +1126,7 @@ def _hooks(given, entry, adds, loads, stores, begun, turning=None):
     return before, after
 
 
-def _forked_steps(forms, operands, given, forked, held: int, documents: int, decayed):
+def _forked_steps(forms, operands, given, forked, held: int, documents: int, decayed, segments):
     """A forked walk forward (`_walk`), its documents in place: each chunk's outputs, the memory entering
     each chunk, the row's last memory, and the walk's table at its end. The walk takes the row's segments in
     token order, a segment a document's tokens within one chunk, each from the memory entering it: the
@@ -1136,7 +1136,13 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
     chunk's forms (`Derived.prepare`'s `window`), the state stored in its document's slot where the segment
     ends a storing document, and the chunk's next memory where it ends the chunk. The segments are at most
     the chunks and the documents, each one window's work, as many as a row laid a chunk a document took; no
-    value is sized by the documents' bound."""
+    value is sized by the documents' bound. Its scan states its trips, the chunks and the bound's documents
+    (a count of its work, `instrumentation.step_flops`, and a checkify of a vmap of it hold), but walks a
+    window only below `segments`, every row's most (`_most_segments`, outside the rows' map, so a step past
+    them is skipped, not selected away); a row's own steps past its last segment change nothing. Every step
+    walking a window, a 2048-token row of three documents at chunk 64 took 1290.8 ms of armada's CPU at a
+    bound of 2048 against 43.2 at its own (row 7952); a while_loop stopping at the last segment counted
+    nothing and broke a checkify of a vmap (train 1239, #3785)."""
     loads, stores, begun, adds, entry, turning = forked
     chunks, count = loads.shape
     place = jnp.arange(count)
@@ -1144,25 +1150,26 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
     # Each segment's first token, in token order: each document's first, and a chunk's first where its
     # document continues; past the row's segments, a sentinel past its tokens.
     marks = (starts | (place == 0)).reshape(-1)
-    events = chunks + documents
-    origins = jnp.nonzero(marks, size=events, fill_value=chunks * count)[0]
-    following = jnp.concatenate([origins[1:], jnp.full((1,), chunks * count, origins.dtype)])
+    # One place past the segments' most: the walk stops at its first sentinel, each segment's end the next
+    # origin (the row's end at its last).
+    origins = jnp.nonzero(marks, size=chunks + documents + 1, fill_value=chunks * count)[0]
     # Every carry typed as each operand that reaches it varies (a checked `shard_map`'s manual axes): the
     # table's given memories, the chunks' operands (a laid erase's corrections among them) and the fork's.
     reaching = (given, *jax.tree.leaves(operands), *jax.tree.leaves(forked))
     decayed = varying_like(decayed, *reaching)
     zero_decay, zero = jnp.zeros_like(decayed), varying_like(jnp.zeros_like(given[0]), *reaching)
 
-    def segment(carried, at):
+    def segment(carried, first, after):
+        """The walk past the segment from token place `first` up to `after` (the next segment's origin, or
+        the row's end), a real one: the loop stops at the first sentinel."""
         (chunk_in, held_chunk, leaving), table, outputs, entering = carried
-        first, after = at
-        real = first < chunks * count
+        # A row's sentinel past its own segments walks its last chunk's first window, its result dropped.
         chunk, origin = jnp.minimum(first // count, chunks - 1), first % count
         through = jnp.where(after // count == chunk, after % count - 1, count - 1)
         # Entering a new chunk, its memory is the one the chunk before left.
         new = chunk != held_chunk
         memory_in = jax.tree.map(lambda a, b: jnp.where(new, a, b), leaving, chunk_in)
-        entering = entering.at[chunk].set(jnp.where(real & new, memory_in[1], entering[chunk]))
+        entering = entering.at[chunk].set(jnp.where(new, memory_in[1], entering[chunk]))
         continuing = ~starts[chunk, origin]
         memory = jnp.where(continuing, memory_in[1],
                            _opened(given, table, loads[chunk, origin], adds, entry, begun[chunk, origin],
@@ -1171,12 +1178,12 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
         decay = jnp.where(continuing, memory_in[0], zero_decay)
         left = forms.step((decay, memory), window)
         out = forms.mapped(window, (decay, memory))
-        rows = (place >= origin) & (place <= through) & real
+        rows = (place >= origin) & (place <= through)
         outputs = outputs.at[chunk].set(jnp.where(rows[:, None], out, outputs[chunk]))
-        table = table_stored(table, jnp.where(real, stores[chunk, through], 0), left[1])
-        ends = real & (through == count - 1)
+        table = table_stored(table, stores[chunk, through], left[1])
+        ends = through == count - 1
         leaving = jax.tree.map(lambda a, b: jnp.where(ends, a, b), left, leaving)
-        return ((memory_in, jnp.where(real, chunk, held_chunk), leaving), table, outputs, entering), None
+        return (memory_in, chunk, leaving), table, outputs, entering
 
     shaped = jax.eval_shape(lambda chunk: forms.mapped(forms.prepare(chunk), (decayed, zero)),
                             jax.tree.map(lambda x: x[0], operands))
@@ -1184,8 +1191,30 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
     start = (((decayed, zero), varying_like(jnp.asarray(-1), origins), (decayed, zero)), table,
              varying_like(jnp.zeros((chunks, *shaped.shape), shaped.dtype), *reaching),
              varying_like(jnp.zeros((chunks, *zero.shape), zero.dtype), *reaching))
-    ((_, _, last), table, outputs, entering), _ = jax.lax.scan(segment, start, (origins, following))
+    def walked(carried, at):
+        first = origins[at]
+        moved = segment(carried, first, origins[at + 1])
+        return jax.tree.map(lambda new, old: jnp.where(first < chunks * count, new, old), moved, carried)
+
+    def step(carried, at):
+        return jax.lax.cond(at < segments, walked, lambda carried, at: carried, carried, at), None
+
+    ((_, _, last), table, outputs, entering), _ = jax.lax.scan(step, start, jnp.arange(chunks + documents))
     return outputs, entering, last[1], table
+
+
+def _most_segments(h, added: bool, turned: bool):
+    """A forked walk's most segments over its rows and heads (`_forked_steps`'), each chunk's first token
+    and each document's, from its loads `[rows, heads, chunks, C]` (`_taken_up`); None for an unforked
+    walk. The skip it bounds runs where the fork's layout is the same for the whole map: under an outer
+    vmap over differing layouts it is batched there, and the walk's conditional runs both branches, as the
+    scan before it did (correct, its saving gone)."""
+    _, forked = _taken_up(h, added, turned)
+    if forked is None:
+        return None
+    loads = forked[0]
+    marks = (loads >= 0) | (jnp.arange(loads.shape[-1]) == 0)
+    return jnp.max(jnp.sum(marks, axis=(-2, -1)))
 
 
 def _forked_replay(replay, operands, given, forked, held: int):
@@ -1254,14 +1283,14 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0, documents: int = 0
     document that took it up and joins the walk's at the token that stored it; a given memory's is its own,
     the walk's last memory's cotangent the row's. Its sizes are the tokens' and the table's, none the
     documents' bound's but the operands' own."""
-    def entered(operands, h):
+    def entered(operands, h, segments):
         memory, forked = _taken_up(h, added, turned)
         # The walk's decay in the forms' own carry dtype (`Derived.init`'s, the state's float32 at least).
         empty = forms.init({})[0]
         decayed = varying_like(jnp.zeros((width,), empty.dtype), *jax.tree.leaves(operands))
         if forked is not None:
             outputs, entering, last, table = _forked_steps(forms, operands, memory, forked, held, documents,
-                                                           decayed)
+                                                           decayed, segments)
             return outputs, last, (entering, table)
         prepared = jax.vmap(forms.prepare)(operands)
 
@@ -1271,8 +1300,8 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0, documents: int = 0
         carried, entering = jax.lax.scan(one, (decayed, memory), prepared)
         return jax.vmap(forms.mapped)(prepared, entering), carried[1], entering[1]
 
-    def walking_one(operands, h):
-        outputs, last, kept = entered(operands, h)
+    def walking_one(operands, h, segments=None):
+        outputs, last, kept = entered(operands, h, segments)
         return (outputs, last), None if recomputed else kept
 
     def replayed_one(operands, h):
@@ -1287,10 +1316,10 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0, documents: int = 0
             return outputs, h
         return _forked_replay(forms.replay, operands, memory, forked, held)
 
-    def adjoint_one(operands, h, kept, d_outputs, d_final):
+    def adjoint_one(operands, h, kept, d_outputs, d_final, segments=None):
         memory, forked = _taken_up(h, added, turned)
         if kept is None:
-            kept = entered(operands, h)[2]
+            kept = entered(operands, h, segments)[2]
         if forked is None:
             def one(d_h, chunk):
                 chunk, h, d_out = chunk
@@ -1306,15 +1335,22 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0, documents: int = 0
         # transposes as one map.
         return jax.vmap(jax.vmap(function))
 
+    def walking(operands, h):
+        # Every row's most segments outside the rows' map, the walk's skip a conditional, not a select.
+        segments = _most_segments(h, added, turned)
+        return each(functools.partial(walking_one, segments=segments))(operands, h)
+
     def adjoint(entering, primals, cotangent, live):
         operands, h = primals
-        d_operands, d_h = each(adjoint_one)(operands, h, entering, *cotangent)
+        segments = _most_segments(h, added, turned)
+        d_operands, d_h = each(functools.partial(adjoint_one, segments=segments))(operands, h, entering,
+                                                                                    *cotangent)
         # A reset's booleans take no cotangent (never `live`), held in their place.
         whole = jax.tree.leaves(({**operands, **d_operands}, d_h))
         return tuple(whole[index] for index in live)
 
     return contracted("test_the_chunked_delta_rule_holds_every_order")(
-        generation.linear_tangent(each(walking_one), adjoint, each(replayed_one), kind=Protected(),
+        generation.linear_tangent(walking, adjoint, each(replayed_one), kind=Protected(),
                                   live_cotangents=True))
 
 
@@ -1460,7 +1496,7 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands, parameters: tu
                                   nested=False, kind=KernelGlue()))(*operands)
 
 
-def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, state=None):
+def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, chunk_size: int, state=None):
     """The memory this shard of a sequence the mesh axis `axis` splits enters its slice with, `[B, Hv, Dk,
     Dv]` in at least fp32, inside a `shard_map` that holds `axis` manual: fla's context-parallel
     summary-then-states (fla/ops/cp/chunk_delta_h.py, fla-core 0.5.2). A delta rule's slice is affine in
@@ -1472,10 +1508,11 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
     (`recurrence_algebra.entering`) from the row's `state` (zero where None) on the first shard is the memory
     each enters, `E_r = F_{r-1} E_{r-1} + Z_{r-1}`; a slice that starts a document (its first token's
     `starts`) enters from zero. `rule(query, key, value, g, beta, state, *, starts)` returns `(output, final
-    memory)`. Taken as `rule`'s final memory from `[0 | I]` with values `[v | 0]` in fp32 operands, the
-    summary cost 6.2 to 6.7 times its pass (M-JS-142) and the 27B's 9.99 ms on a GH200 at 4096 tokens against
-    2.15 for the layer's bf16 operands, whose transfer, though, rounded its identity block's products to
-    bf16 at 3.5 times the pass's distance from float64 (M-JS-143c)."""
+    memory)`; `chunk_size` its chunk, the transfer's too. Taken as `rule`'s final memory from `[0 | I]`
+    with values `[v | 0]` in fp32 operands, the summary cost 6.2 to 6.7 times its pass (M-JS-142) and the
+    27B's 9.99 ms on a GH200 at 4096 tokens against 2.15 for the layer's bf16 operands, whose transfer,
+    though, rounded its identity block's products to bf16 at 3.5 times the pass's distance from float64
+    (M-JS-143c)."""
     batch, _, heads, columns = value.shape
     width = key.shape[-1]
     wide = at_least_fp32(value.dtype)
@@ -1483,7 +1520,8 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
     begins = (jnp.zeros((batch,), bool) if starts is None else jnp.asarray(starts[:, 0], bool)) & (shard > 0)
     zero = rows_like(jnp.zeros((batch, heads, width, columns), wide), value)
     _, write = rule(query, key, value, g, beta, zero, starts=starts)
-    span = algebra.Span(transferred(query, key, value, g, beta, starts), write.astype(wide))
+    span = algebra.Span(transferred(query, key, value, g, beta, starts, chunk_size=chunk_size),
+                        write.astype(wide))
     memory = algebra.entering(span, axis, None if state is None else state.astype(wide))
     return jnp.where(begins[:, None, None, None], 0.0, memory)
 
@@ -1494,10 +1532,16 @@ def transferred(query, key, value, g, beta, starts=None, *, chunk_size: int = CH
     starts in it (`starts`), each chunk's transition chained onto the chunks' before it in fp32 from the
     operands as they are given (`scan.derive_scan`'s walk carrying its transfer: `prepare(...,
     transition=True)`, `step`), as fla-core 0.5.2's context parallelism chains its transfer from bf16
-    `k^T w` (ops/cp/chunk_delta_h.py:304-315), no product's result rounded on the way. The forms' memory is
-    one value column wide and zero: the transfer reads no value."""
+    `k^T w` (ops/cp/chunk_delta_h.py:304-315), no product's result rounded on the way, in the delta rule's
+    chunks at the keys' width (`held_chunk`, the portable math's). The forms' memory is one value column wide
+    and zero: the transfer reads no value. A slice of no tokens transfers the memory as it is (the
+    identity)."""
     _, work, _, key = _grouped(query, key, value, None)
-    width = key.shape[-1]
+    rows, length, heads, width = key.shape
+    if length == 0:
+        identity = jnp.broadcast_to(jnp.eye(width, dtype=work), (rows, heads, width, width))
+        return varying_like(rows_like(identity, value), key, g, beta, starts)
+    chunk_size = held_chunk(chunk_size, width)
     forms = _delta_forms(delta=True, scale=1.0, per_key=g.ndim == 4, width=width, columns=1,
                          work=jnp.dtype(work), reset=starts is not None, bound=None)
     unread = jnp.zeros((*value.shape[:3], 1), work)

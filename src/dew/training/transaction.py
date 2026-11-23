@@ -192,7 +192,7 @@ def _only_when(due, taken, kept, operand):
 
 def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: Committed | None,
             batch: Batch, stepped: jax.typing.ArrayLike, consumed: jax.Array, *, split: int,
-            part: Batch | None = None, passes: int | None = None) -> tuple:
+            part: Batch | None = None, passes: jax.Array | None = None) -> tuple:
     """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
     `batch`, wherever it ran: the advanced state, its step counting `stepped` and its clock the source
     examples its microbatch `consumed` (`TrainState.consumed`, where the run keeps one), the loss, the
@@ -254,7 +254,7 @@ def _unforwarded(traced: jcore.Jaxpr, computed: tuple[bool, ...], variables, com
 def outcome_of(step: jax.Array, clock: jax.Array | None, microstep: jax.Array, advanced: jax.Array,
                loss: jax.Array, aux: Aux, committed: Committed | None, batch: Batch,
                stepped: jax.typing.ArrayLike, consumed: jax.Array, *, split: int, part: Batch | None = None,
-               passes: int | None = None) -> tuple:
+               passes: jax.Array | None = None) -> tuple:
     """`outcome` of the fields it reads of the states (their `step`, `consumed` clock and `microstep`,
     the advanced state's `advanced`), and nothing else of them: the step and clock the advanced state
     takes, then `outcome`'s other results. A host step runs it as a program of its own over those fields
@@ -1277,7 +1277,7 @@ class Transaction:
         if holds_back(current.opt_state) and self.aux_shape.effects is not None:
             raise ValueError("an objective with post-step effects (Aux.effects) under an optimizer that "
                              "holds updates back, whose held calls' effects no update applies; accumulate "
-                             "gradients with Trainer(accumulation=k)")
+                             "gradients with Trainer(update=UpdateBatch(batches=k))")
         if holds_back(current.opt_state) and current.deferred is None:
             raise ValueError("the state holds no tokens waiting for the update its optimizer holds back "
                              "(TrainState.deferred): build it with Trainer.initial_state, or restore it "

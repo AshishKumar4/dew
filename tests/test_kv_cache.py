@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from generation_support import INTERPRETS
+from generation_support import COMPILES_FOR_TPU, INTERPRETS
 from model_support import TINY_DECODER, kept_by_slot
 from reference_error import assert_as_exact
 
@@ -306,16 +306,47 @@ def test_a_quantized_caches_scales_and_codes_are_its_formats_quotients(quantized
     np.testing.assert_array_equal(np.asarray(codes).view(np.uint8), np.asarray(rounded).view(np.uint8))
 
 
+@pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 @pytest.mark.parametrize("declared", ["highest", "float32", "F32_F32_F32", "bfloat16"])
-def test_a_v5e_refuses_the_tpu_paged_decode_wherever_a_run_declares_fp32_products(declared):
+def test_a_v5e_refuses_the_tpu_paged_decode_wherever_a_run_declares_fp32_products(tpu, declared):
     """The TPU paged decode's requirement that the MXU take a run's fp32 products (`fp32_by_bf16_precise`)
-    reads the run's declaration as `precision.declares_fp32_products` names it: on a v5e, refused under
-    'highest', 'float32' and the F32_F32_F32 preset alike, served under bf16 products; the same names
-    `decode_attention.run_products` reads (where the preset was admitted and 'highest' refused)."""
+    reads the run's declaration as `precision.declares_fp32_products` names it: on v5e and v6e (row 12040),
+    refused under 'highest', 'float32' and the F32_F32_F32 preset alike, served under bf16 products; the same
+    names `decode_attention.run_products` reads (where the preset was admitted and 'highest' refused)."""
     (requirement,) = [each for each in TPU_PAGED_SUPPORTS if each.code == "fp32_by_bf16_precise"]
-    with generation.assumed("v5e"), jax.default_matmul_precision(declared):
+    with generation.assumed(tpu), jax.default_matmul_precision(declared):
         refusal = requirement.analysis(None)
-    assert (refusal is None) == (declared == "bfloat16"), (declared, refusal)
+    assert (refusal is None) == (declared == "bfloat16"), (tpu, declared, refusal)
+
+
+@COMPILES_FOR_TPU
+@pytest.mark.usefixtures("libtpu_shared")
+def test_v6e_paged_attention_compiles_default_and_refuses_highest_fp32_by_bf16():
+    """Row 12040: compile-only `v6e` witness for `fp32_by_bf16_precise=False`: JAX's Pallas TPU
+    `paged_attention` compiles on `v6e` at default precision and fails Mosaic lowering at `'highest'`
+    (`Bad rhs type: 256, 256`), matching the real v6e1 tier failure and `TPU_PAGED_SUPPORTS` refusal."""
+    from fla_gdn_support import KernelCase
+    from jax.experimental.pallas.ops.tpu import paged_attention as pa
+    from kernel_compile import compile_tpu_kernels
+
+    q = jax.ShapeDtypeStruct((2, 4, 128), jnp.bfloat16)
+    k = jax.ShapeDtypeStruct((2, 4, 16, 128), jnp.bfloat16)
+    v = jax.ShapeDtypeStruct((2, 4, 16, 128), jnp.bfloat16)
+    lengths = jax.ShapeDtypeStruct((2,), jnp.int32)
+    pages = jax.ShapeDtypeStruct((2, 2), jnp.int32)
+
+    def run(prec):
+        def fn(q, k, v, lengths, pages):
+            with jax.default_matmul_precision(prec):
+                return pa.paged_attention(q, k, v, lengths, pages, pages_per_compute_block=2)
+        return fn
+
+    ok, bad = compile_tpu_kernels([
+        KernelCase("v6e-default", lambda: (run(None), (q, k, v, lengths, pages))),
+        KernelCase("v6e-highest", lambda: (run("highest"), (q, k, v, lengths, pages))),
+    ], "v6e")
+    assert "error" not in ok, ok
+    assert "Bad rhs type" in bad.get("error", ""), bad
 
 
 def test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages():
