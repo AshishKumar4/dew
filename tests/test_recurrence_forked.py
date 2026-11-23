@@ -8,7 +8,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_recurrence_chunk import ADDITIVE, CHUNK, HOOKS, chunk_on, entered_draw, entering_documents, transitioned
+from test_recurrence_chunk import (
+    ADDITIVE,
+    CHUNK,
+    HOOKS,
+    chunk_on,
+    entered_draw,
+    entering_documents,
+    transitioned,
+)
 
 
 @pytest.mark.parametrize('hooks', [HOOKS[4], ADDITIVE], ids=['the delta rule', 'an additive erase'])
