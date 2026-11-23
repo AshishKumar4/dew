@@ -14,6 +14,7 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import importlib
 import json
 import logging
 import re
@@ -1034,9 +1035,10 @@ def _assemblers() -> tuple[str, ...]:
     relock or a system CUDA that moves the ptxas certifies again, where the seal, which holds the CUDA plugins
     alone, kept a verdict another ptxas judged; the nvcc wheels named it before, and no system CUDA's (row
     7309). Read once a process: neither moves while it runs."""
-    from jax._src.lib.mosaic_gpu import _mosaic_gpu_ext
-
-    provider = _mosaic_gpu_ext._get_assembler()
+    # JAX's own module of the extension, which loads it from whichever build provides it: its native
+    # attributes are read off the module, which no stub states.
+    extension = importlib.import_module("jax._src.lib.mosaic_gpu")._mosaic_gpu_ext
+    provider = extension._get_assembler()
     kind = provider.split("(", 1)[0]
     if (ptxas := re.search(r"ptxas: ([^,)]+)", provider)) is None:
         return (kind,)
