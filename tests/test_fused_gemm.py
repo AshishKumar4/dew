@@ -369,6 +369,24 @@ def test_a_regions_price_reads_its_declared_precision_and_every_bank_of_its_matr
     assert found.fused_seconds >= 4 * 4096 * 4096 * 2 / rate, found
 
 
+def test_a_fused_regions_launch_is_launched_once():
+    """A biased bf16 product's fused arm (`fused_gemm.priced`: the product and its epilogue one launch, no
+    prologue) pays its target's fixed launch once: priced on an H100 that launches in no time and on one
+    that launches in a second, its seconds differ by that second alone, where the product's kernel was
+    charged a launch of its own beside its launch's (row 8814's review). Shapes only."""
+    import dataclasses
+
+    x, w = (jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((8192, 4096), (4096, 4096)))
+    bias = jax.ShapeDtypeStruct((4096,), jnp.float32)
+    found = {}
+    for launch in (0.0, 1.0):
+        with generation.assumed(dataclasses.replace(generation.gpu_target("sm90"), launch_seconds=launch)):
+            found[launch] = fused_gemm.analysis(
+                lambda x, w, bias: fused_gemm.product(x, w, out_dtype=jnp.float32) + bias, x, w, bias)
+    assert found[0.0].fused_seconds is not None, found[0.0]
+    assert found[1.0].fused_seconds == found[0.0].fused_seconds + 1.0, found
+
+
 def test_an_integer_regions_product_is_xlas_own_dot_with_nothing_to_analyse():
     """`fused_gemm.product` of int8 operands (a quantized dot's, int32 out) is XLA's own dot, nothing fused:
     `fused_gemm.analysis` of its region reports no stage and no price, and `fused` gives XLA's value."""
