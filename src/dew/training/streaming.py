@@ -356,48 +356,59 @@ def laid_start(trainer, run, dataset, resume) -> Start:
     except LayoutRefused:
         start = None
     plan = trainer._compiler.unplaced if start is not None else None
-    trainer._laid_out(dataclasses.replace(given, host=STREAMED))
-    # The device plan's climb and plans undone: the streamed step is priced at the rung its host step starts
-    # at, the objective's own or the one its remat policy states (`StepCompiler.unsearched_rung`), as it
-    # compiles there.
-    devices_compiler, devices_rung = trainer._compiler, Rung.of(active, xla_defaults=False, narrow=True)
-    rung.put(active)
-    trainer._compiler = devices_compiler.anew()
-    trainer._compiler.unsearched_rung(active)
-    laid = trainer._started(resume, known)
-    dtype = compute_dtype(trainer, laid)
-    unpriced = None
+    # The device plan's search, released wherever the run turns from it: the streamed layout taken, or
+    # the choice raising (`StepCompiler.abandoned`).
+    devices_compiler = trainer._compiler
     try:
-        device = None if plan is None else priced(plan, dtype)
-    except Unpriced as rated:
-        device, unpriced = None, str(rated)
-    held = plan is not None
-    # A held device plan gives way to the streamed step only where it is priced dearer (`chosen`), and the
-    # streamed step is never priced under its update on the host (`host_update_seconds`): a held plan
-    # priced no dearer than that update, or priced not at all (its dtype rated by no datasheet), is the run's
-    # whatever the streamed step compiles to, so it compiles nothing (M-MC-26: the whole host program, 56 s
-    # of an H100's start, for a device plan of 1.8 s against an update of 4.5 s). Every process decides as
-    # the first does, as each takes the plan it chooses.
-    update = host_update_seconds(host_updated(laid, companion_mesh(trainer.device_mesh)), host_memory_rate())
-    kept = None if not held else (
-        f"the device plan's step is unpriced, which keeps its plan ({unpriced})" if device is None
-        else f"the device plan's step is priced no dearer than the streamed step's update on the host alone "
-             f"({update:.3g} s)" if device.seconds <= update else None)
-    # The first process's reason, which every process takes.
-    kept = broadcast_from_process_zero(kept)
-    if kept is not None:
-        trainer.layout_choice = Choice(held, fits=False, device=device, streamed=None, refused=kept,
-                                       streams=False)
-    else:
-        with phases.scoped(trainer, trainer._compiler):
-            fits, headroom, price = streamed(trainer, laid, model_batch(batch), dtype, trainer._shape.device,
-                                             update)
-        trainer.layout_choice = Choice(held, fits, device, price, None,
-                                       streams=broadcast_from_process_zero(chosen(held, fits, device, price)),
-                                       streamed_headroom=headroom)
-    said(trainer.layout_choice)
-    if trainer.layout_choice.streams:
-        return laid
+        trainer._laid_out(dataclasses.replace(given, host=STREAMED))
+        # The device plan's climb and plans undone: the streamed step is priced at the rung its host step
+        # starts at, the objective's own or the one its remat policy states (`StepCompiler.unsearched_rung`),
+        # as it compiles there.
+        devices_rung = Rung.of(active, xla_defaults=False, narrow=True)
+        rung.put(active)
+        trainer._compiler = devices_compiler.anew()
+        trainer._compiler.unsearched_rung(active)
+        laid = trainer._started(resume, known)
+        dtype = compute_dtype(trainer, laid)
+        unpriced = None
+        try:
+            device = None if plan is None else priced(plan, dtype)
+        except Unpriced as rated:
+            device, unpriced = None, str(rated)
+        held = plan is not None
+        # A held device plan gives way to the streamed step only where it is priced dearer (`chosen`), and the
+        # streamed step is never priced under its update on the host (`host_update_seconds`): a held plan
+        # priced no dearer than that update, or priced not at all (its dtype rated by no datasheet), is the
+        # run's whatever the streamed step compiles to, so it compiles nothing (M-MC-26: the whole host
+        # program, 56 s of an H100's start, for a device plan of 1.8 s against an update of 4.5 s). Every
+        # process decides as the first does, as each takes the plan it chooses.
+        update = host_update_seconds(host_updated(laid, companion_mesh(trainer.device_mesh)),
+                                     host_memory_rate())
+        kept = None if not held else (
+            f"the device plan's step is unpriced, which keeps its plan ({unpriced})" if device is None
+            else f"the device plan's step is priced no dearer than the streamed step's update on the host "
+                 f"alone ({update:.3g} s)" if device.seconds <= update else None)
+        # The first process's reason, which every process takes.
+        kept = broadcast_from_process_zero(kept)
+        if kept is not None:
+            trainer.layout_choice = Choice(held, fits=False, device=device, streamed=None, refused=kept,
+                                           streams=False)
+        else:
+            with phases.scoped(trainer, trainer._compiler):
+                fits, headroom, price = streamed(trainer, laid, model_batch(batch), dtype,
+                                                 trainer._shape.device,
+                                                 update)
+            trainer.layout_choice = Choice(held, fits, device, price, None,
+                                           streams=broadcast_from_process_zero(
+                                               chosen(held, fits, device, price)),
+                                           streamed_headroom=headroom)
+        said(trainer.layout_choice)
+        if trainer.layout_choice.streams:
+            devices_compiler.abandoned()
+            return laid
+    except BaseException:
+        devices_compiler.abandoned()
+        raise
     # The device plan taken: its compiler, which holds the plan the run's first compile takes, and its rung.
     trainer._compiler = devices_compiler
     devices_rung.put(active)
