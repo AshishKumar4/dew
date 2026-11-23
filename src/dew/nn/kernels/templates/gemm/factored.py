@@ -18,8 +18,7 @@ from dew.nn.precision import power2
 from dew.nn.sharding import explicit_spec, varying_like
 
 
-def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array, *, gathered: bool = False
-             ) -> jax.Array:
+def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array) -> jax.Array:
     """`run(rows as bf16, *operands) * factor`, linear in `rows`: `run` a product of bf16 rows, each output
     row its own input row's (no gather), and `factor` a packed matrix's fp32 scales broadcast against its
     output (`formats.fp8_factor`). Its transpose is the plain one, the cotangent times its factor through
@@ -28,13 +27,11 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
     after the pullback's sum, so a scale of 2**126 under cotangents that cancel pulls back 0, not inf - inf
     (ledger 1464), each value otherwise the plain transpose's, rounded where it rounds; a replicated factor
     joins after a checked `shard_map`'s devices sum their partials. A factor of each column, which the
-    transpose sums over, stays with the cotangent, as the plain transpose has it. A `gathered` product's
-    output rows are rows of `rows` read by a table (`gemm`'s `gather`), which the pullback sums back into
-    them: its rescue moves the whole cotangent by one power, not each row by its own."""
+    transpose sums over, stays with the cotangent, as the plain transpose has it."""
     if jnp.ndim(factor) and jnp.shape(factor)[-1] != 1:
         return run(rows.astype(jnp.bfloat16), *operands) * factor
     transpose = _Transpose(run, rows.shape, rows.dtype, frozenset(jax.typeof(rows).mat.varying),
-                           explicit_spec(rows), gathered)
+                           explicit_spec(rows))
 
     def apply(residuals, moving):
         scale, ran = residuals
@@ -51,13 +48,12 @@ def factored(run: Callable, operands: tuple, factor: jax.Array, rows: jax.Array,
 @dataclasses.dataclass(frozen=True)
 class _Transpose:
     """`factored`'s transpose of `run` at rows of `shape`, typed as the rows are (`held`, their manual axes;
-    `placed`, their explicit placement), `gathered` where `run` reads them through a table."""
+    `placed`, their explicit placement)."""
     run: Callable
     shape: tuple
     dtype: jnp.dtype
     held: frozenset
     placed: jax.sharding.NamedSharding | jax.sharding.PartitionSpec | None
-    gathered: bool
 
     @functools.cached_property
     def declared(self) -> Callable:
@@ -95,7 +91,7 @@ class _Transpose:
 
     def value(self, cotangent, scale, ran):
         """The plain transpose, the cotangent times its factor pulled back; where an entry of it is not
-        finite, the moved one's (`rows_moved`, `gathered_moved`)."""
+        finite, the moved one's (`moved`)."""
         plain = self.summed(*self.pulled(cotangent * scale, ran))
 
         def moved():
@@ -103,48 +99,30 @@ class _Transpose:
             # vary over that the rows do not, the operands', from types alone.
             before = self.alone(ran, cotangent, scale)
             excess = tuple(sorted(self.operand_axes(ran) - self.held))
-            rescue = self.gathered_moved if self.gathered else self.rows_moved
-            return jnp.where(jnp.isfinite(plain), plain, rescue(cotangent, scale, ran, before, excess))
+            rescued = self.moved(cotangent, scale, ran, before, excess)
+            return jnp.where(jnp.isfinite(plain), plain, rescued)
 
         # The moved pullback where the plain one is not finite alone: each device of a sum decides alike,
         # the plain transpose summed over its axes.
         return jax.lax.cond(jnp.all(jnp.isfinite(plain)), lambda: plain, moved)
 
-    def rows_moved(self, cotangent, scale, ran, before, excess):
-        """The transpose with a factor past 1 as its significand in the cotangent and its power of two
-        (`precision.power2`) after the sum (a scale of a row, `[rows, 1]`, or of all, `[1]` or `[]`), after
-        every device's sum where it is replicated; each row moved so its largest term's binade is
-        `FACTORED_RESCUE`, shared by a sum's devices, so what cancels leaves a remainder its bf16 rows
-        hold."""
-        binade = float_bits.binade_of(scale)
-        power = jnp.where((jnp.abs(scale) > 1) & (binade < 128), binade, 0)
-        power = jax.lax.pmax(power, before) if before else power
-        near = cotangent * power2(scale, -power)
-        near = jax.lax.psum(near, before) if before else near
-        e = float_bits.binade_of(near)
-        top = jnp.max(jnp.where((e > -1024) & (e < 128), e, -1024), axis=-1, keepdims=True, initial=-1024)
-        top = jax.lax.pmax(top, excess) if excess else top
-        lift = jnp.where(top > -1024, FACTORED_RESCUE - top, 0)
-        partial, excess = self.pulled(power2(near, lift), ran)
-        if excess and not jax.typeof(power).mat.varying & set(excess):
-            return power2(self.summed(partial, excess), power - lift)
-        return self.summed(power2(partial, power - lift), excess)
-
-    def gathered_moved(self, cotangent, scale, ran, before, excess):
-        """A gathered product's rows sum back into the rows its table read, so one power moves its whole
-        cotangent: each entry's product from its cotangent's and factor's significands (the cotangent halved
-        where its own binade would carry their product past fp32's largest) and powers, moved so the largest
-        product's binade is `FACTORED_RESCUE`, then back after the sum."""
+    def moved(self, cotangent, scale, ran, before, excess):
+        """The transpose with each row moved by a power of two (`precision.power2`) so its largest
+        cotangent-times-factor product's binade is `FACTORED_RESCUE` (a row's power shared by a sum's
+        devices), and moved back after the sum, so what cancels leaves a remainder its bf16 rows hold. Each
+        product is formed from its cotangent's and factor's significands, exact powers of two apart from
+        them, and their binades, so no product overflows or flushes before it is moved (a cotangent of
+        3 * 2**126 times a factor of 3 is 9 * 2**126 moved, not inf)."""
         f = jnp.broadcast_to(scale, cotangent.shape)
-        e_c, e_f = float_bits.binade_of(cotangent), float_bits.binade_of(f)
+        e_c, e_f = (float_bits.binade_of(v) for v in (cotangent, f))
         counted = (e_c > -1024) & (e_c < 128) & (e_f > -1024) & (e_f < 128)
-        top = jnp.max(jnp.where(counted, e_c + e_f, -1024), initial=-1024)
+        e_c, e_f = jnp.where(counted, e_c, 0), jnp.where(counted, e_f, 0)
+        top = jnp.max(jnp.where(counted, e_c + e_f, -1024), axis=-1, keepdims=True, initial=-1024)
         for axes in (before, excess):
             top = jax.lax.pmax(top, axes) if axes else top
         lift = jnp.where(top > -1024, FACTORED_RESCUE - top, 0)
-        e = jnp.clip(e_f, -126, 127)
-        halved = e_c >= 126
-        near = power2((cotangent * jnp.where(halved, 0.5, 1.0)) * power2(f, -e), e + halved + lift)
+        near = power2(power2(cotangent, -e_c) * power2(f, -e_f), e_c + e_f + lift)
+        near = jax.lax.psum(near, before) if before else near
         partial, excess = self.pulled(near, ran)
         return power2(self.summed(partial, excess), -lift)
 

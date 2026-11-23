@@ -889,12 +889,12 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
 
-def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None,
-                    gather: jax.Array | None = None, *, interpret_on_cpu: bool) -> jax.Array:
-    """A packed matrix's portable product: bf16 `rows` (those `gather` reads, where given) times its decoded
-    bf16 `matrix` (grouped by `group_sizes`, or dense), each product exact and summed in fp32."""
+def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None, *,
+                    interpret_on_cpu: bool) -> jax.Array:
+    """A packed matrix's portable product: bf16 `rows` times its decoded bf16 `matrix` (grouped by
+    `group_sizes`, or dense), each product exact and summed in fp32."""
     summed = gemm(rows, matrix, group_sizes, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT,
-                  interpret_on_cpu=interpret_on_cpu, gather=gather)
+                  interpret_on_cpu=interpret_on_cpu)
     assert isinstance(summed, jax.Array), "an unpaired product has one output"
     return summed
 
@@ -1140,7 +1140,8 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     With `group_sizes`, `matrix` is a bank of experts' matrices (`NvFp4`'s group axis, row 4516) and `lhs`
     their sorted rows: each group's rows times its expert's matrix, each times its expert's factor, frozen
     (no gradient reaches the bank), each tile decoding its group's expert's stages in place on the packed
-    kernel; with `gather` besides, its rows `lhs[gather]`, read where they lie (`gemm`'s `gather`). With
+    kernel; with `gather` besides, its rows `lhs[gather]`, taken before the product so each route's
+    cotangent pulls back apart before its token's sum (`factored`). With
     `layer` (a traced index) too, `matrix` is a stack of banks (`NvFp4.layer`: a scanned load's, row
     4861) read at that layer in place, as `gemm` reads a stacked matrix's (`gemm`'s `layer`): the packed
     kernel's groups read the layer's matrices from its first where they lie in the stack, no slice of it
@@ -1148,11 +1149,15 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     if layer is not None and group_sizes is None:
         raise ValueError("a stack of banks' layer is a grouped call's")
     bank = matrix if layer is None else matrix.layer(layer)
-    rows = lhs.astype(jnp.bfloat16)
+    # A gathered call's rows taken before the product: each routed row's cotangent, times its expert's
+    # factor, pulled back apart (`factored`) and summed into its token's after, as `take`'s transpose sums
+    # them, so a route whose products cancel past fp32's largest keeps another route's small one.
+    routed = lhs if gather is None else jnp.take(lhs, gather, axis=0)
+    rows = routed.astype(jnp.bfloat16)
     launch = grouped_matmul.MosaicPackedGmm()
     words, scales = (jnp.asarray(field if group_sizes is not None else field[None])
                      for field in (matrix.words, matrix.scales))
-    count = rows.shape[0] if gather is None else gather.shape[0]
+    count = rows.shape[0]
     sizes = jnp.asarray([count], jnp.int32) if group_sizes is None else group_sizes.astype(jnp.int32)
     first = None
     if layer is not None:
@@ -1165,28 +1170,28 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     # The launch's matrix is the bank as it lies (`NvFp4`, each matrix's factor deferred to the epilogue):
     # its words and block scales, its shape and dtype the bfloat16 matrices it decodes to.
     bound = launch.bind(spec(rows), jax.tree.map(spec, _undeferred(words, scales)), spec(sizes), (), (), None,
-                        spec(first), spec(gather), out_dtype='float32', trans_rhs=False,
+                        spec(first), None, out_dtype='float32', trans_rhs=False,
                         interpret=interpret_on_cpu, dense=group_sizes is None, exact_sums=True)
     tile = _planned(launch, bound)
     if selection.select(NVFP4, PackedCase(tile, count, whole=not automatic_axes())).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
 
-        def packed(r, words, scales, sizes, gather, first):
-            return _packed(r, words, scales, sizes, gather, first, launch, interpret_on_cpu,
+        def packed(r, words, scales, sizes, first):
+            return _packed(r, words, scales, sizes, None, first, launch, interpret_on_cpu,
                            dense=group_sizes is None)
 
         product: Callable[..., jax.Array] = packed
-        operands = (words, scales, sizes, gather, first)
+        operands = (words, scales, sizes, first)
     else:
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
         # product's, whatever precision the program defaults to (`decoded_product`).
         product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
-        operands = (bank.decoded(), group_sizes, gather)
+        operands = (bank.decoded(), group_sizes)
     factor = bank.factor if group_sizes is None else jnp.repeat(
         bank.factor, sizes, total_repeat_length=count)[:, None]
     # Each row's (its group's) factor joins the sum as `factored` takes a row's: a cancelling cotangent
     # under a factor past fp32's largest pulls back its finite sum.
-    return factored(product, operands, factor, lhs, gathered=gather is not None).astype(out_dtype)
+    return factored(product, operands, factor, routed).astype(out_dtype)
 
 
 def _undeferred(words, scales) -> NvFp4:
