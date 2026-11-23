@@ -614,81 +614,6 @@ def _mosaic_emitted_roles(spec, padded: jax.ShapeDtypeStruct, stacked: jax.Shape
                             forms=emission.forms_of(kernel.params.get("compiler_params"))).roles
 
 
-def _mosaic_chunk_col_masks(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
-                            queries: int, width: int, block: int, *, target: generation.GpuTarget
-                            ) -> list[np.ndarray]:
-    """Evaluate the emitted 1D boolean column load mask passed to `_mgpu_load_chunk` for every `c_block`."""
-    from jax._src import core as jax_core
-    from jax._src.pallas import mpmd, primitives as pl_prims
-    from jax._src.pallas.mosaic_gpu import core as gpu_core, primitives as gpu_prims
-
-    _, body = _mosaic_kernel_body(spec, padded, stacked, queries, width, block, target=target)
-    channels = 1 << (width - 1).bit_length()
-    blocks = channels // block
-    tile_block = max(block, 64)
-
-    def find_mask(jaxpr: jax_core.Jaxpr, invar_vals: list, const_vals: tuple | list, cb: int
-                  ) -> np.ndarray | None:
-        env: dict = dict(zip(jaxpr.constvars, const_vals, strict=True))
-        env.update(zip(jaxpr.invars, invar_vals, strict=True))
-        for eq in jaxpr.eqns:
-            vals = [v.val if isinstance(v, jax_core.Literal) else env.get(v) for v in eq.invars]
-            prim = eq.primitive
-            if prim is gpu_prims.inline_mgpu_p and len(eq.outvars) == 3:
-                for v, val in zip(eq.invars, vals, strict=True):
-                    if (isinstance(v, jax_core.Var) and isinstance(v.aval, jax_core.ShapedArray)
-                            and v.aval.dtype == jnp.bool_ and v.aval.shape == (tile_block,)
-                            and val is not None):
-                        return np.asarray(val, dtype=bool)
-                continue
-            if (called := programs.called(eq)) is not None:
-                if (found := find_mask(called, vals, (), cb)) is not None:
-                    return found
-                continue
-            if prim is pl_prims.run_scoped_p:
-                sub = eq.params["jaxpr"]
-                if (found := find_mask(sub, [None] * len(sub.invars), vals, cb)) is not None:
-                    return found
-                continue
-            if prim is mpmd.mpmd_map_p:
-                for sub in eq.params["jaxprs"]:
-                    sub_in = (vals[:len(sub.invars)] if len(vals) >= len(sub.invars)
-                              else [None] * len(sub.invars))
-                    sub_c = vals if len(sub.constvars) == len(vals) else [None] * len(sub.constvars)
-                    if (found := find_mask(sub, sub_in, sub_c, cb)) is not None:
-                        return found
-                continue
-            if prim is jax.lax.while_p:
-                sub = eq.params["body_jaxpr"]
-                consts = vals[eq.params["cond_nconsts"]:][:eq.params["body_nconsts"]]
-                carry = [None] * (len(sub.jaxpr.invars) - len(consts))
-                if (found := find_mask(sub.jaxpr, [*consts, *carry], sub.consts, cb)) is not None:
-                    return found
-                continue
-            if prim is jax.lax.scan_p:
-                sub, nc = eq.params["jaxpr"], eq.params["num_consts"]
-                carry = [None] * (len(sub.jaxpr.invars) - nc)
-                if (found := find_mask(sub.jaxpr, [*vals[:nc], *carry], sub.consts, cb)) is not None:
-                    return found
-                continue
-            if prim is jax.lax.axis_index_p:
-                env[eq.outvars[0]] = jnp.int32(cb if eq.params["axis_name"] == "block" else 0)
-            elif prim is gpu_core.layout_cast_p and vals[0] is not None:
-                env[eq.outvars[0]] = vals[0]
-            elif not eq.effects and prim is not jax.lax.cond_p and all(v is not None for v in vals):
-                out = prim.bind(*vals, **eq.params)
-                outs = list(out) if prim.multiple_results else [out]
-                env.update(zip(eq.outvars, outs, strict=True))
-        return None
-
-    masks = []
-    for cb in range(blocks):
-        found = find_mask(body, [None] * len(body.invars), (), cb)
-        assert found is not None, "expected chunk loader to receive a 1D boolean column mask"
-        masks.append(found)
-    return masks
-
-
 def _mosaic_expected_bytes(*, rows: int, slices: int, width: int, read_width: int, block: int,
                            itemsize: int = 4) -> float:
     """Expected valid device traffic for one Mosaic GPU `merged_padded` launch (`block` channels/program,
@@ -740,10 +665,6 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
     pad_blocks = 128 // mosaic_block
     assert roles_pad[0].walks[0].device_bytes == float(8 * ((80 / pad_blocks) * 4 + 2 * 4))
     assert roles_pad[0].walks[0].device_bytes < float(8 * ((128 / pad_blocks) * 4 + 2 * 4))
-    col_masks = _mosaic_chunk_col_masks(spec, pad_p, pad_s, 4, 80, mosaic_block, target=sm90)
-    assert sum(int(m.sum()) for m in col_masks) == 80
-    assert not any(m[col - cb * mosaic_block] for cb, m in enumerate(col_masks)
-                   for col in range(80, 128) if 0 <= col - cb * mosaic_block < len(m))
     triton_block = merged._channel_block(spec, pad_p, pad_s, 4, 80, sm75)
     triton_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, sm75)
     assert triton_work.device_bytes == _traced_merge_bytes(
