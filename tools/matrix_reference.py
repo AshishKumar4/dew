@@ -35,8 +35,11 @@ BLOCK = 16
 
 def serve(source: str) -> None:
     """The torch side: fla's layer (`FLA_LAYER_SIDE`'s `fla_layer`, its source at `source`) answering each
-    request (`delta_rule_support.fla_request`), its startup line fla's release and the device."""
-    import fla
+    request (`delta_rule_support.fla_request`), its startup line fla's release and the device. fla itself
+    imported by the layer's source alone, so this tool's other variant's environment needs none
+    (`COHORTS`)."""
+    from importlib.metadata import version
+
     import reference_worker
     import torch
 
@@ -46,7 +49,7 @@ def serve(source: str) -> None:
     def answer(request):
         return namespace["fla_layer"](request, str(request["form"]), str(request["dtype"]))
 
-    reference_worker.serve(answer, f"{fla.__version__} {torch.cuda.get_device_name()}")
+    reference_worker.serve(answer, f"{version('fla-core')} {torch.cuda.get_device_name()}")
 
 
 def recorded(answered, label: str) -> dict:
@@ -73,16 +76,20 @@ def recorded(answered, label: str) -> dict:
             truth = matrix._leaves(exact(*widened(matrix._split(named, inputs))))
         return answer(inputs), {name: np.asarray(value, np.float64) for name, value in truth.items()}
 
-    dew = None
-    if named["kernel"] != "tpu":
-        step = jax.jit(matrix._step(named, named["kernel"]))
-
-        def dew(inputs):
-            return {name: np.asarray(value) for name, value in
-                    matrix._leaves(step(*matrix._split(named, inputs))).items()}
-
+    dew = (None if named["kernel"] == "tpu"
+           else functools.partial(dew_leaves, named, jax.jit(matrix._step(named, named["kernel"]))))
     return record_case(label, answer.draw if hasattr(answer, "draw") else functools.partial(
         matrix._inputs, named), evaluate, store_inputs=False, summary=True, dew=dew)
+
+
+def dew_leaves(named: dict, step, inputs: dict) -> dict:
+    """Dew's own cell `named`'s `step` on a recording's draw `inputs`, its leaves host arrays: what the
+    recording's count is sized paired with (`record_case`'s `dew`)."""
+    import numpy as np
+    import recurrence_matrix as matrix
+
+    leaves = matrix._leaves(step(*matrix._split(named, inputs)))
+    return {name: np.asarray(value) for name, value in leaves.items()}
 
 
 def fla_answers(worker):
