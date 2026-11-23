@@ -114,6 +114,23 @@ def test_every_module_a_stores_code_imports_is_in_its_closure():
         assert fresh(IMPORTED.format(module=module), platforms="cpu") == [], module
 
 
+TREES_LEFT = """
+import ast, gc, json
+from dew._code import closure
+closure("dew.nn.kernels.templates.report")
+gc.collect()
+print(json.dumps(sum(isinstance(each, ast.AST) for each in gc.get_objects())))
+"""
+
+
+def test_a_closure_holds_none_of_the_source_trees_its_walk_parsed():
+    """A store's closure, its walk of Dew's source done, holds no syntax tree it parsed alive, in a fresh
+    process: the walk keeps the imports it read of each module, not its tree, where a process held every
+    module's (1.1M nodes of a cold recurrent step's 4.7M live objects, its full collection 3.9 s and its
+    exit 18 s, row 8420)."""
+    assert fresh(TREES_LEFT, platforms="cpu") == 0
+
+
 KERNELS = """
 import json
 from pathlib import Path
