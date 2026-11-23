@@ -567,7 +567,7 @@ def test_swapped_register_decode_holds_for_fp8_and_ternary_at_skinny_rows():
 def test_a_packed_products_rescue_keeps_an_explicit_meshs_row_placement():
     """A ternary product under an Explicit mesh, its rows split over two CPU devices and its codes whole:
     cotangents of 4 and 4 against codes +1 and -1 at a scale of 2**126 pull back to 0 through the rescue,
-    and +4 and -2 to 2**127, the gradient placed as the rows are (row 1464)."""
+    and 4 and 2 to 2**127, the gradient placed as the rows are (row 1464)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
@@ -579,7 +579,7 @@ def test_a_packed_products_rescue_keeps_an_explicit_meshs_row_placement():
                               NamedSharding(mesh, PartitionSpec("data")))
         pull = jax.jit(lambda r, dy: jax.vjp(lambda x: gemm.ternary_weight_product(
             x, weights, quantize_activations=False, out_dtype=jnp.float32), r)[1](dy)[0])
-        for second, expected in ((4.0, 0.0), (-2.0, 2.0 ** 127)):
+        for second, expected in ((4.0, 0.0), (2.0, 2.0 ** 127)):
             dy = jax.device_put(jnp.zeros((16, 64), jnp.float32).at[0, 0].set(4.0).at[0, 1].set(second),
                                 NamedSharding(mesh, PartitionSpec("data")))
             d_rows = pull(rows, dy)
