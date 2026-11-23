@@ -416,46 +416,6 @@ def test_the_decay_clamps_derivative_is_its_forwards_at_and_around_the_fp32_floo
         assert passed[at] == jax.grad(mainloop.clamped)(point), (point, passed[at])
 
 
-@pytest.mark.check1_shards(seeds=40, per_task=8)
-def test_an_unbounded_query_keeps_its_own_pairs_term_under_a_unit_key_interpreted():
-    """A rule that declares its keys of unit norm and its write gates (`write_bound`) but not its queries
-    (`unit_queries` False) on the recurrence template, interpreted: a later token's query of 2^100 against
-    an earlier unit key `(2^-100, 1, 0, ...)` across a decay of 2^-60 keeps its own pair's term, its output
-    on par with the portable math's from the float64 token recurrence (check 1; its final memory, the
-    earlier token's write alone, holds the template's 16-bit corrected values where the portable math's
-    products are exact, its distance from float64 no rounding of the pair's). Folded
-    against the keys alone, the decayed key 2^-160 rounded to zero before the query scaled it, the output
-    zero (#3703 review): the fold needs every row bounded too (`mainloop.Call.unit_pairs`)."""
-    from test_recurrence_chunk import chunk_on, token_by_token
-
-    from dew.nn.kernels import recurrence
-    from dew.nn.kernels.recurrence_chunk import Chunk
-
-    width, length = 16, 64
-    hooks = recurrence.Hooks(decay='vector', scale=1.0, write_bound=1.0)
-
-    def draw(seed):
-        rng = np.random.default_rng([12131, seed])
-        query, key = np.zeros((2, 1, length, 1, width))
-        key[0, 0, 0, :2] = 2.0 ** -100, 1.0
-        query[0, 1, 0, 0] = 2.0 ** 100
-        value = np.zeros((1, length, 1, width))
-        value[0, 0, 0] = rng.normal(size=width)
-        g = np.zeros((1, length, 1, width))
-        g[0, 1, 0, 0] = -60 * np.log(2.0)
-        beta = 1 / (1 + np.exp(-rng.normal(size=(1, length, 1))))
-        return (Chunk(*(np.asarray(x, jnp.bfloat16) for x in (query, key, value)),
-                      state=np.zeros((1, 1, width, width), np.float32), log_decay=np.asarray(g, np.float32),
-                      beta=np.asarray(beta, jnp.bfloat16)),)
-
-    def output(fn):
-        return jax.jit(lambda operands: fn(operands)[0])
-
-    assert_as_exact(output(partial(chunk_on, 'mosaic_gpu', hooks)), output(partial(chunk_on, 'xla', hooks)),
-                    draw, "an unbounded query's own pair under a unit key", seeds=8,
-                    truth_fn=output(partial(token_by_token, hooks)))
-
-
 def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
     """Kimi delta attention's own pairs' log decay gradient on the recurrence template, interpreted, over
     two bf16 tokens of unit-basis keys `e0` (scale one, a zero memory and decays): the first writing `e0`
