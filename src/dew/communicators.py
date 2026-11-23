@@ -438,7 +438,7 @@ class Resident:
             self.settled.add(key)
 
     def admit(self, made: Collectives, needs: Needs, room: Mapping[int, int],
-              free: Callable[[int], int | None], loaded: Loaded) -> None:
+              free: Callable[[int], int | None], loaded: Loaded | None = None) -> None:
         """Admit a compiled program's communicators (`made`), refusing it, naming the bytes, before it runs,
         where they and the process's earlier ones, each counted once, with the runtime's need more than the
         room Dew left outside XLA's pool (`room`, by ordinal, as `sized_pool` left it), or where those it
@@ -452,14 +452,15 @@ class Resident:
         XLA states it is no measure of what that takes (a GPU step's states its host code alone, 2 to 4 KB,
         row 12131's probe), so a program not yet run is charged what a first run measured loading one took,
         beside the communicators and load of every other admitted on its GPUs that has not run (`ahead`),
-        which what is free now has not counted either. Each refusal names the comparison that failed, before
+        which what is free now has not counted either; a program of no `loaded` is charged its communicators
+        alone. Each refusal names the comparison that failed, before
         the program runs on any of its GPUs."""
         with self.lock:
             self._forget_released()
             held = self.held | made
             needed = needs.needed(held, room, runtime=True)
             communicating = needs.needed(made, room, runtime=False, made=self.held)
-            loads = self.ahead(loaded)
+            loads = {} if loaded is None else self.ahead(loaded)
             added = {gpu: communicating.get(gpu, 0) + loads.get(gpu, 0) for gpu in {*communicating, *loads}}
             now = {gpu: answered for gpu in room if (answered := free(gpu)) is not None}
             new = made.beyond(self.held)
@@ -476,7 +477,7 @@ class Resident:
                                        "outside XLA's pool now", {gpu: added.get(gpu, 0) for gpu in now},
                                        {gpu: now[gpu] for gpu in now})
             self.held = held
-            if loaded.key not in self.settled:
+            if loaded is not None and loaded.key not in self.settled:
                 self.pending.setdefault(loaded.key, Pending(
                     loaded.gpus, {gpu: communicating.get(gpu, 0) for gpu in loaded.gpus}))
 
