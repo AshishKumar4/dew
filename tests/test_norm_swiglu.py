@@ -830,17 +830,35 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
     assert_runs_per_shard(_checked_shard_run, _checked_shard_operands, specs, mesh,
                           "per shard over an explicit mesh", seeds=SEEDS["per shard"], truth_fn=portable)
 
-    # Packed SwiGLU (`[..., 2, H]`) also runs per shard on an Explicit mesh with axes=None (splitting rows
-    # or features) and refuses splitting the pair axis `-2` (row 822).
+    # On an all-Explicit mesh, the operand's own Explicit type comes before named logical `axes` for norms,
+    # unpacked SwiGLU and packed SwiGLU alike (`_shard_spec`, row 12226): replicated norm inputs under
+    # `RESIDUAL` and feature-split SwiGLU inputs under `MLP_HIDDEN` both run per shard without `shard_map`
+    # rejecting `in_specs`.
     from dew.nn.kernels import selection
-    from dew.nn.sharding import MLP_HIDDEN
+    from dew.nn.sharding import MLP_HIDDEN, RESIDUAL
+
+    def typed_over_axes(x, branch, scale, ds, dy, gate, up, dout):
+        seam = evaluated(fused_seam(1e-5, x.dtype, offset=True, after_cast=True, axes=RESIDUAL),
+                         (x, branch, scale), (ds, dy))
+        return seam, evaluated(fused_swiglu(axes=MLP_HIDDEN), (gate, up), dout)
+
+    disagreeing = [PartitionSpec()] * 5 + [PartitionSpec(None, None, "data")] * 3
+    with jax.set_mesh(mesh):
+        disagreeing_ops = placed_on(_checked_shard_operands(), disagreeing, mesh)
+        assert sum(eq.primitive.name == "shard_map"
+                   for eq in traced(typed_over_axes, *disagreeing_ops)) >= 2
+    assert_runs_per_shard(typed_over_axes, _checked_shard_operands, disagreeing, mesh,
+                          "explicit type over logical axes", seeds=SEEDS["per shard"], truth_fn=portable)
+
+    # Packed SwiGLU (`[..., 2, H]`) also runs per shard on an Explicit mesh with axes=None or MLP_HIDDEN
+    # (splitting rows or features) and refuses splitting the pair axis `-2` (row 822).
 
     def draw_packed(draw: int = 0):
         return (jax.random.normal(drawn_key(33, draw), (4, 8, 2, 24)),
                 jax.random.normal(drawn_key(34, draw), (4, 8, 24)))
 
     def packed_run(a, d):
-        return evaluated(fused_packed(), (a,), d)
+        return evaluated(fused_packed(axes=MLP_HIDDEN), (a,), d)
 
     def packed_ref(a, d):
         return evaluated(packed_gated_product("swiglu", implementation="xla"), (a,), d)
@@ -851,6 +869,7 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
             sharded_p, sharded_d = placed_on(draw_packed(), [spec_p, out_spec], mesh)
             with generation.assumed("sm90"):
                 assert norm_swiglu.packed_swiglu_kernel("pallas", sharded_p) == "pallas"
+                assert norm_swiglu.packed_swiglu_kernel("pallas", sharded_p, axes=MLP_HIDDEN) == "pallas"
             assert any(eq.primitive.name == "shard_map"
                        for eq in traced(packed_run, sharded_p, sharded_d))
             assert not any(eq.primitive.name == "reshard"
@@ -919,6 +938,73 @@ def test_packed_gated_product_pair_reshard_preserves_other_explicit_axes():
                 np.testing.assert_array_equal(np.asarray(got_dx), np.asarray(expected_dx))
                 assert padded(got_y) == tuple(out_spec), (impl, padded(got_y), out_spec)
                 assert padded(got_dx) == tuple(in_spec), (impl, padded(got_dx), in_spec)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_packed_mlp_model_trains_on_an_explicit_data_mesh():
+    """A `Trainer` run of a packed-MLP model (`GatedMLP(..., packed=True)`, `mlp.py:264-269`) on
+    `MeshSpec(explicit=('data',))` matches one device's loss and parameter gradients, and on `sm90` selects
+    the fused `swiglu` kernel per shard without resharding (rows 822, 12228)."""
+    import optax
+    from recording import RecordingTracker
+
+    from dew.data import Memory
+    from dew.distributed.batches import shard_batch
+    from dew.nn.mlp import GatedMLP
+    from dew.objectives.base import Aux, Objective, Step
+    from dew.training import Layout, MeshSpec, Trainer
+
+    class PackedMlpObjective(Objective):
+        def __init__(self):
+            self.model = GatedMLP(hidden_features=24, out_features=16, activation="swiglu",
+                                  packed=True, dtype=jnp.bfloat16)
+
+        def fresh_variables(self, key, held):
+            return self.model.init(key, jnp.ones((1, 8, 16), jnp.bfloat16))
+
+        def loss(self, variables, batch, step):
+            prediction = self.model.apply(variables, batch["x"]).astype(jnp.float32)
+            return jnp.mean((prediction - batch["y"].astype(jnp.float32)) ** 2), Aux({})
+
+    rng = np.random.default_rng(7)
+    xs = rng.normal(size=(4, 8, 16)).astype(np.float32)
+    ys = rng.normal(size=(4, 8, 16)).astype(np.float32)
+    raw = {"x": jnp.asarray(xs, jnp.bfloat16), "y": jnp.asarray(ys, jnp.bfloat16)}
+
+    def rows():
+        return Memory([{"x": np.asarray(raw["x"][i]), "y": np.asarray(raw["y"][i])}
+                       for i in range(4)]).read("streamed").batch(4)
+
+    def run(mesh):
+        objective = PackedMlpObjective()
+        trainer = Trainer(objective, optax.sgd(1.0), key=0, mesh=mesh,
+                          layout=Layout(min_shard=1, tolerance=1.))
+        tracker = trainer.tracker = RecordingTracker()
+        start = jax.tree.map(np.asarray, trainer.initial_state().variables["params"])
+        state = trainer.fit(rows(), steps=1, log_every=1, checkpoint_final=False)
+        assert int(state.step) == 1
+        end = jax.tree.map(np.asarray, state.variables["params"])
+        grads = jax.tree.map(lambda a, b: a - b, start, end)
+        losses = [entry["train/loss"] for _, entry in tracker.scalars if "train/loss" in entry]
+        return trainer, objective, float(losses[-1]), grads
+
+    _, _, one_loss, one_grads = run(MeshSpec().build(jax.devices()[:1]))
+    explicit_trainer, objective, explicit_loss, explicit_grads = run(MeshSpec(explicit=("data",)))
+    assert "gate_up_proj" in explicit_grads
+    np.testing.assert_allclose(explicit_loss, one_loss, rtol=1e-5, atol=1e-5)
+    for got, want in zip(jax.tree.leaves(explicit_grads), jax.tree.leaves(one_grads), strict=True):
+        assert np.any(np.abs(got) > 0)
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
+    state0, _, _ = explicit_trainer.place()
+    with jax.set_mesh(explicit_trainer.device_mesh):
+        sharded = shard_batch(explicit_trainer.device_mesh, raw)
+        with generation.assumed("sm90"), generation.routes() as routes:
+            graph = traced(lambda v, b: objective.scalar_loss(v, b, step)[0], state0.variables, sharded)
+    assert {route.kernel for route in routes if route.choice == "swiglu"} == {"pallas"}
+    assert any(eq.primitive.name == "shard_map" for eq in graph)
+    assert not any(eq.primitive.name == "reshard" for eq in graph)
 
 
 def _checked_shard_operands(draw: int = 0):
