@@ -1255,11 +1255,11 @@ def test_a_step_this_dew_wrote_after_an_earlier_masked_runs_is_held_to_its_templ
                "spared": False}
     undecayed = _saved_optimizer(run, earlier)
     LMRunConfig(optim=active).save(str(run))
-    assert json.loads((run / "earlier-masked-decay.json").read_text())["steps"] == [1]
     # Step 1, the earlier Dew's, read across; step 2 written under the active decay.
     assert int(_checkpointed(run, active, 2).step) == 2
     with pytest.raises(ValueError):
         _checkpointed(run, undecayed, 3)
+    assert json.loads((run / "earlier-masked-decay.json").read_text())["steps"] == [1]
 
 
 @pytest.mark.parametrize("optimizer", ["adamw", "adam"], ids=["adamw", "adam-coupled"])
