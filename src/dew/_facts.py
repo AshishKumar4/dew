@@ -71,7 +71,7 @@ def of(fact: Callable, reads: Facts) -> Facts:
     of a value by one fact alone (a program's executables by the refusals of the launches its trace read,
     `dew.nn.kernels.options`)."""
     name = f"{fact.__module__}.{fact.__qualname__}"
-    return {key: answered for key, answered in reads.items() if key[0] == name}
+    return {key: answered for key, answered in reads.items() if isinstance(key, tuple) and key[0] == name}
 
 
 def replay(reads: Facts) -> None:
