@@ -1103,10 +1103,11 @@ def _saved_optimizer(tmp_path, earlier):
 def test_a_run_whose_decay_its_options_masked_off_resumes_its_optimizers_state_as_it_trained(tmp_path, case):
     """A run saved while its optimizer's options masked its decay off (`optimizer_opts={"mask": False}`),
     unspared or in a param group that did not spare (`ParamGroup.spared`), whatever the config spared, loads
-    an optimizer that decays nothing there (its decay 0), each leaf of its state at the path, shape and
-    dtype the earlier Dew's held, and whose step updates as that one's did; Adam's coupled decay of 0, which
-    held no decay step, holds its tree's every node as it did. AdamW's masked decay step held an empty state
-    of a mask's, which a decay of 0 holds bare: a checkpoint of it restores
+    an optimizer that decays nothing there (its decay 0), each leaf of its state, in order, of the shape and
+    dtype the earlier Dew's held, at its path but where a masked coupled decay's step led its chain, and
+    whose step updates as that one's did; Adam's coupled decay of 0, which held no decay step, holds its
+    tree's every node as it did. A masked decay step held an empty state of a mask's, which a decay of 0
+    holds bare or, coupled, not at all: a checkpoint of it restores
     (`test_a_checkpoint_whose_decay_its_options_masked_off_restores_into_the_optimizer_its_record_loads`)."""
     held = MASKED[case]
     optimizer = _saved_optimizer(tmp_path, held["optim"]).build(None)
@@ -1116,7 +1117,9 @@ def test_a_run_whose_decay_its_options_masked_off_resumes_its_optimizers_state_a
         assert str(jax.tree.structure(state)) == held["treedef"]
     leaves = [[jax.tree_util.keystr(path), list(leaf.shape), str(leaf.dtype)]
               for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]]
-    assert leaves == held["state"], leaves
+    assert [leaf[1:] for leaf in leaves] == [leaf[1:] for leaf in held["state"]], leaves
+    if case != "adam-coupled-unspared":
+        assert leaves == held["state"], leaves
     updates, _ = optimizer.update(jax.tree.map(jnp.ones_like, params), state, params)
     assert jax.tree.map(lambda leaf: leaf.tolist(), updates) == held["updates"]
 
