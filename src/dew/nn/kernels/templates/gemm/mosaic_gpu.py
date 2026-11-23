@@ -559,7 +559,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             scale_gmems=scale_gmems, scale_per=scale_per, mx_gmems=mx_gmems, gather_gmem=gather_gmem,
             when_gmem=when_gmem, chained_gmems=chained_gmems, bounded=bounded, packed_format=packed_format)
         stepped_at = functools.partial(
-            _gmm_stepped_at, family=family, tiles=tiles, prologue=(prologue, prologue_axes),
+            _gmm_stepped_at, family=family, tiles=tiles, dtype=lhs.dtype, prologue=(prologue, prologue_axes),
             matrices=matrices, transpose=(transpose_lhs, transpose_rhs), interpret=bool(interpret),
             mx=mx_scales is not None, packed_rows=packed_rows, packed_format=packed_format, dense=dense,
             chosen=None if when is None else chained,
@@ -656,16 +656,15 @@ def _chained_walked(chained: tuple, tiles: Tiles, dtype, transpose_lhs: bool, de
         _gmm_walked(rows, None, None, None, tiles, dtype, transpose_lhs, dense, interpret)[0][0], matrix))
 
 
-def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, prologue: tuple, matrices: dict,
+def _gmm_stepped_at(wg, tile, *, family: mosaic.Family, tiles: Tiles, dtype, prologue: tuple, matrices: dict,
                     transpose: tuple, interpret: bool, mx: bool, packed_rows: bool, scaled: tuple,
                     exact_sums: bool, dense: bool = False, chosen=None, packed_format: str | None = None,
                     **refs) -> tuple[Callable, Callable | None]:
-    """Dew: consumer `wg`'s step of `tile` (`_gmm_step`), `refs` its side tiles: its share of the rows, its
-    idleness (`_idle`), one-consumer grouped row bound (`_row_bound`, `Family.bounded`), and prefetch."""
+    """Dew: consumer `wg`'s step of `tile` (`_gmm_step`), idleness, row bound (`_row_bound`), and prefetch."""
     rows = pl.ds(tiles.share_row(wg), tiles.share)
     (hook, hook_axes), (transpose_lhs, transpose_rhs) = prologue, transpose
     idle = _idle(tiles, tile[0], tile[1], wg)
-    within = _row_bound(tiles, tile[0], tile[1], dense)
+    within = _row_bound(family, tiles, dtype, tile[0], tile[1], dense)
     step_family = family if within is None else family.bounded(within)
     step = functools.partial(
         _gmm_step, family=step_family, prologue=hook, prologue_axes=hook_axes, mine_rows=rows, idle=idle,
@@ -1601,10 +1600,18 @@ def _idle(tiles: Tiles, group: "row_tiles.GroupInfo", row_start, consumer) -> ja
     return (first >= group.actual_end) | (first + tiles.share <= group.actual_start)
 
 
-def _row_bound(tiles: Tiles, group: "row_tiles.GroupInfo", row_start, dense: bool) -> jax.Array | None:
-    """Live rows `[0, rows)` of a one-consumer grouped tile (`tiles.sharing == 1`) before its group's end
-    (`Issuer.bounded`, rows 5623, 7091); None on dense calls or multi-consumer tiles."""
-    if dense or tiles.sharing != 1:
+def uses_row_bound(family: mosaic.Family, tiles: Tiles, dtype, *, dense: bool,
+                   staged_rows: bool = False) -> bool:
+    """Single bounded-MMA eligibility rule shared by `_row_bound` and `pricing.bounded_registers` (rows 5623,
+    7091): one-consumer grouped non-fp32 `gmm` on an issuer whose `bounded()` binds a bound."""
+    return (not staged_rows and not dense and tiles.sharing == 1
+            and jnp.dtype(dtype) != jnp.float32 and family.bounded(0) is not family)
+
+
+def _row_bound(family: mosaic.Family, tiles: Tiles, dtype, group: "row_tiles.GroupInfo", row_start,
+               dense: bool) -> jax.Array | None:
+    """Live rows `[0, rows)` of a one-consumer grouped tile before its group's end (`uses_row_bound`)."""
+    if not uses_row_bound(family, tiles, dtype, dense=dense):
         return None
     return jnp.clip(group.actual_end - row_start, 0, tiles.block_m).astype(jnp.int32)
 

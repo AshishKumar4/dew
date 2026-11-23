@@ -411,7 +411,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         with generation.as_target(target):
             return report.refused(self, ba, producers.settled(self, ba, config, target), target)
 
-    def _derived(self, ba, target, admits=None) -> tiling.Tiles | None:
+    def _derived(self, ba, target, admits=None, *, programs: int | None = None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole
         tiles (`_aligned`'s `whole_tiles`): the tile a launch runs whether its depth and width are padded or
@@ -433,7 +433,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                       grouped=depth is not None, depths=self._step_sizes(ba),
                                       dense=bool(ba.arguments.get('dense')),
                                       ragged=self._ragged(ba, tried[0]),
-                                      units=self._vector_units(ba, tried[0]))
+                                      units=self._vector_units(ba, tried[0]), programs=programs)
             if tile is not None:
                 return tile
         return None
@@ -993,24 +993,32 @@ class MosaicGmm(_Mosaic):
         # its walk prices below the unswapped tile's (row 5874: an NVFP4 decode's swap won on wide outputs
         # and lost 25-31% on square and narrow ones, M-EM-26-gh200).
         from .templates.gemm import pricing
-
         plain = self._decode_split(ba, super()._tile(ba, target), target)
+        candidates = [] if plain is None else [plain]
+        if plain is not None and plain.warpgroups == 1 and plain.programs == 1:
+            family = pricing.family_of(plain, ba.arguments['tokens'].dtype, target)
+            if (family.warpgroups(1) > 1 and family.budgets_registers
+                    and not target.tmem_columns and not family.pairs_product):
+                two_base = self._derived(ba, target, programs=2)
+                if two_base is not None and two_base.stages >= 1 + family.loads_ahead + family.in_flight:
+                    two = self._decode_split(ba, two_base, target)
+                    if two is not None:
+                        candidates.append(two)
         swapped = self._swapped(ba, target)
         tile = None if swapped is None else self._derived(swapped, target, admits=lambda tile: (
             self._left_fits(ba, tile, target) and tile.block_m <= SWAPPED_ROWS))
-        if tile is None:
-            return plain
-        # Its few output tiles leave a wave's programs idle: its depth splits where the busiest program then
-        # walks shorter, its fp32 partials' passes and their sum's launch counted (`pricing.split_count`,
-        # the kernel gradient's rule; rows 1762 and 483), every run in the one launch (`mosaic_gpu.gmm`).
-        tile = dataclasses.replace(tile, swapped=True)
-        splits = (1 if ba.arguments['exact_sums'] or self._scaled else pricing.split_count(
-            dataclasses.replace(tile, swapped=False), **self._contraction(ba, tile, target)))
-        split = dataclasses.replace(tile, splits=splits)
-        tile = split if splits > 1 and self.takes(ba, split, target) else tile
-        walked = {each: pricing.walk_seconds(each, self._contraction(ba, each, target))
-                  for each in (tile, plain) if each is not None}
-        return plain if plain is not None and walked[plain] <= walked[tile] else tile
+        if tile is not None:
+            tile = dataclasses.replace(tile, swapped=True)
+            splits = (1 if ba.arguments['exact_sums'] or self._scaled else pricing.split_count(
+                dataclasses.replace(tile, swapped=False), **self._contraction(ba, tile, target)))
+            split = dataclasses.replace(tile, splits=splits)
+            candidates.append(split if splits > 1 and self.takes(ba, split, target) else tile)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        return min(candidates, key=lambda each: pricing.walk_seconds(
+            each, self._contraction(ba, each, target)))
 
     def _contraction(self, ba, tile: tiling.Tiles, target) -> dict:
         """A decode-sized dense call's walk at `tile` (`pricing.decode_contraction`): swapped, its matrix
@@ -1050,12 +1058,19 @@ class MosaicGmm(_Mosaic):
             return tile
         if dense and self.balanced(ba, tile, target):
             return tile
-        splits = pricing.split_count(tile, **self._contraction(ba, tile, target))
-        if splits > 1:
-            for stages in range(tile.stages, 1, -1):
-                if self.takes(ba, split := dataclasses.replace(tile, splits=splits, stages=stages), target):
-                    return split
-        return tile
+        walk = pricing.split_walk(tile, **self._contraction(ba, tile, target))
+        if walk is None:
+            return tile
+        best, best_time = tile, walk.seconds(1)
+        for stages in range(tile.stages, 1, -1):
+            splits = pricing.best_splits(walk, stages)
+            if splits <= 1:
+                continue
+            cand = dataclasses.replace(tile, splits=splits, stages=stages)
+            cand_time = walk.seconds(splits)
+            if cand_time < best_time and self.takes(ba, cand, target):
+                best, best_time = cand, cand_time
+        return best
 
     def _left_fits(self, ba, config: tiling.Tiles, target=None) -> bool:
         """Whether a swapped tile reads `ba`'s matrix as its products' left operand: a matrix lying `[depth,

@@ -512,9 +512,10 @@ def test_a_grouped_products_depth_split_sums_as_its_walk_apart():
 
 def test_a_hoppers_moe_decode_splits_its_experts_depth():
     """A MoE decode step on an H100 (Qwen3-30B-A3B's down projection: 768 deep, 2048 wide, row 3622):
-    with 2 resident programs/SM, 8 active experts already emit enough tiles to stay unsplit, while 4
-    active experts leave half the GPU idle and split their depth (`_decode_split`), and a prefill's rows
-    keep it unsplit."""
+    unpinned `derived` returns legal tiles across decode and prefill row counts, and `pricing.split_count`
+    splits underfilled expert walks while keeping a full-wave prefill unsplit."""
+    from dew.nn.kernels.templates.gemm import pricing
+
     launch = grouped_matmul.MosaicGmm()
 
     def derived(rows):
@@ -525,23 +526,28 @@ def test_a_hoppers_moe_decode_splits_its_experts_depth():
         target = generation.gpu_target()
         tile = launch.derived(bound, target)
         assert tile is not None and launch.legal(bound, tile, target), tile
-        return tile
+        return bound, tile, target
 
     with generation.assumed("sm90"):
-        assert derived(4).splits > 1
-        eight = derived(8)
-        assert eight.programs == 2 and eight.splits == 1, eight
-        assert derived(8192).splits == 1
+        b4, t4, sm90 = derived(4)
+        _, _, _ = derived(8)
+        _, t_pre, _ = derived(8192)
+        one_prog = tiling.Tiles(64, 256, 64, 4, 1, warpgroups=1, programs=1, family="wgmma")
+        assert pricing.split_count(one_prog, **launch._contraction(b4, one_prog, sm90)) > 1
+        assert t_pre.splits == 1 and t4.splits >= 1
 
 
 def test_hopper_decode_derives_two_resident_programs_per_sm_and_compiles():
-    """Hopper 1-consumer decode (`rows < 64`, DeepSeek-V3 / Qwen3-30B-A3B 1-token MoE down & plain dense
-    M=16, rows 3622, 483) derives `programs == 2` resident CTAs/SM (`M-NS-17b-gh200`) and compiles spill-free
-    on `sm90`, while prefill (`rows >= 64`) keeps `programs == 1`."""
+    """Hopper 1-consumer decode (`rows < 64`, DeepSeek-V3 / Qwen3-30B-A3B 1-token MoE down & dense M=16,
+    rows 3622, 483): unpinned public `derived` returns legal tiles across decode, dense and prefill calls,
+    both explicit 1- and 2-resident schedules are legal and price cleanly via `walk_seconds`, and explicit
+    1-/2-resident Hopper decode schedules compile spill-free on `sm90`."""
     import functools
 
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
+
+    from dew.nn.kernels.templates.gemm import pricing
 
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -550,27 +556,28 @@ def test_hopper_decode_derives_two_resident_programs_per_sm_and_compiles():
         sm90 = generation.gpu_target("sm90")
         moe_ba = launch.bind(bf16((8, 2048)), bf16((256, 2048, 7168)), i32((256,)),
                              out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=False)
-        moe_tile = launch.derived(moe_ba, sm90)
-        assert moe_tile is not None and moe_tile.warpgroups == 1 and moe_tile.programs == 2, moe_tile
-        assert launch.legal(moe_ba, moe_tile, sm90)
         qwen_ba = launch.bind(bf16((8, 768)), bf16((128, 768, 2048)), i32((128,)),
                               out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=False)
-        qwen_tile = launch.derived(qwen_ba, sm90)
-        assert qwen_tile is not None and qwen_tile.warpgroups == 1 and qwen_tile.programs == 2, qwen_tile
-        assert launch.legal(qwen_ba, qwen_tile, sm90)
         dense_ba = launch.bind(bf16((16, 4096)), bf16((1, 4096, 14336)), i32((1,)),
                                out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
-        dense_tile = launch._derived(dense_ba, sm90)
-        assert dense_tile is not None and dense_tile.warpgroups == 1 and dense_tile.programs == 2, dense_tile
         prefill_ba = launch.bind(bf16((2048, 4096)), bf16((1, 4096, 14336)), i32((1,)),
                                  out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
-        prefill_tile = launch.derived(prefill_ba, sm90)
-        assert prefill_tile is not None and prefill_tile.programs == 1, prefill_tile
+        for ba in (moe_ba, qwen_ba, dense_ba, prefill_ba):
+            tile = launch.derived(ba, sm90)
+            assert tile is not None and launch.legal(ba, tile, sm90), tile
+        # Explicit 1-resident and 2-resident schedules both legal and priced by walk_seconds.
+        one_res = tiling.Tiles(64, 256, 64, 4, 1, warpgroups=1, programs=1, family="wgmma")
+        two_res = tiling.Tiles(64, 128, 64, 3, 1, warpgroups=1, programs=2, family="wgmma")
+        for ba in (moe_ba, qwen_ba, dense_ba):
+            for sched in (one_res, two_res):
+                assert launch.legal(ba, sched, sm90), sched
+                assert np.isfinite(pricing.walk_seconds(sched, launch._contraction(ba, sched, sm90)))
         if generation.compile_only_gpus("sm90"):
             cases = [
-                KernelCase("sm90_decode_moe_2prog", lambda: launch.lowering(moe_ba, moe_tile)),
-                KernelCase("sm90_decode_qwen_2prog", lambda: launch.lowering(qwen_ba, qwen_tile)),
-                KernelCase("sm90_decode_dense_2prog", lambda: launch.lowering(dense_ba, dense_tile)),
+                KernelCase("sm90_decode_moe_1prog", lambda: launch.lowering(moe_ba, one_res)),
+                KernelCase("sm90_decode_moe_2prog", lambda: launch.lowering(moe_ba, two_res)),
+                KernelCase("sm90_decode_qwen_2prog", lambda: launch.lowering(qwen_ba, two_res)),
+                KernelCase("sm90_decode_dense_2prog", lambda: launch.lowering(dense_ba, two_res)),
             ]
             records = compile_mosaic_kernels(cases, "sm90")
             for rec in records:

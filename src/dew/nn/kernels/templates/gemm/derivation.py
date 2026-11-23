@@ -28,22 +28,10 @@ from dew.nn.kernels.templates.gemm import pricing
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 
 
-def _decode_two_program(family, target, rows: int, tiled) -> Tiles | None:
-    """Register-accumulated producer-fed 1-consumer decode (`rows < role_rows`, e.g. Hopper wgmma):
-    `family.programs(1)` assumes the 1-program register raise (248 regs -> 1 CTA/SM), starving DRAM
-    bandwidth (`M-NS-17b-gh200`: 51.8% vs Triton 75.6% at 2 CTAs/SM, rows 3622, 483). Prefer a
-    staged-busy 2-program tile when half-SMEM and 2-program consumer registers hold it."""
-    if not (rows < family.role_rows and family.warpgroups(1) > 1 and family.budgets_registers
-            and not target.tmem_columns and not family.pairs_product):
-        return None
-    two_tile, _ = tiled(1, 2)
-    if two_tile is not None and two_tile.stages >= 1 + family.loads_ahead + family.in_flight:
-        return two_tile
-    return None
-
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
-            units: tuple[int, int, int] = (1, 1, 1), dense: bool = False) -> Tiles | None:
+            units: tuple[int, int, int] = (1, 1, 1), dense: bool = False,
+            programs: int | None = None) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
     in preference order, which share its facts but their loaders and registers) for a call whose output has
     `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
@@ -142,12 +130,10 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # balanced side, and with it each operand's reads a FLOP, at least one consumer's (CUTLASS's split, 2-7%
     # faster on every H100 scoreboard row); where no tile of theirs holds, one. Each at the most programs
     from dew.nn.kernels import generation
-
     with generation.as_target(target):
         for consumers in dict.fromkeys((most if whole else 1, 1)):
-            if consumers == 1 and (two_tile := _decode_two_program(family, target, rows, tiled)) is not None:
-                return two_tile
-            held = [tiled(consumers, programs) for programs in range(family.programs(consumers), 0, -1)]
+            program_counts = (range(family.programs(consumers), 0, -1) if programs is None else (programs,))
+            held = [tiled(consumers, count) for count in program_counts]
             tile = next((tile for tile, balanced in held if balanced), None)
             if tile := tile or next((tile for tile, _ in held if tile is not None), None):
                 return tile

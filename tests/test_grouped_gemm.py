@@ -2258,6 +2258,58 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
         for eq in grouped_mmas), grouped_mmas
     assert dense_mmas and all(len(eq.invars) == 3 for eq in dense_mmas), dense_mmas
 
+    # Verify the typed mma_p row bound derives from group metadata (`actual_end - row_start`, clipped), not a
+    # constant (rows 5623, 7091).
+    bound_ops: list[set[str]] = []
+
+    def _trace_mma_bounds(jaxpr, outer_defs: dict, outer_bind: dict):
+        defs = {**outer_defs}
+        platform_idx: dict = {}
+        for eqn in jaxpr.eqns:
+            for outv in eqn.outvars:
+                defs[outv] = eqn
+            if eqn.primitive.name == "platform_index":
+                platforms = eqn.params.get("platforms", ())
+                if "cuda" in platforms:
+                    platform_idx[eqn.outvars[0]] = platforms.index("cuda")
+                continue
+            if eqn.primitive.name == "mma" and len(eqn.invars) == 4:
+                seen_vars, stack, ops = set(), [eqn.invars[3]], set()
+                while stack:
+                    var = stack.pop()
+                    if var in seen_vars or not hasattr(var, "aval"):
+                        continue
+                    seen_vars.add(var)
+                    if var in outer_bind:
+                        stack.append(outer_bind[var])
+                    if (producer := defs.get(var)) is not None:
+                        ops.add(producer.primitive.name)
+                        stack.extend(producer.invars)
+                bound_ops.append(ops)
+            if eqn.primitive.name == "cond" and eqn.invars and eqn.invars[0] in platform_idx:
+                sub = eqn.params["branches"][platform_idx[eqn.invars[0]]]
+                inner = sub.jaxpr if hasattr(sub, "jaxpr") else sub
+                bind = {**outer_bind, **dict(zip(inner.invars, eqn.invars[1:], strict=False))}
+                _trace_mma_bounds(inner, defs, bind)
+                continue
+            for value in eqn.params.values():
+                subs = value if isinstance(value, (tuple, list)) else (value,)
+                for sub in subs:
+                    inner = sub.jaxpr if hasattr(sub, "jaxpr") else sub
+                    if not hasattr(inner, "eqns"):
+                        continue
+                    bind = {**outer_bind}
+                    for iv, ov in zip(inner.constvars, eqn.invars, strict=False):
+                        bind[iv] = ov
+                    for iv, ov in zip(inner.invars, eqn.invars[len(inner.constvars):], strict=False):
+                        bind[iv] = ov
+                    _trace_mma_bounds(inner, defs, bind)
+
+    _trace_mma_bounds(grouped_graph.jaxpr, {}, {})
+    assert bound_ops and all(
+        "sub" in ops and bool({"max", "min", "clamp"} & ops)
+        and bool({"get", "load", "gather", "dynamic_slice"} & ops)
+        for ops in bound_ops), bound_ops
     def dew_fn(x, w, sizes):
         with (generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"),
               tuning.pinned({grouped_matmul.MosaicGmm: tile_128})):

@@ -272,11 +272,11 @@ pushed `sm80` `64x192x64` normed biased forward from 244 modeled registers to 25
 
 def bounded_registers(family: mosaic.Family, config: "Tiles", dtype, *, dense: bool,
                       staged_rows: bool) -> int:
-    """Extra consumer registers for `family.bounded(_row_bound)` on one-consumer grouped `mma.sync` tiles."""
-    if (staged_rows or dense or config.sharing != 1 or not family.operands_in_registers
-            or jnp.dtype(dtype) == jnp.float32):
-        return 0
-    return BOUNDED_REGISTERS
+    """Extra consumer registers for `family.bounded(_row_bound)` (uses `mosaic_gpu.uses_row_bound`)."""
+    from . import mosaic_gpu
+
+    return BOUNDED_REGISTERS if mosaic_gpu.uses_row_bound(
+        family, config, dtype, dense=dense, staged_rows=staged_rows) else 0
 
 
 @dataclasses.dataclass(frozen=True)
