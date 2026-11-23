@@ -232,6 +232,38 @@ def _registry() -> _Registry:
     return _SCOPE.get() or _PROCESS
 
 
+@dataclasses.dataclass(eq=False)
+class Reading:
+    """The refusals a trace reads (`reading`): those in effect as it began, and those it records itself
+    since (a launch it certifies inline, its derivation stepping past its own refusal), never another
+    thread's, recorded into the registry it shares as it traces (theme K01-e's review P0: a held jit's
+    trace at a new shape read another scope's refusal, which JAX's trace cache then held for its own)."""
+    refused: dict[tuple[str, Hashable], frozenset[Refused]]
+    by_launch: dict[str, frozenset] = dataclasses.field(default_factory=dict)
+
+
+_READING: contextvars.ContextVar[Reading | None] = _cache.untraced(
+    contextvars.ContextVar("refusals_read", default=None))
+"""The `reading` a trace in this context reads its refusals from, None outside one."""
+
+
+@contextlib.contextmanager
+def reading(entries: tuple) -> Iterator[Reading]:
+    """A trace's reads of the refusals (`refusals_of`, `refusal_entries`) answered from `entries` (a
+    `refusal_entries` snapshot) and those it records itself within, for as long as it traces."""
+    held = Reading({(identity, config): kernels for identity, config, kernels in entries})
+    token = _READING.set(held)
+    try:
+        yield held
+    finally:
+        _READING.reset(token)
+
+
+def current_reading() -> Reading | None:
+    """The `reading` a trace in this context reads its refusals from, None outside one."""
+    return _READING.get()
+
+
 class Exhausted(ValueError):
     """A derivation that finds no config left for a launch (`base.Unfitted`): a relowering after a spill
     that ends so refuses the program (`compiled`), which no compile keeps spilling."""
@@ -481,7 +513,7 @@ def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]
     refusals, the one way a trace reads
     them (`traced_fact`), so a trace kept past a refusal of another launch holds."""
     with _GUARD:
-        registry = _registry()
+        registry = _READING.get() or _registry()
         if (found := registry.by_launch.get(identity)) is None:
             found = registry.by_launch[identity] = frozenset(
                 (config, kernels) for (launch, config), kernels in registry.refused.items()
@@ -1347,8 +1379,9 @@ def refusal_entries() -> tuple[tuple[str, Hashable, frozenset[Refused]], ...]:
     one is another than a process without it traces (`traced_fact`): a trace's key holds them, roles and
     all (`options.held_context`)."""
     with _GUARD:
-        return tuple(sorted(((identity, config, kernels)
-                             for (identity, config), kernels in _registry().refused.items()), key=repr))
+        refused = (_READING.get() or _registry()).refused
+        return tuple(sorted(((identity, config, kernels) for (identity, config), kernels in refused.items()),
+                            key=repr))
 
 
 def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
@@ -1491,8 +1524,11 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
     registry = _registry()
     with _GUARD:
         if refusal is not None:
-            registry.refused[refusal] = _joined(registry.refused.get(refusal, frozenset()) | kernels)
-            registry.by_launch.pop(refusal[0], None)
+            # Into the registry, and the reading a trace here reads, which reads its own (`reading`).
+            for held in (registry, _READING.get()):
+                if held is not None:
+                    held.refused[refusal] = _joined(held.refused.get(refusal, frozenset()) | kernels)
+                    held.by_launch.pop(refusal[0], None)
         if miss is None:
             return False
         new = miss not in registry.missed
