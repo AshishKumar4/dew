@@ -160,9 +160,8 @@ def _store_transposed_vec4(base, element, row_stride: int, col_stride: int, dest
 
 
 def _emit_transposed_16(source, store_vec, warp, c_grp, r_blk, row_start, col_start, *,
-                        rows: int, cols: int, staging: swizzling.TracedStaging, i32, byte) -> None:
+                        rows: int, cols: int, staging: swizzling.TracedStaging, c, i32, byte) -> None:
     """16-bit transposed drain: 64x8 warp tiles, staggered `dr` loads, barrel-shift + 2x `v4.u32` stores."""
-    c = functools.partial(mgpu_utils.c, ty=i32)
     n_c = cols // 8
     total = (rows // 64) * n_c
     mask_lo, mask_hi = c(0xFFFF), c(0xFFFF0000)
@@ -196,9 +195,8 @@ def _emit_transposed_16(source, store_vec, warp, c_grp, r_blk, row_start, col_st
 
 
 def _emit_transposed_32(source, store_vec, warp, c_grp, r_blk, row_start, col_start, *,
-                        rows: int, cols: int, staging: swizzling.TracedStaging, i32, byte) -> None:
+                        rows: int, cols: int, staging: swizzling.TracedStaging, c, i32, byte) -> None:
     """32-bit transposed drain: 32x4 warp tiles, staggered `dr` loads, barrel-shift + `v4.u32` store."""
-    c = functools.partial(mgpu_utils.c, ty=i32)
     n_c = cols // 4
     total = (rows // 32) * n_c
 
@@ -234,7 +232,10 @@ def _emit_transposed_pieces(smem, dest, row_start, col_start, *, swizzle: int) -
     rows, cols = (dims[0] * dims[2], dims[1] * dims[3]) if len(dims) == 4 else dims
     staging = swizzling.TracedStaging(cols * elem_bits // 8, swizzle)
     i32, i64, byte = (mgpu_ir.IntegerType.get_signless(w) for w in (32, 64, 8))
-    c = functools.partial(mgpu_utils.c, ty=i32)
+
+    def c(value: int):
+        return mgpu_utils.c(value, i32)
+
     strides, _ = mgpu_ir.MemRefType(dest.type).get_strides_and_offset()
     row_stride, col_stride = strides[0], strides[1]
     source = mgpu_utils.memref_ptr(smem)
@@ -254,7 +255,7 @@ def _emit_transposed_pieces(smem, dest, row_start, col_start, *, swizzle: int) -
     mgpu_utils.warpgroup_barrier()
     emitter = _emit_transposed_16 if elem_bits == 16 else _emit_transposed_32
     emitter(source, store_vec, warp, c_grp, r_blk, row_start, col_start,
-            rows=rows, cols=cols, staging=staging, i32=i32, byte=byte)
+            rows=rows, cols=cols, staging=staging, c=c, i32=i32, byte=byte)
     mgpu_utils.warpgroup_barrier()
 
 def _write_transposed(smem_t, piece: jax.Array, family: mosaic.Family, tiles: Tiles) -> None:
