@@ -485,12 +485,19 @@ def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]
 
 
 def refusals_at(op, arguments: tokamax.BoundArguments, target: "generation.GpuTarget | None"
-                ) -> dict[Hashable, frozenset[Refused]]:
+                ) -> frozenset[tuple[Hashable, frozenset[Refused]]]:
     """Each config a compile of this process refused `op`'s launch of `arguments` on `target` at, with the
-    kernels refused there and their roles (`refusals_of` of its identity): the one reading of a launch's
-    refusals, which `refused`, `refused_at` and `spilled_in` read at a config, and a launch none of whose
-    configs is refused reads as empty (row 6999: a fifth reader asked that alone)."""
-    return dict(refusals_of(_identity(op, arguments, target)))
+    kernels refused there and their roles (`refusals_of` of its identity, its cached snapshot as is): the one
+    reading of a launch's refusals, which `refused`, `refused_at` and `spilled_in` read at a config
+    (`_refused_kernels`), and a launch none of whose configs is refused reads as empty (row 6999: a fifth
+    reader asked that alone)."""
+    return refusals_of(_identity(op, arguments, target))
+
+
+def _refused_kernels(found: frozenset[tuple[Hashable, frozenset[Refused]]], config: Hashable
+                     ) -> frozenset[Refused]:
+    """The kernels a launch's refusals (`refusals_at`) refused at `config`, none where it refused none."""
+    return next((kernels for refused_config, kernels in found if refused_config == config), frozenset())
 
 
 def refused(op, arguments: tokamax.BoundArguments, config: Hashable,
@@ -506,7 +513,7 @@ def refused_at(op, arguments: tokamax.BoundArguments, config: Hashable,
     """The names of `op`'s kernels a compile of this process refused at `config` for `arguments` on `target`
     (`Binary.refused`: spilling, or their warpgroup MMAs serialized): a launch of several kernels (a
     recurrence's forward and backward walks) steps the one refused."""
-    return names(refusals_at(op, arguments, target).get(config, ()))
+    return names(_refused_kernels(refusals_at(op, arguments, target), config))
 
 
 def names(kernels: Iterable[Refused]) -> frozenset[str]:
@@ -520,7 +527,7 @@ def spilled_in(op, arguments: tokamax.BoundArguments, config: Hashable,
     refusal states them (`Refused`), by kernel name: what a launch's ladder steps it by (row 6744). A kernel
     whose roles its compile left unread is absent; one read and spilling none (its warpgroup MMAs serialized
     alone) states `()`."""
-    found = refusals_at(op, arguments, target).get(config, ())
+    found = _refused_kernels(refusals_at(op, arguments, target), config)
     return {kernel: roles for kernel, roles in found if roles is not None}
 
 
