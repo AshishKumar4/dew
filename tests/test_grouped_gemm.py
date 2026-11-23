@@ -1506,17 +1506,20 @@ def test_sm80_prefetch_registers_and_tgmm_prefetch_predicate():
         w = jax.ShapeDtypeStruct((1, 4096, 14336), jnp.bfloat16)
         dy = jax.ShapeDtypeStruct((8192, 14336), jnp.bfloat16)
         ba_fwd = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        ba_fwd_interp = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=True,
+                                 dense=True)
         ba_dw = tgmm.bind(x, dy, sizes, out_dtype="float32", interpret=False, dense=True)
+        ba_dw_interp = tgmm.bind(x, dy, sizes, out_dtype="float32", interpret=True, dense=True)
         t320 = tiling.Tiles(64, 320, 32, 5, 8, warpgroups=1, family="mma.sync")
         t128 = tiling.Tiles(128, 128, 32, 5, 8, warpgroups=1, family="mma.sync", programs=2)
         t128_k64 = tiling.Tiles(128, 128, 64, 3, 8, warpgroups=1, family="mma.sync")
         assert not gmm.legal(ba_fwd, t320, sm80)
         assert gmm.legal(ba_fwd, t128, sm80)
         fam = pricing.family_of(t128, jnp.bfloat16)
-        assert pricing.prefetch_registers(fam, t128, ba=ba_dw, staged_rows=True, unstaged=True,
-                                          rewritten=False) == 0
-        assert pricing.prefetch_registers(fam, t128, ba=ba_dw, staged_rows=True, unstaged=False,
-                                          rewritten=False) == 0
+        assert pricing.prefetch_registers(fam, t128, ba=ba_fwd) == 16
+        assert gmm.registers(ba_fwd, t128, sm80) == gmm.registers(ba_fwd_interp, t128, sm80) + 16
+        # TGMM skips fragment prefetch registers entirely at the call site.
+        assert tgmm.registers(ba_dw, t128, sm80) == tgmm.registers(ba_dw_interp, t128, sm80)
         cases = [
             KernelCase("sm80_fwd_128x128x32", lambda: gmm.lowering(ba_fwd, t128)),
             KernelCase("sm80_dw_128x128x32", lambda: tgmm.lowering(ba_dw, t128)),
@@ -2044,6 +2047,39 @@ def test_vmap_folds_singleton_group_sides_and_preserves_named_dispatch():
                                                         interpret_on_cpu=True)))(xs, gw)
 
 
+@lowers("sm90")
+def test_vmap_unfolded_named_triton_lowers_for_cuda():
+    """An unfoldable 2-batch grouped `gemm` / `gemm_t` lowers natively through forced `triton`
+    (`interpret_on_cpu=False`) on CUDA while refusing non-batchable forced `mosaic` or CPU-interpreted
+    `triton` with `selection.KernelRefused` (row 6104)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels import selection
+
+    b, m, k, n = 2, 64, 64, 64
+    xs = jax.ShapeDtypeStruct((b, m, k), jnp.bfloat16)
+    gw = jax.ShapeDtypeStruct((b, 2, k, n), jnp.bfloat16)
+    dys = jax.ShapeDtypeStruct((b, m, n), jnp.bfloat16)
+    gs = jax.ShapeDtypeStruct((2,), jnp.int32)
+
+    fwd = jax.vmap(lambda x, w, s: gemm.gemm(x, w, s, out_dtype=jnp.bfloat16), in_axes=(0, 0, None))
+    dw = jax.vmap(lambda x, dy, s: gemm.gemm_t(x, dy, s, out_dtype=jnp.float32), in_axes=(0, 0, None))
+    with generation.chosen(grouped_matmul="triton"), generation.routes() as seen_fwd:
+        lowered_for(fwd, (xs, gw, gs), "sm90")
+    assert any(r.kernel == "triton" for r in seen_fwd), seen_fwd
+    with generation.chosen(grouped_matmul="triton"), generation.routes() as seen_dw:
+        lowered_for(dw, (xs, dys, gs), "sm90")
+    assert any(r.kernel == "triton" for r in seen_dw), seen_dw
+    with generation.chosen(grouped_matmul="mosaic"), pytest.raises(selection.KernelRefused):
+        lowered_for(fwd, (xs, gw, gs), "sm90")
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="triton"),
+          pytest.raises(selection.KernelRefused)):
+        jax.eval_shape(
+            jax.vmap(lambda x, w, s: gemm.gemm(x, w, s, out_dtype=jnp.bfloat16, interpret_on_cpu=True),
+                     in_axes=(0, 0, None)),
+            xs, gw, gs)
+
+
 def test_underfilled_dense_gemm_derives_depth_split_and_holds_check_1():
     """Deep underfilled multi-row-tile dense GEMMs (`512x16384->1024` on sm90 and sm80 without balanced
     tail) derive `splits > 1`, while shallow-K or well-filled dense GEMMs stay unsplit (`splits == 1`,
@@ -2094,10 +2130,8 @@ def test_sm80_transposed_dx_and_tgmm_skip_regressing_fragment_prefetch():
                              trans_rhs=False, interpret=False, dense=True)
         dx_ba = launch.bind(bf16((1024, 1024)), bf16((1, 1024, 1024)), one, out_dtype="bfloat16",
                             trans_rhs=True, interpret=False, dense=True)
-        fwd_regs = pricing.prefetch_registers(fam, tile, ba=fwd_ba, staged_rows=False, unstaged=False,
-                                              rewritten=False)
-        dx_regs = pricing.prefetch_registers(fam, tile, ba=dx_ba, staged_rows=False, unstaged=False,
-                                             rewritten=False)
+        fwd_regs = pricing.prefetch_registers(fam, tile, ba=fwd_ba)
+        dx_regs = pricing.prefetch_registers(fam, tile, ba=dx_ba)
         assert fwd_regs == 16 and dx_regs == 0, (fwd_regs, dx_regs)
 
 

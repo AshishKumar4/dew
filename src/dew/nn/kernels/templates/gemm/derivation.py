@@ -29,11 +29,14 @@ from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 
 
 def _budgeted(target, shared_budget: int | None) -> tuple:
-    """`(plan_target, tpu_cap)`: on GPUs tightens `target.shared_limit` so `resources.placed` evaluates each
-    ring stage once with no double-probe; on TPUs (where `scoped_vmem` is a read-only property) returns the
-    tightened VMEM cap to check before planning (row 12099)."""
+    """`(plan_target, tpu_cap)`: on GPUs tightens positive `target.shared_limit` so `resources.placed`
+    evaluates each ring stage once with no double-probe (never writing `0`, which `generation.shared_budget`
+    treats as unset); on TPUs (where `scoped_vmem` is a read-only property) returns the tightened VMEM cap
+    (row 12099)."""
     if shared_budget is None:
         return target, None
+    if shared_budget <= 0:
+        return target, 0
     from dew.nn.kernels import generation
 
     if shared_budget >= generation.shared_budget(target):
@@ -110,6 +113,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       cluster's tiles one program's.
 
     None where no tile holds."""
+    if shared_budget is not None and shared_budget <= 0:
+        return None
     # The facts the layouts share (their instruction family's); each layout's registers bound the shapes.
     family = layouts[0]
     columns = _derived_columns(family, width, dtype, units[1])
@@ -226,8 +231,16 @@ def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], sha
                 if not candidate(shape):
                     return None
                 built = launch_of(shape)
-                if tpu_cap is not None and resources.shared_bytes(layout, built.scope(built.floor)) > tpu_cap:
-                    return None
+                if tpu_cap is not None:
+                    fit = built.floor - 1
+                    for stages in range(built.floor, built.most + 1):
+                        if resources.shared_bytes(layout, built.scope(stages)) <= tpu_cap:
+                            fit = stages
+                        else:
+                            break
+                    if fit < built.floor:
+                        return None
+                    built = dataclasses.replace(built, most=fit)
                 return [built]
 
             found = resources.placed(launches_of, layouts, target, programs=programs)

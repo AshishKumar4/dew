@@ -192,13 +192,15 @@ def test_fp32_tf32_grouped_and_dense_gemm_derives_and_compiles_on_mosaic(gpu: st
         high_ba = gmm_launch.bind(f32((256, 128)), f32((2, 128, 128)), sizes, out_dtype="float32",
                                   trans_rhs=(gpu == "sm90"), interpret=False, dense=False, exact_sums=True)
         assert gmm_launch.derived(high_ba, target) is None
+        from jax.core import ShapedArray
+
         from dew.nn import programs
 
         with generation.chosen(grouped_matmul="mosaic"):
             closed_high = jax.make_jaxpr(
                 lambda x, w: gemm.gemm(x, w, out_dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST)
             )(f32((256, 128)), f32((128, 128)))
-        assert any(any(isinstance(v.aval, jax.core.ShapedArray) and v.aval.dtype == jnp.bfloat16
+        assert any(any(isinstance(v.aval, ShapedArray) and v.aval.dtype == jnp.bfloat16
                        for v in e.outvars)
                    for e in programs.equations(closed_high.jaxpr))
         if generation.compile_only_gpus(gpu):

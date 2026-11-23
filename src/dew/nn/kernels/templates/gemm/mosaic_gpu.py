@@ -2181,8 +2181,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 
                 scaling = _tgmm_scaling(step_scales is not None, mine_depth)
                 return _walked_gradient(family, walk, staged_at, part, exact_sums, bool(interpret), scaling,
-                                        family.summed_window(tiles.block_k),
-                                        unstaged and not rewritten and not k_major)
+                                        family.summed_window(tiles.block_k))
 
             finish = functools.partial(_tgmm_finished, family=family, tiles=tiles, m=m, o_gmem=o_gmem,
                                        partials=None if tail is None else (workspace, ready))
@@ -2405,7 +2404,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
 
 
 def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_sums: bool, interpret: bool,
-                     scaling=None, window: int = 1, unstaged: bool = False):
+                     scaling=None, window: int = 1):
     """Dew: a streamed kernel gradient tile's steps (`walk`, a tile's of `mosaic.Family.persist`;
     `staged(index, slots)` their operands), summed into an fp32 tile of `shape`: as the tensor cores add, or
     with `exact_sums` each step's product summed apart and added into the running sum by an IEEE add (a
@@ -2437,8 +2436,6 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
 
         running, _ = walk(exact_step, family.zeros(shape), ())
         return running
-
-    del unstaged
 
     def step(index, slots, nothing, accumulators):
         (acc,) = accumulators
