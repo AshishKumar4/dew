@@ -241,7 +241,11 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
     `d_system` (`_key_memory_back`'s), a program a chunk and value head (persistent); `dv`, the values'
     gradient whole, in `finished_form`'s form, the rest fp32. Apart from the memory launch's walk: its last
     step's, beside the walk's carries, spilled 516 of its 720 bytes a thread on an H100 (kda-ablate at
-    7d5cd5447)."""
+    7d5cd5447). Persistent where its products read their operands from shared memory (warpgroup MMA's,
+    tcgen05's), not where they read registers (`Family.operands_in_registers`, mma.sync's): there the
+    persistent loop's registers held it at 255 on an A100 and spilled 80 bytes a thread on an sm86 and 32 on
+    an sm89, where a program a chunk compiled at 226 spilling none (scratch jsf-kvvar at d435bdd71), as the
+    doubling solve's (`mainloop.solve_persistent`, row 9637)."""
     chunk = call.chunk
     from dew.nn.kernels.templates.recurrence.mainloop_backward import _value_grads
 
@@ -295,7 +299,7 @@ def _key_values_back(dv, v, a, beta, d_system, taken, call: Call):
                          held=_key_values_held(call),
                          staging=(staging_tiles(held, (chunk, vb))[0],
                                   staging_tiles(held, (chunk, chunk))[0]),
-                         landing=landing, persistent=True)(
+                         landing=landing, persistent=not family.operands_in_registers)(
         dv, v, a, beta, d_system, taken)
 
 

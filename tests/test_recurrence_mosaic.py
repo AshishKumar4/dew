@@ -2431,7 +2431,7 @@ def _dealt(units: list, tasks: int, task: int) -> list:
     return [each for name in names for each in parts[int(name)]]
 
 
-IDENTITY_TASKS = {'sm90': 14, 'sm100': 13, 'sm80': 2, 'sm86': 1, 'sm89': 1, 'sm120': 1}
+IDENTITY_TASKS = {'sm90': 14, 'sm100': 13, 'sm80': 2, 'sm86': 2, 'sm89': 2, 'sm120': 1}
 """The shards a target's identity units are dealt among (`_dealt`): only how the work is split, every unit
 dealt to some shard whatever the count, and the count a function of the code alone, so a shard's units are its
 id's at one revision whatever a run's timings (row 7254: a count from the durations record moved each id's
