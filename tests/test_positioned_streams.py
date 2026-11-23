@@ -264,7 +264,8 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
     partition = DataPartition(index=0, count=shares)
 
     def opened():
-        reader = compile(chain, read="streamed", loading=loading).train(partition)
+        # Resumed exactly, as a run that refuses to read its data afresh is.
+        reader = compile(chain, read="streamed", loading=loading, resume="exact").train(partition)
         assert isinstance(reader, Checkpointable) and isinstance(reader, Closeable)
         return reader
 

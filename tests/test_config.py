@@ -641,6 +641,10 @@ class _Bucket:
         self.seen.append(("read", self.uri))
         return self._local().read_text()
 
+    def unlink(self, missing_ok=False):
+        self.seen.append(("unlink", self.uri))
+        self._local().unlink(missing_ok=missing_ok)
+
     def __str__(self):
         return self.uri
 
@@ -661,7 +665,8 @@ def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
 
     assert path == "gs://dew-runs/flowers/run.json"
     assert seen == [("mkdir", "gs://dew-runs/flowers"),
-                    ("write", "gs://dew-runs/flowers/run.json")]
+                    ("write", "gs://dew-runs/flowers/run.json"),
+                    ("unlink", "gs://dew-runs/flowers/earlier-masked-decay.json")]
     assert RunConfig.load("gs://dew-runs/flowers") == config
     assert seen[-1] == ("read", "gs://dew-runs/flowers/run.json")
 
@@ -1235,7 +1240,7 @@ def test_a_run_an_intermediate_dew_rewrote_beside_its_mark_resumes_as_it_trained
     LMRunConfig(optim=rewritten).save(str(run))
     (run / "earlier-masked-decay.json").write_text(json_.dumps({"unmasked_all": True}))
     loaded = LMRunConfig.load(str(run)).optim
-    assert isinstance(loaded.optimizer, AdamW), loaded
+    assert type(loaded.optimizer) is spec, loaded
     assert (loaded.decay_mask, loaded.spared) == (False, False) and loaded.optimizer.weight_decay > 0, loaded
     if decay == 0:
         with pytest.raises(ValueError):
@@ -1291,7 +1296,8 @@ def test_an_intermediate_dews_newer_local_step_decides_its_mark_once_and_for_goo
     rewritten = OptimConfig(optimizer=AdamW(weight_decay=0.0), learning_rate=1e-2, spared=False)
     run, local = tmp_path / "run", tmp_path / "local"
     _checkpointed(run, rewritten, 1)
-    _checkpointed(run, rewritten, 2, local=local, persistent=False)
+    # Its host's own tier under the run's name, as its trainer's `local_directory` places it.
+    _checkpointed(run, rewritten, 2, local=local / run.name, persistent=False)
     [newest] = [path for path in local.rglob("_CHECKPOINT_METADATA") if path.parent.name == "2"]
     metadata = json_.loads(newest.read_text())
     metadata["custom_metadata"] = {**(metadata.get("custom_metadata") or {}), "typed_optimizer": True}
