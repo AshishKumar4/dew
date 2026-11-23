@@ -1073,16 +1073,20 @@ def _check_packed_weight_product_contract(edge: str, *, kind: str) -> None:
     (dx,) = normal_draw(8550, (64, depth), scale=EDGES[edge])
     (cotangent,) = normal_draw(8551, (64, 64))
 
+    from dew.nn.sharding import automatic_axes
+
     def product(rows):
-        if kind == "fp8":
-            return gemm.fp8_weight_product(rows, weights, out_dtype=jnp.float32, interpret_on_cpu=True)
-        return gemm.ternary_weight_product(rows, weights, quantize_activations=False,
-                                           out_dtype=jnp.float32, interpret_on_cpu=True)
+        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
+        with choose:
+            if kind == "fp8":
+                return gemm.fp8_weight_product(rows, weights, out_dtype=jnp.float32, interpret_on_cpu=True)
+            return gemm.ternary_weight_product(rows, weights, quantize_activations=False,
+                                               out_dtype=jnp.float32, interpret_on_cpu=True)
 
     def plain(rows):
         return jax.lax.dot(rows.astype(jnp.bfloat16), decoded, preferred_element_type=jnp.float32)
 
     without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+    with generation.assumed("sm90"):
         assert_contract(product, (x,), (dx,), cotangent, f"{kind} weight product {edge}",
                         truth_fn=plain, plain_fn=plain, without=without)

@@ -127,21 +127,19 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
         with ctx:
             got_bit = gemm.ternary_weight_product(x_bit, w_bit, quantize_activations=True,
                                                   out_dtype=jnp.float32, interpret_on_cpu=interpret)
-        np.testing.assert_array_equal(np.asarray(got_bit[0]), np.zeros((64,), np.float32))
-        np.testing.assert_array_equal(np.asarray(got_bit), np.asarray(ref_bit))
-        with ctx:
             _, (dx, dscale) = jax.value_and_grad(
                 lambda a, s, interpret=interpret: jnp.sum(gemm.ternary_weight_product(
                     a, dataclasses.replace(w_bit, scale=s), quantize_activations=True,
                     out_dtype=jnp.float32, interpret_on_cpu=interpret)),
                 argnums=(0, 1))(x_bit, w_bit.scale)
-        np.testing.assert_array_equal(np.asarray(dx), np.asarray(dx_exact))
-        np.testing.assert_array_equal(np.asarray(dscale), np.asarray(dscale_exact))
-        with ctx:
             _, y_tan = jax.jvp(
                 lambda a, interpret=interpret: gemm.ternary_weight_product(
                     a, w_bit, quantize_activations=True, out_dtype=jnp.float32, interpret_on_cpu=interpret),
                 (x_bit,), (tan_x,))
+        np.testing.assert_array_equal(np.asarray(got_bit[0]), np.zeros((64,), np.float32))
+        np.testing.assert_array_equal(np.asarray(got_bit), np.asarray(ref_bit))
+        np.testing.assert_array_equal(np.asarray(dx), np.asarray(dx_exact))
+        np.testing.assert_array_equal(np.asarray(dscale), np.asarray(dscale_exact))
         np.testing.assert_array_equal(np.asarray(y_tan[1]), np.asarray(jvp_exact[1]))
     for gpu in ("sm80", "sm90"):
         if not generation.compile_only_gpus(gpu):

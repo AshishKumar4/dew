@@ -561,7 +561,7 @@ def test_syrk_portable_row_strip_chunking_matches_full_poly_across_ranks_and_odd
     rng = np.random.default_rng(12162)
     coeffs = jnp.asarray([3.4445, -4.7750, 2.0315], jnp.float32)
     for shape in ((131, 131), (1, 128, 128), (3, 67, 67)):
-        x = jnp.asarray(rng.standard_normal(shape) / 16.0, jnp.bfloat16)
+        x = jnp.asarray(rng.integers(-3, 4, size=shape), jnp.bfloat16) / jnp.bfloat16(16.0)
         got = gemm._syrk_portable(x, coeffs, transpose=False, conjugate=False, precision=None,
                                   out_dtype=jnp.bfloat16)
         sq = jax.lax.dot_general(

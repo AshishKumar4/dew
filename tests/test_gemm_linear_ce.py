@@ -57,15 +57,15 @@ def test_chunked_linear_ce_mosaic_arm_holds_check_1_value_vjp_and_normalizer(
         with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
             def fwd(a, b, c):
                 loss, _, log_z = chunked.chunked_cross_entropy(
-                    a, OutputTable(b, vocab_major=True, bias=c), targets, chunks=2,
-                    tile=(64, 64), predict=False)
+                    a, OutputTable(b, vocab_major=True, bias=c, precision=chunked.BF16), targets,
+                    chunks=2, tile=(64, 64), predict=False)
                 return loss, log_z
             (loss, log_z), pull = jax.vjp(fwd, x, w, bias)
             grads = pull((cot, jnp.zeros_like(cot)))
             cols = chunked._Columns(bias, None)
             _, (peak, mass, rest) = chunked._forward(
                 x, w, targets, None, 2, (64, 64), None,
-                chunked._head_product(OutputTable(w, vocab_major=True, bias=bias), x),
+                chunked._head_product(OutputTable(w, vocab_major=True, bias=bias, precision=chunked.BF16), x),
                 False, 1.0, cols)
             return loss, log_z, grads, peak, mass, rest
 
@@ -89,8 +89,8 @@ def test_chunked_linear_ce_mosaic_arm_holds_check_1_value_vjp_and_normalizer(
     x0, w0, t0, b0, _ = draw(0)
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
           generation.routes() as seen):
-        chunked.chunked_cross_entropy(x0, OutputTable(w0, vocab_major=True, bias=b0), t0,
-                                      chunks=2, tile=(64, 64), predict=False)
+        chunked.chunked_cross_entropy(x0, OutputTable(w0, vocab_major=True, bias=b0, precision=chunked.BF16),
+                                      t0, chunks=2, tile=(64, 64), predict=False)
     assert any(r.kernel == "mosaic" for r in seen), seen
 
 
@@ -105,11 +105,15 @@ def test_chunked_linear_ce_non_gated_cases_take_existing_path_untouched():
     scale = jnp.asarray(rng.uniform(0.8, 1.2, size=(128,)), jnp.float32)
 
     cases = [
-        ("predict", x, OutputTable(w, vocab_major=True), {"predict": True}),
-        ("excluded", x, OutputTable(w, vocab_major=True), {"predict": False, "excluded": 0}),
-        ("temperature", x, OutputTable(w, vocab_major=True), {"predict": False, "temperature": 2.0}),
-        ("scaled", x, OutputTable(w, vocab_major=True, scale=scale), {"predict": False}),
-        ("softcap", x, OutputTable(w, vocab_major=True, softcap=20.0), {"predict": False}),
+        ("predict", x, OutputTable(w, vocab_major=True, precision=chunked.BF16), {"predict": True}),
+        ("excluded", x, OutputTable(w, vocab_major=True, precision=chunked.BF16),
+         {"predict": False, "excluded": 0}),
+        ("temperature", x, OutputTable(w, vocab_major=True, precision=chunked.BF16),
+         {"predict": False, "temperature": 2.0}),
+        ("scaled", x, OutputTable(w, vocab_major=True, scale=scale, precision=chunked.BF16),
+         {"predict": False}),
+        ("softcap", x, OutputTable(w, vocab_major=True, softcap=20.0, precision=chunked.BF16),
+         {"predict": False}),
         ("fp32", x.astype(jnp.float32), OutputTable(w.astype(jnp.float32), vocab_major=True),
          {"predict": False}),
     ]
@@ -150,7 +154,7 @@ def test_linear_cross_entropy_compiles_spill_free(gpu: str, with_bias: bool):
         bias = rest[0] if rest else None
         with generation.chosen(grouped_matmul="mosaic"):
             loss, _, _ = chunked.chunked_cross_entropy(
-                a, OutputTable(weight, vocab_major=True, bias=bias), targets,
+                a, OutputTable(weight, vocab_major=True, bias=bias, precision=chunked.BF16), targets,
                 chunks=2, tile=(256, 256), predict=False)
             return loss
 
