@@ -276,7 +276,9 @@ def options_of(flags: str) -> dict[str, str]:
 def graphs() -> bool:
     """Whether this process's XLA:GPU may run programs as command buffers: unless its XLA_FLAGS leave it
     none, each occurrence of the flag taken in turn as XLA's parser takes it (a list of kinds replacing the
-    one before it, a list of `+KIND`s and `-KIND`s amending it), XLA's defaults where no list is given."""
+    one before it, a list of `+KIND`s and `-KIND`s amending it), XLA's defaults where no list is given. Read
+    here, not through `dew._devices`: the instrument loads by its path into an arm's process, whose Dew may be
+    a checkout that states none of its own reader (row 12063: an older baseline raised ImportError)."""
     name = UNGRAPHED_FLAG.removesuffix("=")
     kinds: set[str] | None = None
     for token in os.environ.get("XLA_FLAGS", "").split():
@@ -328,12 +330,11 @@ class DeviceTime:
 
     def program(self, fn: Callable, evicted: bool) -> Callable:
         """`fn`'s timed program (`kernels`): its call, behind an eviction where `evicted` (`behind`), compiled
-        without command buffers (`options_of(UNGRAPHED_FLAG)`), once a session."""
+        without command buffers (`dew.nn.kernels.options.UNGRAPHED_OPTIONS`), once a session."""
         if (fn, evicted) not in self._joined:
-            from dew.nn.kernels.options import owned_program
+            from dew.nn.kernels.options import UNGRAPHED_OPTIONS, owned_program
 
-            self._joined[fn, evicted] = owned_program(behind(fn) if evicted else fn,
-                                                      step=options_of(UNGRAPHED_FLAG))
+            self._joined[fn, evicted] = owned_program(behind(fn) if evicted else fn, step=UNGRAPHED_OPTIONS)
         return self._joined[fn, evicted]
 
     def behind(self, program: Callable, evicting: jax.Array, *args) -> tuple[KernelTime, ...]:

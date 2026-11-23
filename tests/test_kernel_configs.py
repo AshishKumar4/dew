@@ -701,7 +701,7 @@ def _model(launch, ba, config) -> resources.RegisterModel:
     shared = resources.shared_bytes(family, planned.scope(config.stages))
     return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared,
                                     producer=planned.producer, programs=config.programs,
-                                    moves=mosaic_gpu.MOVES)
+                                    moves=mosaic_gpu.MOVES, target=generation.gpu_target())
 
 
 def _emitted_forms(family) -> set[str]:
@@ -1876,6 +1876,40 @@ def test_an_mma_sync_stage_takes_its_copies_and_ldmatrix_reads_in_one_pass_a_pha
         for column in range(0, row_bytes, 16):
             reads = [swizzling.staged_address(row + lane, column, row_bytes, swizzle) for lane in range(8)]
             assert swizzling.wavefronts(reads, 16) == 1, (row, column, swizzle)
+
+
+@pytest.mark.parametrize("swizzle", [swizzling.UNSWIZZLED, 32, 64, 128])
+def test_a_traced_staged_address_is_the_staging_rules_at_every_row_below_its_anchor(swizzle):
+    """The staged address traced in a kernel's MLIR (`swizzling.TracedStaging`), its anchor at a row and a
+    column and each row below it within the anchor's tile, folds to the staging's own address
+    (`swizzling.staged_address`) of that row and column, for a block of 256-byte rows at each swizzle: the
+    one traced form a drain reads a staged tile by (train 1204's review F3)."""
+    from jax._src.interpreters import mlir as jax_mlir
+    from jax._src.lib.mlir import passmanager
+    from jax.experimental.mosaic.gpu import utils as mgpu_utils
+    from jax.extend.mlir import ir
+    from jax.extend.mlir.dialects import func
+
+    row_bytes = 256
+    staging = swizzling.TracedStaging(row_bytes, swizzle)
+    cases = [(row, column, below) for row in range(0, 24, 3) for column in range(0, row_bytes, 48)
+             for below in (None, *range(swizzling.TILE_ROWS - row % swizzling.TILE_ROWS))]
+    with jax_mlir.make_ir_context(), ir.Location.unknown():
+        module = ir.Module.create()
+        i32 = ir.IntegerType.get_signless(32)
+        with ir.InsertionPoint(module.body):
+            function = func.FuncOp("addresses", ir.FunctionType.get([], [i32] * len(cases)))
+            with ir.InsertionPoint(function.add_entry_block()):
+                anchors = {(row, column): staging.anchor(mgpu_utils.c(row, i32), mgpu_utils.c(column, i32))
+                           for row, column, _ in cases}
+                func.ReturnOp([staging.address(anchors[row, column],
+                                               None if below is None else mgpu_utils.c(below, i32))
+                               for row, column, below in cases])
+        passmanager.PassManager.parse("builtin.module(canonicalize)").run(module.operation)
+        returned = function.entry_block.operations[len(function.entry_block.operations) - 1]
+        folded = [ir.IntegerAttr(value.owner.attributes["value"]).value for value in returned.operands]
+    assert folded == [swizzling.staged_address(row + (below or 0), column, row_bytes, swizzle)
+                      for row, column, below in cases]
 
 
 @pytest.mark.parametrize(("shape", "dtype"), [((128, 64), jnp.bfloat16), ((128, 192), jnp.bfloat16),

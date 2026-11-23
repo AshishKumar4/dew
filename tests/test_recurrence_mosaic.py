@@ -1216,10 +1216,9 @@ def _model(launch: mainloop.Launch, family: mosaic.Family,
     its schedule lowers it (`Launch.producer`), bounded by the launch's shared-memory allocation, and moving
     registers where its plan's residency does (`Launch.resident`, `RegisterModel.moves`)."""
     facts = generation.gpu_target() if target is None else target
-    with generation.assumed(facts):
-        model = resources.register_model(launch.family or family, launch.consumers, launch.registers,
-                                         producer=launch.producer, shared=launch.shared, target=facts,
-                                         programs=launch.resident or 1)
+    model = resources.register_model(launch.family or family, launch.consumers, launch.registers,
+                                     producer=launch.producer, shared=launch.shared, target=facts,
+                                     programs=launch.resident or 1)
     # The plan reserves an upper bound, including reduction scratch a lowering can omit.
     # `planned_failures` checks that bound; RegisterModel.shared declares an exact allocation.
     return dataclasses.replace(model, shared=None)
@@ -2190,7 +2189,7 @@ with report.refusals(), generation.assumed(facts), report.certifying(device):
         programs.append(lowered_for(program if pulled else traced, tuple(shapes), target))
     first, second = (set(report.kernel_modules(kernel_calls(program, unrun=True))) for program in programs)
     binary = next(binary for binary in assembled.binaries(programs[1].compile())
-                  if report.launch_name(binary.kernel, binary.launch) in first & second)
+                  if assembled.launch_name(binary.kernel, binary.launch) in first & second)
     # The second rung's program refuses a kernel whose name the first rung's shares.
     found = report._misses_of([dataclasses.replace(binary, spilled=8)])
     report._held(found, programs[1])

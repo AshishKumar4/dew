@@ -412,18 +412,13 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         if tile is None:
             return None
         return producers.settled(self, ba, tile, target)
+
     def _tile(self, ba, target) -> tiling.Tiles | None:
         return self._derived(ba, target)
 
     def completed(self, ba, config):
         from .templates.gemm import producers
         return producers.started(self, ba, config) if isinstance(config, tiling.Tiles) else config
-
-    def proposes(self, ba, config: tiling.Tiles, target, *, held=None) -> bool:
-        if held is None:
-            return super().proposes(ba, config, target,
-                                    held=lambda: self.within(self.registers(ba, config, target), config))
-        return super().proposes(ba, config, target, held=held)
 
     def rungs(self, ba, config):
         from .templates.gemm import producers
@@ -440,6 +435,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         from .templates import report
         from .templates.gemm import producers
         return report.refused(self, ba, producers.settled(self, ba, config, target), target)
+
     def _derived(self, ba, target, admits=None) -> tiling.Tiles | None:
         """The derivation's tile of `ba` on `target` (`derivation.derived`), each candidate also one `admits`
         takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole

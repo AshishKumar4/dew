@@ -76,10 +76,8 @@ with report.certifying(compile_only_gpus("sm90")[0]):
         text = step.trace(*shapes).lower().as_text()
     else:
         # Certified aside as a compile's lowering is (`OuterProgram._lowered_aside`), settled at its end.
-        with report.settling():
-            with report.certifying_aside() as aside:
-                text = step.trace(*shapes).lower().as_text()
-            report.settled_aside(aside)
+        with report.certifying_aside():
+            text = step.trace(*shapes).lower().as_text()
         assert not report.refused_launches()
     found = [[each.op, each.stored] for each in report.certifications()]
 print(json.dumps({"text": text, "traced": len(traced), "certified": found,
@@ -143,10 +141,8 @@ def loss(query, key, value):
 step = jax.value_and_grad(loss, argnums=(0, 1, 2))
 with report.certifying(compile_only_gpus("sm90")[0]):
     if sys.argv[1] == "captured":
-        with report.settling():
-            with report.certifying_aside() as aside:
-                text = lowered_for(step, shapes, "sm90").as_text()
-            report.settled_aside(aside)
+        with report.certifying_aside():
+            text = lowered_for(step, shapes, "sm90").as_text()
         assert not report.refused_launches()
     else:
         text = lowered_for(step, shapes, "sm90").as_text()
@@ -170,3 +166,69 @@ def test_a_templates_gradient_certified_aside_lowers_as_certified_in_turn_and_ce
     assert captured["text"] == certified["text"]
     assert captured["certified"] and captured["certified"] == certified["certified"], (captured, certified)
     assert not captured["uncertified"], captured["uncertified"]
+
+
+PROGRAM_LOWERING = """
+import json
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.experimental.mosaic.gpu import core as mgpu_core
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.kernels.generation import assumed, compile_only_gpus, gpu_target
+from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.templates import report
+from dew.training.runtime import ready_process
+
+events = {"hit": 0, "miss": 0}
+
+
+def heard(event, *args, **kwargs):
+    kind = event.rsplit("/", 1)[-1]
+    if "/pallas/mosaic_gpu/lowering_cache/" in event and kind in events:
+        events[kind] += 1
+
+
+jax.monitoring.register_event_listener(heard)
+# Readied as a run is, its Mosaic GPU lowerings kept beside its compilation cache (`_cache.keep_lowerings`).
+ready_process()
+mesh = Mesh(np.array(compile_only_gpus("sm90")), ("devices",))
+shapes = [jax.ShapeDtypeStruct(shape, jnp.bfloat16, sharding=NamedSharding(mesh, PartitionSpec()))
+          for shape in ((1, 512, 4, 64), (1, 512, 2, 64), (1, 512, 2, 64))]
+
+
+def loss(query, key, value):
+    attended = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
+    return attended.astype(jnp.float32).sum()
+
+
+step = owned_program(jax.value_and_grad(loss, argnums=(0, 1, 2)))
+# On the step's mesh, as a run's trace is (`jax.set_mesh`), which its replays are lowered on.
+with (report.certifying(compile_only_gpus("sm90")[0]), assumed("sm90"), jax.set_mesh(mesh),
+      mgpu_core.artificial_shared_memory_limit(gpu_target("sm90").shared_limit)):
+    # Traced as its compile traces it, each launch certified aside and settled before it lowers: the
+    # replays lowered.
+    with report.certifying_aside():
+        traced = step.trace(*shapes)
+    replayed = dict(events)
+    traced.lower()
+print(json.dumps({"replayed": replayed, "lowered": {kind: events[kind] - replayed[kind] for kind in events}}))
+"""
+"""An H100's attention template's gradient through Dew's compile point on a compile-only H100, its launches
+certified aside from its trace's calls (`report.capture`): the Mosaic GPU lowering cache's misses and hits
+over its trace's replays and over its program's lowering after them."""
+
+
+def test_a_programs_kernels_certified_aside_are_lowered_once(tmp_path):
+    """A program's kernels certified aside are lowered once: each replay's lowering (`replay.replayed`) is
+    the one its program's lowering reads back from the Mosaic GPU lowering cache, under the same JAX
+    settings, the replay's thread taking the trace's own (`_cache.carried`), its default device among them
+    (row 11803: a replay set its device as JAX's default, which the program's lowering on the trace's thread
+    left unset, so each of an every-template decoder's 44 kernels was lowered again, a third of its
+    program's lowering)."""
+    found = fresh(PROGRAM_LOWERING, platforms="cpu", cache_dir=tmp_path / "cache", flags=keeping_picks())
+    assert found["replayed"]["miss"], found
+    assert found["lowered"]["miss"] == 0 and found["lowered"]["hit"], found

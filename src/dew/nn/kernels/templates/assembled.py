@@ -42,6 +42,16 @@ def kernel_of(name: str) -> tuple[str, str | None, str | None]:
     if not (launch := LAUNCH_SUFFIX.search(kernel)):
         return kernel, None, None
     return kernel[:launch.start()], launch.group(1), launch.group(2)
+
+
+def launch_name(kernel: str, launch: str | None, index: str | None = None) -> str:
+    """`kernel`'s name carrying the digest `launch` (`LAUNCH_SUFFIX`) and optional XLA uniquification
+    `index`, as is where None, `kernel_of`'s inverse: the lossless key a kernel's evidence goes by beside its
+    launch (row 12014: written in report.py, read here)."""
+    named = kernel if launch is None else f"{kernel}__l{launch}"
+    return named if index is None else f"{named}__{index}"
+
+
 MOSAIC_TARGET = b"mosaic_gpu_v2"
 """The custom call target of a Mosaic GPU kernel, which its thunk names (`_kernels`)."""
 SERIALIZED = frozenset({*(f"C751{digit}" for digit in range(6)), "C7519"})

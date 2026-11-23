@@ -164,16 +164,20 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["join"], case, strict=True))
     layer = _layer(combination)
     dtype = jnp.dtype(combination["dtype"])
-    params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
-    if combination["join"] in ("gate_up", "qkv"):
-        params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),
-                              params)
+
+    def draw(seed):
+        # The layer's parameters drawn with each seed's inputs, the same each draw: a GPU tier's prepare,
+        # whose device computes nothing, reaches the site with nothing computed (row 10990).
+        params = layer.init(jax.random.key(4), jnp.zeros((*ROWS, FEATURES), dtype))
+        if combination["join"] in ("gate_up", "qkv"):
+            params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(jax.random.key(6), leaf.shape),
+                                  params)
+        return drawing(params, (*ROWS, FEATURES), dtype)(seed)
+
     unfused = _unfused(combination["join"])
     with generation.chosen(**unfused), generation.routes() as routes:
-        assert_joined_as_exact(combination["join"], with_gradients(layer.apply),
-                               drawing(params, (*ROWS, FEATURES), dtype),
-                               with_gradients(_wide(layer).apply), "-".join(case),
-                               seeds=SEEDS)
+        assert_joined_as_exact(combination["join"], with_gradients(layer.apply), draw,
+                               with_gradients(_wide(layer).apply), "-".join(case), seeds=SEEDS)
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded
                      if pair[0] not in CHOICES and pair[1] != unfused.get(pair[0], "xla"))
@@ -181,7 +185,7 @@ def a_joined_layers_training_step_is_on_par(case: tuple[str, ...]) -> None:
     if combination["join"] == "qkv":
         # Joined, its step binds the side-by-side forward and the chained input gradient; apart, neither
         # (head review of 0099a4701 F4: the cell checked the route alone).
-        operands = drawing(params, (*ROWS, FEATURES), dtype)(0)
+        operands = jax.eval_shape(draw, 0)
         for joins, forms in ((True, {"beside", "chained"}), (False, set())):
             with generation.chosen(**unfused), row_joins("qkv", joins=joins), tuning.seen() as launches:
                 jax.eval_shape(with_gradients(layer.apply), *operands)
