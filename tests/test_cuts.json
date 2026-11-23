@@ -635,8 +635,8 @@
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-bfloat16-key-bias]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-bfloat16-row-indexed]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-bfloat16-softcap-sinks-alibi]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-bfloat16-tile-bias]",
-"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-bfloat16-custom-vjp]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm86-64-SPLIT-float16-none]",
+"tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-bfloat16-key-bias]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-bfloat16-row-indexed]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-bfloat16-softcap]",
 "tests/test_attention_mosaic_compile.py::test_the_forward_compiles_spill_free_as_its_model_decides[sm89-128-NONE-float16-dropout]",
@@ -860,8 +860,8 @@
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-fp32-forward-128x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[b200-fp32-step-64x64]",
 "tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-bf16-step-64x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[rtx5090-bf16-forward-128x64]",
-"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[rtx5090-bf16-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[h100-fp32-step-64x64]",
+"tests/test_attention_triton.py::test_a_triton_launchs_shared_memory_is_what_triton_allocates[rtx5090-bf16-step-128x64]",
 "tests/test_attention_triton.py::test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block[64]",
 "tests/test_attention_triton.py::test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound[float16]",
 "tests/test_attention_triton.py::test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two[32-32-portable]",
@@ -1980,9 +1980,6 @@
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-all-empty]",
 "tests/test_grouped_gemm.py::test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla[float16-tile-boundaries]"
 ],
-"tests/test_grpo.py": [
-"tests/test_grpo.py::test_a_recorded_grpo_run_trains_on_the_rollout_it_records"
-],
 "tests/test_guidance_distillation.py": [
 "tests/test_guidance_distillation.py::test_a_saved_student_samples_one_branch_at_its_conditioners_guidance[flow]",
 "tests/test_guidance_distillation.py::test_a_student_whose_process_reads_raw_outputs_otherwise_is_refused[edm]",
@@ -2401,9 +2398,6 @@
 "tests/test_linear_attention.py::test_the_layer_decodes_as_it_prefills",
 "tests/test_linear_attention.py::test_the_layer_reads_a_holed_row_as_the_row_without_its_holes",
 "tests/test_linear_attention.py::test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound"
-],
-"tests/test_live_bridge.py": [
-"tests/test_live_bridge.py::test_a_page_s_restarts_are_admitted_as_its_cells_are_and_end_with_it"
 ],
 "tests/test_llama4.py": [
 "tests/test_llama4.py::test_a_paged_cache_draws_what_the_dense_cache_draws[paged]"
