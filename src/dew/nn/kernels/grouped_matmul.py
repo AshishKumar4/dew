@@ -415,7 +415,7 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
         tile = self._tile(ba, target)
         if tile is None:
             return None
-        with self._with_target(target):
+        with generation.as_target(target):
             return producers.settled(self, ba, tile)
 
     def _tile(self, ba, target) -> tiling.Tiles | None:
@@ -434,21 +434,12 @@ class _Mosaic(_GroupedLaunch[tiling.Tiles]):
 
         return super().pinnable(ba, config) and not report.refused(self, ba, config, self.launch_target())
 
-    @staticmethod
-    @contextlib.contextmanager
-    def _with_target(target):
-        if target == generation.gpu_target():
-            yield
-            return
-        with generation.assumed(target):
-            yield
-
     def _refused(self, ba, config: tiling.Tiles, target) -> bool:
         # Refused on `target` past its producer's ladder: spilling at the rung it settles on
         # (`producers.settled`, settled under `target` until it takes one, row 11885).
         from .templates import report
         from .templates.gemm import producers
-        with self._with_target(target):
+        with generation.as_target(target):
             return report.refused(self, ba, producers.settled(self, ba, config), target)
 
     def _derived(self, ba, target, admits=None) -> tiling.Tiles | None:

@@ -1311,27 +1311,36 @@ def test_a_run_over_gpus_of_two_kinds_is_refused():
         _one_kind([gpu(0, 0, h100), gpu(1, 1, a100)])
 
 
+def _named(choice: str) -> str | None:
+    """The kernel a `kernel_choices` block in effect names for `choice`, None where none does."""
+    from dew import _cache
+
+    return dict(_cache.KERNEL_CHOICES.value).get(choice)
+
+
 def test_chosen_kernels_keep_other_choices_and_restore_them_after_an_exception():
     with assumed("sm80"):
         with kernel_choices(attention="xla", ssd="pallas"):
-            assert chosen_kernel("attention", "flash") == "xla"
+            assert _named("attention") == "xla"
             with pytest.raises(RuntimeError), kernel_choices(attention="flash"):
-                assert chosen_kernel("attention", "xla") == "flash"
-                assert chosen_kernel("ssd", "xla") == "pallas"
+                assert _named("attention") == "flash"
+                assert _named("ssd") == "pallas"
                 raise RuntimeError("the comparison ended")
-            assert chosen_kernel("attention", "flash") == "xla"
-        assert chosen_kernel("attention", "flash") == "flash"
+            assert _named("attention") == "xla"
+        assert _named("attention") is None
 
 
 def test_a_function_jitted_before_a_choice_traces_again_within_it():
+    from dew.nn.kernels.generation import Choice
+
     @jax.jit
     def ported(x):
-        return x + (chosen_kernel("ssd", "xla") == "pallas")
+        return x + (chosen_kernel(Choice.NARROW_COPIES, "off") == "on")
 
     x = jnp.zeros((), jnp.int32)
-    with kernel_choices(ssd="xla"):
+    with kernel_choices(narrow_copies="off"):
         assert ported(x) == 0
-        with kernel_choices(ssd="pallas"):
+        with kernel_choices(narrow_copies="on"):
             assert ported(x) == 1
         assert ported(x) == 0
 
