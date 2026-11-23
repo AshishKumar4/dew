@@ -102,7 +102,7 @@ def _plan(key_width: int, programs: int, target: generation.GpuTarget) -> tuple[
     Triton step's 17 at one row (M-JS-20)."""
     whole = key_width & (key_width - 1) == 0 and key_width >= 2 * UNROLLED
     # A GPU whose multiprocessors no fact states is held one wave of its residency.
-    wave = cost.wave(target, _resident(2, target))
+    wave = cost.wave(target.multiprocessors, _resident(2, target))
     halves = 2 if whole and programs <= wave else 1
     return halves, _resident(halves, target)
 

@@ -369,7 +369,7 @@ def split_walk(tiles: "Tiles", *, groups: int, rows: int, depth: int, width: int
     steps = -(-rows // max(groups, 1) // tiles.block_k)
     if step_seconds is None or bandwidth is None or output == 0:
         return None
-    wave = multiprocessors * tiles.programs
+    wave = unit_cost.wave(multiprocessors, tiles.programs)
     drift_horizon, drift_extra = 0.0, 0.0
     if (groups == 1 and target is not None and target.l2_bytes is not None
             and family.walks_scoped and output >= wave):
