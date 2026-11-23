@@ -161,7 +161,9 @@ class _Transpose:
         matrix_grid = _edge(_shared_max(matrix_top, tuple(sorted(jax.typeof(matrix_top).mat.varying
                                                                    - self.held))))
         depth, width = self.shape[-1], cotangent.shape[-1]
-        leaves = jax.tree.leaves((cotangent, matrix, rest))
+        # Every axis a contributing operand varies over the rows do not (each device's products summed
+        # there): the static bound reads them all; each psum sums the axes its own sums vary over, of these.
+        leaves = jax.tree.leaves((cotangent, f, gather, matrix, rest))
         varying = frozenset().union(*(jax.typeof(leaf).mat.varying for leaf in leaves))
         axes = tuple(sorted(varying - self.held))
         devices = math.prod(jax.lax.axis_size(axis) for axis in axes)
@@ -318,17 +320,21 @@ def _nonfinite_terms(cotangent: jax.Array, factor: jax.Array, matrix: jax.Array)
     """The classes of products a coordinate's IEEE sum reads where any is not finite, each as a cotangent
     indicator beside a matrix indicator over the columns, side by side, so one GEMM counts the class: a
     product `cotangent * factor` (exact, finite past fp32's largest or not) times a coefficient that is
-    +inf, -inf, or NaN (a NaN operand, or zero times an infinity)."""
-    finite = jnp.isfinite(cotangent) & jnp.isfinite(factor)
-    nan = (jnp.isnan(cotangent) | jnp.isnan(factor) | (jnp.isinf(cotangent) & (factor == 0))
-           | (jnp.isinf(factor) & (cotangent == 0)))
-    zero = finite & ((cotangent == 0) | (factor == 0))
-    sign = jnp.where(nan | zero, 0.0, jnp.sign(cotangent) * jnp.sign(factor))
-    c_pos, c_neg = finite & (sign > 0), finite & (sign < 0)
-    c_pinf, c_ninf = ~finite & ~nan & (sign > 0), ~finite & ~nan & (sign < 0)
-    m_pinf, m_ninf, m_nan = matrix == jnp.inf, matrix == -jnp.inf, jnp.isnan(matrix)
-    m_finite = jnp.isfinite(matrix)
-    m_pos, m_neg, m_zero = m_finite & (matrix > 0), m_finite & (matrix < 0), matrix == 0
+    +inf, -inf, or NaN (a NaN operand, or zero times an infinity). Each operand's class from its bits
+    (`_classes`), so a subnormal is no zero where a process flushes them."""
+    c_negative, c_zero, c_inf, c_nan = _classes(cotangent)
+    f_negative, f_zero, f_inf, f_nan = _classes(factor)
+    finite = ~(c_inf | c_nan | f_inf | f_nan)
+    nan = c_nan | f_nan | (c_inf & f_zero) | (f_inf & c_zero)
+    zero = finite & (c_zero | f_zero)
+    negative = c_negative ^ f_negative
+    signed = ~nan & ~zero
+    c_pos, c_neg = finite & signed & ~negative, finite & signed & negative
+    c_pinf, c_ninf = ~finite & signed & ~negative, ~finite & signed & negative
+    m_negative, m_zero, m_inf, m_nan = _classes(matrix)
+    m_finite = ~(m_inf | m_nan)
+    m_pinf, m_ninf = m_inf & ~m_negative, m_inf & m_negative
+    m_pos, m_neg = m_finite & ~m_zero & ~m_negative, m_finite & ~m_zero & m_negative
     c_all, m_all = jnp.ones_like(c_pos), jnp.ones_like(m_pos)
 
     def side_by_side(cotangents, coefficients):
@@ -338,6 +344,14 @@ def _nonfinite_terms(cotangent: jax.Array, factor: jax.Array, matrix: jax.Array)
     negative = side_by_side((c_pos, c_neg, c_pinf, c_ninf), (m_ninf, m_pinf, m_neg | m_ninf, m_pos | m_pinf))
     invalid = side_by_side((nan, c_all, c_pinf | c_ninf, zero), (m_all, m_nan, m_zero, m_pinf | m_ninf))
     return positive, negative, invalid
+
+
+def _classes(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Whether each of `x` is negative, zero, infinite or NaN, read from its bits (`float_bits.raw_fields`):
+    a subnormal is neither zero nor of no sign, whatever a process's float arithmetic flushes."""
+    _, sign, biased, fraction = float_bits.raw_fields(x)
+    top = biased == (1 << jnp.finfo(x.dtype).nexp) - 1
+    return sign != 0, (biased == 0) & (fraction == 0), top & (fraction == 0), top & (fraction != 0)
 
 
 def _edge(top: jax.Array) -> jax.Array:
