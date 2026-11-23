@@ -441,3 +441,38 @@ def test_a_program_called_within_another_trace_reads_its_facts_at_each_call(encl
     assert _cache.holding(cache, "held", lambda: within(one), 4) == 1.0
     answer[0] = 0
     assert _cache.holding(cache, "held", lambda: within(one), 4) == 0.0
+
+
+def test_a_trace_reading_a_fact_under_a_gpu_it_assumes_is_taken_as_it_ran():
+    """A program whose trace assumes a GPU of its own and reads its memory (`generation.device_memory`, a
+    traced fact), traced under another assumed GPU of other memory: its trace is taken as it ran, the fact as
+    it read it, where each trace of its own was let go because the fact, asked again outside the GPU it
+    assumed, answered otherwise, and traced again without end (row 12296's review P0)."""
+    import dataclasses
+    import threading
+
+    from jax.extend import core
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.options import owned_program
+
+    outer = dataclasses.replace(generation.gpu_target("sm90"), memory=80 * 2 ** 30)
+    inner = dataclasses.replace(outer, memory=40 * 2 ** 30)
+
+    def read(x):
+        with generation.assumed(inner):
+            return x + generation.device_memory() / 2 ** 30
+
+    run, x = owned_program(read), jnp.zeros(())
+    traced: list = []
+    entered = _cache.carried()
+
+    def tracing() -> None:
+        with entered(), generation.assumed(outer):
+            traced.append(run.trace(x))
+
+    running = threading.Thread(target=tracing, daemon=True)
+    running.start()
+    running.join(timeout=120)
+    assert len(traced) == 1, "the trace was let go and traced again without end"
+    assert float(core.jaxpr_as_fun(traced[0].jaxpr)(x)[0]) == 40.0
