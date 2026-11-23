@@ -436,6 +436,12 @@ class Architecture:
     precision of 'highest' asks of a kernel's fp32 weights and bf16 values: a v5e's MXU does not (row 6994,
     7228). Measured False on a v5e and True on a v6e as `float16` is; the default True unmeasured
     elsewhere."""
+    accurate_exp: bool = True
+    """Whether its default fp32 exp is within fp32's rounding, as the recurrences' decays need
+    (`dew.nn.precision.accurate_exp`, row 7375): a v5e's is 1.6e-6 from float64, its exp of a reduced
+    argument alike, measured False (M-JS-135, M-JS-138); a GH200's default is `AccuracyMode.HIGHEST`'s bit
+    for bit (M-JS-135), a CPU's float32 exp alike. Unmeasured on a v6e, stated False as the v5e's, as every
+    TPU no rule states takes it (`GpuTarget.accurate_exp`)."""
 
     @property
     def family(self) -> str | None:
@@ -545,10 +551,10 @@ _BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '
 _TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20, vector_per_clock=1.67e12 / (197e12 / 131072),
                              exponentials_per_clock=1.54e12 / (197e12 / 131072), float16=False,
-                             fp32_by_bf16_precise=False),
+                             fp32_by_bf16_precise=False, accurate_exp=False),
          'v6e': Architecture(('tpu',), {'16bit': 524288}, None, scoped_vmem=32 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20, vector_per_clock=2.83e12 / (918e12 / 524288),
-                             exponentials_per_clock=1.79e12 / (918e12 / 524288))}
+                             exponentials_per_clock=1.79e12 / (918e12 / 524288), accurate_exp=False)}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -726,6 +732,14 @@ class GpuTarget:
     def float16(self) -> bool:
         """Whether the device computes in float16 (`Architecture.float16`)."""
         return self.architecture.float16
+
+    @property
+    def accurate_exp(self) -> bool:
+        """Whether its default fp32 exp is within fp32's rounding (`Architecture.accurate_exp`): a TPU no
+        rule states takes the v5e's measured False."""
+        if tpu(self) and architecture(self.generation) is None:
+            return False
+        return self.architecture.accurate_exp
 
     @property
     def fp32_by_bf16_precise(self) -> bool:
