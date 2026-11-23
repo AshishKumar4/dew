@@ -8,6 +8,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from fla_sites import LIGHTNING_LEAVES, the_template_is_as_exact_as_fla
 from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import chunk_on, draw as hooked_draw, formed, token_by_token
@@ -67,6 +68,7 @@ def fast(run):
     return formed('fast', run)
 
 
+@pytest.mark.check1_shards(seeds=32, per_task=4)
 def test_lightning_attentions_fast_forms_are_as_exact_as_fla_interpreted():
     """Lightning attention at bf16 under the run's fast forms on the template, interpreted: its output, final
     memory and every operand's gradient on par from float64 with recorded fla-core 0.5.2's
