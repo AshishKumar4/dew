@@ -710,11 +710,11 @@ def test_an_objectives_draw_of_its_variables_selects_no_kernel(kind):
         # Its key drawn within the trace too: shapes alone, nothing computed (row 12065).
         drawn = jax.eval_shape(lambda: objective.initializer(jax.random.key(0)))
     with routes() as axes_routes:
-        objective.parameter_axes()
+        axes = objective.parameter_axes
     with routes() as applied_routes:
         jax.eval_shape(model.apply, decoders(drawn), jax.ShapeDtypeStruct((2, 32), jnp.int32))
     assert not drawn_routes, drawn_routes
-    assert not axes_routes, axes_routes
+    assert axes and not axes_routes, axes_routes
     assert applied_routes, "the decoder selects no kernel, so its draw's selecting none says nothing"
 
 
