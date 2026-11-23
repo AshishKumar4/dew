@@ -515,13 +515,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         plgpu.store(buffer, cast, optimized=False)
         mosaic.synced(interpret=False)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+    def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
+                        pending: int = 0) -> tuple[T, jax.Array]:
         if pending:
-            raise ValueError(f"{type(self).__name__}.product is synchronous (pending={pending})")
+            raise ValueError(f"{type(self).__name__}.product_with is synchronous (pending={pending})")
         out = self.products(self.zeros(shape), lhs, rhs)
-        if then is not None:
-            then()
-        return out
+        return between(), out
 
     def products(self, acc, lhs, rhs, *, accumulate: bool = True):
         interpret = launches.interpreting()  # the launch's (`launches.interpreting`)
@@ -834,13 +833,13 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), producer: int | None = None,
-                pingpong: bool = False) -> None:
+                pingpong: bool = False, chunks: tuple[int, int] | None = None) -> None:
         del producer  # no producer role of its own
         self.pingponged(pingpong)
         # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
         # boundary so the output's shared memory can reuse the pipeline's slots.
         del in_flight, unrolled, accumulators  # its walk carries its accumulators
-        staging = self.output_staging(outputs, consumers)
+        staging = self.output_staging(outputs, consumers, chunks)
 
         def store(output, value, ref, place):
             # Interpreted pipelines use barrier-tracked copies, not cp.async groups.
@@ -1008,7 +1007,8 @@ class Mma(MmaIssuer, CpAsync):
     # FlashAttention 2's rows come from one warpgroup's wider tiles, not a second warpgroup.
     consumers = 1
 
-    def output_staging(self, outputs: tuple, consumers: int) -> list:
+    def output_staging(self, outputs: tuple, consumers: int, chunks: tuple[int, int] | None = None) -> list:
+        mosaic.refuse_staging(self, chunks)
         # Each output tile staged at the swizzle its accumulator's stores pass the banks fewest times at
         # (`stored_swizzle`), copied out a 16-byte piece a thread over whole tiles (`persist`'s store,
         # `stores.swizzled_rows_out`).

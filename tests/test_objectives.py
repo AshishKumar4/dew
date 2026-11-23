@@ -127,6 +127,23 @@ def test_an_objectives_drawn_shapes_and_axes_compute_nothing(read):
     assert jax.tree.leaves(found) or found
 
 
+def test_a_decision_objective_is_built_computing_nothing():
+    """A decision objective over a decoder, built with a compile-only GPU the default device, on which
+    nothing computes (a GPU tier's prepare): its head's width read of its backbone's states traced for
+    shapes alone (`DecoderWrapper.head_size`), its tokens and key made within the trace, where made outside
+    they raised on such a device (row 12259)."""
+    from dew.data.text import ByteTokenizer
+    from dew.decision import DecisionObjective, Specials
+    from dew.decision.layout import SegmentLayout
+    from dew.nn.kernels.generation import compile_only_gpus
+
+    layout = SegmentLayout.state_first_row(max_len=32, head_max_len=24, option_tokens=6)
+    with jax.default_device(compile_only_gpus("sm80")[0]):
+        objective = DecisionObjective(lm_objective().model, tokenizer=ByteTokenizer(),
+                                      specials=Specials(None, 10, 0, "\x00", 255), layout=layout)
+    assert objective.model is not None
+
+
 def test_an_objectives_drawn_shapes_trace_its_held_tree_as_the_arrays_it_stands_for():
     """An objective holding a tree of shapes (`jax.ShapeDtypeStruct`s: a resumed run's base) whose `init`
     reads its held leaves as arrays (a head's start transposing the base's vocabulary table): its drawn

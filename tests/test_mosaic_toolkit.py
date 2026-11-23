@@ -478,7 +478,8 @@ def test_a_launch_with_a_joined_correction_warpgroup_counts_its_registers_in_its
     runs one warpgroup more, its consumers' budget is its schedule's (below two consumers' alone, the
     program's launch pool shared four ways), its correction role's half of it, and its register model counts
     the correction's registers in what a program allocates, so a multiprocessor holds no more programs of it
-    than its registers do (row 5368)."""
+    than its registers do (row 5368); and its schedule refuses, as it traces, the role it was sized by run
+    with no body, or a body of a role it was not (row 9785: a warpgroup launched beside no body hung)."""
     from dew.nn.kernels.templates import mosaic_sm100
 
     with generation.assumed("sm100"):
@@ -493,6 +494,9 @@ def test_a_launch_with_a_joined_correction_warpgroup_counts_its_registers_in_its
         alone = resources.register_model(family, 2, held["consumer"], target=generation.gpu_target())
         assert model.resident(held["consumer"]) <= alone.resident(held["consumer"])
         assert model.most == family.programs(2, held["consumer"], joined=joined)
+        for given, bodies in ((joined, {}), ((), {"correction": print})):
+            with pytest.raises(ValueError):
+                family.scheduled(2, print, lambda: None, joined=given, bodies=bodies)
 
 
 def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_configs():
@@ -932,12 +936,14 @@ def _padded(rows: int, family) -> int:
     return -(-rows // family.rows) * family.rows
 
 
-def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1):
+def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1,
+                        staging: tuple[int, int] | None = None):
     """`x @ w` a tile at a time through `family`'s persistent walk (`Family.persist`): each tile the
     family's least rows covering `rows` (its own least where None; `_padded`), of which it stores `rows`,
     tile `t` the tiles' rows `t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile
     multiplying nothing (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each
-    chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor."""
+    chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor,
+    its output staged in `staging`'s chunk columns and buffers (`stores.output_staging`'s by default)."""
     stored = family.rows if rows is None else rows
     rows, columns = _padded(stored, family), w.shape[1]
     family = family.specialized(rows, columns)
@@ -962,7 +968,8 @@ def _persisted_products(x, w, *, family, interpret, rows: int | None = None, res
                     store(0, value, o_gmem, (tile * rows, 0, stored, first, rows))
 
             family.persist(streams, (PERSISTED_TILES,), schedule, issue, finish, consumers=1, axis="programs",
-                           outputs=((shape, jnp.float32),), interpret=interpret, accumulators=(shape,))
+                           outputs=((shape, jnp.float32),), interpret=interpret, accumulators=(shape,),
+                           chunks=staging)
 
         family.scoped(scope, streams=family.streams(blocks, 2, 1))
 
@@ -1023,19 +1030,33 @@ def test_a_pallas_calls_outputs_stated_as_its_operands_axes_are_stated_on_its_ca
 
 
 @INTERPRETS
-def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_in_chunks():
+@pytest.mark.parametrize("staging", [None, (32, 1), (16, 2)], ids=["default", "one buffer", "narrower"])
+def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_in_chunks(staging):
     """Interpreted: a persistent walk on tcgen05's bundle (`mosaic_sm100.RINGS`), its product warp issuing
     each tile's steps into one of two accumulator turns in tensor memory and the epilogue reading each
     tile's out in chunks, over three tiles (the turns wrap) with the middle one multiplying nothing, as a
-    Blackwell's tensor memory holds them: each tile's rows exactly its product, the middle's zeros."""
+    Blackwell's tensor memory holds them, its output staged in the default chunks, one buffer of them, or
+    narrower chunks double-buffered (`Family.persist`'s `staging`, row 5634: a block a ring stage short):
+    each tile's rows exactly its product, the middle's zeros."""
     from dew.nn.kernels.templates import mosaic_sm100
     family = mosaic_sm100.RINGS
     x, w = _persisted_operands(family.rows)
     with generation.assumed("sm100"):
-        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED))
+        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED, staging=staging))
     expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
     expected[family.rows:2 * family.rows] = 0
     np.testing.assert_array_equal(got, expected)
+
+
+def test_a_tcgen05_tiles_stated_chunk_holds_no_more_than_the_piece_its_epilogue_reads_out():
+    """A 128-column tcgen05 tile, read out of tensor memory 64 columns at a time (`Issuer.chunk_columns`),
+    stages its output in a stated chunk of those 64 columns, and is refused one of 128, which holds two of
+    its pieces at once (theme K01-g's review: the tile's width alone was checked)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    outputs, family = (((mosaic_sm100.RINGS.rows, 128), jnp.bfloat16),), mosaic_sm100.RINGS
+    assert family.output_staging(outputs, 1, (64, 1))
+    pytest.raises(ValueError, family.output_staging, outputs, 1, (128, 1))
 
 
 @pytest.mark.parametrize("rows", [4, 8, 16, 24, 32])

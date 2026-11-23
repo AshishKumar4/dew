@@ -11,7 +11,7 @@ import contextlib
 import dataclasses
 import functools
 import threading
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
@@ -245,6 +245,18 @@ def forget(lowered: jax.stages.Lowered) -> None:
         # Its trees first, so only a lowering of the same shapes renders its text to compare.
         for key in [key for key, kept in _CANDIDATES.items() if kept.lowered is lowered or (
                 kept.lowered.in_tree == lowered.in_tree and program_key(kept.lowered) == target)]:
+            del _CANDIDATES[key]
+
+
+def forget_unplanned(lowerings: Sequence[jax.stages.Lowered],
+                     planned: jax.stages.Lowered | None) -> None:
+    """Drop every step this process keeps for a trainer built anew (`candidate_for`) whose program is one of
+    `lowerings` but `planned`'s (every one, where None), by the lowering itself: a search's losing and
+    frontier rungs, whose lowerings key their executables while they live
+    (`dew.training.planning.FitSearch.released_unplanned`)."""
+    dropped = {id(lowered) for lowered in lowerings if lowered is not planned}
+    with _KEEPING:
+        for key in [key for key, kept in _CANDIDATES.items() if id(kept.lowered) in dropped]:
             del _CANDIDATES[key]
 
 

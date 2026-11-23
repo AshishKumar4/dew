@@ -224,6 +224,14 @@ def mosaic_tpu_fp32_precision(m: int = 64, k: int = 64, n: int = 64) -> jax.lax.
     return MOSAIC_TPU_ALGORITHMS[chosen]
 
 
+def mosaic_tpu_dot_precision(lhs_dtype, rhs_dtype, m: int, k: int, n: int) -> jax.lax.Precision:
+    """Mosaic TPU dot precision for `mosaic_tpu._product` and `splash._dot` (row 11970):
+    `mosaic_tpu_fp32_precision(m, k, n)` when both operands are float32, else `lax.Precision.DEFAULT`."""
+    if jnp.dtype(lhs_dtype) == jnp.float32 and jnp.dtype(rhs_dtype) == jnp.float32:
+        return mosaic_tpu_fp32_precision(m, k, n)
+    return jax.lax.Precision.DEFAULT
+
+
 @functools.cache
 def _preset_arithmetic(preset: jax.lax.DotAlgorithmPreset, lhs, rhs) -> DotArithmetic | None:
     """`preset`'s arithmetic over operands of dtypes `lhs` and `rhs`, read from the attribute JAX's own

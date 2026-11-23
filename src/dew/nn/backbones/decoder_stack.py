@@ -39,7 +39,7 @@ from ..cross_pass import CrossPass
 from ..derivatives import formed_together
 from ..host_memory import fetched, fetched_at, on_host
 from ..hyper_connections import Carried
-from ..inspection import counted, current_positions, watched_positions
+from ..inspection import counted, current_component, current_positions, watched_positions
 from ..kv_cache import cache_at_layer, cache_from_layer
 from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
@@ -612,7 +612,7 @@ def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematP
         applied, policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
 
     return in_backward.scanned_run(
-        run.path, layer, weights, held.get(in_backward.MASTERS),
+        (*current_component(), *run.path), layer, weights, held.get(in_backward.MASTERS),
         {name: held[name] for name in current.moments}, in_backward.norms_of(held[in_backward.NORMS]), x,
         (keys, constants), (attention_metadata,))
 

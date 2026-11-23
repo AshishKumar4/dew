@@ -240,8 +240,15 @@ def test_every_keyed_objectives_key_is_the_same_after_its_loss_is_traced_and_bui
     assert not moved, "; ".join(f"{name} {how}" for name, how in moved.items())
 
 
+FITTED = sorted({*cases(None), *(f"run {kind}" for kind in RUN_KINDS)} - KEYLESS)
+"""The objectives a fit of a step reads a batch for: every registered one as its recipe builds it and each
+run kind's as its config does (`built_objectives`), its own case each, so one that a fit keys apart is
+named by its case, and the cases share CI's groups."""
+
+
 @attending("xla")
-def test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew(built_objectives):
+@pytest.mark.parametrize("name", FITTED)
+def test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew(built_objectives, name):
     """Every objective a recipe or a run's config builds (`built_objectives`) that states a key states the
     same one after a fit of a step over the first batch its recipe trains on, its heads (its own, a policy's
     actor's) put back at the rung they were built at (`restore_head`, as a fit's ladder puts them back), as an
@@ -256,30 +263,23 @@ def test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew(built_
 
     # One device: a recipe's first batch holds a couple of rows.
     mesh = MeshSpec().build(jax.devices()[:1])
-    moved = {}
-    for name, build in sorted(built_objectives.items()):
-        if name in KEYLESS:
-            continue
-        objective, batch = build()
-        if batch is None:
-            continue
-        batch = rolled_out(name, batch, objective)
-        rows = len(next(iter(batch.values())))
-        loader = Loader(train=lambda partition, batch=batch: iter([batch] * 2), val=None, records=None,
-                        batch=rows)
-        held = {key: frozen_value(value) for key, value in vars(objective).items()}
-        # Its heads, its own and those of the objectives it holds (a policy's actor), as built.
-        heads = [(each, each.head_tile, each.head_fused) for each in (objective, *vars(objective).values())
-                 if isinstance(each, HeadedObjective)]
-        Trainer(objective, optax.sgd(0.0), key=jax.random.key(0), mesh=mesh).fit(loader, steps=1, log_every=1)
-        for each, tile, fused in heads:
-            each.restore_head(tile, fused=fused)
-        fitted, anew = stated_trace(objective), stated_trace(build()[0])
-        if fitted != anew:
-            written = sorted(key for key, value in vars(objective).items()
-                             if key not in held or held[key] != frozen_value(value))
-            moved[name] = "no key" if fitted is None else f"fitted apart by {written}"
-    assert not moved, "; ".join(f"{name} {how}" for name, how in moved.items())
+    build = built_objectives[name]
+    objective, batch = build()
+    assert batch is not None, f"{name} builds no batch to fit a step over"
+    batch = rolled_out(name, batch, objective)
+    rows = len(next(iter(batch.values())))
+    loader = Loader(train=lambda partition: iter([batch] * 2), val=None, records=None, batch=rows)
+    held = {key: frozen_value(value) for key, value in vars(objective).items()}
+    # Its heads, its own and those of the objectives it holds (a policy's actor), as built.
+    heads = [(each, each.head_tile, each.head_fused) for each in (objective, *vars(objective).values())
+             if isinstance(each, HeadedObjective)]
+    Trainer(objective, optax.sgd(0.0), key=jax.random.key(0), mesh=mesh).fit(loader, steps=1, log_every=1)
+    for each, tile, fused in heads:
+        each.restore_head(tile, fused=fused)
+    fitted, anew = stated_trace(objective), stated_trace(build()[0])
+    written = sorted(key for key, value in vars(objective).items()
+                     if key not in held or held[key] != frozen_value(value))
+    assert fitted is not None and fitted == anew, f"{name} fitted apart by {written}"
 
 
 @pytest.mark.parametrize("name", sorted(BUILT))
