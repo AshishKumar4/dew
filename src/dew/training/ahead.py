@@ -1564,6 +1564,8 @@ def _targeted[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
 def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *, frontier: bool,
                                     plan: FitPlan | None, topology: bytes | None) -> AheadOfTime:
     """`_compiled_ahead`'s planning and compile: the step's plan, its programs and their record."""
+    from dew.distributed.placement import placed_shapes
+
     if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
         raise ValueError("compile-ahead needs a device-resident step over its loader, with no lower_for")
     began = time.perf_counter()
@@ -1594,7 +1596,7 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
     memory = compiled_memory(compiled)
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
-    programs = _step_programs(planned, starts)
+    programs = _step_programs(planned, starts, placed_shapes(start.abstract, start.shardings))
     need = programs_need(devices[0], [(compiled_memory(executable), held, built)
                                       for executable, held, built in programs])
     return AheadOfTime(
@@ -1611,7 +1613,8 @@ def _planned_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Ba
         starts={digest: Executable.of(executable) for digest, (executable, _) in starts.items()})
 
 
-def _step_programs(planned: Planned, starts: Started) -> list[tuple[jax.stages.Compiled, int, int]]:
+def _step_programs(planned: Planned, starts: Started, placed: TrainState
+                   ) -> list[tuple[jax.stages.Compiled, int, int]]:
     """Every program a run of a step compiled ahead runs, each with the bytes its run holds beside it and
     those of them its first call builds (`memory.admission`'s `held` and `built`): the one list the build's
     need (`programs_need`) and its choices left to run time (`report.left_at_run`) read (row 8713). Its
@@ -1620,15 +1623,35 @@ def _step_programs(planned: Planned, starts: Started) -> list[tuple[jax.stages.C
     between its steps (the step's arguments, its first call's builds charged once, and what its loop
     keeps), less the bytes of the state among the program's own arguments (row 8710: a program run beside
     the placed state admitted beside none, so a device admitted at the need ran out of memory where the
-    run's own admission refused it). The step's memory is stated (`_planned_ahead`)."""
+    run's own admission refused it); and each beside what of the run's placed state (`placed`) the step's
+    arguments hold none of (`_unread`). The step's memory is stated (`_planned_ahead`)."""
     candidate = planned.candidate
     memory = compiled_memory(planned.executable)
     assert memory is not None
-    resident = memory.argument - candidate.built + candidate.held
+    unread = _unread(planned.executable, placed, candidate.built)
+    resident = memory.argument - candidate.built + candidate.held + unread
     steps = [planned.executable, *([] if planned.sampled is None else [planned.sampled.executable])]
-    return [*((step, candidate.held, candidate.built) for step in steps),
+    return [*((step, candidate.held + unread, candidate.built) for step in steps),
             *((executable, 0 if among is None else max(0, resident - among), 0)
               for executable, among in starts.values())]
+
+
+def _unread(step: jax.stages.Compiled, placed: TrainState, built: int) -> int:
+    """The bytes of the run's placed state (`placed`, each leaf in a device's own memory) the step's
+    arguments hold none of: its state as its arguments carry it (its moving and frozen trees,
+    `step_program`'s first two), each leaf XLA kept there (a leaf it drops holds no sharding,
+    `Compiled.input_shardings`), less its first call's builds (`built`), which the placed state holds none
+    of. A frozen leaf no step reads is among them, held by the devices all the same (row 8710's review: a
+    need read off the step's arguments left out a leaf the run holds, which its evaluation may read)."""
+    from dew.distributed.placement import placed_bytes
+
+    (arguments, _), (shardings, _) = step.in_avals, step.input_shardings
+    read = [jax.ShapeDtypeStruct(aval.shape, aval.dtype, sharding=sharding)
+            for tree, laid in zip(arguments[:2], shardings[:2], strict=True)
+            for aval, sharding in zip(jax.tree.leaves(tree),
+                                      jax.tree.leaves(laid, is_leaf=lambda leaf: leaf is None), strict=True)
+            if sharding is not None]
+    return max(0, placed_bytes(placed, memory="device") - (placed_bytes(read, memory="device") - built))
 
 
 def _sampled_ahead(planned: Planned) -> AheadProgram | None:
@@ -1767,8 +1790,8 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     shapes (`collecting`), joining `programs` by digest (`_collected`): `started`'s last part. A window's
     allocation and a log's copies take the state alone; the programs over a step's results take none of it,
     and an evaluation's take the weights the run holds beside their batches (`_weights_among`)."""
-    from dew.distributed.placement import placed_shapes
-    from dew.state import apart, together
+    from dew.distributed.placement import allocated_bytes, placed_shapes
+    from dew.state import apart, taken, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest, streak_of
 
     candidate, split = planned.candidate, planned.split
@@ -1778,7 +1801,11 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     # A sampled step's results hold its summaries (`Committed.inspected`), which its programs read too.
     steps = [planned.executable] + ([] if planned.sampled is None else [planned.sampled.executable])
     if trainer._builds_window(placed, candidate, window):
-        with _collected(programs, _arguments):
+        # Built before the window it builds is: beside the run's state less the window's fresh leaves, which
+        # the steady state the need holds keeps (`Candidate.held`) and the builder's own outputs are here,
+        # those it takes over from a donor aliasing its buffers (row 8710's review: charged twice).
+        fresh = allocated_bytes(taken(placed.window, candidate.prepared.window)[0])
+        with _collected(programs, lambda executable: _arguments(executable) + fresh):
             trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
     with _collected(programs, lambda executable: 0):
         for step in steps:
