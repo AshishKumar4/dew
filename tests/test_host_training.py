@@ -1629,10 +1629,15 @@ def test_a_fit_that_streams_over_its_device_plans_search_keeps_none_of_what_that
     12131's P0: the device plan's candidates stayed pinned)."""
     from model_support import memory_limited_to
 
+    from dew.nn.kernels import options
     from dew.training import _candidates
     from dew.training.ahead import stand_in_gpus
 
-    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory_limited_to(streamed_only())):
+    memory = memory_limited_to(streamed_only())
+    # The runs that measured the window keep their plans' steps for a refit: none of this run's.
+    options.release()
+    gc.collect()
+    with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory):
         trainer = streaming_decoder()
         trainer.fit(streaming_data(), steps=1, log_every=100)
     choice = trainer.layout_choice
