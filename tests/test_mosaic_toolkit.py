@@ -478,7 +478,8 @@ def test_a_launch_with_a_joined_correction_warpgroup_counts_its_registers_in_its
     runs one warpgroup more, its consumers' budget is its schedule's (below two consumers' alone, the
     program's launch pool shared four ways), its correction role's half of it, and its register model counts
     the correction's registers in what a program allocates, so a multiprocessor holds no more programs of it
-    than its registers do (row 5368)."""
+    than its registers do (row 5368); and its schedule refuses, as it traces, the role it was sized by run
+    with no body, or a body of a role it was not (row 9785: a warpgroup launched beside no body hung)."""
     from dew.nn.kernels.templates import mosaic_sm100
 
     with generation.assumed("sm100"):
@@ -493,6 +494,9 @@ def test_a_launch_with_a_joined_correction_warpgroup_counts_its_registers_in_its
         alone = resources.register_model(family, 2, held["consumer"], target=generation.gpu_target())
         assert model.resident(held["consumer"]) <= alone.resident(held["consumer"])
         assert model.most == family.programs(2, held["consumer"], joined=joined)
+        for given, bodies in ((joined, {}), ((), {"correction": print})):
+            with pytest.raises(ValueError):
+                family.scheduled(2, print, lambda: None, joined=given, bodies=bodies)
 
 
 def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_configs():
