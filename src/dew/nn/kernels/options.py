@@ -960,11 +960,12 @@ class OuterProgram:
                     self._collected = True
                     self._bounded()
             _facts.replay(kept.reads)
+            executable = kept.executable
             if kept.digest is not None:
-                collected[kept.digest] = kept.executable
+                collected[kept.digest] = executable
             # Each result with the weak type its compile's own trace gave it, never a trace again (row 11766:
             # a trace after a settle's own missed JAX's cache and traced every program twice).
-            return _outputs(kept.executable.out_info, kept.weak_types)
+            return _outputs(executable.out_info, kept.weak_types)
         key, dynamic, named = self.key_of(args, kwargs)
         if (together := _TOGETHER.get()) is not None:
             return self._together(together, (key, refusals), args, kwargs)
@@ -972,7 +973,8 @@ class OuterProgram:
         if kept is None:
             kept = (self._shaped_for(key, args, kwargs, refusals)
                     or self._kept_for(key, args, kwargs, refusals))
-        # The facts its trace read, which no trace of this call reads (`_settle`).
+        # The facts its trace read, which no trace of this call reads (`_settle`); its executable read once,
+        # so what its `running` blocks admit is what runs, a guided replacement past it (`guided`).
         _facts.replay(kept.reads)
         return self.invoked(kept.executable, args, kwargs, *dynamic, **named)
 
