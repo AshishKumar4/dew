@@ -4,13 +4,14 @@ kernels' names, which a tile's producer registers are kept by. Light at import: 
 type (a selector's launch, `grouped_matmul`) reads no toolkit module until a tile is made."""
 
 import dataclasses
+import math
 from typing import ClassVar
 
 import jax
 from jax import numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import base, resources
+from dew.nn.kernels.templates import base, resources, stores
 
 GMM = "dew_gmm"
 """The name of a product's kernel (`gmm`), its producer's registers `Tiles.producers`' by it."""
@@ -105,49 +106,45 @@ class Tiles:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
         if self.staging is not None:
-            chunk, buffers = self.staging
-            if chunk <= 0 or buffers < 1:
-                raise ValueError(f"{self}: output staging needs positive (chunk, buffers), "
-                                 f"got {self.staging}")
-            # Its chunks' columns against the tile's and its issuer's pieces, which no dtype changes; a
-            # chunk's bytes in the call's output dtypes are its launch's to judge (`staged_whole`).
+            # A family that stages its outputs whole refuses chunks (`Family.output_staging` of no outputs);
+            # its chunks against the tile's columns and its issuer's pieces, which no dtype changes
+            # (`stores.staging_refusal` of no dtypes); a chunk's bytes in the call's output dtypes are its
+            # launch's to judge (`staging_refusal`).
+            family.output_staging((), self.warpgroups, self.staging)
             columns = self.block_n * (self.cluster if family.pairs_product else 1)
-            family.output_staging((((self.share, columns), jnp.bfloat16),), self.warpgroups, self.staging)
+            refusal = stores.staging_refusal(columns, (), self.staging, piece=family.chunk_columns(columns))
+            if refusal is not None:
+                raise ValueError(f"{self}: {refusal}")
 
     def stated(self, outputs, family) -> tuple[int, int] | None:
         """The output staging this tile states for a kernel storing `outputs` (`(shape, dtype)` each,
-        `persist`'s `chunks`) on `family` (its issuer specialized for the tile), refused where a chunk is no
-        whole accumulator atom or TMA store (`staged_whole`), as the launch's candidate refuses it: `gmm` or
-        `tgmm` called directly at a pin."""
-        if not self.staged_whole((dtype for _, dtype in outputs), family):
-            raise ValueError(f"{self}: a staged chunk of its outputs is no whole {TMA_STORE_BYTES}-byte TMA "
-                             "store in their dtypes")
+        `persist`'s `chunks`) on `family` (its issuer specialized for the tile), refused where it holds no
+        chunk of them (`staging_refusal`), as the launch's candidate refuses it: `gmm` or `tgmm` called
+        directly at a pin."""
+        if (refusal := self.staging_refusal(tuple(dtype for _, dtype in outputs), family)) is not None:
+            raise ValueError(f"{self}: {refusal}")
         return self.staging
 
-    def staged_whole(self, dtypes, family) -> bool:
-        """Whether each output chunk this tile states (`staging`) slices its accumulator at whole fragments
-        (`ACCUMULATOR_COLUMNS`) and whole atoms of `family`'s issuer as the tile specializes it
-        (`mosaic.Issuer.atom_columns`: two row warps of mma.sync tile 16 columns), and is whole TMA store
-        quanta in every one of the call's output `dtypes` by their bits (`TMA_STORE_BYTES`: a 4-bit float's
-        16 columns are 64 bits, no store); a tile stating none stages at its family's own."""
+    def staging_refusal(self, dtypes, family) -> str | None:
+        """Why the output staging this tile states (`staging`) holds no chunk of the call's outputs of
+        `dtypes` on `family` (its issuer as the tile specializes it), None where it does or states none: a
+        chunk slices its accumulator at whole fragments (`ACCUMULATOR_COLUMNS`) and whole atoms of the issuer
+        (`mosaic.Issuer.atom_columns`: two row warps of mma.sync tile 16 columns), and divides the tile and
+        the issuer's pieces in whole TMA rows of each dtype (`stores.staging_refusal`, the one owner of
+        those)."""
         if self.staging is None:
-            return True
-        chunk = self.staging[0]
-        if chunk % family.atom_columns:
-            return False
-        bits = (jax.dtypes.itemsize_bits(jnp.dtype(dtype)) for dtype in dtypes)
-        return chunk % ACCUMULATOR_COLUMNS == 0 and all(chunk * each % (8 * TMA_STORE_BYTES) == 0
-                                                         for each in bits)
+            return None
+        unit = math.lcm(ACCUMULATOR_COLUMNS, family.atom_columns)
+        if self.staging[0] % unit:
+            return f"a stated chunk of {self.staging[0]} columns slices the accumulator's {unit}-column atoms"
+        columns = self.block_n * (self.cluster if family.pairs_product else 1)
+        return stores.staging_refusal(columns, dtypes, self.staging, piece=family.chunk_columns(columns))
 
-
-TMA_STORE_BYTES = 16
-"""The bytes a TMA store's box row steps by (128 bits): a staged output chunk's row is whole multiples of it
-in its dtype, so a bf16 chunk is a multiple of 8 columns and an fp32 one of 4 (`Tiles.staged_whole`)."""
 
 ACCUMULATOR_COLUMNS = 8
 """The columns an MMA accumulator's register fragment holds together (mma.sync's n8, a warpgroup MMA's
 8-column tiles): a staged chunk slices the accumulator at whole fragments, so an fp32 chunk of 4 columns,
-whole TMA stores, is still none (`Tiles.staged_whole`)."""
+whole TMA stores, is still none (`Tiles.staging_refusal`)."""
 
 
 CONSUMERS = 2

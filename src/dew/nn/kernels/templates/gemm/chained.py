@@ -27,7 +27,7 @@ import jax
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels.templates import mosaic, rings
+from dew.nn.kernels.templates import mosaic, rings, stores
 
 if TYPE_CHECKING:
     from dew.nn.kernels.templates.gemm.tiling import Tiles
@@ -130,12 +130,10 @@ def replay_refusal(tiles: "Tiles", products: int, family: mosaic.Family, dtype) 
                 f"accumulator a product (`guarded_walk`): {columns} columns, no whole {unit}-column units")
     _, staging = _replayed(tiles, products)
     if staging is not None:
-        # Its narrowed staging's chunk within the pieces its issuer emits of the narrowed columns.
-        chunk = staging[0]
-        piece = family.chunk_columns(columns * (tiles.cluster if family.pairs_product else 1))
-        if piece % chunk:
-            return (f"a chained launch's replay stages its {columns} columns in chunks of {chunk}, which its "
-                    f"issuer's {piece}-column pieces do not hold")
+        # Its narrowed staging within the narrowed columns and the pieces its issuer emits of them, as the
+        # allocation reads it (`stores.staging_refusal`); its bytes in the outputs' dtypes, the candidate's.
+        staged = columns * (tiles.cluster if family.pairs_product else 1)
+        return stores.staging_refusal(staged, (), staging, piece=family.chunk_columns(staged))
     return None
 
 
