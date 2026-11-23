@@ -13,9 +13,9 @@ import jax.numpy as jnp
 from jax.custom_derivatives import SymbolicZero
 
 from dew.nn import float_bits
-from dew.nn.aligned import aligned_sum
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import generation
+from dew.nn.precision import power2
 from dew.nn.sharding import explicit_spec, varying_like
 
 
@@ -130,7 +130,7 @@ class _Transpose:
         shared by every device that sums it), and the decoded matrix on its own; each slice pair's
         product summed by a bf16 GEMM whose fp32 sums are integers below 2**24, so exact
         (`FACTORED_WIDTH` columns a chunk), into int32 limbs, its routes' limbs added into their tokens and
-        the devices' over the axes they sum, carried, then rounded once (`aligned.aligned_sum`). No product
+        the devices' over the axes they sum, carried, then rounded once (`_rounded`). No product
         overflows, flushes or rounds before the one rounding, within a route, across its routes, or across
         its devices: what cancels anywhere leaves its exact remainder (rows 1464, 12392, 12403)."""
         gather, wide_operands = routed
@@ -164,7 +164,8 @@ class _Transpose:
         depth, width = self.shape[-1], cotangent.shape[-1]
         chunk = math.gcd(depth, FACTORED_DEPTH)
         columns_a_chunk = max(d for d in range(1, min(width, FACTORED_WIDTH) + 1) if width % d == 0)
-        limbs_count = FACTORED_ROW_SLICES + FACTORED_MATRIX_SLICES - 1
+        # The products' limbs below `FACTORED_HEADROOM` limbs over them that their sums carry into.
+        limbs_count = FACTORED_HEADROOM + FACTORED_ROW_SLICES + FACTORED_MATRIX_SLICES - 1
         rows = cotangent.shape[0]
 
         def pulled_chunk(at, out):
@@ -193,8 +194,9 @@ class _Transpose:
 
                             def multiplied(limbs):
                                 summed = self.wide(a, b, *rest).astype(jnp.int32)
-                                at_t = jax.lax.dynamic_index_in_dim(limbs, i + j, 0, keepdims=False)
-                                return jax.lax.dynamic_update_index_in_dim(limbs, at_t + summed, i + j, 0)
+                                t = FACTORED_HEADROOM + i + j
+                                at_t = jax.lax.dynamic_index_in_dim(limbs, t, 0, keepdims=False)
+                                return jax.lax.dynamic_update_index_in_dim(limbs, at_t + summed, t, 0)
 
                             return jax.lax.cond(jnp.any(b != 0), multiplied, lambda limbs: limbs, limbs)
 
@@ -211,11 +213,8 @@ class _Transpose:
             axes = tuple(sorted(jax.typeof(limbs).mat.varying - self.held))
             limbs = _carried(jax.lax.psum(limbs, axes) if axes else limbs)
             sums_grid = grid if gather is None else _edge(token)
-            # Limb t's weight: 2**(grid + matrix grid - 2 slices - t slices), as factors each normal.
-            terms = [(limbs[t].astype(jnp.float32),
-                      *_powers(sums_grid + matrix_grid - FACTORED_SLICE * (t + 2)))
-                     for t in range(limbs_count)]
-            summed = aligned_sum(terms)
+            # The first limb's unit: 2**(grid + matrix grid - 2 slices + the headroom's slices).
+            summed = _rounded(limbs, sums_grid + matrix_grid + FACTORED_SLICE * (FACTORED_HEADROOM - 2))
             return jax.lax.dynamic_update_slice_in_dim(out, varying_like(summed, out), at * chunk, axis=-1)
 
         # The rows' gradient, typed and placed as the plain transpose's is (its devices' sums taken, as each
@@ -246,6 +245,10 @@ this): their slices' products sum below `2**24`, exact."""
 FACTORED_DEPTH = 64
 """The depth a chunk the exact rescue pulls back at once (a divisor of the rows' depth): its limbs are
 `FACTORED_ROW_SLICES + FACTORED_MATRIX_SLICES - 1` int32 of rows x chunk."""
+
+FACTORED_HEADROOM = 6
+"""Limbs above the products' first its sums carry into (36 bits): a sum over 2**19 columns, every route of a
+token and every device of a mesh, each product below the two grids' tops."""
 
 FACTORED_ROW_SLICES = 97
 """A row's slices: its products' binades span at most a cotangent's and a factor's ranges multiplied (-298
@@ -292,14 +295,34 @@ def _carried(limbs: jax.Array) -> jax.Array:
     return jax.lax.fori_loop(0, limbs.shape[0] - 1, carry, limbs)
 
 
-def _powers(power: jax.Array) -> list[jax.Array]:
-    """`2**power` as factors each a normal float's (`float_bits.exact_power2`), their product exact."""
-    factors, left = [], power
-    for _ in range(9):
-        part = jnp.clip(left, -126, 127)
-        factors.append(float_bits.exact_power2(part))
-        left = left - part
-    return factors
+def _rounded(limbs: jax.Array, unit: jax.Array) -> jax.Array:
+    """The fp32 value nearest (ties to even) `sum(limbs[t] * 2**(unit - FACTORED_SLICE * t))`, carried int32
+    `limbs` (the first signed and below `2**FACTORED_SLICE`, `FACTORED_HEADROOM` deep; each other in
+    `[0, 2**FACTORED_SLICE)`): its leading 30 bits and whether any below them are set, rounded once to the
+    bits fp32 keeps at its binade (fewer where it is subnormal), then scaled (`precision.power2`)."""
+    width = FACTORED_SLICE
+    negative = limbs[0] < 0
+    limbs = _carried(jnp.where(negative[None], -limbs, limbs))
+    nonzero = limbs != 0
+    lead = jnp.argmax(nonzero, axis=0)
+    padded = jnp.concatenate([limbs, jnp.zeros((5, *limbs.shape[1:]), limbs.dtype)])
+    mantissa = sum(jnp.left_shift(jnp.take_along_axis(padded, (lead + k)[None], axis=0)[0], width * (4 - k))
+                   for k in range(5))
+    later = jnp.cumsum(nonzero[::-1].astype(jnp.int32), axis=0)[::-1]
+    later = jnp.concatenate([later, jnp.zeros((5, *later.shape[1:]), later.dtype)])
+    sticky = jnp.take_along_axis(later, (lead + 5)[None], axis=0)[0] > 0
+    top = 31 - jax.lax.clz(jnp.maximum(mantissa, 1))
+    binade = unit - width * (lead + 4) + top
+    kept = jnp.where(binade >= -126, 24, 24 - (-126 - binade))
+    drop = jnp.clip(top + 1 - kept, 0, 30)
+    quotient = jnp.right_shift(mantissa, drop)
+    remainder = mantissa - jnp.left_shift(quotient, drop)
+    half = jnp.left_shift(1, jnp.maximum(drop - 1, 0))
+    up = (drop > 0) & ((remainder > half) | ((remainder == half) & (sticky | (quotient % 2 == 1))))
+    quotient = jnp.where(kept < 0, 0, quotient + up.astype(quotient.dtype))
+    value = power2(quotient.astype(jnp.float32), unit - width * (lead + 4) + drop)
+    value = jnp.where(jnp.any(nonzero, axis=0), value, 0.0)
+    return jnp.where(negative, -value, value)
 
 
 def _significand(x: jax.Array) -> jax.Array:
