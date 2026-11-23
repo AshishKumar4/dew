@@ -561,7 +561,6 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
 
     from dew.data.dataset import Loader
     from dew.distributed.placement import placed_bytes
-    from dew.nn.kernels import options
     from dew.telemetry.compiles import Compiles
     from dew.training import Layout, MeshSpec, Trainer
 
@@ -636,8 +635,6 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     grown = {"bytes_limit": state + 2 * with_copies + state // 2, "bytes_in_use": 0, "pool_bytes": state,
              "largest_free_block_bytes": state // 2}
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: grown)
-    # A fresh run's process, holding no executable of the runs above.
-    options.unhold()
     run, _ = built()
     with chosen(narrow_copies='on'), Compiles("step") as steps:
         run.fit(stream, steps=2)
@@ -661,7 +658,6 @@ def test_a_fresh_plan_refused_with_its_copies_built_deletes_them_before_it_is_se
     from token_support import repeated_token_batch
 
     from dew.data.dataset import Loader
-    from dew.nn.kernels import options
     from dew.training import Layout, MeshSpec, Trainer
     from dew.training.planning import PlanRefused
 
@@ -690,7 +686,6 @@ def test_a_fresh_plan_refused_with_its_copies_built_deletes_them_before_it_is_se
     assert probe["narrow"] and probe["fits"] and copies, (probe, copies)
     need, temporaries = free - probe["headroom"], probe["temp"]
     del roomy
-    options.unhold()
     # Free in all, the need and half the temporaries: the plan made before the state is placed holds. The
     # pool's growth one byte short of the temporaries, and its blocks, the state and copies on it, the
     # rest: half the temporaries and what is placed beside them, no block for them.

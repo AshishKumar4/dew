@@ -639,12 +639,14 @@ _PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_p
 
 
 def release() -> None:
-    """Drop every live program's compiled executables (`OuterProgram.released`) and the process's held ones
-    (`held`), as `jax.clear_caches` drops jit's own, and what else keeps a lowering whose live module keys
-    JAX's loaded executable of it (`held_until_release`): XLA:CPU maps each executable's code into the
+    """Drop every live program's compiled executables (`OuterProgram.released`), as `jax.clear_caches`
+    drops jit's own, what else keeps a lowering whose live module keys JAX's loaded executable of it
+    (`held_until_release`), and the programs `program` made: XLA:CPU maps each executable's code into the
     process, and a program keeps up to `OuterProgram.CACHED` of them for as long as it lives, past a cache
     JAX clears. A process that compiles on and on (a test suite) frees the mappings this way; each program
-    compiles again at its next call."""
+    compiles again at its next call. No executable is held past its owner (a plan's step, a fit search's
+    programs until it settles): a later trainer of the process reads its step back from the persistent
+    compilation cache."""
     # A snapshot taken under the lock, each holder asked outside it: a holder registers under its own lock
     # (`candidate_for` takes `_HOLDERS_LOCK` within `_KEEPING`), so a release that asked it within ours
     # would take the two the other way round.
@@ -652,48 +654,7 @@ def release() -> None:
         holders = list(_HOLDERS)
     for holder in holders:
         holder.released()
-    unhold()
-
-
-def unhold(key: Hashable | None = None) -> None:
-    """Drop the executable the process holds under `key` (`hold`), or every one it holds where None, every
-    program's own kept: one a plan judged and passed over, or what a fresh process holds of them, which a
-    test of what a start compiles begins from."""
-    with _HELD_LOCK:
-        if key is None:
-            _HELD.clear()
-        else:
-            _HELD.pop(key, None)
-
-
-_HELD: collections.OrderedDict[Hashable, jax.stages.Compiled] = collections.OrderedDict()
-"""The executables a process compiled from a lowering it may lower again (`hold`, `held`), the latest
-`OuterProgram.CACHED`, by the program within the process, its options and its devices."""
-_HELD_LOCK = threading.Lock()
-
-
-def held(key: Hashable) -> jax.stages.Compiled | None:
-    """The executable this process compiled under `key` (`hold`), None where it holds none."""
-    with _HELD_LOCK:
-        return _HELD.get(key)
-
-
-def hold(key: Hashable, executable: jax.stages.Compiled) -> None:
-    """Hold `executable` under `key` (the program within the process, `program_key`, its options and the
-    devices it loads on) for the process: a plan of the same step by a later trainer of the process takes
-    it (`held`), where each new trainer read it back from the persistent compilation cache (4.4 s of a
-    small model's 11.9 s start on CPU, row 6995). Its kernels' report is its lowering's, which the later
-    plan reads as it lowers; a held executable compiles nothing, so the compile telemetry names no compile
-    of it (`dew.telemetry.compiles`). A plan holds the executables that fit, which a run may step on, a
-    guided one in its unguided one's place (`dew.training.planning.Planned.guided`); one that missed only
-    where its plan judged devices as they will not stand (`FitSearch.provisional`: before the state is
-    placed, a later phase's off the loop), for the plan made on them to judge again, which drops it where it
-    misses there too: its device code is held for nothing after. The latest `OuterProgram.CACHED` are held,
-    as a program keeps its own; `release` drops them."""
-    with _HELD_LOCK:
-        _HELD[key] = executable
-        while len(_HELD) > OuterProgram.CACHED:
-            _HELD.popitem(last=False)
+    _program.cache_clear()
 
 
 class OuterProgram:

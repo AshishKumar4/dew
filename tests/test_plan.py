@@ -342,12 +342,14 @@ def test_a_dropped_trainer_holds_no_executable_of_its_step():
     assert step() is None
 
 
-def test_a_second_trainer_of_one_step_plans_on_the_executable_the_first_compiled():
-    """A second trainer of a process, its step the same program on the same devices as an earlier one's,
-    plans on the executable the earlier compiled (`dew.nn.kernels.options.hold`): its plan compiles nothing
-    and reads nothing back from the persistent compilation cache, which the compile telemetry would name
-    (`Compiles`, a backend compile or a cache read alike), where every new trainer read its step back (4.4 s
-    of a small model's 11.9 s start on CPU, row 6995); it steps as the first."""
+@pytest.mark.skipif(not jax.config.jax_enable_compilation_cache,
+                    reason="reads its step back from the persistent compilation cache, off in this run")
+def test_a_second_trainer_of_one_step_reads_its_step_back_compiling_nothing():
+    """A second trainer of a process, its step the same program on the same devices as an earlier one's that
+    is dropped: no executable of the first is held past it (row 12131: a process-wide store kept a dropped
+    run's device code and its collectives' room), and the second reads its step back from the persistent
+    compilation cache, its backend compiling nothing (`Compiles`, where row 6995's store answered it from
+    memory); it steps as the first."""
     from dew.telemetry.compiles import Compiles
 
     first = trained(lm(split=1), steps=1)
@@ -461,7 +463,6 @@ def test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refus
     trained = roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     assert roomy.validation is not None
     room = max(roomy.validation.device_bytes.values()) + 1024
-    options.unhold()
     # Held arrays the start copies, the trained parameters on the device.
     held = {"params": trained.variables["params"]}
     lowered = []
@@ -513,7 +514,6 @@ def test_a_fresh_fit_whose_placed_devices_hold_its_step_trains_after_its_unplace
     roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     assert roomy.validation is not None
     state = max(roomy.validation.device_bytes.values())
-    options.unhold()
 
     def held(device) -> int:
         return sum(array.nbytes for array in jax.live_arrays() if device in array.devices())
@@ -553,7 +553,6 @@ def test_a_fit_of_no_steps_on_devices_holding_no_plan_returns_and_its_trainer_tr
     roomy.fit(Loader(lambda partition: rows, None, None, ROWS), steps=1)
     assert roomy.validation is not None
     room = max(roomy.validation.device_bytes.values()) + 1024
-    options.unhold()
     trainer = lm()
     free_until_placed(monkeypatch, room)
     assert int(trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=0).step) == 0
@@ -568,14 +567,12 @@ def needs(monkeypatch, trainer, run=None):
         trained(trainer, steps=0)
     else:
         run()
-    # Measured as in a process apart: the run a test then counts compiles nothing of it.
-    options.unhold()
     return LIMIT - trainer.plan["probes"][0]["headroom"]
 
 
 def test_a_settled_plan_keeps_no_program_its_search_passed_over(monkeypatch):
     """A search that compiled the step whole, which missed, and split, which fits, keeps the plan's program
-    alone once it settles: its executable held for the process (`options.hold`) and its traced step for a
+    alone once it settles: its executable held for the run (`FitSearch.executables`) and its traced step for a
     refit (`_candidates.candidate_for`), each other program it compiled dropped, whose lowering keys its
     loaded executable and, over several GPUs, its collectives' room outside XLA's pool for as long as it is
     kept (row 12131: 24 kept beside a 4B run's step left an all-reduce no room)."""
@@ -590,7 +587,7 @@ def test_a_settled_plan_keeps_no_program_its_search_passed_over(monkeypatch):
     assert len(trainer.plan["probes"]) >= 2 and trainer.plan["split"] > 1, trainer.plan["probes"]
     kept = [kept.lowered for kept in _candidates._CANDIDATES.values()]
     assert len(kept) == 1, len(kept)
-    assert len(options._HELD) == 1, list(options._HELD)
+    assert len(trainer._compiler._executables) == 1, list(trainer._compiler._executables)
 
 
 def test_a_provisional_plans_search_keeps_no_program_once_its_plan_is_taken(monkeypatch):
@@ -621,7 +618,7 @@ def test_a_provisional_plans_search_keeps_no_program_once_its_plan_is_taken(monk
     assert int(trained.step) == 1 and isinstance(plan, dict) and len(plan["probes"]) >= 2, plan
     gc.collect()
     assert len(_candidates._CANDIDATES) == 1, list(_candidates._CANDIDATES)
-    assert len(options._HELD) == 1, list(options._HELD)
+    assert len(trainer._compiler._executables) == 1, list(trainer._compiler._executables)
 
 
 def test_a_provisional_plans_search_is_released_where_the_placed_search_after_it_refuses(monkeypatch):
@@ -1440,7 +1437,6 @@ def test_a_checkpoint_whose_step_climbed_to_recompute_its_layers_resumes_at_that
 
     def fitted(trainer, steps):
         trainer.fit(windows(corpus), steps=steps, log_every=100, checkpoint_every=1)
-        options.unhold()
         return trainer
 
     free(monkeypatch, LIMIT)
@@ -2126,8 +2122,7 @@ def test_a_tight_start_settles_the_split_beside_one_that_missed_and_compiles_onc
     assert any(probe["split"] == between[0] and not probe["fits"] for probe in probes), probes
     asked = [probe["split"] for probe in probes]
     assert len(set(asked)) == len(asked) <= ROWS and compiles.count <= len(asked), (compiles.count, probes)
-    # A warm process: the cold one's record, none of its executables.
-    options.unhold()
+    # A warm process: the cold one's record, none of its executables, which no trainer holds past itself.
     with Compiles("step") as compiles:
         trained(warm, steps=0)
     assert compiles.count == 1 and warm.plan["split"] == between[1]
@@ -2182,7 +2177,6 @@ def test_a_run_of_one_remat_takes_no_plan_a_run_of_another_recorded(monkeypatch,
     tight = lm(split=1)
     trained(tight, steps=0)
     assert tight.plan["remat"] is not None, tight.plan
-    options.unhold()
     free(monkeypatch, LIMIT)
     none = lm(split=1, policy="none")
     trained(none, steps=0)
@@ -2202,7 +2196,6 @@ def test_a_checkpoints_shape_rung_its_run_s_remat_policy_refuses_is_not_climbed_
     trained(tight, steps=0)
     climbed = tight._compiler.checkpoint_rung()
     assert tight.plan["remat"] is not None and climbed["shapes"], tight.plan
-    options.unhold()
     free(monkeypatch, LIMIT)
     none = lm(split=1, policy="none")
     none._compiler.resume_rung({**none._compiler.rung(), "shapes": climbed["shapes"]})
