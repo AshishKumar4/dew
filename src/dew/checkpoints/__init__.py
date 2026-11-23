@@ -2207,8 +2207,9 @@ class Checkpoints:
         placed = template
         template = _clip_pooled_unsaved(_occupancy_unsaved(template, metadata), metadata)
         # An earlier run's masked decay step read across, its record's alone (`earlier_unmasked`).
-        template, form = masked_decay_unsaved(template, metadata, _OPTIMIZERS) if self._unmasked else (
-            template, None)
+        form = None
+        if self._unmasked:
+            template, form = masked_decay_unsaved(template, metadata, _OPTIMIZERS, self._unmasked)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:

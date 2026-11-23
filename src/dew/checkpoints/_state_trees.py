@@ -456,12 +456,18 @@ def mask_readers(config: Mapping[str, JSON]) -> tuple[list[JSON], Sequence[Mappi
     return groups, held if groups else ([] if config.get("spared", True) else [config])
 
 
-def unmasked_decay(record: Mapping[str, JSON]) -> bool:
-    """Whether a run's record (`run.json`) is an earlier run's whose Dew optimizer read a mask of False among
-    its options where its config or a group did not spare (`mask_readers`): the run its record's translation
-    trains at a decay of 0 there (`dew.config.earlier._unmasked`), whose checkpoints hold a masked decay step
-    the translation's optimizer holds bare or none of (`masked_decay_unsaved`). Any other record, today's
-    among them, holds none such."""
+type Unmasked = bool | frozenset[str]
+"""Where an earlier run's optimizer read a mask of False (`unmasked_decay`): its whole state (True, its
+config ungrouped), the param groups of these names alone, or nowhere (False)."""
+
+
+def unmasked_decay(record: Mapping[str, JSON]) -> Unmasked:
+    """Where a run's record (`run.json`) is an earlier run's whose Dew optimizer read a mask of False among
+    its options, as its config or a group did not spare (`mask_readers`): its whole state where it groups
+    none, else the names of its groups that read it, each of which its record's translation trains at a
+    decay of 0 (`dew.config.earlier._unmasked`), whose checkpoints hold a masked decay step the translation's
+    optimizer holds bare or none of (`masked_decay_unsaved`); nowhere (False) for any other record, today's
+    among them."""
     fields = record.get("fields")
     optim = fields.get("optim") if isinstance(fields, Mapping) else None
     tagged = _records.class_record(optim) if isinstance(optim, Mapping) else None
@@ -469,20 +475,28 @@ def unmasked_decay(record: Mapping[str, JSON]) -> bool:
     if not isinstance(config, Mapping):
         return False
     named, options = config.get("optimizer", "adamw"), config.get("optimizer_opts") or {}
-    return (isinstance(named, str) and earlier_typed(named) is not None and isinstance(options, Mapping)
-            and options.get("mask") is False and bool(mask_readers(config)[1]))
+    if not (isinstance(named, str) and earlier_typed(named) is not None and isinstance(options, Mapping)
+            and options.get("mask") is False):
+        return False
+    groups, read = mask_readers(config)
+    if not read:
+        return False
+    return True if not groups else frozenset(str(group.get("name")) for group in read)
 
 
-def earlier_unmasked(directory: str, run_file: str) -> bool:
-    """Whether the checkpoints in `directory` are of a run whose record (`run_file`) is or was an earlier
-    run's whose Dew optimizer read a mask of False among its options (`unmasked_decay`): the one run whose
-    checkpoints a restore reads across its masked decay step (`masked_decay_unsaved`), every other's held to
-    its template as Orbax holds it, an active decay's among them. Read alone, nothing written: the record as
-    it stands, or the mark its run kept beside it as it rewrote that record in its translation
-    (`MASKED_DECAY_MARK`, `keep_unmasked_mark`)."""
+def earlier_unmasked(directory: str, run_file: str) -> Unmasked:
+    """Where the checkpoints in `directory` are of a run whose record (`run_file`) is or was an earlier
+    run's whose Dew optimizer read a mask of False among its options (`unmasked_decay`): the one run, and
+    the parts of its state, whose checkpoints a restore reads across its masked decay step
+    (`masked_decay_unsaved`), every other's held to its template as Orbax holds it, an active decay's among
+    them. Read alone, nothing written: the record as it stands, or the mark its run kept beside it as it
+    rewrote that record in its translation (`MASKED_DECAY_MARK`, `keep_unmasked_mark`)."""
     root = epath.Path(directory)
-    if (root / MASKED_DECAY_MARK).exists():
+    mark = _record_at(root / MASKED_DECAY_MARK)
+    if mark.get("unmasked_all") is True:
         return True
+    if isinstance(groups := mark.get("unmasked_groups"), list):
+        return frozenset(map(str, groups))
     return unmasked_decay(_record_at(root / run_file))
 
 
@@ -490,8 +504,10 @@ def keep_unmasked_mark(path) -> None:
     """Keep `MASKED_DECAY_MARK` beside the run record at `path` (`run.json`) where that record, about to be
     written over in its translation, is an earlier masked run's (`unmasked_decay`), so the run's checkpoints
     read it alike once its record no longer says so (`earlier_unmasked`); nothing where it is not."""
-    if unmasked_decay(_record_at(path)):
-        write_atomically(path.parent / MASKED_DECAY_MARK, json.dumps({"unmasked_decay": True}))
+    unmasked = unmasked_decay(_record_at(path))
+    if unmasked:
+        marked = {"unmasked_all": True} if unmasked is True else {"unmasked_groups": sorted(unmasked)}
+        write_atomically(path.parent / MASKED_DECAY_MARK, json.dumps(marked))
 
 
 def _record_at(path) -> Mapping[str, JSON]:
@@ -503,7 +519,7 @@ def _record_at(path) -> Mapping[str, JSON]:
     return held if isinstance(held, Mapping) else {}
 
 
-def masked_decay_unsaved(template, metadata, optimizers: Sequence[TreePath]):
+def masked_decay_unsaved(template, metadata, optimizers: Sequence[TreePath], unmasked: Unmasked):
     """A restore's `template`, a train state's, read against a checkpoint whose optimizer state holds a decay
     step masked off whole that the template's holds none of or holds bare: an earlier Dew's
     `optimizer_opts={"mask": False}`, which the record's translation trains as a decay of 0
@@ -511,8 +527,10 @@ def masked_decay_unsaved(template, metadata, optimizers: Sequence[TreePath]):
     `optax.EmptyState`) where the template holds the empty state bare (AdamW's decay step, decoupled), and
     that masked step ahead of a solver's state where the template holds the solver's alone (Adam's coupled
     decay, `Adam.COUPLED`, whose chain a decay of 0 drops): each templated as the checkpoint holds it, at
-    each optimizer state at `optimizers`, so the restore reads the leaves alike, neither node holding any;
-    returned beside the template's own form, which the restored state takes back (`formed_as`), or none
+    each optimizer state at `optimizers` where its earlier run read its mask (`unmasked`): its whole state,
+    or the states of those param groups alone (`optax.PartitionState.inner_states`), every other group's as
+    it is, so Orbax holds it to its template; so the restore reads the leaves alike, neither node holding
+    any; returned beside the template's own form, which the restored state takes back (`formed_as`), or none
     where it templates none so. The one translation of that form at the restore boundary (CONTRIBUTING),
     deleted at 1.0."""
     from dew.state import TrainState
@@ -523,16 +541,23 @@ def masked_decay_unsaved(template, metadata, optimizers: Sequence[TreePath]):
     for at in optimizers:
         state = _at(translated, at)
         if state is not None:
-            translated = _with(translated, at, _masked_as_saved(state, _at(metadata, at)))
+            translated = _with(translated, at, _masked_as_saved(state, _at(metadata, at), unmasked))
     return (template, None) if jax.tree.structure(translated) == jax.tree.structure(template) else (
         translated, template)
 
 
-def _masked_as_saved(node, saved):
+def _masked_as_saved(node, saved, unmasked: Unmasked = True):
     """`node`, an optimizer state or a part of one, with each node the checkpoint's metadata `saved` holds as
-    a masked empty decay step templated so (`masked_decay_unsaved`), every other node as it is."""
+    a masked empty decay step templated so (`masked_decay_unsaved`) where its run read its mask: everywhere
+    in it (`unmasked` True), or within the states of the param groups it names alone (`inner_states`),
+    every other node as it is."""
     import optax
 
+    if unmasked is not True and isinstance(node, optax.PartitionState):
+        held = _saved_at(saved, ["inner_states"])
+        return node._replace(inner_states={
+            name: _masked_as_saved(state, _saved_at(held, [name])) if name in unmasked else state
+            for name, state in node.inner_states.items()})
     if isinstance(node, optax.EmptyState):
         return optax.MaskedState(inner_state=node) if _masked_empty(saved) else node
     if (type(node) is tuple and node and not isinstance(node[0], optax.EmptyState | optax.MaskedState)
@@ -542,8 +567,8 @@ def _masked_as_saved(node, saved):
     children, rebuilt = jax.tree_util.tree_flatten_with_path(node, is_leaf=lambda part: part is not node)
     if len(children) == 1 and children[0][1] is node:
         return node
-    return jax.tree.unflatten(rebuilt, [_masked_as_saved(child, _saved_at(saved, [_key_name(path[0])]))
-                                        for path, child in children])
+    return jax.tree.unflatten(rebuilt, [_masked_as_saved(child, _saved_at(saved, [_key_name(path[0])]),
+                                                         unmasked) for path, child in children])
 
 
 def _masked_empty(saved) -> bool:
