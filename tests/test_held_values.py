@@ -5,14 +5,17 @@ import collections
 
 import jax
 import jax.numpy as jnp
+import pytest
 
-from dew import _cache
+from dew import _cache, _facts
 
 
-def test_a_held_none_is_read_back_and_a_value_no_longer_holding_is_made_again():
-    """A value of None is held as any value is, made once; a held value `still` refuses (a held trace whose
-    facts answer otherwise now, row 6708) is made again and held in its place."""
-    cache, made = collections.OrderedDict(), []
+def test_a_held_none_is_read_back_and_a_value_whose_fact_answers_otherwise_is_made_again():
+    """A value of None is held as any value is, made once; a held value whose making read a fact that
+    answers otherwise now (`dew._facts.traced_fact`: a launch refused since, row 6708) is made again and held
+    in its place, and one whose fact answers alike is read back, its fact read again around it (row 12296:
+    every held value held with the facts its making read, `_cache.holding` their one owner)."""
+    cache, made, facts = collections.OrderedDict(), [], {"refused": 0}
 
     def nothing():
         made.append("nothing")
@@ -21,25 +24,26 @@ def test_a_held_none_is_read_back_and_a_value_no_longer_holding_is_made_again():
     assert _cache.holding(cache, "none", nothing, 4) is None
     assert made == ["nothing"]
 
-    facts = {"refused": 0}
+    @_facts.traced_fact
+    def refused() -> int:
+        return facts["refused"]
 
     def traced():
         made.append("traced")
-        return dict(facts)
+        return refused()
 
-    def still(held):
-        return held == facts
-
-    assert _cache.holding(cache, "trace", traced, 4, still=still) == {"refused": 0}
-    assert _cache.holding(cache, "trace", traced, 4, still=still) == {"refused": 0}
+    assert _cache.holding(cache, "trace", traced, 4) == 0
+    with _facts.recording() as again:
+        assert _cache.holding(cache, "trace", traced, 4) == 0
     facts["refused"] = 1
-    assert _cache.holding(cache, "trace", traced, 4, still=still) == {"refused": 1}
-    assert _cache.holding(cache, "trace", traced, 4, still=still) == {"refused": 1}
+    assert _cache.holding(cache, "trace", traced, 4) == 1
+    assert _cache.holding(cache, "trace", traced, 4) == 1
     assert made == ["nothing", "traced", "traced"]
+    assert [answer for _, answer in again.values()] == [0]
 
 
 def test_a_held_trace_made_again_past_its_bound_records_its_facts_afresh():
-    """A held trace (`generation.held_trace`) dropped past its cache's bound by others is made again where it
+    """A held trace (`_cache.holding`) dropped past its cache's bound by others is made again where it
     is read next, and the facts its making reads (`gpu_placed`) are recorded around that read as around its
     first: its holder's report of a reuse is exact across an eviction, never a stale replay (Train 1205's
     review F1, the one owner of a held trace's facts)."""
@@ -55,13 +59,13 @@ def test_a_held_trace_made_again_past_its_bound_records_its_facts_afresh():
             return key
         return make
 
-    with generation.recording() as first:
-        assert generation.held_trace(cache, "first", making("first"), 1) == "first"
-    generation.held_trace(cache, "second", making("second"), 1)
-    with generation.recording() as again:
-        assert generation.held_trace(cache, "first", making("first"), 1) == "first"
-    with generation.recording() as held:
-        generation.held_trace(cache, "first", making("first"), 1)
+    with _facts.recording() as first:
+        assert _cache.holding(cache, "first", making("first"), 1) == "first"
+    _cache.holding(cache, "second", making("second"), 1)
+    with _facts.recording() as again:
+        assert _cache.holding(cache, "first", making("first"), 1) == "first"
+    with _facts.recording() as held:
+        _cache.holding(cache, "first", making("first"), 1)
     assert made == ["first", "second", "first"]
     # Each recording holds the one fact the making read, and its answer.
     assert first and [(fact, answer) for fact, (_, answer) in first.items()] == [
@@ -72,7 +76,7 @@ def test_a_held_trace_made_again_past_its_bound_records_its_facts_afresh():
 def test_a_refusal_scopes_lookup_leaves_a_held_traces_key_as_it_was():
     """Within a refusal scope (`report.refusals`), a lookup of a launch's refusals (`report.refusals_of`,
     which fills the scope's index of them) leaves the key a held trace is kept by (`options.held_context`)
-    as it was: the scope's registry enters it by its refusals alone (`report.refusal_entries`, read under
+    as it was: the scope's registry enters it by its refusals alone (`report.refusal_snapshot`, read under
     its lock), not by its mutable records, where a first probe made its own key stale and a compile worker
     filling it raced the key's walk of its dicts (row 12134's review)."""
     from dew.nn.kernels import options
@@ -328,3 +332,172 @@ def test_a_program_within_a_held_jits_trace_that_refuses_a_launch_leaves_it_to_i
     inner.released()
     with report.refusals():
         assert float(outer(x)) == 0.0
+
+
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+@pytest.mark.parametrize("taken", ["called", "traced", "compiled", "nested"])
+def test_a_held_value_stands_past_a_refusal_of_a_launch_it_read_none_of(taken, warm):
+    """A value held whose making ran a program reading one launch's refusals (`report.refusals_of`), called,
+    traced, compiled or called within a plain jit, stands after another launch is refused, and is made again
+    once its own is: a trace reads the refusals of the launches it reads alone, the whole registry no fact of
+    it (row 12296: any refusal made every held value again, the registry read whole as a program keyed its
+    executables). Run, traced, begun compiling (`options.compiling`) or called within another plain jit once
+    before, its executable, its held jit, its begun compile or its nested jit answering the making with no
+    trace, it holds the facts its trace read as a trace does (row 12296's reviews' P0s: each recorded none,
+    and the value stood past its own launch's refusal)."""
+    from dew.nn.kernels import options
+    from dew.nn.kernels.templates import report
+
+    run = options.owned_program(lambda x: x + (1.0 if report.refusals_of("a launch") else 0.0))
+    x = jnp.zeros(())
+    cache: collections.OrderedDict = collections.OrderedDict()
+    made: list[float] = []
+    begun: list[options.Compiling] = []
+
+    def taking() -> float:
+        if taken == "called":
+            return float(run(x))
+        if taken == "traced":
+            return float(run.trace(x).lower().compile()(x))
+        if taken == "compiled":
+            with options.attempting(begun[-1] if begun else None):
+                return float(run.compiled(x)(x))
+        # Each a plain jit of its own, its trace running the program's nested jit, held across them.
+        return float(jax.jit(lambda y: run(y))(x))
+
+    def making() -> float:
+        made.append(taking())
+        return made[-1]
+
+    with report.refusals():
+        if warm and taken == "compiled":
+            begun.append(options.compiling(run, x))
+        elif warm:
+            assert taking() == 0.0
+        assert _cache.holding(cache, "held", making, 4) == 0.0
+        report.refuse([("another launch", 1, ("k",))])
+        assert _cache.holding(cache, "held", making, 4) == 0.0
+        assert made == [0.0]
+        report.refuse([("a launch", 1, ("k",))])
+        assert _cache.holding(cache, "held", making, 4) == 1.0
+        assert made == [0.0, 1.0]
+
+
+def test_a_held_value_made_over_a_program_traced_again_holds_the_facts_that_trace_read():
+    """A program traced once, a fact its trace reads (`_facts.traced_fact`) then answering otherwise and JAX's
+    caches cleared, traced again by the jit it holds: a value made from that trace holds the fact as it read
+    it now, and once the fact answers as before it is made again, from a trace of that answer (row 12296's
+    review P0: the facts the held jit's first trace read were replayed over the fresh trace's, and the value
+    held on an answer its program never read)."""
+    from dew.nn.kernels.options import owned_program
+
+    answer = [0]
+
+    @_facts.traced_fact
+    def flag() -> int:
+        return answer[0]
+
+    run, x = owned_program(lambda x: x + flag()), jnp.zeros(())
+    cache: collections.OrderedDict = collections.OrderedDict()
+
+    def making() -> float:
+        return float(run.trace(x).lower().compile()(x))
+
+    assert making() == 0.0
+    answer[0] = 1
+    jax.clear_caches()
+    assert _cache.holding(cache, "held", making, 4) == 1.0
+    answer[0] = 0
+    assert _cache.holding(cache, "held", making, 4) == 0.0
+
+
+@pytest.mark.parametrize("enclosed", ["jitted", "mapped"])
+def test_a_program_called_within_another_trace_reads_its_facts_at_each_call(enclosed):
+    """A program called within a plain jit of its own each time (or an eager `jax.vmap`), at one shape under a
+    fact's answer, at another under a second answer, then held made at the first shape: the value is the
+    program's under the answer as it stands, held on it (row 12296's review P0s: the program's jit held across
+    enclosing traces answered the first shape from its cached trace, made under the first answer, with the
+    facts its trace at the other shape read)."""
+    from dew.nn.kernels.options import owned_program
+
+    answer = [0]
+
+    @_facts.traced_fact
+    def flag() -> int:
+        return answer[0]
+
+    run = owned_program(lambda x: x + flag())
+
+    def within(x) -> float:
+        if enclosed == "jitted":
+            return float(jax.jit(lambda y: run(y))(x)[0])
+        return float(jax.vmap(run)(x[None])[0, 0])
+
+    one, two = jnp.zeros((1,)), jnp.zeros((2,))
+    assert within(one) == 0.0
+    answer[0] = 1
+    assert within(two) == 1.0
+    cache: collections.OrderedDict = collections.OrderedDict()
+    assert _cache.holding(cache, "held", lambda: within(one), 4) == 1.0
+    answer[0] = 0
+    assert _cache.holding(cache, "held", lambda: within(one), 4) == 0.0
+
+
+def test_a_trace_reading_a_fact_under_a_gpu_it_assumes_is_taken_as_it_ran():
+    """A program whose trace assumes a GPU of its own and reads its memory (`generation.device_memory`, a
+    traced fact), traced under another assumed GPU of other memory: its trace is taken as it ran, the fact as
+    it read it, where each trace of its own was let go because the fact, asked again outside the GPU it
+    assumed, answered otherwise, and traced again without end (row 12296's review P0)."""
+    import dataclasses
+    import threading
+
+    from jax.extend import core
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.options import owned_program
+
+    outer = dataclasses.replace(generation.gpu_target("sm90"), memory=80 * 2 ** 30)
+    inner = dataclasses.replace(outer, memory=40 * 2 ** 30)
+
+    def read(x):
+        with generation.assumed(inner):
+            return x + generation.device_memory() / 2 ** 30
+
+    run, x = owned_program(read), jnp.zeros(())
+    traced: list = []
+    entered = _cache.carried()
+
+    def tracing() -> None:
+        with entered(), generation.assumed(outer):
+            traced.append(run.trace(x))
+
+    running = threading.Thread(target=tracing, daemon=True)
+    running.start()
+    running.join(timeout=120)
+    assert len(traced) == 1, "the trace was let go and traced again without end"
+    assert float(core.jaxpr_as_fun(traced[0].jaxpr)(x)[0]) == 40.0
+
+
+def test_a_program_called_under_disable_jit_within_a_trace_stages_its_operations_inline():
+    """A program called within `jax.make_jaxpr` under `jax.disable_jit`: its function runs as Python in the
+    trace around it, which stages its operations as a disabled jit does, binding no program of its own
+    (row 12296's review P0: a call within a trace took its held jit's trace and bound that program past the
+    disabled jit)."""
+    from dew.nn.kernels.options import owned_program
+
+    run = owned_program(lambda x: jnp.sin(x) * 2.0)
+    with jax.disable_jit():
+        staged = jax.make_jaxpr(run)(jax.ShapeDtypeStruct((), jnp.float32))
+    names = [equation.primitive.name for equation in staged.jaxpr.eqns]
+    assert "sin" in names and "jit" not in names, names
+
+
+def test_a_program_of_a_static_argument_counted_from_the_end_binds_its_dynamic_operands_alone():
+    """A program whose static argument is named by a negative position (`static_argnums=-1`), called within
+    another jit: the program its trace made is bound to its one array, the static argument read as written,
+    no operand of it (row 12296's review P0: the negative position kept the static string among the operands
+    bound)."""
+    from dew.nn.kernels.options import owned_program
+
+    run = owned_program(lambda x, mode: x * 2.0 if mode == "double" else x, static_argnums=-1)
+    assert float(jax.jit(lambda y: run(y, "double"))(jnp.ones(()))) == 2.0

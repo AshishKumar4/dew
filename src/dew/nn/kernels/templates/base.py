@@ -17,6 +17,7 @@ from typing import ClassVar, TypeGuard
 import tokamax
 
 from dew import _cache
+from dew._facts import Held
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import report, resources
 
@@ -25,7 +26,7 @@ DERIVATIONS_HELD = 4096
 them: a model's distinct launches (each call's shapes and dtypes on its target), 182 for a Qwen3.5-4B decode
 step's trace (FS-WALKELIG)."""
 
-_DERIVED: collections.OrderedDict[Hashable, Hashable] = collections.OrderedDict()
+_DERIVED: collections.OrderedDict[Hashable, Held[Hashable]] = collections.OrderedDict()
 """Each launch's derived config by what its derivation reads (`_derived_once`, held through
 `_cache.holding`), the least recently read first."""
 

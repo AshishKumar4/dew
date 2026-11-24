@@ -28,6 +28,7 @@ from jax.extend.mlir import ir
 from kernel_compile import Uncounted
 from process_support import fresh, keeping_picks
 
+from dew import _facts
 from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
@@ -335,7 +336,7 @@ report.refuse([foreign])
 with assumed(step.target), handed(step):
     within = report.refused_launches()
 print(json.dumps({"within": sorted(map(repr, within)), "step": sorted(map(repr, step.refusals)),
-                  "after": repr(foreign) in map(repr, report.refusal_entries())}))
+                  "after": repr(foreign) in map(repr, report.refusal_snapshot())}))
 """
 """A process on the step's GPU (`AheadOfTime.target`) that refused a launch of another program, handed the
 step compiled ahead at argv[1]."""
@@ -780,11 +781,12 @@ def test_a_products_launch_decided_outside_a_draw_reports_no_route_within_one():
 
 def test_a_products_held_launch_decision_records_the_facts_it_read_wherever_it_is_taken():
     """A product's launch decided once (`projections.launches`, on an assumed H100) records the facts its
-    decision read (`generation.traced_fact`: the CUTLASS build its candidates ask after) into a recording
+    decision read (`_facts.traced_fact`: the CUTLASS build its candidates ask after) into a recording
     around a later call that takes the held decision, as one around its making did: a trace kept by them is
-    held where each answers as it did (`generation.held_trace`, row 12134)."""
+    held where each answers as it did (`_cache.holding`, row 12134)."""
+    from dew._facts import recording
     from dew.nn.kernels import projections
-    from dew.nn.kernels.generation import assumed, recording
+    from dew.nn.kernels.generation import assumed
 
     rows, matrix = (jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((96, 128), (128, 384)))
     with assumed("sm90"):
@@ -1296,10 +1298,10 @@ def test_a_launch_certified_aside_reads_its_own_refusals_alone():
         ((EXPERTS,), jnp.int32))]
     with generation.assumed("sm90"), jax.set_mesh(devices), report.refusals():
         bound = op.bind(*operands, out_dtype="bfloat16", trans_rhs=False, interpret=False)
-        with generation.recording() as read, report.certifying_aside():
+        with _facts.recording() as read, report.certifying_aside():
             report.certified(op, bound, bound.heuristics_config)
         report.refuse([("a launch none of these is", 1, ("its kernel",))])
-        assert read and generation.still(read), read
+        assert read and _facts.still(read), read
 
 
 def test_two_kernels_of_one_name_and_launch_are_refused_not_read_as_one():

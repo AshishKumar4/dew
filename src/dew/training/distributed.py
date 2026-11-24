@@ -21,6 +21,7 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P, Sharding
 
+from dew import _facts
 from dew._cache import holding
 from dew._coordination import from_every_process
 from dew._files import write_atomically
@@ -587,7 +588,7 @@ HELD_APART: Parts[TrainState, TrainState, dict[str, Variables]] = Parts(apart, t
 """A fresh state's parts as a draw reads them (`dew.objectives.drawn.Parts`): its moving trees and its frozen
 tree, whose leaves may be held arrays its init passes through."""
 
-_BUILDS: collections.OrderedDict[Hashable, StartBuild] = collections.OrderedDict()
+_BUILDS: collections.OrderedDict[Hashable, _facts.Held[StartBuild]] = collections.OrderedDict()
 
 
 def placed_start(start: StartBuild, initializer: Initializer, key: jax.Array, abstract: TrainState,

@@ -33,7 +33,7 @@ import tokamax
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import stablehlo
 
-from dew import _cache, communicators
+from dew import _cache, _facts, communicators
 from dew._code import op_provenance, provenance_code
 from dew._devices import deterministic_ops_requested, deviceless, xla_flag
 from dew.nn.kernels import generation
@@ -180,7 +180,7 @@ Refused = tuple[str, tuple[str, ...] | None]
 """A kernel a compile refused, by its name, and the roles its spill stood in where the compile read them
 (`Binary.spilled_in`: `()` read and spilling none, its warpgroup MMAs serialized alone; None unread): one
 record of both, a kernel once a refusal (`_record` joins its roles), so whatever keys, copies or hands on a
-refusal (`derivation_inputs`, `_proposing`, `refusal_entries`) carries what a launch's ladder steps by."""
+refusal (`derivation_inputs`, `_proposing`, `refusal_snapshot`) carries what a launch's ladder steps by."""
 
 
 @dataclasses.dataclass
@@ -222,7 +222,7 @@ only an explicitly handed plan seeds them, after validating its program and targ
 _SCOPE: contextvars.ContextVar[_Registry | None] = _cache.untraced(
     contextvars.ContextVar("refusals_scope", default=None))
 """A `refusals` scope's own registry, in its context alone: a trace reads it through its facts alone
-(`refusals_of`, `refusal_entries`, under `_GUARD`), so a held trace's key leaves it out (`_cache.untraced`),
+(`refusals_of`, `refusal_snapshot`, under `_GUARD`), so a held trace's key leaves it out (`_cache.untraced`),
 where its records' walk raced a compile worker filling them and a first lookup made the key stale."""
 _GUARD = threading.RLock()
 """Serializes the registries' reads and updates between threads."""
@@ -260,8 +260,8 @@ _READING: contextvars.ContextVar[Reading | None] = _cache.untraced(
 
 @contextlib.contextmanager
 def reading(entries: tuple, *, frozen: bool = False) -> Iterator[Reading]:
-    """A trace's reads of the refusals (`refusals_of`, `refusal_entries`) answered from `entries` (a
-    `refusal_entries` snapshot) and those it records itself within, for as long as it traces; `frozen`, none
+    """A trace's reads of the refusals (`refusals_of`, `refusal_snapshot`) answered from `entries` (a
+    `refusal_snapshot` snapshot) and those it records itself within, for as long as it traces; `frozen`, none
     of its own, a refusal recorded within it ending its trace (`ReadingRefused`). One within a frozen one is
     frozen too: a trace inside a held jit's makes part of its program."""
     outer = _READING.get()
@@ -272,11 +272,6 @@ def reading(entries: tuple, *, frozen: bool = False) -> Iterator[Reading]:
         yield held
     finally:
         _READING.reset(token)
-
-
-def current_reading() -> Reading | None:
-    """The `reading` a trace in this context reads its refusals from, None outside one."""
-    return _READING.get()
 
 
 class Exhausted(ValueError):
@@ -521,7 +516,7 @@ def derivation_inputs(op, arguments: tokamax.BoundArguments, target
     return identity, target, refusals_of(identity), deterministic_ops_requested()
 
 
-@generation.traced_fact
+@_facts.traced_fact
 def refusals_of(identity: str) -> frozenset[tuple[Hashable, frozenset[Refused]]]:
     """Each config this context's compiles refused the launch of `identity` (`_identity`), with the kernels
     refused at it and their roles (`Refused`): what a launch's derivation and legality read of the
@@ -1408,14 +1403,15 @@ def _unit_cotangent(out: jax.Array) -> jax.Array | np.ndarray:
     return np.zeros(out.shape, jax.dtypes.float0)
 
 
-@generation.traced_fact
-def refusal_entries() -> tuple[tuple[str, Hashable, frozenset[Refused]], ...]:
+def refusal_snapshot() -> tuple[tuple[str, Hashable, frozenset[Refused]], ...]:
     """Every (launch identity, config, spilled kernels with their roles, `Refused`) refused in this context (a
-    `refusals` scope's or the process's), ordered. A validated plan can hand them to another process
+    `refusals` scope's, the process's, or the reading a trace reads, `reading`), ordered, read as bookkeeping
+    and no fact: a program's keys of its executables and jits (`options.OuterProgram`), what a plan hands on.
+    A trace reads a launch's own refusals (`refusals_of`), never the whole registry, so a held value is made
+    again by a refusal of a launch it read alone (row 12296: the whole registry a trace's fact, any refusal
+    made every held value and executable again). A validated plan can hand them to another process
     explicitly, the roles with them (`refuse` within `refusals`); a shared compilation cache alone must not
-    transfer them between programs. A trace after a refusal derives the next config, so a program kept after
-    one is another than a process without it traces (`traced_fact`): a trace's key holds them, roles and
-    all (`options.held_context`)."""
+    transfer them between programs."""
     with _GUARD:
         refused = (_READING.get() or _registry()).refused
         return tuple(sorted(((identity, config, kernels) for (identity, config), kernels in refused.items()),
@@ -1423,13 +1419,13 @@ def refusal_entries() -> tuple[tuple[str, Hashable, frozenset[Refused]], ...]:
 
 
 def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
-    """`refusal_entries`, each launch's spilled kernels by their names: what a plan's record lists
+    """`refusal_snapshot`, each launch's spilled kernels by their names: what a plan's record lists
     (`dew.training.planning.refusal_record`)."""
-    return tuple((identity, config, names(kernels)) for identity, config, kernels in refusal_entries())
+    return tuple((identity, config, names(kernels)) for identity, config, kernels in refusal_snapshot())
 
 
 def refuse(entries) -> None:
-    """Each `(identity, config, kernels)` of `entries` (`refusal_entries`', its kernels with their roles,
+    """Each `(identity, config, kernels)` of `entries` (`refusal_snapshot`', its kernels with their roles,
     `Refused`, or a pair a decoded record gives as a list; a kernel by its name alone states none) refused in
     this context, as a compile's spill refuses it. A handed plan seeds these inside its own `refusals` scope,
     not unioned with unrelated decisions that the receiving process already holds."""
@@ -1619,13 +1615,13 @@ def compiled_at_once(programs: Sequence[tuple[jax.stages.Lowered, jax.stages.Com
     compiled in turn, as it would have been lowered after them. At most `compile_threads()` compile at
     once. `kept_from` given, each program's kept lowering is appended to its own list (`compiled`'s)."""
     firsts = attempts([(lowered, options) for lowered, options, _ in programs])
-    held = refusal_entries()
+    held = refusal_snapshot()
     kept_programs = []
     lists = [None] * len(programs) if kept_from is None else kept_from
     for (lowered, options, relower), first, keeping in zip(programs, firsts, lists, strict=True):
         # A program launching a config an earlier one's compile refused after its trace took it, each program
         # by what it launches (row 8603); refusals held before every trace, its derivations read.
-        if refusal_entries() != held and refused_in(lowered):
+        if refusal_snapshot() != held and refused_in(lowered):
             lowered, first = relower(), None
         kept_programs.append(compiled(lowered, options, relower=relower, first=first, kept_from=keeping))
     return kept_programs
@@ -2282,10 +2278,10 @@ def _launches(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:
 
 
 def refused_in(program: jax.stages.Lowered) -> set[tuple[str, Hashable]]:
-    """The launches `program` makes at a config refused in this context (`refusal_entries`): a refusal
+    """The launches `program` makes at a config refused in this context (`refusal_snapshot`): a refusal
     committed after its trace took the config (another program's compile, another thread's certification),
     past which it is lowered afresh before it compiles (row 8603)."""
-    refused = {(identity, config) for identity, config, _ in refusal_entries()}
+    refused = {(identity, config) for identity, config, _ in refusal_snapshot()}
     return _launches(program) & refused if refused else set()
 
 
