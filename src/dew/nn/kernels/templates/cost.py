@@ -167,10 +167,13 @@ class Work:
     kernel's body holds and no probe has measured), one an output element, at no rate (`units`): a form
     taking more of them is never cheaper (`dew.algebra.cost.cheaper`), its price never a guess."""
     fused_multiply_adds: float = 0.0
-    """fp32 multiplies the assembler fuses with the add that alone reads them into one instruction (FFMA,
-    ptxas's --fmad, its default), each pair's two among `operations`: a body's multiply whose one use is an
-    add (`emission`), a product's on the CUDA cores (`Precision.HIGHEST`'s FLOPs, two an FFMA), so its lanes
-    run `operations` less these an instruction a clock each (`units`)."""
+    """The adds the assembler fuses into the multiply each alone reads (FFMA, ptxas's --fmad, its default),
+    an element each, their multiplies among `operations`: a body's multiply whose one use is an add of its
+    shape (`emission`), a product's on the CUDA cores (`Precision.HIGHEST`'s FLOPs, an FFMA two,
+    `multiplied`). A CUDA multiprocessor's lanes run each within its multiply's instruction, a TPU's VPU as
+    an operation of its own (`Rates.fused`); counted apart, so every field stays work a unit issues and a
+    branch's or a role's most of each unit is never another's credit (the review of lane/toolkit
+    5cbbe66c586)."""
     global_reductions: float = 0.0
     """The bytes a body reduces into global memory an element at a time through L2's atomic units
     (`red.global`: mma.sync's dQ adds, `atomic_store_p`), each its own memory instruction a lane, at the
@@ -202,8 +205,9 @@ class Rates(NamedTuple):
     16-bit, TF32 and FP8 modes, the CUDA cores, the special-function units, shared memory, the on-chip memory
     XLA's fusion keeps its kernels' operands and results in, the integer units (a CUDA multiprocessor's
     ALU), its FMA pipe's integer multiply-adds, device memory, the element-wise reductions into global
-    memory and a multiprocessor's schedulers' issue slots; None where the target states none. Named, so a
-    unit added among them misreads no consumer (the review of train 1074, F5)."""
+    memory and a multiprocessor's schedulers' issue slots, and the adds fused into multiplies (none of a CUDA
+    multiprocessor's time, infinite; a TPU's at its vector units'); None where the target states none. Named,
+    so a unit added among them misreads no consumer (the review of train 1074, F5)."""
 
     tensor: float | None
     tf32: float | None
@@ -217,6 +221,7 @@ class Rates(NamedTuple):
     device: float | None
     reductions: float | None
     issue: float | None
+    fused: float | None
 
 
 @functools.cache
@@ -270,20 +275,22 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
                  integer=rate(architecture.integer_per_clock),
                  multiply_adds=rate(architecture.integer_multiply_adds_per_clock),
                  device=target.memory_rate if device else math.inf,
-                 reductions=rate(architecture.global_reduction_bytes_per_clock), issue=issue)
+                 reductions=rate(architecture.global_reduction_bytes_per_clock), issue=issue,
+                 fused=rate(vector) if held is None else math.inf)
 
 
 def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
     """`work`'s seconds on each unit at the rates `at` (`rates`'): the tensor cores (their 16-bit, TF32 and
-    FP8 modes in turn), the CUDA cores (their instructions: operations less the multiplies fused into an add,
-    `Work.fused_multiply_adds`, and conversions; and the integer multiply-adds their FMA pipe issues beside
-    them at its own rate), the special-function units, on-chip memory (shared memory's bytes, then what XLA's
+    FP8 modes in turn), the CUDA cores (their instructions, operations and conversions; the adds fused into
+    a multiply, `Work.fused_multiply_adds`, at their own rate; and the integer multiply-adds their FMA pipe
+    issues beside them at its own rate), the special-function units, on-chip memory (shared memory's bytes,
+    then what XLA's
     fusion keeps there, one memory's two levels, so a TPU's one VMEM is one unit), device memory, the integer
     units, the element-wise reductions into global memory, the issue slots every instruction of those units
     takes (`issued`) and the operations no rule prices (`Work.unpriced_operations`, at no rate); and, level
     by level, the work at a rate the target states none of, which no time prices (0 where one does)."""
     grouped = (((work.flops, at.tensor), (work.tf32_flops, at.tf32), (work.fp8_flops, at.eight)),
-               ((work.operations - work.fused_multiply_adds + work.conversions, at.cuda),
+               ((work.operations + work.conversions, at.cuda), (work.fused_multiply_adds, at.fused),
                 (work.integer_multiply_adds, at.multiply_adds)),
                ((work.exponentials, at.special),),
                ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
@@ -299,18 +306,19 @@ def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
 
 def multiplied(field: str, flops: float) -> Work:
     """A product's `flops` in the unit its mode takes (`product.product_mode`'s field): on the CUDA cores
-    (`operations`, `Precision.HIGHEST`'s fp32), each multiply fused with its add, an FFMA a pair
-    (`Work.fused_multiply_adds`)."""
-    return dataclasses.replace(Work(fused_multiply_adds=flops / 2 if field == "operations" else 0.0),
-                               **{field: flops})
+    (`operations`, `Precision.HIGHEST`'s fp32), each multiply an operation and its add fused into it, an FFMA
+    a pair (`Work.fused_multiply_adds`)."""
+    if field != "operations":
+        return dataclasses.replace(Work(), **{field: flops})
+    return Work(operations=flops / 2, fused_multiply_adds=flops / 2)
 
 def issued(work: Work) -> float:
     """The instructions `work`'s threads issue on a CUDA multiprocessor's units, each taking one of its
     schedulers' slots (`Multiprocessor.issue_per_clock`): its fp32 lanes' (`units`' CUDA cores'), its integer
     ALU's and FMA pipe's, its special-function units' and its reductions into global memory (one a lane, four
     bytes each); its tensor-core and memory instructions, each a warp's work of many elements, are none."""
-    return (work.operations - work.fused_multiply_adds + work.conversions + work.integer_operations
-            + work.integer_multiply_adds + work.exponentials + work.global_reductions / 4)
+    return (work.operations + work.conversions + work.integer_operations + work.integer_multiply_adds
+            + work.exponentials + work.global_reductions / 4)
 
 def spanned(work: Work, latency: float | None) -> tuple[float, float]:
     """`work`'s span at a dependent step's `latency` (`Work.span`), and its span at no latency stated

@@ -620,8 +620,11 @@ class _Counting:
     def fused(self, equation, outputs: list, live: collections.Counter, products: set) -> None:
         """A floating multiply the count issued (its value unknown, not of the program's constants) whose
         output one equation alone reads (`live`) is kept in `products`; an add or a subtract the count issued
-        reading one fuses with it into one instruction an element (`Work.fused_multiply_adds`: the
-        assembler's FFMA, ptxas's --fmad, its default), however many of its operands are products."""
+        reading one of its own shape, an element each, fuses with it into one instruction an element (the
+        assembler's FFMA, ptxas's --fmad, its default): its operations, just counted, become adds fused
+        (`Work.fused_multiply_adds`) in the same count, however many of its operands are products. A scalar
+        product added to a row's every element is one multiply for many adds, none fused (the review of
+        lane/toolkit 5cbbe66c586)."""
         primitive = equation.primitive
         if primitive not in (lax.mul_p, lax.add_p, lax.sub_p):
             return
@@ -632,8 +635,10 @@ class _Counting:
         if primitive is lax.mul_p:
             if live[output] == 1:
                 products.add(output)
-        elif any(isinstance(atom, jax_core.Var) and atom in products for atom in equation.invars):
-            self.add(Work(fused_multiply_adds=_elements(output.aval)))
+        elif any(isinstance(atom, jax_core.Var) and atom in products and atom.aval.shape == output.aval.shape
+                 for atom in equation.invars):
+            added = _elements(output.aval)
+            self.add(Work(operations=-added, fused_multiply_adds=added))
 
     def moved(self, equation, values: list, live: collections.Counter) -> list | None:
         """A read or write of a ref in device memory (`emitted`'s `device`) counted as the bytes it moves,
