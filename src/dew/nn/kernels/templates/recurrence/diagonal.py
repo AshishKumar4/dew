@@ -81,11 +81,10 @@ def _decayed(decay, a_t, first):
 
 @tuning.lowered_once(("shape",))
 def summaries(x, g, starts, *, shape: Walk):
-    """Each span's map from its entering state to its last, `(mantissa, exponent, state, scale, cut)` `[B,
-    spans, D]` fp32: the product of its tokens' decays (`_decayed`, the mantissa zero where a document starts
-    in the span, which keeps none of its entering state), its last state from zero, a running sum
-    (`walks.summed_on`, `state 2^(64 scale)`), and whether a document starts in it (one, else zero: a cut,
-    apart from a decay zero by its gates)."""
+    """Each span's map from its entering state to its last, `(mantissa, exponent, state, scale)` `[B, spans,
+    D]` fp32: the product of its tokens' decays (`_decayed`, the mantissa zero where a document starts in the
+    span, which keeps none of its entering state) and its last state from zero, a running sum
+    (`walks.summed_on`, `state 2^(64 scale)`)."""
     operands = (x, g, starts)
 
     def entry(*refs):
@@ -93,21 +92,20 @@ def summaries(x, g, starts, *, shape: Walk):
         program = Program(shape, starts_ref)
 
         def body(_, tokens, carried):
-            decay, h, cutting = carried
+            decay, h = carried
             xs = [program.channels(x_ref, t) for t in tokens]
             gates = [_gate(program, g_ref, t) for t in tokens]
             for x_t, (a_t, first) in zip(xs, gates, strict=True):
                 decay = _decayed(decay, a_t, first)
                 h = summed_on(h, a_t, x_t, first)
-                cutting = cut(first, cutting, cutting + 1.0)
-            return decay, h, cutting
+            return decay, h
 
         zero = jnp.zeros((shape.lanes,), jnp.float32)
-        decay, h, cutting = program.turns(body, ((zero + 1.0, zero), (zero, zero), zero))
-        for ref, value in zip(made, (*decay, *h, jnp.minimum(cutting, 1.0)), strict=True):
+        decay, h = program.turns(body, ((zero + 1.0, zero), (zero, zero)))
+        for ref, value in zip(made, (*decay, *h), strict=True):
             program.summarised(ref, value)
 
-    out_type = tuple(per_span(x, shape) for _ in range(5))
+    out_type = tuple(per_span(x, shape) for _ in range(4))
     return launch(entry, shape, "diagonal_summaries", out_type, operands)
 
 
@@ -137,9 +135,8 @@ def walked(x, g, starts, entering, *, shape: Walk):
 @tuning.lowered_once(("shape",))
 def reverse_summaries(g, starts, dy, *, shape: Walk):
     """Each span's map from its last state's cotangent to its entering state's, `(mantissa, exponent,
-    cotangent, scale, cut)` `[B, spans, D]` fp32: the product of its tokens' decays (`_decayed`), the
-    cotangent its own outputs' (`dy`) give its entering state, a running sum (`walks.summed_on`), and whether
-    a document starts in it (`summaries`')."""
+    cotangent, scale)` `[B, spans, D]` fp32: the product of its tokens' decays (`_decayed`) and the cotangent
+    its own outputs' (`dy`) give its entering state, a running sum (`walks.summed_on`)."""
     operands = (g, starts, dy)
 
     def entry(*refs):
@@ -148,21 +145,20 @@ def reverse_summaries(g, starts, dy, *, shape: Walk):
         zero = jnp.zeros((shape.lanes,), jnp.float32)
 
         def body(_, tokens, carried):
-            decay, c, cutting = carried
+            decay, c = carried
             gates = [_gate(program, g_ref, t) for t in tokens]
             dys = [program.channels(dy_ref, t) for t in tokens]
             for (a_t, first), dy_t in zip(reversed(gates), reversed(dys), strict=True):
                 decay = _decayed(decay, a_t, first)
                 # The cotangent the state before a document's first token takes of it: none.
                 c = tuple(cut(first, value, zero) for value in summed_on(c, a_t, a_t * dy_t, None))
-                cutting = cut(first, cutting, cutting + 1.0)
-            return decay, c, cutting
+            return decay, c
 
-        decay, c, cutting = program.turns(body, ((zero + 1.0, zero), (zero, zero), zero), reverse=True)
-        for ref, value in zip(made, (*decay, *c, jnp.minimum(cutting, 1.0)), strict=True):
+        decay, c = program.turns(body, ((zero + 1.0, zero), (zero, zero)), reverse=True)
+        for ref, value in zip(made, (*decay, *c), strict=True):
             program.summarised(ref, value)
 
-    out_type = tuple(per_span(dy, shape) for _ in range(5))
+    out_type = tuple(per_span(dy, shape) for _ in range(4))
     return launch(entry, shape, "diagonal_summaries_backward", out_type, operands)
 
 
@@ -229,7 +225,7 @@ def _composed(first, then):
     return multiplied(decay, then_decay), chosen(then_cuts, then_value, joined), cuts | then_cuts
 
 
-def _entering(summary: tuple, given, *, reverse: bool = False):
+def _entering(summary: tuple, cutting, given, *, reverse: bool = False):
     """Each span's value as its walk enters it, `[B, spans, D]`: `given` `[B, D]` (the state entering the
     first span; `reverse`, the final state's cotangent entering the last) carried through the spans' maps
     (`summary`, `(mantissa, exponent, value, scale)` as `summaries` or `reverse_summaries` give them) by XLA's
@@ -237,8 +233,8 @@ def _entering(summary: tuple, given, *, reverse: bool = False):
     range scaling a value past it, or a sum from zero past its largest, composes exactly where the value
     entering a span is a float32's (as float32 a span's decay flushed, ReviewRecurrenceBatch; halved, a least
     normal state), and a span a document starts in takes none of the value before it, selected."""
-    mantissa, exponent, value, scale, cutting = summary
-    maps = (extended(mantissa, exponent), extended(value, 64.0 * scale), cutting != 0)
+    mantissa, exponent, value, scale = summary
+    maps = (extended(mantissa, exponent), extended(value, 64.0 * scale), cutting)
     through, written, cuts = lax.associative_scan(_composed, maps, axis=1, reverse=reverse)
     entered = added(multiplied(extended(given[:, None], 0), through), written)
     after = valued(chosen(cuts, written, entered))
@@ -257,7 +253,7 @@ def _forward(x, g, state, starts, shape: Walk):
     """`(outputs, final state, each span's entering state)`."""
     entering = state[:, None]
     if shape.spans > 1:
-        entering = _entering(summaries(x, g, starts, shape=shape), state)
+        entering = _entering(summaries(x, g, starts, shape=shape), walks.fresh(shape, starts), state)
     out, last = walked(x, g, starts, entering, shape=shape)
     return out, last[:, -1], entering
 
@@ -277,7 +273,8 @@ def _backward_rule(shape: Walk, residuals, cotangents):
     dy, dfinal = dy.astype(x.dtype), dfinal.astype(jnp.float32)
     later = dfinal[:, None]
     if shape.spans > 1:
-        later = _entering(reverse_summaries(g, starts, dy, shape=shape), dfinal, reverse=True)
+        later = _entering(reverse_summaries(g, starts, dy, shape=shape), walks.fresh(shape, starts), dfinal,
+                          reverse=True)
     dx, dg, leaving = walked_back(x, g, starts, dy, entering, later, shape=shape)
     return dx, dg, leaving[:, 0], None
 
