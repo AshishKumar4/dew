@@ -713,22 +713,49 @@ executable stating its memory and its live set and refusing to run; within it, i
 attempt of a plan is one compile, whole where the step can fit and stopped where it cannot."""
 
 
-def compile_limit(devices: Sequence, held: int, built: int) -> int | None:
+def compile_limit(devices: Sequence, held: int, built: int,
+                  resident: Mapping[object, int] | None = None) -> int | None:
     """The bytes past which no step fits `devices` (`LIMIT_EXIT`), as XLA sums a step (its arguments, its
     outputs that write over none of them and its temporaries): the fit check's own arithmetic
-    (`step_headroom`) solved for that sum. The check places the step's temporaries and new outputs beside
-    its arguments, `built` of them not yet resident, and the `held` bytes the loop keeps beside it, `built`
-    among them, all in the least allocator limit among `devices`; so the most a fitting step's sum reaches
-    is that limit less what is held beside the step outside its arguments (`held - built`: the prefetched
-    batches), where the devices hold nothing but its arguments. A step XLA stops past it fits nowhere the
-    check admits; one within it is compiled whole and the fit check judges it. A 4.8B multimodal
-    transformer's step on a GH200 (row 5805): the
-    limit less all of `held`, the arguments it builds among it counted twice, stopped a step the check
-    admitted, which its first run then refused. None where a device states no limit."""
-    limits = [limit for device in devices if (limit := device_memory(device).get("bytes_limit")) is not None]
-    if not limits or len(limits) < len(devices):
+    (`_admitted`'s margin over all the bytes the allocator can give, `available`) solved for that sum,
+    from the allocators' reading as the compile starts (`step_room`). The check places the step's
+    temporaries and new outputs beside its arguments, `built` of them not yet resident, and the `held`
+    bytes the loop keeps beside it, `built` among them; so the most a fitting step's sum reaches is the
+    least device's room less what is held beside the step outside its arguments (`held - built`: the
+    prefetched batches). A step XLA stops past it fits nowhere the check admits; one within it is compiled
+    whole and the check judges it. A reading of what else the devices hold (a borderline step beside
+    another program's buffers, row 12465) stops a step the check would refuse at its buffer assignment,
+    before its whole codegen. A 4.8B multimodal transformer's step on a GH200 (row 5805): the limit less all
+    of `held`, the arguments it builds among it counted twice, stopped a step the check admitted, which its
+    first run then refused. None where a device states no limit."""
+    rooms = [step_room(device, (resident or {}).get(device, 0)) for device in devices]
+    if not rooms or None in rooms:
         return None
-    return min(limits) - (held - built)
+    return min(room for room in rooms if room is not None) - (held - built)
+
+
+def step_room(device, resident: int = 0) -> int | None:
+    """The most a step's sum (its arguments, its new outputs, its temporaries) can take of `device` before
+    what the loop holds beside it: the bytes its allocator can give (`available`, as the fit check reads
+    them, `_admitted`), and the step's own arguments' `resident` bytes among those in use given back, as
+    the step reuses them; None where the device states no limit. `resident` over what the allocator holds
+    in use counts as all of it: a reading never gives back more than it holds."""
+    memory = device_memory(device)
+    if "bytes_limit" not in memory:
+        return None
+    return available(memory, unclaimed(device, memory)) + min(resident, memory.get("bytes_in_use", 0))
+
+
+def resident_on(tree: object, devices: Sequence) -> dict[object, int]:
+    """The bytes the arrays of `tree` hold on each of `devices` now, a placed state's shards on its
+    devices; an abstract or donated leaf holds none."""
+    held = dict.fromkeys(devices, 0)
+    for leaf in jax.tree.leaves(tree):
+        if isinstance(leaf, jax.Array) and not leaf.is_deleted():
+            for shard in leaf.addressable_shards:
+                if shard.device in held:
+                    held[shard.device] += shard.data.nbytes
+    return held
 
 
 @dataclasses.dataclass(frozen=True)

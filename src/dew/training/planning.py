@@ -75,6 +75,7 @@ from dew.training.memory import (
     remat_stated,
     remat_topmost,
     remat_topped,
+    resident_on,
     rung_record,
     step_fits,
     step_fits_admitted,
@@ -1135,7 +1136,8 @@ class FitSearch[LossT, EffectsT]:
         As given where a device states no limit or is no GPU."""
         devices = local_devices(self.mesh)
         # The fit check's own held and built bytes (`fitting`): the state's unplaced bytes count in both.
-        limit = (compile_limit(devices, candidate.held, candidate.built)
+        limit = (compile_limit(devices, candidate.held, candidate.built,
+                               resident_on(candidate.prepared, devices))
                  if all(device.platform == "gpu" for device in devices) else None)
         return options if limit is None else {**(options or {}), LIMIT_EXIT: limit}
 

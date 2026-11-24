@@ -2471,3 +2471,23 @@ def test_a_run_whose_held_steps_pass_their_budget_trains_on_each_shape_it_meets(
     assert len(bounded._compiler._executables) == 1 < len(unbounded._compiler._executables)
     assert kept_bounded < kept_whole, (kept_bounded, kept_whole)
     jax.tree.map(np.testing.assert_array_equal, held, whole)
+
+
+@pytest.mark.gpu(reason="an allocator's live reading, which only an attached GPU states")
+def test_a_compiles_limit_reads_what_else_its_gpu_holds_and_gives_back_its_own_arguments():
+    """A compile's limit (`compile_limit`) reads its GPU's allocator as the compile starts (`step_room`):
+    256 MiB another array holds beside the step lowers it by those bytes, so a borderline step stops at its
+    buffer assignment rather than after its whole codegen, and the 64 MiB its own state holds there count
+    as room, as its step reuses them (row 12465)."""
+    from dew.training.memory import compile_limit, resident_on
+
+    device = jax.local_devices()[0]
+    state = jax.device_put(jnp.zeros((64 << 20) // 4, jnp.float32), device)
+    resident = resident_on(state, [device])
+    assert resident == {device: 64 << 20}, resident
+    before = compile_limit([device], 0, 0, resident)
+    assert before == compile_limit([device], 0, 0) + (64 << 20)
+    beside = jax.device_put(jnp.zeros((256 << 20) // 4, jnp.float32), device)
+    after = compile_limit([device], 0, 0, resident)
+    assert before is not None and after is not None and before - after >= 256 << 20, (before, after)
+    del beside, state
