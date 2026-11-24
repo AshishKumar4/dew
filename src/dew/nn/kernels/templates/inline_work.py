@@ -1,0 +1,315 @@
+"""What an inlined Mosaic GPU body (`plgpu.inline_mgpu`'s function, opaque to a kernel's jaxpr) issues, read
+from the code it emits: the body called under a scratch module on stand-ins of its operands, each op it emits
+counted a warpgroup's lanes, the way `emission` counts the rest of the kernel (row 12466)."""
+
+import dataclasses
+import functools
+import math
+import weakref
+from collections.abc import Callable, Sequence
+
+import numpy as np
+from jax._src.interpreters import mlir as jax_mlir
+from jax._src.lib.mlir import ir
+from jax._src.lib.mlir.dialects import func
+from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
+from jax.experimental.mosaic.gpu import fragmented_array, utils as mgpu_utils
+
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates.cost import Work
+
+LANES = 128
+"""The threads of a warpgroup, whose lanes a body's ops issue over: an op issues for each warp a lane of which
+runs it, its 32 lanes all."""
+
+WARP = 32
+
+_FLOAT = frozenset({
+    "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.remf", "arith.maximumf", "arith.minimumf",
+    "arith.maxnumf", "arith.minnumf", "arith.negf", "arith.cmpf", "math.fma", "math.absf", "math.copysign"})
+"""Elementwise float operations, on the fp32 lanes."""
+
+_INTEGER = frozenset({
+    "arith.addi", "arith.subi", "arith.divui", "arith.divsi", "arith.remui", "arith.remsi", "arith.andi",
+    "arith.ori", "arith.xori", "arith.shli", "arith.shrui", "arith.shrsi", "arith.minsi", "arith.maxsi",
+    "arith.minui", "arith.maxui", "arith.cmpi", "arith.ceildivsi", "arith.floordivsi"})
+"""Elementwise integer operations, on the integer units where they compute a vector's lanes; a scalar's (an
+index, an address) is free, as `emission` takes a kernel's scalar index arithmetic."""
+
+_SPECIAL = frozenset({"math.exp", "math.exp2", "math.log", "math.log2", "math.log1p", "math.tanh",
+                      "math.rsqrt", "math.sqrt", "math.sin", "math.cos", "math.erf"})
+"""Special functions, on the special-function units (`Work.exponentials`)."""
+
+_CONVERSIONS = frozenset({"arith.extf", "arith.truncf", "arith.fptosi", "arith.fptoui", "arith.sitofp",
+                          "arith.uitofp"})
+
+_MEMORY = frozenset({"memref.load", "memref.store", "vector.load", "vector.store", "llvm.load", "llvm.store"})
+
+_FREE_PREFIXES = ("vector.", "llvm.mlir.", "builtin.unrealized_conversion_cast", "gpu.thread_id",
+                  "gpu.block_id", "gpu.block_dim", "gpu.grid_dim", "nvvm.read.ptx.sreg", "nvvm.barrier",
+                  "nvvm.fence", "nvvm.shfl.sync", "nvvm.elect.sync")
+"""Ops that move a value between registers or name a thread's place (a shuffle's lanes, a barrier's wait),
+which compute nothing a unit's rate prices: register moves, addresses (`llvm.getelementptr`'s arithmetic),
+a thread's indices, synchronization and a shuffle's exchange, which `emission` prices for no reduction
+either."""
+
+_FREE = frozenset({
+    "arith.constant", "arith.index_cast", "arith.index_castui", "arith.extsi", "arith.extui", "arith.trunci",
+    "arith.bitcast", "scf.yield", "func.return", "gpu.barrier", "llvm.getelementptr", "llvm.ptrtoint",
+    "llvm.inttoptr", "llvm.addrspacecast", "llvm.extractvalue", "llvm.insertvalue", "llvm.bitcast",
+    "llvm.mul", "llvm.add", "memref.subview", "memref.cast", "memref.reinterpret_cast",
+    "memref.collapse_shape", "memref.expand_shape"})
+
+
+class Uncounted(ValueError):
+    """A body's emitted code holds what the count reads no rule for (an op, a trip count its operands state
+    only at run time)."""
+
+
+def body_work(fn: Callable, avals: Sequence, arg_types: Sequence) -> Work:
+    """What `fn`, an `inline_mgpu` body taking operands of `avals` as `arg_types` states them, issues a
+    warpgroup: the body emitted for the target the trace runs for (`generation.gpu_target`), once a body and
+    operands (`_held`). Raises `Uncounted` where its code holds what no rule counts."""
+    key = tuple(map(str, avals))
+    found = _held.get(fn, {})
+    if key not in found:
+        found[key] = _counted(fn, avals, arg_types)
+        _held[fn] = found
+    return found[key]
+
+
+_held: "weakref.WeakKeyDictionary[Callable, dict]" = weakref.WeakKeyDictionary()
+
+
+def _counted(fn: Callable, avals: Sequence, arg_types: Sequence) -> Work:
+    capability = generation.capability(generation.gpu_target().generation) or (9, 0)
+    with jax_mlir.make_ir_context() as context, ir.Location.unknown():
+        from jaxlib.mosaic.python import mosaic_gpu as dialect
+
+        dialect.register_dialect(context)
+        module = ir.Module.create()
+        i32 = ir.IntegerType.get_signless(32)
+        module.operation.attributes["mosaic_gpu.arch_major"] = ir.IntegerAttr.get(i32, capability[0])
+        module.operation.attributes["mosaic_gpu.arch_minor"] = ir.IntegerAttr.get(i32, capability[1])
+        types = [_stand_in_type(aval, kind) for aval, kind in zip(avals, arg_types, strict=True)]
+        with ir.InsertionPoint(module.body):
+            function = func.FuncOp("body", ir.FunctionType.get(types, []))
+            block = function.add_entry_block()
+            with ir.InsertionPoint(block):
+                fn(None, *(_stand_in(aval, kind, argument)
+                           for aval, kind, argument in zip(avals, arg_types, block.arguments, strict=True)))
+                func.ReturnOp([])
+        lanes = _Lanes()
+        return lanes.region(function.operation.regions[0], np.ones(LANES, dtype=bool))
+
+
+def _stand_in_type(aval, kind) -> ir.Type:
+    if isinstance(kind, gpu_primitives.RefType):
+        inner = aval.inner_aval
+        shared = "smem" in str(aval.memory_space).lower()
+        return ir.MemRefType.get(inner.shape, mgpu_utils.dtype_to_ir_type(inner.dtype),
+                                 memory_space=mgpu_utils.smem() if shared else None)
+    return mgpu_utils.dtype_to_ir_type(aval.dtype)
+
+
+def _stand_in(aval, kind, argument):
+    """An operand as the body takes it: a ref's memref; an array's registers in its layout, a scalar's of
+    none (Lane semantics: every operand not a ref is a `FragmentedArray`), a splat of the argument."""
+    if isinstance(kind, gpu_primitives.RefType):
+        return argument
+    integral = np.issubdtype(aval.dtype, np.integer) or aval.dtype == np.bool_
+    signed = bool(np.issubdtype(aval.dtype, np.signedinteger)) if integral else None
+    layout = kind.to_mgpu() if aval.shape else None
+    return fragmented_array.FragmentedArray.splat(argument, tuple(aval.shape), layout, is_signed=signed)
+
+
+@dataclasses.dataclass
+class _Lanes:
+    """A walk of a body's code over a warpgroup's lanes: each scalar its lanes' values where the lanes' place
+    and constants decide them (a thread's index, its warp, its lane), None where data does."""
+
+    values: dict = dataclasses.field(default_factory=dict)
+
+    def region(self, region, active: np.ndarray) -> Work:
+        work = Work()
+        for block in region.blocks:
+            for inner in block.operations:
+                work = work + self.op(inner.operation, active)
+        return work
+
+    def op(self, op, active: np.ndarray) -> Work:
+        name = op.name
+        if name == "scf.for":
+            trips = _trips(*(self.read(op.operands[at]) for at in range(3)))
+            if trips is None:
+                raise Uncounted("an scf.for whose trips its operands state only at run time")
+            return _repeated(self.region(op.regions[0], active), trips)
+        if name == "scf.if":
+            taken = self.read(op.operands[0])
+            if taken is None:
+                # Data decides it: each branch's most, as `emission` takes an unknown conditional.
+                branches = [self.region(region, active) for region in op.regions if region.blocks]
+                return functools.reduce(_most, branches, Work())
+            taken = taken.astype(bool)
+            work = self.region(op.regions[0], active & taken)
+            if len(op.regions) > 1 and op.regions[1].blocks:
+                work = work + self.region(op.regions[1], active & ~taken)
+            return work
+        if op.regions:
+            raise Uncounted(f"{name}'s regions")
+        self.evaluate(op)
+        return self.issued(op, active)
+
+    def read(self, value) -> np.ndarray | None:
+        return self.values.get(value)
+
+    def evaluate(self, op) -> None:
+        """Its results' lanes where its operands' are known."""
+        name = op.name
+        if not op.results or len(op.results) != 1:
+            return
+        result = op.results[0]
+        if isinstance(result.type, ir.VectorType | ir.MemRefType):
+            return
+        if name == "arith.constant":
+            attribute = op.attributes["value"]
+            if isinstance(attribute, ir.IntegerAttr):
+                self.values[result] = np.full(LANES, attribute.value, dtype=np.int64)
+            return
+        if name in ("gpu.thread_id", "nvvm.read.ptx.sreg.tid.x"):
+            dimension = str(op.attributes["dimension"]) if "dimension" in op.attributes else "x"
+            self.values[result] = (np.arange(LANES, dtype=np.int64) if dimension.endswith("x>")
+                                   or dimension == "x" else np.zeros(LANES, dtype=np.int64))
+            return
+        if name == "gpu.block_dim":
+            self.values[result] = np.full(LANES, LANES, dtype=np.int64)
+            return
+        if name == "nvvm.read.ptx.sreg.laneid":
+            self.values[result] = np.arange(LANES, dtype=np.int64) % WARP
+            return
+        operands = [self.read(operand) for operand in op.operands]
+        if not operands or any(operand is None for operand in operands):
+            return
+        found = _lane_values(name, op, operands)
+        if found is not None:
+            self.values[result] = found
+
+    def issued(self, op, active: np.ndarray) -> Work:
+        """What `op` issues over the `active` lanes: an op computes for every lane of a warp any lane of which
+        runs it; a memory op moves its active lanes' bytes."""
+        name = op.name
+        warps = active.reshape(-1, WARP).any(axis=1).sum()
+        issued, moving = float(warps * WARP), float(active.sum())
+        if name in _MEMORY:
+            stored = op.operands[0].type if name.endswith("store") and name != "llvm.store" else None
+            value = (op.operands[0].type if name == "llvm.store" else stored if stored is not None
+                     else op.results[0].type)
+            stores = name in ("memref.store", "vector.store", "llvm.store")
+            address = op.operands[1] if stores else op.operands[0]
+            moved = _bytes(value) * moving
+            return Work(shared_bytes=moved) if _shared(address.type) else Work(device_bytes=moved)
+        if name in _FREE or name.startswith(_FREE_PREFIXES):
+            return Work()
+        typed = op.operands[-1].type if name in ("arith.cmpf", "arith.cmpi", "arith.select") else (
+            op.results[0].type if op.results else None)
+        if typed is None:
+            raise Uncounted(f"{name}, of no result")
+        elements = _elements(typed) * issued
+        if name == "arith.select":
+            if _is_float(typed):
+                return Work(operations=elements)
+            return Work(integer_operations=elements) if isinstance(typed, ir.VectorType) else Work()
+        if name in _FLOAT:
+            return Work(operations=elements)
+        if name in _SPECIAL:
+            return Work(exponentials=elements)
+        if name in _CONVERSIONS:
+            return Work(conversions=elements)
+        if name == "arith.muli":
+            return Work(integer_multiply_adds=elements) if isinstance(typed, ir.VectorType) else Work()
+        if name in _INTEGER:
+            return Work(integer_operations=elements) if isinstance(typed, ir.VectorType) else Work()
+        raise Uncounted(f"no rule counts {name}")
+
+
+def _lane_values(name: str, op, operands: list[np.ndarray]) -> np.ndarray | None:
+    """`name` over its operands' lanes, for the integer arithmetic a lane's place is computed by."""
+    first, *rest = operands
+    second = rest[0] if rest else None
+    match name:
+        case "arith.index_cast" | "arith.index_castui" | "arith.extsi" | "arith.extui" | "arith.trunci":
+            return first
+        case "arith.addi":
+            return first + second
+        case "arith.subi":
+            return first - second
+        case "arith.muli":
+            return first * second
+        case "arith.divui" | "arith.divsi" | "arith.floordivsi":
+            return np.where(second == 0, 0, first // np.where(second == 0, 1, second))
+        case "arith.remui" | "arith.remsi":
+            return np.where(second == 0, 0, first % np.where(second == 0, 1, second))
+        case "arith.andi":
+            return first & second
+        case "arith.ori":
+            return first | second
+        case "arith.xori":
+            return first ^ second
+        case "arith.shli":
+            return first << second
+        case "arith.shrui" | "arith.shrsi":
+            return first >> second
+        case "arith.minsi" | "arith.minui":
+            return np.minimum(first, second)
+        case "arith.maxsi" | "arith.maxui":
+            return np.maximum(first, second)
+        case "arith.cmpi":
+            return _compared(int(op.attributes["predicate"].value), first, second)
+        case "arith.select":
+            return np.where(first.astype(bool), second, rest[1])
+    return None
+
+
+def _compared(predicate: int, first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """`arith.cmpi`'s predicate (eq, ne, slt, sle, sgt, sge, ult, ule, ugt, uge) over lanes."""
+    compare = (np.equal, np.not_equal, np.less, np.less_equal, np.greater, np.greater_equal)
+    return compare[predicate if predicate < 6 else predicate - 4](first, second).astype(np.int64)
+
+
+def _trips(lower, upper, step) -> int | None:
+    """An scf.for's trips where its bounds are one constant over every lane; None otherwise."""
+    if any(bound is None or np.any(bound != bound[0]) for bound in (lower, upper, step)):
+        return None
+    return max(0, -(-(int(upper[0]) - int(lower[0])) // int(step[0])))
+
+
+def _repeated(work: Work, count: int) -> Work:
+    return Work(**{field.name: getattr(work, field.name) * count for field in dataclasses.fields(Work)
+                   if field.name not in ("span", "chains")})
+
+
+def _most(first: Work, second: Work) -> Work:
+    return Work(**{field.name: max(getattr(first, field.name), getattr(second, field.name))
+                   for field in dataclasses.fields(Work) if field.name not in ("span", "chains")})
+
+
+def _elements(value_type: ir.Type) -> int:
+    return math.prod(value_type.shape) if isinstance(value_type, ir.VectorType) else 1
+
+
+def _is_float(value_type: ir.Type) -> bool:
+    element = value_type.element_type if isinstance(value_type, ir.VectorType) else value_type
+    return isinstance(element, ir.FloatType)
+
+
+def _bytes(value_type: ir.Type) -> int:
+    element = value_type.element_type if isinstance(value_type, ir.VectorType) else value_type
+    bits = element.width if hasattr(element, "width") else 32
+    return _elements(value_type) * max(1, bits // 8)
+
+
+def _shared(address_type: ir.Type) -> bool:
+    """Whether an address is into shared memory: a memref in its space, an LLVM pointer of address space 3."""
+    if isinstance(address_type, ir.MemRefType):
+        return address_type.memory_space is not None and "workgroup" in str(address_type.memory_space)
+    return "ptr<3>" in str(address_type)
