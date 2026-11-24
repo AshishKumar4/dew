@@ -35,7 +35,7 @@ from .activations import (
 from .blocks import normal_kernel
 from .flops import projection_flops
 from .gated_mlp import fuses, gated_mlp
-from .joined import joined_dense, joins, projections_of
+from .joined import joined_dense, joins, plain_denses, projections_of
 from .kernels.generation import Choice
 from .kernels.projections import recipe_chain
 from .ngpt import NGPT, normed_hidden
@@ -320,7 +320,7 @@ class GatedMLP(nn.Module):
         return normed_hidden(gate, up, self.suv_gate, self.suv_up, ngpt.hidden(self.out_features),
                              gated_product(activation, axes=self._axes(gate)))
 
-    def _chained(self, x, projections_: tuple[Dense, ...], activation: Callable, train: bool):
+    def _chained(self, x, projections_: tuple[nn.Module, ...], activation: Callable, train: bool):
         """The MLP's output as one chain of its projections where the run's recipe takes them
         (`projections.recipe_chain`: blockwise FP8, the down projection's rows quantized in the up
         projection's epilogue, bitwise the projections apart): an ungated MLP's up and down (row 8547), or a
@@ -330,8 +330,10 @@ class GatedMLP(nn.Module):
         `Dense` whose kernels they hold, their products owned by no wrapper or interceptor (a LoRA's, a
         served quantized kernel's) and observed by no inspection (`joined.projections_of`), take them
         apart."""
+        if not plain_denses(projections_):
+            return None
         found = projections_of(projections_)
-        if (self.use_bias or (self.dropout_rate and train) or not (found.dense and found.held)
+        if (self.use_bias or (self.dropout_rate and train) or not found.held
                 or found.intercepted or found.observed or not found.dot_general
                 or jax.sharding.get_abstract_mesh().shape.get(TENSOR_AXIS, 1) > 1):
             return None
