@@ -460,11 +460,17 @@ def test_a_split_walks_step_is_its_parts_mean():
     assert [role.step(_exponentials) for role in _emitted(guarded, _ROW, _TRIPS, active).roles] == [128, 128]
 
 
-def test_a_walks_guards_on_its_steps_place_count_at_their_trips():
+@pytest.mark.parametrize("start", ["operand", "indices"])
+def test_a_walks_guards_on_its_steps_place_count_at_their_trips(start):
     """A walk over a range whose first step takes its own exponential and every step but its last the next
     one's (`index == lo`, `index + 1 < hi`, as a walk reading ahead guards them) counts one a row a step and
-    none apart: each guard read at the trips it decides, not taken every step."""
+    none apart: each guard read at the trips it decides, not taken every step. Its start an operand, or
+    computed of the kernel's indices alone (an iota's least), which the count holds by its atom as any
+    unknown start (its invariance once hid that identity from the guard, which took both branches every
+    step)."""
     def walk(row, lo, hi):
+        lo = jnp.min(lax.iota(jnp.int32, 8)) if start == "indices" else lo
+
         def step(index, row):
             mosaic.step_index(index)
             row = lax.cond(index == lo, jnp.exp, lambda row: row, row)
@@ -727,6 +733,19 @@ def test_a_steps_mask_of_its_tiles_indices_issues_nothing_and_one_of_its_place_c
     (indexed, selected), (placed, selected_placed) = counted(placed=False), counted(placed=True)
     assert indexed == 0 and placed >= 3 * 128, (indexed, placed)
     assert selected == selected_placed == 128, (selected, selected_placed)
+
+
+def test_a_steps_mask_of_its_parity_counts_its_integer_operations_each_step():
+    """A walk step's mask of its tile's indices offset by its parity (`index % 2`, a value the count holds
+    concretely at each trip it reads, `emission._Place`) is computed each step: the count's concrete trip
+    value is none of the program's constants, so the mask's integer operations count every step."""
+    def step(index, row):
+        mosaic.step_index(index)
+        columns = lax.iota(jnp.int32, 128) + index % 2
+        return jnp.where((columns // 4) % 2 == 1, row, 0.0)
+
+    role = _emitted(lambda row, trips: lax.fori_loop(0, trips, step, row), _ROW, _TRIPS).roles[0]
+    assert role.step(lambda work: work.integer_operations) >= 3 * 128, role
 
 
 def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_fp32_lanes():
