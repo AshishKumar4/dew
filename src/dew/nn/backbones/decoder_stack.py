@@ -524,17 +524,28 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # A served quantized run's scales read as the unrolled stack reads them (`held_scales`).
             quantized = (not run.is_mutable_collection('params')
                          and holds_quantized(run.variables.get('params', {})))
+            # A run whose params it reads alone (a decode, an evaluation) hands its experts' kernels to each
+            # iteration whole beside its index, which the grouped matmul reads in place
+            # (`dew.nn.moe.Layered`), as a bank's run does (`_apart`): sliced by the scan, each layer's
+            # experts were copied out every step, 45% of a Qwen3-30B-A3B decode step on an H100 (row 1346).
+            experts = (not quantized and not run.is_mutable_collection('params')
+                       and holds_experts(run.variables.get('params', {})))
+            whole = tuple(name for name, held in ((LAYER_ROWS, rows), (BANKED_EXPERTS, experts)) if held)
 
             policy = _rows_recomputed(remat)
 
             def scanned(layer, carry, index, *, store=store, step=step, rows=rows, inputs=inputs,
-                        policy=policy, quantized=quantized):
+                        policy=policy, quantized=quantized, experts=experts):
                 # The iteration's per-layer input, its layers along axis 2.
                 per_layer_input = jax.tree.map(
                     lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, axis=2, keepdims=False), inputs)
 
                 def layered(layer, carry):
                     return step(layer, carry, per_layer_input, store)[0]
+
+                if experts:
+                    layered = nn.map_variables(layered, (BANKED_EXPERTS,), init=False, mutable=False,
+                                               trans_in_fn=functools.partial(at_iteration, layer=index))
 
                 if quantized:
                     # Its layer's params, sliced from the stacked rows: each scale held there alone.
@@ -555,11 +566,15 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # holding an effect that reads the carry, an interpreted launch's (row 12077: a quantized paged
             # step). Every other call keeps it, whose trace its random streams advance through, so an init
             # draws as it did.
-            x, _ = nn.scan(scanned, variable_axes={nn.DenyList(LAYER_ROWS) if rows else True: 0},
-                           variable_broadcast=LAYER_ROWS if rows else False, split_rngs={True: True},
-                           length=repeats, metadata_params={nn.PARTITION_NAME: None},
-                           check_constancy_invariants=not decode)(
-                run, x, jnp.arange(repeats))
+            scanning = nn.scan(scanned, variable_axes={nn.DenyList(whole) if whole else True: 0},
+                               variable_broadcast=whole or False, split_rngs={True: True},
+                               length=repeats, metadata_params={nn.PARTITION_NAME: None},
+                               check_constancy_invariants=not decode)
+            if experts:
+                # The expert kernels moved out of the scanned params into the collection it broadcasts.
+                scanning = nn.map_variables(scanning, ('params', BANKED_EXPERTS), init=False, mutable=False,
+                                            trans_in_fn=experts_apart)
+            x, _ = scanning(run, x, jnp.arange(repeats))
     return x
 
 

@@ -705,6 +705,48 @@ BANKED_EXPERT_SEEDS = 8
 
 
 @pytest.mark.usefixtures("scanned_stacks")
+def test_a_resident_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop():
+    """A scanned MoE stack decoding over its own variables, in device memory as a model holds them, hands each
+    iteration of its step's scan the run's expert kernels whole and the iteration's layer, which the grouped
+    matmul reads in place (`dew.nn.moe.Layered`), as a bank's run does: the loop takes every expert stack as
+    a constant, whole, and slices none of them (row 1346: sliced, each layer's experts were copied out
+    every step, 45% of a Qwen3-30B-A3B decode step on an H100). Its steps decode as exactly as the plain
+    loop's, both from the loop's own float64 steps (check 1)."""
+    ids = jax.random.randint(jax.random.key(2), (2, 8), 0, VOCAB)
+    routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(4))}
+    scanned = tiny(num_layers=4, max_seq_len=16, mixture=routed)
+    variables = scanned.init(jax.random.key(0), ids)
+    stacks = {tuple(leaf.shape) for leaf in jax.tree.leaves(experts_apart(variables)[BANKED_EXPERTS])}
+    assert stacks
+
+    cache = scanned.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+    graph = jax.make_jaxpr(lambda variables, cache: scanned.apply(
+        {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(variables, cache)
+    loops = [equation for equation in equations(graph) if equation.primitive.name == "scan"]
+    handed = [{tuple(operand.aval.shape) for operand in scan.params["ft_in"].update(scan.invars).unpack()[0]}
+              for scan in loops]
+    slices = {tuple(equation.invars[0].aval.shape) for scan in loops
+              for equation in equations(scan.params["jaxpr"])
+              if equation.primitive.name in ("dynamic_slice", "slice", "gather")}
+    assert any(stacks <= whole for whole in handed) and not stacks & slices
+
+    draw = drawn_ids(0x1346, 8)
+    # The plain loop's float64 twin over its variables widened once, which the gate compiles for every draw.
+    with jax.enable_x64(new_val=True):
+        wide, wide_variables = (tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64),
+                                float64_held(variables))
+
+    @unrolled
+    def truth(ids):
+        return decoded(wide, wide_variables, ids)[0]
+
+    def steps(ids):
+        return decoded(scanned, variables, ids)[0]
+
+    assert_as_exact(steps, unrolled(steps), draw, "resident MoE decode steps", seeds=BANKED_EXPERT_SEEDS,
+                    truth_fn=truth)
+
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop():
     """A scanned MoE stack decoding over a bank in device memory (`HeldBanks.place`, every run's leaves one
     array) hands each layer it reads a layer at a time the run's expert kernels whole and the layer's
