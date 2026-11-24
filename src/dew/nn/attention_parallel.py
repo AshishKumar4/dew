@@ -104,6 +104,16 @@ def _row_leading(name: str, leaf, rows: int) -> bool:
     return jnp.ndim(leaf) == BATCHED_RANKS.get(name, 2) and leaf.shape[0] == rows
 
 
+def _check_rows(name: str, ids, rows: int) -> None:
+    """Refuse a visibility id at its batched rank (`BATCHED_RANKS`) whose leading length is neither one nor
+    the batch's `rows`: replicated whole beside the exchange's split rows, each shard would read another's
+    (a `[2, Q, R, 2]` runs beside four rows, the review of #4035)."""
+    for leaf in jax.tree.leaves(ids):
+        if jnp.ndim(leaf) == BATCHED_RANKS.get(name, 2) and leaf.shape[0] not in (1, rows):
+            raise ValueError(f"{name} of shape {leaf.shape} leads with {leaf.shape[0]} rows beside the "
+                             f"call's {rows}")
+
+
 def exchanges_heads(query, key, shards: int, *, masked: bool) -> bool:
     """Whether `sequence_parallel_attention` takes the all-to-all (`exchanged_heads_attention`) for a call
     of these query and key shapes over `shards` sequence shards: its query heads divide by tensor times
@@ -306,6 +316,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
             ("activation_batch",), key_value_seq_lengths, queries, query.shape))
     for name, ids in (visibility or {}).items():
+        _check_rows(name, ids, query.shape[0])
         # Whole along the sequence beside the whole sequences the exchange gives, a leaf's batch rows split
         # as the query's own where its contract leads with them (`_row_leading`), any other whole: a
         # shared `[K]` validity of the batch's length is the keys', not the rows'.

@@ -353,6 +353,18 @@ def test_a_shared_id_of_the_batchs_length_stays_whole(name):
 
 
 @pytest.mark.mesh
+def test_runs_of_another_batch_are_refused_before_the_exchange():
+    """Runs a row apiece `[2, Q, R, 2]` beside a batch of four, its rows split two ways, are refused before
+    the all-to-all, where replicated whole each shard read its own two rows' runs as its rows' and rows two
+    and three took rows zero and one's visibility (review of #4035)."""
+    runs = jnp.broadcast_to(jnp.asarray([[0, 2]], jnp.int32), (2, 4, 1, 2))
+    query, key, value, _ = _square_draw(0)
+    with jax.set_mesh(SHARED.build()), pytest.raises(ValueError):
+        jax.jit(lambda q, k, v: scaled_dot_product_attention(
+            q, k, v, causal=True, key_runs=runs, implementation="reference")).trace(query, key, value)
+
+
+@pytest.mark.mesh
 def test_a_call_naming_cudnn_takes_its_visibility_on_the_masked_kernel():
     """A call naming cuDNN whose visibility is per-token ids, over a split sequence, runs on the kernel a
     built mask takes (`kernel_for_materialized_mask`: cuDNN takes no mask), as it did when the ids were

@@ -227,14 +227,17 @@ def test_shared_runs_are_every_rows_as_their_broadcast_is(runs, rows, implementa
     np.testing.assert_array_equal(np.asarray(attend(shared)), np.asarray(attend(rowed)))
 
 
-@pytest.mark.parametrize("shape", [(4, 2, 3), (3, 2, 2), (2, 4, 2, 2, 2)], ids=str)
-def test_runs_of_no_form_it_reads_are_refused_by_name(shape):
-    """Key runs of none of the forms `[B, Q, R, 2]`, `[Q, R, 2]`, `[R, 2]` over the call's four queries (a
-    last axis not a pair, three queries for four, a rank of five) are refused by name, never read as rows
-    (row 12701)."""
+@pytest.mark.parametrize("runs", [
+    jnp.zeros((4, 2, 3), jnp.int32), jnp.zeros((3, 2, 2), jnp.int32), jnp.zeros((2, 4, 2, 2, 2), jnp.int32),
+    jnp.zeros((3, 4, 1, 2), jnp.int32), jnp.asarray([[0.5, 1.9]], jnp.float32)],
+    ids=["no pair", "three queries for four", "rank five", "three rows for two", "fractions"])
+def test_runs_of_no_form_it_reads_are_refused(runs):
+    """Key runs of none of the integer forms `[B, Q, R, 2]`, `[Q, R, 2]`, `[R, 2]` over the call's two rows
+    of four queries (a last axis not a pair, three queries for four, a rank of five, three rows for two,
+    fractions a cast would truncate) are refused, never read as rows or rounded (row 12701, review of
+    #4035)."""
     query = jnp.zeros((2, 4, 4, 8), jnp.float32)
     key = jnp.zeros((2, 4, 2, 8), jnp.float32)
     with pytest.raises(ValueError):
-        scaled_dot_product_attention(query, key, key, causal=True, key_runs=jnp.zeros(shape, jnp.int32),
-                                     implementation="reference")
+        scaled_dot_product_attention(query, key, key, causal=True, key_runs=runs, implementation="reference")
 

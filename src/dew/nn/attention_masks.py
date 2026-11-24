@@ -113,15 +113,16 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
 
 
 def _check_runs(key_runs, query_length: int) -> None:
-    """Refuse `key_runs` of no form `key_spans` reads: `[B, Q, R, 2]`, `[Q, R, 2]` or `[R, 2]`, their queries
-    the call's own `query_length`, so no shape is guessed at as rows (row 12701)."""
+    """Refuse `key_runs` of no form `key_spans` reads: integer `[B, Q, R, 2]`, `[Q, R, 2]` or `[R, 2]`, their
+    queries the call's own `query_length`, so no shape is guessed at as rows and no fraction truncated
+    (row 12701)."""
     if key_runs is None:
         return
     shape = jnp.shape(key_runs)
     queries = {4: shape[1:2], 3: shape[:1], 2: (query_length,)}.get(len(shape))
-    if shape[-1:] != (2,) or queries != (query_length,):
-        raise ValueError(f"key_runs of shape {shape} is none of [B, Q, R, 2], [Q, R, 2] or [R, 2] over the "
-                         f"call's {query_length} queries")
+    if shape[-1:] != (2,) or queries != (query_length,) or not jnp.issubdtype(key_runs.dtype, jnp.integer):
+        raise ValueError(f"key_runs of shape {shape} and dtype {key_runs.dtype} is none of the integer "
+                         f"[B, Q, R, 2], [Q, R, 2] or [R, 2] over the call's {query_length} queries")
 
 
 def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
