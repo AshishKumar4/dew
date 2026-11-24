@@ -91,6 +91,9 @@ def body_work(fn: Callable, avals: Sequence, arg_types: Sequence, values: Sequen
     known = tuple(_scalar(aval, value) for aval, value in itertools.zip_longest(avals, values))
     capability = (generation.capability(generation.gpu_target().generation)
                   or generation.capability(generation.interpreted_target().generation))
+    if capability is None:
+        raise Uncounted("an inline Mosaic GPU body counted for no CUDA capability, its process's nor the "
+                        "interpreted target's")
     key = (capability, tuple(map(str, avals)), tuple(map(str, arg_types)), known, warp)
     found = _held.get(fn, {})
     if key not in found:
@@ -690,12 +693,12 @@ def _unsigned(name: str, first: np.ndarray, last: np.ndarray, width: int | None)
         return None
     first, last = (_at_width(side, width, signed=False) for side in (first, last))
     divisor = np.where(last == 0, 1, last)
-    result = {"arith.divui": lambda: np.where(last == 0, 0, first // divisor),
-              "arith.remui": lambda: np.where(last == 0, 0, first % divisor),
-              "arith.shrui": lambda: first >> last,
-              "arith.minui": lambda: np.minimum(first, last),
-              "arith.maxui": lambda: np.maximum(first, last)}[name]()
-    return _at_width(result, width, signed=True).astype(np.int64)
+    unsigned = {"arith.divui": lambda: np.where(last == 0, 0, first // divisor),
+                "arith.remui": lambda: np.where(last == 0, 0, first % divisor),
+                "arith.shrui": lambda: first >> last,
+                "arith.minui": lambda: np.minimum(first, last),
+                "arith.maxui": lambda: np.maximum(first, last)}[name]()
+    return _at_width(unsigned, width, signed=True).astype(np.int64)
 
 
 def _compared(predicate: int, first: np.ndarray, second: np.ndarray, width: int) -> np.ndarray:
