@@ -469,11 +469,11 @@ def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
 def test_a_fast_fp32_kimi_call_lowers_on_the_template_for_an_mma_sync_gpu(product, target):
     """Kimi delta attention's fp32 forward and training under the fast forms (TF32's products), as its
     selector routes them to the template on an Ampere GPU and named onto it on a consumer Blackwell
-    (mma.sync's issuer each, `mosaic_sm80.MmaIssuer`), lowered compile-only: Mosaic GPU synthesized no shared-memory
-    transfer for the intra walk's 128-byte swizzled fp32 streams, so the template it routed to raised at
-    lowering (row 12647); and its scores' one fp32 part and its system, two sums of one shape and dtype, its
-    own pairs write in place as one stacked ref (`chunk_forward._paired`), where two refs of one shape and
-    dtype were refused at the launch's trace (`mosaic.checked`, row 3180)."""
+    (mma.sync's issuer each, `mosaic_sm80.MmaIssuer`), lowered compile-only: Mosaic GPU synthesized no
+    shared-memory transfer for the intra walk's 128-byte swizzled fp32 streams, so the template it routed to
+    raised at lowering (row 12647); and its scores' one fp32 part and its system, two sums of one shape and
+    dtype, its own pairs write in place as one stacked ref (`chunk_forward._paired`), where two refs of one
+    shape and dtype were refused at the launch's trace (`mosaic.checked`, row 3180)."""
     rows, length, heads, width = 1, 128, 2, 64
     operands = ([jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 4
                 + [jax.ShapeDtypeStruct((rows, length, heads), jnp.float32)])
