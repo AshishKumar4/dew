@@ -50,6 +50,7 @@ class Kernels:
     gemm_epilogue: Literal['fused', 'xla'] | None = None
     gemm_prologue: Literal['fused', 'xla'] | None = None
     grouped_matmul: Literal['apart', 'cutlass', 'mosaic', 'triton', 'xla'] | None = None
+    layer_scan: Literal['plain', 'scanned'] | None = None
     low_rank: Literal['fused', 'xla'] | None = None
     mxfp8: Literal['mosaic', 'xla'] | None = None
     narrow_copies: Literal['off', 'on'] | None = None
