@@ -146,55 +146,23 @@ def _forward(x, taps, bias, valid, documents, parts, activation: bool, eps: floa
 def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bool, eps: float,
               interpret: bool):
     """Every piece's gradients in one launch (`templates.recurrence.conv.backward`) of one piece, the
-    pieces' cotangents joined along the channels, a normalised piece's taken through its norm first
-    (`_through_norms`, fp32): a launch of several pieces emitted its walk once a piece, Qwen3.5-4B's three
-    pieces' backward 0.354 ms on a GH200 against one piece's 0.266 (M-JS-253b)."""
+    pieces' cotangents joined along the channels: a normalised piece's taken through its norm in fp32 by a
+    launch joining them (`templates.recurrence.conv.through`), else by XLA's concatenation. A launch of
+    several pieces emitted its walk once a piece, Qwen3.5-4B's three pieces' backward 0.354 ms on a GH200
+    against one piece's 0.266 (M-JS-253b)."""
     from .templates.recurrence import conv
 
-    cotangents = _through_norms(x, taps, bias, valid, documents, tuple(cotangents), parts, activation, eps,
-                                interpret)
-    joined = jnp.result_type(*cotangents)
-    cotangent = jnp.concatenate([c.astype(joined) for c in cotangents], axis=-1)
+    if any(head is not None for _, head in parts):
+        cotangent = conv.through(x, taps, bias, valid, documents, tuple(cotangents), parts=tuple(parts),
+                                 activation=activation, eps=eps, **_launched(interpret))
+    else:
+        cotangent = jnp.concatenate(cotangents, axis=-1)
     dx, dw, db = conv.backward(x, taps, bias, valid, documents, cotangent, activation=activation,
                                **_launched(interpret))
     # The taps' and bias's gradients formed in their dtypes before the input's cotangent leaves (row 6027).
     dx, (d_taps, d_bias) = with_gradients_formed(
         dx, (dw.T.astype(taps.dtype), None if bias is None else db.astype(bias.dtype)))
     return dx, d_taps, d_bias
-
-
-def _through_norms(x, taps, bias, valid, documents, cotangents: tuple, parts, activation: bool, eps: float,
-                   interpret: bool) -> tuple:
-    """Each piece's cotangent before its norm: a normalised piece's (a delta rule's queries and keys, `head`
-    channels a head) `scale (dy - (u . dy) u)`, `u` its activation's unit along each head and `scale` its
-    inverse norm, from its activation recomputed in fp32 by the forward's launch unnormalised, every product
-    and sum in fp32, the root and inverse each rounded once (`scan.inverse_norm`'s arithmetic); every other
-    piece's as given. Taken inside the backward's walk, the head's two sums a token were a warp's shuffles on
-    its sequential path, at 255 registers a thread: Qwen3.5-4B's conv backward 0.75 ms a layer on a GH200
-    against its forward's 0.07, 19 ms of its training step (M-JS-250)."""
-    from .templates.recurrence import conv
-
-    normed = [(first, width, head) for first, width, head in conv.pieces(parts) if head is not None]
-    if not normed:
-        return cotangents
-    # Every normalised piece's activation in one launch, each read where it lies in `x`.
-    recomputed = iter(conv.forward(x, taps, bias, valid, documents,
-                                   parts=tuple((width, None) for _, width, _ in normed),
-                                   firsts=tuple(first for first, _, _ in normed), activation=activation,
-                                   eps=eps, dtype=jnp.float32, **_launched(interpret)))
-    through = []
-    for (_, width, head), dy in zip(conv.pieces(parts), cotangents, strict=True):
-        if head is None:
-            through.append(dy)
-            continue
-        out = next(recomputed)
-        headed = out.reshape(*out.shape[:-1], width // head, head)
-        scale = 1.0 / jnp.sqrt(jnp.sum(headed * headed, axis=-1, keepdims=True) + eps)
-        unit = headed * scale
-        grad = dy.astype(jnp.float32).reshape(headed.shape)
-        projected = jnp.sum(unit * grad, axis=-1, keepdims=True)
-        through.append((scale * (grad - projected * unit)).reshape(dy.shape))
-    return tuple(through)
 
 
 def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float, dtype, interpret: bool):

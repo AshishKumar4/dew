@@ -381,7 +381,10 @@ def test_a_conv_backward_hands_no_more_partial_sums_than_a_wave_of_programs(gene
     shapes = (jax.ShapeDtypeStruct((channels, taps), jnp.float32),
               jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16))
     calls = custom_calls(lowered_for(jax.grad(loss), shapes, generation_name))
-    (backward,) = [call for call in calls if (rows, length, channels) in call.results]
+    # The backward writes the input's gradient beside its partials; the launch before it (`conv.through`), the
+    # joined cotangent alone.
+    (backward,) = [call for call in calls
+                   if (rows, length, channels) in call.results and len(call.results) > 1]
     handed = sum(int(np.prod(shape)) for shape in backward.results if shape != (rows, length, channels))
     # Each program's partials its channels' (`conv.lanes` of the backward's one unnormalised piece), the
     # taps' and the bias's.
