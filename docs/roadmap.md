@@ -8,7 +8,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5851, 12415, 12419]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5851]
 - One recurrence algebra, the template for every form and product, and port retirement. [2076, 3426, 3427]
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 6008, 6010, 12416, 12423, 12424, 12426]
 - The kernel challenge's lessons in the templates. [5271]
@@ -27,8 +27,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - The recurrence suite's wall: every case within CI's group target. [12088, 12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12438]
-- Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
-- Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 12427, 12428]
+- Low-precision and decode-size GEMMs. [483, 4518, 4519]
+- Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product (a float32 output), a legitimate…. [4860]
@@ -41,7 +41,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
 - test_plan's second-trainer witness asserts no backend compile of jit(step). [12386]
 - Certification admits a spill only where every STL/LDL of its SASS sits at loop depth 0 (prologue/epilogue) or in call slow-path code. [12387]
-- MoE gathered fused head's review. [12399]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]

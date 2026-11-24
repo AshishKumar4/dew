@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.attention import scaled_dot_product_attention
-from dew.nn.kernels import generation as generations, grouped_matmul
+from dew.nn.kernels import generation as generations, grouped_cutlass
 from dew.nn.moe import expert_projection
 
 EXPERTS = 4
@@ -35,7 +35,7 @@ def programs(generation: str) -> dict:
         query = jax.ShapeDtypeStruct((1, 256, 8, 128), jnp.bfloat16)
         key = jax.ShapeDtypeStruct((1, 256, 2, 128), jnp.bfloat16)
         found["attention"] = (attention, [query, key, key])
-    if grouped_matmul.cutlass_built_for(generation) is not None:
+    if grouped_cutlass.cutlass_built_for(generation) is not None:
         rows, kernel = (jax.ShapeDtypeStruct(shape, jnp.bfloat16)
                         for shape in ((512, 256), (EXPERTS, 256, 256)))
         found["cutlass"] = (cutlass_projection, [rows, kernel])

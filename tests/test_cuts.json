@@ -28,10 +28,10 @@
 "tests/test_algebra_scaled.py::test_a_merge_under_shard_map_and_under_a_sharded_jit_is_each_shards_own",
 "tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-along every operand]",
 "tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-along its anchors]",
-"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-along its totals]",
-"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-its gradient's derivative]",
-"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[op by op-along its anchors]",
-"tests/test_algebra_scaled.py::test_a_merged_state_of_broadcast_anchors_is_its_output_and_its_total[a common scalar]",
+"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-batched]",
+"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-its value]",
+"tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[op by op-along its totals]",
+"tests/test_algebra_scaled.py::test_a_merged_state_is_the_same_on_whichever_axis_its_states_lie[jitted]",
 "tests/test_algebra_scaled.py::test_a_merged_state_under_an_explicit_mesh_drops_its_states_axis_from_its_shardings",
 "tests/test_algebra_scaled.py::test_a_merged_states_gradients_derivatives_are_on_par_with_its_parts[jitted-a zero mass]",
 "tests/test_algebra_scaled.py::test_a_merged_states_gradients_derivatives_are_on_par_with_its_parts[jitted-two masses]",
@@ -163,6 +163,9 @@
 "tests/test_attention_dropout.py::test_a_kept_bf16_weight_is_scaled_in_fp32_and_rounded_once",
 "tests/test_attention_dropout.py::test_an_fp16_draw_keeps_a_small_kept_weight_the_reference_keeps[below-two-inference]",
 "tests/test_attention_dropout.py::test_the_mosaic_walk_drops_a_slice_at_its_global_places[training-queries-and-keys]"
+],
+"tests/test_attention_metamorphic.py": [
+"tests/test_attention_metamorphic.py::test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted"
 ],
 "tests/test_attention_mosaic.py": [
 "tests/test_attention_mosaic.py::test_a_block_selected_call_holds_check_1_walking_its_selected_tiles_interpreted[sm80-128-default]",
@@ -1020,7 +1023,7 @@
 "tests/test_block_sft.py::test_an_image_sft_runs_own_path_takes_the_trainers_update",
 "tests/test_block_sft.py::test_both_self_conditioning_branches_match_the_official_adapter[0.0-sc_off_loss]",
 "tests/test_block_sft.py::test_disabling_encoder_gradient_matches_the_reference_control",
-"tests/test_block_sft.py::test_image_sft_trainer_resume_publish_and_generate",
+"tests/test_block_sft.py::test_image_sft_trainer_resumes_where_its_uninterrupted_run_lands",
 "tests/test_block_sft.py::test_image_sft_uses_media_validity_groups_and_positions",
 "tests/test_block_sft.py::test_official_sft_loss_and_every_parameter_gradient",
 "tests/test_block_sft.py::test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target"
@@ -1462,6 +1465,9 @@
 "tests/test_decision_recipe.py::test_decisions_read_their_table_as_the_stages_before_them_make_it",
 "tests/test_decision_recipe.py::test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to_its_end[letters]",
 "tests/test_decision_recipe.py::test_every_head_that_reads_the_base_resumes_a_decision_run_held_as_shapes_to_its_end[untied]"
+],
+"tests/test_decision_schema_stream.py": [
+"tests/test_decision_schema_stream.py::test_a_schema_read_in_context_leaves_the_row_and_its_spans_index_the_context"
 ],
 "tests/test_decision_serving.py": [
 "tests/test_decision_serving.py::test_a_request_jev_would_refuse_gets_a_422_with_its_reason[{not json]",
@@ -2182,7 +2188,7 @@
 "tests/test_host_placement.py::test_a_host_resident_bank_decodes_through_the_cache_it_allocates[untied_head]",
 "tests/test_host_placement.py::test_a_host_resident_bank_scores_what_a_resident_bank_scores[gated_delta_net]",
 "tests/test_host_placement.py::test_a_host_resident_bank_scores_what_a_resident_bank_scores[indexed_latent_attention]",
-"tests/test_host_placement.py::test_a_host_resident_bank_scores_what_a_resident_bank_scores[runs_of_one]",
+"tests/test_host_placement.py::test_a_host_resident_bank_scores_what_a_resident_bank_scores[untied_head]",
 "tests/test_host_placement.py::test_banked_training_preserves_each_layers_dropout_rng_lineage"
 ],
 "tests/test_host_training.py": [
@@ -2294,11 +2300,11 @@
 "tests/test_kept_programs.py::test_programs_kept_under_other_code_settings_or_target_run_where_they_lower_the_same[environment-compiled1]"
 ],
 "tests/test_kernel_configs.py": [
-"tests/test_kernel_configs.py::test_a_hoppers_gathered_projections_reverse_pass_reads_its_rows_where_they_lie",
-"tests/test_kernel_configs.py::test_a_routes_launches_run_per_shard_with_only_their_planned_collectives[per-shard]",
+"tests/test_kernel_configs.py::test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kernels",
+"tests/test_kernel_configs.py::test_a_launch_clips_its_blocks_to_the_operands",
 "tests/test_kernel_configs.py::test_an_amperes_gemm_copies_its_blocks_promised_in_bounds",
 "tests/test_kernel_configs.py::test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it",
-"tests/test_kernel_configs.py::test_each_family_emits_every_launch_form_at_each_consumer_count[sm86]",
+"tests/test_kernel_configs.py::test_each_family_emits_every_launch_form_at_each_consumer_count[sm80]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-dense kernel gradient]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-forward bf16]",
 "tests/test_kernel_configs.py::test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources[sm100-forward exact fp32]",
@@ -2788,7 +2794,7 @@
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[delta attention (KDA)-sm90]",
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[dense bf16, the lane's-sm90]",
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[experts packed NVFP4-sm90]",
-"tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[latent attention, a user's-sm90]",
+"tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[latent attention, a user's-sm80]",
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[lightning attention-sm90]",
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[sinks, the lane's-sm80]",
 "tests/test_model_flows.py::test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu[state-space duality (SSD), fp32, a user's-sm80]",
@@ -3143,14 +3149,14 @@
 "tests/test_placement.py::test_each_parameter_is_placed_by_its_declared_axes[causal_transformer+glm5-next-tiny]"
 ],
 "tests/test_plan.py": [
-"tests/test_plan.py::test_a_fit_whose_step_fits_only_recomputing_searches_it_once_and_compiles_its_plan_once[remat-stated]",
+"tests/test_plan.py::test_a_compiled_steps_memory_is_xlas_analysis_whoever_reads_it",
 "tests/test_plan.py::test_a_fresh_fit_whose_placed_devices_hold_its_step_trains_after_its_unplaced_search_refused",
 "tests/test_plan.py::test_a_fresh_fit_whose_step_fits_no_plan_before_its_state_is_placed_is_refused_unplaced",
-"tests/test_plan.py::test_a_muon_run_that_states_its_stacks_group_keeps_it",
 "tests/test_plan.py::test_a_pinned_split_is_read_as_given_and_its_state_holds_it",
-"tests/test_plan.py::test_a_plan_with_no_second_point_to_fit_is_not_timed[1]",
-"tests/test_plan.py::test_a_run_trains_only_its_requested_steps_without_timing_a_frontier",
-"tests/test_plan.py::test_a_starts_climb_settles_the_lightest_rung_an_exhaustive_walk_finds_fits[decoder-h100]",
+"tests/test_plan.py::test_a_provisional_plans_search_is_released_where_the_placed_search_after_it_refuses",
+"tests/test_plan.py::test_a_resumed_run_continues_its_admitted_plan_without_timing",
+"tests/test_plan.py::test_a_search_handed_to_a_compile_that_refuses_is_released_with_no_winner",
+"tests/test_plan.py::test_a_start_whose_head_alone_fits_tiled_settles_it_at_no_recomputation",
 "tests/test_plan.py::test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle[whole-batch]",
 "tests/test_plan.py::test_a_users_function_wrapped_as_a_librarys_states_the_globals_it_reads",
 "tests/test_plan.py::test_fit_keeps_an_explicit_policy_without_a_frontier_probe[minimal_with_scan_and_conv]"
@@ -3352,7 +3358,7 @@
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm86-qwen3.5-27b-gdn-bfloat16-training-variant-two roles]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-kimi-linear-kda-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-kimi-linear-kda-bfloat16-training]",
-"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-nemotron-h-4b-ssd-bfloat16-training-variant-two roles]",
+"tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-nemotron-h-4b-ssd-bfloat16-training]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm89-qwen3.5-27b-gdn-bfloat16-training]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm90-a write gate-bfloat16-forward-packed]",
 "tests/test_recurrence_mosaic.py::test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides[sm90-kimi-linear-kda-bfloat16-forward-variant-1]",
@@ -3539,8 +3545,8 @@
 "tests/test_rl_expert_balance.py::test_a_policy_runs_balance_flag_builds_a_policy_that_balances_its_routers[dpo]"
 ],
 "tests/test_router_statistics.py": [
-"tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains",
-"tests/test_router_statistics.py::test_all_padding_has_no_router_support_or_bias_effect[mtp-attention_mask-False]",
+"tests/test_router_statistics.py::test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains[a parallel mixer's routed branch]",
+"tests/test_router_statistics.py::test_a_scored_model_trains_no_router_and_is_not_refused",
 "tests/test_router_statistics.py::test_global_router_validation_is_scalar_and_ignores_repeated_rows[trunk]",
 "tests/test_router_statistics.py::test_sequence_balance_normalizes_each_packed_document[mtp]",
 "tests/test_router_statistics.py::test_sequence_balance_normalizes_each_packed_document[trunk]"
@@ -3826,10 +3832,10 @@
 "tests/test_serving.py::test_a_multimodal_model_serves_over_its_language_models_cache[paged]",
 "tests/test_serving.py::test_a_paged_server_serves_layers_that_read_their_keys_places[alibi-prefix]",
 "tests/test_serving.py::test_a_pooled_servers_host_tier_reads_each_processs_prefix_back_from_its_own_slots",
-"tests/test_serving.py::test_a_sampled_request_keeps_its_own_draws",
+"tests/test_serving.py::test_a_request_with_an_integer_seed_launches_nothing_until_admission[7]",
 "tests/test_serving.py::test_a_server_drafts_speculative_blocks_as_a_lone_call_does[greedy]",
-"tests/test_serving.py::test_a_server_drafts_speculative_blocks_as_a_lone_call_does[sampled-four-steps]",
-"tests/test_serving.py::test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it",
+"tests/test_serving.py::test_a_server_drafts_speculative_blocks_as_a_lone_call_does[sampled-four-steps-rbg]",
+"tests/test_serving.py::test_a_server_draws_at_its_tasks_progress_and_at_each_version_it_loads",
 "tests/test_serving.py::test_a_server_on_a_mesh_draws_what_each_request_draws_alone[data]",
 "tests/test_serving.py::test_a_server_on_an_expert_mesh_draws_what_one_device_draws[global-1]",
 "tests/test_serving.py::test_a_server_over_a_pool_draws_what_each_request_draws_alone[dense]",
@@ -3916,8 +3922,8 @@
 "tests/test_stage_blocks.py::test_a_stack_of_like_blocks_over_stages_computes_what_one_device_computes[hybrid_dit-fsdp2_stage2]"
 ],
 "tests/test_stage_local.py": [
-"tests/test_stage_local.py::test_a_lora_adapter_over_a_stage_local_run_trains_as_the_replicated_pipeline",
-"tests/test_stage_local.py::test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one",
+"tests/test_stage_local.py::test_a_loop_over_a_stack_trains_stage_local_as_its_layers_whole_do[a-row-a-step]",
+"tests/test_stage_local.py::test_a_one_stage_scan_reads_a_frozen_base_where_it_lies",
 "tests/test_stage_local.py::test_a_stage_local_decoder_trains_as_the_replicated_pipeline_through_each_optimizer[adamw]",
 "tests/test_stage_local.py::test_a_stage_local_decoder_trains_as_the_replicated_pipeline_through_each_optimizer[global_clip]",
 "tests/test_stage_local.py::test_a_stage_local_decoder_trains_as_the_replicated_pipeline_through_each_optimizer[groups]",
@@ -4109,7 +4115,11 @@
 "tests/test_trace_keys.py": [
 "tests/test_trace_keys.py::test_a_decision_runs_refit_reads_the_step_its_first_fit_traced[lettered]",
 "tests/test_trace_keys.py::test_a_decision_runs_refit_reads_the_step_its_first_fit_traced[shared]",
-"tests/test_trace_keys.py::test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew",
+"tests/test_trace_keys.py::test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew[dpo]",
+"tests/test_trace_keys.py::test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew[guidance_distillation]",
+"tests/test_trace_keys.py::test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew[jepa]",
+"tests/test_trace_keys.py::test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew[masked_diffusion]",
+"tests/test_trace_keys.py::test_every_keyed_objectives_key_is_the_same_after_a_fit_as_built_anew[run decision]",
 "tests/test_trace_keys.py::test_every_keyed_objectives_key_is_the_same_after_its_loss_is_traced_and_built_anew"
 ],
 "tests/test_trainer.py": [
@@ -4154,6 +4164,9 @@
 ],
 "tests/test_wan_vae.py": [
 "tests/test_wan_vae.py::test_an_image_is_the_one_frame_video"
+],
+"tests/test_weighed_check.py": [
+"tests/test_weighed_check.py::test_the_weighed_check_passes_the_reference_against_its_reformulation"
 ],
 "tests/test_whole_validation.py": [
 "tests/test_whole_validation.py::test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one[diffusion]",

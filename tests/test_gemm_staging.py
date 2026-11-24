@@ -1,0 +1,158 @@
+"""A GEMM tile's stated output staging (`tiling.Tiles.staging`, row 5634): the chunks and buffers a launch
+stages its output in, admitted where they hold the issuer's atoms and whole TMA stores in the output's
+dtypes, narrowed with a chained replay, refused by the launches that stage at their family's own."""
+
+import dataclasses
+import functools
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from generation_support import INTERPRETS, lowers
+from reference_error import assert_as_exact
+
+from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels.templates.gemm import pricing, tiling
+
+
+@INTERPRETS
+def test_sm120_output_staging_admits_three_stage_128x256_and_compiles():
+    """Explicit `Tiles.staging` `(chunk, buffers)` lowers output SMEM from 32 KB to 16 KB on `sm120`
+    `mma.sync.fed`, admitting 3-stage `128x256x32` arms (`(64, 1)` and `(32, 2)`) where default `(64, 2)`
+    exceeds the 99 KB block, holding check 1, compiling spill-free on `sm120`, and refusing invalid or
+    non-chunked staging (row 5634, M-FS-62)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    with pytest.raises(ValueError):
+        tiling.Tiles(64, 128, 32, 3, 1, warpgroups=1, family="mma.sync", staging=(64, 1))
+    with pytest.raises(ValueError):
+        tiling.Tiles(128, 256, 32, 3, 1, warpgroups=2, family="mma.sync.fed", staging=(0, 1))
+    with pytest.raises(ValueError):
+        tiling.Tiles(128, 128, 64, 2, 1, warpgroups=1, family="tcgen05", staging=(128, 1))
+
+    gmm = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    base = tiling.Tiles(128, 256, 32, 3, 1, warpgroups=2, family="mma.sync.fed")
+    arm_64x1 = dataclasses.replace(base, staging=(64, 1))
+    arm_32x2 = dataclasses.replace(base, staging=(32, 2))
+    with generation.assumed("sm120"):
+        sm120 = generation.gpu_target()
+        ba = gmm.bind(bf16((256, 128)), bf16((1, 128, 256)), one, out_dtype="bfloat16",
+                      trans_rhs=False, interpret=False, dense=True)
+        assert not gmm.legal(ba, base, sm120)
+        assert gmm.legal(ba, arm_64x1, sm120)
+        assert gmm.legal(ba, arm_32x2, sm120)
+        assert gmm.staged_bytes(ba, base, sm120) - gmm.staged_bytes(ba, arm_64x1, sm120) == 16384
+        assert gmm.staged_bytes(ba, arm_64x1, sm120) == gmm.staged_bytes(ba, arm_32x2, sm120)
+        # One warpgroup's 128 x 128 tile splits its warps two along its rows: 16-column atoms, which an
+        # 8-column chunk slices mid-way, refused by the launch and its kernel.
+        single = tiling.Tiles(128, 128, 32, 2, 1, warpgroups=1, family="mma.sync.fed")
+        square = gmm.bind(bf16((256, 128)), bf16((1, 128, 128)), one, out_dtype="bfloat16", trans_rhs=False,
+                          interpret=False, dense=True)
+        assert not gmm.legal(square, dataclasses.replace(single, staging=(8, 1)), sm120)
+        # Four bf16 columns are 8 bytes a chunk's row: no whole 16-byte TMA store, which the launch refuses
+        # and its kernel too where called at that pin; four fp32 columns are one store but half an
+        # accumulator fragment, and sixteen 4-bit floats 64 bits. A 64-row share of 256 columns specializes
+        # mma.sync's warps along its columns, 32-column atoms: 32 columns of fp32 or bf16 are whole.
+        narrow = dataclasses.replace(base, staging=(4, 1))
+        assert not gmm.legal(ba, narrow, sm120)
+        family = pricing.family_of(base, jnp.bfloat16, sm120)
+        for chunk, dtype in ((4, jnp.bfloat16), (4, jnp.float32), (16, jnp.float4_e2m1fn), (16, jnp.float32)):
+            with pytest.raises(ValueError):
+                dataclasses.replace(base, staging=(chunk, 1)).stated((((64, 256), dtype),), family)
+        for dtype in (jnp.bfloat16, jnp.float32):
+            assert dataclasses.replace(base, staging=(32, 1)).stated((((64, 256), dtype),), family) == (32, 1)
+        atoms = pricing.family_of(single, jnp.bfloat16, sm120)
+        with pytest.raises(ValueError):
+            dataclasses.replace(single, staging=(8, 1)).stated((((128, 128), jnp.bfloat16),), atoms)
+        whole = dataclasses.replace(single, staging=(16, 1))
+        assert whole.stated((((128, 128), jnp.bfloat16),), atoms) == (16, 1)
+
+    def ref_fn(x, w, *, dtype=jnp.float32):
+        return jax.lax.dot(x.astype(dtype), w.astype(dtype), preferred_element_type=dtype).astype(
+            jnp.float64 if dtype == jnp.float64 else jnp.bfloat16)
+
+    for tag, arm in (("64x1", arm_64x1), ("32x2", arm_32x2)):
+        def draw(seed, tag=tag):
+            rng = np.random.default_rng(5634 + (100 if tag == "32x2" else 0) + seed)
+            x = jnp.asarray(rng.standard_normal((128, 64)) / np.sqrt(64), jnp.bfloat16)
+            w = jnp.asarray(rng.standard_normal((64, 256)) / np.sqrt(64), jnp.bfloat16)
+            return x, w
+
+        def dew_fn(x, w, arm=arm):
+            with (generation.assumed("sm120"), generation.chosen(grouped_matmul="mosaic"),
+                  tuning.pinned({grouped_matmul.MosaicGmm: arm})):
+                return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+        assert_as_exact(jax.jit(dew_fn), jax.jit(ref_fn), draw, f"sm120 staging {tag}", seeds=8,
+                        truth_fn=functools.partial(ref_fn, dtype=jnp.float64))
+
+    if generation.compile_only_gpus("sm120"):
+        specs = (bf16((256, 128)), bf16((128, 256)))
+        cases = []
+        for tag, arm in (("sm120_staging_64x1", arm_64x1), ("sm120_staging_32x2", arm_32x2)):
+            def compiled(x, w, arm=arm):
+                with generation.chosen(grouped_matmul="mosaic"), tuning.pinned(
+                        {grouped_matmul.MosaicGmm: arm}):
+                    return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+            cases.append(KernelCase(tag, lambda c=compiled: (c, specs)))
+        with generation.assumed("sm120"):
+            records = compile_mosaic_kernels(cases, "sm120")
+        for rec in records:
+            assert not rec.get("error"), rec
+            assert rec["kernels"], rec
+            assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+def test_stated_output_staging_narrows_with_a_chained_replay_and_stays_off_syrk_and_linear_ce():
+    """A Hopper 128-column tile staging its output in one 128-column chunk replays a chained launch of two
+    products at 64 columns, its chunk narrowed alike, rather than at a tile its staging no longer divides; and
+    linear CE's launch and kernel, which stage at their family's own chunks, take no stated staging (row
+    5634)."""
+    from dew.nn.kernels.templates.gemm import chained, linear_ce, pricing
+
+    tile = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family="wgmma", staging=(128, 1))
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        family = pricing.family_of(tile, jnp.bfloat16, target)
+        assert chained.replay_refusal(tile, 2, family, jnp.bfloat16) is None
+        replay = chained.replay_tile(tile, 2)
+        assert (replay.block_n, replay.staging) == (64, (64, 1))
+
+        ce, bf16 = linear_ce.MOSAIC_LINEAR_CE, functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+        ba = ce.bind(bf16((128, 128)), bf16((256, 128)), jax.ShapeDtypeStruct((128,), jnp.int32), None,
+                     transpose_rhs=True, softcap=None, interpret=False)
+        derived = ce.derived(ba, target)
+        assert derived is not None and ce.legal(ba, derived, target)
+        staged = dataclasses.replace(derived, staging=(derived.block_n, 1))
+        assert not ce.legal(ba, staged, target)
+    with pytest.raises(ValueError):
+        linear_ce.linear_ce(jnp.zeros((128, 128), jnp.bfloat16), jnp.zeros((256, 128), jnp.bfloat16),
+                            jnp.zeros((128,), jnp.int32), tiles=staged, multiprocessors=1, interpret=True)
+
+
+@lowers("sm90")
+def test_a_hopper_product_stating_fp32_staging_at_whole_fragments_lowers():
+    """An sm90 warpgroup-MMA product of fp32 output staged in 8-column chunks, whole accumulator fragments
+    and whole 16-byte TMA stores, is legal and lowers to a kernel; at 4 columns, whole stores but half a
+    fragment, the launch refuses it (row 5634)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    gmm = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    tile = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family="wgmma", staging=(8, 2))
+    with generation.assumed("sm90"):
+        sm90 = generation.gpu_target()
+        ba = gmm.bind(bf16((256, 128)), bf16((1, 128, 256)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                      out_dtype="float32", trans_rhs=False, interpret=False, dense=True)
+        assert gmm.legal(ba, tile, sm90)
+        assert not gmm.legal(ba, dataclasses.replace(tile, staging=(4, 2)), sm90)
+        case = KernelCase("fp32_staging_8", lambda: gmm.lowering(ba, tile))
+        records = compile_mosaic_kernels([case], "sm90")
+    for rec in records:
+        assert not rec.get("error"), rec
+        assert rec["kernels"], rec

@@ -77,6 +77,14 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
         "groups": ("1", "4"),
         "out_dtype": ("float32", "bfloat16"),
     },
+    "linear_ce": {
+        "generation": ("sm90", "sm80"),
+        "bias": ("none", "bias"),
+    },
+    "syrk": {
+        "generation": ("sm90", "sm80"),
+        "form": ("gram", "gram-transposed", "polynomial"),
+    },
     "nvfp4": {
         "generation": ("sm90", "sm80"),
         "width": ("128", "256"),
@@ -178,9 +186,11 @@ or one; the operands' dtype. The blockwise-scaled FP8 product's (the choice `blo
 H100's FP8 tensor cores); the columns a column scale covers (a weight block's 128, or one); the groups;
 the output's dtype. The block-scaled product's (the choices `mxfp8` and `nvfp4_block`): the GPU (a B200's
 block-scaled tensor cores); the block format (MXFP8's E4M3 under E8M0 every 32, NVFP4's E2M1 under E4M3
-every 16); the matrix's width; the groups; the output's dtype. The NVFP4 product's (the choice `nvfp4`): the
-GPU; the matrix's width and depth;
-the output's dtype. The recurrence's (the choices `gated_delta_rule` and `ssd`): the GPU; the form
+every 16); the matrix's width; the groups; the output's dtype. The fused linear cross-entropy's (the choice
+`linear_ce`): the GPU; an LM head with no bias or one. The symmetric products' (the choice `syrk`): the
+GPU; Muon's Gram `X @ X^T`, its transpose `X^T @ X`, or its Newton-Schulz polynomial. The NVFP4
+product's (the choice `nvfp4`): the GPU; the matrix's width and depth; the output's dtype. The
+recurrence's (the choices `gated_delta_rule` and `ssd`): the GPU; the form
 (tests/recurrence_matrix.py's `FORMS`); the kernel under test (the template and the portable math, its
 plain-JAX mainloop, each held to its form's port; each port held to the portable math); the operands' dtype;
 one sequence or packed documents; on the TPU tier (`recurrence_tpu`) the TPU, the rated scan on its TPU
@@ -251,6 +261,8 @@ CELLS: dict[str, tuple[str, str]] = {
     "nvfp4": ("nvfp4_matrix", "an_nvfp4_products_training_step_is_on_par"),
     "blockwise_fp8": ("blockwise_matrix", "a_blockwise_fp8_product_is_on_par"),
     "mxfp8": ("mx_matrix", "an_mxfp8_product_is_on_par"),
+    "linear_ce": ("linear_ce_matrix", "a_linear_ce_loss_is_on_par"),
+    "syrk": ("syrk_matrix", "a_symmetric_product_is_on_par"),
     "recurrence": ("recurrence_matrix", "a_recurrences_training_step_is_on_par"),
     "recurrence_tpu": ("recurrence_matrix", "a_recurrences_training_step_on_a_tpu_is_on_par"),
     "short_conv": ("short_conv_matrix", "a_short_convs_training_step_is_on_par"),

@@ -4,13 +4,14 @@ kernels' names, which a tile's producer registers are kept by. Light at import: 
 type (a selector's launch, `grouped_matmul`) reads no toolkit module until a tile is made."""
 
 import dataclasses
+import math
 from typing import ClassVar
 
 import jax
 from jax import numpy as jnp
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import base, resources
+from dew.nn.kernels.templates import base, resources, stores
 
 GMM = "dew_gmm"
 """The name of a product's kernel (`gmm`), its producer's registers `Tiles.producers`' by it."""
@@ -60,6 +61,7 @@ class Tiles:
     swapped: bool = False
     pingpong: bool = False
     producers: resources.Producers = dataclasses.field(default_factory=resources.Producers)
+    staging: tuple[int, int] | None = None
 
     @property
     def sharing(self) -> int:
@@ -103,6 +105,46 @@ class Tiles:
         if self.warpgroups == 2 and self.stages < 2:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
+        if self.staging is not None:
+            # A family that stages its outputs whole refuses chunks (`Family.output_staging` of no outputs);
+            # its chunks against the tile's columns and its issuer's pieces, which no dtype changes
+            # (`stores.staging_refusal` of no dtypes); a chunk's bytes in the call's output dtypes are its
+            # launch's to judge (`staging_refusal`).
+            family.output_staging((), self.warpgroups, self.staging)
+            columns = self.block_n * (self.cluster if family.pairs_product else 1)
+            refusal = stores.staging_refusal(columns, (), self.staging, piece=family.chunk_columns(columns))
+            if refusal is not None:
+                raise ValueError(f"{self}: {refusal}")
+
+    def stated(self, outputs, family) -> tuple[int, int] | None:
+        """The output staging this tile states for a kernel storing `outputs` (`(shape, dtype)` each,
+        `persist`'s `chunks`) on `family` (its issuer specialized for the tile), refused where it holds no
+        chunk of them (`staging_refusal`), as the launch's candidate refuses it: `gmm` or `tgmm` called
+        directly at a pin."""
+        if (refusal := self.staging_refusal(tuple(dtype for _, dtype in outputs), family)) is not None:
+            raise ValueError(f"{self}: {refusal}")
+        return self.staging
+
+    def staging_refusal(self, dtypes, family) -> str | None:
+        """Why the output staging this tile states (`staging`) holds no chunk of the call's outputs of
+        `dtypes` on `family` (its issuer as the tile specializes it), None where it does or states none: a
+        chunk slices its accumulator at whole fragments (`ACCUMULATOR_COLUMNS`) and whole atoms of the issuer
+        (`mosaic.Issuer.atom_columns`: two row warps of mma.sync tile 16 columns), and divides the tile and
+        the issuer's pieces in whole TMA rows of each dtype (`stores.staging_refusal`, the one owner of
+        those)."""
+        if self.staging is None:
+            return None
+        unit = math.lcm(ACCUMULATOR_COLUMNS, family.atom_columns)
+        if self.staging[0] % unit:
+            return f"a stated chunk of {self.staging[0]} columns slices the accumulator's {unit}-column atoms"
+        columns = self.block_n * (self.cluster if family.pairs_product else 1)
+        return stores.staging_refusal(columns, dtypes, self.staging, piece=family.chunk_columns(columns))
+
+
+ACCUMULATOR_COLUMNS = 8
+"""The columns an MMA accumulator's register fragment holds together (mma.sync's n8, a warpgroup MMA's
+8-column tiles): a staged chunk slices the accumulator at whole fragments, so an fp32 chunk of 4 columns,
+whole TMA stores, is still none (`Tiles.staging_refusal`)."""
 
 
 CONSUMERS = 2
@@ -160,10 +202,11 @@ class TilesTemplate(base.Template[Tiles]):
 
     def _legal(self, ba, config: Tiles, target) -> bool:
         """`legal`'s judgment under `target`: a candidate whose ring of `config.stages` and registers the
-        planner holds at its programs (`resources.plan`)."""
+        planner holds at its programs (`resources.plan`), staging its output at its family's own chunks (a
+        stated `staging` is the grouped launch's alone, `grouped_matmul._Mosaic`)."""
         from . import pricing
 
-        if not self.candidate(ba, config, target):
+        if config.staging is not None or not self.candidate(ba, config, target):
             return False
         family = pricing.family_of(config, self._operand_dtype(ba), target)
         launch = dataclasses.replace(self.launch_of(ba, config, target),

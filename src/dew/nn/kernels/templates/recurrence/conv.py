@@ -358,7 +358,7 @@ def span(length: int, rows: int, programs: int, target: generation.GpuTarget) ->
     tokens = _tokens(length)
     blocks = -(-length // tokens)
     held = target.multiprocessor
-    wave = cost.wave(target, held.registers // (scan.THREADS * held.thread_registers))
+    wave = cost.wave(target.multiprocessors, held.registers // (scan.THREADS * held.thread_registers))
     spans = min(blocks, -(-wave // (rows * programs)))
     return -(-blocks // spans) * tokens
 

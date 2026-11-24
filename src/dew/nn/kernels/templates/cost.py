@@ -328,28 +328,34 @@ def seconds(work: Work, target: generation.GpuTarget) -> float:
     return worked + work.kernels * launch
 
 
-def wave(target: generation.GpuTarget, resident: int) -> int:
-    """The programs one wave of a launch runs at once on `target`: `resident` on each multiprocessor, its
-    multiprocessors one where no fact states them."""
-    return (target.multiprocessors or 1) * max(resident, 1)
+def wave(multiprocessors: int | None, resident: int) -> int:
+    """The programs one wave of a launch runs at once: `resident` on each of `multiprocessors`, one where no
+    fact states them (a target's, `GpuTarget.multiprocessors`)."""
+    return (multiprocessors or 1) * max(resident, 1)
+
+
+def spread(programs: int, over: int) -> int:
+    """How many of `programs` the busiest of `over` runs, as a launch's blocks go to its multiprocessors in
+    turn (or its waves, `over` a wave's programs: how many waves it runs)."""
+    return -(-programs // over)
 
 
 def sharing(programs: int, resident: int, target: generation.GpuTarget) -> int:
     """The programs of a launch of `programs`, `resident` a multiprocessor at most, each multiprocessor of
-    `target` runs at once: no more than its programs spread over the multiprocessors where it knows them,
-    as a launch's blocks go to its multiprocessors in turn; `resident` where it knows none."""
+    `target` runs at once: no more than its programs spread over the multiprocessors where it knows them
+    (`spread`); `resident` where it knows none."""
     if target.multiprocessors is None:
         return resident
-    return min(resident, -(-programs // target.multiprocessors))
+    return min(resident, spread(programs, target.multiprocessors))
 
 
 def busiest_programs(programs: int, wave: int, multiprocessors: int) -> int:
     """The programs the busiest of `multiprocessors` runs over a launch of `programs`, `wave` of them at once:
-    each wave's share of a full wave (`ceil(min(n, wave) / SMs)`), the last priced at a full wave's sharing.
+    each wave's share of a full wave (`spread` of `min(n, wave)`), the last priced at a full wave's sharing.
     Priced at `ceil(n / SMs)` instead, four sm80 kernel gradients' split counts halved and ran 0.6-11.5%
     slower (M-FS-60, row 10865), where this one's ran as priced (M-EM-45b)."""
     count = max(programs, 1)
-    return -(-count // wave) * -(-min(count, wave) // multiprocessors)
+    return spread(count, wave) * spread(min(count, wave), multiprocessors)
 
 
 def streamed(per_program_bytes: float, busiest: int, bandwidth: float, multiprocessors: int) -> float:
@@ -371,8 +377,8 @@ def launch_seconds(work: Work, programs: int, target: generation.GpuTarget, *,
     count = max(programs, 1)
     shared = {unit: getattr(work, unit) / count for unit in (*ISSUED_UNITS, "device_bytes")}
     per_program = dataclasses.replace(work, **shared, kernels=0)
-    per_sm = math.ceil(count / (target.multiprocessors or 1))
-    waves = -(-count // wave(target, resident))
+    per_sm = spread(count, target.multiprocessors or 1)
+    waves = spread(count, wave(target.multiprocessors, resident))
     unit_seconds = max(units(per_program, rates(target, device=False))[0])
     wave_seconds = max(per_sm * unit_seconds, waves * path(per_program, target))
     return max(wave_seconds + (target.launch_seconds or 0.0), seconds(work, target))
