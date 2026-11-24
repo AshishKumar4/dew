@@ -281,13 +281,13 @@ starts, a cached call's query slots."""
 
 
 @pytest.mark.mesh
-@pytest.mark.parametrize("implementation", ["reference", "template"])
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
 @pytest.mark.parametrize("name", sorted(VISIBLE))
 def test_per_token_visibility_travels_whole_through_the_all_to_all(name, implementation):
     """The entry over a split sequence whose call reads per-token ids (`VISIBLE`) takes the all-to-all and
     hands them whole to the kernel beside the whole sequences it gives, so no `[B, 1, S, S]` mask of the
     call's is built (row 1495): its output and its gradients, forward and backward, on par with the whole
-    sequence's (check 1)."""
+    sequence's (check 1), on the kernels check 1's float64 truth runs (the seam's `reference` and `xla`)."""
     call = dict(VISIBLE[name], implementation=implementation)
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
     assert_exchanged_on_par(entry, entry, SPLIT, _dropping_draw,
