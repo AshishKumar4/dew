@@ -881,9 +881,13 @@ def _expert_layers():
 
     rng = np.random.default_rng(12721)
     x = jnp.asarray(rng.normal(size=(64, 128)), jnp.bfloat16)
-    # A dropped slot's row its largest: a token routed to expert 0 beyond its capacity.
+    # The last token's row the largest by far, both its slots routed to expert 0, which every token's first
+    # slot fills past its capacity (`capacity_positions`: 32 of a sequence's 128 slots): dropped twice, a
+    # row no product quantizes; every other token reaches an expert by its second slot.
     x = x.at[-1].set(1e4)
-    indices = jnp.asarray(np.stack([np.zeros(64, np.int32), rng.integers(1, 4, 64)], axis=-1))
+    second = rng.integers(1, 4, 64)
+    second[-1] = 0
+    indices = jnp.asarray(np.stack([np.zeros(64, np.int64), second], axis=-1), jnp.int32)
     weights = jnp.full(indices.shape, 0.5, jnp.bfloat16)
     return {
         "experts": (moe.ExpertMLP(num_experts=4, hidden_features=128, out_features=128,
@@ -911,25 +915,29 @@ def test_a_delayed_nvfp4_expert_layer_records_its_admitted_rows_alone(name):
     recorded = dict(jax.tree_util.tree_flatten_with_path(sown[NVFP4_AMAX],
                                                          is_leaf=lambda leaf: isinstance(leaf, tuple))[0])
     assert histories and [path for path, _ in histories] == list(recorded)
-    first = np.asarray(recorded[histories[0][0]][0])
+    # The projection reading the layer's rows (the gate's, gpt-oss's interleaved gate and up).
+    (read,) = [amax for path, (amax,) in recorded.items() if path[0].key in ("gate_proj", "gate_up_proj")]
     admitted = np.asarray(x[:-1], np.float32)
-    assert float(first) == float(np.max(np.abs(admitted))), (first, np.max(np.abs(admitted)))
+    assert float(read) == float(np.max(np.abs(admitted))), (float(read), np.max(np.abs(admitted)))
 
 
 @pytest.mark.mesh(devices=4)
 def test_a_meshed_delayed_nvfp4_expert_layer_records_what_one_device_does():
     """An expert layer under a delayed-scaling NVFP4 recipe exchanging its slots over a 4-way expert axis
-    (`moe._exchange_shard`, its rounds a `fori_loop`) records each projection's largest magnitude over
-    every device's and round's rows, bitwise what it records on one device (row 12721): returned by its
-    dispatch and reduced over the mesh (`jax.lax.pmax`), no tracer of the map's leaking."""
+    (`moe._exchange_shard`), a skewed routing taking it further rounds (a `fori_loop`) and its largest row
+    the last device's last round's, records what its gate and up projections read, the largest over every
+    device's and round's rows, bitwise what it records on one device (row 12721): returned by its dispatch
+    and reduced over the mesh (`jax.lax.pmax`), no tracer of the map's leaking. Its down projection's, of
+    rows each layout's products round alike only to their recipe's accuracy, is recorded and finite."""
     from dew.mesh import DEFAULT_RULES
     from dew.nn import moe
     from dew.nn.dense import NVFP4_AMAX
     from dew.training import MeshSpec
 
     rng = np.random.default_rng(4)
-    x = jnp.asarray(rng.normal(size=(64, 128)), jnp.bfloat16)
-    indices = jnp.asarray(rng.integers(0, 4, (64, 2)), jnp.int32)
+    x = jnp.asarray(rng.normal(size=(64, 128)), jnp.bfloat16).at[-1].set(64.0)
+    # Every token's first slot to expert 0: each device sends its shard more than one round's share.
+    indices = jnp.asarray(np.stack([np.zeros(64, np.int64), rng.integers(1, 4, 64)], axis=-1), jnp.int32)
     weights = jnp.full(indices.shape, 0.5, jnp.bfloat16)
     found = {}
     for dispatch, devices in (("global", 1), ("exchange", 4)):
@@ -942,8 +950,11 @@ def test_a_meshed_delayed_nvfp4_expert_layer_records_what_one_device_does():
             _, sown = jax.jit(functools.partial(layer.apply, mutable=[NVFP4_AMAX]))(held, x, weights, indices)
         found[dispatch] = jax.tree.map(np.asarray, sown[NVFP4_AMAX])
     assert jax.tree.structure(found["global"]) == jax.tree.structure(found["exchange"])
-    assert jax.tree.all(jax.tree.map(lambda one, other: bool(np.array_equal(one, other)),
-                                     found["global"], found["exchange"]))
+    for name in ("gate_proj", "up_proj"):
+        np.testing.assert_array_equal(found["exchange"][name]["amax_history"],
+                                      found["global"][name]["amax_history"])
+        assert float(found["exchange"][name]["amax_history"][0]) == 64.0
+    assert np.isfinite(float(found["exchange"]["down_proj"]["amax_history"][0]))
 
 
 def test_a_delayed_nvfp4_gated_mlp_trains_each_projection_on_its_own_history():
