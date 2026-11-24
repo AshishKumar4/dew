@@ -30,7 +30,7 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import _position
-from dew._coordination import agreed, agreed_next, agreed_reads, agreed_same, pool_size
+from dew._coordination import agreed, agreed_next, agreed_reads, agreed_same, from_every_process, pool_size
 from dew._records import JSON, integers
 from dew.batch import (
     CLOSES_WINDOW,
@@ -75,7 +75,7 @@ from dew.training.cooldown import Branch, Cooldowns
 from dew.training.diloco import regrouped
 from dew.training.evaluation import Declared, EvalSuite, Evaluation, Split, SplitLoss, episodic
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
-from dew.training.memory import CodeBounded
+from dew.training.memory import CodeBounded, code_bytes
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.observe import Observe
 from dew.training.profiling import ProfileWindow, start_capture, stop_capture
@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     from dew.objectives.base import Objective
     from dew.training._candidates import RunShape
     from dew.training.distributed import StartBuild
+    from dew.training.planning import Planned
     from dew.training.startup import Startup
 
 _log = logging.getLogger(__name__)
@@ -597,6 +598,23 @@ class FitRun:
         if self.ran_out:
             batch = drained(batch, interval.consumed, examples)
         return closes_window(batch, examples, last=last), position
+
+    def restarting(self, differs: tuple[str, ...]) -> None:
+        """Note a resume whose data starts again, its saved plan differing in `differs` (`DataRestarted`)."""
+        if not differs:
+            return
+        self.restarted = differs
+        _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
+                     "again from the beginning of its order while its state resumes (data_resume='relaxed'; "
+                     "'exact' refuses it)", ", ".join(differs))
+
+    def hold_step(self, signature: Hashable, step: tuple, executable: jax.stages.Compiled | None,
+                  planned: Planned | None, passes: int | None) -> None:
+        """Hold `step`, compiled for `signature` at `passes` (`PhasePasses.current`), charged the device code
+        of its `executable` and its `planned` sampled step's as every process charges it (`compiled`)."""
+        sampled = None if planned is None or planned.sampled is None else planned.sampled.executable
+        self.compiled.hold(signature, step, max(from_every_process(code_bytes(executable, sampled))))
+        self.passes.add(passes)
 
     def held(self) -> contextlib.AbstractContextManager[None]:
         """The training stream's placements held for a block of device work beside the steps

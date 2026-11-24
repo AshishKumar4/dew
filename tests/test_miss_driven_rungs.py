@@ -15,16 +15,16 @@ from dew.optim import Adam, OptimConfig
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.ahead import AheadOfTime, compile_ahead
-from dew.training.memory import needed
+from dew.training.memory import least_limit
 from dew.training.planning import PlanRefused
 
 
 def _ahead(model, optimizer, seq: int, rows: int, limit: int, variables=None
            ) -> tuple[AheadOfTime | None, list[dict]]:
-    """`model`'s step compiled ahead for one compile-only H100 of `limit` bytes over `rows` rows of `seq`
-    tokens, its `variables` where given, None where it fit none, and each probe its search compiled, in
-    order."""
-    mesh = MeshSpec().build(compile_only_gpus("sm90", 1, limit))
+    """`model`'s step compiled ahead for one compile-only H100 of `limit` bytes, all its pool's, over `rows`
+    rows of `seq` tokens, its `variables` where given, None where it fit none, and each probe its search
+    compiled, in order."""
+    mesh = MeshSpec().build(compile_only_gpus("sm90", 1, limit, share=1.0))
     built = OptimConfig(optimizer=optimizer, lr=1e-3).build(100)
     objective = LMObjective(model, seq) if variables is None else LMObjective(model, seq, variables=variables)
     trainer = Trainer(objective, built, key=jax.random.key(0), mesh=mesh,
@@ -37,10 +37,12 @@ def _ahead(model, optimizer, seq: int, rows: int, limit: int, variables=None
 
 
 def _needed(ahead: AheadOfTime) -> int:
-    """The least total memory an H100 states for `ahead`'s step to be admitted, its arguments in use and
-    its outputs that write over none beside them (`needed`), as `compile_only_gpus` takes a GPU's memory."""
-    gpu = compile_only_gpus("sm90", 1, 2 ** 34)[0]
-    return needed(gpu, ahead.argument_bytes, ahead.output_bytes - ahead.alias_bytes, ahead.temp_bytes)
+    """The least memory an H100 whose pool holds all of it (a share of 1, as `_ahead`'s) states for
+    `ahead`'s step to be admitted, its arguments in use and its outputs that write over none beside them
+    (`least_limit`): its pool's limit, there its memory, as `compile_only_gpus` takes it."""
+    gpu = compile_only_gpus("sm90", 1, 2 ** 34, share=1.0)[0]
+    beside = ahead.output_bytes - ahead.alias_bytes
+    return least_limit(gpu, [(ahead.argument_bytes, beside, ahead.temp_bytes)])
 
 
 @pytest.mark.parametrize("stack", ["plain", "scanned", "rows"])

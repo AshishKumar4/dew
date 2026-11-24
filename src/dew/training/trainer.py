@@ -33,13 +33,7 @@ from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._cleanup import attempted
-from dew._coordination import (
-    agree_process_phase,
-    agreed,
-    agreed_same,
-    broadcast_from_process_zero,
-    from_every_process,
-)
+from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON
 from dew.batch import Batch, at_path, owned_dicts, placed_at, select, unboxed
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume, _Laid
@@ -177,7 +171,6 @@ from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, leaf_paths, logged_scalars
 from dew.training.memory import (
     CodeBounded,
-    code_bytes,
     first_run,
     first_run_failed,
     recompute_record,
@@ -1566,7 +1559,7 @@ class Trainer(Generic[Loss, Effects]):
         # again where its plan changed (`_prefetched`).
         resumed = self._resumed(run, resume)
         if resumed.differs:
-            self._restarting(run, resumed.differs)
+            run.restarting(resumed.differs)
         return (start.resume, resumed.position, lambda begun=None: self._placed(start, positioned=False)[:2],
                 start.abstract, None)
 
@@ -1587,8 +1580,8 @@ class Trainer(Generic[Loss, Effects]):
         run.stages = stages_of(stream)
         try:
             if saved is not None and isinstance(stream, Checkpointable):
-                self._restarting(run, restored_or_restarted(stream, saved, resume=self.data_resume,
-                                                            step=run.current))
+                run.restarting(restored_or_restarted(stream, saved, resume=self.data_resume,
+                                                     step=run.current))
             batch = next(iter(stream), None)
             position = stream.get_state() if isinstance(stream, Checkpointable) else None
         except BaseException:
@@ -1769,10 +1762,12 @@ class Trainer(Generic[Loss, Effects]):
         accumulation its window pools. The narrow copies are left out: the plan's first rung drops
         them where the step does not fit with them (`dew.training.planning.FitSearch`)."""
         micro = microbatch_shapes(split_fields(batch)[0], split)
-        # Its loss's trace the plan's candidates read again (`StepCompiler.loss_shaped`).
+        # Its loss's trace the plan's candidates read again, over the state as they read it, as placed
+        # (`StepCompiler.loss_shaped`, `dew.training._candidates.candidate_for`).
         with self._traced_on(self.device_mesh) as schedule:
             stepping = self._compiler.loss_shaped(self._stepping(), schedule)
-            _, _, whole, _ = prepared_for(stepping, state, micro, schedule, split, narrow=False)
+            placed = placed_shapes(state, stepping.shardings(state))
+            _, _, whole, _ = prepared_for(stepping, placed, micro, schedule, split, narrow=False)
         return self._validated(whole)[1]
 
     def _fitting(self, state: TrainState, batch: Batch) -> Validation:
@@ -1824,12 +1819,12 @@ class Trainer(Generic[Loss, Effects]):
             # agrees on the one it reads.
             position, differs = resumed_on(source, lambda: position, resume=self.data_resume,
                                            step=run.current)
-            self._restarting(run, differs)
+            run.restarting(differs)
 
         def restore(stream: Checkpointable, saved: bytes) -> None:
             # On the worker that reads the stream, which it opens once (row 5577).
-            self._restarting(run, restored_or_restarted(stream, saved, resume=self.data_resume,
-                                                        step=run.current))
+            run.restarting(restored_or_restarted(stream, saved, resume=self.data_resume,
+                                                 step=run.current))
         if jax.process_count() > 1:
             # Each process opened its own stream over its own copy of the
             # corpus, and none reads a record before all agree it is one.
@@ -1862,16 +1857,6 @@ class Trainer(Generic[Loss, Effects]):
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._shape.prefetch, source_state=position,
                                       reads=run.reads, prepare=prepare, restore=restore, primed=primed)
-
-    @staticmethod
-    def _restarting(run: FitRun, differs: tuple[str, ...]) -> None:
-        """Note a resume whose data starts again, its saved plan differing in `differs` (`DataRestarted`)."""
-        if not differs:
-            return
-        run.restarted = differs
-        _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
-                     "again from the beginning of its order while its state resumes (data_resume='relaxed'; "
-                     "'exact' refuses it)", ", ".join(differs))
 
     def _scheduled(self, plan: FitPlan, run: FitRun) -> None:
         """Open the next stage of a schedule where the run's commits reached the one it stands in
@@ -2322,11 +2307,8 @@ class Trainer(Generic[Loss, Effects]):
             with region("compile"), run.held():
                 step = self.compile(state, batch, trials)
             planned = None if self._compiled is None else self._compiled.planned
-            sampled = None if planned is None or planned.sampled is None else planned.sampled.executable
-            # Charged its step's code and its sampled step's, as every process charges it (`FitRun.compiled`).
-            charge = max(from_every_process(code_bytes(self.executable, sampled)))
-            compiled.hold(signature, (step, self.step_flops), charge)
-            run.passes.add(self.phase_passes.current)
+            run.hold_step(signature, (step, self.step_flops), self.executable, planned,
+                          self.phase_passes.current)
             seconds = time.perf_counter() - began
             settled_heap(run, compiled=True)
             links = {axis: AxisLink(link.bytes_per_second, link.spread) for axis, link in self.links.items()}
