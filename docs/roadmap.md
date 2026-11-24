@@ -40,7 +40,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Certification admits a spill only where every STL/LDL of its SASS sits at loop depth 0 (prologue/epilogue) or in call slow-path code. [12387]
 - Memory Planner Miss-Driven ≤2-Step Search, Fast XLA Sizing & Cold-Compile Elimination. [12462]
 - ReviewGemmConfirm's review of #3913. [12630]
-- Review of #12466's emitted-op counter. [12648]
 - Review of the two-consumer mma.sync family. [12652]
 - Review of the two-consumer mma.sync family. [12653]
 - The fork takes no static register cap for a Mosaic GPU kernel. [12686]
@@ -53,6 +52,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - A 4B decision start's cold fit spends 152.8 s (template) and 162.2 s (vendor) in 12 traces of templates/report.py's certification program pulled_back…. [6593]
 - Pallas's interpreter compiles a thread map's body once per leased CPU client. [7087]
 - A turned training step's kept certified configs (report.certifications, pulled, not refused) compile one Mosaic kernel its lowered program does not run. [12646]
+- Attention (shared key runs broadcast against the batch). [12701]
 
 ## Models and interop
 
@@ -68,6 +68,7 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Training and parallelism
 
 - Time to first step: the compile path's re-derivations. [5556]
+- A single process driving two H100s (Mesh fsdp=2, CUDA 12, driver 570.148.08, NCCL_RUNTIME_CONNECT=0, Dew's default XLA_FLAGS) deadlocks at the first execution…. [12714]
 - Owner-approved Audit 4 API cleanup. [11935]
 - CI time: every test within 120 seconds. [12484, 12641]
 - Distributed and memory training modes. [156, 873, 1306, 617]
