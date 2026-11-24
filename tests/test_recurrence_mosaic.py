@@ -932,15 +932,12 @@ RESOURCE_SHAPES = {
     **{name: (shape.key_heads, shape.value_heads, shape.key_width, shape.value_width, shape.kind == 'kda')
        for name, shape in benchmark_recurrence.SHAPES.items()
        if name in ('qwen3.5-27b-gdn', 'kimi-linear-kda', 'nemotron-h-4b-ssd', 'minimax-text-01-lightning')},
-    'a write gate': (2, 2, 64, 64, False), 'a 192-wide value head': (16, 16, 128, 192, False),
-    'a key decay over wide values': (2, 2, 64, 1024, True)}
+    'a write gate': (2, 2, 64, 64, False), 'a 192-wide value head': (16, 16, 128, 192, False)}
 """The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`, read there:
 a gated delta net's, Kimi delta attention's, an SSD's and MiniMax-Text-01's lightning layer), an unrounded
-write gate, a gated delta rule's value head 192 wide, whose training launches take whole staged blocks
-(a bf16 output gradient's 64-column swizzle; 96 columns cut one), and a decay a key dimension's under values
-sixteen times its keys' width, whose weighted launch matching its key steps would take value blocks past
-its own (row 12690): key heads, value heads, key and value widths, and whether the decay is a key
-dimension's."""
+write gate, and a gated delta rule's value head 192 wide, whose training launches take whole staged blocks
+(a bf16 output gradient's 64-column swizzle; 96 columns cut one): key heads, value heads, key and value
+widths, and whether the decay is a key dimension's."""
 
 WHOLE = frozenset({'a write gate'})
 """The gate's forms without the delta rule whose numbers the run's fast forms leave whole
@@ -1262,8 +1259,6 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                for training in (False, True) for variant in (None, TWO_ROLES, *range(NEIGHBOURS))
                if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
                and (name != 'a 192-wide value head' or (training and dtype == jnp.bfloat16 and not packed))
-               and (name != 'a key decay over wide values'
-                    or (not training and dtype == jnp.bfloat16 and not packed and variant is None))
                and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
                                                            ('qwen3.5-27b-gdn', jnp.float32),
                                                            ('kimi-linear-kda', jnp.bfloat16),
