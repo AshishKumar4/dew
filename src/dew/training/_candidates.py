@@ -248,11 +248,11 @@ def forget_program(target: Hashable, lowered: jax.stages.Lowered | None = None) 
     `target` (`program_key`), or whose lowering is `lowered`: one whose executable its run's compiler let go
     (`dew.training.planning.HeldExecutables`), so no kept lowering holds its device code past that bound,
     or which a guided compile supersedes (`forget`)."""
-    _, in_tree, *_ = target
     with _KEEPING:
-        # Its trees first, so only a lowering of the same shapes renders its text to compare.
+        # A lowering of `lowered`'s trees alone renders its text to compare, where one is given.
         for key in [key for key, kept in _CANDIDATES.items() if kept.lowered is lowered or (
-                kept.lowered.in_tree == in_tree and program_key(kept.lowered) == target)]:
+                (lowered is None or kept.lowered.in_tree == lowered.in_tree)
+                and program_key(kept.lowered) == target)]:
             del _CANDIDATES[key]
 
 

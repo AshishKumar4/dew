@@ -1470,10 +1470,10 @@ class FitSearch[LossT, EffectsT]:
         if missed is None:
             return rungs, None
         shortfall, live = missed
-        dropped = [None if (said := _stated(rung)) is None else live.forward_bytes(said.drops)
-                   for rung in rungs]
-        if None in dropped:
+        stated = [_stated(rung) for rung in rungs]
+        if None in stated:
             return rungs, None
+        dropped = [live.forward_bytes(said.drops) for said in stated if said is not None]
         first = next((at for at, freed in enumerate(dropped) if freed >= shortfall), None)
         if first is None:
             return rungs, None
@@ -1497,7 +1497,7 @@ class FitSearch[LossT, EffectsT]:
             held[",".join(names) or "-"] = held.get(",".join(names) or "-", 0) + size
         _log.warning("the rung predicted to drop %d of the %d bytes the start missed by missed by %d: XLA "
                      "scheduled its peak otherwise, which holds by name %s", predicted, missed[0], now[0],
-                     json.dumps(dict(sorted(held.items(), key=lambda item: -item[1])[:8])))
+                     json.dumps(dict(sorted(held.items(), key=lambda named: -named[1])[:8])))
 
     def recomputing(self, start: Rung, narrow: bool, ns_group: int | None) -> list[Rung]:
         """The ladder's remat rungs above `start`'s, each at the run's own head and the step's own options
