@@ -274,6 +274,9 @@ SLURM_TASK = {"SLURM_JOB_ID": "7", "SLURM_STEP_NODELIST": "node-0", "SLURM_NTASK
     ({**LAUNCHED, "JAX_LOCAL_DEVICE_IDS": "3", "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}, None, False),
     ({**LAUNCHED, "JAX_LOCAL_DEVICE_IDS": "2,3"}, None, True),
     ({**SLURM_TASK, "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7"}, None, False),
+    # A Slurm step of one task joins no pool (`joins_pool`): it drives every GPU it sees.
+    ({**SLURM_TASK, "SLURM_NTASKS": "1", "SLURM_PROCID": "0", "SLURM_LOCALID": "0",
+      "CUDA_VISIBLE_DEVICES": "0,1"}, None, True),
     ({}, 2, True),
     ({}, 1, False),
     ({}, None, False),
