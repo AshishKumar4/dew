@@ -29,25 +29,25 @@ def registers(form: bits.BitForm, words, layout) -> tuple:
     return plgpu.inline_mgpu(arg_types=(layout,), return_type=(typed,) * len(form.outputs))(decoded)(words)
 
 
-def _asm(array, ptx: str, results: int) -> tuple:
-    """`ptx` (`results` 32-bit results of one 32-bit word, constraints `=r,...,r`) on each word of
-    `array`'s registers, a word a block: each result's array."""
+def _asm(array, ptx: str, registers_out: int) -> tuple:
+    """`ptx` (`registers_out` 32-bit registers of one 32-bit word, constraints `=r,...,r`) on each word of
+    `array`'s registers, a word a block: each output register's array."""
     i32 = mgpu_ir.IntegerType.get_signless(32)
-    returned = mgpu_ir.Type.parse(f"!llvm.struct<({', '.join(['i32'] * results)})>")
-    constraints = ",".join(["=r"] * results + ["r"])
-    outs = [np.empty_like(array.registers) for _ in range(results)]
+    returned = mgpu_ir.Type.parse(f"!llvm.struct<({', '.join(['i32'] * registers_out)})>")
+    constraints = ",".join(["=r"] * registers_out + ["r"])
+    outs = [np.empty_like(array.registers) for _ in range(registers_out)]
     for index, register in np.ndenumerate(array.registers):
         [count] = mgpu_ir.VectorType(register.type).shape
-        decoded = [mgpu_llvm.mlir_undef(register.type) for _ in range(results)]
+        decoded = [mgpu_llvm.mlir_undef(register.type) for _ in range(registers_out)]
         for at in range(count):
             position = mgpu_ir.DenseI64ArrayAttr.get([at])
             word = mgpu_vector.extract(register, dynamic_position=[], static_position=position)
             done = mgpu_llvm.inline_asm(returned, [word], ptx, constraints)
-            for result in range(results):
-                value = mgpu_llvm.extractvalue(i32, done, [result])
-                decoded[result] = mgpu_vector.insert(value, decoded[result], dynamic_position=[],
+            for output in range(registers_out):
+                value = mgpu_llvm.extractvalue(i32, done, [output])
+                decoded[output] = mgpu_vector.insert(value, decoded[output], dynamic_position=[],
                                                      static_position=position)
-        for result in range(results):
-            outs[result][index] = decoded[result]
+        for output in range(registers_out):
+            outs[output][index] = decoded[output]
     return tuple(mgpu_fragments.FragmentedArray(_registers=out, _layout=array.layout, _is_signed=False)
                  for out in outs)
