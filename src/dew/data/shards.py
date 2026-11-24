@@ -399,10 +399,10 @@ class IndexedMap(grain.IterDataset):
 
     def __init__(self, parent: grain.IterDataset, step: Callable, made: Callable[[Batch], Batch]):
         super().__init__(parent)
-        self.step, self.made = step, made
+        self.parent, self.step, self.made = parent, step, made
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _IndexedMapIterator(self._parent.__iter__(), self.step, self.made)
+        return _IndexedMapIterator(iter(self.parent), self.step, self.made)
 
 
 class _IndexedMapIterator(grain.DatasetIterator):
