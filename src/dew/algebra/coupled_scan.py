@@ -45,8 +45,9 @@ from jax.scipy.linalg import solve_triangular
 from dew import _cache
 from dew.algebra import derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused
-from dew.algebra.scan import _exp, _replay_backward, _walked_tokens, token_terms, token_type
+from dew.algebra.scan import _exp, _replay_backward, _traced, _walked_tokens, token_terms, token_type
 from dew.nn.precision import at_least_fp32
+from dew.nn.sharding import varying_like
 
 
 def derive_coupled(declaration, *, saturation: program.Saturation) -> Derived:
@@ -107,20 +108,6 @@ def derive_coupled(declaration, *, saturation: program.Saturation) -> Derived:
     return Derived(init, _stepped, merge, finish, _mapped,
                    {"rounding": "running products", "walked": declaration.walked},
                    functools.partial(_replay_backward, replay, names), prepare, replay=replay)
-
-
-def _traced(declaration, function, names: tuple[str, ...], chunk: Mapping):
-    """`function` (the declaration's update or readout) traced at one token of `chunk` over the pair, jit
-    disabled, as `scan._traced` traces a single state's."""
-    shape, dtype = declaration.state[0]
-
-    def named(pair, *xs):
-        return function(pair, **dict(zip(names, xs, strict=True)))
-
-    state = jax.ShapeDtypeStruct(shape, dtype)
-    tokens = [token_type(declaration, chunk, name) for name in names]
-    with jax.disable_jit():
-        return jax.make_jaxpr(named)((state, state), *tokens)
 
 
 def _token(parts: linear_scan.Coupled, token: tuple) -> tuple:
@@ -215,33 +202,47 @@ def _decayed_sums(alpha, mu, lam):
         kept = kept * a
         return (g, m, kept), (g, kept)
 
-    entering = jnp.zeros((tokens + 1,), alpha.dtype)
-    (_, last, _), (g, kept) = lax.scan(token, (entering, entering.at[0].set(1.0), jnp.ones((), alpha.dtype)),
-                                       (alpha, mu, lam, own))
+    # The carries typed as the tokens vary (a checked `shard_map`'s manual axes), as a step's outputs vary.
+    entering = varying_like(jnp.zeros((tokens + 1,), alpha.dtype), alpha, mu, lam)
+    carried = (entering, entering.at[0].set(1.0), varying_like(jnp.ones((), alpha.dtype), alpha, mu, lam))
+    (_, last, _), (g, kept) = lax.scan(token, carried, (alpha, mu, lam, own))
     return g, last, kept
 
 
 def _prepared(alpha, mu, lam, b, u, c, q, r) -> tuple:
-    """A chunk's values that read no state (the module's account): the solve's three solutions (against the
-    inputs, the entering first state's and its momentum's), the scores, the queries decayed to each token from
-    the entering first state and momentum, the free readouts, the keys weighed to the chunk's end, and the
-    entering pair's three factors there."""
+    """A chunk's values that read no state (the module's account), each term the entering pair reaches
+    divided by the chunk's `scale`, a power of two at least its largest decayed sum and one (`_scale`): the
+    solve's three solutions (against the inputs, the entering first state's and its momentum's), the
+    scores, the queries decayed to each token from the entering first state and momentum, the free readouts,
+    the keys weighed to the chunk's end, the entering pair's three factors there, and the scale."""
     g, last, kept = _decayed_sums(alpha, mu, lam)
     before = jnp.concatenate([jnp.zeros_like(g[:1]), g[:-1]])
     kept_before = jnp.concatenate([jnp.ones_like(kept[:1]), kept[:-1]])
     system = jnp.eye(g.shape[0], dtype=g.dtype) - before[:, 1:] * (c @ b.T)
-    sides = jnp.concatenate([u, kept_before[:, None] * c, before[:, :1] * c], axis=-1)
+    scale = _scale(kept, g[:, 0])
+    sides = jnp.concatenate([u, kept_before[:, None] * c, before[:, :1] * c], axis=-1) / scale
     solved = solve_triangular(system, sides, lower=True, unit_diagonal=True)
     width = c.shape[-1]
     inputs, by_first, by_second = jnp.split(solved, [u.shape[-1], u.shape[-1] + width], axis=-1)
     scores = g[:, 1:] * (q @ b.T)
     ends = g[-1], last
-    return (inputs, by_first, by_second, scores, kept[:, None] * q, g[:, :1] * q, r, b * ends[0][1:, None],
-            b * ends[1][1:, None], kept[-1], ends[0][0], ends[1][0])
+    entering = kept[-1] / scale, ends[0][0] / scale, ends[1][0] / scale
+    return (inputs, by_first, by_second, scores, kept[:, None] * q / scale, g[:, :1] * q / scale, r,
+            b * ends[0][1:, None], b * ends[1][1:, None], *entering, scale)
+
+
+def _scale(kept, entering):
+    """A power of two at least one and every decayed sum the entering pair is weighed by in a chunk (`A_t`,
+    `b_t`): each term the pair reaches divided by it before its products, the chunk's sums with it after
+    them, so a term past float32's range where their sum is not cancels before it is rounded (2^127 entering
+    both states, decays of one and write gates of one: `b_2 M_0` is -2^128 where the memory leaving is
+    -2^127, ReviewMomentum1454); exact either way, a power of two."""
+    largest = jnp.maximum(jnp.max(jnp.abs(kept)), jnp.max(jnp.abs(entering)))
+    return jnp.exp2(jnp.ceil(jnp.log2(jnp.maximum(largest, 1.0))))
 
 
 def _inputs(prepared: tuple, pair):
-    """A chunk's inputs `W` from the pair entering it."""
+    """A chunk's inputs `W` from the pair entering it, divided by the chunk's scale (`_prepared`)."""
     inputs, by_first, by_second = prepared[:3]
     return inputs + by_first @ pair[0] + by_second @ pair[1]
 
@@ -251,18 +252,19 @@ def _stepped(state, prepared: tuple, issue=None):
     del issue
     decay, pair = state
     w = _inputs(prepared, pair)
-    *_, first_keys, second_keys, kept, entering_first, entering_second = prepared
-    first = kept * pair[0] + entering_first * pair[1] + first_keys.T @ w
-    second = entering_second * pair[1] + second_keys.T @ w
+    *_, first_keys, second_keys, kept, entering_first, entering_second, scale = prepared
+    first = (kept * pair[0] + entering_first * pair[1] + first_keys.T @ w) * scale
+    second = (entering_second * pair[1] + second_keys.T @ w) * scale
     return decay, jnp.stack([first, second])
 
 
 def _mapped(prepared: tuple, state, issue=None):
     """A chunk's outputs from the pair entering it (`derive_coupled`'s `mapped`)."""
     del issue
-    pair = state[1]
+    pair, scale = state[1], prepared[-1]
     scores, first_queries, second_queries, free = prepared[3:7]
-    return first_queries @ pair[0] + second_queries @ pair[1] + scores @ _inputs(prepared, pair) + free
+    read = first_queries @ pair[0] + second_queries @ pair[1] + scores @ _inputs(prepared, pair)
+    return read * scale + free
 
 
 def _replayed(declaration, names: Sequence[str], parts: linear_scan.Coupled, chunk: Mapping, pair) -> tuple:

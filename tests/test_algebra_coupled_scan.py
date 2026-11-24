@@ -128,3 +128,11 @@ def test_a_pair_no_coupled_form_holds_is_refused(declared, why):
     chunk = {name: value[:CHUNK] for name, value in zip(OPERANDS, draws(packed=False)(0), strict=True)}
     with pytest.raises(Refused):
         forms.prepare(chunk)
+
+
+def test_a_state_of_no_rank_is_refused_named():
+    """A single state of rank zero, no keys by values, is refused, named, as any rank but two is."""
+    declared = scan.Scan(lambda h, x: h + x, lambda h, x: h, {"x": ("time",)}, walked="time",
+                         state=((), jnp.float32))
+    with pytest.raises(Refused):
+        scan.derive_scan(declared, saturation=SATURATION)

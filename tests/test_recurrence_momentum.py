@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import Mesh, PartitionSpec as P
 from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid, softplus, unit
 
@@ -157,3 +158,49 @@ def test_a_query_reads_a_memory_near_float32s_largest_decayed_first():
     for read, memory in ((out[:, 0], final), (stepped_out, stepped_final)):
         np.testing.assert_array_equal(np.asarray(read), 2.0 ** 127)
         np.testing.assert_array_equal(np.asarray(memory[:, :, 0]), 2.0 ** 126)
+
+
+def test_a_momentum_cancelling_past_float32s_range_carries_finite():
+    """ReviewMomentum1454's cancellation: two tokens of queries, keys and erase keys along the first key,
+    decays and write gates of one, values of 2^127 along the first value, the memory and the momentum
+    entering 2^127 there: the chunked op's outputs and final pair are the decode step's, finite, where the
+    entering momentum weighed by the tokens' summed write gates, -2^128, overflowed before the memory's term
+    joined it."""
+    hooks = recurrence.Hooks(decay='scalar', coupled='momentum', write_bound=1.0, scale=1.0)
+    along = jnp.zeros((1, 2, 1, 2), jnp.float32).at[..., 0].set(1.0)
+    value = jnp.zeros((1, 2, 1, 2), jnp.float32).at[..., 0].set(2.0 ** 127)
+    zero, one = jnp.zeros((1, 2, 1), jnp.float32), jnp.ones((1, 2, 1), jnp.float32)
+    state = jnp.zeros((1, 1, 2, 2, 2), jnp.float32).at[:, :, :, 0, 0].set(2.0 ** 127)
+    out, final = chunk(hooks, Chunk(along, along, value, log_decay=zero, beta=one, momentum_decay=zero,
+                                    state=state), chunk_size=CHUNK)
+
+    def one_token(state, token):
+        q, v, a, b, mu = token
+        read, _, state = recurrence.step(hooks, recurrence.Step(state, query=q, key=q, value=v, log_decay=a,
+                                                                beta=b, momentum_decay=mu))
+        return state, read
+
+    tokens = tuple(jnp.moveaxis(x, 1, 0) for x in (along, value, zero, one, zero))
+    stepped_final, stepped = jax.lax.scan(one_token, state, tokens)
+    for got, want in ((out, jnp.moveaxis(stepped, 0, 1)), (final, stepped_final)):
+        assert np.isfinite(np.asarray(want)).all()
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_a_coupled_momentum_runs_in_a_shard_map_that_checks_varying_axes():
+    """The chunked momentum's rows split over a checked `shard_map`'s axis: its outputs, final pair and every
+    operand's gradient finite, each carry typed as the operands reaching it vary, the chunks' decayed sums'
+    among them (ReviewMomentum1454: seeded replicated, their first step's carry varied with the gates)."""
+    *given, cotangent = operands(jnp.float32, untied=False)(0)
+    rows = P('data')
+
+    def rule(query, key, value, log_decay, beta, momentum_decay, state):
+        given = Chunk(query, key, value, log_decay=log_decay, beta=beta, momentum_decay=momentum_decay,
+                      state=state)
+        return chunk(TIED, given, chunk_size=CHUNK)
+
+    mapped = jax.shard_map(rule, mesh=Mesh(np.asarray(jax.devices()[:2]), ('data',)), in_specs=rows,
+                           out_specs=rows, check_vma=True)
+    found = jax.jit(mapped)(*given)
+    pulled = jax.jit(lambda *operands: jax.vjp(mapped, *operands)[1](cotangent))(*given)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((found, pulled)))
