@@ -19,7 +19,6 @@ flax's own calls broadcast the bias in its storage dtype, where its gradient
 then sums, and offer no step to widen it.
 """
 
-import contextlib
 import functools
 import importlib.util
 import inspect
@@ -176,7 +175,7 @@ def _ruled() -> bool:
 
 
 def _product(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions,
-             bias: Array | None = None) -> jax.Array:
+             bias: Array | None = None, tensor_scale: Array | None = None) -> jax.Array:
     """The layer's product of `inputs` and `kernel` over `dimensions`, plus `bias` where given, shaped to
     broadcast over it (`biased`). The product is its `dot_general_cls` (an interceptor's: a quantized
     product), as flax picks it, else its `dot_general`, or lax's at its stated precision (`accumulated`: the
@@ -186,7 +185,9 @@ def _product(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, di
     template declares XLA faster), which takes the bias inside its own rule, but where a wrapper owns the
     products (`intercepted`: Qwix quantizes them as it intercepts `dot_general`). A product with a policy of
     its own (a head's fp32 result: `fp32_result_dot_general`, `head_dot_general`) is the layer's own: the
-    template reads no policy from a callable, and the bias is added past it."""
+    template reads no policy from a callable, and the bias is added past it. `tensor_scale`, the rows' under
+    a delayed-scaling NVFP4 recipe that takes the product (`history_scale`), which the template's product
+    hands its recipe (`projections.recipe_general`)."""
     extents = projections.extents(inputs.shape, kernel.shape, dimensions)
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     if layer.dot_general_cls is not None:
@@ -196,7 +197,7 @@ def _product(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, di
         refuse_recipe("a wrapper's product (an adapter's, a quantizer's)", *extents)
     elif layer.dot_general in (None, float32_dot_general):
         return projections.dot_general(product, projections.kernel_path(layer))(
-            inputs, kernel, dimensions, precision=layer.precision, bias=bias)
+            inputs, kernel, dimensions, precision=layer.precision, bias=bias, tensor_scale=tensor_scale)
     out = product(inputs, kernel, dimensions, precision=layer.precision)
     return out if bias is None else biased(out, bias)
 
@@ -226,29 +227,34 @@ def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, prefer
 
 
 def _biased(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, dimensions, bias: Array | None,
-            shaped, stored: Array | None = None, *, taken: Callable | None = None):
+            shaped, stored: Array | None = None, *, taken: Callable | None = None,
+            tensor_scale: Array | None = None):
     """The layer's product of `inputs` and `kernel` over `dimensions` as flax takes it, plus `bias`
     reshaped by `shaped` to broadcast over it (`biased`: added as flax adds it, its gradient summed
     at fp32, in float64 on a CPU under Dew's tests); where the layer computes in a 16-bit dtype and its
     bias is `stored` at fp32, the product and that bias rounded once (`_rounds_once`). `taken`, where
     given, takes the product, `taken(product)` of `product(inputs, kernel)`, as its caller forms it (a
     joined projection's kernels joined on each device's rows, `dew.nn.joined.joined_dense`; `kernel` then
-    one of them, its dtype the product's), the bias added past it as here."""
+    one of them, its dtype the product's), the bias added past it as here. `tensor_scale`, `_product`'s."""
     take = taken or (lambda product: product(inputs, kernel))
     if bias is not None and _rounds_once(layer, inputs, kernel, bias, stored):
-        widened = take(lambda inputs, kernel: _summed(inputs, kernel, dimensions, layer.precision))
+        widened = take(lambda inputs, kernel: _summed(inputs, kernel, dimensions, layer.precision,
+                                                      tensor_scale))
         return biased(widened, shaped(stored)).astype(inputs.dtype)
     if taken is None:
-        return _product(layer, inputs, kernel, dimensions, None if bias is None else shaped(bias))
-    product = taken(lambda inputs, kernel: _product(layer, inputs, kernel, dimensions))
+        return _product(layer, inputs, kernel, dimensions, None if bias is None else shaped(bias),
+                        tensor_scale)
+    product = taken(lambda inputs, kernel: _product(layer, inputs, kernel, dimensions,
+                                                    tensor_scale=tensor_scale))
     return product if bias is None else biased(product, shaped(bias))
 
 
-def _summed(inputs: Array, kernel: Array, dimensions, precision) -> jax.Array:
+def _summed(inputs: Array, kernel: Array, dimensions, precision,
+            tensor_scale: Array | None = None) -> jax.Array:
     """A biased layer's product left unrounded in fp32, its bias added past it (`_biased`): the run's
     low-precision recipe's where it takes the projection (`projections.recipe_general`: its fp32 sums and its
-    own gradients), else XLA's (`_widened`)."""
-    recipe = projections.recipe_general(inputs, kernel, dimensions, jnp.float32)
+    own gradients, its rows at `tensor_scale` under delayed scaling), else XLA's (`_widened`)."""
+    recipe = projections.recipe_general(inputs, kernel, dimensions, jnp.float32, tensor_scale=tensor_scale)
     return recipe if recipe is not None else _widened(inputs, kernel, dimensions, precision)
 
 
@@ -345,18 +351,6 @@ def recorded(layer: nn.Module, name: str, rows: Array) -> None:
     layer.sow(NVFP4_AMAX, name, projections.nvfp4_amax(rows))
 
 
-def delayed(layer: nn.Module, rows: Array, shape: tuple[int, ...]) -> contextlib.AbstractContextManager:
-    """Around a `Dense` `layer`'s own product of `rows` by its `shape` kernel: its rows quantized at its amax
-    history's tensor scale (`history_scale` of `'amax_history'`, `projections.delayed_scale`, which the
-    product's recipe reads) and their largest magnitude recorded (`recorded`), where the run's
-    delayed-scaling NVFP4 recipe takes it, else nothing."""
-    scale = history_scale(layer, 'amax_history', shape)
-    if scale is None:
-        return contextlib.nullcontext()
-    recorded(layer, 'amax_history', rows)
-    return projections.delayed_scale(scale)
-
-
 def rolled(histories: Mapping, amaxes: Mapping) -> dict:
     """`histories` (an `NVFP4_HISTORY` collection) with each history `amaxes` holds a largest magnitude for
     (a tree mirroring them, each leaf the largest over its projection's calls and a step's microbatches, a
@@ -431,8 +425,11 @@ class Dense(_LinearEnvelope, nn.Dense):
         stored = bias
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
         dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
-        with delayed(self, inputs, kernel.shape):
-            return _biased(self, inputs, kernel, dimensions, bias, lambda bias: bias, stored)
+        # Under a delayed-scaling NVFP4 recipe that takes the product, its rows' scale its amax history's.
+        scale = history_scale(self, 'amax_history', kernel.shape)
+        if scale is not None:
+            recorded(self, 'amax_history', inputs)
+        return _biased(self, inputs, kernel, dimensions, bias, lambda bias: bias, stored, tensor_scale=scale)
 
 
     @nn.nowrap
