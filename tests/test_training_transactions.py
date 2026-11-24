@@ -20,7 +20,7 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
 from dew.objectives import Aux, EMASpec, Objective, Ratio
 from dew.optim import Adam, Optax, OptimConfig
-from dew.training import FitPolicy, Trainer, UpdateBatch
+from dew.training import Trainer, TrainerAdvanced
 
 
 @struct.dataclass
@@ -84,7 +84,8 @@ SHORT_SCALE = dynamic_scale_lib.DynamicScale(growth_interval=1)
 
 def trainer(composite=False, k=2, checkpoints=None):
     return Trainer(Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-                   update=UpdateBatch(batches=k), dynamic_scale=SHORT_SCALE, checkpoints=checkpoints)
+                   accumulation=k, advanced=TrainerAdvanced(dynamic_scale=SHORT_SCALE),
+                   checkpoints=checkpoints)
 
 
 def test_a_commit_counts_the_tokens_of_its_windows_microbatches_alone():
@@ -190,8 +191,8 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
                                                   aux_loss_alpha=None if auxiliary is None else .2,
                                                   seq_aux=auxiliary != "global"))
     optimizer = optax.chain(optax.clip_by_global_norm(.5), optax.sgd(.03), scale_by_qk_clip(.05))
-    train = Trainer(objective, optimizer, key=jax.random.PRNGKey(7), update=UpdateBatch(batches=2),
-                    dynamic_scale=True)
+    train = Trainer(objective, optimizer, key=jax.random.PRNGKey(7), accumulation=2,
+                    advanced=TrainerAdvanced(dynamic_scale=True))
     initial = train.initial_state()
     rows = jax.device_count()
     rng = np.random.default_rng(4)
@@ -284,13 +285,13 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
                                     jnp.int32)}
     spoken = said(0)
     quiet = {"text": jnp.full((rows, 8), silent, jnp.int32)}
-    placement = {"mesh": MeshSpec(fsdp=2, stage=2), "fit": FitPolicy(microbatches=2)} if staged else {}
+    placement = {"mesh": MeshSpec(fsdp=2, stage=2), "microbatches": 2} if staged else {}
 
     def clip(threshold):
         return optax.chain(optax.sgd(0.0), scale_by_qk_clip(threshold))
 
     def trained(threshold, first, second):
-        train = Trainer(objective, clip(threshold), key=jax.random.PRNGKey(3), update=UpdateBatch(batches=2),
+        train = Trainer(objective, clip(threshold), key=jax.random.PRNGKey(3), accumulation=2,
                         **placement)
         initial = train.initial_state()
         # The step consumes the state: what the expectation reads of it is taken first, each layer on its
@@ -362,7 +363,7 @@ def test_replay_preserves_half_precision_cotangents_and_integer_support():
             row = Ratio(((w + 3) ** 2).astype(jnp.float16), jnp.asarray(1))
             return Terms(prediction, row, jnp.zeros(3, jnp.float16),
                          jnp.zeros(3, jnp.int32), jnp.asarray(0)), Aux({})
-    train = Trainer(Half(), optax.sgd(.1), key=jax.random.PRNGKey(1), update=UpdateBatch(batches=2))
+    train = Trainer(Half(), optax.sgd(.1), key=jax.random.PRNGKey(1), accumulation=2)
     initial = train.initial_state()
     data = batches()[0]
     step = train.compile(initial, data)
@@ -446,7 +447,7 @@ def test_every_microbatch_of_an_accumulated_update_reads_the_updates_committed_b
                                step.updates, step.step)
             return super().loss(variables, batch, step)
 
-    state = Trainer(Clocked(), optax.sgd(0.1), key=jax.random.PRNGKey(0), update=UpdateBatch(batches=2)).fit(
+    state = Trainer(Clocked(), optax.sgd(0.1), key=jax.random.PRNGKey(0), accumulation=2).fit(
         Loader(lambda partition: batches(), None, None, 8), steps=6, log_every=100)
     assert int(state.updates) == 3
     # A debug callback's host work runs apart from the arrays it reads; the barrier waits for it.
@@ -468,8 +469,8 @@ def an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
 
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=8)
-    train = Trainer(LMObjective(model, 8), OptimConfig(learning_rate=1e-3).build(10),
-                    key=jax.random.PRNGKey(0), update=UpdateBatch(batches=2))
+    train = Trainer(LMObjective(model, 8), OptimConfig(lr=1e-3).build(10),
+                    key=jax.random.PRNGKey(0), accumulation=2)
     state = train.initial_state()
     rows = jax.device_count()
     train.compile(state, {"text": np.arange(rows * 9, dtype=np.int32).reshape(rows, 9) % 64})
@@ -481,15 +482,17 @@ def an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
 
 
 def test_a_given_loss_scale_starts_each_state_of_its_own():
-    """A trainer given its dynamic loss scale (`Trainer(dynamic_scale=...)`) starts each state from
+    """A trainer given its dynamic loss scale (`TrainerAdvanced(dynamic_scale=...)`) starts each state from
     a copy of it: the step donates its state, so a scale of arrays, as Flax's updates leave one, is
     still whole after a step for the next state and for another trainer given it."""
     scale = jax.tree.map(jnp.asarray, dynamic_scale_lib.DynamicScale(growth_interval=1))
-    first = Trainer(Tiny(), optax.sgd(.03), key=jax.random.PRNGKey(9), dynamic_scale=scale)
+    first = Trainer(Tiny(), optax.sgd(.03), key=jax.random.PRNGKey(9),
+                    advanced=TrainerAdvanced(dynamic_scale=scale))
     state = first.initial_state()
     batch = batches()[0]
     first.compile(state, batch)(state, batch)
-    again = Trainer(Tiny(), optax.sgd(.03), key=jax.random.PRNGKey(9), dynamic_scale=scale)
+    again = Trainer(Tiny(), optax.sgd(.03), key=jax.random.PRNGKey(9),
+                    advanced=TrainerAdvanced(dynamic_scale=scale))
     for trainer in (first, again):
         held = trainer.initial_state().scale
         np.testing.assert_array_equal(np.asarray(held.scale), np.asarray(scale.scale))
@@ -594,7 +597,8 @@ def test_a_local_step_one_process_wrote_reads_onto_the_host_and_onto_any_mesh(tm
     persistent, local = str(tmp_path / "persistent"), str(tmp_path / "local")
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
     # Every leaf split, however small (`Layout.min_shard`), so the matrix lies as two slices.
-    train = Trainer(Matrix(), optax.sgd(.1), key=jax.random.PRNGKey(3), mesh=mesh, layout=Layout(min_shard=1),
+    train = Trainer(Matrix(), optax.sgd(.1), key=jax.random.PRNGKey(3), mesh=mesh,
+                    advanced=TrainerAdvanced(layout=Layout(min_shard=1)),
                     checkpoints=Checkpoints(persistent, local_directory=local, local_every=1))
     initial = train.initial_state()
     data = {"y": jnp.ones(2 * jax.device_count(), jnp.float32)}
@@ -627,7 +631,8 @@ def test_a_run_that_skips_a_step_not_finite_leaves_the_parameters_as_they_were(o
     lands bit for bit where the run that never read that batch does; under Adam its parameters stay finite,
     its moments having decayed a step."""
     solver = optax.sgd(0.1) if optimizer == "sgd" else optax.adam(0.1)
-    state = make_trainer(optimizer=solver, skip_nonfinite=True).fit(dataset(PoisonedThird), steps=5,
+    state = make_trainer(optimizer=solver,
+                         advanced=TrainerAdvanced(skip_nonfinite=True)).fit(dataset(PoisonedThird), steps=5,
                                                                     log_every=100)
     assert int(state.updates) == 4
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(state.variables))
@@ -648,7 +653,9 @@ def test_a_run_stops_at_the_first_step_not_finite_and_saves_none_of_it(tmp_path)
         trainer.fit(dataset(PoisonedThird), steps=5, log_every=1, checkpoint_every=1)
     trainer.checkpoints.wait()
     assert trainer.checkpoints.latest == 2
-    assert int(make_trainer(skip_nonfinite=True).fit(dataset(PoisonedThird), steps=5, log_every=1).step) == 5
+    assert int(make_trainer(advanced=TrainerAdvanced(skip_nonfinite=True)).fit(dataset(PoisonedThird),
+                                                                               steps=5,
+                                                                               log_every=1).step) == 5
 
 
 @pytest.mark.parametrize("skip", [True, False], ids=["skipped", "taken"])
@@ -657,7 +664,8 @@ def test_a_step_whose_loss_is_finite_and_its_gradient_not_is_reported_not_finite
     zero) is reported not finite by its gradient's norm, so the run stops at it, or, skipping such steps, its
     streak counts it: a skipped one trains nothing. It was reported finite, by its loss, and the streak reset
     on it (the theme's head review, F2)."""
-    stepper = Trainer(Tiny(), optax.sgd(0.1), key=jax.random.PRNGKey(9), skip_nonfinite=skip)
+    stepper = Trainer(Tiny(), optax.sgd(0.1), key=jax.random.PRNGKey(9),
+                      advanced=TrainerAdvanced(skip_nonfinite=skip))
     state = stepper.initial_state()
     bad = batches()[1]
     step = stepper.compile(state, bad)
@@ -688,7 +696,8 @@ def test_a_skipped_step_whose_collection_overflows_moves_no_weight_and_writes_no
     its update count and its collection stay as they were, and it reports not finite. Its collection was kept
     while its weight and update count moved (the round-2 review's F3)."""
     rows = jax.device_count()
-    stepper = Trainer(Overflowing(), optax.sgd(0.1), key=jax.random.PRNGKey(0), skip_nonfinite=True)
+    stepper = Trainer(Overflowing(), optax.sgd(0.1), key=jax.random.PRNGKey(0),
+                      advanced=TrainerAdvanced(skip_nonfinite=True))
     state = stepper.initial_state()
     batch = {"x": jnp.full((rows,), 100.0, jnp.float32)}
     step = stepper.compile(state, batch)
@@ -732,9 +741,10 @@ def test_a_skipped_steps_weights_are_kept_by_its_post_step_effects():
     clamp, the clamp's count stepping with the zero gradient's step. The clamp acted on a rejected step's
     weights (the round-3 head review's F7)."""
     from dew.optim import ParamGroup
-    clamped = OptimConfig(optimizer=Adam(), learning_rate=1e-3,
+    clamped = OptimConfig(optimizer=Adam(), lr=1e-3,
                           param_groups=(ParamGroup("all", ("*",), bounds=(0.0, 1.0)),))
-    trainer = Trainer(ClampedOutside(), clamped, key=jax.random.PRNGKey(0), skip_nonfinite=True)
+    trainer = Trainer(ClampedOutside(), clamped, key=jax.random.PRNGKey(0),
+                      advanced=TrainerAdvanced(skip_nonfinite=True))
     trainer.scheduled(1)
     state = trainer.initial_state()
     batch = next(type("Fed", (Inputs,), {"value": np.nan})())
@@ -760,7 +770,8 @@ def test_a_skipped_step_applies_no_effect():
     """A skipped step (inputs not finite) moves nothing by its objective's effects: its count stays zero.
     The effects were gated on the gradient alone and counted the rejected step (the round-4 head review's
     F5)."""
-    trainer = Trainer(CountingEffects(), optax.sgd(0.1), key=jax.random.PRNGKey(0), skip_nonfinite=True)
+    trainer = Trainer(CountingEffects(), optax.sgd(0.1), key=jax.random.PRNGKey(0),
+                      advanced=TrainerAdvanced(skip_nonfinite=True))
     state = trainer.initial_state()
     batch = next(type("Fed", (Inputs,), {"value": np.nan})())
     advanced, _, _, finite, _, _ = trainer.compile(state, batch)(state, batch)
@@ -801,10 +812,11 @@ def test_a_skipping_trainer_after_a_taking_one_of_one_config_skips_by_its_own_po
     second skipping them: the first stops at its poisoned step; the second, whose fit could read the first's
     step from the process's cache of steps (`_candidates.candidate_for`), skips it, its four updates
     finite. The policy keyed no step, so the second took the first's (the rebuild's head review, F1)."""
-    config = OptimConfig(optimizer=Optax('optax:sgd'), learning_rate=0.1)
+    config = OptimConfig(optimizer=Optax('optax:sgd'), lr=0.1)
     with pytest.raises(RuntimeError):
         make_trainer(optimizer=config).fit(dataset(PoisonedThird), steps=5, log_every=1)
-    state = make_trainer(optimizer=config, skip_nonfinite=True).fit(dataset(PoisonedThird), steps=5,
+    state = make_trainer(optimizer=config,
+                         advanced=TrainerAdvanced(skip_nonfinite=True)).fit(dataset(PoisonedThird), steps=5,
                                                                      log_every=1)
     assert int(state.updates) == 4
     assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(state.variables))
@@ -827,7 +839,7 @@ def test_a_diloco_step_not_finite_in_one_group_alone_stops_the_run():
     from dew.training import DiLoCo, MeshSpec
 
     trainer = make_trainer(mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
-                           diloco=DiLoCo(every=4, rate=0.7, momentum=0.9))
+                           advanced=TrainerAdvanced(diloco=DiLoCo(every=4, rate=0.7, momentum=0.9)))
     with pytest.raises(RuntimeError):
         trainer.fit(dataset(SecondGroupPoisoned), steps=3, log_every=1)
 

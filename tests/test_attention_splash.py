@@ -400,35 +400,38 @@ def test_a_paged_decode_step_on_this_tpu_falls_back_where_jaxs_kernel_refuses(wi
 
 
 def test_splash_span_mask_matches_key_spans_without_dense_numpy_mask():
-    """Row 956: `splash_span_mask` builds a Splash `MultiHeadMask` directly from static single-row
-    `KeySpans` (causal, chunked, windowed, and multi-run spans) without allocating a dense `NumpyMask`,
-    and runs interpreted Splash attention matching `template.dense(spans)`."""
+    """Row 956, 12219: `splash_mask_descriptor(..., spans=...)` builds a Splash `MultiHeadMask` directly
+    from static single-row `KeySpans` (causal, chunked, windowed, and multi-run spans) without allocating a
+    dense `NumpyMask`, and runs interpreted Splash attention matching `template.dense(spans)`."""
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 
-    from dew.nn.attention_tpu import splash_attention, splash_mask_descriptor, splash_span_mask, tpu_attention
+    from dew.nn.attention_tpu import splash_attention, splash_mask_descriptor, tpu_attention
     from dew.nn.kernels.templates import attention as template
 
+    def span_desc(spans: template.KeySpans, *, q_len: int = 128, kv_len: int = 128, heads: int = 2):
+        return splash_mask_descriptor(
+            q_len, kv_len, heads, causal=False, sliding_window=None, mask=None, spans=spans)
+
     chunk_spans = template.spans(128, 128, 1, causal=True, chunk=32)
-    desc = splash_span_mask(chunk_spans, heads=2)
+    desc = span_desc(chunk_spans)
     assert desc is not None and not any(isinstance(m, splash_attention_mask.NumpyMask) for m in desc.masks)
     np.testing.assert_array_equal(desc.masks[0][:, :], np.asarray(template.dense(chunk_spans)[0]))
     np.testing.assert_array_equal(desc.masks[0][32:64, 0:64],
                                   np.asarray(template.dense(chunk_spans)[0, 32:64, 0:64]))
     assert bool(desc.masks[0][35, 32]) and not bool(desc.masks[0][35, 0])
-    assert desc == splash_span_mask(chunk_spans, heads=2)
+    assert desc == span_desc(chunk_spans)
 
     # Multi-run spans: union of two disjoint intervals per query.
     q_pos = np.arange(128, dtype=np.int32)
     runs = np.stack([np.stack([np.zeros_like(q_pos), np.minimum(16, q_pos + 1)], axis=-1),
                      np.stack([np.maximum(q_pos - 15, 0), q_pos + 1], axis=-1)], axis=1)[None]
     run_spans = template.spans(128, 128, 1, runs=runs)
-    run_desc = splash_span_mask(run_spans, heads=2)
+    run_desc = span_desc(run_spans)
     assert run_desc is not None
     np.testing.assert_array_equal(run_desc.masks[0][:, :], np.asarray(template.dense(run_spans)[0]))
     # Large static spans past SPLASH_DENSE_MASK_CELLS (4 Mi cells) succeed via `_SpanMask` without NumpyMask.
     wide_spans = template.spans(2048, 2048, 1, causal=True, chunk=256)
-    wide_desc = splash_mask_descriptor(2048, 2048, 16, causal=False, sliding_window=None, mask=None,
-                                       spans=wide_spans)
+    wide_desc = span_desc(wide_spans, q_len=2048, kv_len=2048, heads=16)
     assert wide_desc is not None and not any(
         isinstance(m, splash_attention_mask.NumpyMask) for m in wide_desc.masks)
 
@@ -453,18 +456,17 @@ def test_splash_span_mask_matches_key_spans_without_dense_numpy_mask():
     block_ends = np.minimum(block_starts + 32, 128)
     repeated_spans = template.KeySpans(jnp.asarray(block_starts), jnp.asarray(block_ends), None, None, 128,
                                        per_span=4)
-    rep_desc = splash_span_mask(repeated_spans, heads=2)
+    rep_desc = span_desc(repeated_spans)
     assert rep_desc is not None
     rep_ref = splash_attention(query, key, value, rep_desc, softcap=None, sinks=None, segment_ids=None,
                                interpret=True)
     jitted_rep = jax.jit(lambda q, k, v: tpu_attention(
         q, k, v, None, None, causal=False, sliding_window=None, softcap=None, sinks=None, segment_ids=None,
-        interpret=True, spans=repeated_spans))(query, key, value)
+        interpret=True, descriptor=span_desc(repeated_spans)))(query, key, value)
     np.testing.assert_array_equal(np.asarray(jitted_rep), np.asarray(rep_ref))
     jitted_public = jax.jit(lambda q, k, v: scaled_dot_product_attention(
         q, k, v, implementation="tpu", key_runs=runs))(query, key, value)
     np.testing.assert_array_equal(np.asarray(jitted_public), np.asarray(direct_ref))
-
     # Broadcastable `[Q, 1]` and `[1, K]` concrete masks combined with static spans and `softcap` stay on
     # Splash without falling through to Flash, matching an independently materialized span-and-mask oracle.
     softcap = 30.0

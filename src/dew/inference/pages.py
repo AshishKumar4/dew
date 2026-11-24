@@ -82,8 +82,14 @@ class HostTier:
         return self._held[digest]
 
     def kept(self, digest: bytes) -> int | None:
-        """A slot to hold `digest`'s entry in: a free one, or the least recently kept one's, its entry
-        forgotten; None where the tier holds no slot an owed upload does not read."""
+        """A slot to hold `digest`'s entry in: the slot that holds it already, kept most recently (a digest
+        names one entry: a prefix recomputed after its page left the device is the entry the tier holds,
+        whose second slot would never be freed, the audit's row 12173), else a free one, or the least
+        recently kept one's, its entry forgotten; None where the tier holds no slot an owed upload does not
+        read."""
+        if digest in self._held:
+            self._held.move_to_end(digest)
+            return self._held[digest]
         if self._free:
             slot = self._free.popleft()
         elif self._held:

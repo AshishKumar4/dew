@@ -39,7 +39,7 @@ from dew.objectives.base import Step, model_rngs
 from dew.objectives.diffusion.block import BlockDiffusionObjective, _cache_geometry
 from dew.objectives.lm.chunked import chunked_tile, model_logits
 from dew.optim import post_step_order, scale_by_qk_clip, stepped
-from dew.training import FitPolicy, MeshSpec
+from dew.training import MeshSpec
 from dew.training.transaction import compact_qk, example_fields
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
@@ -100,7 +100,7 @@ def trainer_update(obj, batch, run_key, optimizer):
     over batches of `batch`'s shapes (`stepped`, its stepped state), the step's draws
     (`example_fields`) and the trainer. One device holds the comparison to the trainer's composition
     of the update; its layouts are the parallelism matrix's."""
-    trainer = Trainer(obj, optimizer, key=run_key, fit=FitPolicy(split=1))
+    trainer = Trainer(obj, optimizer, key=run_key, split=1)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     initial = trainer.initial_state()
     step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
@@ -861,13 +861,13 @@ def clipped_run(obj, batch, limit):
     draws, the stepped variables with the updates committed, and the clip's state and the maxima the
     run handed it after the step."""
     initial_key = jax.random.PRNGKey(3)
-    probe = Trainer(obj, qk_clip(limit), key=initial_key, fit=FitPolicy(split=1)).initial_state()
+    probe = Trainer(obj, qk_clip(limit), key=initial_key, split=1).initial_state()
     step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(probe.key, 0), None,
                 **example_fields(probe, 0, 1, batch))
     start = jax.tree.map(np.asarray, probe.variables)
     passes = jax.jit(sown_passes, static_argnums=(0,))(obj, jax.tree.map(jnp.asarray, start), batch, step)
     train = Trainer(obj, recorded_clip(limit, compact_qk(merged(passes))), key=initial_key,
-                    fit=FitPolicy(split=1))
+                    split=1)
     initial = train.initial_state()
     opt_state = jax.tree.map(np.asarray, initial.opt_state[0])
     final, *_ = train.compile(initial, batch)(initial, batch)

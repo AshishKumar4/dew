@@ -12,7 +12,7 @@ from dew.nn.kernels.generation import compile_only_gpus
 from dew.objectives.lm import LMObjective
 from dew.telemetry.instrumentation import hlo_instructions
 from dew.telemetry.trace import collective
-from dew.training import FitPolicy, MeshSpec, Trainer
+from dew.training import MeshSpec, Trainer
 from dew.training.ahead import compile_ahead
 
 ROWS, LENGTH = 4, 2048
@@ -26,7 +26,7 @@ def compiled(memory: int):
     model = CausalTransformer(vocab_size=32000, emb_features=1024, num_layers=4, num_heads=8, num_kv_heads=4,
                               head_dim=128, mlp_features=4096, max_seq_len=LENGTH, dtype=jnp.bfloat16)
     trainer = Trainer(LMObjective(model, seq_len=LENGTH), optax.adamw(1e-4), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, tensor=2), fit=FitPolicy(split=1), checkpoints=None, tracker=None)
+                      mesh=MeshSpec(fsdp=2, tensor=2), split=1, checkpoints=None, tracker=None)
     trainer.device_mesh = trainer.mesh.build(list(compile_only_gpus("sm90", 4, memory)))
     # No narrow copies, which a plan drops where its room is short: one program at any room.
     with generation.chosen(narrow_copies="off"):

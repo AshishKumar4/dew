@@ -63,7 +63,7 @@ from dew.nn.ngpt import NGPT
 from dew.nn.precision import WIDE_CPU_ARITHMETIC
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 ROOT = Path(__file__).resolve().parents[1]
 LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"
@@ -506,7 +506,7 @@ def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_p
         CONTEXT_LENGTHS: jnp.asarray(rng.integers(1, 4, rows), jnp.int32)})
     checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = Trainer(LMObjective(before, 7), optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
-                      layout=Layout(min_shard=2**30), checkpoints=checkpoints)
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)), checkpoints=checkpoints)
     initial = trainer.initial_state()
     state = trainer.fit(Loader(train=lambda partition: iter([{"text": inputs}] * 2), val=None, records=rows,
                                batch=rows), steps=2, log_every=2, checkpoint_every=2)
@@ -543,7 +543,7 @@ def test_a_run_of_a_cross_attending_media_model_loads_as_its_source_carrying_it(
         CONTEXT_LENGTHS: jnp.asarray(rng.integers(1, 4, rows), jnp.int32)})
     checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = Trainer(LMObjective(attached, 7), optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
-                      layout=Layout(min_shard=2**30), checkpoints=checkpoints)
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)), checkpoints=checkpoints)
     trainer.fit(Loader(train=lambda partition: iter([{"text": inputs}] * 2), val=None, records=rows,
                        batch=rows), steps=2, log_every=2, checkpoint_every=2)
     checkpoints.wait()
@@ -584,7 +584,7 @@ def test_the_blocks_train_beside_a_whole_source_where_it_is_not_frozen(source):
         CONTEXT: jnp.asarray(rng.standard_normal((rows, 3, 8)), jnp.float32),
         CONTEXT_LENGTHS: jnp.asarray(rng.integers(1, 4, rows), jnp.int32)})
     trainer = Trainer(LMObjective(attached, 7), optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
-                      layout=Layout(min_shard=2**30))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)))
     initial = flat_tree(thaw(trainer.initial_state().variables)["params"])
     state = trainer.fit(Loader(train=lambda partition: iter([{"text": inputs}] * 2), val=None, records=rows,
                                batch=rows), steps=2, log_every=2)

@@ -391,7 +391,7 @@ def test_deepseek_v4s_projections_are_matrices_muon_steps(compressor):
     # The run's table of the draw's axes, which a trainer holds while its optimizer steps.
     with boxed(boxed_axes(draw)):
         split = muon_partition(params)
-        solver = OptimConfig(optimizer=Muon(), learning_rate=1e-3).build(4)
+        solver = OptimConfig(optimizer=Muon(), lr=1e-3).build(4)
         gradients = jax.tree.map(lambda leaf: jnp.ones_like(leaf) / leaf.size, params)
         updates, _ = solver.update(gradients, solver.init(params), params)
     projections = {path: reason for path, reason in split.items()

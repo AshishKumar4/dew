@@ -154,13 +154,13 @@ def test_syrk_polynomial_pinned_ragged_tile_and_skew_cotangent():
 
 @lowers("sm90")
 def test_unforced_syrk_skips_mosaic_certification_while_forced_certifies():
-    """Default (unforced) BF16 SYRK declines on `measured` before certifying `MosaicSyrk`, while forced
+    """Default (unforced) ragged BF16 SYRK declines on `measured` before certifying `MosaicSyrk`, while forced
     `grouped_matmul='mosaic'` certifies `MosaicSyrk` on the compile-only device (row 11941)."""
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.templates import report
 
-    x = jax.ShapeDtypeStruct((2, 256, 256), jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((4, 150, 200), jnp.bfloat16)
     before_default = {id(c) for c in report.certifications()}
     with report.refusals(), report.certifying(generation.compile_only_gpus("sm90")[0]):
         lowered_for(lambda operand: gemm.symmetric_gram(operand), (x,), "sm90")
@@ -173,6 +173,23 @@ def test_unforced_syrk_skips_mosaic_certification_while_forced_certifies():
         lowered_for(lambda operand: gemm.symmetric_gram(operand), (x,), "sm90")
     assert any(id(c) not in before_forced and c.op == type(syrk.MOSAIC_SYRK).__name__
                for c in report.certifications())
+
+
+def test_syrk_measured_gate_admits_whole_tile_ampere_and_hopper_gram_only():
+    """`M-NG-45-a100` & `M-NG-45b-gh200` admit whole-tile `mma.sync`/`wgmma` symmetric Gram (1.52-1.91x XLA)
+    while keeping ragged shapes, polynomials (pending native Check 1), and unmeasured `sm100` on XLA."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    for gpu in ("sm80", "sm90"):
+        with generation.assumed(gpu):
+            assert gemm._syrk_select(bf16((28, 2560, 4096)), has_poly=False, transpose=False,
+                                     precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+            assert not gemm._syrk_select(bf16((4, 150, 200)), has_poly=False, transpose=False,
+                                         precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+            assert not gemm._syrk_select(bf16((28, 2560, 2560)), has_poly=True, transpose=False,
+                                         precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
+    with generation.assumed("sm100"):
+        assert not gemm._syrk_select(bf16((28, 2560, 4096)), has_poly=False, transpose=False,
+                                     precision=None, out_dtype=jnp.bfloat16, interpret_on_cpu=False)
 
 
 @INTERPRETS
@@ -237,26 +254,29 @@ def test_syrk_derives_square_tile_on_tpu():
         assert syrk.square_super_tile(tile, syrk.family_of(tile, jnp.bfloat16))
 
 
-def test_newton_schulz_and_syrk_xla_fallback_are_bit_equal():
-    """`gemm.symmetric_gram`, `gemm.symmetric_polynomial`, and `newton_schulz` on the XLA fallback path are
-    bit-for-bit equal (`assert_array_equal`) to the direct `batched_product` expressions they replace across
-    batched bf16 wide/tall/square matrices, complex64 matrices (`conjugate=True/False`), and all four
-    preconditionings (rows 11941, 11981)."""
+def test_newton_schulz_and_syrk_xla_fallback_numerics():
+    """`gemm.symmetric_gram` (bf16/fp32/complex64), `gemm.symmetric_polynomial` (fp32/complex64), and
+    `newton_schulz` (fp32/complex64 across all four preconditionings: frobenius, spectral, aol, schatten)
+    stay bit-equal (`assert_array_equal`) to direct `batched_product`; bf16 `symmetric_polynomial` and bf16
+    `newton_schulz` accumulate in fp32 (holding check 1 against float64 truth and exact `-I/512` witness),
+    and AOL scaling preserves bitwise symmetry for native SYRK (rows 11941, 11981, 12024, 12025, 12026)."""
     from dew import newton_schulz as ns
 
     rng = np.random.default_rng(11981)
+    # 1. Gram bit-equality on bf16 wide/tall/square and fp32/complex64 (both conjugate settings).
     for shape, transpose in [((2, 16, 32), False), ((2, 32, 16), True), ((2, 16, 16), False)]:
-        x = jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
-        axis = (x.ndim - 2) if transpose else (x.ndim - 1)
-        ref_g = jax.jit(lambda a, ax=axis: gemm.batched_product(a, a, (ax, ax)))(x)
-        got_g = jax.jit(lambda a, t=transpose: gemm.symmetric_gram(a, transpose=t))(x)
-        np.testing.assert_array_equal(np.asarray(got_g), np.asarray(ref_g))
-
-        c = jnp.asarray(ns.NEWTON_SCHULZ, jnp.bfloat16)
-        ref_p = jax.jit(lambda a, tr: tr[0] * jnp.eye(a.shape[-1], dtype=a.dtype) + tr[1] * a
-                        + tr[2] * gemm.batched_product(a, a, (a.ndim - 1, a.ndim - 2)))(ref_g, c)
-        got_p = jax.jit(lambda a, tr: gemm.symmetric_polynomial(a, tr))(ref_g, c)
-        np.testing.assert_array_equal(np.asarray(got_p), np.asarray(ref_p))
+        for dtype in (jnp.bfloat16, jnp.float32):
+            x = jnp.asarray(rng.standard_normal(shape), dtype)
+            axis = (x.ndim - 2) if transpose else (x.ndim - 1)
+            ref_g = jax.jit(lambda a, ax=axis: gemm.batched_product(a, a, (ax, ax)))(x)
+            got_g = jax.jit(lambda a, t=transpose: gemm.symmetric_gram(a, transpose=t))(x)
+            np.testing.assert_array_equal(np.asarray(got_g), np.asarray(ref_g))
+            if dtype == jnp.float32:
+                c = jnp.asarray(ns.NEWTON_SCHULZ, jnp.float32)
+                ref_p = jax.jit(lambda a, tr: tr[0] * jnp.eye(a.shape[-1], dtype=a.dtype) + tr[1] * a
+                                + tr[2] * gemm.batched_product(a, a, (a.ndim - 1, a.ndim - 2)))(ref_g, c)
+                got_p = jax.jit(lambda a, tr: gemm.symmetric_polynomial(a, tr))(ref_g, c)
+                np.testing.assert_array_equal(np.asarray(got_p), np.asarray(ref_p))
 
     for shape, transpose in [((2, 16, 24), False), ((2, 24, 16), True)]:
         z = jnp.asarray(rng.standard_normal(shape) + 1j * rng.standard_normal(shape), jnp.complex64)
@@ -277,34 +297,159 @@ def test_newton_schulz_and_syrk_xla_fallback_are_bit_equal():
         got_p = jax.jit(lambda a, tr: gemm.symmetric_polynomial(a, tr))(ref_g, c)
         np.testing.assert_array_equal(np.asarray(got_p), np.asarray(ref_p))
 
-    # End-to-end `newton_schulz` bit-equality against inline `batched_product` (frobenius & spectral).
-    def ref_ns(x, preconditioning):
+    # 2. Deterministic #12025 witness: bf16 A=I, c=(1, -1-1/512, 0) yields exact -I/512 in fp32 accumulation.
+    eye_bf16 = jnp.eye(8, dtype=jnp.bfloat16)
+    c_witness = jnp.asarray((1.0, -1.0 - 1.0 / 512.0, 0.0), jnp.float32)
+    for batch_shape in ((), (5,), (16,)):
+        batched_eye = jnp.broadcast_to(eye_bf16, (*batch_shape, 8, 8))
+        got_w = jax.jit(lambda a, c: gemm.symmetric_polynomial(a, c))(batched_eye, c_witness)
+        np.testing.assert_array_equal(np.asarray(got_w), np.asarray((-1.0 / 512.0) * batched_eye))
+
+    # 3. End-to-end `newton_schulz` bit-equality on float32 and complex64 across ALL FOUR preconditionings.
+    def ref_ns(x, preconditioning, *, dtype=None):
+        if dtype is not None:
+            x = x.astype(dtype)
         rows, cols = x.shape[-2:]
         tall, last = rows > cols, x.ndim - 1
+        eps = ns._FIRST_STEP_EPS
+
+        def _gram(m, cj=True):
+            h = m.conj() if (cj and jnp.iscomplexobj(m)) else m
+            return (gemm.batched_product(h, m, (last - 1, last - 1)) if tall
+                    else gemm.batched_product(m, h, (last, last)))
+
+        def _step(m, a, tr):
+            sq = gemm.batched_product(a, a, (last, last - 1))
+            poly = tr[0] * jnp.eye(a.shape[-1], dtype=a.dtype) + tr[1] * a + tr[2] * sq
+            return (gemm.batched_product(m, poly, (last, last - 1)) if tall
+                    else gemm.batched_product(poly, m, (last, last - 1)))
+
         if preconditioning == "frobenius":
             x = x / (jnp.linalg.norm(x, axis=(-2, -1), keepdims=True) + 1e-8)
-        else:
+        elif preconditioning == "spectral":
             x = x / (jnp.linalg.norm(x, ord=2, axis=(-2, -1), keepdims=True) + 1e-8)
         triple = jnp.asarray(ns.NEWTON_SCHULZ, x.dtype)
-        for _ in range(3):
-            held = x.conj()
-            a = (gemm.batched_product(held, x, (last - 1, last - 1)) if tall
-                 else gemm.batched_product(x, held, (last, last)))
-            sq = gemm.batched_product(a, a, (last, last - 1))
-            poly = triple[0] * jnp.eye(a.shape[-1], dtype=a.dtype) + triple[1] * a + triple[2] * sq
-            x = (gemm.batched_product(x, poly, (last, last - 1)) if tall
-                 else gemm.batched_product(poly, x, (last, last - 1)))
+        if preconditioning == "aol":
+            a = _gram(x)
+            scale = jax.lax.rsqrt(jnp.clip(jnp.abs(a).sum(axis=-1), min=eps))
+            side = scale[..., None, :] if tall else scale[..., :, None]
+            x = _step(x * side, a * (scale[..., :, None] * scale[..., None, :]), triple)
+        elif preconditioning == "schatten":
+            a = _gram(x, cj=False)
+            scale = jax.lax.rsqrt(jnp.clip(jnp.linalg.norm(a, axis=(-2, -1), keepdims=True), min=eps))
+            x = _step(x * scale, a * scale ** 2, triple)
+        else:
+            x = _step(x, _gram(x), triple)
+        for _ in range(2):
+            x = _step(x, _gram(x), triple)
         return x
 
-    x_bf16 = jnp.asarray(rng.standard_normal((2, 16, 24)), jnp.bfloat16)
     x_f32 = jnp.asarray(rng.standard_normal((2, 16, 24)), jnp.float32)
     z_c64 = jnp.asarray(rng.standard_normal((2, 16, 24)) + 1j * rng.standard_normal((2, 16, 24)),
                         jnp.complex64)
-    for arr, precond in ((x_bf16, "frobenius"), (z_c64, "frobenius"),
-                         (x_f32, "spectral"), (z_c64, "spectral")):
-        got = jax.jit(lambda a, p=precond: ns.newton_schulz(a, ns.NEWTON_SCHULZ, 3, 1e-8, p))(arr)
-        ref = jax.jit(lambda a, p=precond: ref_ns(a, p))(arr)
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+    for precond in ("frobenius", "spectral", "aol", "schatten"):
+        for arr in (x_f32, z_c64):
+            got = jax.jit(lambda a, p=precond: ns.newton_schulz(a, ns.NEWTON_SCHULZ, 3, 1e-8, p))(arr)
+            ref = jax.jit(lambda a, p=precond: ref_ns(a, p))(arr)
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
+
+def test_bf16_newton_schulz_aol_symmetry_and_fp32_poly_check_1():
+    """bf16 `newton_schulz` AOL preserves transpose equivariance `f(X^T)^T == f(X)` bit-for-bit (proving
+    the AOL-scaled Gram passed to `symmetric_polynomial` is bitwise symmetric, red on sequential scaling),
+    and bf16 `symmetric_polynomial` / `newton_schulz` (`frobenius`, `aol`, `schatten`) hold check 1 against
+    float64 truth (rows 12024, 12025)."""
+    from dew import newton_schulz as ns
+
+    # Red-on-parent #12024 witness through `ns.newton_schulz(..., "aol")`: for wide X vs tall X^T with
+    # coeffs=(0, 1, 0), f(X) = a_scaled @ (s[:, None] * X) while f(X^T)^T = a_scaled^T @ (s[:, None] * X).
+    # Bitwise equality holds iff `a_scaled == a_scaled^T` bit-for-bit (fails under sequential multiplies).
+    rng = np.random.default_rng(12024)
+    x_wide = jnp.asarray(rng.standard_normal((2, 32, 64)), jnp.bfloat16)
+    x_tall = jnp.swapaxes(x_wide, -1, -2)
+    out_wide = jax.jit(lambda a: ns.newton_schulz(a, (0.0, 1.0, 0.0), 1, 1e-8, "aol"))(x_wide)
+    out_tall = jax.jit(lambda a: ns.newton_schulz(a, (0.0, 1.0, 0.0), 1, 1e-8, "aol"))(x_tall)
+    np.testing.assert_array_equal(np.asarray(out_wide), np.asarray(jnp.swapaxes(out_tall, -1, -2)))
+
+    def bf16_poly_ref(a, c, *, dtype=jnp.float32, out_dtype=jnp.bfloat16):
+        cw = c.astype(dtype)
+        sq = jax.lax.dot_general(a.astype(out_dtype), a.astype(out_dtype),
+                                 (((a.ndim - 1,), (a.ndim - 2,)), ((0,), (0,))),
+                                 preferred_element_type=dtype)
+        eye = jnp.eye(a.shape[-1], dtype=dtype)
+        return (cw[0] * eye + cw[1] * a.astype(dtype) + cw[2] * sq).astype(out_dtype)
+
+    def draw_sym(seed):
+        r = np.random.default_rng(12025 + seed)
+        x = jnp.asarray(r.standard_normal((1, 64, 128)) / np.sqrt(128), jnp.bfloat16)
+        a = gemm.symmetric_gram(x)
+        s = jax.lax.rsqrt(jnp.clip(jnp.abs(a).sum(axis=-1), min=ns._FIRST_STEP_EPS))
+        return a * (s[..., :, None] * s[..., None, :]), jnp.asarray(ns.NEWTON_SCHULZ, jnp.float32)
+
+    for interp in (False, True):
+        assert_as_exact(
+            jax.jit(lambda a, c, it=interp: gemm.symmetric_polynomial(a, c, interpret_on_cpu=it)),
+            jax.jit(bf16_poly_ref), draw_sym, f"bf16 aol syrk poly interp={interp}", seeds=SEEDS,
+            truth_fn=functools.partial(bf16_poly_ref, dtype=jnp.float64, out_dtype=jnp.float64),
+        )
+
+    def bf16_ns_ref(x, preconditioning, *, work=jnp.float32, out=jnp.bfloat16):
+        x = x.astype(out)
+        rows, cols = x.shape[-2:]
+        tall, last = rows > cols, x.ndim - 1
+        eps = ns._FIRST_STEP_EPS
+        triple = jnp.asarray(ns.NEWTON_SCHULZ, out).astype(work)
+
+        def _gram(m):
+            ax = last - 1 if tall else last
+            return gemm.batched_product(m, m, (ax, ax))
+
+        def _step(m, a):
+            poly = bf16_poly_ref(a, triple, dtype=work, out_dtype=out)
+            return (gemm.batched_product(m, poly, (last, last - 1)) if tall
+                    else gemm.batched_product(poly, m, (last, last - 1)))
+
+        if preconditioning == "frobenius":
+            x = x / (jnp.linalg.norm(x, axis=(-2, -1), keepdims=True) + 1e-8)
+            x = _step(x, _gram(x))
+        elif preconditioning == "aol":
+            a = _gram(x)
+            scale = jax.lax.rsqrt(jnp.clip(jnp.abs(a).sum(axis=-1), min=eps))
+            side = scale[..., None, :] if tall else scale[..., :, None]
+            x = _step(x * side, a * (scale[..., :, None] * scale[..., None, :]))
+        else:
+            a = _gram(x)
+            scale = jax.lax.rsqrt(jnp.clip(jnp.linalg.norm(a, axis=(-2, -1), keepdims=True), min=eps))
+            x = _step(x * scale, a * scale ** 2)
+        for _ in range(2):
+            x = _step(x, _gram(x))
+        return x
+
+    for precond in ("frobenius", "aol", "schatten"):
+        def draw_bf16(seed, p=precond):
+            r = np.random.default_rng(12025 + seed + len(p))
+            return (jnp.asarray(r.standard_normal((2, 16, 24)) / np.sqrt(24), jnp.bfloat16),)
+
+        assert_as_exact(
+            jax.jit(lambda a, p=precond: ns.newton_schulz(a, ns.NEWTON_SCHULZ, 3, 1e-8, p)),
+            jax.jit(lambda a, p=precond: bf16_ns_ref(a, p)),
+            draw_bf16, f"bf16 newton_schulz {precond}", seeds=SEEDS,
+            truth_fn=lambda a, p=precond: bf16_ns_ref(a, p, work=jnp.float64, out=jnp.float64),
+        )
+
+
+def test_syrk_interpreting_predicate():
+    """`xla_products.interpreted` uses placement platform for SYRK selection and execution (row 12026)."""
+    from dew.nn.kernels import xla_products
+
+    assert xla_products.interpreted(interpret_on_cpu=True) is True
+    assert xla_products.interpreted(interpret_on_cpu=False) is False
+    with generation.assumed("sm90"):
+        assert xla_products.interpreted(interpret_on_cpu=True) is True
+    if generation.compile_only_gpus("sm90"):
+        mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+        with jax.sharding.use_abstract_mesh(mesh):
+            assert xla_products.interpreted(interpret_on_cpu=True) is False
 
 
 @pytest.mark.parametrize("transpose", [False, True])
@@ -368,3 +513,60 @@ def test_newton_schulz_reaches_mosaic_syrk_and_honors_dot_algorithm():
             with configured_precision(preset), generation.routes() as seen:
                 lowered_for(lambda a: gemm.symmetric_gram(a), (x,), "sm90")
             assert any(r.kernel == "mosaic" for r in seen), (preset, seen)
+
+
+@lowers("sm90")
+def test_syrk_measured_gram_gates_to_measured_bf16_cells():
+    """`syrk.measured_gram` admits whole-tile bf16 Gram shapes filling at least one SM wave on measured
+    generations (`sm80`, `sm90`) with no hardcoded shape table, refusing non-whole-tile, underfilled, fp32
+    output, fp16 input, and unmeasured generations (rows 11941, 12163)."""
+    from kernel_compile import lowered_for
+
+    sm80, sm90 = generation.gpu_target("sm80"), generation.gpu_target("sm90")
+    assert syrk.measured_gram(sm80, (28, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
+    assert syrk.measured_gram(sm90, (36, 4096, 14336), jnp.bfloat16, transpose=True, out_dtype=jnp.bfloat16)
+    # Derived shape-class rule admits arbitrary model layer counts and single large matrices >= 1 wave.
+    assert syrk.measured_gram(sm80, (29, 2560, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
+    assert syrk.measured_gram(sm90, (1, 4096, 4096), jnp.bfloat16, transpose=False, out_dtype=jnp.bfloat16)
+    # Refuses non-whole-tile shapes, underfilled grids, non-bf16 dtypes, and unmeasured generations.
+    assert not syrk.measured_gram(sm90, (28, 130, 130), jnp.bfloat16, transpose=False,
+                                  out_dtype=jnp.bfloat16)
+    assert not syrk.measured_gram(sm90, (1, 512, 512), jnp.bfloat16, transpose=False,
+                                  out_dtype=jnp.bfloat16)
+    assert not syrk.measured_gram(sm90, (28, 2560, 4096), jnp.bfloat16, transpose=False,
+                                  out_dtype=jnp.float32)
+    assert not syrk.measured_gram(sm80, (28, 2560, 4096), jnp.float16, transpose=False,
+                                  out_dtype=jnp.float16)
+    for gen in ("sm86", "sm89", "sm120"):
+        assert not syrk.measured_gram(generation.gpu_target(gen), (28, 2560, 4096), jnp.bfloat16,
+                                      transpose=False, out_dtype=jnp.bfloat16)
+
+    # End-to-end auto selection admits whole-tile bf16->bf16 across layer counts and keeps fp32 / underfilled
+    # on XLA.
+    for shape in ((28, 2560, 4096), (29, 2560, 4096)):
+        with generation.routes() as measured_seen:
+            lowered_for(lambda a: gemm.symmetric_gram(a),
+                        (jax.ShapeDtypeStruct(shape, jnp.bfloat16),), "sm90")
+        assert any(r.kernel == "mosaic" for r in measured_seen), (shape, measured_seen)
+    for shape, out_dtype in (((1, 512, 512), jnp.bfloat16), ((28, 2560, 4096), jnp.float32)):
+        with generation.routes() as unmeasured_seen:
+            lowered_for(lambda a, dt=out_dtype: gemm.symmetric_gram(a, out_dtype=dt),
+                        (jax.ShapeDtypeStruct(shape, jnp.bfloat16),), "sm90")
+        assert all(r.kernel != "mosaic" for r in unmeasured_seen), (shape, out_dtype, unmeasured_seen)
+
+
+def test_syrk_portable_row_strip_chunking_matches_full_poly_across_ranks_and_odd_sides():
+    """Narrow `_syrk_portable` chunks fp32 polynomial squares by output row strips for single matrices,
+    batches, and odd side lengths bit-identically to unchunked fp32 evaluation (row 12162)."""
+    rng = np.random.default_rng(12162)
+    coeffs = jnp.asarray([3.4445, -4.7750, 2.0315], jnp.float32)
+    for shape in ((131, 131), (1, 128, 128), (3, 67, 67)):
+        x = jnp.asarray(rng.integers(-3, 4, size=shape), jnp.bfloat16) / jnp.bfloat16(16.0)
+        got = gemm._syrk_portable(x, coeffs, transpose=False, conjugate=False, precision=None,
+                                  out_dtype=jnp.bfloat16)
+        sq = jax.lax.dot_general(
+            x, x, (((x.ndim - 1,), (x.ndim - 2,)), (tuple(range(x.ndim - 2)), tuple(range(x.ndim - 2)))),
+            preferred_element_type=jnp.float32)
+        ref = (coeffs[0] * jnp.eye(shape[-1], dtype=jnp.float32)
+               + coeffs[1] * x.astype(jnp.float32) + coeffs[2] * sq).astype(jnp.bfloat16)
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))

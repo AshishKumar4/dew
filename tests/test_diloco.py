@@ -19,7 +19,7 @@ from dew.averaging import power_decay
 from dew.checkpoints import frozen_entries
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Weighted
 from dew.optim import PowerProfilesState, power_profiles
-from dew.training import Checkpoints, DiLoCo, FitPolicy, Layout, MeshSpec, Trainer, UpdateBatch
+from dew.training import Checkpoints, DiLoCo, Layout, MeshSpec, Trainer, TrainerAdvanced
 
 RATE, OUTER_RATE, MOMENTUM = 0.05, 0.7, 0.9
 
@@ -70,11 +70,13 @@ class Regression64(Objective):
 
 
 def trainer(replicas: int, *, diloco: DiLoCo | None = None, optimizer=None, path=None, objective=None,
-            **options) -> Trainer:
+            advanced=None, **options) -> Trainer:
     return Trainer(Regression64() if objective is None else objective, optax.sgd(RATE) if optimizer is None
                    else optimizer, key=jax.random.key(0),
-                   layout=Layout(min_shard=1, tolerance=1.0),
-                   mesh=MeshSpec(diloco=replicas).build(jax.devices()[:replicas]), diloco=diloco,
+                   advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=Layout(min_shard=1,
+                                                                                             tolerance=1.0),
+                                                diloco=diloco),
+                   mesh=MeshSpec(diloco=replicas).build(jax.devices()[:replicas]),
                    checkpoints=None if path is None else Checkpoints(str(path)), **options)
 
 
@@ -144,7 +146,7 @@ def test_a_two_replica_diloco_run_pooling_two_steps_an_update_is_the_float64_ref
     its window's gradients (row 876 review)."""
     with jax.enable_x64(new_val=True):
         run = trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM),
-                      optimizer=optax.sgd(RATE, momentum=0.5), update=UpdateBatch(batches=2))
+                      optimizer=optax.sgd(RATE, momentum=0.5), accumulation=2)
         initial = jax.device_get(run.initial_state().variables["params"]["Dense_0"])
         state = run.fit(dataset(), steps=8, log_every=1)
         found = params(state.variables["params"])
@@ -210,8 +212,9 @@ def test_a_resumed_diloco_run_restores_each_replica_and_ends_where_an_unbroken_o
         if carried:
             objective.ema = EMASpec(decay=optax.constant_schedule(0.9))
         return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM),
+                       advanced=TrainerAdvanced(dynamic_scale=carried),
                        optimizer=optax.adam(RATE), path=path, objective=objective,
-                       update=UpdateBatch(batches=accumulation), dynamic_scale=carried)
+                       accumulation=accumulation)
 
     with jax.enable_x64(new_val=True):
         unbroken = run().fit(dataset(), steps=5, log_every=1)
@@ -232,7 +235,7 @@ def test_a_diloco_run_resumes_at_the_split_its_replicas_pool(tmp_path):
     (row 5558)."""
     def run(split="auto"):
         return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM), path=tmp_path / "run",
-                       fit=FitPolicy(split=split))
+                       split=split)
 
     with jax.enable_x64(new_val=True):
         run(2).fit(dataset(), steps=2, checkpoint_every=1, log_every=1)
@@ -268,9 +271,9 @@ def test_a_diloco_mesh_holds_each_replicas_rows_and_inner_copy_on_its_own_device
 
 @pytest.mark.mesh(devices=2)
 def test_a_configured_run_trains_two_diloco_groups_from_its_command_line(tmp_path):
-    """`dew train` with `--set trainer.mesh.diloco=2` and a DiLoCo of one window between meetings trains
-    two groups: its checkpoint holds each group's inner copy, stacked over the groups, beside the outer
-    model they met in."""
+    """`dew train` over a run whose `trainer.mesh.diloco` is 2 (`RunConfig.override`), a DiLoCo of one window
+    between meetings, trains two groups: its checkpoint holds each group's inner copy, stacked over the
+    groups, beside the outer model they met in."""
     from run_kinds import lm, trained_by_cli
 
     from dew.checkpoints import Checkpoints as Saved
@@ -294,7 +297,7 @@ def test_a_supplied_diloco_state_trains_on_from_each_groups_own_state():
 
     def run():
         return trainer(2, diloco=DiLoCo(every=1, rate=1.0, momentum=0.0),
-                       optimizer=OptimConfig(learning_rate=Cosine(peak_value=RATE, warmup_steps=1,
+                       optimizer=OptimConfig(schedule=Cosine(peak_value=RATE, warmup_steps=1,
                                                                   decay_steps=8)))
 
     with jax.enable_x64(new_val=True):
@@ -316,7 +319,7 @@ def test_a_diloco_run_of_replayed_windows_trains_as_one_pooling_its_gradients(st
     with jax.enable_x64(new_val=True):
         def run(objective):
             return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM), objective=objective,
-                           update=UpdateBatch(batches=2)).fit(dataset(), steps=4, log_every=1)
+                           accumulation=2).fit(dataset(), steps=4, log_every=1)
         replayed, pooled = run(Regression64(**{statistics: True})), run(Regression64())
     # Each parameter sums its replica's rows' terms over 4 steps, and 2 replicas' means.
     assert_computes_the_oracle(params(replayed.variables["params"]), params(pooled.variables["params"]),
@@ -327,10 +330,12 @@ def test_a_diloco_trainer_refuses_what_it_cannot_express_as_it_is_made():
     """A DiLoCo trainer whose layout keeps state on the host, or which records each example's draws, is
     refused as it is made, before any state is supplied or placed (row 876 review): its host step and its
     offload would place and step the outer model alone, and no one record holds every group's draws."""
-    for options in ({"layout": Layout(min_shard=1, tolerance=1.0, host=("opt_state",))}, {"record": True}):
+    grouped = TrainerAdvanced(diloco=DiLoCo(every=2))
+    for advanced in (dataclasses.replace(grouped, layout=Layout(min_shard=1, tolerance=1.0, host=("opt_state",
+                                                                                                  ))),
+                     dataclasses.replace(grouped, record=True)):
         with pytest.raises(ValueError):
-            Trainer(Regression64(), optax.adam(RATE), key=jax.random.key(0), diloco=DiLoCo(every=2),
-                    **options)
+            Trainer(Regression64(), optax.adam(RATE), key=jax.random.key(0), advanced=advanced)
 
 
 def test_a_meeting_and_a_new_stage_drop_each_groups_part_filled_window():
@@ -403,8 +408,9 @@ def test_a_diloco_runs_profiles_are_kept_snapshots_its_groups_averages_restore_f
     objective = Regression()
     objective.ema = EMASpec(decay=power_decay(0.07))
     run = Trainer(objective, power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
-                  layout=Layout(min_shard=1, tolerance=1.0), mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
-                  diloco=DiLoCo(every=2), checkpoints=Checkpoints(str(tmp_path / "run"), keep=1))
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0), diloco=DiLoCo(every=2)),
+                  mesh=MeshSpec(diloco=2).build(jax.devices()[:2]),
+                  checkpoints=Checkpoints(str(tmp_path / "run"), keep=1))
     state = run.fit(dataset(), steps=96, log_every=96, checkpoint_every=4)
     run.checkpoints.wait()
 

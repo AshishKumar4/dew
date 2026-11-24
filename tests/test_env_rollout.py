@@ -26,8 +26,7 @@ from dew.objectives.rl.control import (
 from dew.rl.env import Batched, TimeLimit, TimeStep, env_rollout, start
 from dew.rl.replay import ReplayBuffer
 from dew.rl.simulator import STACKED
-from dew.training import FitPolicy, UpdateBatch
-from dew.training.budget import Horizon
+from dew.training import TrainerAdvanced
 
 
 @struct.dataclass
@@ -263,7 +262,7 @@ def test_ppo_split_step_preserves_whitening_draws_and_mid_window_resume(tmp_path
                 "terminated": np.ones((2, 1), bool), "truncated": np.zeros((2, 1), bool)}
 
     def run_two(split: int):
-        trainer = Trainer(actor_only, optax.sgd(0.2), key=jax.random.key(4), fit=FitPolicy(split=split),
+        trainer = Trainer(actor_only, optax.sgd(0.2), key=jax.random.key(4), split=split,
                           checkpoints=None, tracker=None)
         trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
         state = trainer.initial_state()
@@ -291,7 +290,7 @@ def test_ppo_split_step_preserves_whitening_draws_and_mid_window_resume(tmp_path
     def residuals(split: int) -> list:
         # What the loss's pullback saves of one microbatch of two rows, read as one of a split of four or
         # as the whole step (`traced_loss`, the step's own loss), its arguments left out.
-        state = Trainer(objective, optax.adam(1e-2), key=jax.random.key(8), fit=FitPolicy(split=split),
+        state = Trainer(objective, optax.adam(1e-2), key=jax.random.key(8), split=split,
                         checkpoints=None, tracker=None).initial_state()
         loss, (variables, *rest) = traced_loss(objective, state, split, split)
         rows = jax.tree.map(lambda leaf: leaf[:2], batch_a)
@@ -360,7 +359,7 @@ def test_split_batch_statistics_refresh_on_rejection_and_replay_composite_terms(
     outputs = []
     for split in (1, 2):
         trainer = Trainer(CompositeObjective(streamed=False), optax.sgd(0.5), key=jax.random.key(5),
-                          fit=FitPolicy(split=split), checkpoints=None, tracker=None)
+                          split=split, checkpoints=None, tracker=None)
         trainer.device_mesh = mesh
         state = trainer.initial_state()
         step_fn = trainer.compile(state, plain_batch)
@@ -370,8 +369,8 @@ def test_split_batch_statistics_refresh_on_rejection_and_replay_composite_terms(
 
     scaled_obj = CompositeObjective(streamed=True)
     root_key = jax.random.key(12)
-    scaled_trainer = Trainer(scaled_obj, optax.sgd(0.5), key=root_key, fit=FitPolicy(split=2),
-                             dynamic_scale=True, checkpoints=None, tracker=None)
+    scaled_trainer = Trainer(scaled_obj, optax.sgd(0.5), key=root_key, split=2,
+                             advanced=TrainerAdvanced(dynamic_scale=True), checkpoints=None, tracker=None)
     scaled_trainer.device_mesh = mesh
     state = scaled_trainer.initial_state()
     step_fn = scaled_trainer.compile(state, plain_batch)
@@ -462,7 +461,8 @@ def test_ppo_raises_the_greedy_policys_return_on_the_walk(simulated):
     env = HostWalks(64, 8, limit=50.0, drawn=True) if simulated else walks
     objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
     rollout = ControlRollout(objective, env, unroll_length=8, epochs=2, minibatches=2)
-    trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout)
+    trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5),
+                      advanced=TrainerAdvanced(rollout=rollout))
     initial = trainer.place()[0]
     data = idle()
     before = episode_return(objective, env, initial.variables, jax.random.key(6), 8)
@@ -800,7 +800,8 @@ def test_a_control_run_resumed_from_its_checkpoint_ends_as_the_run_that_never_st
 
     def trained(directory, steps, rollout):
         local = {"local_directory": str(directory / "local"), "local_every": 1} if where == "local" else {}
-        trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout,
+        trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5),
+                          advanced=TrainerAdvanced(rollout=rollout),
                           checkpoints=Checkpoints(str(directory / "run"), keep=Keep(latest=8), **local))
         # A local run keeps its local checkpoint alone, so the resume reads it.
         every = {"checkpoint_every": 1} if where == "persistent" else {"checkpoint_final": False}
@@ -861,8 +862,9 @@ def test_a_control_run_accumulating_two_minibatches_an_update_serves_each_collec
     objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9)
     rollout = Counted(objective, Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 16), unroll_length=8,
                       epochs=1, minibatches=2)
-    trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout,
-                      update=UpdateBatch(batches=2))
+    trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5),
+                      advanced=TrainerAdvanced(rollout=rollout),
+                      accumulation=2)
     trainer.fit(idle(), steps=4, log_every=4)
     assert len(rollout.made) == 2 and len(rollout.served) == 4
     for made, pair in zip(rollout.made, (rollout.served[:2], rollout.served[2:]), strict=True):
@@ -896,7 +898,8 @@ def test_a_control_runs_cooldowns_leave_its_rollout_as_the_run_left_it(tmp_path)
         # A cooldown scales the rate the optimizer's state holds.
         trainer = Trainer(objective, optax.inject_hyperparams(optax.adam)(learning_rate=3e-3),
                           key=jax.random.key(5), checkpoints=checkpoints,
-                          rollout=ControlRollout(objective, walks, unroll_length=8, epochs=2, minibatches=2))
+                          advanced=TrainerAdvanced(rollout=ControlRollout(objective, walks, unroll_length=8,
+                                                                          epochs=2, minibatches=2)))
         return trainer.fit(data, steps=8, log_every=1, validation=flights, **options)
 
     plain = bits(trained())
@@ -931,7 +934,8 @@ def test_a_control_runs_cooldown_over_a_simulator_leaves_it_as_the_run_left_it()
         # A cooldown scales the rate the optimizer's state holds.
         trainer = Trainer(objective, optax.inject_hyperparams(optax.adam)(learning_rate=3e-3),
                           key=jax.random.key(5),
-                          rollout=ControlRollout(objective, walks, unroll_length=8, epochs=2, minibatches=2))
+                          advanced=TrainerAdvanced(rollout=ControlRollout(objective, walks, unroll_length=8,
+                                                                          epochs=2, minibatches=2)))
         return trainer.fit(data, steps=8, log_every=1, validation=flights, **options)
 
     plain = bits(trained(KeptWalks(16, 8, limit=50.0, drawn=True)))
@@ -1014,7 +1018,8 @@ def test_a_split_scored_by_its_episodes_reports_its_averaged_weights_first_episo
     tracker = LocalTracker(str(tmp_path / "tracked"))
     rollout = ControlRollout(objective, Batched(TimeLimit(Seen(limit=50.0), episode_length=8), 16),
                              unroll_length=8, epochs=2, minibatches=2)
-    state = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout,
+    state = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5),
+                    advanced=TrainerAdvanced(rollout=rollout),
                     tracker=tracker).fit(data, steps=4, log_every=2, validation={"flight": suite})
     logged = [(step, scalars) for step, scalars in tracker.scalars() if "flight/return" in scalars]
     tracker.close()
@@ -1051,7 +1056,8 @@ def test_a_run_ranks_its_checkpoints_by_a_score_its_episodes_report(tmp_path, se
     checkpoints = Checkpoints(str(tmp_path / "run"), keep=Keep(latest=1))
     rollout = ControlRollout(objective, Batched(TimeLimit(Seen(limit=50.0), episode_length=8), 16),
                              unroll_length=8, epochs=2, minibatches=2)
-    Trainer(objective, optax.adam(3e-2), key=jax.random.key(5), rollout=rollout, tracker=tracker,
+    Trainer(objective, optax.adam(3e-2), key=jax.random.key(5), advanced=TrainerAdvanced(rollout=rollout),
+            tracker=tracker,
             checkpoints=checkpoints).fit(data, steps=8, log_every=2, validation={"flight": suite},
                                          best=best, checkpoint_every=2)
     returns = {step: scalars["flight/return"] for step, scalars in tracker.scalars()
@@ -1123,7 +1129,8 @@ def test_control_rollout_fuses_collection_without_warm_recompiles_and_resumes_en
     env = Batched(TimeLimit(Walk(), episode_length=10), 4)
     objective = ControlPPOObjective(ActorCritic(1, (8,), (8,)), 1)
     rollout = ControlRollout(objective, env, unroll_length=4, unrolls=1, epochs=1, minibatches=2)
-    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), rollout=rollout,
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(rollout=rollout),
                       checkpoints=None, tracker=None)
     state = trainer.initial_state()
     first_mb = rollout(state, {}, jax.random.key(1), objective=objective)
@@ -1143,19 +1150,19 @@ def test_control_rollout_fuses_collection_without_warm_recompiles_and_resumes_en
         objective=ObjectiveConfig(control_ppo, {"discount": 0.95, "entropy_cost": 0.05,
                                                 "reads": ["teacher"]}),
         rollout=RolloutConfig("control", {"unroll_length": 2, "epochs": 1, "minibatches": 1}),
-        optim=OptimConfig(Adam(), learning_rate=1e-3),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=1), checkpoint_every=1,
+        optim=OptimConfig(Adam(), lr=1e-3),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, checkpoint_every=1,
                               log_every=1, eval_every=None, multi_host=False))
     phase1.prepare().train("control_phase")
     phase2 = dataclasses.replace(
         phase1, objective=ObjectiveConfig(control_ppo, {"discount": 0.95, "entropy_cost": 0.0,
                                                         "reads": ["teacher"]}),
-        trainer=dataclasses.replace(phase1.trainer, horizon=Horizon(steps=2)))
+        trainer=dataclasses.replace(phase1.trainer, steps=2))
     resumed = phase2.prepare().train("control_phase")
     assert int(resumed.updates) == 2
     bad_phase = dataclasses.replace(
         phase2, objective=ObjectiveConfig(control_ppo, {"discount": 0.8, "entropy_cost": 0.0,
                                                         "reads": ["teacher"]}),
-        trainer=dataclasses.replace(phase1.trainer, horizon=Horizon(steps=3)))
+        trainer=dataclasses.replace(phase1.trainer, steps=3))
     with pytest.raises(ValueError):
         bad_phase.prepare().train("control_phase")

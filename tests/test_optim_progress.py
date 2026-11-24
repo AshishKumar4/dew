@@ -114,8 +114,11 @@ def test_a_schedules_step_horizons_are_operands_so_its_step_is_one_program_at_an
                  for schedule, length in ((first, steps[0]), (second, steps[1]))]
         assert len(traced) == 1 and rates[0] != rates[1], rates
 
-    one_program(Cosine(1.0, warmup_steps="10%"), Cosine(1.0, warmup_steps="10%"), (40, 400), 20)
-    tails = [Power(1.0, a=0.5, warmup_steps=4, tail=PowerTail(start=start, steps=80)) for start in (10, 30)]
+    one_program(Cosine(peak_value=1.0, warmup_steps="10%"), Cosine(peak_value=1.0, warmup_steps="10%"), (40,
+                                                                                                         400),
+                20)
+    tails = [Power(peak_value=1.0, a=0.5, warmup_steps=4, tail=PowerTail(start=start,
+                                                                         steps=80)) for start in (10, 30)]
     one_program(*tails, (100, 100), 20)
 
 
@@ -126,7 +129,7 @@ def test_reclocking_into_an_optimizer_built_for_its_steps_keeps_that_optimizers_
     from dew.optim_schedules import reclocked
 
     params = {"w": np.zeros(3, np.float32)}
-    config = OptimConfig(optimizer=Adam(), learning_rate=Cosine(1.0, warmup_steps=4))
+    config = OptimConfig(optimizer=Adam(), schedule=Cosine(peak_value=1.0, warmup_steps=4))
     clocked = config.build(40, clocked=True).init(params)
     made = config.build(40).init(params)
     held = reclocked(clocked, made)

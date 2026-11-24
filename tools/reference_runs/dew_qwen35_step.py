@@ -135,8 +135,8 @@ def compile_step(args, model, variables):
     work.write(args.work)
     (b1, b2), schedule = OPTIMIZER["betas"], SCHEDULE
     solver = OptimConfig(optimizer=AdamW(eps=OPTIMIZER["eps"], b1=b1, b2=b2,
-                                         weight_decay=OPTIMIZER["weight_decay"]), clip_grads=0.0,
-                         learning_rate=Cosine(init_value=schedule["init"], peak_value=schedule["peak"],
+                                         weight_decay=OPTIMIZER["weight_decay"]), clip=0.0,
+                         schedule=Cosine(init_value=schedule["init"], peak_value=schedule["peak"],
                                               warmup_steps=schedule["warmup"], end_value=schedule["end"])
                          ).build(schedule["decay_steps"])
     trainer = Trainer(objective, solver, key=jax.random.key(args.seed), checkpoints=None, tracker=None)

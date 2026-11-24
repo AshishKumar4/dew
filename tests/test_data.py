@@ -45,6 +45,7 @@ from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
 from dew.data.sources import Source, from_torch, source as stored_source
 from dew.data.steps.generic import Formatting
+from dew.training import TrainerAdvanced
 
 WORKERS = {"loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)}
 
@@ -1273,7 +1274,8 @@ def test_a_run_over_a_data_source_checkpoints_and_resumes_where_it_stopped(tmp_p
 
     def run(steps, directory):
         trainer = Trainer(Regression(), optax.sgd(0.01, momentum=0.9), key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0), checkpoints=Checkpoints(str(directory)))
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
+                          checkpoints=Checkpoints(str(directory)))
         state = trainer.fit(data(), steps=steps, log_every=1, checkpoint_every=2)
         trainer.checkpoints.wait()
         held, _, position = trainer.place()

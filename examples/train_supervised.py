@@ -6,7 +6,7 @@ This file builds the run in plain Python: its own Flax model and loss, two
 interleaved spirals it writes once as JSON lines, and `Supervised`, which
 trains any model on a loss over its outputs, with no subclass of
 `Objective`. `run` is the `RunConfig`; a run file of your own changes a field of
-it at its dotted path, `run().override({"trainer.horizon.steps": 600, "model.hidden": 64})`.
+it at its dotted path, `run().override({"trainer.steps": 600, "model.hidden": 64})`.
 `dew train` imports the file as the module `train_supervised`, so `run.json` names the
 model and the loss by import path (`train_supervised:MLP`), and a new process rebuilds the
 same run from that record alone, continuing it from its own checkpoints:
@@ -28,7 +28,6 @@ from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig
-from dew.training.budget import Horizon
 
 
 class MLP(nn.Module):
@@ -74,5 +73,5 @@ def run() -> RunConfig:
         validation=Files(files["validation"]).map(Formatting()).batch(64),
         objective=ObjectiveConfig("supervised", {
             "loss": cross_entropy, "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
-        optim=OptimConfig(learning_rate=3e-3),
-        trainer=TrainerConfig(horizon=Horizon(steps=300), log_every=50, eval_every=100, checkpoint_every=100))
+        optim=OptimConfig(lr=3e-3),
+        trainer=TrainerConfig(steps=300, log_every=50, eval_every=100, checkpoint_every=100))

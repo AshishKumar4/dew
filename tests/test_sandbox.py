@@ -74,8 +74,34 @@ def test_a_measured_parent_measures_the_launcher_it_starts(tmp_path, monkeypatch
     assert {statements[2], statements[-2]} <= measured
 
 
+def test_a_launched_worker_holds_no_signal_its_starting_threads_end_sends(tmp_path):
+    """A sandbox worker (`launched`) holds no parent-death signal (`PR_GET_PDEATHSIG` 0, which an exec
+    keeps): its lifetime is its group's lifeline's (`owned_group`), where the signal its launcher installed
+    fires when the thread that forked it ends, `_cleanup.start`'s short-lived starter, and killed a healthy
+    worker at its start whenever that thread outlived the install (the models review)."""
+    from dew.rl.sandbox import SandboxLimits, launched
+
+    reported = ("import ctypes; held = ctypes.c_int(); "
+                "ctypes.CDLL(None).prctl(2, ctypes.byref(held), 0, 0, 0); print(held.value, flush=True)")
+    with launched((sys.executable, "-c", reported), SandboxLimits(), str(tmp_path)) as process:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == b"0"
+
+def killing_its_parent_ends(script: Path) -> list[int]:
+    """Run `script` as a parent and SIGKILL it once it prints a running process's id: that process, where it
+    still runs after, none where its group outlives no owner."""
+    root = Path(__file__).resolve().parents[1]
+    parent = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True,
+                              env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
+    assert parent.stdout is not None
+    process = int(parent.stdout.readline())
+    assert running(process)
+    parent.send_signal(signal.SIGKILL)
+    parent.wait()
+    return wait_gone([process])
+
 def test_parent_death_kills_the_worker(tmp_path):
-    """A SIGKILLed parent takes its worker with it through the death signal."""
+    """A SIGKILLed parent takes its worker with it through its group's lifeline (`owned_group`)."""
     script = tmp_path / "parent.py"
     script.write_text(
         "import json, os, sys, time\n"
@@ -84,15 +110,23 @@ def test_parent_death_kills_the_worker(tmp_path):
         "with environment()(IDENTITY) as session:\n"
         "    print(json.loads(session.reset().detail)[0], flush=True)\n"
         "    time.sleep(3600)\n")
-    root = Path(__file__).resolve().parents[1]
-    parent = subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True,
-                              env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
-    assert parent.stdout is not None
-    worker = int(parent.stdout.readline())
-    assert running(worker)
-    parent.send_signal(signal.SIGKILL)
-    parent.wait()
-    assert wait_gone([worker]) == []
+    assert killing_its_parent_ends(script) == []
+
+
+def test_parent_death_kills_what_the_worker_forked(tmp_path):
+    """A SIGKILLed parent takes its worker's own children with it: the worker's group outlives no owner
+    (`dew._cleanup.owned_group`'s lifeline), where the death signal, which Linux clears in a fork, took the
+    worker alone and left what it forked running (the audit's row 12172)."""
+    script = tmp_path / "parent.py"
+    forking = ("import subprocess, sys, time; child = subprocess.Popen(['sleep', '3600']); "
+               "print(child.pid, flush=True); time.sleep(3600)")
+    script.write_text(
+        "import sys, time\n"
+        "from dew.rl.sandbox import SandboxLimits, launched\n"
+        f"with launched((sys.executable, '-c', {forking!r}), SandboxLimits(), {str(tmp_path)!r}) as worker:\n"
+        "    print(worker.stdout.readline().decode().strip(), flush=True)\n"
+        "    time.sleep(3600)\n")
+    assert killing_its_parent_ends(script) == []
 
 
 def test_episodes_collect_through_subprocess_workers():

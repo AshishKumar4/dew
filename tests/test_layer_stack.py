@@ -416,12 +416,13 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
 
 
 @attending("reference")
-@pytest.mark.check1_shards(seeds=128, per_task=24, conditioning=32, conditioning_per_task=4)
+@pytest.mark.check1_shards(seeds=128, per_task=24, conditioning=32, conditioning_per_task=2)
 def test_gemma3ns_runs_of_like_layers_scan_as_its_loop():
     """`scans_as_the_loop` over Gemma 3n's shape, its 128 seeds and their redraws drawn by CI's map tasks
     (`check1_shards`), 24 a task: tasks of 32 took 79 to 115 s on armada's 25/17 workers (f1c0868b8),
-    each seed's rows redrawn until their selections clear the margin; its 32 weighed draws 4 a task (8 a
-    task took 657 s in train 1180's CI, past its 633 s bound, row 11794)."""
+    each seed's rows redrawn until their selections clear the margin; its 32 weighed draws 2 a task (8 a
+    task took 657 s in train 1180's CI, past its 633 s bound, row 11794; 4 a task took 651 to 724 s in
+    train 1189's and later CIs, past their 652 s bound, row 11903)."""
     scans_as_the_loop("gemma3n")
 
 

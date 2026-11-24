@@ -1,8 +1,9 @@
 """A split decode step's slices merged where its launch wrote them (`merged.merged_padded`): its
 derivatives the law's path's (`merged._value`), which its JVP rule takes; it and its state on par with the
 plain merge from float64, here and on a GPU's one launch (tests/test_gpu_attention.py)."""
+import contextvars
+import dataclasses
 import functools
-import inspect
 import math
 
 import jax
@@ -16,8 +17,14 @@ from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, dew_path
 
 from dew.algebra import windows
 from dew.nn import programs
-from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, merged
+from dew.nn.kernels import generation, tuning
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    emission,
+    merged,
+    merged_mosaic,
+)
 
 SPECS = {"natural": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=1.0, natural=True)),
          "fold": algebra.finished_form(algebra.Forward("full", 3, ids=False, scale=0.125, natural=False,
@@ -29,6 +36,8 @@ qualified against its own float64 reference."""
 
 QUERIES, WIDTH = 4, 64
 """A drawn split's real rows and columns, within its launch's padding (`_drawn`)."""
+
+_CTX_HOOK_MODE: contextvars.ContextVar[str] = contextvars.ContextVar("merge_ctx_hook_mode", default="add")
 
 
 def _drawn(seed):
@@ -274,8 +283,26 @@ def test_a_split_merged_with_a_subnormal_initial_mass_keeps_its_output():
     assert float(out.reshape(())) == 1.0
 
 
-@pytest.mark.parametrize("run", ["jitted", "op by op"])
-@pytest.mark.parametrize("form", sorted(SPECS))
+CHECK1_SHARDS = {
+    "test_a_padded_merge_and_its_derivatives_are_on_par[natural-op-by-op]": {"seeds": 32, "per_task": 8},
+}
+"""The cells whose draws run as CI's map tasks (`check1_shards`), by node id: the natural merge's 32 draws
+op by op, each derivative order's every operation a dispatch of its own, took 123 s in one task in train
+1191's CI, 8 a task (row 11921)."""
+
+
+def _merge_cases() -> list:
+    """Every form's merge jitted and op by op as parameters, each marked from `CHECK1_SHARDS` by its node
+    id (`form-run`, its run's spaces hyphens, as a site's id holds none)."""
+    test = "test_a_padded_merge_and_its_derivatives_are_on_par"
+    marked = {name: [pytest.mark.check1_shards(**counts)] for name, counts in CHECK1_SHARDS.items()}
+    cases = [(form, run, f"{form}-{run.replace(' ', '-')}") for form in sorted(SPECS)
+             for run in ("jitted", "op by op")]
+    return [pytest.param(form, run, id=named, marks=marked.get(f"{test}[{named}]", []))
+            for form, run, named in cases]
+
+
+@pytest.mark.parametrize(("form", "run"), _merge_cases())
 def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
     """The padded merge's finished output, its state's mass, the output's gradient and that gradient's
     derivative along a direction on par with the plain merge's (`_plain_state`, JAX's differentiation of it,
@@ -292,7 +319,7 @@ def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
 @pytest.mark.parametrize("cases", ["widths-narrow", "widths-wide", "shapes-finished", "shapes-long"])
 @pytest.mark.parametrize("name", ["sm80", "sm90", "sm100"])
 def test_a_padded_merge_compiles_as_one_launch(name, cases):
-    """The padded merge's one Mosaic GPU launch (`merged._launch_mosaic`, row 9795) compiles spill-free for
+    """The padded merge's one Mosaic GPU launch (`merged_mosaic.launch`, row 9795) compiles spill-free for
     compile-only Ampere, Hopper and Blackwell GPUs in one process per GPU across: value widths 80, 96, 100,
     128 and 192 (predicated coalesced GMEM loads/stores); a `jax.vmap` batch of three splits (beside nothing
     but the one transpose that folds it, every launch typed by `assembled.launched_thunks`); `merged_finished`
@@ -389,7 +416,7 @@ def test_padded_merge_routes_nvidia_mosaic_and_keeps_triton_fallback():
 
 
 def test_replicated_channel_merge_matches_value_with_subnormal_initial_mass():
-    """Rows 9795, 11857: replicating row stats across `[chunk, block]` (the layout `_launch_mosaic` uses
+    """Rows 9795, 11857: replicating row stats across `[chunk, block]` (the layout `merged_mosaic.launch` uses
     for zero-SMEM Mosaic GPU lowering) matches `merged._value` bit-for-bit on regular and subnormal
     (`2^-127`) initial-mass merges."""
     from dew.algebra import windows
@@ -572,196 +599,54 @@ def _traced_merge_bytes(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDt
                                  blocks=channels // block, slices=slices, read_width=read_width, width=width)
 
 
-def _bind_mosaic_sub(sub, outer_invars, parent_kinds: dict[int, str],
-                     parent_blocks: set[int]) -> tuple[dict[int, str], set[int]]:
-    """Map ref kinds and `block` axis vars into `sub` (`run_scoped` binds `outer_invars` to `constvars`,
-    while `scan`, `while` and `cond` bind them to `invars`)."""
-    targets = (sub.constvars if sub.constvars and len(sub.constvars) == len(outer_invars)
-               else sub.invars)
-    kinds = {id(inner): parent_kinds[id(outer)]
-             for inner, outer in zip(targets, outer_invars, strict=False) if id(outer) in parent_kinds}
-    blocks = {id(inner) for inner, outer in zip(targets, outer_invars, strict=False)
-              if id(outer) in parent_blocks}
-    return kinds, blocks
-
-
-def _jaxpr_has_inline_load(jaxpr, kinds: dict[int, str]) -> bool:
-    """Whether `jaxpr` or any nested scope/scan/while/cond executes a Mosaic chunk-load `inline_mgpu`."""
-    from jax import lax
-
-    for eq in jaxpr.eqns:
-        if (eq.primitive.name == "inline_mgpu" and len(eq.invars) >= 2
-                and kinds.get(id(eq.invars[0])) == "out" and kinds.get(id(eq.invars[1])) == "stat"):
-            return True
-        if eq.primitive is lax.scan_p:
-            sub = eq.params["jaxpr"].jaxpr
-            if _jaxpr_has_inline_load(sub, _bind_mosaic_sub(sub, eq.invars, kinds, set())[0]):
-                return True
-        elif eq.primitive is lax.while_p:
-            sub = eq.params["body_jaxpr"].jaxpr
-            body_in = eq.invars[eq.params["cond_nconsts"]:]
-            if _jaxpr_has_inline_load(sub, _bind_mosaic_sub(sub, body_in, kinds, set())[0]):
-                return True
-        elif eq.primitive is lax.cond_p:
-            if any(_jaxpr_has_inline_load(b.jaxpr, _bind_mosaic_sub(b.jaxpr, eq.invars[1:], kinds, set())[0])
-                   for b in eq.params["branches"]):
-                return True
-        elif eq.primitive.name == "run_scoped":
-            sub = eq.params["jaxpr"]
-            if _jaxpr_has_inline_load(sub, _bind_mosaic_sub(sub, eq.invars, kinds, set())[0]):
-                return True
-    return False
-
-
-def _stats_store_gated_on_block_zero(mgpu_fn) -> bool:
-    """Verify the lowered Mosaic MLIR body guards every `llvm.store` inside an `scf.if` whose condition
-    conjoins `arith.cmpi eq(c_block, 0)`."""
-    from jax.extend.mlir import ir as mgpu_ir
-    from jax.extend.mlir.dialects import arith as mgpu_arith, func as mgpu_func
-    from jax.interpreters import mlir as jax_mlir
-
-    class _Arg:
-        def __init__(self, regs: np.ndarray):
-            self.registers = regs
-
-    with jax_mlir.make_ir_context(), mgpu_ir.Location.unknown():
-        f32 = mgpu_ir.F32Type.get()
-        i32 = mgpu_ir.IntegerType.get_signless(32)
-        ref_ty = mgpu_ir.MemRefType.get((1, 1, 1), f32, mgpu_ir.StridedLayoutAttr.get(0, [1, 1, 1]))
-        vec_ty = mgpu_ir.VectorType.get((1,), f32)
-        module = mgpu_ir.Module.create()
-        with mgpu_ir.InsertionPoint(module.body):
-            fn_op = mgpu_func.FuncOp("check", ([ref_ty, ref_ty, vec_ty, vec_ty, i32, i32, i32, i32], []))
-            block = fn_op.add_entry_block()
-            args = list(block.arguments)
-            with mgpu_ir.InsertionPoint(block):
-                mgpu_fn(None, args[0], args[1], _Arg(np.array([args[2]], dtype=object)),
-                        _Arg(np.array([args[3]], dtype=object)),
-                        *(_Arg(np.array(a, dtype=object)) for a in args[4:]))
-        cb_arg = args[7]
-
-        def has_cb_eq_zero(cond) -> bool:
-            owner = cond.owner
-            if not isinstance(owner, (mgpu_ir.Operation, mgpu_ir.OpView)):
-                return False
-            op_obj = owner.operation
-            if op_obj.name == "arith.andi":
-                return any(has_cb_eq_zero(operand) for operand in op_obj.operands)
-            if op_obj.name != "arith.cmpi":
-                return False
-            pred = mgpu_ir.IntegerAttr(op_obj.attributes["predicate"]).value
-            if pred != int(mgpu_arith.CmpIPredicate.eq):
-                return False
-            lhs, rhs = op_obj.operands[0], op_obj.operands[1]
-            for candidate, other in ((lhs, rhs), (rhs, lhs)):
-                other_owner = other.owner
-                if (candidate == cb_arg
-                        and isinstance(other_owner, (mgpu_ir.Operation, mgpu_ir.OpView))
-                        and other_owner.operation.name == "arith.constant"
-                        and mgpu_ir.IntegerAttr(other_owner.operation.attributes["value"]).value == 0):
-                    return True
-            return False
-
-        guarded_stores = 0
-        for op in block.operations:
-            if op.operation.name == "llvm.store":
-                return False
-            if op.operation.name == "scf.if":
-                then_ops = list(op.operation.regions[0].blocks[0].operations)
-                stores = sum(1 for inner in then_ops if inner.operation.name == "llvm.store")
-                if stores:
-                    if not has_cb_eq_zero(op.operation.operands[0]):
-                        return False
-                    guarded_stores += stores
-        return guarded_stores >= 2
-
-
-def _emitted_mosaic_device_bytes(body, *, rows: int, blocks: int, slices: int, width: int) -> float:
-    """Device bytes transferred on the common one-window path of a traced Mosaic `merged_padded` body
-    (`kernel.params['jaxprs'][0]`), reading clipped channel bounds directly from each emitted `inline_mgpu`
-    load/store and verifying row-stat stores are gated on `axis_index('block') == 0` in the lowered MLIR."""
-    from jax import lax
-
-    chunk = windows.chunk_width(slices)
-    chunks = -(-slices // chunk)
-    channels = 1 << (width - 1).bit_length()
-    slice_frac = slices / (chunks * chunk)
-    root_kinds = {id(body.invars[0]): "out", id(body.invars[1]): "stat", id(body.invars[2]): "merged"}
-    if len(body.invars) >= 5:
-        root_kinds[id(body.invars[3])] = "max"
-        root_kinds[id(body.invars[4])] = "tot"
-
-    def inline_bytes(eq, kinds: dict[int, str], live: set[int], block_vars: set[int]) -> float:
-        nonlocals = inspect.getclosurevars(eq.params["mgpu_fn"]).nonlocals
-        k0 = kinds.get(id(eq.invars[0]), "")
-        k1 = kinds.get(id(eq.invars[1]), "") if len(eq.invars) > 1 else ""
-        if k0 == "out" and k1 == "stat":
-            if not any(id(v) in live for v in eq.outvars):
-                return 0.0
-            chunk_len = eq.outvars[0].aval.shape[0]
-            return (chunk_len * nonlocals["block"] * eq.outvars[0].aval.dtype.itemsize
-                    * slice_frac * (nonlocals["read_width"] / channels)
-                    + chunk_len * 2 * eq.outvars[1].aval.dtype.itemsize * slice_frac)
-        if k0 == "merged":
-            return nonlocals["block"] * eq.invars[0].aval.dtype.itemsize * (nonlocals["width"] / channels)
-        if k0 == "max" and k1 == "tot":
-            gated = (id(eq.invars[-1]) in block_vars
-                     and _stats_store_gated_on_block_zero(eq.params["mgpu_fn"]))
-            stat_bytes = eq.invars[0].aval.dtype.itemsize + eq.invars[1].aval.dtype.itemsize
-            return stat_bytes / (blocks if gated else 1)
-        return 0.0
-
-    def walk(jaxpr, kinds: dict[int, str], block_vars: set[int]) -> float:
-        live = _live_vars(jaxpr)
-        block_vars = set(block_vars)
-        total = 0.0
-        for eq in jaxpr.eqns:
-            if eq.primitive.name == "axis_index" and eq.params.get("axis_name") == "block":
-                block_vars.add(id(eq.outvars[0]))
-            elif eq.primitive.name == "inline_mgpu":
-                total += inline_bytes(eq, kinds, live, block_vars)
-            elif eq.primitive is lax.scan_p:
-                sub = eq.params["jaxpr"].jaxpr
-                total += eq.params["length"] * walk(sub, *_bind_mosaic_sub(sub, eq.invars, kinds, block_vars))
-            elif eq.primitive is lax.while_p:
-                sub = eq.params["body_jaxpr"].jaxpr
-                body_in = eq.invars[eq.params["cond_nconsts"]:]
-                total += walk(sub, *_bind_mosaic_sub(sub, body_in, kinds, block_vars))
-            elif eq.primitive is lax.cond_p:
-                b0, b1 = (walk(b.jaxpr, *_bind_mosaic_sub(b.jaxpr, eq.invars[1:], kinds, block_vars))
-                          for b in eq.params["branches"])
-                b1_loads = _jaxpr_has_inline_load(
-                    eq.params["branches"][1].jaxpr,
-                    _bind_mosaic_sub(eq.params["branches"][1].jaxpr, eq.invars[1:], kinds, set())[0])
-                total += max(b0, b1) if not b1_loads else min(b0, b1)
-            elif eq.primitive.name == "run_scoped":
-                sub = eq.params["jaxpr"]
-                total += walk(sub, *_bind_mosaic_sub(sub, eq.invars, kinds, block_vars))
-        return total
-    return walk(body, root_kinds, set()) * rows * blocks
-
-
-def _traced_mosaic_merge_bytes(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
-                               queries: int, width: int, block: int, *, target: generation.GpuTarget,
-                               out_dtype=None, out_heads: int | None = None) -> float:
-    """Independent device-byte count for `merged._launch_mosaic` at `block` from its emitted Mosaic body."""
-    batch, slices, _, heads, _ = padded.shape
-    channels = 1 << (width - 1).bit_length()
+def _mosaic_kernel_body(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+                        queries: int, width: int, block: int, *, target: generation.GpuTarget,
+                        out_dtype=None, out_heads: int | None = None, output_mod=None,
+                        output_kinds: tuple[template.Kind, ...] = (),
+                        output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()):
+    """Trace `merged_mosaic.launch` and return its kernel equation and body jaxpr."""
+    family = generation.family(target.generation) or "mma.sync"
     launch = functools.partial(
-        merged._launch_mosaic, units=algebra.units_of(spec), queries=queries, width=width, block=block,
-        out_dtype=out_dtype, out_heads=out_heads, family=generation.family(target.generation) or "mma.sync")
+        merged_mosaic.launch, units=algebra.units_of(spec), queries=queries, width=width, block=block,
+        out_dtype=out_dtype, out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds,
+        family=family)
     with generation.as_target(target):
-        (kernel,) = (eq for eq in programs.equations(jax.make_jaxpr(launch)(padded, stacked).jaxpr)
-                     if programs.opaque(eq))
-    return _emitted_mosaic_device_bytes(kernel.params["jaxprs"][0], rows=batch * queries * heads,
-                                        blocks=channels // block, slices=slices, width=width)
+        (kernel,) = (eq for eq in programs.equations(
+            jax.make_jaxpr(launch)(padded, stacked, *output_specs).jaxpr) if programs.opaque(eq))
+    body = kernel.params["jaxprs"][0] if "jaxprs" in kernel.params else kernel.params["jaxpr"]
+    return kernel, body
+
+
+def _mosaic_emitted_roles(spec, padded: jax.ShapeDtypeStruct, stacked: jax.ShapeDtypeStruct,
+                          queries: int, width: int, block: int, *, target: generation.GpuTarget,
+                          out_dtype=None, out_heads: int | None = None, output_mod=None,
+                          output_kinds: tuple[template.Kind, ...] = (),
+                          output_specs: tuple[jax.ShapeDtypeStruct, ...] = ()) -> tuple[emission.Role, ...]:
+    """Emitted Mosaic GPU roles across block indices (`c_block == 0` vs `c_block >= 1`) from `emission`."""
+    channels = 1 << (width - 1).bit_length()
+    blocks = channels // block
+    kernel, body = _mosaic_kernel_body(
+        spec, padded, stacked, queries, width, block, target=target, out_dtype=out_dtype,
+        out_heads=out_heads, output_mod=output_mod, output_kinds=output_kinds, output_specs=output_specs)
+    return emission.emitted(body, min(blocks, 2), "block", device=range(len(body.invars)),
+                            forms=emission.forms_of(kernel.params.get("compiler_params"))).roles
+
+
+def _mosaic_expected_bytes(*, rows: int, slices: int, width: int, read_width: int, block: int,
+                           itemsize: int = 4) -> float:
+    """Expected valid device traffic for one Mosaic GPU `merged_padded` launch (`block` channels/program,
+    row stats written once by block 0)."""
+    channels = 1 << (width - 1).bit_length()
+    blocks = channels // block
+    read_cols = min(width, read_width)
+    return float(rows * ((3 * slices * read_cols + width) * itemsize
+                         + (blocks * 3 * slices + 1) * 2 * itemsize))
 
 
 def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_span():
     """`merged.launch_work` prices a native `merged_padded` launch on the common one-window path (rows 8845,
-    9795, 10533): one kernel, span `3 * chunks`, and exact agreement with the emitted Mosaic GPU (`sm90`)
-    and Triton (`sm75`) launch bodies across unmasked, multi-block single-stats-writer, irregular masked
-    tail, and padded-input (`read_width > width`) shapes."""
+    9795, 10533, 12222): one kernel, span `3 * chunks`, non-zero stated arithmetic work, emitted single-stats
+    writer (`c_block == 0`), and predicated padded-column loads on Mosaic GPU vs Triton."""
     sm90 = generation.gpu_target("sm90")
     sm75 = generation.gpu_target("sm75")
     spec = SPECS["fold"]
@@ -779,38 +664,47 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
         work = merged.launch_work(spec, padded, stacked, queries, width, sm90)
         assert work.kernels == 1.0
         assert work.span == float(3 * chunks)
-        assert work.device_bytes == _traced_mosaic_merge_bytes(
-            spec, padded, stacked, queries, width, block, target=sm90)
+        assert work.operations > 0 and work.exponentials > 0
+        assert work.device_bytes == _mosaic_expected_bytes(
+            rows=batch * queries * heads, slices=slices, width=width, read_width=width, block=block)
         triton_block = merged._channel_block(spec, padded, stacked, queries, width, sm75)
         triton_work = merged.launch_work(spec, padded, stacked, queries, width, sm75)
         assert triton_work.device_bytes == _traced_merge_bytes(
             spec, padded, stacked, queries, width, triton_block)
-    # Padded input (`read_width=128 > width=80`): Mosaic predicates loads at `width`, while Triton reads
-    # `read_width` physical columns; each matches its own emitted launch body directly (row 9795).
-    pad_p = jax.ShapeDtypeStruct((2, 8, 16, 8, 128), jnp.float32)
-    pad_s = jax.ShapeDtypeStruct((2, 2, 8, 8, 16), jnp.float32)
+    # Padded input (`read_width=128 > width=80`): Mosaic predicates loads at `width`, observed both on
+    # multi-chunk emitted walk bytes and `launch_work`, while Triton reads `read_width` columns (row 9795).
+    pad_p = jax.ShapeDtypeStruct((2, 16, 16, 8, 128), jnp.float32)
+    pad_s = jax.ShapeDtypeStruct((2, 2, 8, 16, 16), jnp.float32)
     mosaic_block = merged._channel_block(spec, pad_p, pad_s, 4, 80, sm90)
     mosaic_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, sm90)
-    assert mosaic_work.device_bytes == _traced_mosaic_merge_bytes(
-        spec, pad_p, pad_s, 4, 80, mosaic_block, target=sm90)
+    assert mosaic_work.device_bytes == _mosaic_expected_bytes(
+        rows=2 * 4 * 8, slices=16, width=80, read_width=128, block=mosaic_block)
+    roles_pad = _mosaic_emitted_roles(spec, pad_p, pad_s, 4, 80, mosaic_block, target=sm90)
+    pad_blocks = 128 // mosaic_block
+    assert roles_pad[0].walks[0].device_bytes == float(8 * ((80 / pad_blocks) * 4 + 2 * 4))
+    assert roles_pad[0].walks[0].device_bytes < float(8 * ((128 / pad_blocks) * 4 + 2 * 4))
     triton_block = merged._channel_block(spec, pad_p, pad_s, 4, 80, sm75)
     triton_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, sm75)
-    assert triton_work.device_bytes == _traced_merge_bytes(spec, pad_p, pad_s, 4, 80, triton_block)
+    assert triton_work.device_bytes == _traced_merge_bytes(
+        spec, pad_p, pad_s, 4, 80, triton_block)
     assert mosaic_work.device_bytes < triton_work.device_bytes, (mosaic_work, triton_work)
     # Explicit multi-block schedule (`block=64`, 2 blocks for `width=128`) vs single-block (`block=128`):
-    # verifies single-stats-writer (`c_block == 0`) accounting directly on the emitted Mosaic MLIR body
-    # without asserting a derived block choice.
+    # emitted `c_block == 0` role writes the 8 B row stats while `c_block == 1` writes none.
     small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
     small_s = jax.ShapeDtypeStruct((2, 1, 1, 8, 8), jnp.float32)
     units = algebra.units_of(spec)
+    roles_2blk = _mosaic_emitted_roles(spec, small_p, small_s, 1, 128, 64, target=sm90)
+    assert roles_2blk[0].fixed.device_bytes - roles_2blk[1].fixed.device_bytes == float(
+        2 * small_s.dtype.itemsize)
     work_1blk, _ = merged._launch_for_block(units, small_p, small_s, 1, 128, 128, sm90, family="wgmma")
     work_2blk, _ = merged._launch_for_block(units, small_p, small_s, 1, 128, 64, sm90, family="wgmma")
-    assert work_1blk.device_bytes == _traced_mosaic_merge_bytes(spec, small_p, small_s, 1, 128, 128,
-                                                                target=sm90)
-    assert work_2blk.device_bytes == _traced_mosaic_merge_bytes(spec, small_p, small_s, 1, 128, 64,
-                                                                target=sm90)
-    # Second block adds only one extra pass of 3 * 8 * 2 * 4 stat reads (192 B), zero extra stat-store bytes.
+    assert work_1blk.device_bytes == _mosaic_expected_bytes(
+        rows=1, slices=8, width=128, read_width=128, block=128)
+    assert work_2blk.device_bytes == _mosaic_expected_bytes(
+        rows=1, slices=8, width=128, read_width=128, block=64)
     assert work_2blk.device_bytes - work_1blk.device_bytes == float(3 * 8 * 2 * 4)
+    assert work_2blk.operations > work_1blk.operations
+
 
 def test_a_split_merge_with_initial_state_uses_one_merged_padded_launch():
     """A split decode merge with a sink or resumed `Initial` state (`merged.merged_split`, row 9804) lowers
@@ -975,3 +869,308 @@ def test_resumable_split_merge_preserves_subnormal_initial_mass():
     assert float(resumed_m[0, 0, 0]) == 0.0, resumed_m
     np.testing.assert_array_equal(np.asarray(got[0, 0, 0]), np.full(width, float(scale), dtype=np.float32))
     np.testing.assert_array_equal(np.asarray(got[0, 0, 1]), np.zeros(width, dtype=np.float32))
+
+
+def test_a_finished_split_merge_fuses_output_hooks_across_kinds_vmap_and_jvp():
+    """Row 5385: `merged.merged_finished` fuses `output_mod` with stateless, `Kind.HEAD`, `Kind.QUERY`, and
+    `Kind.OUTPUT` (bf16 gate) parameters with and without `initial`, agreeing bitwise with the law plus
+    `template.output_hooked`, preserving `vmap` (mapped and unmapped parameters) and `jvp`, and rejecting
+    invalid parameter combinations."""
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
+    batch, slices, rows, kv_heads, group, tokens, width = 2, 4, 16, 2, 4, 2, 16
+    queries, out_heads = tokens * group, kv_heads * group
+    k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(jax.random.key(5385), 8)
+    padded = jax.random.normal(k1, (batch, slices, rows, kv_heads, width), jnp.float32)
+    totals = jax.random.uniform(k3, (batch, kv_heads, slices, rows), jnp.float32, minval=0.1, maxval=2.0)
+    totals = totals.at[0, 0, :, 0].set(0.0)
+    stacked = jnp.stack([jax.random.normal(k2, (batch, kv_heads, slices, rows), jnp.float32), totals])
+    initial = template.Initial(
+        jax.random.normal(k4, (batch, kv_heads, queries), jnp.float32),
+        jax.random.uniform(k5, (batch, kv_heads, queries), jnp.float32, minval=0.1, maxval=2.0),
+        jax.random.normal(k1, (batch, kv_heads, queries, width), jnp.float32))
+    head_scale = jax.random.normal(k6, (out_heads,), jnp.bfloat16)
+    query_scale = jax.random.normal(k7, (batch, out_heads, tokens), jnp.float32)
+    shared_query = jax.random.normal(k7, (1, 1, tokens), jnp.bfloat16)
+    gate = jax.random.normal(k8, (batch, tokens, out_heads, width), jnp.bfloat16)
+
+    cases = [
+        (lambda o: jnp.tanh(o * 0.5), ()),
+        (lambda o, h: o * h.reshape(()), (template.Param(head_scale, template.Kind.HEAD),)),
+        (lambda o, q: o * q, (template.Param(query_scale, template.Kind.QUERY),)),
+        (lambda o, q: o + q, (template.Param(shared_query, template.Kind.QUERY),)),
+        (lambda o, g: o * jax.nn.sigmoid(g), (template.Param(gate, template.Kind.OUTPUT),)),
+    ]
+    for mod, params in cases:
+        for init in (None, initial):
+            got = merged.merged_finished(spec, padded, stacked, queries=queries, width=width,
+                                         out_dtype=jnp.bfloat16, out_heads=out_heads, initial=init,
+                                         output_mod=mod, output_params=params)
+            state = merged.merged_split(spec, padded, stacked, queries=queries, width=width, initial=init)
+            base = template.ungrouped_rows(
+                algebra.finish(spec, state, initial=True, normalized=True)[0], out_heads)
+            wide_params = tuple(
+                template.Param(p.value.astype(jnp.float32) if jnp.issubdtype(p.value.dtype, jnp.floating)
+                               else p.value, p.kind) for p in params)
+            ref = jnp.swapaxes(template.output_hooked(jnp.swapaxes(base, 1, 2), mod, wide_params),
+                               1, 2).astype(jnp.bfloat16)
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
+    # vmap over both mapped gate and unmapped/mapped Kind.HEAD scale.
+    def gated_mod(o, g, h):
+        return o * jax.nn.sigmoid(g) + h.reshape(())
+
+    ref_both = merged.merged_finished(
+        spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+        output_mod=gated_mod,
+        output_params=(template.Param(gate, template.Kind.OUTPUT),
+                       template.Param(head_scale, template.Kind.HEAD)))
+    vmapped = jax.vmap(lambda p, s, g: merged.merged_finished(
+        spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+        output_mod=gated_mod,
+        output_params=(template.Param(g, template.Kind.OUTPUT),
+                       template.Param(head_scale, template.Kind.HEAD))))(
+        padded[None], stacked[None], gate[None])
+    np.testing.assert_array_equal(np.asarray(vmapped[0]), np.asarray(ref_both))
+    vmapped_head = jax.vmap(lambda p, s, g, h: merged.merged_finished(
+        spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+        output_mod=gated_mod,
+        output_params=(template.Param(g, template.Kind.OUTPUT),
+                       template.Param(h, template.Kind.HEAD))))(
+        padded[None], stacked[None], gate[None], head_scale[None])
+    np.testing.assert_array_equal(np.asarray(vmapped_head[0]), np.asarray(ref_both))
+
+    # JVP differentiates smoothly through both padded slices and output_params.
+    gate_f32 = gate.astype(jnp.float32)
+
+    def fn(p, g):
+        return merged.merged_finished(
+            spec, p, stacked, queries=queries, width=width, out_dtype=jnp.float32, out_heads=out_heads,
+            output_mod=lambda o, x: o * jax.nn.sigmoid(x),
+            output_params=(template.Param(g, template.Kind.OUTPUT),))
+
+    def law(p, g):
+        st = algebra.merged_state(spec, *merged._trimmed(p, stacked, queries=queries, width=width))
+        un = template.ungrouped_rows(st.acc, out_heads)
+        return jnp.swapaxes(template.output_hooked(
+            jnp.swapaxes(un, 1, 2), lambda o, x: o * jax.nn.sigmoid(x),
+            (template.Param(g, template.Kind.OUTPUT),)), 1, 2)
+
+    dp, dg = jnp.ones_like(padded) * 0.1, jnp.ones_like(gate_f32) * 0.1
+    p_out, t_out = jax.jvp(fn, (padded, gate_f32), (dp, dg))
+    p_law, t_law = jax.jvp(law, (padded, gate_f32), (dp, dg))
+    np.testing.assert_array_equal(np.asarray(p_out), np.asarray(p_law))
+    np.testing.assert_array_equal(np.asarray(t_out), np.asarray(t_law))
+    with pytest.raises(ValueError):
+        merged.merged_finished(spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16,
+                               out_heads=out_heads,
+                               output_params=(template.Param(gate, template.Kind.OUTPUT),))
+    with pytest.raises(ValueError):
+        merged.merged_finished(spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16,
+                               out_heads=out_heads, output_mod=lambda o, k: o + k,
+                               output_params=(template.Param(jnp.zeros((batch, out_heads, 8)),
+                                                             template.Kind.KEY),))
+
+
+def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_context():
+    """Row 5385: `merged_padded` vmap folds shared and unshared `Kind.QUERY` parameters by their logical
+    batch extent, `MergedPadded.traced` fingerprints bf16/fp16 hooks at the fp32 dtype passed in-kernel,
+    and `launch_work` keys hook pricing on the active JAX trace context."""
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
+    batch, slices, rows, kv_heads, group, tokens, width = 2, 4, 16, 2, 4, 2, 16
+    queries, out_heads = tokens * group, kv_heads * group
+    k1, k2, k3, k4 = jax.random.split(jax.random.key(5386), 4)
+    padded = jax.random.normal(k1, (batch, slices, rows, kv_heads, width), jnp.float32)
+    stacked = jnp.stack([
+        jax.random.normal(k2, (batch, kv_heads, slices, rows), jnp.float32),
+        jax.random.uniform(k3, (batch, kv_heads, slices, rows), jnp.float32, minval=0.1, maxval=2.0),
+    ])
+    query_scale = jax.random.normal(k4, (batch, out_heads, tokens), jnp.float32)
+    shared_query = jax.random.normal(k4, (1, 1, tokens), jnp.bfloat16)
+    q_shared_v = jnp.stack([shared_query, shared_query * 2.0], axis=0)
+    p2, s2 = jnp.stack([padded, padded * 0.5], axis=0), jnp.stack([stacked, stacked], axis=0)
+    got_sh = jax.vmap(lambda p, s, q: merged.merged_finished(
+        spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+        output_mod=lambda o, x: o + x, output_params=(template.Param(q, template.Kind.QUERY),)))(
+        p2, s2, q_shared_v)
+    for idx in range(2):
+        ref_i = merged.merged_finished(
+            spec, p2[idx], s2[idx], queries=queries, width=width, out_dtype=jnp.bfloat16,
+            out_heads=out_heads, output_mod=lambda o, x: o + x,
+            output_params=(template.Param(q_shared_v[idx], template.Kind.QUERY),))
+        np.testing.assert_array_equal(np.asarray(got_sh[idx]), np.asarray(ref_i))
+    got_unsh = jax.vmap(lambda p, s, q: merged.merged_finished(
+        spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+        output_mod=lambda o, x: o * x, output_params=(template.Param(q, template.Kind.QUERY),)))(
+        padded[None], stacked[None], query_scale[None])
+    ref_unsh = merged.merged_finished(
+        spec, padded, stacked, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+        output_mod=lambda o, x: o * x, output_params=(template.Param(query_scale, template.Kind.QUERY),))
+    np.testing.assert_array_equal(np.asarray(got_unsh[0]), np.asarray(ref_unsh))
+    # A gate shared across the batch (`Kind.OUTPUT`, `[1, T, H, Dv]` a mapped element) reads as each row's.
+    shared_gate = jax.random.normal(k4, (1, tokens, out_heads, width), jnp.bfloat16)
+    gates = jnp.stack([shared_gate, shared_gate * 2.0], axis=0)
+
+    def gated(p, s, g):
+        return merged.merged_finished(
+            spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+            output_mod=lambda o, x: o * x, output_params=(template.Param(g, template.Kind.OUTPUT),))
+
+    got_gated = jax.vmap(gated)(p2, s2, gates)
+    for idx in range(2):
+        np.testing.assert_array_equal(np.asarray(got_gated[idx]), np.asarray(
+            gated(p2[idx], s2[idx], jnp.broadcast_to(gates[idx], (batch, *gates.shape[2:])))))
+
+    def branch_a(o, g):
+        return o * g if g.dtype == jnp.float32 else o + g
+
+    def branch_b(o, g):
+        return o - g if g.dtype == jnp.float32 else o + g
+
+    op_a = merged.MergedPadded(
+        units=algebra.units_of(spec), queries=queries, width=width, out_dtype=jnp.dtype(jnp.bfloat16),
+        out_heads=out_heads, output_mod=branch_a, output_kinds=(template.Kind.OUTPUT,),
+        output_dtypes=(template.kept_dtype(jnp.bfloat16),))
+    op_b = dataclasses.replace(op_a, output_mod=branch_b)
+    assert op_a.traced("output_mod", op_a.output_mod) != op_b.traced("output_mod", op_b.output_mod)
+
+    def ctx_hook(o, g):
+        return o * jax.nn.sigmoid(g) if _CTX_HOOK_MODE.get() == "sigmoid" else o + g
+
+    assert tuning.holdable(ctx_hook)
+    sm90 = generation.gpu_target("sm90")
+    p_s = jax.ShapeDtypeStruct((1, 8, 16, 2, 128), jnp.float32)
+    s_s = jax.ShapeDtypeStruct((2, 1, 2, 8, 16), jnp.float32)
+    g_s = jax.ShapeDtypeStruct((1, 1, 8, 128), jnp.bfloat16)
+    w_off = merged.launch_work(spec, p_s, s_s, 4, 128, sm90, out_dtype=jnp.bfloat16, out_heads=8,
+                               output_mod=ctx_hook, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
+    token = _CTX_HOOK_MODE.set("sigmoid")
+    try:
+        w_on = merged.launch_work(spec, p_s, s_s, 4, 128, sm90, out_dtype=jnp.bfloat16, out_heads=8,
+                                  output_mod=ctx_hook, output_kinds=(template.Kind.OUTPUT,),
+                                  output_specs=(g_s,))
+    finally:
+        _CTX_HOOK_MODE.reset(token)
+    assert w_on.exponentials > w_off.exponentials, (w_off, w_on)
+    captured = jnp.ones((), jnp.float32)
+
+    def unholdable(o, g):
+        return o + g + captured
+
+    assert not tuning.holdable(unholdable)
+    cached_before = merged._planned_block_cached.cache_info().currsize
+    merged.launch_work(spec, p_s, s_s, 4, 128, sm90, out_dtype=jnp.bfloat16, out_heads=8,
+                       output_mod=unholdable, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
+    assert merged._planned_block_cached.cache_info().currsize == cached_before
+    # Real `MergedPadded` wraps holdable hooks in `tuning.Prepared`; pricing must still cache-hit.
+    op_prep = merged.MergedPadded(
+        units=algebra.units_of(spec), queries=4, width=128, out_dtype=jnp.dtype(jnp.bfloat16), out_heads=8,
+        output_mod=ctx_hook, output_kinds=(template.Kind.OUTPUT,),
+        output_dtypes=(template.kept_dtype(jnp.bfloat16),), family="wgmma")
+    with generation.assumed("sm90"):
+        ba_prep = op_prep.bind(p_s, s_s, (g_s,))
+        op_prep._get_heuristics_config(ba_prep)
+        hits_before = merged._planned_block_cached.cache_info().hits
+        op_prep._get_heuristics_config(ba_prep)
+    assert merged._planned_block_cached.cache_info().hits > hits_before
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("target_name", ["sm80", "sm90", "sm100", "sm120"])
+def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matches_emitted_bytes(target_name):
+    """Row 5385: `merged.merged_finished` with fused `output_mod` (`Kind.OUTPUT` bf16 gate + `Kind.HEAD`
+    scale) lowers as a single spill-free zero-SMEM Mosaic GPU `merged_padded` launch on sm80/sm90/sm100/sm120
+    (no post-merge XLA hook fusion), and `merged.launch_work` device bytes agree with the emitted Mosaic body
+    to the exact byte."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    target = generation.gpu_target(target_name)
+    spec = SPECS["fold"]
+    batch, slices, rows, kv_heads, group, tokens, width = 1, 8, 16, 2, 4, 1, 128
+    queries, out_heads = tokens * group, kv_heads * group
+    padded = jax.ShapeDtypeStruct((batch, slices, rows, kv_heads, width), jnp.float32)
+    stacked = jax.ShapeDtypeStruct((2, batch, kv_heads, slices, rows), jnp.float32)
+    gate = jax.ShapeDtypeStruct((batch, tokens, out_heads, width), jnp.bfloat16)
+    head = jax.ShapeDtypeStruct((out_heads,), jnp.bfloat16)
+
+    def mod(o, g, h):
+        assert h.shape == ()
+        return o * jax.nn.sigmoid(g) + h
+
+    kinds = (template.Kind.OUTPUT, template.Kind.HEAD)
+
+    def call(p, s, *extra_p, fn=mod, param_kinds=kinds):
+        return merged.merged_finished(
+            spec, p, s, queries=queries, width=width, out_dtype=jnp.bfloat16, out_heads=out_heads,
+            output_mod=fn, output_params=tuple(
+                template.Param(val, k) for val, k in zip(extra_p, param_kinds, strict=True)))
+
+    with generation.assumed(target_name):
+        cases = [KernelCase("finished-output-hook", lambda: (call, (padded, stacked, gate, head)))]
+        if target_name == "sm90":
+            bool_gate = jax.ShapeDtypeStruct((batch, tokens, out_heads, width), jnp.bool_)
+            int_head = jax.ShapeDtypeStruct((out_heads,), jnp.int32)
+
+            def int_bool_mod(o, m, k):
+                assert k.shape == ()
+                return jnp.where(m, o + k.astype(jnp.float32), 0.0)
+
+            cases.append(KernelCase(
+                "finished-bool-int-hook",
+                lambda: (functools.partial(call, fn=int_bool_mod), (padded, stacked, bool_gate, int_head))))
+            q_param = jax.ShapeDtypeStruct((batch, out_heads, tokens), jnp.bfloat16)
+
+            def query_mod(o, q_p):
+                assert o.ndim == 2 and q_p.ndim == 2 and q_p.shape == (o.shape[0], 1)
+                return o * q_p[:, :1]
+            cases.append(KernelCase(
+                "finished-query-hook",
+                lambda: (functools.partial(call, fn=query_mod, param_kinds=(template.Kind.QUERY,)),
+                         (padded, stacked, q_param))))
+        records = compile_mosaic_kernels(cases, target_name)
+        assert not (failed := mosaic_failures(records)), "\n".join(failed)
+        for record in records:
+            assert "error" not in record and sorted(record["thunks"]) == ["thunk"], record
+            assert record["modules"] and record["modules"].items() <= record["certified"].items(), record
+            kernels = record["kernels"]
+            assert len(kernels) == 1 and kernels[0]["kernel"] == "merged_padded", record
+            assert kernels[0]["spilled"] == 0 and kernels[0]["shared"] == 0, record
+        work = merged.launch_work(spec, padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
+                                  out_heads=out_heads, output_mod=mod, output_kinds=kinds,
+                                  output_specs=(gate, head))
+        base_work = merged.launch_work(spec, padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
+                                       out_heads=out_heads)
+        block, _ = merged._planned_block(
+            algebra.units_of(spec), padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
+            out_heads=out_heads, output_mod=mod, output_kinds=kinds, output_specs=(gate, head))
+        rows = padded.shape[0] * queries * padded.shape[3]
+        blocks = (1 << (width - 1).bit_length()) // block
+        hook_bytes = float(rows * (width * gate.dtype.itemsize + blocks * head.dtype.itemsize))
+        assert work.device_bytes - base_work.device_bytes == hook_bytes, (
+            work.device_bytes, base_work.device_bytes, hook_bytes)
+        roles_hooked = _mosaic_emitted_roles(
+            spec, padded, stacked, queries, width, block, target=target, out_dtype=jnp.bfloat16,
+            out_heads=out_heads, output_mod=mod, output_kinds=kinds, output_specs=(gate, head))
+        roles_base = _mosaic_emitted_roles(
+            spec, padded, stacked, queries, width, block, target=target, out_dtype=jnp.bfloat16,
+            out_heads=out_heads)
+        per_block_hook = float((width / blocks) * gate.dtype.itemsize + head.dtype.itemsize)
+        assert roles_hooked[0].fixed.device_bytes - roles_base[0].fixed.device_bytes == per_block_hook
+
+
+def test_a_finished_merge_reads_its_output_parameters_as_a_launch_keeps_them():
+    """A finished merge's output hook reads a float64 parameter in the fp32 a launch's epilogue keeps it in
+    (`kept_dtype`, `template.padded_call`), as a single slice's fused hook does: a gate of `1 + 2^-25` is
+    1 there, so `gate - 1` gives 0 whatever the slices (the head review of 7188133e84a: 2^-25 on a merge)."""
+    spec = algebra.Forward("spans", 128, ids=False, scale=1.0, natural=True, initial=True)
+    batch, slices, rows, kv_heads, group, tokens, width = 1, 2, 8, 1, 2, 1, 8
+    with jax.enable_x64(new_val=True):
+        padded = jnp.ones((batch, slices, rows, kv_heads, width), jnp.float32)
+        stacked = jnp.stack([jnp.zeros((batch, kv_heads, slices, rows), jnp.float32),
+                             jnp.ones((batch, kv_heads, slices, rows), jnp.float32)])
+        gate = jnp.full((batch, tokens, kv_heads * group, width), 1 + 2.0 ** -25, jnp.float64)
+        out = merged.merged_finished(
+            spec, padded, stacked, queries=tokens * group, width=width, out_dtype=jnp.float32,
+            out_heads=kv_heads * group, output_mod=lambda o, g: o * (g - 1),
+            output_params=(template.Param(gate, template.Kind.OUTPUT),))
+    np.testing.assert_array_equal(np.asarray(out), 0.0)

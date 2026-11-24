@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import Trainer
+from dew.training import TrainerAdvanced
 from dew.optim import Adam, OptimConfig
 from dew.data.dataset import Loader
 from dew.data import ByteTokenizer, Memory, presets
@@ -60,7 +61,7 @@ sft_data = Loader(train=lambda partition: itertools.repeat(sft_batch), val=None,
                    records=8, batch=8)
 sft_objective = LMObjective(model, seq_len=len(row) - 1, variables=base,
                             loss_role=Role.ASSISTANT)
-sft_state = Trainer(sft_objective, OptimConfig(learning_rate=1e-3), key=jax.random.key(1)).fit(
+sft_state = Trainer(sft_objective, OptimConfig(lr=1e-3), key=jax.random.key(1)).fit(
     sft_data, steps=20, log_every=10)
 ```
 
@@ -84,7 +85,7 @@ pair = {"chosen": prompt + response, "rejected": prompt + rejected,
 width = max(len(pair["chosen"]), len(pair["rejected"]))
 pairs = Memory([pair] * 8).repeat().pipe(presets.preferences, seq_len=width, batch=8)
 dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, variables=sft_state.variables)
-dpo_state = Trainer(dpo, OptimConfig(optimizer=Adam(), learning_rate=1e-3), key=jax.random.key(2)).fit(
+dpo_state = Trainer(dpo, OptimConfig(optimizer=Adam(), lr=1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
 
@@ -126,8 +127,8 @@ rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
 rollout = RolloutScheduler.sampled(rl_objective, reward, groups=4, max_new_tokens=8,
                                    sampling=Sampling(temperature=1.0, top_k=40),
                                    decode=tokenizer.decode)
-rl_state = Trainer(rl_objective, OptimConfig(learning_rate=1e-4), key=jax.random.key(3),
-                   rollout=rollout).fit(rl_data, steps=4, log_every=2)
+rl_state = Trainer(rl_objective, OptimConfig(lr=1e-4), key=jax.random.key(3),
+                   advanced=TrainerAdvanced(rollout=rollout)).fit(rl_data, steps=4, log_every=2)
 print(int(rl_state.updates), "GRPO updates")
 ```
 
@@ -217,7 +218,7 @@ data = Memory(rows * 4).repeat().pipe(presets.preferences, seq_len=row_width, ba
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=2 * row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
-trainer = Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=1e-3).build(2), key=jax.random.key(0))
+trainer = Trainer(objective, OptimConfig(optimizer=Adam(), lr=1e-3).build(2), key=jax.random.key(0))
 initial = trainer.initial_state()
 # Copy the snapshot to host memory before training donates device buffers.
 reference = jax.tree.map(lambda x: np.array(x, copy=True), initial.ema)
@@ -311,7 +312,7 @@ Generation prefills the padded batch once and packs the real tokens into each ro
 
 ## Tool episodes
 
-`dew.objectives.rl.EpisodeCollector` collects multi-turn episodes from an environment you supply and an inference policy that can be bound to a set of weights, and `RolloutScheduler.episodes(policy, environment, verifier, objective=..., ...)` trains on them through the ordinary `Trainer(rollout=...)` hook and `GRPOObjective`. By default a `TextGeneration` policy that draws one row a prompt by sampling serves its cohort's turns in process over a paged cache, as `Server.from_task(cache=PagedKV(shared=True))` lays one (`dew.inference.serving`); `page_size=` names the page size, and `page_size='whole'` draws the policy whole, every turn prefilling its whole history again. Pass `dew.inference.TextGeneration(model, variables)` as its policy. Collection calls `policy.bind(snapshot)` once. Each call after that receives the exact context token IDs, a response budget, a key and `Sampling`, and returns a `Generation` with raw and behavior log-probabilities. Canvas generation is not an autoregressive policy and cannot supply these likelihoods. Served this way, or with `EpisodeCollector(..., kv_cache=KVCache(page_size=...))`, a cohort's turns run through the serving engine in process (`dew.inference.serving.Server`, built over the bound `TextGeneration` for the cohort and released with it): each finished turn names its row's history, its context and every draw its cache holds, so the next turn, whose context continues it, reads that history's full pages, and a hybrid's rows the recurrent state they were left in where the history ends at a page's end, and prefills the rest; a group's shared prompt is prefilled once. A turn draws what the policy draws whole, its key folded by its global row. A row whose context does not continue its last turn (an environment that rewrites or compacts it) is prefilled whole, and the collector logs a warning naming the row.
+`dew.objectives.rl.EpisodeCollector` collects multi-turn episodes from an environment you supply and an inference policy that can be bound to a set of weights, and `RolloutScheduler.episodes(policy, environment, verifier, objective=..., ...)` trains on them through the ordinary `Trainer(rollout=...)` hook and `GRPOObjective`. By default a `TextGeneration` policy that draws one row a prompt by sampling serves its cohort's turns in process over a paged cache, as `Server.from_task(cache=PagedKV(shared=True))` lays one (`dew.inference.serving`); `page_size=` names the page size, and `page_size='whole'` draws the policy whole, every turn prefilling its whole history again. Pass `dew.inference.TextGeneration(model, variables)` as its policy. Collection calls `policy.bind(snapshot)` once. Each call after that receives the exact context token IDs, a response budget, a key and `Sampling`, and returns a `Generation` with raw and behavior log-probabilities. Canvas generation is not an autoregressive policy and cannot supply these likelihoods. Served this way, or with `EpisodeCollector(..., cache=PagedKV(page_size=...))`, a cohort's turns run through the serving engine in process (`dew.inference.serving.Server`, built over the bound `TextGeneration` for the cohort and released with it): each finished turn names its row's history, its context and every draw its cache holds, so the next turn, whose context continues it, reads that history's full pages, and a hybrid's rows the recurrent state they were left in where the history ends at a page's end, and prefills the rest; a group's shared prompt is prefilled once. A turn draws what the policy draws whole, its key folded by its global row. A row whose context does not continue its last turn (an environment that rewrites or compacts it) is prefilled whole, and the collector logs a warning naming the row.
 
 The input dataset yields integer `task_id` rows. Your environment factory receives an `EpisodeId` with the task, the attempted step, the sample index and a random seed, and returns an `Environment` to use as a context manager. Its `reset()` returns an `Observation` with the first context. `step(action)` takes a finished model turn and returns either the exact next context or a terminal result. The environment is responsible for decoding, validating tool calls, chat formatting, execution, timeouts and cleaning up resources. Dew itself never executes generated code by default.
 
@@ -517,6 +518,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 from dew import Trainer
+from dew.training import TrainerAdvanced
 from dew.data.dataset import Loader
 from dew.nn.protocols import OutputTable
 from dew.objectives.rl import (EpisodeCollector, EpisodeStatus, Observation, PPOObjective,
@@ -615,7 +617,8 @@ objective = PPOObjective(ToolPolicy(), seq_len=10,
 episodes = EpisodeCollector(objective.policy(objective.init(key)), harness, verify,
                             max_prompt_tokens=8, max_new_tokens=3, max_turns=3, sampling=SAMPLING)
 trainer = Trainer(objective, optax.sgd(.05), key=key,
-                  rollout=PPORollout(objective, episodes, groups=4, gamma=.97, lam=.9))
+                  advanced=TrainerAdvanced(rollout=PPORollout(objective, episodes, groups=4, gamma=.97,
+                                                              lam=.9)))
 data = Loader(train=lambda partition: itertools.repeat({
     "task_id": np.arange(jax.device_count(), dtype=np.int32)}),
     val=None, records=None, batch=jax.device_count())
@@ -645,6 +648,7 @@ import itertools
 import jax
 import numpy as np
 from dew import Field, InputSpec, Trainer
+from dew.training import TrainerAdvanced
 from dew.optim import Adam, OptimConfig
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
@@ -663,7 +667,8 @@ def brightness(images, batch):
 rollout = FlowRollout(objective, brightness, groups=4, steps=5, train_steps=2)
 batch = {"image": np.zeros((2, 4, 4, 1), dtype=np.uint8)}
 data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=2, batch=2)
-trainer = Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=1e-3), key=jax.random.key(0), rollout=rollout)
+trainer = Trainer(objective, OptimConfig(optimizer=Adam(), lr=1e-3), key=jax.random.key(0),
+                  advanced=TrainerAdvanced(rollout=rollout))
 state = trainer.fit(data, steps=2, log_every=1)
 print(int(state.updates))
 ```

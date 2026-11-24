@@ -316,7 +316,7 @@ class Recorder:
 
 
 RECORD = "record/"
-"""The prefix of the metrics under which a recording step (`Trainer(record=True)`) returns what its
+"""The prefix of the metrics under which a recording step (`TrainerAdvanced(record=True)`) returns what its
 evaluations' `Step.sample` and `Step.boundary` calls produced, one array each (`recorded_metrics`),
 which `taken_record` reads back as a `Recorded`."""
 

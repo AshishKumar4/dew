@@ -19,7 +19,7 @@ from reference_error import assert_computes_the_oracle, chain_roundings, widened
 from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout, released_old_decay, released_policy_loss
-from dew.training import FitPolicy, Trainer
+from dew.training import Trainer, TrainerAdvanced
 
 ROWS, SHAPE = 16, (4, 4, 2)
 
@@ -98,7 +98,7 @@ def fitted(nft, reward, prompts, **rollout):
     from dew.data.dataset import Loader
 
     sampled = NFTRollout(nft, reward, **rollout)
-    trainer = Trainer(nft, optax.sgd(1e-2), key=jax.random.key(21), rollout=sampled)
+    trainer = Trainer(nft, optax.sgd(1e-2), key=jax.random.key(21), advanced=TrainerAdvanced(rollout=sampled))
     initial = trainer.place()[0]
     count = len(next(iter(prompts.values())))
     data = Loader(train=lambda partition: itertools.repeat(prompts), val=None, records=count, batch=count)
@@ -180,7 +180,7 @@ def test_a_step_read_in_two_microbatches_trains_and_logs_its_reward():
     sampled, initial, _ = fitted(nft, reward, prompts, groups=2, steps=3, train_steps=2)
     batch = sampled(initial, prompts, jax.random.key(23), objective=nft)
     tracker = RecordingTracker()
-    trainer = Trainer(nft, optax.sgd(1e-2), key=jax.random.key(21), fit=FitPolicy(split=2), tracker=tracker)
+    trainer = Trainer(nft, optax.sgd(1e-2), key=jax.random.key(21), split=2, tracker=tracker)
     rows = len(batch["rewards"])
     # The images the objective's inputs declare, which a step of sampled rows reads none of.
     batch = {**batch, "image": np.zeros((rows, 4, 4, 1), np.float32)}

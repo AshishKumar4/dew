@@ -2,14 +2,11 @@
 
 Reference: arXiv:2505.05470v5, equations 8-9, and
 https://github.com/yifan123/flow_grpo/blob/879042cf5707f8b90daa98d147d7deac2317c5da/flow_grpo/diffusers_patch/sd3_sde_with_logprob.py
-The reference averages coordinate log densities for its policy ratio. These
-checks retain the joint density until the objective performs that reduction.
-Each density, loss and gradient is on par with its closed form from the
-float64 evaluation over drawn inputs (check 1, tests/reference_error.py), the
-closed form evaluated on the walk's own states from the policy's own
-velocities, a walk's recorded densities and their rescoring alike; what is one
-computation, or exact arithmetic, is held exactly.
-"""
+The reference averages coordinate log densities for its policy ratio. These checks retain the joint density
+until the objective performs that reduction. Each density, loss and gradient is on par with its closed form
+from the float64 evaluation over drawn inputs (check 1, tests/reference_error.py), the closed form evaluated
+on the walk's own states from the policy's own velocities, a walk's recorded densities and their rescoring
+alike; what is one computation, or exact arithmetic, is held exactly. """
 
 import contextlib
 import dataclasses
@@ -50,7 +47,7 @@ from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout, transition_ro
 from dew.sampling import CFG, sample
 from dew.sampling.flow import FlowSDE, flow_transition
 from dew.telemetry.records import RECORD_TYPES
-from dew.training import FitPolicy, Trainer
+from dew.training import Trainer, TrainerAdvanced
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
 from tools.parity_verl_omni_flow_loss import RECORDED as VERL_OMNI, dew_loss, loss_inputs
 
@@ -516,6 +513,12 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
         return -np.square(images.mean(axis=(1, 2, 3)) - context["target"])
 
     rollout = FlowRollout(objective, reward, groups=3, steps=4, train_steps=2)
+    # The walk its collective gathers to every process is that prefix alone (row 10795): its states one
+    # past it, its densities and stochastic steps cut to it, its grid whole (row 10985).
+    walked = jax.eval_shape(rollout._generate_impl, variables, rollout._expanded(prompts)[0],
+                            jax.random.key(23))[0]
+    assert (walked.states.shape[1], walked.log_probs.shape[1], walked.stochastic.shape[1],
+            walked.times.shape[-1]) == (3, 2, 2, 4)
     batch = rollout(state, prompts, jax.random.key(23), objective=objective)
     # Its rows hold the walk's first two transitions alone, its trained prefix (row 10903).
     assert batch["timesteps"].shape == batch["transition_mask"].shape == (6, 2)
@@ -730,7 +733,8 @@ def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
     # A trained step, the rollout its own, moves the policy: a row of the images a device.
     from dew.data.dataset import Loader
 
-    trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.key(44), rollout=rollout)
+    trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.key(44),
+                      advanced=TrainerAdvanced(rollout=rollout))
     initial = trainer.place()[0]
     rows = np.arange(jax.device_count()) % len(pixels)
     source = {"image": pixels[rows], "mask": mask[rows]}
@@ -975,11 +979,12 @@ def test_a_step_read_in_two_microbatches_trains_and_logs_its_reward_and_policy_t
                                   InputSpec(Field("image", (4, 4, 1))), guidance=None, beta=0.1)
     rollout = FlowRollout(objective, lambda images, context: np.arange(len(images), dtype=np.float64),
                           groups=2, steps=3)
-    initial = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(93), rollout=rollout).place()[0]
+    initial = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(93),
+                      advanced=TrainerAdvanced(rollout=rollout)).place()[0]
     collected = rollout(initial, {"image": np.zeros((count, 4, 4, 1), np.uint8)}, jax.random.key(94),
                         objective=objective)
     tracker = RecordingTracker()
-    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(93), fit=FitPolicy(split=2),
+    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(93), split=2,
                       tracker=tracker)
     rows = len(collected["rewards"])
     # The images the objective's inputs declare, which a step of collected trajectories reads none of.
@@ -1006,7 +1011,8 @@ def test_float64_callback_distinctions_reach_a_real_policy_update():
     objective = FlowGRPOObjective(model, Process(FlowMatchingScheduler(), FlowMatchPredictionTransform()),
                                   InputSpec(Field("image", (4, 4, 1))), guidance=None)
     rollout = FlowRollout(objective, lambda images, context: raw, groups=3, steps=3)
-    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(91), rollout=rollout)
+    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(91),
+                      advanced=TrainerAdvanced(rollout=rollout))
     initial = trainer.place()[0]
     source = {"image": np.zeros((count, 4, 4, 1), np.uint8)}
     collected = rollout(initial, source, jax.random.key(92), objective=rollout.objective)
@@ -1076,7 +1082,8 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
                                   variables={**untrained, "params": params})
     rollout = FlowRollout(objective, lambda images, batch: images.mean((1, 2, 3)), groups=2, steps=3)
     tracker, metric = RecordingTracker(), PixelMean()
-    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(101), rollout=rollout, tracker=tracker)
+    trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(101),
+                      advanced=TrainerAdvanced(rollout=rollout), tracker=tracker)
     initial = trainer.place()[0]
     step = Step(initial.microstep, jax.random.key(102), initial.averaged)
     evaluated = objective.evaluate(initial.variables, prompts, step)

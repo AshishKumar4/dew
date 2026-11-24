@@ -11,9 +11,9 @@
 		"steps": 1000,
 		"device": "NVIDIA A100-SXM4-40GB",
 		"wall_seconds": 65.3,
-		"script_sha256": "5338f9776206d1cee345e9d53d586cd28abd58d09b3423b165d1f33b3de52373",
+		"script_sha256": "3a3c5d7b446835c20c1d99899f00deea9c82663d26463c73729734efdd8a6216",
 		"description": "Tiny Shakespeare from winglian/tiny-shakespeare, 1% of its records held out by content hash, freshly initialized weights, real recorded training",
-		"cell_sha256": "28fb9c244b3710bafc8e09a61302e7a000e643a6d6ec32b596f9cde66fe8239d"
+		"cell_sha256": "266da4216d34e0e6aa54c7434960234d8810556f321d5f7e0b86c0c28b05422f"
 	},
 	"hero": {
 		"returncode": 0,

@@ -152,17 +152,7 @@ from dew.nn.inputs import (
 )
 from dew.nn.kernels import generation
 from dew.nn.kernels.options import Fetched, compiler_options, program as outer_program
-from dew.nn.kv_cache import (
-    GROUPS,
-    POOLED,
-    ROUNDING_KEYS,
-    KVCache,
-    KVDtype,
-    is_paged,
-    leaf_name,
-    row_axis,
-    unpaged,
-)
+from dew.nn.kv_cache import GROUPS, POOLED, ROUNDING_KEYS, KVCache, is_paged, leaf_name, row_axis, unpaged
 from dew.nn.precision import Numerics
 from dew.nn.progress import END, Progress
 from dew.nn.projections import pack_projections, packed_layout
@@ -638,12 +628,17 @@ second than whole rows (M-IG-12), so a server pages only where its caller says i
 @dataclass(frozen=True)
 class DenseKV:
     """A server's cache each row holds whole, unpaged (`Server.from_task`'s `cache`): the model's own
-    layout's format, its quantization and its offload (`dew.nn.kv_cache.KVCache`), unless named here."""
+    layout unpaged, its format and its offload, or the `layout` named, exactly."""
 
-    quantized: KVDtype | None = None
-    """The format keys and values are stored in (`KVCache.quantized`), None for the model's own."""
-    offloaded: bool | None = None
-    """Whether they lie in host memory (`KVCache.offloaded`), None for the model's own."""
+    layout: KVCache | None = None
+    """The rows' layout (`dew.nn.kv_cache.KVCache`) as it states it, its format among it (`quantized`, None
+    unquantized: Train 1209's review F2, a format a server could not ask for) and its offload; None, the
+    model's own unpaged."""
+
+    def __post_init__(self) -> None:
+        if self.layout is not None and self.layout.page_size is not None:
+            raise ValueError("a dense cache holds each row whole; its layout names no page_size "
+                             "(PagedKV pages one)")
 
 
 @dataclass(frozen=True)
@@ -655,13 +650,14 @@ class PagedKV:
     paged cache's alone."""
 
     page_size: int | None = None
-    """The slots a page holds; None, the model's own layout's, else `PAGE_SIZE`."""
+    """The slots a page holds over the model's own layout; None, its own layout's, else `PAGE_SIZE`."""
     pages: int | None = None
-    """The pool's pages; None, a row's capacity of pages for every slot."""
-    quantized: KVDtype | None = None
-    """The format keys and values are stored in (`KVCache.quantized`), None for the model's own."""
-    offloaded: bool | None = None
-    """Whether the pool lies in host memory (`KVCache.offloaded`), None for the model's own."""
+    """The pool's pages over the model's own layout; None, a row's capacity of pages for every slot."""
+    layout: KVCache | None = None
+    """The pool's layout (`dew.nn.kv_cache.KVCache`) as it states it in place of the model's: its format
+    (`quantized`, None unquantized: Train 1209's review F2), its offload, its page size (None,
+    `PAGE_SIZE`) and its pool; None, the model's own, paged at `page_size` (Train 1208's review F3: the
+    layout's fields were mirrored here under other None meanings)."""
     prefix_cache: bool | None = None
     """Whether a request reuses the pages of a prompt prefix an earlier request computed, its prompt's or
     the whole history a finished one drew (`PagedRows.finished`); None, wherever the server can reuse a
@@ -680,6 +676,9 @@ class PagedKV:
     row in whole pages (`_holds`); the model's own layout elsewhere (rows 5374, 5375, `PAGE_SIZE`)."""
 
     def __post_init__(self) -> None:
+        if self.layout is not None and (self.page_size is not None or self.pages is not None):
+            raise ValueError("a paged cache's layout states its page_size and pages; name them on it, or "
+                             "name them here over the model's own layout")
         if self.shared and self.prefix_cache is False:
             raise ValueError("shared pages are laid where a prefix cache over them pays; a cache that keeps "
                              "no prefix cache shares nothing: name its page_size without shared")
@@ -1906,19 +1905,23 @@ def _laid(model: nn.Module, cache: ServedCache | None, capacity: int, strategy: 
     `PagedKV.shared` over a model that pages none, those pages only where they pay: where a server over them
     keeps a prefix cache (`_reuses_prefixes`) and the model's max_seq_len holds a row of `capacity` in whole
     pages (`_holds`), so requests over one prompt prefill it once (rows 5374, 5375), the model's own unpaged
-    elsewhere. The format each names (`quantized`, `offloaded`) replaces the model's, paged or not."""
+    elsewhere. A layout either names (`layout`) is laid in place of the model's, exactly: its format, its
+    offload, a paged one's page size (`PAGE_SIZE` where it names none) and pool."""
     own = model.kv_cache if isinstance(model, Layered) else None
     if cache is None:
         return own
-    formats = {name: value for name, value in (("quantized", cache.quantized), ("offloaded", cache.offloaded))
-               if value is not None}
-    if own is None and (isinstance(cache, DenseKV) or cache.shared) and not formats:
-        return None
-    base = dataclasses.replace(KVCache() if own is None else own, **formats)
     if isinstance(cache, DenseKV):
-        return unpaged(base)
-    size = cache.page_size or base.page_size or PAGE_SIZE
-    pages = cache.pages if cache.pages is not None else base.pages if size == base.page_size else None
+        laid = own if cache.layout is None else cache.layout
+        return None if laid is None else unpaged(laid)
+    if cache.layout is None:
+        if own is None and cache.shared:
+            return None
+        base = KVCache() if own is None else own
+        size = cache.page_size or base.page_size or PAGE_SIZE
+        pages = cache.pages if cache.pages is not None else base.pages if size == base.page_size else None
+    else:
+        base = cache.layout
+        size, pages = base.page_size or PAGE_SIZE, base.pages
     # Its pool split among the server's row groups where the server lays its rows (`_cache_rows`), not the
     # groups a saved model's layout was split among (the review of API02b: an odd pool named for one group
     # was refused as split among a saved model's two).
@@ -1926,7 +1929,7 @@ def _laid(model: nn.Module, cache: ServedCache | None, capacity: int, strategy: 
     if not cache.shared or base.page_size is not None:
         return paged
     pays = _holds(model, capacity, size) and _reuses_prefixes(model, paged, strategy, prefill_mesh)
-    return paged if pays else base
+    return paged if pays else unpaged(base)
 
 
 def _holds(model: nn.Module, capacity: int, page_size: int | None) -> bool:

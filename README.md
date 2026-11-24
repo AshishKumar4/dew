@@ -215,7 +215,7 @@ The kernel never changes the parameter tree, so a checkpoint trained with one ke
 
 ## Kernels and the algebra engine
 
-Dew's attention, linear recurrence and grouped GEMM kernels are templates: one algorithm per operation, written once in Pallas and lowered through Mosaic GPU on Hopper's wgmma and Ampere's mma.sync, or through Pallas-Triton on other GPUs. Each call's kernel configuration is derived from the device's facts and the call's shape, so the default path needs no tuning. An opt-in tuner, `Trainer(tune_kernels=True)`, is off by default. Where an existing kernel is still measured faster at a shape, Dew keeps it for that shape and records the measurement: FlashAttention 3 for 16-bit attention on the H100, FlashAttention 2 on mma.sync GPUs, XLA for fp32 attention and for dense GEMM, and CUTLASS for part of the grouped GEMM on the H100. The template takes over each of these once it is faster.
+Dew's attention, linear recurrence and grouped GEMM kernels are templates: one algorithm per operation, written once in Pallas and lowered through Mosaic GPU on Hopper's wgmma and Ampere's mma.sync, or through Pallas-Triton on other GPUs. Each call's kernel configuration is derived from the device's facts and the call's shape, so the default path needs no tuning. An opt-in tuner, `TrainerAdvanced(tune_kernels=True)`, is off by default. Where an existing kernel is still measured faster at a shape, Dew keeps it for that shape and records the measurement: FlashAttention 3 for 16-bit attention on the H100, FlashAttention 2 on mma.sync GPUs, XLA for fp32 attention and for dense GEMM, and CUTLASS for part of the grouped GEMM on the H100. The template takes over each of these once it is faster.
 
 Measured against the kernels the templates replace:
 
@@ -540,6 +540,7 @@ This example keeps training the same decoder and rewards stories that mention a 
 ```python
 from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.data.dataset import Loader
+from dew.training import TrainerAdvanced
 
 prompt = tokenizer.encode("Once upon a time, there was a little")
 prompt_batch = {
@@ -585,7 +586,7 @@ rl_state = Trainer(
     rl_objective,
     optax.adamw(1e-4),
     key=jax.random.key(3),
-    rollout=rollout,
+    advanced=TrainerAdvanced(rollout=rollout),
 ).fit(rl_data, steps=20, log_every=10)
 ```
 
@@ -957,7 +958,6 @@ To trace a window of training, pass `Trainer` a `ProfileWindow` with the trace `
 ```python
 from dew import Evaluation, LocalTracker
 from dew.config import RunConfig, TrainerConfig
-from dew.training import Horizon
 from dew.optim import Adam, OptimConfig
 from dew.registry import ModelConfig
 from dew.config.sweep import GridSearch
@@ -969,7 +969,7 @@ config = RunConfig(
     model=ModelConfig.from_model(objective.model),
     data=Memory(batch).repeat().batch(8),
     optim=OptimConfig(optimizer=Adam()),
-    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", horizon=Horizon(steps=40),
+    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=40,
                           eval_every=None, checkpoint_every=None),
 )
 
@@ -982,13 +982,13 @@ def trial(run: RunConfig) -> float:
 
 
 with LocalTracker("runs/sweep/tracking") as tracker:
-    trials = config.sweep({"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
+    trials = config.sweep({"optim.lr": [0.01, 0.003]}, train=trial, trials=2,
                           ledger="runs/sweep/ledger.json", tracker=tracker, search=GridSearch())
 best = min(trials, key=lambda trial: trial.value)
 print(best.overrides, round(best.value, 4))
 ```
 
-This prints `{'optim.learning_rate': 0.01} 1.0024`; the slower rate reaches 1.015. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>`, with its own `run.json`, checkpoints and tracking journal. A finished trial is written to the ledger before it is reported, so calling `sweep` again continues an interrupted sweep without retraining the finished trials. `RandomSearch` and `GridSearch` are built in; `OptunaSearch` needs `dewml[hpo]`.
+This prints `{'optim.lr': 0.01} 1.0024`; the slower rate reaches 1.015. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>`, with its own `run.json`, checkpoints and tracking journal. A finished trial is written to the ledger before it is reported, so calling `sweep` again continues an interrupted sweep without retraining the finished trials. `RandomSearch` and `GridSearch` are built in; `OptunaSearch` needs `dewml[hpo]`.
 
 ## Diffusion and sampling
 
@@ -1084,6 +1084,7 @@ from dew.inference import TextToImage
 from dew.nn.backbones import SimpleDiT
 from dew.config.diffusion import DiffusionRunConfig
 from dew.sampling import Heun
+from dew.training import Keep
 
 run = Path("runs/flowers-run")
 data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
@@ -1092,7 +1093,7 @@ config = DiffusionRunConfig(
     model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=128, num_layers=4,
                                            num_heads=4, dtype=jnp.bfloat16)),
     data=flowers.shuffle(seed=0).repeat().pipe(presets.images, 64, batch=16, augment=True),
-    trainer=TrainerConfig(checkpoint_dir=str(run), steps=20, keep=1),
+    trainer=TrainerConfig(checkpoint_dir=str(run), steps=20, keep=Keep(latest=1)),
     preset=EDM(regime="pixel"),
     text=None,
 )
@@ -1175,7 +1176,8 @@ tokens = Path("runs/tokens")
 export = Path("runs/dew-decoder")
 tokenizer = HFTokenizer("tests/fixtures/tokenizers/tiny-tools")
 
-data = TokenFiles(str(tokens / "train")).shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=128, batch=16)
+data = TokenFiles(str(tokens / "train")).shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=128,
+                                                                       batch=16)
 model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=128, num_layers=4, num_heads=4, num_kv_heads=2,
                           mlp_features=256, max_seq_len=128, dtype=jnp.float32,

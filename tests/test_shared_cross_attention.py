@@ -588,7 +588,7 @@ def test_a_decision_run_reads_its_context_through_a_deepseek_backbones_own_atten
                                     "--head.labels.names", *(LABELS.names or ()), "--head.labels.variants",
                                     *LABELS.variants, "--head.labels.cue", LABELS.cue, "--trainer.name",
                                     "shared", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-                                    "--trainer.horizon.steps", "2", "--trainer.checkpoint-every", "None",
+                                    "--trainer.steps", "2", "--trainer.checkpoint-every", "None",
                                     "--trainer.eval-every", "None", "--trainer.log-every", "1",
                                     "--trainer.multi-host", "False", "--trainer.compilation-cache-dir",
                                     "None"],

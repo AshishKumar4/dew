@@ -2035,14 +2035,14 @@ def iterate(
     seed: int | None = None,
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, in the process, read as
-    `read` says, else as the chain does (`Pipeline.read`), else streamed, as `compile` honors a chain's read:
+    `held_read` decides (`read`, else the chain's, else its sources'), as `compile` does:
     automatic workers (`Loading.unsized`) and those the chain names (row 5735), whose turns would
     interleave the records out of the order the pass publishes. A pass that seals what it makes (a
     snapshot's, `seed` given) draws its random steps' values under `seed`, which the rows it seals keep
     (row 9056: a video's clips drawn once and sealed); publication, whose cache a later pass writes
     through, holds no draw."""
     loading = loading.unsized()
-    read = read or pipeline._chain().mode or "streamed"
+    read = held_read(pipeline._chain(), read, provision=provision)
     pipeline = _in_process(pipeline)
     if (seed is None and draws(pipeline)) or any(isinstance(stage, (BatchStage, MapBatch, Repeat))
                                                  for stage in _steps(pipeline)):
@@ -2369,7 +2369,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
 
         measured = dataclasses.replace(measured, branches=tuple(map(batched, measured.branches)))
     # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
-    return validation(measured.branches[0], batch=1, objective=objective, read=_held_read(chain),
+    return validation(measured.branches[0], batch=1, objective=objective, read=held_read(chain),
                       loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed, widths=widths,
                       measured=measured)
 
@@ -2390,15 +2390,17 @@ def _held_batched(chain: Pipeline, batch: int | None, *, unbatched: bool = False
         else stage for stage in chain.stages))
 
 
-def _held_read(chain: Pipeline) -> Read:
-    """The read a held chain asks, else the one its sources choose (`_preferred_read`)."""
-    return chain.mode or _preferred_read((chain,), provision=True)
+def held_read(chain: Pipeline, read: Read | None = None, *, provision: bool = True) -> Read:
+    """The read a pass over `chain` takes: `read` where stated, else the one the chain asks
+    (`Pipeline.read`), else the one its sources choose (`_preferred_read`), as `compile` decides it: the one
+    rule a held pass, an export and a publication read by."""
+    return read or chain.mode or _preferred_read((chain,), provision=provision)
 
 
 def _held_measure(chain: Pipeline, objective: ObjectiveData | None) -> _Measured:
     """A held chain prepared through its source's own steps as its pass reads them (`_measure`), its
     counts filled where a memory read runs them."""
-    return _measure((chain,), _held_read(chain), provision=True, objective=objective, counts=({},))
+    return _measure((chain,), held_read(chain), provision=True, objective=objective, counts=({},))
 
 
 @compiling
@@ -2440,14 +2442,15 @@ def publish(
     pipeline: Pipeline,
     cache,
     *,
-    read: Read = "streamed",
+    read: Read | None = None,
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
 ):
     """Fill and seal a deterministic prefix, then publish its certified
     generation, unless one is already published under its key (with the plan
     of a terminal pack), which it returns, its stream's fill numbering its rows
-    by the shards its source states (`dew.data.sources.base.Source.manifest`)."""
+    by the shards its source states (`dew.data.sources.base.Source.manifest`).
+    It reads as `held_read` decides: `read`, else the chain's, else its sources'."""
     from dew.data.cache import Cache
     from dew.data.generation import Generation
 
@@ -2466,6 +2469,7 @@ def publish(
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
         builder, accepted = PackingPlan(packing), plan_name(packing, "accepted")
         pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
+    read = held_read(pipeline._chain(), read, provision=provision)
     (pipeline,) = _prepared((pipeline,), read, provision=provision)
     source = pipeline.source
     if isinstance(source, Combined):

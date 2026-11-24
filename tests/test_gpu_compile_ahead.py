@@ -159,7 +159,7 @@ from test_pass_weights import looped
 
 from dew.nn.kernels.generation import compile_only_gpus
 from dew.objectives.lm.objective import LMObjective
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.ahead import compile_ahead
 
 generation, path, multiprocessors, memory = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
@@ -167,7 +167,8 @@ generation, path, multiprocessors, memory = sys.argv[1], sys.argv[2], int(sys.ar
 target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors,
                                             share=float(sys.argv[5])))
 trainer = Trainer(LMObjective(looped(steps=TRAINED.cap), 16), optax.sgd(0.1), key=jax.random.key(0),
-                  mesh=target, layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED)
+                  mesh=target, advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0),
+                                                        sampled_passes=TRAINED))
 compile_ahead(trainer, {"text": token_draw()}).save(path)
 """
 """A run that draws its looped model's pass count per microbatch, its step compiled ahead for the GPU of the
@@ -184,12 +185,13 @@ from test_pass_weights import looped
 
 from dew.objectives.lm.objective import LMObjective
 from dew.telemetry.compiles import Compiles
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.ahead import AheadOfTime
 
 run = Trainer(LMObjective(looped(steps=TRAINED.cap), 16), optax.sgd(0.1), key=jax.random.key(0),
-              mesh=MeshSpec().build(jax.devices()[:1]), layout=Layout(min_shard=1, tolerance=1.0),
-              sampled_passes=TRAINED, ahead=AheadOfTime.load(sys.argv[1]))
+              mesh=MeshSpec().build(jax.devices()[:1]),
+              advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0), sampled_passes=TRAINED,
+                                       ahead=AheadOfTime.load(sys.argv[1])))
 with Compiles(None) as compiles:
     state = run.fit({"text": token_draw()}, steps=4, log_every=2)
 assert int(state.step) == 4

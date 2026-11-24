@@ -32,7 +32,7 @@ plan each lighter rung the run's remat-first search passed over that fits, at th
 (the plan's `lighter`, `FitSearch.below`: a head's tile, XLA's defaults or no copies at less recomputation);
 tools/benchmark_step.py times each on the GPUs, a case at its remat and head tile, a plan of s
 microbatches as its microbatch's rows accumulated s times (`accumulation`), the time it reports a
-microbatch's, s of them an update; and the run names the fastest by its model's remat, `--trainer.fit.split`
+microbatch's, s of them an update; and the run names the fastest by its model's remat, `--trainer.split`
 and `LMObjective.head_tile`. No run times plans itself.
 """
 

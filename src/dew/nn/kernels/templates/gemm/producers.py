@@ -5,11 +5,26 @@ compile finds its kernel spilling, the recurrence's ladder (`resources.Producers
 import dataclasses
 from collections.abc import Iterator
 
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report, resources
 from dew.nn.kernels.templates.gemm import pricing, tiling
 
 
-def started(op, ba, config: tiling.Tiles) -> tiling.Tiles:
+def _stated(op, ba, config: tiling.Tiles, top: int, target) -> tuple[dict[str, int] | None, bool]:
+    """The stated producer cap `{op.KERNEL: cap}` for a tensor-memory family whose consumers exceed `top`,
+    and whether starting above the floor fits (`False` when `stated_producer` is None)."""
+    family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
+    if not family.tensor_columns(pricing.tile_columns(config, family), 1):
+        return None, True
+    regs = op.registers(ba, config, target)
+    if regs is None or regs <= top:
+        return None, True
+    consumers = config.warpgroups + op.rewritten(ba, family)
+    cap = resources.stated_producer(regs, family.warpgroups(consumers), consumers, config.programs)
+    return (None, False) if cap is None else ({op.KERNEL: cap}, True)
+
+
+def started(op, ba, config: tiling.Tiles, target=None) -> tiling.Tiles:
     """`config` with its producer at its ladder's top (`_top`) where it states no registers of its own yet and
     its consumers hold their accumulators in tensor memory (`mosaic.Issuer.tensor_columns`), so its first
     compile is its last: at setmaxnreg's least each of a B200's gathered launches spilled, its issue loop
@@ -18,37 +33,37 @@ def started(op, ba, config: tiling.Tiles) -> tiling.Tiles:
     accumulator's. Where the consumers hold theirs in registers (a warpgroup MMA's) a raise takes registers
     they hold, and the producer starts at the least: an H100's gathered kernel gradient at its entry share
     left its consumers 168 registers, which spilled, and certified at its sixth compile (train 952 F2)."""
-    top = _top(op, ba, config)
-    family = pricing.family_of(config, ba.arguments['tokens'].dtype)
-    if (top is None or config.producers.of(op.KERNEL) is not None
-            or not family.tensor_columns(pricing.tile_columns(config, family), 1)):
-        return config
-    regs = op.registers(ba, config)
-    consumers = config.warpgroups + op.rewritten(ba, family)
-    stated = None
-    if regs is not None and regs > top:
-        cap = resources.stated_producer(regs, family.warpgroups(consumers), consumers, config.programs)
-        if cap is None:
+    target = op.launch_target() if target is None else target
+    with generation.as_target(target):
+        top = _top(op, ba, config, target)
+        family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
+        if (top is None or config.producers.of(op.KERNEL) is not None
+                or not family.tensor_columns(pricing.tile_columns(config, family), 1)):
             return config
-        stated = {op.KERNEL: cap}
-    stepped = config.producers.stepped({op.KERNEL: top}, stated)
-    return config if stepped is None else dataclasses.replace(config, producers=stepped)
+        stated, fits = _stated(op, ba, config, top, target)
+        if not fits:
+            return config
+        stepped = config.producers.stepped({op.KERNEL: top}, stated)
+        return config if stepped is None else dataclasses.replace(config, producers=stepped)
 
 
-def _top(op, ba, config: tiling.Tiles) -> int | None:
+def _top(op, ba, config: tiling.Tiles, target=None) -> int | None:
     """The top of `config`'s producer's ladder, its program's entry share (`resources.entry_registers`),
     where its program has a producer and that producer gathers a step's rows (`mosaic.Family.gathers_rows`,
     a table among the call's); None elsewhere."""
-    family = pricing.family_of(config, ba.arguments['tokens'].dtype)
-    consumers = config.warpgroups + op.rewritten(ba, family)
-    warpgroups = family.warpgroups(consumers)
-    gathers = family.gathers_rows and any(table is not None for table in _tables(ba.arguments.get('gather')))
-    if warpgroups <= consumers or not gathers:
-        return None
-    return resources.entry_registers(warpgroups, config.programs)
+    target = op.launch_target() if target is None else target
+    with generation.as_target(target):
+        family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
+        consumers = config.warpgroups + op.rewritten(ba, family)
+        warpgroups = family.warpgroups(consumers)
+        gathers = (family.gathers_rows
+                   and any(table is not None for table in _tables(ba.arguments.get('gather'))))
+        if warpgroups <= consumers or not gathers:
+            return None
+        return resources.entry_registers(warpgroups, config.programs)
 
 
-def rungs(op, ba, config: tiling.Tiles) -> Iterator[tiling.Tiles]:
+def rungs(op, ba, config: tiling.Tiles, target=None) -> Iterator[tiling.Tiles]:
     """The tiles a refused `config`'s gathering producer (`_top`) steps through where a compile refused it
     with `op`'s kernel (`op.KERNEL`) spilling: its ladder below it in turn, its top first where `config`
     states none, then a setmaxnreg step lower each (`resources.Producers.stepped`), each the next rung's
@@ -56,30 +71,35 @@ def rungs(op, ba, config: tiling.Tiles) -> Iterator[tiling.Tiles]:
     (`tuning.KernelOp._climbed`); none where it gathers nothing (a spill beside a producer of TMA copies
     alone is its consumers', which a raise of the producer starves). The assembler, not a model, finds a
     producer's registers."""
-    top = _top(op, ba, config)
-    if top is None or not _spilled(op, ba, config):
-        return
-    while (stepped := config.producers.stepped({op.KERNEL: top})) is not None:
-        config = dataclasses.replace(config, producers=stepped)
-        yield config
+    target = op.launch_target() if target is None else target
+    with generation.as_target(target):
+        top = _top(op, ba, config, target)
+        if top is None or not _spilled(op, ba, config, target):
+            return
+        stated, _ = _stated(op, ba, config, top, target)
+        while (stepped := config.producers.stepped({op.KERNEL: top}, stated)) is not None:
+            config = dataclasses.replace(config, producers=stepped)
+            yield config
 
 
-def settled(op, ba, config: tiling.Tiles) -> tiling.Tiles:
+def settled(op, ba, config: tiling.Tiles, target=None) -> tiling.Tiles:
     """`config` started (`started`), then its ladder's rungs (`rungs`) while a compile refused each: the tile
     a derivation takes, refused (`report.refused`) where its ladder's foot spilled too."""
-    config = started(op, ba, config)
-    for rung in rungs(op, ba, config):
-        if not _spilled(op, ba, config):
-            break
-        config = rung
-    return config
+    target = op.launch_target() if target is None else target
+    with generation.as_target(target):
+        config = started(op, ba, config, target)
+        for rung in rungs(op, ba, config, target):
+            if not _spilled(op, ba, config, target):
+                break
+            config = rung
+        return config
 
 
-def _spilled(op, ba, config: tiling.Tiles) -> bool:
+def _spilled(op, ba, config: tiling.Tiles, target=None) -> bool:
     """Whether a compile of this process refused `config`, `op`'s kernel spilling (`report.refused_at`)."""
-    refused = report.refused_at(op, ba, config, op.launch_target())
+    target = op.launch_target() if target is None else target
+    refused = report.refused_at(op, ba, config, target)
     return any(kernel.startswith(op.KERNEL) for kernel in refused)
-
 
 def _tables(gather) -> tuple:
     """A call's gather tables: a product's one, a kernel gradient's pair, none."""

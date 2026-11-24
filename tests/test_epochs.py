@@ -13,7 +13,6 @@ from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.pipeline import Pipeline, mix
 from dew.data.sources import Memory
-from dew.training.budget import Horizon
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
@@ -281,7 +280,7 @@ def test_epochs_of_a_read_whose_objective_makes_rows_of_its_examples_are_passes_
     chain = Pipeline(Memory({"id": ids}, shard_rows=4)).shuffle(seed=3, window=12).read(read).batch(8)
     loader, _ = fitted(chain, None, objective=_pulled(Questioned()).data(), epochs=2)
     assert (loader.records, loader.examples) == (None, 24)
-    evaluated = TrainerConfig(horizon=Horizon(epochs=2), eval_every="epoch").eval_interval(loader)
+    evaluated = TrainerConfig(epochs=2, eval_every="epoch").eval_interval(loader)
     state = Trainer(_pulled(Questioned()), optax.sgd(0.01), key=0).fit(chain, epochs=2, log_every=1)
     assert int(state.consumed) == 24
     assert recorded(evaluated) == {"examples": 12}
@@ -305,17 +304,17 @@ def test_the_default_cadence_is_each_pass_where_the_run_counts_them_and_its_end_
     chain = Pipeline(Memory({"id": ids}, shard_rows=4)).shuffle(seed=3, window=12).read(read).batch(8)
     objective = _pulled(Questioned()).data()
     passes, _ = fitted(chain, None, objective=objective, epochs=2)
-    by_epochs = TrainerConfig(horizon=Horizon(epochs=2))
+    by_epochs = TrainerConfig(epochs=2)
     assert recorded(by_epochs.eval_interval(passes)) == recorded(by_epochs.checkpoint_interval(passes)) == {
         "examples": 12}
     stepped, _ = fitted(chain, None, objective=objective, steps=4)
     assert (stepped.records, stepped.pass_examples) == (None, None)
-    by_steps = TrainerConfig(horizon=Horizon(steps=4))
+    by_steps = TrainerConfig(steps=4)
     assert by_steps.eval_interval(stepped) == by_steps.checkpoint_interval(stepped) == "100%"
     with pytest.raises(ValueError):
-        TrainerConfig(horizon=Horizon(steps=4), eval_every="epoch").eval_interval(stepped)
+        TrainerConfig(steps=4, eval_every="epoch").eval_interval(stepped)
     with pytest.raises(ValueError):
-        TrainerConfig(horizon=Horizon(steps=4), checkpoint_every="epoch").checkpoint_interval(stepped)
+        TrainerConfig(steps=4, checkpoint_every="epoch").checkpoint_interval(stepped)
     records = compile(Pipeline(Memory({"id": ids})).batch(4), read="memory")
     assert by_steps.eval_interval(records) == by_steps.checkpoint_interval(records) == 3
 
@@ -619,7 +618,7 @@ def test_a_splits_epoch_cadence_is_the_runs_own_under_a_batch_ramp(tmp_path):
     def readied(ramp: Ramp | None):
         """The run's trainer, loader and suites as it trains, under `ramp`."""
         trainer = dataclasses.replace(run.trainer, checkpoint_dir=str(tmp_path / "runs"),
-                                      horizon=Horizon(epochs=2), eval_every="epoch", multi_host=False,
+                                      epochs=2, eval_every="epoch", multi_host=False,
                                       batch_ramp=ramp)
         prepared = dataclasses.replace(run, trainer=trainer, suites={"val": Suite(every="epoch")}).prepare()
         sized, loader, _, suites, _ = prepared.run.readied(prepared.objective, prepared.dataset,

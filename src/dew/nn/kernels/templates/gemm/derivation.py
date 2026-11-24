@@ -28,22 +28,10 @@ from dew.nn.kernels.templates.gemm import pricing
 from dew.nn.kernels.templates.gemm.tiling import CONSUMERS, Tiles
 
 
-def _decode_two_program(family, target, rows: int, tiled) -> Tiles | None:
-    """Register-accumulated producer-fed 1-consumer decode (`rows < role_rows`, e.g. Hopper wgmma):
-    `family.programs(1)` assumes the 1-program register raise (248 regs -> 1 CTA/SM), starving DRAM
-    bandwidth (`M-NS-17b-gh200`: 51.8% vs Triton 75.6% at 2 CTAs/SM, rows 3622, 483). Prefer a
-    staged-busy 2-program tile when half-SMEM and 2-program consumer registers hold it."""
-    if not (rows < family.role_rows and family.warpgroups(1) > 1 and family.budgets_registers
-            and not target.tmem_columns and not family.pairs_product):
-        return None
-    two_tile, _ = tiled(1, 2)
-    if two_tile is not None and two_tile.stages >= 1 + family.loads_ahead + family.in_flight:
-        return two_tile
-    return None
-
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None, ragged: bool = False,
-            units: tuple[int, int, int] = (1, 1, 1), dense: bool = False) -> Tiles | None:
+            units: tuple[int, int, int] = (1, 1, 1), dense: bool = False,
+            programs: int | None = None) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
     in preference order, which share its facts but their loaders and registers) for a call whose output has
     `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
@@ -127,9 +115,6 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         held_tile = functools.partial(_held_tile, role=role, steps=steps, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
                                       target=target, programs=programs, price_of=price_of)
-        # rows the most its registers hold there and its stages keep busy, rows short of that balance (the
-        # width's held rows, or the balanced side where it holds more) giving way to the next narrower
-        # width, so a tile keeps its rows and narrows rather than shortening. mma.sync's one consumer at
         # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
         # (64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's 1.10-1.14, FSA100POST32). Where no width
         # stages busy at its balance, the widest staging busy at all, then the widest that holds.
@@ -142,17 +127,20 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # 0.73 to 0.999 of the cooperative tile's time at 1 to 32 rows a group, and 1.13 to 1.26 of it at 64.
     most = min(family.consumers, CONSUMERS)
     whole = rows >= family.role_rows if grouped else ragged or rows % (family.role_rows * most) == 0
-    # The most consumers the call takes, a cooperative tile holding each consumer's registers so its
     # balanced side, and with it each operand's reads a FLOP, at least one consumer's (CUTLASS's split, 2-7%
     # faster on every H100 scoreboard row); where no tile of theirs holds, one. Each at the most programs
-    # that hold its tile.
-    for consumers in dict.fromkeys((most if whole else 1, 1)):
-        if consumers == 1 and (two_tile := _decode_two_program(family, target, rows, tiled)) is not None:
-            return two_tile
-        held = [tiled(consumers, programs) for programs in range(family.programs(consumers), 0, -1)]
-        tile = next((tile for tile, balanced in held if balanced), None)
-        if tile := tile or next((tile for tile, _ in held if tile is not None), None):
-            return tile
+    from dew.nn.kernels import generation
+    with generation.as_target(target):
+        for consumers in dict.fromkeys((most if whole else 1, 1)):
+            # Default loop uses family's register-budget programs (raising cooperative wgmma/tgmm to
+            # scalar-floor 2 programs drops caps to 80/56 regs, fatal ptxas C7602); `MosaicGmm._tile`
+            # probes higher 1-consumer residencies via `pricing.max_programs` and prices plans together.
+            program_counts = (range(family.programs(consumers), 0, -1)
+                              if programs is None else (programs,))
+            held = [tiled(consumers, count) for count in program_counts]
+            tile = next((tile for tile, balanced in held if balanced), None)
+            if tile := tile or next((tile for tile, _ in held if tile is not None), None):
+                return tile
     return None
 
 

@@ -32,7 +32,7 @@ from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, O
 from dew.objectives.rl.scheduler import Asynchronous, RolloutScheduler
 from dew.objectives.rl.sessions import Status, pack
 from dew.sampling import Sampling
-from dew.training import Layout, Trainer
+from dew.training import Layout, Trainer, TrainerAdvanced
 
 VOCAB = 13
 STOP = 12
@@ -152,8 +152,10 @@ def rig(environment, verifier, *, tasks, log, workers=16, scheduler=RolloutSched
     stream = dataclasses.replace(stream, train=tapped(stream.train, registered))
 
     def fit(steps, checkpoints=None):
-        trainer = Trainer(target, optax.adam(1e-2), key=jax.random.key(3), rollout=rollout,
-                          layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints)
+        trainer = Trainer(target, optax.adam(1e-2), key=jax.random.key(3),
+                          advanced=TrainerAdvanced(rollout=rollout, layout=Layout(min_shard=1,
+                                                                                  tolerance=1.0)),
+                          checkpoints=checkpoints)
         return trainer.fit(stream, steps=steps, log_every=steps,
                            checkpoint_every=None if checkpoints is None else 1)
 
@@ -456,9 +458,9 @@ def test_a_server_whose_requests_repeat_prompts_shares_their_pages():
 
 def test_shared_pages_over_a_model_that_pages_keep_the_pages_and_format_they_name():
     """Shared pages over a model whose own layout pages lay its rows in the pages, pool and format they name
-    (`PagedKV(shared=True, page_size=..., pages=..., quantized=...)`), as pages that are not shared do (the
-    review of API02b: the model's own layout was kept, each named one dropped); and shared pages that keep
-    no prefix cache, which share nothing, are refused."""
+    (`PagedKV(shared=True, layout=KVCache(page_size=..., pages=..., quantized=...))`), as pages that are not
+    shared do (the review of API02b: the model's own layout was kept, each named one dropped); and shared
+    pages that keep no prefix cache, which share nothing, are refused."""
     from model_support import serving_task
 
     from dew.inference.serving import PAGE_SIZE, PagedRows
@@ -466,7 +468,8 @@ def test_shared_pages_over_a_model_that_pages_keep_the_pages_and_format_they_nam
     task = serving_task(capacity=2 * PAGE_SIZE)
     paged = dataclasses.replace(task, model=task.model.with_kv_cache(KVCache(page_size=8)))
     server = Server.from_task(paged, slots=2, capacity=2 * PAGE_SIZE,
-                              cache=PagedKV(shared=True, page_size=32, pages=64, quantized="int8"))
+                              cache=PagedKV(shared=True,
+                                            layout=KVCache(page_size=32, pages=64, quantized="int8")))
     layout = server.model.kv_cache
     assert isinstance(server.rows, PagedRows)
     assert (layout.page_size, layout.pages, layout.quantized) == (32, 64, "int8")

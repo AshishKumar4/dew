@@ -7,6 +7,26 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A run's surface names its everyday settings plainly and once (API03). `Trainer(objective, Muon(), lr=3e-4)`
+  takes an optimizer's spec with its rate, its schedule (`schedule=`, whose peak is `lr` where it names none)
+  and its clip beside it, and `accumulation`, `update_tokens`, `split`, `remat` and `microbatches` as its own
+  arguments; the rest is `advanced=TrainerAdvanced(...)` (layout, rollout, data resume, custom step, ...). A
+  rate, schedule or clip beside an `OptimConfig` or an Optax transformation is refused. `OptimConfig` holds
+  `lr`, `schedule`, `clip` and `decay_norms_and_biases` (off: norms and biases are spared, as before)
+  where it held `learning_rate`, `clip_grads` and `spared`; `TrainerConfig` holds `steps`, `epochs`,
+  `tokens`, `examples`, `max_tokens`, `accumulation`, `update_tokens`, `split`, `remat` and `microbatches`
+  where it held `horizon`, `update` and `fit`, `keep` as a `Keep`, `best` as one `Best`, and
+  `TrainerConfig.accumulation(dataset)` is `update_batches(dataset)`. On the command line each choice is a
+  subcommand of plain flags, no JSON: `optim.optimizer:muon --optim.optimizer.consistent-rms 0.2`,
+  `optim.schedule:cosine --optim.schedule.warmup-steps 100`, `trainer.precision:bf16-true`,
+  `--trainer.best.metric val/accuracy`, `--diagnostics.kernels.attention xla`. A run saved before reads as
+  it trained (`dew.config.earlier.earlier_surface`).
+
+- Numerics change (rows 12024, 12025): `dew.nn.kernels.gemm.symmetric_polynomial` on its portable XLA route
+  now accumulates `c0 * I + c1 * A + c2 * (A @ A)` in `at_least_fp32` and rounds once to `out_dtype`
+  (matching native Mosaic SYRK instead of narrowing coefficients and `A @ A` to bfloat16; float32 and
+  complex64 updates stay bit-equal). `dew.newton_schulz` AOL preconditioning now scales the Gram matrix via
+  the bitwise-symmetric outer product `a * (scale[:, None] * scale[None, :])`.
 - A beam search (`Beam`, any `Regrouping`) over a paged model decodes over its pool, sized for the search,
   each beam sharing its parent's written pages; only a pool split among groups, or a model that rebuilds
   its cache past a position, decodes unpaged. A pool named smaller than the search needs is refused.

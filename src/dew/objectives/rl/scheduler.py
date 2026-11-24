@@ -773,18 +773,18 @@ class RolloutScheduler:
         """Collect `groups` tool episodes of each `task_id` row at every call, in lock step under the
         step's variables, and train `objective` on them (`EpisodeCollector`; truncated episodes are
         masked), a group's prompt packed once where it shares (`scorer`). A `TextGeneration` policy serves
-        its cohort's turns over a paged cache (`EpisodeCollector.kv_cache`) in pages of `page_size` slots,
+        its cohort's turns over a paged cache (`EpisodeCollector.cache`) in pages of `page_size` slots,
         and where none is named wherever a server over pages shares its turns' histories ('shared',
         `served_layout`, one row a prompt):
         each turn prefills only what follows its row's history, where the policy drawn whole ('whole')
         prefills every turn's history again (row 5374)."""
-        from dew.inference.serving import named_cache, served_layout
+        from dew.inference.serving import PagedKV, named_cache, served_layout
         from dew.inference.tasks import TextGeneration
 
         if not isinstance(policy, TextGeneration) and page_size not in (None, "whole"):
             raise TypeError(f"a cohort served over pages of {page_size} slots serves a TextGeneration "
                             f"policy, not a {type(policy).__name__}")
-        # A served cohort draws one row a prompt (`EpisodeCollector.kv_cache`); a policy drawing more is
+        # A served cohort draws one row a prompt (`EpisodeCollector.cache`); a policy drawing more is
         # drawn whole where no page size is named. Its turns draw under the collector's `sampling`
         # (`_ServedTurns.over`), whose strategy the layout serves, not the policy's own (the review of
         # API02b: a speculative collector was laid on shared pages its policy's sampler took).
@@ -793,10 +793,11 @@ class RolloutScheduler:
         layout = (served_layout(drawn, max_prompt_tokens + max_new_tokens, named_cache(page_size))
                   if isinstance(drawn, TextGeneration) and (drawn.n == 1 or page_size is not None)
                   else None)
-        # A cohort over whole rows draws its policy whole.
-        layout = layout if layout is not None and layout.page_size is not None else None
+        # A cohort over whole rows draws its policy whole; one over pages is served over the layout laid,
+        # exactly (`PagedKV.layout`).
+        cache = PagedKV(layout=layout) if layout is not None and layout.page_size is not None else None
         collector = EpisodeCollector(policy, environment, verifier, max_prompt_tokens, max_new_tokens,
-                                     max_turns, sampling, record, journal, kv_cache=layout)
+                                     max_turns, sampling, record, journal, cache=cache)
         return cls(Synchronous(collector), groups=groups, credit=credit, log=log, scorer=objective)
 
     @property

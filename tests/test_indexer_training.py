@@ -42,7 +42,7 @@ from dew.nn.mla import INDEXER, indexer_kl
 from dew.nn.sparse_selection import top_k_keys
 from dew.objectives.base import Step
 from dew.objectives.lm import IndexerTraining, LMObjective
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from tools.indexer_reference import published_inputs, published_keep
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "indexer"
@@ -527,7 +527,7 @@ def test_the_warmup_trains_through_the_trainer():
     trainer = Trainer(
         LMObjective(model, SEQ, indexer=IndexerTraining("warmup")), optax.adam(1e-2),
         key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
-        layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
+        advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)), tracker=tracker)
     # The state fit starts from: the jitted init, whose initializers fuse
     # differently from an eager one at the last bit.
     initial, _, _ = trainer.place()
