@@ -1569,9 +1569,9 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call, reads=None):
     keyed = largest_live_set(
         product_fragments(call, (held, chunk, chunk), (held, chunk, call.block)),
         product_fragments(call, (held, chunk, chunk), (given, chunk, call.block)))
-    # Under reads of their own a block's reads in fp32 beside its keys, and the reads' gradient beside the
-    # keys' as both are stored.
-    apart = [f32(chunk, call.block)] * (2 * reading)
+    # Under reads of their own a block's reads in fp32 beside its keys; the reads' gradient and the keys' are
+    # stored in turn through one landing (`algebra.keys_gradient`), neither beside the other.
+    apart = [f32(chunk, call.block)] * reading
     held_tiles = Held(phases=(
         held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4 + apart
         + keyed,
