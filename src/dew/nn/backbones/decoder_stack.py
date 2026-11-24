@@ -277,12 +277,12 @@ class Loop:
 
     With `gathered`, a block whose parameters fully sharded data parallelism splits (the run's FSDP axis,
     `dew.mesh.FSDP_AXIS`) reads them gathered whole over that axis once, before its first pass, and every
-    pass reads that one copy (`looping.run_loop`): no gather inside the passes' scan, and the passes'
-    weight gradients summed where they meet, the copy's, before the one reduce-scatter back to the
-    parameters' placement after the loop, where each pass gathered and reduce-scattered its own. Up to
-    `steps` times fewer bytes over the FSDP axis for the block; the copy and its gradient held whole over
-    that axis throughout the loop, which the block's memory must allow (an opt-in for a block that fits). The
-    gradient is the same sum, summed in another order (passes, then devices). It gathers the parameters as
+    pass reads that one copy (`looping.run_loop`): no all-gather inside the passes' loop, forward or
+    recomputed, where each pass gathered its own (`steps` times the block's gathers). The passes' weight
+    gradients are still reduced over the data each pass, as without it: on an Auto mesh the loop's carried
+    gradient of the copy is placed whole, so each pass's partial sum is reduced into it. The copy held whole
+    over that axis throughout the loop, which the block's memory must allow (an opt-in for a block that
+    fits). The gradient is the same sum, summed in another order. It gathers the parameters as
     the step reads them: a run's narrow copies (`dew.training.narrow`), the compute dtype's, where it holds
     them, else the stored dtype. The prelude, the coda (each pass's too, under `exiting`) and the embedding
     and head keep their placement, as does a quantized stored kernel.

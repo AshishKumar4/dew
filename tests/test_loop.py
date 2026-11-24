@@ -1151,8 +1151,8 @@ def _gathered_case(*, gathered: bool, remat: bool):
 def test_a_gathered_loop_reads_its_block_gathered_once(remat):
     """A looped block whose parameters fully sharded data parallelism splits, with `Loop.gathered`, reads
     them gathered once before its passes: its training step's pass loop (the `while` of its three later
-    passes), its body and all it calls, holds no collective, where the same step without it gathers there
-    each pass, each pass and layer recomputed or not
+    passes), its body and all it calls, holds no all-gather, where the same step without it gathers there
+    each pass, and no more of the passes' gradient reductions, each pass and layer recomputed or not
     (row 12722: the gather is not sunk back into a checkpointed body). Every leaf split eight ways
     (`Layout(min_shard=1)`)."""
     from dew.distributed.placement import Layout
@@ -1171,7 +1171,10 @@ def test_a_gathered_loop_reads_its_block_gathered_once(remat):
         with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
             text = jax.jit(gradient).lower(variables, ids, cotangent).compile().as_text()
         found[gathered] = _collectives_in_loop(text, 3)
-    assert found[False]["all-gather"] and not found[True], found
+    assert found[False]["all-gather"] and not found[True]["all-gather"], found
+    # The passes' gradient reductions as without it (`Loop.gathered`), none added.
+    assert found[True]["all-reduce"] + found[True]["reduce-scatter"] <= (
+        found[False]["all-reduce"] + found[False]["reduce-scatter"]), found
 
 
 @pytest.mark.mesh(devices=8)
