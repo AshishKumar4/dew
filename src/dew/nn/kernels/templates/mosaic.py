@@ -181,6 +181,29 @@ _STAGING: contextvars.ContextVar[bool] = contextvars.ContextVar("staging", defau
 """Whether a consumer's staged tiles are stored unpublished (`Family.staged_together`)."""
 
 
+def _disjoint(buffers: Sequence) -> None:
+    """Refuse `buffers` where two may alias: the same ref twice, unless each takes a constant leading index
+    of its own (a stack of tiles' distinct entries)."""
+    seen: dict[int, list] = {}
+    for buffer in buffers:
+        base = getattr(buffer, "ref", buffer)
+        leading = _leading_index(buffer)
+        for other in seen.get(id(base), []):
+            if leading is None or other is None or leading == other:
+                raise ValueError("a staged batch's buffers alias one another: each a buffer of its own")
+        seen.setdefault(id(base), []).append(leading)
+
+
+def _leading_index(buffer) -> int | None:
+    """A view's constant index into its ref's leading axis (`ref.at[i]`'s), None where it takes none."""
+    for transform in getattr(buffer, "transforms", ()):
+        indices = getattr(transform, "indices", None)
+        if indices:
+            first = indices[0]
+            return int(first) if isinstance(first, int) else None
+    return None
+
+
 def issuing() -> None:
     """A product about to read shared memory asynchronously (warpgroup MMA, tcgen05): refused within
     `Family.staged_together`, whose stores its read would take unfenced."""
@@ -2142,8 +2165,16 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         """The depths a step may take for operands of `dtype`, widest first: the swizzles its products
         read a block's rows at."""
 
-    def _store_staged(self, value: jax.Array, buffer) -> None:
+    def _store_staged(self, value: jax.Array, buffer, *, bracketed: bool = True) -> None:
+        del bracketed  # Mosaic GPU brackets an optimized store itself
         buffer[...] = value.astype(buffer.dtype)
+
+    @property
+    def brackets_staged(self) -> bool:
+        """Whether its staged stores take the warpgroup's barriers from its own code rather than Mosaic GPU's
+        automatic ones (`_store_staged`'s unoptimized stores, mma.sync's): a batch of them then takes one
+        pair for all (`staged_all`)."""
+        return False
 
     def staged(self, value: jax.Array, buffer) -> Ref:
         """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register
@@ -2155,6 +2186,25 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         if not _STAGING.get():
             self.published()
         return buffer
+
+    def staged_all(self, pairs: Sequence[tuple[jax.Array, Ref]]) -> list[Ref]:
+        """Each value of `pairs` in its buffer, for products to read, written as one batch and published once:
+        no value read and no product issued between its stores (its values computed before it). An issuer
+        that brackets its stores itself (`brackets_staged`, mma.sync's) takes one barrier before the batch's
+        first store (every warp's reads of the buffers done) and one after its last (every warp's stores
+        seen), where `staged` takes a pair a store (a Kimi intra step's 20 a trip, FS-INTRA-BAR1). Buffers
+        that may alias (one ref twice, its leading indices not two distinct constants) are refused."""
+        buffers = [buffer for _, buffer in pairs]
+        _disjoint(buffers)
+        bracketed = self.brackets_staged
+        if bracketed:
+            synced(interpret=False)
+        for value, buffer in pairs:
+            self._store_staged(value, buffer, bracketed=False)
+        self.published()
+        if bracketed:
+            synced(interpret=False)
+        return buffers
 
     @contextlib.contextmanager
     def staged_together(self) -> Iterator[None]:

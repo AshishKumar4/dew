@@ -514,17 +514,26 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         (`rows_whole`); fewer row warps read element-wise, as the relay path does."""
         return self._matrix_loads and self.rows_whole
 
-    def _store_staged(self, value: jax.Array, buffer) -> None:
+    def _store_staged(self, value: jax.Array, buffer, *, bracketed: bool = True) -> None:
         cast = value.astype(buffer.dtype)
-        if self.rows_whole or launches.interpreting():
+        if not self.brackets_staged:
             buffer[...] = cast
             return
         # Unoptimized store is not bracketed by automatic barriers like `buffer[...] =`: the sync before
         # keeps a warp from overwriting a column another still reads (WAR), and the sync after keeps a
-        # subsequent read from preceding every warp's store (RAW).
-        mosaic.synced(interpret=False)
+        # subsequent read from preceding every warp's store (RAW); a batch's own pair brackets its stores
+        # at once (`Family.staged_all`, `bracketed` false).
+        if bracketed:
+            mosaic.synced(interpret=False)
         plgpu.store(buffer, cast, optimized=False)
-        mosaic.synced(interpret=False)
+        if bracketed:
+            mosaic.synced(interpret=False)
+
+    @property
+    def brackets_staged(self) -> bool:
+        # Its unoptimized stores, which Mosaic GPU brackets with no barriers of its own (a whole-row
+        # store, `rows_whole`, it does).
+        return not self.rows_whole and not launches.interpreting()
 
     def product_with[T](self, lhs, rhs, shape: tuple[int, int], between: Callable[[], T], *,
                         pending: int = 0) -> tuple[T, jax.Array]:
