@@ -275,6 +275,12 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     an sm80 64 x 192 x 64 normed, biased one-consumer grouped forward from 244 modeled registers to 255, 32
     bytes spilled (rows 5623, 7091)."""
 
+    def side_bytes(self, dtype) -> int:
+        # A full register a value in its accumulator's MMA layout (`side_tile`): an sm86 residual forward
+        # priced at a bf16 side's width spilled 648 bytes at 64 x 192 (row 12689's gate).
+        del dtype
+        return 4
+
     held_registers = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry), a measured whole (`scalars_whole`): CUTLASS's cooperative sm90 kernel's 168
