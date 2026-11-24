@@ -176,10 +176,12 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
                          whole=(1, 2, 3))
     count = rows.shape[0]
     laid = jnp.pad(rows, ((0, -count % SCALE_DEPTH), (0, 0)))
-    # Its padding zero rows the backward keeps out of every gradient (`_chain_backward`'s live rows).
+    # Its padding zero rows the backward keeps out of every gradient (`_chain_backward`'s live rows),
+    # compiled for a GPU (never interpreted: a run's recipe).
+    interpret = False
     w_ins = (up[None],) if gate is None else (gate[None], up[None])
     blocks = jnp.full((1,), laid.shape[0] // SCALE_DEPTH, jnp.int32)
-    return _blockwise_chain(laid, w_ins, down[None], blocks, activation, jnp.dtype(out_dtype), False,
+    return _blockwise_chain(laid, w_ins, down[None], blocks, activation, jnp.dtype(out_dtype), interpret,
                             count)[:count]
 
 
