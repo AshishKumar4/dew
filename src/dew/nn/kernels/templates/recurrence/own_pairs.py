@@ -345,29 +345,32 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                 own_bands(queries, (keyed, decayed), betas, summed, products=products,
                           unit_pairs=call.unit_pairs)
 
-            @pl.when(index == steps - 1)
-            def _():
-                # Each output's blocks a sub-chunk, compact (`[C, SUB]` at the head's columns).
-                for o, (name, ref) in enumerate(zip(products, outs, strict=True)):
-                    form = forms[name]
-                    views = tuple(form.views(ref, row, chunk, h * algebra.SUB, algebra.SUB))
-                    if name == "system":
-                        if threaded:
-                            # Each thread a column of a sub-chunk's block's inverse, from the summed blocks.
-                            _inverses_written(threaded[-1].at[o], views, parts=form.parts)
-                        else:
-                            _inverses_stored(call, bands[o], views, form)
-                        continue
-                    if threaded and form.parts == 1:
-                        # A one-part form copied from the summed blocks straight, scaled and rounded as each
-                        # word is copied: no landing.
-                        copied_by_thread(threaded[-1].at[o], views[0], scale=scale)
-                        continue
-                    block = family.tile_of(threaded[-1].at[o]) if threaded else bands[o]
-                    masked = algebra.block_masked(block, strict=False, scale=scale)
-                    _blocks_written(call, masked, views, form, landing[name])
-
             return bands, accumulators
+
+        def read(bands, totals):
+            """Each output's blocks a sub-chunk, compact (`[C, SUB]` at the head's columns), once the walk is
+            done: inside its last step, the walk's state live beside the system's inversion held a Kimi
+            Linear thread at 256 to 472 bytes of spills on an H100 and a B200 at every residency the
+            derivation tried (no tiles derived, the resource gate's)."""
+            del totals
+            for o, (name, ref) in enumerate(zip(products, outs, strict=True)):
+                form = forms[name]
+                views = tuple(form.views(ref, row, chunk, h * algebra.SUB, algebra.SUB))
+                if name == "system":
+                    if threaded:
+                        # Each thread a column of a sub-chunk's block's inverse, from the summed blocks.
+                        _inverses_written(threaded[-1].at[o], views, parts=form.parts)
+                    else:
+                        _inverses_stored(call, bands[o], views, form)
+                    continue
+                if threaded and form.parts == 1:
+                    # A one-part form copied from the summed blocks straight, scaled and rounded as each
+                    # word is copied: no landing.
+                    copied_by_thread(threaded[-1].at[o], views[0], scale=scale)
+                    continue
+                block = family.tile_of(threaded[-1].at[o]) if threaded else bands[o]
+                masked = algebra.block_masked(block, strict=False, scale=scale)
+                _blocks_written(call, masked, views, form, landing[name])
 
         def prologue():
             if shifts:
@@ -379,7 +382,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
 
         carry = (() if by_thread(call)
                  else tuple(family.as_tile(family.zeros((chunk, algebra.SUB))) for _ in products))
-        return mosaic.Walk(views, step, steps=steps, carry=carry, prologue=prologue)
+        return mosaic.Walk(views, step, steps=steps, carry=carry, prologue=prologue, read=read)
 
     blocks = pair_streams(call, keys, queries=scored)
     # Each output's pairs a key a term, a sub-chunk's offsets: the model's.
