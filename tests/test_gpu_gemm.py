@@ -166,7 +166,7 @@ def native_syrk_holds_check_1_on_this_gpu(polynomial: bool, transpose: bool):
         return y, pull(cot.astype(out_dtype))[0]
 
     assert_as_exact(jax.jit(run_dew), jax.jit(run_plain), draw,
-                    f"native syrk poly={polynomial} tr={transpose}", seeds=4,
+                    f"native syrk poly={polynomial} tr={transpose}", seeds=8,
                     truth_fn=functools.partial(run_plain, dtype=jnp.float64, out_dtype=jnp.float64))
 
 
@@ -195,7 +195,7 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
         return jax.lax.dot(x.astype(wide), w.astype(wide), preferred_element_type=wide).astype(out)
 
     assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x2560",
-                    seeds=4, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+                    seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 def _syrk_and_tail_cells():
     return [
