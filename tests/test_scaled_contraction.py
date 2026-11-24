@@ -148,21 +148,78 @@ def test_a_divisor_past_the_format_divides_its_cotangent_finite():
     np.testing.assert_array_equal(np.asarray(pull(big)[0]), 0.5)
 
 
+BATCHED_MEAN = Form(("bk", "bkd"), ((1, (((0, 1),), ((1, 1),))),), "bd", divisor=((1, (((0, 1),),)),),
+                   divided="b")
+"""`MEAN` a batch row apiece."""
+
+SPREAD = [[2.0 ** 127], [-(2.0 ** 127)], [2.0 ** -30], [0.0]]
+"""Values that cancel past fp32's range beside a part far beneath them (row 12452's witness)."""
+
+
 def test_a_part_beneath_values_that_cancel_survives_them_at_every_order():
     """A mean of four unit masses over values `[2^127, -2^127, 2^-30, 0]` is `2^-32`: the values contracted a
-    band at a time (`scaled_contraction._banded`), the pair that cancels in one band, `2^-30` in another,
-    where one exponent for the group (`2^127`) flushed it and gave 0 (row 12452). So is the tangent of a
-    mean of values all `2^127` along that direction (the reference's value-only tangent, the row's witness),
-    and the gradient along the masses, `(v_k - mean) / 4`."""
+    band at a time into exponent bins (`scaled_contraction._banded`), where one exponent for the group
+    (`2^127`) flushed `2^-30` and gave 0 (row 12452). So is the tangent of a mean of values all `2^127`
+    along that direction (the reference's value-only tangent, the row's witness); the gradient along the
+    masses is `(v_k - mean) / 4`, and its tangent along the values the same of the direction, at second
+    order; each batch row's under `vmap` as alone."""
     masses = jnp.ones(4, jnp.float32)
-    spread = jnp.asarray([[2.0 ** 127], [-(2.0 ** 127)], [2.0 ** -30], [0.0]], jnp.float32)
+    spread = jnp.asarray(SPREAD, jnp.float32)
+    large = jnp.full((4, 1), 2.0 ** 127, jnp.float32)
     np.testing.assert_array_equal(np.asarray(contract(MEAN, masses, spread)), [2.0 ** -32])
-    _, tangent = jax.jvp(lambda v: contract(MEAN, masses, v), (jnp.full((4, 1), 2.0 ** 127, jnp.float32),),
-                         (spread,))
+    _, tangent = jax.jvp(lambda v: contract(MEAN, masses, v), (large,), (spread,))
     np.testing.assert_array_equal(np.asarray(tangent), [2.0 ** -32])
+    pulled = np.asarray([2.0 ** 125, -(2.0 ** 125), 3 * 2.0 ** -34, -(2.0 ** -34)], np.float32)
     found = jax.grad(lambda m: contract(MEAN, m, spread)[0])(masses)
-    np.testing.assert_array_equal(np.asarray(found), np.asarray(
-        [2.0 ** 125, -(2.0 ** 125), 3 * 2.0 ** -34, -(2.0 ** -34)], np.float32))
+    np.testing.assert_array_equal(np.asarray(found), pulled)
+    _, second = jax.jvp(lambda v: jax.grad(lambda m: contract(MEAN, m, v)[0])(masses), (large,), (spread,))
+    np.testing.assert_array_equal(np.asarray(second), pulled)
+    rows = jax.vmap(lambda v: contract(MEAN, masses, v))(jnp.stack([spread, large]))
+    np.testing.assert_array_equal(np.asarray(rows), [[2.0 ** -32], [2.0 ** 127]])
+
+
+def test_band_pairs_join_from_the_largest_whatever_their_order():
+    """A mean whose products are `+2^121`, `2^-54` and `-2^121` (masses `[2^-6, 2^-126, 2^50]`, values
+    `[2^127, 2^72, -2^71]`) is `2^-104`: the band pairs come in mixed-radix order, `2^-54`'s between the two
+    that cancel, and each lands in its own exponent bin, the bins joined from the largest, where joined as
+    they came `2^-54` was flushed beside `2^121` and the mean was 0 (review of #3967, P0)."""
+    masses = jnp.asarray([2.0 ** -6, 2.0 ** -126, 2.0 ** 50], jnp.float32)
+    values = jnp.asarray([[2.0 ** 127], [2.0 ** 72], [-(2.0 ** 71)]], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(MEAN, masses, values)), [2.0 ** -104])
+
+
+def test_a_non_finite_row_leaves_the_others_banded():
+    """Beside a row whose value is infinite (its mean IEEE's, `inf`), a row whose values cancel past the
+    format keeps its `2^-32`: the banded sum reads non-finite values as none and the IEEE result is laid over
+    its own outputs alone, where one infinite value anywhere took every row unbanded (review of #3967, P2)."""
+    masses = jnp.ones((2, 4), jnp.float32)
+    values = jnp.asarray([SPREAD, [[jnp.inf], [1.0], [1.0], [1.0]]], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(BATCHED_MEAN, masses, values)),
+                                  [[2.0 ** -32], [np.inf]])
+
+
+def test_a_term_of_more_band_pairs_than_int32_counts_is_summed_unbanded():
+    """A product of nine groups, each over values a hundred binades apart, sums to `1 + 2^-900`, 1: its band
+    pairs past what int32 counts (`_band` 0), the term is summed unbanded, where its pairs' count wrapped
+    negative and the sum stopped before its first (review of #3967, P1)."""
+    form = Form(("k",) * 9, ((1, tuple(((index, 1),) for index in range(9))),), "")
+    operand = jnp.asarray([1.0, 2.0 ** -100], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(form, *(operand,) * 9)), 1.0)
+
+
+def test_a_banded_sum_holds_its_rows_varying_types_in_a_shard_map():
+    """Batch rows split over two devices in a `shard_map` with its varying types checked: each row's banded
+    mean its own (`2^-32` for the values that cancel, `2^127` for values all `2^127`), the band loops'
+    carries typed as the rows they sum (review of #3967, P1)."""
+    from jax.sharding import PartitionSpec
+
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    masses = jnp.ones((2, 4), jnp.float32)
+    values = jnp.asarray([SPREAD, [[2.0 ** 127]] * 4], jnp.float32)
+    rows = PartitionSpec("data")
+    found = jax.jit(jax.shard_map(lambda m, v: contract(BATCHED_MEAN, m, v), mesh=mesh, in_specs=(rows, rows),
+                                  out_specs=rows, check_vma=True))(masses, values)
+    np.testing.assert_array_equal(np.asarray(found), [[2.0 ** -32], [2.0 ** 127]])
 
 
 def test_terms_that_cancel_keep_the_term_beneath_them():

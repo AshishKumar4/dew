@@ -19,11 +19,13 @@ letters (`_transpose`). No order takes a quotient, a power or a sum outside it, 
 (2^-200 at a mass of 2^100, zero) or a cotangent's sum past the format before the factor that brings it
 back (the reference's mean, `attention.held_mean`).
 
-A term's group whose values span more binades than a band (`_band`) is contracted a band of each group at a
-time, each band pair at its own power of two, and every term's contractions joined as double floats at their
-own powers from the largest (`windows.joined`, `_banded`): so terms that cancel keep a part any number of
-binades beneath them (`2^127 - 2^127 + 2^-30` is `2^-30`, where one exponent for the group flushed it, row
-12452). Within a band a contraction rounds as an fp32 sum does (`2^127 + 2^100 - 2^127`, one band, is 0).
+In float32 the terms are joined as double floats from the largest at each output (`_descending`), and a
+term whose group's values span more binades than a band (`_band`) is contracted a band of each group at a
+time, each band pair's sum added into the exponent bin of its own magnitude at each output, the bins joined
+from the largest (`_banded`): so whatever order the pairs come in, terms that cancel keep a part any number
+of binades beneath them (`2^127 - 2^127 + 2^-30` is `2^-30`, where one exponent for the group flushed it, row
+12452). Within a band pair a contraction rounds as an fp32 sum does (`2^127 + 2^100 - 2^127` in one pair is
+0), and within a bin its pairs as a double float does.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ from jax.interpreters import ad, batching, mlir
 
 from dew.algebra import windows
 from dew.nn.float_bits import binade_of, float_bits
-from dew.nn.precision import at_least_fp32, exact_float32, power2
+from dew.nn.precision import at_least_fp32, exact_float32, power2, two_sum
 
 Factor = tuple[int, int]
 """An operand's index and its power, `+1` or `-1`; or `0`, an int32 operand of exponents its group's
@@ -124,11 +126,28 @@ def _held(form: Form, group: tuple[Factor, ...], arrays: Sequence[jax.Array], dt
     return letters, significand, jnp.where(live, exponent - largest, 0), jnp.squeeze(largest, summed)
 
 
-def _band(groups: int) -> int:
-    """The binades a group's band spans in a term of `groups` groups: each group's banded significand at
-    least `2^-band` its band's largest times `2^-n`, so the term's product of one band of each stays a
-    normal fp32 (`groups` bands and their factors' `2^-n` beneath `2^-120`)."""
-    return 120 // groups - 4
+BIN = 24
+"""The binades an exponent bin of the banded sum spans (`_banded`): fp32's significand, so a bin's
+contributions, each within it, add as a double float whose cancellations are exact."""
+
+SPAN = 640
+"""The binades beneath its top (`HEADROOM` over the terms' largest) the banded sum's bins reach: past two
+fp32 operands' products of the format's largest (2^254) to its least subnormal (2^-149) and its count."""
+
+HEADROOM = 64
+"""The binades a contraction's sum may rise above its term's exponent: its factors' significands within
+`[2^-n, 2^n]` and its count's (at most 2^31) bits, beneath 64 for every term a form names."""
+
+
+def _band(groups: tuple) -> int:
+    """The binades a group's band spans in a term of `groups` (each `_held`'s group, its factors counted):
+    a band pair's product of significands each within `[2^-(band + n), 2^n]` stays a normal fp32
+    (`2^-120`); 0 where the term's groups and factors leave no band of at least 8, or more band pairs than
+    int32 counts (its sum taken unbanded)."""
+    factors = sum(len(group) for group in groups)
+    width = (120 - factors) // len(groups)
+    # Its pairs counted in int32 (`_banded`): a term of more groups than that holds taken unbanded too.
+    return width if width >= 8 and (SPAN // width + 1) ** len(groups) < 2 ** 31 else 0
 
 
 def _dtype(arrays) -> jnp.dtype:
@@ -139,11 +158,11 @@ def _dtype(arrays) -> jnp.dtype:
 
 def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
     """`terms`' signed sum over `out` unlanded: its significands' sum and the exponent it lies at. Each
-    term's groups held apart from their binades (`_held`) and contracted at their exponents' largest, the
-    terms joined as double floats at their own powers; where a group's values span more than a band
-    (`_band`) every term contracted a band pair at a time and joined so (`_banded`), so a part beneath terms
-    that cancel survives them. In float32 (a float64 sum's one exponent spans the float32 operands it takes;
-    its terms joined at their largest)."""
+    term's groups held apart from their binades (`_held`) and contracted at their exponents' largest; in
+    float32 the terms joined as double floats from the largest at each output (`_descending`), and where a
+    group's values span more than a band (`_band`) the sum taken again a band pair at a time into exponent
+    bins (`_banded`), so a part beneath terms that cancel survives them. A non-finite output IEEE's, as one
+    exponent lands it; a float64 sum's one exponent spans the float32 operands it takes."""
     precision = PRECISION if dtype == jnp.float32 else jax.lax.Precision.HIGHEST
     shaped = Form(form.subscripts, terms, out)
     held = [[_held(shaped, group, arrays, dtype) for group in groups] for _, groups in terms]
@@ -164,55 +183,88 @@ def _sum(arrays, form: Form, terms: tuple[Term, ...], out: str, dtype):
     landed = sum((power2(summed, scale - joined) for summed, scale in parts), jnp.zeros((), dtype))
     if dtype != jnp.float32:
         return landed, joined
-    # The terms joined as double floats at their own powers (`windows.joined`), so terms that cancel keep a
-    # part beneath them; a non-finite sum IEEE's, as landed.
-    high, low, exponent = functools.reduce(windows.joined, [
-        (summed, jnp.zeros_like(summed), jnp.where(summed != 0, scale, 0)) for summed, scale in parts])
     special = ~jnp.isfinite(landed)
-    landed, joined = jnp.where(special, landed, high + low), jnp.where(special, joined, exponent)
-    # A band past the first in any group, and every value finite: the sum again a band pair at a time.
-    spans = [functools.reduce(jnp.maximum, [jnp.max(-offset, initial=0) for _, _, offset, _ in groups])
-             // _band(len(groups)) for groups in held]
-    finite = jnp.all(jnp.asarray([jnp.all(jnp.isfinite(significand))
-                                  for groups in held for _, significand, _, _ in groups]))
-    return jax.lax.cond(finite & (functools.reduce(jnp.maximum, spans) > 0),
-                        lambda: _banded(terms, held, scales, contracted),
-                        lambda: (landed, joined))
+    high, low, exponent = _descending(parts)
+    plain = jnp.where(special, landed, high + low), jnp.where(special, joined, exponent)
+    # A band past the first in a group of a term a band holds: the sum again a band pair at a time.
+    wide = [functools.reduce(jnp.maximum, [jnp.max(-offset, initial=0) for _, _, offset, _ in parts])
+            >= _band(groups) for (_, groups), parts in zip(terms, held, strict=True) if _band(groups)]
+    if not wide:
+        return plain
+    banded = jax.lax.cond(functools.reduce(jnp.logical_or, wide),
+                          lambda: _banded(terms, held, scales, contracted), lambda: plain)
+    return jnp.where(special, landed, banded[0]), jnp.where(special, joined, banded[1])
+
+
+def _descending(parts: list) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`parts` (each a sum and the exponent it lies at, `LEAST` a zero's) joined as double floats at their
+    own powers (`windows.joined`), at each output from the largest down: a part joined beside one that a
+    later part cancels kept no bit beneath the double float's reach, so in that order none is."""
+    if len(parts) == 1:
+        summed, scale = parts[0]
+        return summed, jnp.zeros_like(summed), jnp.where(summed != 0, scale, 0)
+    sums = jnp.stack([summed for summed, _ in parts])
+    scales = jnp.stack([scale for _, scale in parts])
+    order = jnp.argsort(-jnp.where(sums != 0, scales + binade_of(sums), LEAST), axis=0, stable=True)
+    sums, scales = (jnp.take_along_axis(x, order, axis=0) for x in (sums, scales))
+    return functools.reduce(windows.joined, [
+        (sums[at], jnp.zeros_like(sums[at]), jnp.where(sums[at] != 0, scales[at], 0))
+        for at in range(len(parts))])
 
 
 def _banded(terms: tuple[Term, ...], held: list, scales: list, contracted) -> tuple[jax.Array, jax.Array]:
-    """`_sum`'s terms contracted a band of each group at a time (`_band`: a value whose offset beneath its
-    group's largest lies in `[-(i + 1) band, -i band)` in band `i`, raised `2^(i band)`), each band pair's sum
-    at its own power of two joined into the total as double floats (`windows.joined`), the terms' pairs in
-    one `lax.while_loop` from each term's first: its program one contraction of each term whatever the
-    bands, and a part beneath a pair that cancels kept to the double floats' reach."""
-    bands = [[(-offset) // _band(len(groups)) for _, _, offset, _ in groups] for groups in held]
-    counts = [[jnp.max(band, initial=0) + 1 for band in term] for term in bands]
-    pairs = jnp.stack([functools.reduce(jnp.multiply, term) for term in counts])
-    zero = scales[0] - scales[0]
+    """`_sum`'s terms contracted a band of each group at a time (`_band`: a finite value whose offset
+    beneath its group's largest lies in `[-(i + 1) band, -i band)` in band `i`, raised `2^(i band)`; one
+    past `SPAN` none), each band pair's sum added into the exponent bin of its magnitude at each output
+    (`BIN` binades from `HEADROOM` over the terms' largest, `SPAN` beneath it, as double floats at the bin's
+    power), the bins joined from the largest down (`windows.joined`): so whatever order the pairs come in, a
+    part beneath pairs that cancel keeps its bin's double float. A term no band holds adds its one sum.
+    Each term's pairs one `lax.while_loop` (its program one contraction whatever the bands), its count
+    within `SPAN // band + 1` a group, the loops' carries typed from the terms' own reductions."""
+    top = functools.reduce(jnp.maximum, scales) + HEADROOM
+    bins = SPAN // BIN + 1
+    zero = (top - top).astype(jnp.float32)
+    state = (jnp.zeros((bins, *zero.shape), jnp.float32) + zero,) * 2
 
-    def pair(t: int, at):
-        """Term `t`'s band pair `at` (its groups' bands in mixed radix of their counts), its double float."""
-        sign, _ = terms[t]
-        significands, raised, rest = [], 0, at
-        for (_, significand, offset, _), band, count in zip(held[t], bands[t], counts[t], strict=True):
-            index = rest % count
-            rest = rest // count
-            width = _band(len(held[t]))
-            significands.append(jnp.where(band == index, power2(significand, offset + index * width), 0))
-            raised = raised + index * width
-        summed = sign * contracted(held[t], significands)
-        return summed, jnp.zeros_like(summed), jnp.where(summed != 0, scales[t] - raised, 0)
+    def added(state, summed, power):
+        """`summed * 2^power` at each output added into its bin."""
+        binade = jnp.where(summed != 0, power + binade_of(summed), top - SPAN - BIN)
+        index = jnp.clip((top - 1 - binade) // BIN, 0, bins - 1)
+        laid = jnp.arange(bins, dtype=jnp.int32).reshape(bins, *(1,) * zero.ndim)
+        reference = top - (laid + 1) * BIN
+        contribution = jnp.where(index == laid, power2(summed, power - reference), 0)
+        high, error = two_sum(state[0], contribution)
+        return high, state[1] + error
 
-    def step(state):
-        t, at, total = state
-        total = jax.lax.switch(t, [lambda at, total, t=t: windows.joined(total, pair(t, at))
-                                   for t in range(len(terms))], at, total)
-        moved = at + 1 >= pairs[t]
-        return jnp.where(moved, t + 1, t), jnp.where(moved, 0, at + 1), total
+    for t, ((sign, groups), parts) in enumerate(zip(terms, held, strict=True)):
+        width = _band(groups)
+        finite = [jnp.where(jnp.isfinite(significand), significand, 0) for _, significand, _, _ in parts]
+        offsets = [offset for _, _, offset, _ in parts]
+        if not width:
+            summed = contracted(parts, [power2(significand, offset)
+                                        for significand, offset in zip(finite, offsets, strict=True)])
+            state = added(state, sign * summed, scales[t])
+            continue
+        most = SPAN // width
+        bands = [(-offset) // width for _, _, offset, _ in parts]
+        counts = [jnp.minimum(jnp.max(band, initial=0), most) + 1 for band in bands]
+        pairs = functools.reduce(jnp.multiply, counts)
 
-    start = (jnp.int32(0), jnp.int32(0), (zero.astype(jnp.float32), zero.astype(jnp.float32), zero))
-    _, _, (high, low, exponent) = jax.lax.while_loop(lambda state: state[0] < len(terms), step, start)
+        def step(carry, t=t, sign=sign, parts=parts, finite=finite, bands=bands, counts=counts, width=width):
+            at, state = carry
+            significands, raised, rest = [], 0, at
+            for significand, (_, _, offset, _), band, count in zip(finite, parts, bands, counts, strict=True):
+                index = rest % count
+                rest = rest // count
+                significands.append(jnp.where(band == index, power2(significand, offset + index * width), 0))
+                raised = raised + index * width
+            return at + 1, added(state, sign * contracted(parts, significands), scales[t] - raised)
+
+        _, state = jax.lax.while_loop(lambda carry, pairs=pairs: carry[0] < pairs, step,
+                                      (pairs - pairs, state))
+    reference = top - (jnp.arange(bins, dtype=jnp.int32).reshape(bins, *(1,) * zero.ndim) + 1) * BIN
+    high, low, exponent = functools.reduce(windows.joined, [
+        (state[0][at], state[1][at], reference[at]) for at in range(bins)])
     return high + low, exponent
 
 
