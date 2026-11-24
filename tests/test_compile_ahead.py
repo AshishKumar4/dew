@@ -967,9 +967,10 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
     the frontier then tried at fewer microbatches; and the run, which times nothing, is left at its plan.
     With room for one microbatch, and with room for what two microbatches and the sibling at two need at
     'full', their head tiled, and less than one needs (each measured, `need_ahead`), where the plan's
-    compile at one did not fit. Tiled, as the plan's fit there takes it: on cuBLAS's GEMMs the untiled
-    head's workspace makes the offloaded sibling at two need more than 'full' at one, so only the tiled
-    head has a room where 'full' takes two microbatches and the sibling fits."""
+    compile at one did not fit. Its head tiled from the start, as the fused tiled head's plan beside it
+    is: the untiled head's need falls with every microbatch, of which its rows allow any count they divide
+    (`planning.splits`), so its own rung fits at some count, and only a step starting at the tiled head has
+    a room where 'full' takes two microbatches and the sibling fits."""
     from dew.nn.backbones.decoder_block import REMAT_POLICIES, remat_record
     from dew.objectives.base import head_fused_of, head_tile_of
     from dew.training.ahead import compile_ahead
@@ -984,6 +985,8 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
         assert capacity < one, (one, two, sibling)
     trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=capacity)), split="auto", remat="full",
                         vocab=TILED_VOCAB)
+    if several:
+        trainer.objective.tile_head()
     ahead = compile_ahead(trainer, token_rows(TILED_VOCAB, TILED_BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
