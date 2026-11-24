@@ -377,8 +377,7 @@ def _gathered_passes(model, every_pass: Callable, x, inputs: dict, gathered: Cal
     the axis once after the loop (`Loop.gathered`); `inputs`' arrays held whole on every device of the axis,
     and what the passes write (their sown and cached collections) placed back on the mesh the step traces
     (`sharding.typed_on`). The passes' operations are typed on the axis: a projection takes no launch
-    mapped per shard there (`projections.rows_split`), the partitioner's product running it, and a random
-    draw (a dropout's) is refused, its key typed on the step's mesh."""
+    mapped per shard there (`projections.rows_split`), the partitioner's product running it."""
     from dew.nn.kernels import generation
 
     whole = jax.sharding.PartitionSpec()

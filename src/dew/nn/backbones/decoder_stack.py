@@ -278,22 +278,22 @@ class Loop:
     compares it (not `PASSED`).
 
     With `gathered`, a block whose parameters fully sharded data parallelism splits (the run's FSDP axis,
-    `dew.mesh.FSDP_AXIS`) reads them gathered whole over that axis once, before its first pass, and every
-    pass reads that one copy (`looping.run_loop`): no all-gather inside the passes' loop, forward or
-    recomputed, where each pass gathered its own (`steps` times the block's gathers). Nor a reduction: the
-    passes run with that axis Explicit and the copy reduced over it (`sharding.gathered_over`), so each
-    pass's weight gradient stays its devices' partial sum, the passes' partial sums are added where they lie,
-    and their total is reduced over the axis once, after the loop (one reduce-scatter where each pass
-    reduced its own). The copy held whole over that axis throughout the loop, which the block's memory must
-    allow (an opt-in for a block that fits). The gradient is the same sum, summed in another order. It
-    gathers the parameters as the step reads them: a run's narrow copies (`dew.training.narrow`), the
-    compute dtype's, where it holds them, else the stored dtype, a quantized stored kernel's as it is
-    stored. The decoder's own parameters the passes read (its step and reinjection norms) are gathered with
-    the block's; the prelude, the coda (each pass's too, under `exiting`) and the embedding and head keep
-    their placement. Every operation of the passes is typed on that axis, so one with no rule for it fails
-    as it traces, and a random draw in a pass (a dropout's) is refused there too: its key is typed on the
-    step's mesh. The block's layers run one by one in each pass (a scan over them takes no reduced copy),
-    and its projections as the partitioner places them, no launch mapped per shard.
+    `dew.mesh.FSDP_AXIS`) reads them gathered whole over that axis once, before its first pass, and every pass
+    reads that one copy (`looping.run_loop`): no all-gather inside the passes' loop, forward or recomputed,
+    where each pass gathered its own (`steps` times the block's gathers). Nor a matrix's gradient reduction:
+    the passes run with that axis Explicit and each matrix's copy reduced over it (`sharding.gathered_over`),
+    so each pass's gradient of it stays its devices' partial sum, the passes' partial sums are added where
+    they lie, and their total is reduced over the axis once, after the loop (one reduce-scatter where each
+    pass reduced its own); a vector's (a norm's scale, a bias), held replicated, is reduced each pass, as
+    without it. The copy held whole over that axis throughout the loop, which the block's memory must allow
+    (an opt-in for a block that fits). The gradient is the same sum, summed in another order. It gathers the
+    parameters as the step reads them: a run's narrow copies (`dew.training.narrow`), the compute dtype's,
+    where it holds them, else the stored dtype, a quantized stored kernel's as it is stored. The decoder's own
+    parameters the passes read (its step and reinjection norms) are gathered with the block's; the prelude,
+    the coda (each pass's too, under `exiting`) and the embedding and head keep their placement. Every
+    operation of the passes is typed on that axis, so one with no rule for it fails as it traces. The block's
+    layers run one by one in each pass (a scan over them takes no reduced copy), and its projections as the
+    partitioner places them, no launch mapped per shard.
     """
     steps: int
     step_norm: bool = True
