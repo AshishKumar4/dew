@@ -402,6 +402,19 @@ def consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
         np.testing.assert_array_equal(np.asarray(value), expected)
 
 
+def consumers_sharing_one_pipeline_on_an_a100(consumers, split):
+    """The shared mma.sync walk run on an A100, its pipeline's meets real: five steps over two slots, its
+    segments each consumer's own where `split`, compiled in a tier's prepare (`ahead_arm`)."""
+    p, x = _fed_operands()
+    got = ahead_arm(jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers,
+                                              lo=3 if split else 0, shared=True, split=split)),
+                    f"a shared walk's products: {consumers} consumers{', split' * split}")(p, x)
+    summed = sum(weight * np.asarray(p, np.float32)[:, rows] @ np.asarray(x, np.float32)[rows]
+                 for rows, weight in _split_weights(consumers)) if split else None
+    for value, expected in zip(got, (summed, 2 * summed) if split else _fed_expected(p, x), strict=True):
+        np.testing.assert_array_equal(np.asarray(value), expected)
+
+
 @pytest.mark.parametrize("unrolled", [False, True])
 @pytest.mark.parametrize("stages", [2, 3, 4, 5])
 def test_a_walk_takes_each_step_of_its_range_once_in_order_at_its_turn(stages, unrolled):

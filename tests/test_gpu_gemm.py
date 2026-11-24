@@ -217,6 +217,9 @@ PARTIAL_TILE = "a TMA copy of a partial tile, which reads zeros and clips stores
 RING = "a ring's asynchronous slots, which the interpreter walks in one order"
 """Why the toolkit's rings stay on the GPU (the GEMM lane, 11-11)."""
 
+SHARED = "a collective cp.async pipeline's meets, which the interpreter takes as no-ops (row 5272)"
+"""Why two mma.sync consumers' shared walk stays on an A100 (row 12652)."""
+
 CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
 """Why a pair of multiprocessors' cooperative tile stays on the GPU (the GEMM lane, 11-12)."""
 
@@ -309,6 +312,10 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(mosaic_toolkit.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
                                  consumers, lo), "sm90", fault=RING)
           for consumers, lo in ((1, 0), (2, 0), (2, 3))),
+        *(Cell(f"consumers sharing one cp.async pipeline: {consumers} consumers{', split' * split}",
+               functools.partial(mosaic_toolkit.consumers_sharing_one_pipeline_on_an_a100, consumers, split),
+               "sm80", fault=SHARED)
+          for consumers, split in ((1, False), (2, False), (2, True))),
         Cell("the shared GEMM mainloop runs on Blackwell's tcgen05",
              gemm_tcgen05.the_shared_mainloop_runs_exactly_on_blackwell, "sm100",
              native={"launch": "tcgen05 mainloop"}),
