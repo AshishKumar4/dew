@@ -436,7 +436,8 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                                       grouped=depth is not None, depths=self._step_sizes(ba),
                                       dense=bool(ba.arguments.get('dense')),
                                       ragged=self._ragged(ba, tried[0]),
-                                      units=self._vector_units(ba, tried[0]), programs=programs)
+                                      units=self._vector_units(ba, tried[0]), programs=programs,
+                                      outputs=_stored_dtypes(ba))
             if tile is not None:
                 return tile
         return None
