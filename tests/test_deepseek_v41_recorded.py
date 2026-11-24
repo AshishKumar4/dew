@@ -100,10 +100,10 @@ def test_an_image_prompt_is_on_par_with_the_releases(vision_source):
     wide = float64_twin(loaded.model)
     # The quantizers off, as the reference ran (`vision_run`).
     plain = wide.clone(language_model=unquantized(wide.language_model))
-    span = jax.jit(lambda variables, media: plain.apply(
-        variables, media, method=lambda module, pixels: module.conditioner(pixels)))
+    # The span and the full pass in one program (row 12314: the span compiled apart took 16 s of the test).
     whole = jax.jit(lambda variables, ids, indices, media: plain.apply(
-        variables, ids, image_indices=indices, conditioning=media))
+        variables, ids, indices, media, method=lambda module, ids, indices, media: (
+            module.conditioner(media), module(ids, image_indices=indices, conditioning=media))))
     prompt = int(shape["decode_prompt"])
     images = shape["token_types"] >= 0
     indices = jnp.asarray(np.where(images, np.cumsum(images, -1) - 1, -1))
@@ -116,8 +116,8 @@ def test_an_image_prompt_is_on_par_with_the_releases(vision_source):
         with jax.enable_x64(new_val=True):
             variables = float64_held(loaded.variables)
             media = {"pixel_values": jnp.asarray(inputs["pixels"], jnp.float64)[None, None]}
-            logits = whole(variables, jnp.asarray(inputs["input_ids"]), indices, media)
-            return {"vision_span": span(variables, media)[0], "vision_prompt_logits": logits[:, :prompt],
+            span, logits = whole(variables, jnp.asarray(inputs["input_ids"]), indices, media)
+            return {"vision_span": span[0], "vision_prompt_logits": logits[:, :prompt],
                     "vision_decode_logits": logits[:, prompt:]}
 
     site = "deepseek v41 vision"
