@@ -230,10 +230,10 @@ def _read_checked(hooks: recurrence.Hooks, operands: Chunk) -> dict:
         if operands.state is not None and operands.state.ndim != 4:
             raise ValueError(f"an unforked call's `state` is 4-dimensional [B, Hv, Dk, Dv], not "
                              f"{operands.state.shape} (a table [B, S', Hv, Dk, Dv] takes `loads`)")
-        given = {'stores': operands.stores, 'entry_key': operands.entry_key,
-                 'entry_value': operands.entry_value, 'entry_weight': operands.entry_weight,
-                 'adds': operands.adds}
-        forked_only = [name for name, value in given.items() if value is not None]
+        fields = {'stores': operands.stores, 'entry_key': operands.entry_key,
+                  'entry_value': operands.entry_value, 'entry_weight': operands.entry_weight,
+                  'adds': operands.adds}
+        forked_only = [name for name, value in fields.items() if value is not None]
         if operands.held:
             forked_only.append('held')
         if forked_only:
