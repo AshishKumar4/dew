@@ -153,7 +153,7 @@ class _Transpose:
             columns = jax.lax.dynamic_slice_in_dim(matrix, at * chunk, chunk, axis=-2)
             limbs = varying_like(_limbs(limbs_count, cotangent, chunk), cotangent, columns,
                                  *jax.tree.leaves(rest), grid)
-            # Each non-finite class's products (`_nonfinite_terms`) a coordinate sums: +inf, -inf, NaN.
+            # Whether a coordinate sums a product of each class not finite (`_nonfinite_terms`).
             classes = varying_like(_limbs(3, cotangent, chunk), cotangent, f, columns, *jax.tree.leaves(rest))
 
             def width_chunk(index, carry):
@@ -195,7 +195,7 @@ class _Transpose:
                 return _carried(jax.lax.fori_loop(0, FACTORED_ROW_SLICES, row_slice, limbs)), classes
 
             limbs, classes = jax.lax.fori_loop(0, width // columns_a_chunk, width_chunk, (limbs, classes))
-            # The counts in fp32 from here: a sum over routes and devices stays positive where any is.
+            # In fp32 from here, each 0 or 1: a sum over routes and devices is positive where any is.
             classes = classes.astype(jnp.float32)
             if gather is not None:
                 routed_limbs = varying_like(_limbs(limbs_count, plain, chunk), limbs, gather)
@@ -247,16 +247,18 @@ class _Transpose:
                              f"{devices} devices could pass its leading limb's int32 ({FACTORED_REACH})")
 
     def classified(self, classes, cotangent, factor, coefficients, rest):
-        """`classes` (int32 counts of the products not finite each coordinate sums: +inf, -inf, NaN) plus a
-        chunk's (`_nonfinite_terms`, one 0/1 bf16 GEMM a class), counted only where the chunk holds a
-        product not finite: a finite cancellation runs none of their GEMMs. Each device decides alone;
-        their counts meet in the psum after the chunk's columns."""
+        """`classes` (int32 0 or 1: whether each coordinate's products include one of a class not finite,
+        +inf, -inf, NaN) with a chunk's (`_nonfinite_terms`, one 0/1 bf16 GEMM a class, its count below
+        2**24) present or not (`_present`, never a sum that could wrap), read only where the chunk holds a
+        product not finite: a finite cancellation runs none of their GEMMs where its predicate is one value
+        (unbatched, or a batch's alike); under `vmap` a batched predicate's `cond` runs both branches and
+        selects, the same classes. Each device decides alone; their classes meet after the chunk's
+        columns."""
         def counted(classes):
             for index, (rows, matrix) in enumerate(_nonfinite_terms(cotangent, factor, coefficients)):
                 counts = self.wide(rows.astype(jnp.bfloat16), matrix.astype(jnp.bfloat16), *rest)
-                counts = counts.astype(jnp.int32)
                 held = jax.lax.dynamic_index_in_dim(classes, index, 0, keepdims=False)
-                classes = jax.lax.dynamic_update_index_in_dim(classes, held + counts, index, 0)
+                classes = jax.lax.dynamic_update_index_in_dim(classes, _present(held, counts), index, 0)
             return classes
 
         special = functools.reduce(jnp.logical_or, [jnp.any(~jnp.isfinite(v))
@@ -369,6 +371,12 @@ def _products(cotangent: jax.Array, factor: jax.Array) -> tuple[jax.Array, jax.A
     product = jnp.where(doubled, product * 0.5, product)
     binade = jnp.where(counted, e_c + e_f + doubled.astype(e_c.dtype), -1024)
     return (jnp.abs(product) * 2.0 ** 23).astype(jnp.int32), binade, product < 0
+
+
+def _present(held: jax.Array, counts: jax.Array) -> jax.Array:
+    """`held` (int32 0 or 1) or whether `counts` (a chunk's count of a class, fp32) holds any: a class's
+    presence, bounded whatever the columns, routes or devices that meet it."""
+    return jnp.maximum(held, (counts > 0).astype(held.dtype))
 
 
 def _ieee(classes: jax.Array, summed: jax.Array) -> jax.Array:

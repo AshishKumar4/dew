@@ -639,6 +639,20 @@ def test_the_rescues_routes_add_into_their_tokens_alike_at_any_fan_in():
     assert (one[1:] >= 0).all() and (one[1:] < 2 ** factored.FACTORED_SLICE).all()
 
 
+def test_the_rescues_class_presence_never_wraps():
+    """A non-finite class's presence at a coordinate (`factored._present`) stays 1 over 256 chunks each
+    counting 2**24 - 1 of its products, past int32's largest as a sum, where summed counts would wrap
+    negative and read as none (NaN returned as 0); a chunk counting none leaves it 0 (rows 12403,
+    12621)."""
+    from dew.nn.kernels.templates.gemm import factored
+
+    held = jnp.zeros((), jnp.int32)
+    for _ in range(256):
+        held = factored._present(held, jnp.float32(2 ** 24 - 1))
+    assert int(held) == 1
+    assert int(factored._present(jnp.zeros((), jnp.int32), jnp.float32(0.0))) == 0
+
+
 def test_the_rescues_rounding_reads_a_leading_limb_past_one_digit():
     """A sum whose first limb (`factored._rounded`'s, of any int32 size) is 128, past one digit: 2**169 at a
     unit of 2**162 is +inf (-inf negated), not its wrapped bits; 128 + 2**-6 at a unit of one is exact, and
