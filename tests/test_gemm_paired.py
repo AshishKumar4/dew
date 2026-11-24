@@ -1478,8 +1478,8 @@ def _paired_pullback(epilogue, names, x, gate, up, out_dtypes):
     sizes = jnp.asarray(_SIZES_1376, jnp.int32)
 
     def outputs(x, gate, up):
-        hidden, gate_out, _ = gemm.gemm(x, gate, sizes, paired=up, epilogue=epilogue, out_dtype=out_dtypes[0],
-                                        out_dtypes=out_dtypes, named=names)
+        hidden, gate_out, *_ = gemm.gemm(x, gate, sizes, paired=up, epilogue=epilogue,
+                                         out_dtype=out_dtypes[0], out_dtypes=out_dtypes, named=names)
         return hidden, gate_out
 
     (hidden, gate_out), pull = jax.vjp(outputs, x, gate, up)
@@ -1498,11 +1498,12 @@ def _forward_pairs(names, epilogue, operands, out_dtypes) -> int:
                for eqn in equations(graph, platform="cpu"))
 
 
-def _assert_named_pullback(epilogue, operands, out_dtypes, *, kept: bool) -> None:
-    """The paired pullback with the projections' outputs named against unnamed: its outputs and gradients
+def _assert_named_pullback(epilogue, operands, out_dtypes, *, kept: bool,
+                           named: tuple = (None, "gate_proj", "up_proj")) -> None:
+    """The paired pullback with the projections' outputs `named` against unnamed: its outputs and gradients
     raw-bit equal, and its forward products one pair (two) where the backward reads its kept accumulators
     (`kept`), else the same as unnamed (the pair recomputed)."""
-    named, unnamed = (None, "gate_proj", "up_proj"), (None, None, None)
+    unnamed = (None,) * len(named)
     got, want = (_paired_pullback(epilogue, names, *operands, out_dtypes) for names in (named, unnamed))
     for name, g, w in zip(("hidden", "gate", "d_x", "d_gate", "d_up"), got, want, strict=True):
         assert g.dtype == w.dtype, name
@@ -1596,3 +1597,39 @@ def test_a_nonlinear_paired_epilogues_rounded_cotangents_are_its_products_bf16_o
     assert cotangent_products, "the input gradient multiplies the accumulators' cotangents"
     assert {eqn.invars[0].aval.dtype for eqn in cotangent_products} == {jnp.dtype(jnp.bfloat16)}, [
         eqn.invars[0].aval.dtype for eqn in cotangent_products]
+
+
+def test_a_paired_epilogues_integer_rounding_stored_as_fp32_is_recomputed_not_read():
+    """A paired fp32 epilogue rounding its accumulators to int32 whose outputs the call stores as fp32: fp32
+    holds no int32 exactly (2**24 + 1 rounds), so its backward recomputes the pair (`gemm._lossless_cast`,
+    #4050's review)."""
+    def epilogue(gate_acc, up_acc):
+        hidden = jax.nn.silu(gate_acc) * up_acc
+        # The cotangents land on the activation and its copy; the integer roundings are named, unused.
+        return hidden, hidden, gate_acc.astype(jnp.int32), up_acc.astype(jnp.int32)
+
+    _assert_named_pullback(epilogue, _operands_1376(jnp.float32), (jnp.float32,) * 4, kept=False,
+                           named=(None, None, "gate_proj", "up_proj"))
+
+
+def test_a_paired_float8_fake_quant_epilogue_reads_its_kept_e4m3_roundings():
+    """A bf16 paired epilogue fake-quantizing its accumulators to E4M3 (`f32 -> float8_e4m3fn -> f32`): its
+    reverse pass runs (no type promotion asked of float8 and fp32, which JAX refuses), and bf16 holds every
+    E4M3 value, so it reads the kept roundings, one forward pair (#4050's review)."""
+    def epilogue(gate_acc, up_acc):
+        gate_rows, up_rows = gate_acc.astype(jnp.float8_e4m3fn), up_acc.astype(jnp.float8_e4m3fn)
+        hidden = jax.nn.silu(gate_rows.astype(jnp.float32)) * up_rows.astype(jnp.float32)
+        return hidden.astype(jnp.bfloat16), gate_rows, up_rows
+
+    _assert_named_pullback(epilogue, _operands_1376(jnp.bfloat16), (jnp.bfloat16,) * 3, kept=True)
+
+
+def test_a_paired_epilogue_returning_a_rounding_twice_reads_the_named_one():
+    """A paired epilogue returning its gate's bf16 rounding twice, only the second named: its backward
+    reads that kept output, one forward pair, the duplicate's first place no obstacle (#4050's review)."""
+    def epilogue(gate_acc, up_acc):
+        hidden, gate_rows, up_rows = _swiglu_of_roundings(jnp.bfloat16)(gate_acc, up_acc)
+        return hidden, gate_rows, gate_rows, up_rows
+
+    _assert_named_pullback(epilogue, _operands_1376(jnp.bfloat16), (jnp.bfloat16,) * 4, kept=True,
+                           named=(None, None, "gate_proj", "up_proj"))
