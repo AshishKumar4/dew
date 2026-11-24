@@ -238,19 +238,19 @@ def ungraph_peer_waits() -> None:
     `unpartition_gpu_pool`."""
     if backend_open() or not cuda_plugin():
         return
-    if peer_waits_ungraphed(os.environ, _pool.local_gpus):
+    if peer_waits_ungraphed(os.environ, _pool.placed_gpus):
         _gpu_default("xla_gpu_enable_command_buffer", PEER_WAITS_UNGRAPHED)
 
 
 def peer_waits_ungraphed(env: Mapping[str, str],
-                         drives: Callable[[str, Mapping[str, str]], tuple[int, ...] | None]) -> bool:
+                         drives: Callable[[Mapping[str, str]], tuple[int, ...] | None]) -> bool:
     """Whether a CUDA process of environment `env` leaves XLA's peer-waiting commands out of its graphs
     (`ungraph_peer_waits`): its XLA_FLAGS name no commands to graph, and it drives more than one GPU, those
-    `drives` names for it before its backend opens (`dew._pool.local_gpus`: its place's, `dew launch`'s or
+    `drives` names for it before its backend opens (`dew._pool.placed_gpus`: its place's, `dew launch`'s or
     a Slurm or Open MPI task's, else every one it may use; None uncounted)."""
     if _flag(env.get("XLA_FLAGS", ""), "xla_gpu_enable_command_buffer") is not None:
         return False
-    gpus = drives(_pool.ALL_GPUS, env)
+    gpus = drives(env)
     return gpus is not None and len(gpus) > 1
 
 

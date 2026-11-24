@@ -106,20 +106,25 @@ def selected_gpus(selected: str) -> tuple[int, ...] | None:
 
 def local_gpus(selected: str = ALL_GPUS, environ: Mapping[str, str] | None = None) -> tuple[int, ...] | None:
     """The GPUs a process of JAX's selection `selected` opens, by the CUDA driver's ordinals, which its
-    memory and placement reads take (`dew._devices.gpu_memory`): those `selected` names; else, before its
-    backend opens, those its place names (`dew.clusters.detected_environment`: `dew launch`'s
-    JAX_LOCAL_DEVICE_IDS, a Slurm or Open MPI task's local rank), which JAX's selection then names; else
-    every one the process may use (`local_gpu_count`); None where they could not be counted. `environ` is
-    the process's environment where None."""
+    memory and placement reads take (`dew._devices.gpu_memory`): those `selected` names, else every one the
+    process may use (`local_gpu_count`, of `environ`, the process's own where None); None where they could
+    not be counted."""
     named = selected_gpus(selected)
     if named is not None:
         return named
-    found = detected_environment(environ=environ)
-    placed = None if found is None else found.place().local_device_ids
-    if placed is not None:
-        return placed
     count = local_gpu_count(environ)
     return None if count is None else tuple(range(count))
+
+
+def placed_gpus(environ: Mapping[str, str] | None = None) -> tuple[int, ...] | None:
+    """The GPUs a process of environment `environ` (its own where None) will drive, read before its backend
+    opens: those its place names (`dew.clusters.detected_environment`: `dew launch`'s JAX_LOCAL_DEVICE_IDS,
+    a Slurm or Open MPI task's local rank), which JAX's selection then names as it joins its pool, else every
+    one it may use (`local_gpus`); None where they could not be counted. A node's GPUs, which a task's place
+    leaves idle, are `local_gpus`' (`refuse_idle_gpus`)."""
+    found = detected_environment(environ=environ)
+    placed = None if found is None else found.place().local_device_ids
+    return placed if placed is not None else local_gpus(environ=environ)
 
 
 def local_gpu_count(environ: Mapping[str, str] | None = None) -> int | None:

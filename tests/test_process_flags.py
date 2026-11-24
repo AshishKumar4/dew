@@ -285,7 +285,7 @@ def test_a_process_driving_more_than_one_gpu_graphs_no_peer_wait_unless_its_run_
     """`import dew` keeps XLA's conditionals and one-shot collective kernels out of its CUDA graphs in a
     process that drives more than one GPU, where one GPU's graph waited on its peer while the peer's host
     held the driver (row 12714): the GPUs it drives as its place names them before its backend opens
-    (`dew._pool.local_gpus`: `dew launch`'s or a Slurm task's, row 12761), else its visible GPUs, else those
+    (`dew._pool.placed_gpus`: `dew launch`'s or a Slurm task's, row 12761), else its visible GPUs, else those
     its CUDA driver counts; one GPU, an uncounted host or a run naming the commands keeps XLA's list. An
     environment that names its GPUs is read by Dew's own count; one that names none, by the driver's count
     `counted` (None uncounted)."""
@@ -293,6 +293,6 @@ def test_a_process_driving_more_than_one_gpu_graphs_no_peer_wait_unless_its_run_
     from dew._devices import peer_waits_ungraphed
 
     named = any(key in env for key in ("CUDA_VISIBLE_DEVICES", "JAX_LOCAL_DEVICE_IDS", "SLURM_LOCALID"))
-    drives = _pool.local_gpus if named else lambda selected, environ: (
-        None if counted is None else tuple(range(counted)))
+    uncounted = None if counted is None else tuple(range(counted))
+    drives = _pool.placed_gpus if named else lambda environ: uncounted
     assert peer_waits_ungraphed(env, drives) is ungraphed
