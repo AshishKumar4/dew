@@ -87,3 +87,50 @@ def test_an_operation_of_several_floating_results_and_no_rule_is_refused():
     symmetric = torch.eye(3, dtype=torch.float64) * 2 + 1
     with pytest.raises(ValueError):
         rounding_scale(lambda: torch.linalg.eigh(symmetric), UNIT)
+
+
+@pytest.mark.parametrize("form", ["default", "dim", "correction"])
+def test_a_variance_is_the_one_its_overload_computes(form):
+    """`aten.var` read by its overload (`_dew_torch.rounding`): each form's value at no rounding is torch's
+    own (a population variance of the whole for `default`'s `unbiased=False`, never per column), and a
+    correction past the count divides by ATen's nonnegative degrees of freedom (the confirm review: every
+    overload read as `dim`'s)."""
+    import torch
+
+    # Consecutive integers: every partial mean and sum exact, whatever order the variance accumulates in,
+    # and each denominator a power of two (16 states, 5 less one) or none (4 less a correction of 5).
+    square = torch.arange(16, dtype=torch.float64).reshape(4, 4)
+    rows = torch.arange(5, dtype=torch.float64) + torch.arange(4, dtype=torch.float64)[:, None]
+    computed = {"default": lambda: torch.ops.aten.var.default(square, unbiased=False),
+                "dim": lambda: torch.ops.aten.var.dim(rows, [1], unbiased=True, keepdim=True),
+                "correction": lambda: torch.ops.aten.var.correction(square, [0], correction=5)}[form]
+    value, _ = rounding_scale(computed, 0.0)
+    np.testing.assert_array_equal(value, computed().numpy())
+
+
+def test_a_complex_variance_is_refused():
+    """A complex tensor's variance (each deviation's squared magnitude, which squaring the deviation is not:
+    `[1j, -1j]`'s is 1, its squared deviations' mean -1) is refused rather than read as a real one's (the
+    confirm review)."""
+    import torch
+
+    z = torch.tensor([1j, -1j], dtype=torch.complex128)
+    with pytest.raises(ValueError):
+        rounding_scale(lambda: torch.ops.aten.var.correction(z, correction=0), UNIT)
+
+
+def test_a_nearest_backward_at_a_scale_apart_from_its_shapes_ratio_is_refused():
+    """A nearest upsampling's backward whose stated scale is not its shapes' integral factor (3 to 9 rows at
+    a scale of 3.2, which maps no block of three) is refused rather than summed as blocks; at its factor it
+    is torch's own sum (the confirm review)."""
+    import torch
+
+    gradient = torch.ones(1, 1, 9, 4, dtype=torch.float64)
+
+    def backward(scale):
+        return lambda: torch.ops.aten.upsample_nearest2d_backward(gradient, [9, 4], [1, 1, 3, 2], scale, 2.0)
+
+    with pytest.raises(ValueError):
+        rounding_scale(backward(3.2), UNIT)
+    value, _ = rounding_scale(backward(3.0), 0.0)
+    np.testing.assert_array_equal(value, backward(3.0)().numpy())

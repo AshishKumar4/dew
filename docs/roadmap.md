@@ -27,7 +27,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Log-linear attention 6.6x fla's forward on a GH200. [10525]
 - The recurrence suite's wall: every case within CI's group target. [12088, 12429]
 - Attention tests to the bible's §6 and §7 test rules. [12432, 12438]
-- Low-precision and decode-size GEMMs. [483, 4518, 4519]
+- Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
@@ -41,6 +41,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - The GEMM compile gate certifies each launch with one CUDA build's compile-only client (the kernel-compile extra's), then checks the settled kernel under each…. [10766]
 - test_plan's second-trainer witness asserts no backend compile of jit(step). [12386]
 - Certification admits a spill only where every STL/LDL of its SASS sits at loop depth 0 (prologue/epilogue) or in call slow-path code. [12387]
+- Memory Planner Miss-Driven ≤2-Step Search, Fast XLA Sizing & Cold-Compile Elimination. [12462]
+- ReviewGemmConfirm's review of #3913. [12630]
 - Exact on every path, every edge and every derivative order. [2656]
 - MoE transport, role-aware low precision and observability. [4515]
 - resources.operand_fragments counts every part of a multi-part shared operand live at once. [6494]
@@ -49,7 +51,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Models and interop
 
-- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646, 12414, 12425]
+- Every recurrence transition and state family. [1300, 1448, 1450, 1451, 1452, 1454, 1455, 1457, 1458, 1459, 1460, 1646]
 - Every nn and interop primitive, seam, contract and derivative has one owner. [11980, 5625]
 - Owner-approved Audit 4 API cleanup. [11937]
 - Owner-approved Audit 4 API cleanup. [11938]
@@ -62,6 +64,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Time to first step: the compile path's re-derivations. [5556]
 - Owner-approved Audit 4 API cleanup. [11935]
+- CI time: every test within 120 seconds. [12484]
 - Distributed and memory training modes. [156, 873, 1306, 617]
 - A fact and a question for the step's owner. [6646]
 - Gradients held to an update placed after the backward are parameter-sized temporaries. [6698]
@@ -93,6 +96,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Src/dew/algebra/program.py:823-827 (_within) rewrites a sub-jaxpr inside an equation by equation.replace(params=params) and recomputes neither equation.effects…. [12217]
 - Released checkpoints judged on GPUs. [1703, 11674]
 - Bit-level synthesis in dew.algebra. [3733]
+- ReviewGemmConfirm's review of #3913. [12629]
 - VLLM engine's last_loop cache diverges from its own model code past the sliding window. [638]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 - Reference comparisons held by derived bounds. [1719, 2094]

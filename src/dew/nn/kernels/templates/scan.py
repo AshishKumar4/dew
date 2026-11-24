@@ -142,7 +142,7 @@ def compensated_columns(pairs, running) -> None:
 def suffix_columns(terms) -> None:
     """Each column of `terms`, a plain fp32 shared tile `(rows + 1, columns)`, its rows' terms and then its
     starting sum, replaced row by row by its suffix sum, row `r` the start plus rows `r` to the last
-    (`algebra.suffix_summed`'s arithmetic: each term joined to a running compensated pair,
+    (`compensated_columns`' arithmetic, `_column_sums`: each term joined to a running compensated pair,
     `precision.renormalized_sum`, its rounded sum stored), a column a thread of the first `columns` (at most
     `THREADS`), its loads and stores its own words, and the warpgroup met once when done. Additions alone, so
     no multiply contracts into them."""
@@ -158,13 +158,27 @@ def _suffix_columns(ref) -> None:
     thread = arith.remui(utils.thread_idx(), arith.constant(i32, THREADS))
     column = arith.index_cast(index, thread)
     zero = native.Word(arith.constant(f32, 0.0))
+
+    def at(row: int) -> list:
+        return [arith.constant(index, row), column]
+
     with utils.when(arith.cmpi(arith.CmpIPredicate.ult, thread, arith.constant(i32, columns))):
-        pair = (native.Word(memref.load(ref, [arith.constant(index, rows), column])), zero)
-        for row in reversed(range(rows)):
-            at = [arith.constant(index, row), column]
-            pair = precision.renormalized_sum(pair, (native.Word(memref.load(ref, at)), zero))
-            memref.store(pair[0].value, ref, at)
+        _column_sums(reversed(range(rows)), lambda row: (native.Word(memref.load(ref, at(row))), zero),
+                     lambda row, pair: memref.store(pair[0].value, ref, at(row)),
+                     (native.Word(memref.load(ref, at(rows))), zero))
     utils.warpgroup_barrier()
+
+
+def _column_sums(rows, term, store, pair):
+    """A thread's column's running compensated sum: `pair` joined to each of `rows`' terms (`term(row)`, a
+    `(hi, lo)` of words) in their order by `precision.renormalized_sum`, each sum handed to `store(row,
+    sum)`, the last returned: the running prefix's (`compensated_columns`, its terms pairs, both halves
+    stored) and the decay gradient's suffix sums (`suffix_columns`, its terms one word, the sums' rounded
+    halves stored, from the last row)."""
+    for row in rows:
+        pair = precision.renormalized_sum(pair, term(row))
+        store(row, pair)
+    return pair
 
 
 def zeroed_columns(running) -> None:
@@ -196,14 +210,16 @@ def _compensated_columns(ref, running) -> None:
         hi, lo = (native.Word(memref.load(source, [half, *at])) for half in halves)
         return hi, lo
 
-    pair = pair_at(running, [column])
-    for row in range(rows):
-        at = [arith.constant(index, row), column]
-        pair = precision.renormalized_sum(pair, pair_at(ref, at))
+    def stored(target, at: list, pair) -> None:
         for half, value in zip(halves, pair, strict=True):
-            memref.store(value.value, ref, [half, *at])
-    for half, value in zip(halves, pair, strict=True):
-        memref.store(value.value, running, [half, column])
+            memref.store(value.value, target, [half, *at])
+
+    def at(row: int) -> list:
+        return [arith.constant(index, row), column]
+
+    pair = _column_sums(range(rows), lambda row: pair_at(ref, at(row)),
+                        lambda row, pair: stored(ref, at(row), pair), pair_at(running, [column]))
+    stored(running, [column], pair)
     utils.warpgroup_barrier()
 
 

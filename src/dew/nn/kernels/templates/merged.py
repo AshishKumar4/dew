@@ -34,6 +34,7 @@ from jax.experimental import pallas as pl
 from jax.extend import core as jcore
 from jax.interpreters import batching, mlir
 
+from dew import _cache
 from dew.algebra import windows
 from dew.nn import programs
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
@@ -375,7 +376,8 @@ def _compute_planned_block(units: windows.Units, padded: jax.ShapeDtypeStruct,
                            output_specs: tuple[jax.ShapeDtypeStruct, ...]) -> tuple[int, cost.Work]:
     _, slices, _, _, _ = padded.shape
     total_slices = slices + int(has_initial)
-    family = generation.family(target.generation) if _uses_mosaic(target) else None
+    family = (generation.family(target.generation)
+              if _uses_mosaic(target, output_mod) else None)
     blocks = _candidate_blocks(width, total_slices)
 
     candidates = {block: _launch_for_block(
@@ -452,11 +454,24 @@ def launch_work(units: algebra.Forward | windows.Units, padded: jax.ShapeDtypeSt
                           raw_scale, out_dtype, out_heads, output_mod, output_kinds, output_specs)[1]
 
 
-def _uses_mosaic(target: generation.GpuTarget) -> bool:
+MOSAIC_SLOWER = frozenset({"sm80", "sm90"})
+"""The generations whose Mosaic GPU merge measured slower than its Pallas Triton launch, which serves them
+until it does not (kernel-templates.md §7), a decode step at one row (row 12398), the slices' launch
+unchanged: a GH200's 2.4 to 4.7 times Triton's (M-NA-4-gh200 20261123T165603Z: bf16 K32768 d64 67.9
+against 14.5 us, fp16 K32768 d128 84.0 against 21.8), an A100's 1.4 to 3.9 times (M-NA-4-a100
+20261123T171841Z: bf16 K32768 d64 89.28 against 24.58 us, fp16 K32768 d64 60.96 against 15.58)."""
+
+
+def _uses_mosaic(target: generation.GpuTarget, output_mod: Callable | None = None) -> bool:
     """Whether `target` lowers `merged_padded` on Mosaic GPU (NVIDIA sm80+ instruction families) rather than
-    the Pallas Triton fallback kept for pre-Ampere CUDA GPUs (`platform="cuda"`, row 9795)."""
+    the Pallas Triton launch, kept for pre-Ampere CUDA GPUs (`platform="cuda"`, row 9795) and for an unhooked
+    merge on the generations where Mosaic's measured slower (`MOSAIC_SLOWER`, a merge of no output hook)
+    unless a merge config is pinned (`tuning.pinned`, as a lab timing Mosaic there pins one)."""
     family = generation.family(target.generation)
-    return family is not None and family != "tpu"
+    if family is None or family == "tpu":
+        return False
+    return (target.generation not in MOSAIC_SLOWER or output_mod is not None
+            or MergedPadded in dict(_cache.KERNEL_PINS.value))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -557,7 +572,8 @@ def _kernel(padded, stacked, *extra, units: windows.Units, queries: int, width: 
                       output_mod=output_mod, output_kinds=output_kinds)
     init_args, out_args = merged_mosaic.split_extra(extra, output_kinds)
     target = generation.gpu_target()
-    if _uses_mosaic(target):
+    out_specs = tuple(jax.ShapeDtypeStruct(arg.shape, arg.dtype) for arg in out_args)
+    if _uses_mosaic(target, output_mod):
         dtype = None if out_dtype is None else jnp.dtype(out_dtype)
         family = generation.family(target.generation) or "mma.sync"
         out_dtypes = tuple(kept_dtype(arg.dtype) for arg in out_args)
@@ -567,7 +583,6 @@ def _kernel(padded, stacked, *extra, units: windows.Units, queries: int, width: 
             output_dtypes=out_dtypes, family=family)(padded, stacked, tuple(extra))
     padded_s, stacked_s = (jax.ShapeDtypeStruct(operand.shape, operand.dtype)
                            for operand in (padded, stacked))
-    out_specs = tuple(jax.ShapeDtypeStruct(arg.shape, arg.dtype) for arg in out_args)
     block, _ = _planned_block(units, padded_s, stacked_s, queries, width, target, bool(init_args),
                               raw_scale, out_dtype, out_heads, output_mod, output_kinds, out_specs)
     return _launch(

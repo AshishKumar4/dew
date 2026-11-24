@@ -1,6 +1,7 @@
 """A split decode step's slices merged where its launch wrote them (`merged.merged_padded`): its
 derivatives the law's path's (`merged._value`), which its JVP rule takes; it and its state on par with the
 plain merge from float64, here and on a GPU's one launch (tests/test_gpu_attention.py)."""
+import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -297,15 +298,25 @@ def test_a_padded_merge_and_its_derivatives_are_on_par(form, run):
     assert_as_exact(program, reference, _drawn, f"a padded merge, {form}, {run}", seeds=MERGE_SEEDS)
 
 
+def _mosaic_served(name: str):
+    """Mosaic GPU serving `name`'s unhooked merges as they lower: a config pinned (`tuning.pinned`) where
+    Pallas Triton serves the generation's unhooked merge (`merged.MOSAIC_SLOWER`), 16 channels a program,
+    which every width and split here takes; else nothing held."""
+    if name not in merged.MOSAIC_SLOWER:
+        return contextlib.nullcontext()
+    return tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)})
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("cases", ["widths-narrow", "widths-wide", "shapes-finished", "shapes-long"])
 @pytest.mark.parametrize("name", ["sm80", "sm90", "sm100"])
 def test_a_padded_merge_compiles_as_one_launch(name, cases):
     """The padded merge's one Mosaic GPU launch (`merged_mosaic.launch`, row 9795) compiles spill-free for
-    compile-only Ampere, Hopper and Blackwell GPUs in one process per GPU across: value widths 80, 96, 100,
-    128 and 192 (predicated coalesced GMEM loads/stores); a `jax.vmap` batch of three splits (beside nothing
-    but the one transpose that folds it, every launch typed by `assembled.launched_thunks`); `merged_finished`
-    with and without `Initial`; and long splits of 64 and 256 slices (row 8439)."""
+    compile-only Ampere, Hopper and Blackwell GPUs in one process per GPU, pinned where Pallas Triton serves
+    a generation unpinned (`_mosaic_served`), across: value widths 80, 96,
+    100, 128 and 192 (predicated coalesced GMEM loads/stores); a `jax.vmap` batch of three splits (beside
+    nothing but the one transpose that folds it, every launch typed by `assembled.launched_thunks`);
+    `merged_finished` with and without `Initial`; and long splits of 64 and 256 slices (row 8439)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -357,44 +368,72 @@ def test_a_padded_merge_compiles_as_one_launch(name, cases):
             *(one_case(f"slices-{slices}", slices=slices, width=128) for slices in (64, 256)),
         ],
     }
-    with generation.assumed(name):
+    with generation.assumed(name), _mosaic_served(name):
         records = compile_mosaic_kernels(named[cases], name)
     assert not mosaic_failures(records), "\n".join(mosaic_failures(records))
     for record in records:
         assert "error" not in record, record
         expected = (["thunk", "wrapped_transpose"] if record["name"] == "batched" else ["thunk"])
         assert sorted(record["thunks"]) == expected, record
-        assert record["modules"] and record["modules"].items() <= record["certified"].items(), record
+        # A pinned config is taken uncertified (`tuning.pinned`): certified where it serves unpinned.
+        assert name in merged.MOSAIC_SLOWER or (
+            record["modules"] and record["modules"].items() <= record["certified"].items()), record
         kernels = record["kernels"]
         assert len(kernels) == 1 and kernels[0]["kernel"] == "merged_padded", record
         assert kernels[0]["spilled"] == 0 and kernels[0]["shared"] == 0, record
 
 @COMPILES_ON_CPU
-def test_padded_merge_routes_nvidia_mosaic_and_keeps_triton_fallback():
-    """Row 9795: `_uses_mosaic` selects Mosaic GPU on NVIDIA sm80+ CUDA families and keeps the Pallas Triton
-    `_launch` fallback on pre-Ampere CUDA GPUs (`platform="cuda"`)."""
+def test_a_padded_merge_lowers_on_triton_where_mosaic_measured_slower():
+    """Rows 9795, 12398: the generations where Mosaic GPU's merge measured slower (`merged.MOSAIC_SLOWER`,
+    an A100's and a GH200's) merge on Pallas Triton's launch, as their compiled executables carry it: a
+    plain merge, and a finished one with a resumed state (`Initial`, the form row 11857's GPU run found
+    Pallas Triton refusing), each unhooked as the measured one was. Mosaic serves there a hooked merge (a
+    sigmoid output hook) and one whose config is pinned, as its executable carries its kernel; Pallas Triton
+    lowers no Mosaic GPU primitive rule's `platform_index`."""
     from fla_gdn_support import KernelCase
-
-    for gen in ("sm80", "sm90", "sm100", "sm120"):
-        assert merged._uses_mosaic(generation.gpu_target(gen)), gen
-    assert not merged._uses_mosaic(generation.gpu_target("sm75"))
-    padded = jax.ShapeDtypeStruct((2, 16, 16, 8, 128), jnp.float32)
-    stacked = jax.ShapeDtypeStruct((2, 2, 8, 16, 16), jnp.float32)
-    triton_fn = functools.partial(
-        merged._launch, units=algebra.units_of(SPECS["natural"]), queries=4, width=128, block=128)
     from jax._src.pallas.mosaic_gpu import core as plgpu_core, lowering as mosaic_lowering
     from jax.extend import core as jcore
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn.kernels import launches
+
+    spec = algebra.finished_form(algebra.Forward(form="full", ids=False, keys=16, scale=1.0))
+    padded = jax.ShapeDtypeStruct((2, 16, 16, 8, 128), jnp.float32)
+    stacked = jax.ShapeDtypeStruct((2, 2, 8, 16, 16), jnp.float32)
+    init_m = jax.ShapeDtypeStruct((1, 1, 2), jnp.float32)
+    init_acc = jax.ShapeDtypeStruct((1, 1, 2, 16), jnp.float32)
+    small = (jax.ShapeDtypeStruct((1, 2, 4, 1, 16), jnp.float32),
+             jax.ShapeDtypeStruct((2, 1, 1, 2, 4), jnp.float32))
+
+    def plain(p, s):
+        return tuple(merged.merged_padded(SPECS["natural"], p, s, queries=4, width=128))
+
+    def resumed(p, s, im, it, ia):
+        return merged.merged_finished(spec, p, s, queries=2, width=16, out_dtype=jnp.bfloat16, out_heads=2,
+                                      initial=template.Initial(im, it, ia))
+
+    def hooked(p, s):
+        return merged.merged_finished(spec, p, s, queries=2, width=16, out_dtype=jnp.bfloat16, out_heads=2,
+                                      output_mod=jax.nn.sigmoid)
 
     launches._register_mosaic_gpu_lowerings()
     assert jcore.primitives.platform_index_p not in mosaic_lowering.mosaic_lowering_rules[
         plgpu_core.WGxWG_SEMANTICS]
+    for name in sorted(merged.MOSAIC_SLOWER):
+        with generation.assumed(name):
+            records = compile_kernels([
+                KernelCase("plain", lambda: (plain, (padded, stacked))),
+                KernelCase("resumed", lambda: (resumed, (*small, init_m, init_m, init_acc)))], name)
+        for record in records:
+            assert "error" not in record and sorted(record["thunks"]) == ["merged_padded"], record
     with generation.assumed("sm90"):
-        records = compile_kernels([KernelCase("triton-fallback", lambda: (triton_fn, (padded, stacked)))],
-                                  "sm90")
-    assert len(records) == 1 and "error" not in records[0] and sorted(records[0]["thunks"]) == [
-        "merged_padded"], records
+        hooked_records = compile_mosaic_kernels([KernelCase("hooked", lambda: (hooked, small))], "sm90")
+        with tuning.pinned({merged.MergedPadded: merged.MergeConfig(16)}):
+            pinned_records = compile_mosaic_kernels(
+                [KernelCase("pinned", lambda: (plain, (padded, stacked)))], "sm90")
+    for record in (*hooked_records, *pinned_records):
+        assert not mosaic_failures([record]), record
+        assert [kernel["kernel"] for kernel in record["kernels"]] == ["merged_padded"], record
 
 
 def test_replicated_channel_merge_matches_value_with_subnormal_initial_mass():
@@ -629,7 +668,8 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
     """`merged.launch_work` prices a native `merged_padded` launch on the common one-window path (rows 8845,
     9795, 10533, 12222): one kernel, span `3 * chunks`, non-zero stated arithmetic work, emitted single-stats
     writer (`c_block == 0`), and predicated padded-column loads on Mosaic GPU vs Triton."""
-    sm90 = generation.gpu_target("sm90")
+    # A B200's, whose merge Mosaic GPU serves (`merged.MOSAIC_SLOWER`).
+    mosaic = generation.gpu_target("sm100")
     sm75 = generation.gpu_target("sm75")
     spec = SPECS["fold"]
 
@@ -642,8 +682,8 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
     for batch, slices, padded_q, heads, queries, width, chunks in cases:
         padded = jax.ShapeDtypeStruct((batch, slices, padded_q, heads, width), jnp.float32)
         stacked = jax.ShapeDtypeStruct((2, batch, heads, slices, padded_q), jnp.float32)
-        block = merged._channel_block(spec, padded, stacked, queries, width, sm90)
-        work = merged.launch_work(spec, padded, stacked, queries, width, sm90)
+        block = merged._channel_block(spec, padded, stacked, queries, width, mosaic)
+        work = merged.launch_work(spec, padded, stacked, queries, width, mosaic)
         assert work.kernels == 1.0
         assert work.span == float(3 * chunks)
         assert work.operations > 0 and work.exponentials > 0
@@ -657,14 +697,14 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
     # multi-chunk emitted walk bytes and `launch_work`, while Triton reads `read_width` columns (row 9795).
     pad_p = jax.ShapeDtypeStruct((2, 16, 16, 8, 128), jnp.float32)
     pad_s = jax.ShapeDtypeStruct((2, 2, 8, 16, 16), jnp.float32)
-    mosaic_block = merged._channel_block(spec, pad_p, pad_s, 4, 80, sm90)
-    mosaic_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, sm90)
+    mosaic_block = merged._channel_block(spec, pad_p, pad_s, 4, 80, mosaic)
+    mosaic_work = merged.launch_work(spec, pad_p, pad_s, 4, 80, mosaic)
     assert mosaic_work.device_bytes == _mosaic_expected_bytes(
         rows=2 * 4 * 8, slices=16, width=80, read_width=128, block=mosaic_block)
     # Each block's chunk loads its own valid columns (block 0's first `mosaic_block`, block 1's the next,
     # none past 80) and its maxima and totals: the emitted roles' walks hold 80 columns over the blocks
     # they cover, not the 128 padded ones.
-    roles_pad = _mosaic_emitted_roles(spec, pad_p, pad_s, 4, 80, mosaic_block, target=sm90)
+    roles_pad = _mosaic_emitted_roles(spec, pad_p, pad_s, 4, 80, mosaic_block, target=mosaic)
     covered = min(80, len(roles_pad) * mosaic_block)
     assert sum(role.walks[0].device_bytes for role in roles_pad) == float(
         8 * (covered * 4 + len(roles_pad) * 2 * 4))
@@ -678,11 +718,11 @@ def test_a_padded_merges_launch_work_counts_common_passes_unmasked_bytes_and_spa
     small_p = jax.ShapeDtypeStruct((1, 8, 8, 1, 128), jnp.float32)
     small_s = jax.ShapeDtypeStruct((2, 1, 1, 8, 8), jnp.float32)
     units = algebra.units_of(spec)
-    roles_2blk = _mosaic_emitted_roles(spec, small_p, small_s, 1, 128, 64, target=sm90)
+    roles_2blk = _mosaic_emitted_roles(spec, small_p, small_s, 1, 128, 64, target=mosaic)
     assert roles_2blk[0].fixed.device_bytes - roles_2blk[1].fixed.device_bytes == float(
         2 * small_s.dtype.itemsize)
-    work_1blk, _ = merged._launch_for_block(units, small_p, small_s, 1, 128, 128, sm90, family="wgmma")
-    work_2blk, _ = merged._launch_for_block(units, small_p, small_s, 1, 128, 64, sm90, family="wgmma")
+    work_1blk, _ = merged._launch_for_block(units, small_p, small_s, 1, 128, 128, mosaic, family="tcgen05")
+    work_2blk, _ = merged._launch_for_block(units, small_p, small_s, 1, 128, 64, mosaic, family="tcgen05")
     assert work_1blk.device_bytes == _mosaic_expected_bytes(
         rows=1, slices=8, width=128, read_width=128, block=128)
     assert work_2blk.device_bytes == _mosaic_expected_bytes(
@@ -1022,15 +1062,16 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
         return o * jax.nn.sigmoid(g) if _CTX_HOOK_MODE.get() == "sigmoid" else o + g
 
     assert tuning.holdable(ctx_hook)
-    sm90 = generation.gpu_target("sm90")
+    # A B200's, whose merge Mosaic GPU serves (`merged.MOSAIC_SLOWER`).
+    mosaic = generation.gpu_target("sm100")
     p_s = jax.ShapeDtypeStruct((1, 8, 16, 2, 128), jnp.float32)
     s_s = jax.ShapeDtypeStruct((2, 1, 2, 8, 16), jnp.float32)
     g_s = jax.ShapeDtypeStruct((1, 1, 8, 128), jnp.bfloat16)
-    w_off = merged.launch_work(spec, p_s, s_s, 4, 128, sm90, out_dtype=jnp.bfloat16, out_heads=8,
+    w_off = merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
                                output_mod=ctx_hook, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
     token = _CTX_HOOK_MODE.set("sigmoid")
     try:
-        w_on = merged.launch_work(spec, p_s, s_s, 4, 128, sm90, out_dtype=jnp.bfloat16, out_heads=8,
+        w_on = merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
                                   output_mod=ctx_hook, output_kinds=(template.Kind.OUTPUT,),
                                   output_specs=(g_s,))
     finally:
@@ -1043,15 +1084,15 @@ def test_a_finished_split_merge_vmaps_query_params_and_keys_hooks_by_dtype_and_c
 
     assert not tuning.holdable(unholdable)
     cached_before = merged._planned_block_cached.cache_info().currsize
-    merged.launch_work(spec, p_s, s_s, 4, 128, sm90, out_dtype=jnp.bfloat16, out_heads=8,
+    merged.launch_work(spec, p_s, s_s, 4, 128, mosaic, out_dtype=jnp.bfloat16, out_heads=8,
                        output_mod=unholdable, output_kinds=(template.Kind.OUTPUT,), output_specs=(g_s,))
     assert merged._planned_block_cached.cache_info().currsize == cached_before
     # Real `MergedPadded` wraps holdable hooks in `tuning.Prepared`; pricing must still cache-hit.
     op_prep = merged.MergedPadded(
         units=algebra.units_of(spec), queries=4, width=128, out_dtype=jnp.dtype(jnp.bfloat16), out_heads=8,
         output_mod=ctx_hook, output_kinds=(template.Kind.OUTPUT,),
-        output_dtypes=(template.kept_dtype(jnp.bfloat16),), family="wgmma")
-    with generation.assumed("sm90"):
+        output_dtypes=(template.kept_dtype(jnp.bfloat16),), family="tcgen05")
+    with generation.assumed("sm100"):
         ba_prep = op_prep.bind(p_s, s_s, (g_s,))
         op_prep._get_heuristics_config(ba_prep)
         hits_before = merged._planned_block_cached.cache_info().hits
@@ -1123,8 +1164,9 @@ def test_a_finished_split_merge_with_output_hooks_compiles_spill_free_and_matche
         work = merged.launch_work(spec, padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
                                   out_heads=out_heads, output_mod=mod, output_kinds=kinds,
                                   output_specs=(gate, head))
-        base_work = merged.launch_work(spec, padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
-                                       out_heads=out_heads)
+        with _mosaic_served(target_name):
+            base_work = merged.launch_work(spec, padded, stacked, queries, width, target,
+                                           out_dtype=jnp.bfloat16, out_heads=out_heads)
         block, _ = merged._planned_block(
             algebra.units_of(spec), padded, stacked, queries, width, target, out_dtype=jnp.bfloat16,
             out_heads=out_heads, output_mod=mod, output_kinds=kinds, output_specs=(gate, head))
