@@ -444,6 +444,30 @@ def test_a_state_cut_in_a_row_encoded_whole_takes_the_longest_cut_whose_row_fits
     assert list(row(state, len(fitting.tokens)).tokens) == list(fitting.tokens)
 
 
+def test_a_long_state_cut_in_a_merging_row_encoded_whole_encodes_few_cuts_past_its_room():
+    """A question row encoded whole over a vocabulary that merges three characters into one token (one
+    merge takes back two tokens, `Offsets.taken_back`), its state 4000 characters and its room a few dozen:
+    the state is cut to the longest that fits, its walk past its share stopping once a cut overflows by
+    more than a merge takes back, so the row's offsets are read a few times, not once a character (row
+    11839: a subword cut walked every longer cut, each row encoded whole)."""
+    _, _, _, *question = release().segments
+
+    class Counting(Merging):
+        """The merging vocabulary, counting the texts it reads the offsets of."""
+
+        read = 0
+
+        def offsets(self, text: str):
+            self.read += 1
+            return super().offsets(text)
+
+    layout = SegmentLayout.state_first_row(max_len=256, labels=release().labels, unit="whole",
+                                           segments=(Text("S:"), State(), Text("\n"), *question))
+    tokenizer = Counting(b"xyz")
+    [laid] = layout.rows(tokenizer, SPECIALS, "a" * 4000, {"team": TEAM})
+    assert len(laid.tokens) == 256 and tokenizer.read < 24, (len(laid.tokens), tokenizer.read)
+
+
 def test_a_long_state_cut_in_a_byte_row_encoded_whole_encodes_few_cuts_past_its_room():
     """A question row encoded whole over the byte vocabulary, its state 4000 characters and its room a few
     dozen: the state is cut to the longest that fits, its walk past its share stopping at the first cut that

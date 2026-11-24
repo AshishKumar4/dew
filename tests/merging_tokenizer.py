@@ -14,6 +14,8 @@ class Merging(ByteTokenizer):
     def __init__(self, merged: bytes = b"B. y"):
         super().__init__()
         self.merged = merged
+        # Its merged string one token of its characters (`Offsets.taken_back`).
+        self.taken_back = len(merged) - 1
 
     def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
         """Its ids, each covering its characters, the merged string one id covering all of its."""
