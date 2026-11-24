@@ -12,34 +12,28 @@ from dew.nn.kernels import generation
 pytestmark = [pytest.mark.kernel, COMPILES_ON_CPU]
 
 
-def _runs(count: int, rows: int, tokens: int) -> jax.Array:
-    """`count` key runs a query `[rows, tokens, count, 2]`: the first key of each 64-key block before the
-    query's own, then the 64 keys up to its own."""
-    query = jnp.arange(tokens, dtype=jnp.int32)
-    runs = [jnp.stack([jnp.minimum(query, run * 64), jnp.minimum(query, run * 64) + 1], -1)
-            for run in range(count - 1)]
-    runs.append(jnp.stack([jnp.maximum(query - 63, 0), query + 1], -1))
-    return jnp.broadcast_to(jnp.stack(runs, 1)[None], (rows, tokens, count, 2))
-
-
-def test_a_forward_over_several_runs_compiles_every_config_it_certifies_spill_free(without_deterministic_ops):
-    """A causal forward over three key runs a query (eight heads 64 wide over 2 x 2,048 tokens) compiles on
-    a compile-only H100 with no kernel its derivation certifies spilled or refused: its runs' union
-    counted, one select an entry (`attention_algebra.seen`), each further run's bounds priced as the rows its
-    walk holds (`attention_mosaic_registers._runs_bounds`); on main its walk at 64 x 128 three consumers
-    spilled 120 bytes at its raised 160 and stepped down (FS-6766-MAIN1, row 6766; four runs' scaled rewalk
-    still steps down once, that row's)."""
+@pytest.mark.parametrize("count", [2, 3])
+def test_a_forward_over_several_runs_compiles_every_config_it_certifies_spill_free(count,
+                                                                                  without_deterministic_ops):
+    """A causal forward over `count` key runs a query (eight heads 64 wide over 2 x 2,048 tokens, runs traced
+    as a call's operand) compiles on a compile-only H100 with no kernel its derivation certifies spilled or
+    refused: its runs' union counted, one select an entry (`attention_algebra.seen`), each further run's
+    bounds priced as the rows its walk holds (`attention_mosaic_registers._runs_bounds`), and two runs' union,
+    which LLVM takes back to an or, priced with the unmasked logits its selects keep. On main three runs' walk
+    at 64 x 128 three consumers spilled 120 bytes at its raised 160 and stepped down (FS-6766-MAIN1); two
+    runs' (MoBA's top_k 2) spilled 220 where three spilled none (FS-6766-ATT1, row 6766)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     q = jax.ShapeDtypeStruct((2, 2048, 8, 64), jnp.bfloat16)
-    runs = _runs(3, 2, 2048)
+    runs = jax.ShapeDtypeStruct((2, 2048, count, 2), jnp.int32)
 
-    def forward(q, k, v):
+    def forward(q, k, v, runs):
         return scaled_dot_product_attention(q, k, v, causal=True, key_runs=runs, implementation="template")
 
     with generation.assumed("sm90"):
-        found = compile_mosaic_kernels([KernelCase("three runs", lambda: (forward, (q, q, q)))], "sm90")
+        found = compile_mosaic_kernels([KernelCase(f"{count} runs", lambda: (forward, (q, q, q, runs)))],
+                                       "sm90")
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
     forwards = [certified for record in found for certified in record.get("certifications", [])
                 if certified["op"] == "MosaicForward"]

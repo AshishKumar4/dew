@@ -229,6 +229,12 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
             step.append((block_k, value_width * family.rhs_copies, dtype))
     masks = _mask_places(family, block_q, block_k)
     step += masks
+    if runs == 2:
+        # Two runs' counted union is their or again to LLVM (`zext a + zext b != 0`), whose select of it
+        # becomes a select a run, each reading the unmasked logits, which live beside the masked tile: an
+        # H100's walk at 64 x 128, three consumers, spilled 220 bytes at two runs where three and four spill
+        # none (MoBA's top_k 2, its own chunk and one selected, FS-6766-ATT1; probe dynruns4, 0461980dd).
+        step.append(logits)
     # The step's tiles the exponential's raised small weights are formed beside: a 16-bit call's step (an
     # inference walk's logits and weights and its masks' places; a training walk's spilled 224 to 248 bytes
     # at 238 of 240 priced so, et-scaledneed5); an fp32 call's parts walk its logits alone, its weights'
