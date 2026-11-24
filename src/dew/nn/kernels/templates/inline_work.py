@@ -409,13 +409,13 @@ def _assembly(text: str, active: np.ndarray, operand: Callable) -> Work:
     unknown = (np.ones(LANES, dtype=bool), np.zeros(LANES, dtype=bool))
 
     def lanes_of(word: str) -> np.ndarray | None:
+        # An operand's lanes, an immediate's value on every lane, or None for a register the block sets.
         word = word.strip(",")
         if word.startswith("$") and word[1:].isdigit():
             return operand(int(word[1:]))[0]
-        try:
+        if re.fullmatch(r"-?(0[xX][0-9a-fA-F]+|[0-9]+)", word):
             return np.full(LANES, int(word, 0), dtype=np.int64)
-        except ValueError:
-            return None
+        return None
 
     def bounds_of(word: str) -> tuple[np.ndarray, np.ndarray]:
         word = word.strip(",")

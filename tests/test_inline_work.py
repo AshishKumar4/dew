@@ -218,10 +218,10 @@ def test_a_forms_inline_block_compiles_for_an_h100(form):
     shape = (64, 16)
 
     def body(words_ref, *out_refs):
-        words = plgpu.layout_cast(words_ref[...], plgpu.Layout.WGMMA)
-        for out_ref, register in zip(out_refs, inline_forms.registers(chosen, words, plgpu.Layout.WGMMA),
-                                     strict=True):
-            out_ref[...] = register
+        decoded = inline_forms.registers(chosen, plgpu.layout_cast(words_ref[...], plgpu.Layout.WGMMA),
+                                         plgpu.Layout.WGMMA)
+        for at, out_ref in enumerate(out_refs):
+            out_ref[...] = decoded[at]
 
     launch = plgpu.kernel(body, out_type=(jax.ShapeDtypeStruct(shape, jnp.uint32),) * len(chosen.outputs),
                           num_threads=1, thread_name="wg")
