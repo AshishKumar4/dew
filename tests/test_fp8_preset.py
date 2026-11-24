@@ -879,16 +879,18 @@ def test_an_mlp_the_chain_cannot_read_runs_its_projections_apart(kind):
                    activation=jax.nn.relu if kind == "a function of its own" else "gelu",
                    dtype=None if mixed else jnp.float64 if wide else jnp.bfloat16,
                    **({} if linear is None else {"linear": linear}))
-    x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.float64 if wide else jnp.bfloat16)
-    variables = nn.unbox(mlp.init(jax.random.key(1), x))
+    # A float64 run's whole: its rows drawn, its parameters made and its graph traced under x64.
+    widened = jax.enable_x64(new_val=True) if wide else contextlib.nullcontext()
+    with widened:
+        x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.float64 if wide else jnp.bfloat16)
+        variables = nn.unbox(mlp.init(jax.random.key(1), x))
     if mixed:
         params = variables["params"]
         variables = {"params": {"up_proj": {"kernel": params["up_proj"]["kernel"].astype(jnp.bfloat16)},
                                 "down_proj": {"kernel": params["down_proj"]["kernel"].astype(jnp.float32)}}}
     placed = (jax.sharding.use_abstract_mesh(AbstractMesh((2,), ("sequence",), axis_types=(AxisType.Auto,)))
               if kind == "a sequence axis" else contextlib.nullcontext())
-    with (generation.run_precision(fp8), projection_role("mlp"), placed,
-          jax.enable_x64(new_val=True) if wide else contextlib.nullcontext()):
+    with generation.run_precision(fp8), projection_role("mlp"), placed, widened:
         graph = jax.make_jaxpr(lambda variables, x: mlp.apply(variables, x))(variables, x)
         out = jax.eval_shape(lambda variables, x: mlp.apply(variables, x), variables, x)
     regions = [equation for equation in equations(graph) if equation.primitive.name == "marked_call"
