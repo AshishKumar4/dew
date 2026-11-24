@@ -1588,7 +1588,9 @@ class CausalTransformer(LinearProducts):
                     break
             return first_out
 
-        output = jax.eval_shape(probed, tuple(self._layer_shapes_at(index) for index, _ in steps))
+        # Probed alone: its layers' routes are no route the call takes (`generation.routes`).
+        with generation.routes(alone=True):
+            output = jax.eval_shape(probed, tuple(self._layer_shapes_at(index) for index, _ in steps))
         output = output.streams if isinstance(output, Carried) else output
         return jnp.result_type(streams.dtype, output.dtype), non_array
 

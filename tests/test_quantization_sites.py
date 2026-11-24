@@ -250,9 +250,12 @@ def test_a_generation_over_the_loaded_tree_packs_under_its_one_scale_in_the_call
     # loaded tree draws what one over the prepared tree draws.
     apart = scaled_apart(loaded)
     full = reference["ids"].astype(np.int32)
+    # Compile both applies: `apart` scans its identical layers while the prepared tree packs only the
+    # second, leaving its layers unrolled, so an unjitted call would compare compiled scan against eager.
+    compiled = jax.jit(loaded.model.apply)
     np.testing.assert_array_equal(
-        np.asarray(loaded.model.apply(inference_projections(loaded.model, apart), full)),
-        np.asarray(loaded.model.apply(apart, full)))
+        np.asarray(compiled(inference_projections(loaded.model, apart), full)),
+        np.asarray(compiled(apart, full)))
     drawn, expected = (task(ids, 3, key=0).host() for task in (
         borrowed.bind(apart), borrowed.bind(inference_projections(loaded.model, apart))))
     np.testing.assert_array_equal(drawn.tokens, expected.tokens)

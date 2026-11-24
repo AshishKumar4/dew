@@ -41,6 +41,7 @@ from ..derivatives import formed_together
 from ..host_memory import fetched, fetched_at, on_host
 from ..hyper_connections import Carried
 from ..inspection import counted, current_component, current_positions, watched_positions
+from ..kernels import generation
 from ..kv_cache import cache_at_layer, cache_from_layer
 from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
@@ -818,10 +819,11 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
         variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
         # A provider writes its keys and values into the store it is given: the
         # abstract run writes into a copy, so nothing it traces leaves it.
-        _, changed = jax.eval_shape(lambda variables: _applied(
-            run, None if store is None else dict(store), variables, {}, None, hidden,
-            per_layer_slice, opened=True, train=train, decode=decode,
-            attention_metadata=attention_metadata), variables)
+        with generation.routes(alone=True):
+            _, changed = jax.eval_shape(lambda variables: _applied(
+                run, None if store is None else dict(store), variables, {}, None, hidden,
+                per_layer_slice, opened=True, train=train, decode=decode,
+                attention_metadata=attention_metadata), variables)
         written = list(changed)
         probed.append((spec, written))
     # Capture filters may select one module name but not another with the same layer spec. Keep
@@ -1785,8 +1787,9 @@ def _settled(module: nn.Module, prefixes: tuple[str, ...], x: jax.Array, layer: 
                 for name in names if name in tree or name in staged}
         if held:
             first[collection] = held
-    output = jax.eval_shape(lambda held: BlockStage(layer, 1, run, parent=None).apply(
-        held, x, None, rows, mutable=True, rngs={'params': jax.random.key(0)})[0], first)
+    with generation.routes(alone=True):
+        output = jax.eval_shape(lambda held: BlockStage(layer, 1, run, parent=None).apply(
+            held, x, None, rows, mutable=True, rngs={'params': jax.random.key(0)})[0], first)
     return jnp.result_type(x.dtype, output.dtype)
 
 
