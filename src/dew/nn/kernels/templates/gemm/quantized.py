@@ -268,8 +268,13 @@ def forms_of(out_forms: tuple | None, count: int) -> tuple:
 
 
 def _formed(out_forms) -> tuple:
-    """Each of `out_forms` as a `Form` (its fields' tuple read in their order), None as it is."""
-    return tuple(None if form is None else Form(*form) for form in out_forms or ())
+    """Each of `out_forms` as a `Form` (`_form`), None as it is."""
+    return tuple(None if form is None else _form(form) for form in out_forms or ())
+
+
+def _form(form: Form | tuple) -> Form:
+    """`form` as a `Form`, its fields' tuple read in their order."""
+    return form if isinstance(form, Form) else Form(*form)
 
 
 def reduced(buffer, piece: jax.Array) -> None:
@@ -321,7 +326,7 @@ def outputs(part: tuple[int, int], dtypes: tuple, forms: tuple) -> tuple:
 def declared(dtype, form: Form | tuple, rows: int, columns: int) -> jax.ShapeDtypeStruct:
     """An output a form stores (`forms_of`) as its call declares it: one value a row each `divisor` of
     `columns`, `[columns // divisor, rows]` where transposed, `[rows, columns // divisor]` otherwise."""
-    form = Form(*form)
+    form = _form(form)
     if columns % form.divisor:
         raise ValueError(f"{columns} columns hold no whole {form.divisor}-column blocks")
     stored_columns = columns // form.divisor
@@ -392,7 +397,7 @@ def stored(value: jax.Array, form: Form | tuple | None) -> jax.Array:
     store."""
     if form is None:
         return value
-    form = Form(*form)
+    form = _form(form)
     if form.packed:
         return _pairs(value)
     blocks = value[:, ::form.divisor]
