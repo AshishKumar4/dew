@@ -462,18 +462,18 @@ def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
                     "kimi delta attention's small cross term's decay gradient", seeds=8)
 
 
-@pytest.mark.parametrize('target', [pytest.param('sm80', marks=lowers('sm80')),
-                                    pytest.param('sm120', marks=lowers('sm120'))])
-# A consumer Blackwell's selector prefers fla's port for Kimi delta attention: the template named there.
+@lowers('sm80')
 @pytest.mark.parametrize('product', ['forward', 'training'])
-def test_a_fast_fp32_kimi_call_lowers_on_the_template_for_an_mma_sync_gpu(product, target):
+def test_a_fast_fp32_kimi_call_lowers_on_the_template_for_an_ampere_gpu(product):
     """Kimi delta attention's fp32 forward and training under the fast forms (TF32's products), as its
-    selector routes them to the template on an Ampere GPU and named onto it on a consumer Blackwell
-    (mma.sync's issuer each, `mosaic_sm80.MmaIssuer`), lowered compile-only: Mosaic GPU synthesized no
+    selector routes them to the template on an Ampere GPU, lowered compile-only: Mosaic GPU synthesized no
     shared-memory transfer for the intra walk's 128-byte swizzled fp32 streams, so the template it routed to
     raised at lowering (row 12647); and its scores' one fp32 part and its system, two sums of one shape and
     dtype, its own pairs write in place as one stacked ref (`chunk_forward._paired`), where two refs of one
-    shape and dtype were refused at the launch's trace (`mosaic.checked`, row 3180)."""
+    shape and dtype were refused at the launch's trace (`mosaic.checked`, row 3180). The routes asserted the
+    template's, so a fallback to another kernel hides no launch that does not lower. A consumer Blackwell,
+    mma.sync's issuer too (`mosaic_sm80.MmaIssuer`, which the streams' rule reads), takes fla's port for this
+    call, its template refusing it for its resources (row 12681)."""
     rows, length, heads, width = 1, 128, 2, 64
     operands = ([jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 4
                 + [jax.ShapeDtypeStruct((rows, length, heads), jnp.float32)])
@@ -484,12 +484,11 @@ def test_a_fast_fp32_kimi_call_lowers_on_the_template_for_an_mma_sync_gpu(produc
     def training(*given):
         return jax.grad(lambda *given: jnp.sum(forward(*given)), argnums=(0, 1, 2, 3, 4))(*given)
 
-    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), target)
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), 'sm80')
     # The default product precision the fast forms round at (the suite's lanes configure 'highest').
-    with (generation.assumed(target), jax.sharding.use_abstract_mesh(mesh),
+    with (generation.assumed('sm80'), jax.sharding.use_abstract_mesh(mesh),
           generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')),
-          jax.default_matmul_precision('default'), generation.routes() as found,
-          generation.chosen(**({'gated_delta_rule': 'mosaic_gpu'} if target == 'sm120' else {}))):
+          jax.default_matmul_precision('default'), generation.routes() as found):
         traced = jax.jit(forward if product == 'forward' else training).trace(*operands)
         traced.lower(lowering_platforms=("cuda",))
     # On the template, so a fallback to the portable math cannot hide a launch that does not lower.
