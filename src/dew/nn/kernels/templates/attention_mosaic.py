@@ -1889,10 +1889,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         family = bundle_of(config, dtype, target=target)
         # Consumers past those its family's derivations take (`Family.shared_consumers`'s) the paired fused
-        # launch's alone, queries first, its consumers' dQ summed (`dq_summed`): no other walk of its family
-        # is written for them.
+        # launch's alone, queries first over keys each its own, its consumers' dQ summed (`dq_summed`): no
+        # other walk of its family is written for them (a shared key block's, `_coop_launch`, loads by one).
         if (family is not None and config.consumers > family.consumers
-                and not (config.queries_first and dq_summed(family, config.consumers))):
+                and not (config.queries_first and not config.shared_keys
+                         and dq_summed(family, config.consumers))):
             return False
         # Deterministic mode takes no one launch: its programs add into dQ (and grouped dK and dV) across
         # programs, whose fixed order would wait on programs an ordinary launch need not hold resident

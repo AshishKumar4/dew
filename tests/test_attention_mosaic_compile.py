@@ -2460,6 +2460,17 @@ def test_an_a100s_one_launch_on_two_paired_consumers_holds_check_1_interpreted(c
                     target=generation.gpu_target("sm80"))
 
 
+def test_an_a100s_two_consumers_are_legal_on_its_paired_launch_alone():
+    """An A100's two consumers past its derivations' one (`mosaic_sm80`'s `shared_consumers`) are legal on
+    the paired launch (`PAIRED`: queries first, each consumer its own keys, their dQ summed) and on no launch
+    whose consumers share a key block (`shared_keys`, `_coop_launch`, which loads its block by one)."""
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        op, ba = _backward_call((1, 512, 8, 2), 64, accurate=False)
+        assert op.legal(ba, PAIRED, target)
+        assert not op.legal(ba, dataclasses.replace(PAIRED, shared_keys=True), target)
+
+
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
 def test_an_a100s_fast_backward_on_two_paired_consumers_compiles(causal, without_deterministic_ops):

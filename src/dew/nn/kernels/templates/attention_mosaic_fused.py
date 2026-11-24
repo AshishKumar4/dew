@@ -476,7 +476,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         # (`modelled`): dQ's, dK's, dV's and dP's.
         cost=stated(walk.spec, batch, heads, query, key, value, dout,
                     tile_walk=TileWalk((queries, keys_padded), (block_q, block_k), consumers, keyed=True,
-                                       common=family.feeds_itself)),
+                                       common=family.walks_streamed)),
         model_flops=modelled(walk.spec, batch, heads, walk.spec.queries or queries,
                              2 * width + 2 * value.shape[-1]))
     query, key, value, dout = (head_layout(family, arr) for arr in (query, key, value, dout))
@@ -508,15 +508,14 @@ def _adds_of(walk: _Backward, dq_ref, out_smem, place: tuple, index, summing: di
 
 def _walked_run(program, consumers: int, firsts: tuple, q_steps: int, spans_of):
     """The run of query tiles a consumer walks unmasked (`whole_run`, its keys from `firsts[1]`): where its
-    program's consumers walk every streamed step paired and each walk is a scope of its own (a collective
-    pipeline a segment, `Transport.walks_streamed`, `walks_scoped`), the tiles every consumer's key block
-    from `firsts[0]` sees whole (their runs intersected, None where any is), so every walk splits at the same
-    steps: each consumer's own run split them apart, and one waited at the next scope's barrier while the
-    other read the last (an A100's two consumers, causal: one masked tile before one's run, two before the
-    other's)."""
+    program's consumers meet at every step to sum its dQ (`dq_summed`), the tiles every consumer's key block
+    from `firsts[0]` sees whole (their runs intersected, None where any is), so every consumer walks the same
+    segments and meets the other in the same branch of each step (its masked or its whole one): each
+    consumer's own run put them in different branches at a step (an A100's two consumers, causal: one
+    masked tile before one's run, two before the other's)."""
     family, block_k = program.family, program.tiles.block_k
     pair_first, k_first = firsts
-    if not (consumers > 1 and family.walks_streamed and family.walks_scoped):
+    if not dq_summed(family, consumers):
         return program.whole_run(k_first, q_steps, spans_of)
     runs = [program.whole_run(pair_first + index * block_k, q_steps, spans_of) for index in range(consumers)]
     if any(run is None for run in runs):
