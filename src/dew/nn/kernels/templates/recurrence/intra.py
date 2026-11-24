@@ -1,9 +1,10 @@
 """The recurrence template's intra launches under a decay a key dimension (Kimi delta attention's): each
 chunk's pairs within it, the scores and the keys' system, walked a key block at a time on the mainloop's
 skeleton (`mainloop.launch_kernel`), their factors formed once for both (the algebra's `key_block_pairs`),
-and the system's inverse by doubling (`_intra_solve`), as fla_kda's intra rows and solve; each sub-chunk's
-own pairs are `own_pairs`'. A seam of the mainloop of its own: these launches read its primitives, and
-nothing of the mainloop reads them."""
+and the system's inverse merged from its sub-chunks' blocks by forward substitution after the walk, as
+fla_kda's fused inter-sub-chunk solve; each sub-chunk's own pairs, and their system's inverse, are
+`own_pairs`'. A seam of the mainloop of its own: these launches read its primitives, and nothing of the
+mainloop reads them."""
 
 import dataclasses
 import functools
@@ -22,10 +23,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
     Operand,
-    _doubling_held,
-    _inverse_flops,
-    _merges,
-    _merging,
+    _merged,
     building,
     bundle_dtype,
     chunk_liveness,
@@ -41,7 +39,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     masks,
     product_fragments,
     shared_allocation,
-    solve_persistent,
     staging_tiles,
     stream_blocks,
     stream_tile,
@@ -51,63 +48,40 @@ from dew.nn.precision import compensated_add
 
 
 def systems(call: Call) -> Operand:
-    """The form `_intra` passes each chunk's keys' system to `_intra_solve` in: fp32, as fla's intra rows
-    store their `Akk` for its solve."""
+    """The form a chunk's keys' system takes in fp32, as fla's intra rows store their `Akk`: its pairs'
+    backward's (`key_backward`)."""
     return Operand(call.rows, 1, jnp.dtype(jnp.float32))
 
 
-@lowered_once
-def _intra_solve(system, taken, call: Call):
-    """`(I + A)^-1` less its unit diagonal `[R, HV * C]` as `call.held` of each chunk and value head's keys'
-    system `A` (`_intra`'s, `systems`' form), inverted by doubling on the chunk's tile (`algebra.doubled`):
-    fla_kda's solve. Fused with the pairs, the doubling's tiles beside theirs held an H100's thread at 168
-    registers and one program a multiprocessor, 12.5% of its warps' cycles issuing, the launch 0.944 ms of
-    Kimi Linear's 1.86 ms forward (kda-ncu-h100-1170e4d25)."""
-    chunk = call.chunk
-    held, solved, family = dataclasses.replace(call.held, rows=call.rows), systems(call), call.family
-
-    def program(at, a_ref, taken_ref, out_ref, *, streams, staging, landing):
-        n, h = at["chunks"], at["heads"]
-        row = n * chunk
-        views = stream_views(system=solved.views(a_ref, row, chunk, h * chunk, chunk))
-
-        def step(index, slots, carry, accumulators):
-            del index
-            lower = algebra.solved(stream_tile(slots, "system", solved).value(),
-                                   _merging(tuple(staging), call))
-            held.store(out_ref, lower, row, chunk, h * chunk, chunk, family=family, smem=landing["square"])
-            return carry, accumulators
-
-        return mosaic.Walk(views, step)
-
-    return launch_kernel(program, call, out_type=held.shape(call.heads * chunk),
-                         grid=(call.chunks, call.heads),
-                         grid_names=("chunks", "heads"),
-                         blocks=stream_blocks(system=((chunk, chunk), solved)),
-                         stages=2 if solve_persistent(call) else 1,
-                         live=chunk_liveness(1), steps=1, model=_inverse_flops(chunk),
-                         held=Held(phases=(_doubling_held(call),)),
-                         staging=_merges(call), landing={"square": held.landing(chunk, chunk)},
-                         persistent=solve_persistent(call), reduces=False)(
-        system, taken)
+def placed_form(call: Call) -> Operand:
+    """The form the own pairs' scores (`own_pairs.intra_own`'s) take to the walk's product placing them on
+    their diagonal blocks (`_sub_chunk_walk`'s 'place', against an exact identity): the held scores' where
+    16-bit (a part times one, exact), else three bf16 parts, which an fp32 value is exactly (a TF32 operand
+    rounds it)."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    if held.stored != jnp.float32:
+        return held
+    return Operand(call.rows, product.bf16_part_count(jnp.float32, accurate=True), jnp.dtype(jnp.float32))
 
 
-@building(lambda launch: ("recurrence_intra", "recurrence_intra_scores", "recurrence_prefix"))
-def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool, prefix=None):
-    """`(Aqk [R, HV * C], A [R, HV * C] where the call `solves`, prefix [R, HV * Dk])` of each chunk and value
-    head under a decay a key dimension: the decay's prefix (`call.gates`, `_prefix`'s) from the laid decay
-    `g` `[R, HV * Dk]` fp32, its limbs a tuple (`Call.prefix_limbs`), which every later launch reads
-    (`prefix` where given, a training forward's kept for its backward, `chunk_forward.kept_forward`), then the
-    scores as `call.held` and the keys' system where it `solves` (`systems`' form, the write-gated keys'
-    pairs, strict), which `_intra_solve` inverts, in one walk sharing every factor (`_sub_chunk_walk`): each
-    pair of sub-chunks' decay factored (`algebra.key_block_pairs`), their products on the tensor cores
-    (fla_kda's intra rows), each sub-chunk's own pairs zero (a launch of their own, `own_pairs.intra_own`)."""
+def inverse_form(call: Call) -> Operand:
+    """The form the own pairs' inverted blocks (`own_pairs.intra_own`'s) and the walk's inverse take to the
+    solve's products (`_sub_chunk_walk`): the doubling's merges' (`mainloop._merged`), on the walk's bundle
+    (`sub_chunked`)."""
+    return _merged(sub_chunked(call))
+
+
+@building(lambda launch: ("recurrence_intra", "recurrence_intra_scores"))
+def _intra(q, k, prefix: tuple, beta, taken, own: tuple, call: Call, *, scale: float, solves: bool):
+    """`(Aqk [R, HV * C], (I + A)^-1 less its unit diagonal [R, HV * C] where the call `solves`)` of each
+    chunk and value head under a decay a key dimension, as `call.held`, from the decay's `prefix` (`_prefix`'s
+    limbs) and each sub-chunk's own blocks `own` (`own_pairs.intra_own`'s, compact: the scores' and the
+    system's inverted), in one walk sharing every factor (`_sub_chunk_walk`): each pair of sub-chunks' decay
+    factored (`algebra.key_block_pairs`), their products on the tensor cores (fla_kda's intra rows), then each
+    sub-chunk's own scores placed on its diagonal and the system's inverse merged from its blocks, fla_kda's
+    chunk_kda_fwd_kernel_inter_solve_fused (fla-core 0.5.2 ops/kda/chunk_intra.py)."""
     products = ("scores", "system") if solves else ("scores",)
-    # The decay's prefix a launch of its own on the call's bundle (fla_kda's chunk_local_cumsum), the walk of
-    # the pairs reading it on the sub-chunk's (`_sub_chunk_walk`).
-    prefix = _prefix(g, taken, call) if prefix is None else prefix
-    return (*_sub_chunk_walk(q, k, prefix, beta, taken, sub_chunked(call), scale=scale, products=products),
-            prefix)
+    return _sub_chunk_walk(q, k, prefix, beta, taken, own, sub_chunked(call), scale=scale, products=products)
 
 
 def sub_chunked(call: Call) -> Call:
@@ -197,12 +171,12 @@ def _rows_of(ref, keys: int) -> jax.Array:
 
 
 def intra_block_stored(call: Call, name: str, block, ref, landing: dict, *, row, head) -> None:
-    """The intra walk's sub-chunk row block `[SUB, C]` of output `name` at `row`, a sub-chunk's rows of the
-    chunk's square."""
+    """The intra walk's sub-chunk row block `[SUB, C]` of output `name` (the scores, or the system's inverse)
+    at `row`, a sub-chunk's rows of the chunk's square, as `call.held`, each through its own landing."""
     chunk = call.chunk
-    form, smem = ((dataclasses.replace(call.held, rows=call.rows), landing["square"]) if name == "scores"
-                  else (systems(call), landing["system"]))
-    form.store(ref, block, row, algebra.SUB, head * chunk, chunk, family=call.family, smem=smem)
+    form = dataclasses.replace(call.held, rows=call.rows)
+    form.store(ref, block, row, algebra.SUB, head * chunk, chunk, family=call.family,
+               smem=landing["square" if name == "scores" else "inverse"])
 
 
 def _sum_index(call: Call, output: int, later: int) -> int:
@@ -366,25 +340,34 @@ def _running_prefix(call: Call, rows, running, decays: jax.Array, keys: int) -> 
         scan.compensated_columns(rows, running)
 
 
-def _sub_chunk_walk(q, k, prefix, beta, taken, call: Call, *, scale: float, products: tuple[str, ...]):
+def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale: float,
+                    products: tuple[str, ...]):
     """The intra walk on a bundle whose products take a sub-chunk's rows (`sub_chunked`), each
     chunk's key blocks from the prefix stored (`_prefix`), no scan of its own:
     each step the block's separated prefix (`algebra.separated`) staged for its sub-chunks' references, each
     output's rows gated down and each sub-chunk's keys gated up (`algebra.key_block_pairs`), and
     its products `[SUB, keys] @ [keys, C]` issued into each output's and sub-chunk's sum (`_sum_index`), read
-    and stored a sub-chunk's rows at a time once the walk is done (`intra_block_stored`): fla_kda's
-    inter-sub-chunk blocks (chunk_kda_fwd_kernel_inter_solve_fused, fla-core 0.5.2 ops/kda/chunk_intra.py)."""
+    a sub-chunk's rows at a time once the walk is done (`_read_out`): fla_kda's inter-sub-chunk blocks
+    (chunk_kda_fwd_kernel_inter_solve_fused, fla-core 0.5.2 ops/kda/chunk_intra.py), each sub-chunk's own
+    blocks `own` (`own_pairs.intra_own`'s, the scores' and the system's inverses) read once a chunk."""
     chunk, width, family = call.chunk, call.width, call.family
     scored, outputs, later = "scores" in products, len(products), _later(call)
+    solving = "system" in products
+    placed, inverted = placed_form(call), inverse_form(call)
+    once_names = ("own_scores", "own_inverses") if solving else ("own_scores",)
+    once_blocks = stream_blocks(own_scores=((chunk, algebra.SUB), placed),
+                                **({"own_inverses": ((chunk, algebra.SUB), inverted)} if solving else {}))
     keys = key_block(call, functools.partial(_sub_chunk_held, call, outputs=outputs),
                      functools.partial(_sub_chunk_staged, call, products=products),
-                     functools.partial(pair_streams, call, queries=scored), contracted=True)
+                     lambda block: {**pair_streams(call, block, queries=scored), **once_blocks},
+                     contracted=True)
     steps = width // keys
     shrinking = min(abs(scale), 1.0)
     growing = math.copysign(max(abs(scale), 1.0), scale)
 
     def program(at, q_ref, k_ref, *refs, streams, staging, landing):
-        prefix_refs, (beta_ref, _taken_ref, *sums) = refs[:len(prefix)], refs[len(prefix):]
+        prefix_refs, (beta_ref, _taken_ref, *rest) = refs[:len(prefix)], refs[len(prefix):]
+        own_refs, sums = rest[:len(own)], rest[len(own):]
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         keyed = h // call.group * width
@@ -392,11 +375,19 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, call: Call, *, scale: float, prod
                              **limb_views(call, prefix_refs, row, chunk, h * width, width),
                              **({"queries": call.given.views(q_ref, row, chunk, keyed, width)} if scored
                                 else {}))
-        lefts, raised, separated = staging
+        forms = {"own_scores": placed, "own_inverses": inverted}
+        once = stream_views(lambda i: (0, 0), **{name: forms[name].views(ref, row, chunk, h * algebra.SUB,
+                                                                          algebra.SUB)
+                                                 for name, ref in zip(forms, own_refs, strict=False)})
+        (lefts, raised, separated), solve = staging[:3], staging[3:]
+        # The own blocks' tiles (`Walk.once`), read after the walk (`_read_out`).
+        held_once: dict = {}
 
         def step(index, slots, carry, accumulators):
             del index
             slots.acquire_all()
+            for name in once_names:
+                held_once[name] = stream_tile(slots, name, forms[name])
             # Laid in the family's layout (`Family.tile_of`), as the scan lays it.
             whole = algebra.separated(*(family.tile_of(tile.refs[0]) for tile in limb_tiles(call, slots)))
             mosaic.synced(call.interpret)
@@ -439,37 +430,82 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, call: Call, *, scale: float, prod
             return carry, tuple(summed)
 
         def read(carry, totals):
-            """Each output's sums a sub-chunk's rows at a time, its first sub-chunk's zero (no keys before
-            it), the system's columns before each row block's sub-chunk alone (a row whose write gate
-            overflows times a zero factor is a NaN past them), the scores scaled past one."""
             del carry
-            for r, name in enumerate(products):
-                # The first sub-chunk's zero laid as the sums are (`Family.as_tile`): a splat lands strided,
-                # where the store's landing takes the sums' tiled layout.
-                blocks = [family.as_tile(family.zeros((algebra.SUB, chunk)))]
-                for j in range(later):
-                    total = totals[_sum_index(call, r, j)]
-                    blocks.append(algebra.columns_before(total, (j + 1) * algebra.SUB) if name == "system"
-                                  else total * growing)
-                for j, block in enumerate(blocks):
-                    intra_block_stored(call, name, block, sums[r], landing, row=row + j * algebra.SUB,
-                                       head=h)
+            _read_out(call, products, totals, held_once, solve, landing, sums, row=row, head=h,
+                      growing=growing)
 
         return mosaic.Walk(views, step, steps=steps, sums=((algebra.SUB, chunk),) * (outputs * later),
-                           read=read)
+                           read=read, once=dict(once))
 
     blocks = pair_streams(call, keys, queries=scored)
-    formed = [dataclasses.replace(call.held, rows=call.rows) if name == "scores" else systems(call)
-              for name in products]
+    out_forms = [dataclasses.replace(call.held, rows=call.rows)] * outputs
     staging, landing = _sub_chunk_staged(call, keys, products=products)
-    inputs = (q, k, *prefix, beta, taken)
-    return launch_kernel(program, call, out_type=tuple(form.shape(call.heads * chunk) for form in formed),
+    inputs = (q, k, *prefix, beta, taken, *own)
+    # The own blocks' streams each its widest swizzle at a sub-chunk's columns, fp32's unswizzled: a TF32
+    # product's operand takes no swizzled fp32 tile (row 12647, `_pair_swizzles`).
+    swizzles = {**_pair_swizzles(call, blocks, keys),
+                **{name: swizzling.UNSWIZZLED if dtype == jnp.float32
+                   else resources.widest_swizzle(dtype, algebra.SUB)
+                   for name, (_, dtype) in once_blocks.items()}}
+    return launch_kernel(program, call, out_type=tuple(form.shape(call.heads * chunk) for form in out_forms),
                          grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=blocks,
-                         stages=(1, 2), live=chunk_liveness(len(inputs) - 1), steps=steps,
-                         model=outputs * 2 * later * algebra.SUB * chunk * width,
+                         once=once_blocks, stages=(1, 2), live=chunk_liveness(len(prefix) + 3), steps=steps,
+                         model=_sub_chunk_flops(call, keys, outputs),
                          held=_sub_chunk_held(call, keys, outputs), staging=staging, landing=landing,
                          name=_named("recurrence_intra", products), sums=(chunk,) * (outputs * later),
-                         swizzles=_pair_swizzles(call, blocks, keys))(*inputs)
+                         swizzles=swizzles)(*inputs)
+
+
+def _read_out(call: Call, products: tuple[str, ...], totals, held_once: dict, solve: tuple, landing: dict,
+              sums, *, row, head, growing: float) -> None:
+    """The intra walk's outputs from its sums (`totals`, each a sub-chunk's row block `[SUB, C]` past the
+    first's), a sub-chunk's rows at a time. The scores': the walk's (its first sub-chunk's none: no keys
+    before it), scaled past one, beside each sub-chunk's own placed on its diagonal block (`placed`: the own
+    blocks against an exact shifted identity, 'place'). The system's inverse, where the walk solves: its rows
+    of blocks by forward substitution, `X_b = X_bb (E_b - L_b X)` for each sub-chunk `b` in turn, `X_bb` its
+    own block's inverse (`own_pairs.intra_own`'s), `L_b` the walk's sums of its rows' pairs before its
+    sub-chunk (`algebra.columns_before`: a row whose write gate overflows times a zero factor is a NaN past
+    them), `X` the rows of blocks before it (staged, zero past them), `E_b` the identity's rows: fla_kda's
+    merges, each stored less its unit diagonal, as `mainloop._weighted` takes it."""
+    sub, chunk, family = algebra.SUB, call.chunk, call.family
+    place, lower, solved, stacked = solve
+    issuer = Issuer(call, {"place.exact": place, "lower": lower, "solve": solved})
+    rows_of = jax.lax.broadcasted_iota(jnp.int32, (sub, chunk), 0)
+    columns_of = jax.lax.broadcasted_iota(jnp.int32, (sub, chunk), 1)
+
+    def identity(b):
+        """The identity's rows of sub-chunk `b` `[SUB, C]`."""
+        return jnp.where(columns_of == rows_of + b * sub, 1.0, 0.0)
+
+    def rows_at(tile, b):
+        return operands.Parts(tuple(ref.at[pl.ds(b * sub, sub)] for ref in tile.refs), tile.dtype)
+
+    def stored(name, block, b):
+        intra_block_stored(call, name, block, sums[0 if name == "scores" else 1], landing,
+                           row=row + b * sub, head=head)
+
+    for b in range(chunk // sub):
+        placed = issuer.summed([("place", rows_at(held_once["own_scores"], b), product.Exact(identity(b)))])
+        walked = None if b == 0 else totals[_sum_index(call, 0, b - 1)] * growing
+        stored("scores", placed if walked is None else walked + placed, b)
+    if "system" not in products:
+        return
+    inverted = inverse_form(call)
+    # The rows of blocks staged zero, so a row block's sum over those not yet solved reads zero.
+    for b in range(chunk // sub):
+        zero = family.zeros((sub, chunk))
+        operands.staged(family, zero, tuple(ref.at[pl.ds(b * sub, sub)] for ref in stacked))
+    for b in range(chunk // sub):
+        unit = identity(b)
+        right = unit
+        if b:
+            pairs = algebra.columns_before(totals[_sum_index(call, 1, b - 1)], b * sub)
+            right = unit - issuer.summed([("lower", pairs, operands.Parts(stacked, inverted.dtype))])
+        found = issuer.summed([("solve", rows_at(held_once["own_inverses"], b), right)])
+        stored("inverse", found - unit, b)
+        if b + 1 < chunk // sub:
+            family.settled(0)
+            operands.staged(family, found, tuple(ref.at[pl.ds(b * sub, sub)] for ref in stacked))
 
 
 def _pair_swizzles(call: Call, blocks: dict, keys: int) -> dict[str, int]:
@@ -494,9 +530,25 @@ def _sub_chunk_held(call: Call, block: int, outputs: int = 1) -> Held:
     paired = product_fragments(call, (pairing, algebra.SUB, block), (pairing, block, chunk),
                                rhs_transposed=True)
     carried = [f32(algebra.SUB, chunk)] * (outputs * _later(call))
+    # After the walk (`_read_out`): a row block's placed scores, its sum and its identity beside the row and
+    # column indices; solving, the substitution's sum, its right side and its rows of the inverse.
+    read = [f32(algebra.SUB, chunk)] * (3 + 3 * (outputs > 1)) + masks(algebra.SUB, chunk) * 2
     return Held(carried=carried, phases=(
         [f32(chunk, block)] * (3 + outputs),
-        [f32(chunk, block)] * 3 + masks(chunk, block) + held_tile(pairing, chunk, block) + paired))
+        [f32(chunk, block)] * 3 + masks(chunk, block) + held_tile(pairing, chunk, block) + paired,
+        read))
+
+
+def _sub_chunk_flops(call: Call, keys: int, outputs: int) -> int:
+    """`_sub_chunk_walk`'s tensor FLOPs: each output's later sub-chunks' pairs a key block, the own scores
+    placed (`[SUB, SUB] @ [SUB, C]` a sub-chunk), and solving, the substitution's sums over the rows of
+    blocks (`[SUB, C] @ [C, C]`) and each own inverse's product (`[SUB, SUB] @ [SUB, C]`)."""
+    del keys
+    chunk, sub, count = call.chunk, algebra.SUB, call.chunk // algebra.SUB
+    walked = outputs * 2 * _later(call) * sub * chunk * call.width
+    placed = count * 2 * sub * sub * chunk
+    solved = (_later(call) * 2 * sub * chunk * chunk + count * 2 * sub * sub * chunk) if outputs > 1 else 0
+    return walked + placed + solved
 
 
 def pair_streams(call: Call, keys: int, *, queries: bool) -> dict:
@@ -516,14 +568,20 @@ def _sub_chunk_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tu
     products are done when issued (mma.sync's, `Family.products_overlap` false), one a sub-chunk where its
     products may still read them as the next is staged: a buffer a sub-chunk held 32 KiB more a program at
     Kimi Linear's 64-key block in two parts."""
-    chunk, pairing = call.chunk, _pairing_operand(call)
-    landing = {**({"square": dataclasses.replace(call.held, rows=call.rows).landing(algebra.SUB, chunk)}
-                  if "scores" in products else {}),
-               **({"system": systems(call).landing(algebra.SUB, chunk)} if "system" in products else {})}
+    chunk, pairing, sub = call.chunk, _pairing_operand(call), algebra.SUB
+    held = dataclasses.replace(call.held, rows=call.rows)
+    landing = {"square": held.landing(sub, chunk),
+               **({"inverse": held.landing(sub, chunk)} if "system" in products else {})}
     lefts = tuple(staging_tiles(pairing, (chunk, keys))[0] for _ in products)
     raised = staging_tiles(pairing, *((chunk, keys),) * (_later(call) if call.family.products_overlap else 1))
     separated = swizzling.plain((2, chunk, keys), jnp.float32)
-    return (lefts, raised, separated), landing
+    # After the walk (`_read_out`): the placing identity's one exact part, in the placed scores' dtype; and
+    # solving, the substitution's left and right operands and its rows of blocks, in the merges' form.
+    placed, inverted = placed_form(call), inverse_form(call)
+    (place,) = staging_tiles(Operand(sub, 1, jnp.dtype(placed.stored)), (sub, chunk))
+    solve = ((place, *staging_tiles(inverted, (sub, chunk), (sub, chunk), (chunk, chunk)))
+             if "system" in products else (place, (), (), ()))
+    return (lefts, raised, separated, *solve), landing
 
 
 def intra_rows(call: Call, name: str, operand: Callable[[str], jax.Array], beta) -> jax.Array:

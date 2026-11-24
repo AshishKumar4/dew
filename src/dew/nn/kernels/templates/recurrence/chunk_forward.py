@@ -12,9 +12,9 @@ import numpy as np
 
 from dew.nn.kernels import chunked_launch, generation, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
-from dew.nn.kernels.templates import mosaic, product, stacked
+from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence import own_pairs
-from dew.nn.kernels.templates.recurrence.intra import _intra, _intra_solve
+from dew.nn.kernels.templates.recurrence.intra import _intra, _prefix
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Operand,
@@ -266,22 +266,14 @@ class _Run:
 
 
 def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool, prefix=None) -> tuple:
-    """`intra._intra`'s scores, system where it `solves`, and prefix (`prefix` where given, the forward's
-    kept), each sub-chunk's own pairs written in place on their diagonal blocks by a launch of their own
-    (`own_pairs.intra_own`), the entries the walk leaves zero, each rounded once."""
-    *walked, prefix = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves, prefix=prefix)
-    # Sums of one shape and dtype (a fast fp32 call's on an A100, its scores' one part fp32 as its system)
-    # stacked into one ref, which `mosaic.checked` asks of refs a launch writes in place (row 3180).
-    groups = stacked.groups([(found.shape, found.dtype) for found in walked])
-    into = [jax.new_ref(walked[group[0]] if len(group) == 1 else jnp.stack([walked[i] for i in group]))
-            for group in groups]
-    own_pairs.intra_own(q, k, prefix, beta, taken, call, scale=scale,
-                        products=("scores", "system") if solves else ("scores",), into=(into, groups))
-    found = [None] * len(walked)
-    for ref, group in zip(into, groups, strict=True):
-        for place, index in enumerate(group):
-            found[index] = ref[...] if len(group) == 1 else ref[place]
-    return (*found, prefix)
+    """The scores, the system's inverse less its unit diagonal where the call `solves` (`intra._intra`'s),
+    and the decay's prefix (`intra._prefix`'s, or `prefix` where given, the forward's kept): the prefix's
+    launch, then each sub-chunk's own pairs and their system's inverses a launch of their own
+    (`own_pairs.intra_own`), then the walk placing the own scores and merging the inverse."""
+    prefix = _prefix(decays, taken, call) if prefix is None else prefix
+    products = ("scores", "system") if solves else ("scores",)
+    own = own_pairs.intra_own(q, k, prefix, beta, taken, call, scale=scale, products=products)
+    return (*_intra(q, k, prefix, beta, taken, own, call, scale=scale, solves=solves), prefix)
 
 
 def _taken(dtype, family: mosaic.Family | None, *, per_key: bool, rounded: bool, delta: bool,
@@ -372,8 +364,8 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     a, w, u, keys, scores, system = None, None, v, k, None, []
     decays = laid(g).reshape(rows, -1)
     if per_key:
-        # A decay a key dimension's prefix's limbs `[R, HV * Dk]` and its scores, and its system where the
-        # call solves it (no inverse given), one launch's (`_intra`).
+        # A decay a key dimension's prefix's limbs `[R, HV * Dk]` and its scores, and its system's inverse
+        # where the call solves it (no inverse given), merged after the walk's pairs (`_paired`).
         solves = delta and kept is None and inverse is None
         scores, *system, prefix = _paired(q, k, decays, beta, taken, call, scale=scale, solves=solves,
                                           prefix=None if kept is None else kept[4])
@@ -392,7 +384,8 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         a = inverse
         w, u, keys = _weighted(k, v, a, prefix, beta, taken, call)
     elif per_key and delta:
-        a = _intra_solve(system[0], taken, call)
+        # The walk's inverse (`_paired`'s, merged from the own blocks' after the pairs).
+        a = system[0]
         w, u, keys = _weighted(k, v, a, prefix, beta, taken, call)
     elif per_key:
         (keys,) = _weighted(k, v, None, prefix, beta, taken, call)
