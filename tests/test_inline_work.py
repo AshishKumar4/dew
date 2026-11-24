@@ -113,7 +113,8 @@ def test_a_warps_tensor_core_product_counts_its_operations_in_its_mode():
 
 def test_a_store_its_operand_guards_counts_the_lanes_that_take_it():
     """A store guarded by an operand (`inline_ptx`'s predicate: the first lane's) moves that lane's word
-    alone; one guarded by a predicate the block computes itself is unpriced, its lanes unknown."""
+    alone; one guarded by a predicate the block sets itself of a constant moves what that predicate's lanes
+    move (none), and one of the data is unpriced, its lanes unknown."""
     def elected(ctx, ref):
         del ctx, ref
         i32 = ir.IntegerType.get_signless(32)
@@ -122,15 +123,26 @@ def test_a_store_its_operand_guards_counts_the_lanes_that_take_it():
 
     assert _counted(elected) == Work(shared_bytes=4)
 
-    def own(ctx, ref):
-        del ctx, ref
-        i32 = ir.IntegerType.get_signless(32)
-        word = arith.constant(i32, 1)
-        mgpu_utils.inline_ptx("{ .reg .pred p; setp.eq.u32 p, $1, 0; @p st.shared.u32 [$0], $1; }", word,
-                              word, has_side_effects=True)
+    def guarded(held):
+        def body(ctx, ref):
+            del ctx
+            i32 = ir.IntegerType.get_signless(32)
+            word = held(ref)
+            mgpu_utils.inline_ptx("{ .reg .pred p; setp.eq.u32 p, $1, 0; @p st.shared.u32 [$0], $1; }",
+                                  arith.constant(i32, 1), word, has_side_effects=True)
+        return body
+
+    # A predicate the block sets of a constant: no lane holds it, so the store moves nothing.
+    i32 = ir.IntegerType.get_signless
+    assert _counted(guarded(lambda ref: arith.constant(i32(32), 1))) == Work()
+
+    def loaded(ref):
+        # A word of the data: which lanes hold the predicate set of it is unknown.
+        value = memref.load(ref, [arith.constant(ir.IndexType.get(), 0)])
+        return arith.bitcast(i32(32), value)
 
     with pytest.raises(emission.Unpriced):
-        _counted(own)
+        _counted(guarded(loaded))
 
 
 def test_a_copy_through_the_launch_context_moves_its_shared_tile_once():
@@ -165,13 +177,20 @@ def test_a_tickets_elected_and_last_lanes_move_their_words_alone():
 
 
 def test_a_launch_contexts_copy_counts_under_its_branch_and_loop():
-    """A copy a body asks its launch context for inside a branch no lane takes moves nothing, and inside a
-    static loop of two trips moves its tile twice: it is counted where the body asks for it."""
+    """A copy a body asks its launch context for inside a branch no lane takes, or under an issuer no lane
+    holds, moves nothing, and inside a static loop of two trips moves its tile twice: it is counted where
+    the body asks for it, under its issuer's guard."""
     def untaken(ctx, ref):
         with mgpu_utils.when(_thread(0)):
             ctx.async_copy(src_ref=ref, dst_ref=ref)
 
     assert _counted(untaken) == Work()
+
+    def unissued(ctx, ref):
+        # Its issuer a predicate no lane holds.
+        ctx.async_copy(src_ref=ref, dst_ref=ref, predicate=_thread(0))
+
+    assert _counted(unissued) == Work()
 
     def looped(ctx, ref):
         index = ir.IndexType.get()
