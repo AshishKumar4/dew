@@ -155,7 +155,7 @@ def native_hopper_cluster2_balanced_tail_holds_check_1():
         return jax.lax.dot(x.astype(wide), w.astype(wide), preferred_element_type=wide).astype(out)
 
     assert_as_exact(jax.jit(dew_fn), jax.jit(plain), draw, "hopper cluster=2 balanced tail 2048x8192x2560",
-                    seeds=4, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
+                    seeds=8, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 def _syrk_and_tail_cells():
     return [
