@@ -4,6 +4,7 @@ counted a warpgroup's lanes, the way `emission` counts the rest of the kernel (r
 
 import dataclasses
 import functools
+import itertools
 import math
 import weakref
 from collections.abc import Callable, Sequence
@@ -11,7 +12,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 from jax._src.interpreters import mlir as jax_mlir
 from jax._src.lib.mlir import ir
-from jax._src.lib.mlir.dialects import func
+from jax._src.lib.mlir.dialects import arith, func
 from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
 from jax.experimental.mosaic.gpu import fragmented_array, utils as mgpu_utils
 
@@ -66,22 +67,32 @@ class Uncounted(ValueError):
     only at run time)."""
 
 
-def body_work(fn: Callable, avals: Sequence, arg_types: Sequence) -> Work:
+def body_work(fn: Callable, avals: Sequence, arg_types: Sequence, values: Sequence = ()) -> Work:
     """What `fn`, an `inline_mgpu` body taking operands of `avals` as `arg_types` states them, issues a
-    warpgroup: the body emitted for the target the trace runs for (`generation.gpu_target`), once a body and
-    operands (`_held`). Raises `Uncounted` where its code holds what no rule counts."""
-    key = tuple(map(str, avals))
+    warpgroup: the body emitted for the target the trace runs for (`generation.gpu_target`), each integer
+    scalar operand whose value the count holds (`values`, None where unknown: a block's start along its
+    launch's axis) a constant of it, so the lanes its predicates take are read; once a body, operands and
+    values (`_held`). Raises `Uncounted` where its code holds what no rule counts."""
+    known = tuple(_scalar(aval, value) for aval, value in itertools.zip_longest(avals, values))
+    key = (tuple(map(str, avals)), known)
     found = _held.get(fn, {})
     if key not in found:
-        found[key] = _counted(fn, avals, arg_types)
+        found[key] = _counted(fn, avals, arg_types, known)
         _held[fn] = found
     return found[key]
+
+
+def _scalar(aval, value) -> int | None:
+    """`value` where it is an integer scalar operand's concrete value, else None."""
+    if value is None or getattr(aval, "shape", None) != () or not np.issubdtype(aval.dtype, np.integer):
+        return None
+    return int(value) if isinstance(value, int | np.integer) or np.ndim(value) == 0 else None
 
 
 _held: "weakref.WeakKeyDictionary[Callable, dict]" = weakref.WeakKeyDictionary()
 
 
-def _counted(fn: Callable, avals: Sequence, arg_types: Sequence) -> Work:
+def _counted(fn: Callable, avals: Sequence, arg_types: Sequence, known: Sequence) -> Work:
     capability = generation.capability(generation.gpu_target().generation) or (9, 0)
     with jax_mlir.make_ir_context() as context, ir.Location.unknown():
         from jaxlib.mosaic.python import mosaic_gpu as dialect
@@ -96,8 +107,10 @@ def _counted(fn: Callable, avals: Sequence, arg_types: Sequence) -> Work:
             function = func.FuncOp("body", ir.FunctionType.get(types, []))
             block = function.add_entry_block()
             with ir.InsertionPoint(block):
+                arguments = [argument if value is None else arith.constant(argument.type, value)
+                             for argument, value in zip(block.arguments, known, strict=True)]
                 fn(None, *(_stand_in(aval, kind, argument)
-                           for aval, kind, argument in zip(avals, arg_types, block.arguments, strict=True)))
+                           for aval, kind, argument in zip(avals, arg_types, arguments, strict=True)))
                 func.ReturnOp([])
         lanes = _Lanes()
         return lanes.region(function.operation.regions[0], np.ones(LANES, dtype=bool))

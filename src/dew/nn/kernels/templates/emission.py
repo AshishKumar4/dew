@@ -29,7 +29,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn import derivatives, precision, programs
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import resources
+from dew.nn.kernels.templates import inline_work, resources
 from dew.nn.kernels.templates.cost import ISSUED_UNITS, Chain, Stated, Work, followed
 from dew.nn.kernels.templates.product import product_mode
 
@@ -696,13 +696,7 @@ class _Counting:
             self.add(_tensor(lhs.dtype, 2 * _elements(equation.outvars[0].aval)
                              * math.prod(lhs.shape[dimension] for dimension in contracted)))
         elif primitive is gpu.inline_mgpu_p:
-            work = _STATED.get(params["mgpu_fn"])
-            if work is None:
-                raise Unpriced(f"an inlined Mosaic GPU body states no work ({params['mgpu_fn']}): its "
-                               "emitter's `emission.stating`")
-            # Its arguments lead its operands, their refs' transforms' leaves after them.
-            arguments = equation.invars[:params["pytree_args"].num_leaves]
-            self.add(work(*(variable.aval for variable in arguments)))
+            self.add(_inlined(params, equation.invars, values))
         elif primitive is lax.cond_p:
             return self.cond(params["branches"], values, given)
         elif (region := _REGIONS.get(primitive)) is not None:
@@ -855,6 +849,22 @@ class _Counting:
             self.loops[-1].work = self.loops[-1].work + _envelope(trial.loops[-1].work for trial in trials)
             self.loops[-1].marks += max(trial.loops[-1].marks for trial in trials)
         return [None] * len(branches[0].outvars)
+
+
+def _inlined(params: Mapping, invars: Sequence, values: Sequence) -> Work:
+    """An inlined Mosaic GPU body's work: what the code it emits issues (`inline_work.body_work`), its
+    arguments its operands' leading ones, their refs' transforms' leaves after them, its scalars' values
+    where the count holds them."""
+    leading = params["pytree_args"].num_leaves
+    avals = [variable.aval for variable in invars[:leading]]
+    stated = _STATED.get(params["mgpu_fn"])
+    if stated is not None:
+        return stated(*avals)
+    try:
+        return inline_work.body_work(params["mgpu_fn"], avals, params["flat_arg_types"], values[:leading])
+    except inline_work.Uncounted as error:
+        raise Unpriced(f"an inlined Mosaic GPU body ({params['mgpu_fn']}) emits what no rule counts: "
+                       f"{error}") from error
 
 
 def _ranged(params, values: list) -> tuple[int, _Bound, _Bound, int] | None:
