@@ -1283,21 +1283,13 @@ def test_a_gathered_loops_mapped_projections_take_their_weights_as_they_lie():
         with (jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout),
               generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic")):
             graph = jax.make_jaxpr(gradient)(variables, ids, jnp.ones(logits.shape, logits.dtype))
-        found[gathered] = _gathers_in_loops(graph.jaxpr)
+        found[gathered] = _gathers_in_loops(graph)
     assert found[False] and not found[True], found
 
 
-def _gathers_in_loops(jaxpr) -> int:
-    """The `all_gather`s within `jaxpr`'s loops (`scan`, `while`), at any depth inside them."""
-    def within(jaxpr, *, looped: bool) -> int:
-        count = 0
-        for equation in jaxpr.eqns:
-            inner = looped or equation.primitive.name in ("scan", "while")
-            count += looped and equation.primitive.name == "all_gather"
-            for param in equation.params.values():
-                for sub in (param if isinstance(param, tuple | list) else (param,)):
-                    held = getattr(sub, "jaxpr", sub)
-                    if isinstance(held, jax.extend.core.Jaxpr):
-                        count += within(held, looped=inner)
-        return count
-    return within(jaxpr, looped=False)
+def _gathers_in_loops(graph) -> int:
+    """The `all_gather`s within `graph`'s loops (`scan`, `while`), at any depth inside them."""
+    from reference_error import equations
+
+    return sum(inner.primitive.name == "all_gather" for equation in equations(graph)
+               if equation.primitive.name in ("scan", "while") for inner in equations(equation.params))
