@@ -6,7 +6,6 @@ walk (`templates.recurrence.diagonal`) or the chunked op's portable math (`recur
 
 import dataclasses
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
