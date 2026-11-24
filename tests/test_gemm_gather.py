@@ -13,6 +13,7 @@ import pytest
 from gathered_walks import gathered_kernel
 from generation_support import cublas_compiled
 from jax.sharding import Mesh
+from map_judge import marked_seeds
 from reference_error import assert_as_exact, equations
 
 from dew.nn.kernels import formats, gemm, generation, grouped_launch, grouped_matmul, tuning
@@ -699,23 +700,35 @@ def test_a_gathered_product_with_a_prologue_holds_check_1_with_its_gradients(gen
                     truth_fn=run(functools.partial(plain, wide=jnp.float64)))
 
 
+_LAYER_SIZES = (70, 0, 129, 57)
+"""The gathered stacked layer's groups (`_gathered_layer`): ragged, one empty."""
+
+
+def _normed(x, inv_rms, weight):
+    return x * inv_rms[:, None] * weight[None, :]
+
+
+def _swiglu(gate, up):
+    return jax.nn.silu(gate) * up
+
+
+def _gathered_layer(tokens, sizes, table, inv_rms, weight, gate_w, up_w, **options):
+    """The second stacked layer's gate|up over `tokens`' rows at `table`, normed by their inverse RMS and the
+    norm's weight in the prologue and SwiGLU in the epilogue (`gemm.gemm`, row 5391)."""
+    return gemm.gemm(tokens, gate_w, sizes, paired=up_w, layer=jnp.int32(1), gather=table, prologue=_normed,
+                     prologue_operands=((inv_rms, ("rows",)), (weight, ("depth",))), epilogue=_swiglu,
+                     out_dtype=jnp.bfloat16, **options)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
 @pytest.mark.parametrize("gpu", ["sm90", "sm100"])
-def test_gathered_prologued_paired_stacked_layer_runs_fused_and_compiles(gpu: str):
+def test_gathered_prologued_paired_stacked_layer_runs_fused(gpu: str, request):
     """A gathered, prologued, paired, stacked-layer grouped GEMM (`#5391`: scanned MoE gate|up over a
-    normalized/scaled token stream) runs inside the one Mosaic mainloop without an XLA gather pre-copy,
-    holds check 1 forward + VJP, and compiles spill-free on Hopper `sm90` and Blackwell `sm100`."""
-    from fla_gdn_support import KernelCase
-    from jax.core import ShapedArray
-    from kernel_compile import compile_mosaic_kernels
-
-    sizes = jnp.asarray([70, 0, 129, 57], jnp.int32)
-    rows = int(sizes.sum())
-
-    def normed(x, inv_rms, weight):
-        return x * inv_rms[:, None] * weight[None, :]
-
-    def swiglu(gate, up):
-        return jax.nn.silu(gate) * up
+    normalized/scaled token stream) runs inside the one Mosaic mainloop on Hopper `sm90` and Blackwell
+    `sm100`, interpreted, and holds check 1 forward + VJP. Its draws run in map tasks of 4: with the compile
+    below in one test they took 126 s on sm100, past the group target (row 12639)."""
+    sizes = jnp.asarray(_LAYER_SIZES, jnp.int32)
+    rows = sum(_LAYER_SIZES)
 
     def draw(seed):
         rng = np.random.default_rng(5391 + seed)
@@ -729,10 +742,7 @@ def test_gathered_prologued_paired_stacked_layer_runs_fused_and_compiles(gpu: st
 
     def run_dew(tokens, table, inv_rms, weight, gate_w, up_w, cotangent):
         def fn(t, r, w, gw, uw):
-            return gemm.gemm(t, gw, sizes, paired=uw, layer=jnp.int32(1), gather=table,
-                             prologue=normed,
-                             prologue_operands=((r, ("rows",)), (w, ("depth",))),
-                             epilogue=swiglu, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+            return _gathered_layer(t, sizes, table, r, w, gw, uw, interpret_on_cpu=True)
 
         with generation.assumed(gpu):
             out, pull = jax.vjp(fn, tokens, inv_rms, weight, gate_w, up_w)
@@ -740,52 +750,58 @@ def test_gathered_prologued_paired_stacked_layer_runs_fused_and_compiles(gpu: st
 
     def run_plain(tokens, table, inv_rms, weight, gate_w, up_w, cotangent, *, wide=jnp.float32):
         def fn(t, r, w, gw, uw):
-            x = normed(t[table].astype(wide), r.astype(wide), w.astype(wide)).astype(
+            x = _normed(t[table].astype(wide), r.astype(wide), w.astype(wide)).astype(
                 wide if wide == jnp.float64 else t.dtype).astype(wide)
             grp = jnp.repeat(jnp.arange(4), sizes, total_repeat_length=rows)
             g = jnp.einsum("rk,rkn->rn", x, gw[1].astype(wide)[grp])
             u = jnp.einsum("rk,rkn->rn", x, uw[1].astype(wide)[grp])
-            out = swiglu(g, u)
+            out = _swiglu(g, u)
             return out if wide == jnp.float64 else out.astype(jnp.bfloat16)
         out, pull = jax.vjp(fn, tokens, inv_rms, weight, gate_w, up_w)
         return out, *pull(cotangent.astype(out.dtype))
 
     t0, tbl0, r0, w0, gw0, uw0, _ = draw(0)
     with generation.assumed(gpu), generation.chosen(grouped_matmul="mosaic"), generation.routes() as seen:
-        gemm.gemm(t0, gw0, sizes, paired=uw0, layer=jnp.int32(1), gather=tbl0, prologue=normed,
-                  prologue_operands=((r0, ("rows",)), (w0, ("depth",))), epilogue=swiglu,
-                  out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+        _gathered_layer(t0, sizes, tbl0, r0, w0, gw0, uw0, interpret_on_cpu=True)
     assert any(r.kernel == "mosaic" for r in seen), seen
     assert_as_exact(jax.jit(run_dew), jax.jit(run_plain), draw, "gathered+prologue+paired+layer",
-                    seeds=SEEDS, truth_fn=functools.partial(run_plain, wide=jnp.float64))
+                    seeds=marked_seeds(request), truth_fn=functools.partial(run_plain, wide=jnp.float64))
 
-    if generation.compile_only_gpus(gpu):
-        bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-        f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
-        i32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.int32)
-        specs = (bf16((192, 128)), i32((rows,)), f32((rows,)), bf16((128,)),
-                 bf16((2, 4, 128, 256)), bf16((2, 4, 128, 256)), i32((4,)))
 
-        def compiled(t, tbl, r, w, gw, uw, sz):
-            with generation.chosen(grouped_matmul="mosaic"):
-                return gemm.gemm(t, gw, sz, paired=uw, layer=jnp.int32(1), gather=tbl,
-                                 prologue=normed,
-                                 prologue_operands=((r, ("rows",)), (w, ("depth",))),
-                                 epilogue=swiglu, out_dtype=jnp.bfloat16)
+@pytest.mark.parametrize("gpu", ["sm90", "sm100"])
+def test_gathered_prologued_paired_stacked_layer_compiles_spill_free_without_a_gather_copy(gpu: str):
+    """`test_gathered_prologued_paired_stacked_layer_runs_fused`'s layer for a compile-only `gpu`: its CUDA
+    program gathers no tokens before the Mosaic mainloop, and its kernels compile spill-free (row 5391)."""
+    from fla_gdn_support import KernelCase
+    from jax.core import ShapedArray
+    from kernel_compile import compile_mosaic_kernels
 
-        with generation.assumed(gpu):
-            graph = jax.make_jaxpr(compiled)(*specs)
-            assert not any(
-                eqn.primitive.name == "gather"
-                and any(isinstance(v.aval, ShapedArray) and v.aval.shape == (192, 128) for v in eqn.invars)
-                for eqn in equations(graph, platform="cuda")
-            ), "tokens pre-gathered in CUDA path before Mosaic mainloop"
-            records = compile_mosaic_kernels(
-                [KernelCase(f"gathered_prologue_paired_layer_{gpu}", lambda: (compiled, specs))], gpu)
-        for rec in records:
-            assert not rec.get("error"), rec
-            assert rec["kernels"], rec
-            assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+    if not generation.compile_only_gpus(gpu):
+        pytest.skip(f"no compile-only {gpu} in this environment")
+    rows = sum(_LAYER_SIZES)
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    i32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.int32)
+    specs = (bf16((192, 128)), i32((rows,)), f32((rows,)), bf16((128,)),
+             bf16((2, 4, 128, 256)), bf16((2, 4, 128, 256)), i32((4,)))
+
+    def compiled(t, tbl, r, w, gw, uw, sz):
+        with generation.chosen(grouped_matmul="mosaic"):
+            return _gathered_layer(t, sz, tbl, r, w, gw, uw)
+
+    with generation.assumed(gpu):
+        graph = jax.make_jaxpr(compiled)(*specs)
+        assert not any(
+            eqn.primitive.name == "gather"
+            and any(isinstance(v.aval, ShapedArray) and v.aval.shape == (192, 128) for v in eqn.invars)
+            for eqn in equations(graph, platform="cuda")
+        ), "tokens pre-gathered in CUDA path before Mosaic mainloop"
+        records = compile_mosaic_kernels(
+            [KernelCase(f"gathered_prologue_paired_layer_{gpu}", lambda: (compiled, specs))], gpu)
+    for rec in records:
+        assert not rec.get("error"), rec
+        assert rec["kernels"], rec
+        assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
 
 
 def test_gathered_prologued_negative_indices_and_sm80_forced_mosaic():

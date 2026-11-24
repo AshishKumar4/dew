@@ -458,7 +458,8 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
     """A dense kernel gradient the selector gives XLA (an A100's declared cell, `grouped_matmul.DECLARED`,
     which DENSE1 timed as XLA's dot) runs XLA's own dot over its rows, as a dense forward does (`xla_dot`): no
     ragged dot of one group, which took an A100's gate_up weight gradient 470 ms against the template's 11.4
-    (W121-a100)."""
+    (W121-a100), and its rows read as they are: a dense call routes every row, and a mask of them was a select
+    XLA kept, up to 23% of the A100's XLA kernel gradient (M-NG-45-a100's 4B key)."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     with generation.assumed("sm80"), generation.routes() as routes:
         graph = jax.make_jaxpr(lambda x, dy: gemm.gemm_t(x, dy, None, out_dtype=jnp.bfloat16))(
@@ -466,7 +467,11 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}, routes
     names = {equation.primitive.name for equation in equations(graph, platform="cuda")}
     assert "dot_general" in names and "ragged_dot_general" not in names, names
+    masks = [equation for equation in equations(graph, platform="cuda")
+             if equation.primitive.name == "select_n" and equation.outvars[0].aval.shape == (512, 256)]
+    assert not masks, "a dense call's rows are selected whole before its product"
     assert graph.out_avals[0].shape == (1, 256, 384)
+
 
 @pytest.mark.parametrize("product", ["forward", "input gradient", "kernel gradient"])
 def test_an_amperes_gpt_oss_projection_routes_to_a_kernel_that_lowers(product):
@@ -2287,6 +2292,24 @@ def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
         assert pricing.granular_tile(fam, t64, jnp.bfloat16, target=sm100, stream_blocks=scales)
         assert not pricing.granular_tile(
             fam, dataclasses.replace(t64, programs=3), jnp.bfloat16, target=sm100, stream_blocks=scales)
+
+
+def test_the_planner_prices_mma_syncs_row_bound_where_its_grouped_kernel_issues_it():
+    """The planner's register estimate of a one-consumer grouped mma.sync launch, whose products take a row
+    bound, is a dense one's at the same tile and rows and its issuer's registers for the bound
+    (`MmaIssuer.bound_registers`) besides: the dense call's products take none (row 12304)."""
+    gmm, tile = grouped_matmul.MosaicGmm(), tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    calls = {grouped: gmm.bind(bf16((512, 256)), bf16((4 if grouped else 1, 256, 256)),
+                               jax.ShapeDtypeStruct((4 if grouped else 1,), jnp.int32), out_dtype="bfloat16",
+                               trans_rhs=False, interpret=False, dense=not grouped)
+             for grouped in (True, False)}
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        estimated = {grouped: gmm._registers(ba, tile, merging=False, target=target)
+                     for grouped, ba in calls.items()}
+        bound = pricing.family_of(tile, jnp.bfloat16, target).bound_registers
+    assert bound > 0 and estimated[True] - estimated[False] == bound, (bound, estimated)
 
 
 @INTERPRETS

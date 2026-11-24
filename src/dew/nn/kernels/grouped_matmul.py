@@ -68,14 +68,18 @@ if TYPE_CHECKING:
     from .templates.gemm import mosaic_gpu, pricing
 
 
+def _stored_dtypes(ba) -> tuple:
+    """The dtypes a bound product call stores: its epilogue's outputs', else its one output's."""
+    return ba.arguments['hooks'].out_dtypes or (ba.arguments['out_dtype'],)
+
+
 def _stored_bytes(ba, rows: int, width: int) -> float:
     """The bytes a product's epilogue moves an element of its `rows` x `width` output
     (`pricing.split_walk`'s `stored`): each output's dtype's, and its epilogue operands' bytes over the
     output's elements (an [rows, columns] operand's an element, a column vector's a row's share)."""
     from .templates import cost
 
-    hooks = ba.arguments['hooks']
-    written = sum(jnp.dtype(dtype).itemsize for dtype in hooks.out_dtypes or (ba.arguments['out_dtype'],))
+    written = sum(jnp.dtype(dtype).itemsize for dtype in _stored_dtypes(ba))
     return written + cost.stored(*ba.arguments.get('epilogue_operands', ())) / max(rows * width, 1)
 
 def _matrix_extents(ba) -> tuple[int, int]:
@@ -200,8 +204,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         block = (config.block_m, columns, config.block_k)
         if not family.budgets_registers or generation.tpu(target):
             return None
-        hooks = ba.arguments['hooks']
-        stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
+        stored = _stored_dtypes(ba)
         plain = resources.tile_registers(family, config.sharing, block, dtype, stored=stored,
                                         rhs_transposed=self._matrix_transposed(ba),
                                         lhs_retained=ba.arguments.get('paired') is not None)
@@ -613,7 +616,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 or not self._divides(ba, config, target) or self._refused(ba, config, target)):
             return False
         hooks = ba.arguments['hooks']
-        stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
+        stored = _stored_dtypes(ba)
         if not self._granular(ba, config, family, target) or config.staging_refusal(
                 quantized.outputs((config.share, pricing.tile_columns(config, family)), stored,
                                   quantized.forms_of(hooks.out_forms, len(stored))),
@@ -830,8 +833,8 @@ class MosaicGmm(_Mosaic):
             prologue_dtypes=tuple(side.dtype for side in ba.arguments['prologue_operands']),
             epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
-            dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
-            forms=quantized.forms_of(hooks.out_forms, len(hooks.out_dtypes or (None,))),
+            dtypes=_stored_dtypes(ba),
+            forms=quantized.forms_of(hooks.out_forms, len(_stored_dtypes(ba))),
             paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED,
             block_scaled=self.BLOCK_SCALED, gathered=ba.arguments.get('gather') is not None,
             interpret=bool(ba.arguments['interpret']), joined=ba.arguments.get('joined') is not None)
@@ -928,7 +931,7 @@ class MosaicGmm(_Mosaic):
             # A side tile along the axis (a vector's copy is one tile of its own, its load past it zeros).
             return any(len(axes) > 1 and axis in axes for axes in axes_of[:len(operands)])
 
-        outputs = hooks.out_dtypes or (ba.arguments['out_dtype'],)
+        outputs = _stored_dtypes(ba)
         depth_partial = (rows_of(depth, tokens.dtype, *((kernel.dtype,) if trans_rhs else ()))
                          and not tiled(ba.arguments['prologue_operands'], hooks.prologue_axes, 'depth')
                          and ba.arguments.get('gather') is None)
@@ -1516,7 +1519,7 @@ class MosaicWordPackedGmm(MosaicPackedGmm):
             config, family, dtype=dtype, rhs_dtype=dtype if rows else jnp.uint32, transpose_rhs=True,
             prologue_axes=(), prologue_dtypes=(), epilogue_axes=hooks.epilogue_axes,
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
-            dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
+            dtypes=_stored_dtypes(ba),
             packed_format=self._desc(ba).name, packed_rows=rows)
     def _operand_bytes(self, ba, tile: tiling.Tiles) -> tuple[tuple[float, float], tuple]:
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']

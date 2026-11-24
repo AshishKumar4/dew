@@ -69,10 +69,9 @@ def test_ternary_weights_pack_decode_and_stage_match_bitwise():
     assert d_empty.shape == (16, 0)
 
 
-def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compiles():
-    """`gemm.ternary_weight_product` holds check 1 on both default XLA and interpreted Mosaic routes across
-    dense & grouped scales, matches BitNet b1.58 per-token int8 activation quantization + STE (including
-    zero rows), and compiles spill-free on sm80 and sm90 (row 1464)."""
+def test_ternary_weight_product_holds_check_1_on_both_routes():
+    """`gemm.ternary_weight_product` holds check 1 on both the default XLA and the interpreted Mosaic route
+    at a per-column scale (row 1464)."""
     def draw(seed):
         rng = np.random.default_rng(1464 + seed)
         x = jnp.asarray(rng.standard_normal((128, 256)) / np.sqrt(256), jnp.bfloat16)
@@ -90,6 +89,12 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
         assert_as_exact(jax.jit(dew_fn), jax.jit(decoded_weight_dot), draw,
                         f"ternary_weight interp={interpret}",
                         seeds=8, truth_fn=functools.partial(decoded_weight_dot, dtype=jnp.float64))
+
+
+def test_a_grouped_ternary_weight_product_is_exact_at_every_scale_shape():
+    """A grouped ternary product of small integer rows is its decoded ragged dot exactly at a scalar, a
+    per-column, a per-group and a per-group-column scale, on both routes and through `gemm.gemm` (row
+    1464)."""
     rng = np.random.default_rng(1465)
     x_g = jnp.asarray(rng.integers(-3, 4, size=(64, 256)), jnp.bfloat16)
     w_g = jnp.asarray(rng.standard_normal((2, 256, 64)), jnp.float32)
@@ -108,7 +113,12 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
         np.testing.assert_array_equal(np.asarray(gemm.gemm(x_g, bank, sizes, out_dtype=jnp.float32)),
                                       np.asarray(ref))
 
-    # BitNet b1.58 per-token int8 activation quantization + zero-row safety + unquantized STE gradient.
+
+
+def test_a_ternary_weight_product_quantizes_its_activations_as_bitnet_does():
+    """BitNet b1.58's per-token int8 activation quantization, a zero row's product zero, and the unquantized
+    straight-through gradient in the rows and the scale, on both routes (row 1464)."""
+    rng = np.random.default_rng(1466)
     x_bit = jnp.asarray(rng.standard_normal((32, 256)), jnp.bfloat16).at[0].set(0.0)
     w_bit = formats.TernaryWeights.of(jnp.asarray(rng.standard_normal((256, 64)), jnp.float32))
     x_f32 = x_bit.astype(jnp.float32)
@@ -147,9 +157,13 @@ def test_ternary_weight_product_holds_check_1_dense_grouped_bitlinear_and_compil
         np.testing.assert_array_equal(np.asarray(dx), np.asarray(dx_exact))
         np.testing.assert_array_equal(np.asarray(dscale), np.asarray(dscale_exact))
         np.testing.assert_array_equal(np.asarray(y_tan[1]), np.asarray(jvp_exact[1]))
-    for gpu in ("sm80", "sm90"):
-        if not generation.compile_only_gpus(gpu):
-            continue
+
+
+@pytest.mark.parametrize("gpu", [pytest.param("sm80", marks=lowers("sm80")),
+                                 pytest.param("sm90", marks=lowers("sm90"))])
+def test_a_ternary_weight_product_compiles_spill_free(gpu: str):
+    """The ternary product's Mosaic launch compiles spill-free on a compile-only sm80 and sm90 (row 1464)."""
+    if generation.compile_only_gpus(gpu):
         x_s = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
         w_sample = formats.TernaryWeights.of(np.ones((256, 128), np.float32))
         w_spec = jax.tree.map(lambda a: jax.ShapeDtypeStruct(np.shape(a), np.asarray(a).dtype), w_sample)
