@@ -41,8 +41,7 @@ from dew.sampling.text import Generation, Sampling, policy_identity
 from .sessions import Call, Session, Snapshot, Status, Task, Transcript, finite_reward, json_objects
 
 if TYPE_CHECKING:
-    from dew.inference.serving import Server
-    from dew.nn.kv_cache import KVCache
+    from dew.inference.serving import PagedKV, Server
 
     from .journal import EpisodeJournal, JournalRun
 
@@ -400,17 +399,18 @@ class EpisodeCollector:
     sampling: Sampling
     record: EpisodeRecorder | None = None
     journal: EpisodeJournal | None = None
-    kv_cache: KVCache | None = None
-    """A paged cache layout (`dew.nn.kv_cache.KVCache` with a `page_size`) the cohort's turns are served over:
-    its `TextGeneration` policy, bound to the snapshot, becomes a `dew.inference.serving.Server` in process,
+    cache: PagedKV | None = None
+    """The paged cache the cohort's turns are served over (`dew.inference.serving.PagedKV`, as
+    `Server.from_task` takes it: one name for a served cache, Train 1208's review F3): its
+    `TextGeneration` policy, bound to the snapshot, becomes a `dew.inference.serving.Server` in process,
     one a cohort, whose prefix cache keeps each row's history, so a turn whose context continues its row's
     last reads that history's full pages from the cache and prefills only the rest (the history's tokens
     past its last full page among them, and, over a recurrent mixer, those past the last page its state is
     held at), a group's shared prompt once, and a row whose context does not continue its last prefills it
     whole, saying so (a warning naming the row); its pages and states are the server's, released when the
-    cohort's collection returns. None draws each turn from the policy whole. A
-    served turn draws what the policy's draws: every row's tokens and likelihoods, the key folded by its
-    global row."""
+    cohort's collection returns. None draws each turn from the policy whole, as a cache of whole rows would:
+    a server's dense rows keep no history to read back. A served turn draws what the policy's draws: every
+    row's tokens and likelihoods, the key folded by its global row."""
 
     def __post_init__(self) -> None:
         for name in ("max_prompt_tokens", "max_new_tokens", "max_turns"):
@@ -715,7 +715,7 @@ class EpisodeCollector:
                 # The journal records the policy the cohort draws under (`records.record_json`), the
                 # task's inherited controls among it: one it cannot record is refused before it opens.
                 to_record(sampling, Sampling)
-            if self.kv_cache is not None:
+            if self.cache is not None:
                 policy = _ServedTurns.over(policy, self, sampling, rows=ids.size * samples)
             key_words = tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist())
             # The policy the cohort draws under (`_effective`), by its components' identity, which every
@@ -797,8 +797,8 @@ def session_of(episode: Episode, *, group: str) -> Session:
 
 
 class _ServedTurns:
-    """A cohort's turns served in process (`EpisodeCollector.kv_cache`): its bound `TextGeneration` as a
-    `dew.inference.serving.Server` over the paged layout, each turn a call of every row, row `i` folding the
+    """A cohort's turns served in process (`EpisodeCollector.cache`): its bound `TextGeneration` as a
+    `dew.inference.serving.Server` over the paged cache, each turn a call of every row, row `i` folding the
     turn's key by its global row as the policy's own call folds it: where its context continues the history
     its last turn left, the server reads that history's full pages and its state where it ends at a page's
     end, which it named as the turn finished (`PagedRows.finished`), and prefills the rest; a row whose
@@ -813,10 +813,10 @@ class _ServedTurns:
              rows: int) -> _ServedTurns:
         """`policy`, a bound `TextGeneration`, served for a cohort of `rows` rows of this process under
         `sampling`, the policy the cohort draws under (`EpisodeCollector._effective`): a slot a row, each
-        holding the cohort's whole allowed context and draw, its pool's pages the layout's."""
+        holding the cohort's whole allowed context and draw, its pool's pages the cache's."""
         from dataclasses import replace
 
-        from dew.inference.serving import PagedKV, Server, row_groups
+        from dew.inference.serving import Server, row_groups
         from dew.inference.tasks import TextGeneration
 
         if not isinstance(policy, TextGeneration):
@@ -834,10 +834,8 @@ class _ServedTurns:
         processes = 1 if mesh is None else len({device.process_index for device in mesh.devices.flat})
         groups = row_groups(mesh)
         slots = -(-rows * processes // groups) * groups
-        # The task over the cohort's laid layout, its pages as that layout pages them.
-        task = replace(task, model=task.model.with_kv_cache(collector.kv_cache))
         server = Server.from_task(task, slots=slots, capacity=collector.max_prompt_tokens
-                                  + collector.max_new_tokens, cache=PagedKV())
+                                  + collector.max_new_tokens, cache=collector.cache)
         # A pool's rows fold by their global row, this process's from its rank's first on.
         first = jax.process_index() * rows if server.pooled else 0
         return cls(server, sampling, first)

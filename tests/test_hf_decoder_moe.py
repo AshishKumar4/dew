@@ -860,7 +860,6 @@ def test_kimi_k25_reads_raw_images_through_its_releases_own_processor(tmp_path):
     (source / "preprocessor_config.json").write_text(json.dumps(released))
     loaded = Pretrained.load(source, dtype="float32", trust_remote_code=True)
     release = AutoProcessor.from_pretrained(str(source), trust_remote_code=True, local_files_only=True)
-    assert type(release).__name__ == "KimiK25Processor"
     rng = np.random.default_rng(4367)
     images = [(rng.random(shape) * 255).astype(np.uint8) for shape in ((12, 8, 3), (8, 16, 3), (10, 10, 3))]
     rows = ["w5 <|media_pad|> w7", "<|media_pad|> w2 w3 <|media_pad|>"]

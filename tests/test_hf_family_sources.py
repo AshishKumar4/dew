@@ -310,7 +310,10 @@ def test_the_pad_row_takes_the_gradient_its_source_gives_it(name, case, tmp_path
     config, recorded = _padding_case(name, case, directory)
     model = models.build("causal_transformer",
                          {**translate_config(config), "dtype": "float32"})
-    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32)))
+    # The lookup's variables alone, which every read below takes (`method="token_embeddings"`): a whole
+    # decoder's draw of a mixture of experts' layers took most of a case's 135 s (row 11917).
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32),
+                                    method="token_embeddings"))
     table = token_table(variables)[1]
     rows = jnp.arange(table.shape[0])[None]
     placeholders = [config[field] for field in PLACEHOLDERS.get(name, ())]

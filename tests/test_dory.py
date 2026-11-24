@@ -669,24 +669,23 @@ sized apart, the reference compared with itself: sized by `seeds_for` on armada'
 eg-sized2 at 0aed05577f7), where each run sized it again."""
 
 
-@attending("xla")
-def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
-    """A rank-2 adapter on all eight projections of every layer, the attention's output gate
-    (`g_proj`) apart from the feed-forward's `gate_proj`: one step moves every B factor, so the
-    loss reaches each projection; a run resumed after its first step ends where two uninterrupted
-    steps end; the saved factors load back to the same logits; PEFT, the saved adapter's consumer,
-    merges it into every projection the checkpoint holds by its name there, and the transcription
-    over that merge computes the adapted model's logits within the rule of its own run against
-    float64; and the merged checkpoint reloads to logits on par with the adapted model's from
-    float64."""
+def every_projections_adapter():
+    """The tiny Dory and a rank-2 adapter on all eight projections of every layer, the attention's output
+    gate (`g_proj`) apart from the feed-forward's `gate_proj`, and the checkpoint's tensors."""
     from safetensors.numpy import load_file
 
     loaded = load()
-    adapted = loaded.adapt(LoRA(rank=2, modules=PROJECTIONS), key=0)
-    original = load_file(str(TINY / 'model.safetensors'))
-    # Every projection the checkpoint holds, by its name there, is one PEFT's merge moves.
-    projections = {name for name in original
-                   if name.removesuffix('.weight').rsplit('.', 1)[-1] in PROJECTIONS}
+    return loaded, loaded.adapt(LoRA(rank=2, modules=PROJECTIONS), key=0), load_file(
+        str(TINY / 'model.safetensors'))
+
+
+@attending("xla")
+@pytest.mark.compiles_at_run(reason="training steps and their checkpoints against each other, no check-1 "
+                                    "site")
+def test_a_lora_on_every_projection_trains_and_resumes(tmp_path):
+    """A rank-2 adapter on every projection: one step moves every B factor, so the loss reaches each
+    projection; a run resumed after its first step ends where two uninterrupted steps end, bit for bit."""
+    _, adapted, _ = every_projections_adapter()
 
     def objective():
         return LMObjective(adapted.model, 8, variables=adapted.variables)
@@ -703,18 +702,45 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     whole = train(objective(), tmp_path / 'whole', 2)
     jax.tree.map(np.testing.assert_array_equal, resumed['params'], whole['params'])
 
-    adapted.adapter.save(resumed, tmp_path / 'adapter')
-    again = LoRA.load(loaded.model, loaded.variables, tmp_path / 'adapter', layouts=loaded.layouts)
-    ids = REFERENCE['input_ids']
-    logits = np.asarray(adapted.model.apply(resumed, ids))
-    np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)), logits)
+
+ADAPTER_SCALE = 0.02
+"""How far a drawn adapter's B factors lie from zero: about where two of `train`'s Adam steps at 1e-2 move
+them, so its projections' sums round as a trained adapter's do."""
+
+
+@attending("xla")
+def test_a_loras_saved_factors_load_back_and_merge_as_peft_merges_them(tmp_path):
+    """A rank-2 adapter on every projection, its B factors drawn off zero as training moves them
+    (`ADAPTER_SCALE`): its saved factors load back to the same logits; PEFT, the saved adapter's consumer,
+    merges it into every projection the checkpoint holds by its name there, and the transcription over that
+    merge computes the adapted model's logits within the rule of its own run against float64; and the
+    merged checkpoint reloads to logits on par with the adapted model's from float64. Every step before its
+    check-1 sites runs on the host in a GPU tier part's prepare (`ahead_on_the_host`), so its prepare
+    reaches them (row 11560)."""
     import torch
 
+    # The adapter's key split and its factors' draw on the host too, where its prepare ran them on its
+    # compile-only GPU (the models review).
+    with ahead_on_the_host():
+        loaded, adapted, original = every_projections_adapter()
+    # Every projection the checkpoint holds, by its name there, is one PEFT's merge moves.
+    projections = {name for name in original
+                   if name.removesuffix('.weight').rsplit('.', 1)[-1] in PROJECTIONS}
+    ids = REFERENCE['input_ids']
+    with ahead_on_the_host():
+        drawn = jax.device_get(jax.tree_util.tree_map_with_path(
+            lambda path, leaf, key: leaf + ADAPTER_SCALE * jax.random.normal(key, leaf.shape, leaf.dtype)
+            if jax.tree_util.keystr(path).endswith("['lora_B']") else leaf,
+            adapted.variables, keyed(adapted.variables, jax.random.key(0xADA))))
+        adapted.adapter.save(drawn, tmp_path / 'adapter')
+        again = LoRA.load(loaded.model, loaded.variables, tmp_path / 'adapter', layouts=loaded.layouts)
+        np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)),
+                                      np.asarray(adapted.model.apply(drawn, ids)))
+        adapted.save(tmp_path / 'merged', variables=drawn)
+        merged = Pretrained.load(tmp_path / 'merged', dtype='float32')
     config, peft = json.loads((TINY / 'config.json').read_text()), peft_merged(TINY, tmp_path / 'adapter')
     assert {name for name in peft if not np.array_equal(peft[name], original[name])} == projections
-    vocabulary = adapted.model.vocab_size
-
-    draw = token_draw(0xD0E, vocabulary, ids.shape)
+    draw = token_draw(0xD0E, adapted.model.vocab_size, ids.shape)
 
     # The adapter as PEFT merges it, its consumer: the transcription over PEFT's merge computes the
     # adapted model's logits on par with its own fp32 run from its float64 one (check 1).
@@ -724,22 +750,26 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     def peft_logits(dtype):
         return as_given(lambda drawn: merged_by_peft[dtype].forward(np.asarray(drawn)))
 
-    def adapted_logits(drawn):
-        return adapted.model.apply(resumed, drawn)
+    def adapted_logits(tokens):
+        return adapted.model.apply(drawn, tokens)
 
     assert_as_exact(adapted_logits, peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
                     seeds=PEFT_MERGED_SEEDS, truth_fn=peft_logits(torch.float64))
-    adapted.save(tmp_path / 'merged', variables=resumed)
-    merged = Pretrained.load(tmp_path / 'merged', dtype='float32')
+
     # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
     # model's logits are on par with the adapted model's over drawn ids, both from the adapted
     # model's float64 forward (check 1).
-
-    def merged_logits(drawn):
-        return merged.model.apply(merged.variables, drawn)
+    def merged_logits(tokens):
+        return merged.model.apply(merged.variables, tokens)
 
     assert_as_exact(merged_logits, adapted_logits, draw, 'merged adapter logits', seeds=MERGED_SEEDS,
-                    truth_fn=as_given(lambda drawn: float64_forward(adapted.model, resumed, drawn)[0]))
+                    truth_fn=as_given(lambda tokens: float64_forward(adapted.model, drawn, tokens)[0]))
+
+
+def keyed(tree, key: jax.Array):
+    """A key for each leaf of `tree`, split from `key`, in its structure."""
+    leaves, structure = jax.tree.flatten(tree)
+    return jax.tree.unflatten(structure, list(jax.random.split(key, len(leaves))))
 
 
 INTENT = Choice('which team?', {'billing': 'payments', 'technical': 'outages', 'sales': 'pricing'})
