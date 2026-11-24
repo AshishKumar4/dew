@@ -39,7 +39,9 @@ def _certified_and_emitted(given) -> tuple[set, list]:
     before = {id(certified) for certified in report.certifications()}
     with report.refusals(), generation.assumed('sm90'), report.certifying(compile_only_gpus('sm90')[0]):
         lowered = jax.jit(formed('fast', gradients)).trace(shaped).lower(lowering_platforms=('cuda',))
-    pulled = [each for each in report.certifications() if id(each) not in before and each.pulled]
+    # Each pulled config the selector certified and kept (a refused config's kernels the step runs none of).
+    pulled = [each for each in report.certifications()
+              if id(each) not in before and each.pulled and not each.refused]
     assert pulled and len({each.config for each in pulled}) == len(pulled), [each.config for each in pulled]
     certified = {module for each in pulled for module, _ in each.kernels.values()}
     return certified, [call.config for call in kernel_calls(lowered) if call.kind == 'mosaic_gpu']
@@ -68,7 +70,7 @@ def test_a_turned_training_step_runs_the_kernels_its_selector_certified(forked, 
     assert emitted and set(emitted) == certified, (sorted(set(emitted) ^ certified))
 
 
-FORKED_FIELDS = ('state', 'stores', 'entry_key', 'entry_value', 'entry_weight', 'adds', 'held')
+FORKED_FIELDS = ('state', 'stores', 'entry_key', 'entry_value', 'entry_weight', 'held')
 """A forked call's own fields (`state` its table's `[B, S', Hv, Dk, Dv]`), each an unforked call refuses."""
 
 
@@ -81,8 +83,7 @@ def test_an_unforked_call_refuses_each_forked_field_alone(field):
     (whole,) = hooked_draw(TURNED, packed=False, seed=0)
     forked = entering_documents(entered_draw(TURNED, seed=0, entries=True)[0])
     given = {'state': forked.state, 'stores': forked.stores, 'entry_key': forked.entry_key,
-             'entry_value': forked.entry_value, 'entry_weight': forked.entry_weight, 'adds': forked.adds,
-             'held': forked.held}
+             'entry_value': forked.entry_value, 'entry_weight': forked.entry_weight, 'held': forked.held}
     jax.eval_shape(functools.partial(chunk, TURNED), whole)
     with pytest.raises(ValueError):
         chunk(TURNED, dataclasses.replace(whole, **{field: given[field]}))
