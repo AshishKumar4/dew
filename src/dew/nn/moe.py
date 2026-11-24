@@ -785,21 +785,21 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     (`grouped_matmul._takes_pair`), each under `expert_projection`'s law. On an H100 the pair took 0.79
     to 1.0 of the two products' time at the routings of DeepSeek-V3, Qwen3-30B-A3B and GPT-OSS-20B, its
     outputs theirs bit for bit (FS-3699-PAIRED2-h100, ledger 3699). Both products take one compute dtype,
-    the rows' and both matrices' however a matrix is held; two stacks' layer (`Layered`) pair at it, read in
-    place: an iteration's (`at_iteration`) or a bank's run's index, one for every kernel its layer reads,
-    which a derivative's span hands on as one tracer a kernel (`derivatives.span`), so the pair takes the
-    first's. `Gathered` rows are read and scaled where they lie, as `expert_projection` reads them."""
-    (first_stack, layer), (second_stack, _) = (
+    the rows' and both matrices' however a matrix is held; two stacks read at one layer index (`Layered`,
+    the same index: `ExpertMLP`'s kernels, `_one_layer`) pair at it, read in place, and stacks read at two
+    indices each at its own. `Gathered` rows are read and scaled where they lie, as `expert_projection`
+    reads them."""
+    (first_stack, layer), (second_stack, second_layer) = (
         (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
         for kernel in (first, second))
     compute = canonicalize_dtype(x.tokens if isinstance(x, Gathered) else x, _held(first_stack),
                                  _held(second_stack), dtype=dtype)
-    if (isinstance(first, Layered) is not isinstance(second, Layered)
-            or isinstance(first_stack, formats.NvFp4) or isinstance(second_stack, formats.NvFp4)
-            or _recipe_takes_experts(first_stack)):
-        # A stack's layer beside a matrix, a packed bank (its product the NVFP4 one,
-        # which pairs with none), or a run's low-precision recipe that takes the experts (`recipe_refusal`),
-        # take each product apart (`expert_projection`); experts the recipe leaves pair as without one.
+    if (layer is not second_layer or isinstance(first_stack, formats.NvFp4)
+            or isinstance(second_stack, formats.NvFp4) or _recipe_takes_experts(first_stack)):
+        # Matrices of two layer indices (or a stack's layer beside a matrix), a packed bank (its product the
+        # NVFP4 one, which pairs with none), or a run's low-precision recipe that takes the experts
+        # (`recipe_refusal`), take each product apart (`expert_projection`); experts the recipe leaves pair as
+        # without one.
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
                 expert_projection(x, second, group_sizes, compute, implementation, precision))
     tokens, rows, prologue = _streamed(x, compute)
@@ -808,6 +808,17 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
                              out_dtypes=(compute, compute), precision=precision, paired=second_stack,
                              layer=layer, gather=rows, **prologue)
     return gate, up
+
+
+def _one_layer(kernels: tuple) -> tuple:
+    """An `ExpertMLP`'s kernels as its projections read them: a bank's (`Layered`) every one at the first's
+    layer index. They are one layer's by construction (`at_iteration` writes the iteration's index beside
+    every kernel of the run), which the dispatch hands on as a tracer a kernel (`derivatives.span`), so the
+    gate and up projections pair at that one index (`paired_projections`)."""
+    if not all(isinstance(kernel, Layered) for kernel in kernels):
+        return kernels
+    layer = kernels[0].layer
+    return tuple(Layered(kernel.stack, layer) for kernel in kernels)
 
 
 def _recipe_takes_experts(matrix: jax.Array) -> bool:
@@ -1345,6 +1356,8 @@ class ExpertMLP(nn.Module):
 
     def _project(self, tokens: jax.Array | Gathered, sizes: jax.Array, _expert_ids: jax.Array,
                  kernels: tuple[jax.Array, ...], *, dtype: Dtype) -> jax.Array:
+        kernels = _one_layer(kernels)
+
         def linear(x: jax.Array | Gathered, kernel: jax.Array, scatter: jax.Array | None = None) -> jax.Array:
             return jnp.asarray(expert_projection(
                 x, kernel, sizes, dtype, self.implementation, self.precision, scatter=scatter))

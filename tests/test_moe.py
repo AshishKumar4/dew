@@ -518,10 +518,11 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
     outputs and its gradients of the tokens, both stacks and the scales are as exact as the products of the
     rows gathered and scaled and the layer's matrices sliced, each multiplied apart, both from float64
     truth (check 1; row 12306). The kernels run interpreted on this CPU, as the H100's."""
+    from generation_support import here
     from reference_error import assert_as_exact, with_gradients
 
     from dew.nn import moe
-    from dew.nn.kernels import generation, grouped_matmul
+    from dew.nn.kernels import gemm, generation, grouped_matmul
 
     layers, experts, depth, width, tokens, top_k = 2, 2, 128, 256, 68, 2
     slots = tokens * top_k
@@ -541,6 +542,17 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
         layer = jnp.asarray(1, jnp.int32)
         return moe.paired_projections(moe.Gathered(x, rows, where, scales), moe.Layered(gate, layer),
                                       moe.Layered(up, layer), sizes, jnp.bfloat16, "auto", None)
+
+    def launched(x, gate, up, scales):
+        # The paired call `dew` makes (its binding asserted below) run as the H100's launch: on a GPU the
+        # projections themselves; on this CPU the template's interpreter over the same hand-off
+        # (`moe._streamed`), which product code never asks for (`interpret_on_cpu`).
+        if here() != "cpu":
+            return dew(x, gate, up, scales)
+        tokens, gather, prologue = moe._streamed(moe.Gathered(x, rows, where, scales), jnp.bfloat16)
+        return gemm.gemm(tokens, gate, sizes, compute=jnp.bfloat16, out_dtype=jnp.bfloat16,
+                         out_dtypes=(jnp.bfloat16, jnp.bfloat16), paired=up, layer=jnp.asarray(1, jnp.int32),
+                         gather=gather, **prologue, interpret_on_cpu=True)
 
     def plain(x, gate, up, scales, wide=jnp.float32, out=jnp.bfloat16):
         # The rows scaled as the prologue scales them, in the products' dtype; float64 truth rounds nothing.
@@ -569,7 +581,21 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
             assert arguments["first"] is not None and arguments["gather"].shape == (slots,)
             assert arguments["tokens"].shape == (tokens, depth) and arguments["hooks"].prologue is not None
         label = "a layer's paired experts over scaled rows"
-        assert_as_exact(jax.jit(valued(dew)), jax.jit(valued(plain)), draw, label, seeds=8,
-                        truth_fn=valued(truth))
-        assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(plain)), draw,
+        with generation.routes() as routes:
+            assert_as_exact(jax.jit(valued(launched)), jax.jit(valued(plain)), draw, label, seeds=8,
+                            truth_fn=valued(truth))
+        assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
+        # The gradients eagerly, as the Mosaic interpreters' ordered callbacks need.
+        assert_as_exact(with_gradients(launched), jax.jit(with_gradients(plain)), draw,
                         f"{label}, gradients", seeds=8, truth_fn=with_gradients(truth))
+
+    # Stacks read at two indices are each read at its own: no pair, the second stack at its layer.
+    with grouped_matmul.weighed() as calls:
+        jax.eval_shape(lambda x, gate, up, scales: moe.paired_projections(
+            moe.Gathered(x, rows, where, scales), moe.Layered(gate, jnp.asarray(0, jnp.int32)),
+            moe.Layered(up, jnp.asarray(1, jnp.int32)), sizes, jnp.bfloat16, "auto", None), *draw(0)[:4])
+    assert all(next(iter(call.bound.values()))[1].arguments["paired"] is None for call, _ in calls)
+    x, gate, up, scales, _ = draw(0)
+    _, apart = moe.paired_projections(moe.Gathered(x, rows, where, scales), moe.Layered(gate, jnp.asarray(0)),
+                                      moe.Layered(up, jnp.asarray(1)), sizes, jnp.bfloat16, "xla", None)
+    np.testing.assert_array_equal(np.asarray(apart), np.asarray(plain(x, gate, up, scales)[1]))
