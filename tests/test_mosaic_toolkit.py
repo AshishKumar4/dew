@@ -831,8 +831,9 @@ def test_a_tile_its_programs_share_merges_without_serializing_their_warpgroup_mm
     transposed) at a 128 x 256 tile on an H100: 160 tiles over its 132 multiprocessors, so programs share a
     tile's depth and its last arriver merges their partials (`Family.fixed_up`, `across.arrived`). Its merge's
     branch on a verdict ptxas held lane by lane put a compiler-inserted warpgroup arrive in a divergent path
-    and serialized every HGMMA of the walk (C7520: 1.23x XLA's time on a GH200, row 10151); the binary its
-    compile assembles notes no loss of performance."""
+    and serialized every HGMMA of the walk (C7520: 1.23x XLA's time on a GH200, row 10151): the binary its
+    compile assembles notes no C7520, nor does the gate's own assembly of its PTX by each CUDA build's ptxas
+    note any serialization (`assembled.SERIALIZED`)."""
     import kernel_compile
     from fla_gdn_support import KernelCase
 
@@ -850,9 +851,11 @@ def test_a_tile_its_programs_share_merges_without_serializing_their_warpgroup_mm
         [record] = kernel_compile.compile_mosaic_kernels([KernelCase("q-dx", lambda: (call, operands))],
                                                          "sm90")
     assert record.get("binaries"), record.get("error")
-    noted = [(binary["kernel"], note["code"], note["message"]) for binary in record["binaries"]
-             for note in binary["notes"]]
-    assert noted == [], noted
+    diverged = [(binary["kernel"], note["message"]) for binary in record["binaries"]
+                for note in binary["notes"] if note["code"] == "C7520"]
+    serialized = [(kernel["kernel"], code) for kernel in record["kernels"] for code in kernel["losses"]
+                  if code in assembled.SERIALIZED]
+    assert (diverged, serialized) == ([], []), (diverged, serialized)
 
 
 def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
