@@ -163,7 +163,7 @@ def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, *, chunk:
 
 
 def _mgpu_load_initial(init_m_ref, init_t_ref, init_acc_ref, b, h, q, c_start, *, block: int,
-                       tile_block: int, width: int, blocks: int = 1, tile_1d):
+                       tile_block: int, width: int, tile_1d):
     """Predicated GMEM load of one row's `Initial` state (`[tile_block]` acc, replicated m and total)."""
     scalar = plgpu.Layout.WG_SPLAT(())
     acc_ty = plgpu.ShapeDtypeStruct((tile_block,), init_acc_ref.dtype, layout=tile_1d)
@@ -218,7 +218,7 @@ def _mgpu_load_initial(init_m_ref, init_t_ref, init_acc_ref, b, h, q, c_start, *
 
 
 def _mgpu_store_finished(merged_ref, acc, b, out_t, out_h, c_start, *, block: int, tile_block: int,
-                         width: int, blocks: int = 1, acc_layout):
+                         width: int, acc_layout):
     """Predicated coalesced GMEM store of one `[block]` slice of finished output (`[tile_block]` or
     row 0 of `[2, tile_block]`, row 9795)."""
     scalar = plgpu.Layout.WG_SPLAT(())
@@ -279,7 +279,7 @@ def _mgpu_store_stats(max_ref, tot_ref, maximum, total, b, q, h, *, tile_1d):
 
 
 def _mgpu_load_output_param(param_ref, b, out_t, out_h, c_start, *, kind: Kind, block: int,
-                            tile_block: int, width: int, blocks: int = 1, tile_layout):
+                            tile_block: int, width: int, tile_layout):
     """Predicated coalesced GMEM load of one `output_mod` parameter (`Kind.HEAD` as 0D scalar, `Kind.QUERY`
     as `[2, 1]` splat, `Kind.OUTPUT` as `[2, tile_block]` `tile_layout` fragment), widening 16-bit floats to
     fp32 in registers and preserving signedness for integer and Boolean operands (row 5385)."""
@@ -358,8 +358,7 @@ def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: i
     has_initial = bool(init_args)
     total_slices = slices + int(has_initial)
     chunk = max(windows.chunk_width(total_slices), 2)
-    channels = 1 << (width - 1).bit_length()
-    blocks = channels // block
+    blocks = (1 << (width - 1).bit_length()) // block
     tile_block = max(block, 64)
     tile_layout = _tile_layout(tile_block)
     tile_1d = _tile_1d_layout(tile_layout)
@@ -378,7 +377,7 @@ def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: i
             init_m_ref, init_t_ref, init_acc_ref = init_refs
             raw_acc, raw_m, raw_t = _mgpu_load_initial(
                 init_m_ref, init_t_ref, init_acc_ref, b, h, q, c_start, block=block, tile_block=tile_block,
-                width=width, blocks=blocks, tile_1d=tile_1d)
+                width=width, tile_1d=tile_1d)
             init_state: algebra.Partial | None = algebra.initial_state(
                 units, algebra.Partial(raw_acc, raw_m, raw_t), raw_scale=raw_scale)
         else:
@@ -416,8 +415,7 @@ def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: i
             if output_mod is not None:
                 vals = tuple(
                     _mgpu_load_output_param(ref, b, out_t, out_h, c_start, kind=kind, block=block,
-                                            tile_block=tile_block, width=width, blocks=blocks,
-                                            tile_layout=tile_layout)
+                                            tile_block=tile_block, width=width, tile_layout=tile_layout)
                     for ref, kind in zip(param_refs, output_kinds, strict=True))
                 acc = output_mod(
                     plgpu.layout_cast(lax.broadcast_in_dim(acc, (2, tile_block), (1,)), tile_layout), *vals)
@@ -426,12 +424,12 @@ def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: i
                 store_layout = tile_1d
             written = plgpu.layout_cast(acc.astype(out_dtype), store_layout)
             _mgpu_store_finished(merged_ref, written, b, out_t, out_h, c_start, block=block,
-                                 tile_block=tile_block, width=width, blocks=blocks, acc_layout=store_layout)
+                                 tile_block=tile_block, width=width, acc_layout=store_layout)
         else:
             merged_ref, maximum_ref, total_ref = out_refs
             written = plgpu.layout_cast(state.acc, tile_1d)
             _mgpu_store_finished(merged_ref, written, b, q, h, c_start, block=block, tile_block=tile_block,
-                                 width=width, blocks=blocks, acc_layout=tile_1d)
+                                 width=width, acc_layout=tile_1d)
             pl.when(c_block == 0)(
                 lambda: _mgpu_store_stats(maximum_ref, total_ref, plgpu.layout_cast(state.m, tile_1d),
                                           plgpu.layout_cast(state.total, tile_1d), b, q, h, tile_1d=tile_1d))
@@ -445,7 +443,7 @@ def launch(padded, stacked, *extra, units: windows.Units, queries: int, width: i
         out_shape = (jax.ShapeDtypeStruct((*rows, width), padded.dtype),
                      jax.ShapeDtypeStruct(rows, stacked.dtype), jax.ShapeDtypeStruct(rows, stacked.dtype))
     launched = mosaic.kernel(
-        entry, out_type=out_shape, grid=(batch * queries * heads, channels // block),
+        entry, out_type=out_shape, grid=(batch * queries * heads, blocks),
         grid_names=("row", "block"), warpgroups=1, compiled=mosaic.compiler_params(approx_math=False),
         interpret=False, family=family, name="merged_padded")
     merged_out = launched(padded, stacked, *extra)
