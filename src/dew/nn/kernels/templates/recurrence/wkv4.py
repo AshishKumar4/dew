@@ -232,38 +232,57 @@ def _back(program: Program, refs: tuple, shape: Walk, kept_ref, carried, emit):
 
 
 def _token_back(program: Program, t, k_t, v_t, dy_t, read, terms, decay, after):
-    """One token walked back in fla's carried form (fused_recurrent.py's backward), contracted: `(cotangent of
-    the carry before it, (dk, dv, dw, du) of it)` from `after`, the cotangent `(g_alpha, g_beta, g_eps)` of
-    the carry past it, each at its own maximum's frame. A step's key and decay gradients are formed net of the
-    frame's shift: the maximum's cotangent less the past's share where the key sets the maximum, less the
-    token's own where the past does (`_won`), each share weighted by its step's factor first (`kept`, `added`,
-    at most one): taken apart, a reset token's key gradient was the difference of two terms each past
-    float32's largest (2^200 - 2^200, ReviewRecurrenceBatch); the output's `v - out` and `alpha - v beta`
-    products are each weighted first. A document's first token leaves the carry before it none; outside the
-    row, the carry as it is and no gradient."""
+    """One token walked back in fla's carried form (fused_recurrent.py's backward): `(cotangent of the carry
+    before it, (dk, dv, dw, du) of it)` from `after`, the cotangent `(g_alpha, g_beta, g_eps)` of the carry
+    past it, each at its own maximum's frame, each term in the reverse mode's own order
+    (`rwkv4.recurrent_wkv4`'s), whose rounding check 1 holds it to, and contracted where that order parts past
+    float32's range (`_finite_or`): a step's key and decay gradients net of the frame's shift, the maximum's
+    cotangent less the past's share where the key sets the maximum (`_won`) and less the token's own where the
+    past does, each share weighted by its step's factor first (`_contracted`), and the output's `v - out` and
+    `alpha - v beta` weighted first. In the reverse mode's order a reset token's key gradient was the
+    difference of two terms each past float32's largest (2^200 - 2^200, ReviewRecurrenceBatch); contracted
+    throughout, a small call's decay and bonus gradients were 1.7 times the recurrence's error. A document's
+    first token leaves the carry before it none; outside the row, the carry as it is and no gradient."""
     alpha, beta, eps = read
     out, past, present, denominator = terms
     g_alpha, g_beta, g_eps = after
     zero = jnp.zeros_like(g_eps)
     c = dy_t / denominator
     by_present, by_past = c * present, c * past
-    du = by_present * v_t - by_present * out
+    du = _finite_or(by_present * (v_t - out), lambda: by_present * v_t - by_present * out)
     weighted = by_past * (present / denominator)
-    eps_read = weighted * alpha - (weighted * v_t) * beta
+    eps_read = _finite_or(weighted * (alpha - v_t * beta), lambda: weighted * alpha - (weighted * v_t) * beta)
     aged = decay + eps
     won = _won(k_t, aged)
     top = jnp.where(won, k_t, aged)
     kept, added = jnp.exp(aged - top), jnp.exp(k_t - top)
-    past_share = (kept * g_alpha) * alpha + (kept * g_beta) * beta
-    own_share = (added * g_alpha) * v_t + added * g_beta
-    dk = du + jnp.where(won, g_eps - past_share, own_share)
-    dw = jnp.where(won, past_share, g_eps - own_share)
+    # The reverse mode's own terms (the recurrence's, `rwkv4.recurrent_wkv4`'s), contracted where they part
+    # past float32's range.
+    past_share, own_share = (g_alpha * alpha + g_beta * beta) * kept, (g_alpha * v_t + g_beta) * added
+    shifted = g_eps - past_share - own_share
+    dk = du + _finite_or(jnp.where(won, own_share + shifted, own_share),
+                         lambda: jnp.where(won, g_eps - _contracted(kept, g_alpha, alpha, g_beta, beta),
+                                           _contracted(added, g_alpha, v_t, g_beta, 1.0)))
+    dw = _finite_or(jnp.where(won, past_share, past_share + shifted),
+                    lambda: jnp.where(won, _contracted(kept, g_alpha, alpha, g_beta, beta),
+                                      g_eps - _contracted(added, g_alpha, v_t, g_beta, 1.0)))
     dv = by_present + added * g_alpha
     before = (kept * g_alpha + by_past, kept * g_beta - by_past * out, dw + eps_read)
     first = program.first(t, k_t)
     before = tuple(cut(first, value, zero) for value in before)
     inside = program.inside(t, k_t)
     return _held(inside, before, after), tuple(jnp.where(inside, x, zero) for x in (dk, dv, dw, du))
+
+
+def _finite_or(value, contracted):
+    """`value` where finite, else `contracted()`, the same quantity formed so no term passes float32's range
+    where it does not: `value` the reverse mode's own order, whose rounding check 1 holds the kernels to."""
+    return jnp.where(jnp.isfinite(value), value, contracted())
+
+
+def _contracted(factor, g_alpha, alpha, g_beta, beta):
+    """`factor (g_alpha alpha + g_beta beta)`, each cotangent weighted by `factor` (at most one) first."""
+    return (factor * g_alpha) * alpha + (factor * g_beta) * beta
 
 
 def _kept(shape: Walk):
