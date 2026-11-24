@@ -38,7 +38,7 @@ from jax.sharding import PartitionSpec as P
 from dew import quantization
 from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
-from dew.nn.dense import Dense, packed_matrix
+from dew.nn.dense import Dense, history_scale, packed_matrix, recorded
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent, with_tangents_formed_at
 from dew.nn.residuals import Residual
 
@@ -708,7 +708,7 @@ def _scaled(rows: jax.Array, scales: jax.Array) -> jax.Array:
 def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | formats.NvFp4 | Layered,
                       group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
                       precision: PrecisionLike, bias: jax.Array | None = None,
-                      scatter: jax.Array | None = None) -> jax.Array:
+                      scatter: jax.Array | None = None, tensor_scale: jax.Array | None = None) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
     each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
     counting each expert's leading rows, under one precision contract for both
@@ -727,7 +727,8 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | formats.NvFp4
     the bias's own dtype. `Gathered` rows are read where they lie (`gemm.gemm`'s `gather`, at a stack's
     layer too), scaled in the product's prologue (`_streamed`), but by a run's recipe, which takes them
     gathered; with `scatter`, each output row lands at its entry's row (`gemm.gemm`'s `scatter`, a
-    permutation).
+    permutation). `tensor_scale`, the rows' NVFP4 tensor scale under a delayed-scaling recipe that takes the
+    experts (`dense.history_scale`, `projections.recipe_projection`'s), which it requires (row 12721).
 
     Every implementation runs the GEMM template
     (`dew.nn.kernels.gemm.gemm`), which selects each of its
@@ -758,7 +759,8 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | formats.NvFp4
         recipe = (None if recipe_role() is None or packed else projections.recipe_projection(
             jnp.asarray(gathered(x), compute),
             rounded_operand(stack if layer is None else stack[layer], compute), group_sizes,
-            out_dtype=compute, bias=None if bias is None else rounded_operand(bias, compute)))
+            out_dtype=compute, bias=None if bias is None else rounded_operand(bias, compute),
+            tensor_scale=tensor_scale))
     if recipe is not None:
         return recipe if scatter is None else jnp.zeros_like(recipe).at[scatter].set(recipe,
                                                                                     unique_indices=True)
@@ -807,7 +809,8 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
 def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Array | Layered,
                   down: jax.Array | Layered, group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
                   precision: PrecisionLike, activation: str, limit: float | None,
-                  scatter: jax.Array | None = None) -> jax.Array:
+                  scatter: jax.Array | None = None, scales: tuple[jax.Array | None, ...] | None = None,
+                  noted: Callable[[jax.Array], None] | None = None) -> jax.Array:
     """A gated expert MLP's output (gate, up and down projections of `x`'s expert-sorted rows, the gated
     product of `activation` between them, clamped by `limit`), as `dew.nn.gated_mlp.fused_products` runs a
     dense one (row 1376): the gate and up projections one paired product, their roundings and their gated
@@ -819,19 +822,26 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     saving the two names keeps. Where the pair runs apart (`paired_projections`) or the down projection takes
     no prologue (a packed bank's NVFP4 product, a run's recipe that takes the experts, `expert_projection`),
     each projection runs on its own and the gated product between them (`gated_product`), as before. Every
-    arm's output the compute dtype's. `scatter`, `expert_projection`'s."""
+    arm's output the compute dtype's. `scatter`, `expert_projection`'s. `scales`, the gate's, up's and down's
+    delayed-scaling NVFP4 tensor scales (`dense.history_scale`, row 12721) where a run's delayed recipe takes
+    the experts, which runs them apart, and `noted`, what records the down projection's rows (their gated
+    product) there (`dense.recorded`)."""
     compute, paired = _paired(x, gate, up, dtype)
     down_stack, down_layer = (down.stack, down.layer) if isinstance(down, Layered) else (down, None)
     if (paired is None or down_layer is not paired[-1] or isinstance(down_stack, formats.NvFp4)
             or _recipe_takes_experts(down_stack)):
-        gate_rows, up_rows = (_apart(x, (gate, up), group_sizes, compute, implementation, precision)
+        gate_scale, up_scale, down_scale = scales or (None, None, None)
+        gate_rows, up_rows = (_apart(x, (gate, up), group_sizes, compute, implementation, precision,
+                                     (gate_scale, up_scale))
                               if paired is None else
                               _paired_call(paired, group_sizes, compute, implementation, precision))
         gate_rows, up_rows = (checkpoint_name(gate_rows, Residual.GATE_PROJ),
                               checkpoint_name(up_rows, Residual.UP_PROJ))
         hidden = gated_product(activation)(*swiglu_clamped(gate_rows, up_rows, limit))
+        if noted is not None:
+            noted(hidden)
         return _computed(expert_projection(hidden, down, group_sizes, compute, implementation, precision,
-                                           scatter=scatter), compute)
+                                           scatter=scatter, tensor_scale=down_scale), compute)
     hook = gated_hook(activation, limit)
     gate_rows, up_rows, hidden = _paired_call(
         paired, group_sizes, compute, implementation, precision, epilogue=rounded_gated(hook, compute),
@@ -847,10 +857,14 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
 
 
 def _apart(x: jax.Array | Gathered, kernels: tuple, group_sizes: jax.Array, compute: Dtype,
-           implementation: str, precision: PrecisionLike) -> tuple[jax.Array, ...]:
-    """`expert_projection` of `x` through each of `kernels` on its own, each output the compute dtype's."""
-    return tuple(_computed(expert_projection(x, kernel, group_sizes, compute, implementation, precision),
-                           compute) for kernel in kernels)
+           implementation: str, precision: PrecisionLike,
+           scales: tuple[jax.Array | None, ...] | None = None) -> tuple[jax.Array, ...]:
+    """`expert_projection` of `x` through each of `kernels` on its own, at its delayed-scaling NVFP4 tensor
+    scale of `scales` where given, each output the compute dtype's."""
+    scales = scales or (None,) * len(kernels)
+    return tuple(_computed(expert_projection(x, kernel, group_sizes, compute, implementation, precision,
+                                             tensor_scale=scale), compute)
+                 for kernel, scale in zip(kernels, scales, strict=True))
 
 
 def _paired_call(paired: tuple, group_sizes: jax.Array, compute: Dtype, implementation: str,
@@ -1440,10 +1454,15 @@ class ExpertMLP(nn.Module):
     def _project(self, tokens: jax.Array | Gathered, sizes: jax.Array, _expert_ids: jax.Array,
                  kernels: tuple[jax.Array, ...], *, dtype: Dtype) -> jax.Array:
         kernels = _one_layer(kernels)
+        names = (('up_proj', 'down_proj') if self.activation == 'relu2'
+                 else ('gate_proj', 'up_proj', 'down_proj'))
+        scales = self._delayed(names, kernels, tokens)
 
-        def linear(x: jax.Array | Gathered, kernel: jax.Array, scatter: jax.Array | None = None) -> jax.Array:
+        def linear(x: jax.Array | Gathered, kernel: jax.Array, scatter: jax.Array | None = None,
+                   tensor_scale: jax.Array | None = None) -> jax.Array:
             return jnp.asarray(expert_projection(
-                x, kernel, sizes, dtype, self.implementation, self.precision, scatter=scatter))
+                x, kernel, sizes, dtype, self.implementation, self.precision, scatter=scatter,
+                tensor_scale=tensor_scale))
 
         # Gathered rows' slots: the last projection writes each row at its slot (`Gathered`).
         slots = tokens.slots if isinstance(tokens, Gathered) else None
@@ -1451,15 +1470,41 @@ class ExpertMLP(nn.Module):
         # The same residual names as the dense MLP's, so one remat policy
         # covers both (residuals.RESIDUALS).
         if self.activation == 'relu2':
-            up = checkpoint_name(linear(tokens, kernels[0]), Residual.UP_PROJ)
+            up_scale, down_scale = scales or (None, None)
+            up = checkpoint_name(linear(tokens, kernels[0], tensor_scale=up_scale), Residual.UP_PROJ)
             hidden = relu2(up)
-            return checkpoint_name(linear(hidden, kernels[1], slots), Residual.DOWN_PROJ)
+            if scales is not None:
+                recorded(self, 'down_proj', hidden)
+            return checkpoint_name(linear(hidden, kernels[1], slots, down_scale), Residual.DOWN_PROJ)
         # The gate and up projections read the same rows: one paired product, their gated product its
         # epilogue and the down projection's prologue (`gated_experts`).
         gate, up, down = kernels
-        return checkpoint_name(gated_experts(tokens, gate, up, down, sizes, dtype, self.implementation,
-                                             self.precision, self.activation, self.swiglu_limit, slots),
-                               Residual.DOWN_PROJ)
+        return checkpoint_name(gated_experts(
+            tokens, gate, up, down, sizes, dtype, self.implementation, self.precision, self.activation,
+            self.swiglu_limit, slots, scales=scales,
+            noted=None if scales is None else functools.partial(recorded, self, 'down_proj')),
+            Residual.DOWN_PROJ)
+
+    @nn.nowrap
+    def _delayed(self, names: tuple[str, ...], kernels: tuple, tokens: jax.Array | Gathered
+                 ) -> tuple[jax.Array | None, ...] | None:
+        """Each of the layer's projections' (`names`, its `kernels`') delayed-scaling NVFP4 tensor scale in
+        the experts' role (`dense.history_scale`, row 12721), the rows they read first recorded
+        (`dense.recorded`; the down projection's its caller records), or None where the run's recipe is no
+        delayed one that takes them (a packed bank its recipe never takes)."""
+        if any(isinstance(kernel.stack if isinstance(kernel, Layered) else kernel, formats.NvFp4)
+               for kernel in kernels):
+            return None
+        with projection_role("experts"):
+            scales = tuple(history_scale(self, name, (kernel.stack if isinstance(kernel, Layered)
+                                                      else kernel).shape) for name, kernel in zip(
+                names, kernels, strict=True))
+        if all(scale is None for scale in scales):
+            return None
+        rows = gathered(tokens)
+        for name in names[:-1]:
+            recorded(self, name, rows)
+        return scales
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
         wide = at_least_fp32(slots.dtype)

@@ -795,3 +795,85 @@ def test_the_blockwise_recipes_scales_meet_its_products_in_range():
     with generation.run_precision(RECIPE_NUMERICS["blockwise_fp8"]), projection_role("mlp"):
         out = np.asarray(jax.jit(layer.apply)(params, x), np.float32)
     np.testing.assert_array_equal(out, np.full((4, 128), 2.0 ** 117, np.float32))
+
+
+def _delayed_nvfp4():
+    from dew.nn.precision import DTYPE_PRESETS, LowPrecision, Numerics
+
+    return Numerics(DTYPE_PRESETS["bf16-mixed"], low_precision=LowPrecision(recipe="nvfp4",
+                                                                             tensor_scaling="delayed"))
+
+
+def test_a_delayed_nvfp4_dense_reads_its_history_and_records_its_rows():
+    """A Dense under a delayed-scaling NVFP4 recipe that takes it (row 12721) holds its amax history
+    (`dense.NVFP4_HISTORY`, zeros of the recipe's length where initialized), quantizes its rows at the tensor
+    scale of the history's largest, its output bitwise the recipe projection's at that scale, and records its
+    rows' largest magnitude under its history's name (`dense.NVFP4_AMAX`); it refuses to run without a
+    history, and a current-scaling recipe holds none."""
+    from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY, Dense
+    from dew.nn.kernels import projections
+    from dew.nn.precision import NVFP4, projection_role
+
+    rng = np.random.default_rng(12721)
+    x = jnp.asarray(rng.normal(size=(100, 128)), jnp.bfloat16)
+    layer = Dense(64, use_bias=False, dtype=jnp.bfloat16)
+    with generation.run_precision(_delayed_nvfp4()), projection_role("mlp"):
+        variables = layer.init(jax.random.key(0), x)
+        assert variables[NVFP4_HISTORY]["amax_history"].tolist() == [0.0] * 16
+        history = jnp.asarray([3.0, 7.5] + [0.0] * 14, jnp.float32)
+        held = {**variables, NVFP4_HISTORY: {"amax_history": history}}
+        out, sown = layer.apply(held, x, mutable=[NVFP4_AMAX])
+        want = projections.recipe_projection(x, variables["params"]["kernel"], out_dtype=jnp.bfloat16,
+                                             tensor_scale=projections.delayed_tensor_scale(history))
+        with pytest.raises(ValueError, match="amax histories"):
+            layer.apply({"params": variables["params"]}, x)
+    np.testing.assert_array_equal(np.asarray(out).view(np.uint16), np.asarray(want).view(np.uint16))
+    assert np.asarray(sown[NVFP4_AMAX]["amax_history"]).tolist() == [
+        float(projections.nvfp4_amax(x))]
+    with generation.run_precision(NVFP4), projection_role("mlp"):
+        assert NVFP4_HISTORY not in layer.init(jax.random.key(0), x)
+
+
+def test_a_rolled_history_takes_its_steps_largest_newest():
+    """A training step's update of a delayed-scaling NVFP4 run's histories (`dense.rolled`, row 12721):
+    each history a step recorded shifted by one along its steps, the step's largest newest and its oldest
+    dropped, a scanned stack's `[layers, steps]` each layer's own; a history no call recorded as it was."""
+    from dew.nn.dense import rolled
+
+    histories = {"a": {"amax_history": jnp.asarray([1.0, 2.0, 3.0])},
+                 "b": {"amax_history": jnp.asarray([4.0, 5.0, 6.0])},
+                 "stack": {"up_proj": jnp.asarray([[1.0, 2.0], [3.0, 4.0]])}}
+    out = rolled(histories, {"a": {"amax_history": jnp.float32(9.0)},
+                             "stack": {"up_proj": jnp.asarray([7.0, 8.0])}})
+    assert out["a"]["amax_history"].tolist() == [9.0, 1.0, 2.0]
+    assert out["b"]["amax_history"].tolist() == [4.0, 5.0, 6.0]
+    assert out["stack"]["up_proj"].tolist() == [[7.0, 1.0], [8.0, 3.0]]
+
+
+def test_a_delayed_nvfp4_expert_layer_quantizes_each_projection_at_its_own_scale():
+    """An expert layer under a delayed-scaling NVFP4 recipe that takes its experts (row 12721) runs its
+    gate, up and down projections apart, each quantized at its own history's tensor scale
+    (`moe.gated_experts`'s `scales`), and records its down projection's rows, their gated product: its
+    output bitwise each projection by `moe.expert_projection` at that scale."""
+    from dew.nn import moe
+    from dew.nn.kernels import projections
+
+    rng = np.random.default_rng(12722)
+    tokens, depth, width = 136, 128, 256
+    rows = jnp.asarray(rng.normal(size=(tokens, depth)), jnp.bfloat16)
+    gate, up = (jnp.asarray(rng.normal(size=(2, depth, width)) / 8, jnp.bfloat16) for _ in range(2))
+    down = jnp.asarray(rng.normal(size=(2, width, depth)) / 8, jnp.bfloat16)
+    sizes = jnp.asarray([70, 66], jnp.int32)
+    scales = tuple(projections.delayed_tensor_scale(jnp.asarray([value], jnp.float32))
+                   for value in (3.0, 5.0, 7.0))
+    noted = []
+    with generation.run_precision(_delayed_nvfp4()):
+        out = moe.gated_experts(rows, gate, up, down, sizes, jnp.bfloat16, "auto", None, "swiglu", None,
+                                scales=scales, noted=noted.append)
+        gate_rows, up_rows = (moe.expert_projection(rows, kernel, sizes, jnp.bfloat16, "auto", None,
+                                                    tensor_scale=scale)
+                              for kernel, scale in zip((gate, up), scales[:2], strict=True))
+        hidden = moe.gated_product("swiglu")(*moe.swiglu_clamped(gate_rows, up_rows, None))
+        want = moe.expert_projection(hidden, down, sizes, jnp.bfloat16, "auto", None, tensor_scale=scales[2])
+    np.testing.assert_array_equal(np.asarray(out).view(np.uint16), np.asarray(want).view(np.uint16))
+    np.testing.assert_array_equal(np.asarray(noted[0]).view(np.uint16), np.asarray(hidden).view(np.uint16))

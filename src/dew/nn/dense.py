@@ -19,12 +19,13 @@ flax's own calls broadcast the bias in its storage dtype, where its gradient
 then sums, and offer no step to widen it.
 """
 
+import contextlib
 import functools
 import importlib.util
 import inspect
 import sys
 import types
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -305,6 +306,77 @@ def _reshaped(init, flat_shape):
 
 
 
+NVFP4_HISTORY = 'nvfp4'
+"""The collection of a delayed-scaling NVFP4 run's amax histories (`LowPrecision.tensor_scaling`, row
+12721): each projection the run's recipe takes holds one (a `Dense`'s `'amax_history'`, an expert layer's
+each projection's by its name), float32 `[amax_history]` (`[layers, amax_history]` in a scanned stack), its
+rows' largest magnitudes of its last steps, newest first; zeros until a step records one (the scale of an
+all-zero history is 1). The forward reads it alone; a training step rolls it once per committed update with
+the step's recorded largest (`rolled`), no optimizer seeing it."""
+NVFP4_AMAX = 'nvfp4_amax'
+"""The sown collection of each such projection's rows' largest magnitude a call (`projections.nvfp4_amax`,
+a float32 scalar, one a layer in a scanned stack), named and placed as its history (`NVFP4_HISTORY`), which
+a training step takes the largest of across its calls and microbatches and rolls in (`rolled`)."""
+
+
+def history_scale(layer: nn.Module, name: str, shape: tuple[int, ...]) -> jax.Array | None:
+    """The tensor scale `layer`'s projection `name` by a `shape` (`[..., depth, width]`) matrix quantizes
+    its rows at, where the run trains in a delayed-scaling NVFP4 recipe that takes it in the role traced
+    (`projections.recipe_takes`): its amax history's (`projections.delayed_tensor_scale`), the history held
+    at `layer`'s path as `name` (`NVFP4_HISTORY`); None elsewhere (row 12721). Its rows' largest magnitude
+    the caller records (`recorded`)."""
+    from dew.nn.precision import recipe_role
+
+    held = recipe_role()
+    if held is None or held[0].tensor_scaling != "delayed" or not projections.recipe_takes(*shape[-2:]):
+        return None
+    if not (layer.has_variable(NVFP4_HISTORY, name) or layer.is_mutable_collection(NVFP4_HISTORY)):
+        raise ValueError(f"{layer.name}'s run trains in delayed-scaling NVFP4, whose projections read their "
+                         f"amax histories (the {NVFP4_HISTORY!r} collection), and its variables hold none: "
+                         "initialize the model under the run's recipe")
+    length = held[0].amax_history
+    history = layer.variable(NVFP4_HISTORY, name, lambda: jnp.zeros((length,), jnp.float32))
+    return projections.delayed_tensor_scale(history.value)
+
+
+def recorded(layer: nn.Module, name: str, rows: Array) -> None:
+    """`rows`' largest magnitude (`projections.nvfp4_amax`) sown as `layer`'s projection `name`'s this call
+    (`NVFP4_AMAX`), where the call keeps it: what its history rolls in (`rolled`)."""
+    layer.sow(NVFP4_AMAX, name, projections.nvfp4_amax(rows))
+
+
+def delayed(layer: nn.Module, rows: Array, shape: tuple[int, ...]) -> contextlib.AbstractContextManager:
+    """Around a `Dense` `layer`'s own product of `rows` by its `shape` kernel: its rows quantized at its amax
+    history's tensor scale (`history_scale` of `'amax_history'`, `projections.delayed_scale`, which the
+    product's recipe reads) and their largest magnitude recorded (`recorded`), where the run's
+    delayed-scaling NVFP4 recipe takes it, else nothing."""
+    scale = history_scale(layer, 'amax_history', shape)
+    if scale is None:
+        return contextlib.nullcontext()
+    recorded(layer, 'amax_history', rows)
+    return projections.delayed_scale(scale)
+
+
+def rolled(histories: Mapping, amaxes: Mapping) -> dict:
+    """`histories` (an `NVFP4_HISTORY` collection) with each history `amaxes` holds a largest magnitude for
+    (a tree mirroring them, each leaf the largest over its projection's calls and a step's microbatches, a
+    float32 scalar, or one a layer `[layers]` for a scanned stack's `[layers, steps]` history) shifted by one
+    along its steps, that largest newest, its oldest dropped; every other history as it was (a
+    projection no call of the step ran). A training step's update of a delayed-scaling NVFP4 run's state,
+    once per committed update (row 12721)."""
+    def roll(history, amax):
+        # A scanned stack's history `[layers, steps]` and its amax `[layers]`: each layer's rolled.
+        newest = jnp.reshape(jnp.asarray(amax, history.dtype), (*history.shape[:-1], 1))
+        return jnp.concatenate([newest, history[..., :-1]], axis=-1)
+
+    def at(name, value):
+        if isinstance(value, Mapping):
+            return rolled(value, amaxes.get(name, {}))
+        return roll(value, amaxes[name]) if name in amaxes else value
+
+    return {name: at(name, value) for name, value in histories.items()}
+
+
 def _promoted(layer: nn.Dense | nn.DenseGeneral, inputs: Array, kernel: Array, bias: Array | None):
     """The layer's operands through its `promote_dtype`, as flax promotes them."""
     inputs, kernel, bias = layer.promote_dtype(inputs, kernel, bias, dtype=layer.dtype)
@@ -359,7 +431,8 @@ class Dense(_LinearEnvelope, nn.Dense):
         stored = bias
         inputs, kernel, bias = _promoted(self, inputs, kernel, bias)
         dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
-        return _biased(self, inputs, kernel, dimensions, bias, lambda bias: bias, stored)
+        with delayed(self, inputs, kernel.shape):
+            return _biased(self, inputs, kernel, dimensions, bias, lambda bias: bias, stored)
 
 
     @nn.nowrap
