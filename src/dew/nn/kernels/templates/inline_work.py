@@ -20,7 +20,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, func
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates.cost import Work, most
 
 LANES = 128
 """The threads of a warpgroup, whose lanes a body's ops issue over: an op issues for each warp a lane of which
@@ -234,7 +234,7 @@ class _Lanes:
                 # takes an unknown conditional. Where data a lane holds decides it, a warp's lanes may part
                 # and run both, each over every lane (below).
                 branches = [self.region(region, active) for region in op.regions if region.blocks]
-                return functools.reduce(_most, branches, Work())
+                return most(branches)
             # Each branch over the lanes that may take it: a lane its place decides takes one, a lane data
             # decides may take either.
             work = self.region(op.regions[0], active & maybe)
@@ -684,11 +684,6 @@ def _trips(lower, upper, step) -> int | None:
 def _repeated(work: Work, count: int) -> Work:
     return Work(**{field.name: getattr(work, field.name) * count for field in dataclasses.fields(Work)
                    if field.name not in ("span", "chains")})
-
-
-def _most(first: Work, second: Work) -> Work:
-    return Work(**{field.name: max(getattr(first, field.name), getattr(second, field.name))
-                   for field in dataclasses.fields(Work) if field.name not in ("span", "chains")})
 
 
 def _thread(name: str) -> bool:

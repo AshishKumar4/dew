@@ -38,6 +38,7 @@ from dew.nn.kernels.templates.cost import (
     Work,
     followed,
     issued as issue_slots,
+    most,
     multiplied,
 )
 from dew.nn.kernels.templates.product import product_mode
@@ -880,11 +881,11 @@ class _Counting:
             if self.loops:
                 self.arrivals.left(trial.landing)
             trials.append(trial)
-        self.fixed = self.fixed + _envelope(trial.fixed for trial in trials)
+        self.fixed = self.fixed + most([trial.fixed for trial in trials])
         if any(trial.walks for trial in trials):
-            self.walks.append(_envelope(_mean(trial.walks) for trial in trials if trial.walks))
+            self.walks.append(most([_mean(trial.walks) for trial in trials if trial.walks]))
         if self.loops:
-            self.loops[-1].work = self.loops[-1].work + _envelope(trial.loops[-1].work for trial in trials)
+            self.loops[-1].work = self.loops[-1].work + most([trial.loops[-1].work for trial in trials])
             self.loops[-1].marks += max(trial.loops[-1].marks for trial in trials)
         return [None] * len(branches[0].outvars)
 
@@ -1059,16 +1060,6 @@ def _mean(walks: Sequence[Work]) -> Work:
     next through the ring they share (`cost.followed`), each loop's weight kept, before the mean."""
     paths = functools.reduce(followed, (walk.chains for walk in walks))
     return repeated(dataclasses.replace(sum(walks, Work()), chains=paths), 1 / len(walks))
-
-
-def _envelope(works) -> Work:
-    """The most of each unit any of `works` holds, the issue slots the most any one of them issues
-    (`Work.issue_excess`), and every path none of the others outlasts (as works side by side keep them)."""
-    works = list(works)
-    most = Work(**{field.name: max(getattr(work, field.name) for work in works)
-                   for field in dataclasses.fields(Work) if field.name not in ("chains", "issue_excess")},
-                chains=sum(works, Work()).chains)
-    return dataclasses.replace(most, issue_excess=max(0.0, issue_slots(most) - max(map(issue_slots, works))))
 
 
 def built_with(cost: pl.CostEstimate | Stated | None) -> pl.CostEstimate | None:
