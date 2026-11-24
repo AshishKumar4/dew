@@ -92,6 +92,17 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
                                    dropout_seed=dropout_seed)
 
 
+ROW_VECTORS = frozenset({"key_value_seq_starts"})
+"""The visibility ids whose one dimension is the batch's rows (`[B]`); every other id's lone dimension is the
+tokens' (a shared `[K]` validity, `[S]` places, `[Q]` slots), its rows a leading dimension of a rank above
+one (`[B, S]`, `[B, K]`, `[B, Q, R, 2]`), as `dew.nn.attention_masks.key_spans` reads them."""
+
+
+def _row_leading(name: str, leaf, rows: int) -> bool:
+    """Whether visibility id `name`'s array `leaf` leads with the batch's `rows` (`ROW_VECTORS`)."""
+    return (jnp.ndim(leaf) >= 2 or (jnp.ndim(leaf) == 1 and name in ROW_VECTORS)) and leaf.shape[0] == rows
+
+
 def exchanges_heads(query, key, shards: int, *, masked: bool) -> bool:
     """Whether `sequence_parallel_attention` takes the all-to-all (`exchanged_heads_attention`) for a call
     of these query and key shapes over `shards` sequence shards: its query heads divide by tensor times
@@ -294,11 +305,12 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
         extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
             ("activation_batch",), key_value_seq_lengths, queries, query.shape))
     for name, ids in (visibility or {}).items():
-        # Whole along the sequence beside the whole sequences the exchange gives: a leaf of the batch's
-        # rows split as the query's own, any other whole.
+        # Whole along the sequence beside the whole sequences the exchange gives, a leaf's batch rows split
+        # as the query's own where its contract leads with them (`_ROW_LEADING`), any other whole: a
+        # shared `[K]` validity of the batch's length is the keys', not the rows'.
         extras[name] = (ids, jax.tree.map(
-            lambda leaf: P(_entry(queries, 0) if jnp.ndim(leaf) and leaf.shape[0] == query.shape[0]
-                           else None), ids))
+            lambda leaf, name=name: P(_entry(queries, 0) if _row_leading(name, leaf, query.shape[0])
+                                      else None), ids))
     if dropout_seed is not None:
         # Each shard's global rows and heads, split as its query rows and the exchanged heads.
         extras['dropout_seed'] = (dropout_seed, P(None))

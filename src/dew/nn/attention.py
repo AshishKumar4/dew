@@ -756,7 +756,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         causal, sliding_window, mask, key_value_seq_lengths, materialized, visibility = _sequence_sharded(
             query, key, shards, causal=causal, sliding_window=sliding_window, mask=mask, spanned=spanned,
             segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts)
-        if materialized:
+        if materialized or (visibility and implementation == 'cudnn'):
             implementation = kernel_for_materialized_mask(
                 implementation, query, key, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits)
@@ -1409,7 +1409,8 @@ def _sequence_sharded(query, key, shards: int, *, causal, sliding_window, mask, 
     the mask it means, its causality, window, documents, key lengths and starts among them where `spanned`
     holds any (`visibility_mask`), and the documents travel as the mask they stand for, causality and the
     window folded in beside them. Returns the causality, window, mask and key lengths it takes, whether it
-    materialized a mask its kernel must take (`kernel_for_materialized_mask`), and the visibility ids."""
+    materialized a mask its kernel must take (`kernel_for_materialized_mask`), and the visibility ids, which
+    a call naming cuDNN takes on that masked kernel too (cuDNN takes no mask; its kernel would build one)."""
     queries, keys = query.shape[-3], key.shape[-3]
     ids = {name: x for name, x in {"segment_ids": segment_ids, "key_value_seq_starts": starts,
                                    **spanned}.items() if x is not None}

@@ -285,9 +285,11 @@ starts, a cached call's query slots."""
 @pytest.mark.parametrize("name", sorted(VISIBLE))
 def test_per_token_visibility_travels_whole_through_the_all_to_all(name, implementation):
     """The entry over a split sequence whose call reads per-token ids (`VISIBLE`) takes the all-to-all and
-    hands them whole to the kernel beside the whole sequences it gives, so no `[B, 1, S, S]` mask of the
-    call's is built (row 1495): its output and its gradients, forward and backward, on par with the whole
-    sequence's (check 1), on the kernels check 1's float64 truth runs (the seam's `reference` and `xla`)."""
+    hands them whole to the kernel beside the whole sequences it gives, so no global `[B, 1, S, S]` mask is
+    built (row 1495; a kernel that reads masks builds its shard's own, the template none,
+    `test_the_template_builds_no_mask_of_a_split_calls_visibility`): its output and its gradients, forward
+    and backward, on par with the whole sequence's (check 1), on the kernels check 1's float64 truth runs
+    (the seam's `reference` and `xla`)."""
     call = dict(VISIBLE[name], implementation=implementation)
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
     assert_exchanged_on_par(entry, entry, SPLIT, _dropping_draw,
@@ -298,6 +300,58 @@ def test_per_token_visibility_travels_whole_through_the_all_to_all(name, impleme
              if var.aval.dtype == jnp.bool_ and var.aval.shape[-2:] == (SEQ_LEN, SEQ_LEN)
              and var.aval.shape[0] == BATCH]
     assert not masks, masks
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", sorted(VISIBLE))
+def test_the_template_builds_no_mask_of_a_split_calls_visibility(name):
+    """The template over a split sequence reads a call's per-token ids as its spans on each device, so its
+    program holds no `[rows, 1, S, S]` mask at all, its shard's rows or the batch's (row 1495)."""
+    call = dict(VISIBLE[name], implementation="template")
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    with jax.set_mesh(SPLIT.build()):
+        program = jax.make_jaxpr(entry)(*_dropping_draw(0))
+    masks = [var.aval.shape for var in _variables(program.jaxpr)
+             if var.aval.dtype == jnp.bool_ and len(var.aval.shape) == 4
+             and var.aval.shape[1:] == (1, SEQ_LEN, SEQ_LEN)]
+    assert not masks, masks
+
+
+SHARED = MeshSpec(fsdp=2, sequence=2)
+"""Batch rows split two ways beside the sequence: a shared vector of the batch's length (`B == K == 4`)."""
+
+
+def _square_draw(seed):
+    """Four rows of four tokens, four query heads over two key heads, and an output cotangent."""
+    q_key, k_key, v_key, c_key = jax.random.split(jax.random.key(seed), 4)
+    query = jax.random.normal(q_key, (4, 4, 4, 8), jnp.float32)
+    key, value = (jax.random.normal(k, (4, 4, 2, 8), jnp.float32) for k in (k_key, v_key))
+    return query, key, value, jax.random.normal(c_key, query.shape, jnp.float32)
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", ["key_valid", "query_slots"])
+def test_a_shared_vector_of_the_batchs_length_stays_whole(name):
+    """A shared `[K]` validity or `[Q]` slots of the batch's length (four rows of four tokens, the rows
+    split two ways) travels whole, the keys' or the queries' as it is, not split as rows (review of #4023):
+    the entry on par with whole sequences, forward and backward."""
+    vector = (jnp.asarray([True, True, False, True]) if name == "key_valid"
+              else jnp.arange(4, dtype=jnp.int32))
+    call = {"causal": True, name: vector, "implementation": "reference"}
+    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+    assert_exchanged_on_par(entry, entry, SHARED, _square_draw, f"a shared {name} of the batch's length")
+
+
+@pytest.mark.mesh
+def test_a_call_naming_cudnn_takes_its_visibility_on_the_masked_kernel():
+    """A call naming cuDNN whose visibility is per-token ids, over a split sequence, runs on the kernel a
+    built mask takes (`kernel_for_materialized_mask`: cuDNN takes no mask), as it did when the ids were
+    that mask (review of #4023): on par with xla's whole sequences."""
+    split = with_gradients(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, **dict(VISIBLE["blocks"], implementation="cudnn")))
+    whole = with_gradients(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, **dict(VISIBLE["blocks"], implementation="xla")))
+    assert_exchanged_on_par(split, whole, SPLIT, _dropping_draw, "blocks naming cudnn over a split sequence")
 
 
 def _variables(jaxpr) -> list:
