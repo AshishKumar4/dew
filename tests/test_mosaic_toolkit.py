@@ -2159,9 +2159,10 @@ def test_an_mma_sync_walks_shared_memory_is_what_its_pipeline_scopes_for_its_cop
     device the family runs on makes (`CpAsync.lifetimes`, read from JAX's own builder, row 6135): a slot of
     each block a stage and no barrier, whatever GPU is assumed (an sm120, whose copies would be TMA's and
     take a barrier a stage, runs no mma.sync on cp.async: `bundles.legal`); a walk of fewer steps than stages
-    as many slots as steps, also planned inside a jit's trace over a mesh of its own. That the plan is the
-    kernel's own allocation the compile gate checks of every launch (`kernel_compile.mosaic_failures`: its
-    planned shared bytes against those the compiled kernel asks for)."""
+    as many slots as steps, also planned inside a jit's trace over a mesh of its own; two consumers running
+    it together, the two barriers they meet at, as the builder scopes them for its thread axis. That the plan
+    is the kernel's own allocation the compile gate checks of every launch (`kernel_compile.mosaic_failures`:
+    its planned shared bytes against those the compiled kernel asks for)."""
     family = bundles.named("mma.sync", jnp.bfloat16, None)
     streams = family.streams({"lhs": ((64, 32), jnp.bfloat16), "rhs": ((32, 64), jnp.bfloat16)}, 3, 1)
 
@@ -2173,6 +2174,9 @@ def test_an_mma_sync_walks_shared_memory_is_what_its_pipeline_scopes_for_its_cop
     for target in ("sm80", "sm120"):
         with generation.assumed(target):
             assert walked() == ([(3, 64, 32), (3, 32, 64)], []), target
+    streams = family.streams({"lhs": ((64, 32), jnp.bfloat16), "rhs": ((32, 64), jnp.bfloat16)}, 3, 2)
+    assert walked() == ([(3, 64, 32), (3, 32, 64)], [2])
+    streams = family.streams({"lhs": ((64, 32), jnp.bfloat16), "rhs": ((32, 64), jnp.bfloat16)}, 3, 1)
     planned = []
     mesh = Mesh(np.array(jax.devices("cpu")[:1]), ("data",))
     with jax.set_mesh(mesh):

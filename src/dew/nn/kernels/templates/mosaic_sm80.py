@@ -17,6 +17,7 @@ from typing import Any, Self
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax._src import core as jax_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
@@ -153,32 +154,35 @@ def _pipelined(key: tuple, steps: int | None) -> tuple:
     """The shared memory `emit_pipeline` scopes for a walk of `steps` steps (its stages where they are not
     known) over the streams `key` names (`_pipeline_key`), as JAX's own builder allocates them
     (`get_allocations`) for the copies the walk makes (`CP_ASYNC_GENERATION`'s, a slot of each block a stage,
-    fewer for fewer steps, no barrier), whatever GPU, mesh or trace the caller is in: traced on an abstract
-    device of that generation, in a trace of its own that runs nothing, once a walk of the candidate
+    fewer for fewer steps, no barrier) and, where several consumers run it together over their thread axis,
+    the two barriers they meet at (`meet_ref`), whatever GPU, mesh or trace the caller is in: traced on an
+    abstract device of that generation, in a trace of its own that runs nothing, once a walk of the candidate
     search's."""
-    stages, streams = key
+    stages, streams, consumers = key
     pipeline = Pipeline({name: (shape, jnp.dtype(dtype)) for name, shape, dtype, _ in streams}, stages,
                         {name: swizzle for name, _, _, swizzle in streams if swizzle is not None})
     found = {}
 
     def allocated() -> None:
         built = plgpu.emit_pipeline(lambda *_: None, grid=(stages if steps is None else steps,),
-                                    in_specs=_specs(pipeline), max_concurrent_steps=stages)
+                                    in_specs=_specs(pipeline), max_concurrent_steps=stages,
+                                    thread_axis=None if consumers == 1 else "wg")
         found.update(built.get_allocations(*(jax.ShapeDtypeStruct(shape, dtype)
                                              for shape, dtype in pipeline.blocks.values())))
 
     planned = generation.gpu_mesh(jax.sharding.AbstractMesh((1,), ("walk",)), CP_ASYNC_GENERATION)
-    with meshless(), jax.sharding.use_abstract_mesh(planned):
+    threads = () if consumers == 1 else (("wg", consumers),)
+    with meshless(), jax.sharding.use_abstract_mesh(planned), jax_core.extend_axis_env_nd(threads):
         jax.make_jaxpr(allocated)()
-    leaves = (*found["in_smem_refs"], *found["out_smem_refs"], found["barrier_ref"])
+    leaves = (*found["in_smem_refs"], *found["out_smem_refs"], found["barrier_ref"], found["meet_ref"])
     return tuple(leaf for leaf in leaves if leaf is not None)
 
 
 def _pipeline_key(pipeline: "Pipeline") -> tuple:
-    """`pipeline`'s streams as `_pipelined` caches their allocations: its stages, and each stream's name, tile
-    shape, dtype and named swizzle."""
-    return pipeline.stages, tuple((name, tuple(shape), jnp.dtype(dtype).name, pipeline.swizzles.get(name))
-                                  for name, (shape, dtype) in pipeline.blocks.items())
+    """`pipeline`'s streams as `_pipelined` caches their allocations: its stages, each stream's name, tile
+    shape, dtype and named swizzle, and the consumers running it together."""
+    return (pipeline.stages, tuple((name, tuple(shape), jnp.dtype(dtype).name, pipeline.swizzles.get(name))
+                                   for name, (shape, dtype) in pipeline.blocks.items()), pipeline.consumers)
 
 
 def _row_copied(source, table, slot, swizzle: int, interpret: bool) -> None:
@@ -866,12 +870,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         if streams.gathered:
             return (), (_gathered_slots(streams, steps),)
         # Keyed by its slots, `steps` only where fewer than its stages (`emit_pipeline` allocates
-        # min(stages, steps)): a call's every depth past them plans one walk, not one each (row 11639).
-        # Two consumers running it together meet at two barriers in turn (its thread axis's).
+        # min(stages, steps)): a call's every depth past them plans one walk, not one each (row 11639); two
+        # consumers running it together, the barriers they meet at among them.
         slots = steps if steps is not None and steps < streams.stages else None
-        meet = (() if streams.consumers == 1
-                else (plgpu.Barrier(num_arrivals=streams.consumers, num_barriers=2),))
-        return (), ((*_pipelined(_pipeline_key(streams), slots), *meet),)
+        return (), (_pipelined(_pipeline_key(streams), slots),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
