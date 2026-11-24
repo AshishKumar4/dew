@@ -2263,26 +2263,22 @@ def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
             fam, dataclasses.replace(t64, programs=3), jnp.bfloat16, target=sm100, stream_blocks=scales)
 
 
-def test_the_planner_prices_mma_syncs_row_bound_where_its_grouped_kernel_issues_it(monkeypatch):
+def test_the_planner_prices_mma_syncs_row_bound_where_its_grouped_kernel_issues_it():
     """The planner's register estimate of a one-consumer grouped mma.sync launch, whose products take a row
-    bound, holds its issuer's own registers for it (`MmaIssuer.bound_registers`); a dense call's, whose
-    products take none, holds none (row 12304)."""
-    from dew.nn.kernels.templates import mosaic_sm80
-
+    bound, is a dense one's at the same tile and rows and its issuer's registers for the bound
+    (`MmaIssuer.bound_registers`) besides: the dense call's products take none (row 12304)."""
     gmm, tile = grouped_matmul.MosaicGmm(), tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     calls = {grouped: gmm.bind(bf16((512, 256)), bf16((4 if grouped else 1, 256, 256)),
                                jax.ShapeDtypeStruct((4 if grouped else 1,), jnp.int32), out_dtype="bfloat16",
                                trans_rhs=False, interpret=False, dense=not grouped)
              for grouped in (True, False)}
-    bound = mosaic_sm80.MmaIssuer.bound_registers
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        priced = {grouped: gmm.registers(ba, tile, target) for grouped, ba in calls.items()}
-        monkeypatch.setattr(mosaic_sm80.MmaIssuer, "bound_registers", 0)
-        unbound = {grouped: gmm.registers(ba, tile, target) for grouped, ba in calls.items()}
-    assert bound > 0 and priced[True] - unbound[True] == bound, (bound, priced, unbound)
-    assert priced[False] == unbound[False], (priced, unbound)
+        estimated = {grouped: gmm._registers(ba, tile, merging=False, target=target)
+                     for grouped, ba in calls.items()}
+        bound = pricing.family_of(tile, jnp.bfloat16, target).bound_registers
+    assert bound > 0 and estimated[True] - estimated[False] == bound, (bound, estimated)
 
 
 @INTERPRETS
