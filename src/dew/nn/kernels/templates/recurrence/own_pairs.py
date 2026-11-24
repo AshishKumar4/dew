@@ -440,7 +440,12 @@ def _inverted(source_ref, view_refs, *, parts: int) -> None:
     """`_inverses_written` in Mosaic GPU's terms: thread `s * SUB + c` (of the first `C`) column `c` of
     sub-chunk `s`'s inverse, `x_i = -sum_{m < i} D_im x_m` past its unit entry, zero above it, an fp32 sum in
     order of `m` (fla's forward substitution), each entry split into the parts it is stored in
-    (`_parts_of`)."""
+    (`_parts_of`). Formed a column of `D` at a time from the unit vector, `x_i -= D_im x_m` for each `i`
+    past `m` once `x_m` is final (the same sums in the same order, negation exact), the terms of the rows
+    before the column selected out: its `SUB` entries and one of `D`'s live at once. Formed a row at a time,
+    each row's every term read beside the entries before it, ptxas held a Kimi Linear own pairs' thread at
+    408 to 472 bytes of spills on an H100 and a B200, at every producer cap and residency the derivation
+    tried (no tiles derived, the resource gate's)."""
     index, i32, f32 = ir.IndexType.get(), ir.IntegerType.get_signless(32), ir.F32Type.get()
     chunk, sub = ir.MemRefType(source_ref.type).shape
     stored = ir.MemRefType(view_refs[0].type).element_type
@@ -456,17 +461,16 @@ def _inverted(source_ref, view_refs, *, parts: int) -> None:
     with utils.when(arith.cmpi(arith.CmpIPredicate.ult, thread, const(chunk))):
         block, column = arith.divui(thread, const(sub)), arith.remui(thread, const(sub))
         base = arith.muli(block, const(sub))
-        found = []
-        for i in range(sub):
-            row = arith.addi(base, const(i))
-            total = zero
-            for m in range(i):
-                entry = memref.load(source_ref, at(row, const(m)))
-                total = arith.addf(total, arith.mulf(entry, found[m]))
-            # Zero above the column's unit entry, one at it, the substituted sum below.
-            above = arith.cmpi(arith.CmpIPredicate.ult, const(i), column)
-            unit = arith.cmpi(arith.CmpIPredicate.eq, const(i), column)
-            found.append(arith.select(above, zero, arith.select(unit, one, arith.negf(total))))
+        # The unit vector of the column, each entry past it less its terms as they come.
+        found = [arith.select(arith.cmpi(arith.CmpIPredicate.eq, const(i), column), one, zero)
+                 for i in range(sub)]
+        for m in range(sub - 1):
+            # A row before the column contributes no term: its entry is zero, its pairs' product left out.
+            taken = arith.cmpi(arith.CmpIPredicate.ule, column, const(m))
+            for i in range(m + 1, sub):
+                entry = memref.load(source_ref, at(arith.addi(base, const(i)), const(m)))
+                term = arith.select(taken, arith.mulf(entry, found[m]), zero)
+                found[i] = arith.subf(found[i], term)
         for i, value in enumerate(found):
             for part, view_ref in zip(_parts_of(value, parts, stored), view_refs, strict=True):
                 memref.store(part, view_ref, at(arith.addi(base, const(i)), column))
@@ -547,8 +551,12 @@ def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
         run = block // QUARTERS
         state = run
         words = run * (2 + outputs)
+        # Where the system is an output, its blocks' inversion (`_inverted`): a thread's column, `SUB`
+        # entries, beside an entry of the system's.
+        inverting = [f32(scan.THREADS, algebra.SUB + 2)] if outputs > 1 else []
         return Held(phases=([f32(chunk, block)] * 6, [f32(chunk, block)] * 3,
-                            [f32(scan.THREADS, state + 2 * words)], [f32(chunk, algebra.SUB)] * 2))
+                            [f32(scan.THREADS, state + 2 * words)], [f32(chunk, algebra.SUB)] * 2,
+                            inverting))
     return Held(carried=[f32(chunk, algebra.SUB)] * outputs, phases=(
         [f32(chunk, block)] * 6,
         [f32(chunk, block)] * (outputs + 6),
