@@ -248,3 +248,14 @@ def forms_refusal(out_forms: tuple | None, config, *, dense: bool) -> str | None
     if not dense and any(form is not None and form[1] for form in out_forms):
         return "a transposed output is a dense call's"
     return None
+
+
+def stored(value: jax.Array, form: tuple[int, bool] | None) -> jax.Array:
+    """`value` (`[rows, columns]`, an epilogue's output broadcast across each block's columns where `form`
+    reduces it) as its call stores it (`declared`): itself for a tile; a block's first column each block,
+    `[columns // divisor, rows]` where transposed: XLA's form of `reduced`'s store."""
+    if form is None:
+        return value
+    divisor, transposed = form
+    blocks = value[:, ::divisor]
+    return blocks.T if transposed else blocks

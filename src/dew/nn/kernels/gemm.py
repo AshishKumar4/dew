@@ -1322,8 +1322,8 @@ met yet; else the scaled blocks summed in XLA (`xla_products.step_scaled`)."""
 
 def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
                           column_scales: jax.Array, *, out_dtype, epilogue: Callable | None = None,
-                          out_dtypes: tuple | None = None, interpret_on_cpu: bool = False
-                          ) -> jax.Array | tuple[jax.Array, ...]:
+                          out_dtypes: tuple | None = None, out_forms: tuple | None = None,
+                          interpret_on_cpu: bool = False) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` (FP8 codes, `[rows, depth]`) times its matrix of `kernel` (FP8 codes,
     K-major `[groups, width, depth]`, as Hopper's FP8 tensor cores read it), each 128-deep block's partial,
     summed exactly in fp32, times its rows' scales (`row_scales`, `[depth / 128, rows]`) and its group's
@@ -1334,14 +1334,26 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's. `epilogue`, where
     given, takes each fp32 sum and returns the call's outputs, in `out_dtypes` where it returns several (the
     template's epilogue, XLA's the same function of its sums: a next product's rows quantized from them,
-    `quantized.blockwise_fp8_epilogue`, row 8547)."""
+    `quantized.blockwise_fp8_epilogue`, row 8547), each stored as `out_forms` states (`Hooks.out_forms`: an
+    output broadcast across each block's columns stored one value a row a block, transposed, as a next
+    blockwise product reads its rows' scales)."""
+    from .templates.gemm import quantized
+
     sizes_spec = jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32)
     launch = grouped_matmul.MosaicStepScaledGmm()
     per = kernel.shape[1] // column_scales.shape[-1]
+    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
+    hooks = NO_HOOKS if epilogue is None else Hooks(
+        epilogue=epilogue, out_dtypes=tuple(dtype.name for dtype in dtypes) if out_dtypes else None,
+        out_forms=out_forms)
+    stored = dtypes[0].name if epilogue is not None else 'float32'
+    # One group's product of every row stores reduced outputs whole rows a share (`quantized.forms_refusal`).
+    whole = bool(out_forms) and group_sizes.shape[0] == 1
     # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
-    tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel), sizes_spec, out_dtype='float32',
+    tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel), sizes_spec, out_dtype=stored,
                                          trans_rhs=True, interpret=interpret_on_cpu, exact_sums=True,
-                                         scales=_abstract(row_scales, column_scales)))
+                                         scales=_abstract(row_scales, column_scales), hooks=hooks,
+                                         dense=whole))
             if per == 1 or per % SCALE_DEPTH == 0 else None)
 
     def portable(lhs, kernel, sizes, row_scales, column_scales):
@@ -1350,21 +1362,20 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
         return xla_products.step_scaled(lhs.astype(jnp.bfloat16), matrices, sizes, row_scales,
                                         column_scales, precision=jax.lax.Precision.DEFAULT)
 
-    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
-    hooks = NO_HOOKS if epilogue is None else Hooks(
-        epilogue=epilogue, out_dtypes=tuple(dtype.name for dtype in dtypes) if out_dtypes else None)
 
     def finished(summed):
-        # XLA's sums through the same epilogue, each output in its dtype.
+        # XLA's sums through the same epilogue, each output in its dtype and form (`quantized.stored`).
         outputs = summed if epilogue is None else epilogue(summed)
         outputs = outputs if isinstance(outputs, tuple) else (outputs,)
-        cast = tuple(value.astype(dtype) for value, dtype in zip(outputs, dtypes, strict=True))
+        forms = out_forms or (None,) * len(dtypes)
+        cast = tuple(quantized.stored(value.astype(dtype), form)
+                     for value, dtype, form in zip(outputs, dtypes, forms, strict=True))
         return cast if out_dtypes else cast[0]
 
     def mosaic(lhs, kernel, sizes, row_scales, column_scales, *, interpret):
-        stored = dtypes[0].name if epilogue is not None else 'float32'
         out = launch(lhs, kernel, sizes.astype(jnp.int32), out_dtype=stored, trans_rhs=True,
-                     interpret=interpret, exact_sums=True, scales=(row_scales, column_scales), hooks=hooks)
+                     interpret=interpret, exact_sums=True, scales=(row_scales, column_scales), hooks=hooks,
+                     dense=whole)
         return out if epilogue is not None else finished(out)
 
     def portable_finished(*operands):
