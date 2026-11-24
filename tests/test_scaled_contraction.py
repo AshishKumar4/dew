@@ -199,11 +199,11 @@ def test_a_non_finite_row_leaves_the_others_banded():
 
 
 def test_a_term_of_more_band_pairs_than_int32_counts_is_summed_unbanded():
-    """A product of nine groups, each over values a hundred binades apart, sums to `1 + 2^-900`, 1: its band
-    pairs past what int32 counts (`_band` 0), the term is summed unbanded, where its pairs' count wrapped
-    negative and the sum stopped before its first (review of #3967, P1)."""
+    """A product of nine groups, each over values 130 binades apart, sums to `1 + 2^-1170`, 1: its band pairs
+    past what int32 counts (`_band` 0), the term is summed unbanded, where its pairs' count (15^9) wrapped
+    negative and the sum stopped before its first and gave 0 (review of #3967, P1)."""
     form = Form(("k",) * 9, ((1, tuple(((index, 1),) for index in range(9))),), "")
-    operand = jnp.asarray([1.0, 2.0 ** -100], jnp.float32)
+    operand = jnp.asarray([1.0, 2.0 ** -130], jnp.float32)
     np.testing.assert_array_equal(np.asarray(contract(form, *(operand,) * 9)), 1.0)
 
 
@@ -211,12 +211,12 @@ def test_a_banded_sum_holds_its_rows_varying_types_in_a_shard_map():
     """Batch rows split over two devices in a `shard_map` with its varying types checked: each row's banded
     mean its own (`2^-32` for the values that cancel, `2^127` for values all `2^127`), the band loops'
     carries typed as the rows they sum (review of #3967, P1)."""
-    from jax.sharding import PartitionSpec
+    from jax.sharding import NamedSharding, PartitionSpec
 
     mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
-    masses = jnp.ones((2, 4), jnp.float32)
-    values = jnp.asarray([SPREAD, [[2.0 ** 127]] * 4], jnp.float32)
     rows = PartitionSpec("data")
+    masses, values = (jax.device_put(x, NamedSharding(mesh, rows)) for x in (
+        jnp.ones((2, 4), jnp.float32), jnp.asarray([SPREAD, [[2.0 ** 127]] * 4], jnp.float32)))
     found = jax.jit(jax.shard_map(lambda m, v: contract(BATCHED_MEAN, m, v), mesh=mesh, in_specs=(rows, rows),
                                   out_specs=rows, check_vma=True))(masses, values)
     np.testing.assert_array_equal(np.asarray(found), [[2.0 ** -32], [2.0 ** 127]])
