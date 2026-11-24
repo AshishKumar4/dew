@@ -848,7 +848,7 @@ class RunConfig:
         """The run's class record: its class by its alias in `dew.registry.runs`, or by its import path
         where the table holds none, and its fields (`to_dict`); beside them, that it states its trainer's
         layout and its messages' additive term as this Dew does (`LAYOUT_UNSETTABLE`, `ADDITIVE_UNSETTABLE`),
-        and names fused linear CE's and SYRK's kernels apart from the grouped products' (`KERNELS_SPLIT`),
+        and names SYRK's kernel apart from the grouped products' (`KERNELS_SPLIT`),
         which `earlier_run` reads and takes off."""
         return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict(), LAYOUT_UNSETTABLE: True,
                 ADDITIVE_UNSETTABLE: True, KERNELS_SPLIT: True}

@@ -133,12 +133,12 @@ def a_linear_ce_loss_is_on_par(case: tuple[str, ...]) -> None:
     every other choice at XLA."""
     combination = dict(zip(AXES["linear_ce"], case, strict=True))
     draw = functools.partial(_operands, combination)
-    for kernel in ("mosaic", "xla"):
-        with generation.routes() as routes:
-            jax.eval_shape(_step(kernel), *draw(0))
-        recorded = {(found.choice, found.kernel) for found in routes}
-        ce = {found for choice, found in recorded if choice == "linear_ce"}
-        unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
-        assert ce == {kernel} and not unnamed, (kernel, sorted(recorded), unnamed)
-    assert_as_exact(jax.jit(_step("mosaic")), jax.jit(_step("xla")), draw, "-".join(case), seeds=SEEDS,
-                    truth_fn=_truth)
+    with generation.routes() as routes:
+        assert_as_exact(jax.jit(_step("mosaic")), jax.jit(_step("xla")), draw, "-".join(case), seeds=SEEDS,
+                        truth_fn=_truth)
+    # The gate's own call's routes: each arm's loss ran the kernel it named (`Route.forced`), the template's
+    # `mosaic` and the reference's `xla`, and every other choice XLA.
+    ce = {(found.forced, found.kernel) for found in routes if found.choice == "linear_ce"}
+    unnamed = sorted({(found.choice, found.kernel) for found in routes
+                      if found.choice not in CHOICES and found.kernel != "xla"})
+    assert ce == {("mosaic", "mosaic"), ("xla", "xla")} and not unnamed, (sorted(ce), unnamed)

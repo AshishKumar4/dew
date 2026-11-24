@@ -46,7 +46,7 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     a run or trainer, a trainer's retired `export_model` taken off and a looped decoder's
     `loop_message_additive` true read as unset where it could not be unset (`earlier_retired`, rows 11636,
     11742); its model's attention kernel as the run's (`earlier_attention_kernel`, row 11938); a pin of the
-    grouped products' kernel written before fused linear CE and SYRK took choices of their own as theirs too
+    grouped products' kernel written before SYRK took a choice of its own as SYRK's too
     (`earlier_grouped_pins`, row 12457); and every
     field a class lost since, its model's, its source options' and any class record's, left out
     (`earlier_removed`, `dew._records.REMOVED_FIELDS`).
@@ -102,12 +102,15 @@ def earlier_layer_scan(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def earlier_grouped_pins(record: Mapping[str, object]) -> Mapping[str, object]:
-    """A saved run's record written before fused linear cross-entropy and Muon's symmetric products took
-    kernel choices of their own (`linear_ce`, `syrk`, row 12457; no `KERNELS_SPLIT` beside its fields),
-    whose `grouped_matmul` pin of `mosaic` or `xla` chose their kernels too: that pin theirs as well, where
-    the run named none of its own for them, so a resumed run computes its loss and its Muon steps as it
-    trained. A pin of another of the grouped products' kernels named none of theirs. Carried to 1.0
-    (ledger 1552)."""
+    """A saved run's record written before Muon's symmetric products took a kernel choice of their own
+    (`syrk`, rows 12457, 12485; no `KERNELS_SPLIT` beside its fields), whose `grouped_matmul` pin of
+    `mosaic` or `xla` chose SYRK's kernel too, refusals and all: that pin SYRK's as well, where the run named
+    none of its own, so a resumed run takes its Muon steps as it trained. Fused linear cross-entropy's is
+    not carried: its pin read the grouped products' only where its loss's dtype held the kernel, falling to
+    the chunked program elsewhere, a handoff no pin of `linear_ce` states (row 12457's defect, the coupling
+    itself), and both its arms compute the loss alike (check 1, tests/linear_ce_matrix.py), so the resumed
+    run's loss is its chunked program's. A pin of another of the grouped products' kernels named none of
+    SYRK's. Carried to 1.0 (ledger 1552)."""
     fields = record.get("fields")
     if not isinstance(fields, Mapping):
         return record
@@ -118,7 +121,7 @@ def earlier_grouped_pins(record: Mapping[str, object]) -> Mapping[str, object]:
     pinned = kernels.get("grouped_matmul") if isinstance(kernels, Mapping) else None
     if pinned not in ("mosaic", "xla"):
         return record
-    return chosen_kernel(chosen_kernel(record, "linear_ce", pinned), "syrk", pinned)
+    return chosen_kernel(record, "syrk", pinned)
 
 
 def chosen_kernel(record: Mapping[str, object], choice: str, kernel: str) -> Mapping[str, object]:
@@ -182,10 +185,10 @@ this Dew does, unset as null: a record written while it could not be unset (true
 reads its true as unset (`earlier_retired`), where one written since keeps a stated true (row 11742)."""
 
 KERNELS_SPLIT = "kernels_split"
-"""The key beside a run record's fields (`RunConfig.record`) that says its kernel pins name fused linear
-cross-entropy's and Muon's symmetric products' own choices (`linear_ce`, `syrk`): a record written before
-they had them lacks it, and its `grouped_matmul` pin reads as theirs too (`earlier_grouped_pins`), where
-one written since keeps them apart (row 12457)."""
+"""The key beside a run record's fields (`RunConfig.record`) that says its kernel pins name Muon's symmetric
+products' own choice (`syrk`): a record written before it had one lacks it, and its `grouped_matmul` pin
+reads as SYRK's too (`earlier_grouped_pins`), where one written since keeps them apart (rows 12457,
+12485)."""
 
 MARKERS = (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE, KERNELS_SPLIT)
 """Every key a run record holds beside its fields, each saying how it states a field (`RunConfig.record`)."""
