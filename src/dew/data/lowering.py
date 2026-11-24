@@ -673,10 +673,10 @@ class _ShardSteps:
                                         for stage in self.stages)
         rows = self.reader.indexed(shard) if plain and isinstance(self.reader, base.IndexedShards) else None
         return rows if rows is None or not self.stages else base.MappedRows(
-            rows, functools.partial(_made, _Rows(self.stages)))
+            rows, functools.partial(_one_made, _Rows(self.stages)))
 
 
-def _made(steps: _Rows, record: Batch) -> Batch:
+def _one_made(steps: _Rows, record: Batch) -> Batch:
     """`record` through `steps`, maps alone, each making one record of one (`_ShardSteps.indexed`)."""
     made = steps(record)
     assert isinstance(made, Mapping), type(made)
