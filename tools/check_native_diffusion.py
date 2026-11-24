@@ -26,6 +26,7 @@ from dew.inputs import Field, unit_range
 from dew.interop import Pretrained
 from dew.interop.pretrained import PretrainedPipeline
 from dew.nn.inputs import DenoisingCondition
+from dew.nn.kernels import generation
 from dew.nn.kernels.options import program
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
@@ -37,7 +38,7 @@ def bundle(directory, streamed: bool = False):
     """The pipeline, loaded whole, or streamed onto a mesh a leaf at a time."""
     from dew.training import MeshSpec
 
-    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla",
+    loaded = Pretrained.load(str(directory), dtype="float32",
                              mesh=MeshSpec() if streamed else None)
     if not isinstance(loaded, PretrainedPipeline):
         raise TypeError(f"{directory} loads as a {type(loaded).__name__}, not a diffusion pipeline")
@@ -674,7 +675,7 @@ def model_site(directory):
 
     directory = Path(directory)
     config = json.loads((directory / "unet/config.json").read_text())
-    model = unet_fields(config, attention_impl="xla").value
+    model = unet_fields(config).value
     parameters, _ = translate_unet_weights(component_tensors(directory, "unet"), model)
     ids = TIME_IDS.get(directory.name)
     time_ids = None if ids is None else jnp.asarray([ids] * MODEL_ROWS, jnp.int32)
@@ -717,7 +718,8 @@ def check_model(directory):
 
 
 if __name__ == "__main__":
-    import sys
+    with generation.chosen(attention="xla"):
+        import sys
 
     # tools.* and the tests' reference_error, as the test suite imports them.
     ROOT = Path(__file__).resolve().parents[1]

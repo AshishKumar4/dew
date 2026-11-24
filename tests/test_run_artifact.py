@@ -9,6 +9,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from model_support import attending
 
 import dew
 from dew.checkpoints import Checkpoints
@@ -27,9 +28,10 @@ from dew.training import Trainer
 
 def model():
     return CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2,
-                             mlp_features=32, max_seq_len=16, dtype='float32', attention_impl='xla')
+                             mlp_features=32, max_seq_len=16, dtype='float32')
 
 
+@attending("xla")
 def test_live_model_record_rebuilds_exact_constructor_fields():
     original = model()
     rebuilt = ModelConfig.from_model(original).build()
@@ -48,6 +50,7 @@ def documented_block(page, after):
     return text[start:text.index("```", start)]
 
 
+@attending("xla")
 def test_the_documented_model_records_itself_and_its_run_loads_back(tmp_path, monkeypatch):
     """docs/key-concepts.md's example, run as written in a module of its own:
     nothing registers it, its import path names it, its constructor fields
@@ -82,6 +85,7 @@ def test_the_documented_model_records_itself_and_its_run_loads_back(tmp_path, mo
                                   objective.pipeline(state)([""], key=3).host().images)
 
 
+@attending("xla")
 def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(tmp_path):
     """The record of a LoRA run is the base model's record with the adapter's
     rank, alpha, native modules and the name each binds under; the loaded
@@ -118,6 +122,7 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
                                   np.asarray(objective.model.apply(state.variables, tokens)))
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["dpo", "ppo"])
 def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_path):
     """A LoRA run of an objective whose average is its frozen reference
@@ -227,6 +232,7 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
                                   np.asarray(objective.model.apply(state.variables, x, t)))
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["text", "masked", "block"])
 def test_a_hub_run_loads_as_its_task_at_the_requested_snapshot(tmp_path, monkeypatch, kind):
     """`dew.pipeline`, the one loader of a run published to the Hub, pulls it at the revision asked for and

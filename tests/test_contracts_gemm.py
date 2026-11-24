@@ -3,6 +3,7 @@ products, the grouped GEMM and its portable projection, the GEMM prologue and tr
 expert primal and a router's report of its differentiation, the frozen FP8 product, the quantized
 convolution, a broadcast summing its gradient wide (ledger 2641; the harness is tests/contract_support.py)."""
 
+import contextlib
 import functools
 import itertools
 
@@ -914,7 +915,7 @@ def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
 
     def plain_poly(operand, poly):
         sq = jax.lax.dot_general(operand, operand, (((2,), (1,)), ((0,), (0,))))
-        return poly[0] * jnp.eye(6, dtype=operand.dtype) + poly[1] * operand + poly[2] * sq
+        return poly[0] * jnp.eye(operand.shape[-1], dtype=operand.dtype) + poly[1] * operand + poly[2] * sq
 
     assert_contract(lambda operand, poly: gemm.symmetric_polynomial(operand, poly, out_dtype=operand.dtype),
                     (mat, coeffs), (d_mat, d_coeffs), c_gram, f"symmetric_polynomial {edge}",
@@ -927,3 +928,166 @@ def test_a_symmetric_gram_and_polynomial_hold_every_reverse_order(edge):
         _, pull = jax.vjp(lambda operand, t=transpose: gemm.symmetric_gram(operand, transpose=t), small_x)
         (dx_big,) = pull(big_dy)
         np.testing.assert_array_equal(np.asarray(dx_big), np.asarray([[[2.0 ** 126]]], jnp.float32))
+
+    # Native Mosaic SYRK VJP contract (row 12036): bf16 under assumed sm90 + chosen mosaic + interpret_on_cpu,
+    # directly exercising `_symmetric_gram_bwd` and `_symmetric_poly_bwd`.
+    (x_bf,) = normal_draw(11948, (1, 64, 64), scale=EDGES[edge])
+    (d_bf,) = normal_draw(11949, (1, 64, 64), scale=EDGES[edge])
+    (c_bf,) = normal_draw(11950, (1, 64, 64))
+    sym_bf = 0.5 * (x_bf + jnp.swapaxes(x_bf, -1, -2))
+    d_sym_bf = 0.5 * (d_bf + jnp.swapaxes(d_bf, -1, -2))
+    (_, p_bf) = normal_draw(11951, (1,), (3,), scale=EDGES[edge])
+    (_, dp_bf) = normal_draw(11952, (1,), (3,), scale=EDGES[edge])
+
+    import contextlib
+
+    from dew.nn.sharding import automatic_axes
+
+    def native_gram_bf(operand):
+        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
+        with generation.assumed("sm90"), choose:
+            return gemm.symmetric_gram(operand.astype(jnp.bfloat16), out_dtype=jnp.bfloat16,
+                                       interpret_on_cpu=True)
+
+    def plain_gram_bf(operand):
+        x = operand.astype(jnp.bfloat16)
+        return jax.lax.dot_general(x, x, (((2,), (2,)), ((0,), (0,))),
+                                   preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+
+    assert_contract(native_gram_bf, (x_bf,), (d_bf,), c_bf, f"symmetric_gram native mosaic bf16 {edge}",
+                    truth_fn=plain_gram, plain_fn=plain_gram_bf, without=FORWARD_ORDERS)
+
+    def native_poly_bf(operand, poly):
+        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
+        with generation.assumed("sm90"), choose:
+            return gemm.symmetric_polynomial(operand.astype(jnp.bfloat16), poly, out_dtype=jnp.bfloat16,
+                                             interpret_on_cpu=True)
+
+    def plain_poly_bf(operand, poly):
+        x = operand.astype(jnp.bfloat16)
+        sq = jax.lax.dot_general(x, x, (((2,), (1,)), ((0,), (0,))), preferred_element_type=jnp.float32)
+        p = poly.astype(jnp.float32)
+        return (p[0] * jnp.eye(64, dtype=jnp.float32) + p[1] * x.astype(jnp.float32) + p[2] * sq).astype(
+            jnp.bfloat16)
+
+    assert_contract(native_poly_bf, (sym_bf, p_bf), (d_sym_bf, dp_bf), c_bf,
+                    f"symmetric_polynomial native mosaic bf16 {edge}",
+                    truth_fn=plain_poly, plain_fn=plain_poly_bf, without=FORWARD_ORDERS)
+
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_compute_prologued_gemm_holds_every_order(edge):
+    """`gemm.gemm` with a named `compute` beside `prologue` and `applied` over an fp32 master weight
+    (row 1958): every order, under a nested jit and a scan, finite wherever float64 is a normal float32 and
+    wherever plain `portable_projection(prologue(gate, up), down)` is."""
+    from dew.nn import activations
+    from dew.nn.kernels import xla_products
+
+    hook = activations.gated_hook("swiglu", None)
+    group_sizes = jnp.asarray([5, 0, 3], jnp.int32)
+    gate, up, down = normal_draw(1958, (8, 6), (8, 6), (3, 6, 4), scale=EDGES[edge])
+    d_gate, d_up, d_down = normal_draw(1959, (8, 6), (8, 6), (3, 6, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(1960, (8, 4))
+
+    def fused(g, u, w):
+        hidden = hook(g.astype(jnp.bfloat16), u.astype(jnp.bfloat16)).astype(jnp.bfloat16)
+        return gemm.gemm(g.astype(jnp.bfloat16), w, group_sizes, prologue=hook,
+                         prologue_operands=((u.astype(jnp.bfloat16), ("rows", "depth")),),
+                         applied=hidden, compute=jnp.bfloat16, out_dtype=jnp.bfloat16)
+
+    def plain(g, u, w):
+        act = hook(g.astype(jnp.bfloat16), u.astype(jnp.bfloat16)).astype(jnp.bfloat16)
+        return xla_products.portable_projection(act, w, group_sizes, jnp.bfloat16, None, jnp.bfloat16)
+
+    def truth(g, u, w):
+        act = hook(g, u)
+        return jax.lax.ragged_dot(act, w, group_sizes)
+
+    assert_contract(fused, (gate, up, down), (d_gate, d_up, d_down), cotangent,
+                    f"compute prologued gemm {edge}", truth_fn=truth, plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_fp8_weight_product_holds_every_order(edge):
+    """`gemm.fp8_weight_product` (free-layout staged FP8 weights decoded inline via
+    `bits.E4M3_BFLOAT16_FORM`, `generation.linear_tangent`): every order in `lhs`, under a nested jit and a
+    scan, finite wherever float64 is a normal float32 and wherever the decoded product is (row 8548)."""
+    _check_packed_weight_product_contract(edge, kind="fp8")
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_ternary_weight_product_holds_every_order(edge):
+    """`gemm.ternary_weight_product` (2-bit packed BitNet b1.58 weights decoded inline, `linear_tangent`):
+    every order in `lhs`, plus interpreted packed & portable routes with `quantize_activations=True` checked
+    against independent integer-dot forward and STE activation + scale tangent oracles (row 1464)."""
+    import dataclasses
+
+    from dew.nn import precision as prec
+    from dew.nn.kernels import formats
+
+    _check_packed_weight_product_contract(edge, kind="ternary")
+    if edge != "normal":
+        return
+    raw_w = normal_draw(1464, (256, 64), scale=1.0)[0]
+    weights = formats.TernaryWeights.of(raw_w, scale=jnp.float32(0.75))
+    (x,) = normal_draw(1465, (64, 256), scale=1.0)
+    (dx,) = normal_draw(1466, (64, 256), scale=1.0)
+    # Independent integer-dot forward oracle and unquantized STE activation + scale tangent oracles.
+    w_bf16 = weights.unscaled(jnp.bfloat16)
+    x_f32 = x.astype(jnp.float32)
+    peak = jnp.max(jnp.abs(x_f32), axis=-1)
+    safe_peak = jnp.where(peak > 0, peak, jnp.float32(1.0))
+    x_int = jnp.clip(jnp.round(prec.divided(x_f32, safe_peak[:, None]) * jnp.float32(127.0)),
+                     -128.0, 127.0).astype(jnp.bfloat16)
+    dot_int = jax.lax.dot(x_int, w_bf16, preferred_element_type=jnp.float32)
+    prod_int = prec.divided(dot_int, jnp.float32(127.0))
+    fwd_oracle = prec.twice_scaled(prod_int, peak[:, None], weights.scale)
+    x_tan_oracle = jax.lax.dot(dx.astype(jnp.bfloat16), w_bf16,
+                               preferred_element_type=jnp.float32) * weights.scale
+    s_tan_oracle = prec.twice_scaled(prod_int, peak[:, None], jnp.float32(1.0))
+    for kernel in ("mosaic", "xla"):
+        with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
+              generation.routes() as seen):
+            def fn(a, s):
+                return gemm.ternary_weight_product(
+                    a, dataclasses.replace(weights, scale=s), quantize_activations=True,
+                    out_dtype=jnp.float32, interpret_on_cpu=True)
+
+            out, dy_x = jax.jvp(lambda a: fn(a, weights.scale), (x,), (dx,))
+            _, dy_s = jax.jvp(lambda s: fn(x, s), (weights.scale,), (jnp.float32(1.0),))
+        assert any(r.kernel == kernel for r in seen), (kernel, seen)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(fwd_oracle))
+        np.testing.assert_array_equal(np.asarray(dy_x), np.asarray(x_tan_oracle))
+        np.testing.assert_array_equal(np.asarray(dy_s), np.asarray(s_tan_oracle))
+
+
+def _check_packed_weight_product_contract(edge: str, *, kind: str) -> None:
+    from dew.nn.kernels import formats
+
+    depth = 256 if kind == "ternary" else 64
+    raw_w = normal_draw(8548 if kind == "fp8" else 1464, (depth, 64), scale=1.0)[0]
+    weights = (formats.Fp8Weights.of(raw_w, fmt="e4m3", scale=jnp.float32(0.5)) if kind == "fp8"
+               else formats.TernaryWeights.of(raw_w, scale=jnp.float32(0.5)))
+    decoded = weights.decoded(jnp.bfloat16)
+    (x,) = normal_draw(8549, (64, depth), scale=EDGES[edge])
+    (dx,) = normal_draw(8550, (64, depth), scale=EDGES[edge])
+    (cotangent,) = normal_draw(8551, (64, 64))
+
+    from dew.nn.sharding import automatic_axes
+
+    def product(rows):
+        choose = contextlib.nullcontext() if automatic_axes() else generation.chosen(grouped_matmul="mosaic")
+        with choose:
+            if kind == "fp8":
+                return gemm.fp8_weight_product(rows, weights, out_dtype=jnp.float32, interpret_on_cpu=True)
+            return gemm.ternary_weight_product(rows, weights, quantize_activations=False,
+                                               out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    def plain(rows):
+        return jax.lax.dot(rows.astype(jnp.bfloat16), decoded, preferred_element_type=jnp.float32)
+
+    without = () if generation.placed_platform() == "gpu" else ("jvp of grad, remat", "second jvp, remat")
+    with generation.assumed("sm90"):
+        assert_contract(product, (x,), (dx,), cotangent, f"{kind} weight product {edge}",
+                        truth_fn=plain, plain_fn=plain, without=without)

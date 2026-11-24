@@ -81,7 +81,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import _records
 from dew._cleanup import attempted
-from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
+from dew._coordination import agreed, broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew._files import is_uri, write_atomically
 from dew._records import JSON, duration, json_value, record, share, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
@@ -545,16 +545,16 @@ def _refuse_reshaped(template, stored, where: str) -> None:
 
 
 def _packed_checked(tree) -> None:
-    """Refuse a restored tree holding a packed bank whose words another encoder packed (its stored form
-    version, `dew.nn.kernels.formats.NvFp4.checked`), gathering every packed leaf's form whole across
-    processes in one collective (`collective_host`, row 8958)."""
+    """Refuse a restored tree holding a packed bank (`NvFp4`/`Fp8Weights`/`TernaryWeights`) whose form
+    version or scale shape fails `.checked`, gathering forms in one collective (rows 8958, 12161)."""
     from dew._coordination import collective_host
-    from dew.nn.kernels.formats import NvFp4
+    from dew.nn.kernels.formats import Fp8Weights, NvFp4, TernaryWeights
 
+    kinds = (NvFp4, Fp8Weights, TernaryWeights)
     packed = [(jax.tree_util.keystr(path, simple=True, separator="/"), leaf)
               for path, leaf in jax.tree_util.tree_flatten_with_path(
-                  tree, is_leaf=lambda node: isinstance(node, NvFp4))[0]
-              if isinstance(leaf, NvFp4)]
+                  tree, is_leaf=lambda node: isinstance(node, kinds))[0]
+              if isinstance(leaf, kinds)]
     if not packed:
         return
     forms = collective_host([leaf.form for _, leaf in packed], phase="packed forms")
@@ -1354,8 +1354,9 @@ class Checkpoints:
 
     def _from_holder(self, holders: frozenset[int], read: Callable[[], JSON]) -> JSON:
         """What `read` gives on the first of `holders`, the processes holding the local step a process
-        lost, handed to every process (`from_every_process`); every process calls it alike."""
-        return from_every_process(read() if jax.process_index() == min(holders) else None)[min(holders)]
+        lost, handed to every process: a read that fails on the holder raises on all (`agreed`, row 12175)."""
+        held = agreed("a holder's read", lambda: read() if jax.process_index() == min(holders) else None)
+        return from_every_process(held)[min(holders)]
 
     def _lost(self, step: int) -> bool:
         """Whether this process lost its copy of local `step`, which it recovers from the processes

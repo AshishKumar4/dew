@@ -30,7 +30,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import gelu_tanh
-from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.blocks import modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import (
@@ -113,7 +113,7 @@ class _Attention(JointAttention):
 
     def attend(self, query, key, value, lengths):
         attend = functools.partial(scaled_dot_product_attention,
-                                   implementation=self.attention_impl, precision=self.precision)
+                                   precision=self.precision)
         image = self.image_tokens
         return jnp.concatenate([
             attend(query[:, :image], key, value, key_value_seq_lengths=image + lengths),
@@ -132,13 +132,12 @@ class _Block(nn.Module):
     eps: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def _attention(self, image: int = 0):
         return _Attention(self.heads, self.head_dim, bias=False, epsilon=self.eps, image_tokens=image,
                           dtype=self.dtype, precision=self.precision,
-                          attention_impl=self.attention_impl, name="attn")
+                          name="attn")
 
     @nn.nowrap
     def _feed_forward(self):
@@ -199,7 +198,6 @@ class QwenImageTransformer(nn.Module):
     causal_condition: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @property
     def features(self) -> int:
@@ -250,7 +248,7 @@ class QwenImageTransformer(nn.Module):
         """A joint block as the model runs it, named by `where` (or unbound, `parent=None`, where a FLOP
         count reads it): one factory, so the count and the execution build the same block."""
         return _Block(self.features, self.heads, self.head_dim, self.mlp_ratio, self.eps, dtype=self.dtype,
-                      precision=self.precision, attention_impl=self.attention_impl, **where)
+                      precision=self.precision, **where)
 
     def _time(self, time):
         """`QwenImage21TimestepProjEmbeddings`: cosines first, then two

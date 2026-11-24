@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import attending
 from safetensors.numpy import load_file
 
 from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_weights
@@ -26,6 +27,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3n-vision-tiny"
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def bundle():
     config = json.loads((FIXTURE / "config.json").read_text())
     record = translate_wrapper_config(config)
@@ -34,7 +36,7 @@ def bundle():
     precision = jax.lax.Precision.HIGHEST
     tower = towers.from_record(record["tower"]).build().clone(precision=precision)
     projector = projectors.from_record(record["projector"]).clone(precision=precision)
-    decoder = models.build("causal_transformer", record["text"], dtype="float32", attention_impl="reference")
+    decoder = models.build("causal_transformer", record["text"], dtype="float32")
     decoder = decoder.clone(precision=precision)
     return record, variables, tower, projector, decoder
 
@@ -56,6 +58,7 @@ def test_a_bfloat16_norm_rounds_as_timm_does():
     np.testing.assert_array_equal(np.asarray(output, np.float32), fixture["output"])
 
 
+@attending("reference")
 @pytest.mark.parametrize("case", ("odd", "even", "pooled"))
 def test_mobilenet_encoder_and_soft_projection_match_reference(bundle, case):
     """Odd ratios, unchanged resolution and average-pooling are separate paths.
@@ -73,6 +76,7 @@ def test_mobilenet_encoder_and_soft_projection_match_reference(bundle, case):
     np.testing.assert_allclose(soft, np.load(FIXTURE / f"soft_{case}.npy"), rtol=0, atol=1e-4)
 
 
+@attending("reference")
 def test_encoder_backward_and_sgd_update_match_reference(bundle):
     """timm input-gradient error 8.2e-9 and post-update error 1.5e-5 on CPU.
 
@@ -98,6 +102,7 @@ def test_encoder_backward_and_sgd_update_match_reference(bundle):
     np.testing.assert_allclose(stepped, np.load(FIXTURE / "stepped_ref.npy"), rtol=0, atol=1e-4)
 
 
+@attending("reference")
 def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(bundle):
     """Full image-to-logit fp32 parity through the native wrapper, including
     hard vision IDs (48..55 here) and the per-layer table that ends at 48.
@@ -106,7 +111,7 @@ def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(b
     Silencing the hard embedding norm moves the logits by more than 1e-2.
     """
     record, variables, _, projector, _ = bundle
-    loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURE, dtype="float32")
     model = loaded.model.clone(precision=jax.lax.Precision.HIGHEST)
     pixels = jnp.asarray(np.load(FIXTURE / "pixels_odd.npy"))
     ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
@@ -128,6 +133,7 @@ def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(b
     assert np.max(np.abs(np.asarray(run(muted)) - reference)) > 1e-2
 
 
+@attending("reference")
 def test_drop_path_uses_training_rng_and_is_disabled_for_evaluation(bundle):
     _, variables, tower, _, _ = bundle
     tower = tower.clone(construction=dataclasses.replace(tower.construction, drop_path_rate=0.4))

@@ -34,7 +34,7 @@ from dew.algebra.extract import Linear
 from dew.nn.derivatives import Activation, Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
-from dew.nn.programs import called, control_flow, inlined, live, with_bodies
+from dew.nn.programs import called, control_flow, inlined, live, with_bodies, with_bodies_of, with_equations
 
 
 @dataclasses.dataclass(frozen=True)
@@ -265,7 +265,7 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation,
         return jaxpr
     # Without the equations a spliced form left behind, which nothing reads.
     landed = [kept for equation in jaxpr.eqns for kept in spliced.get(id(equation), [equation])]
-    return jaxpr.replace(eqns=live(landed, jaxpr.outvars))
+    return with_equations(jaxpr, live(landed, jaxpr.outvars))
 
 
 WINDOWS_HELD = 4096
@@ -822,10 +822,10 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
         else:
             params = equation.params
         if any(params[name] is not value for name, value in equation.params.items()):
-            equation = equation.replace(params=params)
+            equation = with_bodies_of(equation, params)
             changed = True
         equations.append(equation)
-    return jaxpr.replace(eqns=equations) if changed else jaxpr
+    return with_equations(jaxpr, equations) if changed else jaxpr
 
 
 WITHIN = (Surrogate, KernelGlue, Activation)
@@ -875,7 +875,7 @@ def _reclosed(jaxpr: jcore.Jaxpr, spans: Sequence[_Span], spliced: Mapping[int, 
             equations.append(calls[place])
         if id(equation) not in removed:
             equations.append(equation)
-    return jaxpr.replace(eqns=equations)
+    return with_equations(jaxpr, equations)
 
 
 def _opening(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
@@ -959,7 +959,7 @@ def _opened(jaxpr: jcore.Jaxpr, spans: list[_Span] | None = None) -> jcore.Jaxpr
         computed.update(zip(equation.outvars, returned, strict=True))
         if spans is not None:
             spans.append(_Span(equation, frozenset(map(id, made)), list(returned)))
-    return jaxpr.replace(eqns=equations, outvars=[outer(atom) for atom in jaxpr.outvars])
+    return with_equations(jaxpr, equations, outvars=[outer(atom) for atom in jaxpr.outvars])
 
 
 @dataclasses.dataclass(frozen=True)

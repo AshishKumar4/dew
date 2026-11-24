@@ -24,7 +24,6 @@ from dew.interop.composite import CompositeSource, HeadComponent, NativeComponen
 from dew.interop.pretrained import Pretrained
 from dew.interop.releases import ReleasePlan, writable
 from dew.lora import FACTORS
-from dew.nn.attention import AttentionImpl
 from dew.nn.cross_attention import ContextEncoder
 from dew.nn.sharding import drawn_axes
 from dew.registry import dtype_name, from_record, import_path
@@ -57,7 +56,7 @@ class DecisionHeadSource(HeadComponent):
     def axes(self, head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
         return head_axes(head, backbone)
 
-    def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
+    def build(self, backbone: Pretrained | None, dtype: str, *,
               shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
         held = _records.record(self.record, "head")
         fields = _records.record(held["fields"], "head.fields")
@@ -68,8 +67,7 @@ class DecisionHeadSource(HeadComponent):
             width, compute = DecisionModel.head_size(backbone.model)
         configured = {name: value for name, value in fields.items() if name != "hidden_size"}
         return Head.from_record(_records.json_value({**held, "fields": {
-            **configured, "dtype": None if compute is None else dtype_name(compute),
-            "attention_impl": attention_impl}}, "head"), width)
+            **configured, "dtype": None if compute is None else dtype_name(compute)}}, "head"), width)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -159,9 +157,9 @@ class PretrainedDecision(Pretrained):
                                            for path, _ in jax.tree_util.tree_leaves_with_path(backbone)
                                            for key in path):
             raise ValueError("the backbone carries LoRA factors its model binds to no adapter")
-        # The task's numerics, which a decoder bundle built of its model states none of.
+        # The task's numerics and kernel pins, which a decoder bundle built of its model states none of.
         held = {**{field.name: getattr(decoder, field.name) for field in dataclasses.fields(Pretrained)},
-                "numerics": task.precision}
+                "numerics": task.precision, "kernels": task.kernels}
         return cls(**held, head=head, head_variables=thaw(part(task.variables, "head")), layout=task.layout,
                    specials=task.specials, calibration=task.calibration, decision_tokenizer=task.tokenizer,
                    context_encoder=task.model.context_encoder, named_encoder=task.named_encoder,

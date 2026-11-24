@@ -31,8 +31,8 @@ from dew.batch import token_id, token_ids
 from dew.nn.protocols import Bounded, Layered, Predicting
 from dew.registry import from_record
 from dew.sampling import decoding
-from dew.sampling.strategies import Beam, Speculative, Strategy
-from dew.sampling.text import Sampling, ordered_transforms, with_ids_of
+from dew.sampling.strategies import Beam, Sample, Speculative, Strategy
+from dew.sampling.text import Sampling, ordered_transforms
 
 
 def read_generation_config(directory: Path) -> Mapping[str, object]:
@@ -115,6 +115,10 @@ class _Control:
     mode: Literal["always", "sampling", "beam"] = "always"
     refusal: str | None = None
     masked_neutral: tuple[JSON, ...] | None = None
+    searches: bool = False
+    """Whether it acts through the source's decoding strategy alone (a search's, a proposal's), so a policy
+    naming its own strategy replaces it and nothing judges it (`source_decoding`); a strategy's own
+    controls (`owner` "strategy") are such controls too."""
 
 
 @dataclass(frozen=True)
@@ -242,12 +246,16 @@ _CONTROLS: dict[str, _Control] = {
     "_commit_hash": _Control("metadata"),
     "_from_model_config": _Control("metadata"),
     "assistant_confidence_threshold": _Control("strategy"),
-    "assistant_early_exit": _Control("unsupported", refusal="early-exit proposal is not implemented"),
+    "assistant_early_exit": _Control(
+        "unsupported", refusal="early-exit proposal is not implemented", searches=True,
+    ),
     "assistant_ensemble_weight": _Control(
-        "unsupported", neutral=(1.0,), refusal="ensemble verification below one accepts a biased distribution"
+        "unsupported", neutral=(1.0,),
+        refusal="ensemble verification below one accepts a biased distribution", searches=True,
     ),
     "assistant_lookbehind": _Control(
-        "unsupported", refusal="translating between two tokenizers' token spaces is not implemented"
+        "unsupported", refusal="translating between two tokenizers' token spaces is not implemented",
+        searches=True,
     ),
     "bad_words_ids": _Control("transform"),
     "begin_suppress_tokens": _Control("transform"),
@@ -263,24 +271,31 @@ _CONTROLS: dict[str, _Control] = {
         masked_neutral=(),
     ),
     "compile_config": _Control("unsupported", refusal="the native decoder owns its compilation"),
-    "constraints": _Control("unsupported", refusal="constrained beam search is not implemented"),
+    "constraints": _Control(
+        "unsupported", refusal="constrained beam search is not implemented", searches=True,
+    ),
     "continuous_batching_config": _Control("unsupported", refusal="continuous batching is not implemented"),
     "decoder_start_token_id": _Control("inapplicable"),
     "disable_compile": _Control(
         "unsupported", neutral=(False,), refusal="the native decoder always runs compiled"
     ),
     "diversity_penalty": _Control(
-        "unsupported", neutral=(0.0,), mode="beam", refusal="diverse group beam search is not implemented"
+        "unsupported", neutral=(0.0,), mode="beam", refusal="diverse group beam search is not implemented",
+        searches=True,
     ),
     "do_sample": _Control("policy", masked_neutral=(True,)),
-    "dola_layers": _Control("unsupported", refusal="DoLa is a decoding strategy that is not implemented"),
+    "dola_layers": _Control(
+        "unsupported", refusal="DoLa is a decoding strategy that is not implemented", searches=True,
+    ),
     "early_stopping": _Control("strategy", neutral=(False,), mode="beam"),
     "encoder_no_repeat_ngram_size": _Control("transform", neutral=(0,)),
     "encoder_repetition_penalty": _Control("transform", neutral=(1.0,)),
     "epsilon_cutoff": _Control("transform", neutral=(0.0,), mode="sampling"),
     "eta_cutoff": _Control("transform", neutral=(0.0,), mode="sampling"),
     "exponential_decay_length_penalty": _Control("transform"),
-    "force_words_ids": _Control("unsupported", refusal="constrained beam search is not implemented"),
+    "force_words_ids": _Control(
+        "unsupported", refusal="constrained beam search is not implemented", searches=True,
+    ),
     "forced_bos_token_id": _Control("transform"),
     "forced_eos_token_id": _Control("transform"),
     # Dream's `diffusion_generate` (generation_utils.py at Dream-org/Dream-v0-Base-7B 6572adb): the keyword
@@ -299,11 +314,14 @@ _CONTROLS: dict[str, _Control] = {
     ),
     "length_penalty": _Control("strategy", neutral=(1.0,), mode="beam"),
     "low_memory": _Control(
-        "unsupported", neutral=(False,), refusal="sequential beam evaluation is not implemented"
+        "unsupported", neutral=(False,), refusal="sequential beam evaluation is not implemented",
+        searches=True,
     ),
     "max_cache_len": _Control("capacity"),
     "max_length": _Control("task"),
-    "max_matching_ngram_size": _Control("unsupported", refusal="prompt lookup proposal is not implemented"),
+    "max_matching_ngram_size": _Control(
+        "unsupported", refusal="prompt lookup proposal is not implemented", searches=True,
+    ),
     "max_new_tokens": _Control("task"),
     "max_time": _Control("unsupported", refusal="a host clock cannot stop a coordinated device loop"),
     "min_length": _Control("transform", neutral=(0,)),
@@ -312,9 +330,11 @@ _CONTROLS: dict[str, _Control] = {
         "unsupported",
         neutral=("constant",),
         refusal="only a constant proposal length fits a fixed device block",
+        searches=True,
     ),
     "num_beam_groups": _Control(
-        "unsupported", neutral=(1,), mode="beam", refusal="diverse group beam search is not implemented"
+        "unsupported", neutral=(1,), mode="beam", refusal="diverse group beam search is not implemented",
+        searches=True,
     ),
     "num_beams": _Control("strategy", neutral=(1,)),
     "num_return_sequences": _Control("task"),
@@ -336,11 +356,14 @@ _CONTROLS: dict[str, _Control] = {
         "unsupported",
         neutral=(0.0,),
         refusal="contrastive search is a decoding strategy that is not implemented",
+        searches=True,
     ),
     "prefill_chunk_size": _Control(
         "unsupported", refusal="the native prefill evaluates a prompt in one call"
     ),
-    "prompt_lookup_num_tokens": _Control("unsupported", refusal="prompt lookup proposal is not implemented"),
+    "prompt_lookup_num_tokens": _Control(
+        "unsupported", refusal="prompt lookup proposal is not implemented", searches=True,
+    ),
     "remove_invalid_values": _Control("transform", neutral=(False,)),
     "renormalize_logits": _Control("transform", neutral=(False,)),
     "return_dict_in_generate": _Control("inapplicable"),
@@ -348,7 +371,8 @@ _CONTROLS: dict[str, _Control] = {
     "speculation_type": _Control("strategy"),
     "suppress_tokens": _Control("transform"),
     "target_lookbehind": _Control(
-        "unsupported", refusal="translating between two tokenizers' token spaces is not implemented"
+        "unsupported", refusal="translating between two tokenizers' token spaces is not implemented",
+        searches=True,
     ),
     "token_healing": _Control(
         "unsupported",
@@ -414,8 +438,9 @@ def audit_masked(config: Mapping[str, object], generation_config: Mapping[str, o
 
 
 def _audit(config: Mapping[str, object], generation_config: Mapping[str, object],
-           model: nn.Module, do_sample: bool, beams: JSON, overridden: bool) -> None:
-    """Refuse active unsupported controls after applying the caller's override."""
+           model: nn.Module, do_sample: bool, beams: JSON, overridden: bool, searched: bool = True) -> None:
+    """Refuse active unsupported controls after applying the caller's override: a strategy's controls
+    (`_Control.searches`) only where the source's strategy stays in effect (`searched`)."""
     refused: list[str] = []
     for name in sorted(_CONTROLS.keys() | generation_config.keys()):
         rule = _CONTROLS.get(name)
@@ -423,6 +448,8 @@ def _audit(config: Mapping[str, object], generation_config: Mapping[str, object]
             if rule.owner in ("policy", "metadata", "inapplicable", "task"):
                 continue
             if overridden and rule.owner == "transform":
+                continue
+            if not searched and (rule.searches or rule.owner == "strategy"):
                 continue
             if rule.mode == "beam" and _neutral(beams, _CONTROLS["num_beams"].neutral):
                 continue
@@ -441,8 +468,8 @@ def _audit(config: Mapping[str, object], generation_config: Mapping[str, object]
         raise ValueError(
             f"native decoding cannot honor active source controls {refused}; "
             "text_generation(sampling=Sampling(...)) replaces the basic policy and the "
-            "transform chain, and TextGeneration(model, variables, processor, logits=..., "
-            "stopping=..., strategy=...) builds the task from components outright")
+            "transform chain, and TextGeneration(model, variables, processor, "
+            "Sampling(logits=..., stopping=..., strategy=...)) builds the task from components outright")
 
 
 def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str, object],
@@ -634,14 +661,19 @@ def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) 
     `source_decoding` reads back as the same policy: the inverse of
     `_source_sampling`. A top_k of None is written 0, which both read as no
     cut, since an unset one reads as transformers' default (`TRANSFORMERS_TOP_K`).
-    transformers has no presence or frequency penalty, so a policy using one
-    is refused, not exported without it."""
-    dropped = [name for name in ("presence_penalty", "frequency_penalty") if getattr(sampling, name) != 0.0]
+    A beam search is written as `num_beams`, `length_penalty` and
+    `early_stopping` (`_source_strategy`'s inverse). What it holds no field of
+    (`unconfigured`) is refused, not exported without it."""
+    dropped = unconfigured(sampling)
     if dropped:
         raise ValueError(f"transformers' generation config has no {' or '.join(dropped)}; "
                          "export a policy without it")
+    strategy = sampling.strategy
     sample = sampling.temperature > 0
     values: dict[str, JSON] = {"do_sample": sample, "use_cache": True}
+    if isinstance(strategy, Beam):
+        values.update(num_beams=strategy.width, length_penalty=strategy.length_penalty,
+                      early_stopping=strategy.early_stopping)
     for entry in _POLICY_FIELDS:
         include, encoded = entry.write(getattr(sampling, entry.field), sample)
         if include:
@@ -649,6 +681,43 @@ def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) 
     if max_new_tokens:
         values["max_new_tokens"] = max_new_tokens
     return values
+
+
+def unconfigured(sampling: Sampling) -> list[str]:
+    """The parts of `sampling` a generation_config.json holds no field of, so that `source_decoding` would
+    read back another policy (`generation_config_of` refuses them): a presence or frequency penalty, a logits
+    chain of its own, criteria beside its EOS, a grammar, a strategy other than a beam search, and a beam
+    search transformers runs otherwise: one beam (no search), drawn at a positive temperature (stochastic
+    beams, refused), stopping on other than its policy's EOS ids, or reporting its boundaries."""
+    dropped = [name for name in ("presence_penalty", "frequency_penalty") if getattr(sampling, name) != 0.0]
+    dropped += [name for name, held in (("logits", sampling.logits is not None),
+                                        ("stopping", bool(sampling.stopping))) if held]
+    strategy = sampling.strategy
+    if strategy is not None and not isinstance(strategy, Beam) and not (
+            isinstance(strategy, Sample) and strategy.grammar is None):
+        dropped.append(f"strategy {type(strategy).__name__}")
+    if isinstance(strategy, Beam):
+        dropped += [what for what, held in (
+            ("a search of one beam", strategy.width == 1),
+            ("a beam search drawn at a positive temperature", sampling.temperature > 0),
+            ("a beam search stopping on other than its policy's EOS ids",
+             strategy.stop_ids != len(sampling.stops)),
+            ("a beam search's boundaries", strategy.boundaries)) if held]
+    return dropped
+
+
+def written_part(sampling: Sampling) -> Sampling:
+    """`sampling` less what a generation_config.json holds no field of (`unconfigured`): the part a bundle of
+    a saved run states as its generation config (`Pretrained.from_saved`), its task loading the run's whole
+    policy from its settings; writing its release refuses the rest (`dew.interop.releases.bundle_plan`),
+    as transformers' reader of it would run another policy."""
+    strategy = sampling.strategy
+    kept = strategy if isinstance(strategy, Sample) and strategy.grammar is None else None
+    if isinstance(strategy, Beam):
+        searched = replace(sampling, logits=None, stopping=(), presence_penalty=0.0, frequency_penalty=0.0)
+        kept = strategy if not unconfigured(searched) else None
+    return replace(sampling, logits=None, stopping=(), strategy=kept, presence_penalty=0.0,
+                   frequency_penalty=0.0)
 
 
 def masked_generation_config(max_new_tokens: int | None = None, pad_token_id: int | None = None,
@@ -694,25 +763,34 @@ def source_cache(config: Mapping[str, object], generation_config: Mapping[str, o
 
 
 def source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     model: nn.Module, rows: int, override: Sampling | None
-                     ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...] | None, Strategy | None]:
-    """Return the policy, chain and strategy a loaded source decodes with.
+                     model: nn.Module, rows: int, override: Sampling | None) -> Sampling:
+    """Return the decoding policy a loaded source decodes with: its controls, its logits chain and its
+    strategy (`Sampling`).
 
-    An explicit policy replaces the first two, so they are not built and the
-    controls behind them are not judged: a watermark the caller just replaced
-    cannot block the call. The source's EOS and pad ids fill the ones it
+    An explicit policy replaces the controls and the chain, so they are not
+    built and the controls behind them are not judged: a watermark the
+    caller just replaced cannot block the call; the source's strategy stands
+    where the policy names none, and is neither built nor judged where it
+    names one (the review of API02b: a source's stochastic beams refused a
+    call that samples alone). The source's EOS and pad ids fill the ones it
     leaves None, since they belong to the model and its tokenizer.
     """
     requested_mode = _generation_value(config, generation_config, "do_sample")
     if override is None and requested_mode is not None and type(requested_mode) is not bool:
         raise ValueError("do_sample must be a boolean")
     do_sample = requested_mode is True if override is None else override.temperature > 0
-    _audit(config, generation_config, model, do_sample,
-           _generation_value(config, generation_config, "num_beams"), override is not None)
-    strategy = _source_strategy(config, generation_config, model, do_sample, rows)
+    # The source's beams are judged where its strategy stays in effect alone.
+    replaced = override is not None and override.strategy is not None
+    beams = _generation_value(config, generation_config, "num_beams")
+    _audit(config, generation_config, model, do_sample, beams, override is not None, searched=not replaced)
     if override is not None:
-        ids = Sampling(eos_token_ids=eos_ids(config, generation_config) or None,
-                       pad_token_id=pad_id(config, generation_config))
-        return with_ids_of(override, ids), None, strategy
+        # The override over the source's ids and strategy, by the one rule a call's policy replaces another's.
+        source = Sampling(eos_token_ids=eos_ids(config, generation_config) or None,
+                          pad_token_id=pad_id(config, generation_config),
+                          strategy=None if replaced else _source_strategy(config, generation_config, model,
+                                                                          do_sample, rows))
+        return override.with_defaults_of(source)
+    strategy = _source_strategy(config, generation_config, model, do_sample, rows)
     policy = _source_sampling(config, generation_config, do_sample)
-    return policy, _source_transforms(config, generation_config, policy, isinstance(strategy, Beam)), strategy
+    chain = _source_transforms(config, generation_config, policy, isinstance(strategy, Beam))
+    return replace(policy, logits=chain, strategy=strategy)

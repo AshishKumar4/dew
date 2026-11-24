@@ -963,11 +963,10 @@ def _dense_draw(rows: int, depth: int, width: int, *, cotangent: bool = False):
     `cotangent` a bf16 cotangent of its bf16 output."""
     def draw(seed):
         rng = np.random.default_rng(seed)
-        drawn = (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
-                 jnp.asarray(rng.normal(size=(depth, width)), jnp.bfloat16))
-        return (*drawn, jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16)) if cotangent else drawn
+        drawn = (rng.normal(size=(rows, depth)).astype(jnp.bfloat16),
+                 rng.normal(size=(depth, width)).astype(jnp.bfloat16))
+        return (*drawn, rng.normal(size=(rows, width)).astype(jnp.bfloat16)) if cotangent else drawn
     return draw
-
 
 @runs("sm90")
 @pytest.mark.parametrize("rows", [1, 65, 256, 257])

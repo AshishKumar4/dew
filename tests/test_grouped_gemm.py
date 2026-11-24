@@ -293,15 +293,15 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     here = generation.gpu_target().generation
     if grouped_matmul.cutlass_built_for(here) is None:
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
-    group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
+    group_sizes = np.asarray(SIZES[sizes], np.int32)
 
     def draw(seed):
         x, w, dy, _ = operands(SIZES[sizes], jnp.bfloat16, seed)
-        return tuple(jnp.asarray(value, jnp.bfloat16) for value in (x, w, dy))
+        return tuple(np.asarray(value, jnp.bfloat16) for value in (x, w, dy))
 
     def projection(implementation, dtype=jnp.bfloat16):
-        return lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None)
-
+        return lambda x, w: expert_projection(x, w, jnp.asarray(group_sizes, jnp.int32), dtype,
+                                              implementation, None)
     # Its build's kernel pinned, as a tuned pick names it: the pin taken as legal for the wheel's one kernel
     # (`_Cutlass.legal`), where a template's shared-memory model, which CUTLASS has none of, raised.
     pinned = {grouped_matmul.CutlassGmm: grouped_matmul.cutlass_tile(grouped_matmul.cutlass_built_for(here),
@@ -380,19 +380,19 @@ def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):
     here = generation.gpu_target().generation
     if grouped_matmul.cutlass_built_for(here) is None:
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
-    group_sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
+    group_sizes = np.asarray(SIZES["ragged"], np.int32)
 
     def draw(seed):
         first, second = (operands(SIZES["ragged"], jnp.bfloat16, seed + offset)[:3]
                          for offset in (0, 1 << 16))
-        x, w, dy = (jnp.stack([jnp.asarray(a, jnp.bfloat16), jnp.asarray(b, jnp.bfloat16)])
+        x, w, dy = (np.stack([np.asarray(a, jnp.bfloat16), np.asarray(b, jnp.bfloat16)])
                     for a, b in zip(first, second, strict=True))
         return x, w[0] if shared else w, dy
 
     def mapped(implementation, dtype=jnp.bfloat16):
-        one = with_gradients(lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None))
+        one = with_gradients(lambda x, w: expert_projection(x, w, jnp.asarray(group_sizes, jnp.int32), dtype,
+                                                            implementation, None))
         return jax.vmap(one, in_axes=(0, None if shared else 0, 0))
-
     def through_cutlass(x, w, dy):
         with generation.chosen(grouped_matmul="cutlass"):
             return mapped("pallas")(x, w, dy)
@@ -1441,7 +1441,6 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         tail_deep = mosaic_gpu._dense_tail(tile_64x256, jnp.bfloat16, (8192, 4096, 28672), (2, 2), 216,
                                            balanced=True)
         assert tail_deep is None
-        assert not gmm._merges(ba_deep, tile_64x256, sm80)
         assert not gmm.balanced(ba_deep, tile_64x256, sm80)
         # Single-wave tail (waves=1, rem=40, 0 drift): planner produces one Tail plan passed straight to
         # emitter via `_stated` without re-pricing.
@@ -1453,8 +1452,6 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
         tail_1w = mosaic_gpu._dense_tail(tile_1w, jnp.bfloat16, (2048, 1024, 4096), (2, 2), 216,
                                          balanced=stated_1w["balanced"])
         assert tail_1w is stated_1w["balanced"] and tail_1w is not None
-        assert tgmm._merges(ba_1w, tile_1w, sm80)
-        assert tgmm._balances(ba_1w, tile_1w, sm80)
         assert tgmm.balanced(ba_1w, tile_1w, sm80)
     # Multi-wave nonzero-tail check-1 witness: 320x128 -> grid=(5, 2)=10 tiles on 4 programs -> waves=2,
     # rem=2 (nonzero tail!). At l2=64KB and memory_rate=120GB/s, persistent L2 drift flips the tail decision
@@ -1509,18 +1506,20 @@ def test_sm80_prefetch_registers_and_tgmm_prefetch_predicate():
         w = jax.ShapeDtypeStruct((1, 4096, 14336), jnp.bfloat16)
         dy = jax.ShapeDtypeStruct((8192, 14336), jnp.bfloat16)
         ba_fwd = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        ba_fwd_interp = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=True,
+                                 dense=True)
         ba_dw = tgmm.bind(x, dy, sizes, out_dtype="float32", interpret=False, dense=True)
+        ba_dw_interp = tgmm.bind(x, dy, sizes, out_dtype="float32", interpret=True, dense=True)
         t320 = tiling.Tiles(64, 320, 32, 5, 8, warpgroups=1, family="mma.sync")
         t128 = tiling.Tiles(128, 128, 32, 5, 8, warpgroups=1, family="mma.sync", programs=2)
         t128_k64 = tiling.Tiles(128, 128, 64, 3, 8, warpgroups=1, family="mma.sync")
         assert not gmm.legal(ba_fwd, t320, sm80)
         assert gmm.legal(ba_fwd, t128, sm80)
         fam = pricing.family_of(t128, jnp.bfloat16)
-        assert mosaic_gpu.tgmm_prefetches(fam, unstaged=True, rewritten=False, k_major=False,
-                                          interpret=False, scaled=False, summed=False)
-        assert not mosaic_gpu.tgmm_prefetches(fam, unstaged=False, rewritten=False, k_major=False,
-                                              interpret=False, scaled=False, summed=False)
-        assert tgmm.legal(ba_dw, t128, sm80) and tgmm.legal(ba_dw, t128_k64, sm80)
+        assert pricing.prefetch_registers(fam, t128, ba=ba_fwd) == 16
+        assert gmm.registers(ba_fwd, t128, sm80) == gmm.registers(ba_fwd_interp, t128, sm80) + 16
+        # TGMM skips fragment prefetch registers entirely at the call site.
+        assert tgmm.registers(ba_dw, t128, sm80) == tgmm.registers(ba_dw_interp, t128, sm80)
         cases = [
             KernelCase("sm80_fwd_128x128x32", lambda: gmm.lowering(ba_fwd, t128)),
             KernelCase("sm80_dw_128x128x32", lambda: tgmm.lowering(ba_dw, t128)),
@@ -1629,6 +1628,639 @@ def test_hopper_cluster2_balanced_tail_lowers_spill_free():
         assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
 
 
+def test_explicit_target_derivation_sm120_and_refusal_under_mismatched_ambient_gpu():
+    """Deriving and pricing `MosaicGmm` for an explicit `target` reads that target's bundle (`MmaFed` 60
+    held regs on sm120 vs 65 on sm100) and explicit-target refusals regardless of the ambient GPU, with no
+    `_with_target` override (rows 12011, 11889)."""
+    from dew.nn.kernels.templates import report
+
+    gmm = grouped_matmul.MosaicGmm()
+    assert not hasattr(gmm, "_with_target")
+    sm120 = generation.gpu_target("sm120")
+    sm86 = generation.gpu_target("sm86")
+    x = jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((1, 4096, 4096), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+    ba = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+
+    with generation.assumed("sm120"):
+        expected_tile = gmm.derived(ba, sm120)
+        assert expected_tile is not None
+        expected_regs = gmm.registers(ba, expected_tile, sm120)
+
+    for ambient in ("sm90", "sm100"):
+        with generation.assumed(ambient):
+            got_tile = gmm.derived(ba, sm120)
+            assert got_tile == expected_tile
+            assert gmm.registers(ba, expected_tile, sm120) == expected_regs
+
+    # Explicit-target refusal recorded under sm86 is honored when deriving for sm86 under ambient sm90.
+    with report.refusals():
+        with generation.assumed("sm86"):
+            first = gmm.derived(ba, sm86)
+            assert first is not None
+            sm86_id = report._identity(gmm, ba, sm86)
+        report.refuse([(sm86_id, first, frozenset({gmm.KERNEL}))])
+        with generation.assumed("sm90"):
+            stepped = gmm.derived(ba, sm86)
+            assert stepped != first
+
+
+def test_stream_rms_normalized_fuses_through_fused_gemm_prologue():
+    """Residual-stream RMSNorm (`norms.stream_rms_normalized`) feeding `fused_gemm.product` splits its
+    stream sum + statistics into the XLA pre-pass and fuses the scaling into the GEMM prologue through
+    `fused_gemm.analysis` while holding Check 1 on value and VJP (rows 6104, 12137)."""
+    from jax.experimental.pallas import fuser
+
+    from dew.nn.kernels import fused_gemm
+    from dew.nn.norms import stream_rms_normalized
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+
+    def body(x, branch, scale, w):
+        _, normed = stream_rms_normalized(x, branch, scale, 1e-6, jnp.bfloat16, scale_offset=False,
+                                          scale_after_cast=False, fp32_statistics=True,
+                                          implementation="xla")
+        return fused_gemm.product(normed, w, out_dtype=jnp.bfloat16)
+
+    with generation.assumed("sm90"):
+        found = fused_gemm.analysis(body, bf16((8192, 4096)), bf16((8192, 4096)), f32((4096,)),
+                                    bf16((4096, 4096)))
+    assert found.prologue is not None and found.prologue.kernel == "fused", found
+
+    def draw(seed):
+        rng = np.random.default_rng(12137 + seed)
+        return (
+            jnp.asarray(rng.standard_normal((64, 64)) / 8.0, jnp.bfloat16),
+            jnp.asarray(rng.standard_normal((64, 64)) / 8.0, jnp.bfloat16),
+            jnp.asarray(rng.uniform(0.8, 1.2, size=(64,)), jnp.float32),
+            jnp.asarray(rng.standard_normal((64, 64)) / 8.0, jnp.bfloat16),
+            jnp.asarray(rng.standard_normal((64, 64)), jnp.bfloat16),
+        )
+
+    def run_fused(x, branch, scale, w, dy):
+        with generation.assumed("sm90"), generation.chosen(gemm_prologue="fused"):
+            y, pull = jax.vjp(fuser.fuse(body), x, branch, scale, w)
+            return y, pull(dy)
+
+    def run_ref(x, branch, scale, w, dy, *, dtype=jnp.bfloat16, wide=jnp.float32):
+        def fn(a, b, s, m):
+            _, normed = stream_rms_normalized(a, b, s, 1e-6, dtype, scale_offset=False,
+                                              scale_after_cast=False, fp32_statistics=True,
+                                              implementation="xla")
+            return jax.lax.dot(normed, m, preferred_element_type=wide).astype(dtype)
+
+        y, pull = jax.vjp(fn, x.astype(dtype), branch.astype(dtype), scale.astype(wide), w.astype(dtype))
+        return y, pull(dy.astype(dtype))
+
+    assert_as_exact(jax.jit(run_fused), jax.jit(run_ref), draw, "stream_rms_normalized fused_gemm",
+                    seeds=SEEDS, truth_fn=functools.partial(run_ref, dtype=jnp.float64, wide=jnp.float64))
+
+
+def test_derivation_honors_carved_out_resource_budgets():
+    """`derivation.derived` honors a tightened `GpuTarget.shared_limit` below the device whole budget
+    (rows 1762, 12139)."""
+    from dew.nn.kernels.templates import bundles, resources
+    from dew.nn.kernels.templates.gemm import derivation
+
+    sm90 = generation.gpu_target("sm90")
+    gmm = grouped_matmul.MosaicGmm()
+    x = jax.ShapeDtypeStruct((2048, 2048), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((1, 2048, 2048), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+    ba = gmm.bind(x, w, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+    layouts = bundles.groups("sm90", jnp.bfloat16, stated=True)[0]
+    carved_smem = 96 * 1024
+    carved = dataclasses.replace(sm90, shared_limit=carved_smem)
+    tile = derivation.derived(
+        layouts, rows=2048, depth=2048, width=2048, dtype=jnp.bfloat16,
+        multiprocessors=carved.multiprocessors or 132, target=carved,
+        candidate=lambda t: gmm.candidate(ba, t, carved),
+        launch_of=lambda t: gmm.launch_of(ba, t, carved),
+        grouped=False, dense=True,
+    )
+    assert tile is not None
+    assert gmm.staged_bytes(ba, tile, carved) <= resources.program_shared(carved_smem, tile.programs)
+
+
+def _add_tangent_rule(a, b):
+    import operator
+
+    del a, b
+    return operator.add
+
+
+def test_prologued_custom_jvp_is_picklable():
+    """`gemm._prologued` uses a top-level picklable `_ProloguedTangent` (pickle round-trip + JVP check,
+    row 12142)."""
+    import operator
+    import pickle
+
+    tangent_rule = gemm._ProloguedTangent(operator.add, _add_tangent_rule)
+    restored = pickle.loads(pickle.dumps(tangent_rule))
+    assert restored == tangent_rule
+    wrapped = gemm._prologued(operator.add, _add_tangent_rule)
+    x = jnp.asarray([[1.0, 2.0], [3.0, 4.0]], jnp.float32)
+    y = jnp.asarray([[0.5, 1.5], [2.5, 3.5]], jnp.float32)
+    dx = jnp.ones_like(x)
+    dy = jnp.full_like(y, 2.0)
+    primal_out, tangent_out = jax.jvp(wrapped, (x, y), (dx, dy))
+    np.testing.assert_array_equal(np.asarray(primal_out), np.asarray(x + y))
+    np.testing.assert_array_equal(np.asarray(tangent_out), np.asarray(dx + dy))
+    primal_r, tangent_r = restored((x, y), (dx, dy))
+    np.testing.assert_array_equal(np.asarray(primal_r), np.asarray(x + y))
+    np.testing.assert_array_equal(np.asarray(tangent_r), np.asarray(dx + dy))
+
+
+def test_gemm_named_compute_beside_prologue_and_applied_holds_check_1():
+    """`gemm.gemm` accepts a named `compute` beside `prologue`, `applied`, and `scatter` (row 1958, unblocking
+    MoE `ExpertMLP` gated down projections over fp32 master weights): value and VJP (including full fp32 `dW`
+    precision) hold check 1 against float64 truth."""
+    from dew.nn import activations
+    from dew.nn.kernels import xla_products
+
+    hook = activations.gated_hook("swiglu", None)
+    group_sizes = jnp.asarray([40, 0, 24], jnp.int32)
+    scatter = jnp.asarray(np.random.default_rng(19580).permutation(64), jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(1958 + seed)
+        gate = jnp.asarray(rng.standard_normal((64, 32)) / np.sqrt(32), jnp.bfloat16)
+        up = jnp.asarray(rng.standard_normal((64, 32)) / np.sqrt(32), jnp.bfloat16)
+        down = jnp.asarray(rng.standard_normal((3, 32, 32)) / np.sqrt(32), jnp.float32)
+        cot = jnp.asarray(rng.standard_normal((64, 32)), jnp.bfloat16)
+        return gate, up, down, cot
+
+    def dew_fn(gate, up, down, cot):
+        def fwd(g, u, w):
+            hidden = hook(g, u).astype(jnp.bfloat16)
+            return gemm.gemm(g, w, group_sizes, prologue=hook, prologue_operands=((u, ("rows", "depth")),),
+                             applied=hidden, scatter=scatter, compute=jnp.bfloat16, out_dtype=jnp.bfloat16)
+
+        out, pull = jax.vjp(fwd, gate, up, down)
+        return out, pull(cot)
+
+    def ref_fn(gate, up, down, cot, *, dtype=jnp.float32):
+        def fwd(g, u, w):
+            act = hook(g.astype(dtype), u.astype(dtype))
+            if dtype == jnp.float32:
+                act = act.astype(jnp.bfloat16)
+            slots = xla_products.portable_projection(
+                act, w, group_sizes, jnp.bfloat16 if dtype == jnp.float32 else dtype,
+                None, jnp.bfloat16 if dtype == jnp.float32 else dtype)
+            return jnp.zeros_like(slots).at[scatter].set(slots)
+
+        if dtype == jnp.float64:
+            out, pull = jax.vjp(fwd, gate.astype(dtype), up.astype(dtype), down.astype(dtype))
+            return out, pull(cot.astype(dtype))
+        out, pull = jax.vjp(fwd, gate, up, down)
+        return out, pull(cot)
+
+    assert_as_exact(jax.jit(dew_fn), jax.jit(ref_fn), draw, "gemm compute beside prologue+applied+scatter",
+                    seeds=8, truth_fn=functools.partial(ref_fn, dtype=jnp.float64))
+    g0, u0, d0, c0 = draw(0)
+    _, (_, _, dw) = jax.jit(dew_fn)(g0, u0, d0, c0)
+    assert dw.dtype == jnp.float32
+
+
+def test_gemm_named_compute_prologue_preserves_compute_precision_in_vjp():
+    """`gemm.gemm` with `compute` + `prologue` keeps the operand cotangent in `compute` precision before
+    pulling back through the prologue VJP for both wider (`bf16 -> fp32`) and narrower (`fp32 -> bf16`)
+    compute dtypes (row 1958)."""
+    from dew.nn.precision import rounded_operand
+
+    def scale_pro(x, s):
+        return x * s[None, :]
+
+    def scaled_gemm(a, s, b, *, compute_dtype):
+        return gemm.gemm(a, b, prologue=scale_pro, prologue_operands=((s, ("depth",)),),
+                         compute=compute_dtype, out_dtype=compute_dtype)
+
+    # Exact wider-compute witness: bf16 lhs, fp32 rhs = 1 + 2^-9, compute=out_dtype=fp32.
+    # Rounding d_operand to bf16 before prologue VJP would collapse d_scale to 1.0 instead of 1 + 2^-9.
+    lhs = jnp.ones((4, 1), jnp.bfloat16)
+    rhs = jnp.full((1, 1), 1.0 + 2.0 ** -9, jnp.float32)
+    scale = jnp.ones((1,), jnp.float32)
+    cot = jnp.ones((4, 1), jnp.float32)
+    _, pull = jax.vjp(functools.partial(scaled_gemm, compute_dtype=jnp.float32), lhs, scale, rhs)
+    d_lhs, d_scale, _ = pull(cot)
+    assert d_lhs.dtype == jnp.bfloat16
+    assert d_scale.dtype == jnp.float32
+    expected = np.asarray([4.0 * (1.0 + 2.0 ** -9)], np.float32)
+    np.testing.assert_array_equal(np.asarray(d_scale), expected)
+
+    # Narrower compute (`fp32` lhs/rhs, `compute=out_dtype=bf16`) matches portable XLA forward and VJP.
+    rng = np.random.default_rng(19581)
+    x_f32 = jnp.asarray(rng.standard_normal((16, 32)), jnp.float32)
+    s_f32 = jnp.asarray(rng.uniform(0.5, 1.5, (32,)), jnp.float32)
+    w_f32 = jnp.asarray(rng.standard_normal((32, 16)), jnp.float32)
+    dy_bf16 = jnp.asarray(rng.standard_normal((16, 16)), jnp.bfloat16)
+
+    def narrow_ref(a, s, b):
+        y = scale_pro(a.astype(jnp.bfloat16), s).astype(jnp.bfloat16)
+        return jax.lax.dot(y, rounded_operand(b, jnp.bfloat16),
+                           preferred_element_type=jnp.float32).astype(jnp.bfloat16)
+
+    out_d, pull_d = jax.vjp(functools.partial(scaled_gemm, compute_dtype=jnp.bfloat16), x_f32, s_f32, w_f32)
+    out_r, pull_r = jax.vjp(narrow_ref, x_f32, s_f32, w_f32)
+    np.testing.assert_array_equal(np.asarray(out_d), np.asarray(out_r))
+    for gd, gr in zip(pull_d(dy_bf16), pull_r(dy_bf16), strict=True):
+        assert gd.dtype == gr.dtype
+        np.testing.assert_array_equal(np.asarray(gd), np.asarray(gr))
+
+
+def test_vmap_folds_batch_dimensions_into_single_gemm_launch():
+    """`jax.vmap` of `gemm.gemm` folds `[B, M, K] @ [K, N]` into one `[B*M, K] @ [K, N]` dense launch and
+    `[B, M, K] @ [B, K, N]` into one grouped launch with `group_sizes=[M]*B`; forward, `vmap(grad)`,
+    `grad(vmap)`, and nested `vmap(vmap)` hold check 1 on interpreted Mosaic GPU (row 6104)."""
+    batch, rows, depth, width = 3, 64, 64, 64
+
+    def draw_shared(seed):
+        rng = np.random.default_rng(6104 + seed)
+        xs = jnp.asarray(rng.standard_normal((batch, rows, depth)) / np.sqrt(depth), jnp.bfloat16)
+        w = jnp.asarray(rng.standard_normal((depth, width)) / np.sqrt(depth), jnp.bfloat16)
+        cot = jnp.asarray(rng.standard_normal((batch, rows, width)), jnp.bfloat16)
+        return xs, w, cot
+
+    def draw_batched_w(seed):
+        rng = np.random.default_rng(61040 + seed)
+        xs = jnp.asarray(rng.standard_normal((batch, rows, depth)) / np.sqrt(depth), jnp.bfloat16)
+        ws = jnp.asarray(rng.standard_normal((batch, depth, width)) / np.sqrt(depth), jnp.bfloat16)
+        cot = jnp.asarray(rng.standard_normal((batch, rows, width)), jnp.bfloat16)
+        return xs, ws, cot
+
+    # 1. Verify single folded launch of B*M rows (shared W) and B groups (batched W) under assumed sm90.
+    xs0, w0, _ = draw_shared(0)
+    xs1, ws1, _ = draw_batched_w(0)
+    from kernel_outputs import launched_outputs
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+        found_shared = launched_outputs(
+            jax.vmap(lambda a: gemm.gemm(a, w0, out_dtype=jnp.bfloat16, interpret_on_cpu=True)), xs0)
+        assert len(found_shared) == 1
+        assert found_shared[0][1][0].shape == (batch * rows, width)
+
+        found_grouped = launched_outputs(
+            jax.vmap(lambda a, b: gemm.gemm(a, b, out_dtype=jnp.bfloat16, interpret_on_cpu=True)), xs1, ws1)
+        assert len(found_grouped) == 1
+        assert found_grouped[0][1][0].shape == (batch * rows, width)
+
+        # Nested vmap(vmap) folds [2, 3, 64, 64] -> [384, 64] in one launch.
+        xs2 = jnp.stack([xs0, xs0 * jnp.bfloat16(0.5)])
+        found_nested = launched_outputs(
+            jax.vmap(jax.vmap(lambda a: gemm.gemm(a, w0, out_dtype=jnp.bfloat16, interpret_on_cpu=True))),
+            xs2)
+        assert len(found_nested) == 1
+        assert found_nested[0][1][0].shape == (2 * batch * rows, width)
+    # 2. Check 1 on vmap-of-grad and grad-of-vmap for shared W and batched W.
+    def vmap_of_grad_shared(xs, w, cot):
+        def one_grad(a, b, c):
+            return jax.grad(lambda x, y: jnp.sum(
+                gemm.gemm(x, y, out_dtype=jnp.bfloat16, interpret_on_cpu=True).astype(jnp.float32)
+                * c.astype(jnp.float32)), argnums=(0, 1))(a, b)
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            return jax.vmap(one_grad, in_axes=(0, None, 0))(xs, w, cot)
+
+    def vmap_of_grad_shared_ref(xs, w, cot, *, dtype=jnp.float32):
+        def one_grad(a, b, c):
+            return jax.grad(lambda x, y: jnp.sum(
+                jax.lax.dot(x, y, preferred_element_type=dtype).astype(
+                    jnp.bfloat16 if dtype == jnp.float32 else dtype).astype(dtype) * c.astype(dtype)),
+                argnums=(0, 1))(a, b)
+        if dtype == jnp.float64:
+            return jax.vmap(one_grad, in_axes=(0, None, 0))(
+                xs.astype(dtype), w.astype(dtype), cot.astype(dtype))
+        return jax.vmap(one_grad, in_axes=(0, None, 0))(xs, w, cot)
+
+    assert_as_exact(vmap_of_grad_shared, jax.jit(vmap_of_grad_shared_ref), draw_shared,
+                    "vmap(grad(gemm)) shared W", seeds=8,
+                    truth_fn=functools.partial(vmap_of_grad_shared_ref, dtype=jnp.float64))
+
+    def grad_of_vmap_batched(xs, ws, cot):
+        def loss(a, b):
+            y = jax.vmap(lambda x, m: gemm.gemm(x, m, out_dtype=jnp.bfloat16,
+                                                interpret_on_cpu=True))(a, b)
+            return jnp.sum(y.astype(jnp.float32) * cot.astype(jnp.float32))
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+            return jax.grad(loss, argnums=(0, 1))(xs, ws)
+
+    def grad_of_vmap_batched_ref(xs, ws, cot, *, dtype=jnp.float32):
+        def loss(a, b):
+            y = jax.vmap(lambda x, m: jax.lax.dot(x, m, preferred_element_type=dtype).astype(
+                jnp.bfloat16 if dtype == jnp.float32 else dtype))(a, b)
+            return jnp.sum(y.astype(dtype) * cot.astype(dtype))
+        if dtype == jnp.float64:
+            return jax.grad(loss, argnums=(0, 1))(xs.astype(dtype), ws.astype(dtype))
+        return jax.grad(loss, argnums=(0, 1))(xs, ws)
+
+    assert_as_exact(grad_of_vmap_batched, jax.jit(grad_of_vmap_batched_ref), draw_batched_w,
+                    "grad(vmap(gemm)) batched W", seeds=8,
+                    truth_fn=functools.partial(grad_of_vmap_batched_ref, dtype=jnp.float64))
+
+
+def test_vmap_folds_singleton_group_sides_and_preserves_named_dispatch():
+    """Vmapped dense `gemm` and `gemm_t` fold both unmapped `(1, N)` and mapped `(B, 1, N)` singleton
+    `('groups', ...)` sides cleanly without crashing, and unfoldable vmapped calls preserve named dispatch
+    (`cutlass`/`xla`) while raising `selection.KernelRefused` for forced Pallas kernels
+    (row 6104)."""
+    from dew.nn.kernels import selection
+
+    rng = np.random.default_rng(61042)
+    b, m, k, n = 3, 64, 64, 64
+    xs = jnp.asarray(rng.standard_normal((b, m, k)) / np.sqrt(k), jnp.bfloat16)
+    ws = jnp.asarray(rng.standard_normal((b, k, n)) / np.sqrt(k), jnp.bfloat16)
+    shared_bias = jnp.asarray(rng.standard_normal((1, n)), jnp.float32)
+    mapped_bias = jnp.asarray(rng.standard_normal((b, 1, n)), jnp.float32)
+    shared_scale = jnp.asarray(rng.uniform(0.5, 1.5, (1, k)), jnp.bfloat16)
+    mapped_scale = jnp.asarray(rng.uniform(0.5, 1.5, (b, 1, k)), jnp.bfloat16)
+    dys = jnp.asarray(rng.standard_normal((b, m, n)) / np.sqrt(n), jnp.bfloat16)
+
+    def add_bias(acc, bias):
+        return acc + bias
+
+    def mul_scale(rows, scale):
+        return rows * scale
+
+    # Unmapped (1, N) and mapped (B, 1, N) ('groups', 'columns') epilogue under batched rhs.
+    y_shared = jax.vmap(
+        lambda x, w: gemm.gemm(x, w, epilogue=add_bias,
+                               epilogue_operands=((shared_bias, ("groups", "columns")),),
+                               out_dtype=jnp.bfloat16),
+        in_axes=(0, 0))(xs, ws)
+    y_mapped = jax.vmap(
+        lambda x, w, bias: gemm.gemm(x, w, epilogue=add_bias,
+                                     epilogue_operands=((bias, ("groups", "columns")),),
+                                     out_dtype=jnp.bfloat16),
+        in_axes=(0, 0, 0))(xs, ws, mapped_bias)
+    ref_shared = jnp.stack([
+        gemm.gemm(xs[i], ws[i], epilogue=add_bias, epilogue_operands=((shared_bias, ("groups", "columns")),),
+                  out_dtype=jnp.bfloat16) for i in range(b)])
+    ref_mapped = jnp.stack([
+        gemm.gemm(xs[i], ws[i], epilogue=add_bias,
+                  epilogue_operands=((mapped_bias[i], ("groups", "columns")),),
+                  out_dtype=jnp.bfloat16) for i in range(b)])
+    np.testing.assert_array_equal(np.asarray(y_shared), np.asarray(ref_shared))
+    np.testing.assert_array_equal(np.asarray(y_mapped), np.asarray(ref_mapped))
+
+    # Unmapped (1, K) and mapped (B, 1, K) ('groups', 'depth') prologue in vmapped dense gemm_t.
+    dw_shared = jax.vmap(
+        lambda x, dy: gemm.gemm_t(x, dy, None, prologue=mul_scale,
+                                  prologue_operands=((shared_scale, ("groups", "depth")),),
+                                  out_dtype=jnp.float32),
+        in_axes=(0, 0))(xs, dys)
+    dw_mapped = jax.vmap(
+        lambda x, dy, sc: gemm.gemm_t(x, dy, None, prologue=mul_scale,
+                                      prologue_operands=((sc, ("groups", "depth")),),
+                                      out_dtype=jnp.float32),
+        in_axes=(0, 0, 0))(xs, dys, mapped_scale)
+    ref_dw_shared = jnp.stack([
+        gemm.gemm_t(xs[i], dys[i], None, prologue=mul_scale,
+                    prologue_operands=((shared_scale, ("groups", "depth")),), out_dtype=jnp.float32)
+        for i in range(b)])
+    ref_dw_mapped = jnp.stack([
+        gemm.gemm_t(xs[i], dys[i], None, prologue=mul_scale,
+                    prologue_operands=((mapped_scale[i], ("groups", "depth")),), out_dtype=jnp.float32)
+        for i in range(b)])
+    np.testing.assert_array_equal(np.asarray(dw_shared), np.asarray(ref_dw_shared))
+    np.testing.assert_array_equal(np.asarray(dw_mapped), np.asarray(ref_dw_mapped))
+
+    # Unfoldable grouped vmap: forced mosaic raises KernelRefused; xla/cutlass route via selection.
+    gs = jnp.asarray([32, 32], jnp.int32)
+    gw = jnp.asarray(rng.standard_normal((b, 2, k, n)) / np.sqrt(k), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        with generation.chosen(grouped_matmul="mosaic"), pytest.raises(selection.KernelRefused):
+            jax.vmap(lambda x, w: gemm.gemm(x, w, gs, out_dtype=jnp.bfloat16, interpret_on_cpu=True))(xs, gw)
+        with generation.chosen(grouped_matmul="xla"), generation.routes() as seen:
+            jax.jit(jax.vmap(lambda x, w: gemm.gemm(x, w, gs, out_dtype=jnp.bfloat16,
+                                                    interpret_on_cpu=True)))(xs, gw)
+        assert any(r.kernel == "xla" for r in seen), seen
+        if grouped_matmul.cutlass_built_for("sm90") is None:
+            with generation.chosen(grouped_matmul="cutlass"), pytest.raises(selection.KernelRefused):
+                jax.jit(jax.vmap(lambda x, w: gemm.gemm(x, w, gs, out_dtype=jnp.bfloat16,
+                                                        interpret_on_cpu=True)))(xs, gw)
+
+
+@lowers("sm90")
+def test_vmap_unfolded_named_triton_lowers_for_cuda():
+    """An unfoldable 2-batch grouped `gemm` / `gemm_t` lowers natively through forced `triton`
+    (`interpret_on_cpu=False`) on CUDA while refusing non-batchable forced `mosaic` or CPU-interpreted
+    `triton` with `selection.KernelRefused` (row 6104)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels import selection
+
+    b, m, k, n = 2, 64, 64, 64
+    xs = jax.ShapeDtypeStruct((b, m, k), jnp.bfloat16)
+    gw = jax.ShapeDtypeStruct((b, 2, k, n), jnp.bfloat16)
+    dys = jax.ShapeDtypeStruct((b, m, n), jnp.bfloat16)
+    gs = jax.ShapeDtypeStruct((2,), jnp.int32)
+
+    fwd = jax.vmap(lambda x, w, s: gemm.gemm(x, w, s, out_dtype=jnp.bfloat16), in_axes=(0, 0, None))
+    dw = jax.vmap(lambda x, dy, s: gemm.gemm_t(x, dy, s, out_dtype=jnp.float32), in_axes=(0, 0, None))
+    with generation.chosen(grouped_matmul="triton"), generation.routes() as seen_fwd:
+        lowered_for(fwd, (xs, gw, gs), "sm90")
+    assert any(r.kernel == "triton" for r in seen_fwd), seen_fwd
+    with generation.chosen(grouped_matmul="triton"), generation.routes() as seen_dw:
+        lowered_for(dw, (xs, dys, gs), "sm90")
+    assert any(r.kernel == "triton" for r in seen_dw), seen_dw
+    with generation.chosen(grouped_matmul="mosaic"), pytest.raises(selection.KernelRefused):
+        lowered_for(fwd, (xs, gw, gs), "sm90")
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="triton"),
+          pytest.raises(selection.KernelRefused)):
+        jax.eval_shape(
+            jax.vmap(lambda x, w, s: gemm.gemm(x, w, s, out_dtype=jnp.bfloat16, interpret_on_cpu=True),
+                     in_axes=(0, 0, None)),
+            xs, gw, gs)
+
+
+def test_dense_gemm_takes_split_and_unsplit_pins_and_holds_check_1():
+    """A deep dense GEMM's tile on sm90, and its transposed input gradient's on sm80, run split in two or
+    unsplit alike (both legal), and pinned split or unsplit an sm90 product holds check 1 against float64
+    truth (row 10151)."""
+    from dew.nn.kernels import tuning
+
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    for name, transposed, matrix in (("sm90", False, (1, 16384, 1024)), ("sm80", True, (1, 1024, 16384))):
+        with generation.assumed(name):
+            target = generation.gpu_target()
+            ba = launch.bind(bf16((512, 16384)), bf16(matrix), one, out_dtype="bfloat16",
+                             trans_rhs=transposed, interpret=False, dense=True)
+            tile = launch.derived(ba, target)
+            assert tile is not None, name
+            for splits in (1, 2):
+                assert launch.legal(ba, dataclasses.replace(tile, splits=splits), target), (name, splits)
+
+    # Exercise explicit unsplit and split pins numerically against float64 truth.
+    def draw(seed):
+        rng = np.random.default_rng(10151 + seed)
+        return (jnp.asarray(rng.standard_normal((128, 256)) / 16.0, jnp.bfloat16),
+                jnp.asarray(rng.standard_normal((256, 128)) / 16.0, jnp.bfloat16))
+
+    for splits in (1, 2):
+        pin = tiling.Tiles(128, 128, 64, 2, 1, warpgroups=2, family="wgmma", splits=splits)
+
+        def dew_fn(x, w, *, pinned=pin):
+            with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+                  tuning.pinned({grouped_matmul.MosaicGmm: pinned})):
+                return gemm.gemm(x, w, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+        assert_as_exact(
+            jax.jit(dew_fn),
+            jax.jit(lambda x, w: jax.lax.dot(x, w, preferred_element_type=jnp.float32).astype(jnp.bfloat16)),
+            draw, f"dense explicit splits={splits}", seeds=8,
+            truth_fn=lambda x, w: jax.lax.dot(x.astype(jnp.float64), w.astype(jnp.float64),
+                                              preferred_element_type=jnp.float64))
+
+
+def test_sm80_transposed_dx_and_tgmm_skip_regressing_fragment_prefetch():
+    """Ampere `CpAsync` skips cross-step fragment prefetch on transposed `dX` (`M-FS-53-a100`, `M-NG-2-a100`:
+    gate_up dX +32-34% slower) and `tgmm` (`M-NG-45-a100`: dW geomean 1.019x, 4B key +11.6%), keeping forward
+    untransposed prefetch active with its +16/+32 register cost (row 5271)."""
+    from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        tile = tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
+        fam = pricing.family_of(tile, jnp.bfloat16, target)
+        assert mosaic_gpu.prefetches(fam, matrices=1, prologue=None, scaled=False, chained=False,
+                                     interpret=False, transposed=(False, False), summed=False)
+        assert not mosaic_gpu.prefetches(fam, matrices=1, prologue=None, scaled=False, chained=False,
+                                         interpret=False, transposed=(False, True), summed=False)
+        fwd_ba = launch.bind(bf16((1024, 1024)), bf16((1, 1024, 1024)), one, out_dtype="bfloat16",
+                             trans_rhs=False, interpret=False, dense=True)
+        dx_ba = launch.bind(bf16((1024, 1024)), bf16((1, 1024, 1024)), one, out_dtype="bfloat16",
+                            trans_rhs=True, interpret=False, dense=True)
+        fwd_regs = pricing.prefetch_registers(fam, tile, ba=fwd_ba)
+        dx_regs = pricing.prefetch_registers(fam, tile, ba=dx_ba)
+        assert fwd_regs == 16 and dx_regs == 0, (fwd_regs, dx_regs)
+
+
+def test_explicit_target_b200_gathered_settles_under_ambient_sm80():
+    """Deriving and settling a B200 (`sm100`) gathered tile under ambient `sm80` binds `sm100`'s
+    register/raise facts via `generation.as_target(target)` instead of crashing on Ampere's `None` raises
+    (row 12098)."""
+    from dew.nn.kernels.templates import resources
+    from dew.nn.kernels.templates.gemm import producers
+
+    launch = grouped_matmul.MosaicGmm()
+    sm100 = generation.gpu_target("sm100")
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    gather = jax.ShapeDtypeStruct((256,), jnp.int32)
+    ba = launch.bind(bf16((256, 256)), bf16((2, 256, 256)), sizes, (), (), None, None, gather,
+                     out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=False)
+    # Cold cache under ambient sm80 first so `_DERIVED` cannot mask derivation or producer settlement.
+    with generation.assumed("sm80"):
+        got = launch.derived(ba, sm100)
+        assert got is not None and got.producers.of(launch.KERNEL) is not None
+        assert launch.legal(ba, got, sm100)
+        unsettled = dataclasses.replace(got, producers=resources.Producers())
+        assert not launch._refused(ba, unsettled, sm100)
+        assert producers.settled(launch, ba, unsettled, sm100) == got
+    with generation.assumed("sm100"):
+        want = producers.settled(launch, ba, unsettled, sm100)
+        assert launch.legal(ba, got, sm100)
+    assert got == want
+
+
+def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
+    """On `walks_scoped` A100 (`sm80`, L2=40MB), `SplitWalk` prices a deep-K dense wave past the L2 drift
+    horizon (`8192x51200->5120`, `M-FS-6`, row 5363) faster split than unsplit while shallower shapes and
+    Hopper `sm90` price unsplit least; derived tiles stay legal and a pinned `splits=2` `sm80` tile compiles
+    spill-free."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    from dew.nn.kernels.templates.gemm import pricing
+
+    launch = grouped_matmul.MosaicGmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+
+    def walk_of(tile, target, depth_k: int, width_n: int):
+        unsplit = dataclasses.replace(tile, splits=1)
+        work = pricing.decode_contraction(
+            unsplit, target, rows=8192, groups=1, depth=depth_k, width=width_n, columns=None, held=8192,
+            operands=((2, 2), (None, None)), stored=2.0, multiprocessors=target.multiprocessors)
+        return pricing.split_walk(unsplit, **work)
+
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        deep_ba = launch.bind(bf16((8192, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
+                              trans_rhs=True, interpret=False, dense=True)
+        deep_tile = launch.derived(deep_ba, target)
+        assert deep_tile is not None and launch.legal(deep_ba, deep_tile, target), deep_tile
+        deep_walk = walk_of(deep_tile, target, 51200, 5120)
+        assert deep_walk is not None and deep_walk.seconds(2) < deep_walk.seconds(1), deep_walk
+        for depth_k, width_n in ((4096, 4096), (24576, 4096)):
+            ba = launch.bind(bf16((8192, depth_k)), bf16((1, width_n, depth_k)), one, out_dtype="bfloat16",
+                             trans_rhs=True, interpret=False, dense=True)
+            tile = launch.derived(ba, target)
+            assert tile is not None and launch.legal(ba, tile, target), tile
+            walk = walk_of(tile, target, depth_k, width_n)
+            assert walk is not None and walk.seconds(1) <= walk.seconds(2), (depth_k, walk)
+        pinned = dataclasses.replace(deep_tile, splits=2)
+        assert launch.legal(deep_ba, pinned, target), pinned
+        if generation.compile_only_gpus("sm80"):
+            records = compile_mosaic_kernels(
+                [KernelCase("sm80_deep_k_split_dx", lambda: launch.lowering(deep_ba, pinned))], "sm80")
+            for rec in records:
+                assert not rec.get("error"), rec
+                assert rec["kernels"], rec
+                assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        h_ba = launch.bind(bf16((8192, 51200)), bf16((1, 5120, 51200)), one, out_dtype="bfloat16",
+                           trans_rhs=True, interpret=False, dense=True)
+        h_tile = launch.derived(h_ba, target)
+        assert h_tile is not None and launch.legal(h_ba, h_tile, target), h_tile
+        h_walk = walk_of(h_tile, target, 51200, 5120)
+        assert h_walk is not None and h_walk.seconds(1) <= h_walk.seconds(2), h_walk
+
+
+def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
+    """Blackwell `tcgen05.pair` refuses `splits > 1` (`mosaic_gpu.pair_refuses`) in both `MosaicGmm.legal`
+    and `MosaicTgmm.legal` even though `_ran` validates the unsplit partial tile, and underfilled dense
+    `sm100` calls keep `splits == 1` on `tcgen05.pair`."""
+    gmm, tgmm = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    one = jax.ShapeDtypeStruct((1,), jnp.int32)
+    with generation.assumed("sm100"):
+        sm100 = generation.gpu_target()
+        fwd_ba = gmm.bind(bf16((512, 16384)), bf16((1, 16384, 1024)), one, out_dtype="bfloat16",
+                          trans_rhs=False, interpret=False, dense=True)
+        tile = gmm.derived(fwd_ba, sm100)
+        assert tile is not None and gmm.legal(fwd_ba, tile, sm100), tile
+        pair_tile = tiling.Tiles(128, 128, 64, 6, 4, warpgroups=1, cluster=2, family="tcgen05.pair")
+        assert not gmm.legal(fwd_ba, dataclasses.replace(pair_tile, splits=3), sm100)
+        if tile.family == "tcgen05.pair":
+            assert tile.splits == 1, tile
+        dw_ba = tgmm.bind(bf16((8192, 1024)), bf16((8192, 1024)), one, out_dtype="float32",
+                          interpret=False, dense=True)
+        assert not tgmm.legal(dw_ba, dataclasses.replace(pair_tile, splits=2), sm100)
+        # Power-of-two tcgen05.alloc rounding: 128 acc cols + 1 block-scale ring (128 < tensor < 170)
+        # allocates 256 cols/program, so 2 programs (512 <= 512) fit while 3 programs (768 > 512, vs
+        # unrounded 3 * tensor <= 512) refuse on real sm100 (row 12302).
+        from dew.nn.kernels.templates.gemm import pricing
+
+        def scales() -> dict[str, tuple[tuple[int, ...], object]]:
+            return {"s": ((1, 1, 32, 16), jnp.uint8)}
+
+        t64 = tiling.Tiles(128, 64, 64, 2, 1, warpgroups=1, cluster=1, family="tcgen05", programs=2)
+        fam = pricing.family_of(t64, jnp.bfloat16, sm100)
+        tensor = fam.tensor_columns(64, 1) + fam.stream_tensor_columns(scales(), 2)
+        assert tensor > 128 and tensor * 3 <= (sm100.tmem_columns or 0), tensor
+        assert pricing.granular_tile(fam, t64, jnp.bfloat16, target=sm100, stream_blocks=scales)
+        assert not pricing.granular_tile(
+            fam, dataclasses.replace(t64, programs=3), jnp.bfloat16, target=sm100, stream_blocks=scales)
+
+
 @INTERPRETS
 def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
     """One-consumer `mma.sync` grouped tiles (`tiles.sharing == 1`) bind `group.actual_end - row_start` onto
@@ -1655,6 +2287,61 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
         for eq in grouped_mmas), grouped_mmas
     assert dense_mmas and all(len(eq.invars) == 3 for eq in dense_mmas), dense_mmas
 
+    # Verify the typed mma_p row bound derives from group metadata (`actual_end - row_start`, clipped), not a
+    # constant (rows 5623, 7091).
+    from jax.extend import core as jcore
+
+    bound_ops: list[set[str]] = []
+
+    def _trace_mma_bounds(jaxpr, outer_defs: dict, outer_bind: dict):
+        defs = {**outer_defs}
+        platform_idx: dict = {}
+        for eqn in jaxpr.eqns:
+            for outv in eqn.outvars:
+                defs[outv] = eqn
+            if eqn.primitive.name == "platform_index":
+                platforms = eqn.params.get("platforms", ())
+                if "cuda" in platforms:
+                    platform_idx[eqn.outvars[0]] = platforms.index("cuda")
+                continue
+            if eqn.primitive.name == "mma" and len(eqn.invars) == 4:
+                seen_vars, stack, ops = set(), [eqn.invars[3]], set()
+                while stack:
+                    var = stack.pop()
+                    if not isinstance(var, jcore.Var) or var in seen_vars:
+                        continue
+                    seen_vars.add(var)
+                    if var in outer_bind:
+                        stack.append(outer_bind[var])
+                    if (producer := defs.get(var)) is not None:
+                        ops.add(producer.primitive.name)
+                        stack.extend(producer.invars)
+                bound_ops.append(ops)
+            if (eqn.primitive.name == "cond" and eqn.invars
+                    and isinstance(eqn.invars[0], jcore.Var) and eqn.invars[0] in platform_idx):
+                sub = eqn.params["branches"][platform_idx[eqn.invars[0]]]
+                inner = sub.jaxpr if hasattr(sub, "jaxpr") else sub
+                bind = {**outer_bind, **dict(zip(inner.invars, eqn.invars[1:], strict=False))}
+                _trace_mma_bounds(inner, defs, bind)
+                continue
+            for value in eqn.params.values():
+                subs = value if isinstance(value, (tuple, list)) else (value,)
+                for sub in subs:
+                    inner = sub.jaxpr if hasattr(sub, "jaxpr") else sub
+                    if not hasattr(inner, "eqns"):
+                        continue
+                    bind = {**outer_bind}
+                    for iv, ov in zip(inner.constvars, eqn.invars, strict=False):
+                        bind[iv] = ov
+                    for iv, ov in zip(inner.invars, eqn.invars[len(inner.constvars):], strict=False):
+                        bind[iv] = ov
+                    _trace_mma_bounds(inner, defs, bind)
+
+    _trace_mma_bounds(grouped_graph.jaxpr, {}, {})
+    assert bound_ops and all(
+        "sub" in ops and bool({"max", "min", "clamp"} & ops)
+        and bool({"get", "load", "gather", "dynamic_slice", "ref_get"} & ops)
+        for ops in bound_ops), bound_ops
     def dew_fn(x, w, sizes):
         with (generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"),
               tuning.pinned({grouped_matmul.MosaicGmm: tile_128})):

@@ -76,7 +76,48 @@ def replica_grids(args) -> dict:
             "expected": {name: value.tolist() for name, value in values.items()}}
 
 
-MODES = {"replica_key": replica_key, "replica_grids": replica_grids}
+def replica_complex(args) -> dict:
+    """A complex leaf a pool replicates (a spectral state's), process 1's copy lost and zeros where its
+    template places it (`_zeros`): it receives process 0's value, its real and imaginary parts each, bit for
+    bit (`_from_replicas`; row 12177: no word holds a complex number's bits, so its sum failed to trace)."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.checkpoints._replicas import Grid, _from_replicas, _zeros
+    from dew.distributed.placement import MeshSpec
+
+    mesh = MeshSpec().build()
+    replicated = NamedSharding(mesh, PartitionSpec())
+    values = (np.arange(4, dtype=np.float32) - 1.5) + 1j * (np.arange(4, dtype=np.float32) / 3)
+    values = values.astype(np.complex64)
+    written = jax.make_array_from_callback(values.shape, replicated, lambda index: values[index])
+    template = {"spectrum": jax.ShapeDtypeStruct(values.shape, values.dtype, sharding=replicated)}
+    tree = {"spectrum": written} if jax.process_index() == 0 else jax.tree.map(_zeros, template)
+    grids = Grid.each(template)
+    assert grids is not None, "a template placed by name lies on its mesh's grid"
+    recovered = np.asarray(_from_replicas(tree, grids, frozenset({0}))["spectrum"].addressable_data(0))
+    return {"bits": recovered.view(np.uint32).tolist(), "expected": values.view(np.uint32).tolist()}
+
+
+def shared_mark_refused(args) -> dict:
+    """A pool asking whether its processes share a directory (`seen_by_every_process`) where process 0
+    cannot write its mark, a file standing where the directory would be (a read-only or full disk alike):
+    the error each process ends with, process 0's own and its peer's the agreement's (`PeerFailure`), none
+    left waiting for a mark that never lands (row 12176)."""
+    from dew._coordination import PeerFailure, seen_by_every_process
+
+    blocked = args.out.parent / "blocked"
+    if args.process_id == 0:
+        blocked.write_text("a file where the run's directory would be")
+    try:
+        seen_by_every_process(str(blocked / "run"))
+    except (OSError, PeerFailure) as error:
+        return {"raised": type(error).__name__}
+    return {"raised": None}
+
+
+MODES = {"replica_key": replica_key, "replica_grids": replica_grids, "replica_complex": replica_complex,
+         "shared_mark_refused": shared_mark_refused}
 
 
 def main(argv=None) -> None:

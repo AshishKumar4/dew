@@ -70,7 +70,7 @@ def perturbed_export(destination: Path, scratch: Path):
 
     with tarfile.open(ARCHIVE) as archive:
         archive.extractall(scratch, filter="data")
-    loaded = Pretrained.load(str(scratch / "pipeline"), dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(str(scratch / "pipeline"), dtype="float32")
     variables = perturbed_variables(loaded.variables)
     loaded.save(destination, variables=variables)
     return loaded, variables

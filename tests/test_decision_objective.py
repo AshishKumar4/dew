@@ -13,6 +13,7 @@ import optax
 import pytest
 from decision_support import decision_rows
 from flax import linen as nn
+from model_support import attending
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound
 
 from dew.artifacts import Decisions
@@ -153,6 +154,7 @@ def drawn_variables(objective: DecisionObjective):
     return lambda seed: (nn.unbox(init(jax.random.key(seed))),)
 
 
+@attending("xla")
 def test_the_loss_scores_a_soft_target_as_its_rule_does():
     """The log loss of a row whose gold is a distribution is the cross-entropy
     against that distribution, not against its most likely option: as exact as
@@ -182,6 +184,7 @@ def test_the_loss_scores_a_soft_target_as_its_rule_does():
 
 
 
+@attending("xla")
 @pytest.mark.parametrize("rule", [LogLoss(), Brier()], ids=lambda rule: rule.name)
 def test_a_held_pass_scores_a_soft_target_as_its_training_charges_it(rule):
     """Held-out rows whose gold is a distribution are scored against that
@@ -203,6 +206,7 @@ def test_a_held_pass_scores_a_soft_target_as_its_training_charges_it(rule):
                     f"a soft target's held-out {rule.name}", seeds=SOFT_SEEDS[f"held {rule.name}"])
 
 
+@attending("xla")
 @pytest.mark.parametrize("joint", [False, True], ids=["a question a row", "joint"])
 def test_a_training_reads_draws_lay_a_row_out_to_no_fewer_tokens_than_it_states(joint):
     """A training read draws each row's layout (`LayoutRows`: a choice's options in a fresh order, a "none
@@ -241,6 +245,7 @@ DOCUMENTS_SEEDS = 8
 """Check 1's declared seeds for the loss at a read's declared documents against the objective's bound."""
 
 
+@attending("xla")
 def test_a_training_read_of_rows_past_half_a_window_declares_one_document_a_window():
     """A decision run's training read in memory, its rows drawn by its layout's encoding after it holds them,
     declares from the fewest tokens that encoding lays each row out to (`LayoutRows.shortest`) the most
@@ -259,6 +264,7 @@ def test_a_training_read_of_rows_past_half_a_window_declares_one_document_a_wind
     assert all(int(np.asarray(batch["segments"]).max()) == 1 for batch in read)
 
 
+@attending("xla")
 def test_a_step_reads_its_windows_at_the_documents_its_read_declares():
     """A window's rows are its read's packer documents: a memory read measures the most a window holds and
     declares it (`tokens_bound`, `dew.data.steps.generic.Coordinated`), and the step lays its
@@ -303,6 +309,7 @@ HELD = [Example(f"{index}" if index % 3 == 0 else f"{index} " + "x" * (12 + inde
 """Distinct states and question rows, some requests answering both questions and others just one."""
 
 
+@attending("xla")
 def test_a_held_pass_packs_its_rows_and_scores_every_row_once():
     """Held question rows share windows, four windows a batch: their exact identities
     appear once, repeats count nothing, each question decides as it does alone,
@@ -365,7 +372,7 @@ def test_a_held_pass_packs_its_rows_and_scores_every_row_once():
 
 def tiny_backbone() -> CausalTransformer:
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                             max_seq_len=128, attention_impl="xla")
+                             max_seq_len=128)
 
 
 class NativeEncoder(nn.Module):
@@ -384,6 +391,7 @@ class AliasedEncoder(NativeEncoder):
         return self(tokens, **fields)
 
 
+@attending("xla")
 def test_a_decision_window_states_the_most_tokens_its_rows_score_from_its_shape():
     """A decision batch states each window's tokens from its shape alone (`row_tokens`): the most its
     packed rows score (`scored_tokens`), so a run with a token budget or cadence bounds its committed
@@ -436,6 +444,7 @@ def leaves(tree, *path):
     return jax.tree.leaves(tree)
 
 
+@attending("xla")
 def test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from_the_run(tmp_path):
     """The backbone runs under its adapter, applied as its own module: the
     factors and the head move, every base weight stays bitwise where it
@@ -472,6 +481,7 @@ def test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
 
 
+@attending("xla")
 @pytest.mark.parametrize("head", ["transformed", "adapted", "fp8", "fp8-adapted"])
 def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_path):
     """A joint head's lexical prior gathers its backbone's vocabulary rows where no one matrix gives
@@ -523,6 +533,7 @@ def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_pa
         assert any(moved), path
 
 
+@attending("xla")
 def test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metrics():
     """The validation pass fills a part-full batch with repeats it marks, so
     one held-out row under a batch of eight is scored once: the pass's loss
@@ -545,6 +556,7 @@ def test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metri
     assert result.scores["val/accuracy"] == float(right)
 
 
+@attending("xla")
 @pytest.mark.parametrize("separate_tokenizer", [False, True], ids=["shared-source", "separate-tokenizer"])
 def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     """A shared decision record restores the backbone's image processor.
@@ -562,7 +574,7 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     from dew.interop import Pretrained
 
     directory = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
-    source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
+    source = Pretrained.load(directory, dtype="float32")
     tokenizer_directory = directory
     if separate_tokenizer:
         tokenizer_directory = tmp_path / "tokenizer"
@@ -602,6 +614,7 @@ def saved_and_reloaded(task, run):
     return objective, objective.pipeline(state), Decide.from_run(str(run))
 
 
+@attending("xla")
 def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_path):
     """A text task records its own byte vocabulary, not its source's tokenizer.
 
@@ -613,7 +626,7 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
 
     from dew.interop import Pretrained
 
-    source = Pretrained.load(tokenized_qwen3(tmp_path / "source"), dtype="float32", attention_impl="xla",
+    source = Pretrained.load(tokenized_qwen3(tmp_path / "source"), dtype="float32",
                              max_seq_len=128)
     base = DecisionObjective(source, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
     task = Decide(base.model, nn.unbox(base.init(jax.random.key(0))), LAYOUT, TOKENIZER, SPECIALS,
@@ -629,6 +642,7 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
                                   live("charged twice!", asked)["team"].probabilities)
 
 
+@attending("xla")
 def test_a_saved_one_question_head_refuses_multi_question_requests(tmp_path):
     """A joint layout may train and batch many one-question rows, but neither the live
     nor the saved task may read several question types as one question's embedding."""
@@ -668,6 +682,7 @@ def test_a_saved_one_question_head_refuses_multi_question_requests(tmp_path):
                 task("first", questions)
 
 
+@attending("xla")
 def test_a_saved_head_reloads_in_the_numerics_it_trained_in(tmp_path):
     """A head configured apart from its backbone, here computing in bfloat16
     over float32 states at jax's highest matmul precision, is recorded with its
@@ -713,6 +728,22 @@ def test_a_head_record_names_its_head_and_holds_its_fields(record):
         Head.from_record(record, 32)
 
 
+def test_a_saved_steps_head_reads_without_its_retired_kernel_and_a_current_record_naming_it_is_refused():
+    """A step an earlier Dew saved whose head held its attention kernel (`attention_impl`, the run's since row
+    11938) reads as the head without it where a saved step and a release are read (`earlier_shapes`), and
+    the head's constructor (`Head.from_record`) refuses a record naming it as any field its class lacks,
+    where it dropped the field from any record, a current one's too (the API02 review)."""
+    from dew.decision.head import DecisionHead, Head
+    from dew.inference.tasks import earlier_shapes
+
+    record = json.loads(json.dumps(DecisionHead(32, layers=1).record()))
+    stale = {**record, "fields": {**record["fields"], "attention_impl": "xla"}}
+    assert Head.from_record(earlier_shapes({"head": stale})["head"], 32) == DecisionHead(32, layers=1)
+    with pytest.raises(ValueError):
+        Head.from_record(stale, 32)
+
+
+@attending("xla")
 def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     """A calibration saved into a run reloads with the step it was fitted
     on; trained further, the run's latest weights refuse it rather than
@@ -743,6 +774,7 @@ def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
         Decide.from_pretrained(FIXTURES / "tiny").save(str(tmp_path))
 
 
+@attending("xla")
 def test_diffusion_gemma_reads_each_row_once_whole_and_reloads_from_the_run(tmp_path):
     """DiffusionGemma is a backbone like any other: its causal encoder reads
     each clean row once (`hidden_states`), so a state-first row is chosen
@@ -752,7 +784,7 @@ def test_diffusion_gemma_reads_each_row_once_whole_and_reloads_from_the_run(tmp_
     directory = Path(__file__).parent / "fixtures" / "hf" / "diffusion-gemma-denoise-tiny"
     text = {**json.loads((directory / "config.json").read_text()), "vocab_size": 256}
     model = diffusion_gemma.build({"model_type": "diffusion_gemma", "canvas_length": 4, "text_config": text},
-                                  dtype="float32", attention_impl="xla")
+                                  dtype="float32")
     chosen = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS).layout
     assert (isinstance(chosen, SegmentLayout) and chosen.form == 'state_first')
     objective = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
@@ -824,6 +856,7 @@ def test_a_hub_tokenizer_lays_rows_out_from_the_revision_its_identity_names(monk
     assert resolved == [("acme/tokenizer", None)]
 
 
+@attending("xla")
 @pytest.mark.parametrize("joint", [False, True])
 def test_a_head_reads_none_of_its_rows_padding(joint):
     """A batch's rows of unequal length pad the shorter: Laya's head and the joint head give the same
@@ -854,6 +887,7 @@ def test_a_head_reads_none_of_its_rows_padding(joint):
     np.testing.assert_array_equal(logits(diverged), logits(states))
 
 
+@attending("xla")
 @pytest.mark.parametrize("joint", [False, True])
 def test_the_abstract_state_draws_a_missing_head_at_the_shapes_init_draws(joint):
     """A missing head drawn in a trace of the state (the abstract state a restore builds) has the
@@ -903,6 +937,7 @@ print(json.dumps({"dtypes": [str(c.dtype) for c in cosines],
     assert_fp32_reduction_bound(cosine, wide, first["magnitudes"], terms=3 * 24 + 4)
 
 
+@attending("xla")
 def test_a_phased_runs_phases_and_validation_read_in_one_width():
     """Every chain a run reads binds the widths measured over them all (data.md §10, `run_widths`), a run of
     phases' each phase too: phases asking three and five options and a validation asking seven read each in

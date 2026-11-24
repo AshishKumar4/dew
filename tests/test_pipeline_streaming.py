@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import drawn_prompts, extract_fixture
-from model_support import streamed_export
+from model_support import attending, streamed_export
 from reference_error import as_given, assert_as_exact
 
 from dew.interop.pretrained import Pretrained, load_diffusion_source
@@ -60,6 +60,7 @@ def assert_same_bits(found, expected) -> None:
     np.testing.assert_array_equal(found.reshape(-1).view(np.uint8), expected.reshape(-1).view(np.uint8))
 
 
+@attending("xla")
 @pytest.mark.parametrize("family", ["flux", "z_image", "wan"])
 def test_a_streamed_pipeline_keeps_its_towers_placed_as_it_samples(extracted, family):
     """A pipeline loaded onto a mesh samples a prompt end to end on its placed leaves: the conditioner's,
@@ -67,7 +68,7 @@ def test_a_streamed_pipeline_keeps_its_towers_placed_as_it_samples(extracted, fa
     streamed and eager paths share one sampling code, so their wiring cannot differ; their numerics are
     the per-component checks' (the conditioner by check 1, `assert_encoded_as_the_task`; the walk one
     program, `test_on_a_mesh_an_encoded_call_is_the_prompted_call`; the streamed export bit for bit)."""
-    streamed = Pretrained.load(str(extracted[family]), dtype="float32", attention_impl="xla", mesh=MeshSpec())
+    streamed = Pretrained.load(str(extracted[family]), dtype="float32", mesh=MeshSpec())
     placed = {path: leaf.sharding for path, leaf in jax.tree_util.tree_leaves_with_path(streamed.variables)}
     assert placed
     jax.block_until_ready(streamed.text_to_image()(["a red bird"], steps=2, key=3).images)
@@ -136,6 +137,7 @@ def assert_encoded_as_the_task(directory: Path, family: str, task, placement: di
                     seeds=CONDITIONER_SEEDS, truth_fn=as_given(lambda seed: truth(drawn(seed))))
 
 
+@attending("xla")
 @pytest.mark.parametrize("family", sorted(ENCODED))
 def test_an_encoded_call_without_the_text_encoder_draws_the_prompted_images(extracted, family):
     """The pipeline loaded without its text encoder, given the prompted call's encodings and its blank
@@ -144,11 +146,11 @@ def test_an_encoded_call_without_the_text_encoder_draws_the_prompted_images(extr
     The conditioner loaded alone encodes as the task does (`assert_encoded_as_the_task`): two programs,
     on par from float64."""
     directory = extracted[family]
-    whole = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    whole = load_diffusion_source(str(directory), dtype="float32")
     task = whole.text_to_image()
     request = task.prepare(PROMPTS, key=3, steps=2)
     prompted = task(request, key=3).host().images
-    lean = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", text=False)
+    lean = load_diffusion_source(str(directory), dtype="float32", text=False)
     assert "conditioning" not in lean.variables["encoders"]
     lean_task = lean.text_to_image()
     rows = len(PROMPTS)
@@ -159,6 +161,7 @@ def test_an_encoded_call_without_the_text_encoder_draws_the_prompted_images(extr
     assert_encoded_as_the_task(directory, family, task, {}, rows)
 
 
+@attending("xla")
 @pytest.mark.mesh
 @pytest.mark.parametrize("family", ["sd", "xl", "sd3", "flux", "z_image", "wan"])
 def test_a_pipeline_loaded_without_its_text_encoder_places_its_denoiser_as_the_whole_one(extracted, family):
@@ -166,7 +169,7 @@ def test_a_pipeline_loaded_without_its_text_encoder_places_its_denoiser_as_the_w
     whole pipeline places it: its denoiser drawn over the shapes its encoder's draw states
     (`ConditionEncoder.drawn`), not placed by shapes alone (row 3709)."""
     placement = {"mesh": MeshSpec(fsdp=jax.device_count()), "layout": LAYOUT}
-    whole, lean = (load_diffusion_source(str(extracted[family]), dtype="float32", attention_impl="xla",
+    whole, lean = (load_diffusion_source(str(extracted[family]), dtype="float32",
                                          text=text, **placement) for text in (True, False))
     held = {path: leaf.sharding for path, leaf in jax.tree_util.tree_leaves_with_path(whole.variables)}
     placed = jax.tree_util.tree_leaves_with_path(lean.variables)
@@ -175,6 +178,7 @@ def test_a_pipeline_loaded_without_its_text_encoder_places_its_denoiser_as_the_w
         assert leaf.sharding == held[path], jax.tree_util.keystr(path)
 
 
+@attending("xla")
 @pytest.mark.mesh
 def test_a_projected_lean_pipeline_places_as_the_whole_one_in_any_context(extracted):
     """An XL pipeline, whose second CLIP tower's pooled state its composition projects, loaded without its
@@ -184,13 +188,14 @@ def test_a_projected_lean_pipeline_places_as_the_whole_one_in_any_context(extrac
     mesh = MeshSpec(fsdp=jax.device_count())
     placement = {"mesh": mesh, "layout": LAYOUT, "param_dtype": "auto"}
     with jax.set_mesh(mesh.build(jax.devices())), nn.logical_axis_rules(LAYOUT.axis_rules):
-        whole, lean = (load_diffusion_source(str(extracted["xl"]), dtype="float32", attention_impl="xla",
+        whole, lean = (load_diffusion_source(str(extracted["xl"]), dtype="float32",
                                              text=text, **placement) for text in (True, False))
     held = {path: leaf.sharding for path, leaf in jax.tree_util.tree_leaves_with_path(whole.variables)}
     for path, leaf in jax.tree_util.tree_leaves_with_path(lean.variables):
         assert leaf.sharding == held[path], jax.tree_util.keystr(path)
 
 
+@attending("xla")
 @pytest.mark.mesh
 @pytest.mark.parametrize("family", sorted(ENCODED))
 def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
@@ -203,10 +208,10 @@ def test_on_a_mesh_an_encoded_call_is_the_prompted_call(extracted, family):
     conditioner's float64 encoding (check 1), and their masks equal."""
     directory = extracted[family]
     placement = {"mesh": MeshSpec(fsdp=jax.device_count()), "layout": LAYOUT}
-    whole = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", **placement)
+    whole = load_diffusion_source(str(directory), dtype="float32", **placement)
     task = whole.text_to_image()
     prompted = task.prepare(PROMPTS, key=3, steps=2)
-    lean = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", text=False,
+    lean = load_diffusion_source(str(directory), dtype="float32", text=False,
                                  **placement)
     lean_task = lean.text_to_image()
     rows = len(PROMPTS)

@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from attention_oracle import attention_terms, kept
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
-from model_support import model_draw, stepped_outputs
+from model_support import attending, model_draw, stepped_outputs
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -56,7 +56,7 @@ def model_of(kind: str, **span):
     """A two-layer decoder whose first layer is `kind`, the local attention kind over `span`."""
     return CausalTransformer(
         vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
-        max_seq_len=24, layer_types=(kind, "full_attention"), kinds={kind: span}, attention_impl="xla")
+        max_seq_len=24, layer_types=(kind, "full_attention"), kinds={kind: span})
 
 
 def chunked_model(chunk: int):
@@ -372,6 +372,7 @@ def test_row_fields_split_as_the_query_rows_do_where_the_heads_contend_for_the_a
                     seeds=FEWEST_SEEDS)
 
 
+@attending("xla")
 @pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4)], ids=["dense", "paged"])
 @pytest.mark.parametrize("shared", [False, True], ids=["per-row", "shared"])
 @pytest.mark.parametrize("origin", [0, 2], ids=["from-zero", "logical-origin"])
@@ -417,6 +418,7 @@ def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, sh
                     truth_fn=whole(model.clone(dtype=jnp.float64)))
 
 
+@attending("xla")
 def test_a_chunked_kind_bands_a_row_with_padding_among_its_tokens_by_its_tokens():
     """Chunks span tokens, not slots: a row whose four tokens sit at slots 0,
     3, 6 and 9 among padding, a chunk of 4, attends as the four tokens alone
@@ -433,6 +435,7 @@ def test_a_chunked_kind_bands_a_row_with_padding_among_its_tokens_by_its_tokens(
                     seeds=SEEDS['holey chunk'], truth_fn=float64_run(model))
 
 
+@attending("xla")
 def test_a_chunked_kind_attends_alike_on_every_path_whatever_places_it_is_given():
     """Given places that do not count the tokens (every token's 0, as tokens
     sharing one place give), the whole pass (the band over 13 tokens in
@@ -451,6 +454,7 @@ def test_a_chunked_kind_attends_alike_on_every_path_whatever_places_it_is_given(
                     seeds=SEEDS['diagnostic chunk'], truth_fn=diagnostic(model.clone(dtype=jnp.float64)))
 
 
+@attending("xla")
 @pytest.mark.parametrize("window", [2, 8], ids=["banded", "dense"])
 def test_a_windowed_kind_counts_a_rows_tokens_not_its_slots(window):
     """A window spans tokens, as the cache counts them: a row whose six tokens
@@ -547,7 +551,8 @@ def packed_windowed_bf16_attention_runs_its_band_on_par(without_deterministic_op
     lengths = [300, 200, 380]
     segments = np.concatenate([np.repeat(np.arange(1, 4), lengths),
                                np.zeros(length - sum(lengths), int)])[None]
-    segment_ids = jnp.asarray(segments, jnp.int32)
+    # A host array, placed by the programs that read it: a GPU tier part's prepare places nothing.
+    segment_ids = np.asarray(segments, np.int32)
 
     def draw(seed):
         streams = jax.random.split(jax.random.key(seed), 4)

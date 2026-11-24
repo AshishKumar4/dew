@@ -6,6 +6,7 @@ with its bfloat16 pixels, is asked for its own tensors and read on the host as i
 from pathlib import Path
 
 import numpy as np
+from model_support import attending
 from PIL import Image
 
 from dew.decision.images import Images
@@ -14,11 +15,12 @@ from dew.interop import Pretrained
 LLAMA4 = Path(__file__).parent / "fixtures" / "hf" / "llama4-native-tiny"
 
 
+@attending("xla")
 def test_a_torch_processors_images_read_as_its_model_inputs_do():
     """Llama 4's processor computes its pixels in PyTorch, in bfloat16, which NumPy cannot hold: a
     request's images read through it as its model inputs read them, each pixel field a host array
     equal to the processor's own inputs' field."""
-    loaded = Pretrained.load(LLAMA4, dtype="float32", attention_impl="xla", max_seq_len=64)
+    loaded = Pretrained.load(LLAMA4, dtype="float32", max_seq_len=64)
     processor = loaded.processor
     assert processor is not None
     pictures = [Image.fromarray(array) for array in np.load(LLAMA4 / "raw_images.npy")[:1]]

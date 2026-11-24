@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from model_support import attending
 from recorded_runs import assert_arms_as_recorded
 from reference_error import indexed_recording, recording
 from tool_support import load
@@ -45,6 +46,7 @@ def engine_batch(inputs: dict[str, np.ndarray]):
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def objective():
     return scorer()
 
@@ -69,8 +71,7 @@ def draw(seed: int) -> dict[str, np.ndarray]:
 @functools.cache
 def scorer():
     """The packed GRPO objective over the checkpoint in float32, and its variables."""
-    pretrained = Pretrained.load(str(FIXTURES / "hf/qwen3-moe-vllm"), dtype="float32",
-                                 attention_impl="reference")
+    pretrained = Pretrained.load(str(FIXTURES / "hf/qwen3-moe-vllm"), dtype="float32")
     grpo = GRPOObjective(pretrained.model, WIDTH - 1, sampling_temperature=SAMPLING["temperature"])
     return grpo, pretrained.variables
 
@@ -93,6 +94,7 @@ def recorded_draw():
     return inputs, np.asarray(truth(index, inputs)["log_probs"])
 
 
+@attending("reference")
 def test_packed_scoring_computes_the_engines_filtered_likelihoods():
     """With the engine's routing replayed and each id renormalized over the support vLLM kept at its
     temperature, Dew's fp32 likelihoods are on par with transformers' fp32 run on the same replay over drawn
@@ -101,6 +103,7 @@ def test_packed_scoring_computes_the_engines_filtered_likelihoods():
                             "vLLM replay log-probs", host=True)
 
 
+@attending("reference")
 def test_the_full_vocabulary_likelihood_misses_the_engines_filtered_one(objective):
     """The tempered full-vocabulary likelihood, the engine's kept support dropped, misses the filtered
     float64 truth by far more than rounding: the support is what the replay scores."""
@@ -114,6 +117,7 @@ def test_the_full_vocabulary_likelihood_misses_the_engines_filtered_one(objectiv
     assert np.abs(raw - truth.reshape(-1)).max() > 0.5
 
 
+@attending("reference")
 def test_the_trainer_routes_every_token_as_the_record_says(objective):
     """The routing Dew's forward sows follows the record it replays. On
     vLLM's record Dew's own top-k already agrees, so the check also replays

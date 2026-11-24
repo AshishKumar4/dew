@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import save_file
 
@@ -118,6 +119,7 @@ def tokens(seed: int):
     return (np.random.default_rng([seed, 2006]).integers(0, VOCAB, (2, 40)).astype(np.int32),)
 
 
+@attending("reference")
 @pytest.mark.parametrize("variant", sorted(VARIANTS))
 def test_a_mamba_ssm_mamba3_checkpoint_loads_as_mamba_ssm_computes_it(tmp_path, variant):
     """mamba_ssm's config and names read through its one reader (`mamba2.config_from_mamba_ssm`, its layer
@@ -128,7 +130,7 @@ def test_a_mamba_ssm_mamba3_checkpoint_loads_as_mamba_ssm_computes_it(tmp_path, 
     (tmp_path / "config.json").write_text(json.dumps(checkpoint_config(variant)))
     save_file({name: value for name, value in tensors.items() if name != "lm_head.weight"},
               tmp_path / "model.safetensors")
-    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path, dtype="float32")
 
     @as_given
     def reference(ids):

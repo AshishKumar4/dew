@@ -9,6 +9,7 @@ import jax
 import numpy as np
 import pytest
 import torch
+from model_support import attending
 from tool_support import run_from
 from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -204,6 +205,7 @@ def reference_tool():
         yield module, oracle_precision
 
 
+@attending("reference")
 def test_author_float64_offload_receives_bit_identical_weights_and_prefill_suffix_results(reference_tool):
     """The author's float64 model, its weights streamed from the native banks and kept at their stored
     precision once recovered, receives each weight bit for bit as the resident model loads it, and
@@ -213,8 +215,7 @@ def test_author_float64_offload_receives_bit_identical_weights_and_prefill_suffi
 
     tool, precision = reference_tool
     with jax.enable_x64(new_val=True):
-        bundle = Pretrained.load(SOURCE, weights=False, dtype="float64", param_dtype="float64",
-                                  attention_impl="reference")
+        bundle = Pretrained.load(SOURCE, weights=False, dtype="float64", param_dtype="float64")
         config = AutoConfig.from_pretrained(SOURCE, local_files_only=True).get_text_config()
         stored = AutoModelForCausalLM.from_pretrained(
             SOURCE, config=config, dtype=torch.float32, attn_implementation="eager").eval()

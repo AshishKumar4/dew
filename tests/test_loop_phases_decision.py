@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from run_kinds import MostlyKept, trained
 
 from dew.config import ModelConfig
@@ -192,6 +193,7 @@ def recorded(record, name: str):
     return next((value for value in found if value is not None), None)
 
 
+@attending("reference")
 def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_its_theta():
     """A run asking only for a θ per pass over a checkpoint whose implicit loop holds one θ takes it at the
     checkpoint's own count, each row the checkpoint's θ, so it computes what the checkpoint computed; over a
@@ -199,7 +201,7 @@ def test_a_theta_per_pass_over_a_checkpoints_implicit_loop_starts_each_row_at_it
     from dew.config import looping
     from dew.interop.pretrained import Pretrained
 
-    loaded = Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(QWEN35), dtype="float32")
     implicit = looping(loaded, 3, (1, 3), implicit=True)
     (held,) = [leaf for name, leaf in named_leaves(implicit.variables).items() if "loop_theta" in name]
     theta = np.random.default_rng(7661).uniform(0.1, 0.9, held.shape).astype(np.float32)

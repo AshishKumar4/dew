@@ -9,6 +9,7 @@ too."""
 import dataclasses
 
 import pytest
+from model_support import attending
 
 from dew._records import JSON
 from dew.data.text import ByteTokenizer
@@ -162,6 +163,7 @@ def test_a_row_without_a_state_segment_keeps_none_of_the_state():
     assert "abc" not in text(row.tokens)
 
 
+@attending("xla")
 def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_before(tmp_path):
     """A run of a joint layout of segments of its own reloads them from its record, its task answering
     as the live one does; a run saved as an earlier Dew saved it, its record naming its layout and
@@ -212,6 +214,7 @@ def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_be
         Decide.from_run(str(tmp_path / "unread"))
 
 
+@attending("xla")
 def test_an_earlier_record_of_a_segmented_question_layout_loads_without_the_budgets_it_ignored(tmp_path):
     """A run of a lettered question layout of segments, saved as an earlier Dew saved it, its record
     holding the question budgets it wrote at their defaults (192 and 48) and its rows ignored, and not
@@ -255,6 +258,7 @@ def test_an_earlier_record_of_a_segmented_question_layout_loads_without_the_budg
                                   today(EXAMPLES[0].state, asked)["team"].probabilities)
 
 
+@attending("xla")
 def test_a_whole_request_whose_row_leaves_its_state_out_is_refused():
     """A layout whose segments write no state keeps none of it, so a scoring task that answers only
     whole requests refuses a request with a state, as it refuses one whose state the row cut."""

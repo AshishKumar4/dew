@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import assert_as_exact
 
 from dew.eval.continual import AccuracyMatrix, continual_run, label_accuracy, label_scores
@@ -73,6 +74,7 @@ def test_label_scores_refuse_a_prompt_with_no_token_to_score_a_label_from():
         label_scores(lambda tokens, _: jnp.zeros(tokens.shape, jnp.float32), [[]], [[1], [2, 3]], share=True)
 
 
+@attending("xla")
 @pytest.mark.parametrize("adapted", [False, True], ids=["plain", "in-context"])
 def test_label_scores_are_the_labels_summed_log_likelihood(adapted):
     """Each label's score after each prompt is the sum of its tokens' log-likelihoods as the objective
@@ -80,7 +82,7 @@ def test_label_scores_are_the_labels_summed_log_likelihood(adapted):
     forks (`ForkedRows`), and a model whose continuum level steps in context, which chooses through its
     steps, its rows each laid out alone (`shares_prefixes`)."""
     model = CausalTransformer(vocab_size=VOCAB, emb_features=8, num_layers=1, num_heads=2, head_dim=4,
-                              mlp_features=16, max_seq_len=32, attention_impl="xla",
+                              mlp_features=16, max_seq_len=32,
                               continuum=ContinuumLevel(hidden=4) if adapted else None)
     adaptation = ChunkAdaptation(window=2, rate=0.1) if adapted else None
     objective = LMObjective(model, 7, adaptation=adaptation)

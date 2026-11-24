@@ -44,12 +44,15 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     source's `packed_experts` as `packed_weights` (`earlier_packed_experts`, row 8550); and wherever it holds
     a run or trainer, a trainer's retired `export_model` taken off and a looped decoder's
     `loop_message_additive` true read as unset where it could not be unset (`earlier_retired`, rows 11636,
-    11742).
+    11742); its model's attention kernel as the run's (`earlier_attention_kernel`, row 11938); and every
+    field a class lost since, its model's, its source options' and any class record's, left out
+    (`earlier_removed`, `dew._records.REMOVED_FIELDS`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
     unsettable, additive = (record.get(key) is True for key in (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE))
-    moved = _records.moved_record({key: value for key, value in record.items() if key not in MARKERS})
+    moved = earlier_removed(earlier_attention_kernel(earlier_layer_scan(_records.moved_record(
+        {key: value for key, value in record.items() if key not in MARKERS}))))
     earlier = earlier_none_of_the_above(earlier_profile(earlier_trainer(
         moved if unsettable else earlier_trainer_layout(moved))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
@@ -58,6 +61,86 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     earlier = {name: _records.earlier_layout(_records.json_value(value, name))
                for name, value in earlier.items()}
     return records.earlier_chains(earlier_data_plan(earlier), _chains())
+
+
+def earlier_attention_kernel(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose model named its attention kernel (`attention_impl`, a model's field
+    until row 11938) with the kernel the run's own (`chosen_kernel`'s `attention`), where it named one but
+    'auto' and the run named none: the model's own, else a decoder's it wraps (`saved_decoders`,
+    `DiffusionGemma.text`, `MultimodalTransformer.language_model`, the API02 review: the root alone missed
+    a wrapped decoder's); the field itself is left out after (`earlier_removed`). Carried to 1.0 (ledger
+    1552)."""
+    from dew.inference.tasks import earlier_attention_pin
+
+    fields = record.get("fields")
+    model = fields.get("model") if isinstance(fields, Mapping) else None
+    kernel = earlier_attention_pin(model) if isinstance(model, Mapping) else None
+    return record if kernel is None else chosen_kernel(record, "attention", kernel)
+
+
+def earlier_layer_scan(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose model or source options scanned its stack (`scan_layers=True`, a field
+    of each until row 4074) with the scan the run's own kernel choice (`chosen_kernel`'s `layer_scan`), so
+    a resumed run, a host-streamed one among them, scans as it trained (the API02 review: a saved
+    streamed rung resumed a layer at a time and its host placement raised); the fields themselves are left
+    out after (`earlier_removed`). Carried to 1.0 (ledger 1552)."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping):
+        return record
+    from dew.inference.tasks import saved_decoders
+
+    scanned = any(decoder.get("scan_layers") is True for part in (fields.get("model"), fields.get("source"))
+                  if isinstance(part, Mapping) for decoder in saved_decoders(part))
+    return chosen_kernel(record, "layer_scan", "scanned") if scanned else record
+
+
+def chosen_kernel(record: Mapping[str, object], choice: str, kernel: str) -> Mapping[str, object]:
+    """A saved run's record whose kernel choices name `kernel` for `choice` (`Diagnostics.kernels`, or the
+    run's `kernels` a record of before its diagnostics states, which `earlier_retired` moves there), where
+    the run named none of its own for it, which stands."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping):
+        return record
+    diagnostics = fields.get("diagnostics")
+    named = _records.class_record(diagnostics) if isinstance(diagnostics, Mapping) else None
+    pins = named[1] if named is not None else diagnostics if isinstance(diagnostics, Mapping) else fields
+    kernels = pins.get("kernels")
+    chosen = {choice: kernel, **(kernels if isinstance(kernels, Mapping) else {})}
+    if not isinstance(diagnostics, Mapping):
+        return {**record, "fields": {**fields, "kernels": chosen}}
+    stated = {**pins, "kernels": chosen}
+    return {**record, "fields": {**fields, "diagnostics": (stated if named is None
+                                                            else {"class": named[0], "fields": stated})}}
+
+
+def earlier_removed(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record without the fields their classes lost since it was saved
+    (`dew._records.REMOVED_FIELDS`: how a model executes, never what it computes): its source options'
+    (`SourceOptions`, which its run states by its type alone) and every class record's
+    (`dew._records.earlier_fields`); its model's are its model record's to drop
+    (`dew.inference.tasks.earlier_model`, which every reader of a saved model reads it through). Carried to
+    1.0 (ledger 1552)."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping):
+        return record
+    kept = dict(fields)
+    source = kept.get("source")
+    if isinstance(source, Mapping) and _records.class_record(source) is None:
+        kept["source"] = _without_removed(source, _SOURCE_OPTIONS)
+    walked = earlier_fields(_records.json_value({**record, "fields": kept}, "run"))
+    assert isinstance(walked, Mapping)
+    return walked
+
+
+_SOURCE_OPTIONS = "dew.interop.source_options:SourceOptions"
+"""The class a run's source options are (`RunConfig.source`), stated by the run's type, never by a record."""
+
+
+def _without_removed(fields: Mapping[str, object], name: str) -> Mapping[str, object]:
+    """`fields`, a record of the class `name`, without the fields it lost since (`REMOVED_FIELDS`)."""
+    removed = _records.REMOVED_FIELDS.get(name, frozenset())
+    return fields if removed.isdisjoint(fields) else {key: value for key, value in fields.items()
+                                                       if key not in removed}
 
 
 LAYOUT_UNSETTABLE = "layout_unsettable"

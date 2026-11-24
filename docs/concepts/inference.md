@@ -164,15 +164,15 @@ Results hold global arrays sharded by row, including any filler rows that were a
 import jax
 import jax.numpy as jnp
 
-from dew.inference import SafetensorsBanks
+from dew.inference.banks import SafetensorsBanks
 from dew.interop import translate_config
 from dew.nn.backbones import CausalTransformer
 from dew.sampling.text import Sampling, generate
 
 with SafetensorsBanks("path/to/gpt-oss-20b-BF16",
                        cache_bytes=0, param_dtype="auto") as source:
-    fields = {**translate_config(source.config), "max_seq_len": 128, "scan_layers": True}
-    model = CausalTransformer(**fields, dtype=jnp.bfloat16, attention_impl="xla")
+    fields = {**translate_config(source.config), "max_seq_len": 128}
+    model = CausalTransformer(**fields, dtype=jnp.bfloat16)
     variables = source.stream(model)
     generated = jax.block_until_ready(generate(
         model, variables, [[1, 2, 3, 4]], max_new_tokens=8,
@@ -185,7 +185,7 @@ The path is the local directory of a downloaded checkpoint snapshot. The loader 
 
 For a source's `place`, and any other pinned-host placement, budget for the allocator's reserve as well as the live weights, staging and the runtime. XLA's pinned-host BFC allocator grows its regions in powers of two and keeps freed chunks. On the RTX 4080, the GPT-OSS-20B BF16 two-layer prefix (with `place`, an eight-token context limit and `SafetensorsBanks(cache_bytes=0)`) held about 1.55 GB of reserve on top of 3.29 GB of live pinned weights. The sharded array that Dew assembles from the per-device buffer shares that buffer, so the reserve is allocator capacity and not a second copy of the weights. A cgroup or container limit can therefore be reached before the computed weight total. Do not take the observed reserve as a fixed overhead for other models.
 
-Streaming is for single-device inference only. It requires `scan_layers=True` and a layout without host placement, and it refuses training, multi-device meshes and pipeline stages. Host callbacks need the CPU backend next to the accelerator, so if you set platforms explicitly, use `JAX_PLATFORMS=cuda,cpu` (or `<accelerator>,cpu`) before initializing JAX. Keep the source open until all executions have finished, and do not change its files in place. The runtime-only `streaming` collection holds live callback handles, not checkpoint weights. This path saves nothing through `Checkpoints`, and its variables tree is not a resident checkpoint that you can save or export; the original safetensors directory remains the checkpoint.
+Streaming is for single-device inference only. It requires the decoder's scanned stack (`generation.chosen(layer_scan="scanned")`), and a layout without host placement, and it refuses training, multi-device meshes and pipeline stages. Host callbacks need the CPU backend next to the accelerator, so if you set platforms explicitly, use `JAX_PLATFORMS=cuda,cpu` (or `<accelerator>,cpu`) before initializing JAX. Keep the source open until all executions have finished, and do not change its files in place. The runtime-only `streaming` collection holds live callback handles, not checkpoint weights. This path saves nothing through `Checkpoints`, and its variables tree is not a resident checkpoint that you can save or export; the original safetensors directory remains the checkpoint.
 
 On CPU and an RTX 4080, the tiny Mixtral checkpoint's singleton banks and a real four-layer scan match the all-resident model bitwise, including the expert weights fetched at run time. The two-layer GPU scan fuses RMSNorm differently, and legitimately so, because a one-trip loop with effects cannot be peeled. Its logit gap stays within the elementwise spread between the singleton and scanned fusions of the same resident weights, with a measured maximum of 1.61e-6 at the highest matmul precision. The cached greedy tokens match.
 
@@ -279,12 +279,11 @@ images = refiner(refiner.prepare(prompts, key=key, steps=steps, initial=latents,
 `Server.from_task(task, slots=, capacity=)` keeps `slots` cache rows of `capacity` positions resident, and it admits queued requests into free rows while the other rows keep decoding. Each step is one compiled program that prefills the prompts admitted in that step and draws one token for every occupied row, or a verified block of them where the task drafts speculatively (below). A request leaves its row at EOS or when its budget runs out, and the next request takes the slot. A served request draws with the key it was submitted with, folded the way a one-row `TextGeneration` call folds it, so it draws the tokens it would draw alone, except where the model's products round at boundaries that two programs' roundings cross (below, with the cache layouts).
 
 ```python
-from dew.inference.serving import Server
-from dew.nn.kv_cache import KVCache
+from dew.inference import PagedKV, Server
 
 greedy = dataclasses.replace(task, sampling=Sampling(temperature=0.0))
 server = Server.from_task(greedy, slots=4, capacity=128,
-                          kv_cache=KVCache(page_size=16, pages=32), prefix_cache=True)
+                          cache=PagedKV(page_size=16, pages=32, prefix_cache=True))
 prompts = ["One day, Lily saw a big dog in", "One day, Lily saw a big dog in the park."]
 served = server(prompts[:1], 20, key=0) + server(prompts[1:], 20, key=0)
 alone = greedy(prompts, 20, key=0)
@@ -308,16 +307,16 @@ Calling the server with a batch submits every prompt, steps until they all finis
 | `slots` | Rows decoded at once. |
 | `capacity` | Cache positions per row; a request whose prompt and budget do not fit is refused at `submit`. |
 | `admission` | Prompts one step prefills; default the largest multiple of the mesh's row-group count up to eight, times `decode_steps`. |
-| `kv_cache` | A `KVCache` layout replacing the model's own; a page size, the model's own layout in pages of that many slots; `'whole'`, the model's own layout unpaged; `'shared'`, for requests that repeat prompts (a group's samples, a session's turns): the model's own layout in pages of 64 wherever the server keeps a prefix cache over them and the model's max_seq_len holds a row in whole pages, so each repeated prompt prefills once. None, the default, keeps the model's own layout: over prompts that don't repeat, pages of 64 drew 13–21% fewer tokens a second than whole rows on an A100. |
+| `cache` | How the rows hold their cache. `DenseKV()`, each row's whole, the model's own layout unpaged. `PagedKV(...)`, one pool of pages every row draws from, in pages of its `page_size` (the model's own, else 64) and its pool of `pages`, with what the server keeps of the prompts' prefixes (below); `PagedKV(shared=True)` pages only for requests that repeat prompts (a group's samples, a session's turns), wherever the server keeps a prefix cache over the pages and the model's max_seq_len holds a row in whole pages, so each repeated prompt prefills once. Either lays a `layout` (`KVCache`) it names in place of the model's, exactly: its format (`quantized`, None unquantized), its offload and, paged, its page size (64 where it names none) and pool; `PagedKV`'s `page_size` and `pages` page the model's own layout instead. None, the default, keeps the model's own layout: over prompts that don't repeat, pages of 64 drew 13–21% fewer tokens a second than whole rows on an A100. |
 | `chunk` | Prefill a long prompt in pieces of at most this many tokens, one piece a step. Needs a paged cache. |
-| `prefix_cache` | Share the full prompt pages of an earlier request that began with the same tokens, and a finished request's whole history (its prompt and every draw its cache holds) with a later prompt that continues it, its full pages. Needs a paged cache. None, the default, keeps it wherever the layout pages and the server can reuse a prefix (row-wise sampling, no separate prefill mesh, a model that computes a split prompt as a whole one); a request draws what it draws without it. |
+| `PagedKV.prefix_cache` | Share the full prompt pages of an earlier request that began with the same tokens, and a finished request's whole history (its prompt and every draw its cache holds) with a later prompt that continues it, its full pages. Needs a paged cache. None, the default, keeps it wherever the layout pages and the server can reuse a prefix (row-wise sampling, no separate prefill mesh, a model that computes a split prompt as a whole one); a request draws what it draws without it. |
 | `prefill_mesh` | Prefill the admitted prompts on a mesh of their own, as disaggregated serving does: the server keeps a copy of its weights there and moves each admission's prefilled rows to the decoding mesh, where they decode. Each prompt prefills whole over a dense cache. |
-| `host_pages` | Keep that many more prefix pages in host memory: a cached page the pool reclaims is copied to the host first, and a request that shares it reads it back into a fresh page before its prefill. Needs `prefix_cache`. A model whose rows keep a state beside their pages sends a state that gives way to the host too, as many states as the bytes of `host_pages` pages hold. |
+| `PagedKV.host_pages` | Keep that many more prefix pages in host memory: a cached page the pool reclaims is copied to the host first, and a request that shares it reads it back into a fresh page before its prefill. Needs `prefix_cache`. A model whose rows keep a state beside their pages sends a state that gives way to the host too, as many states as the bytes of `host_pages` pages hold. |
 | `decode_steps` | Decode iterations per device call (default 1). |
 
 A decoder tells the server what its layers allow through `dew.nn.protocols.Serving`: `inference_projection_groups` names the projection groups a decode step reads packed (a model that does not decode autoregressively names none), `cache_rebuild_position` is where LongRoPE's cached keys go stale, which refuses paged and mixed serving, `mixed_admission_refusal` says why one mixed prefill-and-decode forward would compute differently, and `split_prefill_refusal` says why a prompt must be prefilled whole, which refuses `chunk` and `prefix_cache`. `CausalTransformer` implements it. A custom decoder that does not implement it packs no projections (`dew.nn.projections.projection_groups`) and runs prefill and decode as separate forwards (`dew.inference.serving_kernel.mixed_refusal`), and the server takes its prefill as safe to split (`dew.inference.serving`), so a decoder whose prefill depends on seeing the prompt whole implements `Serving` and says so in `split_prefill_refusal`. A task loaded from a source or a saved run packs a decoder's projection groups once, after placing its weights, and keeps one copy. A task over a live objective's weights packs them inside each generation's compiled call, outside its per-token step, and frees them when the call returns. A group packs only where its members share one placement that leaves their output axis whole, so a tensor-parallel layout that splits the heads keeps the query, key and value apart. A server serves the weights its task holds, and `reload` packs a canonical tree as the served one is packed.
 
-`KVCache` (`dew.nn.kv_cache`) sets the cache layout. It is passed as `kv_cache=` to `from_task`, or set as a `CausalTransformer`'s `kv_cache` field for `TextGeneration`:
+`KVCache` (`dew.nn.kv_cache`) sets a model's cache layout, a `CausalTransformer`'s `kv_cache` field, which `TextGeneration` decodes over and a server keeps unless its `cache` lays another:
 
 | Field | Meaning |
 |---|---|

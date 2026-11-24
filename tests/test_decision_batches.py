@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from PIL import Image
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 
@@ -38,8 +39,9 @@ cases' questions, their states drawn from the seed."""
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def decide() -> Decide:
-    return Decide.from_pretrained(LAYA, attention_impl="xla")
+    return Decide.from_pretrained(LAYA)
 
 
 def discrete(response: dict) -> dict:
@@ -58,6 +60,7 @@ def clear(decide: Decide, request: dict) -> bool:
     return all(float(gap) > MARGIN for gap in gaps)
 
 
+@attending("xla")
 def test_a_list_of_bodies_is_answered_as_each_alone_and_a_refusal_is_its_own(decide):
     """Every case in one list, beside two bodies Jev refuses: each case's response is its lone
     response in every field a batch cannot move, its usage included; each refused body takes the
@@ -79,6 +82,7 @@ def test_a_list_of_bodies_is_answered_as_each_alone_and_a_refusal_is_its_own(dec
     assert all(isinstance(response, ValueError) for response in decide.systemone(refused))
 
 
+@attending("xla")
 def test_a_batchs_probabilities_are_each_bodys_alone(decide):
     """Each body's answers in a batch of four, every option's probability, on par from float64 with its
     answers alone (check 1): a padded batch is another program, which rounds its sums otherwise."""
@@ -130,6 +134,7 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
                     "batched probabilities", seeds=BATCH_SEEDS, truth_fn=truth)
 
 
+@attending("xla")
 def test_a_mixed_list_answers_its_images_alone_and_its_text_together(tmp_path):
     """A joint release, whose backbone reads images: in one list, a body with images is answered by
     its own pass, as it is alone, to the same response, and the text bodies beside it as each is alone
@@ -139,7 +144,7 @@ def test_a_mixed_list_answers_its_images_alone_and_its_text_together(tmp_path):
     for source in [*backbone.iterdir(), release / "joint_head_config.json",
                    release / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
-    decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    decide = Decide.from_pretrained(tmp_path)
     pictures = [Image.fromarray(array) for array in np.load(backbone / "images.npy")]
     seen = {**CASES["quickstart"], "images": pictures}
     text = [CASES["structured"], CASES["conversation"]]
@@ -150,6 +155,7 @@ def test_a_mixed_list_answers_its_images_alone_and_its_text_together(tmp_path):
         assert discrete(response) == discrete(decide.systemone(body))
 
 
+@attending("xla")
 def test_a_batch_of_requests_reads_each_requests_images_as_it_is_asked_alone(tmp_path):
     """A batch of requests given each request's images (`images`, none for a request without) answers a
     request with images by its own pass, as the request asked alone with them is answered (row 9061: a
@@ -159,7 +165,7 @@ def test_a_batch_of_requests_reads_each_requests_images_as_it_is_asked_alone(tmp
     for source in [*backbone.iterdir(), release / "joint_head_config.json",
                    release / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
-    decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    decide = Decide.from_pretrained(tmp_path)
     pictures = [Image.fromarray(array) for array in np.load(backbone / "images.npy")]
     asked = [(body["state"], {name: Question.from_wire(wire) for name, wire in body["questions"].items()})
              for body in (CASES["structured"], CASES["quickstart"])]
@@ -169,6 +175,7 @@ def test_a_batch_of_requests_reads_each_requests_images_as_it_is_asked_alone(tmp
     assert all(np.array_equal(answered[1][name].probabilities, alone[name].probabilities) for name in alone)
 
 
+@attending("xla")
 def test_a_mixed_list_with_a_backbone_that_reads_no_images_refuses_the_images_alone(decide):
     """A text backbone refuses a body's images in a list as it does alone, and answers the rest."""
     answered = decide.systemone([{**CASES["quickstart"], "images": ["aGVsbG8="]}, CASES["structured"]])
@@ -178,6 +185,7 @@ def test_a_mixed_list_with_a_backbone_that_reads_no_images_refuses_the_images_al
 
 
 
+@attending("xla")
 def test_one_engine_serves_generation_and_scoring_from_one_thread(decide):
     """A generation server and a scoring server under one engine (`dew.inference.engine.Engine`), their
     requests submitted together from the caller's thread: each generation draws what it draws alone,
@@ -207,6 +215,7 @@ def test_one_engine_serves_generation_and_scoring_from_one_thread(decide):
         assert discrete(answer) == discrete(decide.systemone(body))
 
 
+@attending("xla")
 def test_a_long_scoring_backlog_does_not_hold_generation_back(decide):
     """One engine serving generation and scoring, a pass a scoring turn: with a scoring backlog of
     one row a pass, a generation submitted beside it finishes while the backlog still has passes to
@@ -243,6 +252,7 @@ IMAGE_SEEDS = 8
 of one row length (8, 2026-10-29)."""
 
 
+@attending("xla")
 def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_path):
     """Two requests of one state, each with its own image of one size, are rows as long as each other
     of alike images, so they join one pass (`WireScoring.fits`, `Images.joined`); each row's every
@@ -257,7 +267,7 @@ def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_pat
     for source in [*backbone.iterdir(), release / "joint_head_config.json",
                    release / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
-    decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    decide = Decide.from_pretrained(tmp_path)
     pictures = [Image.fromarray(array) for array in np.load(backbone / "images.npy")][:2]
     words = ["one", "two", "three", "four", "five", "six", "seven", "eight"]
     task, variables = decide.scoring()

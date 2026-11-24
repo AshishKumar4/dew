@@ -1,4 +1,4 @@
-"""The pallas splash kernel behind attention_impl 'tpu': what it computes and
+"""The pallas splash kernel behind the attention kernel 'tpu': what it computes and
 which calls it takes.
 
 Splash is a TPU kernel, but pallas can run a Mosaic kernel under its own
@@ -9,7 +9,7 @@ Mosaic instead, because the interpreter is exactly what `jax.default_backend()
 != 'tpu'` turns off, and the one `on_tpu` case adds a length the interpreter
 is not worth running; `tools/qualify_splash.py` is that run plus a timing.
 
-The reference is `attention_impl 'reference'`, the einsum and softmax path,
+The reference is the 'reference' attention kernel, the einsum and softmax path,
 run in fp32 at HIGHEST precision on the same inputs. Off a TPU fp32 holds to
 a few parts in a million; bf16, and fp32 on a TPU, hold to two ulps of the
 output scale, which is the distance the cudnn parity in tests/test_kernels.py
@@ -288,7 +288,7 @@ def test_splash_keeps_the_kernel_contract_on_a_mesh(axis, key_heads, packed):
 def test_the_tpu_kernels_lower_for_a_tpu_on_a_mesh_that_splits_rows_or_heads(axes, kernel):
     """jax refuses to lower a Mosaic kernel the partitioner would have to split ("Mosaic kernels
     cannot be automatically partitioned"), so on a v6e mesh splitting rows, heads or both, each
-    kernel of attention_impl 'tpu', splash and the flash kernel a bias sends a call to, lowers
+    kernel of the attention kernel 'tpu', splash and the flash kernel a bias sends a call to, lowers
     forward and backward as each shard's rows and heads (`sharded.tpu_lowering`); sinks and a bias
     split with their heads."""
     from sharded import placed, tpu_lowering, tpu_mesh
@@ -387,10 +387,10 @@ def test_a_paged_decode_step_on_this_tpu_falls_back_where_jaxs_kernel_refuses(wi
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.kernels import generation
-    def model(layout, dtype, implementation="auto"):
+    def model(layout, dtype):
         return CausalTransformer(vocab_size=64, emb_features=width * 2, num_layers=1, num_heads=4,
                                  num_kv_heads=2, head_dim=width, mlp_features=width * 2, max_seq_len=32,
-                                 dtype=dtype, kv_cache=layout, attention_impl=implementation)
+                                 dtype=dtype, kv_cache=layout)
 
     served = width % 128 == 0 and (precision is None or generation.gpu_target().fp32_by_bf16_precise)
     with jax.default_matmul_precision(precision), generation.routes() as routes:

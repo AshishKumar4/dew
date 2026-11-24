@@ -9,6 +9,7 @@ import itertools
 from pathlib import Path
 
 import numpy as np
+from model_support import attending
 from test_decision_objective import EXAMPLES, SPECIALS, TOKENIZER, tiny_backbone
 
 from dew.data import Loading, Memory
@@ -47,6 +48,7 @@ def windows(seed: int, count: int, *, resumed: int | None = None) -> list[np.nda
     return got
 
 
+@attending("xla")
 def test_option_orders_follow_the_data_seed_each_pass_and_a_resume():
     per_pass = -(-len(EXAMPLES) // ROWS)
     one, other = windows(0, 2 * per_pass), windows(0, 2 * per_pass)

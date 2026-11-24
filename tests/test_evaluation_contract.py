@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from model_support import attending
 
 from dew.artifacts import ImageGrid, TokenScores
 from dew.eval import PSNR
@@ -77,6 +78,7 @@ def test_perplexity_streams_weighted_targets_and_empty_contributions():
         metric.finalize(empty)
 
 
+@attending("xla")
 @pytest.mark.parametrize("objective_type", [DPOObjective, GRPOObjective])
 def test_policy_preview_uses_policy_weights_instead_of_frozen_reference(objective_type):
     import jax
@@ -89,7 +91,7 @@ def test_policy_preview_uses_policy_weights_instead_of_frozen_reference(objectiv
 
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=16, tie_embeddings=False,
-                              dtype="float32", attention_impl="xla")
+                              dtype="float32")
     objective = objective_type(
         model, seq_len=8, samples=Samples(prompt=[1, 2], max_new_tokens=3, sampling=Sampling(temperature=0))
     )

@@ -30,7 +30,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import gated_product
-from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import matching_lengths, patch_lengths, projection_flops, self_attention_flops
@@ -80,7 +80,6 @@ class Flux2SingleBlock(nn.Module):
     epsilon: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -110,7 +109,7 @@ class Flux2SingleBlock(nn.Module):
         key = RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm_k")(key)
         attended = scaled_dot_product_attention(
             rotate(query, *rotation, pairs="adjacent"), rotate(key, *rotation, pairs="adjacent"), value,
-            implementation=self.attention_impl, precision=self.precision)
+            precision=self.precision)
         gated, value_half = jnp.split(projected[..., 3 * inner:], 2, axis=-1)
         joined = jnp.concatenate(
             [attended.reshape(x.shape[0], x.shape[1], inner), gated_product('swiglu')(gated, value_half)],
@@ -149,7 +148,6 @@ class Flux2Transformer(TextStream, nn.Module):
     guidance_embeds: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @property
     def modulation_pieces(self) -> dict[str, int]:
@@ -172,8 +170,7 @@ class Flux2Transformer(TextStream, nn.Module):
 
     @nn.nowrap
     def _block_fields(self) -> dict:
-        return {"epsilon": self.eps, "dtype": self.dtype, "precision": self.precision,
-                "attention_impl": self.attention_impl}
+        return {"epsilon": self.eps, "dtype": self.dtype, "precision": self.precision}
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:

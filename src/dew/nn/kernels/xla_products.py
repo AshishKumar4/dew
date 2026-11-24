@@ -4,6 +4,7 @@ GEMM's own portable branch (`kernels.gemm`): its products as the call's precisio
 `ragged_placement`), a step-scaled one (`step_scaled`), a projection differentiated by its own products
 (`portable_projection`), and the platform choice between a kernel and them (`_on_platform`)."""
 
+import contextlib
 import functools
 
 import jax
@@ -28,6 +29,15 @@ def interpreted(interpret_on_cpu: bool) -> bool:
     return interpret_on_cpu and generation.placed_platform() == 'cpu'
 
 
+@contextlib.contextmanager
+def interpreted_context(interpret_on_cpu: bool):
+    """Bind `generation.assumed(generation.interpreted_target())` while `interpreted(interpret_on_cpu)` holds
+    (row 12158)."""
+    with (generation.assumed(generation.interpreted_target())
+          if interpreted(interpret_on_cpu) else contextlib.nullcontext()):
+        yield
+
+
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     """`kernel` where the call lowers for its target's platform (CUDA, or a TPU's), and `fallback`
     everywhere else: a TPU's program, which never runs on CUDA, holds no CUDA branch, and a GPU's no TPU
@@ -45,6 +55,59 @@ def _on_platform(kernel, fallback, interpret_on_cpu: bool):
                              "emulates; state it with generation.assumed(...)")
         branches['cpu'] = functools.partial(kernel, interpret=True)
     return branches, fallback
+
+
+def committed_device(operands):
+    """A process-local device of concrete `operands` when every committed leaf shares one platform
+    (including homogeneous multi-host sharding), or None if uncommitted, traced, empty, or mixed-platform."""
+    from jax.core import Tracer
+
+    devices = {
+        device
+        for leaf in jax.tree.leaves(operands)
+        if isinstance(leaf, jax.Array) and not isinstance(leaf, Tracer) and leaf.committed
+        for device in leaf.devices()
+    }
+    platforms = {device.platform for device in devices}
+    if len(platforms) != 1:
+        return None
+    local = next((device for device in devices if device.process_index == jax.process_index()), None)
+    return local if local is not None else jax.local_devices(backend=next(iter(platforms)))[0]
+
+
+@contextlib.contextmanager
+def committed_context(operands):
+    """Bind `jax.default_device(committed_device(operands))` for concrete committed `operands` (row 12158)."""
+    from jax.core import Tracer
+
+    if any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
+        yield
+        return
+    device = committed_device(operands)
+    with jax.default_device(device) if device is not None else contextlib.nullcontext():
+        yield
+
+
+def dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
+    """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
+    (`_on_platform`). Resolves concrete committed placement before `_on_platform`, traces abstractly so every
+    branch selects, then runs eagerly on the committed device (row 11887)."""
+    from jax.core import Tracer
+
+    def run():
+        branches, default = _on_platform(kernel, portable, interpret_on_cpu)
+
+        def call(*args):
+            return jax.lax.platform_dependent(*args, default=default, **branches)
+
+        return call
+
+    if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
+        with committed_context(operands):
+            call = run()
+            jax.eval_shape(call, *operands)
+            return call(*operands)
+    return run()(*operands)
 
 
 def as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:

@@ -42,9 +42,8 @@ from dew.config import ObjectiveConfig, RunConfig
 from dew.config.lm import LMRunConfig
 from dew.data import Memory, presets
 from dew.inference import TextGeneration
-from dew.inference.serving import Server
+from dew.inference.serving import PagedKV, Server
 from dew.nn.kernels.generation import run_precision
-from dew.nn.kv_cache import KVCache
 from dew.nn.mixer_base import MixerBase
 from dew.nn.precision import numerics_of
 from dew.quantization import QuantizedDtype
@@ -173,7 +172,7 @@ def float64_twin(served: TextGeneration, canonical: nn.Module) -> tuple[nn.Modul
     with jax.enable_x64(new_val=True):
         weights = jax.tree.map(value, dict(served.variables),
                                is_leaf=lambda node: isinstance(node, Annotated))
-    return canonical.clone(dtype=jnp.float64, attention_impl="reference"), weights
+    return canonical.clone(dtype=jnp.float64), weights
 
 
 Draws = list[tuple[np.ndarray, int, np.ndarray]]
@@ -490,7 +489,7 @@ PROMPTS = (1, 3)
 """A served batch's prompts: one alone, or three together."""
 
 
-SERVERS = {"paged": {"kv_cache": KVCache(page_size=16, pages=12)}, "speculative": {}}
+SERVERS = {"paged": {"cache": PagedKV(page_size=16, pages=12)}, "speculative": {}}
 """Each way a cell serves its prompts through a server (`Server.from_task`), each prompt a request: over a
 paged cache, pages of 16 tokens pooled over its rows; or drafting speculative blocks (its task's
 `Speculative` strategy) over the dense cache a server speculates over."""
@@ -512,8 +511,8 @@ def serving_task(cell: Mapping) -> tuple[TextGeneration, nn.Module]:
     model = decoder().clone(max_seq_len=128, num_nextn_predict_layers=int(speculative))
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     canonical = model.clone(dtype=numerics_of(cell["precision"]).dtypes.compute)
-    task = TextGeneration(canonical, variables, sampling=Sampling(temperature=0),
-                          **({"strategy": Speculative(block=3)} if speculative else {}))
+    drafting = Speculative(block=3) if speculative else None
+    task = TextGeneration(canonical, variables, sampling=Sampling(temperature=0, strategy=drafting))
     if cell["quantization"] is not None:
         task = task.quantized(Quantization(dtype=cell["quantization"], weight_only=True))
     return task, canonical
@@ -647,7 +646,7 @@ def published_task(cell: Mapping, root: Path):
 
     archive, inside = PIPELINES[cell["family"]]
     extract_fixture(Path(__file__).resolve().parents[1] / f"tests/fixtures/{archive}.tar.xz", root / archive)
-    loaded = Pretrained.load(str(root / archive / inside), dtype=cell["dtype"], attention_impl="xla")
+    loaded = Pretrained.load(str(root / archive / inside), dtype=cell["dtype"])
     return loaded.text_to_image()
 
 

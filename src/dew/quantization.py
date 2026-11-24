@@ -60,6 +60,7 @@ import importlib
 import inspect
 import math
 import re
+import sys
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
@@ -471,6 +472,46 @@ def intercepted_nonlinear(module: LinearProducts, name: str, input_scales: bool 
     bounds): a frozen FP8 product, an adapter's dropout, and a checkpoint's quantizer of its input where
     `input_scales` (a bound that reads the quantizer's own rounding passes False)."""
     return module.nonlinear_input(name, qwix=False, input_scales=input_scales)
+
+
+def _quantized_array() -> type | None:
+    """Qwix's `QArray` where Qwix is loaded and binds it, else None: a stored quantized array exists only
+    then, so a tree without one never imports Qwix, and a Qwix another thread is still importing (its module
+    present, its `QArray` not yet bound) holds none (as `dew.nn.dense.providing` reads it, row 11804)."""
+    qwix = sys.modules.get("qwix")
+    held = None if qwix is None else vars(qwix).get("QArray")
+    return held if isinstance(held, type) else None
+
+
+def holds_quantized(params: Mapping) -> bool:
+    """Whether `params` holds a stored quantized array (`QArray`): its leaves' types read alone, no array
+    touched."""
+    quantized = _quantized_array()
+    if quantized is None:
+        return False
+    leaves = jax.tree.leaves(params, is_leaf=lambda leaf: isinstance(leaf, quantized))
+    return any(isinstance(leaf, quantized) for leaf in leaves)
+
+
+def held_scales(params: Mapping) -> Mapping:
+    """A layer's `params` with each stored quantized array's scale (and zero point, Qwix's `QArray`) behind
+    an optimization barrier: a scanned run's layer, its params sliced from the scan's stacked rows, reads its
+    served kernels' scales as the unrolled stack's layer does. The slice fused into a dequantizing
+    projection's fusion with RoPE (XLA:CPU), which kept LLVM from sharing the scale across RoPE's halves and
+    its rotation from contracting to fused multiply-adds: the served forward then rounded twice where the
+    unrolled one and quantized training round once (row 12078)."""
+    quantized = _quantized_array()
+    if quantized is None:
+        return params
+
+    def held(leaf):
+        if not isinstance(leaf, quantized):
+            return leaf
+        zero = leaf.zero_point
+        return dataclasses.replace(leaf, scale=jax.lax.optimization_barrier(leaf.scale),
+                                   zero_point=None if zero is None else jax.lax.optimization_barrier(zero))
+
+    return jax.tree.map(held, params, is_leaf=lambda leaf: isinstance(leaf, quantized))
 
 
 def _qwix(module: str = "qwix") -> ModuleType:

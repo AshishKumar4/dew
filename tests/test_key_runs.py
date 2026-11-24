@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, attending
 
 from dew.batch import coordinates
 from dew.decision.layout import _parallel
@@ -81,9 +81,10 @@ def model(**kinds):
     """A two-layer float32 decoder of the kinds `kinds` names, in turn, on xla's kernel."""
     types = tuple(kinds) * (TINY_DECODER["num_layers"] // len(kinds))
     return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32", "layer_types": types,
-                                "kinds": kinds, "attention_impl": "xla"})
+                                "kinds": kinds})
 
 
+@attending("xla")
 @pytest.mark.parametrize("causal", [False, True], ids=["bidirectional", "causal"])
 @pytest.mark.parametrize("kinds", [{"full_attention": {}}, {"sliding_attention": {"window": 2}}],
                          ids=["full", "window"])
@@ -128,6 +129,7 @@ def _prefilled(decoder, rows: int, call: int):
     return params, prefilled["cache"], block
 
 
+@attending("xla")
 @pytest.mark.parametrize("call", [CALL, 1], ids=["block", "step"])
 def test_a_cached_calls_keys_validity_alone_hides_those_keys_from_its_own_visibility(call):
     """A cached call (`call` tokens after a prompt, a decode step's one among them) stating its keys'
@@ -191,6 +193,6 @@ def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mea
     np.testing.assert_array_equal(np.asarray(paired), np.asarray(masked))
     if "chunked_attention" in kinds:
         return
-    template = decoder.clone(dtype=jnp.bfloat16, attention_impl="template")
-    with generation.assumed("sm80"):
+    template = decoder.clone(dtype=jnp.bfloat16)
+    with generation.assumed("sm80"), generation.chosen(attention="template"):
         jax.eval_shape(lambda: read(template, **spanned))

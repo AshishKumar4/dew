@@ -38,6 +38,7 @@ from torch.overrides import TorchFunctionMode
 from dew.batch import Variables
 from dew.interop.pretrained import Pretrained
 from dew.interop.sources import load_shards
+from dew.nn.kernels import generation
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.state import TrainState
@@ -187,10 +188,10 @@ def trained_export(directory: Path, export: Path, train: Callable[[Pretrained, n
     one step on its own ids (`train`), its trained weights written back into the source's own tensor names
     at `export`, and the export loaded as the checkpoint was."""
     ids = np.load(directory / "input_ids.npy")
-    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference", text_only=text_only)
+    source = Pretrained.load(str(directory), dtype="float32", text_only=text_only)
     trained = train(source, ids).variables
     source.save(export, variables=trained)
-    return source, ids, trained, Pretrained.load(str(export), dtype="float32", attention_impl="reference",
+    return source, ids, trained, Pretrained.load(str(export), dtype="float32",
                                                  text_only=text_only)
 
 
@@ -809,7 +810,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import sys
+    with generation.chosen(attention="reference"):
+        import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     main()

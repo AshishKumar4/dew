@@ -57,7 +57,7 @@ from dew._facts import Held
 from dew.nn import derivatives
 from dew.nn.kernels import generation
 from dew.nn.nested import nested
-from dew.nn.programs import RaggedLayout, entrywise, ragged_layout
+from dew.nn.programs import RaggedLayout, entrywise, ragged_layout, with_equations
 
 if TYPE_CHECKING:
     from dew.nn.kernels import tuning
@@ -685,4 +685,4 @@ def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written]) -> jcore.Jaxpr:
         if place not in removed:
             equations.append(equation)
     equations.extend(written.get(len(jaxpr.eqns), []))
-    return jaxpr.replace(eqns=equations)
+    return with_equations(jaxpr, equations)

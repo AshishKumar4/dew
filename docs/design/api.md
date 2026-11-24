@@ -316,9 +316,10 @@ with or without `text_only`. A run passes both through `--source.text-only` and
 `--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is, the load's
 `modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional,
 and its differential extension through `--source.dex`, the `DifferentialExtension`'s record as JSON
-(`dew.nn.dex`), and `scan_layers` through `--source.scan-layers`, which scans a decoder's runs of
-like layers, its periodic pattern among them, its stored tree unchanged, and refuses a model with no
-layers to scan (`Pretrained.load`); a diffusion pipeline, which no override reaches, refuses them. `dew.pipeline` takes
+(`dew.nn.dex`); a diffusion pipeline, which no override reaches, refuses them. How a decoder runs its
+layers is none of a source's choices: under `generation.chosen(layer_scan="scanned")` it scans its runs of
+like layers, its periodic pattern among them, by its structure, its stored tree unchanged, and a layer at a
+time otherwise, the default until row 4074 makes the scan it. `dew.pipeline` takes
 the same choices for a source as `options=SourceOptions(...)`, and refuses them for a run directory,
 whose record holds its own.
 
@@ -343,11 +344,11 @@ within its own bounds, runs them with one bounded device call a `step`, and sett
 `Timed` future. The engine steps each busy kind once a turn from one thread, so a long queue of one
 kind never holds another back, and it orders a kind's weight reload with its steps. Two kinds ship:
 autoregressive generation's `Server`, a slot scheduler over a resident cache, its prefix cache on by
-default wherever its layout pages (`Server.from_task`'s `prefix_cache` None), a finished request's
+default wherever its layout pages (`PagedKV.prefix_cache` None), a finished request's
 history (its prompt and every draw its cache holds) named for a later prompt that continues it,
 `server(prompts, max_new_tokens, key=..., first=0)` folding row `i`'s key by `first + i`; an episode
 cohort's turns run through it in process
-(`EpisodeCollector(kv_cache=KVCache(page_size=...))`); and `ScoringServer`, a
+(`EpisodeCollector(cache=PagedKV(page_size=...))`); and `ScoringServer`, a
 task answered by forward passes over its requests' rows. A scoring task (`Scoring`) holds no
 weights. It lays a request out as rows at submission (`admit`, refusing one alone, a ValueError), says
 which rows one pass holds (`fits`), runs a pass over the weights the server hands it (`forward`), and
@@ -392,7 +393,7 @@ JEPA imports nothing from diffusion.
 
 ## 5. What is deleted
 
-`SimpleTrainer`'s W&B and publishing methods, `ObjectiveTrainer`'s diffusion parameters and default objective, `RandomMarkovState`, `get_diffusion_preset`, the `+suffix` DSL and `canonicalize_architecture`, `apply_precision_policy`'s string round trip (dtype and attention_impl become fields the registry validates), `serialize_model`, `parse_config`, `DiffusionInputConfig` and `ConditionalInputConfig`, `model_key_override`, the three dataset maps, `Metrics`, `FLAXDIFF_AUGMENT_MODE` (augmentation becomes a field of the dataset spec), `__encode__` and `__decode__` in favour of `encode` and `decode`.
+`SimpleTrainer`'s W&B and publishing methods, `ObjectiveTrainer`'s diffusion parameters and default objective, `RandomMarkovState`, `get_diffusion_preset`, the `+suffix` DSL and `canonicalize_architecture`, `apply_precision_policy`'s string round trip (dtype becomes a field the registry validates, the attention kernel a run's kernel choice), `serialize_model`, `parse_config`, `DiffusionInputConfig` and `ConditionalInputConfig`, `model_key_override`, the three dataset maps, `Metrics`, `FLAXDIFF_AUGMENT_MODE` (augmentation becomes a field of the dataset spec), `__encode__` and `__decode__` in favour of `encode` and `decode`.
 
 ## 6. Stress test
 

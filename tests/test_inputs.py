@@ -7,6 +7,7 @@ copying resident inputs through the host.
 
 import numpy as np
 import pytest
+from model_support import attending
 from steady_state import guarded
 
 
@@ -172,6 +173,7 @@ def test_a_request_refuses_a_bool_row_beside_integer_rows():
         [4, 5], [2, 3]]
 
 
+@attending("reference")
 def test_tokens_laid_out_both_as_coordinates_and_as_fields_are_refused():
     """A call that lays its tokens out twice, as `Coordinates` and as a flat field beside them, is refused
     wherever it enters, a ModelInputs or the decoder's call, where the coordinates silently dropped the
@@ -184,8 +186,7 @@ def test_tokens_laid_out_both_as_coordinates_and_as_fields_are_refused():
     from dew.nn.inputs import ModelInputs
 
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, num_kv_heads=2,
-                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
-                              attention_impl="reference")
+                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32)
     tokens = jnp.asarray([[0, 3, 4, 5], [6, 7, 8, 9]], jnp.int32)
     valid = jnp.asarray([[False, True, True, True], [True, True, True, True]])
     laid = coordinates(tokens.shape, valid=valid)
@@ -200,6 +201,7 @@ def test_tokens_laid_out_both_as_coordinates_and_as_fields_are_refused():
                                   model.apply(variables, tokens, attention_mask=valid))
 
 
+@attending("reference")
 def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
     """The same packed, left-padded rows, as `Coordinates` (a data pipeline's
     packing) or as the validity, segment and position fields (a rollout's), are
@@ -214,8 +216,7 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
     from dew.nn.inputs import ModelInputs
 
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, num_kv_heads=2,
-                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
-                              attention_impl="reference")
+                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32)
     tokens = jnp.asarray([[0, 0, 3, 4, 5, 6, 7, 8], [0, 9, 10, 11, 12, 13, 14, 15]], jnp.int32)
     valid = tokens != 0
     segments = jnp.asarray([[0, 0, 1, 1, 1, 2, 2, 2], [0, 1, 1, 2, 2, 2, 3, 3]], jnp.int32)
@@ -236,6 +237,7 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
         np.testing.assert_array_equal(np.asarray(actual)[real], np.asarray(expected)[real])
 
 
+@attending("reference")
 @pytest.mark.parametrize("placed", [False, True])
 def test_a_request_generates_alike_from_coordinates_and_from_its_fields(placed):
     """An unpacked, left-padded request with its own positions generates the same
@@ -254,8 +256,7 @@ def test_a_request_generates_alike_from_coordinates_and_from_its_fields(placed):
     from dew.training import MeshSpec
 
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, num_kv_heads=2,
-                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
-                              attention_impl="reference")
+                              head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32)
     tokens = jnp.asarray([[0, 0, 3, 4, 5], [6, 7, 8, 9, 10]], jnp.int32)
     valid = tokens != 0
     positions = jnp.asarray([[0, 0, 4, 5, 6], [0, 1, 2, 3, 4]], jnp.int32)

@@ -1,4 +1,4 @@
-"""An episode cohort served in process (`EpisodeCollector.kv_cache`): its turns run through the serving
+"""An episode cohort served in process (`EpisodeCollector.cache`): its turns run through the serving
 engine, each turn prefilling only what follows its row's last, and draw what the policy draws whole."""
 
 import hashlib
@@ -15,6 +15,7 @@ from model_support import float64_twin
 from reference_error import as_given, assert_as_exact
 from test_serving import hybrid_model
 
+from dew.inference.serving import PagedKV
 from dew.inference.tasks import TextGeneration
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs, pad_token_rows
@@ -140,7 +141,7 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
     def draw(seed: int):
         return (nn.unbox(initialized(jax.random.key(seed), jnp.ones((1, 2), jnp.int32))),)
 
-    served = collector(model, draw(0)[0], sampling, kv_cache=KVCache(page_size=2))
+    served = collector(model, draw(0)[0], sampling, cache=PagedKV(page_size=2))
     whole = collector(model, draw(0)[0], sampling)
     names = ("raw", "behavior") if sampling.temperature else ("raw",)
     truth_score = scored(float64_twin(model), sampling)
@@ -195,17 +196,24 @@ def test_an_episode_schedulers_cohort_draws_what_its_policy_draws_whole(kind, se
 
     model = MODELS[kind]().with_kv_cache(KVCache(page_size=PAGE))
     # Every token but the pad ends a turn, so each episode runs its turns and its contexts grow past pages.
+    # The collector's policy runs over its task's (`Sampling.with_defaults_of`): a task searching beams keeps
+    # its search where the collector's names none, and the cohort's layout is laid for it (Train 1208's review
+    # F1: the task's strategy was dropped, its turns sampled over pages).
     sampling = replace(GREEDY if searched else SAMPLED, eos_token_ids=tuple(range(1, VOCAB)))
     initialized = jax.jit(model.init)
     for seed in range(4):
         variables = nn.unbox(initialized(jax.random.key(seed), jnp.ones((1, 2), jnp.int32)))
-        policy = TextGeneration(model, variables, **({"strategy": Beam(width=2)} if searched else {}))
+        policy = TextGeneration(model, variables,
+                                sampling=Sampling(strategy=Beam(width=2) if searched else None))
         acquisition = RolloutScheduler.episodes(
             policy, conversations, lambda episode: 1.0,
             objective=GRPOObjective(model, seq_len=PROMPT + RESPONSE), max_prompt_tokens=PROMPT,
             max_new_tokens=RESPONSE, max_turns=TURNS, sampling=sampling).acquisition
-        assert isinstance(acquisition, Synchronous) and isinstance(acquisition.collector, EpisodeCollector)
-        layout = acquisition.collector.kv_cache
+        assert isinstance(acquisition, Synchronous)
+        drawing = acquisition.collector
+        assert isinstance(drawing, EpisodeCollector)
+        cache = drawing.cache
+        layout = None if cache is None else cache.layout
         if searched:
             assert layout is None, "a policy searching beams is drawn whole"
         else:
@@ -238,14 +246,38 @@ def test_an_episode_schedulers_cohort_over_a_model_declaring_no_pages_is_served_
         policy, conversations, lambda episode: 1.0, objective=GRPOObjective(model, seq_len=PROMPT + RESPONSE),
         max_prompt_tokens=PROMPT, max_new_tokens=RESPONSE, max_turns=TURNS, sampling=SAMPLED
     ).acquisition.collector
-    layout = collector_.kv_cache
-    assert (layout.page_size if layout is not None else None) == (64 if paged else None)
+    assert isinstance(collector_, EpisodeCollector)
+    cache = collector_.cache
+    assert (cache.layout.page_size if cache is not None and cache.layout is not None else None) == (
+        64 if paged else None)
     if n == 1:
         whole = EpisodeCollector(policy, conversations, lambda episode: 1.0, PROMPT, RESPONSE, TURNS,
                                  sampling=SAMPLED)
         scheduled, drawn = collected(collector_, variables), collected(whole, variables)
         for name in ("contexts", "tokens"):
             np.testing.assert_array_equal(scheduled[name], drawn[name], err_msg=name)
+
+
+def test_a_served_cohort_under_its_tasks_inherited_controls_draws_what_its_whole_cohort_draws():
+    """A served cohort whose task binds controls the collector's sampling leaves at their defaults (its
+    stopping, `MaxNewTokens(2)`) draws under the policy the two make (`EpisodeCollector._effective`), its
+    server made with it and its turns held to it, what the cohort drawing each turn whole draws, every
+    episode recording that policy; where the server was held to the collector's own and refused the
+    cohort's first turn (the API02 review)."""
+    from dew.sampling.decoding import MaxNewTokens
+
+    model = attention_model()
+    variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    bound = Sampling(stopping=(MaxNewTokens(2),))
+    policy = TextGeneration(model, variables, sampling=bound)
+    served, whole = (EpisodeCollector(policy, conversations, lambda episode: 1.0, PROMPT, RESPONSE, TURNS,
+                                      sampling=GREEDY, **changes)
+                     for changes in ({"cache": PagedKV(page_size=2)}, {}))
+    drawn = collected(served, variables)
+    np.testing.assert_array_equal(drawn["tokens"], collected(whole, variables)["tokens"])
+    assert (drawn["tokens"] >= 0).sum(axis=1).max() == 2
+    episodes = served.episodes(Snapshot(variables, 0, 0, jax.random.key(23)), [Task("31")], GROUPS)
+    assert {episode.sampling for episode in episodes} == {GREEDY.with_defaults_of(bound)}
 
 
 def test_a_served_row_whose_context_does_not_continue_its_last_turn_is_prefilled_whole(caplog):
@@ -257,7 +289,7 @@ def test_a_served_row_whose_context_does_not_continue_its_last_turn_is_prefilled
     model = attention_model()
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     turns = _ServedTurns.over(TextGeneration(model, variables), collector(
-        model, variables, GREEDY, kv_cache=KVCache(page_size=2)), rows=2)
+        model, variables, GREEDY, cache=PagedKV(page_size=2)), GREEDY, rows=2)
     policy = TextGeneration(model, variables)
 
     def laid(contexts):
@@ -286,7 +318,7 @@ def test_a_served_cohort_after_an_update_draws_what_the_updated_policy_draws():
     model = attention_model()
     variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     stepped = nn.unbox(model.init(jax.random.key(1), jnp.ones((1, 2), jnp.int32)))
-    served = collector(model, variables, SAMPLED, kv_cache=KVCache(page_size=2))
+    served = collector(model, variables, SAMPLED, cache=PagedKV(page_size=2))
     collected(served, variables)
     # The collector binds each cohort's snapshot (`EpisodeInference.bind`): the second reads the step's.
     ours = collected(served, stepped)

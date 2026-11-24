@@ -21,6 +21,7 @@ choose them the way jax does, with CUDA_VISIBLE_DEVICES or JAX_PLATFORMS.
 """
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import time
@@ -51,6 +52,7 @@ from common import (
 )
 from reference_source import dew_revision
 
+from dew import kernels
 from dew.optim import AdamW
 from dew.training import FitPolicy
 
@@ -131,8 +133,7 @@ def build(args: argparse.Namespace) -> Run:
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
 
     # On the host: the trainer places the weights over its mesh.
-    pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
-                                 attention_impl=args.attention, on_host=True)
+    pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32", on_host=True)
     model, variables = pretrained.model, pretrained.variables
     if isinstance(model, MultimodalTransformer):
         # A text run trains a multimodal checkpoint's decoder, its language model, alone: the towers
@@ -322,11 +323,15 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
 def main() -> None:
     args = arguments()
     built_from = versions()
-    run = build(args)
-    probe = RouterProbe(run, args.probe_rows) if args.probe_every else None
-    state, curves = train(args, run, probe)
-    if probe is not None:
-        probe(run.total, state.variables)
+    # The attention kernel the run names, every trace it builds, trains and probes under (`dew.kernels.use`);
+    # "auto" forces none, its selector's choice.
+    forced = contextlib.nullcontext() if args.attention == "auto" else kernels.use(attention=args.attention)
+    with forced:
+        run = build(args)
+        probe = RouterProbe(run, args.probe_rows) if args.probe_every else None
+        state, curves = train(args, run, probe)
+        if probe is not None:
+            probe(run.total, state.variables)
     result = record(args, run, curves, probe, built_from)
     if args.profile_steps:
         write_record(args.out, result)

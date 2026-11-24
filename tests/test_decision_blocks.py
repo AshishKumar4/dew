@@ -12,7 +12,7 @@ import jax
 import numpy as np
 import pytest
 from decision_support import decision_rows
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, attending
 from test_decision_objective import EXAMPLES, SPECIALS as BYTE_SPECIALS, TOKENIZER, tiny_backbone
 from test_decision_render import CHOICE_PROMPT, QWEN, SPECIALS, STATE, TEAM, release
 
@@ -86,6 +86,7 @@ def test_a_state_first_row_in_blocks_asks_its_question_from_its_head():
         assert tuple(blocks[index, :len(row.tokens)]) == row.blocks
 
 
+@attending("xla")
 def test_a_packed_window_holds_each_rows_blocks_where_it_packed_the_row():
     """Packed into windows, each row's tokens keep exactly the blocks the row has alone, rows of
     unequal states sharing windows, and the window's padding is in none."""

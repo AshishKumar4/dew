@@ -24,6 +24,7 @@ from dew.nn.activations import GATE_ACTIVATIONS, logistic
 from dew.nn.attention import (
     AttentionImpl,
     attention_case,
+    chosen_attention,
     mask_kernel,
     reference_only,
     scaled_dot_product_attention,
@@ -1047,7 +1048,7 @@ class CausalSelfAttention(nn.Module):
                 key_valid=self._keys_valid(attention_metadata, B, S),
                 dtype=self.ctx.dtype, precision=self.ctx.precision,
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                implementation=self.ctx.attention_impl, sinks=sinks,
+                sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap), Residual.CONTEXT)
             return self._output(attention, gate, B, S, own_value, progress)
         refused = self._unhonoured(attention_metadata, "general")
@@ -1187,7 +1188,7 @@ class CausalSelfAttention(nn.Module):
         # be NaN, which the block's join drops forward but not from the gradients.
         attention = checkpoint_name(scaled_dot_product_attention(
             query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
-            force_fp32_for_softmax=self.ctx.force_fp32_for_softmax, implementation=self.ctx.attention_impl,
+            force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
             wide_logits=self.ctx.wide_logits,
             key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
             max_segments=max_segments, sinks=self.sinks, softcap=self.ctx.attn_logit_softcap),
@@ -1271,7 +1272,7 @@ class CausalSelfAttention(nn.Module):
         distance from an fp32 forward is 1.04 times xla's on Qwen3-0.6B and
         1.00 on 1.7B (tests/reference_error.py allows 2), and greedy rows part
         only at bf16 near-ties (docs/performance.md)."""
-        return mask_kernel(self.ctx.attention_impl, query, key, as_bias=decode and query.shape[1] > 1,
+        return mask_kernel(chosen_attention(), query, key, as_bias=decode and query.shape[1] > 1,
                            dtype=self.ctx.dtype, precision=self.ctx.precision,
                            force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
                            softcap=self.ctx.attn_logit_softcap, sinks=bool(self.ctx.attention_sinks),
@@ -1330,7 +1331,7 @@ class CausalSelfAttention(nn.Module):
         the queries' places counted over their documents' tokens
         (`counted_places`), and `held` a sharing layer's keys' places and groups (`_kept_groups`)."""
         B, S = query.shape[:2]
-        causal, mask, documents, implementation = self.ctx.causal, None, None, self.ctx.attention_impl
+        causal, mask, documents, implementation = self.ctx.causal, None, None, chosen_attention()
         # An uncached call's keys are its own tokens; a cached call's are at the places and in the groups
         # their cache keeps beside them where the layer reads them (`Append.places`, `_kept_groups`),
         # else at their slots, which nothing reads.
@@ -1378,14 +1379,14 @@ class CausalSelfAttention(nn.Module):
         # Over the keys the call reads (the cache's or the prefix's joined), decided only where it is taken.
         masked = functools.partial(self._mask_kernel, query, key, decode)
         cached = isinstance(documents, CrossDocuments)
-        if (cached or groups != _Groups()) and self.ctx.attention_impl != 'auto':
+        if (cached or groups != _Groups()) and chosen_attention() != 'auto':
             implementation = masked()  # a named kernel's handoff (`_mask_kernel`)
         valid = prefix_valid
         if prefix is None and self._restricts_visibility(attention_metadata, decode, causal) and not cached:
             # A decode step's mask and a cache call's documents hold the rows' validity; an uncached
             # call's real keys reach the kernel beside the rest, its window counting real tokens.
             valid = None if decode or attention_metadata is None else attention_metadata.valid
-            if decode or self.ctx.attention_impl != 'auto':
+            if decode or chosen_attention() != 'auto':
                 implementation = masked()
         runs = query_places = None
         # A cached call's forks follow its row's cache, from the document it continues (`fork_anchor`).
@@ -1540,7 +1541,7 @@ class CausalSelfAttention(nn.Module):
         own = None if metadata is None else call_visibility(
             metadata, rotary_positions, batch=B, queries=S, keys=keys, key_places=key_places,
             sliding_window=self.ctx.sliding_window, cached=decode, anchor=anchor, groups=self._group_fields())
-        if own is not None and (own.mask is not None or decode or self.ctx.attention_impl != 'auto'):
+        if own is not None and (own.mask is not None or decode or chosen_attention() != 'auto'):
             implementation = masked()
         return own, implementation
 
@@ -1582,7 +1583,7 @@ class CausalSelfAttention(nn.Module):
             return checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                implementation=self.ctx.attention_impl, wide_logits=self.ctx.wide_logits, causal=causal,
+                wide_logits=self.ctx.wide_logits, causal=causal,
                 sliding_window=window, mask=mask, bias=bias, sinks=sinks, softcap=self.ctx.attn_logit_softcap,
                 segment_ids=documents,
                 block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held,
@@ -1732,9 +1733,8 @@ class CausalSelfAttention(nn.Module):
                                     query.dtype)
         case = attention_case(query, keys, dtype=self.ctx.dtype, precision=self.ctx.precision,
                               force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-                              softcap=self.ctx.attn_logit_softcap, named=self.ctx.attention_impl)
-        return case.quantized is None and select(ATTENTION, case, None if self.ctx.attention_impl == 'auto'
-                                                 else self.ctx.attention_impl).kernel == 'template'
+                              softcap=self.ctx.attn_logit_softcap, named=chosen_attention())
+        return case.quantized is None and select(ATTENTION, case).kernel == 'template'
 
     def _worked(self, store: KVStore, query, index, positions, prompt, slots, starts=None,
                 window: int | None = None) -> jax.Array:
@@ -1782,7 +1782,7 @@ class CausalSelfAttention(nn.Module):
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
-            implementation=self.ctx.attention_impl, causal=False,
+            causal=False,
             softcap=self.ctx.attn_logit_softcap, sinks=sinks,
             key_value_seq_lengths=reads.astype(jnp.int32), key_value_seq_starts=starts)
         return checkpoint_name(attention, Residual.CONTEXT)
@@ -1801,7 +1801,7 @@ class CausalSelfAttention(nn.Module):
         return store.paged_kernel(query, softcap=self.ctx.attn_logit_softcap,
                                   arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,
                                                             self.ctx.force_fp32_for_softmax),
-                                  named=self.ctx.attention_impl, windowed=windowed, sinks=sunk)
+                                  named=chosen_attention(), windowed=windowed, sinks=sunk)
 
     def _decode_masks(self, positions, rows: int, key_length: int, valid, history: dict[str, jax.Array]
                       ) -> tuple[jax.Array, jax.Array | None]:

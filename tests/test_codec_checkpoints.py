@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors
+from model_support import attending
 from recorded_runs import assert_arms_as_recorded
 
 from dew.interop import Pretrained
@@ -56,7 +57,7 @@ def drawing(name: str):
 def computing(name: str):
     """`dew(dtype, inputs)` of checkpoint `name`: its logits at `dtype` through Dew's public load, the model
     rebuilt in float64 for a float64 run (`ModelConfig.with_dtype`) over the same decoded weights."""
-    loaded = Pretrained.load(CODECS / name, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(CODECS / name, dtype="float32")
     wide = ModelConfig.from_model(loaded.model).with_dtype("float64").build()
 
     def dew(dtype, inputs) -> dict:
@@ -72,6 +73,7 @@ def pipeline_arms(name: str):
     return CODECS / name / "recording.npz", drawing(name), computing(name), ("logits",)
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", RECORDED)
 def test_a_quantized_checkpoint_computes_its_reference(name):
     """The reference is the format author's own CPU forward of the same files, and Dew's logits are on par
@@ -81,6 +83,7 @@ def test_a_quantized_checkpoint_computes_its_reference(name):
     assert_arms_as_recorded(pipeline_arms(name), site(name), CODEC_SEEDS[name], f"{name} logits")
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", CHECKPOINTS)
 def test_a_quantized_checkpoint_saves_its_own_bytes(name, tmp_path):
     """The checkpoint held in its own storage (`param_dtype='auto'`) saves its own bytes; held in float32
@@ -89,11 +92,11 @@ def test_a_quantized_checkpoint_saves_its_own_bytes(name, tmp_path):
     directory = CODECS / name
     with np.load(directory / "reference.npz") as reference:
         ids = reference["ids"].astype(np.int32)
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     stored = read_weights(directory)
     own = tmp_path / "own"
-    Pretrained.load(directory, dtype="float32", param_dtype="auto", attention_impl="reference").save(own)
+    Pretrained.load(directory, dtype="float32", param_dtype="auto").save(own)
     assert_same_stored_tensors(read_weights(own), stored)
     masters = tmp_path / "masters"
     loaded.save(masters)
@@ -106,7 +109,7 @@ def test_a_quantized_checkpoint_saves_its_own_bytes(name, tmp_path):
             assert jnp.issubdtype(value.dtype, jnp.floating) and written[tensor].dtype == np.float32, tensor
             np.testing.assert_array_equal(written[tensor], value.astype(np.float32), err_msg=tensor)
     for saved in (own, masters):
-        reloaded = Pretrained.load(saved, dtype="float32", attention_impl="reference")
+        reloaded = Pretrained.load(saved, dtype="float32")
         np.testing.assert_array_equal(reloaded.model.apply(reloaded.variables, ids), actual)
 
 
@@ -186,6 +189,7 @@ def _w4a16_qwen3(directory: Path, attention: bool = False, untied: float | None 
     return directory
 
 
+@attending("reference")
 def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_decoded(tmp_path):
     """A ModelOpt source's W4A16_NVFP4 Linears loaded packed (`Pretrained.load`'s `packed_weights`, row
     8550): each kernel an NVFP4 matrix in the `QUANTIZATION` collection, no parameter beside it, holding
@@ -200,7 +204,7 @@ def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_dec
     from dew.quantization import QUANTIZATION, decoded_banks
 
     source = _w4a16_qwen3(tmp_path / "source")
-    packed = Pretrained.load(source, dtype="bfloat16", attention_impl="reference", packed_weights=True)
+    packed = Pretrained.load(source, dtype="bfloat16", packed_weights=True)
     banks = {path: bank for path, bank in flatten_dict(
         dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()
         if isinstance(bank, NvFp4)}
@@ -241,6 +245,7 @@ def test_a_modelopt_sources_w4a16_linears_served_packed_are_on_par_with_them_dec
                                    {part: stored[part] for part in parts})
 
 
+@attending("reference")
 def test_a_modelopt_w4a16_load_without_its_values_holds_the_packed_tree_and_refuses_an_adapter(tmp_path):
     """A ModelOpt W4A16 source with its biased attention packed too (Qwen2's `attention_bias`, row 8550's
     review): its load without values (`weights=False`, a resume's) holds the tree a load of its values holds,
@@ -252,7 +257,7 @@ def test_a_modelopt_w4a16_load_without_its_values_holds_the_packed_tree_and_refu
     from dew.nn.projections import projection_groups
 
     source = _w4a16_qwen3(tmp_path / "source", attention=True)
-    packed, shaped = (Pretrained.load(source, dtype="bfloat16", attention_impl="reference",
+    packed, shaped = (Pretrained.load(source, dtype="bfloat16",
                                       packed_weights=True, weights=read) for read in (True, False))
     assert jax.tree.structure(shaped.variables) == jax.tree.structure(packed.variables)
     for held, shape in zip(jax.tree.leaves(packed.variables), jax.tree.leaves(shaped.variables), strict=True):
@@ -272,6 +277,7 @@ WITNESSES = {2.0 ** -124: {}, 2.0 ** -126 * (1 + 7 * 2.0 ** -23): {(0, 0): 0x003
 and 1 times 128 times 2^122, 2^129, infinities (row 11740's review: a NaN and 2^127)."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("overall", list(WITNESSES), ids=["a power of two", "near the least normal",
                                                          "past the largest", "its factor past it"])
 def test_a_packed_output_heads_vocabulary_rows_are_its_decoded_values(tmp_path, overall):
@@ -285,7 +291,7 @@ def test_a_packed_output_heads_vocabulary_rows_are_its_decoded_values(tmp_path, 
     from dew.quantization import QUANTIZATION, decoded_banks
 
     source = _w4a16_qwen3(tmp_path / "source", untied=overall)
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference", packed_weights=True)
+    loaded = Pretrained.load(source, dtype="float32", packed_weights=True)
     assert "lm_head" in loaded.variables[QUANTIZATION] and "lm_head" not in loaded.variables["params"]
     stored = {name: np.asarray(value) for name, value in read_weights(source).items()}
     codes = stored["lm_head.weight"]

@@ -8,6 +8,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Protocol
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +29,59 @@ from dew.sampling import Sampling
 TINY_DECODER = {"emb_features": 32, "num_layers": 2, "num_heads": 4, "mlp_features": 64, "max_seq_len": 16}
 """A causal transformer 32 wide, two layers of four heads; each test file adds
 its own vocabulary and any field its claim turns on."""
+
+
+class Decorator(Protocol):
+    """A function's decorator that keeps its signature."""
+
+    def __call__[**Given, Value](self, function: Callable[Given, Value], /) -> Callable[Given, Value]: ...
+
+
+def under_kernels(**kernels: str) -> Decorator:
+    """A decorator running its function, a test's, a fixture's or an arm's, with the kernel choices
+    `kernels` names (`generation.chosen`): JAX keys its trace and compile caches on the choices, so a
+    jitted function traces inside. A generator's body runs after the call returns, outside them: a yielding
+    fixture names its choices around its steps."""
+    from dew.nn.kernels import generation
+
+    def chosen[**Given, Value](function: Callable[Given, Value]) -> Callable[Given, Value]:
+        @functools.wraps(function)
+        def run(*arguments: Given.args, **keywords: Given.kwargs) -> Value:
+            with generation.chosen(**kernels):
+                return function(*arguments, **keywords)
+        return run
+    return chosen
+
+
+def stacked_as(scan: str) -> Decorator:
+    """A function run with every decoder's stack compiled as `scan` names (`layer_scan`)."""
+    return under_kernels(layer_scan=scan)
+
+
+def unrolled[**Given, Value](function: Callable[Given, Value]) -> Callable[Given, Value]:
+    """`function` with every decoder's stack a layer at a time, an arm against the scanned stack
+    (`scanning`)."""
+    return stacked_as("plain")(function)
+
+
+def scanning[**Given, Value](function: Callable[Given, Value]) -> Callable[Given, Value]:
+    """`function` with every decoder's stack scanned, an arm against the stack a layer at a time
+    (`unrolled`)."""
+    return stacked_as("scanned")(function)
+
+
+def attending(kernel: str) -> Decorator:
+    """A test, fixture or function run with every attention layer it traces on `kernel` (`attention`, as a
+    run's `Diagnostics.kernels` names it; a model's own `attention_impl` before row 11938)."""
+    return under_kernels(attention=kernel)
+
+
+def stacked(scanned: bool):
+    """The block within which every decoder's stack runs scanned or unrolled a layer at a time, its default
+    (`generation.chosen(layer_scan=...)`): a test's arm of either."""
+    from dew.nn.kernels import generation
+
+    return generation.chosen(layer_scan="scanned" if scanned else "plain")
 
 
 def recorded_site(path: Path, site: str, inputs_of, truth_fn):
@@ -60,6 +114,13 @@ def with_logit_cotangent(draw, vocab: int, salt: int):
         cotangent = np.random.default_rng([salt, seed]).normal(size=(*ids.shape, vocab))
         return variables, ids, cotangent.astype(np.float32)
     return drawn
+
+
+def compiled_apply(model: nn.Module, variables, *inputs, **options):
+    """`model.apply(variables, *inputs, **options)` as one program: a scanned stack's eager call compiles
+    its scan apart and runs the rest a primitive at a time, rounding as neither program does, so two
+    forms a contract holds bit for bit compare as the programs a run compiles (row 12078)."""
+    return jax.jit(functools.partial(model.apply, **options))(variables, *inputs)
 
 
 def allocated_cache(model, variables, rows: int):

@@ -516,6 +516,12 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
         return -np.square(images.mean(axis=(1, 2, 3)) - context["target"])
 
     rollout = FlowRollout(objective, reward, groups=3, steps=4, train_steps=2)
+    # The walk its collective gathers to every process is that prefix alone (row 10795): its states one
+    # past it, its densities and stochastic steps cut to it, its grid whole (row 10985).
+    walked = jax.eval_shape(rollout._generate_impl, variables, rollout._expanded(prompts)[0],
+                            jax.random.key(23))[0]
+    assert (walked.states.shape[1], walked.log_probs.shape[1], walked.stochastic.shape[1],
+            walked.times.shape[-1]) == (3, 2, 2, 4)
     batch = rollout(state, prompts, jax.random.key(23), objective=objective)
     # Its rows hold the walk's first two transitions alone, its trained prefix (row 10903).
     assert batch["timesteps"].shape == batch["transition_mask"].shape == (6, 2)
@@ -815,7 +821,7 @@ def test_a_clip_reward_scores_each_sample_against_its_prompts_caption():
 def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
     import sys
 
-    from process_support import run_pool, start_process
+    from process_support import run_pools, start_process
     from test_multiprocess import assert_same_parameters, dumped_params
 
     worker = Path(__file__).with_name("flow_grpo_worker.py")
@@ -827,8 +833,10 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
                               coordinator if processes > 1 else "unused", str(out)], 1,
                              environment={"JAX_ENABLE_X64": "0"})
 
-    reports = run_pool("flow", tmp_path / "pool", 2, timeout=120, start=started)
-    [baseline] = run_pool("flow", tmp_path / "single", 1, timeout=120, start=started)
+    # The pool of two and the one process run at once, each its own coordinator (row 12299: one after the
+    # other took 126 s).
+    reports, [baseline] = run_pools(("flow", tmp_path / "pool", 2, {}), ("flow", tmp_path / "single", 1, {}),
+                                    timeout=120, start=started)
     # Where run_pool has each rank write its report, its parameters beside it.
     outputs = [tmp_path / "pool" / f"process{rank}.json" for rank in range(2)]
     baseline_path = tmp_path / "single" / "process0.json"

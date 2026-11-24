@@ -6,6 +6,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from model_support import attending
 
 from dew.interop import Pretrained
 from dew.sampling.text import Sampling
@@ -13,8 +14,9 @@ from dew.sampling.text import Sampling
 DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'qwen35-moe-native-tiny'
 
 
+@attending("reference")
 def test_qwen35_moe_text_and_images_match_the_conditional_reference():
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32')
     assert loaded.processor is not None
     text = loaded.processor.from_hf({
         'input_ids': np.load(DIRECTORY / 'text_input_ids.npy'),
@@ -36,12 +38,13 @@ def test_qwen35_moe_text_and_images_match_the_conditional_reference():
     np.testing.assert_array_equal(generated.tokens[:, -3:], np.load(DIRECTORY / 'continuation.npy'))
 
 
+@attending("reference")
 def test_qwen35_moe_images_are_laid_out_on_the_host_and_placed_once():
     """Qwen 3.5's processor lays a prompt's images out on the host, their rows aligned to their placeholders
     and the rotary positions computed from those host arrays, and places the model's inputs once
     (`Processor.from_hf`): no array is read back from a device on the way, where the image groups and
     grids were placed and then read back for the positions."""
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32')
     images = np.load(DIRECTORY / 'raw_images.npy')
     with jax.transfer_guard_device_to_host('disallow'):
         inputs = loaded.processor(json.loads((DIRECTORY / 'prompts.json').read_text()),
@@ -49,13 +52,14 @@ def test_qwen35_moe_images_are_laid_out_on_the_host_and_placed_once():
     assert 'rotary_positions' in inputs.token_fields
 
 
+@attending("reference")
 def test_advertised_mtp_without_weights_loads_the_actual_conditional_trunk(tmp_path):
     from interop_support import respelled
 
     checkpoint = respelled(DIRECTORY, tmp_path / 'checkpoint', lambda config: {
         **config, 'text_config': {**config['text_config'], 'mtp_num_hidden_layers': 1}})
-    advertised = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
-    original = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    advertised = Pretrained.load(checkpoint, dtype='float32')
+    original = Pretrained.load(DIRECTORY, dtype='float32')
     ids = np.load(DIRECTORY / 'text_input_ids.npy')
     np.testing.assert_array_equal(advertised.model.apply(advertised.variables, ids),
                                   original.model.apply(original.variables, ids))
@@ -72,6 +76,7 @@ def test_published_qwen35_moe_tiny_checkpoint_logits_and_generation():
                                 '57faabc3b49ec3ae69b8d6158130ce19496bc2d3', 'Qwen3.5 MoE')
 
 
+@attending("reference")
 def test_images_read_through_a_config_that_leaves_the_merge_size_to_its_default(tmp_path):
     """A Qwen 3.5 config may omit vision_config.spatial_merge_size, whose reference default is 2;
     the tower and merger are built at that default, so the processor places the images at it too
@@ -80,7 +85,7 @@ def test_images_read_through_a_config_that_leaves_the_merge_size_to_its_default(
 
     checkpoint = without_config_field(DIRECTORY, tmp_path / 'checkpoint',
                                       'vision_config', 'spatial_merge_size')
-    loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(checkpoint, dtype='float32')
     assert loaded.processor is not None
     images = np.load(DIRECTORY / 'raw_images.npy')
     inputs = loaded.processor(json.loads((DIRECTORY / 'prompts.json').read_text()),

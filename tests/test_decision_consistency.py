@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from decision_support import decision_rows
+from model_support import attending
 from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
 from dew.data.dataset import DataPartition
@@ -80,6 +81,7 @@ def test_a_window_numbers_each_rows_groups_apart_and_restores_the_padding():
     assert groups[0, 4] == -1 and canonical[0, 2, 1] == -1 and np.all(canonical[0, 4] == -1)
 
 
+@attending("xla")
 def test_a_weight_of_zero_reads_no_groups_and_a_weight_adds_the_term_beside_the_label_loss():
     """At consistency 0 a row carries no groups and the loss is the label loss alone; with a weight
     the label loss is unchanged to the bit, the term rides beside it, and the objective's value is
@@ -107,6 +109,7 @@ def test_a_weight_of_zero_reads_no_groups_and_a_weight_adds_the_term_beside_the_
     assert "consistency" in aux.metrics
 
 
+@attending("xla")
 def test_a_run_with_no_consistency_term_reads_no_groups_however_its_rows_state_them():
     """A raw row whose groups name a question it does not ask: a run with no consistency term reads its
     examples apart and never its groups, so it trains on the row (row 5734), where the row's groups were
@@ -132,6 +135,7 @@ def test_a_run_with_no_consistency_term_reads_no_groups_however_its_rows_state_t
         batch(0.5)
 
 
+@attending("xla")
 def test_a_looped_backbones_exit_gate_trains_under_ouros_exit_objective_over_each_passs_answers():
     """A decision over a backbone whose loop has an exit gate trains the gate under Ouro's exit objective
     (`exit_entropy`): each question's label loss at each pass, its answers read off that pass's states by
@@ -207,6 +211,7 @@ PARAPHRASED = GroupedExamples(
 member unlabelled; and an ungrouped question beside one of them."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("layout", [SegmentLayout.joint_row(max_len=4096),
                                     SegmentLayout.state_first_row(max_len=512)],
                          ids=["joint", "state-first"])
@@ -257,6 +262,7 @@ def test_examples_grouped_across_rows_train_in_one_window_and_agree_as_one_group
                                   np.asarray(apart[0]))
 
 
+@attending("xla")
 def test_a_unit_no_window_holds_trains_its_examples_apart_and_one_without_a_label_is_rejected():
     """A unit of rows the packer places whole: past a window's tokens its examples train apart, each a
     row of its own that fits alone, none dropped for its group, and with no labelled question it is
@@ -281,6 +287,7 @@ def test_a_unit_no_window_holds_trains_its_examples_apart_and_one_without_a_labe
     assert fit.map({"example": unlabelled}) == Rejected("unlabelled")
 
 
+@attending("xla")
 def test_grouped_examples_without_a_consistency_term_are_their_examples_rows():
     """With no consistency term the groups are not read: grouped examples pack as their examples do
     alone, the same windows to the token, so no unit ties their rows into one document."""
@@ -298,6 +305,7 @@ def test_grouped_examples_without_a_consistency_term_are_their_examples_rows():
             np.asarray(one), np.asarray(other), err_msg=name), grouped[name], alone[name])
 
 
+@attending("xla")
 @pytest.mark.parametrize("grouped", [False, True], ids=["apart", "consistency"])
 def test_grouped_examples_keep_the_examples_that_fit(grouped):
     """An example of grouped examples that no row holds is left out as it would be alone, and its
@@ -320,6 +328,7 @@ def test_grouped_examples_keep_the_examples_that_fit(grouped):
     assert rows(fit.map({"example": together})) == rows(fit.map({"example": fits}))
 
 
+@attending("xla")
 @pytest.mark.parametrize("asked", ["wire", "question"])
 def test_grouped_examples_read_from_their_own_rows_fields(asked):
     """A store's row of grouped examples' fields (`examples` and `groups`) trains as such a row does:
@@ -346,6 +355,7 @@ def test_grouped_examples_read_from_their_own_rows_fields(asked):
     assert any(np.sum(groups == group) == 3 for group in range(groups.shape[-1]))
 
 
+@attending("xla")
 def test_a_unit_is_budgeted_for_the_options_its_training_adds():
     """A unit's rows are budgeted at the length the training encoding may give them: with a "none of
     the above" added beside each answered choice (`none_of_the_above`), two rows that fit a window as
@@ -403,6 +413,7 @@ UNITS = {
 }
 
 
+@attending("xla")
 @pytest.mark.parametrize("case", list(UNITS))
 def test_a_unit_the_fit_holds_fits_its_window_however_training_draws_its_options(case):
     """Every draw of the training encoding's "none of the above", beside the right option or in its
@@ -521,6 +532,7 @@ def test_a_flat_tables_groups_column_reaches_its_example():
         table({"text": "t", "label": "billing", "groups": {"g": {"label": {"billing": "b", "tech": "t"}}}})
 
 
+@attending("xla")
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "both_ways"])
 def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_beside_the_label_loss(causal):
     """With `input_lm` w the loss is the label loss, unchanged to the bit, beside w times the rows' own
@@ -585,6 +597,7 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
     assert weighted.training_flops(None, batch) > plain.training_flops(None, batch)
 
 
+@attending("xla")
 def test_a_decision_run_training_an_exit_gate_steps_at_one_pass_of_a_sampled_count():
     """A decision run training a looped backbone's exit gate (`exit_entropy`) under a sampled pass count
     (`SampledPasses`) whose law draws one pass plans and steps (row 9691: the step of one pass held no

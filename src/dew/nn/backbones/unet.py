@@ -8,8 +8,6 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import AttentionImpl
-
 from ..activations import silu
 from ..attention_blocks import Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
@@ -37,7 +35,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None, operations=None):
     residual = partial(ResidualBlock, activation=model.activation,
                        norm_groups=model.norm_groups, dtype=model.dtype,
                        precision=model.precision)
-    attention = partial(stage_attention, attention_impl=model.attention_impl, dtype=model.dtype,
+    attention = partial(stage_attention, dtype=model.dtype,
                         precision=model.precision)
 
     x = operations.project(conv(features=feature_depths[0]), x)
@@ -119,7 +117,6 @@ class Unet(nn.Module):
     norm_groups:int=8
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: AttentionImpl = "auto"
 
     @nn.nowrap
     def _convolution(self, features: int, **scope):

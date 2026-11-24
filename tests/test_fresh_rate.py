@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import attending
 from test_optim import assert_updates_as, in_forms
 
 from dew.nn.cross_attention import CrossAttention, crossing
@@ -121,6 +122,7 @@ def labelled(groups: tuple[ParamGroup, ...], params) -> dict[tuple[str, ...], st
             for path, label in jax.tree_util.tree_leaves_with_path(labels)}
 
 
+@attending("reference")
 def test_a_decision_claims_its_sources_fresh_blocks_only_over_the_sources_weights():
     """A decision over a source that drew cross-attention blocks declares them, and the head it draws
     beside the loaded backbone, fresh: a fresh group claims exactly those parameters of its tree, the
@@ -132,7 +134,7 @@ def test_a_decision_claims_its_sources_fresh_blocks_only_over_the_sources_weight
     from dew.decision.objective import DecisionObjective
     from dew.interop import Pretrained
 
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference").with_cross_attention(
+    source = Pretrained.load(LLAMA, dtype="float32").with_cross_attention(
         CrossAttention((0,), 8), key=0, frozen=False)
 
     def decision(**variables) -> DecisionObjective:
@@ -149,6 +151,7 @@ def test_a_decision_claims_its_sources_fresh_blocks_only_over_the_sources_weight
     assert decision(variables=declared.init(jax.random.key(0))).fresh_modules() == ()
 
 
+@attending("reference")
 @pytest.mark.parametrize("named", [(), (FRESH, BASE)], ids=["no groups", "a fresh group"])
 def test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_groups_rate(named):
     """A `Trainer` built directly over a decision whose source drew a cross-attention block beside its
@@ -165,7 +168,7 @@ def test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_gr
     from dew.interop import Pretrained
     from dew.training import Trainer
 
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference").with_cross_attention(
+    source = Pretrained.load(LLAMA, dtype="float32").with_cross_attention(
         CrossAttention((0,), 8), key=0, frozen=False)
     decision = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
     trainer = Trainer(decision, OptimConfig(optimizer=Adam(), learning_rate=RATE, param_groups=named), key=0)
@@ -180,6 +183,7 @@ def test_a_trainer_given_a_config_steps_its_objectives_fresh_modules_at_their_gr
         assert_updates_as(trainer.optimizer, optax.adam(rate), params, [path], "/".join(path))
 
 
+@attending("reference")
 def test_a_parameter_a_loaded_module_gains_starts_at_its_draw_and_trains_in_the_fresh_group():
     """A loaded decoder whose modules gain parameters of their own, an exit gate a loop gives it
     (`Pretrained.with_model`), starts each at its initializer's draw, the loaded weights as they were, and
@@ -195,7 +199,7 @@ def test_a_parameter_a_loaded_module_gains_starts_at_its_draw_and_trains_in_the_
     from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.inputs import request_key
 
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     gated = source.with_model(dataclasses.replace(source.model, loop=Loop(steps=2, exit_gate=True)), key=3)
     assert gated.fresh == ("early_exit_gate/bias", "early_exit_gate/kernel")
     drawn = flatten_dict(unbox(gated.model.init(request_key(3), jnp.zeros((1, 1), jnp.int32)))["params"])

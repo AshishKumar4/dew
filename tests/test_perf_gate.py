@@ -869,7 +869,7 @@ def test_a_steps_compiled_ahead_on_a_host_with_no_gpu_are_named_for_their_cases(
     environ = {**outside_suite(os.environ), "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}"}
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_step.py"),
                            "--cases", json.dumps([TINY]),
-                           "--attention-impl", "xla", "--compile-ahead", str(tmp_path / "ahead"),
+                           "--attention", "xla", "--compile-ahead", str(tmp_path / "ahead"),
                            "--generation", "sm90", "--capacity-gib", "1"], cwd=ROOT, env=environ,
                           capture_output=True, text=True, timeout=900, check=False)
     assert done.returncode == 0, done.stderr[-3000:]

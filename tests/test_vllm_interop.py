@@ -50,6 +50,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from float64_terms import float64_forward
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from dew.inference import OpenAICompletion
@@ -98,12 +99,13 @@ def client() -> OpenAICompletion:
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def reference(client):
     """The served export read back into Dew: its tokenizer and fp32 model."""
     from transformers import AutoTokenizer
 
     return (AutoTokenizer.from_pretrained(client.model, local_files_only=True),
-            Pretrained.load(client.model, dtype="float32", attention_impl="xla"))
+            Pretrained.load(client.model, dtype="float32"))
 
 
 @pytest.fixture(scope="module")
@@ -113,6 +115,7 @@ def continuation(client) -> str:
     return client(PROMPTS[0], DRAWN, sampling=GREEDY).texts[0]
 
 
+@attending("xla")
 def test_the_server_tokenizes_and_draws_dews_own_greedy_continuation(client, reference):
     """The export describes one computation and both engines run it.
 
@@ -136,6 +139,7 @@ def test_the_server_tokenizes_and_draws_dews_own_greedy_continuation(client, ref
                                           f"({tokenizer.decode(ours)!r})")
 
 
+@attending("xla")
 def test_choices_stay_in_prompt_order_under_one_aggregate_usage(client, reference):
     """Many prompts are one request, and its usage is one total.
 
@@ -178,6 +182,7 @@ def test_top_k_top_p_and_min_p_reach_the_servers_sampler(client, continuation):
     assert drawn() != continuation
 
 
+@attending("xla")
 def test_a_stop_token_ends_the_completion_and_names_itself(client, reference):
     """`Sampling.eos_token_ids` is the client's only termination control, and it
     reaches the server as `stop_token_ids`.
@@ -203,6 +208,7 @@ def test_a_stop_token_ends_the_completion_and_names_itself(client, reference):
     assert int(np.asarray(ours.tokens)[0, len(head)]) == first
 
 
+@attending("xla")
 def test_the_server_reports_dews_own_logprobs(client, reference):
     """Tighter than the token identity, and it drifts first.
 

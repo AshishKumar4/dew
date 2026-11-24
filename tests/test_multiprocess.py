@@ -34,6 +34,7 @@ import numpy as np
 import pytest
 from lane_environment import MESH_DEVICES
 from interop_support import assert_same_stored_tensors, written_tensors
+from model_support import attending
 from pool_records import served_image
 from process_support import (
     ProcessGroup,
@@ -372,6 +373,7 @@ def test_a_schedule_ends_its_stage_at_one_step_on_every_process(tmp_path):
                                dumped_params(tmp_path / "alone" / "process0.json"))
 
 
+@attending("xla")
 @pytest.mark.distributed
 def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_path):
     """A slot release placed over two processes, its readout partitioned across them, publishes every
@@ -385,7 +387,7 @@ def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_pa
     source, _ = slot_release(tmp_path, "head")
     reports = run_pool("decision_publish", tmp_path / "out", 2, release=source, run_dir=tmp_path / "served")
     assert [report["partitioned"] for report in reports] == [True, True]
-    host = Pretrained.load(source, dtype="float32", attention_impl="xla", on_host=True)
+    host = Pretrained.load(source, dtype="float32", on_host=True)
     host.save(tmp_path / "saved")
     assert_same_stored_tensors(written_tensors(tmp_path / "served"), written_tensors(tmp_path / "saved"))
     assert_same_stored_tensors(dumped_params(tmp_path / "out" / "process0.json"),
@@ -1563,6 +1565,22 @@ def test_a_process_that_lost_its_local_copy_recovers_it_from_a_replica(tmp_path,
                                     dumped_params(tmp_path / "whole" / f"process{index}.json"))
 
 
+def test_a_replicas_holder_whose_read_fails_ends_every_process_of_the_resume(tmp_path, killed_local_pool):
+    """Process 1 lost its local step and process 0, which holds its replica, cannot read that step's
+    metadata (a disk that went bad): the holder's read fails on every process of the resume, each ending
+    with an error, none left waiting for an answer it never sends (row 12175: the peer waited for ever,
+    `Stuck`)."""
+    directory = tmp_path / "unreadable"
+    shutil.copytree(killed_local_pool, directory)
+    shutil.rmtree(directory / "local" / "process1")
+    step = local_committed(directory, 0, LOCAL_KILL_AFTER).parent
+    for written in [*step.rglob("_CHECKPOINT_METADATA"), *step.rglob("_METADATA")]:
+        written.write_text("not a checkpoint's metadata")
+    reports = run_pool("fit_refused", tmp_path / "resumed", 2, timeout=240, **local_flags(directory))
+    raised = [report["raised"] for report in reports]
+    assert raised[0] not in (None, "PeerFailure") and raised[1] == "PeerFailure", raised
+
+
 @pytest.fixture(scope="module")
 def killed_split_pool(tmp_path_factory):
     """The killed pool run of `killed_local_pool` with fsdp over every device of the pool, so each
@@ -1628,6 +1646,24 @@ def test_a_local_step_on_two_meshes_is_recovered_on_each_from_a_replica(tmp_path
     for report in run_pool("replica_grids", tmp_path / "pool", 2, devices=2, script=REPLICA_KEY):
         assert report["grids"] == 2 and report["covered"] is True, report
         assert report["recovered"] == report["expected"], report
+
+
+@pytest.mark.distributed
+def test_a_pool_whose_first_process_cannot_mark_a_shared_directory_fails_on_every_process(tmp_path):
+    """Process 0's mark of a directory the pool asks whether it shares (`seen_by_every_process`) that it
+    cannot write fails on every process, process 0 with its own error and its peer with the agreement's,
+    none left waiting for the mark (row 12176: the peer waited for ever)."""
+    reports = run_pool("shared_mark_refused", tmp_path / "pool", 2, script=REPLICA_KEY, timeout=120)
+    assert [report["raised"] for report in reports] == ["NotADirectoryError", "PeerFailure"], reports
+
+
+@pytest.mark.distributed
+def test_a_complex_leaf_a_process_lost_is_recovered_bit_for_bit_from_a_replica(tmp_path):
+    """A complex leaf the pool replicates, which the process that lost its copy receives from its replica's
+    holder, its real and imaginary parts each as their words, bit for bit (row 12177;
+    `replica_key_worker.replica_complex`)."""
+    for report in run_pool("replica_complex", tmp_path / "pool", 2, script=REPLICA_KEY):
+        assert report["bits"] == report["expected"], report
 
 
 # --------------------------------------------------------------------------
@@ -1858,6 +1894,7 @@ def test_a_pool_decides_its_frozen_fp8_sites_on_process_zero(tmp_path):
     assert [report["after"] for report in reports] == [True, True]
 
 
+@attending("reference")
 @pytest.mark.distributed
 def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
     """Identical user code on one device and on a two-process pool: the run's
@@ -2083,7 +2120,9 @@ def test_a_pool_agrees_on_its_decoding_components_or_refuses_the_request(tmp_pat
 
     The disagreements keep every shape and dtype identical: one rank bans a
     different token, one names a different function, one suppresses a
-    different token. A pool comparing only the schema would accept all three
+    different token, one function by one name reads a global set apart, and one
+    mapping holds the same pairs in another order (row 12171: a name and its
+    cells, a mapping sorted). A pool comparing only the schema would accept them
     and run two different policies without saying so.
     """
     reports = run_pool("decoding_components", tmp_path, 2, devices=2, fsdp_size=2, timeout=240)
@@ -2091,7 +2130,8 @@ def test_a_pool_agrees_on_its_decoding_components_or_refuses_the_request(tmp_pat
 
     for rank, report in enumerate(reports):
         assert report["rows"] == 3
-        assert report["refused"] == ["criterion payload", "transform identity", "transform payload"]
+        assert report["refused"] == ["criterion payload", "transform identity", "transform payload",
+                                     "transform globals", "transform mapping order"]
         # A chain both ranks agreed on, undefined on rank 1's rows alone,
         # is refused on both; weights on no mesh answer each rank's own
         # request of its own size as one process answers it.

@@ -7,7 +7,6 @@ import pytest
 from reference_error import assert_as_exact
 from test_level_stacking import (
     BLOCKED,
-    BLOCKED_SCANNED,
     BLOCKED_TRUTH,
     STACKING_SEEDS,
     banked,
@@ -35,9 +34,9 @@ def test_a_rows_blocks_at_rate_zero_score_as_its_forward_reads_them():
                     truth_fn=plain(BLOCKED_TRUTH, truth=True))
 
 
-@pytest.mark.parametrize(("model", "store"), [(BLOCKED, None), (BLOCKED_SCANNED, banked)],
-                         ids=["layers", "banked"])
-def test_a_rows_blocks_step_as_the_literal_chunk_loop_reads_them(model, store):
+@pytest.mark.parametrize(("stack_scan", "store"), [("plain", None), ("scanned", banked)],
+                         ids=["layers", "banked"], indirect=["stack_scan"])
+def test_a_rows_blocks_step_as_the_literal_chunk_loop_reads_them(stack_scan, store):
     """A decoder's blocks step in context over rows whose attention reads blocks whole, each target's loss on
     par with the literal chunk loop's (`chunk_loop`, check 1), whose chunk holds a block's every token from
     the chunk its first token is in: a block's chunk reads it whole before the cache holds it, at that
@@ -48,6 +47,6 @@ def test_a_rows_blocks_step_as_the_literal_chunk_loop_reads_them(model, store):
         return jax.jit(lambda variables, tokens, blocks: chunk_loop(reference, variables, tokens, adaptation,
                                                                     truth=truth, blocks=blocks))
 
-    assert_as_exact(jax.jit(stacked(adaptation, model, store)), literal(BLOCKED, truth=False), blocked_draw,
+    assert_as_exact(jax.jit(stacked(adaptation, BLOCKED, store)), literal(BLOCKED, truth=False), blocked_draw,
                     "stacked blocks over a row's blocks", seeds=STACKING_SEEDS["blocks"],
                     truth_fn=literal(BLOCKED_TRUTH, truth=True))

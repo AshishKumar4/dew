@@ -62,6 +62,7 @@ The recipe's data is a chain, which it records with the run, and its model a `Mo
 ```python
 # byte_demo.py
 from dew.config import TrainerConfig
+from dew.config.trainer import Diagnostics
 from dew.training import Horizon
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
@@ -74,8 +75,9 @@ run = LMRunConfig(
     data=TokenFiles("tokens/train").shuffle(seed=0).repeat().pipe(presets.token_windows, **windows)
     .loading(loading),
     validation=TokenFiles("tokens/val").pipe(presets.token_windows, **windows, records=16).loading(loading),
-    model=ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "reference", "emb_features": 16,
-                                             "num_layers": 1, "num_heads": 2, "mlp_features": 32}),
+    model=ModelConfig("causal_transformer", {"dtype": "float32", "emb_features": 16, "num_layers": 1,
+                                             "num_heads": 2, "mlp_features": 32}),
+    diagnostics=Diagnostics(kernels={"attention": "reference"}),
     trainer=TrainerConfig(horizon=Horizon(steps=2), log_every=1, eval_every=2, checkpoint_every=2,
                           checkpoint_dir="runs", name="byte-demo", multi_host=False),
     max_new_tokens=0,
@@ -123,7 +125,7 @@ Each setting's default is the recipe's own, which can differ from the configurat
 | Setting | Notes |
 |---|---|
 | model `dtype` | The model's compute dtype, which each recipe's default model states (`ModelConfig` fields). Parameters are stored in float32. A run-wide matmul precision is `--trainer.precision`; a model's own is its `precision` field. |
-| model `attention_impl` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
+| `--diagnostics.kernels` | The kernel the run runs for each op it names, its attention's a name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example names `reference` so no device-specific kernel runs. |
 | `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon`, `muonclip` or `laprop` at its defaults, or its record with its settings as JSON (`'{"class": "adamw", "fields": {"b2": 0.95}}'`). |
 | `--optim.learning-rate` | The learning rate: a number, or a schedule's record as JSON (`'{"class": "cosine", "fields": {...}}'`). |
 | `--trainer.horizon.steps` / `--trainer.horizon.epochs` | Run length; set one, not both. |
@@ -151,7 +153,7 @@ To train on your own text, export records with the tokenizer the run will use. T
 
 For whole documents, preserve their boundaries when exporting: the producer ends each with the tokenizer's EOS unless told `--no-eos`; and pack them in a run file, which packs in the store's order and orders the packed rows after: `TokenFiles(url).pipe(presets.lm, None, seq_len=256, batch=None, pack="first-fit").shuffle(0).repeat().batch(32)`. The byte tokenizer's EOS is ID 255, which never occurs in UTF-8 text. Packing resets attention boundaries and positions between documents.
 
-`--pretrained` takes a supported Hugging Face model directory, a Hub ID, `repo@revision` for a branch, tag or commit, or a saved Dew run's directory, whose checkpoint `--source.step` (a step, `latest`, `best` or `best:<metric>`) and `--source.ema` select and the run's record pins. A Hub ID can start a download, which may need authentication and a license agreement. `run.json` records a Hub source as `repo@commit`, with the commit it resolved to. To run offline, prepare a local checkpoint and its tokenizer, tokenize the data with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. The checkpoint decides the architecture, so of its model's fields `max_seq_len`, `dtype` and `attention_impl` alone may be set. With any other field, the recipe refuses to load the checkpoint. [Language models](concepts/language_models.md) covers loading and export.
+`--pretrained` takes a supported Hugging Face model directory, a Hub ID, `repo@revision` for a branch, tag or commit, or a saved Dew run's directory, whose checkpoint `--source.step` (a step, `latest`, `best` or `best:<metric>`) and `--source.ema` select and the run's record pins. A Hub ID can start a download, which may need authentication and a license agreement. `run.json` records a Hub source as `repo@commit`, with the commit it resolved to. To run offline, prepare a local checkpoint and its tokenizer, tokenize the data with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. The checkpoint decides the architecture, so of its model's fields `max_seq_len` and `dtype` alone may be set. With any other field, the recipe refuses to load the checkpoint. [Language models](concepts/language_models.md) covers loading and export.
 
 The LM recipe's objective is `lm`, `masked_diffusion` or `block_diffusion` (`ObjectiveConfig`), each with its own constructor's arguments as fields: `mtp_weight` 0.3 for `LMObjective`, say, and `prefix` 64 (or `"prompt"`, on chat rows) for a prefix run ([Prefix blocks](concepts/language_models.md#prefix-blocks)). `masked_diffusion` trains a bidirectional masked-denoising model, with an EMA (`ema_decay`, 0.999) unless set to `None`. With `--pretrained` it continues from a LLaDA or Dream checkpoint. Without it, the model starts from a fresh initialization, and needs the model's `mask_token_id` as well as `causal=False`. `block_diffusion` fine-tunes a DiffusionGemma checkpoint and needs both `--pretrained` and a token-store chain, and `prompt_length`, the clean prefix of each row. The recipe does not run SFT, distillation, DPO, GRPO or PPO; those run in Python, alone or chained with pretraining by `recipes/chain.py` ([Stage chains](concepts/post_training.md#stage-chains)).
 
@@ -168,7 +170,7 @@ By default the recipe trains on Oxford Flowers with a CLIP condition encoder. Pr
 
 For a committed store, the chain's source is its URL (`RunConfig.override({"data.source.url": ...})` points a recipe's chain at it). A URL catalog adds a fetch step before decoding, written in the chain. The CLIP condition and metric need their pretrained checkpoint; an offline tracker does not prepare it.
 
-`--pretrained` fine-tunes a published diffusion pipeline in the diffusers layout. It takes a Hub ID, `repo@revision` or a local directory holding SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image or Z-Image. The pipeline decides the model, its autoencoder and its text conditioning, which comes from all of its text encoders and reaches the model as `conditioning`. So the run's model then states only its `dtype` and `attention_impl`, the parameters load in float32, and `text` and `autoencoder` stay unset. The pipeline runs at the data's resolution, and its images use the autoencoder's own channels; Qwen-Image 2.1's, for example, are RGBA. `--pretrained` also takes a saved Dew diffusion run's directory, at the checkpoint `--source.step` and `--source.ema` select: the run starts from that run's own model, conditioning, autoencoder, weights and sampling policy, as its `TextToImage.from_run` holds them.
+`--pretrained` fine-tunes a published diffusion pipeline in the diffusers layout. It takes a Hub ID, `repo@revision` or a local directory holding SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image or Z-Image. The pipeline decides the model, its autoencoder and its text conditioning, which comes from all of its text encoders and reaches the model as `conditioning`. So the run's model then states only its `dtype`, the parameters load in float32, and `text` and `autoencoder` stay unset. The pipeline runs at the data's resolution, and its images use the autoencoder's own channels; Qwen-Image 2.1's, for example, are RGBA. `--pretrained` also takes a saved Dew diffusion run's directory, at the checkpoint `--source.step` and `--source.ema` select: the run starts from that run's own model, conditioning, autoencoder, weights and sampling policy, as its `TextToImage.from_run` holds them.
 
 `preset:none` trains with the convention the pipeline's scheduler reads, using the flow shift its sampler applies at that resolution. That shift is 3.0 for SD3, and for Flux it is exp(mu), with mu linear in the packed latent's token count. A scheduler file says how its checkpoint samples and says nothing about how it was trained, so this is a choice Dew makes for fine-tuning. A preset of the same kind replaces it, for example `preset:flow --preset.shift 1.0`. `run.json` records a Hub source as `repo@commit`.
 

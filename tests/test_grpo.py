@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import attending
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -315,7 +316,7 @@ def annealing(**fields) -> GRPOObjective:
     from dew.nn.dex import DifferentialExtension
 
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                              max_seq_len=12, dtype="float32", attention_impl="xla",
+                              max_seq_len=12, dtype="float32",
                               dex=DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
     return GRPOObjective(model, seq_len=7, behavior_importance=2.0, **fields)
 
@@ -358,6 +359,7 @@ def asynchronously(objective: GRPOObjective, seen, steps: int = 6, *, rewarded: 
                                                                    checkpoint_every=None)
 
 
+@attending("xla")
 def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads():
     """An asynchronous collection's proximal policy, rescored under the trainer's weights
     (`Asynchronous.rescore`), is the policy the step's loss reads, at the updates the run has committed
@@ -383,6 +385,7 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
     assert not np.array_equal(rescored, ended)
 
 
+@attending("xla")
 def test_a_reward_penalty_over_the_starting_weights_is_nil_half_way_through_an_anneal():
     """The reward's reference penalty (`GRPOObjective.reward_kl`) scores the reference at the progress the
     proximal column is read at (ledger 2666): half way through a DEX decoder's anneal, rows rescored at

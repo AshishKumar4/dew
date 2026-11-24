@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import fixture_ids, transformers_arms, transformers_model
+from model_support import attending
 from reference_error import assert_as_exact, widened
 
 from dew.interop import Pretrained
@@ -22,6 +23,7 @@ LOGITS_SEEDS = {False: 16, True: 16}
 left-padded, sized by `seeds_for` paired with Dew's logits on the CPU."""
 
 
+@attending("reference")
 @pytest.mark.parametrize('padded', [False, True])
 def test_phi3_short_and_long_logits_match_transformers(padded):
     """Rows past LongRoPE's 8-token original context read the long factors and their first four ids
@@ -30,7 +32,7 @@ def test_phi3_short_and_long_logits_match_transformers(padded):
     the mask counts, too."""
     import torch
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32')
     mask = np.load(DIRECTORY / 'attention_mask.npy') if padded else None
     valid = np.ones(np.load(DIRECTORY / 'input_ids.npy').shape, bool) if mask is None else mask
     # The fields its recorder (tools/hf_reference.py `write_classic_tiny`) gave each row.
@@ -55,11 +57,12 @@ def test_phi3_short_and_long_logits_match_transformers(padded):
                                   reference(ids)['long'].argmax(-1))
 
 
+@attending("reference")
 def test_phi3_cached_greedy_crosses_the_longrope_boundary():
     from dew.inference.tasks import TextGeneration
     from dew.sampling.text import Sampling
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', max_seq_len=48)
     ids = np.load(DIRECTORY / 'input_ids.npy')
     task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0))
     generated = task(ids[:, :4], max_new_tokens=6, key=0)
@@ -71,6 +74,7 @@ CROSSING_SEEDS = 128
 sized by `seeds_for` paired with Dew's walk on the CPU."""
 
 
+@attending("reference")
 def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_the_crossing():
     """Four ids prefilled and six more fed one at a time through the cache, which rebuilds where the
     rows grow past LongRoPE's original context: each step's logits are on par with transformers'
@@ -79,7 +83,7 @@ def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_
     from dew.nn.inputs import ModelInputs
     from dew.sampling.text import decode_ops, prefill_state
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', max_seq_len=48)
     ops = decode_ops(loaded.model, loaded.variables, 0, 0)
 
     def ours(ids):
@@ -100,6 +104,7 @@ def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_
         np.testing.assert_array_equal(np.asarray(logits).argmax(-1), reference(ids)[step].argmax(-1))
 
 
+@attending("reference")
 def test_a_kinds_longrope_rebuilds_the_cache_at_its_crossing_as_the_models_does():
     """LongRoPE given on the layers' kind rather than on the model switches its factors at the same
     crossing, which the cache rebuilds at (`cache_rebuild_position`, over every layer's kind): the
@@ -110,7 +115,7 @@ def test_a_kinds_longrope_rebuilds_the_cache_at_its_crossing_as_the_models_does(
     from dew.nn.inputs import ModelInputs
     from dew.sampling.text import decode_ops, prefill_state
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', max_seq_len=48)
     kinds = dict(loaded.model.kinds or {})
     kinded = loaded.model.clone(rope_scaling=None, kinds={**kinds, **{
         kind: dataclasses.replace(kinds.get(kind, LayerKind()), rope_scaling=loaded.model.rope_scaling)
@@ -134,10 +139,11 @@ MIXED_SEEDS = 32
 `seeds_for` paired with Dew's rows on the CPU."""
 
 
+@attending("reference")
 def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64_rule():
     import torch
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', max_seq_len=64)
     shape = np.load(DIRECTORY / 'input_ids.npy')[:, :4].shape
     positions = np.stack((np.arange(12, 16), np.arange(4)))
     vocabulary = json.loads((DIRECTORY / 'config.json').read_text())['vocab_size']
@@ -170,6 +176,7 @@ PACKED_SEEDS = 8
 with the packed row on the CPU."""
 
 
+@attending("reference")
 def test_phi3_packed_documents_each_take_their_own_longrope_table():
     """A packed row selects LongRoPE's short or long factors per document, by how far the
     document reaches past the 8-token original context, as the document alone does: a 3-token
@@ -180,7 +187,7 @@ def test_phi3_packed_documents_each_take_their_own_longrope_table():
     logits alone from their float64 run over drawn ids (check 1)."""
     from dew.nn.inputs import ModelInputs
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', max_seq_len=48)
     vocabulary = json.loads((DIRECTORY / 'config.json').read_text())['vocab_size']
     wide = loaded.model.clone(dtype=jnp.float64)
     for lengths, start in (((3, 9), None), ((6,), None), ((1, 1, 1, 9), -2)):
@@ -221,12 +228,13 @@ def test_phi3_packed_documents_each_take_their_own_longrope_table():
                         truth_fn=lambda tokens, by=by_itself: by(wide, widened(loaded.variables))(tokens))
 
 
+@attending("reference")
 def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
     from dew.inference import TextGeneration
     from dew.inference.serving import Server
     from dew.sampling import Sampling
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', max_seq_len=64)
     task = TextGeneration(loaded.model, loaded.variables,
                           sampling=Sampling(temperature=0, eos_token_ids=None))
     ids = np.load(DIRECTORY / 'input_ids.npy').astype(np.int32)
@@ -245,6 +253,8 @@ def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
         np.testing.assert_array_equal(served.lengths, alone.lengths)
 
 
+@attending("reference")
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_banked_phi3_server_rebuilds_each_crossing_rows_cache_on_its_own_rows():
     """Phi-3 scanning its layers over a banked store (`HeldBanks.place`), whose decode cache is banked as
     its weights, the layers first: three rows of a dense server over its two layers cross the LongRoPE
@@ -258,8 +268,7 @@ def test_a_banked_phi3_server_rebuilds_each_crossing_rows_cache_on_its_own_rows(
     from dew.sampling import Sampling
     from dew.training import MeshSpec
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64,
-                             scan_layers=True)
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', max_seq_len=64)
     banked = HeldBanks(loaded.variables).place(loaded.model, mesh=MeshSpec().build(jax.devices()[:1]))
     task = TextGeneration(loaded.model, banked, sampling=Sampling(temperature=0, eos_token_ids=None))
     ids = np.load(DIRECTORY / 'input_ids.npy').astype(np.int32)
@@ -275,6 +284,7 @@ def test_a_banked_phi3_server_rebuilds_each_crossing_rows_cache_on_its_own_rows(
         np.testing.assert_array_equal(served.lengths, alone.lengths)
 
 
+@attending("reference")
 def test_a_fused_projection_and_its_part_stored_apart_must_agree(tmp_path):
     """Phi-3 fuses gate and up as gate_up_proj, so a checkpoint that also
     stores the gate under its own name holds that part twice. An equal copy
@@ -287,14 +297,14 @@ def test_a_fused_projection_and_its_part_stored_apart_must_agree(tmp_path):
     fused = tensors['model.layers.0.mlp.gate_up_proj.weight']
     gate = fused[: fused.shape[0] // 2]
     ids = np.load(DIRECTORY / 'input_ids.npy')
-    alone = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    alone = Pretrained.load(DIRECTORY, dtype='float32')
 
     part = 'model.layers.0.mlp.gate_proj.weight'
     save_hf_layout({**tensors, part: gate.copy()}, config, tmp_path / 'equal')
-    twice = Pretrained.load(tmp_path / 'equal', dtype='float32', attention_impl='reference')
+    twice = Pretrained.load(tmp_path / 'equal', dtype='float32')
     np.testing.assert_array_equal(twice.model.apply(twice.variables, ids),
                                   alone.model.apply(alone.variables, ids))
 
     save_hf_layout({**tensors, part: gate + 1}, config, tmp_path / 'unequal')
     with pytest.raises(ValueError):
-        Pretrained.load(tmp_path / 'unequal', dtype='float32', attention_impl='reference')
+        Pretrained.load(tmp_path / 'unequal', dtype='float32')

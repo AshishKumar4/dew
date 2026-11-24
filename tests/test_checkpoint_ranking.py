@@ -16,6 +16,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Counting, dataset, val_batches
+from model_support import attending
 from recording import RecordingTracker
 
 from dew.artifacts import TokenScores
@@ -955,6 +956,7 @@ def test_a_runs_persistent_and_local_checkpoints_hold_one_envelope(tmp_path):
                                             persistent["state"], saved["state"])))
 
 
+@attending("xla")
 def test_a_validation_pass_scores_the_head_model_and_context_it_runs_under():
     """A validation pass's loss is the one a fresh objective of the same head, model and context scores, bit
     for bit: after its objective tiles its head, after a model that predicts otherwise replaces its own at
@@ -974,7 +976,7 @@ def test_a_validation_pass_scores_the_head_model_and_context_it_runs_under():
 
     def model(**fields):
         return CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                                 max_seq_len=16, dtype='float32', attention_impl='xla', **fields)
+                                 max_seq_len=16, dtype='float32', **fields)
 
     batch = {'text': np.tile(np.arange(9, dtype=np.int32), (8, 1))}
     objective = LMObjective(model(), seq_len=8, ema_decay=None)

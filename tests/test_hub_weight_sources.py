@@ -25,7 +25,7 @@ import sys
 import numpy as np
 from flax.traverse_util import flatten_dict
 from dew.interop import Pretrained
-loaded = Pretrained.load(sys.argv[1], dtype="float32", attention_impl="reference")
+loaded = Pretrained.load(sys.argv[1], dtype="float32")
 flat = flatten_dict(loaded.variables)
 np.savez(sys.argv[2], **{"/".join(path): np.asarray(leaf) for path, leaf in flat.items()})
 """

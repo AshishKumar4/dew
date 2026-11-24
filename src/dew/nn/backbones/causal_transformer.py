@@ -45,7 +45,6 @@ from dew.batch import (
     token_coordinates,
     with_validity,
 )
-from dew.nn.attention import AttentionImpl
 from dew.nn.continuum import (
     HeadTerms,
     Levels,
@@ -69,6 +68,7 @@ from ..flops import counted_flops, parameter_flops
 from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import LayerInputs, PredictionPhase, coordinates_of
+from ..kernels import generation
 from ..kv_cache import CacheSpec, KVCache, put_opened
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mla import MLAMixer
@@ -154,10 +154,11 @@ class CausalTransformer(LinearProducts):
     (arXiv 2412.19437, section 2.2). Each depth is therefore one position
     shorter than the one before it.
 
-    With `scan_layers`, each run of like layers (layers whose resolved specs
-    give the same parameter shapes and computation) runs as one scanned body,
-    so compile time stops growing with depth. The variables tree stays the
-    unscanned one (`StackView`). `init` always draws a run of like layers under
+    Each run of like layers (layers whose resolved specs give the same
+    parameter shapes and computation), and a step's periodic repeats, run as
+    one scanned body (`decoder_stages.scanned`), so compile time grows with
+    the period, not the depth. The variables tree stays the unscanned one
+    (`StackView`). `init` always draws a run of like layers under
     the scan, once per run. When the mesh has a stage axis larger than one, the
     stack runs as a pipeline.
     """
@@ -333,7 +334,6 @@ class CausalTransformer(LinearProducts):
     dtype: Dtype | None = dataclasses.field(default=None, metadata={RUNS: True, NUMBERS: True})
     precision: PrecisionLike = dataclasses.field(default=None, metadata={RUNS: True, NUMBERS: True})
     force_fp32_for_softmax: bool = dataclasses.field(default=True, metadata={RUNS: True, ROUNDS: True})
-    attention_impl: AttentionImpl = dataclasses.field(default="auto", metadata={RUNS: True})
     kv_cache: KVCache = dataclasses.field(default=KVCache(), metadata={RUNS: True})
     """How attention layers store the decode cache: dense or paged, full or
     quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""
@@ -404,15 +404,11 @@ class CausalTransformer(LinearProducts):
     (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
-    scan_layers: bool = dataclasses.field(default=False, metadata={RUNS: True})
-    """Runs of like layers under flax's scan, and a step over resident weights, training's or a decode
-    step's, a period's repeats as one body too (`scan_groups(periodic=True)`), so its program grows with
-    the period, not the depth; a stage-local state on one stage holds each run as the scan reads it."""
     bank_layers: int | None = dataclasses.field(default=None, metadata={RUNS: True})
     """The most layers one scanned run holds, which is also how many layers its
     parameter bank stacks. A longer run of like layers is split into
     consecutive runs of at most this many, each with its own bank under its own
-    name. None keeps a whole run in one bank. `scan_layers` and `init` read it,
+    name. None keeps a whole run in one bank. The scan and `init` read it,
     and because init draws each run under one scan, it also changes what init
     draws for a given seed. The split bounds the memory needed to build a
     host-resident bank and read it back, so set it for a deep stack that is
@@ -633,7 +629,7 @@ class CausalTransformer(LinearProducts):
         bound to them reads them. `scanned` records whether those fetches are
         sequenced, which a host layout requires.
         """
-        return (DecoderBank((), self.stored_view(store), scanned=self.scan_layers),)
+        return (DecoderBank((), self.stored_view(store), scanned=decoder_stages.scanned()),)
 
     def stored_view(self, store: Variables) -> StackView:
         """How `store` holds this decoder's layer stack (`bank_sites`), as a decoder bound to its shapes
@@ -800,7 +796,7 @@ class CausalTransformer(LinearProducts):
                                for index, key in enumerate(zip(specs, structures, strict=True)))
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
-        self.groups = scan_groups(self.scan_keys, self.bank_layers) if self.scan_layers else tuple(
+        self.groups = scan_groups(self.scan_keys, self.bank_layers) if decoder_stages.scanned() else tuple(
             (index, 1) for index in range(self.num_layers))
         self.mtp = decoder_predictions.depths(self, types, kinds, mixer_spec, gated_mlp, routed, wiring)
         if self.dspark is not None:
@@ -1481,9 +1477,10 @@ class CausalTransformer(LinearProducts):
         # A one-stage state another run stacked, which this stack does not scan, holds the runs this stack
         # scanning would (its periods among them): read as that stack's, it goes back onto its layers.
         held = 'stages' in dict(dict(store).get('params', {}))
-        model = self.clone(scan_layers=True) if stages == 1 and held and not self.scan_layers else self
-        view = model._view_of(store, lambda module: decoder_stages.stage_view(module, stages))
-        if stages == 1 and not (model.scan_layers and any(count > 1 for _, count in view.groups)):
+        scans = decoder_stages.scanned() or (stages == 1 and held)
+        with generation.chosen(layer_scan="scanned" if scans else "plain"):
+            view = self._view_of(store, lambda module: decoder_stages.stage_view(module, stages))
+        if stages == 1 and not (scans and any(count > 1 for _, count in view.groups)):
             return ()
         return (DecoderBank((), view),)
 
@@ -1759,11 +1756,6 @@ class CausalTransformer(LinearProducts):
     def with_dex(self, extension: DifferentialExtension | None) -> Self:
         """This decoder with `extension`'s differential on its chosen heads (`dew.nn.dex`), None for none."""
         return self.clone(dex=extension)
-
-    @nn.nowrap
-    def with_scanned_layers(self) -> Self:
-        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
-        return self.clone(scan_layers=True)
 
     @nn.nowrap
     def reads_progress(self) -> bool:
