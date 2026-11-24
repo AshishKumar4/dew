@@ -40,7 +40,7 @@ def tokenwise(query, key, value, log_decay, beta, momentum_decay, erase, state, 
         error = jnp.einsum('bhk,bhkv->bhv', p, memory) - v
         momentum = jnp.exp(mu)[..., None, None] * momentum + k[..., :, None] * error[..., None, :]
         memory = jnp.exp(a)[..., None, None] * memory - b[..., None, None] * momentum
-        return (memory, momentum), jnp.einsum('bhk,bhkv->bhv', q * KEYS ** -0.5, memory)
+        return (memory, momentum), jnp.einsum('bhk,bhkv->bhv', q * q.shape[-1] ** -0.5, memory)
 
     steps = (*(jnp.moveaxis(jnp.asarray(x, work), 1, 0)
                for x in (query, key, value, log_decay, beta, momentum_decay, erase)), first.T)
