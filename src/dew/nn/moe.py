@@ -44,6 +44,7 @@ from dew.nn.residuals import Residual
 
 from .activations import (
     GatedActivation,
+    Situ,
     gated_hook,
     gated_product,
     logistic,
@@ -829,7 +830,7 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     compute, paired = _paired(x, gate, up, dtype)
     down_stack, down_layer = (down.stack, down.layer) if isinstance(down, Layered) else (down, None)
     if (paired is None or down_layer is not paired[-1] or isinstance(down_stack, formats.NvFp4)
-            or _recipe_takes_experts(down_stack) or not isinstance(activation, str)):
+            or _recipe_takes_experts(down_stack) or isinstance(activation, Situ)):
         gate_scale, up_scale, down_scale = scales or (None, None, None)
         gate_rows, up_rows = (_apart(x, (gate, up), group_sizes, compute, implementation, precision,
                                      (gate_scale, up_scale))
