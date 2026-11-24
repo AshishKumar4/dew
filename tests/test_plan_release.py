@@ -168,7 +168,10 @@ def test_a_frontier_below_a_plan_settled_joined_reads_the_parted_steps_beneath_i
     settled, place = search.rung_now(), search.place()
     assert search.compiled == [(0, None), place] and place[0] > 0, search.compiled
     lighter = search.below([1], origin, settled)
-    assert [(probe.rung["ns_group"], probe.fits) for probe in lighter] == [(1, True)], search.compiled
+    # The configured rung's parted step read first, and every lighter plan found a parted one: each place
+    # beneath the plan (its head's tiles, XLA's defaults) misses joined and fits parted.
+    assert search.compiled[2] == (0, 1) and lighter, search.compiled
+    assert all(probe.rung["ns_group"] == 1 and probe.fits for probe in lighter), search.compiled
 
 
 def test_a_process_whose_trace_noted_no_stacks_reads_the_frontier_its_peers_read():
@@ -184,4 +187,7 @@ def test_a_process_whose_trace_noted_no_stacks_reads_the_frontier_its_peers_read
     assert search.searched([1], 0) == 1
     settled = search.rung_now()
     lighter = search.below([1], origin, settled)
-    assert [(probe.rung["ns_group"], probe.fits) for probe in lighter] == [(1, True)], search.compiled
+    # The configured rung's parted step read first, and every lighter plan found a parted one: each place
+    # beneath the plan (its head's tiles, XLA's defaults) misses joined and fits parted.
+    assert search.compiled[2] == (0, 1) and lighter, search.compiled
+    assert all(probe.rung["ns_group"] == 1 and probe.fits for probe in lighter), search.compiled
