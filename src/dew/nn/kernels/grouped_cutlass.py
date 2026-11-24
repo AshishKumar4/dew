@@ -108,7 +108,6 @@ class _Cutlass(_GroupedLaunch[tiling.Tiles]):
         return config in self.space(ba)
 
 
-@dataclasses.dataclass(frozen=True)
 def _formed(tokens: jax.Array, prologue_operands: tuple, hooks: Hooks) -> jax.Array:
     """The rows a CUTLASS launch multiplies: `tokens` through the call's prologue where it has one, formed by
     XLA before the call in the tokens' dtype, as `gemm`'s portable program forms them (the copy a call naming
@@ -120,6 +119,7 @@ def _formed(tokens: jax.Array, prologue_operands: tuple, hooks: Hooks) -> jax.Ar
     return hooks.before()(tokens, *prologue_operands).astype(tokens.dtype)
 
 
+@dataclasses.dataclass(frozen=True)
 class CutlassGmm(_Cutlass):
     """`Gmm` through CUTLASS (the wheel's grouped GEMM target, `dew_cutlass.TARGETS`)."""
 
