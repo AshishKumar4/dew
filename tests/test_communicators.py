@@ -25,6 +25,11 @@ from dew._code import code_digest
 from dew._devices import FRACTIONS, WRITTEN, pool_bound
 from dew.communicators import Collectives, CommunicatorRoom, Needs
 
+AT_RUN = "its programs compiled and admitted as it runs them, against the GPU's live room, no check-1 site"
+"""Why a test here compiles at its run (`compiles_at_run`): what it checks is a program's admission against
+the room its GPU holds as each compile runs, which a part's prepare, its device computing nothing, has none
+of to compile ahead (rows 12622 to 12628)."""
+
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 GIB = 2**30
 
@@ -319,6 +324,7 @@ def test_a_program_of_no_identity_is_admitted_by_its_communicators_alone_and_hel
     resident.admit(every, FOUR, room, lambda gpu: 0)
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_program_released_before_it_ran_leaves_its_communicators_unmade_and_charged_to_no_other():
     """A program admitted that never runs is charged ahead of every later one only while it lives: its
     executable released (a search's passed-over rung), what it would have loaded and connected is no
@@ -597,6 +603,7 @@ def test_a_program_compiled_ahead_for_absent_gpus_is_not_admitted_here():
 
 
 @pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search_naming_it():
     """A fit search whose every candidate's admission refuses it (`dew.communicators.CommunicatorRoom`: the
     runtime's need past the room the pool left) asks each candidate as a step that misses, and refuses the
@@ -634,6 +641,7 @@ def test_a_step_whose_admission_refuses_every_candidate_is_refused_by_its_search
     assert outcomes and "fits" not in outcomes, refused.value.asked
 
 
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 @pytest.mark.parametrize("fetched", [False, True], ids=["called", "fetched"])
 def test_a_program_whose_keywords_are_named_as_its_own_call_runs(fetched):
     """A function whose keyword arguments are named `args`, `kwargs` and `executable`, run through Dew's
@@ -653,6 +661,7 @@ def test_a_program_whose_keywords_are_named_as_its_own_call_runs(fetched):
 
 
 @pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_first_run_that_fails_raises_to_its_caller_and_stays_charged_as_not_run():
     """A program's first run that fails on its devices, as an asynchronous one does where its outputs are
     awaited, raises its error to its caller (`communicators.called`), whoever calls it, never swallowed,
@@ -689,6 +698,7 @@ def _charged(program, gpu: int) -> int:
 
 
 @pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(monkeypatch):
     """A fit whose search compiled the step whole, which missed, and split, which fits, and ran the split
     step charges every later program its own load alone, what the step's first run measured: never the
@@ -743,6 +753,7 @@ def test_a_settled_plan_charges_no_later_program_for_one_its_search_passed_over(
 
 
 @pytest.mark.gpu(reason="a program's admission charges a GPU's room outside XLA's pool alone")
+@pytest.mark.compiles_at_run(reason=AT_RUN)
 def test_an_inspected_runs_sampled_step_is_taken_as_run_once_it_completes():
     """A run inspecting every other step runs its plain step on its first step and its sampled step, a
     program of its own, on its second: each is taken as run as its own first run completes, at the runner
