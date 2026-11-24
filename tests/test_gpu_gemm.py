@@ -55,6 +55,7 @@ import numpy as np
 import pytest
 import syrk_matrix
 import test_contracts_gemm as contracts_gemm
+import test_fed_walks as fed_walks
 import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
 import test_gemm_nvfp4_chain as gemm_nvfp4_chain
@@ -180,11 +181,37 @@ PARTIAL_TILE = "a TMA copy of a partial tile, which reads zeros and clips stores
 RING = "a ring's asynchronous slots, which the interpreter walks in one order"
 """Why the toolkit's rings stay on the GPU (the GEMM lane, 11-11)."""
 
+SHARED = "a collective cp.async pipeline's meets, which the interpreter takes as no-ops (row 5272)"
+"""Why two mma.sync consumers' shared walk stays on an A100 (row 12652)."""
+
 CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
 """Why a pair of multiprocessors' cooperative tile stays on the GPU (the GEMM lane, 11-12)."""
 
 BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the interpreter runs in one order"
 """Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
+
+
+def _toolkit_cells() -> list[Cell]:
+    """The toolkit's rings and walks on the GPUs whose waits the interpreter takes as no-ops: an H100's rings
+    and reads, an A100's shared cp.async pipeline (each kept by name for its fault)."""
+    return [
+        *(Cell(f"a ring streams tiles of their own trip counts: {consumers} consumers",
+               functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
+                                 consumers), "sm90", fault=RING)
+          for consumers in (1, 2)),
+        *(Cell(f"every warpgroup read lands its products: {path}",
+               functools.partial(mosaic_toolkit.every_warpgroup_read_lands_its_products_on_an_h100, path),
+               "sm90", fault="ptxas's fold of a read path's sign op (row 4346)")
+          for path in mosaic_toolkit.READS),
+        *(Cell(f"consumers feeding their own ring split a step: {consumers} consumers from {lo}",
+               functools.partial(fed_walks.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
+                                 consumers, lo), "sm90", fault=RING)
+          for consumers, lo in ((1, 0), (2, 0), (2, 3))),
+        *(Cell(f"consumers sharing one cp.async pipeline: {consumers} consumers{', split' * split}",
+               functools.partial(fed_walks.consumers_sharing_one_pipeline_on_an_a100, consumers, split),
+               "sm80", fault=SHARED)
+          for consumers, split in ((1, False), (2, False), (2, True))),
+    ]
 
 
 KERNEL_PARTS = 4
@@ -200,7 +227,7 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
     """The GEMM and toolkit cells above a GPU runs (`gpu_flow.covering`: each kept for a GPU-only fault by
     name, the fewest others covering its native axes, every other the CPU's, interpreted and through the
     compile gate), each one's failure kept and all raised together, a part's share of them (`in_parts`); the
-    toolkit's on an H100 alone."""
+    toolkit's apart (`_toolkit_cells`)."""
     run_cells(parted(covering([
         Cell("a fused projection trains its producer and epilogue",
              a_fused_projection_trains_its_producer_and_epilogue, "sm90",
@@ -265,18 +292,7 @@ def test_the_gemm_kernels_run_on_this_gpu(part):
                                  shared), native={"launch": "cutlass", "groups": "mapped",
                                                   "matrices": "shared" if shared else "mapped"})
           for shared in (False, True)),
-        *(Cell(f"a ring streams tiles of their own trip counts: {consumers} consumers",
-               functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
-                                 consumers), "sm90", fault=RING)
-          for consumers in (1, 2)),
-        *(Cell(f"every warpgroup read lands its products: {path}",
-               functools.partial(mosaic_toolkit.every_warpgroup_read_lands_its_products_on_an_h100, path),
-               "sm90", fault="ptxas's fold of a read path's sign op (row 4346)")
-          for path in mosaic_toolkit.READS),
-        *(Cell(f"consumers feeding their own ring split a step: {consumers} consumers from {lo}",
-               functools.partial(mosaic_toolkit.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
-                                 consumers, lo), "sm90", fault=RING)
-          for consumers, lo in ((1, 0), (2, 0), (2, 3))),
+        *_toolkit_cells(),
         Cell("the shared GEMM mainloop runs on Blackwell's tcgen05",
              gemm_tcgen05.the_shared_mainloop_runs_exactly_on_blackwell, "sm100",
              native={"launch": "tcgen05 mainloop"}),

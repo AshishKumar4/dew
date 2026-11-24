@@ -132,9 +132,9 @@ class Tcgen05Placed(Tcgen05Rings):
         return tmem_limit // resources.tensor_memory_allocated(tmem_columns) <= 1
 
     def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
-                    walk: Callable[..., R], *, between=None, counted=0) -> R:
+                    walk: Callable[..., R], *, between=None, counted=0, common: bool = False) -> R:
         # Its consumer reads no ring (its issuer does): no step it passes.
-        del views, wg, between
+        del views, wg, between, common
         return walk(streams, *own, streamed[0] - counted)
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = (),
