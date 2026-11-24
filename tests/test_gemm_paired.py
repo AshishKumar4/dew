@@ -1485,7 +1485,7 @@ def test_a_paired_epilogues_kept_roundings_are_its_backwards_accumulators_and_it
 
     def gradient(names):
         def loss(x, gate, up):
-            hidden, _, _ = gemm.gemm(x, gate, sizes, paired=up, epilogue=swiglu,
+            hidden, _, _ = gemm.gemm(x, gate, sizes, paired=up, epilogue=swiglu, out_dtype=jnp.bfloat16,
                                      out_dtypes=(jnp.bfloat16,) * 3, named=names, interpret_on_cpu=True)
             return jnp.sum(hidden.astype(jnp.float32))
         policy = jax.checkpoint_policies.save_only_these_names("gate_proj", "up_proj")
