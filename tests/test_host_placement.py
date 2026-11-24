@@ -252,6 +252,33 @@ def test_a_host_resident_bank_scores_what_a_resident_bank_scores(shape):
 
 
 @pytest.mark.usefixtures("scanned_stacks")
+def test_a_host_resident_routed_step_fetches_each_layers_experts_alone():
+    """A training step over a routed stack whose banks are in host memory fetches each iteration's layer of
+    its experts' kernels to the device, never every layer's: the scan's fetches (`host_memory.fetched`'s
+    `device_put`s) each take one layer's kernels where the run reads them in place a resident run would
+    hand whole (row 1346's resident experts, `decoder_stack._scanned_runs`; the #4074 review: whole, each
+    iteration copied the bank)."""
+    from reference_error import equations
+
+    from dew.nn.moe import BANKED_EXPERTS, experts_apart
+
+    _, scanned, variables, tokens = pair(**SHAPES["moe"])
+    _, on_host = stores(scanned, variables)
+    layers = [name for name in on_host["params"] if name.startswith("layers_")]
+    banked = [experts_apart({"params": on_host["params"][name]})[BANKED_EXPERTS] for name in layers]
+    kernels = {tuple(leaf.shape) for bank in banked for leaf in jax.tree.leaves(bank)}
+    assert kernels and all(len(shape) == 4 for shape in kernels)
+
+    def loss(params):
+        return scanned.apply({**on_host, "params": params}, tokens, train=True,
+                             rngs={"dropout": jax.random.key(1)}).sum()
+
+    graph = jax.make_jaxpr(jax.grad(loss))(on_host["params"])
+    fetches = {tuple(operand.aval.shape) for equation in equations(graph)
+               if equation.primitive.name == "device_put" for operand in equation.invars}
+    assert {shape[1:] for shape in kernels} <= fetches and not kernels & fetches, (kernels, fetches)
+
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_a_host_resident_bank_decodes_through_the_cache_it_allocates(shape):
     """A prefill and greedy steps through a fetched stack: the same

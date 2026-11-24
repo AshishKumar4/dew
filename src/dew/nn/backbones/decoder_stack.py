@@ -529,7 +529,9 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # iteration whole beside its index, which the grouped matmul reads in place
             # (`dew.nn.moe.Layered`), as a bank's run does (`_apart`): sliced by the scan, each layer's
             # experts were copied out every step, 45% of a Qwen3-30B-A3B decode step on an H100 (row 1346).
-            experts = (not quantized and not run.is_mutable_collection('params')
+            # A fetched run's kernels lie in host memory, of which each iteration fetches its layer's alone
+            # (`fetched`): handed whole, every iteration would copy every layer's to the device.
+            experts = (not quantized and not fetching and not run.is_mutable_collection('params')
                        and holds_experts(run.variables.get('params', {})))
             whole = tuple(name for name, held in ((LAYER_ROWS, rows), (BANKED_EXPERTS, experts)) if held)
 
