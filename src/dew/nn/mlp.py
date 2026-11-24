@@ -35,7 +35,7 @@ from .activations import (
 from .blocks import normal_kernel
 from .flops import projection_flops
 from .gated_mlp import fuses, gated_mlp
-from .joined import joined_dense, joins, projections_of
+from .joined import joined_dense, joins, plain_denses, projections_of
 from .kernels.generation import Choice
 from .kernels.projections import recipe_chain
 from .ngpt import NGPT, normed_hidden
@@ -323,16 +323,18 @@ class GatedMLP(nn.Module):
         its matrices whole), the parameters' creation, or projections not plain `Dense` whose kernels they
         hold, their products owned by no wrapper or interceptor (a LoRA's, a served quantized kernel's) and
         observed by no inspection (`joined.projections_of`), take them apart."""
-        found = projections_of((self.up_proj, self.down_proj))
-        if (self.use_bias or (self.dropout_rate and train) or not (found.dense and found.held)
+        projections_ = (self.up_proj, self.down_proj)
+        if not plain_denses(projections_):
+            return None
+        found = projections_of(projections_)
+        if (self.use_bias or (self.dropout_rate and train) or not found.held
                 or found.intercepted or found.observed or not found.dot_general
                 or jax.sharding.get_abstract_mesh().shape.get(TENSOR_AXIS, 1) > 1):
             return None
+        up_proj, down_proj = projections_
         # Each kernel read and cast as its projection's call casts it (`dense._promoted`).
-        rows, up = _promoted(self.up_proj, x, meta.unbox(self.up_proj.get_variable('params', 'kernel')),
-                             None)[:2]
-        down = _promoted(self.down_proj, rows, meta.unbox(self.down_proj.get_variable('params', 'kernel')),
-                         None)[1]
+        rows, up = _promoted(up_proj, x, meta.unbox(up_proj.get_variable('params', 'kernel')), None)[:2]
+        down = _promoted(down_proj, rows, meta.unbox(down_proj.get_variable('params', 'kernel')), None)[1]
         out = recipe_chain(rows.reshape(-1, rows.shape[-1]), up, down, activation, out_dtype=rows.dtype)
         if out is None:
             return None
