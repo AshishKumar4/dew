@@ -1518,7 +1518,7 @@ def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax
         ("bhgqk", "bhgqk", "bkhd", "bhgqd", "bhgq", "bhgq"),
         ((1, (((0, 1),), ((2, 1),))), (1, (((1, 1),), ((2, 1),))), (1, (((3, 1), (4, 1)),))), "bhgqd",
         divisor=((1, (((0, 1),),)), (1, (((4, 1), (5, 1)),))), divided="bhgq",
-        narrowed=((0, 0, jnp.dtype(value.dtype).name),))
+        narrowed=((0, 0, jnp.dtype(value.dtype).name),) if jnp.dtype(value.dtype) != jnp.dtype(wide) else ())
     mean = scaled_contraction.contract(
         form, masses.reshape(*grouped, keys), narrowing.reshape(*grouped, keys), value.astype(wide),
         acc0.reshape(*grouped, width), carried.reshape(grouped), total0.reshape(grouped))
@@ -2049,8 +2049,8 @@ def value_shift(dout: jax.Array, value: jax.Array, hooks: Hooks) -> jax.Array:
     wherever `sum_d max|dO_d| max|V_d|` over that row and head (the largest `|dP|` and `|D|` it can form, its
     channels' maxima paired, an initial state's mean among the values) stays under fp32's `2^127`, else the
     binades it passes by, so `dP = dO V^T`, `D = dO . O` and their difference form finite; a row's own, so
-    one past the format takes no other's small values beneath it. One for the whole call where a score hook
-    has parameters, whose gradients a launch may sum across rows before they are raised (`shared_place`).
+    one past the format takes no other's small values beneath it, equal only along the axes a score hook's
+    parameter is shared across.
     Within a row and head the shift is its keys' and queries' together: a query of small values beside a
     key at the format's edge is taken beneath it too (row 12452). Its sum taken at each factor's own largest
     binade, finite whatever their product."""
@@ -2071,8 +2071,15 @@ def value_shift(dout: jax.Array, value: jax.Array, hooks: Hooks) -> jax.Array:
     lead_o, lead_v = binade_of(jnp.max(cotangents, axis=-1)), binade_of(jnp.max(values, axis=-1))
     held = jnp.sum(power2(cotangents, -lead_o[..., None]) * power2(values, -lead_v[..., None]), axis=-1)
     shift = jnp.maximum(binade_of(held) + lead_o + lead_v - 126, 0)
-    if hooks.score_params:
-        shift = jnp.broadcast_to(jnp.max(shift), shift.shape)
+    # Equal along each axis a score hook's parameter is shared across, whose gradient a launch may sum
+    # across it before it is raised (`shared_place`): a head's parameter across the batch rows, another's
+    # across those of its leading two axes of extent one.
+    for param in hooks.score_params:
+        shape = param.value.shape
+        if param.kind == Kind.HEAD or (shape[0] == 1 and batch > 1):
+            shift = jnp.broadcast_to(jnp.max(shift, axis=0, keepdims=True), shift.shape)
+        if param.kind != Kind.HEAD and len(shape) > 1 and shape[1] == 1 and heads > 1:
+            shift = jnp.broadcast_to(jnp.max(shift, axis=1, keepdims=True), shift.shape)
     return jax.lax.stop_gradient(shift).astype(jnp.int32)
 
 
@@ -2080,6 +2087,20 @@ def shifted(x: jax.Array, shift: jax.Array) -> jax.Array:
     """`x * 2^shift` in `x`'s dtype, `x` itself bit for bit where the shift is 0 (a subnormal on a process
     that flushes them included)."""
     return jnp.where(shift == 0, x, power2(x, shift).astype(x.dtype))
+
+
+def hook_restored(grad: jax.Array, shift: jax.Array, kind: Kind) -> jax.Array:
+    """A score hook's parameter gradient as a launch returns it, raised by its rows' and heads' shift `[B,
+    H]` (`beneath_shift`) before any sum across them: a head's laid `[., B, H, 1]`, another's `[B, H, ...]`;
+    an axis a launch summed already (extent one) at its shift, equal along it (`value_shift`)."""
+    rows, heads = (1, 2) if kind == Kind.HEAD else (0, 1)
+    if grad.shape[rows] != shift.shape[0]:
+        shift = jnp.max(shift, axis=0, keepdims=True)
+    if grad.shape[heads] != shift.shape[1]:
+        shift = jnp.max(shift, axis=1, keepdims=True)
+    laid = [1] * grad.ndim
+    laid[rows], laid[heads] = shift.shape
+    return shifted(grad, shift.reshape(laid))
 
 
 def beneath_shift(dout: jax.Array, value: jax.Array, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
@@ -2202,9 +2223,11 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     outputs = launch(*arrays, **params)
     dq, softmax = restored(outputs[0]), outputs[1:7]
     grads_out = list(outputs[8:])
-    dq_grads = [shifted(grads_out.pop(0), jnp.max(shift)) for kind in kinds if kind in DQ_GRADS]
+    dq_grads = [hook_restored(grads_out.pop(0), shift, kind) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
-    dk, key_grads = restored(dk), [shifted(grad, jnp.max(shift)) for grad in key_grads]
+    dk = restored(dk)
+    key_grads = [hook_restored(grad, shift, kind)
+                 for grad, kind in zip(key_grads, [kind for kind in kinds if kind in DKV_GRADS], strict=True)]
     delta, anchor, peak, total, mass, lost = (array[:, :, :queries] for array in softmax)
     # D and what its two roundings lost, its refinement's (`lost`, `gradient.dq_finish`) and its anchor's sum.
     delta, low = two_sum(anchor, delta)

@@ -1187,3 +1187,18 @@ def test_the_references_mean_past_the_format_differentiates_beside_any_state():
         lambda v: _state_mean(peaked, keys, v, seen, jnp.full((1, 1, 1), 2.0 ** 24, jnp.float32),
                               jnp.full((1, 1, 1), 2.0, jnp.float32)), (value,), (jnp.ones_like(value),))
     np.testing.assert_array_equal(np.asarray(tangent), 0.5)
+
+
+def test_the_references_fp32_query_gradient_at_values_near_the_largest():
+    """An fp32 query `0` over keys `[0, 1]` at scale 1 and eight channels of values `2^127` and `1.5 x 2^127`,
+    a unit cotangent: its weights 1/2, `dS = [-2^127, 2^127]`, so `dQ = 2^127`, where an fp32 weight's
+    identity narrowing landed the scores' part (`dP / T`, inf) apart from the total's (`-D / T`, -inf):
+    NaN."""
+    spans = template.spans(1, 2, 1)
+    query = jnp.zeros((1, 1, 1, 1), jnp.float32)
+    key = jnp.asarray([0.0, 1.0], jnp.float32).reshape(1, 2, 1, 1)
+    value = jnp.stack([jnp.full(8, 2.0 ** 127), jnp.full(8, 1.5 * 2.0 ** 127)]).astype(jnp.float32)
+    value = value.reshape(1, 2, 1, 8)
+    out, pull = jax.vjp(lambda q: template.reference(q, key, value, spans, template.Hooks(), scale=1.0),
+                        query)
+    np.testing.assert_array_equal(np.asarray(pull(jnp.ones_like(out))[0]), 2.0 ** 127)

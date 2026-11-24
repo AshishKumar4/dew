@@ -292,7 +292,11 @@ def _transpose(cotangent, *arrays, form: Form):
         subscripts.append(form.out)
         pulled = len(operands) - 1
         terms = []
-        marks = {t: dtype for t, index, dtype in form.narrowed if index == linear}
+        # A mark of a dtype no narrower than the sum's (an fp32 weight's identity cast) rounds nothing: its
+        # term stays in the one sum, its cancellation with the rest kept.
+        width = jnp.dtype(_dtype(operands)).itemsize
+        marks = {t: dtype for t, index, dtype in form.narrowed
+                 if index == linear and jnp.dtype(dtype).itemsize < width}
         rounded: dict[str, list[Term]] = {}
         for t, (sign, groups) in enumerate(form.terms):
             found = [(g, f) for g, group in enumerate(groups) for f, (index, _) in enumerate(group)

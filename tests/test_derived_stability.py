@@ -220,14 +220,20 @@ def test_the_derived_chunk_holds_every_order_at_the_decays_edges(edge, name):
 def test_a_rows_gradients_take_no_other_rows_shift():
     """Two batch rows of one query over two zero-logit keys `K = [0, 1]`, cotangent 2^127: row A's values at
     fp32's largest take its values beneath a shift (`attention.value_shift`), row B's `[0, 2^-120]` none, so
-    its dQ is `2^5` (its weights 1/2, `dS = [-2^5, 2^5]`), where one shift for the call took its 2^-120
-    beneath 2^-248 and gave 0."""
+    its dQ is `2^5` (its weights 1/2, `dS = [-2^5, 2^5]`), unhooked and under a tile bias each row's own,
+    where one shift for the call took its 2^-120 beneath 2^-248 and gave 0."""
     spans = template.spans(1, 2, 2)
     query = jnp.zeros((2, 1, 1, 1), jnp.float32)
     key = jnp.asarray([0.0, 1.0], jnp.float32).reshape(1, 2, 1, 1).repeat(2, axis=0)
     value = jnp.asarray([[2.0 ** 127, 2.0 ** 127], [0.0, 2.0 ** -120]], jnp.float32).reshape(2, 2, 1, 1)
     dout = jnp.full((2, 1, 1, 1), 2.0 ** 127, jnp.float32)
     natural, accurate = attention_route.run_forms()
-    made = attention_portable.backward(attention_portable.Tiles(block_q=8, block_k=8, pad=8), query, key,
-                                       value, spans, None, dout, natural=natural, accurate=accurate)
-    np.testing.assert_array_equal(np.asarray(made.query[1]), 2.0 ** 5)
+    tiles = attention_portable.Tiles(block_q=8, block_k=8, pad=8)
+    # Unhooked, and under a tile bias of zeros each row's own (`Kind.TILE` `[2, 1, 1, 2]`): a parameter no
+    # row shares keeps the rows' shifts apart.
+    biased = template.Hooks(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype),
+                            (template.Param(jnp.zeros((2, 1, 1, 2), jnp.float32), template.Kind.TILE),))
+    for hooks in (None, biased):
+        made = attention_portable.backward(tiles, query, key, value, spans, hooks, dout, natural=natural,
+                                           accurate=accurate)
+        np.testing.assert_array_equal(np.asarray(made.query[1]), 2.0 ** 5)
