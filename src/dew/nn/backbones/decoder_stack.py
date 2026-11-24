@@ -33,6 +33,7 @@ from dew.batch import Variables, merge, part, sows_appended
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 from dew.nn.inspection import QK
 from dew.nn.protocols import StagedStacks
+from dew.quantization import held_scales, holds_quantized
 
 from .. import in_backward
 from ..cross_pass import CrossPass
@@ -520,11 +521,14 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # scans its stacked layers.
             rows = tuple(run.variables.get(LAYER_ROWS, {}))
             repeats = count // len(run.specs) if periodic else count
+            # A served quantized run's scales read as the unrolled stack reads them (`held_scales`).
+            quantized = (not run.is_mutable_collection('params')
+                         and holds_quantized(run.variables.get('params', {})))
 
             policy = _rows_recomputed(remat)
 
             def scanned(layer, carry, index, *, store=store, step=step, rows=rows, inputs=inputs,
-                        policy=policy):
+                        policy=policy, quantized=quantized):
                 # The iteration's per-layer input, its layers along axis 2.
                 per_layer_input = jax.tree.map(
                     lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, axis=2, keepdims=False), inputs)
@@ -532,6 +536,10 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                 def layered(layer, carry):
                     return step(layer, carry, per_layer_input, store)[0]
 
+                if quantized:
+                    # Its layer's params, sliced from the stacked rows: each scale held there alone.
+                    layered = nn.map_variables(layered, 'params', init=False, mutable=False,
+                                               trans_in_fn=held_scales)
                 if not rows:
                     return layered(layer, carry), None
 
