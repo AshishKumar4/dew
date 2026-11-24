@@ -716,19 +716,37 @@ def _is_float(value_type: ir.Type) -> bool:
 
 def _element_offsets(op, offsets: list) -> np.ndarray | None:
     """An `llvm.getelementptr`'s address in bytes up to a uniform term, its base's (`offsets[0]`) plus its
-    one index's times its element's bytes (a dynamic index `offsets[1]`, a constant one a uniform term), so
-    each index of a chain of them keeps its lanes; None for several indices (a struct's or array's walk)."""
+    one index's, read signed at its width as LLVM reads it, times its element's stride (a dynamic index
+    `offsets[1]`, a constant one a uniform term), so each index of a chain of them keeps its lanes; None for
+    several indices (a struct's or array's walk) or an element whose stride is no rule's (`_stride`)."""
     indices = ir.DenseI32ArrayAttr(op.attributes["rawConstantIndices"])
     if len(indices) != 1:
         return None
     base = offsets[0]
     if len(offsets) == 1:
         return base
-    element = ir.TypeAttr(op.attributes["elem_type"]).value
+    stride = _stride(ir.TypeAttr(op.attributes["elem_type"]).value)
+    index_type = op.operands[1].type
+    index = (offsets[1] if not isinstance(index_type, ir.IntegerType)
+             else _signed(offsets[1], index_type.width))
+    return None if stride is None else base + index * stride
+
+
+def _stride(element: ir.Type) -> int | None:
+    """An element's allocation stride in bytes as LLVM lays an array of it out: a scalar's bytes, a vector of
+    a power of two of them its elements' bytes (its alignment its size); None for any other (a vector of
+    three, padded to four, or an aggregate), whose padding no rule states."""
     scalar = element.element_type if isinstance(element, ir.VectorType) else element
     if not isinstance(scalar, ir.IntegerType | ir.FloatType | ir.IndexType):
         return None
-    return base + offsets[1] * _bytes(element)
+    count = _elements(element)
+    return _bytes(element) if count & (count - 1) == 0 else None
+
+
+def _signed(values: np.ndarray, width: int) -> np.ndarray:
+    """`values`' low `width` bits read as a signed integer."""
+    half = 1 << (width - 1)
+    return (values + half) % (1 << width) - half if width < 64 else values
 
 
 def _bytes(value_type: ir.Type) -> int:
