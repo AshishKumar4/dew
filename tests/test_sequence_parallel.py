@@ -209,12 +209,17 @@ def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec
                                         f"sequence {spec.sequence}")
 
 
-def _dropping_draw(seed):
-    """Queries, keys and values of `heads`' shapes, and an output cotangent."""
+def _draw(seed, heads: int = 4, kv_heads: int = 2):
+    """Queries of `heads` heads, keys and values of `kv_heads`, and an output cotangent."""
     q_key, k_key, v_key, c_key = jax.random.split(jax.random.key(seed), 4)
-    query = jax.random.normal(q_key, (BATCH, SEQ_LEN, 4, 8), jnp.float32)
-    key, value = (jax.random.normal(k, (BATCH, SEQ_LEN, 2, 8), jnp.float32) for k in (k_key, v_key))
+    query = jax.random.normal(q_key, (BATCH, SEQ_LEN, heads, 8), jnp.float32)
+    key, value = (jax.random.normal(k, (BATCH, SEQ_LEN, kv_heads, 8), jnp.float32) for k in (k_key, v_key))
     return query, key, value, jax.random.normal(c_key, query.shape, jnp.float32)
+
+
+_dropping_draw = _draw
+_gathered_draw = functools.partial(_draw, heads=3, kv_heads=1)
+"""Three query heads over one key head, which no two-way sequence's all-to-all divides: the gather."""
 
 
 @pytest.mark.mesh
@@ -296,70 +301,39 @@ GATHERED_VISIBLE = {
 """`VISIBLE` and the ids it holds none of: key validity, places, padded slots (row 1495's gather path)."""
 
 
-def _gathered_draw(seed):
-    """Three query heads over one key head, which no two-way sequence's all-to-all divides: the gather."""
-    q_key, k_key, v_key, c_key = jax.random.split(jax.random.key(seed), 4)
-    query = jax.random.normal(q_key, (BATCH, SEQ_LEN, 3, 8), jnp.float32)
-    key, value = (jax.random.normal(k, (BATCH, SEQ_LEN, 1, 8), jnp.float32) for k in (k_key, v_key))
-    return query, key, value, jax.random.normal(c_key, query.shape, jnp.float32)
+EXCHANGED_VISIBLE = [("all-to-all", name) for name in sorted(VISIBLE)] + [
+    ("gather", name) for name in sorted(GATHERED_VISIBLE)]
+"""Each exchange's calls of per-token ids: the all-to-all's (`_dropping_draw`'s heads, which it divides) and
+the gather's (`_gathered_draw`'s, which it does not)."""
+
+
+def _exchanged(exchange: str) -> tuple[dict, object]:
+    """`exchange`'s calls and the draw whose heads take it (`EXCHANGED_VISIBLE`)."""
+    return (VISIBLE, _dropping_draw) if exchange == "all-to-all" else (GATHERED_VISIBLE, _gathered_draw)
 
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
-@pytest.mark.parametrize("name", sorted(VISIBLE))
-def test_per_token_visibility_travels_whole_through_the_all_to_all(name, implementation):
-    """The entry over a split sequence whose call reads per-token ids (`VISIBLE`) takes the all-to-all and
-    hands them whole to the kernel beside the whole sequences it gives, so no global `[B, 1, S, S]` mask is
-    built (row 1495; a kernel that reads masks builds its shard's own, the template none,
-    `test_the_template_builds_no_mask_of_a_split_calls_visibility`): its output and its gradients, forward
-    and backward, on par with the whole sequence's (check 1), on the kernels check 1's float64 truth runs
-    (the seam's `reference` and `xla`)."""
-    call = dict(VISIBLE[name], implementation=implementation)
+@pytest.mark.parametrize(("exchange", "name"), EXCHANGED_VISIBLE,
+                         ids=[" ".join(pair) for pair in EXCHANGED_VISIBLE])
+def test_per_token_visibility_passes_through_either_exchange(exchange, name, implementation):
+    """The entry over a split sequence whose call reads per-token ids hands them to the kernel, so no global
+    `[B, 1, S, S]` mask is built (row 1495; a kernel that reads masks builds its shard's own, the template
+    none): the all-to-all whole beside the whole sequences it gives (`VISIBLE`), the gather its key-side ids
+    whole, each striped query reading them at its slot (`GATHERED_VISIBLE`,
+    `attention_parallel._striped_visibility`). Its output and its gradients, forward and backward, on par
+    with the whole sequence's (check 1), on the kernels check 1's float64 truth runs (the seam's
+    `reference` and `xla`)."""
+    calls, draw = _exchanged(exchange)
+    call = dict(calls[name], implementation=implementation)
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
-    assert_exchanged_on_par(entry, entry, SPLIT, _dropping_draw,
-                            f"the entry over a split sequence, {name}, {implementation}")
+    assert_exchanged_on_par(entry, entry, SPLIT, draw,
+                            f"the entry through the {exchange}, {name}, {implementation}")
     with jax.set_mesh(SPLIT.build()):
-        program = jax.make_jaxpr(entry)(*_dropping_draw(0))
+        program = jax.make_jaxpr(entry)(*draw(0))
     masks = [var.aval.shape for var in _variables(program.jaxpr)
              if var.aval.dtype == jnp.bool_ and var.aval.shape[-2:] == (SEQ_LEN, SEQ_LEN)
              and var.aval.shape[0] == BATCH]
-    assert not masks, masks
-
-
-@pytest.mark.mesh
-@pytest.mark.parametrize("implementation", ["reference", "xla"])
-@pytest.mark.parametrize("name", sorted(GATHERED_VISIBLE))
-def test_per_token_visibility_is_read_at_each_striped_querys_slot_through_the_gather(name, implementation):
-    """The entry over a split sequence of heads the all-to-all does not divide (three over one, a two-way
-    sequence) takes the gather, whose striped queries read the call's key-side ids whole at their slots,
-    their global places (`attention_parallel._striped_visibility`), so no global `[B, 1, S, S]` mask is
-    built (row 1495): every id kind, its output and its gradients, forward and backward, on par with the
-    whole sequence's (check 1), on the kernels check 1's float64 truth runs."""
-    call = dict(GATHERED_VISIBLE[name], implementation=implementation)
-    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
-    assert_exchanged_on_par(entry, entry, SPLIT, _gathered_draw,
-                            f"the entry through the gather, {name}, {implementation}")
-    with jax.set_mesh(SPLIT.build()):
-        program = jax.make_jaxpr(entry)(*_gathered_draw(0))
-    masks = [var.aval.shape for var in _variables(program.jaxpr)
-             if var.aval.dtype == jnp.bool_ and var.aval.shape[-2:] == (SEQ_LEN, SEQ_LEN)
-             and var.aval.shape[0] == BATCH]
-    assert not masks, masks
-
-
-@pytest.mark.mesh
-@pytest.mark.parametrize("name", sorted(GATHERED_VISIBLE))
-def test_the_template_builds_no_mask_of_a_gathered_calls_visibility(name):
-    """The template through the gather reads a call's per-token ids as its spans at each striped query's
-    slot, so its program holds no `[rows, 1, queries, S]` mask at all, its shard's or the batch's (row
-    1495; a key length's `[rows, 1, 1, S]` is no query's)."""
-    call = dict(GATHERED_VISIBLE[name], implementation="template")
-    entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
-    with jax.set_mesh(SPLIT.build()):
-        program = jax.make_jaxpr(entry)(*_gathered_draw(0))
-    masks = [var.aval.shape for var in _variables(program.jaxpr)
-             if var.aval.dtype == jnp.bool_ and len(var.aval.shape) == 4 and var.aval.shape[1] == 1
-             and var.aval.shape[2] > 1 and var.aval.shape[-1] == SEQ_LEN]
     assert not masks, masks
 
 
@@ -377,21 +351,25 @@ def test_a_cross_call_through_the_gather_takes_its_visibility_as_a_mask():
         return query[:, :8], key, value, cotangent
 
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
-    assert_exchanged_on_par(entry, entry, SPLIT, draw, "a cross call's block groups through the gather")
+    assert_exchanged_on_par(entry, entry, SPLIT, draw, "a cross call's key validity through the gather")
 
 
 @pytest.mark.mesh
-@pytest.mark.parametrize("name", sorted(VISIBLE))
-def test_the_template_builds_no_mask_of_a_split_calls_visibility(name):
-    """The template over a split sequence reads a call's per-token ids as its spans on each device, so its
-    program holds no `[rows, 1, S, S]` mask at all, its shard's rows or the batch's (row 1495)."""
-    call = dict(VISIBLE[name], implementation="template")
+@pytest.mark.parametrize(("exchange", "name"), EXCHANGED_VISIBLE,
+                         ids=[" ".join(pair) for pair in EXCHANGED_VISIBLE])
+def test_the_template_builds_no_mask_of_a_split_calls_visibility(exchange, name):
+    """The template over a split sequence reads a call's per-token ids as its spans, on each device beside
+    the all-to-all's whole sequences or at each striped query's slot through the gather, so its program
+    holds no `[rows, 1, queries, S]` mask at all, its shard's or the batch's (row 1495; a key length's
+    `[rows, 1, 1, S]` is no query's)."""
+    calls, draw = _exchanged(exchange)
+    call = dict(calls[name], implementation="template")
     entry = with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
     with jax.set_mesh(SPLIT.build()):
-        program = jax.make_jaxpr(entry)(*_dropping_draw(0))
+        program = jax.make_jaxpr(entry)(*draw(0))
     masks = [var.aval.shape for var in _variables(program.jaxpr)
-             if var.aval.dtype == jnp.bool_ and len(var.aval.shape) == 4
-             and var.aval.shape[1:] == (1, SEQ_LEN, SEQ_LEN)]
+             if var.aval.dtype == jnp.bool_ and len(var.aval.shape) == 4 and var.aval.shape[1] == 1
+             and var.aval.shape[2] > 1 and var.aval.shape[-1] == SEQ_LEN]
     assert not masks, masks
 
 

@@ -152,7 +152,8 @@ def _striped_visibility(visibility: dict, shards: int, length: int, queries, row
             query_ids, key_ids = (ids.query, ids.key) if isinstance(ids, CrossDocuments) else (ids, ids)
             (query_ids, query_spec), (key_ids, key_spec) = (query_side(name, query_ids, -1),
                                                             key_side(name, key_ids))
-            out[name] = (CrossDocuments(query_ids, key_ids), CrossDocuments(query_spec, key_spec))
+            documents = CrossDocuments(query_ids, key_ids)
+            out[name] = (documents, jax.tree.unflatten(jax.tree.structure(documents), [query_spec, key_spec]))
         elif name == "places":
             query_places, key_places = ids if isinstance(ids, tuple) else (ids, ids)
             (query_places, query_spec), (key_places, key_spec) = (query_side(name, query_places, -1),
