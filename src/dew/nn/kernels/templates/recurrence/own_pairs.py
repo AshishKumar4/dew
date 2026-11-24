@@ -284,10 +284,11 @@ def shifted_up(call: Call, e, value: jax.Array) -> jax.Array:
 
 
 def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: tuple[str, ...],
-              into: tuple) -> None:
+              into: tuple[list, tuple]) -> None:
     """Each output of the intra walk's (`products`) sub-chunks' own pairs, each its own decay, written in
-    place on the sub-chunks' diagonal blocks of the walk's sums `into` (in-place refs `[R, HV * C]` in the
-    outputs' forms, `jax.new_ref`'s), the entries the walk leaves zero (`algebra.key_block_pairs` takes the
+    place on the sub-chunks' diagonal blocks of the walk's sums `into` (`(refs, groups)`: in-place refs
+    `[R, HV * C]` in the outputs' forms, `jax.new_ref`'s, sums of one shape and dtype stacked into one ref, a
+    group's, `stacked.groups`), the entries the walk leaves zero (`algebra.key_block_pairs` takes the
     keys before a sub-chunk alone), so each entry is rounded once (`algebra.key_diagonal_bands`' blocks,
     masked as the output takes them, `algebra.block_masked`): a launch of their own, no products on the
     tensor cores, as fla_kda's token-parallel diagonal is (chunk_kda_fwd_intra_token_parallel). It walks each
@@ -299,6 +300,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
     programs a multiprocessor holds most (`mainloop.widest_layout`): no products, its walk waits on its loads,
     beside a producer a GH200 held five programs, 20 consumer warps (its plan, row 5260)."""
     call = dataclasses.replace(call, family=widest_layout(call))
+    refs, groups = into
     chunk, width, family = call.chunk, call.width, call.family
     scored = "scores" in products
     keys = key_block(call, functools.partial(_own_held, call, outputs=len(products)),
@@ -307,7 +309,8 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
     steps = width // keys
 
     def program(at, q_ref, k_ref, *refs, streams, staging, landing):
-        prefix_refs, (beta_ref, _taken_ref, *sums) = refs[:len(prefix)], refs[len(prefix):]
+        prefix_refs, (beta_ref, _taken_ref, *held) = refs[:len(prefix)], refs[len(prefix):]
+        sums = _summed_views(held, groups)
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         keyed = h // call.group * width
@@ -387,7 +390,17 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                   staging=staging, landing=landing, name=_named("recurrence_intra_own", products),
                   issues=False,
                   swizzles={name: resources.widest_swizzle(dtype, keys)
-                            for name, (_, dtype) in blocks.items()})(*inputs, *into)
+                            for name, (_, dtype) in blocks.items()})(*inputs, *refs)
+
+
+def _summed_views(refs, groups: tuple[tuple[int, ...], ...]) -> list:
+    """Each output's sums as the launch writes them, in the outputs' order: a group of one its ref, a stacked
+    group's member its place along the ref's leading axis (`chunk_forward._paired`'s refs)."""
+    views: list = [None] * sum(map(len, groups))
+    for ref, group in zip(refs, groups, strict=True):
+        for place, index in enumerate(group):
+            views[index] = ref if len(group) == 1 else ref.at[place]
+    return views
 
 
 def _blocks_written(call: Call, name: str, blocks, ref, row, column, landing) -> None:

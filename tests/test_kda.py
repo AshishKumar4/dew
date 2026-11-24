@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from certified import assert_certified
+from generation_support import lowers
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through
 from reference_error import (
@@ -38,6 +39,7 @@ from reference_error import (
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
+from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, recurrent_delta_rule
 from dew.nn.precision import l2norm as jax_l2norm
 from tools.kda_reference import (
@@ -458,3 +460,24 @@ def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
 
     assert_as_exact(decays_gradient(partial(chunk_on, 'mosaic_gpu')), decays_gradient(token_by_token), draw,
                     "kimi delta attention's small cross term's decay gradient", seeds=8)
+
+
+@lowers('sm80')
+def test_a_fast_fp32_kimi_forward_lowers_for_an_ampere_gpu():
+    """Kimi delta attention's fp32 forward under the fast forms, lowered through the template for an Ampere
+    GPU: its scores take one fp32 part (TF32, mma.sync's) and its system its fp32, two sums of one shape and
+    dtype, which its own pairs write in place as one stacked ref (`chunk_forward._paired`), where two refs of
+    one shape and dtype are refused at the launch (`mosaic.checked`, row 3180; the queue review's P0)."""
+    rows, length, heads, width = 1, 128, 2, 64
+    operands = ([jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 3
+                + [jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32),
+                   jax.ShapeDtypeStruct((rows, length, heads), jnp.float32)])
+
+    def forward(query, key, value, g, beta):
+        return chunk_gated_delta_rule(query, key, value, g, beta)
+
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), 'sm80')
+    with (generation.assumed('sm80'), jax.sharding.use_abstract_mesh(mesh),
+          generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')),
+          generation.chosen(gated_delta_rule='mosaic_gpu')):
+        jax.jit(forward).trace(*operands).lower(lowering_platforms=("cuda",))
