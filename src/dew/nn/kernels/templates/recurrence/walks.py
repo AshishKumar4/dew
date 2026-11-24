@@ -199,22 +199,33 @@ def summed_on(carried, factor, term, first):
     the term joins it."""
     value, scale = _raised(*carried)
     decayed, scale = _raised(factor * value, scale)
-    lowered = jnp.where(scale >= 1.0, term * 2.0 ** -64, term)
-    lowered = jnp.where(scale >= 2.0, lowered * 2.0 ** -64, lowered)
+    lowered = term * _power(scale >= 1.0, -64) * _power(scale >= 2.0, -64)
     value = cut(first, decayed + lowered, term)
     scale = cut(first, scale, jnp.zeros_like(scale))
     large = jnp.abs(value) >= LARGE
-    return jnp.where(large, value * 2.0 ** -64, value), jnp.where(large, scale + 1.0, scale)
+    return value * _power(large, -64), scale + _counted(large)
 
 
 def _raised(value, scale):
     """`(value, scale)` raised back toward its range where it fell below one at a raised scale, 2^64 a step
-    (exact), at most twice."""
-    for _ in range(2):
-        small = (scale >= 1.0) & (jnp.abs(value) < 1.0)
-        value = jnp.where(small, value * 2.0 ** 64, value)
-        scale = jnp.where(small, scale - 1.0, scale)
-    return value, scale
+    (exact), at most twice: once below one at a scale of one or more, again below 2^-64 at two or more. Each
+    step a product with a power of two the comparisons select, the value read by them and the product alone:
+    selecting between the value and its raised copy, two at each of a token's two running sums, XLA's CPU
+    compile of a bf16 diagonal scan's three-span forward ran past 400 s where once took 2 (jsf-hang7)."""
+    magnitude = jnp.abs(value)
+    once = (scale >= 1.0) & (magnitude < 1.0)
+    twice = once & (scale >= 2.0) & (magnitude < 2.0 ** -64)
+    return value * _power(once, 64) * _power(twice, 64), scale - _counted(once) - _counted(twice)
+
+
+def _power(selected, exponent: int):
+    """`2^exponent` where `selected`, one elsewhere (exact as a factor)."""
+    return jnp.where(selected, 2.0 ** exponent, 1.0)
+
+
+def _counted(selected):
+    """One where `selected`, zero elsewhere: a scale's step."""
+    return jnp.where(selected, 1.0, 0.0)
 
 
 REACH = 2048
