@@ -24,6 +24,9 @@
 "tests/test_algebra_laws.py": [
 "tests/test_algebra_laws.py::test_every_structure_of_the_backward_tile_is_certified[True-False-True]"
 ],
+"tests/test_algebra_rules_sound.py": [
+"tests/test_algebra_rules_sound.py::test_every_rewrites_right_side_is_on_par_with_its_left_side[linear[15]]"
+],
 "tests/test_algebra_scaled.py": [
 "tests/test_algebra_scaled.py::test_a_merge_under_shard_map_and_under_a_sharded_jit_is_each_shards_own",
 "tests/test_algebra_scaled.py::test_a_merged_state_is_on_par_with_its_output_and_its_total_and_their_derivatives[jitted-along every operand]",
@@ -1169,9 +1172,6 @@
 "tests/test_chunked_cross_entropy.py::test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float64_rule[uncapped-float32]",
 "tests/test_chunked_cross_entropy.py::test_the_softcap_gradient_survives_saturated_logits",
 "tests/test_chunked_cross_entropy.py::test_the_whole_logits_head_computes_what_the_tiled_one_does[None-float32]"
-],
-"tests/test_code_digest.py": [
-"tests/test_code_digest.py::test_every_kernel_modules_code_is_keyed_by_its_closure_no_import_site_unreviewed"
 ],
 "tests/test_codec_checkpoints.py": [
 "tests/test_codec_checkpoints.py::test_a_quantized_checkpoint_saves_its_own_bytes[modelopt/tiny]"
@@ -4343,6 +4343,9 @@
 "tests/test_trainer.py::test_a_generator_declared_to_replay_resumes_on_the_batches_the_whole_run_reads",
 "tests/test_trainer.py::test_a_share_of_a_run_with_no_planned_length_is_refused",
 "tests/test_trainer.py::test_an_explicit_state_starts_a_token_count_with_its_own_reader"
+],
+"tests/test_training_dtypes.py": [
+"tests/test_training_dtypes.py::test_x64_router_bias_storage_survives_updates_and_restart[float32]"
 ],
 "tests/test_training_transactions.py": [
 "tests/test_training_transactions.py::test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima[whole]",
