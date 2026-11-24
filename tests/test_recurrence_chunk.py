@@ -2086,6 +2086,17 @@ def test_the_operands_are_checked_as_the_decode_steps():
                                                       beta=jnp.ones((1, 4, 1))))
 
 
+def test_an_unforked_call_refuses_a_table_state_or_forked_fields():
+    """An unforked call (`Chunk.loads` None) refuses a table `state` `[B, S', Hv, Dk, Dv]` and the forked
+    call's own fields (entry writes, here), where the template padded the table's head axis as a memory's and
+    a selector planning it raised a reshape's error (row 12631)."""
+    drawn, _ = entered_draw(TURNED, seed=0, entries=True)
+    with pytest.raises(ValueError):
+        chunk(TURNED, drawn)
+    with pytest.raises(ValueError):
+        chunk(TURNED, dataclasses.replace(drawn, state=None))
+
+
 def test_aligned_unit_keys_erase_the_decay_gradient():
     """In one dimension k=beta=1 writes S'=v, independently of the decay. The WY inverse/readout
     paths cancelled only after rounding, leaving a spurious 4.74e-8 gradient in this exact zero."""

@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from generation_support import lowers
-from test_recurrence_chunk import draw as hooked_draw, entered_draw, formed
+from test_recurrence_chunk import draw as hooked_draw, entered_draw, entering_documents, formed
 from test_recurrence_mosaic import TURNED
 
 from dew.nn.kernels import generation
@@ -54,7 +54,7 @@ def test_a_turned_training_step_runs_the_kernels_its_selector_certified(forked):
     grouped keys the selector certified a launch the step never ran (row 7976); a forked call's rotation
     bound fp32 whatever its turns certified one a call of wider turns never ran (row 12402)."""
     if forked:
-        given, _ = entered_draw(TURNED, seed=0, entries=True)
+        given = entering_documents(entered_draw(TURNED, seed=0, entries=True)[0])
     else:
         (given,) = hooked_draw(TURNED, packed=False, seed=0)
     assert given.key.shape[2] < given.value.shape[2], given.key.shape
