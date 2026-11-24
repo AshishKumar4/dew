@@ -65,7 +65,7 @@ import test_gemm_widths as gemm_widths
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
 import test_warpgroup_scan as warpgroup_scan
-from gpu_flow import Cell, cells_of, covering, run_cells, when
+from gpu_flow import Cell, cells_of, covering, in_parts, parted, run_cells, when
 from jax.experimental.pallas import fuser
 from reference_error import ahead_arm, assert_as_exact
 from test_gemm_template import rms_norm as template_rms_norm
@@ -187,11 +187,21 @@ BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the 
 """Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
 
 
-def test_the_gemm_kernels_run_on_this_gpu():
+KERNEL_PARTS = 4
+"""The kernels flow's parts (`in_parts`): its prepare alone 164 s warm on a GH200's host (MAINGPU-63d4814e1),
+and with the join matrix's 665 s cold in a train's prepare group (row 12759), past the train's bound."""
+
+JOIN_PARTS = 2
+"""The join matrix's parts (`in_parts`): its prepare 153 s warm on a GH200's host (MAINGPU-63d4814e1)."""
+
+
+@in_parts(KERNEL_PARTS)
+def test_the_gemm_kernels_run_on_this_gpu(part):
     """The GEMM and toolkit cells above a GPU runs (`gpu_flow.covering`: each kept for a GPU-only fault by
     name, the fewest others covering its native axes, every other the CPU's, interpreted and through the
-    compile gate), each one's failure kept and all raised together; the toolkit's on an H100 alone."""
-    run_cells(covering([
+    compile gate), each one's failure kept and all raised together, a part's share of them (`in_parts`); the
+    toolkit's on an H100 alone."""
+    run_cells(parted(covering([
         Cell("a fused projection trains its producer and epilogue",
              a_fused_projection_trains_its_producer_and_epilogue, "sm90",
              native={"launch": "fused prologue and epilogue", "pass": "training"}),
@@ -305,7 +315,7 @@ def test_the_gemm_kernels_run_on_this_gpu():
                native={"launch": "warpgroup scan", "reverse": str(reverse), "exclusive": str(exclusive)})
           for positions in warpgroup_scan.POSITIONS for reverse in (False, True)
           for exclusive in (False, True)),
-    ]))
+    ]), part, KERNEL_PARTS))
 
 
 def _cutlass_cells() -> tuple:
@@ -373,12 +383,14 @@ def test_the_mx_matrix_holds_on_this_gpu():
         native=lambda case: dict(zip(("format", "out_dtype"), (case[1], case[4]), strict=True)))))
 
 
-def test_the_join_matrix_holds_on_this_gpu():
+@in_parts(JOIN_PARTS)
+def test_the_join_matrix_holds_on_this_gpu(part):
     """The joined projections' check-1 matrix (tests/join_matrix.py): a layer's training step with two of its
     projections joined, or an attention layer's query, key and value side by side, on par with them apart,
     each cell on a GPU of its generation (its pin): Hopper's side-by-side forward and chained input gradient
-    on the warpgroup MMA, which the CPU only interprets (head review of 0099a4701 F6)."""
-    run_cells(cells_of(kernel_matrix.check("join")))
+    on the warpgroup MMA, which the CPU only interprets (head review of 0099a4701 F6); a part's share of them
+    (`in_parts`)."""
+    run_cells(parted(cells_of(kernel_matrix.check("join")), part, JOIN_PARTS))
 
 
 def test_the_linear_ce_matrix_holds_on_this_gpu():

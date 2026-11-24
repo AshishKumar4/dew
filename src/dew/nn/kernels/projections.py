@@ -13,6 +13,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 
 from dew import _cache
 from dew._facts import Held
@@ -155,7 +156,8 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
 
 
 def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Callable, *, out_dtype,
-                 gate: jax.Array | None = None, tensor_scales: tuple | None = None) -> jax.Array | None:
+                 gate: jax.Array | None = None, tensor_scales: tuple | None = None,
+                 names: tuple[str, str] | None = None) -> jax.Array | None:
     """`recipe_projection(activation(recipe_projection(rows, up)), down)` of an ungated MLP's rows (`[rows,
     in]`, any count; `up` `[in, hidden]`, `down` `[hidden, out]`, dense) as one chain where the run trains in
     DeepSeek-V3's blockwise FP8 recipe, or in NVFP4's under delayed tensor scaling, and its role takes both
@@ -170,7 +172,9 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
     elsewhere: the run's recipe another's (MXFP8's, current NVFP4's: an activation's own tensor scale is known
     only once the activation is) or none, a delayed recipe's chain given no scales, no rows (each projection
     apart lays one zero block), or a projection its role keeps, which the `recipe_projection` calls then take
-    apart. Each product's route is its selector's (`BLOCKWISE_FP8`, `NVFP4_BLOCK_OP`)."""
+    apart. Each product's route is its selector's (`BLOCKWISE_FP8`, `NVFP4_BLOCK_OP`). `names`, the
+    checkpoint names of the gate's and the up projection's rounded products (`_chain_forward`), which a remat
+    policy reads, as `GatedMLP` names them apart (row 12758)."""
     from dew.nn.precision import recipe_role
 
     held = recipe_role()
@@ -195,7 +199,7 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
     if along is not None:
         def each(rows, up, down, gate, *scales):
             out = recipe_chain(rows, up, down, activation, out_dtype=out_dtype, gate=gate,
-                               tensor_scales=None if tensor_scales is None else scales)
+                               tensor_scales=None if tensor_scales is None else scales, names=names)
             assert out is not None, "the recipe takes the chain on every device as on the whole"
             return out
 
@@ -207,7 +211,7 @@ def recipe_chain(rows: jax.Array, up: jax.Array, down: jax.Array, activation: Ca
     # Its padding zero rows the backward keeps out of every gradient (`_chain_pulled`'s live rows).
     return _chained(chained, laid, up[None], down[None], activation, out_dtype=out_dtype,
                     gate=None if gate is None else gate[None], live=count, interpret=False,
-                    tensor_scales=tensor_scales)[:count]
+                    tensor_scales=tensor_scales, names=names)[:count]
 
 
 def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, along, tensor_scale=None) -> jax.Array:
@@ -338,21 +342,29 @@ def _chain_value(x, w_ins, w_down, group_blocks, tensor_scales, activation, out_
     return _quantized_rows_product(codes, scales, w_down, sizes, out_dtype, interpret), tuple(products)
 
 
-def _chain(recipe, x, w_ins, w_down, group_blocks, tensor_scales, activation, out_dtype, interpret, live):
-    del live  # a padded row's forward is its own row's, which the caller drops
+def _chain(recipe, x, w_ins, w_down, group_blocks, tensor_scales, activation, out_dtype, interpret, live,
+           names):
+    del live, names  # a padded row's forward is its own row's, which the caller drops; no residuals
     return _CHAINS[recipe].value(x, w_ins, w_down, group_blocks, tensor_scales, activation, out_dtype,
                                  interpret)[0]
 
 
 def _chain_forward(recipe, x, w_ins, w_down, group_blocks, tensor_scales, activation, out_dtype, interpret,
-                   live):
+                   live, names):
     del live
     out, products = _CHAINS[recipe].value(x, w_ins, w_down, group_blocks, tensor_scales, activation,
                                           out_dtype, interpret)
+    if names is not None:
+        # The residuals the backward reads, named as the projections apart name their outputs (`names`: the
+        # gate's and the up's; an ungated chain's one product the up's), so a remat policy saving them keeps
+        # the first projections and their quantizing epilogue out of the backward (row 12758).
+        products = tuple(checkpoint_name(product, name)
+                         for product, name in zip(products, names[-len(products):], strict=True))
     return out, (x, w_ins, w_down, group_blocks, products)
 
 
-def _chain_backward(recipe, activation, out_dtype, interpret, live, residuals, cotangent):
+def _chain_backward(recipe, activation, out_dtype, interpret, live, names, residuals, cotangent):
+    del names
     # No gradient through the group blocks or the tensor scales (constants of the step, the run's histories').
     return (*_chain_pulled(_CHAINS[recipe].backward, activation, out_dtype, interpret, live, residuals,
                            cotangent), None, None)
@@ -382,7 +394,8 @@ def _chain_pulled(backward, activation, out_dtype, interpret, live, residuals, c
 
 
 def blockwise_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation, *, out_dtype,
-                    gate: jax.Array | None = None, interpret_on_cpu: bool = False) -> jax.Array:
+                    gate: jax.Array | None = None, names: tuple[str, str] | None = None,
+                    interpret_on_cpu: bool = False) -> jax.Array:
     """`blockwise_fp8_projection(activation(blockwise_fp8_projection(x, w_up)), w_down)` of `x`'s rows
     (`[rows, depth]`, whole 128-row blocks, one group of them; `w_up` `[1, depth, hidden]`, `w_down` `[1,
     hidden, width]`), each product rounded to `out_dtype`, the activation of the rounded up projection rounded
@@ -395,15 +408,16 @@ def blockwise_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation
     both); its value bitwise theirs where the kernel's activation computes as XLA's does (an exact one,
     ReLU's; any, interpreted), else its rows' codes those of the kernel's activation, within check 1 of
     theirs (a GH200's GELU moved 0.38% of the codes by its tanh, M-NG-21b; testing.md's kernel against the
-    composition it replaces); `activation` is an elementwise function of `out_dtype` arrays, the MLP's."""
+    composition it replaces); `activation` is an elementwise function of `out_dtype` arrays, the MLP's.
+    `names`, `recipe_chain`'s."""
     _one_group(x, w_up, w_down, gate)
     return _chained("blockwise_fp8", x, w_up, w_down, activation, out_dtype=out_dtype, gate=gate,
-                    live=x.shape[0], interpret=interpret_on_cpu)
+                    live=x.shape[0], interpret=interpret_on_cpu, names=names)
 
 
 def nvfp4_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation, *, out_dtype,
-                tensor_scales: tuple, gate: jax.Array | None = None, interpret_on_cpu: bool = False
-                ) -> jax.Array:
+                tensor_scales: tuple, gate: jax.Array | None = None, names: tuple[str, str] | None = None,
+                interpret_on_cpu: bool = False) -> jax.Array:
     """`nvfp4_projection(activation(nvfp4_projection(x, w_up, tensor_scale=s)), w_down, tensor_scale=t)` of
     `x`'s rows (`[rows, depth]`, whole 128-row blocks, one group of them; `w_up` `[1, depth, hidden]`,
     `w_down` `[1, hidden, width]`) at a delayed-scaling NVFP4 recipe's `tensor_scales` `(s, t)`, the rows'
@@ -418,10 +432,10 @@ def nvfp4_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation, *,
     (at `s` too) stored and read by the up projection's epilogue. Its gradients bitwise the projections
     apart at the same scales (each projection's own surrogate, `_nvfp4_backward`), its value as
     `blockwise_chain`'s is: bitwise where the kernel's activation computes as XLA's does, else within check
-    1; `activation` is an elementwise function of `out_dtype` arrays, the MLP's."""
+    1; `activation` is an elementwise function of `out_dtype` arrays, the MLP's. `names`, `recipe_chain`'s."""
     _one_group(x, w_up, w_down, gate)
     return _chained("nvfp4", x, w_up, w_down, activation, out_dtype=out_dtype, gate=gate, live=x.shape[0],
-                    interpret=interpret_on_cpu, tensor_scales=tensor_scales)
+                    interpret=interpret_on_cpu, tensor_scales=tensor_scales, names=names)
 
 
 def _one_group(x, w_up, w_down, gate) -> None:
@@ -436,7 +450,7 @@ def _one_group(x, w_up, w_down, gate) -> None:
 
 
 def _chained(recipe: str, x, w_up, w_down, activation, *, out_dtype, gate, live: int, interpret: bool,
-             tensor_scales: tuple | None = None) -> jax.Array:
+             tensor_scales: tuple | None = None, names: tuple[str, str] | None = None) -> jax.Array:
     """The `recipe` chain's declared-derivative call (`_recipe_chain`) of one group of `x`'s whole blocks,
     its first `live` rows the caller's: a public chain's, every row; `recipe_chain`'s, the rows it padded. An
     NVFP4 chain's `tensor_scales` its operands, no gradient through them; a blockwise FP8 chain's none."""
@@ -446,8 +460,10 @@ def _chained(recipe: str, x, w_up, w_down, activation, *, out_dtype, gate, live:
 
     # Each scale one scalar, refused before it reaches a product (`bits.nvfp4_given_scale`).
     scales = tuple(bits.nvfp4_given_scale(scale) for scale in tensor_scales or ())
+    if names is not None and len(names) != 2:
+        raise ValueError(f"a chain's names are its gate's and its up projection's, not {names}")
     return _recipe_chain(recipe, x, w_ins, w_down, group_blocks, scales, activation, jnp.dtype(out_dtype),
-                         interpret, live)
+                         interpret, live, None if names is None else tuple(names))
 
 
 def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
@@ -622,7 +638,7 @@ take none: an activation's block or tensor scales its own, known only once it is
 # (`Surrogate`), its tensor scales constants of the step.
 _recipe_chain = contracted("test_a_recipe_chain_holds_every_reverse_order")(
     declared_derivative(Surrogate(), _chain, _chain_forward, _chain_backward,
-                        nondiff_argnums=(0, 6, 7, 8, 9)))
+                        nondiff_argnums=(0, 6, 7, 8, 9, 10)))
 
 
 def dot_general(xla, path: tuple | None = None):

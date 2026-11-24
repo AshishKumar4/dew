@@ -175,6 +175,24 @@ def test_unforced_syrk_skips_mosaic_certification_while_forced_certifies():
                for c in report.certifications())
 
 
+@pytest.mark.parametrize("other", ["mosaic", "cutlass", "triton"])
+def test_naming_the_grouped_products_kernel_leaves_muons_symmetric_products_their_own(other):
+    """Muon's symmetric Gram and Newton-Schulz polynomial (`gemm.SYRK`) select under their own choice
+    (`syrk`): naming the grouped products' kernel (`grouped_matmul`) routes no SYRK call to it nor refuses
+    one, each symmetric product on an sm90's routes the default's, as `syrk` unnamed takes it (row 12485)."""
+    x = jax.ShapeDtypeStruct((4, 128, 256), jnp.bfloat16)
+
+    def routes_of(**named):
+        with generation.assumed("sm90"), generation.chosen(**named), generation.routes() as found:
+            jax.eval_shape(gemm.symmetric_gram, x)
+            jax.eval_shape(lambda a: gemm.symmetric_polynomial(a, (3.4445, -4.7750, 2.0315)),
+                           jax.ShapeDtypeStruct((4, 128, 128), jnp.bfloat16))
+        return [(route.choice, route.kernel) for route in found if route.choice == "syrk"]
+
+    default = routes_of()
+    assert default and routes_of(grouped_matmul=other) == default
+
+
 def test_syrk_measured_gate_admits_whole_tile_ampere_and_hopper_gram_only():
     """`M-NG-45-a100` & `M-NG-45b-gh200` admit whole-tile `mma.sync`/`wgmma` symmetric Gram (1.52-1.91x XLA)
     while keeping ragged shapes, polynomials (pending native Check 1), and unmeasured `sm100` on XLA."""

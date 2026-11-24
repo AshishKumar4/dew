@@ -92,6 +92,14 @@ def _product(groups: int, out_dtype: str, kernel: str):
     return product
 
 
+CUBLASLT_PRECISION = jax.lax.Precision.DEFAULT
+"""The precision a cuBLASLt FP8 arm's dots state (`cublaslt`, test_gemm_blockwise's kernel gradient): XLA
+enables cuBLASLt's FP8 fast accumulation, the form the owner's parity holds (docs/design/testing.md, "FP8
+products"), only at a dot's DEFAULT compute precision (`IsFastAccumEnabled`,
+xla/stream_executor/cuda/cuda_blas_lt.cc), and a dot stating none takes the lane's
+JAX_DEFAULT_MATMUL_PRECISION=highest (tests/lane_environment.py), under which the arm summed in fp32."""
+
+
 def cublaslt_arm(fn, inputs):
     """`fn`, a program whose dots multiply FP8 codes into fp32, compiled as cuBLASLt's FP8 GEMM runs each
     (`generation_support.cublas_compiled`), the reference arm of a block-scaled FP8 form on Hopper
@@ -102,7 +110,9 @@ def cublaslt_arm(fn, inputs):
 
 def cublaslt(sizes, out_dtype: str) -> callable:
     """cuBLASLt's FP8 GEMM on a product's codes a 128-deep block at a time (XLA's dot of two FP8 operands
-    into fp32, `cublaslt_arm`), every row by each group's matrix and a group's rows kept, each block's
+    into fp32 at DEFAULT precision, `cublaslt_arm`: cuBLASLt's fast accumulation, each block summed in the
+    tensor cores' narrow accumulator, which XLA turns off at any other precision, the lane's `highest`
+    among them; rows 12753, 12754), every row by each group's matrix and a group's rows kept, each block's
     partial scaled by its rows' and columns' scales and the blocks added in fp32, as the product's
     definition (`truth`) orders them: `run(rows, matrices, row_scales, column_scales)`."""
     owners = np.repeat(np.arange(len(sizes)), np.asarray(sizes))
@@ -114,7 +124,7 @@ def cublaslt(sizes, out_dtype: str) -> callable:
             mine = jnp.asarray(np.pad(owners == group, (0, rows.shape[0] - owners.size)))[:, None]
             for block in range(row_scales.shape[0]):
                 depth = slice(128 * block, 128 * (block + 1))
-                partial = jnp.dot(rows[:, depth], matrices[group, :, depth].T,
+                partial = jnp.dot(rows[:, depth], matrices[group, :, depth].T, precision=CUBLASLT_PRECISION,
                                   preferred_element_type=jnp.float32)
                 columns = jnp.repeat(column_scales[group, block], per)
                 out = out + jnp.where(mine, partial * row_scales[block, :, None] * columns[None, :], 0)

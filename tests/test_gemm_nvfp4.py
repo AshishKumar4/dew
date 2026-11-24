@@ -290,12 +290,19 @@ def test_a_stack_of_nvfp4_banks_is_read_at_its_layer_as_that_layers_bank(kernel,
         return gemm.nvfp4_product(rows, matrix, sizes, table, layer=layer, out_dtype=jnp.float32,
                                   interpret_on_cpu=True)
 
+    def pulled(rows, matrix, layer=None):
+        out, pull = jax.vjp(lambda x: product(x, matrix, layer), rows)
+        return out, pull(cotangent)[0]
+
     with generation.assumed("sm90"), generation.chosen(nvfp4=kernel), generation.routes() as routes:
+        # One program for the stack at a traced layer and one for a bank, each run at every layer: three eager
+        # traces of the interpreted kernel a layer took 160 s, past a group's 120 s target (row 12471's file).
+        stacked = jax.jit(lambda layer: pulled(rows, stack, layer))
+        alone = jax.jit(lambda bank: pulled(rows, bank))
         for layer, bank in enumerate(banks):
-            got, pull = jax.vjp(lambda x, layer=layer: product(x, stack, jnp.asarray(layer)), rows)
-            want, pull_bank = jax.vjp(lambda x, bank=bank: product(x, bank), rows)
-            assert np.asarray(got).tobytes() == np.asarray(want).tobytes(), layer
-            assert np.asarray(pull(cotangent)[0]).tobytes() == np.asarray(pull_bank(cotangent)[0]).tobytes()
+            got, want = stacked(jnp.asarray(layer)), alone(bank)
+            for got_leaf, want_leaf in zip(got, want, strict=True):
+                assert np.asarray(got_leaf).tobytes() == np.asarray(want_leaf).tobytes(), layer
     assert {route.kernel for route in routes if route.choice == "nvfp4"} == {kernel}, routes
 
 

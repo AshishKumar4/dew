@@ -111,8 +111,9 @@ def _gradient_truth(lhs_t, rhs_t, *scales):
 
 def _gradient_cublaslt(*operands):
     """cuBLASLt's FP8 GEMM on the kernel gradient's codes a block at a time (`blockwise_matrix.cublaslt_arm`:
-    its blocks' dots of the FP8 codes into fp32), each partial scaled and added in order."""
-    return _blocked(*operands, jnp.float32)
+    its blocks' dots of the FP8 codes into fp32 at `CUBLASLT_PRECISION`, cuBLASLt's fast accumulation), each
+    partial scaled and added in order."""
+    return _blocked(*operands, jnp.float32, precision=blockwise_matrix.CUBLASLT_PRECISION)
 
 
 def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
@@ -461,3 +462,39 @@ def test_a_padded_recipe_chain_keeps_its_padding_out_of_every_gradient(activatio
         fused = jax.jit(with_gradients(chained))(x, up, down, cotangent)
         separate = jax.jit(with_gradients(apart))(x, up, down, cotangent)
     blockwise_matrix.assert_bitwise_leaves(("value", "d_x", "d_up", "d_down"), fused, separate, finite=True)
+
+
+@pytest.mark.parametrize("recipe", ["blockwise_fp8", "nvfp4"])
+@pytest.mark.parametrize("gated", [False, True], ids=["ungated", "gated"])
+def test_a_recipe_chains_products_carry_the_names_a_remat_policy_saves(recipe, gated):
+    """A recipe chain given `names` (`blockwise_chain`, `nvfp4_chain`; `recipe_chain`'s, which `GatedMLP`
+    passes) names its first projections' rounded products, the residuals its backward reads, as the
+    projections apart name their outputs: under a remat policy saving those names they are saved, the gate's
+    and the up's (an ungated chain's one product the up's), so its backward recomputes neither projection nor
+    its quantizing epilogue (row 12758); unnamed, the same policy saves no product of the chain's."""
+    rng = np.random.default_rng(12758)
+    x = jnp.asarray(rng.normal(size=(128, 128)), jnp.bfloat16)
+    firsts = [jnp.asarray(rng.normal(size=(1, 128, 256)) / 16, jnp.bfloat16) for _ in range(1 + gated)]
+    down = jnp.asarray(rng.normal(size=(1, 256, 128)) / 16, jnp.bfloat16)
+
+    def activation(*values):
+        return jax.nn.silu(values[0]) * values[-1] if gated else jax.nn.relu(values[0])
+
+    def chained(names):
+        def run(x, *matrices):
+            *gate, up, down = matrices
+            options = {"gate": gate[0] if gate else None, "names": names, "out_dtype": jnp.bfloat16}
+            if recipe == "nvfp4":
+                scales = (jnp.float32(2.0 ** -6), jnp.float32(2.0 ** -8))
+                return projections.nvfp4_chain(x, up, down, activation, tensor_scales=scales, **options)
+            return projections.blockwise_chain(x, up, down, activation, **options)
+        policy = jax.checkpoint_policies.save_only_these_names("gate", "up")
+        return jax.checkpoint(lambda *operands: jnp.sum(run(*operands).astype(jnp.float32)), policy=policy)
+
+    def saved(names) -> list[str]:
+        residuals = jax.ad_checkpoint.saved_residuals(chained(names), x, *firsts, down)
+        sources = [source for _, source in residuals]
+        return sorted(name for name in ("gate", "up") for source in sources if f"named '{name}'" in source)
+
+    assert saved(("gate", "up")) == (["gate", "up"] if gated else ["up"])
+    assert saved(None) == []
