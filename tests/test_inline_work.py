@@ -10,7 +10,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, memref, scf
 
-from dew.nn.kernels.templates import emission
+from dew.nn.kernels.templates import cost, emission
 from dew.nn.kernels.templates.cost import Work
 
 _ROW = jax.ShapeDtypeStruct((128,), jnp.float32)
@@ -62,6 +62,37 @@ def test_a_branch_a_lanes_place_decides_issues_for_its_warps_and_moves_its_lanes
             _scaled(ref)
 
     assert _counted(body) == Work(operations=32, shared_bytes=2 * 4 * 16)
+
+
+def _uniform_branch(*, multiplied: bool, xored: bool):
+    """A body branching on a word every lane loads at one place, data its lanes hold alike: its then arm a
+    multiply a lane where `multiplied`, its else arm an integer xor over two warps' lanes where `xored`."""
+    def body(ctx, ref):
+        del ctx
+        first = memref.load(ref, [arith.constant(ir.IndexType.get(), 0)])
+        positive = arith.cmpf(arith.CmpFPredicate.OGT, first, arith.constant(ir.F32Type.get(), 0.0))
+        branch = scf.IfOp(positive, [], hasElse=True)
+        with ir.InsertionPoint(branch.then_block):
+            if multiplied:
+                arith.mulf(first, first)
+            scf.YieldOp([])
+        with ir.InsertionPoint(branch.else_block):
+            if xored:
+                with mgpu_utils.when(_thread(64)):
+                    arith.xori(mgpu_utils.thread_idx(), mgpu_utils.thread_idx())
+            scf.YieldOp([])
+
+    return body
+
+
+def test_a_uniform_branch_issues_its_costliest_arms_slots():
+    """A branch data every lane holds alike decides runs one arm, so its issue slots are the costlier arm's,
+    a body with that arm alone: its arms' most taken unit by unit (one arm's fp32 multiplies beside the
+    other's integer xors) counted a mix neither issues (the review of lane/toolkit 4667ed46469)."""
+    both = cost.issued(_counted(_uniform_branch(multiplied=True, xored=True)))
+    alone = max(cost.issued(_counted(_uniform_branch(multiplied=True, xored=False))),
+                cost.issued(_counted(_uniform_branch(multiplied=False, xored=True))))
+    assert both == alone, (both, alone)
 
 
 def test_a_static_loop_counts_its_trips_and_a_concrete_operand_its_lanes():
