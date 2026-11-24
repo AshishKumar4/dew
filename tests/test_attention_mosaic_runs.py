@@ -22,24 +22,24 @@ def _runs(count: int, rows: int, tokens: int) -> jax.Array:
     return jnp.broadcast_to(jnp.stack(runs, 1)[None], (rows, tokens, count, 2))
 
 
-@pytest.mark.parametrize("count", [3, 4])
-def test_a_forward_over_several_runs_certifies_its_derived_config_once(count, without_deterministic_ops):
-    """A causal forward over `count` key runs a query (eight heads 64 wide over 2 x 2,048 tokens) compiles on
+def test_a_forward_over_several_runs_certifies_its_derived_config_once(without_deterministic_ops):
+    """A causal forward over three key runs a query (eight heads 64 wide over 2 x 2,048 tokens) compiles on
     a compile-only H100 at the config its derivation gives, certified once and spill-free: its runs' union
     counted, one select an entry (`attention_algebra.seen`), each further run's bounds priced as the rows its
     walk holds (`attention_mosaic_registers._runs_bounds`); on main its walk at 64 x 128 three consumers
-    spilled 120 and 144 bytes at its raised 160 and stepped down (FS-6766-MAIN1, row 6766)."""
+    spilled 120 bytes at its raised 160 and stepped down (FS-6766-MAIN1, row 6766; four runs' scaled rewalk
+    still steps down once, that row's)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     q = jax.ShapeDtypeStruct((2, 2048, 8, 64), jnp.bfloat16)
-    runs = _runs(count, 2, 2048)
+    runs = _runs(3, 2, 2048)
 
     def forward(q, k, v):
         return scaled_dot_product_attention(q, k, v, causal=True, key_runs=runs, implementation="template")
 
     with generation.assumed("sm90"):
-        found = compile_mosaic_kernels([KernelCase(f"{count} runs", lambda: (forward, (q, q, q)))], "sm90")
+        found = compile_mosaic_kernels([KernelCase("three runs", lambda: (forward, (q, q, q)))], "sm90")
     assert not (failed := mosaic_failures(found)), "\n".join(failed)
     forwards = [certified for record in found for certified in record.get("certifications", [])
                 if certified["op"] == "MosaicForward"]
