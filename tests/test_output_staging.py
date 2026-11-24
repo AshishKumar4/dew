@@ -9,7 +9,7 @@ from generation_support import INTERPRETS, on_the_host
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import stores
+from dew.nn.kernels.templates import bundles, stores
 
 NVFP4 = (stores.Output((64, 256), jnp.uint8, 2), stores.Output((64, 256), jnp.float8_e4m3fn, 16))
 """A 64-row share of a 256-column NVFP4 tile's codes (two to a byte) and scales (one a 16-column block)."""
@@ -71,10 +71,41 @@ def test_a_packed_outputs_chunk_stores_whole_rows_of_each_or_is_refused():
     assert stores.staging_refusal(128, (jnp.float32,), packed=(fp32._replace(shape=(2, 128)),))
 
 
-def _packed_store(rows: int, columns: int, divisor: int, chunk: int, *, transposed: bool):
+def test_a_packed_buffer_is_refused_unaligned_past_a_box_or_on_a_whole_tile_family():
+    """A packed chunk's buffer is a whole number of 128 bytes, so each of a stack of them starts aligned for
+    its tensor copy (a transposed [3, 64] byte buffer, 192 bytes, refused), at most 256 elements an axis
+    (a transposed 512-column chunk's [512, 64] refused), and a family staging whole tiles (mma.sync's)
+    refuses an output packed or written by its own write."""
+    aligned = stores.Output((64, 192), jnp.uint8, 32, transposed=True)
+    with pytest.raises(ValueError):
+        stores.output_staging(192, (jnp.uint8,), (96, 2), packed=(aligned,))
+    wide = stores.Output((64, 512), jnp.uint8, 1, transposed=True)
+    with pytest.raises(ValueError):
+        stores.output_staging(512, (jnp.uint8,), (512, 1), packed=(wide,))
+    whole = bundles.named("mma.sync", jnp.bfloat16, None)
+    with pytest.raises(ValueError):
+        whole.output_staging((stores.Output((64, 64), jnp.bfloat16, write=stores.written),), 1)
+    with pytest.raises(ValueError):
+        whole.output_staging((NVFP4[0]._replace(shape=(64, 64)),), 1)
+
+
+def test_a_ring_family_stages_plain_and_packed_outputs_side_by_side():
+    """A wgmma ring family's staging of a plain bf16 output beside NVFP4's codes and a transposed fp32 scale:
+    each its own buffers, the plain one its derived chunk of 64 bf16 columns, the codes 128 tile columns a
+    chunk in 64 bytes, the scale `[1, 64]` a 128-column chunk."""
+    family = bundles.named("wgmma", jnp.bfloat16, None)
+    scale = stores.Output((64, 256), jnp.float32, 128, transposed=True)
+    staged = family.output_staging((((64, 256), jnp.bfloat16), NVFP4[0], scale), 2)
+    assert [(buffer.shape, jnp.dtype(buffer.dtype)) for buffer in staged] == [
+        ((2, 2, 64, 64), jnp.dtype(jnp.bfloat16)), ((2, 2, 64, 64), jnp.dtype(jnp.uint8)),
+        ((2, 2, 1, 64), jnp.dtype(jnp.float32))]
+
+
+def _packed_store(rows: int, columns: int, divisor: int, chunk: int, *, transposed: bool, first=0):
     """A kernel staging a share of `rows` by `columns` tile columns, each its column's index plus a thousand
     times its row, through two buffers of `chunk` tile columns stored packed (`stores.staged_chunks`), its
-    write keeping each `divisor`th column (a stand-in for a block's scale), transposed where asked."""
+    write keeping each `divisor`th column (a stand-in for a block's scale), transposed where asked, its
+    share's first row `first`."""
     stored = chunk // divisor
     block = (stored, rows) if transposed else (rows, stored)
 
@@ -86,8 +117,8 @@ def _packed_store(rows: int, columns: int, divisor: int, chunk: int, *, transpos
         def scoped(smem):
             value = (jax.lax.broadcasted_iota(jnp.float32, (rows, columns), 1)
                      + 1000.0 * jax.lax.broadcasted_iota(jnp.float32, (rows, columns), 0))
-            stores.staged_chunks(smem, value, out_gmem, (0, 0, jnp.int32(rows), 0, rows, rows), write=write,
-                                 divisor=divisor, transposed=transposed)
+            stores.staged_chunks(smem, value, out_gmem, (0, first, jnp.int32(rows), 0, rows, rows),
+                                 write=write, divisor=divisor, transposed=transposed)
             plgpu.wait_smem_to_gmem(0)
 
         pl.run_scoped(scoped, plgpu.SMEM((2, *block), jnp.float32))
@@ -107,3 +138,12 @@ def test_a_packed_output_stores_each_chunks_columns_at_its_stored_place(transpos
         got = np.asarray(_packed_store(rows, columns, 4, 16, transposed=transposed)())
     expected = np.arange(0, columns, 4)[None, :] + 1000.0 * np.arange(rows)[:, None]
     np.testing.assert_array_equal(got, expected.T if transposed else expected)
+
+
+@INTERPRETS
+def test_a_transposed_store_of_a_share_starting_mid_tile_is_refused():
+    """A transposed output stores its share's rows whole from the share's first row, so a share whose first
+    row is traced (a grouped tile's group starting mid-tile) is refused as it traces, before any store, where
+    it would overwrite the rows before it."""
+    with on_the_host(), pytest.raises(ValueError):
+        _packed_store(8, 64, 4, 16, transposed=True, first=jnp.int32(0))()
