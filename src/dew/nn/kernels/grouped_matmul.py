@@ -291,10 +291,12 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                       for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
                                             strict=True) if held_axes(axes) == ('columns',))
         vectors += family.column_registers(columns, jnp.float32) if hooks.accumulators > 1 else 0
-        tile_count = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes)
+        tiles = tuple(side.dtype for side, axes in zip(ba.arguments.get('epilogue_operands', ()),
+                                                       hooks.epilogue_axes, strict=True)
+                      if len(held_axes(axes)) > 1)
         out_dtypes = hooks.out_dtypes or stored
         return pricing.epilogue_registers(family, config.share, columns, out_dtypes, vectors=vectors,
-                                          tile_count=tile_count, has_hook=True, staging=config.staging)
+                                          tiles=tiles, has_hook=True, staging=config.staging)
 
     def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba
