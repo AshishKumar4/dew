@@ -1,18 +1,22 @@
 """Two mma.sync consumers' collective cp.async walk prefetching each step's first fragments (row 12695)."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from generation_support import INTERPRETS
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.sharding import Mesh
 
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import bundles
 
 INTERPRETED = plgpu.InterpretGPUParams()
 ROWS, WIDTH, STEPS, CONSUMERS = 64, 64, 4, 2
 
 
-def _prefetched_walk(x, segments: tuple[tuple[int, int], ...]):
+def _prefetched_walk(x, segments: tuple[tuple[int, int], ...], interpret=INTERPRETED):
     """Two consumers sharing one cp.async pipeline walk `segments` of `x`'s `ROWS`-row steps, stated common,
     their bounds traced: each step adds its tile to an fp32 sum, its first row read ahead by the pipeline's
     prefetch. Returns each consumer's sum and the prefetches each ran (`[CONSUMERS]`, counted in global
@@ -43,7 +47,7 @@ def _prefetched_walk(x, segments: tuple[tuple[int, int], ...]):
 
             def walk(streams, lo, hi, start):
                 del lo, hi, start
-                return family.walk(streams, walk_segments, (), ((ROWS, WIDTH),), INTERPRETED,
+                return family.walk(streams, walk_segments, (), ((ROWS, WIDTH),), interpret,
                                    first=first, prefetch=prefetch)[1][0]
 
             streamed = (first, first + STEPS)
@@ -54,7 +58,7 @@ def _prefetched_walk(x, segments: tuple[tuple[int, int], ...]):
     sums = jax.ShapeDtypeStruct((CONSUMERS, ROWS, WIDTH), jnp.float32)
     counts = jax.ShapeDtypeStruct((CONSUMERS,), jnp.int32)
     return family.kernel(body, out_type=(sums, counts), grid=(1,), grid_names=("programs",),
-                         consumers=CONSUMERS, interpret=INTERPRETED, name="prefetched")(x)
+                         consumers=CONSUMERS, interpret=interpret, name="prefetched")(x)
 
 
 @INTERPRETS
@@ -69,3 +73,13 @@ def test_a_traced_empty_common_segment_prefetches_nothing():
     expected = np.asarray(x, np.float32).reshape(STEPS, ROWS, WIDTH).sum(axis=0)
     for summed in np.asarray(sums):
         np.testing.assert_array_equal(summed, expected)
+
+
+def test_a_prefetching_common_walk_lowers_for_an_a100():
+    """The prefetching walk, its traced segments' pipelines each under a branch on its trips, lowers for an
+    A100 on any host."""
+    x = jax.ShapeDtypeStruct((STEPS * ROWS, WIDTH), jnp.bfloat16)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+    walked = functools.partial(_prefetched_walk, segments=((0, 0), (0, 1), (1, STEPS)), interpret=False)
+    with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(walked).trace(x).lower(lowering_platforms=("cuda",))
