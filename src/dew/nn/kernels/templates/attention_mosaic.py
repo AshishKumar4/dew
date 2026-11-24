@@ -2002,9 +2002,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         issues its products back to back (TRAINC-h100: 6.88 against 3.72 ms causal, 9.68 against 7.56 full,
         at 64 x 64 with two consumers and one). The fast form of a hookless call (or one whose hook takes no
         parameters, a softcap, or under an initial state, sinks) takes one launch where one holds the whole
-        width, its dK/dV program queries first adding each tile's dQ atomically (FUSEDFORM-h100: 1.05 to 1.4
-        times as fast at widths 64 and 128 over 1k to 8k tokens; ET-A05AB3-h100: 5.20 against 6.19 ms the two
-        keys-first launches at Qwen3-8B causal, 1.19 against 1.53 at width 64;
+        width, its dK/dV program queries first adding each tile's dQ atomically, where the cost model prices
+        it below the two launches (`_cheaper`: an A100's two launches measured faster at every cell,
+        M-NA-13-a100, MHA d64 2706 against 2419 us, Llama d64 6688 against 4582, Qwen d128 12950 against
+        12401, d256 20454 against 12909, its dQ adds throttled on the global queue, M-NA-9-a100; on an H100
+        FUSEDFORM-h100: 1.05 to 1.4 times as fast at widths 64 and 128 over 1k to 8k tokens; ET-A05AB3-h100:
+        5.20 against 6.19 ms the two keys-first launches at Qwen3-8B causal, 1.19 against 1.53 at width 64;
         check 1 on drawn inputs and finite over every stability family it takes, FUSEDSTAB-h100; 384 MB of
         temporaries against 258 at llama-d128 2 x 4096, its dQ fp32), a call over key spans, windows,
         documents or runs as a plain one (ET-CROSS-h100 and ET-SPAN4-h100, the attention launches a training
@@ -2030,8 +2033,59 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The dK/dV launch's consumers a backward's at most (`BACKWARD_CONSUMERS`), whatever its layout's.
         dkv = ({"dkv_family": fed[0].name, "dkv_consumers": min(fed[0].consumers, BACKWARD_CONSUMERS)}
                if fed else {})
-        config = self._one_launch(ba, target, family, fed, dkv) or self._two_launches(ba, target, family, dkv)
-        return None if config is None else self._deepened(ba, config, target)
+        candidates = [self._deepened(ba, config, target) for config in (
+            self._one_launch(ba, target, family, fed, dkv), self._two_launches(ba, target, family, dkv))
+            if config is not None]
+        return self._cheaper(ba, candidates, target) if candidates else None
+
+    def _cheaper(self, ba: tokamax.BoundArguments, candidates: list[BackwardTiles],
+                 target: generation.GpuTarget) -> BackwardTiles:
+        """The one launch or the two `candidates` hold whose launches the cost model prices least
+        (`price_config`), stored beside the verdicts so a warm start traces nothing to price (`_choice_key`,
+        `tuning.stored_choice`); the first where one alone is legal or the target holds no rates."""
+        if len(candidates) <= 1 or not target.multiprocessors or not cost.rates(target, device=False).tensor:
+            return candidates[0]
+        key = _choice_key(self, ba, tuple(candidates), target)
+        stored = None if key is None else tuning.stored_choice(target.generation, key)
+        if isinstance(stored, (tuple, list)):
+            matched = next((config for config in candidates if config.fused == bool(stored[0])), None)
+            if matched is not None:
+                return matched
+        prices = [self.price_config(ba, config, target) for config in candidates]
+        if any(price is None for price in prices):
+            return candidates[0]
+        best = min(zip(prices, range(len(candidates)), candidates, strict=True))[2]
+        if key is not None:
+            tuning.store_choice(target.generation, key, (int(best.fused),))
+        return best
+
+    def price_config(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget
+                     ) -> float | None:
+        """Price `config`'s launches on `target`, the fused one's or the two's summed (`cost.launch_seconds`
+        over `emission.work_of`, each at `config`'s residency), traced under `report.launching`."""
+        names = ("query", "key", "value", "dout", "start", "end", "query_ids", "key_ids", "score_params",
+                 "initial", "residuals", "drop")
+        operands = tuple(tuning.shapes(ba.arguments[name]) for name in names)
+        identity = report._identity(self, ba, target)
+
+        def priced(*args):
+            return self._fwd(*args, interpret=False, config=config)[0]
+
+        priced.__name__ = priced.__qualname__ = (
+            f"priced_{type(self).__name__}_l{report._digest(identity)}_c{report._digest(repr(config))}")
+        with generation.assumed(target), report.launching(self, ba, config):
+            traced = jax.make_jaxpr(priced)(*operands)
+        kernels = [eq for eq in programs.equations(traced.jaxpr) if eq.primitive in programs.NATIVE_KERNELS]
+        if not kernels:
+            return None
+        resident = self.resident(ba, config, target)
+        total = 0.0
+        for kernel in kernels:
+            work = emission.work_of(kernel)
+            if work is None:
+                return None
+            total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident)
+        return total
 
     def _deepened(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                   target: generation.GpuTarget) -> BackwardTiles:
