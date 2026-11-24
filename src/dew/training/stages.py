@@ -404,7 +404,7 @@ class StageLocal:
                 rows.extend(program(_cut_piece, static_argnames="stacked", out_shardings=(row,) * count)(
                     piece, stacked=len(shape)))
                 _stacked_ahead(count, leaf.shape[len(shape):], leaf.dtype, row, shape[1:],
-                               _sharded(row, devices, (None, *[None] * (len(shape) - 1), *row.spec)))
+                               _piece_sharding(row, devices, len(shape)))
             return rows
 
         def saved_tree(tree):
@@ -427,9 +427,8 @@ class StageLocal:
                 assert isinstance(devices, NamedSharding) and isinstance(devices.mesh, Mesh), (
                     "a stage's rows are read onto its own devices")
                 # A stage's rows are the restore's own arrays, no other leaf's: its piece takes them over.
-                piece = _sharded(row, devices.mesh, (None, *[None] * (len(shape) - 1), *row.spec))
-                pieces.append(program(_stacked_piece, static_argnames="within", donate_argnums=0,
-                                      out_shardings=piece)(held, within=shape[1:]))
+                restack = _restack(_piece_sharding(row, devices.mesh, len(shape)))
+                pieces.append(restack(held, within=shape[1:]))
             return jax.make_array_from_single_device_arrays(
                 (*shape, *rows[0].shape), self._stacked_sharding(row, len(shape)),
                 [shard.data for piece in pieces for shard in piece.addressable_shards], dtype=rows[0].dtype)
@@ -463,15 +462,18 @@ class StageLocal:
         leaves = jax.tree.leaves(stacked)
         if not leaves:
             return
-        placements = tuple(site.view.layer_form({"stages": jax.tree.map(lambda leaf: leaf.sharding, held)},
-                                                self._row_shardings)
-                           for site, held in entries)
+        placements = self._placements(entries)
         key = ("stage-whole", sites, jax.tree.structure(stacked),
                tuple((leaf.shape, np.dtype(leaf.dtype), leaf.sharding) for leaf in leaves),
                jax.tree.structure(placements), tuple(jax.tree.leaves(placements)))
-        compile_ahead(key, lambda: program(_layered_entries, static_argnums=0, out_shardings=placements,
-                                           donate_argnums=(1,)),
-                      sites, stacked, what="a stage-local stored unstack")
+        compile_ahead(key, lambda: _unstack(placements, consumed=True), sites, stacked,
+                      what="a stage-local stored unstack")
+
+    def _placements(self, entries) -> tuple:
+        """Where each stacked run's layers go back (`whole`'s, and its unstack compiled ahead's)."""
+        return tuple(site.view.layer_form({"stages": jax.tree.map(lambda leaf: leaf.sharding, held)},
+                                          self._row_shardings)
+                     for site, held in entries)
 
     def whole(self, variables, *, consumed: bool = False):
         """`variables` with each stacked run back on its stored layers, each layer on every stage
@@ -482,11 +484,7 @@ class StageLocal:
         if not entries:
             return variables
         sites, stacked = tuple(site for site, _ in entries), tuple(held for _, held in entries)
-        placements = tuple(site.view.layer_form({"stages": jax.tree.map(lambda leaf: leaf.sharding, held)},
-                                                self._row_shardings)
-                           for site, held in entries)
-        unstacked = (program(_layered_entries, static_argnums=0, out_shardings=placements,
-                             donate_argnums=(1,) if consumed else ())(sites, stacked)
+        unstacked = (_unstack(self._placements(entries), consumed=consumed)(sites, stacked)
                      if jax.tree.leaves(stacked) else _layered_entries(sites, stacked))
         return jax.tree.map(lambda held: {**held, **unstacked[held.index]} if isinstance(held, _Unstacked)
                             else held, template, is_leaf=lambda node: isinstance(node, _Unstacked))
@@ -516,17 +514,35 @@ def _stacked_piece(rows: list[jax.Array], *, within: tuple[int, ...]) -> jax.Arr
     return _stacked_rows(rows, (1, *within))
 
 
+def _piece_sharding(row: NamedSharding, mesh, stacked: int) -> NamedSharding:
+    """A stage's piece of a leaf stacked over `stacked` leading dimensions, on `mesh`, its rows' placement
+    after them."""
+    return _sharded(row, mesh, (None, *[None] * (stacked - 1), *row.spec))
+
+
+def _restack(piece_sharding: NamedSharding):
+    """The program a restore stacks a stage's rows into its piece by (`restored`), its rows donated: the
+    one its restack compiled ahead compiles (`_stacked_ahead`)."""
+    return program(_stacked_piece, static_argnames="within", donate_argnums=0, out_shardings=piece_sharding)
+
+
+def _unstack(placements: tuple, *, consumed: bool):
+    """The program `StageLocal.whole` takes its stacked runs back onto their layers by, at `placements`,
+    their stacked arrays donated where `consumed`: the one its unstack compiled ahead compiles."""
+    return program(_layered_entries, static_argnums=0, out_shardings=placements,
+                   donate_argnums=(1,) if consumed else ())
+
+
 def _stacked_ahead(count: int, row_shape: tuple[int, ...], dtype, row_sharding: NamedSharding,
                    within: tuple[int, ...], piece_sharding: NamedSharding) -> None:
-    """Compile a stage piece's restore restack (`_stacked_piece`) ahead, off the step, so a resume finds
-    it in the persistent compilation cache (`compile_ahead`)."""
+    """Compile a stage piece's restore restack (`_restack`) ahead, off the step, so a resume finds it in
+    the persistent compilation cache (`compile_ahead`)."""
     from dew.checkpoints._state_trees import compile_ahead
 
     abstract = [jax.ShapeDtypeStruct(row_shape, dtype, sharding=row_sharding)] * count
     key = ("stage-restack", count, row_shape, np.dtype(dtype), row_sharding, within, piece_sharding)
-    compile_ahead(key, lambda: program(_stacked_piece, static_argnames="within", donate_argnums=0,
-                                       out_shardings=piece_sharding),
-                  abstract, what="a stage-local restore stack", within=within)
+    compile_ahead(key, lambda: _restack(piece_sharding), abstract, what="a stage-local restore stack",
+                  within=within)
 
 
 def _layered_entries(sites: tuple[DecoderBank, ...], stacked: tuple[Mapping, ...]) -> tuple[dict, ...]:
