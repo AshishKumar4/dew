@@ -24,8 +24,10 @@ class _Triton(_GroupedLaunch[Tile]):
     def eligible(self, ba, target) -> bool:
         # Every CUDA GPU the template sends the kernels to (`kernels.gemm`), and
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU (a
-        # paired product the selector hands on apart: `_takes_pair`).
-        return generation.capability(target.generation) is not None and self.derived(ba, target) is not None
+        # paired product the selector hands on apart: `_takes_pair`); no output stored in a form of its own
+        # (`Hooks.out_forms`, the Mosaic template's staged stores alone).
+        return (generation.capability(target.generation) is not None and not ba.arguments['hooks'].out_forms
+                and self.derived(ba, target) is not None)
 
     def derived(self, ba, target) -> Tile | None:
         """The one tile the launch runs on `target`, from facts (the ranked set and its cost model deleted,
