@@ -814,7 +814,7 @@ def test_an_ungated_mlps_projections_run_as_one_recipe_chain_bitwise_their_two_a
     fp8 = RECIPE_NUMERICS["blockwise_fp8"]
     mlp = GatedMLP(hidden_features=256, out_features=128, activation="gelu", dtype=jnp.bfloat16)
     x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.bfloat16)
-    variables = mlp.init(jax.random.key(1), x)
+    variables = nn.unbox(mlp.init(jax.random.key(1), x))
 
     def chained(variables, x):
         return mlp.apply(variables, x)
