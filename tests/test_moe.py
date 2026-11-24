@@ -635,10 +635,10 @@ def _gated_case():
                 *(jnp.asarray(rng.normal(size=shape) / 8, dtype)
                   for shape in ((layers, experts, depth, width),) * 2 + ((layers, experts, width, depth),)))
 
-    def gated(x, gate, up, down, limit=None):
+    def gated(x, gate, up, down, limit=None, activation="swiglu"):
         kernels = (moe.Layered(kernel, layer) for kernel in (gate, up, down))
         return moe.gated_experts(moe.Gathered(x, rows, where), *kernels, sizes, x.dtype, "auto", None,
-                                 "swiglu", limit)
+                                 activation, limit)
 
     def apart(x, gate, up, down, limit=None):
         # Each projection on its own, the gated product between them, as before the fused form.
@@ -761,3 +761,25 @@ def test_a_gated_expert_layers_checkpointed_gradient_runs_its_pair_once(dtype):
     assert plain, "the gated expert layer runs its pair"
     # Replayed, the checkpointed gradient would hold each of them twice.
     assert paired(jax.checkpoint(loss, policy=REMAT_POLICIES["minimal"].checkpoint_policy())) == plain
+
+
+def test_a_gated_expert_layer_whose_hook_no_epilogue_lowers_runs_its_projections_apart():
+    """On an H100 whose grouped matmul is Mosaic GPU's, a gated expert layer under exact GeGLU (its GELU's
+    erfc, which no Mosaic launch lowers, `hooks.hook_lowers`) runs its projections apart, forward and
+    backward, each a Mosaic launch with no hook, refusing none (`moe.gated_experts`), as a dense gated MLP
+    hands off (`dew.nn.gated_mlp`)."""
+    from dew.nn.kernels import generation, grouped_matmul
+
+    draw, gated, _, _ = _gated_case()
+    operands = draw(0)
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
+          generation.routes() as routes, grouped_matmul.weighed() as calls):
+        def exact(*operands):
+            return gated(*operands, activation="geglu_exact").astype(jnp.float32).sum()
+
+        loss = jax.grad(exact, argnums=(0, 1, 2, 3))
+        jax.eval_shape(loss, *operands)
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}, routes
+    bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
+    assert not any(arguments.get("paired") is not None and arguments["hooks"].epilogue is not None
+                   for arguments in bound), bound

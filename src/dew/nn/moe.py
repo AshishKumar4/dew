@@ -55,6 +55,7 @@ from .activations import (
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels import formats, gemm, generation, projections
+from .kernels.templates.gemm.hooks import hook_lowers
 from .precision import (
     at_least_fp32,
     capped_logits,
@@ -823,13 +824,19 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     activation, a bf16 ulp apart where they differ. Where the pair runs apart (`paired_projections`) or the
     down projection takes
     no prologue (a packed bank's NVFP4 product, a run's recipe that takes the experts, `expert_projection`)
-    or the activation is a `Situ` (no hook's arithmetic), each projection runs on its own and the gated
+    or the gated product's hook lowers on no launch's epilogue (a `Situ`, an exact GELU's erfc), each
+    projection runs on its own and the gated
     product between them (`gated_product`), as before. Every arm's output the compute dtype's. `scatter`,
     `expert_projection`'s."""
     compute, paired = _paired(x, gate, up, dtype)
     down_stack, down_layer = (down.stack, down.layer) if isinstance(down, Layered) else (down, None)
+    # The gated product's hook where a launch's epilogue and prologue take its operations (`hook_lowers`, as
+    # `dew.nn.gated_mlp` asks: an exact GELU's erfc lowers on no Mosaic launch), else None.
+    tile = jax.ShapeDtypeStruct((128, 128), compute)
+    named = None if isinstance(activation, Situ) else gated_hook(activation, limit)
+    hook = named if named is not None and hook_lowers(named, (tile, tile), generation.gpu_target()) else None
     if (paired is None or down_layer is not paired[-1] or isinstance(down_stack, formats.NvFp4)
-            or _recipe_takes_experts(down_stack) or isinstance(activation, Situ)):
+            or _recipe_takes_experts(down_stack) or hook is None):
         gate_rows, up_rows = (_apart(x, (gate, up), group_sizes, compute, implementation, precision)
                               if paired is None else
                               _paired_call(paired, group_sizes, compute, implementation, precision))
@@ -838,7 +845,6 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
         hidden = gated_product(activation)(*swiglu_clamped(gate_rows, up_rows, limit))
         return _computed(expert_projection(hidden, down, group_sizes, compute, implementation, precision,
                                            scatter=scatter), compute)
-    hook = gated_hook(activation, limit)
     gate_rows, up_rows, hidden = _paired_call(
         paired, group_sizes, compute, implementation, precision, epilogue=rounded_gated(hook, compute),
         named=(Residual.GATE_PROJ, Residual.UP_PROJ, None))
