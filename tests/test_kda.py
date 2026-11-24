@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 from certified import assert_certified
 from forks_support import LAYOUTS, assert_forks_as_own_rows
+from generation_support import lowers
 from model_support import as_stepped, decode_through
 from reference_error import (
     assert_as_exact,
@@ -38,6 +39,7 @@ from reference_error import (
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
+from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, recurrent_delta_rule
 from dew.nn.precision import l2norm as jax_l2norm
 from tools.kda_reference import (
@@ -458,3 +460,29 @@ def test_a_kimi_decays_gradient_of_a_small_cross_term_is_exact_interpreted():
 
     assert_as_exact(decays_gradient(partial(chunk_on, 'mosaic_gpu')), decays_gradient(token_by_token), draw,
                     "kimi delta attention's small cross term's decay gradient", seeds=8)
+
+
+@lowers('sm80')
+@pytest.mark.parametrize('product', ['forward', 'training'])
+def test_a_fast_fp32_kimi_call_lowers_on_its_route_for_an_ampere_gpu(product):
+    """Kimi delta attention's fp32 forward and training under the fast forms (TF32's products), as its
+    selector routes them on an Ampere GPU, lowered compile-only: Mosaic GPU synthesized no shared-memory
+    transfer for the intra walk's 128-byte swizzled fp32 streams, so the template it routed to raised at
+    lowering (row 12647)."""
+    rows, length, heads, width = 1, 128, 2, 64
+    operands = ([jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 4
+                + [jax.ShapeDtypeStruct((rows, length, heads), jnp.float32)])
+
+    def forward(query, key, value, g, beta):
+        return chunk_gated_delta_rule(query, key, value, g, beta)[0]
+
+    def training(*given):
+        return jax.grad(lambda *given: jnp.sum(forward(*given)), argnums=(0, 1, 2, 3, 4))(*given)
+
+    mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), 'sm80')
+    # The default product precision the fast forms round at (the suite's lanes configure 'highest').
+    with (generation.assumed('sm80'), jax.sharding.use_abstract_mesh(mesh),
+          generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')),
+          jax.default_matmul_precision('default')):
+        traced = jax.jit(forward if product == 'forward' else training).trace(*operands)
+        traced.lower(lowering_platforms=("cuda",))
