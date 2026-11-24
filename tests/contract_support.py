@@ -433,10 +433,16 @@ def _on_a_mesh(fn, mesh, meshed: dict, *, truth_fn, draw, seeds, held) -> None:
 
 def _training_mesh():
     """Training's mesh of two of this process's devices (`MeshSpec`'s, its data axis two) a case's orders run
-    on (`_on_a_mesh`); None where the cell set its own mesh, under which its orders already run."""
+    on (`_on_a_mesh`); None where the cell set its own mesh, under which its orders already run, and in a GPU
+    tier part (`store_wire.COMPILED`): its prepare's devices are its host's CPUs and its store compiles for
+    one compile-only GPU, so no mesh of its run's devices is one its prepare holds, and a launch's specs
+    over a mesh are each order's own on the CPU lane's devices, where every case runs too (the GEMM lane's
+    dry prepare of the NVFP4 product's cell: "Received incompatible devices for jitted computation")."""
+    from store_wire import COMPILED
+
     from dew.training import MeshSpec
 
-    if not jax.sharding.get_abstract_mesh().empty:
+    if not jax.sharding.get_abstract_mesh().empty or COMPILED.get() is not None:
         return None
     return MeshSpec().build(jax.devices()[:2])
 
