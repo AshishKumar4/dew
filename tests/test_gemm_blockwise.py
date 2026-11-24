@@ -250,19 +250,21 @@ def test_restored_blockwise_cublaslt_references_prepare_on_sm90(tmp_path, monkey
     assert len(with_ref) == 2, [list(h.keys()) for h in arm_sites]
 
 
-def test_a_blockwise_chain_through_the_template_is_its_two_projections_apart():
+@pytest.mark.parametrize("rows", [256, 384])
+def test_a_blockwise_chain_through_the_template_is_its_two_projections_apart(rows):
     """An ungated MLP's two blockwise FP8 projections chained (`projections.blockwise_chain`), on an H100,
     interpreted, through the template named: the down projection's rows quantized in the up projection's
     epilogue and stored there (E4M3 codes and 1 x 128 scales `[hidden / 128, rows]`, transposed,
     `quantized.reduced`), its value and every gradient bitwise the two projections apart with the
     activation between them in XLA, as a recipe's run takes them today (row 8547); and the up projection's
-    launch the template's, its scales output in its form (`Hooks.out_forms`)."""
-    group_blocks = jnp.asarray([2], jnp.int32)
+    launch the template's, its scales output in its form (`Hooks.out_forms`). 384 rows end in a share past
+    the last row tile's pair of 128 (its stores whole shares, the tensor's bound clipping them)."""
+    group_blocks = jnp.asarray([rows // 128], jnp.int32)
     rng = np.random.default_rng(8547)
-    x = jnp.asarray(rng.normal(size=(256, 256)), jnp.bfloat16)
+    x = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
     up = jnp.asarray(rng.normal(size=(1, 256, 384)) / 16, jnp.bfloat16)
     down = jnp.asarray(rng.normal(size=(1, 384, 256)) / 16, jnp.bfloat16)
-    cotangent = jnp.asarray(rng.normal(size=(256, 256)), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
 
     def chained(x, up, down):
         return projections.blockwise_chain(x, up, down, jax.nn.gelu, out_dtype=jnp.bfloat16,
