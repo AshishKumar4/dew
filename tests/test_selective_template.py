@@ -842,3 +842,15 @@ def test_the_forwards_shared_memory_is_what_mosaic_allocates(packed, tmp_path):
     ampere = bundles.of('sm80', jnp.bfloat16)
     assert resources.shared_bytes(ampere, selective.forward_scope(ampere, chunk, states, dtypes, packed)) > 0
 
+
+
+def test_a_pick_measured_before_the_selective_scans_revision_names_another_op():
+    """Row 12421: the selective scan's revision is its op's field, which its stored picks' identity reads
+    (`tuning._identity`), so a pick measured at the revision before its backward's exp2 and fused joins names
+    another op than the scan's: a class attribute alone, the instance kept KernelOp's revision 1, and those
+    picks matched."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.templates.recurrence.selective import SELECTIVE
+
+    before = dataclasses.replace(SELECTIVE, revision=1)
+    assert tuning.encoded(tuning._identity(SELECTIVE)) != tuning.encoded(tuning._identity(before))

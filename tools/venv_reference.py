@@ -102,8 +102,15 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          **{f"multimodal-{family}": {
              "test": "test_multimodal_model", "arms": family, "worker": "multimodal_worker.py",
              "reference": "huggingface/transformers 5.16.1", "license": "Apache-2.0",
-             "distribution": ("transformers", "5.16.1")}
-            for family in importlib.import_module("multimodal_families").DRAWN},
+             "distribution": ("transformers", "5.16.1"),
+             "weighed": family in importlib.import_module("multimodal_families").WEIGHED,
+             # Its unweighted sizing never resolves (Qwen3.5's kept GPU records' reading, rows 5236 and
+             # 5237; Gemma 3n's ladder to the cap in two GPU recordings, IG-MMGPU16 and 17): the cap
+             # declared, its ladder not climbed (`record_case`'s `unweighted`).
+             **({"unweighted": importlib.import_module("dew.parity").MOST_SEEDS}
+                if family in ("qwen35", "gemma3n") else {})}
+            for family in (importlib.import_module("multimodal_families").DRAWN
+                           | importlib.import_module("multimodal_families").WEIGHED)},
          **{f"multimodal-{family}-text": {
              "test": "test_multimodal_model", "arms": f"{family}/text", "worker": "multimodal_worker.py",
              "reference": "huggingface/transformers 5.16.1", "license": "Apache-2.0",
@@ -162,7 +169,11 @@ the recording keeps the outputs whole, `judged` where the recording is the arm i
 and `dew` that arm's reference (another library running what Dew exports for it), so its seeds are sized
 with the two in those places, and `truths` where its float32 errors no count of draws resolves: the
 recording keeps the reference's float64 truth alone at that many draws (`record_truths`), which its test
-holds Dew's float64 run to (docs/design/testing.md)."""
+holds Dew's float64 run to (docs/design/testing.md); `weighed` where its test declares check 1's weighed
+check: asked for a draw's rounding scale (the request's `<draw>.weighed`), its worker answers it alone
+(`<draw>.scale.<leaf>`, the reference's own, `_dew_torch.rounding.rounding_scale`), which the recording
+keeps (`record_case`'s `scale`), asked only of the draws the weighed check's stages read, the scale's taps
+costing what the draw's runs do several times over."""
 
 
 def site_arms(site: str):
@@ -195,8 +206,13 @@ def recording(site: str, python: str, source: str | None, given=None, *, kept_in
         if held != wanted:
             raise SystemExit(f"the recording is of {name} {wanted}; {python} holds {held}")
     environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
-    environment |= {"JAX_PLATFORMS": "cpu", **({} if source is None else {"PYTHONPATH": source})}
+    # The worker's strings hashed alike at every run, so a set's order, and an operation order read from one,
+    # repeats: a weighed scale's tap draws its signs in its operations' order, and a record that does not
+    # repeat to the bit does not resume (`recorded_references._Kept`; Gemma 4's scale differed by hash seed).
+    environment |= {"JAX_PLATFORMS": "cpu", "PYTHONHASHSEED": "0",
+                    **({} if source is None else {"PYTHONPATH": source})}
     command = [python, str(ROOT / "tools" / known["worker"]), site]
+    weighed = known.get("weighed", False)
     with session(command, env=environment) as worker:
         def evaluate(inputs):
             answer = worker.ask({f"case.{key}": value for key, value in inputs.items()})
@@ -206,6 +222,18 @@ def recording(site: str, python: str, source: str | None, given=None, *, kept_in
                         if leaf.startswith("case.replayed.")}
             return (*({leaf: arm[leaf] for leaf in outputs} for arm in (reference, truth)), replayed)
 
+        def scale(inputs, seed: int) -> dict[str, np.ndarray]:
+            answer = worker.ask({**{f"case.{key}": value for key, value in inputs.items()},
+                                 "case.weighed": np.ones((), bool)})
+            made = {leaf.removeprefix("case.scale."): value for leaf, value in answer.items()
+                    if leaf.startswith("case.scale.")}
+            missing = sorted(set(outputs) - set(made))
+            if missing:
+                raise ValueError(f"{site}'s worker answered draw {seed} with no rounding scale of "
+                                 f"{missing}: a weighed site's worker answers `<draw>.scale.<leaf>` for "
+                                 f"every leaf")
+            return {leaf: made[leaf] for leaf in outputs}
+
         if "truths" in known:
             return record_truths(site, draw, evaluate, known["truths"])
         narrow = getattr(jnp, known.get("narrow", "float32"))
@@ -213,8 +241,13 @@ def recording(site: str, python: str, source: str | None, given=None, *, kept_in
                else jax.jit(lambda inputs: run(narrow, inputs)))
         return record_case(site, draw, evaluate, store_inputs=False,
                            summary=not known.get("outputs"), dew=dew,
-                           judged=known.get("judged", False), kept_in=kept_in, resumed_from=resumed_from)
+                           judged=known.get("judged", False), kept_in=kept_in, resumed_from=resumed_from,
+                           scale=scale if weighed else None, unweighted=known.get("unweighted"))
 
+
+DEVICE_WORKERS = frozenset({"multimodal_worker.py"})
+"""The workers that run where DEW_REFERENCE_DEVICE names, a GPU's float64 units among them; every other
+site's runs on its own device (`SITES`' `device`, the CPU by default)."""
 
 def main() -> None:
     import argparse
@@ -232,10 +265,14 @@ def main() -> None:
     site, python, source = args.site, args.python, args.source
     known, given = SITES[site], site_arms(site)
     arrays = recording(site, python, source, given, kept_in=args.kept, resumed_from=args.resume)
-    written = save(given[0], {**arrays, "provenance": provenance(
-        known["reference"], "", known.get("device", "cpu"),
-        f"python tools/venv_reference.py {site} PYTHON{' SOURCE' if source is not None else ''}")},
-        reference=known["reference"], license=known["license"])
+    # The device the reference ran on: a site's own, or where its worker honors it, the one
+    # DEW_REFERENCE_DEVICE names (`multimodal_worker.py`'s alone), which the command reproducing it states.
+    override = os.environ.get("DEW_REFERENCE_DEVICE") if known["worker"] in DEVICE_WORKERS else None
+    device = override or known.get("device", "cpu")
+    prefix = "" if override is None else f"DEW_REFERENCE_DEVICE={override} "
+    command = f"{prefix}python tools/venv_reference.py {site} PYTHON{' SOURCE' if source is not None else ''}"
+    written = save(given[0], {**arrays, "provenance": provenance(known["reference"], "", device, command)},
+                   reference=known["reference"], license=known["license"])
     print(f"{written}: {sorted(arrays)}")
 
 

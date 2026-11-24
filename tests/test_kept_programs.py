@@ -514,6 +514,53 @@ def test_a_save_of_programs_within_another_keeps_its_program_in_both_and_the_lat
         inner.kept, outer.kept)
 
 
+KEPT_AT_NEED = """
+import json
+import sys
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from dew.nn.kernels.options import owned_program
+from dew.telemetry.compiles import Compiles
+from dew.training.ahead import AheadPrograms, keeping, kept, stand_in_gpus
+
+
+def doubled(values):
+    return values * 2
+
+
+run, devices = owned_program(doubled), jax.devices("cpu")
+if sys.argv[1] == "keep":
+    with stand_in_gpus(devices, 2**36), keeping() as programs:
+        np.asarray(run(jnp.arange(3.)))
+        programs.save(sys.argv[2])
+    print(json.dumps({"need": AheadPrograms.load(sys.argv[2]).target.memory}))
+else:
+    with stand_in_gpus(devices, int(sys.argv[3]), share=1.0), kept(sys.argv[2]), Compiles(None) as compiles:
+        answer = np.asarray(run(jnp.arange(3.))).tolist()
+    ran = [program.name for program in compiles.programs if program.kind == "compiled"]
+    print(json.dumps({"answer": answer, "compiled": [name for name in ran if name == "jit(doubled)"]}))
+"""
+"""A process keeping a program on a stand-in GPU of 64 GiB (`keep`: the need its file states), or handed
+the file on one whose allocator holds `argv[3]` bytes (`take`): the call's answer and its compiles."""
+
+
+def test_programs_kept_on_a_large_gpu_run_on_a_smaller_one_admitting_them_and_compile_a_byte_short(tmp_path):
+    """A file of programs kept on a GPU states what its programs need of a device (`programs_need`), not the
+    limit of the GPU that kept them (row 8711, as rows 8094 and 8371 for a step compiled ahead): a later
+    process on a GPU whose allocator holds that need, far less than the keeper's, runs the kept executable
+    and compiles nothing; on one holding a byte less it is handed nothing, and compiles the program."""
+    path = str(tmp_path / "programs.dew-aot")
+    need = process_support.fresh(KEPT_AT_NEED, "keep", path, variables=UNCACHED)["need"]
+    assert 0 < need < 2**30, need
+    at = process_support.fresh(KEPT_AT_NEED, "take", path, str(need), variables=UNCACHED)
+    short = process_support.fresh(KEPT_AT_NEED, "take", path, str(need - 1), variables=UNCACHED)
+    assert at == {"answer": [0.0, 2.0, 4.0], "compiled": []}, at
+    assert short == {"answer": [0.0, 2.0, 4.0], "compiled": ["jit(doubled)"]}, short
+
+
 def _doubled(x):
     """A module's function a program compiles (the identity witness's)."""
     return 2 * x
