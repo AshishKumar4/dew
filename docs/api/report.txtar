@@ -961,6 +961,7 @@ dew.kernels.Kernels
   sparse_attention: Literal['template', 'xla'] | None = None
   ssd: Literal['mosaic_gpu', 'pallas', 'tpu', 'xla'] | None = None
   swiglu: Literal['pallas', 'xla'] | None = None
+  wkv4: Literal['mosaic_gpu', 'xla'] | None = None
 dew.lora.LoRA
   rank: int
   modules: tuple[str, ...]
