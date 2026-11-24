@@ -9,6 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 import functools
+import itertools
 import operator
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any, Self
@@ -243,6 +244,9 @@ class Streams:
 
     pipeline: Pipeline
     views: dict
+    agreed: tuple | None = None
+    """The steps `(lo, hi)` every consumer of a pipeline two run loads together, where `walk_own` agrees
+    them: a walk loads them in turn whatever its consumer's own segments (`CpAsync.walk`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -955,16 +959,23 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
         # Each pipeline's step, its trips' steps (a trip's place in the walk), and its trips.
         walks = [(step, functools.partial(operator.add, lo), hi - lo) for step, lo, hi in segments]
-        if streams.pipeline.consumers > 1 and len(segments) > 1:
-            # Consumers running one pipeline together meet at each of its trips, so they walk one grid: a
-            # pipeline of its own a segment would meet unpaired where their segments' boundaries differ (a
-            # causal call's masked segment one consumer's keys end sooner in). One pipeline over the
-            # segments' steps alone, laid end to end, each trip its segment's step (`_placed`): no trip loads
-            # a gap's tile or an empty segment's, and the trips are each consumer's alike where its segments
-            # hold as many steps. A trip reads no fragments ahead of its own: its boundary would be called
-            # under its segment's choice.
-            walks = [_placed(segments)]
-            prefetching = False
+        if streams.pipeline.consumers > 1:
+            # Consumers running one pipeline together meet at each of its trips and fill each slot together,
+            # so they load one sequence of steps: the range `walk_own` agrees (`Streams.agreed`), each
+            # consumer's step at each of its trips that of its own segment holding it, none where none does
+            # (a gap, a step past its own segments). Segments ordered and apart; a trip reads no fragments
+            # ahead of its own where its consumer's segments are not the agreed range itself (its boundary
+            # would be called under its segment's choice).
+            if streams.agreed is None:
+                if len(segments) > 1:
+                    raise NotImplementedError(f"two {self.name} consumers' walk of several segments "
+                                              "loads the steps `walk_own` agrees")
+            else:
+                lo, hi = streams.agreed
+                whole = len(segments) == 1 and segments[0][1] is lo and segments[0][2] is hi
+                if not whole:
+                    walks = [(_dispatched(segments), functools.partial(operator.add, lo), hi - lo)]
+                    prefetching = False
         for step, placed, trips in walks:
             if isinstance(trips, int) and trips <= 0:
                 # No steps: the carry and its zero accumulators as they start (`emit_pipeline` takes no
@@ -1005,7 +1016,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             return super().walk_own(streams, views, own, streamed, wg, walk, between=between, counted=counted)
         del views, own, wg, between, counted
         lo, hi = streamed
-        return walk(streams, lo, hi, lo)
+        return walk(dataclasses.replace(streams, agreed=(lo, hi)), lo, hi, lo)
 
     def loaded(self, copies, *, issued: jax.Array | bool = True, axes: tuple | None = None) -> None:
         # Through registers (no TMA before Hopper), in a layout of the tile's rank: a side vector's the
@@ -1120,30 +1131,26 @@ class Mma(MmaIssuer, CpAsync):
         return min(stagings, key=lambda swizzle: (passes(swizzle), -swizzle))
 
 
-def _placed(segments: tuple) -> tuple[Callable, Callable, jax.Array | int]:
-    """`segments`' steps `(step, lo, hi)` laid end to end as one pipeline's trips: a step taking each trip
-    at its walk step by its segment's own step, the walk step of each trip, and their trips (the segments'
-    steps alone: no trip is a gap's or an empty segment's)."""
-    lengths = [hi - lo for _, lo, hi in segments]
-    offsets = [sum(lengths[:at]) for at in range(len(segments))]
-
-    def held(trip):
-        # Each segment's whether it holds the trip: exactly one, an empty one none.
-        return [(trip >= offset) & (trip < offset + length)
-                for offset, length in zip(offsets, lengths, strict=True)]
-
-    def placed(trip):
-        return sum(inside.astype(jnp.int32) * (lo + trip - offset)
-                   for inside, (_, lo, _), offset in zip(held(trip), segments, offsets, strict=True))
+def _dispatched(segments: tuple) -> Callable:
+    """One step taking each of `segments`' steps `(step, lo, hi)`, ordered and apart, at its own place: the
+    step of the segment whose range holds its index, nothing where none does. Segments whose bounds are
+    known are refused where they overlap or fall out of order."""
+    known = [(lo, hi) for _, lo, hi in segments if isinstance(lo, int) and isinstance(hi, int)]
+    if len(known) == len(segments) and any(hi > lo and nxt_lo < hi and nxt_hi > nxt_lo
+                                           for (lo, hi), (nxt_lo, nxt_hi) in itertools.pairwise(known)):
+        raise ValueError(f"a collective walk's segments lie ordered and apart, not {known}")
 
     def step(index, slots, carried, accumulators):
-        # The trip's segment, read off its walk step's place among the segments' (`placed`'s inverse).
-        which = sum(((index >= lo) & (index < hi)).astype(jnp.int32) * at
-                    for at, (_, lo, hi) in enumerate(segments))
-        return lax.switch(which, [functools.partial(each, index, slots) for each, _, _ in segments],
-                          carried, accumulators)
+        # The first segment holding the step (each a step at most), 0 where none does.
+        which, unheld = jnp.int32(0), jnp.ones((), jnp.bool_)
+        for at, (_, lo, hi) in enumerate(segments):
+            inside = (index >= lo) & (index < hi) & unheld
+            which, unheld = jnp.where(inside, at + 1, which), unheld & ~inside
+        branches = [lambda carried, accumulators: (carried, accumulators),
+                    *(functools.partial(each, index, slots) for each, _, _ in segments)]
+        return lax.switch(which, branches, carried, accumulators)
 
-    return step, placed, sum(lengths)
+    return step
 
 
 def _most(family: "CpAsync", consumers: int, *, clustered: bool = False) -> None:
