@@ -9,7 +9,7 @@ import pytest
 
 from dew.lora import LoRA
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
-from dew.nn.kernels.generation import compile_only_gpus
+from dew.nn.kernels.generation import chosen, compile_only_gpus
 from dew.objectives.lm import LMObjective
 from dew.optim import Adam, OptimConfig
 from dew.registry import models
@@ -54,8 +54,7 @@ def test_a_search_asks_first_the_rung_its_miss_reads_as_dropping_what_it_was_sho
     block's scope names (`dew.nn.protocols.RUNG_SCOPE`): the miss reads no rung, and the search climbs the
     ladder in its order to the rung that fits, asking each once."""
     model = models.build("causal_transformer", vocab_size=256, emb_features=256, num_layers=4, num_heads=4,
-                         num_kv_heads=2, head_dim=64, mlp_features=8192, max_seq_len=1024, dtype="bfloat16",
-                         attention_impl="xla", scan_layers=stack != "plain")
+                         num_kv_heads=2, head_dim=64, mlp_features=8192, max_seq_len=1024, dtype="bfloat16")
 
     def ahead_at(remat: str | None, limit: int) -> tuple[AheadOfTime | None, list[dict]]:
         at = model if remat is None else model.clone(remat=REMAT_POLICIES[remat])
@@ -65,12 +64,14 @@ def test_a_search_asks_first_the_rung_its_miss_reads_as_dropping_what_it_was_sho
         adapter = LoRA(rank=2, modules=("q_proj",)).apply(at, base, key=1)
         return _ahead(adapter.model, Adam(), 1024, 1, limit, adapter.variables)
 
-    rung = {name: ahead_at(name, 2 ** 34)[0] for name in ("minimal", "save_dot_except_mlp")}
-    assert all(ahead is not None for ahead in rung.values()), rung
-    lighter, dropping = (_needed(ahead) for ahead in rung.values() if ahead is not None)
-    # Its devices between the two rungs' needs: 'minimal' misses there, 'save_dot_except_mlp' fits.
-    assert dropping < lighter, (dropping, lighter)
-    ahead, probes = ahead_at(None, (dropping + lighter) // 2)
+    # Its stack scanned or a layer at a time, its attention XLA's own, whatever the selector would take.
+    with chosen(layer_scan="plain" if stack == "plain" else "scanned", attention="xla"):
+        rung = {name: ahead_at(name, 2 ** 34)[0] for name in ("minimal", "save_dot_except_mlp")}
+        assert all(ahead is not None for ahead in rung.values()), rung
+        lighter, dropping = (_needed(ahead) for ahead in rung.values() if ahead is not None)
+        # Its devices between the two rungs' needs: 'minimal' misses there, 'save_dot_except_mlp' fits.
+        assert dropping < lighter, (dropping, lighter)
+        ahead, probes = ahead_at(None, (dropping + lighter) // 2)
     assert ahead is not None and ahead.plan["remat"] == "save_dot_except_mlp", probes
     asked = [probe["remat"] for probe in probes]
     assert asked == ([None, "save_dot_except_mlp"] if stack == "plain"
