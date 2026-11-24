@@ -749,13 +749,13 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         block_groups = image_groups = None
     if sliding_window is None:
         places = None
+    visibility = None
     if shards > 1:
         spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
                    "key_runs": key_runs, "places": places, "query_slots": query_slots}
         causal, sliding_window, mask, key_value_seq_lengths, materialized, visibility = _sequence_sharded(
-            query, key, shards, causal=causal, sliding_window=sliding_window, mask=mask,
-            segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts,
-            spanned=spanned)
+            query, key, shards, causal=causal, sliding_window=sliding_window, mask=mask, spanned=spanned,
+            segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts)
         if materialized:
             implementation = kernel_for_materialized_mask(
                 implementation, query, key, dtype=dtype, precision=precision,
