@@ -15,6 +15,7 @@ A packed document's first token enters both states at zero."""
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -25,11 +26,27 @@ from .diagonal import diagonal_scan
 from .recurrence_chunk import CHUNK_SIZE, Chunk, chunk
 
 
+@jax.custom_jvp
+def _squash(r):
+    """The fast squash `r / (1 + |r|)`, bounded in (-1, 1) (the module's account)."""
+    return r / (1.0 + jnp.abs(r))
+
+
+@_squash.defjvp
+def _squash_jvp(primals, tangents):
+    """`_squash`'s derivative `dr / (1 + |r|)^2`, divided twice, never the quotient rule's `(1 + |r| - |r|)`,
+    which cancels to zero where `1 + |r|` rounds to `|r|` (a center of -2^25: fla's ATK backward's 2^-50),
+    nor squared past the range where `|r|` passes 2^64."""
+    (r,), (dr,) = primals, tangents
+    held = 1.0 + jnp.abs(r)
+    return r / held, dr / held / held
+
+
 def _squashed(key, moment, center, x: float, eps: float):
     """The write keys `k x^{-s}` of keys `k` and their moment (the module's account), `center` a key head's,
     broadcast over the keys' last two axes."""
     r = jnp.log(moment + eps) - jnp.asarray(center, moment.dtype)[:, None]
-    return key * jnp.exp(-np.log(x) * (r / (1.0 + jnp.abs(r))))
+    return key * jnp.exp(-np.log(x) * _squash(r))
 
 CENTER = -0.2
 """fla's default center of ATK's squash, a key head's `log_atk_scale`."""
