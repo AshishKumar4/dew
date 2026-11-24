@@ -1328,8 +1328,9 @@ sizing at its run (rows 7988, 8293)."""
 def a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly():
     """On an NVIDIA GPU the profile of the admitted step's runs holds its instructions' times, its
     program compiles again guided by it, and the run steps the guided executable alone: the one the plan
-    was admitted with is freed and the backend holds no more executables than with it alive, as it would
-    not where the handoff is discarded. The guided steps' losses and weights are as exact as the unguided
+    was admitted with is freed, the backend holding one step and no executable it did not hold with it
+    alive, as it would where the handoff is discarded; the programs the search passed over are freed since
+    (row 12131). The guided steps' losses and weights are as exact as the unguided
     step's (check 1)."""
     with autopgle(2):
         trainer = lm()
@@ -1337,7 +1338,10 @@ def a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly
     assert trainer.plan["pgle"]["runs"] == 2 and trainer.plan["pgle"]["bytes"] > 0
     assert trials.unguided is not None and trials.unguided() is None
     live = live_executables()
-    assert live == trials.live, (live - trials.live, trials.live - live, holding(live - trials.live))
+    # The guided step the run's one: the plan's own freed beside it, and every program its search passed
+    # over too (row 12131), none held that was not held at its handoff.
+    assert live["jit_step"] == 1, (live, trials.live, holding(live))
+    assert not live - trials.live, (live - trials.live, trials.live - live, holding(live - trials.live))
     guided = as_given(functools.partial(regression_steps, pgle=True))
     unguided = as_given(functools.partial(regression_steps, pgle=False))
     label, truth = "a step guided by its profile", regression_truth()
