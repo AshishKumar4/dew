@@ -42,7 +42,6 @@ from dew.batch import (
     Variables,
 )
 from dew.checkpoints import Checkpoints
-from dew.data.compile import Handed, native
 from dew.data.dataset import (
     Checkpointable,
     Closeable,
@@ -58,6 +57,7 @@ from dew.data.dataset import (
     rows_of,
     stream_ends,
 )
+from dew.data.handed import Handed, native
 from dew.data.pipeline import Dataset
 from dew.data.plan import DataResume, PlanChanged
 from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position, split_fields
@@ -1252,7 +1252,7 @@ class FitArguments(TypedDict, total=False):
 
 def handed_splits(
         validation: HandedSplits | None) -> Dataset | Mapping[str, Dataset | Split | EvalSuite] | None:
-    """`fit`'s validation with what was handed as it is read as handed (`dew.data.compile.native`): a
+    """`fit`'s validation with what was handed as it is read as handed (`dew.data.handed.native`): a
     Grain dataset as the split `val`, and a named split's Grain dataset or NumPy arrays as that split.
     Arrays are a split by name alone, as a mapping of splits is one by its names."""
     if isinstance(validation, pygrain.MapDataset | pygrain.IterDataset):

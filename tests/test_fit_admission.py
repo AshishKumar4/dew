@@ -27,7 +27,7 @@ from dew.inputs import Field, InputSpec
 from dew.objectives.jepa.objective import JepaObjective
 from dew.objectives.supervised import Supervised
 from dew.registry import ModelConfig
-from dew.training import Trainer
+from dew.training import Trainer, TrainerAdvanced
 from dew.training.observe import Observe
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -212,7 +212,7 @@ def test_a_handed_validation_batch_is_shared_alike_by_every_reader():
     """Five rows of handed arrays read by two shares: each reads three, the one short filled with a
     repeat its `VALID_ROWS` marks, so the shares make one global batch and every real row scores once;
     read by one host of two row shards, they are six, the repeat marked."""
-    from dew.data.compile import native
+    from dew.data.handed import native
 
     columns = regression_rows(5, 0)
     read = native(columns, training=False)
@@ -311,3 +311,91 @@ def test_a_stream_with_no_batch_ends_its_run_where_it_starts_its_final_checkpoin
     named = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
     with pytest.raises(ValueError):
         Trainer(named, optax.sgd(0.1), key=jax.random.key(0)).fit(empty, steps=5, log_every=100)
+
+
+@pytest.mark.parametrize("average", [None, "device", "host"])
+def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_once(tmp_path, monkeypatch,
+                                                                                average):
+    """A fit compiled ahead that evaluates midway states a need admitting each of its evaluation's programs
+    beside the state its run holds while it scores, the weights it scores by counted once where the state
+    holds them on the device (row 8710: the need admitted every program compiled beside the step with nothing
+    beside it, so a GPU admitted at it ran out of memory at an evaluation of batches larger than its step's,
+    where the run's own admission refused it; then it counted the weights twice, beside the state and among
+    the evaluation's arguments, and refused a GPU the evaluation fitted). A model 1024 wide, its state
+    outweighing its step's other bytes: an evaluation of 4 times its step's rows fits where its step does and
+    adds nothing to the need (its weights counted twice, 27 MB more, FS-8710-N-c1ff975583c-4x1024); one of 64
+    times needs more than the step, an average kept on the device among its state, and the need admits it.
+    With an average the objective keeps (`EMASpec`), the evaluation scores by it: kept on the device, it is
+    the state's; kept in host memory
+    (`Layout(host=("ema",))`), the evaluation fetches it beside the live variables, new bytes the need admits
+    in full (its review: a fetched average read as the state's). The run holds a frozen leaf of 32 MiB that
+    neither its step nor its evaluations read, which XLA drops from both programs' arguments: each
+    evaluation is admitted at the need beside the state a device holds, placed apart from any program, the
+    leaf among it (its review: a need read off the step's arguments left it out)."""
+    import jax.numpy as jnp
+    from model_support import TINY_DECODER
+    from test_compile_ahead import BATCH, SEQ_LEN, TINY_SHARD, VOCAB, gpus
+    from token_support import token_rows
+
+    from dew.batch import FROZEN
+    from dew.distributed.placement import placed_bytes, placed_shapes
+    from dew.objectives.base import EMASpec
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Layout, MeshSpec
+    from dew.training.ahead import compile_ahead, stand_in_gpus
+    from dew.training.memory import admitted
+
+    SPARE = 2 ** 23
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+
+    def built(scale: int | None):
+        model = models.build("causal_transformer", vocab_size=VOCAB, **{**TINY_DECODER, "emb_features": 1024},
+                             num_kv_heads=2)
+        objective = LMObjective(model, SEQ_LEN)
+        # A frozen leaf the run holds that neither its step nor its evaluations read: XLA drops it from both
+        # programs' arguments, the devices hold it all the same (its review: a need from the step's arguments
+        # left it out).
+        drawn = objective.init(jax.random.key(0))
+        objective.variables = {**drawn, FROZEN: {"spare": jnp.zeros((SPARE,), jnp.float32)}}
+        if average is not None:
+            objective.ema = EMASpec(decay=optax.constant_schedule(0.9))
+        trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                          mesh=MeshSpec().build(gpus("sm90")),
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD,
+                                                                 host=("ema",) if average == "host" else ())))
+        if scale is None:
+            return trainer, compile_ahead(trainer, batch)
+        scored = scale * BATCH
+        validation = {"val": Memory(token_rows(VOCAB, 2 * scored, SEQ_LEN + 1, seed=1)).batch(scored)}
+        return trainer, compile_ahead(trainer, batch, fit={"steps": 4, "validation": validation,
+                                                           "eval_every": 2})
+
+    _, plain = built(None)
+    four = built(4)[1].built.memory
+    # A host-kept average is fetched beside the state, which may raise the need past the step's.
+    assert four == plain.built.memory if average != "host" else four >= plain.built.memory
+    evaluator, evaluating = built(64)
+    evaluations = [evaluating.starts[digest].memory for digest in set(evaluating.starts) - set(plain.starts)]
+    need = evaluating.built.memory
+    assert evaluations and need is not None and need > plain.built.memory
+    # The run's state as a device holds it, placed apart from any program (the spare frozen leaf among it,
+    # which neither the step nor an evaluation reads, so neither holds it among its arguments), and the
+    # weights an evaluation scores by that a device holds in its own memory, none of a host-kept average's,
+    # less the spare leaf it reads none of.
+    start = evaluator._started()
+    placed = placed_shapes(start.abstract, start.shardings)
+    device = evaluator.device_mesh.devices.flat[0]
+    held = placed_bytes(placed, device=device, memory="device")
+    scored = jax.tree_util.tree_flatten_with_path(evaluator.objective._pipeline_weights(placed, None))[0]
+    among = (placed_bytes([leaf for _, leaf in scored], device=device, memory="device")
+             - placed_bytes([leaf for path, leaf in scored if "spare" in jax.tree_util.keystr(path)],
+                            device=device, memory="device"))
+    with stand_in_gpus(jax.devices("cpu")[:1], need, share=1.0) as stood:
+        for memory in evaluations:
+            assert memory is not None
+            beside = memory.output - memory.alias + held - among
+            room = admitted(stood, memory.argument, beside, memory.temp)
+            assert room is not None and room >= 0, (room, memory, held, among)

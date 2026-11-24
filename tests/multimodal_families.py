@@ -28,6 +28,11 @@ DRAWN = frozenset({"gemma3", "llama4"})
 """The families on check 1 over drawn images and audio, every leaf of theirs (`OUTPUTS`) resolved and
 recorded as their site (`multimodal-<family>`, tools/multimodal_worker.py); the others hold their leaves
 on their source draw until each resolves."""
+WEIGHED = frozenset({"gemma4", "gemma3n", "qwen35"})
+"""The families whose drawn site declares check 1's weighed check (`assert_as_exact`'s `conditioning`): a
+few draws of ill-conditioned updates both arms share rule their unweighted pool at any count (rows
+5233-5237), so their recording keeps each draw's reference rounding scale (tools/multimodal_worker.py's
+`<draw>.scale.<leaf>`, tools/venv_reference.py's `weighed`)."""
 LEARNING_RATE = 1e-4
 """The rate of the SGD step every family's references and Dew's runs take."""
 TEXT_DRAWN = frozenset({"qwen35"})

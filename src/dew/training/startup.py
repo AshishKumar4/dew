@@ -15,8 +15,9 @@ from typing import TYPE_CHECKING, Protocol
 import flax.linen as nn
 
 from dew._records import JSON
-from dew.data.compile import Handed, fitted
+from dew.data.compile import fitted
 from dew.data.dataset import DataPartition, Loader
+from dew.data.handed import Handed
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.data.plan import DataResume
 from dew.telemetry.instrumentation import count_compilation_cache

@@ -153,7 +153,7 @@ def main(config: Config) -> Path:
     # rebuild the checkpoint's own architecture at the precision it trained in; a smoke run's attention
     # XLA's, every other the selector's.
     run = replace(run, model=ModelConfig.from_model(source.model), diagnostics=replace(
-        run.diagnostics, kernels={**run.diagnostics.kernels, "attention": "xla"} if config.smoke
+        run.diagnostics, kernels=replace(run.diagnostics.kernels, attention="xla") if config.smoke
         else run.diagnostics.kernels))
 
     name = config.out.name

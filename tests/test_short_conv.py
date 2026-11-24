@@ -177,6 +177,8 @@ def row_truth(x, weights, parts, grads, segments):
     ((1, 700), ((128, None),), 4, True, False, True),
     ((2, 19), ((128, 128), (128, 128), (256, None)), 3, True, True, False),
     ((2, 19), ((128, 128), (128, 128), (256, None)), 3, True, True, True),
+    # A plain piece between normalised ones: the recompute reads the normalised ones where they lie.
+    ((2, 19), ((128, 128), (256, None), (128, 128)), 3, True, True, False),
     ((2, 9), ((128, None),), 2, True, False, False),
 ])
 @pytest.mark.parametrize("route", ROUTES)
@@ -379,10 +381,14 @@ def test_a_conv_backward_hands_no_more_partial_sums_than_a_wave_of_programs(gene
     shapes = (jax.ShapeDtypeStruct((channels, taps), jnp.float32),
               jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16))
     calls = custom_calls(lowered_for(jax.grad(loss), shapes, generation_name))
-    (backward,) = [call for call in calls if (rows, length, channels) in call.results]
+    # The backward writes the input's gradient beside its partials; the launch before it (`conv.through`), the
+    # joined cotangent alone.
+    (backward,) = [call for call in calls
+                   if (rows, length, channels) in call.results and len(call.results) > 1]
     handed = sum(int(np.prod(shape)) for shape in backward.results if shape != (rows, length, channels))
-    # Each program's partials its channels' (`conv.lanes`), the taps' and the bias's.
-    width = conv.lanes(parts, jnp.bfloat16)
+    # Each program's partials its channels' (`conv.lanes` of the backward's one unnormalised piece), the
+    # taps' and the bias's.
+    width = conv.lanes(((channels, None),), jnp.bfloat16)
     programs = handed // ((taps + 1) * width)
     target = generation.gpu_target(generation_name)
     held = target.multiprocessor
