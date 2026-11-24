@@ -2087,8 +2087,9 @@ def raised_sum(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.
     cancel give what they cancel to (two rows' `±2^252` under a shared bias 0, where each raised first was
     `±inf` and their sum NaN), a part at its own scale keeps its bits beside a larger one's, and normal parts
     that cancel to a subnormal keep it where fp32's sum flushes it (XLA's CPU, `bodies.subnormals`). Its
-    factor `2^shift` three powers of two each within fp32's normals (a shift of 257 at most, an `inf` row's
-    cotangent's), so a part of 0 raised is 0, never `0 * inf`."""
+    factor `2^shift` three powers of two each within fp32's normals (at most `2^87`: a shift of 258 at most,
+    both a row's values and its cotangent infinite, 257 one of them), so a part of 0 raised is 0, never
+    `0 * inf`."""
     if not axes:
         return shifted(grad, shift)
     one = jnp.ones((), jnp.float32)

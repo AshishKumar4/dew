@@ -244,15 +244,17 @@ def _witness(keys: list[float], values: list[list[float]], douts: list[list[floa
     output cotangents `douts` each row's, each row's keys `bounds`' (`template.spans`' `lengths` and
     `starts`) or all, under a tile bias `[B or 1, 1, Q, K]` (`bias` its queries' rows, one table for every
     row where `shared`), and its exact gradients at a logit scale of 1, each leaf's first channel
-    (`gradients`, the bias's whole; `_held`'s None unchecked), every other channel's 0."""
+    (`gradients`, the bias's whole; `_held`'s None unchecked, in every channel), every other channel's 0."""
     batch, queries, count = len(values), len(douts[0]), len(keys)
     query = jnp.zeros((batch, queries, 1, WIDTH), jnp.bfloat16)
     key = jnp.broadcast_to(_channel([keys]), (batch, count, 1, WIDTH))
     table = jnp.asarray(bias, jnp.float32)[None, None]
     hooks = template.Hooks(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype), (template.Param(
         table if shared else jnp.broadcast_to(table, (batch, 1, queries, count)), template.Kind.TILE),))
-    expected = {name: np.pad(_held(rows)[:, :, None, None], ((0, 0), (0, 0), (0, 0), (0, WIDTH - 1)))
-                for name, rows in gradients.items() if name != "bias"}
+    # An unchecked entry's every channel unchecked: an inf cotangent's NaN reaches them all.
+    expected = {name: np.where(np.isnan(first), np.nan, np.pad(first, ((0, 0),) * 3 + ((0, WIDTH - 1),)))
+                for name, rows in gradients.items() if name != "bias"
+                for first in (_held(rows)[:, :, None, None],)}
     expected["bias"] = _held(gradients["bias"]).reshape(hooks.score_params[0].value.shape)
     spans = template.spans(queries, count, batch, **{name: jnp.asarray(bound, jnp.int32)
                                                       for name, bound in (bounds or {}).items()})
