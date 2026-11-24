@@ -165,28 +165,33 @@ FED_ROWS, FED_WIDTH = 64, 128
 
 
 def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled: bool = False,
-                  in_flight: int = 0):
+                  in_flight: int = 0, shared: bool = False):
     """`p @ x` and `2 * p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on
     warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
     first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
     contraction, its blocks staged at `swizzling.swizzle_for`'s 64 bytes), and their sums meet before one
     store each, twice in one scope reused (`across.summed_across`), in a scope after the rings'
-    (`Family.scoped` returns); the walk's steps counted from `lo`, its ring counters from 0 (`first`)."""
+    (`Family.scoped` returns); the walk's steps counted from `lo`, its ring counters from 0 (`first`).
+    `shared`: on mma.sync, its consumers running one cp.async pipeline together (`CpAsync.shared_consumers`,
+    each copying its share of every block and meeting the other before a slot is read and refilled)."""
     from dew.nn.kernels.templates import mosaic_sm90
-    family, share = mosaic_sm90.FED, FED_ROWS // consumers
+    share = FED_ROWS // consumers
+    family = bundles.named("mma.sync", jnp.bfloat16, None) if shared else mosaic_sm90.FED
     swizzle = swizzling.swizzle_for(jnp.bfloat16, share)
+    threaded = consumers > 1 or not shared
 
     def body(p_gmem, x_gmem, out_gmem, doubled_gmem):
         allocated = family.streams({'p': ((FED_ROWS, FED_ROWS), jnp.bfloat16),
                                     'x': ((FED_ROWS, FED_WIDTH), jnp.bfloat16)}, STAGES, consumers,
-                                   swizzles={'p': swizzle, 'x': swizzle})
-        wg = jax.lax.axis_index("wg")
+                                   swizzles=None if shared else {'p': swizzle, 'x': swizzle})
+        wg = jax.lax.axis_index("wg") if threaded else 0
 
         def walked(*, streams):
             first = jnp.int32(lo)
             # A plain walk's views take its own step indices, as a producer's stream gives them.
             views = {'p': (p_gmem, lambda j: (0, j - first)), 'x': (x_gmem, lambda j: (j - first, 0))}
-            feed = family.fed(family.opened(streams), views, first, first + FED_STEPS, wg)
+            feed = (family.opened(streams, views) if shared
+                    else family.fed(family.opened(streams), views, first, first + FED_STEPS, wg))
 
             def step(at, slots, carry, accumulators):
                 del at
@@ -206,11 +211,12 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
                 across.summed_across(value, scratch, wg, consumers,
                                      lambda value, out=out: out.__setitem__(slice(None), value))
 
-        pl.run_scoped(total, **across.summing((FED_ROWS, FED_WIDTH), consumers), collective_axes="wg")
+        pl.run_scoped(total, **across.summing((FED_ROWS, FED_WIDTH), consumers),
+                      **({"collective_axes": "wg"} if threaded else {}))
 
     out = jax.ShapeDtypeStruct((FED_ROWS, FED_WIDTH), jnp.float32)
     return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=consumers,
-                         interpret=interpret, name="fed")(p, x)
+                         interpret=interpret, name="shared" if shared else "fed")(p, x)
 
 
 def _fed_staged_over_rings(p, x, *, interpret, ordered: bool):
@@ -298,31 +304,34 @@ def test_consumers_staging_over_their_rings_write_only_past_every_consumers_read
 @INTERPRETS
 @pytest.mark.parametrize("unrolled", [False, True])
 @pytest.mark.parametrize("in_flight", [0, 1])
-@pytest.mark.parametrize(("consumers", "lo"), [(1, 0), (2, 0), (2, 3)])
-def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store(consumers, lo, in_flight,
-                                                                                  unrolled):
+@pytest.mark.parametrize(("shared", "consumers", "lo"),
+                         [(False, 1, 0), (False, 2, 0), (False, 2, 3), (True, 1, 0), (True, 2, 0)])
+def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store(shared, consumers, lo,
+                                                                                  in_flight, unrolled):
     """Interpreted: consumers with no producer walk every step of one ring through slot reuse (five steps
     over two slots), each its share of a step's rows, and store their sum once, twice through one scratch:
     exactly the product and its double; a walk whose steps start past 0 (a later key block's), its ring
     counters from its own first (`first`), alike; a step's products running on past it or not, and the
     walk a step a trip or a rotation of its ring a trip (`mosaic.stepping`: two whole rotations and the
-    fifth step alone)."""
+    fifth step alone). `shared`: two mma.sync consumers over one cp.async pipeline alike (row 5272: the
+    A100 backward's dK/dV on two consumers; an mma.sync program took one alone)."""
     p, x = _fed_operands()
     got = _fed_products(p, x, interpret=INTERPRETED, consumers=consumers, lo=lo, unrolled=unrolled,
-                        in_flight=in_flight)
+                        in_flight=in_flight, shared=shared)
     for value, expected in zip(got, _fed_expected(p, x), strict=True):
         np.testing.assert_array_equal(np.asarray(value), expected)
 
 
 @pytest.mark.parametrize("consumers", [1, 2])
-def test_the_fed_walk_lowers_for_an_h100(consumers):
+@pytest.mark.parametrize(("shared", "target"), [(False, "sm90"), (True, "sm80")])
+def test_the_fed_walk_lowers_for_its_gpu(shared, target, consumers):
     """The fed walk's kernel, two consumers' 32-row contraction staged at 64 bytes, lowers for an H100 on any
-    host."""
+    host; two mma.sync consumers' shared cp.async walk for an A100 (`shared`)."""
     p, x = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _fed_operands())
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers)).trace(p, x).lower(
-            lowering_platforms=("cuda",))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), target)
+    with generation.assumed(target), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, shared=shared)).trace(
+            p, x).lower(lowering_platforms=("cuda",))
 
 
 def consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
