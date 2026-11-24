@@ -85,9 +85,11 @@ def body_work(fn: Callable, avals: Sequence, arg_types: Sequence, values: Sequen
 
 def _scalar(aval, value) -> int | None:
     """`value` where it is an integer scalar operand's concrete value, else None."""
-    if value is None or getattr(aval, "shape", None) != () or not np.issubdtype(aval.dtype, np.integer):
+    if getattr(aval, "shape", None) != () or not np.issubdtype(aval.dtype, np.integer):
         return None
-    return int(value) if isinstance(value, int | np.integer) or np.ndim(value) == 0 else None
+    if isinstance(value, np.ndarray) and value.ndim == 0 and np.issubdtype(value.dtype, np.integer):
+        return int(value)
+    return int(value) if isinstance(value, int | np.integer) else None
 
 
 _held: "weakref.WeakKeyDictionary[Callable, dict]" = weakref.WeakKeyDictionary()
@@ -201,8 +203,9 @@ class _Lanes:
         if name == "nvvm.read.ptx.sreg.laneid":
             self.values[produced] = np.arange(LANES, dtype=np.int64) % WARP
             return
-        operands = [self.read(operand) for operand in op.operands]
-        if not operands or any(operand is None for operand in operands):
+        read = [self.read(operand) for operand in op.operands]
+        operands = [lanes for lanes in read if lanes is not None]
+        if not operands or len(operands) != len(read):
             return
         found = _lane_values(name, op, operands)
         if found is not None:
