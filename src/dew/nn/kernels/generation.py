@@ -321,6 +321,15 @@ class Architecture:
     exponentials_per_clock: float | None = None
     integer_per_clock: float | None = None
     integer_multiply_adds_per_clock: float | None = None
+    global_reduction_bytes_per_clock: float | None = None
+    """The bytes a multiprocessor reduces into global memory a clock an element at a time (`red.global`,
+    `Work.global_reductions`): its warps' reduction requests to L2's atomic units, held back by its memory
+    instruction queue (lg_throttle) well before those units fill. Measured on an A100 (M-NA-9, the fused
+    attention backward's dQ adds, A100-SXM4-40GB at 1.095 GHz, each request four bytes a lane): 2.97, 3.00 and
+    3.69 bytes a clock a multiprocessor at head widths 64, 128 and 256 (its RED.E.ADD.F32 lanes' bytes over
+    its time, lg_throttle 38-51% of its not-issued samples, 90-95% of those at the adds, L2's atomic input
+    26-33% busy), stated at the two narrower's 3.0; None where unmeasured, where the reductions are work at
+    no rate (`dew.algebra.cost.cheaper`: a form adding more of them is never cheaper)."""
     tma: bool = False
     dependent_launch: bool = False
     tmem_columns: int | None = None
@@ -392,7 +401,8 @@ shl.b32, xor.b32 and mad.lo.s32 at 64; add.s32 at 128, min.s32 at 64 to 128)."""
 _AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024},
                        Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None),
                        vector_per_clock=128, exponentials_per_clock=CUDA_EXPONENTIALS,
-                       integer_per_clock=INTEGER_PER_CLOCK, integer_multiply_adds_per_clock=INTEGER_PER_CLOCK)
+                       integer_per_clock=INTEGER_PER_CLOCK, integer_multiply_adds_per_clock=INTEGER_PER_CLOCK,
+                       global_reduction_bytes_per_clock=3.0)
 _AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512},
                                 Multiprocessor(register_raises=None),
                                 vector_per_clock=256, exponentials_per_clock=CUDA_EXPONENTIALS,

@@ -166,6 +166,11 @@ class Work:
     """Elementwise operations no rule prices (`emission.operation_work`: an atan2's, an erf_inv's, which no
     kernel's body holds and no probe has measured), one an output element, at no rate (`units`): a form
     taking more of them is never cheaper (`dew.algebra.cost.cheaper`), its price never a guess."""
+    global_reductions: float = 0.0
+    """The bytes a body reduces into global memory an element at a time through L2's atomic units
+    (`red.global`: mma.sync's dQ adds, `atomic_store_p`), each its own memory instruction a lane, at the
+    rate its multiprocessor's requests reach them (`Architecture.global_reduction_bytes_per_clock`); a TMA
+    reduction (`copy_smem_to_gmem`'s `add`) is a copy's bytes, not these."""
     chains: tuple[Chain, ...] = dataclasses.field(default=(), metadata=_NOT_ISSUED)
 
     def __add__(self, other: "Work") -> "Work":
@@ -191,8 +196,9 @@ class Rates(NamedTuple):
     """A target's rate of each unit `units` prices, per second (`rates`), read by name: the tensor cores'
     16-bit, TF32 and FP8 modes, the CUDA cores, the special-function units, shared memory, the on-chip memory
     XLA's fusion keeps its kernels' operands and results in, the integer units (a CUDA multiprocessor's
-    ALU), its FMA pipe's integer multiply-adds and device memory; None where the target states none. Named,
-    so a unit added among them misreads no consumer (the review of train 1074, F5)."""
+    ALU), its FMA pipe's integer multiply-adds, device memory and the element-wise reductions into global
+    memory; None where the target states none. Named, so a unit added among them misreads no consumer (the
+    review of train 1074, F5)."""
 
     tensor: float | None
     tf32: float | None
@@ -204,6 +210,7 @@ class Rates(NamedTuple):
     integer: float | None
     multiply_adds: float | None
     device: float | None
+    reductions: float | None
 
 
 @functools.cache
@@ -213,7 +220,8 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
     vector units (the CUDA cores, a TPU's VPU), the special-function units, shared memory, the on-chip memory
     XLA's fusion keeps its kernels' operands and results in (`Work.kept_bytes`), the integer units (a CUDA
     multiprocessor's ALU, `Architecture.integer_per_clock`), its FMA pipe's integer multiply-adds
-    (`Architecture.integer_multiply_adds_per_clock`) and device memory. Each is a multiprocessor's at
+    (`Architecture.integer_multiply_adds_per_clock`), device memory and the element-wise reductions into
+    global memory (`Architecture.global_reduction_bytes_per_clock`). Each is a multiprocessor's at
     the clock the target holds under a step's tensor-core load (`GpuTarget.loaded_clock_hz`: a B200's
     measured 1.549 GHz, not its 1.965 GHz boost), or with `device` the whole device's (its multiprocessors at
     that clock, the tensor cores at its datasheet's dense peak where it states no clock), where a tile walk's
@@ -247,7 +255,8 @@ def rates(target: generation.GpuTarget, *, device: bool) -> Rates:
                  shared=math.inf if device else staged, kept=kept,
                  integer=rate(architecture.integer_per_clock),
                  multiply_adds=rate(architecture.integer_multiply_adds_per_clock),
-                 device=target.memory_rate if device else math.inf)
+                 device=target.memory_rate if device else math.inf,
+                 reductions=rate(architecture.global_reduction_bytes_per_clock))
 
 
 def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
@@ -255,16 +264,16 @@ def units(work: Work, at: Rates) -> tuple[list[float], tuple[float, ...]]:
     FP8 modes in turn), the CUDA cores (operations and conversions, and the integer multiply-adds their FMA
     pipe issues beside them at its own rate), the special-function units, on-chip
     memory (shared memory's bytes, then what XLA's fusion keeps there, one memory's two levels, so a TPU's
-    one VMEM is one unit), device memory, the integer units and the operations no rule prices
-    (`Work.unpriced_operations`, at no rate); and, level by level, the work at a rate the target states none
-    of, which no time prices (0 where one does)."""
+    one VMEM is one unit), device memory, the integer units, the element-wise reductions into global memory
+    and the operations no rule prices (`Work.unpriced_operations`, at no rate); and, level by level, the work
+    at a rate the target states none of, which no time prices (0 where one does)."""
     grouped = (((work.flops, at.tensor), (work.tf32_flops, at.tf32), (work.fp8_flops, at.eight)),
                ((work.operations + work.conversions, at.cuda),
                 (work.integer_multiply_adds, at.multiply_adds)),
                ((work.exponentials, at.special),),
                ((work.shared_bytes, at.shared), (work.kept_bytes, at.kept)),
                ((work.device_bytes, at.device),), ((work.integer_operations, at.integer),),
-               ((work.unpriced_operations, None),))
+               ((work.global_reductions, at.reductions),), ((work.unpriced_operations, None),))
     priced = [sum((amount / per_second for amount, per_second in unit if amount and per_second is not None),
                   0.0) for unit in grouped]
     unpriced = tuple(amount if per_second is None else 0.0 for unit in grouped for amount, per_second in unit)
