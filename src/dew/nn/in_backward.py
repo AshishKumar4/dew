@@ -106,10 +106,12 @@ def read_once(program: jcore.Jaxpr, roots: Mapping[jcore.Var, RunRead], runs: Se
     loss's own level, its variables (`roots`) read by nothing else: through calls (but a nested jit, whose
     cached program a later trace reads without calling the run), placements (`_PLACED`) and layouts every
     variable of the run takes alike (`_LAID_OUT`); its rule's operands shaped as its trace saw them (no
-    batching transform's lanes beside them) and drawing no random bits."""
+    batching transform's lanes beside them) and drawing no random bits; none of its variables among the
+    loss's results (its statistics, which a reduction may read, outside the program)."""
     reads: collections.Counter[tuple[str, ...]] = collections.Counter()
     refused: set[tuple[str, ...]] = set()
-    _reads(program, {value: (root, ()) for value, root in roots.items()}, reads, refused)
+    held = _reads(program, {value: (root, ()) for value, root in roots.items()}, reads, refused)
+    refused.update(held[value][0].run for value in program.outvars if computed(value) and value in held)
     return all(reads[run] == 1 and run not in refused for run in runs)
 
 
