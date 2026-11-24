@@ -798,34 +798,41 @@ def test_the_blockwise_recipes_scales_meet_its_products_in_range():
 
 
 
-def test_an_ungated_mlps_projections_run_as_one_recipe_chain_bitwise_their_two_apart():
-    """An ungated MLP whose two projections DeepSeek-V3's blockwise FP8 recipe takes in its role runs them as
-    one chain (`projections.recipe_chain`, row 8547): one recipe region of the recipe's derivative where the
-    two apart held one each (`dew.nn.derivatives.Surrogate`), its rows any count (laid in whole blocks), and
-    its output and every gradient, the rows' and both kernels', bitwise the two projections apart with its
-    activation between them (`projections.recipe_projection`)."""
+@pytest.mark.parametrize("activation", ["gelu", "swiglu"])
+def test_an_mlps_projections_run_as_one_recipe_chain_bitwise_their_projections_apart(activation):
+    """An MLP whose projections DeepSeek-V3's blockwise FP8 recipe takes in its role runs them as one chain
+    (`projections.recipe_chain`): an ungated one's up and down (row 8547), a gated one's gate, up and down,
+    its gated product in the up projection's epilogue (row 12689). One recipe region of the recipe's
+    derivative where the projections apart held one each (`dew.nn.derivatives.Surrogate`), its rows any
+    count (laid in whole blocks), and its output and every gradient, the rows' and every kernel's, bitwise
+    the projections apart with its activation between them (`projections.recipe_projection`)."""
     from reference_error import equations
 
-    from dew.nn.activations import ungated_activation
+    from dew.nn.activations import gated_product, ungated_activation
     from dew.nn.derivatives import Surrogate
     from dew.nn.mlp import GatedMLP
     from dew.nn.precision import projection_role
 
     fp8 = RECIPE_NUMERICS["blockwise_fp8"]
-    mlp = GatedMLP(hidden_features=256, out_features=128, activation="gelu", dtype=jnp.bfloat16)
+    mlp = GatedMLP(hidden_features=256, out_features=128, activation=activation, dtype=jnp.bfloat16)
     x = jax.random.normal(jax.random.key(0), (2, 100, 128), jnp.bfloat16)
     variables = nn.unbox(mlp.init(jax.random.key(1), x))
+    gated = activation == "swiglu"
 
     def chained(variables, x):
         return mlp.apply(variables, x)
 
     def apart(variables, x):
         rows = x.reshape(-1, x.shape[-1])
-        up = projections.recipe_projection(rows, variables["params"]["up_proj"]["kernel"].astype(x.dtype),
-                                           out_dtype=x.dtype)
-        hidden = ungated_activation("gelu", up)
-        out = projections.recipe_projection(
-            hidden, variables["params"]["down_proj"]["kernel"].astype(x.dtype), out_dtype=x.dtype)
+
+        def projected(rows, name):
+            kernel = variables["params"][name]["kernel"].astype(x.dtype)
+            return projections.recipe_projection(rows, kernel, out_dtype=x.dtype)
+
+        up = projected(rows, "up_proj")
+        hidden = (gated_product(activation)(projected(rows, "gate_proj"), up) if gated
+                  else ungated_activation(activation, up))
+        out = projected(hidden, "down_proj")
         return out.reshape(*x.shape[:-1], out.shape[-1])
 
     with generation.run_precision(fp8), projection_role("mlp"):

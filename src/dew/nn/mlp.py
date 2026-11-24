@@ -246,11 +246,16 @@ class GatedMLP(nn.Module):
         activation = self._activation()
         axes = self._axes(x)
         if not isinstance(activation, (str, Situ)):
-            out = self._chained(x, activation, train)
+            out = self._chained(x, (self.up_proj, self.down_proj), activation, train)
             if out is None:
                 up = checkpoint_name(self._placed(self.up_proj(x)), Residual.UP_PROJ)
                 out = self._down(activation(up), train)
             return activation(out) if self.activation_after else out
+        if isinstance(activation, str) and self._fusable() and self.swiglu_limit is None:
+            chained = self._chained(x, (self.gate_proj, self.up_proj, self.down_proj),
+                                    gated_product(activation), train)
+            if chained is not None:
+                return scaled(chained, self.down_multiplier)
         # A packed MLP holds no gate_proj apart (`_fusable`): its projections are read past that.
         if (isinstance(activation, str) and self._fusable()
                 and fuses(projections := (self.gate_proj, self.up_proj, self.down_proj), x, activation,
@@ -315,25 +320,30 @@ class GatedMLP(nn.Module):
         return normed_hidden(gate, up, self.suv_gate, self.suv_up, ngpt.hidden(self.out_features),
                              gated_product(activation, axes=self._axes(gate)))
 
-    def _chained(self, x, activation: Activation, train: bool):
-        """The ungated MLP's output as one chain of its two projections where the run's recipe takes both
+    def _chained(self, x, projections_: tuple[Dense, ...], activation: Callable, train: bool):
+        """The MLP's output as one chain of its projections where the run's recipe takes them
         (`projections.recipe_chain`: blockwise FP8, the down projection's rows quantized in the up
-        projection's epilogue, bitwise the two apart, row 8547), else None, each projection then its own: a
-        bias, hidden units dropped between them, a tensor axis splitting the hidden width (the chain reads
-        its matrices whole), the parameters' creation, or projections not plain `Dense` whose kernels they
-        hold, their products owned by no wrapper or interceptor (a LoRA's, a served quantized kernel's) and
-        observed by no inspection (`joined.projections_of`), take them apart."""
-        found = projections_of((self.up_proj, self.down_proj))
+        projection's epilogue, bitwise the projections apart): an ungated MLP's up and down (row 8547), or a
+        gated one's gate, up and down, `activation` its gated product of the two (row 12689). Else None, each
+        projection then its own: a bias, hidden units dropped between them, a tensor axis splitting the
+        hidden width (the chain reads its matrices whole), the parameters' creation, or projections not plain
+        `Dense` whose kernels they hold, their products owned by no wrapper or interceptor (a LoRA's, a
+        served quantized kernel's) and observed by no inspection (`joined.projections_of`), take them
+        apart."""
+        found = projections_of(projections_)
         if (self.use_bias or (self.dropout_rate and train) or not (found.dense and found.held)
                 or found.intercepted or found.observed or not found.dot_general
                 or jax.sharding.get_abstract_mesh().shape.get(TENSOR_AXIS, 1) > 1):
             return None
+        *first, down_proj = projections_
         # Each kernel read and cast as its projection's call casts it (`dense._promoted`).
-        rows, up = _promoted(self.up_proj, x, meta.unbox(self.up_proj.get_variable('params', 'kernel')),
-                             None)[:2]
-        down = _promoted(self.down_proj, rows, meta.unbox(self.down_proj.get_variable('params', 'kernel')),
-                         None)[1]
-        out = recipe_chain(rows.reshape(-1, rows.shape[-1]), up, down, activation, out_dtype=rows.dtype)
+        promoted = [_promoted(projection, x, meta.unbox(projection.get_variable('params', 'kernel')), None)
+                    for projection in first]
+        rows = promoted[-1][0]
+        down = _promoted(down_proj, rows, meta.unbox(down_proj.get_variable('params', 'kernel')), None)[1]
+        gate = promoted[0][1] if len(promoted) == 2 else None
+        out = recipe_chain(rows.reshape(-1, rows.shape[-1]), promoted[-1][1], down, activation,
+                           out_dtype=rows.dtype, gate=gate)
         if out is None:
             return None
         return checkpoint_name(out.reshape(*x.shape[:-1], out.shape[-1]), Residual.DOWN_PROJ)
