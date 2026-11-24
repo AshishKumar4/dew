@@ -350,6 +350,13 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                 # Each sub-chunk's diagonal block of each output, in place in the walk's sums (`into`), the
                 # entries it leaves zero.
                 for o, (name, ref) in enumerate(zip(products, sums, strict=True)):
+                    form = _band_form(call, name)
+                    if threaded and form.parts == 1:
+                        # A one-part form copied from the summed blocks straight, masked, scaled and
+                        # rounded as each word is copied: no landing.
+                        (view,) = form.views(ref, row, chunk, h * chunk, chunk)
+                        _diagonal_copied(threaded[-1].at[o], view, strict=name == "system", scale=scale)
+                        continue
                     block = family.tile_of(threaded[-1].at[o]) if threaded else bands[o]
                     masked = algebra.block_masked(block, strict=name == "system", scale=scale)
                     _blocks_written(call, name, masked, ref, row, h * chunk, landing[name])
@@ -403,22 +410,26 @@ def _blocks_written(call: Call, name: str, blocks, ref, row, column, landing) ->
         mosaic.synced(call.interpret)
 
 
-def _diagonal_copied(landing, view) -> None:
-    """`landing` `[C, SUB]` (a row's columns its sub-chunk's diagonal block's) copied onto the sub-chunks'
-    diagonal blocks of `view` `[C, C]`, each thread its run of entries."""
-    chunk, sub = landing.shape
+def _diagonal_copied(source, view, *, strict: bool | None = None, scale: float = 1.0) -> None:
+    """`source` `[C, SUB]` (a row's columns its sub-chunk's diagonal block's) copied onto the sub-chunks'
+    diagonal blocks of `view` `[C, C]`, each thread its run of entries: as it is (a landing of the view's
+    dtype), or, given `strict`, an fp32 sum of the blocks taken as `algebra.block_masked` takes it (the pair
+    with itself dropped where `strict`, else every word `scale`d) and rounded once to the view's dtype."""
+    chunk, sub = source.shape
     entries = chunk * sub
-    work = Work(operations=entries, shared_bytes=entries * landing.dtype.itemsize,
-                device_bytes=entries * view.dtype.itemsize)
-    body = emission.stating(lambda *_: work)(lambda ctx, source, target: _copied(source, target))
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()), return_type=())(body)(landing, view)
+    work = Work(operations=entries * (1 if strict is None else 3),
+                shared_bytes=entries * source.dtype.itemsize, device_bytes=entries * view.dtype.itemsize)
+    body = emission.stating(lambda *_: work)(
+        lambda ctx, from_ref, to_ref: _copied(from_ref, to_ref, strict=strict, scale=scale))
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()), return_type=())(body)(source, view)
 
 
-def _copied(landing_ref, view_ref) -> None:
+def _copied(source_ref, view_ref, *, strict: bool | None, scale: float) -> None:
     """`_diagonal_copied` in Mosaic GPU's terms: a thread's `C * SUB / THREADS` entries, each its row and
-    column in `landing` and its sub-chunk's block's column in `view`."""
+    column in `source` and its sub-chunk's block's column in `view`."""
     index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
-    chunk, sub = ir.MemRefType(landing_ref.type).shape
+    chunk, sub = ir.MemRefType(source_ref.type).shape
+    stored = ir.MemRefType(view_ref.type).element_type
     run = chunk * sub // scan.THREADS
 
     def const(value):
@@ -427,12 +438,22 @@ def _copied(landing_ref, view_ref) -> None:
     def at(*values):
         return [arith.index_cast(index, value) for value in values]
 
+    def taken(value, r, c):
+        """A sum as its output takes it (`algebra.block_masked`), rounded to the view's dtype once."""
+        if strict:
+            kept = arith.cmpi(arith.CmpIPredicate.ult, c, arith.remui(r, const(sub)))
+            value = arith.select(kept, value, arith.constant(ir.F32Type.get(), 0.0))
+        else:
+            value = arith.mulf(value, arith.constant(ir.F32Type.get(), scale))
+        return value if stored == value.type else arith.truncf(stored, value)
+
     thread = arith.remui(utils.thread_idx(), const(scan.THREADS))
     for step in range(run):
         entry = arith.addi(arith.muli(thread, const(run)), const(step))
         r, c = arith.divui(entry, const(sub)), arith.remui(entry, const(sub))
         column = arith.addi(arith.muli(arith.divui(r, const(sub)), const(sub)), c)
-        memref.store(memref.load(landing_ref, at(r, c)), view_ref, at(r, column))
+        value = memref.load(source_ref, at(r, c))
+        memref.store(value if strict is None else taken(value, r, c), view_ref, at(r, column))
 
 
 def _band_form(call: Call, name: str):
@@ -458,7 +479,10 @@ def _own_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
                    *((swizzling.plain((chunk, keys), given),) if "scores" in products else ()),
                    *((swizzling.plain((chunk,), jnp.float32),) if "system" in products else ()),
                    swizzling.plain((outputs, chunk, algebra.SUB), jnp.float32))
-    return staging, {name: _band_form(call, name).landing(chunk, algebra.SUB) for name in products}
+    # A landing where a form of parts takes its blocks through registers (`_blocks_written`); a one-part
+    # form's blocks copied from their sums straight (`_diagonal_copied`).
+    landed = [name for name in products if not by_thread(call) or _band_form(call, name).parts > 1]
+    return staging, {name: _band_form(call, name).landing(chunk, algebra.SUB) for name in landed}
 
 
 def _threaded(threaded: list, products: tuple[str, ...]) -> tuple:
