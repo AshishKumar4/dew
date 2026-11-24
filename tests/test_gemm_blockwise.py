@@ -2,7 +2,9 @@
 on the CPU: the template's step-scaled walk, interpreted as an H100's, on par with the scaled blocks summed in
 XLA (check 1), from the float64 sum of the dequantized blocks (tests/blockwise_matrix.py's `truth`)."""
 
+import contextlib
 import functools
+import io
 
 import blockwise_matrix
 import jax
@@ -492,9 +494,12 @@ def test_a_recipe_chains_products_carry_the_names_a_remat_policy_saves(recipe, g
         return jax.checkpoint(lambda *operands: jnp.sum(run(*operands).astype(jnp.float32)), policy=policy)
 
     def saved(names) -> list[str]:
-        residuals = jax.ad_checkpoint.saved_residuals(chained(names), x, *firsts, down)
-        sources = [source for _, source in residuals]
-        return sorted(name for name in ("gate", "up") for source in sources if f"named '{name}'" in source)
+        # JAX's report of the residuals a differentiated call saves, a line each (`print_saved_residuals`).
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            jax.ad_checkpoint.print_saved_residuals(chained(names), x, *firsts, down)
+        lines = printed.getvalue().splitlines()
+        return sorted(name for name in ("gate", "up") for line in lines if f"named '{name}'" in line)
 
     assert saved(("gate", "up")) == (["gate", "up"] if gated else ["up"])
     assert saved(None) == []
