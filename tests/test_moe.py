@@ -524,10 +524,12 @@ def test_a_layers_paired_and_scaled_expert_products_read_their_rows_and_layer_in
     scales = jax.random.uniform(keys[3], (8,), jnp.float32, 0.5, 1.5)
     sizes = jnp.asarray([3, 2, 3], jnp.int32)
     stream = moe.Gathered(tokens, rows, jnp.arange(8, dtype=jnp.int32), scales)
+    # One index for both stacks, as a scanned iteration hands its layer (`moe.at_iteration`).
+    layer = jnp.asarray(1, jnp.int32)
 
     with grouped_matmul.weighed() as calls:
-        gate, up = moe.paired_projections(stream, *(moe.Layered(stack, jnp.asarray(1, jnp.int32))
-                                                    for stack in stacks), sizes, jnp.float32, "auto", None)
+        gate, up = moe.paired_projections(stream, *(moe.Layered(stack, layer) for stack in stacks), sizes,
+                                          jnp.float32, "auto", None)
     bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
     assert bound
     # The pair weighed whole, and its products apart where a launch takes no pair (`gemm`'s `APART`): each
