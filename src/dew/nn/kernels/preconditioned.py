@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.precision import at_least_fp32, l2norm
+from dew.nn.precision import at_least_fp32, broadcast_summed, l2norm
 
 from . import recurrence
 from .diagonal import diagonal_scan
@@ -36,48 +36,21 @@ def _squash(r):
 def _squash_jvp(primals, tangents):
     """`_squash`'s derivative `dr / (1 + |r|)^2`, divided twice, never the quotient rule's `(1 + |r| - |r|)`,
     which cancels to zero where `1 + |r|` rounds to `|r|` (a center of -2^25: fla's ATK backward's 2^-50),
-    nor squared past the range where `|r|` passes 2^64."""
+    nor squared past the range where `|r|` passes 2^64; its primal `_squash` itself, so a derivative of a
+    derivative takes this rule again rather than the quotient rule's."""
     (r,), (dr,) = primals, tangents
     held = 1.0 + jnp.abs(r)
-    return r / held, dr / held / held
-
-
-@jax.custom_vjp
-def _centered(logs, center):
-    """`logs - center`, a key head's center `[Hk]` over its keys' logs `[..., Hk, Dk]`."""
-    return logs - center[:, None]
-
-
-def _centered_fwd(logs, center):
-    return _centered(logs, center), None
-
-
-def _centered_bwd(_, cotangent):
-    """`_centered`'s pullback: the logs' cotangent as it is, the centers' each key head's sum of it over its
-    rows, tokens and keys as a balanced tree (`_balanced`): summed by XLA:CPU's reduction, a draw's 1280
-    terms a key head put the centers' gradient 1.585 times fla's token walk's distance from float64 in
-    check 1, where the walk sums them a token at a time; the tree passes."""
-    terms = jnp.moveaxis(cotangent, -2, 0).reshape(cotangent.shape[-2], -1).T
-    return cotangent, -_balanced(terms)
-
-
-_centered.defvjp(_centered_fwd, _centered_bwd)
-
-
-def _balanced(terms):
-    """`terms` summed over their first axis as a balanced tree, each level a half added to the other and an
-    odd one carried: its error grows with the log of their count, a running sum's with the count."""
-    while terms.shape[0] > 1:
-        half = terms.shape[0] // 2
-        terms = jnp.concatenate([terms[:half] + terms[half:2 * half], terms[2 * half:]])
-    return terms[0]
+    return _squash(r), dr / held / held
 
 
 def _squashed(key, moment, center, x: float, eps: float):
     """The write keys `k x^{-s}` of keys `k` and their moment (the module's account), `center` a key head's,
-    broadcast over the keys' last two axes (`_centered`)."""
-    r = _centered(jnp.log(moment + eps), jnp.asarray(center, moment.dtype))
-    return key * jnp.exp(-np.log(x) * _squash(r))
+    spread over its keys and every token (`precision.broadcast_summed`): the centers' gradient, a key head's
+    sum over every row, token and key, summed at least in float32 (float64 on a CPU), where XLA:CPU's
+    reduction of a draw's 1280 terms put check 1 at 1.585 against fla's token walk."""
+    logs = jnp.log(moment + eps)
+    centers = broadcast_summed(jnp.asarray(center, moment.dtype), logs.shape, (logs.ndim - 2,))
+    return key * jnp.exp(-np.log(x) * _squash(logs - centers))
 
 CENTER = -0.2
 """fla's default center of ATK's squash, a key head's `log_atk_scale`."""

@@ -190,3 +190,63 @@ def test_the_squash_saturated_keeps_the_centers_and_moments_gradients():
     for got, want in zip(found, expected, strict=True):
         assert np.all(got != 0)
         np.testing.assert_array_equal(np.sign(got), np.sign(want))
+
+
+def test_the_squash_saturated_keeps_its_second_derivative():
+    """The squash's second derivative where it saturates, `r = 2^25` (`1 + |r|` rounding to `|r|`): forward
+    over reverse of `(s(r) - 1)^2 / 2` nonzero and of float64's sign, about `3 2^-100`, where the squash's
+    derivative rule returned its primal as a quotient, which the second derivative took through the
+    quotient rule again and cancelled to zero (ReviewRecurrenceBatch)."""
+    from dew.nn.kernels.preconditioned import _squash
+
+    def loss(r):
+        return 0.5 * (_squash(r) - 1.0) ** 2
+
+    def second(r):
+        return jax.jvp(jax.grad(loss), (r,), (jnp.ones_like(r),))[1]
+
+    found = float(second(jnp.float32(2.0 ** 25)))
+    with jax.enable_x64(new_val=True):
+        expected = float(second(jnp.float64(2.0 ** 25)))
+    assert found != 0 and np.sign(found) == np.sign(expected)
+
+
+def test_atks_keys_over_no_tokens_keep_the_moment_and_no_gradient():
+    """ATK's keys over a sequence of no tokens: no write keys, the moment leaving the one entering, and the
+    centers' and the entering moment's gradients zero and one, where a sum over the tokens' first axis read
+    an element of none (ReviewRecurrenceBatch)."""
+    key = jnp.zeros((1, 0, 2, 8), jnp.float32)
+    gates = jnp.zeros((1, 0, 2), jnp.float32)
+    state = jnp.full((1, 2, 8), 0.25, jnp.float32)
+    center = jnp.full((2,), CENTER, jnp.float32)
+
+    def leaving(center, state):
+        written, moment = preconditioned_keys(key, gates, gates, state, center=center)
+        return jnp.sum(written) + jnp.sum(moment)
+
+    (d_center, d_state) = jax.grad(leaving, argnums=(0, 1))(center, state)
+    np.testing.assert_array_equal(np.asarray(preconditioned_keys(key, gates, gates, state, center=center)[1]),
+                                  np.asarray(state))
+    np.testing.assert_array_equal(np.asarray(d_center), 0.0)
+    np.testing.assert_array_equal(np.asarray(d_state), 1.0)
+
+
+def test_the_rule_runs_in_a_shard_map_that_checks_varying_axes():
+    """The chunked rule's rows split over a checked `shard_map`'s axis, its centers replicated: its output,
+    final states and every operand's gradient finite, and the centers' gradient of the unsplit rule's
+    signs, the sum of each shard's (ReviewRecurrenceBatch: a pullback returning a shard's own centers'
+    cotangent to a replicated center is refused)."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    *given, cotangent = operands(per_key=False)(0)
+    rows = PartitionSpec('data')
+    specs = (*(rows,) * (len(given) - 1), PartitionSpec())
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ('data',))
+    mapped = jax.shard_map(chunked, mesh=mesh, in_specs=specs, out_specs=rows, check_vma=True)
+
+    def pulled(rule):
+        return jax.jit(lambda *x: jax.vjp(rule, *x)[1](cotangent))(*given)
+
+    found, split, whole = jax.jit(mapped)(*given), pulled(mapped), pulled(chunked)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((found, split)))
+    np.testing.assert_array_equal(np.sign(np.asarray(split[-1])), np.sign(np.asarray(whole[-1])))
