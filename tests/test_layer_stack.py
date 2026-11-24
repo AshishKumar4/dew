@@ -707,17 +707,17 @@ BANKED_EXPERT_SEEDS = 8
 @pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("held", ["resident", "banked"])
 def test_a_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop(held):
-    """A scanned MoE stack decoding over its own variables, in device memory as a model holds them
-    (resident), or over a bank in device memory (`HeldBanks.place`, every run's leaves one array), hands
-    each layer the run's expert kernels whole and the layer's index, which the grouped matmul reads in
-    place (`dew.nn.moe.Layered`): the step's loop takes every expert stack as a constant, whole, slicing
-    none of them, and each grouped call over them takes the whole stack, its layers' experts one axis, and
-    the layer's offset into it (`grouped_matmul.weighed`: the launch boundary, past which a launch reads
-    the layer where it lies; row 1346: sliced, each layer's experts were copied out every step, 45% of a
-    Qwen3-30B-A3B decode step on an H100). A bank's every other leaf is read in the iteration that reads
-    it, none staged a layer ahead in the loop's carry, which a bank in host memory alone needs, and a call
-    keeping every collection open writes none of its kernels back. Its steps decode as exactly as the plain
-    loop's, both from the loop's own float64 steps (check 1)."""
+    """A scanned MoE stack decoding over its own variables, in device memory as a model holds them (resident),
+    or over a bank in device memory (`HeldBanks.place`, every run's leaves one array), hands each layer the
+    run's expert kernels whole and the layer's index, which the grouped matmul reads in place
+    (`dew.nn.moe.Layered`): the step's loop takes every expert stack as a constant, whole, slicing none of
+    them, and the grouped calls of its experts' projections take the whole stack, its layers' experts one
+    axis, and the layer's offset into it (`grouped_matmul.weighed`: the launch boundary, past which a launch
+    reads the layer where it lies; row 1346: sliced, each layer's experts were copied out every step, 45% of a
+    Qwen3-30B-A3B decode step on an H100). A bank's every other leaf is read in the iteration that reads it,
+    none staged a layer ahead in the loop's carry, which a bank in host memory alone needs, and a call keeping
+    every collection open writes none of its kernels back. Its steps decode as exactly as the plain loop's,
+    both from the loop's own float64 steps (check 1)."""
     from dew.nn.kernels import grouped_matmul
 
     ids = jax.random.randint(jax.random.key(2), (2, 8), 0, VOCAB)
@@ -743,12 +743,13 @@ def test_a_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_the_loop
               for equation in equations(scan.params["jaxpr"])
               if equation.primitive.name in ("dynamic_slice", "slice", "gather")}
     assert any(stacks <= whole for whole in handed) and not stacks & slices
+    # The calls the experts' projections make take the whole stack, its layers' experts one axis, at the
+    # layer's offset: a launch reads the layer there in place. (A target's portable product, XLA's on this
+    # CPU, slices the layer from the stack past that boundary and weighs its call again, the layer's.)
     bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
     whole = {(layers * experts, *matrix) for layers, experts, *matrix in stacks}
     experts = [arguments for arguments in bound if tuple(arguments["kernel"].shape) in whole]
     assert experts and all(arguments["first"] is not None for arguments in experts), bound
-    layers = {stack[1:] for stack in stacks}
-    assert not any(tuple(arguments["kernel"].shape) in layers for arguments in bound)
     if held == "banked":
         # A call that keeps every collection open hands back none of the expert kernels it read in place.
         assert BANKED_EXPERTS not in scanned.apply(store, ids[:, :4], mutable=True)[1]
