@@ -216,9 +216,13 @@ ranges' bound on the sums above (`_bounded`, under float32's range)."""
 
 
 def _exponential(exponent, base2: bool, cut) -> scaled.Scaled:
-    """`exp(exponent)` (`2^exponent` where `base2`) as a scaled value, its power of two the base-2
-    exponent's nearest integer and its significand the remainder's exponential (`windows`' factors' form),
-    zero where `cut` (a document's first token) or below `FLOOR`: a decay past float32's least normal kept."""
+    """`exp(exponent)` (`2^exponent` where `base2`) as a scaled value, zero where `cut` (a document's first
+    token): the scan's own decay (`scan._exp`, fp32's rounding) where it is a normal float, exactly as a
+    scaled value; else its power of two the base-2 exponent's nearest integer and its significand the
+    remainder's exponential (`windows`' factors' form), zero below `FLOOR`: a decay past float32's least
+    normal kept, and an ordinary one the token walk's own."""
+    natural = _exp(base2, exponent)
+    ordinary = jnp.isfinite(natural) & (natural >= np.finfo(natural.dtype).tiny)
     if base2:
         high, low = exponent, jnp.zeros_like(exponent)
     else:
@@ -229,7 +233,9 @@ def _exponential(exponent, base2: bool, cut) -> scaled.Scaled:
     whole = whole + (high - whole >= 0.5).astype(high.dtype)
     fraction = (high - whole) + low
     significand = jnp.where(held, jnp.exp(fraction * np.asarray(math.log(2), fraction.dtype)), 0.0)
-    return scaled.normalized(significand, whole.astype(jnp.int32), SUMS_REACH)
+    split = scaled.normalized(significand, whole.astype(jnp.int32), SUMS_REACH)
+    exact = scaled.scaled(jnp.where(ordinary, natural, 0.0))
+    return scaled.where(ordinary & ~cut, exact, split)
 
 
 def _floored(value: scaled.Scaled) -> scaled.Scaled:
