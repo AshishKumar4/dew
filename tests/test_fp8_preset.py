@@ -805,19 +805,22 @@ def _delayed_nvfp4():
                                                                              tensor_scaling="delayed"))
 
 
-def test_a_delayed_nvfp4_dense_reads_its_history_and_records_its_rows():
+@pytest.mark.parametrize("general", [False, True], ids=["dense", "dense-general"])
+def test_a_delayed_nvfp4_dense_reads_its_history_and_records_its_rows(general):
     """A Dense under a delayed-scaling NVFP4 recipe that takes it (row 12721) holds its amax history
     (`dense.NVFP4_HISTORY`, zeros of the recipe's length where initialized), quantizes its rows at the tensor
     scale of the history's largest, its output bitwise the recipe projection's at that scale, and records its
     rows' largest magnitude under its history's name (`dense.NVFP4_AMAX`); it refuses to run without a
-    history, and a current-scaling recipe holds none."""
-    from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY, Dense
+    history, and a current-scaling recipe holds none. A DenseGeneral too (an attention's projection's
+    module), its product's extents as matrices its history's."""
+    from dew.nn.dense import NVFP4_AMAX, NVFP4_HISTORY, Dense, DenseGeneral
     from dew.nn.kernels import projections
     from dew.nn.precision import NVFP4, projection_role
 
     rng = np.random.default_rng(12721)
     x = jnp.asarray(rng.normal(size=(100, 128)), jnp.bfloat16)
-    layer = Dense(64, use_bias=False, dtype=jnp.bfloat16)
+    layer = (DenseGeneral((4, 16), use_bias=False, dtype=jnp.bfloat16) if general
+             else Dense(64, use_bias=False, dtype=jnp.bfloat16))
     with generation.run_precision(_delayed_nvfp4()), projection_role("mlp"):
         variables = layer.init(jax.random.key(0), x)
         assert np.asarray(variables[NVFP4_HISTORY]["amax_history"]).tolist() == [0.0] * 16
@@ -826,9 +829,10 @@ def test_a_delayed_nvfp4_dense_reads_its_history_and_records_its_rows():
         held = {"params": variables["params"], NVFP4_HISTORY: {"amax_history": history}}
         out, sown = layer.apply(held, x, mutable=[NVFP4_AMAX])
         # The layer's kernel as it multiplies it, promoted to its dtype.
-        kernel = jnp.asarray(variables["params"]["kernel"], jnp.bfloat16)
+        kernel = jnp.asarray(variables["params"]["kernel"], jnp.bfloat16).reshape(128, 64)
         want = projections.recipe_projection(x, kernel, out_dtype=jnp.bfloat16,
                                              tensor_scale=projections.delayed_tensor_scale(history))
+        want = want.reshape(out.shape)
         with pytest.raises(ValueError):
             layer.apply({"params": variables["params"]}, x)
     np.testing.assert_array_equal(np.asarray(out).view(np.uint16), np.asarray(want).view(np.uint16))

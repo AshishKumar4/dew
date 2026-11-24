@@ -326,7 +326,8 @@ a training step takes the largest of across its calls and microbatches and rolls
 
 
 def history_scale(layer: nn.Module, name: str, shape: tuple[int, ...]) -> jax.Array | None:
-    """The tensor scale `layer`'s projection `name` by a `shape` (`[..., depth, width]`) matrix quantizes
+    """The tensor scale `layer`'s projection `name` by a `shape` (`[..., depth, width]`, a product's extents
+    as matrices) matrix quantizes
     its rows at, where the run trains in a delayed-scaling NVFP4 recipe that takes it in the role traced
     (`projections.recipe_takes`): its amax history's (`projections.delayed_tensor_scale`), the history held
     at `layer`'s path as `name` (`NVFP4_HISTORY`); None elsewhere (row 12721). Its rows' largest magnitude
@@ -513,8 +514,15 @@ class DenseGeneral(_LinearEnvelope, nn.DenseGeneral):
         # The product is [batch dims, kept dims, features]; the bias broadcasts over the kept dims.
         kept = tuple(inputs.shape[dim] if dim in batch_dims else 1
                      for dim in range(inputs.ndim) if dim not in axis)
-        return _biased(self, inputs, kernel, ((axis, contracted), (batch_dims, tuple(range(batched)))), bias,
-                       lambda bias: jnp.reshape(bias, kept + features), stored)
+        dimensions = ((axis, contracted), (batch_dims, tuple(range(batched))))
+        # Under a delayed-scaling NVFP4 recipe that takes the product (its depth by width as matrices), its
+        # rows' scale its amax history's.
+        extents = projections.extents(inputs.shape, kernel.shape, dimensions)
+        scale = history_scale(self, 'amax_history', extents)
+        if scale is not None:
+            recorded(self, 'amax_history', inputs)
+        return _biased(self, inputs, kernel, dimensions, bias,
+                       lambda bias: jnp.reshape(bias, kept + features), stored, tensor_scale=scale)
 
 
 def _contractions(module: nn.Dense | nn.DenseGeneral, ndim: int
