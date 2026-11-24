@@ -9,6 +9,7 @@ step.
 
 import itertools
 import threading
+from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -123,7 +124,7 @@ def test_a_draw_a_criterion_cuts_short_is_truncated_and_one_the_task_alone_ends_
     params = target.init(jax.random.key(0))
     unstopped = Sampling(temperature=1.0, eos_token_ids=None)
     server = NativeRolloutServer(Server.from_task(
-        TextGeneration(target.model, params, None, sampling=unstopped, stopping=(MaxNewTokens(1),)),
+        TextGeneration(target.model, params, None, sampling=replace(unstopped, stopping=(MaxNewTokens(1),))),
         slots=2, capacity=64))
     try:
         draw = server.submit([1, 2, 3], BUDGET, key=5).result(timeout=120)
@@ -134,14 +135,14 @@ def test_a_draw_a_criterion_cuts_short_is_truncated_and_one_the_task_alone_ends_
     def three(state, tokens):
         return tokens == 3
 
-    task = TextGeneration(target.model, params, None, sampling=unstopped, stopping=(three,))
+    task = TextGeneration(target.model, params, None, sampling=replace(unstopped, stopping=(three,)))
     with pytest.raises(ValueError):
         NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
     # An EOS criterion beside the policy's own ends draws on an id the policy does not name.
     from dew.sampling.decoding import EndOfSequence
 
-    task = TextGeneration(target.model, params, None, sampling=SAMPLING,
-                          stopping=(EndOfSequence(jnp.asarray([3], jnp.int32)),))
+    task = TextGeneration(target.model, params, None,
+                          sampling=replace(SAMPLING, stopping=(EndOfSequence(jnp.asarray([3], jnp.int32)),)))
     with pytest.raises(ValueError):
         NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
 
@@ -252,7 +253,13 @@ def test_a_native_draw_ends_on_the_stop_string_it_completes(pieces):
     seen = []
     task = TextGeneration(model, params, RunProcessor(pieces),
                           sampling=Sampling(temperature=1.0, eos_token_ids=ids["<eos>"], stop=("stop",)))
-    server = NativeRolloutServer(Server.from_task(task, slots=2, capacity=64))
+    served = Server.from_task(task, slots=2, capacity=64)
+    # The server's policy is the caller's, its stop strings uncompiled, so a task under it serves again (the
+    # review of API02b: its compiled criteria beside the strings compiled twice, and a rollout refused it).
+    assert served.sampling.stop == ("stop",) and served.sampling.stopping == ()
+    again = Server.from_task(replace(task, sampling=served.sampling), slots=2, capacity=64)
+    NativeRolloutServer(again).close()
+    server = NativeRolloutServer(served)
     batch = {"prompt": np.asarray([[ids["a"]]], np.int32), "prompt_length": np.asarray([1], np.int32),
              **{name: np.zeros((1, 8), np.int32) for name in ("data_source", "ground_truth", "extra_info")}}
     [prompt] = prompt_tasks(batch)

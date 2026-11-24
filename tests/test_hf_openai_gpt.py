@@ -4,10 +4,12 @@ import json
 
 import pytest
 from interop_support import assert_exported_decoder_follows_transformers, token_draw
+from model_support import attending
 
 from dew.interop import Pretrained
 
 
+@attending("reference")
 @pytest.mark.parametrize("afn", ["gelu", "relu"])
 def test_a_gpt1_decoder_computes_transformers_logits_and_greedy_continuation(afn, tmp_path):
     """GPT-1's decoder (modeling_openai.py: learned positions, each block norming its stream after each
@@ -21,11 +23,12 @@ def test_a_gpt1_decoder_computes_transformers_logits_and_greedy_continuation(afn
     config = OpenAIGPTConfig(vocab_size=96, n_embd=64, n_layer=2, n_head=4, n_positions=32, afn=afn)
     torch.manual_seed(0)
     OpenAIGPTLMHeadModel(config).eval().save_pretrained(tmp_path / "source")
-    loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path / "source", dtype="float32")
     assert_exported_decoder_follows_transformers(loaded, tmp_path, token_draw(0x3079, 96, (2, 9)),
                                                  "GPT-1 logits", lambda model, ids: model(ids).logits)
 
 
+@attending("reference")
 def test_gpt1_scales_by_the_head_width_whatever_its_config_carries(tmp_path):
     """GPT-1's blocks always scale their attention by the head width (modeling_openai.py builds each with
     `scale=True`): a config carrying GPT-2's `scale_attn_weights: false` loads with that scale, as
@@ -38,5 +41,5 @@ def test_gpt1_scales_by_the_head_width_whatever_its_config_carries(tmp_path):
                          ).eval().save_pretrained(tmp_path)
     path = tmp_path / "config.json"
     path.write_text(json.dumps({**json.loads(path.read_text()), "scale_attn_weights": False}))
-    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path, dtype="float32")
     assert loaded.model.attention_scale is None

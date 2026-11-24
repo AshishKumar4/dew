@@ -37,7 +37,7 @@ from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.optim import OptimConfig
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 SMOKE_SOURCE = FIXTURES / "hf/diffusion-gemma-workflow"
@@ -91,13 +91,9 @@ def adapted_objective(config: Config) -> tuple[PretrainedBlockDecoder, BlockDiff
     source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32,
                                          on_host=True).adapt(
         LoRA(rank=config.rank, modules=tuple(config.modules), alpha=config.alpha), key=0)
-    # A host layout streams the stack one layer per scan iteration, so the
-    # decoder runs as a scan; a plain loop's fetches would all be hoisted and
-    # the whole base would land on the device this is keeping it off.
-    scanned = source.model.clone(text=source.model.text.clone(scan_layers=True))
-    # The source over the scanned model, so the objective takes its weights and end-of-sequence ids.
+    # The source, so the objective takes its weights and end-of-sequence ids; its stack runs scanned (`main`).
     return source, BlockDiffusionObjective(
-        replace(source, model=scanned), prompt_length=config.prompt_tokens, num_canvases=config.canvases,
+        source, prompt_length=config.prompt_tokens, num_canvases=config.canvases,
         pad_token_id=int(source.config["text_config"]["pad_token_id"]))
 
 
@@ -120,9 +116,9 @@ def main(config: Config) -> Path:
     data = chat_rows(config, objective, data_source(config.chat).shuffle(seed=0).repeat())
 
     checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
-    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(1),
+    trainer = Trainer(objective, OptimConfig(lr=config.learning_rate), key=jax.random.key(1),
                       mesh=MeshSpec(fsdp=jax.device_count()),
-                      layout=Layout(host=("variables",)), checkpoints=checkpoints)
+                      advanced=TrainerAdvanced(layout=Layout(host=("variables",))), checkpoints=checkpoints)
     state = trainer.fit(data, steps=config.steps, log_every=1,
                         checkpoint_every=config.steps)
     checkpoints.wait()
@@ -144,4 +140,8 @@ def main(config: Config) -> Path:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Config))
+    # A host layout streams the stack one layer per scan iteration, so the decoder runs as a scan
+    # (`dew.kernels.use(layer_scan="scanned")`); a plain loop's fetches would all be hoisted and the whole
+    # base would land on the device this is keeping it off.
+    with dew.kernels.use(layer_scan="scanned"):
+        main(tyro.cli(Config))

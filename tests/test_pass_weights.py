@@ -2,6 +2,7 @@
 grown phase by phase (`Trainer`'s `phase_passes`): each loss and gradient is the passes' own models' at
 their weights, on par from float64 (check 1), and a phased run steps each phase at its own count."""
 
+import dataclasses
 import itertools
 
 import jax
@@ -11,7 +12,7 @@ import optax
 import pytest
 from decision_support import decision_rows
 from flax import linen as nn
-from model_support import float64_twin
+from model_support import attending, float64_twin
 from reference_error import assert_as_exact, dew_path
 
 from dew.batch import PHASE, VALID_ROWS, Phase
@@ -26,7 +27,7 @@ from dew.nn.protocols import EXITS
 from dew.objectives.base import Step
 from dew.objectives.lm.objective import LMObjective
 from dew.objectives.passes import PassWeights, exiting
-from dew.training import FitPolicy
+from dew.training import TrainerAdvanced
 
 PASS_SEEDS = 64
 """Draws of each check-1 site here: tiny models, whose losses' errors settle well inside it."""
@@ -57,7 +58,7 @@ def looped(implicit: bool = False, steps: int = STEPS) -> CausalTransformer:
     exits through; `implicit` takes each later pass by the θ-method (`Loop.implicit`), which reads each
     pass's state un-normed (no `step_norm`)."""
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
-                             max_seq_len=128, attention_impl="xla",
+                             max_seq_len=128,
                              loop=Loop(steps, layers=(1, 2), implicit=implicit, step_norm=not implicit))
 
 
@@ -86,6 +87,7 @@ def by_passes(model, weights, tokens):
     return run
 
 
+@attending("xla")
 @pytest.mark.parametrize("implicit", [False, True], ids=["explicit", "theta"])
 @pytest.mark.parametrize("weights", ["mean", (0.1, 0.3, 0.6)], ids=["mean", "stated"])
 def test_an_lm_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight(weights, implicit):
@@ -103,6 +105,7 @@ def test_an_lm_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight(w
                     label, seeds=PASS_SEEDS, truth_fn=jax.jit(by_passes(float64_twin(model), stated, tokens)))
 
 
+@attending("xla")
 def test_weights_on_the_last_pass_alone_are_the_models_own_loss():
     """Weights all on the last pass score its output alone, the model's own loss: the same program as
     no pass weights, so its loss and gradient are the same bits."""
@@ -124,6 +127,7 @@ def decision_objective(model, weights):
                              shuffle_options=False, pass_weights=weights)
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=64, per_task=16)
 def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight():
     """`pass_weights` over a decision model's looped backbone, a consistency term beside the label loss
@@ -180,6 +184,7 @@ def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_wei
                     truth_fn=jax.jit(apart(float64_twin(model), float64_twin(head))))
 
 
+@attending("xla")
 @pytest.mark.parametrize("loss", [False, True], ids=["metrics alone", "with the loss"])
 def test_a_validation_reports_each_pass_beside_the_run(loss):
     """A pass-weighed run's validation reports each pass's metrics under `val/pass_<k>/` beside the run's
@@ -205,6 +210,7 @@ def test_a_validation_reports_each_pass_beside_the_run(loss):
         assert scores[f"val/pass_{k}/accuracy"] == alone["val/accuracy"]
 
 
+@attending("xla")
 @pytest.mark.parametrize("stated", [(0.5, 0.6, 0.0), (0.5, 0.5), "max", (-0.1, 0.5, 0.6)],
                          ids=["over one", "two of three passes", "no rule", "negative"])
 def test_pass_weights_that_mean_no_mixture_of_the_loops_passes_are_refused(stated):
@@ -214,14 +220,16 @@ def test_pass_weights_that_mean_no_mixture_of_the_loops_passes_are_refused(state
         LMObjective(looped(), 16, pass_weights=stated)
 
 
+@attending("xla")
 def test_pass_weights_over_a_model_with_no_loop_are_refused():
     """A model that runs no loop has one pass, its output: pass weights over it are refused, naming it."""
     plain = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                              max_seq_len=128, attention_impl="xla")
+                              max_seq_len=128)
     with pytest.raises(ValueError):
         LMObjective(plain, 16, pass_weights="mean")
 
 
+@attending("xla")
 def test_a_phased_run_steps_each_phase_at_its_own_pass_count():
     """A run whose loop runs 1 pass in its first phase and 3 in its second (`phase_passes`) steps each phase
     as a run of the model with that many passes steps it: from the same state over the same batch, its loss
@@ -233,11 +241,13 @@ def test_a_phased_run_steps_each_phase_at_its_own_pass_count():
     tokens = jnp.asarray(np.random.default_rng(2).integers(0, 256, (jax.device_count() * 2, 17)), jnp.int32)
     batch = {"text": tokens}
 
-    def trainer_of(model, **phased):
+    def trainer_of(model, advanced=None, **phased):
         return Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0), **phased)
+                       advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=Layout(min_shard=1,
+                                                                                                 tolerance=1.0)),
+                       **phased)
 
-    phased = trainer_of(model, phase_passes=(1, STEPS))
+    phased = trainer_of(model, advanced=TrainerAdvanced(phase_passes=(1, STEPS)))
     for phase, passes in enumerate((1, STEPS)):
         # The phase the batch was read in, as a phased stream marks it (`dew.batch.PHASE`).
         assert phased.phase_passes.at({**batch, PHASE: Phase(phase)}) == passes
@@ -290,13 +300,16 @@ def phased_loader(tokens):
     return Loader(train=lambda partition: PhasedTokens(tokens), val=None, records=None, batch=len(tokens))
 
 
-def phased_trainer(model, seed, phases: tuple[int, ...] | None = (1, STEPS), **options):
+def phased_trainer(model, seed, phases: tuple[int, ...] | None = (1, STEPS), advanced=None, **options):
     """A trainer of `model`'s LM over 16 tokens, its loop at 1 pass in phase 0 and STEPS in phase 1 (none
     where `phases` is None)."""
     from dew.training import Layout, Trainer
 
     return Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(int(seed)),
-                   layout=Layout(min_shard=1, tolerance=1.0), phase_passes=phases, **options)
+                   advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=Layout(min_shard=1,
+                                                                                             tolerance=1.0),
+                                                phase_passes=phases),
+                   **options)
 
 
 def phased_params(trainer, tokens, steps: int = 4, **fitted) -> dict:
@@ -317,7 +330,7 @@ def phase_needs(monkeypatch, tokens) -> tuple[int, int, int]:
 
     def needed(model, split, *, startup=False):
         free(monkeypatch, LIMIT)
-        trainer = phased_trainer(model, 0, None, fit=FitPolicy(split=split))
+        trainer = phased_trainer(model, 0, None, split=split)
         state, _, _ = trainer.place()
         trainer.compile(state, {"text": jnp.asarray(tokens)})
         options.unhold()
@@ -326,6 +339,7 @@ def phase_needs(monkeypatch, tokens) -> tuple[int, int, int]:
     return needed(looped(steps=1), 1, startup=True), needed(looped(), 1), needed(looped(), 2)
 
 
+@attending("xla")
 def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp_path):
     """A run whose loop runs 1 pass in its first phase and 3 in its second (`phase_passes`), on devices with
     room for the one-pass step whole and for the three-pass step only in two microbatches, plans each phase
@@ -355,14 +369,15 @@ def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp
     assert [(probe["split"], probe["ahead"]) for probe in planned.plan["probes"]] == [(1, True), (2, True)]
     free(monkeypatch, LIMIT)
     directory = str(tmp_path / "pinned")
-    phased_params(phased_trainer(looped(), 0, fit=FitPolicy(split=1), checkpoints=Checkpoints(directory)),
+    phased_params(phased_trainer(looped(), 0, split=1, checkpoints=Checkpoints(directory)),
                   tokens, steps=2, checkpoint_every=2)
-    pinned = phased_params(phased_trainer(looped(), 0, fit=FitPolicy(split=2),
+    pinned = phased_params(phased_trainer(looped(), 0, split=2,
                                           checkpoints=Checkpoints(directory)), tokens)
     for mine, theirs in zip(bits(landed), bits(pinned), strict=True):
         np.testing.assert_array_equal(mine, theirs)
 
 
+@attending("xla")
 def test_a_later_phases_search_off_the_loop_keeps_no_program_its_boundary_passes_over(monkeypatch):
     """A later phase planned off the loop (`dew.training.ahead.LaterPlans`) whose search compiled the step
     whole, which missed, and in halves, which fit, holds both until its boundary takes a plan, then keeps
@@ -429,6 +444,7 @@ def test_a_phased_runs_later_phase_is_compiled_off_its_loop(monkeypatch, tmp_pat
         np.testing.assert_array_equal(mine, theirs)
 
 
+@attending("xla")
 def test_a_phase_whose_program_plans_other_copies_counts_them_built_in_its_fit(monkeypatch):
     """A run whose loop runs 3 passes in its first phase and 1 in its second, in bf16 over fp32 weights with
     narrow copies on: the second phase's program plans other copies than the first's, which its step makes
@@ -479,6 +495,7 @@ def cut_loop_loss(model, weights, tokens):
     return run
 
 
+@attending("xla")
 def test_an_lm_loss_weighing_a_cut_loops_passes_is_its_exits_loss_at_their_weights():
     """Under a cut (`backprop_steps=1` of 3 passes) the passes' terms are the cut loop's exits, one forward,
     a held-back pass's exit training its coda and the head alone: the loss and every parameter's gradient on
@@ -493,14 +510,17 @@ def test_an_lm_loss_weighing_a_cut_loops_passes_is_its_exits_loss_at_their_weigh
                     truth_fn=jax.jit(cut_loop_loss(float64_twin(model), weights, tokens)))
 
 
+@attending("xla")
 def test_a_pass_count_a_phase_whose_last_is_not_the_models_is_refused():
     """The last phase's count is the one the model holds and the run hands on: another is refused."""
     from dew.training import Trainer
 
     with pytest.raises(ValueError):
-        Trainer(LMObjective(looped(), 16), optax.sgd(0.1), key=jax.random.key(0), phase_passes=(1, 2))
+        Trainer(LMObjective(looped(), 16), optax.sgd(0.1), key=jax.random.key(0),
+                advanced=TrainerAdvanced(phase_passes=(1, 2)))
 
 
+@attending("xla")
 def test_a_phases_objective_is_its_own_whatever_objectives_it_holds():
     """A distillation of a looped student (its student and teacher objectives inside it): the objective a
     first phase's step is built from runs its student one pass while the run's own, which validation and
@@ -509,7 +529,7 @@ def test_a_phases_objective_is_its_own_whatever_objectives_it_holds():
     from dew.training.phase_passes import PhasePasses
 
     teacher = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                                max_seq_len=128, attention_impl="xla")
+                                max_seq_len=128)
     run = DistillationObjective(LMObjective(looped(), 16, ema_decay=None),
                                 LMObjective(teacher, 16, ema_decay=None), alpha=0.5, temperature=1.0)
     phases = PhasePasses.of(run, (1, STEPS))
@@ -533,6 +553,7 @@ def remade(state, batch, key, *, objective):
     return {"text": np.asarray(batch["text"])}
 
 
+@attending("xla")
 @pytest.mark.parametrize("rollout", [None, remade], ids=["read", "rollout"])
 def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_path, rollout):
     """A fit over two phases of data on the step clock, its loop one pass in the first (two steps) and
@@ -549,12 +570,14 @@ def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_p
     data = compile(phases(DataPhase(corpus(1), Steps(2)), DataPhase(corpus(2))), read="indexed", loading=READ)
     model = looped()
 
-    def trainer_of(model, directory, **phased):
+    def trainer_of(model, directory, advanced=None, **phased):
         return Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0), rollout=rollout,
+                       advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=Layout(min_shard=1,
+                                                                                                 tolerance=1.0),
+                                                    rollout=rollout),
                        checkpoints=Checkpoints(str(directory), keep=8), **phased)
 
-    whole = trainer_of(model, tmp_path / "phased", phase_passes=(1, STEPS)).fit(
+    whole = trainer_of(model, tmp_path / "phased", advanced=TrainerAdvanced(phase_passes=(1, STEPS))).fit(
         data, steps=4, log_every=100, checkpoint_every=None)
     trainer_of(model.with_passes(1), tmp_path / "apart").fit(data, steps=2, log_every=100, checkpoint_every=1)
     apart = trainer_of(model, tmp_path / "apart").fit(data, steps=4, log_every=100, checkpoint_every=1)
@@ -579,6 +602,7 @@ class Flops:
         pass
 
 
+@attending("xla")
 def test_a_phased_runs_work_counts_each_step_at_its_phases_pass_count():
     """A fit over two phases, its loop one pass in the first and three in the second (`phase_passes`),
     counts each step's work (`train/flops`, which train/mfu divides) as a run of its phase's pass count
@@ -590,21 +614,24 @@ def test_a_phased_runs_work_counts_each_step_at_its_phases_pass_count():
     from dew.data.compile import compile
     from dew.training import Layout, Trainer
 
-    def counted(model, data, steps, **phased):
+    def counted(model, data, steps, advanced=None, **phased):
         flops = Flops()
         Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0), tracker=flops,
-                layout=Layout(min_shard=1, tolerance=1.0), **phased).fit(
+                advanced=dataclasses.replace(advanced or TrainerAdvanced(), layout=Layout(min_shard=1,
+                                                                                          tolerance=1.0)),
+                **phased).fit(
             compile(data, read="indexed", loading=READ), steps=steps, log_every=1, checkpoint_every=None)
         return flops.at
 
     phased = counted(looped(), phases(DataPhase(corpus(1), Steps(2)), DataPhase(corpus(2))), 4,
-                     phase_passes=(1, STEPS))
+                     advanced=TrainerAdvanced(phase_passes=(1, STEPS)))
     one = counted(looped().with_passes(1), corpus(1), 1)
     three = counted(looped(), corpus(2), 1)
     assert one[1] < three[1]
     assert [phased[step] for step in (1, 2, 3, 4)] == [one[1], one[1], three[1], three[1]]
 
 
+@attending("xla")
 def test_an_lm_validation_of_metrics_alone_reports_each_pass():
     """A pass-weighed LM's validation of its perplexity alone (no loss asked) reports each pass's under
     `val/pass_<k>/perplexity`, the last pass's the run's own."""
@@ -623,6 +650,7 @@ def test_an_lm_validation_of_metrics_alone_reports_each_pass():
     assert scores[f"val/pass_{STEPS}/perplexity"] == scores["val/perplexity"]
 
 
+@attending("xla")
 def test_a_qk_clip_reads_every_scored_exits_head():
     """A decision loss weighing a looped backbone's passes, the first weighed and the last not, sows for
     QK-Clip its head's logit maxima at every scored exit, a call each (`dew.batch.sown_calls`), which the

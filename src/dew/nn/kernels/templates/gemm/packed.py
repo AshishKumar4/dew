@@ -36,20 +36,6 @@ NVFP4_STEP = 256
 """The depth an NVFP4 matrix's step decodes (`gmm`'s `scales`): two 128-depth groups of its staged order, so
 each column's block scales are a 16-byte row, a copy's least."""
 
-FP8_GROUP = 64
-"""Dew: the depths an FP8 free-layout weight matrix's staged order groups (`fp8_staged_depth`): sixteen uint32
-words a column (a 64-byte cp.async/TMA row), each word's four codes decoding into sixteen-depth slices."""
-
-FP8_STEP = 64
-"""Minimum depth step for inline FP8 weight decode in the GEMM mainloop (`mosaic_gpu.gmm`'s `packed_format`,
-row 8548): one 64-depth group of sixteen uint32 words per column, fitting sm80 `mma.sync`'s 64-deep steps."""
-
-
-def fp8_staged_depth(group, word, code):
-    """Dew: the depth `formats.fp8_staged_rows` gives word `word`'s code `code` of 64-depth `group`."""
-    return FP8_GROUP * group + 16 * code + word
-
-
 TERNARY_GROUP = 256
 """Dew: the depths a BitNet b1.58 ternary weight matrix's staged order groups (`ternary_staged_depth`,
 row 1464): sixteen uint32 words a column (a 64-byte row), each word's sixteen 2-bit codes decoding into
@@ -64,21 +50,6 @@ def ternary_staged_depth(group, word, code):
     return TERNARY_GROUP * group + 16 * code + word
 
 
-def fp8_minifloat(fmt: str) -> bits.Minifloat:
-    """Resolve `'e4m3'` / `'e5m2'` to its `bits.Minifloat` descriptor via `formats.fp8_minifloat`."""
-    from dew.nn.kernels import formats
-
-    return formats.fp8_minifloat(fmt)[0]
-
-
-def _decode_fp8_lanes(fmt: str, loaded: jax.Array, active) -> list[jax.Array]:
-    minifloat = fp8_minifloat(fmt)
-    form, _ = bits.fp8_form(minifloat)
-    decoded = form.traced(loaded) if active is None else inline_forms.registers(form, loaded, active)
-    return [bits.fp8_restored(half, minifloat, jnp.bfloat16) for register in decoded
-            for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
-
-
 def _decode_ternary_lanes(loaded: jax.Array, active) -> list[jax.Array]:
     from dew.nn.kernels import formats
 
@@ -89,8 +60,8 @@ def _decode_ternary_lanes(loaded: jax.Array, active) -> list[jax.Array]:
 
 @dataclasses.dataclass(frozen=True)
 class PackedWeightFormat:
-    """Format-neutral descriptor for inline-decoded scale-free packed weights (`e4m3`, `e5m2`, `ternary`,
-    rows 8548, 1464, 5387): word geometry, steps, byte cost, live-register cost, and lane decoder."""
+    """Descriptor for inline-decoded scale-free packed weights (`ternary`, rows 1464, 5387): word geometry,
+    steps, byte cost, live-register cost, and lane decoder."""
     name: str
     codes_per_word: int
     group_depth: int
@@ -101,22 +72,16 @@ class PackedWeightFormat:
 
 
 def weight_format(name: str) -> PackedWeightFormat:
-    """Resolve a scale-free packed weight format name (`'e4m3'`, `'e5m2'`, `'ternary'`) to its descriptor."""
-    if name in ("e4m3", "e5m2"):
-        form, _ = bits.fp8_form(fp8_minifloat(name))
-        return PackedWeightFormat(
-            name=name, codes_per_word=4, group_depth=FP8_GROUP, weight_bytes=1.0,
-            steps=(FP8_STEP, 2 * FP8_STEP), decode_live=form.live,
-            decode_lanes=lambda loaded, active, f=name: _decode_fp8_lanes(f, loaded, active))
+    """Resolve a scale-free packed weight format name (`'ternary'`) to its descriptor."""
     if name == "ternary":
         return PackedWeightFormat(
             name="ternary", codes_per_word=16, group_depth=TERNARY_GROUP, weight_bytes=0.25,
             steps=(TERNARY_STEP,), decode_live=4, decode_lanes=_decode_ternary_lanes)
-    raise ValueError(f"unsupported packed weight format {name!r}; expected 'e4m3', 'e5m2', or 'ternary'")
+    raise ValueError(f"unsupported packed weight format {name!r}; expected 'ternary'")
 
 
 def packed_group_depth(fmt: str) -> int:
-    """Depth covered by one 16-word group of packed format `fmt` (`'e4m3'`, `'e5m2'`, or `'ternary'`)."""
+    """Depth covered by one 16-word group of packed format `fmt` (`'ternary'`)."""
     return weight_format(fmt).group_depth
 
 
@@ -165,7 +130,7 @@ def word_taken(rhs, fmt: str, tiles, *, transpose_rhs: bool, prologue, paired, t
 def packed_depth(k: int, k2: int, n: int, rhs, tiles, *, packed_rows: bool, scales,
                  packed_format: str | None, transpose_rhs: bool, prologue, paired,
                  transpose_lhs: bool, lhs=None, family=None, dense: bool = False) -> tuple[int, int]:
-    """Resolve logical contraction depth `(k, k2)` for packed NVFP4/FP8/ternary calls and validate."""
+    """Resolve logical contraction depth `(k, k2)` for packed NVFP4/ternary calls and validate."""
     per = packed_codes_per_word(packed_format) if packed_format is not None else 8
     k, k2 = ((per * k, k2) if packed_rows
              else (k, 8 * k2 if scales is not None else (per if packed_format is not None else 1) * k2))
@@ -234,8 +199,8 @@ def shared_decode(tiles, *, interpret) -> bool:
 class Decoding:
     """Dew: a consumer's decode of a packed matrix's stages (`_gmm_step`'s): its `buffers` (`[stages,
     columns, depth]` bfloat16), and with `consumers` sharing them, its own share of the columns (`wg`'s),
-    after which they meet (`met`). Decodes NVFP4 when `weight_fmt` is None, or free-layout FP8 (`'e4m3'` /
-    `'e5m2'`) when set (row 8548)."""
+    after which they meet (`met`). Decodes NVFP4 when `weight_fmt` is None, or a word-packed format
+    (`weight_format`: BitNet b1.58 ternary) when set."""
 
     buffers: Any
     wg: Any
@@ -283,7 +248,7 @@ def stage_decoded(words, scales, out, interpret: bool, *, layout=None) -> None:
 
 
 def rows_decoded(words, scales, interpret: bool, *, layout=None, fmt: str | None = None) -> jax.Array:
-    """Dew: a stage of packed matrix rows (NVFP4 with `scales`, or FP8/BitNet b1.58 ternary when `fmt` is
+    """Dew: a stage of packed matrix rows (NVFP4 with `scales`, or BitNet b1.58 ternary when `fmt` is
     set; row 5387) decoded directly into register operand A (`[rows, depth]` bfloat16 in `wgmma`'s fragment
     layout, zero SMEM staging)."""
     stream = (packed_lanes(words, fmt, interpret, layout=layout) if fmt is not None
@@ -328,7 +293,7 @@ def _nvfp4_lanes(words: jax.Array, layout) -> list[jax.Array]:
 
 def packed_lanes(words, desc: PackedWeightFormat | str, interpret: bool, *, layout=None):
     """Yield `(group, code, lane)` (`[columns, 16]` bfloat16) for a scale-free word-packed weight format
-    (`PackedWeightFormat` or its name), shared by staged and direct in-register decoders (rows 8548, 1464,
+    (`PackedWeightFormat` or its name), shared by staged and direct in-register decoders (rows 1464,
     5387)."""
     resolved = weight_format(desc) if isinstance(desc, str) else desc
     active = None if interpret else layout
@@ -343,11 +308,6 @@ def stage_decoded_words(words, out, desc: PackedWeightFormat, interpret: bool, *
     """Decode a stage of word-packed weight groups (`desc`) into `out` (`[columns, depth]` bfloat16)."""
     for group, code, lane in packed_lanes(words, desc, interpret, layout=layout):
         out[:, pl.ds(desc.group_depth * group + 16 * code, 16)] = lane
-
-
-def stage_decoded_fp8(words, out, fmt: str, interpret: bool, *, layout=None) -> None:
-    """Decode a stage of free-layout FP8 words (`'e4m3'` / `'e5m2'`) into `out` (row 8548)."""
-    stage_decoded_words(words, out, weight_format(fmt), interpret, layout=layout)
 
 
 def stage_decoded_ternary(words, out, interpret: bool, *, layout=None) -> None:

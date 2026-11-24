@@ -11,6 +11,8 @@ from multiprocess_worker import TINY
 from process_support import serve_mode, worker_parser
 from rl_support import pooled_rollout
 
+from dew.training import TrainerAdvanced
+
 
 def mode_served_refusals(args) -> dict:
     """What a pool refuses to serve from one process's engine, on every process and before any program
@@ -26,7 +28,7 @@ def mode_served_refusals(args) -> dict:
 
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla")
+                              dtype="float32")
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     mesh = MeshSpec(fsdp=jax.device_count()).build()
     pooled = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
@@ -71,7 +73,8 @@ def served_run(records: list) -> tuple:
                                       groups=2, max_new_tokens=4, sampling=Sampling(temperature=1.0),
                                       ahead=1, max_lag=2, sync_every=2, log=records.append)
     trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.key(5),
-                      mesh=MeshSpec(fsdp=jax.device_count()), layout=Layout(min_shard=TINY), rollout=rollout)
+                      mesh=MeshSpec(fsdp=jax.device_count()),
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=TINY), rollout=rollout))
     data = Loader(train=lambda partition: itertools.repeat(local), val=None, records=rows * processes,
                   batch=rows * processes)
     return rollout, trainer, rollout.tasks(data)

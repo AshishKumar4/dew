@@ -26,7 +26,7 @@ import numpy as np
 import pytest
 from deepseek_v41_support import ROOT, TINY
 from flax.traverse_util import flatten_dict, unflatten_dict
-from model_support import decode_through
+from model_support import attending, decode_through, unrolled
 from quantized_arms import QUANTIZERS
 from quantized_basis import dequantized_in_own_basis
 from reference_error import FACTOR, as_given, assert_as_exact, distance
@@ -88,6 +88,7 @@ def test_the_quantizers_round_as_the_release_kernels():
             np.testing.assert_array_equal(actual, kernels[f"{label}/{name}"], err_msg=f"{label} {name}")
 
 
+@attending("reference")
 def test_the_quantizers_round_fp32_input_as_the_stand_ins(source):
     """The kernels take bf16 only, so on fp32 input the stand-ins, held to
     the kernels on bf16 above, define the rounding: Dew's quantizers match
@@ -133,6 +134,7 @@ primitive, executed alone, is within its own operation's contract, so a draw's e
 draw a test of its own, where the two took 298 s in one (train 1003, row 7449)."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("seed", range(QAT_SEEDS))
 def test_a_quantization_aware_step_is_never_wrong(source, monkeypatch, seed):
     """The tiny's quantization-aware training step, its activations rounding through the release's
@@ -227,6 +229,7 @@ def released():
     return config, record, model, shapes
 
 
+@attending("reference")
 def test_the_candidate_pool_decides_the_logits(source):
     """Dropping the pool's restriction on the Reindex layers moves the logits
     further from the float64 truth than rounding can, so the fixture
@@ -242,6 +245,7 @@ def test_the_candidate_pool_decides_the_logits(source):
     assert distance(unpooled.apply(loaded.variables, ids), TRUTH["logits"]) > FACTOR * rounding("logits")
 
 
+@attending("reference")
 def test_a_sequence_shorter_than_its_candidate_sources_rate_computes_and_trains(source):
     """A sequence no compressed window of the candidate source closes (fewer tokens than its rate: the
     tiny's CSA2 layers of the source's rate pooling four tokens a window, drawn afresh) computes its logits
@@ -270,6 +274,7 @@ def test_a_sequence_shorter_than_its_candidate_sources_rate_computes_and_trains(
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def padded_walk(source):
     """The reference's prompt beside its second row cut by three tokens and padded on the left by them, as
     arrays: `(tokens, valid, alone, steps, walk)`, `alone` the cut row unpadded, `walk` the batch's greedy
@@ -286,6 +291,7 @@ def padded_walk(source):
     return tokens, valid, alone, steps, walk.tokens
 
 
+@attending("reference")
 @pytest.mark.shared_setup("padded_walk")
 def test_left_padding_changes_no_row(source, padded_walk):
     """Rows of different lengths in one batch, the shorter padded on the
@@ -301,6 +307,7 @@ def test_left_padding_changes_no_row(source, padded_walk):
     np.testing.assert_array_equal(np.asarray(walk)[1, -steps:], np.asarray(by_itself.tokens)[0, -steps:])
 
 
+@attending("reference")
 @pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
 def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(source, given):
     """Uncached, rows padded on the left by three tokens, a count no compression rate divides,
@@ -317,6 +324,7 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
     assert distance(logits[:, pad:], TRUTH["logits"]) <= FACTOR * rounding("logits")
 
 
+@attending("reference")
 def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
     """V4's layers take the model's one rope scaling (`MixerContext.rope_scaling`), each kind's own
     in its place where the kind gives one (`kind_of`), as the compressed kinds give their YaRN ramp: a
@@ -337,6 +345,7 @@ def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
         plain.clone(rope_scaling=longrope).apply(loaded.variables, ids)
 
 
+@attending("reference")
 def test_a_prefilled_decode_cache_holds_no_payload_twice(source):
     """After a prompt's prefill for drafting, the target's and the drafter's decode caches hold no
     payload twice: V4's window head, which serves as its keys and its values, and the drafter's context
@@ -360,6 +369,7 @@ def test_a_prefilled_decode_cache_holds_no_payload_twice(source):
     assert not twice(jax.device_get(state.cache))
 
 
+@attending("reference")
 def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
     """Uncached, DSpark drafts after a context whose padding `valid` marks, after it in one row and
     before it in the other, as after the context alone: its real positions keep their ranks, the
@@ -388,6 +398,7 @@ def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
         plain.apply(loaded.variables, padded, drawn, decode=False, coordinates=two, method="draft")
 
 
+@attending("reference")
 @pytest.mark.shared_setup("padded_walk")
 def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(source, padded_walk):
     """At zero temperature every rejected draft is replaced by the target's
@@ -396,8 +407,8 @@ def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(sourc
     loaded, plain, _ = source
     tokens, valid, _, steps, walk = padded_walk
     speculated = generate(plain, loaded.variables, ModelInputs(tokens, {"attention_mask": valid}), steps,
-                          key=jax.random.key(1), sampling=Sampling(temperature=0),
-                          strategy=Speculative(block=3))
+                          key=jax.random.key(1), sampling=Sampling(temperature=0,
+                                                                   strategy=Speculative(block=3)))
     np.testing.assert_array_equal(np.asarray(speculated.tokens), np.asarray(walk))
     np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
 
@@ -406,6 +417,7 @@ DRAFT_SEEDS = 8
 """The cached draft's declared check-1 seeds against the uncached one, sized by `seeds_for` on armada."""
 
 
+@attending("reference")
 def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
     """After a prefill and a verified stretch whose rows keep different
     counts, the block the decode ops draft is the one the drafter drafts
@@ -505,6 +517,7 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
                     "dspark draft", seeds=DRAFT_SEEDS, truth_fn=truth)
 
 
+@attending("reference")
 @pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
 def test_a_paged_window_cache_decodes_what_the_compact_cache_decodes(source, quantized):
     """The tiny V4.1 checkpoint's window cache takes the decoder's layout: paged, it draws the compact
@@ -521,6 +534,7 @@ def test_a_paged_window_cache_decodes_what_the_compact_cache_decodes(source, qua
                                   decoded(KVCache(quantized=quantized)))
 
 
+@attending("reference")
 @pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
 def test_a_paged_drafting_cache_drafts_what_the_compact_cache_drafts(source, quantized):
     """The DSpark drafter's window cache takes the decoder's layout: after a prefill and a verified
@@ -719,25 +733,27 @@ def test_a_quantized_drafting_cache_drafts_what_dequantizing_in_the_own_basis_co
                                   np.asarray(own(variables, context, block)))
 
 
-def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():
+@attending("reference")
+@pytest.mark.usefixtures("scanned_stacks")
+def test_consecutive_reindex_layers_publish_their_selections_when_scanned():
     """Two Reindex layers of one kind in a row stay two runs of one under
-    scan_layers, so the Reuse layer after them attends the second one's
+    the scan, so the Reuse layer after them attends the second one's
     selection, as it does unrolled, to within twice the fixture logits' fp32
     rounding; scanned together, their publications would stay inside the
     loop."""
     config = json.loads((TINY / "config.json").read_text())
     text = config["text_config"]
     config = {**config, "text_config": {**text, "index_source_layer_ids": [2, 4, 6, 7, 8, 10]}}
-    fields = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
+    fields = {**translate_config(config), "dtype": "float32"}
     ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
-    unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
-                         for scan in (False, True))
-    variables = unrolled.init(jax.random.key(0), ids)
-    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
-        "logits"
-    )
+    model = models.build("causal_transformer", **fields)
+    variables = model.init(jax.random.key(0), ids)
+    assert distance(model.apply(variables, ids), unrolled(model.apply)(variables, ids)) <= (
+        2 * FACTOR * rounding("logits"))
 
 
+@attending("reference")
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_reindex_layer_reads_its_full_layers_publications_with_no_reuse_layer():
     """A stack whose CSA2 layers are a Full layer and the Reindex layers after it,
     with no Reuse layer and so no shared keys and values, still threads the store
@@ -751,15 +767,13 @@ def test_a_reindex_layer_reads_its_full_layers_publications_with_no_reuse_layer(
         "index_source_layer_ids": [2, 3, 4, 5], "candidate_source_layer_id": 2,
         "engram_layer_ids": [1], "engram_num_embeddings": text["engram_num_embeddings"][:1],
         "dspark_target_layer_ids": [3, 4, 5]}}
-    fields = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
+    fields = {**translate_config(config), "dtype": "float32"}
     assert not fields.get("kv_shared_layers")
     ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
-    unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
-                         for scan in (False, True))
-    variables = unrolled.init(jax.random.key(0), ids)
-    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding(
-        "logits"
-    )
+    model = models.build("causal_transformer", **fields)
+    variables = model.init(jax.random.key(0), ids)
+    assert distance(model.apply(variables, ids), unrolled(model.apply)(variables, ids)) <= (
+        2 * FACTOR * rounding("logits"))
 
 
 def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeypatch):
@@ -790,13 +804,14 @@ def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeyp
     assert wrapper_route("embed.weight", record) == ("language_model", "embed.weight")
 
 
+@attending("reference")
 def test_a_bundle_loaded_text_only_is_its_text_checkpoint(tmp_path):
     """The bundle with its ViT, loaded `text_only`, reads as the family's text checkpoint: the model the
     text-only checkpoint builds, its variables leaf for leaf that checkpoint's, so neither the tower, the
     aligner nor the routers' image-span bias is read, and its logits bit for bit."""
-    text = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference",
+    text = Pretrained.load(vision_bundle(tmp_path), dtype="float32",
                            text_only=True)
-    plain = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
+    plain = Pretrained.load(TINY, dtype="float32")
     assert text.model == plain.model
     assert jax.tree.structure(text.variables) == jax.tree.structure(plain.variables)
     jax.tree.map(np.testing.assert_array_equal, text.variables, plain.variables)
@@ -828,6 +843,7 @@ def quantized_as_released(directory: Path) -> Path:
     return directory
 
 
+@attending("reference")
 def test_a_quantized_bundle_loaded_text_only_is_its_quantized_text_checkpoint(tmp_path):
     """A bundle stored as the release stores its decoder (FP8 and FP4 under its quantization_config),
     loaded `text_only`, is the quantized text-only checkpoint loaded: its codec reads the decoder's names
@@ -839,19 +855,20 @@ def test_a_quantized_bundle_loaded_text_only_is_its_quantized_text_checkpoint(tm
     text = tmp_path / "text"
     shutil.copytree(TINY, text, ignore=shutil.ignore_patterns("vision*"))
     quantized_as_released(text)
-    taken = Pretrained.load(bundle, dtype="float32", attention_impl="reference", text_only=True)
-    plain = Pretrained.load(text, dtype="float32", attention_impl="reference")
+    taken = Pretrained.load(bundle, dtype="float32", text_only=True)
+    plain = Pretrained.load(text, dtype="float32")
     assert taken.model == plain.model
     jax.tree.map(np.testing.assert_array_equal, taken.variables, plain.variables)
 
 
+@attending("reference")
 def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):
     """Routing the image span by the text bias moves the prefill's logits
     further from the float64 truth than rounding can, and the image
     positions change the n-gram ids of the text after them, so the fixture
     exercises both."""
     reference = np.load(TINY / "vision.npz")
-    loaded = Pretrained.load(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(vision_bundle(tmp_path), dtype="float32")
     routers = flatten_dict(loaded.variables["moe"])
     routers.update({path: routers[(*path[:-1], "e_score_correction_bias")]
                     for path in routers if path[-1] == "media_bias"})

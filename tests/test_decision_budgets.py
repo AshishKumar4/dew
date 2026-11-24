@@ -13,6 +13,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from model_support import attending
 from real_tokenizers import TOKENIZERS, backbone_reading, real_tokenizer
 
 from dew.data.dataset import Loading
@@ -238,6 +239,7 @@ def _options(row: dict) -> list[tuple[int, ...]]:
     return [tuple(tokens[start + 1:end]) for start, end in zip(markers, ends, strict=True)]
 
 
+@attending("xla")
 def test_a_choice_of_fewer_options_than_its_floor_draws_no_none_of_the_above():
     """A choice of fewer options than the objective's floor (`none_of_the_above_options`), a yes or a no,
     draws no "none of the above" however often a read draws one, where it would change what the question
@@ -254,7 +256,7 @@ def test_a_choice_of_fewer_options_than_its_floor_draws_no_none_of_the_above():
     example = Example("the lamp", {"two": two, "three": three}, {"two": "yes", "three": "red"})
     layout = SegmentLayout.marker_row(max_len=256)
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
-                                 max_seq_len=256, attention_impl="xla")
+                                 max_seq_len=256)
 
     def offers(fewest: int) -> dict[str, bool]:
         objective = DecisionObjective(backbone, tokenizer=BYTES, specials=BYTE_SPECIALS, layout=layout,
@@ -274,6 +276,7 @@ def test_a_choice_of_fewer_options_than_its_floor_draws_no_none_of_the_above():
     assert offers(0) == {"two": True, "three": True}
 
 
+@attending("xla")
 def test_a_yes_or_no_draws_no_none_of_the_above_by_default_and_a_recorded_run_keeps_its_floor():
     """An objective left at its defaults draws no "none of the above" on a choice of two options, a yes
     or a no, which it would turn into another question, and draws it on one of three (row 2938); a run
@@ -288,7 +291,7 @@ def test_a_yes_or_no_draws_no_none_of_the_above_by_default_and_a_recorded_run_ke
     three = Choice("Which colour?", ["red", "green", "blue"])
     example = Example("the lamp", {"two": two, "three": three}, {"two": "yes", "three": "red"})
     backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
-                                 max_seq_len=256, attention_impl="xla")
+                                 max_seq_len=256)
     objective = DecisionObjective(backbone, tokenizer=BYTES, specials=BYTE_SPECIALS,
                                   layout=SegmentLayout.marker_row(max_len=256), none_of_the_above=1.0)
     fit, expand, configured = objective.data().train

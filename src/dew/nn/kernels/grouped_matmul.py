@@ -37,7 +37,7 @@ import jax
 import jax.numpy as jnp
 
 from . import generation, selection
-from .formats import Fp8Weights, TernaryWeights
+from .formats import TernaryWeights
 from .generation import INHERENT
 from .grouped_cells import (
     B200_GRID,
@@ -1459,9 +1459,9 @@ class MosaicPackedGmm(MosaicGmm):
 
 @dataclasses.dataclass(frozen=True)
 class MosaicWordPackedGmm(MosaicPackedGmm):
-    """Format-neutral `MosaicPackedGmm` base for inline-decoded scale-free word-packed weights (`Fp8Weights`,
-    `TernaryWeights`, rows 8548, 1464, 5387), driven by `packed.PackedWeightFormat`."""
-    DEFAULT_FMT: ClassVar[str] = 'e4m3'
+    """`MosaicPackedGmm` of inline-decoded scale-free word-packed weights (`TernaryWeights`, rows 1464, 5387),
+    driven by `packed.PackedWeightFormat`."""
+    DEFAULT_FMT: ClassVar[str] = 'ternary'
 
     @property
     def _scaled(self) -> bool:
@@ -1473,14 +1473,14 @@ class MosaicWordPackedGmm(MosaicPackedGmm):
     def _desc(self, ba) -> packed.PackedWeightFormat:
         kernel = ba.arguments['kernel']
         return packed.weight_format(
-            kernel.fmt if isinstance(kernel, (Fp8Weights, TernaryWeights)) else self.DEFAULT_FMT)
+            kernel.fmt if isinstance(kernel, TernaryWeights) else self.DEFAULT_FMT)
 
     def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
         del trans_rhs
-        assert isinstance(kernel, (Fp8Weights, TernaryWeights))
+        assert isinstance(kernel, TernaryWeights)
         return kernel.words, True, {'packed_format': kernel.fmt}
     def _swapped_extra(self, kernel, formats: dict) -> dict:
-        assert isinstance(kernel, (Fp8Weights, TernaryWeights))
+        assert isinstance(kernel, TernaryWeights)
         return {'packed_format': kernel.fmt, **formats}
     def _allocations(self, ba, config: tiling.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
         from .templates.gemm import mosaic_gpu
@@ -1508,11 +1508,6 @@ class MosaicWordPackedGmm(MosaicPackedGmm):
         return _beside(MosaicGmm._registers(self, ba, config, merging=merging, target=target),
                        decoded // resources.THREADS + self._desc(ba).decode_live)
 
-
-@dataclasses.dataclass(frozen=True)
-class MosaicFp8PackedGmm(MosaicWordPackedGmm):
-    """`MosaicWordPackedGmm` of free-layout FP8 weights (`formats.Fp8Weights`, rows 8548, 5387)."""
-    DEFAULT_FMT: ClassVar[str] = 'e4m3'
 
 @dataclasses.dataclass(frozen=True)
 class MosaicTgmm(_Mosaic):

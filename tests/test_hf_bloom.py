@@ -5,6 +5,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 from interop_support import fixture_ids, respelled, transformers_arms, transformers_model
+from model_support import attending
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained
@@ -16,6 +17,7 @@ CACHED_SEEDS = 8
 `seeds_for` paired with Dew's prefill on the CPU."""
 
 
+@attending("reference")
 def test_bloom_padded_rows_prefill_and_decode_through_the_cache_as_the_reference_reads_them():
     """Beyond the shared flow (tests/test_hf_reference_decoders.py): the left-padded rows prefilled into
     the cache give logits on par with transformers' over the same rows and mask, from its float64 twin,
@@ -23,7 +25,7 @@ def test_bloom_padded_rows_prefill_and_decode_through_the_cache_as_the_reference
     row's real tokens gives."""
     import torch
 
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=32)
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', max_seq_len=32)
     mask = np.load(DIRECTORY / 'attention_mask.npy')
     draw = fixture_ids(DIRECTORY, mask)
 
@@ -49,14 +51,15 @@ def test_bloom_padded_rows_prefill_and_decode_through_the_cache_as_the_reference
         np.testing.assert_array_equal(np.asarray(decoded[row, -1]).argmax(), np.asarray(full[0, -1]).argmax())
 
 
+@attending("reference")
 def test_the_exact_path_of_one_tensor_parallel_rank_computes_bloom_itself(tmp_path):
     """`slow_but_exact` over a single tensor-parallel rank is BLOOM's own computation: it loads and
     computes the plain checkpoint's logits bit for bit."""
     exact = Pretrained.load(
         respelled(DIRECTORY, tmp_path / 'bloom',
                   lambda config: {**config, 'slow_but_exact': True, 'pretraining_tp': 1}),
-        dtype='float32', attention_impl='reference')
-    plain = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+        dtype='float32')
+    plain = Pretrained.load(DIRECTORY, dtype='float32')
     ids = jnp.asarray(np.load(DIRECTORY / 'input_ids.npy'))
     np.testing.assert_array_equal(np.asarray(exact.model.apply(exact.variables, ids)),
                                   np.asarray(plain.model.apply(plain.variables, ids)))

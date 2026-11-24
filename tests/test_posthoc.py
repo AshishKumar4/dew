@@ -15,7 +15,7 @@ from dew.checkpoints import Checkpoints, Keep, Ranking
 from dew.config import RunConfig
 from dew.objectives.base import EMASpec
 from dew.optim import OptimConfig, PowerProfilesState, power_profiles
-from dew.training import Layout, Trainer, UpdateBatch
+from dew.training import Layout, Trainer, TrainerAdvanced
 
 # Outputs of NVlabs/edm2 training/phema.py (std_to_exp, power_function_beta,
 # solve_posthoc_coefficients) on the same inputs, float64.
@@ -53,7 +53,7 @@ def test_a_reconstructed_average_matches_one_tracked_directly(tmp_path):
     objective = Regression()
     objective.ema = EMASpec(decay=power_decay(0.07))
     trainer = Trainer(objective, power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0),
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
                       checkpoints=Checkpoints(str(tmp_path / "run")))
     state = trainer.fit(dataset(), steps=96, log_every=96, checkpoint_every=4)
     trainer.checkpoints.wait()
@@ -78,7 +78,7 @@ def test_an_accumulating_run_snapshotted_every_step_reconstructs_its_average(tmp
     the one a run snapshotted only at its committed updates rebuilds, bit for bit."""
     def rebuilt(name, every):
         trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=2),
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), accumulation=2,
                           checkpoints=Checkpoints(str(tmp_path / name)))
         trainer.fit(dataset(), steps=16, log_every=16, checkpoint_every=every)
         trainer.checkpoints.wait()
@@ -98,7 +98,7 @@ def test_an_older_snapshot_keeps_its_profiles_alone_and_rebuilds_the_same_averag
     snapshots is the one whole snapshots rebuild, bit for bit."""
     def kept(name, keep):
         trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
-                          layout=Layout(min_shard=1, tolerance=1.0),
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
                           checkpoints=Checkpoints(str(tmp_path / name), keep=keep))
         trainer.fit(dataset(), steps=32, log_every=32, checkpoint_every=4)
         trainer.checkpoints.wait()
@@ -124,7 +124,7 @@ def test_a_snapshot_kept_for_its_model_reads_its_model_and_its_profiles(tmp_path
     post-hoc EMA's, neither read refused for the payload the other keeps."""
     keep = Keep(latest=1, every=4, weights_only=True)
     trainer = Trainer(Regression(), power_profiles(optax.sgd(0.1), (0.05, 0.10)), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0),
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)),
                       checkpoints=Checkpoints(str(tmp_path / "run"), keep=keep))
     trainer.fit(dataset(), steps=8, log_every=8, checkpoint_every=4)
     trainer.checkpoints.wait()

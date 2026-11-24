@@ -14,6 +14,7 @@ from dew.data import Loading, Memory, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.images import EncodeCaptions
+from dew.training import TrainerAdvanced
 
 TORCHVISION = np.load(Path(__file__).resolve().parent / "fixtures" / "colour_jitter" / "torchvision.npz")
 
@@ -301,7 +302,9 @@ def test_a_run_checks_its_inputs_against_what_the_device_steps_make(host):
     data = loaded(batch=8, seed=0, staging_size=24, objective=objective.data())
     assert np.shape(next(iter(data.train(DataPartition())))["image"])[1:] == (24, 24, 3)
     layout = Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.)
-    state = Trainer(objective, optax.adam(1e-3), key=0, layout=layout).fit(data, steps=2, log_every=1)
+    state = Trainer(objective, optax.adam(1e-3), key=0, advanced=TrainerAdvanced(layout=layout)).fit(data,
+                                                                                                     steps=2,
+                                                                                                     log_every=1)
     assert int(state.step) == 2
 
 
@@ -327,7 +330,7 @@ def test_a_device_steps_rows_keep_their_explicit_axis_where_the_run_reads_them()
                                    Flow(), InputSpec(Field("image", (12, 12, 3))), solver=Euler(), steps=2)
     data = loaded(batch=8, seed=0, staging_size=24, jitter=False, objective=objective.data())
     trainer = Trainer(objective, optax.adam(1e-3), key=0, mesh=MeshSpec(explicit=("data",)),
-                      layout=Layout(min_shard=1, tolerance=1.))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.)))
     state = trainer.fit(data, steps=2, log_every=1)
     assert int(state.step) == 2
     staged, _ = split_fields(next(iter(data.train(DataPartition()))))

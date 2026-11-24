@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from data_support import record_batches
+from model_support import attending
 from objective_cases import cases
 from objective_data import corpus_windows
 from reference_error import assert_computes_the_oracle, chain_roundings
@@ -178,6 +179,7 @@ def assert_every_record_once(name: str, report: dict) -> None:
                                    np.asarray([report["unbatched"]]), name, roundings=report["roundings"])
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", EVALUATED)
 def test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatched_one(
         name, windows, tmp_path):
@@ -186,6 +188,7 @@ def test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatch
     assert_every_record_once(name, evaluated(name, windows, tmp_path))
 
 
+@attending("reference")
 def test_a_validation_token_accuracy_is_the_unpadded_one_and_at_most_one():
     """TRL's count on tests/fixtures/token_accuracy's five-row batch, padded
     to eight with three repeats of its row with the most right targets: the
@@ -193,7 +196,7 @@ def test_a_validation_token_accuracy_is_the_unpadded_one_and_at_most_one():
     above it before they were left out of the count's numerator."""
     reference = dict(np.load(TOKEN_ACCURACY / "decoder.npz"))
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2, mlp_features=32,
-                              max_seq_len=16, attention_impl="reference")
+                              max_seq_len=16)
     params = model.init(jax.random.key(0), jnp.ones((1, 12), jnp.int32))
     objective = LMObjective(model, seq_len=11, ema_decay=None, loss_role=Role.ASSISTANT, token_accuracy=True)
     variables = {**objective.init(jax.random.key(0)), "params": params["params"]}
@@ -212,6 +215,7 @@ def test_a_validation_token_accuracy_is_the_unpadded_one_and_at_most_one():
     assert float(aux.metrics["token_accuracy"]) <= 1.0
 
 
+@attending("xla")
 def test_a_masked_diffusion_accuracy_leaves_its_repeat_rows_out(windows):
     """With every weight zero the model predicts token 0 at every masked
     position, so repeat rows of zeros are all right and the real text, which
@@ -227,6 +231,7 @@ def test_a_masked_diffusion_accuracy_leaves_its_repeat_rows_out(windows):
     assert float(aux.metrics["masked_accuracy"]) == 0.0
 
 
+@attending("xla")
 def test_a_dpo_accuracy_is_the_real_rows_whatever_the_repeats_hold(windows):
     """DPO's preference accuracy over five pairs the policy ranks right,
     padded with repeats that swap chosen and rejected (each window's halves
@@ -276,6 +281,7 @@ def assert_the_metric_over_every_record(report: dict, count: int = RECORDS) -> N
                                "the cross entropy", roundings=report["roundings"])
 
 
+@attending("xla")
 @pytest.mark.parametrize("count", [RECORDS, 1])
 def test_a_metric_over_a_pass_is_the_metric_over_every_record(windows, count):
     """On one process (`tests/test_multiprocess.py` runs the same on two,

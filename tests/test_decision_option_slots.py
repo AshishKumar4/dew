@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from decision_support import decision_rows
 from flax import linen as nn
+from model_support import attending
 from reference_error import assert_as_exact, widened, with_gradients
 from safetensors.numpy import load_file
 
@@ -60,7 +61,7 @@ def stored_batch():
         length = inputs.tokens.shape[1]
         padded = np.stack([np.pad(states[case], ((0, length - len(states[case])), (0, 0))) for case in CASES])
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    return Pretrained.load(TINY, dtype="float32", attention_impl="xla"), table, inputs, padded
+    return Pretrained.load(TINY, dtype="float32"), table, inputs, padded
 
 
 def with_slots(inputs: DecisionInputs, slots: int | None) -> DecisionInputs:
@@ -81,6 +82,7 @@ def test_a_rows_real_options_compact_in_order_and_a_row_over_the_cap_is_refused(
         compacted(options, 4)
 
 
+@attending("xla")
 def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
     """The stored tiny joint head over the five cases: every real option's
     logit as over the grid at two numbers of option slots, to float32
@@ -151,10 +153,10 @@ def ragged_objective(examples) -> DecisionObjective:
                  for row in layout.rows(tokenizer, specials, example.state, example.questions))
     return DecisionObjective(
         CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=1, mlp_features=24,
-                          max_seq_len=length, attention_impl="xla"),
+                          max_seq_len=length),
         tokenizer=tokenizer, specials=specials, layout=SegmentLayout.joint_row(max_len=length),
-        head=JointSchemaHead(hidden_size=16, width=16, routing_layers=2, layers=1, heads=1, feedforward=24,
-                             attention_impl="xla"), shuffle_options=False)
+        head=JointSchemaHead(hidden_size=16, width=16, routing_layers=2, layers=1, heads=1, feedforward=24),
+        shuffle_options=False)
 
 
 def scored(objective: DecisionObjective, inputs: DecisionInputs):
@@ -196,6 +198,7 @@ def scorer_gap(features, options, *drawn) -> float:
     return float(np.min(np.abs(difference[real])))
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=512, per_task=128)
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     """Rows of `CLAUSES` and `HYPOTHESES` x 3 real options, ragged, packed into two windows of a grid as
@@ -257,6 +260,7 @@ def ragged_batch():
     return objective, {name: value for name, value in slotted.items() if name != VALID_ROWS}
 
 
+@attending("xla")
 def test_a_ragged_batchs_loss_reads_its_real_options_alone():
     """Whatever the joint head gives a slot with no real option, a ragged batch's loss and its
     gradients are the same bits (`ragged_batch`): the model's logits mask those slots."""

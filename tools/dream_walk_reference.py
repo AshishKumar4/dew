@@ -77,7 +77,7 @@ def walked(release: str) -> list[list[int]]:
         raise ImportError(f"{release}'s generation utilities are no module to load")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    source = Pretrained.load(FIXTURES / "dream-tiny", dtype="float32", attention_impl="reference")
+    source = Pretrained.load(FIXTURES / "dream-tiny", dtype="float32")
     mask = source.model.mask_token_id
 
     def held_out(step, x, scores):
@@ -121,7 +121,11 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--vendor"]:
         vendor()
     else:
-        recording = {"settings": {"steps": STEPS, "new_tokens": NEW_TOKENS},
-                     "responses": {release: walked(release) for release in RELEASES}}
+        # Dew's side on the reference attention, the run's kernel choice (a model's field before row 11938).
+        from dew.nn.kernels import generation
+
+        with generation.chosen(attention="reference"):
+            recording = {"settings": {"steps": STEPS, "new_tokens": NEW_TOKENS},
+                         "responses": {release: walked(release) for release in RELEASES}}
         (FIXTURES / "dream-tiny" / "origin.json").write_text(json.dumps(recording, indent=1) + "\n")
         print(json.dumps(recording))

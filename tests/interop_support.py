@@ -77,7 +77,7 @@ def float64_logits(loaded):
     """The logits of `loaded` (a `Pretrained`) cloned to float64, its weights widened once, as a function
     of a draw (`drawn_ids`) run where x64 is enabled: a recorded decoder's float64 truth, which its
     recording's sketch holds."""
-    model = loaded.model.clone(dtype=jnp.float64, attention_impl="reference")
+    model = loaded.model.clone(dtype=jnp.float64)
     variables = widened(loaded.variables)
     return lambda inputs: {"logits": model.apply(variables, jnp.asarray(inputs["input_ids"]))}
 
@@ -454,7 +454,7 @@ def assert_reloads(loaded, saved: Path, ids: np.ndarray) -> None:
     from dew.interop import Pretrained
 
     assert_restores(loaded.model, loaded.variables,
-                    Pretrained.load(saved, dtype='float32', attention_impl='reference'), ids)
+                    Pretrained.load(saved, dtype='float32'), ids)
 
 
 def assert_restores(model, variables, restored, ids: np.ndarray) -> None:
@@ -482,7 +482,7 @@ def source_transformer(source: Path, name: str, model_class, fields, path) -> tu
     from dew.interop.diffusion import component_tensors, read_transformer
 
     config = json.loads((source / name / "transformer" / "config.json").read_text())
-    model = model_class(**fields(config, dtype="float32", attention_impl="xla"))
+    model = model_class(**fields(config, dtype="float32"))
     params, layouts = read_transformer(component_tensors(source / name, "transformer"), path)
     return model, params, layouts
 
@@ -677,7 +677,7 @@ def assert_decodes_as_it_scores(loaded, label: str, *, seeds: int, prefill: int,
     def stepped(ids):
         return as_stepped(lambda held: forward(variables, held), ids, prefill)
 
-    wide = loaded.model.clone(dtype=jnp.float64, attention_impl="reference")
+    wide = loaded.model.clone(dtype=jnp.float64)
     draw = clearing_selections(loaded, token_draw(salt, model.vocab_size, (rows, length)), label)
     assert_as_exact(as_given(decoded), as_given(stepped), draw, label, seeds=seeds,
                     truth_fn=lambda ids: wide.apply(widened(variables), ids))

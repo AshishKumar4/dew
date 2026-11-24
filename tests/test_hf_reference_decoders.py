@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import fixture_ids, transformers_arms, transformers_model
+from model_support import attending
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
 
 from dew.interop import Pretrained
@@ -40,7 +41,7 @@ whose declared count it reads."""
 
 
 def load(name: str) -> Pretrained:
-    return Pretrained.load(ROOT / name, dtype='float32', attention_impl='reference', **FIXTURES[name])
+    return Pretrained.load(ROOT / name, dtype='float32', **FIXTURES[name])
 
 
 CHECK1_SHARDS = {
@@ -60,6 +61,7 @@ def fixtures() -> list:
         held := CHECK1_SHARDS.get(f"{test}[{name}]")) else []) for name in sorted(FIXTURES)]
 
 
+@attending("reference")
 @pytest.mark.parametrize('name', fixtures())
 def test_padded_and_unpadded_logits_and_the_greedy_continuation_match_the_reference(name):
     """Left-padded rows under their mask and the unpadded rows, each on par with the reference from

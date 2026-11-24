@@ -310,7 +310,7 @@ def native(args, pool):
     from dew.registry import dtype_name
 
     # Each leaf at the dtype the release stores it in, as the verdict reads the release's headers.
-    bundle = Pretrained.load(args.source, dtype=args.dtype, param_dtype="auto", attention_impl="xla")
+    bundle = Pretrained.load(args.source, dtype=args.dtype, param_dtype="auto")
     if not isinstance(bundle, PretrainedDecision):
         raise ValueError(f"{args.source} is no release a decision task loads from")
     decide = Decide.of(bundle)
@@ -517,8 +517,7 @@ def author(args, pool, run):
             from dew.interop import Pretrained
 
             stack.enter_context(jax.enable_x64(new_val=True))
-            bundle = Pretrained.load(args.source, weights=False, dtype="float64", param_dtype="float64",
-                                      attention_impl="reference")
+            bundle = Pretrained.load(args.source, weights=False, dtype="float64", param_dtype="float64")
             if not isinstance(bundle, PretrainedDecision):
                 raise ValueError(f"{args.source} is no release a decision task loads from")
             if bundle.head.tied_labels() is None or jax.tree.leaves(bundle.head_variables):
@@ -800,7 +799,12 @@ def main():
         verdict(args, pool)
         return
     run = recorded_run(args)
-    values, metadata = native(args, pool) if args.phase == "native" else author(args, pool, run)
+    from dew.nn.kernels import generation
+
+    # The native phase's attention XLA's, the float64 truth's the reference path's.
+    kernel = "xla" if args.phase == "native" else "reference" if run["phase"] == "truth" else None
+    with contextlib.nullcontext() if kernel is None else generation.chosen(attention=kernel):
+        values, metadata = native(args, pool) if args.phase == "native" else author(args, pool, run)
     if recorded_run(args) != run:
         raise RuntimeError("the pool or the source changed while the phase ran, so its record names neither")
     metadata.update(run, peak_host_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,

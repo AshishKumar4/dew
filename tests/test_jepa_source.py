@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from recorded_runs import assert_arms_as_recorded
 from torch_layout import QKV, dew_leaf, join_qkv, node, split_qkv, torch_leaf
 
@@ -154,13 +155,13 @@ def computing(case: str):
                 node[path[-1]] = jnp.asarray(array, dtype)
         encoder = JepaEncoder(patch_size=config["patch_size"], emb_features=config["embed_dim"],
                               num_layers=config["depth"], num_heads=config["num_heads"],
-                              mlp_ratio=config["mlp_ratio"], norm_epsilon=config["eps"], attention_impl="xla",
+                              mlp_ratio=config["mlp_ratio"], norm_epsilon=config["eps"],
                               dtype=dtype)
         predictor = JepaPredictor(grid=(grid, grid), emb_features=config["embed_dim"],
                                   predictor_features=config["predictor_embed_dim"],
                                   num_layers=config["pred_depth"], num_heads=config["pred_num_heads"],
                                   mlp_ratio=config["mlp_ratio"], norm_epsilon=config["eps"],
-                                  attention_impl="xla", dtype=dtype)
+                                  dtype=dtype)
         images = jnp.asarray(inputs["images"], dtype).transpose(0, 2, 3, 1)
         context_idx, target_idx = inputs["context_idx"], inputs["target_idx"]
         probes = tuple(jnp.asarray(inputs[f"probe_{name}"], dtype) for name in ("context", "predictions"))
@@ -187,6 +188,7 @@ def pipeline_arms(case: str):
     return FIXTURES / f"{case}.npz", drawing(case), computing(case), OUTPUTS
 
 
+@attending("xla")
 @pytest.mark.parametrize("case", list(CASES))
 def test_the_embeddings_predictions_and_every_gradient_are_as_exact_as_v_jepas(case):
     """Dew's embeddings, predictions and gradients as exact as V-JEPA's float32 against float64 (check 1)."""

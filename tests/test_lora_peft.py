@@ -18,6 +18,7 @@ import optax
 import pytest
 import torch
 from flax import linen as nn
+from model_support import attending
 from peft import LoraConfig, inject_adapter_in_model
 from reference_error import (
     GateFailure,
@@ -62,7 +63,7 @@ def adapted(case: str):
     """The case's PEFT adapter on the tiny Llama, read by `LoRA.load`, and its reference arrays."""
     with np.load(FIXTURES / case / "reference.npz") as data:
         reference = {key: data[key] for key in data}
-    decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    decoder = Pretrained.load(LLAMA, dtype="float32")
     return LoRA.load(decoder.model, decoder.variables, FIXTURES / case / "adapter",
                      layouts=decoder.layouts), reference
 
@@ -82,7 +83,7 @@ def trainer(case: str):
     objective = LMObjective(adapter.model, reference["input_ids"].shape[1] - 1, variables=adapter.variables,
                             ema_decay=None)
     params = nn.unbox(objective.init(jax.random.key(0)))
-    sgd = OptimConfig(optimizer=Optax('optax:sgd'), learning_rate=rate, clip_grads=0.0).build(2)
+    sgd = OptimConfig(optimizer=Optax('optax:sgd'), lr=rate, clip=0.0).build(2)
 
     @jax.jit
     def run(tokens, factors, masks):
@@ -260,15 +261,22 @@ def peft_factors(adapter, factors, directory) -> dict[str, np.ndarray]:
             for key, value in load_file(directory / lora.PEFT_WEIGHTS).items()}
 
 
+@attending("reference")
 def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it():
     """rsLoRA: each target scales by its own alpha over the square root of its
     own rank (layer 1's v_proj at rank 2, down_proj at alpha 3). The adapted
-    logits, and one training step, are PEFT's (`assert_trains_as_peft`); the
-    base model's logits are not, check 1 deciding against them."""
+    logits, and one training step, are PEFT's (`assert_trains_as_peft`)."""
     adapter, _ = adapted("rslora")
     assert (adapter.rslora, adapter.dropout) == (True, 0.0)
     assert_trains_as_peft("rslora")
-    decoder = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+
+
+@attending("reference")
+def test_the_base_models_logits_are_not_an_rslora_adapters():
+    """The rsLoRA adapter's base model's logits are not its adapted ones (PEFT's), check 1 deciding against
+    them: the adapter moves what the site compares. A test of its own beside the adapter's, which took 130 s
+    with it (row 12374)."""
+    decoder = Pretrained.load(LLAMA, dtype="float32")
     base = jax.jit(lambda tokens: decoder.model.apply(decoder.variables, tokens))
     reference_arm = peft_trained("rslora")
 
@@ -282,6 +290,7 @@ def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it():
     assert not isinstance(failed.value, Inconclusive)
 
 
+@attending("reference")
 def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_peft_ran_on():
     """Dropout at 0.25: a training step drops each target's branch input,
     `B A dropout(x)`, and not the base path. Each branch's dropout given the
@@ -303,6 +312,7 @@ DROPOUT_SEEDS = 4
 step's standard deviations, the bound the site held before the gate, fails."""
 
 
+@attending("reference")
 def test_a_training_step_drops_each_branch_input_at_the_adapters_rate():
     """A training step draws a dropout of its own on each of the six targets'
     branch inputs at the adapter's rate: each nonzero input entry kept at
@@ -358,6 +368,7 @@ MULTI_AXIS_SEEDS = 16
 """Check 1's declared seeds for the multi-axis branch, sized by `seeds_for` (2026-10-21, on armada)."""
 
 
+@attending("reference")
 def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
     """The branch of a target contracting (8, 6) input axes into (5, 6)
     output ones is the matrix LoRA of the flattened kernel: with x as

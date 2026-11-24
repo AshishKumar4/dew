@@ -36,7 +36,7 @@ from dew.telemetry.instrumentation import step_flops
 from dew.training._fit import Start, handed, staged
 from dew.training.diloco import DILOCO_ON_HOST
 from dew.training.distributed import marked, microbatch_shapes
-from dew.training.execution import HostExecution, frozen_trees, stack_sites, unscanned
+from dew.training.execution import PLAIN_LOOP, HostExecution, frozen_trees, stack_sites, unscanned
 from dew.training.memory import (
     StepPrice,
     Unpriced,
@@ -102,16 +102,15 @@ NOT_BUILT = 7908
 def refusal(trainer, *, stated: bool, ahead: bool) -> str | None:
     """Why `trainer`'s run cannot stream its parameters from the host, None where it can. What the streamed
     step cannot be: a layout the run states (`stated`), a custom step, which owns its execution, a run
-    lowering for another target (`lower_for`), whose steps this host prices on no devices of that target
-    (a stated host layout lowers, `StepCompiler._lowered_host`), a run whose rollout makes its steps'
-    batches (`Trainer(rollout=)`), whose stream's first batch is the rollout's input, no step's, so no step
-    is priced before a rollout runs (a stated host layout samples from a device copy of its weights,
-    `dew.training.rollout.on_devices`), or a process holding no CPU companion of the devices, which JAX
-    makes only before it initializes. And what it is not
-    built for yet (`NOT_BUILT`; DiLoCo's groups by row `DILOCO_ON_HOST`): DiLoCo, a step compiled `ahead`,
-    a pass count drawn per microbatch, a part whose table
-    states no host link to price it by (`GpuTarget.host_links`: a TPU's but v6e's), and a frozen stack a
-    plain loop runs (`frozen_loops`). Read before any plan is built."""
+    lowering for another target (`lower_for`), whose steps this host prices on no devices of that target (a
+    stated host layout lowers, `StepCompiler._lowered_host`), a run whose rollout makes its steps' batches
+    (`TrainerAdvanced(rollout=)`), whose stream's first batch is the rollout's input, no step's, so no step is
+    priced before a rollout runs (a stated host layout samples from a device copy of its weights,
+    `dew.training.rollout.on_devices`), or a process holding no CPU companion of the devices, which JAX makes
+    only before it initializes. And what it is not built for yet (`NOT_BUILT`; DiLoCo's groups by row
+    `DILOCO_ON_HOST`): DiLoCo, a step compiled `ahead`, a pass count drawn per microbatch, a part whose table
+    states no host link to price it by (`GpuTarget.host_links`: a TPU's but v6e's), and a frozen stack a plain
+    loop runs (`frozen_loops`). Read before any plan is built."""
     unbuilt = (
         (trainer.diloco is not None, "DiLoCo's groups", DILOCO_ON_HOST),
         (ahead, "a step compiled ahead", NOT_BUILT),
@@ -299,7 +298,10 @@ def said(choice: Choice) -> None:
         _log.info("the run resumes its checkpoint's layout: the parameters %s",
                   "streamed from the host" if choice.streams else "on the devices")
     elif choice.refused is not None:
-        _log.info("the step does not stream its parameters from the host: %s", choice.refused)
+        # A plain loop's refusal said as loudly as the streaming it costs (the API02 review: a default
+        # plain decoder lost the host layout its scanned default chose, unsaid): its remedy names the scan.
+        (_log.warning if choice.refused.startswith(PLAIN_LOOP) else _log.info)(
+            "the step does not stream its parameters from the host: %s", choice.refused)
     elif choice.streams:
         _log.warning("the step streams its parameters from the host (Layout(host=('variables',))): %s",
                      choice.record())

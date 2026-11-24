@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained
@@ -33,7 +34,7 @@ SEEDS = {**dict.fromkeys(SPANNING, 8), **{f"{name} left by its last layer": 8 fo
 
 
 def _loaded(name: str) -> Pretrained:
-    return Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    return Pretrained.load(FIXTURES / name, dtype="float32")
 
 
 def _spanning(model):
@@ -65,6 +66,7 @@ def _read(model):
     return jax.jit(run)
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", SPANNING)
 def test_streams_over_a_range_spanning_the_stack_compute_the_whole_stacks(name):
     """A released decoder's streams over the range of layers spanning its stack, entered by its first
@@ -78,6 +80,7 @@ def test_streams_over_a_range_spanning_the_stack_compute_the_whole_stacks(name):
                     seeds=SEEDS[name], truth_fn=_read(whole.clone(dtype=jnp.float64)))
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", [name for name in SPANNING if name != "deepseek-v4-tiny"])
 def test_a_range_its_last_layer_leaves_collapses_as_the_stacks_head_does(name):
     """Under a loop, which runs the range again, the range's last layer leaves the streams itself, by the
@@ -106,6 +109,7 @@ def test_a_range_its_last_layer_leaves_collapses_as_the_stacks_head_does(name):
                     truth_fn=logits(whole.clone(dtype=jnp.float64)))
 
 
+@attending("reference")
 def test_a_dspark_target_outside_the_range_reads_its_residual():
     """A DSpark target layer before streams over a later range of layers reads its plain residual, the
     mean of its one copy, as a target inside reads its streams' mean: V4.1's context at its first

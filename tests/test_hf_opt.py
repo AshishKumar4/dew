@@ -13,6 +13,7 @@ from interop_support import (
     transformers_arms,
     transformers_model,
 )
+from model_support import attending
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained
@@ -24,11 +25,12 @@ OPT_SEEDS = 8
 """The logits' declared draws of ids against transformers' (check 1)."""
 
 
+@attending("reference")
 def test_opt_logits_follow_transformers_and_its_greedy_continuation():
     """OPT's logits, its learned positions read two places on (OPT's offset), are on par with
     transformers' from its float64 twin over drawn ids (check 1), and a cached greedy continuation draws
     the tokens transformers drew."""
-    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(DIRECTORY, dtype='float32')
     reference, truth = transformers_arms(transformers_model(DIRECTORY),
                                          lambda model, ids: model(ids, use_cache=False).logits)
     assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, fixture_ids(DIRECTORY),
@@ -58,6 +60,7 @@ def test_released_opt350m_logits_and_cached_greedy_generation(tmp_path):
                      revision='08ab08cc4b72ff5593870b5d527cf4230323703c')
 
 
+@attending("reference")
 @pytest.mark.parametrize("variant", [
     {"do_layer_norm_before": False, "word_embed_proj_dim": 32},
     {"do_layer_norm_before": True, "_remove_final_layer_norm": True}],
@@ -76,12 +79,13 @@ def test_an_opt_350m_shaped_decoder_computes_transformers_logits(variant, tmp_pa
                        num_attention_heads=4, max_position_embeddings=32, **variant)
     torch.manual_seed(0)
     OPTForCausalLM(config).eval().save_pretrained(tmp_path / "source")
-    loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path / "source", dtype="float32")
     assert_exported_decoder_follows_transformers(loaded, tmp_path, token_draw(0x350, 96, (2, 9)),
                                                  "OPT-350m logits",
                                                  lambda model, ids: model(ids, use_cache=False).logits)
 
 
+@attending("reference")
 def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_and_keeps_loop_norms():
     """Past an embedding's own width the head's vocabulary rows are given in the stream's coordinates,
     through `project_out`: the final states times those rows are the logits, bit for bit in float64 on
@@ -95,8 +99,7 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
     with jax.enable_x64(new_val=True):
         model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
                                   max_seq_len=8, embedding_features=4, post_residual_norms=True,
-                                  pre_norms=False, final_norm=False, dtype=jnp.float64,
-                                  attention_impl="reference")
+                                  pre_norms=False, final_norm=False, dtype=jnp.float64)
         ids = jnp.arange(6, dtype=jnp.int32).reshape(1, 6) % 16
         variables = nn.unbox(model.init(jax.random.key(0), ids))
         # Integer-valued weights and final states: both products are exact in float64, whatever their
@@ -107,8 +110,7 @@ def test_an_opt_350m_shaped_decoder_reads_its_head_in_the_streams_coordinates_an
         logits = model.apply(whole, hidden, method=CausalTransformer.logits_from_hidden)
         np.testing.assert_array_equal(np.asarray(logits), np.asarray(hidden @ rows.T))
     looped = {"num_layers": 2, "loop": Loop(2, layers=(0, 2), step_norm=True), "final_norm": False}
-    base = CausalTransformer(vocab_size=16, emb_features=8, num_heads=2, mlp_features=16, max_seq_len=8,
-                             attention_impl="reference")
+    base = CausalTransformer(vocab_size=16, emb_features=8, num_heads=2, mlp_features=16, max_seq_len=8)
     normed = base.clone(**looped)
     plain = base.clone(**{**looped, "loop": Loop(2, layers=(0, 2), step_norm=False)})
     params = nn.unbox(normed.init(jax.random.key(1), ids))
@@ -119,6 +121,7 @@ PROJECTED_TWIN_DRAWS = 3
 """The draws a projected decoder's depth and context are held to its stream-width twin on."""
 
 
+@attending("reference")
 def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream_embedding():
     """A decoder whose embedding has a width of its own (`embedding_features`), with a prediction depth and
     a cross-attention layer reading a context by the table, pairs its depth with and encodes its context
@@ -140,7 +143,7 @@ def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream
     from dew.objectives.lm import LMObjective
 
     shape = {"vocab_size": 61, "emb_features": 16, "num_layers": 2, "num_heads": 2, "mlp_features": 32,
-             "max_seq_len": 8, "attention_impl": "reference", "num_nextn_predict_layers": 1,
+             "max_seq_len": 8, "num_nextn_predict_layers": 1,
              "cross_attention": CrossAttention((1,), 4)}
     projected = CausalTransformer(**shape, embedding_features=8)
     twin = CausalTransformer(**shape, tie_embeddings=False)

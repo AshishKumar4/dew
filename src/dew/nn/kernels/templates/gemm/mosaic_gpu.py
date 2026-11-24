@@ -162,10 +162,10 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     each matrix and each prologue side operand that follows the steps (`_stepped`), each epilogue side
     operand's staging at a consumer's share of the tile, each prologue side operand without depth's at the
     tile's rows; a `transpose_lhs` call's rows stream their `[depth, rows]` blocks. A `packed` matrix (an
-    NVFP4 one's, `scales`' in `gmm`, or a free-layout FP8 matrix's, `packed_format`) streams each group's
+    NVFP4 one's, `scales`' in `gmm`, or a word-packed matrix's, `packed_format`) streams each group's
     sixteen uint32 words (`words_{q}`, a 64-byte row, which cp.async's two-dimensional copies take and a
     register tile loads whole) and (for NVFP4) its block scales K-major, decoded a stage at a time into
-    bfloat16 buffers (`packed.stage_decoded` / `packed.stage_decoded_fp8`)."""
+    bfloat16 buffers (`packed.stage_decoded` / `packed.stage_decoded_words`)."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     # A consumer's accumulators: its share of the rows by the tile's columns, a pair's both where its products
     # span it (`tile_columns`); each stream's slot a multiprocessor's block.
@@ -1516,7 +1516,7 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
         rows_views = {**{f'words_{q}': (lhs_gmem.at[rows], lambda j, q=q: (0, groups_of * (first + j) + q))
                          for q in range(groups_of)}, **scales_view}
     elif 'scales' in matrix_gmems or packed_format is not None:
-        # A packed matrix's words, a stream for each group of depths of a step (128 for NVFP4, 64 for FP8):
+        # A packed matrix's words, a stream for each group of depths of a step (128 NVFP4, 256 ternary):
         # step j's group q, sixteen words a column at the tile's columns.
         step_groups = tiles.block_k // (packing.packed_group_depth(packed_format)
                                         if packed_format is not None

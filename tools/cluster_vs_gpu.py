@@ -37,7 +37,6 @@ import time
 import urllib.request
 from pathlib import Path
 
-from dew.training import FitPolicy
 
 CORPUS = ("https://huggingface.co/datasets/roneneldan/TinyStories/resolve/"
           "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64/TinyStories-valid.txt")
@@ -161,9 +160,9 @@ def arguments() -> argparse.Namespace:
                         help="print the step's collectives and memory, and train nothing")
     parser.add_argument("--target", type=float, help="the loss to stop at; the shape's own by default")
     parser.add_argument("--dtype", default=None, help="compute dtype; float32 on CPU, bfloat16 on a GPU")
-    parser.add_argument("--scan-layers", action="store_true",
-                        help="the decoder's layers under one scan, so a step gathers a layer's weights at a "
-                             "time")
+    parser.add_argument("--scanned", action="store_true",
+                        help="the decoder's like layers under one scan "
+                             "(generation.chosen(layer_scan='scanned'))")
     parser.add_argument("--diloco", type=int, metavar="H",
                         help="DiLoCo (Douillard et al. 2023): each host trains its own copy on its own "
                              "share of every global batch, and every H steps the hosts sync "
@@ -189,7 +188,7 @@ def main() -> None:
     from dew.distributed.batches import shard_batch
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
-    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
     from dew.training.ahead import step_batch
     from dew.training.diloco import DiLoCo
 
@@ -201,13 +200,15 @@ def main() -> None:
     batch_size = shape["batch"] if args.batch is None else args.batch
     data = windows(tokens, batch_size)
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
-                              dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
+                              dtype=getattr(jnp, dtype))
     trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=None), optax.adamw(shape["lr"], weight_decay=0.1),
                       key=jax.random.key(0),
                       mesh=MeshSpec(diloco=world, **mesh_of(shape["mesh"], jax.local_device_count()))
                             if args.diloco else MeshSpec(**mesh_of(shape["mesh"], jax.device_count())),
-                      fit=FitPolicy(microbatches=shape.get("microbatches")), layout=Layout(),
-                      checkpoints=None, tracker=None, diloco=DiLoCo(every=args.diloco) if args.diloco else None)
+                      microbatches=shape.get("microbatches"),
+                      advanced=TrainerAdvanced(layout=Layout(),
+                                               diloco=DiLoCo(every=args.diloco) if args.diloco else None),
+                      checkpoints=None, tracker=None)
     # Each process reads its own rows of every global batch, which shard_batch assembles: under DiLoCo a
     # group's share.
     partition = DataPartition.of(trainer.device_mesh)
@@ -263,4 +264,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from dew.nn.kernels import generation
+
+    with generation.chosen(layer_scan="scanned" if arguments().scanned else "plain"):
+        main()

@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 
-from dew import Checkpoints, Field, InputSpec, Trainer
+from dew import Checkpoints, Field, InputSpec, Trainer, kernels
 from dew.artifacts import uint8_pixels
 from dew.data import Memory, presets
 from dew.data.dataset import Loader
@@ -48,10 +48,10 @@ def language_model(out: Path):
     model = CausalTransformer(
         vocab_size=8, emb_features=16, num_layers=1,
         num_heads=2, mlp_features=32, max_seq_len=16,
-        dtype=jnp.float32, attention_impl="xla",
+        dtype=jnp.float32,
     )
     objective = LMObjective(model, seq_len=8, ema_decay=0.9)
-    optimizer = OptimConfig(optimizer=Adam(), learning_rate=0.01)
+    optimizer = OptimConfig(optimizer=Adam(), lr=0.01)
     checkpoints = Checkpoints(str(out / "lm-checkpoints"))
     trainer = Trainer(objective, optimizer, key=jax.random.key(0),
                       checkpoints=checkpoints)
@@ -86,7 +86,7 @@ def preferences(model, pretrained):
     # The objective predicts three next tokens from each four-ID sequence.
     objective = DPOObjective(model, seq_len=3, beta=0.1, variables=pretrained)
     reference = jax.tree.map(lambda x: np.array(x, copy=True), pretrained)
-    trainer = Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=0.001), key=jax.random.key(2))
+    trainer = Trainer(objective, OptimConfig(optimizer=Adam(), lr=0.001), key=jax.random.key(2))
     state = trainer.fit(data, steps=4, log_every=1)
     delta = max(float(np.max(np.abs(np.asarray(after) - before)))
                 for before, after in zip(jax.tree.leaves(reference),
@@ -104,13 +104,13 @@ def flow_images(out: Path):
                    records=8, batch=8)
     model = SimpleDiT(
         patch_size=4, emb_features=16, num_layers=1,
-        num_heads=2, mlp_ratio=2, dtype=jnp.float32, attention_impl="xla",
+        num_heads=2, mlp_ratio=2, dtype=jnp.float32,
     )
     objective = DiffusionObjective(
         model, Flow(), InputSpec(Field("image", (8, 8, 3))),
         solver=Euler(), guidance=None, steps=4,
     )
-    trainer = Trainer(objective, OptimConfig(optimizer=Adam(), learning_rate=0.001), key=jax.random.key(3))
+    trainer = Trainer(objective, OptimConfig(optimizer=Adam(), lr=0.001), key=jax.random.key(3))
     state = trainer.fit(data, steps=3, log_every=1)
     preview = objective.preview(
         state.variables, batch,
@@ -145,4 +145,5 @@ def main(config: Config):
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Config))
+    with kernels.use(attention="xla"):
+        main(tyro.cli(Config))

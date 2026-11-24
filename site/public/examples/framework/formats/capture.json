@@ -1,7 +1,7 @@
 {
 	"about": "The screen formats.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "b2c7b9f721d101ccb726762500dcdef16f3e626f528f53a31fb6ed6d5bf28d9b",
+	"script_sha256": "9fcc5454c8b4924a72d9811995fd158c117e1203c978bd3719f68338b25d14fd",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",

@@ -27,6 +27,7 @@ from memory_support import (
     layer,
     written,
 )
+from model_support import attending, scanning, unrolled
 from port_support import row_names_port
 from reference_error import as_given, assert_as_exact, dew_path, widened
 
@@ -94,9 +95,9 @@ def test_a_scanned_memory_decoder_trains_as_the_plain_loop():
     float64 (check 1)."""
     plain = decoder()
     _, draw = memory_draw(plain)
-    assert_as_exact(trained(decoder(scan_layers=True)), dew_path(trained(plain)), draw,
+    assert_as_exact(scanning(trained(plain)), dew_path(unrolled(trained(plain))), draw,
                     "scanned memory decoder gradient", seeds=SEEDS["scanned memory decoder gradient"],
-                    truth_fn=trained(decoder(dtype=jnp.float64)))
+                    truth_fn=unrolled(trained(decoder(dtype=jnp.float64))))
 
 
 def test_a_rematted_memory_decoder_trains_as_the_plain_loop_reaching_every_memory():
@@ -105,12 +106,12 @@ def test_a_rematted_memory_decoder_trains_as_the_plain_loop_reaching_every_memor
     every memory's initial network."""
     from dew.nn.backbones.decoder_block import RematPolicy
 
-    plain, rematted = decoder(), decoder(scan_layers=True, remat=RematPolicy(save=(CARRY,)))
+    plain, rematted = decoder(), decoder(remat=RematPolicy(save=(CARRY,)))
     _, draw = memory_draw(plain)
-    assert_as_exact(trained(rematted), trained(plain), draw, "rematted memory decoder gradient",
-                    seeds=SEEDS["rematted memory decoder gradient"],
-                    truth_fn=trained(decoder(dtype=jnp.float64)))
-    gradient = trained(rematted)(*draw(0))[1]
+    assert_as_exact(scanning(trained(rematted)), unrolled(trained(plain)), draw,
+                    "rematted memory decoder gradient", seeds=SEEDS["rematted memory decoder gradient"],
+                    truth_fn=unrolled(trained(decoder(dtype=jnp.float64))))
+    gradient = scanning(trained(rematted))(*draw(0))[1]
     for index in (0, 1):
         layer = gradient[f"layers_{index}"]["self_attn"]
         assert all(np.abs(np.asarray(leaf)).max() > 0 for name in layer if head_of((name,)) is not None
@@ -120,7 +121,7 @@ def test_a_rematted_memory_decoder_trains_as_the_plain_loop_reaching_every_memor
 def test_a_scanned_memory_decoder_decodes_as_its_full_pass():
     """The scanned memory decoder's cached decode, token by token after a prefill, gives the full pass's
     last logits, on par against float64 (check 1)."""
-    plain, scanned = decoder(), decoder(scan_layers=True)
+    plain, scanned = decoder(), decoder()
     draw_model, _ = memory_draw(plain)
 
     @jax.jit
@@ -135,8 +136,8 @@ def test_a_scanned_memory_decoder_decodes_as_its_full_pass():
     def last(model):
         return jax.jit(lambda variables, ids: model.apply(variables, ids)[:, -1])
 
-    assert_as_exact(decoded, last(plain), draw_model, "memory decoder decode",
-                    seeds=SEEDS["memory decoder decode"], truth_fn=last(decoder(dtype=jnp.float64)))
+    assert_as_exact(scanning(decoded), unrolled(last(plain)), draw_model, "memory decoder decode",
+                    seeds=SEEDS["memory decoder decode"], truth_fn=unrolled(last(decoder(dtype=jnp.float64))))
 
 
 ADAPTED = {"titans": ("titans", ("layers_0", "layers_1"), 2 * HEADS * 2),
@@ -569,6 +570,7 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
         assert not np.array_equal(likelihoods(moved), likelihoods(first))
 
 
+@attending("reference")
 def test_a_server_serves_a_quantized_memory_decoder_on_par_with_its_full_forward():
     """A memory decoder served quantized (`TextGeneration.quantized`: every inner Dense of its heads'
     networks, weights and activations) through a server's two slots draws tokens whose likelihoods are on
@@ -655,8 +657,7 @@ def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_o
     from model_support import Digits
 
     from dew.inference import RunProcessor, TextGeneration
-    from dew.inference.serving import Server
-    from dew.nn.kv_cache import KVCache
+    from dew.inference.serving import PagedKV, Server
     from dew.sampling import Sampling
 
     memory = None if network is None else InContextMemory(
@@ -673,8 +674,8 @@ def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_o
         task = task.quantized(Quantization(patterns=(INNER,), weight_only=weight_only, bwd_qtype="int8",
                                            bwd_stochastic_rounding="uniform"))
     # A slot, and the prefix state it keeps, a continuation of each of two keys: both keys' states held.
-    server = Server.from_task(task, slots=2 * continuations, capacity=64, kv_cache=KVCache(page_size=16),
-                              prefix_cache=True)
+    server = Server.from_task(task, slots=2 * continuations, capacity=64,
+                              cache=PagedKV(page_size=16, prefix_cache=True))
     prompt = "1" * 33
 
     def reused(key: int) -> int:
@@ -801,7 +802,7 @@ def test_muon_steps_each_memory_heads_matrices_on_their_own():
               for index in (0, 1)}
     assert {name: tree for name, tree in numbers.items() if head_of((name,)) is not None} == {
         f"head_{head}": layers for head in range(2)}
-    solver = OptimConfig(optimizer=Muon(), learning_rate=1e-3).build(10)
+    solver = OptimConfig(optimizer=Muon(), lr=1e-3).build(10)
     updates, _ = solver.update(jax.tree.map(jnp.ones_like, params), solver.init(params), params)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(updates))
 

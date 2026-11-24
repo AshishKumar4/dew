@@ -138,7 +138,7 @@ def waiting(opt_state: optax.OptState) -> jax.Array | None:
 
 
 _WHOLE = ("hold the whole update back: optax.MultiSteps(optimizer, k), or optax.chain(optimizer, "
-          "optax.apply_every(k)); or accumulate gradients with Trainer(update=UpdateBatch(batches=k))")
+          "optax.apply_every(k)); or accumulate gradients with Trainer(accumulation=k)")
 """The compositions whose held updates the trainer counts by, which a refusal names."""
 
 
@@ -159,8 +159,9 @@ def refuse_untold(opt_state: optax.OptState) -> None:
 
     def visit(node, where: str | None, routed: bool) -> None:
         if isinstance(node, optax.ApplyIfFiniteState):
-            raise refused("optax.apply_if_finite", "drop non-finite steps with Trainer(dynamic_scale=...), "
-                          "which leaves a non-finite attempt uncounted and draws its next one afresh")
+            raise refused("optax.apply_if_finite", "drop non-finite steps with "
+                          "TrainerAdvanced(dynamic_scale=...), which leaves a non-finite attempt uncounted "
+                          "and draws its next one afresh")
         if isinstance(node, optax.ConditionallyMaskState) and not routed:
             raise refused("optax.conditionally_mask", "alternate networks under dew.held_updates.phased, "
                           "which routes each update to one of them, or hold updates back with "

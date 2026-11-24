@@ -8,6 +8,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from model_support import attending
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
 
 from dew.interop import Pretrained
@@ -20,7 +21,7 @@ SHAPE = (4, 48)
 
 
 def load():
-    return Pretrained.load(TINY, text_only=True, dtype='float32', attention_impl='reference')
+    return Pretrained.load(TINY, text_only=True, dtype='float32')
 
 
 def draw(seed):
@@ -29,6 +30,7 @@ def draw(seed):
     return np.random.default_rng(seed).integers(0, vocabulary, SHAPE).astype(np.int32)
 
 
+@attending("reference")
 def test_its_language_model_loops_a_block_under_streams_over_it():
     """The release's loop and mHC settings, stated at its wrapper's scope, read as its language model's:
     the block [2, 6) run twice, each pass reading the last one's output as it is, and two streams over the
@@ -40,6 +42,7 @@ def test_its_language_model_loops_a_block_under_streams_over_it():
         hc_pre_scale=0.75, hc_layers=(2, 6))
 
 
+@attending("reference")
 def test_its_logits_are_on_par_with_the_remote_codes():
     """The text-only load's logits on par with the remote code's fp32 run from its float64 run (check 1),
     over its recording's seeds of ids (tools/sensenova_loop_reference.py `--recording`): Dew's own float64

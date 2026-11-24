@@ -11,13 +11,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from test_loop_sampled import CAP, TRAINED, token_batch
 from test_pass_weights import phased_trainer
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.kernels.generation import chosen
-from dew.training import FitPolicy, UpdateBatch
+from dew.training import TrainerAdvanced
 from dew.training.compiler import DrawingStep
 from dew.training.interval import Interval
 
@@ -28,6 +29,7 @@ COMPOSED = [
 ]
 
 
+@attending("xla")
 @pytest.mark.parametrize(("drawn", "implicit", "copies", "gated"), COMPOSED,
                          ids=lambda value: "on" if value else "off")
 def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copies, gated):
@@ -37,13 +39,14 @@ def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copi
     each microbatch's loss, with every feature on, that of the program a run fixed at its count compiles
     from the same state (its copies or its weights read whole the same values)."""
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
-                              max_seq_len=128, attention_impl="xla", dtype=jnp.bfloat16,
+                              max_seq_len=128, dtype=jnp.bfloat16,
                               loop=Loop(CAP, layers=(1, 2), implicit=implicit, step_norm=not implicit,
                                         exit_gate=gated))
     batch = token_batch()
     with chosen(narrow_copies="on" if copies else "off"):
-        trainer = phased_trainer(model, 0, None, sampled_passes=TRAINED if drawn else None,
-                                 update=UpdateBatch(batches=2))
+        trainer = phased_trainer(model, 0, None,
+                                 advanced=TrainerAdvanced(sampled_passes=TRAINED if drawn else None),
+                                 accumulation=2)
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         interval = Interval(0.0, None, microbatches=0)
@@ -61,7 +64,7 @@ def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copi
             if oracle:
                 (count,) = step.counts
                 if count not in fixed:
-                    alone = phased_trainer(model.with_passes(count), 0, None, update=UpdateBatch(batches=2))
+                    alone = phased_trainer(model.with_passes(count), 0, None, accumulation=2)
                     start, _, _ = alone.place()
                     fixed[count] = alone.compile(start, batch)
                 own_loss = fixed[count](jax.device_put(*given), batch)[1]
@@ -72,6 +75,7 @@ def test_a_looped_decoders_features_composed_plan_and_step(drawn, implicit, copi
     assert bool(held) == copies, (drawn, implicit, copies, gated)
 
 
+@attending("xla")
 def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_computes_its_batchs_statistics():
     """An objective computing statistics of a step's whole batch (`batch_statistics`) computes them at its
     first part, by that part's pass count, and reads them at every part: a drawn count read in two parts a
@@ -89,14 +93,14 @@ def test_a_drawn_pass_count_read_in_parts_is_refused_where_its_objective_compute
             return (jnp.float32(split),)
 
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=3, num_heads=2, mlp_features=48,
-                              max_seq_len=128, attention_impl="xla", loop=Loop(CAP, layers=(1, 2)))
+                              max_seq_len=128, loop=Loop(CAP, layers=(1, 2)))
     batch = token_batch()
 
     def trainer_of(split: int, law=TRAINED):
         looped_for = model if law.cap == CAP else model.with_passes(law.cap)
         return Trainer(Normalized(looped_for, 16), optax.sgd(0.1), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0), phase_passes=None, sampled_passes=law,
-                       update=UpdateBatch(batches=2), fit=FitPolicy(split=split))
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0), phase_passes=None,
+                                                sampled_passes=law), accumulation=2, split=split)
 
     def stepped(trainer) -> float:
         state, _, _ = trainer.place()

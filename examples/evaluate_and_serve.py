@@ -44,6 +44,7 @@ import numpy as np
 import tyro
 
 import dew
+from dew import kernels
 from dew.artifacts import uint8_pixels
 from dew.config import TrainerConfig
 from dew.config.lm import LMRunConfig
@@ -56,7 +57,7 @@ from dew.objectives.lm import LMObjective, Perplexity
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig
 from dew.sampling import Sampling
-from dew.training import Evaluation, Horizon
+from dew.training import Evaluation
 
 GREEDY = Sampling(temperature=0.0)
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -118,16 +119,15 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
     loading = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
     model = CausalTransformer(emb_features=16, num_layers=1, num_heads=2, head_dim=8, mlp_features=32,
-                              vocab_size=256, max_seq_len=48, dtype=jnp.float32,
-                              attention_impl="reference")
+                              vocab_size=256, max_seq_len=48, dtype=jnp.float32)
     run = LMRunConfig(
         model=ModelConfig.from_model(model),
         data=Memory([{"text": play[:6000]}]).repeat().pipe(
             presets.lm, "byte", seq_len=32, batch=4, pack=None, eos=False).loading(loading),
         validation=TokenFiles(str(held)).pipe(presets.token_windows, seq_len=32, batch=4).loading(loading),
         max_new_tokens=8,
-        optim=OptimConfig(learning_rate=1e-3),
-        trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), horizon=Horizon(steps=2), log_every=1,
+        optim=OptimConfig(lr=1e-3),
+        trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), steps=2, log_every=1,
                               eval_every=None, checkpoint_every=2, multi_host=False,
                               compilation_cache_dir=None))
     objective = LMObjective(model, 32, ema_decay=0.9, processor=RunProcessor(ByteTokenizer()))
@@ -287,4 +287,5 @@ def main(config: Config) -> Path:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(Config))
+    with kernels.use(attention="reference"):
+        main(tyro.cli(Config))

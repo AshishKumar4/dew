@@ -21,7 +21,7 @@ import sys
 import time
 import types
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Generic, Unpack
+from typing import TYPE_CHECKING, Generic, Literal, Unpack
 
 import jax
 import jax.numpy as jnp
@@ -82,7 +82,7 @@ from dew.objectives.base import (
     taken_record,
 )
 from dew.objectives.drawn import drawn_once, traced_draw
-from dew.optim import declaring, with_bounds
+from dew.optim import OptimConfig, OptimizerSpec, declaring, with_bounds
 from dew.optim_schedules import (
     ScheduleBase,
     held_rates,
@@ -181,7 +181,7 @@ from dew.training.model_flops import TOKENS, TRAINING_FLOPS, model_batch, prepar
 from dew.training.observe import Observe
 from dew.training.phase_passes import PhasePasses, SampledPasses
 from dew.training.planning import Candidate, Planned, Trials, read_whole, released, splits
-from dew.training.policy import FitPolicy, UpdateBatch
+from dew.training.policy import FitPolicy, Remat, UpdateBatch
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process, signal_wake
@@ -204,7 +204,6 @@ _input_log = logging.getLogger("dew.training.input")
 """Where a run says what its input costs its steps, once (`_written`)."""
 
 if TYPE_CHECKING:
-    from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
     from dew.training.ahead import AheadOfTime, LaterPlans
 
@@ -216,7 +215,6 @@ Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
 
 _DEFAULT_MESH = MeshSpec()
-_ONE_BATCH, _PLANNED = UpdateBatch(), FitPolicy()
 
 
 def _closer(stream: Iterator[Batch]) -> Callable[[], None] | None:
@@ -253,8 +251,57 @@ def _custom_step_refusal(step, record: bool, inspection, rollout: Rollout | None
     if rollout is not None and sampled is not None:
         raise ValueError("a rollout samples one policy a step, not sampled_passes' count a microbatch")
     if step is not None and (record or inspection is not None):
-        raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach, and "
-                         "commits no update an inspection reads: build Step(record=True), report its arrays")
+        raise ValueError("a custom step builds its own Steps, which TrainerAdvanced(record=True) cannot "
+                         "reach, and commits no update an inspection reads: build Step(record=True), report "
+                         "its arrays")
+
+
+@dataclasses.dataclass(frozen=True)
+class TrainerAdvanced(Generic[Loss, Effects]):
+    """What a `Trainer` sets beyond its everyday settings: where its state lives, how it steps, what it
+    measures, inspects or compiles ahead, each the trainer's default where unset."""
+
+    layout: Layout | None = None
+    """Where the state lives (`Layout`), whose rules name the mesh's axes (`Layout.data_axes` its rows');
+    None, the run's layout chooser decides (`dew.training.streaming.laid_start`)."""
+    rollout: Rollout | None = None
+    """Runs once per batch read, before the step and outside replay."""
+    data_resume: DataResume = "relaxed"
+    """How a resume treats its data: "relaxed" starts it again where its plan differs, "exact" refuses."""
+    skip_nonfinite: bool = False
+    """Skip a step that is not finite, which a run otherwise takes and stops at (training.md)."""
+    step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None
+    """Replaces the built-in transaction. A custom step then owns the clocks, the scaler, the EMA and the
+    mutable writes, and the compiled wrapper owns only the attempted-step counter; it passes a model that
+    reads the run's progress it (`PassesProgress`)."""
+    dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False
+    """Scale the loss dynamically, as a float16 compute needs (`loss_scale`)."""
+    profile: ProfileWindow | None = None
+    """The steps a profiler traces (`ProfileWindow`)."""
+    lower_for: str | None = None
+    """A CUDA generation the first step is lowered for in place of compiling it (`_lowering.Lowered`)."""
+    ahead: AheadOfTime | None = None
+    """A step compiled ahead (`dew.training.ahead`), run as the first step where it is that program; one
+    compiled without its GPU kind's tuned choices (`AheadOfTime.tuned`) is not run: the run compiles its
+    step as without it, said once (`AheadOfTime.runnable`)."""
+    tune_kernels: bool = False
+    """Opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived config. It
+    measures each of Dew's own launches that declares variants to time (`KernelOp`); tokamax's flash kernel
+    runs at tokamax's heuristic config, which it does not measure."""
+    record: bool = False
+    """Each step returns in its metrics what each evaluation sampled or passed (`taken_record`)."""
+    links: Mapping[str, Link] | None = None
+    """An axis's `Link` by name, in place of measuring it (`_links`)."""
+    inspection: Inspection | None = None
+    """What the run watches at its sampled steps (`dew.training.inspection`)."""
+    param_dtype: str | None = None
+    """The dtype fresh parameters are stored in (Flax's `param_dtype`); None, each module's own."""
+    diloco: DiLoCo | None = None
+    """Trains the mesh's diloco groups apart, every few updates averaged (`dew.training.diloco`)."""
+    phase_passes: Sequence[int] | None = None
+    """A looped model's count of passes a phase of the run's data (`dew.training.phase_passes`)."""
+    sampled_passes: SampledPasses | None = None
+    """A looped model's pass count drawn per microbatch (`dew.training.phase_passes`)."""
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -274,68 +321,51 @@ class Trainer(Generic[Loss, Effects]):
     def __init__(
         self,
         objective: Objective[Loss, Effects],
-        optimizer: optax.GradientTransformation | OptimConfig,
+        optimizer: OptimizerSpec | OptimConfig | optax.GradientTransformation,
         *,
-        key: int | jax.Array,
+        key: int | jax.Array = 0,
+        lr: float | None = None,
+        schedule: ScheduleBase | None = None,
+        clip: float = 0.0,
+        accumulation: int | None = None,
+        update_tokens: int | None = None,
+        split: int | Literal["auto"] = "auto",
+        remat: Remat = "auto",
+        microbatches: int | None = None,
         mesh: MeshSpec | Mesh = _DEFAULT_MESH,
-        layout: Layout | None = None,
-        update: UpdateBatch = _ONE_BATCH,
-        fit: FitPolicy = _PLANNED,
-        dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False,
         checkpoints: Checkpoints | None = None,
         tracker: Tracker | None = None,
-        step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None,
-        rollout: Rollout | None = None,
-        profile: ProfileWindow | None = None,
-        lower_for: str | None = None,
-        ahead: AheadOfTime | None = None,
-        tune_kernels: bool = False,
-        record: bool = False,
-        links: Mapping[str, Link] | None = None,
-        inspection: Inspection | None = None,
-        param_dtype: str | None = None,
-        diloco: DiLoCo | None = None,
-        phase_passes: Sequence[int] | None = None,
-        sampled_passes: SampledPasses | None = None,
-        data_resume: DataResume = "relaxed",
-        skip_nonfinite: bool = False,
+        advanced: TrainerAdvanced[Loss, Effects] | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
         The mesh, the compiled step and the capabilities' resources come into being in `fit`, so constructing
         a Trainer allocates nothing.
 
-        `update` is one optimizer commit's size (`UpdateBatch`): the steps it pools, or the tokens it trains
-        on, which `fit` reads its steps from. `fit` is how the step fits the devices (`FitPolicy`): the
-        microbatches each step's batch is read in, its rows split evenly, and what it recomputes, each "auto",
-        the planner's (`compile`), by default; under a mesh of pipeline stages its split is the microbatches
-        the stages feed, a multiple of them, "auto" one a stage. `optimizer` is an optax transformation, or an
-        `OptimConfig` each `fit` builds over its updates; the run steps the objective's
-        (`Objective.optimizer`), made from it. `step` replaces the built-in transaction. A custom step then
-        owns the clocks, the scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
-        attempted-step counter; it passes a model that reads the run's progress it (`PassesProgress`).
-        `rollout` runs once per batch read, before the step and outside replay. `skip_nonfinite` skips a step
-        not finite, which a run otherwise takes and stops at (training.md, a step that is not finite).
-        `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of
-        any axes, which `layout`'s rules name (`Layout.data_axes` its rows').
-        `lower_for`, a CUDA generation, lowers the first step for it in place of compiling it
-        (`dew.training._lowering.Lowered`); `ahead`, a step compiled ahead (`dew.training.ahead`), runs as
-        the first step where it is that program, and one compiled without its GPU kind's tuned choices
-        (`AheadOfTime.tuned`) is not run: the run compiles its step as without it, said once
-        (`AheadOfTime.runnable`).
-        `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived
-        config. It measures each of Dew's own launches that declares variants to time (`KernelOp`: the
-        kernel templates, `attention_impl="template"`, the norms, SwiGLU and decode attention); tokamax's
-        flash kernel (`attention_impl="triton"`) runs at tokamax's heuristic config, which it does not
-        measure. `record` makes each step return in its metrics what each
-        evaluation, replays too, sampled or passed as a boundary (`taken_record`). `links` states an axis's
-        `Link` by name in place of measuring it (`_links`). `param_dtype`, a dtype's name, stores the
-        parameters the run draws fresh, as Flax's `param_dtype` (`dew.state.drawn_in`); None keeps each
-        module's own. `inspection` names what the run watches at its sampled steps
-        (`dew.training.inspection`). `diloco` trains the mesh's diloco groups apart, every few updates
-        averaged (`dew.training.diloco`). `phase_passes` runs a looped model a count of passes a phase of
-        the run's data, and `sampled_passes` one drawn per microbatch (`dew.training.phase_passes`).
+        `optimizer` is an optimizer's spec (`Muon()`, `AdamW(b2=0.95)`), run at `lr`, or along `schedule`, its
+        peak `lr` where it names none, its gradient's norm clipped to `clip` where that is above 0
+        (`OptimConfig`, which each `fit` builds over its updates); an `OptimConfig`, which states those
+        itself; or an optax transformation, which states its own rate. The run steps the objective's
+        (`Objective.optimizer`), made from it. One optimizer update adds up `accumulation` batches, or the
+        batches of `update_tokens` tokens, a whole number of the data's token batches, which `fit` reads its
+        steps from; neither named, one batch (`UpdateBatch`). `split` is the microbatches each step's batch
+        is read in, its rows split evenly, and `remat` what the step recomputes, each "auto", the planner's
+        (`compile`), by default; under a mesh of pipeline stages `microbatches` is those the stages feed, a
+        multiple of them, None one a stage (`FitPolicy`). `mesh` is a `MeshSpec` or a native
+        `jax.sharding.Mesh` of any axes. `advanced` holds the rest, what a run sets where it lays its state
+        out, steps, measures or inspects otherwise than by default (`TrainerAdvanced`).
         """
+        advanced = TrainerAdvanced() if advanced is None else advanced
+        if isinstance(optimizer, OptimizerSpec):
+            optimizer = OptimConfig(optimizer=optimizer, lr=lr, schedule=schedule, clip=clip)
+        elif lr is not None or schedule is not None or clip:
+            raise ValueError(f"lr, schedule and clip set an optimizer spec's run (Trainer(objective, Muon(), "
+                             f"lr=3e-4)); {type(optimizer).__name__} states its own")
+        update = UpdateBatch(batches=accumulation, tokens=update_tokens)
+        fit = FitPolicy(split=split, remat=remat, microbatches=microbatches)
+        layout, rollout, step, record = advanced.layout, advanced.rollout, advanced.step, advanced.record
+        inspection, diloco, sampled_passes = advanced.inspection, advanced.diloco, advanced.sampled_passes
+        dynamic_scale, links, data_resume = advanced.dynamic_scale, advanced.links, advanced.data_resume
         self.objective = objective
         # A config's groups take what the objective draws fresh (`OptimConfig.claiming`); a built one keys.
         self._given = optimizer if isinstance(optimizer, optax.GradientTransformation) else None
@@ -349,10 +379,10 @@ class Trainer(Generic[Loss, Effects]):
         # An update's steps are its batches, or one until `fit` reads its tokens' (`UpdateBatch.of_tokens`).
         self.update, self.fit_policy, self.accumulation = update, fit, update.stated_batches
         self._update_read = update.tokens is None
-        self.split = split = fit.stated_split
+        self.split = stated = fit.stated_split
         # How a resume treats its data (`DataResume`): relaxed starts it again where its plan differs.
         self.data_resume: DataResume = data_resume
-        self.skip_nonfinite = skip_nonfinite
+        self.skip_nonfinite = advanced.skip_nonfinite
         self._microbatches, self._loss_scale = fit.microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
@@ -363,10 +393,10 @@ class Trainer(Generic[Loss, Effects]):
         _refuse_two_remats(objective, fit)
         self.record = record
         self.records: list[Recorded] = []
-        self.profile = profile
-        self.lower_for, self.tune_kernels = lower_for, tune_kernels
-        self.inspection, self.param_dtype, self.diloco = inspection, param_dtype, diloco
-        self.phase_passes = PhasePasses.of(objective, phase_passes, sampled_passes)
+        self.profile = advanced.profile
+        self.lower_for, self.tune_kernels = advanced.lower_for, advanced.tune_kernels
+        self.inspection, self.param_dtype, self.diloco = inspection, advanced.param_dtype, diloco
+        self.phase_passes = PhasePasses.of(objective, advanced.phase_passes, sampled_passes)
         # The later data phases' steps of the fit in progress, planned off its loop (`LaterPlans`).
         self._later: LaterPlans | None = None
         if diloco is not None:
@@ -375,7 +405,7 @@ class Trainer(Generic[Loss, Effects]):
         # compile found (`Compiled`), which `plan`, `memory`, `executable`, `step_flops` and `links` read.
         # A step compiled ahead is taken once the process is readied (`_handed_ahead`): constructing a trainer
         # opens no backend.
-        self._ahead_handed = ahead
+        self._ahead_handed = advanced.ahead
         self._compiler = StepCompiler(objective, links, None, self.phase_passes, fit.remat)
         self._compiled: Compiled | None = None
         # Whether a step has run since the last compile proved its plan fits (`memory`).
@@ -387,7 +417,7 @@ class Trainer(Generic[Loss, Effects]):
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
         # The run's batches' cut (`RunShape`); a layout stated is kept, `Layout()` too (row 9016).
-        self._shape, self._layout_stated = RunShape(split=split), layout is not None
+        self._shape, self._layout_stated = RunShape(split=stated), layout is not None
         self._given_layout = Layout() if layout is None else layout
         self._laid_out(self._given_layout)
 

@@ -11,6 +11,7 @@ import optax
 import orbax.checkpoint as ocp
 import pytest
 from etils import epath
+from model_support import attending
 
 from dew.batch import FROZEN
 from dew.checkpoints import FROZEN_STORE, Checkpoints
@@ -32,7 +33,7 @@ def records(rows):
 
 def model():
     return CausalTransformer(vocab_size=16, emb_features=32, num_layers=2, num_heads=2,
-                             mlp_features=64, max_seq_len=16, dtype="float32", attention_impl="xla")
+                             mlp_features=64, max_seq_len=16, dtype="float32")
 
 
 def adapted_run(directory, steps: int, *, keep: int = 3) -> tuple[Trainer, Checkpoints, object]:
@@ -54,6 +55,7 @@ def recorded(checkpoints: Checkpoints, step: int) -> dict:
     return checkpoints._open().metadata(step).custom_metadata["frozen"]
 
 
+@attending("xla")
 def test_a_lora_run_writes_its_frozen_base_once_and_each_step_holds_its_factors(tmp_path):
     """Three checkpoints of a LoRA run record one digest for the base under
     `frozen`, written once to the store, and each step's written tree holds
@@ -78,6 +80,7 @@ def test_a_lora_run_writes_its_frozen_base_once_and_each_step_holds_its_factors(
         np.testing.assert_array_equal(np.asarray(saved), np.asarray(back))
 
 
+@attending("xla")
 def test_a_resume_from_the_store_trains_on_bitwise_as_an_uninterrupted_run(tmp_path):
     """Two steps, a resume and a third land where three uninterrupted steps
     do, every leaf of the state bitwise."""
@@ -89,6 +92,7 @@ def test_a_resume_from_the_store_trains_on_bitwise_as_an_uninterrupted_run(tmp_p
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
 
+@attending("xla")
 def test_a_stored_collection_whose_content_changed_is_refused(tmp_path):
     """The store's copy of the base, rewritten with one weight moved, no
     longer has the digest the step recorded, and the restore says so."""
@@ -119,6 +123,7 @@ class Counting(Objective):
                 Aux(metrics={}, variables={"count": {"n": variables["count"]["n"] + 1}}))
 
 
+@attending("xla")
 def test_part_of_a_stored_collection_restores_as_a_bank_reader_asks_for_it(tmp_path):
     """A template naming one layer of the stored frozen base, as a bank reader's
     does, reads that layer alone, equal to the whole read's; the content
@@ -162,6 +167,7 @@ def test_a_stored_collection_stays_while_a_kept_step_records_it_and_goes_with_th
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
 
+@attending("xla")
 def test_the_adapter_and_its_task_load_from_a_run_whose_base_is_stored_once(tmp_path):
     """`Adapter.from_run` reads the factors and the stored base back, and
     computes what the trained adapter computes."""
@@ -296,6 +302,7 @@ print(json.dumps({
 """
 
 
+@attending("xla")
 def test_a_run_restores_in_a_new_process_onto_another_mesh_and_dtype(tmp_path):
     """A LoRA run's checkpoint read by a new process onto a two-device fsdp
     mesh in bf16: the step's leaves and the store's frozen base come back in

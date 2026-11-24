@@ -11,7 +11,7 @@ import pytest
 from flax import linen as nn
 
 from dew.objectives.supervised import Supervised
-from dew.training import Trainer
+from dew.training import Trainer, TrainerAdvanced
 
 
 def test_a_named_input_run_over_a_grain_iterable_reads_its_first_record_once():
@@ -60,7 +60,8 @@ def test_a_named_input_run_resumed_exactly_over_a_changed_plan_reads_no_record_b
                         loading=Loading(workers=0),
                         resume="exact")
         objective = Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x")
-        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), data_resume="exact",
+        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0),
+                          advanced=TrainerAdvanced(data_resume="exact"),
                           checkpoints=Checkpoints(str(tmp_path)))
         return trainer.fit(chain, steps=steps, log_every=100, checkpoint_every=1)
 

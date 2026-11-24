@@ -105,7 +105,7 @@ def exported(args) -> dict:
     def built(fields):
         """The decoder of `fields`, its variables, those placed across the pool, every layer's attention
         extended by DEX, and the placed decoder's bundle."""
-        model = models.build("causal_transformer", **fields, scan_layers=args.scan)
+        model = models.build("causal_transformer", **fields)
         variables = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32)))
         placed = HeldBanks(variables).place(model, mesh=MeshSpec(fsdp=args.fsdp_size),
                                             layout=Layout(min_shard=TINY_SHARD, tolerance=1.0))
@@ -235,7 +235,12 @@ def main(argv=None) -> None:
     parser = worker_parser(MODES, __doc__)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--scan", action="store_true", help="the decoder scans its runs of like layers")
-    serve_mode(MODES, parser.parse_args(argv))
+    args = parser.parse_args(argv)
+    from dew.nn.kernels import generation
+
+    # The choice a parent process made, which a child inherits only as told (`generation.Choice.LAYER_SCAN`).
+    with generation.chosen(layer_scan="scanned" if args.scan else "plain"):
+        serve_mode(MODES, args)
 
 
 if __name__ == "__main__":

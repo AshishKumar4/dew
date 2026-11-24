@@ -27,6 +27,7 @@ from kimi_support import (
     kimi_source,
     recorded_dew,
 )
+from model_support import attending
 from recorded_runs import assert_as_exact_as_recorded
 from reference_error import ieee_fixture
 
@@ -39,6 +40,7 @@ TINY = ROOT / "kimi-k3-tiny"
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def source():
     return kimi_source(TINY)
 
@@ -61,6 +63,7 @@ draw = drawn_batch
 dew = recorded_dew(TINY, OUTPUTS)
 
 
+@attending("reference")
 def test_forward_and_cached_decode_match_the_reference_over_left_padding():
     """fp32 logits over drawn batches of 70 tokens (past one KDA chunk), one row left-padded by 9, and the
     first row's cached decode (40 tokens prefilled, then one a step), on par with fla 0.5.2's on CUDA with
@@ -71,6 +74,7 @@ def test_forward_and_cached_decode_match_the_reference_over_left_padding():
                                 "Kimi K3's logits and cached decode")
 
 
+@attending("reference")
 def test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference(source):
     """One all-parameter SGD step at the reference's learning rate (1e-2,
     which moves the logits by up to 4.2). The loss is within 1e-5 of the
@@ -85,6 +89,7 @@ def test_one_sgd_step_updates_the_logits_as_exactly_as_the_reference(source):
     assert_update_as_exact(source, TINY)
 
 
+@attending("reference")
 def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
     """The model stepped once (`sgd_step`, whose numerics the test above holds,
     apart so each fits its group, ledger 4330) and exported: the export writes
@@ -109,6 +114,7 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
         np.testing.assert_array_equal(np.asarray(after), before, err_msg=name)
 
 
+@attending("reference")
 def test_greedy_generation_and_decode_steps_match_the_reference(source):
     """Four greedy tokens from both rows through the cached KDA recurrence and
     MLA cache, held as tests/test_generate_reference.py holds greedy decoding.
@@ -120,6 +126,7 @@ def test_greedy_generation_and_decode_steps_match_the_reference(source):
     assert_greedy_as_exact(source)
 
 
+@attending("reference")
 @pytest.mark.parametrize("param_dtype", ["bfloat16", "auto"])
 def test_a_narrow_storage_load_holds_the_float32_loads_weights_rounded_once(source, param_dtype):
     """K3 nests its decoder under text_config, which its language model alone reads whole as its
@@ -127,7 +134,7 @@ def test_a_narrow_storage_load_holds_the_float32_loads_weights_rounded_once(sour
     experts decode in float32 and every leaf is the float32 load's, rounded once to the storage dtype
     (bfloat16, the config's own for 'auto')."""
     loaded, _, _ = source
-    narrow = Pretrained.load(TINY, dtype="float32", param_dtype=param_dtype, attention_impl="reference",
+    narrow = Pretrained.load(TINY, dtype="float32", param_dtype=param_dtype,
                              text_only=True)
     assert jax.tree.structure(narrow.variables) == jax.tree.structure(loaded.variables)
     stored = set()

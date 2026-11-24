@@ -14,6 +14,7 @@ import numpy as np
 import optax
 import pytest
 from etils import epath
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 from test_standalone_evaluation import tiny_decoder
 
@@ -76,6 +77,7 @@ def weights(run: str, *, ema: bool | None = None):
     return adapter.merge(adapter.variables)
 
 
+@attending("xla")
 @pytest.mark.parametrize(("other", "mesh"), [
     ("whole", None), ("frozen", None), pytest.param("whole", STAGED, marks=pytest.mark.mesh(devices=8))],
     ids=["whole", "frozen", "whole-stages"])
@@ -102,6 +104,7 @@ def test_a_lora_run_and_a_fine_tune_average_their_effective_weights_as_float64_d
     assert average.runs == ((str(epath.Path(runs[0])), 2, False), (str(epath.Path(runs[1])), 1, False))
 
 
+@attending("xla")
 @pytest.mark.parametrize("mesh", [None, pytest.param(STAGED, marks=pytest.mark.mesh(devices=8))],
                          ids=["data", "stages"])
 def test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read_where_it_keeps_one(
@@ -172,12 +175,14 @@ def test_two_runs_subnormal_leaves_average_as_float64_rounds_them():
     assert running(*[np.full(3, tiny)] * 3).tolist() == [tiny] * 3
 
 
+@attending("xla")
 def test_one_run_does_not_average(tmp_path):
     """An average is of two or more runs: a single run is refused."""
     with pytest.raises(ValueError):
         averaged([trained(tmp_path / "run", 1, adapted=False)])
 
 
+@attending("xla")
 def test_runs_trained_under_other_remat_and_dropout_average_and_other_computations_are_refused_by_name(
         tmp_path):
     """Two runs of one model, one recomputing its blocks (`remat`, which the memory plan picks for each

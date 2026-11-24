@@ -26,8 +26,7 @@ from dew.rl.aggregation import LABEL, Teacher
 from dew.rl.env import Batched
 from dew.rl.evaluation import episodes
 from dew.rl.flight import TEACHER, FlightEnv, GateRace, Racing
-from dew.training import Trainer
-from dew.training.budget import Horizon
+from dew.training import Trainer, TrainerAdvanced
 
 WORLD_MODEL, ACTOR_CRITIC = "dew.objectives.rl.dreamer:WorldModel", "dew.objectives.rl.control:ActorCritic"
 DREAMER_V3 = "dew.objectives.rl.dreamer:DreamerV3Objective"
@@ -42,7 +41,7 @@ TINY = {"deter": 16, "hidden": 8, "stoch": 4, "classes": 4, "blocks": 2, "units"
 """A world model's widths at a test's size."""
 DYNAMICS = {"action_size": 4, "stoch": 4, "classes": 4, "width": 16, "layers": 1, "heads": 2, "context": 4}
 """TransDreamer's dynamics at a test's size, over windows of 4 steps."""
-OPTIM = OptimConfig(optimizer=Adam(), learning_rate=1e-3)
+OPTIM = OptimConfig(optimizer=Adam(), lr=1e-3)
 
 
 def racing() -> Racing:
@@ -50,7 +49,7 @@ def racing() -> Racing:
 
 
 def trainer(root: Path, steps: int, **fields) -> TrainerConfig:
-    return TrainerConfig(checkpoint_dir=str(root), horizon=Horizon(steps=steps), log_every=1, eval_every=None,
+    return TrainerConfig(checkpoint_dir=str(root), steps=steps, log_every=1, eval_every=None,
                          checkpoint_every=None, multi_host=False, **fields)
 
 
@@ -89,7 +88,8 @@ def fitted(run: EnvRunConfig, objective, rollout, steps: int):
     """`objective` trained `steps` updates over `rollout` by a trainer composed in Python, on the loader the
     run's rollout replaces, under the run's numerics, as `RunConfig.train` traces its programs."""
     with generation.run_precision(run.trainer.precision):
-        return Trainer(objective, run.optim, key=0, rollout=rollout).fit(run.prepare().dataset, steps=steps,
+        return Trainer(objective, run.optim, key=0,
+                       advanced=TrainerAdvanced(rollout=rollout)).fit(run.prepare().dataset, steps=steps,
                                                                          log_every=1)
 
 
@@ -135,7 +135,7 @@ def test_a_run_from_its_record_trains_as_the_run_composed_in_python(tmp_path, co
 
     run, objective, rollout = composed(tmp_path)
     state = run.prepare().train("record")
-    assert_bitwise(state, fitted(run, objective, rollout, run.trainer.horizon.steps))
+    assert_bitwise(state, fitted(run, objective, rollout, run.trainer.steps))
     saved = RunConfig.load(str(tmp_path / "record"))
     with Compiles("step") as again:
         retrained = saved.prepare().train("again")
@@ -144,7 +144,7 @@ def test_a_run_from_its_record_trains_as_the_run_composed_in_python(tmp_path, co
     if composed is dreamer:
         with Compiles("step") as changed:
             saved.override({"objective.horizon": 100.0,
-                            "trainer.horizon.steps": 1}).prepare().train("horizon")
+                            "trainer.steps": 1}).prepare().train("horizon")
         assert any(program.kind == "traced" for program in changed.programs)
 
 
@@ -181,7 +181,7 @@ def test_a_runs_episodes_score_its_flights_from_the_evaluations_key(tmp_path, ag
         flown = episodes(policy, race, 8, memory=objective.memory)
     with generation.run_precision(run.trainer.precision):
         expected = flown(state.variables if state.ema is None else state.averaged,
-                         evaluation_key(state.key, run.trainer.horizon.steps))
+                         evaluation_key(state.key, run.trainer.steps))
     assert logged == {f"episodes/{name}": value for name, value in expected.items()}
 
 
@@ -299,9 +299,9 @@ def test_a_resumed_run_ends_as_the_run_that_never_stopped(tmp_path, agent):
         assert isinstance(prepared_whole.rollout, DreamerRollout)
         assert [path for path, leaf in jax.tree_util.tree_leaves_with_path(prepared_whole.rollout.saved())
                 if getattr(leaf, "weak_type", False)] == []
-    run.override({"trainer.horizon.steps": 2}).prepare().train("stopped")
+    run.override({"trainer.steps": 2}).prepare().train("stopped")
     assert_bitwise(whole, run.prepare().train("stopped"))
-    next_run = run.override({"trainer.horizon.steps": 5, "env.difficulty": 0.5})
+    next_run = run.override({"trainer.steps": 5, "env.difficulty": 0.5})
     if agent == "dreamer":
         next_run = dataclasses.replace(
             next_run,
@@ -311,7 +311,7 @@ def test_a_resumed_run_ends_as_the_run_that_never_stopped(tmp_path, agent):
     assert int(next_run.prepare().train("stopped").step) == 5
     refused = {"objective.discount": 0.5} if agent == "ppo" else {"objective.horizon": 100.0}
     with pytest.raises(ValueError):
-        next_run.override({"trainer.horizon.steps": 6, **refused}).prepare().train("stopped")
+        next_run.override({"trainer.steps": 6, **refused}).prepare().train("stopped")
 
 
 REFUSED = {

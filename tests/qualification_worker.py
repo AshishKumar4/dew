@@ -33,11 +33,12 @@ from dew.data.compile import compile
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.sources.tokens import TokenFiles
 from dew.interop import Pretrained
+from dew.nn.kernels import generation
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.state import without_empty_window
 from dew.telemetry.instrumentation import compilation_cache_counts
-from dew.training import Trainer, UpdateBatch
+from dew.training import Trainer, TrainerAdvanced
 from dew.training.runtime import prepare_process
 from dew.training.tracker import LocalTracker
 
@@ -59,7 +60,7 @@ def write_reference(path: Path, source, variables, probe, step) -> None:
     """The fp32 loss of the probe batch and each source tensor's gradient,
     from the model at its reference attention, with fp32 matmuls on any
     backend (a GPU's default is TF32-class)."""
-    parity = LMObjective(source.model.clone(dtype=jnp.float32, attention_impl='reference'),
+    parity = LMObjective(source.model.clone(dtype=jnp.float32),
                          SEQUENCE, ema_decay=None)
 
     def reference_loss(params):
@@ -98,10 +99,10 @@ def export(run: Path, source, variables, probe) -> None:
     """Save the trained variables in the source's format, reload them, and
     hold the reload's fp32 logits on the probe to the trained model's."""
     source.save(run / "export", variables=variables)
-    reloaded = Pretrained.load(run / "export", dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(run / "export", dtype="float32")
     ids = jnp.asarray(probe["text"][:, :-1])
-    with jax.default_matmul_precision("highest"):
-        expected = source.model.clone(dtype=jnp.float32, attention_impl='reference').apply(variables, ids)
+    with jax.default_matmul_precision("highest"), generation.chosen(attention="reference"):
+        expected = source.model.clone(dtype=jnp.float32).apply(variables, ids)
         actual = reloaded.model.apply(reloaded.variables, ids)
     np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-4, rtol=0)
     np.savez(run / "export_logits.npz", ids=np.asarray(ids), logits=np.asarray(actual))
@@ -126,7 +127,7 @@ def run(directory: Path, mode: str) -> None:
                 write_atomically(directory / "ready-to-kill", str(os.getpid()))
                 threading.Event().wait()
 
-    source = Pretrained.load(directory / "source", dtype="float32", attention_impl="xla")
+    source = Pretrained.load(directory / "source", dtype="float32")
     objective = LMObjective(source.model.clone(dropout_rate=0.1), SEQUENCE,
                             variables=source.variables, ema_decay=0.9)
     tokens = directory / "tokens"
@@ -137,7 +138,7 @@ def run(directory: Path, mode: str) -> None:
     data = compile(train, validation=held, read="memory", seed=17, loading=Loading(workers=0, threads=1))
     trainer = Trainer(objective, optax.chain(optax.clip_by_global_norm(0.5),
                                              optax.adamw(0.003, weight_decay=0.01)), key=jax.random.key(11),
-                      update=UpdateBatch(batches=2), dynamic_scale=True, checkpoints=checkpoints,
+                      accumulation=2, advanced=TrainerAdvanced(dynamic_scale=True), checkpoints=checkpoints,
                       tracker=Interrupting(out / "metrics"))
     before, _, before_position = trainer.place()
     assert mode != "resumed" or mid_accumulation(before), "the resume lost the accumulated gradient"
@@ -171,4 +172,6 @@ def run(directory: Path, mode: str) -> None:
 
 
 if __name__ == "__main__":
-    run(Path(sys.argv[1]), sys.argv[2])
+    # The run's attention xla's, its export's held to the reference path (`export`).
+    with generation.chosen(attention="xla"):
+        run(Path(sys.argv[1]), sys.argv[2])

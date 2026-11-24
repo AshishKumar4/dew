@@ -53,6 +53,7 @@ from reference_error import distance
 from dew.interop import Pretrained
 from dew.nn.fake_quant import FakeQuantizing, straight_through
 from dew.nn.inputs import ModelInputs
+from dew.nn.kernels import generation
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 
@@ -369,7 +370,7 @@ def noise() -> dict[str, float]:
     """The largest distance between Dew's and the reference's inputs to the
     roundings and selections of both forwards: a quantizer's input over its
     block's amax, a top-k row over its largest finite magnitude."""
-    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(TINY, dtype="float32")
     reference = np.load(TINY / "reference.npz")
     ids = jnp.asarray(reference["input_ids"])
     measured = {}
@@ -486,7 +487,7 @@ def residuals() -> dict[str, object]:
     compiled quantizer does not reproduce bit for bit. The twins agree with
     the truth to float64 rounding, so the fp32 runs differ from it by fp32
     rounding alone."""
-    loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(TINY, dtype="float32")
     reference, truth = np.load(TINY / "reference.npz"), np.load(TINY / "reference_f64.npz")
     measured: dict[str, object] = {f"qat_{site}_mismatches": int(np.sum(
         np.asarray(jax.jit(quantize)(jnp.asarray(reference[f"qat_{site}_in"]))).view(np.uint32)
@@ -502,7 +503,7 @@ def residuals() -> dict[str, object]:
         measured[f"{prefix}selection_rows"] = apart(*scores(record, reference, truth, prefix))
     vision = np.load(TINY / "vision.npz")
     with tempfile.TemporaryDirectory() as directory:
-        bundle = Pretrained.load(vision_bundle(Path(directory)), dtype="float32", attention_impl="reference")
+        bundle = Pretrained.load(vision_bundle(Path(directory)), dtype="float32")
         given, wide, _ = decided(lambda model, variables: vision_run(model, variables, vision),
                                  bundle.model, bundle.variables)
     for name, value, twin in zip(("vision_span", "vision_prompt_logits", "vision_decode_logits"),
@@ -522,4 +523,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with generation.chosen(attention="reference"):
+        main()

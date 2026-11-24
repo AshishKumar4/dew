@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 from lane_environment import outside_suite
 from diffusion_stubs import RES, TOKENS, StubText
+from model_support import attending
 from PIL import Image
 from process_support import dew_train, logged_losses, raised
 from test_inference import make_run
@@ -84,6 +85,7 @@ def test_readme_demo_resumes_updates_its_policy_freezes_the_reference_and_draws_
                                   np.concatenate(list(uint8_pixels(preview)), axis=1))
 
 
+@attending("reference")
 def test_text_to_image_example_records_requested_seeds_and_their_real_pixels(tmp_path, monkeypatch):
     """A trained local DiT and real tiny CLIP render the manifest's prompts and keys."""
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
@@ -245,14 +247,14 @@ def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_n
         return logged_losses(directory / "train_supervised")
 
     settings = {"trainer.name": "train_supervised", "trainer.checkpoint_dir": str(tmp_path / "first"),
-                "trainer.horizon.steps": 6, "trainer.log_every": 1, "model.hidden": 8}
+                "trainer.steps": 6, "trainer.log_every": 1, "model.hidden": 8}
     (tmp_path / "set_supervised.py").write_text(
         "from train_supervised import run as built\n"
         f"run = (built() if callable(built) else built).override({settings!r})\n")
     train(str(tmp_path / "set_supervised.py"))
     record = tmp_path / "first" / "train_supervised" / "run.json"
     written = json.loads(record.read_text())["fields"]
-    assert written["trainer"]["horizon"]["steps"] == 6 and written["model"]["fields"]["hidden"] == 8
+    assert written["trainer"]["steps"] == 6 and written["model"]["fields"]["hidden"] == 8
     assert written["objective"]["fields"]["loss"] == {"function": "train_supervised:cross_entropy"}
 
     again = {"trainer.name": "train_supervised", "trainer.checkpoint_dir": str(tmp_path / "again")}

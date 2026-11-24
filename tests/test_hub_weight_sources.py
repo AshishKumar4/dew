@@ -25,7 +25,7 @@ import sys
 import numpy as np
 from flax.traverse_util import flatten_dict
 from dew.interop import Pretrained
-loaded = Pretrained.load(sys.argv[1], dtype="float32", attention_impl="reference")
+loaded = Pretrained.load(sys.argv[1], dtype="float32")
 flat = flatten_dict(loaded.variables)
 np.savez(sys.argv[2], **{"/".join(path): np.asarray(leaf) for path, leaf in flat.items()})
 """
@@ -112,7 +112,7 @@ tokens, root = sys.argv[1:3]
 chain = TokenFiles(tokens).pipe(presets.lm, None, seq_len=8, batch=8, pack=None).loading(Loading(workers=0))
 LMRunConfig.cli(["--pretrained", "local/llama", "--tokenizer", "local/llama", "--trainer.name", "run",
                  "--trainer.checkpoint-dir", root,
-                 "--trainer.horizon.steps", "1", "--trainer.compilation-cache-dir", "None",
+                 "--trainer.steps", "1", "--trainer.compilation-cache-dir", "None",
                  "--trainer.multi-host",
                  "False", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "1",
                  "--max-new-tokens", "0"], default=LMRunConfig(data=chain)).run()
@@ -130,7 +130,7 @@ from dew.registry import ModelConfig
 table, root = sys.argv[1:3]
 rows = Files(table, format="csv").pipe(decisions, question="team").read("memory").batch(8)
 DecisionRunConfig.cli(["--pretrained", "local/chat", "--trainer.name", "run",
-                       "--trainer.checkpoint-dir", root, "--trainer.horizon.steps", "1",
+                       "--trainer.checkpoint-dir", root, "--trainer.steps", "1",
                        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
                        "--trainer.eval-every", "None",
                        "--trainer.checkpoint-every", "1", "--no-calibrate"],

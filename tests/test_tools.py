@@ -433,8 +433,7 @@ def test_residual_orders_preserve_the_tiny_nemotron_function():
 
     from dew.interop import Pretrained
 
-    loaded = Pretrained.load(FIXTURES / 'hf/nemotron-h-moe-tiny', dtype='float32',
-                             attention_impl='reference')
+    loaded = Pretrained.load(FIXTURES / 'hf/nemotron-h-moe-tiny', dtype='float32')
     order = np.array([3, 0, 12, 5, 10, 1, 8, 7, 2, 14, 4, 13, 6, 15, 9, 11])
     ids = jnp.array([[2, 7, 11, 3]], jnp.int32)
     axes = model_axes(loaded.model, ids)
@@ -480,7 +479,7 @@ def test_residual_orders_preserve_a_looped_ngpt():
 
     from dew.interop import Pretrained
 
-    loaded = Pretrained.load(FIXTURES / 'hf/dory-tiny', dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(FIXTURES / 'hf/dory-tiny', dtype='float32')
     ids = jnp.array([[2, 7, 11, 3, 5, 1, 9, 4]], jnp.int32)
     axes = model_axes(loaded.model, ids)
     with jax.enable_x64(new_val=True):
@@ -750,7 +749,7 @@ def parameter_movement(models, case, steps: int = 2):
         return {jax.tree_util.keystr(path): leaf
                 for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
-    trainer = models.build_trainer(case, "reference")
+    trainer = models.build_trainer(case)
     with models.compiled_step(case, trainer) as compiled:
         before = jax.tree.map(np.asarray, named(compiled.state.variables))  # the step consumes the state
         state, loss, finite, _ = models.timed_steps(compiled.step, compiled.state, steps)
@@ -765,7 +764,7 @@ def parameter_movement(models, case, steps: int = 2):
 def test_step_benchmark_native_diffusion_trains_text_and_pooled_conditioning(architecture, monkeypatch):
     cases, models = owners(monkeypatch)
     case = composite_case(cases, architecture)
-    trainer = models.build_trainer(case, "reference")
+    trainer = models.build_trainer(case)
     encoder = trainer.objective.inputs.conditions["conditioning"].encoder
     encoded = encoder.encode(encoder.params, models.global_batch(case)["text"])
     assert encoded.context.shape == (case.batch_size, cases.TEXT_TOKENS,

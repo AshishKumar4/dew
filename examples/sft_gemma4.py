@@ -39,8 +39,7 @@ from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.optim import AdamW, OptimConfig
 from dew.registry import ModelConfig
 from dew.state import TrainState
-from dew.training import MeshSpec, UpdateBatch, prepare_process
-from dew.training.budget import Horizon
+from dew.training import MeshSpec, prepare_process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 SMOKE_MODEL = FIXTURES / "hf/gemma4-ple"
@@ -113,13 +112,13 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
                     .read(config.data_read).loading(loading)),
         tokenizer=tokenizer,
         max_new_tokens=4 if smoke else 64,
-        optim=OptimConfig(learning_rate=config.learning_rate, optimizer=AdamW(weight_decay=0.0),
-                          clip_grads=1.0),
+        optim=OptimConfig(lr=config.learning_rate, optimizer=AdamW(weight_decay=0.0),
+                          clip=1.0),
         # A smoke run stays out of any process pool; a real run joins one
         # when a cluster started it and runs alone otherwise.
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
-                              horizon=Horizon(steps=config.steps),
-                              update=UpdateBatch(batches=config.accumulation), log_every=1 if smoke else 20,
+                              steps=config.steps,
+                              accumulation=config.accumulation, log_every=1 if smoke else 20,
                               eval_every=config.steps, checkpoint_every=config.steps,
                               multi_host=False if smoke else None, compilation_cache_dir=None if smoke else
                               TrainerConfig().compilation_cache_dir))
@@ -139,7 +138,6 @@ def main(config: Config) -> Path:
     run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
     source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
-                                    attention_impl="xla" if config.smoke else "auto",
                                     max_seq_len=config.sequence_length + run.max_new_tokens,
                                     on_host=True)  # the trainer places it over its fsdp mesh
     words = HFTokenizer(tokenizer)
@@ -152,8 +150,11 @@ def main(config: Config) -> Path:
                         sampling=run.sampling, decode=words.decode))
 
     # run.json records the model as loaded, so `dew.pipeline` and the export
-    # rebuild the checkpoint's own architecture at the precision it trained in.
-    run = replace(run, model=ModelConfig.from_model(source.model))
+    # rebuild the checkpoint's own architecture at the precision it trained in; a smoke run's attention
+    # XLA's, every other the selector's.
+    run = replace(run, model=ModelConfig.from_model(source.model), diagnostics=replace(
+        run.diagnostics, kernels={**run.diagnostics.kernels, "attention": "xla"} if config.smoke
+        else run.diagnostics.kernels))
 
     name = config.out.name
     state: TrainState = run.train(objective, run.data, validation=run.validation, name=name,

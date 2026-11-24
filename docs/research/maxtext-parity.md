@@ -602,7 +602,7 @@ Not planned, by design: MaxText's legacy AQT controls, the `minimal_flash` famil
 
 | Knob | What it is | Who ships it and source | Dew today | Gap | Fit |
 |---|---|---|---|---|---|
-| `enable_diloco` | Use infrequent outer-loop synchronization across replicas. | MaxText [base.yml:940][maxtext-base] | Trainer(diloco=DiLoCo(every, rate, momentum)), `--trainer.diloco.*` (`src/dew/training/diloco.py`) | Streaming fragments (staggered partial meetings) are missing. | Runs. |
+| `enable_diloco` | Use infrequent outer-loop synchronization across replicas. | MaxText [base.yml:940][maxtext-base] | TrainerAdvanced(diloco=DiLoCo(every, rate, momentum)), `--trainer.diloco.*` (`src/dew/training/diloco.py`) | Streaming fragments (staggered partial meetings) are missing. | Runs. |
 | `diloco_sync_period` | Local steps between DiLoCo synchronizations. | MaxText [base.yml:941][maxtext-base] | `DiLoCo.every`, windows of updates between meetings | Streaming fragments (staggered partial meetings) are missing. | Runs. |
 | `diloco_outer_lr` | DiLoCo outer optimizer learning rate. | MaxText [base.yml:942][maxtext-base] | `DiLoCo.rate`, Nesterov SGD's | Streaming fragments (staggered partial meetings) are missing. | Runs. |
 | `diloco_outer_momentum` | DiLoCo outer optimizer momentum. | MaxText [base.yml:943][maxtext-base] | `DiLoCo.momentum` | Streaming fragments (staggered partial meetings) are missing. | Runs. |

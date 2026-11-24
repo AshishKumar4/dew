@@ -23,6 +23,7 @@ import selection_margins
 from affine_run import dataset
 from flax import linen as nn
 from lm_support import token_batch_of
+from model_support import attending
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, over_windows, summed_as_run, widened, windows
 
@@ -35,7 +36,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.objectives.routing import ExpertBalance
 from dew.sampling import Sampling
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -55,7 +56,7 @@ def tiny_decoder(**options):
     """The native decoder at test size: two layers of 16 features in float32,
     attention through XLA so the CPU runs the same kernel everywhere."""
     return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
-                             mlp_features=32, max_seq_len=64, dtype="float32", attention_impl="xla",
+                             mlp_features=32, max_seq_len=64, dtype="float32",
                              **options)
 
 
@@ -150,6 +151,7 @@ SHIFTED_SEEDS = 8
 
 # --- the loss --------------------------------------------------------------
 
+@attending("xla")
 def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
     """Over drawn decoders and tokens, the loss of the objective the registry builds (`objectives.build`,
     as a configured run's is) on par with the cross entropy of each token's next (check 1), which differs
@@ -186,6 +188,7 @@ class AliasedLanguageModel(NativeLanguageModel):
         return self(tokens, **fields)
 
 
+@attending("xla")
 def test_a_native_models_call_is_scored_with_no_method_that_forwards_to_it():
     """A model whose `__call__` gives its logits and which names no `logits` is scored by its own forward
     (`forward_method`), as a caller of `apply` reads it: the objective's loss over it and its gradient are
@@ -259,6 +262,7 @@ def test_a_bridged_nnx_models_own_methods_are_read_before_its_forward():
     assert forward_method(plain, "logits") == forward_method(plain, "hidden_states") == "__call__"
 
 
+@attending("xla")
 def test_a_native_forward_that_gives_no_logits_is_refused_by_name():
     """A module whose `__call__` gives `[B, S, 6]` beside a vocabulary of `VOCAB` is refused where the
     objective reads it, naming the module and the method read, where its hidden states would have been
@@ -276,6 +280,7 @@ VALID_SEEDS = 8
 """Check 1's declared seeds for the loss of rows whose last token is invalid (`seeds_for`, paired)."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
 def test_the_validity_the_decoder_reads_decides_which_targets_count(given):
     """Rows of three tokens whose last is marked invalid, by the attention
@@ -315,6 +320,7 @@ PADDED_SEEDS = 8
 """Check 1's declared seeds for the loss with its padded targets left out (`seeds_for`, paired)."""
 
 
+@attending("xla")
 def test_padded_targets_are_left_out_of_the_average():
     """Over drawn decoders and tokens, some of them the pad id, the loss on par with the cross entropy of
     the targets that are not (check 1), which differs from every target's."""
@@ -331,6 +337,7 @@ def test_padded_targets_are_left_out_of_the_average():
     assert masked != written_cross_entropy(objective.model)(params, tokens), "masking made no difference"
 
 
+@attending("xla")
 def test_a_padded_target_the_head_gives_no_mass_adds_nothing_to_the_loss_or_its_gradient():
     """A head that never predicts the pad id (its bias -inf there) gives a padded target an infinite
     loss, at weight 0: the loss, its gradient and the perplexity metric over the counted targets are
@@ -356,6 +363,7 @@ def test_a_padded_target_the_head_gives_no_mass_adds_nothing_to_the_loss_or_its_
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+@attending("xla")
 def test_aux_reports_perplexity_and_token_accuracy():
     objective = make_objective()
     params = nn.unbox(objective.init(jax.random.key(0)))
@@ -374,6 +382,7 @@ def test_aux_reports_perplexity_and_token_accuracy():
     np.testing.assert_array_equal(aux.metrics["token_accuracy"], counted_share(right))
 
 
+@attending("xla")
 def test_dropout_runs_on_the_step_key():
     """The loss passes the step key as the dropout rng, so a model with
     dropout is stochastic across keys and reproducible under one."""
@@ -390,6 +399,7 @@ def test_dropout_runs_on_the_step_key():
     assert first != other
 
 
+@attending("xla")
 def test_padded_tokens_are_left_out_of_the_accuracy_too():
     objective = make_objective(pad_id=0)
     params = nn.unbox(objective.init(jax.random.key(0)))
@@ -406,6 +416,7 @@ def test_padded_tokens_are_left_out_of_the_accuracy_too():
 
 # --- what the trainer needs ------------------------------------------------
 
+@attending("xla")
 def test_pretrained_weights_are_what_init_returns():
     """Continued pretraining: the trainer's whole initial state is the
     checkpoint, not a fresh init that happens to have the same shapes."""
@@ -425,12 +436,13 @@ def make_trainer(tmp_path=None, fsdp=1, learning_rate=3e-3, tracker=None, **obje
         optax.adam(learning_rate),
         key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp),
-        layout=Layout(min_shard=TINY),
+        advanced=TrainerAdvanced(layout=Layout(min_shard=TINY)),
         checkpoints=None if tmp_path is None else Checkpoints(str(tmp_path / "lm")),
         tracker=tracker,
     )
 
 
+@attending("xla")
 @pytest.mark.parametrize("fsdp", [1, 4])
 def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
     """The whole seam on the simulated mesh: 8x1 data parallel, then 2x4 FSDP.
@@ -457,10 +469,11 @@ def test_the_objective_trains_through_the_trainer(tmp_path, fsdp):
 
 # --- evaluation ------------------------------------------------------------
 
+@attending("reference")
 def test_evaluation_correctness_is_the_same_full_forward_argmax():
 
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
-                              mlp_features=32, max_seq_len=8, attention_impl="reference")
+                              mlp_features=32, max_seq_len=8)
     objective = LMObjective(model, seq_len=4, ema_decay=None, token_accuracy=False)
     tokens = jnp.asarray([[1, 2, 3, 4, 1], [4, 3, 2, 1, 4]], jnp.int32)
     params = nn.unbox(objective.init(jax.random.key(0)))
@@ -476,6 +489,7 @@ EVALUATED_SEEDS = 8
 (`seeds_for`, paired)."""
 
 
+@attending("xla")
 def test_evaluation_scores_every_target_of_the_batch():
     """Evaluation scores each target at weight one, and over drawn decoders and tokens the targets'
     mean loss on par with their written cross entropy (check 1)."""
@@ -492,6 +506,7 @@ def test_evaluation_scores_every_target_of_the_batch():
                                             seeds=EVALUATED_SEEDS)
 
 
+@attending("xla")
 def test_evaluation_reads_the_ema_copy():
     """Over drawn live and averaged decoders and tokens, evaluation's mean loss on par with the written
     cross entropy of the averaged copy (check 1), and not the live one's."""
@@ -516,6 +531,7 @@ def test_evaluation_reads_the_ema_copy():
     assert live != averaged(params, ids, ema)
 
 
+@attending("xla")
 def test_scoring_with_samples_configured_does_not_decode():
     def fail_decode(ids):
         raise AssertionError("scoring decoded a preview")
@@ -532,11 +548,12 @@ def test_scoring_with_samples_configured_does_not_decode():
                     truth_fn=written_losses(objective.model.clone(dtype=jnp.float64)))
 
 
+@attending("xla")
 def test_preview_generates_reproducible_text_from_ema():
 
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32,
-                              dtype="float32", attention_impl="xla")
+                              dtype="float32")
     objective = LMObjective(
         model,
         seq_len=SEQ,
@@ -552,13 +569,14 @@ def test_preview_generates_reproducible_text_from_ema():
     assert averaged.tokens.shape == (1, 7)
 
 
+@attending("xla")
 def test_a_preview_over_prompts_of_different_lengths_draws_what_each_draws_alone():
     """Two prompts of three and five ids preview together, left-padded as one
     request: each row holds the ids its prompt draws alone, and each text is
     that prompt and its draw, with no padding."""
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32,
-                              dtype="float32", attention_impl="xla")
+                              dtype="float32")
     prompts = [[1, 2, 3], [4, 5, 6, 7, 1]]
 
     def objective_for(prompt):
@@ -642,6 +660,7 @@ class ScoresRead(Perplexity):
         return super().__call__(artifact, batch)
 
 
+@attending("xla")
 def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     """Objective artifacts through the trainer's loop and into the metric:
     two batches of different padding weigh by their counted targets. The
@@ -769,6 +788,7 @@ def scored_by(objective):
         return weighted_mean(*objective.token_scores(params, tokens, coordinates=laid)[:2])
     return scored
 
+@attending("xla")
 def test_a_packed_batch_ignores_the_boundary_and_the_padding():
     """A packed row trains on every transition inside a document and on none across the boundary or
     into the padding, and over drawn decoders and documents its loss is on par with the cross entropy
@@ -800,6 +820,7 @@ def test_a_packed_batch_ignores_the_boundary_and_the_padding():
                     "a packed row's written loss", seeds=PACKED_SEEDS, truth_fn=written(float64_packed()))
 
 
+@attending("xla")
 def test_a_packed_batch_scores_like_its_documents_alone():
     """Packing is only a layout: over drawn decoders and documents, a packed
     row's loss is on par with the two documents' on their own, from the whole
@@ -841,6 +862,7 @@ def test_a_packed_batch_scores_like_its_documents_alone():
                     "the documents' chunked losses", seeds=PACKED_SEEDS, truth_fn=chunked(wide))
 
 
+@attending("xla")
 def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
     """Over drawn decoders and documents, the loss of a batch whose packing comes as `text_coordinates`
     on par with the per-token scores of the packed row (check 1), and not the loss of the same row
@@ -867,6 +889,7 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
         "the packed keys made no difference to the loss")
 
 
+@attending("xla")
 @pytest.mark.parametrize("stale", [("text_segment_ids",), ("text_positions",),
                                   ("text_segment_ids", "text_positions")])
 def test_a_packed_batch_refuses_the_old_packing_columns(stale):
@@ -913,6 +936,7 @@ def assistant_targets(tokens, roles):
     return roles[:, 1:] == Role.ASSISTANT
 
 
+@attending("xla")
 def test_loss_role_counts_only_assistant_targets():
     """With loss_role set, over drawn decoders and tokens the loss is on par
     with the cross entropy over the targets whose role matches (check 1),
@@ -936,6 +960,7 @@ def test_loss_role_counts_only_assistant_targets():
     np.testing.assert_array_equal(aux.metrics["token_accuracy"], counted_share(right, kept))
 
 
+@attending("xla")
 def test_a_roles_column_is_ignored_without_loss_role():
     """The same SFT batch trains every target under a plain LMObjective: over
     drawn decoders and tokens its loss is on par with every target's cross
@@ -948,6 +973,7 @@ def test_a_roles_column_is_ignored_without_loss_role():
     assert_scores_the_written_cross_entropy(loss, drawn_roles, "every target beside roles", seeds=ROLES_SEEDS)
 
 
+@attending("xla")
 def test_evaluation_weights_follow_loss_role():
     objective = make_objective(loss_role=Role.ASSISTANT)
     params = nn.unbox(objective.init(jax.random.key(0)))
@@ -960,6 +986,7 @@ def test_evaluation_weights_follow_loss_role():
     np.testing.assert_array_equal(np.asarray(scores.weights), expected)
 
 
+@attending("xla")
 def test_a_loss_role_run_stepped_on_a_batch_without_roles_is_refused():
     """A run whose objective counts the assistant's targets alone (`loss_role`), trained on a batch the chat
     data path did not lay out (no roles column), is refused by its trainer's step, a ValueError, where it
@@ -982,6 +1009,7 @@ Z_TERM_SEEDS = 256
 `seeds_for` paired with the objective on the CPU."""
 
 
+@attending("xla")
 def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
     """`z_loss * log(Z)^2` per counted target, masked and averaged with the
     cross entropy, as MaxText's `cross_entropy_with_logits` and
@@ -1038,6 +1066,7 @@ Z_LOSS_SEEDS = 32
 one model)."""
 
 
+@attending("xla")
 def test_z_loss_gradient_carries_the_reference_factor():
     """The oracle's logit gradient, `(1 + 2 z log Z) softmax - onehot`, pulled
     back through the model, holds the objective's parameter gradient on par
@@ -1164,6 +1193,7 @@ def test_the_token_batch_key_is_one_of_dew_batch_s_exports():
     assert names.get("TEXT_KEY") == "text"
 
 
+@attending("xla")
 def test_a_batch_with_a_sidecar_held_as_none_is_counted_as_its_loss_reads_it():
     """A batch whose `ModelInputs` lay out its rows and whose `text_coordinates` sidecar is None: the loss
     reads the None as no sidecar, and so do the host's counts of the tokens it scores, one reading of the

@@ -9,7 +9,7 @@ the command line (`dew.config.lm.LMRunConfig`). Its windows are a chain
         https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
     dew data export data/shakespeare.txt data/shakespeare-byte \\
         --format array_record --tokenizer byte --eos --read memory
-    python recipes/lm/train.py --trainer.horizon.epochs 10
+    python recipes/lm/train.py --trainer.epochs 10
 
 Whole documents packed into the windows are a run file's chain: the store packed in its own order
 (`presets.lm(..., pack="first-fit", batch=None)`), then shuffled, repeated and batched

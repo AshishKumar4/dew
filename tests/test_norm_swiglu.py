@@ -28,6 +28,7 @@ from dew.nn import attention, norms
 from dew.nn.activations import gated_product, packed_gated_product
 from dew.nn.kernels import generation, norm_swiglu, tuning
 from dew.nn.norms import RMSNorm, gated_rms_normalized, rms_normalized, stream_rms_normalized
+from dew.training import TrainerAdvanced
 
 pytestmark = pytest.mark.kernel
 
@@ -809,6 +810,11 @@ def test_seam_and_product_run_per_shard_as_on_one_device(split):
                           f"per shard over {split}", seeds=SEEDS["per shard"], truth_fn=portable)
 
 
+def draw_packed(draw: int = 0):
+    """A draw's packed `[4, 8, 2, 24]` gate-and-up pair and its `[4, 8, 24]` cotangent."""
+    return (jax.random.normal(drawn_key(33, draw), (4, 8, 2, 24)),
+            jax.random.normal(drawn_key(34, draw), (4, 8, 24)))
+
 @pytest.mark.mesh(devices=2)
 def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_operands():
     """On an explicit mesh splitting the rows, no logical axes named: the operands' own types place the
@@ -853,10 +859,6 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
     # Packed SwiGLU (`[..., 2, H]`) also runs per shard on an Explicit mesh with axes=None or MLP_HIDDEN
     # (splitting rows or features) and refuses splitting the pair axis `-2` (row 822).
 
-    def draw_packed(draw: int = 0):
-        return (jax.random.normal(drawn_key(33, draw), (4, 8, 2, 24)),
-                jax.random.normal(drawn_key(34, draw), (4, 8, 24)))
-
     def packed_run(a, d):
         return evaluated(fused_packed(axes=MLP_HIDDEN), (a,), d)
 
@@ -886,13 +888,16 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
         with generation.assumed("sm90"):
             assert norm_swiglu.packed_swiglu_kernel("pallas", r3_p) == "pallas"
         assert not any(eq.primitive.name == "reshard" for eq in traced(packed_ref, r3_p, r3_d))
-    raw_p, raw_d = draw_packed()
+    # A pair the mesh splits is refused by the kernel and moved onto the hidden width by the product
+    # (`whole_along`, row 12225): its output split there, each device's share on par with one device's, the
+    # move the one exchange it makes (a share computed at another width rounds its transcendental apart).
+    moved = [PartitionSpec(None, None, "data", None), PartitionSpec(None, None, "data")]
     for dtype in (jnp.float32, jnp.bfloat16):
-        p_dt, d_dt = raw_p.astype(dtype), raw_d.astype(dtype)
-        expected_y, expected_dx = jax.jit(packed_ref)(p_dt, d_dt)
+        def draw_typed(draw: int = 0, dtype=dtype):
+            return tuple(x.astype(dtype) for x in draw_packed(draw))
+
         with jax.set_mesh(mesh):
-            bad_pair, bad_dy = placed_on((p_dt, d_dt), [PartitionSpec(None, None, "data", None),
-                                                        PartitionSpec()], mesh)
+            bad_pair, _ = placed_on(draw_typed(), moved, mesh)
             for named_axes in (None, MLP_HIDDEN):
                 if dtype == jnp.float32:
                     with generation.assumed("sm90"):
@@ -900,19 +905,19 @@ def test_seam_and_product_run_per_shard_where_an_explicit_mesh_places_their_oper
                         assert norm_swiglu.packed_swiglu_kernel("pallas", bad_pair, axes=named_axes) == "xla"
                         with generation.chosen(swiglu="pallas"), pytest.raises(selection.KernelRefused):
                             norm_swiglu.packed_swiglu_kernel("auto", bad_pair, axes=named_axes)
-                for impl in ("auto", "xla"):
-                    fn = packed_gated_product("swiglu", implementation=impl, axes=named_axes)
-                    got_y, got_dx = jax.jit(lambda a, d, f=fn: evaluated(f, (a,), d))(bad_pair, bad_dy)
-                    np.testing.assert_array_equal(np.asarray(got_y), np.asarray(expected_y))
-                    np.testing.assert_array_equal(np.asarray(got_dx), np.asarray(expected_dx))
+        for impl in ("auto", "xla"):
+            fn = packed_gated_product("swiglu", implementation=impl, axes=MLP_HIDDEN)
+            assert_runs_per_shard(lambda a, d, f=fn: evaluated(f, (a,), d), draw_typed, moved, mesh,
+                                  f"a packed pair moved onto its width, {impl} in {jnp.dtype(dtype).name}",
+                                  seeds=SEEDS["per shard"], truth_fn=packed_ref, moves=("all-to-all",))
 
 
 @pytest.mark.mesh(devices=4)
 def test_the_packed_kernel_refuses_a_pair_an_explicit_axis_splits_on_a_mesh_with_an_automatic_one():
     """On a mesh of an Explicit axis and an Auto one, a packed `[..., 2, H]` operand whose pair the Explicit
     axis splits is refused by the packed kernel a direct caller asks for (`packed_swiglu_kernel`), its
-    logical axes naming no split of the pair, as on an all-Explicit mesh: read by its own placement, where the
-    logical axes' placement alone let it into the per-shard map (the head review of row 12224)."""
+    logical axes naming no split of the pair: the operand's own placement read (`_packed_specs`), as on an
+    all-Explicit mesh (row 822's check guarded where the logical axes and the placement part)."""
     from jax.sharding import AxisType
 
     from dew.nn.kernels import selection
@@ -931,14 +936,13 @@ def test_the_packed_kernel_refuses_a_pair_an_explicit_axis_splits_on_a_mesh_with
 @pytest.mark.mesh(devices=4)
 def test_packed_gated_product_pair_reshard_preserves_other_explicit_axes():
     """Resharding a pair-sharded `[..., 2, H]` input onto `None` along `-2` preserves other Explicit axes
-    splitting rows or features on output and input-gradient shardings alongside bit equality (row 822)."""
+    splitting rows or features on output and input-gradient shardings (row 822), the pair's axis moved onto
+    the hidden width, after any axis splitting it already, rather than gathered: each device computes its
+    share of the product, on par with one device's (row 12225)."""
     from jax.sharding import AxisType
 
     mesh = jax.make_mesh((2, 2), ("data", "model"), axis_types=(AxisType.Explicit, AxisType.Explicit),
                          devices=jax.devices()[:4])
-    raw_p = jax.random.normal(drawn_key(33, 0), (4, 8, 2, 24))
-    raw_d = jax.random.normal(drawn_key(34, 0), (4, 8, 24))
-
     def packed_ref(a, d):
         return evaluated(packed_gated_product("swiglu", implementation="xla"), (a,), d)
 
@@ -946,19 +950,21 @@ def test_packed_gated_product_pair_reshard_preserves_other_explicit_axes():
         spec = arr.sharding.spec
         return (*spec, *(None,) * (arr.ndim - len(spec)))
 
-    expected_y, expected_dx = jax.jit(packed_ref)(raw_p, raw_d)
     for in_spec, out_spec in (
-            (PartitionSpec("data", None, "model", None), PartitionSpec("data", None, None)),
-            (PartitionSpec(None, None, "model", "data"), PartitionSpec(None, None, "data"))):
+            (PartitionSpec("data", None, "model", None), PartitionSpec("data", None, "model")),
+            (PartitionSpec(None, None, "model", "data"), PartitionSpec(None, None, ("data", "model")))):
         with jax.set_mesh(mesh):
-            sharded_p, sharded_d = placed_on((raw_p, raw_d), [in_spec, out_spec], mesh)
+            sharded_p, sharded_d = placed_on(draw_packed(), [in_spec, out_spec], mesh)
             for impl in ("auto", "xla"):
                 fn = packed_gated_product("swiglu", implementation=impl)
                 got_y, got_dx = jax.jit(lambda a, d, f=fn: evaluated(f, (a,), d))(sharded_p, sharded_d)
-                np.testing.assert_array_equal(np.asarray(got_y), np.asarray(expected_y))
-                np.testing.assert_array_equal(np.asarray(got_dx), np.asarray(expected_dx))
                 assert padded(got_y) == tuple(out_spec), (impl, padded(got_y), out_spec)
                 assert padded(got_dx) == tuple(in_spec), (impl, padded(got_dx), in_spec)
+        # Each device's share on par with one device's, the move the one exchange: a share computed at
+        # another width rounds its transcendental apart, so not bit for bit (row 12225).
+        assert_runs_per_shard(lambda a, d: evaluated(packed_gated_product("swiglu"), (a,), d), draw_packed,
+                              [in_spec, out_spec], mesh, f"a pair moved onto its width {out_spec}",
+                              seeds=SEEDS["per shard"], truth_fn=packed_ref, moves=("all-to-all",))
 
 
 @pytest.mark.mesh(devices=2)
@@ -996,7 +1002,7 @@ def test_a_packed_mlp_model_trains_on_an_explicit_data_mesh():
     def make_trainer(mesh):
         objective = PackedMlpObjective()
         return objective, Trainer(objective, optax.sgd(1.0), key=0, mesh=mesh,
-                                  layout=Layout(min_shard=1, tolerance=1.))
+                                  advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.)))
 
     x0, y0 = draw(0)
     rows = Memory([{"x": np.asarray(x0[i]), "y": np.asarray(y0[i])}

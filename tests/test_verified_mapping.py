@@ -42,6 +42,7 @@ import numpy as np
 import pytest
 import torch
 from interop_support import tiny_config
+from model_support import attending
 from safetensors.numpy import load_file
 from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.models.glm4_moe_lite.configuration_glm4_moe_lite import Glm4MoeLiteConfig
@@ -96,6 +97,7 @@ def test_an_optional_size_stated_null_states_nothing(head_dim):
     assert isinstance(verdict, Unmapped if head_dim == "absent" else VerifiedMapping), verdict
 
 
+@attending("reference")
 @pytest.mark.parametrize("model_type, fields", [("cwm", {"sliding_window": 4}), ("glm4_moe_lite", GLM_FLASH)])
 def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path, model_type, fields):
     """A verified type is not its family: it saves under its own config and
@@ -103,12 +105,12 @@ def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path, model_typ
     source, destination = tmp_path / "source", tmp_path / "export"
     ids, _ = write_tiny(source, model_type, **fields)
     with pytest.warns(VerifiedMappingWarning):
-        loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+        loaded = Pretrained.load(source, dtype="float32")
     loaded.save(destination)
     assert json.loads((destination / "config.json").read_text()) == loaded.config
     assert set(load_file(destination / "model.safetensors")) == set(load_file(source / "model.safetensors"))
     with pytest.warns(VerifiedMappingWarning):
-        restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
+        restored = Pretrained.load(destination, dtype="float32")
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)),
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
 
@@ -300,6 +302,7 @@ def test_a_deep_release_verifies_at_its_probes_cut_depth_as_at_its_own():
     assert isinstance(route, VerifiedRoute) and route.verified.family == "qwen2"
 
 
+@attending("reference")
 def test_a_candidate_departing_from_the_sources_function_is_named_and_one_computing_it_is_not():
     """Tier 2's verdict (`verify.logits_mapped`): the candidate's float64 logits against the source's
     float64 twin's, within the source's own float32 rounding of them. A source computing the candidate's
@@ -316,9 +319,9 @@ def test_a_candidate_departing_from_the_sources_function_is_named_and_one_comput
 
     family = next(entry for entry in ENTRIES if "llama" in entry.model_types)
     record = decoder_parts.translate_family_config(tiny_config("llama").to_dict(), family)[0]
-    model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
+    model = models.build("causal_transformer", {**record, "dtype": "float32"})
     variables = model.init(jax.random.key(0), verify.probe_ids(record["vocab_size"]))
-    wide = models.build("causal_transformer", {**record, "dtype": "float64", "attention_impl": "reference"})
+    wide = models.build("causal_transformer", {**record, "dtype": "float64"})
 
     def source(moved):
         def run(ids):

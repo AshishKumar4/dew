@@ -12,6 +12,7 @@ Pass that file as --work to the reference runner at the same global shape.
 """
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import sys
@@ -57,7 +58,7 @@ def lm(args) -> WorkloadWork:
     from dew.objectives.lm import LMObjective
 
     fields = translate_config(json.loads(Path(args.config).read_text()))
-    fields.update(dtype=args.dtype, attention_impl=args.attention)
+    fields.update(dtype=args.dtype)
     objective = LMObjective(fields.value, args.seq, ema_decay=None)
     rows = np.broadcast_to(np.zeros((args.seq + 1,), np.int32), (args.batch, args.seq + 1))
     return measure(objective, {TEXT_KEY: rows})
@@ -68,7 +69,7 @@ def dit(args) -> WorkloadWork:
     from diffusion import counting_objective
 
     shape = (args.height, args.width, args.channels)
-    objective = counting_objective(shape, args.dtype, args.attention)
+    objective = counting_objective(shape, args.dtype)
     return measure(objective, {"image": np.broadcast_to(np.zeros(shape, np.uint8), (args.batch, *shape))})
 
 
@@ -84,7 +85,7 @@ def qwen35(args) -> WorkloadWork:
     batch, sequence = (2, 16) if args.smoke else (8, 3072)
     if args.smoke:
         fields = translate_config(config(smoke=True))
-        fields.update(dtype=args.dtype, attention_impl=args.attention)
+        fields.update(dtype=args.dtype)
         model = fields.value.clone(remat=None)
     else:
         model, _ = backbone(MODEL, REVISION, args.dtype)
@@ -100,7 +101,7 @@ def case(args) -> WorkloadWork:
 
     chosen = dataclasses.replace(parity_case(args.model, args.size, batch_size=args.batch_size,
                                              vocab_size=args.vocab_size), dtype=args.dtype)
-    return measure(build_objective(chosen, args.attention), global_batch(chosen))
+    return measure(build_objective(chosen), global_batch(chosen))
 
 
 def arguments(argv=None):
@@ -134,8 +135,14 @@ def arguments(argv=None):
 
 
 if __name__ == "__main__":
+    from dew.nn.kernels import generation
+
     args = arguments()
-    counted = args.count(args)
+    # Every workload's programs on the attention kernel named, the selector's where 'auto'.
+    named = (contextlib.nullcontext() if args.attention == "auto"
+             else generation.chosen(attention=args.attention))
+    with named:
+        counted = args.count(args)
     counted.write(args.out)
     print(json.dumps({"training_flops_per_step": counted.training_flops_per_step,
                       "tokens_per_step": counted.tokens_per_step, "basis": counted.basis}))

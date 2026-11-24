@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import attending
 
 from dew.batch import everything, merge, select, under
 from dew.data import Memory
@@ -13,7 +14,7 @@ from dew.data.compile import validation
 from dew.data.pipeline import Pipeline
 from dew.data.steps.generic import Formatting
 from dew.objectives.base import Objective, Ratio, Step
-from dew.training import UpdateBatch
+from dew.training import TrainerAdvanced
 
 
 def tree():
@@ -207,8 +208,8 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
     assert float(value) == 1.0
     np.testing.assert_array_equal(gradient["w"], rows[0].sum(0) / 8)
 
-    trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(0), update=UpdateBatch(batches=2),
-                      layout=Layout(min_shard=1, tolerance=1.0))
+    trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
     stepped = trainer.fit(dataset(lambda: iter([{"x": x} for x in rows]), batch=8), steps=2).variables
     expected = -0.5 * (rows[0].sum(0) + rows[1].sum(0)) / 16
     np.testing.assert_array_equal(stepped["params"]["w"], expected)
@@ -276,6 +277,7 @@ def test_a_supplied_gradient_binds_each_rule_to_its_own_parameter_in_any_mapping
     np.testing.assert_array_equal(gradient["right"], [0.0, 1.0, 2.0])
 
 
+@attending("xla")
 def test_an_objective_whose_saved_task_builds_from_its_settings_builds_its_task_from_them():
     """An objective, any package's, whose saved task builds from the settings a run records
     (`from_settings`) builds its live task from its own settings, as a saved run of it loads: the
@@ -289,7 +291,7 @@ def test_an_objective_whose_saved_task_builds_from_its_settings_builds_its_task_
     from dew.sampling.text import Sampling
 
     model = CausalTransformer(vocab_size=11, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
-                              max_seq_len=8, attention_impl="xla")
+                              max_seq_len=8)
 
     class Decoding(Objective):
         saved_task = TextGeneration
