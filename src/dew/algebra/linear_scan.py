@@ -99,6 +99,14 @@ class Token(Expr):
     def state(cls) -> Token: ...
 
     @classmethod
+    def second(cls) -> Token: ...
+    """A pair's second state (`scan.Scan.state` a pair), of the first's shape."""
+
+    @classmethod
+    def pair(cls, first: Token, second: Token) -> Token: ...
+    """A pair's update: its first state's value and its second's."""
+
+    @classmethod
     def value(cls, index: i64Like) -> Token: ...
     """The traced programs' value `index` (`Parts.atoms`), free of the state: an input, a constant, or an
     equation's whose algebra no constructor states."""
@@ -179,6 +187,13 @@ class Affine(Expr):
     update a scalar decay lets read either way (`D` commuting into the read) keeps the after-decay form."""
 
     @classmethod
+    def coupled(cls, base2: i64Like, first: Token, lam: Token, second: Token, left: Token, right: Token,
+                correction: Token) -> Affine: ...
+    """A pair's update under a 2x2 triangular transition of scalars: the second state `m' = exp(second) m +
+    left (right + correction^T h)^T`, its rank-one input reading the first state as the token enters it, and
+    the first `h' = exp(first) h + lam m'` (`exp2` where `base2`)."""
+
+    @classmethod
     def readout(cls, reader: Token, free: Token) -> Affine: ...
     """`reader^T h + free`."""
 
@@ -200,6 +215,28 @@ _MINUS_ONE = Token.scalar(Token.literal(-1.0))
 
 def _token_rules():
     """The algebra's identities, freeness, and the affine forms (the module's account)."""
+    return ruleset(*_token_rule_list(), name="token_affine")
+
+
+def _coupled_rules():
+    """`_token_rules`' and a pair's coupled form (`Affine.coupled`): its second state's decayed value plus a
+    rank-one input reading the first state the token enters, its first's decayed value plus a scalar times
+    that second value, the very value the pair's second place holds."""
+    y, z, lam, a, b, c, s, t = vars_("y z lam a b c s t", Token)
+    h, m = Token.state(), Token.second()
+    found = []
+    for base2, power in ((0, Token.exp), (1, Token.exp2)):
+        written = Token.column(a).times(Token.row(b.plus(Token.read(c, h))))
+        second = Token.scalar(power(z)).times(m).plus(written)
+        first = Token.scalar(power(y)).times(h).plus(Token.scalar(lam).times(s))
+        found.append(rule(eq(t).to(Token.pair(first, s)), eq(s).to(second), free(y), free(z), free(lam),
+                          free(a), free(b), free(c)).then(
+            union(form_of(t)).with_(Affine.coupled(base2, y, lam, z, a, b, c))))
+    return ruleset(*_token_rule_list(), *found, name="token_affine_coupled")
+
+
+def _token_rule_list() -> list:
+    """`_token_rules`' rules."""
     a, b, c, e, m, x, z, t = vars_("a b c e m x z t", Token)
     (index,), (number,) = vars_("index", i64), vars_("number", f64)
     h = Token.state()
@@ -261,7 +298,7 @@ def _token_rules():
                   union(form_of(t)).with_(Affine.applied(a, Token.zero()))),
               rule(eq(t).to(Token.applied(h, a).plus(b)), free(a), free(b)).then(
                   union(form_of(t)).with_(Affine.applied(a, b)))]
-    return ruleset(*found, name="token_affine")
+    return found
 
 
 @dataclasses.dataclass(frozen=True)
@@ -357,6 +394,64 @@ def parts(update: Program, readout: Program, saturation: program.Saturation) -> 
                  reader_scale=reader_scale, across=across, before=before is not None, erase=erase)
 
 
+@dataclasses.dataclass(frozen=True)
+class Coupled:
+    """A pair's token update and readout as the coupled map the rules reach (`coupled_parts`): the second
+    state `m' = exp(second) m + left (right + correction^T h)^T`, its rank-one input reading the first state
+    `h` as the token enters it, and the first `h' = exp(first) h + lam m'` (`exp2` where `base2`), the
+    transition `[[exp(first), lam exp(second)], [0, exp(second)]]` of scalars on the two states beside the
+    input's rank one; the readout `reader_scale reader^T h' + free`, of the first state alone. Each a term
+    free of the states over the traced programs' values `atoms`, as `Parts`' are."""
+
+    update: Program
+    readout: Program
+    atoms: tuple
+    base2: bool
+    first: Token
+    second: Token
+    lam: Token
+    left: Token
+    right: Token
+    correction: Token
+    reader: Token
+    free: Token
+    reader_scale: float | np.floating = 1.0
+
+
+def coupled_parts(update: Program, readout: Program, saturation: program.Saturation) -> Coupled:
+    """A pair's token update and readout (each a traced program whose two first inputs are the states, the
+    update's two outputs their values after the token) as the coupled map (`Coupled`), their e-graph
+    saturated as `parts`' is under `_coupled_rules`; refused, named, where the update reaches no coupled form
+    (any other pair's), or the readout is not the first state contracted with a vector over its keys plus a
+    part free of the states."""
+    atoms: list = []
+    made, read = _translated(update, atoms, pair=True, outputs=2), _translated(readout, atoms, pair=True)
+    began, graph = time.perf_counter(), EGraph()
+    graph.register(made, read)
+    sized = program.node_count(graph)
+    limits = saturation.sized(sized, max(_chain(update), _chain(readout)))
+    saturated = program.run_within(graph, _coupled_rules(), limits, "a coupled scan's token")
+    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began))
+    stopped = (f" (its saturation stopped at its limits, {limits[0]} nodes and {limits[1]} iterations, short "
+               f"of its fixpoint)" if saturated.limited else "")
+    args = get_callable_args(graph.extract(form_of(made)), Affine.coupled)
+    if args is None:
+        raise Refused("a pair's update is not its second state decayed by a scalar plus a rank-one input "
+                      "reading the first state the token enters, and its first decayed by a scalar plus a "
+                      f"scalar times that second value{stopped}")
+    found = get_callable_args(graph.extract(form_of(read)), Affine.readout)
+    if found is None:
+        raise Refused("a pair's readout is not its first state contracted with a vector over its keys plus a "
+                      f"part free of the states{stopped}")
+    from dew.nn.precision import at_least_fp32
+
+    reader, free = found
+    reader, reader_scale = _reader_scale(reader, atoms, at_least_fp32(aval(update.jaxpr.invars[0]).dtype))
+    base2, first, lam, second, left, right, correction = args
+    return Coupled(update, readout, tuple(atoms), bool(terms.integer(base2)), first, second, lam, left, right,
+                   correction, reader, free, reader_scale)
+
+
 def _reader_scale(reader: Token, atoms: list, dtype: np.dtype) -> tuple[Token, float | np.floating]:
     """A shrinking literal factored once with its dtype. A magnifying one stays on the reader, so its
     transpose never magnifies the memory before a small cotangent."""
@@ -393,13 +488,16 @@ _KEEPING = (jax.lax.copy_p,)
 """Equations that keep a value's elements, dtype and shape."""
 
 
-def _translated(traced: Program, atoms: list) -> Token:
+def _translated(traced: Program, atoms: list, *, pair: bool = False, outputs: int = 1) -> Token:
     """`traced`'s output (its first input the state) as a term (`Token`): each equation its constructor's,
     a value free of the state whose equation has none a leaf (`Token.value`, its place in `atoms`); refused
-    where the state is read through such an equation."""
+    where the state is read through such an equation. A `pair`'s two first inputs are its states
+    (`Token.state`, `Token.second`), and an update of `outputs` two its first and second values
+    (`Token.pair`)."""
     jaxpr = traced.jaxpr
-    held: dict = {jaxpr.invars[0]: Token.state()}
-    reads = {jaxpr.invars[0]}
+    states = jaxpr.invars[:2] if pair else jaxpr.invars[:1]
+    held: dict = dict(zip(states, (Token.state(), Token.second()), strict=False))
+    reads = set(states)
 
     def leaf(atom, shape: tuple) -> Token:
         atoms.append((traced, atom))
@@ -425,6 +523,8 @@ def _translated(traced: Program, atoms: list) -> Token:
             held[equation.outvars[0]] = made
         if reading:
             reads.update(equation.outvars)
+    if outputs == 2:
+        return Token.pair(term(jaxpr.outvars[0]), term(jaxpr.outvars[1]))
     return term(jaxpr.outvars[0])
 
 

@@ -77,6 +77,9 @@ kernel's segment sums formed as a matmul against a 0/1 triangle stay finite (an 
 thousands of resets in a walk's sum stay far inside fp32's range, and the compensated prefix keeps each
 difference of two partials exact past them."""
 
+State = tuple[tuple[int, ...], jnp.dtype]
+"""A state's shape and dtype (`Scan.state`)."""
+
 Reads = Literal["after", "before", "apart"]
 """Where a scan's readout reads its state (`Scan.reads`): after its token's update, as it enters, or after its
 decay apart from its group's writes (`Scan.group`)."""
@@ -107,13 +110,16 @@ class Scan:
     cancelled catastrophically (one row 13 times its reference in 48 seeds, row 7402). A correction reads
     apart from a group of one alone: each token reads the state after its decay, before its own corrected
     write, its pairs with the chunk's earlier tokens' corrected writes (row 7608); a group past one beside a
-    correction is refused, its tokens' writes correcting the state its group's earlier writes left."""
+    correction is refused, its tokens' writes correcting the state its group's earlier writes left.
+    A `state` that is a pair of one shape and dtype is a coupled pair's (`coupled_scan`): `update((h, m),
+    **token)` both states after the token and `readout((h, m), **token)` its output, their forms derived
+    apart (`coupled_scan.derive_coupled`)."""
 
     update: Callable
     readout: Callable
     operands: Mapping[str, Axes]
     walked: str
-    state: tuple[tuple[int, ...], jnp.dtype]
+    state: State | tuple[State, State]
     reset: str | None = None
     ranges: Mapping[str, float | tuple[float, float]] = dataclasses.field(default_factory=dict)
     reads: Reads = "after"
@@ -170,6 +176,11 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
     product) forming and joining a walk's transfer. The same forms without one take Dew's products, the
     portable route's; a chunk's transition, which a walk that carries its transfer composes (`prepare(chunk,
     transition=True)`), is always Dew's, formed chunk-parallel."""
+    if isinstance(declaration.state[0][0], tuple):
+        # A pair's states (`Scan.state`), each a shape and a dtype.
+        from dew.algebra.coupled_scan import derive_coupled
+
+        return derive_coupled(declaration, saturation=saturation)
     names = tuple(name for name in declaration.operands if name != declaration.reset)
     shape, dtype = declaration.state
     if len(shape) != 2:
