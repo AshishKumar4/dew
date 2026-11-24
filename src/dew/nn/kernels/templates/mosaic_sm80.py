@@ -1015,12 +1015,20 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
             specs = _specs(streams.pipeline,
                            {name: functools.partial(_at, streams.views[name][1], placed) for name in names})
-            # Two consumers run one pipeline, each copying its share of every block (`thread_axis`).
-            pipeline = plgpu.emit_pipeline(
-                body, grid=(trips,), in_specs=specs, max_concurrent_steps=streams.pipeline.stages,
-                init_carry=carry, prefetch=prefetched_of if prefetching else None,
-                thread_axis=None if streams.pipeline.consumers == 1 else "wg")
-            carry = pipeline(*(streams.views[name][0] for name in names))
+
+            def walked(carry, body=body, specs=specs, trips=trips):
+                # Two consumers run one pipeline, each copying its share of every block (`thread_axis`).
+                return plgpu.emit_pipeline(
+                    body, grid=(trips,), in_specs=specs, max_concurrent_steps=streams.pipeline.stages,
+                    init_carry=carry, prefetch=prefetched_of if prefetching else None,
+                    thread_axis=None if streams.pipeline.consumers == 1 else "wg",
+                )(*(streams.views[name][0] for name in names))
+
+            # A pipeline that prefetches reads its first step's fragments as it starts, filled or not: a
+            # segment whose trips are known only as it runs (a common segment's) runs its pipeline only
+            # where it has any, every consumer alike, so an empty one reads no slot no copy filled.
+            carry = (walked(carry) if not prefetching or isinstance(trips, int)
+                     else lax.cond(trips > 0, walked, lambda carry: carry, carry))
         return carry
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
