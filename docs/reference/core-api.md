@@ -57,7 +57,7 @@ Import these from `dew.training`:
 
 <!-- api: dew.training.MeshSpec dew.training.Layout dew.training.MeshSpec.build -->
 
-`MeshSpec.build` uses the supplied devices, or JAX's visible devices. The specified factors must divide the device count, and data parallelism takes the remaining factor. `Trainer(fit=FitPolicy(microbatches=...))` sets a pipelined step's microbatches, a positive multiple of a stage axis above 1; a trainer also takes a native `jax.sharding.Mesh` in place of a `MeshSpec` ([distributed](../concepts/distributed.md#a-native-mesh)). With `replicas` above 1, `build` makes a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes whose devices all share one slice), and every other axis stays inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call chooses between the all-to-all and the gather exchange from its shape.
+`MeshSpec.build` uses the supplied devices, or JAX's visible devices. The specified factors must divide the device count, and data parallelism takes the remaining factor. `Trainer(microbatches=...)` sets a pipelined step's microbatches, a positive multiple of a stage axis above 1; a trainer also takes a native `jax.sharding.Mesh` in place of a `MeshSpec` ([distributed](../concepts/distributed.md#a-native-mesh)). With `replicas` above 1, `build` makes a hybrid mesh whose data axis spans that many groups of granules (TPU slices, GPU hosts or NVLink domains, or processes whose devices all share one slice), and every other axis stays inside a group; see [training on several nodes](../guides/multi-node.md#mesh-layout-across-nodes). A sequence axis above 1 splits every attention call's positions, and each call chooses between the all-to-all and the gather exchange from its shape.
 
 `Layout` has these fields:
 
@@ -110,7 +110,7 @@ Checkpointable data must supply the consumed iterator position. A failed scaled 
 
 An `OptimConfig` is built by `fit` over the run's optimizer updates. If you need `initial_state`, `place` or `compile` before `fit`, pass `OptimConfig(...).build(steps)` to `Trainer` instead, where `steps` is the run's length in optimizer updates.
 
-`OptimConfig.optimizer` is one of Dew's optimizers, each with its own settings: `Adam`, `AdamW`, `Lamb`, `Muon`, `MuonClip`, `LaProp`, `GaussNewton` (`dew.optim`), as `AdamW(b1=0.9, b2=0.95, weight_decay=0.1)`; or any Optax optimizer factory by its import path, `Optax("optax:sgd", {"momentum": 0.9})`, built as `factory(learning_rate, **settings)`, so a recorded run trains on the transformation an experiment ran. On the command line it is one value, its name at its defaults (`--optim.optimizer muon`) or its record (`--optim.optimizer '{"class": "adamw", "fields": {"b2": 0.95}}'`). `LaProp` is DreamerV3's optimizer: its `b1` and `b2` are its momentum's and mean square's decays, its `agc` its adaptive gradient clip (0 clips nothing), and it takes no weight decay.
+`OptimConfig.optimizer` is one of Dew's optimizers, each with its own settings: `Adam`, `AdamW`, `Lamb`, `Muon`, `MuonClip`, `LaProp`, `GaussNewton` (`dew.optim`), as `AdamW(b1=0.9, b2=0.95, weight_decay=0.1)`; or any Optax optimizer factory by its import path, `Optax("optax:sgd", {"momentum": 0.9})`, built as `factory(learning_rate, **settings)`, so a recorded run trains on the transformation an experiment ran. On the command line it is one value, its name at its defaults (`optim.optimizer:muon`) or its record (`optim.optimizer:adamw --optim.optimizer.b2 0.95`). `LaProp` is DreamerV3's optimizer: its `b1` and `b2` are its momentum's and mean square's decays, its `agc` its adaptive gradient clip (0 clips nothing), and it takes no weight decay.
 
 <!-- api: dew.training.Trainer.initial_state dew.training.Trainer.place dew.training.Trainer.compile dew.training.trainer.CompiledStep -->
 
@@ -138,7 +138,7 @@ Import sources, `Dataset`, the step modules, `presets` and `Loading` from `dew.d
 
 A source is already a `Dataset`, and every verb returns a new one. A preset of `dew.data.presets` (`images`, `lm`, `sft`, `prompts`, `preferences`, `canvas` or `clips`) is a function from a dataset and its settings to a dataset, applied with `pipe`. It ends in `batch`, so its result goes to `Trainer.fit`, which compiles it into a `Loader`. Validation is a second dataset, `fit(..., validation=)`, usually a part of `holdout` through the same preset; nothing is held out unless the chain says so.
 
-`batch(tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Loader exposes `batch_tokens`. Row and token budgets are mutually exclusive. A run configuration takes the micro-batch from its chain and `update_tokens` from `TrainerConfig`, and records the derived update/micro accumulation.
+`batch(tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Loader exposes `batch_tokens`. Row and token budgets are mutually exclusive. A run configuration takes the micro-batch from its chain and the update from `TrainerConfig.update_tokens` (`--trainer.update-tokens N`, `Trainer(update_tokens=N)`), and records the derived update/micro accumulation.
 
 A `Dataset` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take` and `cache`; a `map` after `batch` is a host step on the training batch. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
 
@@ -660,7 +660,7 @@ that call's kernel. A kernel named for a call it does not take raises `dew.kerne
 `ValueError` carrying the op (`choice`), the kernel and every requirement the call fails (`refusals`),
 rather than running another kernel in silence.
 
-A run's `RunConfig.diagnostics.kernels` (`--diagnostics.kernels attention xla`) is the block it enters around everything it traces,
+A run's `RunConfig.diagnostics.kernels` (`--diagnostics.kernels.attention xla`) is the block it enters around everything it traces,
 its steps', evaluations' and samples' (`RunConfig.traced`, beside its recorded precision). Its record keeps
 the choice, so a resume runs the kernels the run ran.
 

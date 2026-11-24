@@ -33,8 +33,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-from dew.training.budget import Horizon
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "tools")]
 CORPUS = "tests/fixtures/saved_runs"
@@ -125,9 +123,9 @@ def main() -> None:
             # The run keeps its last step alone: a later main pins and resumes from the latest. Its own
             # trainer, its clock and numerics, otherwise.
             built = build(root, drawn=False)
-            steps = None if built.trainer.horizon.examples else 2
+            steps = None if built.trainer.examples else 2
             trainer = dataclasses.replace(built.trainer, checkpoint_dir=str(root / "runs"),
-                                          horizon=Horizon(steps=steps), log_every=1, eval_every=None,
+                                          steps=steps, log_every=1, eval_every=None,
                                           checkpoint_every=None, multi_host=False, compilation_cache_dir=None)
             run = dataclasses.replace(built, trainer=trainer)
             # A source the repo holds is recorded by its path in the repo, which a later checkout reads

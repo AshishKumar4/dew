@@ -61,7 +61,6 @@ from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
 from dew.optim import Adam, LaProp, Linear, OptimConfig
 from dew.registry import ModelConfig
-from dew.training.budget import Horizon
 
 AUXILIARY = (("state", 512), ("gates", 512), ("airframe", 256), ("physics", 256), ("obstacles", 256))
 """The world model's auxiliary heads: each privileged view and its head's units, its width the race's."""
@@ -133,9 +132,9 @@ def teacher_run(out: Path, *, hz: float, level: float, drones: int = 4096) -> En
         objective=ObjectiveConfig(f"{CONTROL}:ControlPPOObjective", {
             "discount": 0.99 ** (60 / hz), "lam": 0.95 ** (60 / hz), "clip": 0.2, "entropy_cost": 1e-4,
             "reads": ["teacher"]}),
-        rollout=RolloutConfig("control", rollout), optim=OptimConfig(optimizer=Adam(), learning_rate=3e-4,
-                                                                     clip_grads=1.0),
-        trainer=TrainerConfig(checkpoint_dir=str(out), horizon=Horizon(steps=every), log_every=every,
+        rollout=RolloutConfig("control", rollout), optim=OptimConfig(optimizer=Adam(), lr=3e-4,
+                                                                     clip=1.0),
+        trainer=TrainerConfig(checkpoint_dir=str(out), steps=every, log_every=every,
                               eval_every=None, checkpoint_every=None, keep=Keep(latest=1, every=every)))
 
 
@@ -305,9 +304,9 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
     while time.perf_counter() - began < seconds:
         done = _latest(out / TEACHER_RUN)
         run = teacher_run(out, hz=hz, level=level, drones=drones)
-        if run.trainer.horizon.steps is None:
+        if run.trainer.steps is None:
             raise ValueError("the teacher's run is bounded in steps")
-        prepared = run.override({"trainer.horizon.steps": done + run.trainer.horizon.steps}).prepare()
+        prepared = run.override({"trainer.steps": done + run.trainer.steps}).prepare()
         if warm is not None and not done:
             prepared.objective.variables = warmed(warm, prepared.objective)
         state = prepared.train(TEACHER_RUN)
@@ -350,7 +349,7 @@ def wrap(out: Path, *, weights: Path, hz: float = 60.0, level: float = 1.0, dron
     as it reads a trained teacher, and the teacher phase goes on from it. The record cannot name the file the
     weights came from; the report (teacher.json, the teacher phase's, unscored) does."""
     prepared = teacher_run(out, hz=hz, level=level,
-                           drones=drones).override({"trainer.horizon.steps": 0}).prepare()
+                           drones=drones).override({"trainer.steps": 0}).prepare()
     prepared.objective.variables = warmed(weights, prepared.objective)
     state = prepared.train(TEACHER_RUN)
     # The teacher phase's own report, unscored, so the phase goes on from the wrapped run.
@@ -417,7 +416,7 @@ class World:
             objective=ObjectiveConfig(f"{DREAMER}:DreamerV3Objective", objective),
             rollout=RolloutConfig("dreamer", rollout),
             teacher=TeacherConfig(str(self.teacher), self.teacher_step, demonstrates=True),
-            optim=OptimConfig(optimizer=LaProp(), learning_rate=rate),
+            optim=OptimConfig(optimizer=LaProp(), schedule=rate),
             trainer=TrainerConfig(checkpoint_dir=str(self.out), key=STAGES.index(stage), log_every=1000,
                                   eval_every=None, checkpoint_every=self.saved_every, keep=Keep(latest=1)))
         if stage != STAGES[0]:
@@ -456,7 +455,7 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
                    and all(point["updates"] != done for point in points))
         reached = done if pending else updates if every is None else min(updates, (done // every + 1) * every)
         prepared = dataclasses.replace(prepared, run=prepared.run.override(
-            {"trainer.horizon.steps": reached, "env.difficulty": level, "env.ramp": level}))
+            {"trainer.steps": reached, "env.difficulty": level, "env.ramp": level}))
         state = prepared.train(stage)
         done = int(state.step)
         if every is None or (points and points[-1]["updates"] == done):

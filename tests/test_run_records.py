@@ -17,6 +17,7 @@ from dew.config.earlier import earlier_run
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
 from dew.decision.config import DecisionRunConfig
+from dew.kernels import Kernels
 from dew.quantization import Quantization
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,7 +109,7 @@ def test_a_run_whose_model_named_its_attention_kernel_runs_it_as_the_runs_own(ke
     earlier = {**held, "fields": {**held["fields"], "diagnostics": diagnostics, "model": {
         **model, "fields": {**model["fields"], "attention_impl": "reference"}}}}
     run = RunConfig.read(earlier_run(earlier))
-    assert run.diagnostics.kernels == {"attention": "reference", **kernels}
+    assert run.diagnostics.kernels == Kernels(**{"attention": "reference", **kernels})
     assert "attention_impl" not in json.loads(json.dumps(run.record()))["fields"]["model"]["fields"]
 
 
@@ -123,13 +124,13 @@ def test_a_run_saved_scanning_its_stack_resumes_scanned():
     held = json.loads(PUBLISHED.read_text())
     source = {**held["fields"]["source"], "scan_layers": True}
     run = RunConfig.read(earlier_run({**held, "fields": {**held["fields"], "source": source}}))
-    assert run.diagnostics.kernels == {"layer_scan": "scanned"}
+    assert run.diagnostics.kernels == Kernels(layer_scan="scanned")
     with run.traced():
         assert scanned()
     assert not scanned()
     diagnostics = {**held["fields"]["diagnostics"], "kernels": {"layer_scan": "plain"}}
     named = {**held, "fields": {**held["fields"], "source": source, "diagnostics": diagnostics}}
-    assert RunConfig.read(earlier_run(named)).diagnostics.kernels == {"layer_scan": "plain"}
+    assert RunConfig.read(earlier_run(named)).diagnostics.kernels == Kernels(layer_scan="plain")
 
 
 WRAPPERS = [("diffusion_gemma", "text"), ("dew.nn.multimodal:MultimodalTransformer", "language_model")]

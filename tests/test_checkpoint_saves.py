@@ -15,6 +15,7 @@ from test_trainer import make_trainer
 
 from dew.checkpoints import REPLICA_SLICE_BYTES, Checkpoints
 from dew.telemetry.compiles import Compiles
+from dew.training import TrainerAdvanced
 
 
 @pytest.mark.mesh
@@ -63,7 +64,7 @@ def test_an_optimizer_given_an_infinite_bound_trains_and_saves(tmp_path, scaled)
     non-finite state (the base review of 2026-11-15: such a run crashed at its first save, and under a loss
     scale every step was rejected)."""
     unbounded = optax.chain(optax.inject_hyperparams(optax.clip)(max_delta=math.inf), optax.sgd(0.1))
-    state = make_trainer(tmp_path, optimizer=unbounded, dynamic_scale=scaled).fit(
+    state = make_trainer(tmp_path, optimizer=unbounded, advanced=TrainerAdvanced(dynamic_scale=scaled)).fit(
         dataset(), steps=3, log_every=100, checkpoint_every=1)
     assert int(state.updates) == 3
     assert Checkpoints(str(tmp_path / "run")).latest == 3

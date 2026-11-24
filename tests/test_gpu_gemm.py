@@ -415,3 +415,42 @@ def test_the_low_rank_matrix_holds_on_this_gpu():
     step with its base product and update fused on par with them apart, at each case a GPU-only red seeded
     (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the CPU's."""
     run_cells(kernel_matrix.seeded_cells("low_rank"))
+
+
+def test_an_adapted_products_factor_gradients_hold_fp32_under_a_bf16_preset():
+    """An adapted product of fp32 rows under the BF16_BF16_F32 preset, which a GPU's dot takes: its factor
+    `a`'s gradient, `rowsᵀ · (scale · dy · bᵀ)`, keeps fp32's digits (`low_rank._kept`), so a row entry of
+    `1 + 2**-20`, which bf16 rounds to 1, reaches it: exactly float64's (row 12394)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    rows = jnp.zeros((8, 16), jnp.float32).at[0, 0].set(1.0 + 2.0 ** -20)
+    kernel, a = jnp.zeros((16, 8), jnp.float32), jnp.zeros((16, 4), jnp.float32)
+    b = jnp.zeros((4, 8), jnp.float32).at[0, 0].set(1.0)
+    _, pull = jax.vjp(lambda a_: low_rank(rows, kernel, a_, b, 1.0, out_dtype=jnp.float32,
+                                          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32), a)
+    (d_a,) = pull(jnp.zeros((8, 8), jnp.float32).at[0, 0].set(1.0))
+    want = np.zeros((16, 4), np.float32)
+    want[0, 0] = 1.0 + 2.0 ** -20
+    np.testing.assert_array_equal(np.asarray(d_a), want)
+
+
+def test_an_adapted_products_backward_keeps_a_narrow_presets_fp32_products_wide():
+    """An adapted product of fp16 rows under the F16_F16_F32 dot preset, which a GPU's dot takes: an fp32
+    cotangent of 2**16 against a 2**-10 kernel, and an fp16 one of 1 through a scale of 2**16 and a factor of
+    2**-10, each give the rows 64; the backward's products of fp32 operands keep them at fp32 (`_kept`), not
+    narrowed back to fp16's inf (row 1304)."""
+    from dew.nn.kernels.low_rank import low_rank
+
+    preset = jax.lax.DotAlgorithmPreset.F16_F16_F32
+    x = jnp.zeros((8, 16), jnp.float16)
+    for kernel, a, scale, out_dtype, dy in (
+            (jnp.full((16, 8), 2.0 ** -10, jnp.float16), jnp.zeros((16, 4), jnp.float16), 1.0, jnp.float32,
+             2.0 ** 16),
+            (jnp.zeros((16, 8), jnp.float16), jnp.full((16, 4), 2.0 ** -10, jnp.float16), 2.0 ** 16,
+             jnp.float16, 1.0)):
+        b = jnp.zeros((4, 8), jnp.float16).at[:, 0].set(1.0 if scale > 1 else 0.0)
+        _, pull = jax.vjp(lambda rows, kernel=kernel, a=a, b=b, scale=scale, out_dtype=out_dtype: low_rank(
+            rows, kernel, a, b, scale, out_dtype=out_dtype, precision=preset), x)
+        (d_x,) = pull(jnp.zeros((8, 8), out_dtype).at[0, 0].set(dy))
+        assert np.all(np.isfinite(np.asarray(d_x, np.float32))), (out_dtype, d_x[0])
+        assert np.asarray(d_x[0, 0], np.float32) == 64.0 * (4.0 if scale > 1 else 1.0), (out_dtype, d_x[0])

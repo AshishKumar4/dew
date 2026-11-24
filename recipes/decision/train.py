@@ -1,8 +1,8 @@
 """Fine-tune a decision model on a table of labelled text (`dew.decision.config.DecisionRunConfig`).
 
-    python recipes/decision/train.py --trainer.horizon.epochs 3
+    python recipes/decision/train.py --trainer.epochs 3
     python recipes/decision/train.py --pretrained Qwen/Qwen3-0.6B --lora.rank 16 \\
-        --lora.modules q_proj v_proj --optim.learning-rate 1e-4 --trainer.horizon.steps 2000
+        --lora.modules q_proj v_proj --optim.lr 1e-4 --trainer.steps 2000
 
 The default table is BANKING77's training split: each row's `text` is the state and its
 `label_text` the answer to one `intent` question over its 77 intents. A tenth of the rows, by

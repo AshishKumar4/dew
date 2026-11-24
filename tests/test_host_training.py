@@ -37,7 +37,7 @@ from dew.objectives.base import TEACHER, Aux, EMASpec, Objective, Ratio
 from dew.objectives.distillation import DistillationObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
-from dew.training import FitPolicy, Layout, Trainer, UpdateBatch
+from dew.training import Layout, Trainer, TrainerAdvanced
 
 HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)
@@ -132,7 +132,8 @@ def crossed(optimizer, label: str, devices=None):
     from dew.training import MeshSpec
 
     mesh = {} if devices is None else {"mesh": MeshSpec().build(devices)}
-    placed = compiled_for(lambda layout: Trainer(Coupled(), optimizer, key=jax.random.key(4), layout=layout,
+    placed = compiled_for(lambda layout: Trainer(Coupled(), optimizer, key=jax.random.key(4),
+                                                 advanced=TrainerAdvanced(layout=layout),
                                                  **mesh))
 
     def run(layout, small, large):
@@ -157,8 +158,9 @@ def test_a_host_step_read_in_a_stated_split_is_on_par_with_the_devices_split_ste
     window's under a dynamic loss scale: three updates on par from float64 with the device-resident run
     stating the same split (check 1), its counts and keys exact."""
     placed = compiled_for(lambda layout: Trainer(Tiny(composite=False), optax.adamw(.03, weight_decay=.1),
-                                                 key=jax.random.PRNGKey(9), fit=FitPolicy(split=2),
-                                                 dynamic_scale=SHORT_SCALE, layout=layout))
+                                                 key=jax.random.PRNGKey(9), split=2,
+                                                 advanced=TrainerAdvanced(dynamic_scale=SHORT_SCALE,
+                                                                          layout=layout)))
 
     def run(layout, batch):
         state, step, _ = placed(layout, batch)
@@ -197,7 +199,7 @@ def test_a_host_window_that_replays_steps_on_its_startups_programs_alone():
 
     def run(quiet: bool):
         trainer = Trainer(Tiny(composite=True), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-                          update=UpdateBatch(batches=2), dynamic_scale=SHORT_SCALE, layout=HOST)
+                          accumulation=2, advanced=TrainerAdvanced(dynamic_scale=SHORT_SCALE, layout=HOST))
         state, _, _ = trainer.place()
         data = [placed_batch(trainer, batch) for batch in batches()]
         step = trainer.compile(state, data[0])
@@ -249,7 +251,8 @@ def test_a_host_fits_misses_are_its_own_record_never_another_fits(caplog, tmp_pa
                 yield {"text": rows}
         checkpoints, decay = (None, None) if directory is None else (Checkpoints(str(directory)), 0.9)
         trainer = Trainer(LMObjective(decoder(), 8, head_chunks=1, ema_decay=decay), optax.adam(.01),
-                          key=jax.random.key(3), layout=layout, tracker=tracker, checkpoints=checkpoints)
+                          key=jax.random.key(3), advanced=TrainerAdvanced(layout=layout), tracker=tracker,
+                          checkpoints=checkpoints)
         trainer.fit(Loader(stream, None, batch=jax.device_count(), records=None), steps=4, log_every=1,
                     eval_every=None, checkpoint_every=None if directory is None else 1,
                     observe=Observe(2, let_go) if released else None)
@@ -306,7 +309,8 @@ def test_a_projecting_decoders_host_steps_run_on_its_startups_programs_alone():
 
         model = decoder(altup=AltUp(num_inputs=2, coef_clip=.5))
         objective = _CountedProjection(model, 8, head_chunks=1, ema_decay=None)
-        trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(3), layout=HOST)
+        trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(3),
+                          advanced=TrainerAdvanced(layout=HOST))
         assert int(three_steps(trainer, 16).updates) == 3
         assert 0 < len(objective.reads) < 3
 
@@ -322,8 +326,8 @@ def test_an_inspecting_host_runs_sampled_and_unsampled_steps_compile_nothing():
 
         model = decoder()
         trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.01),
-                          key=jax.random.key(3), layout=HOST,
-                          inspection=Inspection(modules=("layers_0",), targets=("params",), cotangents=True))
+                          key=jax.random.key(3), advanced=TrainerAdvanced(layout=HOST, inspection=Inspection(
+                              modules=("layers_0",), targets=("params",), cotangents=True)))
         state, _, _ = trainer.place()
         rows = np.stack([np.arange(row, row + 9) % 16 for row in range(jax.device_count())]).astype(np.int32)
         batch = placed_batch(trainer, {"text": jnp.asarray(rows)})
@@ -363,7 +367,8 @@ def test_an_inspecting_fits_streamed_step_is_admitted_with_its_sampled_step():
             with (assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), memory), host_memory_stated(1e20),
                   contextlib.suppress(PlanRefused, LayoutRefused)):
                 trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None), optax.adam(.01),
-                                  key=jax.random.key(3), inspection=inspection if inspected else None)
+                                  key=jax.random.key(3),
+                                  advanced=TrainerAdvanced(inspection=inspection if inspected else None))
                 trainer.fit({"text": rows}, steps=1, log_every=100)
             assert trainer.layout_choice is not None
             return trainer.layout_choice
@@ -410,7 +415,7 @@ def test_a_frozen_embeddings_host_steps_run_on_its_startups_programs_alone():
         return "embed_tokens" not in path
 
     trainer = Trainer(LMObjective(model, 8, head_chunks=1, ema_decay=None, variables=freeze(fresh, trained)),
-                      optax.adam(.01), key=jax.random.key(3), layout=HOST)
+                      optax.adam(.01), key=jax.random.key(3), advanced=TrainerAdvanced(layout=HOST))
     state = three_steps(trainer, 16)
     assert "embed_tokens" in state.variables[FROZEN] and int(state.updates) == 3
 
@@ -427,8 +432,9 @@ def test_a_host_decoders_steps_run_on_its_startups_programs_alone():
 def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, composite):
     data = batches()
     placed = compiled_for(lambda layout: Trainer(Tiny(composite), optax.adamw(.03, weight_decay=.1),
-                                                 key=jax.random.PRNGKey(9), update=UpdateBatch(batches=2),
-                                                 dynamic_scale=SHORT_SCALE, layout=layout))
+                                                 key=jax.random.PRNGKey(9), accumulation=2,
+                                                 advanced=TrainerAdvanced(dynamic_scale=SHORT_SCALE,
+                                                                          layout=layout)))
 
     def run(layout, *microbatches):
         state, step, _ = placed(layout, microbatches[0])
@@ -458,7 +464,7 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = Trainer(Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-                      update=UpdateBatch(batches=2), dynamic_scale=SHORT_SCALE, layout=HOST,
+                      accumulation=2, advanced=TrainerAdvanced(dynamic_scale=SHORT_SCALE, layout=HOST),
                       checkpoints=checkpoints)
     start, _, _ = trainer.place()
     step = trainer.compile(start, data[0])
@@ -483,7 +489,7 @@ def test_decoder_scan_training_keeps_the_original_logical_state():
     states = []
     for layout in (DEVICE, HOST):
         trainer = Trainer(LMObjective(model, 8, head_chunks=1), optax.adam(.001),
-                          key=jax.random.key(1), layout=layout)
+                          key=jax.random.key(1), advanced=TrainerAdvanced(layout=layout))
         state, _, _ = trainer.place()
         step = trainer.compile(state, data)
         state, *_ = step(state, data)
@@ -505,7 +511,7 @@ def test_dropout_composite_replay_restarts_with_effects_and_ema_intact(tmp_path)
     checkpoints = Checkpoints(str(tmp_path / "dropout"))
     def make(checkpoints=None):
         return Trainer(objective, optax.chain(optax.clip_by_global_norm(.5), optax.adam(.001)),
-                       key=jax.random.key(3), layout=HOST, update=UpdateBatch(batches=2),
+                       key=jax.random.key(3), advanced=TrainerAdvanced(layout=HOST), accumulation=2,
                        checkpoints=checkpoints)
     data = {"text": jnp.tile(jnp.arange(9, dtype=jnp.int32)[None], (jax.device_count(), 1))}
     trainer = make()
@@ -533,7 +539,7 @@ def test_a_nonfinite_optimizer_candidate_of_a_finite_gradient_commits_alike_on_h
     results = []
     for layout in (DEVICE, HOST):
         trainer = Trainer(Tiny(), optimizer, key=jax.random.PRNGKey(9),
-                                    dynamic_scale=SHORT_SCALE, layout=layout)
+                                    advanced=TrainerAdvanced(dynamic_scale=SHORT_SCALE, layout=layout))
         initial, _, _ = trainer.place()
         data = batches()[0]
         # the step consumes the state
@@ -574,7 +580,7 @@ def test_composite_replay_does_not_apply_effects_twice():
     results = []
     for layout in (DEVICE, HOST):
         trainer = Trainer(Effects(), optax.adam(.01), key=jax.random.PRNGKey(9),
-                          update=UpdateBatch(batches=2), layout=layout)
+                          accumulation=2, advanced=TrainerAdvanced(layout=layout))
         state, _, _ = trainer.place()
         data = batches()[0]
         step = trainer.compile(state, data)
@@ -669,7 +675,7 @@ def updated(objective, batch, layout, *, optimizer=None, checkpoints=None, steps
     """`steps` compiled updates of one objective under one placement, the state on its stored layers
     (`Trainer.stored`: a device layout's one-stage scan holds its runs stacked)."""
     trainer = Trainer(objective, optax.adam(.01) if optimizer is None else optimizer,
-                      key=jax.random.key(5), layout=layout, checkpoints=checkpoints)
+                      key=jax.random.key(5), advanced=TrainerAdvanced(layout=layout), checkpoints=checkpoints)
     state, _, _ = trainer.place()
     step = trainer.compile(state, batch)
     for _ in range(steps):
@@ -708,8 +714,9 @@ def test_a_warm_host_run_traces_nothing():
     next windows run the programs it compiled: an eager vjp handed the
     pullback a new static function every realization, which traced again."""
     objective = LMObjective(decoder(), 8, head_chunks=1)
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST,
-                      update=UpdateBatch(batches=2))
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5),
+                      advanced=TrainerAdvanced(layout=HOST),
+                      accumulation=2)
     state, _, _ = trainer.place()
     batch = tokens()
     step = trainer.compile(state, batch)
@@ -733,8 +740,9 @@ def test_a_host_master_steps_phases_compile_with_the_options_dew_compiles_with(t
     from dew.training.transaction import Transaction
 
     objective = LMObjective(decoder(), 8, head_chunks=1)
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST,
-                      update=UpdateBatch(batches=2))
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5),
+                      advanced=TrainerAdvanced(layout=HOST),
+                      accumulation=2)
     state, _, _ = trainer.place()
     batch = tokens()
     cached = jax.config.jax_enable_compilation_cache
@@ -768,12 +776,13 @@ prepare_process(compilation_cache_dir=sys.argv[1])
 from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
-from dew.training import Layout, Trainer
+from dew.training import Layout, Trainer, TrainerAdvanced
 directory, where, steps = sys.argv[2], sys.argv[3], int(sys.argv[4])
 model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
                           max_seq_len=8)
 trainer = Trainer(LMObjective(model, 8, head_chunks=1), optax.adam(.01), key=jax.random.key(5),
-                  layout=Layout(host=("variables",) if where == "host" else (), min_shard=1, tolerance=1.),
+                  advanced=TrainerAdvanced(layout=Layout(host=("variables",) if where == "host" else (),
+                                                         min_shard=1, tolerance=1.)),
                   checkpoints=None if directory == "-" else Checkpoints(directory), tracker=None)
 state, _, _ = trainer.place()
 started = int(state.step)
@@ -849,7 +858,7 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
     host = updated(objective(), batch, HOST)
     close(host, resident)
     initial = frozen_leaves(Trainer(objective(), optax.adam(.01), key=jax.random.key(5),
-                                    layout=HOST).place()[0])
+                                    advanced=TrainerAdvanced(layout=HOST)).place()[0])
     assert initial and frozen_leaves(host).keys() == initial.keys()
     for name, value in frozen_leaves(host).items():
         np.testing.assert_array_equal(value, initial[name], err_msg=name)
@@ -869,7 +878,8 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
     checkpoints.save(int(prefix.step), prefix, None)
     checkpoints.wait()
     restored, _, _ = Trainer(objective(), optax.adam(.01), key=jax.random.key(5),
-                             layout=HOST, checkpoints=Checkpoints(str(tmp_path / "mixed"))).place()
+                             advanced=TrainerAdvanced(layout=HOST),
+                             checkpoints=Checkpoints(str(tmp_path / "mixed"))).place()
     equal(prefix, restored)
     resumed = updated(objective(), batch, HOST, checkpoints=Checkpoints(str(tmp_path / "mixed")))
     equal(resumed, updated(objective(), batch, HOST, steps=2))
@@ -930,7 +940,8 @@ def test_a_host_distillation_steps_as_the_device_layout_does():
     def arm(layout):
         """A layout's step from the run's start over a draw's rows, and the objective it steps."""
         objective, compiled = distillation(), []
-        trainer = Trainer(objective, optax.sgd(.1), key=jax.random.key(5), layout=layout)
+        trainer = Trainer(objective, optax.sgd(.1), key=jax.random.key(5),
+                          advanced=TrainerAdvanced(layout=layout))
 
         def run(text):
             state, _, _ = trainer.place()
@@ -974,7 +985,7 @@ def test_a_host_distillations_frozen_teacher_stays_the_arrays_it_was_placed_as(t
     the host, reads none of it, so after two steps the teacher is the very arrays it was placed as.
     The banked teacher saves and restores as it is held."""
     objective = distillation(lora_teacher())
-    trainer = Trainer(objective, optax.sgd(.1), key=jax.random.key(5), layout=HOST)
+    trainer = Trainer(objective, optax.sgd(.1), key=jax.random.key(5), advanced=TrainerAdvanced(layout=HOST))
     state, _, _ = trainer.place()
     assert {"params", FROZEN} <= set(state.variables[TEACHER])
     placed = jax.tree.leaves(state.variables[TEACHER])
@@ -988,7 +999,8 @@ def test_a_host_distillations_frozen_teacher_stays_the_arrays_it_was_placed_as(t
     checkpoints = Checkpoints(str(tmp_path / "distilled"))
     checkpoints.save(int(state.step), state, None)
     checkpoints.wait()
-    restored, _, _ = Trainer(distillation(lora_teacher()), optax.sgd(.1), key=jax.random.key(5), layout=HOST,
+    restored, _, _ = Trainer(distillation(lora_teacher()), optax.sgd(.1), key=jax.random.key(5),
+                             advanced=TrainerAdvanced(layout=HOST),
                              checkpoints=Checkpoints(str(tmp_path / "distilled"))).place()
     equal(state, restored)
 
@@ -1011,7 +1023,8 @@ def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_
                             variables=jax.tree.map(np.asarray, adapter.variables))
     checkpoints = Checkpoints(str(tmp_path / "run"))
     rows = [{"text": np.arange(1, 10, dtype=np.int32)} for _ in range(8)]
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST, checkpoints=checkpoints)
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5),
+                      advanced=TrainerAdvanced(layout=HOST), checkpoints=checkpoints)
     data = Memory(rows).shuffle().repeat().batch(jax.device_count()).read("memory").loading(
         Loading(workers=0))
     state = trainer.fit(data, steps=1, checkpoint_every=1, log_every=100)
@@ -1095,7 +1108,8 @@ def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
     def objective():
         return LMObjective(model, 8, head_chunks=1, variables=freeze(held, trainable))
 
-    trainer = Trainer(objective(), optax.adam(.01), key=jax.random.key(5), layout=DEVICE)
+    trainer = Trainer(objective(), optax.adam(.01), key=jax.random.key(5),
+                      advanced=TrainerAdvanced(layout=DEVICE))
     start, _, _ = trainer.place()
     step = trainer.compile(start, batch)
     _, loss, *_ = step(start, batch)
@@ -1114,7 +1128,7 @@ def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
     media = {name: value for name, value in frozen_leaves(host).items()
              if "tower" in name or "projector" in name}
     initial = frozen_leaves(Trainer(objective(), optax.adam(.01), key=jax.random.key(5),
-                                    layout=HOST).place()[0])
+                                    advanced=TrainerAdvanced(layout=HOST)).place()[0])
     assert media
     for name, value in media.items():
         np.testing.assert_array_equal(value, initial[name], err_msg=name)
@@ -1182,7 +1196,8 @@ def test_place_streams_the_held_tree_and_releases_each_source():
     held = freeze(jax.tree.map(np.asarray, drawn),
                   lambda path: path[-2:] == ("q_proj", "kernel"))
     objective = LMObjective(model, 8, head_chunks=1, variables=held)
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5),
+                      advanced=TrainerAdvanced(layout=HOST))
     state, _, _ = trainer.place()
     for path, leaf in _named_leaves(held):
         assert isinstance(leaf, jax.Array), path
@@ -1225,7 +1240,8 @@ def test_a_tree_of_frozen_dicts_is_placed_as_a_tree_of_dicts_is():
         jax.tree.map(np.asarray, nn.unbox(model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))),
         lambda path: path[-2:] == ("q_proj", "kernel")))
     objective = LMObjective(model, 8, head_chunks=1, variables=given)
-    state, _, _ = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST).place()
+    state, _, _ = Trainer(objective, optax.adam(.01), key=jax.random.key(5),
+                          advanced=TrainerAdvanced(layout=HOST)).place()
     held = objective.held_variables()
     assert held is not None
     for path, leaf in _named_leaves(held):
@@ -1252,7 +1268,8 @@ def _scaled_fit(objective, step: DeviceStep):
     from dew.data.dataset import Loader
 
     data = Loader(lambda partition: affine_batches(), None, None, 8, device=(step,))
-    return Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), layout=HOST).fit(
+    return Trainer(objective, optax.sgd(0.1), key=jax.random.key(0),
+                   advanced=TrainerAdvanced(layout=HOST)).fit(
         data, steps=2, log_every=1)
 
 
@@ -1361,10 +1378,10 @@ def streaming_decoder(layout: Layout | None = None, checkpoints: Checkpoints | N
     Adam's, so two decoders key their steps apart
     (`Trainer._step_key`) and a run compared with another traces its own step; decoders handed one Adam
     key theirs alike, as a resumed run's and the run it resumes do, and read the step the first traced."""
-    given = {} if layout is None else {"layout": layout}
     return Trainer(LMObjective(streaming_model(dtype), 8, head_chunks=1, ema_decay=None),
                    optax.adam(.001) if optimizer is None else optimizer, key=jax.random.key(6),
-                   checkpoints=checkpoints, rollout=rollout, fit=FitPolicy(split=split, remat=remat), **given)
+                   checkpoints=checkpoints, advanced=TrainerAdvanced(layout=layout, rollout=rollout),
+                   split=split, remat=remat)
 
 
 @pytest.mark.usefixtures("scanned_stacks")
@@ -1399,8 +1416,9 @@ def test_a_host_step_under_a_full_remat_policy_recomputes_every_layer():
     from dew.training.memory import recompute_record, remat_topmost
 
     held = streaming_decoder(Layout(host=("variables",)))
-    trainer = Trainer(held.objective, optax.adam(.001), key=jax.random.key(6), layout=held.layout,
-                      fit=FitPolicy(remat="full"))
+    trainer = Trainer(held.objective, optax.adam(.001), key=jax.random.key(6),
+                      advanced=TrainerAdvanced(layout=held.layout),
+                      remat="full")
     trainer.fit(streaming_data(), steps=1, log_every=100)
     own, topmost = (streaming_decoder(Layout(host=("variables",))).objective for _ in range(2))
     remat_topmost(topmost)
@@ -1561,7 +1579,7 @@ def test_a_fit_over_a_plain_loop_frozen_stack_keeps_its_device_layout(caplog):
         with assumed_on_cpu("sm90"), stand_in_gpus(jax.devices("cpu"), 80 * 2 ** 30):
             split = Trainer(LMObjective(adapted.model, 8, head_chunks=1, ema_decay=None,
                                         variables=adapted.variables), optax.adam(.001), key=jax.random.key(6),
-                            fit=FitPolicy(split=3))
+                            split=3)
             with pytest.raises(LayoutRefused):
                 split.fit(streaming_data(), steps=1, log_every=100)
         # Its devices too small for its state between steps, which the given layout's placement refuses before
@@ -1707,9 +1725,14 @@ def test_a_fit_that_fails_placing_its_state_keeps_none_of_its_device_plan():
     it: the trainer that ran it holds no plan no compile took, and no candidate its search compiled
     outlives the fit (`StepCompiler.abandoned`; review of row 12131's P0 r7: a start whose state's
     placement raised left its plan on the trainer's compiler)."""
+    from dew.nn.kernels import options
     from dew.training import _candidates
     from dew.training.ahead import stand_in_gpus
     from dew.training.memory import host_memory_stated
+
+    # The traced steps a fit before it kept for a refit (`_candidates`): none of this one's.
+    options.release()
+    gc.collect()
 
     def refused():
         raise RuntimeError("the devices refused the start")
@@ -1903,7 +1926,8 @@ def test_a_phased_runs_two_prices_are_at_its_first_phases_pass_count():
     prices = []
     for steps, phases in ((3, (1, 3)), (1, None)):
         model = looped(steps=steps).clone(dtype=jnp.bfloat16)
-        trainer = Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0), phase_passes=phases)
+        trainer = Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
+                          advanced=TrainerAdvanced(phase_passes=phases))
         streamed = streamed_priced(trainer, phased_loader(tokens))
         prices.append((trainer.layout_choice.device, streamed.compute, streamed.link))
     phased, single = prices
@@ -2048,7 +2072,8 @@ def rolled_out_fit(rollout, steps: int = 2, tracker=None):
         while True:
             yield {"text": rows}
     trainer = Trainer(LMObjective(decoder(), 8, head_chunks=1, ema_decay=None), optax.adam(.01),
-                      key=jax.random.key(3), layout=HOST, rollout=rollout, tracker=tracker,
+                      key=jax.random.key(3), advanced=TrainerAdvanced(layout=HOST, rollout=rollout),
+                      tracker=tracker,
                       mesh=MeshSpec().build(jax.devices()[2:4]))
     return trainer, trainer.fit(Loader(stream, None, batch=2, records=None), steps=steps, log_every=1,
                                 eval_every=None, checkpoint_every=None)
@@ -2219,7 +2244,8 @@ def test_a_host_step_under_autopgle_runs_its_programs_guided_by_a_trials_profile
         with autopgle(2):
             return trainer.compile(start, data, Handed(start, data))
 
-    placed = compiled_for(lambda arm: Trainer(Coupled(), optax.adam(.01), key=jax.random.key(4), layout=HOST),
+    placed = compiled_for(lambda arm: Trainer(Coupled(), optax.adam(.01), key=jax.random.key(4),
+                                              advanced=TrainerAdvanced(layout=HOST)),
                           compile)
 
     def run(arm, small, large):
@@ -2245,8 +2271,9 @@ def test_a_host_step_under_autopgle_runs_its_programs_guided_by_a_trials_profile
         stepped.append(executable)
         yield
 
-    accumulating = Trainer(Coupled(), optax.adam(.01), key=jax.random.key(4), layout=HOST,
-                           update=UpdateBatch(batches=2))
+    accumulating = Trainer(Coupled(), optax.adam(.01), key=jax.random.key(4),
+                           advanced=TrainerAdvanced(layout=HOST),
+                           accumulation=2)
     data = {"small": jnp.asarray(np.float32(.5)), "large": jnp.asarray(np.float32(40.))}
     trial = Handed(widened_start(accumulating), data)
     with autopgle(2):
@@ -2262,10 +2289,10 @@ def test_a_host_step_under_autopgle_runs_its_programs_guided_by_a_trials_profile
 
 @pytest.mark.usefixtures("scanned_stacks")
 def test_a_host_step_lowers_for_a_gpu_here_compiling_nothing():
-    """A step that keeps its variables on the host, lowered on this CPU for an H100 (`Trainer(lower_for=)`,
-    its norms Pallas's), raises the dry run's `Lowered` with each program its steady steps call: its
-    realizations' for the GPU, their norms lowered to its Triton kernels, its companion's for this host,
-    none of them compiled."""
+    """A step that keeps its variables on the host, lowered on this CPU for an H100
+    (`TrainerAdvanced(lower_for=)`, its norms Pallas's), raises the dry run's `Lowered` with each program its
+    steady steps call: its realizations' for the GPU, their norms lowered to its Triton kernels, its
+    companion's for this host, none of them compiled."""
     import dew
     from dew.nn.kernels.lowered import triton_kernels
     from dew.telemetry.compiles import Compiles
@@ -2273,7 +2300,8 @@ def test_a_host_step_lowers_for_a_gpu_here_compiling_nothing():
 
     trainer = Trainer(LMObjective(decoder(dtype=jnp.bfloat16, emb_features=128, num_heads=2, max_seq_len=128),
                                   128, head_chunks=1, ema_decay=None),
-                      optax.adam(.01), key=jax.random.key(3), layout=HOST, lower_for="sm90")
+                      optax.adam(.01), key=jax.random.key(3), advanced=TrainerAdvanced(layout=HOST,
+                                                                                       lower_for="sm90"))
     # Its fresh state's shapes, as a build host's start reads them (`prepare_host_step`).
     state = trainer._started("never").abstract
     batch = {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)}

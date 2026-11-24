@@ -1,6 +1,6 @@
 """Train a diffusion model over images or latents.
 
-    python recipes/diffusion/train.py --trainer.horizon.epochs 2000
+    python recipes/diffusion/train.py --trainer.epochs 2000
 
 Oxford flowers with flower captions is the default; docs/recipes.md lists the
 other corpora. The run is `dew.config.diffusion.DiffusionRunConfig`, its model and

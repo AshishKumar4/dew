@@ -184,6 +184,14 @@ class ShardManifest:
     index_ordered: bool = False
     counted: Callable[[int], tuple[int, ...]] | None = None
     fixed_parts: bool = False
+    subdivided_by: str | None = None
+    """The rule its `subdivide` cuts by where that rule changed from its first (`EVEN_CUT`), None where it
+    cuts as it always has: a read that cuts by it holds it in its position (`cut`)."""
+    cut: str | None = None
+    """The rule its shards were cut finer by, where they were by a changed one (`subdivided_by`,
+    `dew.data.shards.cut`): a read's position names its places in the shards it was dealt, so one saved
+    under another cut is refused where it resumes (`dew.data.shards._Passing`), and one of a read its store
+    cut by an unchanged rule, or not at all, resumes as it was."""
 
     @property
     def digest(self) -> str:
@@ -441,8 +449,10 @@ def _indexed_manifest(source: Source, uri: str, rows: int, reader: ShardOpener |
     each named alike by the record it starts at (docs/design/data.md: a store of fewer shards than its
     readers × workers is cut into that many)."""
     count = len(source.records("indexed")) if count is None else count
+    subdivide = functools.partial(_even_ranges, uri, count, lambda start, end: f"records:{start}")
     return ShardManifest(_ranges(uri, count, rows), _IndexedSlice(source) if reader is None else reader,
-                         subdivide=functools.partial(_subdivided, uri, count) if subdivides else None,
+                         subdivide=subdivide if subdivides else None,
+                         subdivided_by=EVEN_CUT if subdivides else None,
                          index_ordered=True)
 
 
@@ -452,9 +462,23 @@ def _ranges(uri: str, count: int, size: int) -> tuple[Shard, ...]:
                  for start in range(0, count, size))
 
 
-def _subdivided(uri: str, count: int, required: int) -> tuple[Shard, ...]:
-    """`count` records at `uri` cut into at least `required` ranges, none where it holds fewer records."""
-    return _ranges(uri, count, count // required) if count >= required else ()
+EVEN_CUT = "even"
+"""The rule a store's ranges are cut finer by (`_even_ranges`): exactly the readers' count of ranges, their
+sizes differing by one record at most, where its first cut ranges of `count // required` records, more of
+them than readers (Train 1240's review); a read that cut its store holds it in its position
+(`ShardManifest.cut`), so a position the first cut saved is refused, never read at other rows."""
+
+
+def _even_ranges(uri: str, count: int, name: Callable[[int, int], str], required: int) -> tuple[Shard, ...]:
+    """`count` records at `uri` cut into exactly `required` consecutive ranges, their sizes differing by one
+    at most, each named by `name(start, end)` (`ShardManifest.subdivide`); none where it holds fewer
+    records than ranges."""
+    if count < required:
+        return ()
+    step, remainder = divmod(count, required)
+    bounds = [index * step + min(index, remainder) for index in range(required + 1)]
+    return tuple(Shard(name(start, end), uri, start, end, end - start)
+                 for start, end in itertools.pairwise(bounds))
 
 
 @runtime_checkable
@@ -500,28 +524,11 @@ def _single_indexed_manifest(source: Source, uri: str) -> ShardManifest:
     """One whole-store shard `(0..count)` for a single-reader stream, preserving the single-shard
     positions earlier runs saved, with row-wise `subdivide` when readers × workers exceed one."""
     count = len(source.records("indexed"))
-
-    def subdivide(required: int) -> tuple[Shard, ...]:
-        parts = min(required, count)
-        if parts < required:
-            return ()
-        step, remainder = divmod(count, parts)
-        bounds = [index * step + min(index, remainder) for index in range(parts + 1)]
-        return tuple(
-            Shard(
-                f"{uri}:{bounds[index]}:{bounds[index + 1]}",
-                uri,
-                bounds[index],
-                bounds[index + 1],
-                bounds[index + 1] - bounds[index],
-            )
-            for index in range(parts)
-        )
-
     return ShardManifest(
         (Shard(uri, uri, 0, count, count),),
         _IndexedSlice(source),
-        subdivide=subdivide,
+        # Cut by its first rule, its ranges and their names as earlier runs saved them: no cut to name.
+        subdivide=functools.partial(_even_ranges, uri, count, lambda start, end: f"{uri}:{start}:{end}"),
         index_ordered=True,
     )
 

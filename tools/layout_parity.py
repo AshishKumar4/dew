@@ -225,7 +225,8 @@ def zoo() -> dict[str, Any]:
     nemotron_h.update(vocab_size=512, num_layers=20, max_seq_len=33,
                      layer_types=tuple(nemotron_h["layer_types"]) * 4)
     window = {**dense, "layer_types": ("sliding",) * 4, "kinds": {"sliding": {"window": 12}}}
-    mla = {**dense, "mixer": {"class": "mla", "fields": {"q_lora_rank": 48, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
+    mla = {**dense, "mixer": {"class": "mla", "fields": {"q_lora_rank": 48, "kv_lora_rank": 32,
+                                                         "qk_nope_head_dim": 16,
                               "qk_rope_head_dim": 8, "v_head_dim": 8}}}
     mamba2 = {**dense, "layer_types": ("mamba",) * 4, "kinds": {"mamba": mamba}}
     mamba1 = {**dense, "layer_types": ("mamba",) * 4, "kinds": {"mamba": {"mixer": {
@@ -233,7 +234,8 @@ def zoo() -> dict[str, Any]:
                                      "chunk_size": 8}}}}}
     rigel = {**dense, "layer_types": ("mamba",) * 3 + ("sliding",),
              "kinds": {"mamba": mamba, "sliding": {"window": 12}}}
-    dit: dict[str, object] = {"patch_size": 2, "emb_features": 64, "num_layers": 4, "num_heads": 4, "mlp_ratio": 2,
+    dit: dict[str, object] = {"patch_size": 2, "emb_features": 64, "num_layers": 4, "num_heads": 4,
+                              "mlp_ratio": 2,
            "output_channels": 4}
     # Sixteen rows: a pipeline's microbatch has to take a share of every
     # device's rows, and stage2_fsdp2 on eight devices splits the rows four
@@ -278,7 +280,8 @@ def zoo() -> dict[str, Any]:
         **_image_zoo(),
         "multimodal": Case("multimodal_transformer", dense, media={
             "family": "gemma3", "image_token_id": 511, "images": 1, "pixels": [3, 16, 16],
-            "tower": {"class": "siglip", "fields": {"hidden_size": 32, "intermediate_size": 64, "num_layers": 1,
+            "tower": {"class": "siglip", "fields": {"hidden_size": 32, "intermediate_size": 64,
+                                                    "num_layers": 1,
                       "num_heads": 4, "image_size": 16, "patch_size": 8}},
             "projector": {"class": "gemma", "fields": {"text_width": 64, "patches_per_side": 2,
                           "tokens_per_side": 2}}}, **lm),
@@ -431,7 +434,7 @@ def _trainer(case, fields: Layout, *, one_device: bool = False, accumulation: in
     from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
     from dew.nn.kernels.generation import gpu_target
     from dew.nn.sharding import Link
-    from dew.training import Layout, MeshSpec, Trainer, UpdateBatch
+    from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
     class Drawn(Trainer):
         def initial_state(self, initializer=None, key=None):
@@ -461,9 +464,10 @@ def _trainer(case, fields: Layout, *, one_device: bool = False, accumulation: in
     links = {axis: Link(1e15, 1e12) for axis in (TENSOR_AXIS, SEQUENCE_AXIS)} if unmeasured else None
     trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
                       key=jax.random.key(0), **bench.trainer_mesh(fields),
-                      layout=Layout(min_shard=case.fsdp_min_param_size, tolerance=1.0),
-                      update=UpdateBatch(batches=accumulation), checkpoints=None, tracker=None, links=links,
-                      record=record)
+                      accumulation=accumulation, checkpoints=None, tracker=None,
+                      advanced=TrainerAdvanced(
+                          layout=Layout(min_shard=case.fsdp_min_param_size, tolerance=1.0), links=links,
+                          record=record))
     if one_device:
         trainer.device_mesh = MeshSpec().build([jax.local_devices()[0]])
     elif devices is not None:
@@ -748,7 +752,7 @@ class Arm:
     """One layout's trainer and its first step, compiled once and run on each draw (`drawn_batch`) from
     the one initial state every layout starts from (`_initial`), placed once on the layout's mesh and
     each run on a fresh copy of it there (the step donates the state it is handed), recording what its
-    loss drew and started from (`Trainer(record=True)`)."""
+    loss drew and started from (`TrainerAdvanced(record=True)`)."""
 
     def __init__(self, case, fields: Layout, *, one_device: bool = False, devices: int | None = None):
         import jax

@@ -29,12 +29,13 @@ from dew.nn.kernels import (
     gemm,
     generation,
     grouped_cells,
+    grouped_cutlass,
     grouped_launch,
     grouped_matmul,
     grouped_triton,
     tuning,
 )
-from dew.nn.kernels.templates.gemm import mosaic_gpu, row_tiles, tiling
+from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing, row_tiles, tiling
 from dew.nn.moe import expert_projection
 
 pytestmark = pytest.mark.kernel
@@ -278,10 +279,10 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
 
     hopper = installed((9, 0), "sm90")
     assert hopper["sm90"] == "sm90" and hopper["sm80"] is None
-    assert grouped_matmul.cutlass_built_for("sm90") == "sm90"
-    assert grouped_matmul.cutlass_built_for("sm80") is None
+    assert grouped_cutlass.cutlass_built_for("sm90") == "sm90"
+    assert grouped_cutlass.cutlass_built_for("sm80") is None
     ampere = installed((8, 0), "sm80")
-    assert ampere["sm80"] == "sm80" and grouped_matmul.cutlass_built_for("sm80") == "sm80"
+    assert ampere["sm80"] == "sm80" and grouped_cutlass.cutlass_built_for("sm80") == "sm80"
 
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
@@ -291,7 +292,7 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
     here = generation.gpu_target().generation
-    if grouped_matmul.cutlass_built_for(here) is None:
+    if grouped_cutlass.cutlass_built_for(here) is None:
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
     group_sizes = np.asarray(SIZES[sizes], np.int32)
 
@@ -304,8 +305,8 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
                                               implementation, None)
     # Its build's kernel pinned, as a tuned pick names it: the pin taken as legal for the wheel's one kernel
     # (`_Cutlass.legal`), where a template's shared-memory model, which CUTLASS has none of, raised.
-    pinned = {grouped_matmul.CutlassGmm: grouped_matmul.cutlass_tile(grouped_matmul.cutlass_built_for(here),
-                                                                     jnp.bfloat16)}
+    built = grouped_cutlass.cutlass_built_for(here)
+    pinned = {grouped_cutlass.CutlassGmm: grouped_cutlass.cutlass_tile(built, jnp.bfloat16)}
 
     def through_cutlass(x, w, dy):
         with generation.chosen(grouped_matmul="cutlass"), tuning.pinned(pinned):
@@ -378,7 +379,7 @@ def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):
     gradients through CUTLASS's launches chosen by name, each map one launch in turn (their FFI calls'
     sequential batching, row 4389), are as exact as XLA's ragged dot mapped, from float64."""
     here = generation.gpu_target().generation
-    if grouped_matmul.cutlass_built_for(here) is None:
+    if grouped_cutlass.cutlass_built_for(here) is None:
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
     group_sizes = np.asarray(SIZES["ragged"], np.int32)
 
@@ -1390,7 +1391,7 @@ def test_gemm_register_model_fits_sm90_epilogue_and_tgmm_census():
 def test_tpu_gemm_derives_legal_vmem_bounded_tiles_from_step_seconds(tpu_name):
     """On TPU v5e and v6e (`mxu`), `MosaicGmm` and `MosaicTgmm` derive legal VMEM-bounded tiles through the
     shared `pricing.step_seconds` cost model (rows 10152, 11944)."""
-    from dew.nn.kernels.templates.gemm import derivation, pricing
+    from dew.nn.kernels.templates.gemm import derivation
 
     target = generation.gpu_target(tpu_name)
     gmm, tgmm = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()
@@ -1427,7 +1428,6 @@ def test_ampere_multi_wave_dense_dx_unifies_planner_and_kernel_and_holds_check_1
     """On Ampere (`mma.sync`), `pricing.dense_tail` prices multi-wave persistent L2 drift once so planner
     (`_merges`, `_balances`) and kernel (`_dense_tail`) agree by construction, and a multi-wave dense
     input gradient holds check 1 via `assert_as_exact` (rows 5363, 11945, 11947)."""
-    from dew.nn.kernels.templates.gemm import pricing
 
     sm80 = generation.gpu_target("sm80")
     gmm, tgmm = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()
@@ -1496,7 +1496,6 @@ def test_sm80_prefetch_registers_and_tgmm_prefetch_predicate():
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
-    from dew.nn.kernels.templates.gemm import pricing
 
     sm80 = generation.gpu_target("sm80")
     gmm, tgmm = grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()
@@ -1538,7 +1537,6 @@ def test_hopper_cluster2_balanced_tail_holds_check_1(rows, depth, mp):
     """Hopper `cluster=2` dense forward (`gmm`) and kernel gradient (`tgmm`) with balanced tail across
     cluster pairs (`pairs = mp // 2`, leading `pair` axis on `workspace`/`ready`), including ragged
     `m % (2*bm) != 0` and `iterations < pairs`, hold check 1 via `assert_as_exact` (row 10151)."""
-    from dew.nn.kernels.templates.gemm import pricing
 
     tile = tiling.Tiles(128, 256, 64, 2, 1, warpgroups=2, cluster=2, family="wgmma")
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=mp, measured={})
@@ -2035,7 +2033,7 @@ def test_vmap_folds_singleton_group_sides_and_preserves_named_dispatch():
             jax.jit(jax.vmap(lambda x, w: gemm.gemm(x, w, gs, out_dtype=jnp.bfloat16,
                                                     interpret_on_cpu=True)))(xs, gw)
         assert any(r.kernel == "xla" for r in seen), seen
-        if grouped_matmul.cutlass_built_for("sm90") is None:
+        if grouped_cutlass.cutlass_built_for("sm90") is None:
             with generation.chosen(grouped_matmul="cutlass"), pytest.raises(selection.KernelRefused):
                 jax.jit(jax.vmap(lambda x, w: gemm.gemm(x, w, gs, out_dtype=jnp.bfloat16,
                                                         interpret_on_cpu=True)))(xs, gw)
@@ -2119,7 +2117,7 @@ def test_sm80_transposed_dx_and_tgmm_skip_regressing_fragment_prefetch():
     """Ampere `CpAsync` skips cross-step fragment prefetch on transposed `dX` (`M-FS-53-a100`, `M-NG-2-a100`:
     gate_up dX +32-34% slower) and `tgmm` (`M-NG-45-a100`: dW geomean 1.019x, 4B key +11.6%), keeping forward
     untransposed prefetch active with its +16/+32 register cost (row 5271)."""
-    from dew.nn.kernels.templates.gemm import mosaic_gpu, pricing
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
 
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -2177,7 +2175,6 @@ def test_a100_deep_k_dense_dx_derives_l2_drift_split_and_compiles():
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
-    from dew.nn.kernels.templates.gemm import pricing
 
     launch = grouped_matmul.MosaicGmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)

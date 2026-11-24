@@ -31,6 +31,7 @@ from dew.optim import (
     post_step_order,
     stepped,
 )
+from dew.training import TrainerAdvanced
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2
@@ -216,7 +217,7 @@ def test_a_run_saved_before_the_clip_pooled_its_maxima_resumes_and_steps_on(tmp_
         checkpoints = Checkpoints(str(tmp_path))
         chain = optax.named_chain(("sgd", optax.sgd(1e-2)), ("z_clip", clip))
         grouped = {} if groups is None else {"mesh": MeshSpec(diloco=groups).build(jax.devices()[:groups]),
-                                             "diloco": DiLoCo(every=2)}
+                                             "advanced": TrainerAdvanced(diloco=DiLoCo(every=2))}
         state = Trainer(LMObjective(model, seq_len=7), chain, key=jax.random.key(0), checkpoints=checkpoints,
                         **grouped).fit(data, steps=steps, checkpoint_every=1)
         checkpoints.wait()
@@ -270,7 +271,7 @@ def test_a_fit_moves_its_weights_by_its_named_chains_post_step_effects_in_its_or
 
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
     params = {"delay": jnp.asarray([0.05, 2.95]), "kernel": jnp.asarray([0.05, 2.95])}
-    config = OptimConfig(optimizer=Adam(), learning_rate=0.5, param_groups=(
+    config = OptimConfig(optimizer=Adam(), lr=0.5, param_groups=(
         ParamGroup("delays", ("delay",), bounds=(0.0, 3.0)), ParamGroup("rest", ("*",))))
     solver = config.build(1)
     grads = {"delay": jnp.asarray([1.0, -1.0]), "kernel": jnp.asarray([1.0, -1.0])}
@@ -301,9 +302,9 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
 
 
 @pytest.mark.parametrize("schedule", [
-    lambda warmup: Cosine(1.0, warmup_steps=warmup, decay_steps=100),
-    lambda warmup: Linear(1.0, warmup_steps=warmup, decay_steps=100),
-    lambda warmup: Power(1.0, warmup_steps=warmup, a=0.5),
+    lambda warmup: Cosine(peak_value=1.0, warmup_steps=warmup, decay_steps=100),
+    lambda warmup: Linear(peak_value=1.0, warmup_steps=warmup, decay_steps=100),
+    lambda warmup: Power(peak_value=1.0, warmup_steps=warmup, a=0.5),
 ], ids=["cosine", "linear", "power"])
 def test_a_warmup_may_be_a_share_of_the_run(schedule):
     """A warmup written as a share of the run is the whole updates nearest that share of its updates,
@@ -320,31 +321,32 @@ def test_a_warmup_may_be_a_share_of_the_run(schedule):
 @pytest.mark.parametrize("warmup", ["0%", "101%", "5", "five%"])
 def test_a_warmup_that_is_neither_steps_nor_a_share_is_refused(warmup):
     with pytest.raises(ValueError):
-        Cosine(1.0, warmup_steps=warmup, decay_steps=100).schedule(200)
+        Cosine(peak_value=1.0, warmup_steps=warmup, decay_steps=100).schedule(200)
 
 
 
 def test_a_one_cycle_rise_may_be_a_share_of_the_run():
     """OneCycle's `warmup_fraction` may be written as a share: `30%` is the schedule 0.3 makes, step for
     step, and its warmup is the steps to its peak, torch's 0.3 * 100 - 1."""
-    shared, written = OneCycle(1.0, warmup_fraction="30%"), OneCycle(1.0, warmup_fraction=0.3)
+    shared, written = OneCycle(peak_value=1.0, warmup_fraction="30%"), OneCycle(peak_value=1.0,
+                                                                                warmup_fraction=0.3)
     for step in (0, 10, 28, 29, 30, 60, 99):
         assert float(shared.schedule(100)(step)) == float(written.schedule(100)(step))
     assert shared.warmup(100) == written.warmup(100) == 29
-    assert OptimConfig(learning_rate=shared).warmups(100) == {"learning_rate": 29}
+    assert OptimConfig(schedule=shared).warmups(100) == {"schedule": 29}
     with pytest.raises(ValueError):
-        OneCycle(1.0, warmup_fraction="30").schedule(100)
+        OneCycle(peak_value=1.0, warmup_fraction="30").schedule(100)
 
 
 def test_a_config_records_the_warmups_of_the_schedules_its_optimizer_runs():
-    """A config records the warmups of the schedules its solvers run (`ParamGroup.rate`): where every
+    """A config records the warmups of the schedules its solvers run (`grouped_rates`): where every
     group names its own, the config's rate runs nowhere and is not resolved, so a share of a run with
     no planned length is no error; a group naming none runs the config's rate, recorded once."""
-    unused = Power(1.0, warmup_steps="5%", a=0.5)
-    own = OptimConfig(learning_rate=unused, param_groups=(
-        ParamGroup("weights", ("kernel",), schedule=Cosine(1.0, warmup_steps=4, decay_steps=10)),
-        ParamGroup("rest", ("*",), schedule=Cosine(1.0, warmup_steps=2, decay_steps=10))))
+    unused = Power(peak_value=1.0, warmup_steps="5%", a=0.5)
+    own = OptimConfig(schedule=unused, param_groups=(
+        ParamGroup("weights", ("kernel",), schedule=Cosine(peak_value=1.0, warmup_steps=4, decay_steps=10)),
+        ParamGroup("rest", ("*",), schedule=Cosine(peak_value=1.0, warmup_steps=2, decay_steps=10))))
     assert own.warmups(None) == {"param_groups.weights.schedule": 4, "param_groups.rest.schedule": 2}
-    inherited = OptimConfig(learning_rate=unused, param_groups=(
+    inherited = OptimConfig(schedule=unused, param_groups=(
         ParamGroup("weights", ("kernel",)), ParamGroup("rest", ("*",))))
-    assert inherited.warmups(200) == {"learning_rate": 10}
+    assert inherited.warmups(200) == {"schedule": 10}

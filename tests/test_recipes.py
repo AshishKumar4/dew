@@ -2,7 +2,7 @@
 over its own run (`default`, its `main`'s where the command sets nothing a run file states), with the
 model's sizes, the run's length, the data and the pretrained source swapped for small local ones as a user
 edits a recipe's run, and the run it saves checked. A recipe whose defaults
-refuse its own command is red: the decision recipe's `--trainer.horizon.steps 2000` was refused at its default
+refuse its own command is red: the decision recipe's `--trainer.steps 2000` was refused at its default
 cadence ("epoch"), which no test of the recipes ran."""
 
 import dataclasses
@@ -72,9 +72,9 @@ def byte_store(root: Path, name: str) -> str:
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("command", [
-    ["--trainer.horizon.epochs", "1"],
+    ["--trainer.epochs", "1"],
     ["--pretrained", str(QWEN_TINY), "--lora.rank", "2", "--lora.modules", "q_proj", "v_proj",
-     "--optim.learning-rate", "1e-4", "--trainer.horizon.steps", "2"],
+     "--optim.lr", "1e-4", "--trainer.steps", "2"],
 ], ids=["epochs", "lora"])
 def test_the_decision_recipe_trains_and_saves_its_run(command, tmp_path):
     """recipes/decision/train.py's two documented commands over a small table: a run by epochs over the
@@ -83,7 +83,7 @@ def test_the_decision_recipe_trains_and_saves_its_run(command, tmp_path):
     pretrained = [] if "--pretrained" in command else ["--pretrained", str(TINY_LAYA)]
     state = recipe.main([*pretrained, *command, *TRAINED, "--trainer.checkpoint-dir", str(tmp_path / "runs")],
                         tickets())
-    assert int(state.step) == 2 if "--trainer.horizon.steps" in command else int(state.step) > 0
+    assert int(state.step) == 2 if "--trainer.steps" in command else int(state.step) > 0
     assert saved(tmp_path, state)
 
 
@@ -95,7 +95,7 @@ def test_the_diffusion_recipe_trains_and_saves_its_run(tmp_path):
     run = with_model(recipe.default(*pictures()), "simple_dit", **IMAGE_MODEL).override({
         "data.images.size": 8, "data.images.batch": 8, "validation.images.size": 8,
         "validation.images.batch": 8})
-    state = DiffusionRunConfig.cli(["--trainer.horizon.epochs", "1", *TRAINED, "--trainer.checkpoint-dir",
+    state = DiffusionRunConfig.cli(["--trainer.epochs", "1", *TRAINED, "--trainer.checkpoint-dir",
                                     str(tmp_path / "runs"), "--val-metrics", "[]", "--text.encoder",
                                     "char_table", "--text.checkpoint", "char_table"], default=run).run()
     assert int(state.step) > 0 and saved(tmp_path, state)
@@ -110,7 +110,7 @@ def test_the_jepa_recipe_trains_and_saves_its_run(tmp_path):
     run = with_model(recipe.default(*images.holdout(split="test")), **IMAGE_MODEL).override({
         "data.images.size": 16, "data.images.batch": 8, "validation.images.size": 16,
         "validation.images.batch": 8})
-    state = JepaRunConfig.cli(["--trainer.horizon.epochs", "1", "--probe-classes", "2", *TRAINED,
+    state = JepaRunConfig.cli(["--trainer.epochs", "1", "--probe-classes", "2", *TRAINED,
                                "--trainer.checkpoint-dir", str(tmp_path / "runs")], default=run).run()
     assert int(state.step) > 0 and saved(tmp_path, state)
 
@@ -126,7 +126,7 @@ def test_the_lm_recipe_trains_an_epoch_of_its_store_and_saves_its_run(tmp_path):
     store = write_token_corpus(tmp_path / "shakespeare-byte", tokens).train
     run = with_model(recipe.default(store), emb_features=16, num_layers=1, num_heads=2).override({
         "data.token_windows.seq_len": 16, "data.token_windows.batch": 8})
-    state = LMRunConfig.cli(["--trainer.horizon.epochs", "1", *TRAINED, "--trainer.checkpoint-dir",
+    state = LMRunConfig.cli(["--trainer.epochs", "1", *TRAINED, "--trainer.checkpoint-dir",
                              str(tmp_path / "runs"), "--max-new-tokens", "0"], default=run).run()
     assert int(state.step) == 5 and saved(tmp_path, state)
 

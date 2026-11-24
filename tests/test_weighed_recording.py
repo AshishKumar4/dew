@@ -90,6 +90,7 @@ def recordings(request, tmp_path_factory):
     recorder, directory = load("recorded_references"), tmp_path_factory.mktemp("weighed")
     dew = jax.jit(lambda inputs: at(reformulated, layout)(jnp.float32, inputs))
     saved, scale = {"layout": layout}, scaled(layout)
+    saved["scale"] = scale
     with jax.enable_x64(new_val=True):
         for name, options in (("whole", {}), ("summary", {"summary": True})):
             recorded = recorder.record_case("site", inputs_of, evaluated(layout), dew=dew, scale=scale,
@@ -139,3 +140,24 @@ def test_a_recorded_arm_with_no_weighed_evidence_is_refused_by_name():
     summary = parity.leaf_summaries([np.ones((1, 4), np.float32)], [truth["y"]])
     with pytest.raises(AssertionError):
         conditioning.of(truth, (), 0).weighed({"y": summary[0]}, "the recorded reference")
+
+
+def test_a_recording_declaring_its_unweighted_count_is_the_one_its_ladder_makes(recordings):
+    """A weighed site whose unweighted sizing never resolves (this one's lands at the cap), recorded
+    declaring that count (`record_case`'s `unweighted`): the summary its paired ladder makes, entry for entry
+    (multimodal-qwen35's GPU recording climbed the ladder again every slice); a count past the cap refused."""
+    layout = recordings["layout"]
+    recorder = load("recorded_references")
+    dew = jax.jit(lambda inputs: at(reformulated, layout)(jnp.float32, inputs))
+    _, laddered = recordings["summary"]
+    options = {"dew": dew, "scale": recordings["scale"], "store_inputs": False, "summary": True}
+    with jax.enable_x64(new_val=True):
+        declared = recorder.record_case("site", inputs_of, evaluated(layout), unweighted=parity.MOST_SEEDS,
+                                        **options)
+        with pytest.raises(ValueError):
+            recorder.record_case("site", inputs_of, evaluated(layout), unweighted=2 * parity.MOST_SEEDS,
+                                 **options)
+    assert declared.keys() == laddered.keys()
+    for name in laddered:
+        np.testing.assert_array_equal(declared[name], laddered[name], err_msg=name)
+

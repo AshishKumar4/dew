@@ -108,7 +108,7 @@ dew tpu copy dew-16 /tmp/dew-first-recipe/tokens '~/dew-tokens' \
 ```bash
 dew tpu sync dew-16 --zone us-central2-b --dry-run
 dew launch --tpu dew-16 --zone us-central2-b --cwd dew --dry-run -- \
-    python recipes/lm/train.py --trainer.horizon.steps 2 --trainer.log-every 1 --trainer.checkpoint-every 2 \
+    python recipes/lm/train.py --trainer.steps 2 --trainer.log-every 1 --trainer.checkpoint-every 2 \
     --trainer.checkpoint-dir /home/you/dew-checkpoints --trainer.name byte-demo --max-new-tokens 0
 ```
 

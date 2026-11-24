@@ -24,6 +24,7 @@ from dew import communicators
 from dew._code import code_digest
 from dew._devices import FRACTIONS, WRITTEN, pool_bound
 from dew.communicators import Collectives, CommunicatorRoom, Needs
+from dew.training import TrainerAdvanced
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 GIB = 2**30
@@ -771,7 +772,7 @@ def test_an_inspected_runs_sampled_step_is_taken_as_run_once_it_completes():
         model = models.build("causal_transformer", vocab_size=64, emb_features=16, num_layers=1, num_heads=2,
                              mlp_features=32, max_seq_len=16)
         trainer = Trainer(LMObjective(model, seq_len=16), optax.sgd(0.1), key=jax.random.key(0),
-                          inspection=Inspection(every=2))
+                          advanced=TrainerAdvanced(inspection=Inspection(every=2)))
         rows = Replaying(lambda position: {"text": jax.device_get(BATCH["text"])})
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=2)
         gc.collect()

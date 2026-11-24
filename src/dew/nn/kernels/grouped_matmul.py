@@ -29,8 +29,6 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-import importlib
-import importlib.util
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Protocol
@@ -55,6 +53,7 @@ from .grouped_cells import (
     Kind,
     Made,
 )
+from .grouped_cutlass import CutlassGmm, CutlassTgmm
 from .grouped_launch import INTERPRETED, _GroupedLaunch
 from .grouped_triton import Gmm, Tgmm, _gradient_sides, _product_sides
 from .templates import base
@@ -210,7 +209,8 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         # Kernel gradient prepares its depth half of each step's rows stage (`_staged_halves`, DECIDE1/3117).
         staged = rewritten = 0
         if self.STAGED_ROWS and not family.operands_in_registers and not family.tensor_columns(columns, 1):
-            chunk = stores.staged_columns(columns, stored)
+            chunk = stores.output_staging(
+                columns, stored, config.staging, piece=family.chunk_columns(columns))[0]
             tgmm_tiles = [((1,), jnp.int32)] * 6 + [((config.share, chunk), stored[0])]
             plain += family.scalar_registers(tgmm_tiles) - family.scalar_registers()
         if self.STAGED_ROWS and not family.operands_in_registers and not self.unstaged(ba):
@@ -279,15 +279,15 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
         columns = pricing.tile_columns(config, family)
         if hooks.epilogue is None:
-            return pricing.epilogue_registers(family, config.share, columns, stored, has_hook=False)
+            return pricing.epilogue_registers(family, config.share, columns, stored, staging=config.staging)
         vectors = sum(family.column_registers(columns, side.dtype)
                       for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
                                             strict=True) if held_axes(axes) == ('columns',))
         vectors += family.column_registers(columns, jnp.float32) if hooks.accumulators > 1 else 0
         tile_count = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes)
         out_dtypes = hooks.out_dtypes or stored
-        return pricing.epilogue_registers(family, config.share, columns, out_dtypes,
-                                          vectors=vectors, tile_count=tile_count, has_hook=True)
+        return pricing.epilogue_registers(family, config.share, columns, out_dtypes, vectors=vectors,
+                                          tile_count=tile_count, has_hook=True, staging=config.staging)
 
     def _step_sizes(self, ba) -> tuple[int, ...] | None:
         del ba
@@ -591,7 +591,7 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
         copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         from .templates.axes import held as held_axes
-        from .templates.gemm import mosaic_gpu
+        from .templates.gemm import mosaic_gpu, pricing
         family = next((bundle for group in self._groups(ba, target) for bundle in group
                        if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
@@ -599,9 +599,11 @@ class _Mosaic(tiling.TilesTemplate, _GroupedLaunch[tiling.Tiles]):
                 or self._pair_refuses(ba, config, family) or self._pingpong_refuses(config, family)
                 or not self._divides(ba, config, target) or self._refused(ba, config, target)):
             return False
-        if not self._granular(ba, config, family, target):
-            return False
         hooks = ba.arguments['hooks']
+        if not self._granular(ba, config, family, target) or config.staging_refusal(
+                hooks.out_dtypes or (ba.arguments['out_dtype'],),
+                family.specialized(config.share, pricing.tile_columns(config, family))) is not None:
+            return False
         sides = (('prologue_operands', hooks.prologue_axes), ('epilogue_operands', hooks.epilogue_axes))
         vectors = {(axis, jnp.dtype(side.dtype)) for name, axes_of in sides
                    for side, side_axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)
@@ -1854,134 +1856,6 @@ def _column_scale_registers(ba, config: tiling.Tiles, target=None) -> int:
 
     family = pricing.family_of(config, ba.arguments['tokens'].dtype, target)
     return family.column_registers(config.block_n, jnp.float32)
-
-
-def _cutlass_call(target: int, out: jax.ShapeDtypeStruct) -> Callable:
-    """dew_cutlass's FFI call giving `out` of the `target`-th of the targets the wheel names
-    (`dew_cutlass.TARGETS`: its grouped GEMM, then its weight gradient), a mapped call running its maps in
-    turn, one launch each (row 4389: JAX's FFI batching refuses a call that states no rule)."""
-    name = importlib.import_module('dew_cutlass').TARGETS[target]
-    return jax.ffi.ffi_call(name, out, vmap_method='sequential')
-
-
-def cutlass_tile(architecture: str, out_dtype) -> tiling.Tiles:
-    """Dew's record of the kernel the installed dew_cutlass instantiates for `architecture` writing
-    `out_dtype`, as Dew's records name a launch (row 4323): the build's own statement of its compiled types
-    (`dew_cutlass.KERNELS`: its tile, stages, consumer threads, cluster rows and instruction family), a
-    fact of that binary, not a derivation. Its kernels band no column tiles."""
-    from .templates import resources
-
-    kernel = importlib.import_module('dew_cutlass').KERNELS[(architecture, jnp.dtype(out_dtype).name)]
-    rows, columns, depth = kernel.tile
-    return tiling.Tiles(rows, columns, depth, kernel.stages, 1,
-                            warpgroups=kernel.consumers // resources.THREADS, cluster=kernel.cluster,
-                            family=kernel.instructions)
-
-
-def cutlass_built_for(generation_name: str) -> str | None:
-    """The generation of the installed dew_cutlass's kernels a GPU of `generation_name` runs, as the wheel
-    dispatches on its compute capability (`dew_cutlass.architecture`, the one statement of it); None where
-    the wheel is not installed or runs none there."""
-    return generation.cutlass_built().get(generation_name)
-
-
-class _Cutlass(_GroupedLaunch[tiling.Tiles]):
-    """CUTLASS's grouped GEMMs (`kernels/cutlass`, the dew-cutlass wheel) as XLA FFI calls: on Ampere and
-    every 8.x part, CUTLASS 2's grouped kernel; on Hopper, CUTLASS 3's pointer-array cooperative kernel on a
-    pair of multiprocessors; bf16 operands and bf16 or fp32 out, each group's shape set up on the device. A
-    vendored production route on the cells where it measured faster than the template (`DECLARED`), and by
-    name elsewhere, at the one kernel its build holds for the GPU and output (`tile`, the build's own record
-    of it, `cutlass_tile`)."""
-    name: ClassVar[str] = 'cutlass'
-    config_cls: ClassVar[type[tiling.Tiles]] = tiling.Tiles
-
-    def eligible(self, ba, target) -> bool:
-        return cutlass_built_for(target.generation) is not None and self.in_contract(ba)
-
-    def tile(self, ba) -> tiling.Tiles | None:
-        """The record of the kernel the build holds for the GPU being selected for (`generation.gpu_target`,
-        `cutlass_built_for`) writing the call's output (`cutlass_tile`); None where it holds none."""
-        built = cutlass_built_for(generation.gpu_target().generation)
-        return None if built is None else cutlass_tile(built, ba.arguments['out_dtype'])
-
-    @staticmethod
-    def in_contract(ba) -> bool:
-        """Whether its kernels take the call wherever dew_cutlass holds them (`eligible` adds the installed
-        library's generations): bf16 operands, bf16 or fp32 out, int32 sizes, every extent a multiple of 8
-        elements (16-byte aligned rows of every operand and output, as its TMA copies and each group's
-        pointers need), no hooks or exact sums, compiled (no interpreter), its stack read whole."""
-        operands = [value for name, value in ba.arguments.items()
-                    if name in ('tokens', 'kernel', 'cotangent')]
-        extents = {extent for operand in operands for extent in operand.shape[1:]}
-        return (all(operand.dtype == jnp.bfloat16 for operand in operands)
-                and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
-                and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
-                and ba.arguments['hooks'] == NO_HOOKS and not ba.arguments.get('exact_sums')
-                and not ba.arguments['interpret'] and ba.arguments.get('first') is None)
-
-    def space(self, ba) -> tuple[tiling.Tiles, ...]:
-        tile = self.tile(ba)
-        return () if tile is None else (tile,)
-
-    def offering(self, ba, target) -> tuple[tiling.Tiles, ...]:
-        # Its build's kernel is the one it runs (`cutlass_tile`), sized to every part of its architecture.
-        return self.space(ba)
-
-    def legal(self, ba, config: tiling.Tiles, target) -> bool:
-        """Whether `config` runs the call: its build's one kernel (`space`), which CUTLASS sized to every part
-        of its architecture, its shared memory and registers its own; a pin or a tuned pick names it."""
-        del target
-        return config in self.space(ba)
-
-
-@dataclasses.dataclass(frozen=True)
-class CutlassGmm(_Cutlass):
-    """`Gmm` through CUTLASS (the wheel's grouped GEMM target, `dew_cutlass.TARGETS`)."""
-
-    ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
-
-    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
-             first: jax.Array | None = None, gather: jax.Array | None = None,
-             scatter: jax.Array | None = None, joined: jax.Array | None = None, beside: tuple = (),
-             chained: tuple = (), *, out_dtype: str,
-             trans_rhs: bool, interpret: bool,
-             hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
-             dense: bool = False, config: tiling.Tiles, return_residuals: bool = False):
-        # No hooks, side operands, second matrix, stack read from a first matrix or exact sums: the launch is
-        # not eligible for them (`_Cutlass.eligible`); a dense call is one group, as any.
-        del prologue_operands, epilogue_operands, paired, first, gather, scatter, interpret, hooks, exact_sums
-        del dense, config, joined, beside, chained
-        importlib.import_module('dew_cutlass').registered()
-        width = kernel.shape[1] if trans_rhs else kernel.shape[2]
-        out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
-        call = _cutlass_call(0, out)
-        return call(tokens, kernel, sizes, transpose_w=trans_rhs), None
-
-
-@dataclasses.dataclass(frozen=True)
-class CutlassTgmm(_Cutlass):
-    """`Tgmm` through CUTLASS (the wheel's weight-gradient target, `dew_cutlass.TARGETS`): each group's
-    gradient a GEMM over its rows, an empty group's zero, its pair splitting the gradient's rows."""
-
-    ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
-
-    def tile(self, ba) -> tiling.Tiles | None:
-        # Dew's record of a kernel gradient pairs no row tiles (`tiling.Tiles.cluster`: `tgmm` takes no
-        # pair), whatever cluster the binary's kernel runs on.
-        tile = super().tile(ba)
-        return None if tile is None else dataclasses.replace(tile, cluster=1)
-
-    def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), gather: tuple | None = None, *, out_dtype: str, interpret: bool,
-             hooks: Hooks = NO_HOOKS,
-             exact_sums: bool = False, dense: bool = False, config: tiling.Tiles,
-             return_residuals: bool = False):
-        del prologue_operands, gather, interpret, hooks, exact_sums, dense, config  # as `CutlassGmm._fwd`'s
-        importlib.import_module('dew_cutlass').registered()
-        out = jax.ShapeDtypeStruct((sizes.shape[0], tokens.shape[1], cotangent.shape[1]),
-                                   jnp.dtype(out_dtype))
-        return _cutlass_call(1, out)(tokens, cotangent, sizes), None
 
 
 def _grown(value, dims: dict | tuple, extents: dict):

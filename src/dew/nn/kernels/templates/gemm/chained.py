@@ -19,6 +19,7 @@ with their sums bounded (`guarded_walk`, row 8282)."""
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -106,7 +107,15 @@ def replay_tile(tiles: "Tiles", products: int) -> "Tiles":
     columns narrowed `narrowing` ways, each product its accumulator. The one replay plan the launch
     (`chained_refusal`, `replay_refusal`), its selection (`grouped_matmul.MosaicGmm._replays`) and its replay
     walk read."""
-    return dataclasses.replace(tiles, block_n=tiles.block_n // narrowing(products))
+    columns, staging = _replayed(tiles, products)
+    return dataclasses.replace(tiles, block_n=columns, staging=staging)
+
+
+def _replayed(tiles: "Tiles", products: int) -> tuple[int, tuple[int, int] | None]:
+    """The columns of `replay_tile`'s tile and its stated output staging, whose chunk narrows with them to the
+    widest dividing both: the one narrowing its tile and its refusal (`replay_refusal`) read."""
+    columns = tiles.block_n // narrowing(products)
+    return columns, None if tiles.staging is None else (math.gcd(tiles.staging[0], columns), tiles.staging[1])
 
 
 def replay_refusal(tiles: "Tiles", products: int, family: mosaic.Family, dtype) -> str | None:
@@ -119,6 +128,10 @@ def replay_refusal(tiles: "Tiles", products: int, family: mosaic.Family, dtype) 
     if tiles.block_n % narrowed or not columns or columns % unit:
         return (f"a chained launch's replay walks its tile's {tiles.block_n} columns {narrowed} ways, an "
                 f"accumulator a product (`guarded_walk`): {columns} columns, no whole {unit}-column units")
+    # A stated staging narrows with the columns (`_replayed`) and needs no refusal of its own: its chunk,
+    # dividing the tile's columns and its issuer's piece of them (`Tiles`' construction), narrowed to the gcd
+    # with the narrowed columns, divides those and the narrowed piece, which is them or the issuer's 64
+    # (`Issuer.chunk_columns`, the narrowed columns at most the tile's).
     return None
 
 

@@ -20,6 +20,7 @@ from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, Latent
 from dew.objectives.rl.tssm import TSSM
 from dew.rl.distributions import symexp, symlog, twohot_bins, twohot_loss, twohot_mean, unimix_log_probs
 from dew.rl.env import Batched, Carry, Driven, TimeLimit, TimeStep, env_rollout, start
+from dew.training import TrainerAdvanced
 
 
 def test_two_hot_predicts_zero_at_uniform_odds_and_trains_toward_its_encoding():
@@ -132,7 +133,8 @@ def test_a_rollout_advances_an_environment_whose_state_shares_an_array():
     env = Batched(TimeLimit(SharedTarget(), episode_length=20), 8)
     objective = DreamerV3Objective(tiny())
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
-    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7),
+                      advanced=TrainerAdvanced(rollout=rollout))
     data = idle()
     trainer.fit(data, steps=3, log_every=3)
     owed = -(-3 * 8 * 16 // 32)
@@ -242,7 +244,8 @@ def test_a_rollout_writes_its_replay_in_place(agent):
     objective = DreamerV3Objective(model())
     rollout = DreamerRollout(objective, environments(), capacity=400, batch=8, length=16, train_ratio=8.0,
                              prefill=24)
-    state = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout).place()[0]
+    state = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7),
+                    advanced=TrainerAdvanced(rollout=rollout)).place()[0]
     rollout(state, {}, jax.random.key(1), objective=objective)
     begun = rollout.held_replay
     assert begun is not None
@@ -297,7 +300,8 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
     env = environments()
     objective = DreamerV3Objective(model())
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
-    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7),
+                      advanced=TrainerAdvanced(rollout=rollout))
     initial = jax.device_get(trainer.place()[0])
     data = idle()
     final = trainer.fit(data, steps=150, log_every=150)
@@ -424,7 +428,8 @@ def test_a_rollout_from_demonstrations_takes_no_prefill_and_writes_on_them():
     stream = {**recorded.observation, "action": recorded.action}
     seeded = ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), 400).add(stream)
     rollout = DreamerRollout(objective, env, batch=8, length=16, train_ratio=32.0, prefill=0, replay=seeded)
-    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7),
+                      advanced=TrainerAdvanced(rollout=rollout))
     data = idle()
     trainer.fit(data, steps=12, log_every=12)
     owed = -(-12 * 8 * 16 // 32)
@@ -522,7 +527,7 @@ def dreamer_fit(directory, objective, rollout, steps, **options):
     data = idle()
     checkpoints = None if directory is None else Checkpoints(str(directory), keep=Keep(latest=8))
     trainer = Trainer(objective, options.pop("optimizer", optax.adam(1e-3)), key=jax.random.key(7),
-                      rollout=rollout, checkpoints=checkpoints)
+                      advanced=TrainerAdvanced(rollout=rollout), checkpoints=checkpoints)
     return trainer.fit(data, steps=steps, log_every=1, checkpoint_every=None if directory is None else 1,
                        **options)
 
@@ -993,7 +998,8 @@ def test_even_twohot_bins_space_supports_evenly_and_dreamer_validates_bounds_and
     # dynamic `fori_loop` compiles 1 prefill rollout and 1 live rollout across updates.
     rollout = DreamerRollout(four_obj, Batched(TimeLimit(Target(2), episode_length=20), 4), capacity=64,
                              batch=4, length=8, train_ratio=24.0, prefill=12)
-    trainer = Trainer(four_obj, optax.adam(1e-3), key=jax.random.key(0), rollout=rollout,
+    trainer = Trainer(four_obj, optax.adam(1e-3), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(rollout=rollout),
                       checkpoints=None, tracker=None)
     state = trainer.initial_state()
     rollout(state, {}, jax.random.key(1), objective=four_obj)

@@ -1,6 +1,6 @@
 """`Supervised` trains any Flax model on a loss over its outputs, and a run
 names it, its loss and its metrics in a record that builds it again;
-`--set` changes one field of a run, read as that field's type reads it."""
+`RunConfig.override` changes one field of a run by its dotted path, read as that field's type reads it."""
 
 import json
 import os
@@ -27,7 +27,6 @@ from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
 from dew.registry import ModelConfig
 from dew.training import Trainer
-from dew.training.budget import Horizon
 
 INPUTS = InputSpec(Field("x", (3,)))
 
@@ -179,7 +178,7 @@ def test_the_loss_is_the_mean_over_the_real_rows_and_metrics_report_by_name():
 
 
 def supervised_run(loss) -> RunConfig:
-    return RunConfig(model=ModelConfig.from_model(Affine()), trainer=TrainerConfig(horizon=Horizon(steps=1)),
+    return RunConfig(model=ModelConfig.from_model(Affine()), trainer=TrainerConfig(steps=1),
                      objective=ObjectiveConfig("supervised", {"loss": loss, "metrics": (Accuracy(),),
                                                               "inputs": INPUTS}))
 
@@ -256,8 +255,8 @@ def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
 
     def drop(runs):
         return {"training halves the held-out evidence bound": cut(*held_out_measures(
-            objective, config.optim.build(config.trainer.horizon.steps), loader,
-            lambda run: points([run, 10_000], rows=256), runs=runs, steps=config.trainer.horizon.steps),
+            objective, config.optim.build(config.trainer.steps), loader,
+            lambda run: points([run, 10_000], rows=256), runs=runs, steps=config.trainer.steps),
             margin=2)}
 
     assert_learns(drop, "the autoencoder experiment", units=RUNS)

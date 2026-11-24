@@ -32,7 +32,7 @@ from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.embeddings import prepared_embeddings
 from dew.nn.cross_pass import MERGE_PREFIX, MESSAGES_UNWRITTEN, CrossPass, CrossPassMerge
 from dew.optim import AdamW
-from dew.training import FitPolicy, UpdateBatch
+from dew.training import TrainerAdvanced
 
 VOCAB = 37
 
@@ -461,8 +461,9 @@ def test_a_loaded_decoder_gains_messages_that_leave_it_as_it_was_and_train_fresh
     layers = source.model.num_layers
     looped = source.with_model(source.model.with_passes(3, (1, layers), messages=MESSAGES), key=3)
     assert looped.fresh and all("cross_pass_" in path for path in looped.fresh)
-    fresh = ParamGroup("fresh", fresh=True, learning_rate_multiplier=10.0, spared=True)
-    claimed = OptimConfig(param_groups=(fresh, ParamGroup("base", ("*",), spared=True))).with_fresh(
+    fresh = ParamGroup("fresh", fresh=True, learning_rate_multiplier=10.0, decay_norms_and_biases=False)
+    claimed = OptimConfig(param_groups=(fresh, ParamGroup("base", ("*",),
+                                                          decay_norms_and_biases=False))).with_fresh(
         (), looped.fresh).param_groups
     assert set(claimed[0].patterns) == set(looped.fresh)
 
@@ -518,7 +519,8 @@ def test_a_loop_passing_messages_trains_sampled_counts_exits_and_narrow_copies()
                                         remat=True, messages=CrossPass(block_size=1, rank=4)))
     batch = token_batch()
     with chosen(narrow_copies="on"):
-        trainer = phased_trainer(model, 0, None, sampled_passes=TRAINED, update=UpdateBatch(batches=2))
+        trainer = phased_trainer(model, 0, None, advanced=TrainerAdvanced(sampled_passes=TRAINED),
+                                 accumulation=2)
         state, _, _ = trainer.place()
         step = trainer.compile(state, batch)
         interval = Interval(0.0, None, microbatches=0)
@@ -590,10 +592,10 @@ def test_a_loop_passing_messages_bounds_its_step_memory_across_unrolled_passes()
             remat=REMAT_POLICIES["full"],
             loop=Loop(steps, step_norm=False, layers=(0, 4), exit_gate=True, messages=messages))
         trainer = Trainer(LMObjective(model, MIXER_LENGTH, exit_entropy=0.1),
-                          OptimConfig(optimizer=AdamW(), learning_rate=1e-3).build(None),
+                          OptimConfig(optimizer=AdamW(), lr=1e-3).build(None),
                           key=jax.random.key(0),
                           mesh=MeshSpec(fsdp=devices).build(compile_only_gpus("sm90", devices, 2**36)),
-                          layout=STEP_LAYOUT, fit=FitPolicy(split=1), inspection=inspection)
+                          advanced=TrainerAdvanced(layout=STEP_LAYOUT, inspection=inspection), split=1)
         ahead = compile_ahead(trainer, token_rows(512, MIXER_ROWS, MIXER_LENGTH + 1))
         if inspection is None:
             return ahead.live_bytes - ahead.argument_bytes

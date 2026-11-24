@@ -34,7 +34,7 @@ from dew.objectives.rl.sessions import (
     SEGMENT_IDS_KEY,
 )
 from dew.objectives.routing import ExpertBalance
-from dew.training import Trainer, UpdateBatch
+from dew.training import Trainer
 
 VOCAB = BALANCED_VOCAB
 EXPERTS = BALANCED_EXPERTS
@@ -203,7 +203,7 @@ def test_a_policy_run_moves_each_balancing_bias_by_its_pooled_load_once_per_comm
     booked = rows * copies * load(FIRST)
     step_direction = np.float32(RATE) * np.array([0, 1, -1, 0], np.float32)
     obj = objective(kind, routed_by_id(), 1)
-    train = Trainer(obj, optax.sgd(0.0), key=jax.random.PRNGKey(3), update=UpdateBatch(batches=2))
+    train = Trainer(obj, optax.sgd(0.0), key=jax.random.PRNGKey(3), accumulation=2)
     state = train.initial_state()
     run = train.compile(state, designed(kind, FIRST, rows))
     for commit in range(2):
