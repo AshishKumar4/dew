@@ -705,6 +705,30 @@ def test_an_integer_operation_counts_on_the_integer_units_not_the_fp32_lanes():
         assert (role.fixed.integer_operations, role.fixed.operations) == (128, 0), role.fixed
 
 
+def test_a_steps_mask_of_its_tiles_indices_issues_nothing_and_one_of_its_place_counts():
+    """A walk step's mask of its tile's indices alone (iotas and literals: the recurrence solve's blocks by a
+    floor division and a remainder) issues no integer operation a step, the GPU's compile folding it or
+    computing it once outside the loop (`emission._INVARIANT`, row 4123: the solve's masks priced at 6.1M
+    integer operations a GH200 program against about a thousand integer instructions a thread a trip); a mask
+    of the step's place counts its integer operations each step. Its select of the row's data counts on the
+    fp32 lanes alike."""
+    def walk(placed: bool):
+        def step(index, row):
+            mosaic.step_index(index)
+            columns = lax.iota(jnp.int32, 128) + (index if placed else 0)
+            return jnp.where((columns // 4) % 2 == 1, row, 0.0)
+
+        return lambda row, trips: lax.fori_loop(0, trips, step, row)
+
+    def counted(placed: bool) -> tuple:
+        role = _emitted(walk(placed), _ROW, _TRIPS).roles[0]
+        return role.step(lambda work: work.integer_operations), role.step(_operations)
+
+    (indexed, selected), (placed, selected_placed) = counted(placed=False), counted(placed=True)
+    assert indexed == 0 and placed >= 3 * 128, (indexed, placed)
+    assert selected == selected_placed == 128, (selected, selected_placed)
+
+
 def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_fp32_lanes():
     """A row's integer multiply counts one integer multiply-add an element (`Work.integer_multiply_adds`:
     IMAD, the FMA pipe's, as a bit form's left shifts by a multiply are, `bits.BitForm.work`) and nothing of
