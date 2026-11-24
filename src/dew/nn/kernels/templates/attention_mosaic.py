@@ -2049,9 +2049,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def _cheaper(self, ba: tokamax.BoundArguments, candidates: list[BackwardTiles],
                  target: generation.GpuTarget) -> BackwardTiles:
         """The one launch or the two `candidates` hold whose launches the cost model prices least
-        (`price_config`), a candidate whose work the target prices no rate of (`cost.units`' unpriced: a
-        GPU stating no `global_reduction_bytes_per_clock` beside the fused launch's dQ adds) never the cheaper
-        beside one it prices whole, as `dew.algebra.cost.cheaper` reads it; stored beside the verdicts so a
+        (`price_config`), a candidate it cannot price whole never the cheaper beside one it can, as
+        `dew.algebra.cost.cheaper` reads it: one whose work the target prices no rate of (`cost.units`'
+        unpriced: a GPU stating no `global_reduction_bytes_per_clock` beside the fused launch's dQ adds), or
+        whose launches' registers its model holds past their budget (`_past_registers`), whose spills no rate
+        prices (an H100's two launches at 128 x 64 one consumer, model 331 at a budget of 248: its dQ took
+        248 registers and 696 bytes of stack, refused, where the fused one certified). Stored beside the
+        verdicts so a
         warm start traces nothing to price (`_choice_key`, `tuning.stored_choice`); the first where one alone
         is legal or the target holds no rates."""
         if len(candidates) <= 1 or not target.multiprocessors or not cost.rates(target, device=False).tensor:
@@ -2075,7 +2079,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                      ) -> tuple[bool, float] | None:
         """Price `config`'s launches on `target`, the fused one's or the two's summed (`cost.launch_seconds`
         over `emission.work_of`, each at `config`'s residency), traced under `report.launching`: whether any
-        of their work lies at a rate the target states none of (`cost.units`' unpriced), and the seconds. As
+        of their work lies at a rate the target states none of (`cost.units`' unpriced) or their registers'
+        model passes their budget (`_past_registers`: spills no rate prices), and the seconds. As
         its hookless call (its hook fields none): a hook a choice prices takes no parameters (one with any
         holds no fused launch, so no choice), its work the same a score in either form, and a launch keyed
         by its hooks' fingerprints (`KernelOp.keyed`, which traces none) prices as its live call does."""
@@ -2098,7 +2103,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return None
         resident = self.resident(ba, config, target)
         rates = cost.rates(target, device=False)
-        total, unpriced = 0.0, False
+        total, unpriced = 0.0, self._past_registers(ba, config, target)
         for kernel in kernels:
             work = emission.work_of(kernel)
             if work is None:
@@ -2106,6 +2111,17 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             total += cost.launch_seconds(work, emission.launch_programs(kernel), target, resident=resident)
             unpriced = unpriced or any(cost.units(work, rates)[1])
         return unpriced, total
+
+    def _past_registers(self, ba: tokamax.BoundArguments, config: BackwardTiles,
+                        target: generation.GpuTarget) -> bool:
+        """Whether a launch of `config` holds more registers in its model than its consumers' budget
+        (`_launch_registers` against `register_budget`, each launch at its own tiles: the dQ launch at
+        `config`, the dK/dV launch at `BackwardTiles.dkv`); never on a family that budgets none."""
+        if not bundle_of(config, ba.arguments["query"].dtype, target=target).budgets_registers:
+            return False
+        dq, dkv = self._launch_registers(ba, config, target=target)
+        launches = [(dkv, config)] if config.fused else [(dq, config), (dkv, config.dkv)]
+        return any(held > self.register_budget(tiles, target) for held, tiles in launches)
 
     def _deepened(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                   target: generation.GpuTarget) -> BackwardTiles:
