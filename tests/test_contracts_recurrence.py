@@ -728,7 +728,7 @@ def test_the_derived_delta_rule_chunks_hold_their_orders(per_key, edge, taken):
             part = {name: value[index * chunk:(index + 1) * chunk] for name, value in values_.items()}
             prepared = forms.prepare(part)
             outputs.append(forms.mapped(prepared, state))
-            state = forms.step(state, prepared)
+            state = forms.step(state, prepared)[0]
         return jnp.concatenate(outputs)
 
     def tokenwise(q, k, v, g, beta):
@@ -765,7 +765,7 @@ def test_the_derived_delta_rules_chunk_adjoint_holds_its_orders(edge):
                  for index in range(tokens // chunk)]
         states = [forms.init({})]
         for part in parts:
-            states.append(forms.step(states[-1], forms.prepare(part)))
+            states.append(forms.step(states[-1], forms.prepare(part))[0])
         d_state, d_queries = jnp.zeros((keys_, values)), []
         for index in reversed(range(len(parts))):
             d_state, d_chunk = forms.backward(parts[index], states[index], d_state,

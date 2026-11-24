@@ -59,7 +59,8 @@ from dew.algebra.scan import (
     token_terms,
     token_type,
 )
-from dew.nn.precision import at_least_fp32
+from dew.nn.float_bits import exact_power2
+from dew.nn.precision import at_least_fp32, power2
 from dew.nn.sharding import varying_like
 
 
@@ -153,11 +154,31 @@ def _chunk_parts(declaration, names: Sequence[str], parts: linear_scan.Coupled, 
 
 
 def _at_token(declaration, names: Sequence[str], parts: linear_scan.Coupled, token: Mapping) -> tuple:
-    """One token's decays `alpha` and `mu`, `lam`, `B`, `U`, `C`, `Q` and `R` (`_chunk_parts`), a reset
-    token's decays zero too, as the token walk reads them (`_replayed`)."""
+    """One token's decays `alpha` and `mu` as floats, `lam`, `B`, `U`, `C`, `Q` and `R` (`_chunk_parts`), a
+    reset token's decays zero too: the types the token walk carries its pair in (`_replayed`)."""
     first, second, lam, b, u, c, q, r, cut = _chunk_parts(declaration, names, parts, token)
     alpha, mu = (jnp.where(cut, 0.0, _exp(parts.base2, x)) for x in (first, second))
     return alpha, mu, lam, b, u, c, q, r
+
+
+def _decayed(state, exponent, base2: bool, cut) -> tuple:
+    """`exp(exponent) state` (`2^exponent` where `base2`) as a factor and a term, `factor state + term`,
+    zero where `cut`: the scan's own decay (`scan._exp`) the factor where it is a normal float, the token
+    walk's rounding, its expression the walk's; beneath float32's least normal the factor zero and the term
+    the state times the remainder's exponential, its power of two the base-2 exponent's nearest integer
+    applied after (`precision.power2`), so the product and its derivative in the exponent stay what the
+    decay of a large state leaves (exp(-120) over 2^100, ReviewMomentum1454), as the chunk's forms keep them
+    (`_exponential`), never the decay landed alone."""
+    decay = _exp(base2, exponent)
+    if base2:
+        high, low = exponent, jnp.zeros_like(exponent)
+    else:
+        high, low = scaled.base2(exponent)
+    whole = lax.stop_gradient(jnp.round(high))
+    fraction = (high - whole) + low
+    faint = jnp.abs(decay) < np.finfo(decay.dtype).tiny
+    split = power2(jnp.exp(fraction * np.asarray(math.log(2), fraction.dtype)) * state, whole)
+    return jnp.where(cut | faint, 0.0, decay), jnp.where(faint & ~cut, split, 0.0)
 
 
 def _bounded(declaration, names: Sequence[str], chunk: Mapping, parts: linear_scan.Coupled) -> None:
@@ -300,9 +321,11 @@ def _decayed_sums(alpha: scaled.Scaled, mu: scaled.Scaled, lam) -> tuple:
     and `b_t` at column zero; the last token's `m(., C)` `[C + 1]` (`m(0, C)` at column zero), and `A` `[C]`.
     `m(s, t) = mu_t m(s, t - 1)`, one at `s = t`; `g(s, t) = alpha_t g(s, t - 1) + lam_t m(s, t)`."""
     tokens = lam.shape[-1]
+    # The sums in the widest of their factors' types (a float64 decay beside a float32 gate's, x64's).
+    lam = lam.astype(jnp.result_type(alpha.significand, mu.significand, lam))
     own = jnp.eye(tokens + 1, dtype=jnp.bool_)[1:]
     weights = scaled.scaled(lam)
-    floats = (scaled.landed(alpha), scaled.landed(mu), lam)
+    floats = (scaled.landed(alpha).astype(lam.dtype), scaled.landed(mu).astype(lam.dtype), lam)
     tiny = np.finfo(lam.dtype).tiny
     faint = jnp.any(jnp.stack([(jnp.abs(running) < tiny) & (twin.significand != 0)
                                for running, twin in ((floats[0], alpha), (floats[1], mu))]))
@@ -358,15 +381,16 @@ LOCAL_REACH = SUMS_REACH + 2048
 
 class Chunked(NamedTuple):
     """A chunk's values that read no state (`_prepared`), its decayed sums scaled values (`_decayed_sums`)
-    each brought into its term once, none divided by another's factor: the system `I - L`,
-    the tokens' inputs `U` and corrections `C`, the entering memory's and momentum's factors a token back
-    (`A_{t-1}`, `b_{t-1}`), the queries' dots with the keys and their sums `g(s, t)`, the entering memory's
-    factors to each token (`A_t`), the queries and the momentum's factors to each token (`b_t`), the free
-    readouts, the keys and their sums to the chunk's end (`g(s, C)`), the keys weighed by the momentum's
-    (`m(s, C)`, at most one), and the entering memory's, momentum's and momentum's own factors there (`A_C`,
-    `b_C`, `m(0, C)`)."""
+    each brought into its term once, none divided by another's factor: the system's strictly lower part `L`
+    (`L_ts = g(s, t - 1) C_t . B_s`) and whether a product of it flushed (`_weighed`), the tokens' inputs `U`
+    and corrections `C`, the entering memory's and momentum's factors a token back (`A_{t-1}`, `b_{t-1}`),
+    the queries' dots with the keys and their sums `g(s, t)`, the entering memory's factors to each token
+    (`A_t`), the queries and the momentum's factors to each token (`b_t`), the free readouts, the keys and
+    their sums to the chunk's end by the memory (`g(s, C)`) and the momentum (`m(s, C)`), and the entering
+    memory's, momentum's and momentum's own factors there (`A_C`, `b_C`, `m(0, C)`)."""
 
-    system: jax.Array
+    lower: jax.Array
+    flushed: jax.Array
     inputs: jax.Array
     corrections: jax.Array
     kept_before: scaled.Scaled
@@ -379,7 +403,7 @@ class Chunked(NamedTuple):
     free: jax.Array
     keys: jax.Array
     memory_sums: scaled.Scaled
-    momentum_keys: jax.Array
+    momentum_sums: scaled.Scaled
     kept: scaled.Scaled
     entering_momentum: scaled.Scaled
     momentum_kept: scaled.Scaled
@@ -390,16 +414,14 @@ def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool) -> Chunked
     alpha, mu = _exponential(first, base2, cut), _exponential(second, base2, cut)
     g, last, kept = _decayed_sums(alpha, mu, lam)
     before = _shifted(g, 0.0)
-    lower = scaled.applied(c @ b.T, _sliced(before, (..., slice(1, None))))
-    system = jnp.eye(lam.shape[-1], dtype=lam.dtype) - lower
+    lower, flushed = _weighed(c @ b.T, _sliced(before, (..., slice(1, None))))
     ends = _sliced(g, -1)
     return Chunked(
-        system=system, inputs=u, corrections=c,
-        kept_before=_shifted(kept, 1.0), momentum_before=_sliced(before, (..., 0)), dots=q @ b.T,
-        sums=_sliced(g, (..., slice(1, None))), kept_to=kept, queries=q,
-        momentum=_sliced(g, (..., 0)), free=r, keys=b, memory_sums=_sliced(ends, slice(1, None)),
-        momentum_keys=scaled.applied(b, _column(_sliced(last, slice(1, None)))), kept=_sliced(kept, -1),
-        entering_momentum=_sliced(ends, 0), momentum_kept=_sliced(last, 0))
+        lower=lower, flushed=jnp.any(flushed > 0), inputs=u, corrections=c, kept_before=_shifted(kept, 1.0),
+        momentum_before=_sliced(before, (..., 0)), dots=q @ b.T, sums=_sliced(g, (..., slice(1, None))),
+        kept_to=kept, queries=q, momentum=_sliced(g, (..., 0)), free=r, keys=b,
+        memory_sums=_sliced(ends, slice(1, None)), momentum_sums=_sliced(last, slice(1, None)),
+        kept=_sliced(kept, -1), entering_momentum=_sliced(ends, 0), momentum_kept=_sliced(last, 0))
 
 
 def _sum(*terms) -> scaled.Scaled:
@@ -415,21 +437,37 @@ def _sum(*terms) -> scaled.Scaled:
     return total
 
 
+def _total(value: scaled.Scaled) -> scaled.Scaled:
+    """`value`'s sum over its first axis in scaled arithmetic at once: each term's significand moved to the
+    largest exponent among the nonzero ones (exact, a power of two, at most its format's `shift`, as
+    `scaled.add` aligns), the moved significands summed once in float and renormalized."""
+    live = value.significand != 0
+    top = jnp.max(jnp.where(live, value.exponent, jnp.iinfo(jnp.int32).min), axis=0)
+    top = jnp.where(jnp.any(live, axis=0), top, 0)
+    form = value.format
+    moved = value.significand * exact_power2(jnp.clip(value.exponent - top, -form.shift, 0),
+                                             value.significand.dtype)
+    widened = value.reach + form.shift + form.mantissa + 3 + math.ceil(math.log2(max(value.shape[0], 2)))
+    return scaled.normalized(jnp.sum(moved, axis=0), top, widened)
+
+
 def _column(value: scaled.Scaled) -> scaled.Scaled:
     """A token's factor `[C]` laid over its row's values `[C, 1]`."""
     return _sliced(value, (..., None))
 
 
-def _summed(product, operands: tuple, shape: tuple[int, ...], weights: scaled.Scaled | None = None
+def _summed(factors, operands: tuple, shape: tuple[int, ...], weights: scaled.Scaled | None = None
             ) -> scaled.Scaled:
-    """`sum_s weights_s product(*operands_s)` (the products alone where `weights` is None) over the
-    operands' and the weights' first axis, a term at a time in scaled arithmetic (each term's float product
-    times its scaled weight): a sum of products past the format's range where the total is not kept
-    (ReviewMomentum1454: `g(1, 2) w_1` -2^128 where the memory leaving is -2^127), its carry typed as its
-    operands vary (a checked `shard_map`'s)."""
+    """`sum_s weights_s x_s y_s` (the products alone where `weights` is None), `(x_s, y_s)` the
+    `factors(*operands_s)` over the operands' and the weights' first axis, a term at a time in scaled
+    arithmetic, each product of the factors' scaled values: a sum of products past the format's range where
+    the total is not kept (ReviewMomentum1454: `g(1, 2) w_1` -2^128 where the memory leaving is -2^127),
+    and a product beneath its least normal kept for the weight that raises it (`q M` 2^-129 under a weight
+    of -16, -2^-125), its carry typed as its operands vary (a checked `shard_map`'s)."""
     def term(total, step):
         *each, significand, exponent = step
-        weighed = scaled.scaled(product(*each))
+        x, y = factors(*each)
+        weighed = scaled.mul(scaled.scaled(x), scaled.scaled(y))
         if weights is not None:
             weighed = scaled.mul(weighed, scaled.Scaled(significand, exponent, weights.reach))
         total = scaled.add(scaled.Scaled(total[0], total[1], LOCAL_REACH), weighed)
@@ -438,10 +476,16 @@ def _summed(product, operands: tuple, shape: tuple[int, ...], weights: scaled.Sc
     count = operands[0].shape[0]
     held = ((jnp.zeros((count,), operands[0].dtype), jnp.zeros((count,), jnp.int32)) if weights is None
             else (weights.significand, weights.exponent))
-    zero = tuple(varying_like(jnp.zeros(shape, kind), *operands, *held)
-                 for kind in (operands[0].dtype, jnp.int32))
+    # The sum in the widest of its terms' types (a float64 weight beside float32 factors, x64's).
+    wide = jnp.result_type(*operands, held[0])
+    zero = tuple(varying_like(jnp.zeros(shape, kind), *operands, *held) for kind in (wide, jnp.int32))
     (significand, exponent), _ = lax.scan(term, zero, (*operands, *held))
     return scaled.Scaled(significand, exponent, LOCAL_REACH)
+
+
+def _outer(left, right) -> tuple:
+    """A column of `left` beside a row of `right`: their outer product's factors (`_summed`)."""
+    return left[:, None], right[None, :]
 
 
 def _read(vectors, state) -> scaled.Scaled:
@@ -450,53 +494,75 @@ def _read(vectors, state) -> scaled.Scaled:
     token walk's of the decayed state does not, and none flushes after it where the read is normal (a query
     of 1/2 each of four keys over a memory of 2^127 under a decay of 1/2; a decay of exp(-86) over a memory
     of 2^20, ReviewMomentum1454)."""
-    return _summed(lambda vector, row: vector[:, None] * row[None, :], (vectors.T, state),
-                   (vectors.shape[0], state.shape[-1]))
+    return _summed(_outer, (vectors.T, state), (vectors.shape[0], state.shape[-1]))
+
+
+def _substituted(lower, sides: scaled.Scaled):
+    """`W` of `(I - L) W = sides`, a token at a time in scaled arithmetic: each row its side plus the earlier
+    rows' weights by `L`, summed in scaled arithmetic (`_total`) and landed once, so a side past the format's
+    range that the correction brings back (2^127 entering the memory and -2^127 the momentum under decays and
+    write gates of one: a side 2^128 where the input is 2^127, ReviewMomentum1454) is never rounded alone."""
+    def row(w, t):
+        products = scaled.mul(scaled.scaled(lower[t][:, None]), scaled.scaled(w))
+        side = scaled.Scaled(sides.significand[t], sides.exponent[t], sides.reach)
+        return w.at[t].set(scaled.landed(scaled.add(side, _total(products)))), None
+
+    start = varying_like(jnp.zeros(sides.shape, sides.significand.dtype), lower, sides.significand)
+    w, _ = lax.scan(row, start, jnp.arange(lower.shape[0]))
+    return w
 
 
 def _inputs(chunk: Chunked, pair):
     """A chunk's inputs `W` from the pair entering it: the system solved (a unit lower-triangular solve)
     against each token's input and its correction's reads of the entering memory and momentum, each weighed
-    by its factor: the float sum where it is its own, else its scaled twin's (`_landed`)."""
+    by its factor, the float solve's where it is its own (`_taken`, no product of the system flushed), else
+    its scaled twin's (`_substituted`, its sides never landed)."""
     twin = _sum(chunk.inputs, scaled.mul(_read(chunk.corrections, pair[0]), _column(chunk.kept_before)),
                 scaled.mul(_read(chunk.corrections, pair[1]), _column(chunk.momentum_before)))
-    running = (chunk.inputs + scaled.applied(chunk.corrections @ pair[0], _column(chunk.kept_before))
-               + scaled.applied(chunk.corrections @ pair[1], _column(chunk.momentum_before)))
-    return solve_triangular(chunk.system, _landed(running, twin), lower=True, unit_diagonal=True)
+    sides = (chunk.inputs + scaled.applied(chunk.corrections @ pair[0], _column(chunk.kept_before))
+             + scaled.applied(chunk.corrections @ pair[1], _column(chunk.momentum_before)))
+    eye = jnp.eye(chunk.lower.shape[0], dtype=chunk.lower.dtype)
+    running = solve_triangular(eye - chunk.lower, sides, lower=True, unit_diagonal=True)
+    substituted = _substituted(chunk.lower, twin)
+    taken = jnp.isfinite(running) & ((jnp.abs(running) >= ORDINARY) | ((running == 0) & (substituted == 0)))
+    return jnp.where(taken & ~chunk.flushed, running, substituted)
+
+
+def _leaving(entering_terms: tuple, keys, w, sums: scaled.Scaled):
+    """A state leaving a chunk: its entering terms (`(state, factor)` pairs) and the chunk's writes `B^T W`
+    weighed by their sums to its end, the float computation's where it is its own (`_landed`), else its
+    twin's in scaled arithmetic."""
+    written = _summed(_outer, (keys, w), (keys.shape[-1], w.shape[-1]), sums)
+    twin = _sum(*(scaled.mul(scaled.scaled(state), factor) for state, factor in entering_terms), written)
+    weighed, flushed = _weighed(w, _column(sums))
+    running = sum((scaled.applied(state, factor) for state, factor in entering_terms), keys.T @ weighed)
+    return _landed(running, twin, _reached((keys != 0).astype(w.dtype).T @ flushed))
 
 
 def _stepped(state, chunk: Chunked, issue=None):
-    """The pair after a prepared chunk (`derive_coupled`'s `step`), its walk's decay as it was: the memory
-    the entering memory decayed, the entering momentum weighed by its scaled factor and the chunk's writes
-    weighed by theirs (`_summed`), landed once (`_sum`); the momentum the entering one decayed and the
-    chunk's writes, each weighed by a product of decays at most one."""
+    """The pair after a prepared chunk and the chunk's inputs it solved (`derive_coupled`'s `step`, kept
+    for `_mapped`), its walk's decay as it was: the memory the entering memory decayed, the entering
+    momentum weighed by its factor and the chunk's writes weighed by theirs; the momentum the entering one
+    decayed and the chunk's writes (`_leaving`)."""
     del issue
     decay, pair = state
     w = _inputs(chunk, pair)
-    written = _summed(lambda key, value: key[:, None] * value[None, :], (chunk.keys, w), pair[0].shape,
+    memory = _leaving(((pair[0], chunk.kept), (pair[1], chunk.entering_momentum)), chunk.keys, w,
                       chunk.memory_sums)
-    twin = _sum(scaled.mul(scaled.scaled(pair[0]), chunk.kept),
-                scaled.mul(scaled.scaled(pair[1]), chunk.entering_momentum), written)
-    weighed, flushed = _weighed(w, _column(chunk.memory_sums))
-    running = (scaled.applied(pair[0], chunk.kept) + scaled.applied(pair[1], chunk.entering_momentum)
-               + chunk.keys.T @ weighed)
-    memory = _landed(running, twin, _reached((chunk.keys != 0).astype(w.dtype).T @ flushed))
-    momentum = scaled.applied(pair[1], chunk.momentum_kept) + chunk.momentum_keys.T @ w
-    return decay, jnp.stack([memory, momentum])
+    momentum = _leaving(((pair[1], chunk.momentum_kept),), chunk.keys, w, chunk.momentum_sums)
+    return (decay, jnp.stack([memory, momentum])), w
 
 
-def _mapped(chunk: Chunked, state, issue=None):
-    """A chunk's outputs from the pair entering it (`derive_coupled`'s `mapped`): each token's decayed
-    query's read of the entering memory, its query's read of the entering momentum weighed by its scaled
-    factor, its dots with the chunk's keys weighed by their sums against the chunk's inputs (`_summed`) and
-    its free readout, landed once (`_sum`)."""
+def _mapped(chunk: Chunked, state, w, issue=None):
+    """A chunk's outputs from the pair entering it and the inputs its step solved (`derive_coupled`'s
+    `mapped`): each token's query's reads of the entering memory and momentum weighed by their factors, its
+    dots with the chunk's keys weighed by their sums against the chunk's inputs (`_summed`) and its free
+    readout, the float computation's where it is its own, else its scaled twin's (`_landed`)."""
     del issue
     pair = state[1]
-    w = _inputs(chunk, pair)
     weights = scaled.Scaled(chunk.sums.significand.T[..., None], chunk.sums.exponent.T[..., None],
                             chunk.sums.reach)
-    scored = _summed(lambda dots, value: dots[:, None] * value[None, :], (chunk.dots.T, w),
-                     (chunk.dots.shape[0], w.shape[-1]), weights)
+    scored = _summed(_outer, (chunk.dots.T, w), (chunk.dots.shape[0], w.shape[-1]), weights)
     memory = scaled.mul(_read(chunk.queries, pair[0]), _column(chunk.kept_to))
     momentum = scaled.mul(_read(chunk.queries, pair[1]), _column(chunk.momentum))
     scores, flushed = _weighed(chunk.dots, chunk.sums)
@@ -507,20 +573,24 @@ def _mapped(chunk: Chunked, state, issue=None):
 
 
 def _replayed(declaration, names: Sequence[str], parts: linear_scan.Coupled, chunk: Mapping, pair) -> tuple:
-    """`chunk` walked token by token from the pair entering it (`_at_token`'s parts): `(outputs, pair)`, each
-    token's output and the pair leaving the chunk, a reset token's entering pair selected to zero."""
+    """`chunk` walked token by token from the pair entering it (`_chunk_parts`' parts, each decay applied
+    unlanded, `_decayed`): `(outputs, pair)`, each token's output and the pair leaving the chunk, a reset
+    token's entering pair selected to zero."""
     along, every = _walked_tokens(declaration, chunk)
     count = next(iter(along.values())).shape[0]
     along.update({name: jnp.broadcast_to(value, (count, *value.shape)) for name, value in every.items()})
 
     def token(carried, step):
-        alpha, mu, lam, b, u, c, q, r = _at_token(declaration, names, parts, step)
+        first_exponent, second_exponent, lam, b, u, c, q, r, cut = _chunk_parts(declaration, names, parts,
+                                                                                 step)
         first, second = carried
         if declaration.reset is not None:
             first, second = (jnp.where(step[declaration.reset], 0.0, x) for x in (first, second))
         w = u + jnp.sum(c[:, None] * first, axis=0)
-        second = mu * second + b[:, None] * w[None, :]
-        first = alpha * first + lam * second
+        mu, faint_second = _decayed(second, second_exponent, parts.base2, cut)
+        alpha, faint_first = _decayed(first, first_exponent, parts.base2, cut)
+        second = mu * second + b[:, None] * w[None, :] + faint_second
+        first = alpha * first + lam * second + faint_first
         return (first, second), jnp.sum(q[:, None] * first, axis=0) + r
 
     # The pair carried in the type its update's parts widen it to (`scan._carry_type`, the single state's

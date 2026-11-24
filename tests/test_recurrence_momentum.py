@@ -215,35 +215,105 @@ def test_a_coupled_momentum_runs_in_a_shard_map_that_checks_varying_axes():
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((found, pulled)))
 
 
-def test_a_chunks_writes_past_float32s_range_cancel_as_the_token_walks():
-    """ReviewMomentum1454's local write (row 12693): two tokens of queries and keys along the first key,
-    erase keys along the second, the memory's decays and the write gates one, the momentum's 1/8 then one,
-    the memory entering 2^127 along the first key and the momentum none, values -2^127 then 0: the chunked
-    op's outputs and final pair are the decode step's, finite, where its first write weighed by its sum to the
-    chunk's end, -2 2^127, overflowed before the memory entering joined it (the entering momentum's factors,
-    -1/8 and -1/4, which a chunk-wide divisor read, divided by nothing)."""
+def assert_chunks_are_the_decode_steps(query, key, erase, value, beta, momentum_decay, state):
+    """The chunked op's outputs and final pair the decode step's a token at a time, bit for bit, each finite,
+    a row and head of tokens `[1, S, 1, ...]` under unit memory decays and the erase keys their own."""
     hooks = recurrence.Hooks(decay='scalar', coupled='momentum', erase='untied', write_bound=1.0, scale=1.0)
-    along = jnp.zeros((1, 2, 1, 2), jnp.float32).at[..., 0].set(1.0)
-    erase = jnp.zeros((1, 2, 1, 2), jnp.float32).at[..., 1].set(1.0)
-    value = jnp.asarray([-(2.0 ** 127), 0.0], jnp.float32).reshape(1, 2, 1, 1)
-    zero, one = jnp.zeros((1, 2, 1), jnp.float32), jnp.ones((1, 2, 1), jnp.float32)
-    state = jnp.zeros((1, 1, 2, 2, 1), jnp.float32).at[:, :, 0, 0, 0].set(2.0 ** 127)
-    momentum_decay = jnp.asarray([np.log(0.125), 0.0], jnp.float32).reshape(1, 2, 1)
-    given = Chunk(along, along, value, log_decay=zero, beta=one, momentum_decay=momentum_decay,
+    zero = jnp.zeros(beta.shape, jnp.float32)
+    given = Chunk(query, key, value, log_decay=zero, beta=beta, momentum_decay=momentum_decay,
                   erase_key=erase, state=state)
     out, final = chunk(hooks, given, chunk_size=CHUNK)
 
     def one_token(state, token):
-        q, p, v, a, b, mu = token
-        read, _, state = recurrence.step(hooks, recurrence.Step(state, query=q, key=q, value=v, log_decay=a,
+        q, k, p, v, a, b, mu = token
+        read, _, state = recurrence.step(hooks, recurrence.Step(state, query=q, key=k, value=v, log_decay=a,
                                                                 beta=b, momentum_decay=mu, erase_key=p))
         return state, read
 
-    tokens = tuple(jnp.moveaxis(x, 1, 0) for x in (along, erase, value, zero, one, momentum_decay))
+    tokens = tuple(jnp.moveaxis(x, 1, 0) for x in (query, key, erase, value, zero, beta, momentum_decay))
     stepped_final, stepped = jax.lax.scan(one_token, state, tokens)
     for got, want in ((out, jnp.moveaxis(stepped, 0, 1)), (final, stepped_final)):
         assert np.isfinite(np.asarray(want)).all()
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def along(length: int, keys: int, index: int, scale: float = 1.0):
+    """A token's vector `[1, length, 1, keys]` along key `index`, of `scale`."""
+    return jnp.zeros((1, length, 1, keys), jnp.float32).at[..., index].set(scale)
+
+
+def pair(memory, momentum, keys: int = 2):
+    """An entering pair `[1, 1, 2, keys, 1]` of a memory and a momentum along the first key."""
+    entering = jnp.zeros((1, 1, 2, keys, 1), jnp.float32)
+    return entering.at[:, :, 0, 0, 0].set(memory).at[:, :, 1, 0, 0].set(momentum)
+
+
+def test_a_chunks_writes_past_float32s_range_cancel_as_the_token_walks():
+    """ReviewMomentum1454's local write (row 12693): two tokens of queries and keys along the first key,
+    erase keys along the second, the write gates one, the momentum's decays 1/8 then one, the memory
+    entering 2^127 along the first key and the momentum none, values -2^127 then 0: the chunked op is the
+    decode step, where its first write weighed by its sum to the chunk's end, -2 2^127, overflowed before the
+    memory entering joined it (the entering momentum's factors, -1/8 and -1/4, which a chunk-wide divisor
+    read, divided by nothing)."""
+    value = jnp.asarray([-(2.0 ** 127), 0.0], jnp.float32).reshape(1, 2, 1, 1)
+    decays = jnp.asarray([np.log(0.125), 0.0], jnp.float32).reshape(1, 2, 1)
+    assert_chunks_are_the_decode_steps(along(2, 2, 0), along(2, 2, 0), along(2, 2, 1), value,
+                                       jnp.ones((1, 2, 1), jnp.float32), decays, pair(2.0 ** 127, 0.0))
+
+
+def test_a_chunks_corrected_sides_past_float32s_range_are_never_landed_alone():
+    """ReviewMomentum1454's sides (row 12693): two tokens of queries, keys and erase keys along the first
+    key, every decay and gate one, no values, the memory entering 2^127 and the momentum -2^127: the chunked
+    op is the decode step, where the second token's corrected side, 2^128, landed infinite before the solve
+    took the first token's input, -2^127, from it."""
+    keyed = along(2, 2, 0)
+    assert_chunks_are_the_decode_steps(keyed, keyed, keyed, jnp.zeros((1, 2, 1, 1), jnp.float32),
+                                       jnp.ones((1, 2, 1), jnp.float32), jnp.zeros((1, 2, 1), jnp.float32),
+                                       pair(2.0 ** 127, -(2.0 ** 127)))
+
+
+def test_a_chunks_momentum_past_float32s_range_carries_as_the_token_walks():
+    """ReviewMomentum1454's momentum (row 12693): two tokens of keys along the first key and erase keys along
+    the second, the decays one and no write gate, the memory entering none and the momentum 2^127, values
+    2^127: the chunked op is the decode step, its momentum leaving -2^127, where the chunk's writes to it,
+    -2^128, landed infinite before the momentum entering joined them."""
+    value = jnp.full((1, 2, 1, 1), 2.0 ** 127, jnp.float32)
+    assert_chunks_are_the_decode_steps(along(2, 2, 0), along(2, 2, 0), along(2, 2, 1), value,
+                                       jnp.zeros((1, 2, 1), jnp.float32), jnp.zeros((1, 2, 1), jnp.float32),
+                                       pair(0.0, 2.0 ** 127))
+
+
+def test_a_chunks_faint_reads_are_kept_for_the_factors_that_raise_them():
+    """ReviewMomentum1454's faint read (row 12693): sixteen tokens of queries (2^-70, 1), keys and erase keys
+    along the second key, every decay and gate one, no values, no memory entering and a momentum of 2^-59
+    along the first key: the chunked op is the decode step, its last output -2^-125, where the query's read
+    of the momentum, 2^-129, flushed before its factor of -16 raised it."""
+    query = along(16, 2, 1).at[..., 0].set(2.0 ** -70)
+    gates = jnp.ones((1, 16, 1), jnp.float32)
+    assert_chunks_are_the_decode_steps(query, along(16, 2, 1), along(16, 2, 1),
+                                       jnp.zeros((1, 16, 1, 1), jnp.float32), gates, jnp.zeros_like(gates),
+                                       pair(0.0, 2.0 ** -59))
+
+
+def test_a_chunk_solves_its_inputs_once():
+    """ReviewMomentum1454's double solve (row 12693): the chunked op's forward program holds one triangular
+    solve, its walk's step's, which its outputs read again (`forms.Derived`'s `kept`), where the outputs'
+    map solved the chunk's system a second time."""
+    *given, _ = operands(jnp.float32, untied=False)(0)
+    program = jax.make_jaxpr(lambda *x: tied(chunked(TIED))(*x))(*given)
+
+    def solves(jaxpr) -> int:
+        """The triangular solves of `jaxpr` and of every program its equations hold."""
+        count = 0
+        for equation in jaxpr.eqns:
+            count += equation.primitive.name == 'triangular_solve'
+            for value in equation.params.values():
+                for held in value if isinstance(value, (tuple, list)) else (value,):
+                    inner = getattr(held, 'jaxpr', held)
+                    count += solves(inner) if hasattr(inner, 'eqns') else 0
+        return count
+
+    assert solves(program.jaxpr) == 1
 
 
 def faint(seed):

@@ -1193,8 +1193,8 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
                                    turning))
         window = forms.prepare(jax.tree.map(lambda x: x[chunk], operands), window=(origin, through))
         decay = jnp.where(continuing, memory_in[0], zero_decay)
-        left = forms.step((decay, memory), window)
-        out = forms.mapped(window, (decay, memory))
+        left, kept = forms.step((decay, memory), window)
+        out = forms.mapped(window, (decay, memory), kept)
         rows = (place >= origin) & (place <= through)
         outputs = outputs.at[chunk].set(jnp.where(rows[:, None], out, outputs[chunk]))
         table = table_stored(table, stores[chunk, through], left[1])
@@ -1202,8 +1202,11 @@ def _forked_steps(forms, operands, given, forked, held: int, documents: int, dec
         leaving = jax.tree.map(lambda a, b: jnp.where(ends, a, b), left, leaving)
         return (memory_in, chunk, leaving), table, outputs, entering
 
-    shaped = jax.eval_shape(lambda chunk: forms.mapped(forms.prepare(chunk), (decayed, zero)),
-                            jax.tree.map(lambda x: x[0], operands))
+    def mapped_alone(chunk):
+        prepared = forms.prepare(chunk)
+        return forms.mapped(prepared, (decayed, zero), forms.step((decayed, zero), prepared)[1])
+
+    shaped = jax.eval_shape(mapped_alone, jax.tree.map(lambda x: x[0], operands))
     table = varying_like(jnp.zeros((held, *given.shape[1:]), given.dtype), *reaching)
     start = (((decayed, zero), varying_like(jnp.asarray(-1), origins), (decayed, zero)), table,
              varying_like(jnp.zeros((chunks, *shaped.shape), shaped.dtype), *reaching),
@@ -1312,10 +1315,12 @@ def _walk(forms, width: int, recomputed: bool, held: int = 0, documents: int = 0
         prepared = jax.vmap(forms.prepare)(operands)
 
         def one(carried, chunk):
-            return forms.step(carried, chunk), carried
+            leaving, kept = forms.step(carried, chunk)
+            return leaving, (carried, kept)
 
-        carried, entering = jax.lax.scan(one, (decayed, memory), prepared)
-        return jax.vmap(forms.mapped)(prepared, entering), carried[1], entering[1]
+        # Each chunk's state solved once, in sequence, what it kept read again by its outputs at once.
+        carried, (entering, kept) = jax.lax.scan(one, (decayed, memory), prepared)
+        return jax.vmap(forms.mapped)(prepared, entering, kept), carried[1], entering[1]
 
     def walking_one(operands, h, segments=None):
         outputs, last, kept = entered(operands, h, segments)
@@ -1600,7 +1605,7 @@ def transferred(query, key, value, g, beta, starts=None, *, chunk_size: int = CH
         start = jax.tree.map(lambda x: varying_like(x, *varying),
                              forms.init(jax.tree.map(lambda x: x[0], chunks)))
         prepared = jax.vmap(functools.partial(forms.prepare, transition=True))(chunks)
-        last, _ = jax.lax.scan(lambda walk, chunk: (forms.step(walk, chunk), None), start, prepared)
+        last, _ = jax.lax.scan(lambda walk, chunk: (forms.step(walk, chunk)[0], None), start, prepared)
         return last.transfer
 
     return jax.vmap(jax.vmap(walked))(operands)

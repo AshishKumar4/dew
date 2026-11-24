@@ -251,8 +251,10 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             return prepared
         return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
 
-    def mapped(prepared, state, issue=None):
-        # Dew's products where no mainloop issues them (`_issued`): a readout's the portable math's.
+    def mapped(prepared, state, kept=None, issue=None):
+        # Dew's products where no mainloop issues them (`_issued`): a readout's the portable math's. A
+        # single state's step keeps nothing for it (`_stepped`).
+        del kept
         (outputs,) = prepared.split.emit(prepared.values[1], state[1], issue or _issued)
         entering = prepared.entering
         return outputs if entering is None else _entered(outputs, entering, prepared.values_read, state[1])
@@ -352,14 +354,15 @@ def _apart(declaration: Scan, affine, tokens: int) -> int:
 
 
 def _stepped(state, prepared: Prepared, issue=None):
-    """A walk's state after a prepared chunk (`derive_scan`'s `step`): its decay summed, its state the
-    chunk's carry from it, and where the walk carries its transfer, the chunk's transition composed on it."""
+    """A walk's state after a prepared chunk and what it keeps for the chunk's outputs (`derive_scan`'s
+    `step`, `Derived`'s scans): its decay summed, its state the chunk's carry from it, and where the walk
+    carries its transfer, the chunk's transition composed on it; a single state keeps nothing (None)."""
     decay, h = state[:2]
     natural, values = prepared.values
     (leaving,) = prepared.split.carry(values, h, issue)
     decay = _held(decay + natural.astype(decay.dtype))
     if not isinstance(state, Walk):
-        return decay, leaving
+        return (decay, leaving), None
     if prepared.corrected and state.transfer is None:
         raise Refused("a walk started for tokens that do not correct the state steps a chunk whose do")
     if state.transfer is not None and prepared.transition is None:
@@ -367,7 +370,7 @@ def _stepped(state, prepared: Prepared, issue=None):
                       "(`prepare(chunk, transition=True)`)")
     transfer = (None if state.transfer is None
                 else (issue or _issued)("transfer_compose", prepared.transition, state.transfer))
-    return Walk(decay, leaving, transfer, _summed(state.across, prepared.across))
+    return Walk(decay, leaving, transfer, _summed(state.across, prepared.across)), None
 
 
 def _at_token(declaration: Scan, names: Sequence[str], affine, token: Mapping) -> tuple:
