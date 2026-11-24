@@ -12,7 +12,6 @@ kernel emits."""
 
 import dataclasses
 import functools
-import itertools
 import math
 import weakref
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -527,8 +526,10 @@ class _Counting:
         # The products it issued and has not waited on (each one's columns, `_columns`), and what lands on
         # each barrier it will wait on: products committed to it, copies arriving on it (`waited`), by the
         # barrier's allocation where the count holds it (`_Barrier`).
-        # The variables the program's constants alone decide (`run`, `_static`).
+        # The variables the program's constants alone decide (`run`, `_static`), and the provenance of the
+        # last body's outputs it ran.
         self.static: set[jax_core.Var] = set()
+        self.returned: list[bool] | None = None
         self.issued: list[float] = []
         self.landing: dict[_Barrier | jax_core.Var, Chain] = {}
         # The slots of each barrier its copies landed on, as their transforms name them (`_slot`): a wait on
@@ -583,21 +584,21 @@ class _Counting:
             self.add(Work(chains=(landed,) if landed is not None else arrived or (Chain(barriers=1),)))
 
     def run(self, jaxpr: jax_core.Jaxpr, values: list, constants: Sequence = (),
-            static: Sequence[bool] = ()) -> list:
+            static: Sequence[bool] = (), constant_static: Sequence[bool] = ()) -> list:
         """Count `jaxpr` given its inputs' concrete `values` (None where unknown) and which of them are
         `static` (none where not given), and its constants' (`constvars`) where its caller binds them (a
-        scoped body's, `run_scoped`'s operands), a concrete one static; its outputs' concrete values. A value
-        is static where the program's own constants alone decide it (`_static`), whatever the count holds of
-        it: a trip's place the count holds concretely is none (`_Place`)."""
+        scoped body's, `run_scoped`'s operands, `constant_static` theirs); its outputs' concrete values, and
+        which of them are static (`returned`). A value is static where the program's own constants alone
+        decide it (`_static`), whatever the count holds of it: a trip's place the count holds concretely is
+        none (`_Place`)."""
         held = dict(zip(jaxpr.invars, values, strict=True))
         if constants:
             held.update(zip(jaxpr.constvars, constants, strict=True))
         # Each variable's provenance rewritten as it is bound, so a jaxpr run again (a call's, shared by its
         # callers) holds none of an earlier run's.
-        bound = [*itertools.zip_longest(jaxpr.invars, static, fillvalue=False),
-                 *((variable, _concrete(held.get(variable))) for variable in jaxpr.constvars)]
-        for variable, given in bound:
-            (self.static.add if given else self.static.discard)(variable)
+        for variables, flags in ((jaxpr.invars, static), (jaxpr.constvars, constant_static)):
+            for at, variable in enumerate(variables):
+                (self.static.add if at < len(flags) and flags[at] else self.static.discard)(variable)
 
         def read(atom):
             if isinstance(atom, jax_core.Literal):
@@ -612,11 +613,16 @@ class _Counting:
         for equation in jaxpr.eqns:
             values = [read(atom) for atom in equation.invars]
             given = [isinstance(atom, jax_core.Literal) or atom in self.static for atom in equation.invars]
+            self.returned = None
             outputs = self.moved(equation, values, live) or self.equation(equation, values, given)
             held.update(zip(equation.outvars, outputs, strict=True))
-            fixed = _static(equation, given)
-            for variable in equation.outvars:
-                (self.static.add if fixed else self.static.discard)(variable)
+            # A body it ran here states its outputs' provenance (a call's, a scope's, a branch's); else the
+            # operation's own (`_static`).
+            fixed = (self.returned if self.returned is not None and len(self.returned) == len(outputs)
+                     else [_static(equation, given)] * len(outputs))
+            for variable, known in zip(equation.outvars, fixed, strict=True):
+                (self.static.add if known else self.static.discard)(variable)
+        self.returned = [isinstance(atom, jax_core.Literal) or atom in self.static for atom in jaxpr.outvars]
         return [read(atom) for atom in jaxpr.outvars]
 
     def moved(self, equation, values: list, live: set) -> list | None:
@@ -652,7 +658,7 @@ class _Counting:
         if (primitive is lax.select_n_p and programs.integral_scalar(values[0])
                 and all(value is not None for value in values[1:])):
             return [values[1 + int(values[0])]]
-        if (primitive is lax.iota_p or primitive in _PURE) and _static(equation, given):
+        if _static(equation, given):
             # Of the program's constants alone: folded by its compile or computed once outside every loop. A
             # call of them runs on, its body's folds the values a later guard reads.
             return unknown
@@ -704,7 +710,8 @@ class _Counting:
         elif primitive is derivatives.marked_call_p and isinstance(params["kind"], _MARKS):
             return self.marked(params, values, given)
         elif (expanded := _expanded(equation)) is not None:
-            return self.run(expanded[0], values, expanded[1], given)
+            # The expansion's constants are its trace's own.
+            return self.run(expanded[0], values, expanded[1], given, [True] * len(expanded[1]))
         elif primitive not in _FREE:
             raise Unpriced(f"no rule prices {primitive} in a kernel's body")
         return unknown
@@ -727,9 +734,8 @@ class _Counting:
     def scoped(self, equation, values: list, given: list[bool]) -> list:
         """A scope (`run_scoped`): its operands its body's constants, its body's inputs the refs it
         allocates."""
-        del given
         body = equation.params["jaxpr"]
-        return self.run(body, [_barrier(var) for var in body.invars], values)
+        return self.run(body, [_barrier(var) for var in body.invars], values, constant_static=given)
 
     def loop(self, equation, values: list, given: list[bool]) -> None:
         """A loop whose trips its data decides (a while's): the outermost such loop that runs walk steps
@@ -940,8 +946,9 @@ elementwise arithmetic and a value's elements rearranged, which of static operan
 
 def _static(equation, given: Sequence[bool]) -> bool:
     """Whether `equation`'s outputs are of the program's constants alone: an iota's (a tile's row and column
-    indices), and what a pure operation (`_PURE`) or a call of no effects computes of static operands
-    (`given`: literals, and values so computed), the masks a tile's indices make among them. The GPU's
+    indices), and what a pure operation (`_PURE`) computes of static operands (`given`: literals, and values
+    so computed), the masks a tile's indices make among them; a call's, a scope's or a branch's outputs are
+    as the body the count runs states them (`_Counting.run`). The GPU's
     compile folds such a value or computes it once outside every loop, so it issues nothing a step: the
     recurrence solve's masks, priced at 6.1M integer operations a GH200 program (FS-4123-INT3, its launch
     integer-bound), compile to about a thousand integer instructions a thread a walk's trip, its moves and
@@ -950,13 +957,7 @@ def _static(equation, given: Sequence[bool]) -> bool:
     index, a step's parity, a scan's carry) is none of them."""
     if equation.primitive is lax.iota_p:
         return True
-    pure = equation.primitive in _PURE or (programs.called(equation) is not None and not equation.effects)
-    return pure and bool(given) and all(given)
-
-
-def _concrete(value) -> bool:
-    """Whether the count holds `value` concretely: a host's integer, float or array."""
-    return isinstance(value, int | float | np.generic | np.ndarray)
+    return equation.primitive in _PURE and bool(given) and all(given)
 
 
 def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mapping,

@@ -735,17 +735,38 @@ def test_a_steps_mask_of_its_tiles_indices_issues_nothing_and_one_of_its_place_c
     assert selected == selected_placed == 128, (selected, selected_placed)
 
 
-def test_a_steps_mask_of_its_parity_counts_its_integer_operations_each_step():
+@pytest.mark.parametrize("held", ["step", "scope"])
+def test_a_steps_mask_of_a_runtime_value_counts_its_integer_operations_each_step(held):
     """A walk step's mask of its tile's indices offset by its parity (`index % 2`, a value the count holds
-    concretely at each trip it reads, `emission._Place`) is computed each step: the count's concrete trip
-    value is none of the program's constants, so the mask's integer operations count every step."""
+    concretely at each trip it reads, `emission._Place`, none of the program's constants) is computed each
+    step, its integer operations counted every step, in the step or in a scope's body that captures it
+    (`pl.run_scoped`), whose constants are as its operands are."""
+    def masked(row, offset):
+        columns = lax.iota(jnp.int32, 128) + offset
+        return jnp.where((columns // 4) % 2 == 1, row, 0.0)
+
     def step(index, row):
         mosaic.step_index(index)
-        columns = lax.iota(jnp.int32, 128) + index % 2
-        return jnp.where((columns // 4) % 2 == 1, row, 0.0)
+        parity = index % 2
+        if held == "scope":
+            return pl.run_scoped(lambda scratch: masked(row, parity), plgpu.SMEM((8,), jnp.float32))
+        return masked(row, parity)
 
     role = _emitted(lambda row, trips: lax.fori_loop(0, trips, step, row), _ROW, _TRIPS).roles[0]
     assert role.step(lambda work: work.integer_operations) >= 3 * 128, role
+
+
+def test_a_calls_static_output_beside_a_runtime_one_issues_nothing_a_step():
+    """A call returning a mask of its tile's indices beside a value of the step (`jax.jit`) gives each output
+    the provenance its body computes: the mask stays static, so its use issues nothing a step, where the
+    call's runtime operand once made every output a runtime value."""
+    def step(index, row):
+        mosaic.step_index(index)
+        odd, _ = jax.jit(lambda at: (lax.iota(jnp.int32, 128) % 2 == 1, at + 1))(index)
+        return jnp.where(odd & (lax.iota(jnp.int32, 128) < 64), row, 0.0)
+
+    role = _emitted(lambda row, trips: lax.fori_loop(0, trips, step, row), _ROW, _TRIPS).roles[0]
+    assert role.step(lambda work: work.integer_operations) < 128, role
 
 
 def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_fp32_lanes():
