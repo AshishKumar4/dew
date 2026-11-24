@@ -199,12 +199,15 @@ def test_a_non_finite_row_leaves_the_others_banded():
 
 
 def test_a_term_of_more_band_pairs_than_int32_counts_is_summed_unbanded():
-    """A product of nine groups, each over values 130 binades apart, sums to `1 + 2^-1170`, 1: its band pairs
-    past what int32 counts (`_band` 0), the term is summed unbanded, where its pairs' count (15^9) wrapped
-    negative and the sum stopped before its first and gave 0 (review of #3967, P1)."""
+    """A product of nine groups over two keys, the first group's values `[1, 2^-126]` and the others'
+    `[2^-126, 1]`, sums to `2^-126 + 2^-1008`, `2^-126`: the products' largest pairs the first group's last
+    band with the others' first, and the term's band pairs pass what int32 counts (15^9, `_band` 0), so it is
+    summed unbanded, where the pairs' count wrapped negative, the sum took its first pair alone and gave 0
+    (review of #3967, P1)."""
     form = Form(("k",) * 9, ((1, tuple(((index, 1),) for index in range(9))),), "")
-    operand = jnp.asarray([1.0, 2.0 ** -130], jnp.float32)
-    np.testing.assert_array_equal(np.asarray(contract(form, *(operand,) * 9)), 1.0)
+    first = jnp.asarray([1.0, 2.0 ** -126], jnp.float32)
+    others = jnp.asarray([2.0 ** -126, 1.0], jnp.float32)
+    np.testing.assert_array_equal(np.asarray(contract(form, first, *(others,) * 8)), 2.0 ** -126)
 
 
 def test_a_banded_sum_holds_its_rows_varying_types_in_a_shard_map():
