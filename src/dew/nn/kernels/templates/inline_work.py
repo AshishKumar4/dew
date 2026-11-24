@@ -6,6 +6,7 @@ import dataclasses
 import functools
 import itertools
 import math
+import re
 import weakref
 from collections.abc import Callable, Sequence
 
@@ -48,10 +49,10 @@ _CONVERSIONS = frozenset({"arith.extf", "arith.truncf", "arith.fptosi", "arith.f
 
 _MEMORY = frozenset({"memref.load", "memref.store", "vector.load", "vector.store", "llvm.load", "llvm.store"})
 
-_FREE_PREFIXES = ("vector.", "llvm.mlir.", "builtin.unrealized_conversion_cast", "gpu.thread_id",
+_FREE_PREFIXES = ("llvm.mlir.", "builtin.unrealized_conversion_cast", "gpu.thread_id",
                   "gpu.block_id", "gpu.block_dim", "gpu.grid_dim", "nvvm.read.ptx.sreg", "nvvm.barrier",
-                  "nvvm.fence", "nvvm.shfl.sync", "nvvm.elect.sync", "nvvm.mbarrier", "nvvm.cp.async.commit",
-                  "nvvm.cp.async.wait", "nvvm.cp.async.mbarrier")
+                  "nvvm.bar.", "nvvm.fence", "nvvm.shfl.sync", "nvvm.elect.sync", "nvvm.mbarrier",
+                  "nvvm.cp.async.commit", "nvvm.cp.async.wait", "nvvm.cp.async.mbarrier")
 """Ops that move a value between registers or name a thread's place (a shuffle's lanes, a barrier's wait),
 which compute nothing a unit's rate prices: register moves, addresses (`llvm.getelementptr`'s arithmetic),
 a thread's indices, synchronization and a shuffle's exchange, which `emission` prices for no reduction
@@ -62,7 +63,12 @@ _FREE = frozenset({
     "arith.bitcast", "scf.yield", "func.return", "gpu.barrier", "llvm.getelementptr", "llvm.ptrtoint",
     "llvm.inttoptr", "llvm.addrspacecast", "llvm.extractvalue", "llvm.insertvalue", "llvm.bitcast",
     "llvm.mul", "llvm.add", "memref.subview", "memref.cast", "memref.reinterpret_cast",
-    "memref.collapse_shape", "memref.expand_shape"})
+    "memref.collapse_shape", "memref.expand_shape", "llvm.insertelement", "llvm.extractelement",
+    "llvm.shufflevector", "llvm.mlir.undef", "llvm.mlir.poison", "llvm.mlir.constant",
+    # A vector's registers regrouped: its elements taken, put, broadcast or reshaped, none computed.
+    "vector.extract", "vector.insert", "vector.broadcast", "vector.splat", "vector.from_elements",
+    "vector.extract_strided_slice", "vector.insert_strided_slice", "vector.shape_cast", "vector.bitcast",
+    "vector.shuffle"})
 
 
 class Uncounted(ValueError):
@@ -70,17 +76,20 @@ class Uncounted(ValueError):
     only at run time)."""
 
 
-def body_work(fn: Callable, avals: Sequence, arg_types: Sequence, values: Sequence = ()) -> Work:
+def body_work(fn: Callable, avals: Sequence, arg_types: Sequence, values: Sequence = (),
+              warp: int | None = None) -> Work:
     """What `fn`, an `inline_mgpu` body taking operands of `avals` as `arg_types` states them, issues a
-    warpgroup: the body emitted for the target the trace runs for (`generation.gpu_target`), each integer
-    scalar operand whose value the count holds (`values`, None where unknown: a block's start along its
-    launch's axis) a constant of it, so the lanes its predicates take are read; once a body, operands and
-    values (`_held`). Raises `Uncounted` where its code holds what no rule counts."""
+    warpgroup (its `warp`'s 32 lanes where a warp's role runs it, `plgpu.warp_map`'s): the body emitted for
+    the target the trace runs for (`generation.gpu_target`), each integer scalar operand whose value the
+    count holds (`values`, None where unknown: a block's start along its launch's axis) a constant of it, so
+    the lanes its predicates take are read; once a body, target, operands, their layouts, values and warp
+    (`_held`). Raises `Uncounted` where its code holds what no rule counts."""
     known = tuple(_scalar(aval, value) for aval, value in itertools.zip_longest(avals, values))
-    key = (tuple(map(str, avals)), known)
+    capability = generation.capability(generation.gpu_target().generation) or (9, 0)
+    key = (capability, tuple(map(str, avals)), tuple(map(str, arg_types)), known, warp)
     found = _held.get(fn, {})
     if key not in found:
-        found[key] = _counted(fn, avals, arg_types, known)
+        found[key] = _counted(fn, avals, arg_types, known, capability, warp)
         _held[fn] = found
     return found[key]
 
@@ -97,8 +106,26 @@ def _scalar(aval, value) -> int | None:
 _held: "weakref.WeakKeyDictionary[Callable, dict]" = weakref.WeakKeyDictionary()
 
 
-def _counted(fn: Callable, avals: Sequence, arg_types: Sequence, known: Sequence) -> Work:
-    capability = generation.capability(generation.gpu_target().generation) or (9, 0)
+class _Launch:
+    """A body's launch context as the count stands it in: each TMA copy it asks for (`async_copy`, a
+    gathered ring's rows) its shared side's bytes moved between device and shared memory, once, however
+    many lanes issue it; any other use of the context is no rule's."""
+
+    def __init__(self):
+        self.work = Work()
+
+    def async_copy(self, *, src_ref, dst_ref, **options) -> None:
+        del options
+        shared = dst_ref if _shared(dst_ref.type) else src_ref
+        moved = float(_bytes_of(ir.MemRefType(shared.type)))
+        self.work = self.work + Work(device_bytes=moved, shared_bytes=moved)
+
+    def __getattr__(self, name: str):
+        raise Uncounted(f"a body's use of its launch context's {name}")
+
+
+def _counted(fn: Callable, avals: Sequence, arg_types: Sequence, known: Sequence, capability: tuple,
+             warp: int | None) -> Work:
     with jax_mlir.make_ir_context() as context, ir.Location.unknown():
         from jaxlib.mosaic.python import mosaic_gpu as dialect
 
@@ -111,14 +138,18 @@ def _counted(fn: Callable, avals: Sequence, arg_types: Sequence, known: Sequence
         with ir.InsertionPoint(module.body):
             function = func.FuncOp("body", ir.FunctionType.get(types, []))
             block = function.add_entry_block()
+            launch = _Launch()
             with ir.InsertionPoint(block):
                 arguments = [argument if value is None else arith.constant(argument.type, value)
                              for argument, value in zip(block.arguments, known, strict=True)]
-                fn(None, *(_stand_in(aval, kind, argument)
-                           for aval, kind, argument in zip(avals, arg_types, arguments, strict=True)))
+                fn(launch, *(_stand_in(aval, kind, argument)
+                             for aval, kind, argument in zip(avals, arg_types, arguments, strict=True)))
                 func.ReturnOp([])
-        lanes = _Lanes()
-        return lanes.region(function.operation.regions[0], np.ones(LANES, dtype=bool))
+        active = np.ones(LANES, dtype=bool)
+        if warp is not None:
+            # A warp's role runs it on its own 32 lanes.
+            active = np.arange(LANES) // WARP == warp % (LANES // WARP)
+        return _Lanes().region(function.operation.regions[0], active) + launch.work
 
 
 def _stand_in_type(aval, kind) -> ir.Type:
@@ -189,9 +220,10 @@ class _Lanes:
             return _repeated(self.region(op.regions[0], active), trips)
         if name == "scf.if":
             maybe, surely = self.bounds(op.operands[0])
-            if maybe.all() and not surely.any():
-                # Data decides it on every lane: each branch's most, as `emission` takes an unknown
-                # conditional.
+            if maybe.all() and not surely.any() and op.operands[0] not in self.varying:
+                # Data every lane holds alike decides it: one branch runs, each branch's most, as `emission`
+                # takes an unknown conditional. Where data a lane holds decides it, a warp's lanes may part
+                # and run both, each over every lane (below).
                 branches = [self.region(region, active) for region in op.regions if region.blocks]
                 return functools.reduce(_most, branches, Work())
             # Each branch over the lanes that may take it: a lane its place decides takes one, a lane data
@@ -312,7 +344,14 @@ class _Lanes:
         if name in _FREE or name.startswith(_FREE_PREFIXES):
             return Work()
         if name == "llvm.inline_asm":
-            return _assembly(ir.StringAttr(op.attributes["asm_string"]).value, issued, moving)
+            def guarded(at: int, negated: bool) -> np.ndarray:
+                # `$N` numbers the block's results first, then its operands.
+                if at < len(op.results):
+                    return active
+                maybe, surely = self.bounds(op.operands[at - len(op.results)])
+                return active & (~surely if negated else maybe)
+
+            return _assembly(ir.StringAttr(op.attributes["asm_string"]).value, issued, moving, guarded)
         if name == "nvvm.cp.async.shared.global":
             # Each active lane's copy of `size` bytes from device into shared memory.
             copied = ir.IntegerAttr(op.attributes["size"]).value * moving
@@ -349,18 +388,29 @@ _PTX_INTEGER = ("lop3.", "shf.", "prmt.", "and.", "or.", "xor.", "not.", "shl.",
 _PTX_MULTIPLY = ("mul.", "mad.")
 
 
-def _assembly(text: str, issued: float, moving: float) -> Work:
+def _assembly(text: str, issued: float, moving: float, guarded: Callable[[int, bool], np.ndarray]) -> Work:
     """Inline PTX's work, an instruction at a time: float arithmetic on the fp32 lanes (a packed pair's, `x2`,
     two an instruction), special functions on their units, integer arithmetic and bit manipulation on the
     integer units (a multiply on the FMA pipe), a conversion at the conversions' rate, a load or store its
     active lanes' bytes; a shuffle, a move, a predicate and synchronization free (scalar, a lane's
-    exchange); a global atomic its word read and written by each lane that runs it. Raises `Uncounted` for
+    exchange); a global atomic its word read and written by each lane that runs it. An instruction guarded
+    by an operand (`@$N`, `@!$N`) runs on the lanes that may take it (`guarded`); a memory instruction
+    guarded by a predicate the block computes itself is refused, its lanes unknown. Raises `Uncounted` for
     any other instruction."""
     work = Work()
+    full = (issued, moving)
     for line in text.replace("{", ";").replace("}", ";").split(";"):
         words = line.split()
+        issued, moving = full
+        guard = None
         if words and words[0].startswith("@"):
-            words = words[1:]
+            negated = words[0].startswith("@!")
+            guard, words = words[0].lstrip("@!"), words[1:]
+            if guard.startswith("$") and guard[1:].isdigit():
+                lanes = guarded(int(guard[1:]), negated)
+                issued = float(lanes.reshape(-1, WARP).any(axis=1).sum() * WARP)
+                moving = float(lanes.sum())
+                guard = None
         if not words or words[0].startswith("."):
             continue
         mnemonic = words[0]
@@ -378,6 +428,20 @@ def _assembly(text: str, issued: float, moving: float) -> Work:
             work = work + Work(integer_multiply_adds=elements * issued)
         elif mnemonic.startswith(_PTX_INTEGER):
             work = work + Work(integer_operations=elements * issued)
+        elif mnemonic.startswith("mma.") and (shape := re.search(r"\.m(\d+)n(\d+)k(\d+)\.", mnemonic)):
+            # A warp's matrix product: 2 M N K operations each warp that issues it, in its operands' mode.
+            m, n, k = map(int, shape.groups())
+            operations = 2 * m * n * k * issued / WARP
+            if ".tf32" in mnemonic:
+                work = work + Work(tf32_flops=operations)
+            elif any(kind in mnemonic for kind in (".e4m3", ".e5m2")):
+                work = work + Work(fp8_flops=operations)
+            elif any(kind in mnemonic for kind in (".bf16", ".f16")):
+                work = work + Work(flops=operations)
+            else:
+                raise Uncounted(f"no rule counts the PTX instruction {mnemonic}")
+        elif guard is not None and mnemonic.startswith(("ld.", "st.", "atom.", "red.", "cp.async.")):
+            raise Uncounted(f"a memory instruction guarded by the block's own predicate {guard}: {mnemonic}")
         elif mnemonic.startswith(("cp.async.ca.", "cp.async.cg.")):
             # A lane's copy of its operand's bytes (16 where it states none) from device into shared memory.
             sizes = [int(word.strip(",")) for word in words[1:] if word.strip(",").isdigit()]
@@ -485,6 +549,14 @@ def _bytes(value_type: ir.Type) -> int:
     if isinstance(element, ir.IndexType):
         return _elements(value_type) * 8
     raise Uncounted(f"a memory op of {value_type}, whose bytes no rule states")
+
+
+def _bytes_of(memref: ir.MemRefType) -> int:
+    """A memref's bytes: its elements at their width."""
+    element = memref.element_type
+    if not isinstance(element, ir.IntegerType | ir.FloatType):
+        raise Uncounted(f"a copy of {memref}, whose bytes no rule states")
+    return math.prod(memref.shape) * max(1, element.width // 8)
 
 
 def _shared(address_type: ir.Type) -> bool:

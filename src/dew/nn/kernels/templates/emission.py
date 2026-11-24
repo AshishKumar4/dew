@@ -680,7 +680,7 @@ class _Counting:
             self.add(_tensor(lhs.dtype, 2 * _elements(equation.outvars[0].aval)
                              * math.prod(lhs.shape[dimension] for dimension in contracted)))
         elif primitive is gpu.inline_mgpu_p:
-            self.add(_inlined(params, equation.invars, values))
+            self.add(_inlined(params, equation.invars, values, None if self.warp is None else self.warp[1]))
         elif primitive is lax.cond_p:
             return self.cond(params["branches"], values, given)
         elif (region := _REGIONS.get(primitive)) is not None:
@@ -839,7 +839,7 @@ class _Counting:
         return [None] * len(branches[0].outvars)
 
 
-def _inlined(params: Mapping, invars: Sequence, values: Sequence) -> Work:
+def _inlined(params: Mapping, invars: Sequence, values: Sequence, warp: int | None) -> Work:
     """An inlined Mosaic GPU body's work: what the code it emits issues (`inline_work.body_work`), its
     arguments its operands' leading ones, their refs' transforms' leaves after them, its scalars' values
     where the count holds them."""
@@ -851,7 +851,8 @@ def _inlined(params: Mapping, invars: Sequence, values: Sequence) -> Work:
                               variable.aval)
              for variable, transforms in zip(invars[:leading], viewed, strict=True)]
     try:
-        return inline_work.body_work(params["mgpu_fn"], avals, params["flat_arg_types"], values[:leading])
+        return inline_work.body_work(params["mgpu_fn"], avals, params["flat_arg_types"], values[:leading],
+                                     warp)
     except inline_work.Uncounted as error:
         raise Unpriced(f"an inlined Mosaic GPU body ({params['mgpu_fn']}) emits what no rule counts: "
                        f"{error}") from error
