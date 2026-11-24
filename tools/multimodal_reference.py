@@ -179,11 +179,12 @@ def numerics(model, encoded: dict) -> dict[str, np.ndarray]:
     """`model`'s logits over the batch `encoded` a row at a time (zero at every padded position), then its
     summed next-token `loss`, its `pixel_gradient` (where it reads pixels) and the `updated_logits` after
     one SGD step (`_sgd_step`, in place), in the model's dtype: the references the source draw's files
-    hold (`_write_numerics`) and a drawn site's (tools/multimodal_worker.py)."""
+    hold (`_write_numerics`) and a drawn site's (tools/multimodal_worker.py), on the model's device and read
+    back to the host."""
     valid = encoded["attention_mask"].bool()
-    dtype = next(model.parameters()).dtype
+    dtype, device = next(model.parameters()).dtype, next(model.parameters()).device
     shape = (*encoded["input_ids"].shape, model.config.get_text_config().vocab_size)
-    logits, updated = torch.zeros(shape, dtype=dtype), torch.zeros(shape, dtype=dtype)
+    logits, updated = (torch.zeros(shape, dtype=dtype, device=device) for _ in range(2))
     singles = _row_slices(encoded, model)
     with torch.no_grad():
         for row, single in enumerate(singles):
@@ -192,12 +193,13 @@ def numerics(model, encoded: dict) -> dict[str, np.ndarray]:
     with torch.no_grad():
         for row, single in enumerate(singles):
             updated[row, valid[row]] = model(**single, use_cache=False).logits[0]
-    found = {"logits": logits.numpy(), "loss": loss.detach().numpy(), "updated_logits": updated.numpy()}
+    found = {"logits": logits.cpu().numpy(), "loss": loss.detach().cpu().numpy(),
+             "updated_logits": updated.cpu().numpy()}
     if pixel_inputs:
         gradients = [gradient for pixels in pixel_inputs if (gradient := pixels.grad) is not None]
         if len(gradients) != len(pixel_inputs):
             raise RuntimeError("the backward pass left a pixel input without its gradient")
-        found["pixel_gradient"] = torch.cat(gradients).numpy()
+        found["pixel_gradient"] = torch.cat(gradients).cpu().numpy()
     return found
 
 

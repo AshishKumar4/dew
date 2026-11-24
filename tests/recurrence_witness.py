@@ -457,7 +457,7 @@ def key_enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     factor = point(np.float32(scale))
     # The pairs of sub-chunks the gated queries scaled by the scale's magnitude up to one (their sum held
     # across the key blocks), the rest and its sign the read sums'; each sub-chunk's own scaled once summed
-    # (`algebra.band_masked`).
+    # (`algebra.block_masked`).
     shrinking, growing = min(abs(scale), 1.0), math.copysign(max(abs(scale), 1.0), scale)
     crossed = fp32(mul(key_pairs(point(step.q), step.k, exponents, lane, shrinking),
                        point(np.float32(growing))), lane)

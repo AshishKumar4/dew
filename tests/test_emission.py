@@ -617,16 +617,81 @@ def test_a_warpgroup_waits_on_a_copy_its_barrier_lands_or_on_another_warpgroups_
     assert _waits(handed, plgpu.Barrier()) == ((cost.Chain(barriers=1),),)
 
 
-def test_a_copy_into_a_rings_slot_waits_as_the_ring_hides_it():
-    """A tile copy landing on one of a ring's barriers (one a slot, three of them) waits as that ring's
-    three stages hide it, two slots ahead of the step that reads it, where one copy landing on its own
-    barrier hides nothing (row 4123: every copy priced waited whole, its ring's depth unread)."""
-    def ringed(out_gmem, tiles, ready):
-        plgpu.copy_gmem_to_smem(out_gmem, tiles.at[1], ready.at[1])
-        plgpu.barrier_wait(ready.at[1])
+def _ring_trips(ringed) -> tuple:
+    """The paths of one warpgroup's kernel `ringed`, of a ring of three tile slots and their barriers, as a
+    launch's work states them (`launch_work`)."""
+    kernel = plgpu.kernel(ringed, out_type=_ROW,
+                          scratch_types=[plgpu.SMEM((3, 128), jnp.float32), plgpu.Barrier(num_barriers=3)])
+    (launched,) = (equation for equation in programs.equations(jax.make_jaxpr(kernel)().jaxpr)
+                   if equation.primitive in programs.NATIVE_KERNELS)
+    return emission.launch_work(launched, Stated(steps=0, bytes_accessed=0)).chains
 
-    assert _waits(ringed, plgpu.SMEM((3, 128), jnp.float32), plgpu.Barrier(num_barriers=3)) == (
-        (cost.Chain(copies=1, copy_bytes=512, stages=3),),)
+
+@pytest.mark.parametrize("prefetched, stages", [(True, 3), (False, 1)], ids=["prefetched", "at-once"])
+def test_a_copy_into_a_rings_slot_waits_as_the_ring_hides_it(prefetched, stages):
+    """Each trip of a loop waiting on its own slot of a ring of three: a copy it issues two slots ahead, the
+    ring's first two filled before the loop, a prefetch as deep as the ring, waits as its three stages hide
+    it, where one copy landing on its own barrier hides nothing (row 4123: every copy priced waited whole, its
+    ring's depth unread); a copy into its own slot, waited at once, waits whole, the ring's depth no proof of
+    turns between (row 12369: an attention consumer's copy and wait on one slot priced a third; its review:
+    the prefetch one transfer ahead of three stages, the at-once arm's slot filled twice before a wait)."""
+    def ringed(out_gmem, tiles, ready):
+        if prefetched:
+            for filled in (0, 1):
+                plgpu.copy_gmem_to_smem(out_gmem, tiles.at[filled], ready.at[filled])
+
+        def trip(step):
+            slot = step % 3
+            copied = (step + 2) % 3 if prefetched else slot
+            plgpu.copy_gmem_to_smem(out_gmem, tiles.at[copied], ready.at[copied])
+            plgpu.barrier_wait(ready.at[slot])
+            return step + 1
+
+        lax.while_loop(lambda step: step < 4, trip, 0)
+
+    assert _ring_trips(ringed) == (cost.Chain(copies=1, copy_bytes=512, stages=stages),)
+
+
+def test_a_copy_waited_at_once_on_a_slot_a_captured_scalar_names_waits_whole():
+    """A copy and its wait on a ring's slot a captured 0-d NumPy index names, a literal that hashes as none:
+    the wait reads the slot the copy named, at once, and waits for the copy whole (row 12369's review: such a
+    slot ended the count in a TypeError)."""
+    slot = np.array(1, np.int32)
+
+    def ringed(out_gmem, tiles, ready):
+        plgpu.copy_gmem_to_smem(out_gmem, tiles.at[slot], ready.at[slot])
+        plgpu.barrier_wait(ready.at[slot])
+
+    assert _ring_trips(ringed) == (cost.Chain(copies=1, copy_bytes=512),)
+
+
+def test_a_copy_one_warpgroup_issues_waits_in_the_warpgroup_that_reads_it():
+    """A tile copy a producer warpgroup issues onto one of a ring's barriers each trip of a loop, which the
+    consumer warpgroup waits on: the launch's path waits for the copy as the ring's three stages hide it,
+    where the consumer read the wait as another warpgroup's arrival, one barrier round trip, and the copy
+    waited on no path (row 4123, the pricing head's review: a GH200's recurrence reverse priced at 0.29 of its
+    time, its producer's copies on none of its paths, M-FS-64)."""
+    def split(out_gmem, tiles, ready):
+        def trip(step):
+            @pl.when(lax.axis_index("wg") == 1)
+            def _():
+                plgpu.copy_gmem_to_smem(out_gmem, tiles.at[1], ready.at[1])
+
+            @pl.when(lax.axis_index("wg") == 0)
+            def _():
+                plgpu.barrier_wait(ready.at[1])
+
+            return step + 1
+
+        # Trips of a loop the program's walk runs (a while loop's, as a walk's own), the copy one trip's.
+        lax.while_loop(lambda step: step < 4, trip, 0)
+
+    kernel = plgpu.kernel(split, out_type=_ROW, num_threads=2, thread_name="wg",
+                          scratch_types=[plgpu.SMEM((3, 128), jnp.float32), plgpu.Barrier(num_barriers=3)])
+    (launched,) = (equation for equation in programs.equations(jax.make_jaxpr(kernel)().jaxpr)
+                   if equation.primitive in programs.NATIVE_KERNELS)
+    assert emission.launch_work(launched, Stated(steps=0, bytes_accessed=0)).chains == (
+        cost.Chain(copies=1, copy_bytes=512, stages=3),)
 
 
 def test_an_integer_operation_counts_on_the_integer_units_not_the_fp32_lanes():

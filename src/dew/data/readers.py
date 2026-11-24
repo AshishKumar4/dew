@@ -474,7 +474,7 @@ class _FillShare:
 
 
 class Replayed:
-    """A Grain iterator whose first element was read already (`dew.data.compile.native_loader`'s probe of the
+    """A Grain iterator whose first element was read already (`dew.data.handed.native_loader`'s probe of the
     batch): it gives that element first, then reads on, its position the one before it until it is given."""
 
     def __init__(self, source: pygrain.DatasetIterator, first: Batch, before):

@@ -68,7 +68,7 @@ from dew.nn.kernels.formats import (
 )
 from dew.nn.kernels.templates import axes as side_axes_of, product as product_of
 from dew.nn.kernels.templates.axes import GROUPS
-from dew.nn.kernels.templates.gemm import scattered, tiling
+from dew.nn.kernels.templates.gemm import rows_permuted, scattered, tiling
 from dew.nn.kernels.templates.gemm.factored import factored
 from dew.nn.kernels.templates.gemm.hooks import NO_HOOKS, Hooks
 from dew.nn.kernels.templates.product import SCALE_DEPTH, bf16_part_count, declared, formed, terms
@@ -119,33 +119,33 @@ def gemm(lhs: jax.Array, rhs: jax.Array | NvFp4 | Fp8Weights | TernaryWeights,
     order differentiates (`_prologued`). `compute`, where given, is the dtype the products take, `lhs` rounded
     to it as `rhs` is, where `lhs`'s own dtype is what its cotangent takes, summed in fp32 and rounded once to
     it (an fp32 input's of a bf16 product); the rounding passes tangents through unrounded, the MoE
-    projection's law (`xla_products.portable_projection`), and there is no prologue. `layer`, where given (a
-    traced index), picks one layer of a stacked `rhs` (`[layers, *matrices]`: a layer's groups, or its one
-    matrix for a dense product), read in place: the launches take the layer's groups and read their matrices
-    where they lie in the stack, from the layer's first (`_grouped`), so no slice of the stack is made and
-    they tile, split and sum as the call over the layer's matrices alone. Its gradient is the stack's, every
-    other layer's zero. `paired`, a second matrix of `rhs`'s shape (a stack of them at the same `layer`), the
-    rows multiply into a second accumulator the epilogue takes before its side operands (`epilogue(acc,
-    paired_acc, *sides)`: a gate's and an up projection's SwiGLU), else an output. `gather`, int32 `[rows]` of
-    a grouped call (a stack's layer's too), makes the product's rows `lhs[gather]`, read where they lie: a
-    mixture of experts' tokens in their own order, the router's sort fused into the rows' loads where Mosaic
-    GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA elsewhere; the rows'
-    cotangent is summed back into each token's (`lhs`'s, a token every slot reads). With a prologue, its
-    side operands along the rows are the product's rows' (`gather`'s order, a normalized stream's scale
-    gathered with it), and the prologue runs fused on the gathered rows where Mosaic GPU's launch takes
-    both (row 5391: an expert projection over a normalized or scaled token stream).
-    `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at each output's
-    row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
+    projection's law (`xla_products.portable_projection`); a prologue forms its operand in it. `layer`, where
+    given (a traced index), picks one layer of a stacked `rhs` (`[layers, *matrices]`: a layer's groups, or
+    its one matrix for a dense product), read in place: the launches take the layer's groups and read their
+    matrices where they lie in the stack, from the layer's first (`_grouped`), so no slice of the stack is
+    made and they tile, split and sum as the call over the layer's matrices alone. Its gradient is the
+    stack's, every other layer's zero. `paired`, a second matrix of `rhs`'s shape (a stack of them at the same
+    `layer`), the rows multiply into a second accumulator the epilogue takes before its side operands
+    (`epilogue(acc, paired_acc, *sides)`: a gate's and an up projection's SwiGLU), else an output. `gather`,
+    int32 `[rows]` of a grouped call (a stack's layer's too), makes the product's rows `lhs[gather]`, read
+    where they lie: a mixture of experts' tokens in their own order, the router's sort fused into the rows'
+    loads where Mosaic GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA
+    elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every slot reads). With
+    a prologue, its side operands along the rows are the product's rows' (`gather`'s order, a normalized
+    stream's scale gathered with it), and the prologue runs fused on the gathered rows where Mosaic GPU's
+    launch takes both (row 5391: an expert projection over a normalized or scaled token stream). `scatter`,
+    int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at each output's row
+    `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
     (`stores.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
     gather. `applied`, where given, is the prologue's operand already formed, `prologue(lhs, *sides)` rounded
     to `lhs`'s dtype, which its producer wrote (a paired product's epilogue, beside `lhs` and the sides it
     read): the product multiplies it in place of forming each tile, and every derivative is the prologue's
-    (`portable`'s, which forms it), so `applied` takes no cotangent, and reverse mode forms the prologue's
-    VJP in the transposed product's epilogue (`_input_cotangents`). An NVFP4 `rhs` (`NvFp4`; a stack of banks
-    at its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen. `named`, a remat name or None an output (an
-    epilogue's output that is its accumulator rounded to its dtype, a gate's projection before its SwiGLU,
-    `fused_gemm` lifting the program's name onto it): each named output is a residual of the call's derivative
-    under its name (`checkpoint_name`), so a policy keeping the name keeps it, and the reverse pass reads the
+    (`portable`'s, which forms it), so `applied` takes no cotangent, and reverse mode forms the prologue's VJP
+    in the transposed product's epilogue (`_input_cotangents`). An NVFP4 `rhs` (`NvFp4`; a stack of banks at
+    its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen. `named`, a remat name or None an output (an epilogue's
+    output that is its accumulator rounded to its dtype, a gate's projection before its SwiGLU, `fused_gemm`
+    lifting the program's name onto it): each named output is a residual of the call's derivative under its
+    name (`checkpoint_name`), so a policy keeping the name keeps it, and the reverse pass reads the
     accumulator from it where the epilogue reads its accumulator through that rounding alone, recomputing no
     product (row 7131). `beside`, matrices of `rhs`'s groups and depth each of its own width: an output each
     (a tuple), one launch over their columns side by side where one takes them (`mosaic_gpu.gmm`'s), the input
@@ -255,7 +255,7 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
     cotangent, read = _scattered_cotangent(cotangent, scatter, epilogue=epilogue, first=first)
     # The named outputs the forward kept (`gemm`'s `named`, an epilogue's) were stored where their rows
     # landed: read back in the product's row order, as the epilogue's derivative reads its cotangent.
-    saved = tuple(saved if scatter is None else (value[scatter] for value in saved))
+    saved = tuple(saved if scatter is None else (rows_permuted(value, scatter) for value in saved))
     # The operands a reverse pass differentiates, by their place among the operands' leaves: a frozen
     # matrix's kernel gradient, or an operand no reverse pass reaches, is never formed.
     wanted = set(live)
@@ -272,7 +272,7 @@ def _pulled(call: _Call, operands, cotangent, live, saved: tuple = ()) -> tuple:
                                              prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
                                              epilogue_axes, cotangents, dtypes, compute, acc_shape,
                                              {**held, 'gather': gather},
-                                             dict(zip(call.named, saved, strict=True)))
+                                             dict(zip(call.named, saved, strict=True)), scatter=scatter)
     # Each accumulator's cotangent meets the forward's rounded operands as the portable program's
     # derivative has it: in `lhs`'s dtype where that holds it exactly (a cotangent no wider, passed
     # through), wide otherwise, each product rounding once.
@@ -318,16 +318,17 @@ def _scattered_cotangent(cotangent, scatter, *, epilogue, first) -> tuple:
     reads it row by row, or a stack's layer's input gradient, whose launch reads no slots, no table then."""
     if scatter is None or (epilogue is None and first is None):
         return cotangent, scatter
-    return jax.tree.map(lambda d: d[scatter], cotangent), None
+    return jax.tree.map(lambda d: rows_permuted(d, scatter), cotangent), None
 
 
 def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute, applied, lhs,
                   beside: tuple = ()) -> None:
     """`gemm`'s refusal of a call it does not take: gathered rows but a grouped call's, or beside a formed
     operand (`applied`, a producer's rows already in the product's order), scattered rows but a grouped
-    call's, a prologue beside a named `compute`, a formed operand but a prologue's, of `lhs`'s shape and
-    dtype, and matrices side by side beside any of the call's parts `beside` holds (its hooks, pair, tables,
-    formed operand, named `compute`, layer, several dtypes and names, None where the call has none)."""
+    call's, a formed operand but a prologue's, of `lhs`'s shape and its products' dtype (`compute`, `lhs`'s
+    where None), and matrices side by side beside any of the call's parts `beside` holds (its hooks, pair,
+    tables, formed operand, named `compute`, layer, several dtypes and names, None where the call has
+    none)."""
     if any(part not in (None, ()) for part in beside):
         raise ValueError("matrices side by side take no hooks, pair, tables, formed operand, named compute, "
                          "layer, several dtypes or names")
@@ -824,7 +825,7 @@ def _packed_weight_rules(launch: grouped_matmul.MosaicWordPackedGmm, make_bank,
     def portable(r: jax.Array, w: jax.Array, s: jax.Array) -> jax.Array:
         matrices = decoded(w)
         return (jax.lax.dot(r, matrices, preferred_element_type=jnp.float32) if dense
-                else jax.lax.ragged_dot(r, matrices, s, preferred_element_type=jnp.float32))
+                else xla_products.placed_ragged_dot(r, matrices, s, preferred_element_type=jnp.float32))
 
     def forward(r: jax.Array, w: jax.Array, s: jax.Array):
         with xla_products.interpreted_context(interpret):
@@ -886,18 +887,35 @@ def fp8_weight_product(lhs: jax.Array, weights: Fp8Weights, group_sizes: jax.Arr
             operands = (weights.unscaled(jnp.bfloat16), group_sizes)
         factor = fp8_factor(jnp.asarray(weights.scale, jnp.float32), sizes, rows.shape[0], weights.shape,
                             dense)
-        scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs)
+        scaled = factored(functools.partial(_interpreted, product, interpret_on_cpu), operands, factor, lhs,
+                          wide=interpreted_wide(interpret_on_cpu),
+                          wide_operands=(weights, group_sizes), prepared=decoded_operands)
         return scaled.astype(lhs.dtype if out_dtype is None else out_dtype)
 
 
-def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None, *,
-                    interpret_on_cpu: bool) -> jax.Array:
-    """A packed matrix's portable product: bf16 `rows` times its decoded bf16 `matrix` (grouped by
-    `group_sizes`, or dense), each product exact and summed in fp32."""
+def decoded_operands(matrix, group_sizes: jax.Array | None) -> tuple:
+    """A packed matrix (`Fp8Weights`, `TernaryWeights`, `NvFp4`) decoded to bf16, beside its group sizes:
+    `factored`'s `prepared`, decoded once a rescue, where it runs."""
+    decoded = matrix.decoded() if isinstance(matrix, NvFp4) else matrix.unscaled(jnp.bfloat16)
+    return decoded, group_sizes
+
+
+def decoded_product(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array | None,
+                    gather: jax.Array | None = None, *, interpret_on_cpu: bool) -> jax.Array:
+    """A packed matrix's portable product: bf16 `rows` (those `gather` reads, where given, read where they
+    lie: `gemm`'s `gather`) times its decoded bf16 `matrix` (grouped by `group_sizes`, or dense), each
+    product exact and summed in fp32."""
     summed = gemm(rows, matrix, group_sizes, out_dtype=jnp.float32, precision=jax.lax.Precision.DEFAULT,
-                  interpret_on_cpu=interpret_on_cpu)
+                  interpret_on_cpu=interpret_on_cpu, gather=gather)
     assert isinstance(summed, jax.Array), "an unpaired product has one output"
     return summed
+
+
+def interpreted_wide(interpret_on_cpu: bool) -> Callable:
+    """`wide_transpose` as `factored`'s `wide`, interpreted where `interpret_on_cpu` asks, as the product's
+    own pullback is (`_interpreted`), wherever the rescue traces it."""
+    wide = functools.partial(wide_transpose, interpret_on_cpu=interpret_on_cpu)
+    return functools.partial(_interpreted, wide, interpret_on_cpu)
 
 
 def _interpreted(product: Callable, interpret_on_cpu: bool, *operands) -> jax.Array:
@@ -1171,17 +1189,38 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     tile = _planned(launch, bound)
     if selection.select(NVFP4, PackedCase(tile, count, whole=not automatic_axes())).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
-        summed = _packed(rows, words, scales, sizes, gather, first, launch, interpret_on_cpu,
-                         dense=group_sizes is None)
+
+        def packed(r, words, scales, sizes, gather, first):
+            return _packed(r, words, scales, sizes, gather, first, launch, interpret_on_cpu,
+                           dense=group_sizes is None)
+
+        product: Callable[..., jax.Array] = packed
+        operands = (words, scales, sizes, gather, first)
     else:
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
-        # product's, whatever precision the program defaults to.
-        summed = gemm(rows, bank.decoded(), group_sizes, out_dtype=jnp.float32,
-                      precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu, gather=gather)
-        assert isinstance(summed, jax.Array), "an unpaired product has one output"
+        # product's, whatever precision the program defaults to (`decoded_product`).
+        product = functools.partial(decoded_product, interpret_on_cpu=interpret_on_cpu)
+        operands = (bank.decoded(), group_sizes, gather)
     factor = bank.factor if group_sizes is None else jnp.repeat(
         bank.factor, sizes, total_repeat_length=count)[:, None]
-    return (summed * factor).astype(out_dtype)
+    # Each row's (its group's) factor joins the sum as `factored` takes a row's: a cancelling cotangent
+    # under a factor past fp32's largest pulls back its finite sum, the bank decoded only where it does.
+    return factored(product, operands, factor, lhs, gather=gather,
+                    wide=interpreted_wide(interpret_on_cpu),
+                    wide_operands=(bank, group_sizes), prepared=decoded_operands).astype(out_dtype)
+
+
+def wide_transpose(cotangent: jax.Array, matrices: jax.Array, sizes: jax.Array | None, *,
+                    interpret_on_cpu: bool) -> jax.Array:
+    """The rows' transpose of a product with decoded bf16 `matrices` (grouped by `sizes`, or one), in fp32:
+    the cotangent as its bf16 parts (`_bf16_parts`), each part's product exact and summed in fp32, the
+    parts' sums added in fp32, as the packed kernel's pullback forms it before its one rounding."""
+    parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
+    return functools.reduce(jnp.add, [
+        jnp.asarray(gemm(part, matrices, sizes, transpose_rhs=True, out_dtype=jnp.float32,
+                         precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu))
+        for part in parts])
+
 
 
 def _undeferred(words, scales) -> NvFp4:
@@ -1232,10 +1271,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         del saved
         rows, words, scales, sizes, gather, first = operands
         matrices = decoded(words, scales, first)
-        parts = _bf16_parts(cotangent, bf16_part_count(jnp.float32))
-        d_rows = functools.reduce(jnp.add, [
-            gemm(part, matrices, None if dense else sizes, transpose_rhs=True, out_dtype=jnp.float32,
-                 precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
+        d_rows = wide_transpose(cotangent, matrices, None if dense else sizes, interpret_on_cpu=interpret)
         if gather is not None:
             d_rows = jnp.zeros(rows.shape, d_rows.dtype).at[gather].add(d_rows)
         leaves = (d_rows.astype(rows.dtype), zero_from_primal(words), zero_from_primal(scales),
@@ -1656,7 +1692,7 @@ def _worked(d_accs: tuple, narrow: tuple, compute) -> tuple[tuple, tuple]:
 
 def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
                 epilogue_arrays, epilogue_axes, cotangents: tuple, dtypes: tuple, compute, acc_shape: tuple,
-                plain: dict, saved: dict | None = None) -> tuple[tuple, tuple, tuple]:
+                plain: dict, saved: dict | None = None, scatter=None) -> tuple[tuple, tuple, tuple]:
     """Each accumulator's cotangent (one a matrix of `matrices`: the product's, and its `paired`'s), the
     epilogue side operands' and whether each accumulator's passes an output's through in `compute`'s dtype
     (`_passes_cotangent`): the outputs' own without an epilogue (None for an output no reverse pass
@@ -1688,7 +1724,10 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     # typed the same on every device, the VJP of an epilogue adding a side each device reads its own of
     # summed the devices' cotangents into it (the add's broadcast transposed to a psum), every device's
     # gradient then their sum (row 10526).
-    operands = (lhs, *matrices, *jax.tree.leaves(prologue_arrays))
+    # Its routing too (its group sizes, `plain`'s gather table, its `scatter`): a table each device holds its
+    # own of routes rows that vary with it, as the forward's accumulator is typed (`fused_gemm._product`'s).
+    operands = (lhs, *matrices, *jax.tree.leaves(prologue_arrays),
+                *(table for table in (group_sizes, plain.get('gather'), scatter) if table is not None))
 
     def zero() -> jax.Array:
         return varying_like(jnp.zeros(acc_shape, at_least_fp32(compute)), *operands)
@@ -1708,6 +1747,10 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
                                **plain))
     else:
         accs = (zero(),) * count
+    # Each typed as the stand-in is, whatever its own operands vary over: a recomputed product reads its rows
+    # in the product's order, no scatter table among its operands, though its cotangent is the scattered
+    # one's, read back through it.
+    accs = tuple(varying_like(each, *operands) for each in accs)
 
     def epilogued(*args):
         # Each row's side values, whose transpose sums a groups axis's cotangents over each group's rows.

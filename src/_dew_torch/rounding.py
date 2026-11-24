@@ -81,7 +81,8 @@ EXACT_ATEN = frozenset({
     "logical_or", "logical_not", "bitwise_and", "bitwise_or", "bitwise_not", "isnan", "isinf", "sign",
     "floor", "ceil", "round", "trunc", "argmax", "argmin", "sort", "topk", "clamp", "clamp_min",
     "clamp_max", "masked_fill", "masked_fill_", "tril", "triu", "_local_scalar_dense", "as_strided",
-    "embedding", "index_put", "index_put_", "scatter", "scatter_",
+    "embedding", "index_put", "index_put_", "scatter", "scatter_", "masked_scatter", "masked_scatter_",
+    "masked_scatter_backward", "broadcast_in_dim",
     "slice_scatter", "select_scatter", "diagonal", "diag_embed", "expand_copy", "view_copy",
     "permute_copy", "squeeze_copy", "unsqueeze_copy", "t_copy", "transpose_copy", "set_", "resize_",
     "_unsafe_index", "nonzero", "unfold", "any", "all", "bernoulli", "rand", "randn", "randint", "to",
@@ -115,6 +116,56 @@ SUMS_ATEN = frozenset({"mm", "bmm", "addmm", "baddbmm", "sum", "cumsum", "convol
 terms' magnitudes (`_terms`)."""
 
 
+def _variance(overload: str, x, *args, **kwargs):
+    """`aten.var`'s value at its `overload` (`default`: `unbiased`; `dim`: `dim`, `unbiased`, `keepdim`;
+    `correction`: `dim`, keyword `correction` and `keepdim`) as the primitive operations it computes: the
+    mean, each term's deviation squared and their sum over ATen's degrees of freedom, the count less the
+    correction and never below zero, each rounding as its own rule weighs it (a norm's variance, a vision
+    tower's); any other overload refused, naming it (the confirm review: every overload read as `dim`'s)."""
+    named = dict(zip({"default": ("unbiased",), "dim": ("dim", "unbiased", "keepdim"),
+                      "correction": ("dim",)}.get(overload, ()), args, strict=False))
+    if overload not in ("default", "dim", "correction") or len(args) > len(named):
+        raise ValueError(f"the rounding scale reads aten.var's default, dim and correction forms alone; got "
+                         f"its {overload} form")
+    given = {**named, **kwargs}
+    dim, keepdim = given.get("dim"), bool(given.get("keepdim", False))
+    correction = given.get("correction") if overload == "correction" else None
+    held = (1 if given.get("unbiased", True) else 0) if correction is None else correction
+    dims = list(range(x.dim())) if dim is None or dim == [] else [dim] if isinstance(dim, int) else list(dim)
+    count = math.prod(x.shape[axis] for axis in dims)
+    if x.is_complex():
+        # A complex variance sums each deviation's squared magnitude, which the squared deviation is not.
+        raise ValueError("the rounding scale reads a real variance alone; got a complex tensor's")
+    deviation = x - x.mean(dims, keepdim=True)
+    return (deviation * deviation).sum(dims, keepdim=keepdim) / max(count - held, 0)
+
+
+def _nearest_backward(overload: str, gradient, output_size, input_size, scales_h=None, scales_w=None):
+    """`aten.upsample_nearest2d_backward`'s value as the operations it computes, where each input cell is
+    copied to a whole block of output cells (an integral factor, a feature pyramid's): the gradient's
+    blocks, reshaped apart, each summed (`sum`'s rule); any other factor refused, naming it. Every
+    `overload` reads its arguments alike."""
+    del overload
+    (height, width), (out_height, out_width) = input_size[-2:], output_size
+    if out_height % height or out_width % width:
+        raise ValueError(f"the rounding scale reads a nearest upsampling's backward of integral factors "
+                         f"alone; got {height}x{width} to {out_height}x{out_width}")
+    rows, columns = out_height // height, out_width // width
+    # A stated scale maps output cells to input cells by itself, not by the shapes' ratio: blocks only where
+    # it is that ratio (the confirm review: 3 to 9 rows at a scale of 3.2 is no block of three).
+    for scale, factor in ((scales_h, rows), (scales_w, columns)):
+        if scale is not None and float(scale) != factor:
+            raise ValueError(f"the rounding scale reads a nearest upsampling's backward at its shapes' "
+                             f"integral factors alone; got a scale of {scale} over a factor of {factor}")
+    blocks = gradient.reshape(*gradient.shape[:-2], height, rows, width, columns)
+    return blocks.sum((-3, -1))
+
+
+COMPOSED = {"var": _variance, "upsample_nearest2d_backward": _nearest_backward}
+"""The aten operations the tap computes as primitive ones of its own where torch has no decomposition of
+them: each by its form here, given the overload dispatched (`var`'s forms differ)."""
+
+
 @functools.cache
 def _tapped():
     """The tap's dispatch mode (`Tapped`), made where it is first asked, so torch loads only then."""
@@ -136,6 +187,11 @@ def _tapped():
             name = func.overloadpacket.__name__
             ruled = name == "pow" or any(name in rules for rules in (SUMS_ATEN, ULPS_ATEN, ONCE_ATEN,
                                                                      EXACT_ATEN, CIRCULAR))
+            if name in COMPOSED:
+                # An operation torch neither decomposes nor rounds once, as the primitive ones it computes,
+                # each overload by its own form (`str(func)`: `aten.var.correction`).
+                with self:
+                    return COMPOSED[name](str(func).rsplit(".", 1)[1], *args, **kwargs)
             if not ruled:
                 # A composite operation is the primitive ones it computes: its own composite form where it
                 # has one (a math attention's), else torch's decomposition of it.

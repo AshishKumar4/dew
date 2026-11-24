@@ -690,8 +690,10 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     assert probe["fits"] is True and probe["temp"] == ahead.temp_bytes
     assert probe["argument"] == ahead.argument_bytes
     # The plan was made against the allocator's limit the GPU's stated memory gives (`allocator_limit`); the
-    # build states what its programs need of it (`programs_need`).
-    assert ahead.capacity == 2**30 and 0 < ahead.built.memory <= ahead.capacity
+    # build states what its programs need of it (`programs_need`), never under what its step's fit check
+    # left of that limit (row 8712).
+    assert ahead.capacity == 2**30
+    assert ahead.capacity - probe["headroom"] <= ahead.built.memory <= ahead.capacity
     stated = device_memory(trainer.device_mesh.devices.flat[0], ahead.argument_bytes)
     assert stated["pool_bytes"] == ahead.capacity
     assert stated["largest_free_block_bytes"] == ahead.capacity - ahead.argument_bytes
@@ -1121,7 +1123,9 @@ def test_a_step_built_for_a_whole_gpu_loads_where_its_programs_fit_and_is_refuse
     """A step compiled ahead for a GPU of 64 GiB states what its programs need of a device
     (`programs_need`): a GPU whose allocator holds that much takes it, however much less than the room its
     plan was made in (the GPU tier's part, its pool sized by its tests' peaks, refused a tiny step built for
-    80 GiB, rows 8094 and 8371), and one holding a byte less is refused, naming the need."""
+    80 GiB, rows 8094 and 8371), and one holding a byte less is refused, naming the need. The need is never
+    under what the step's own fit check read of its room (row 8712: a need that dropped the step's terms
+    passed every bound from above)."""
     import dataclasses
 
     from dew.training.ahead import BuildTarget, compile_ahead
@@ -1130,12 +1134,13 @@ def test_a_step_built_for_a_whole_gpu_loads_where_its_programs_fit_and_is_refuse
     ahead = compile_ahead(fine_tune(MeshSpec().build(gpus("sm90", limit=2**36))), token_rows(VOCAB, BATCH,
                                                                                          SEQ_LEN + 1))
     need = ahead.built.memory
-    assert need is not None and need < 2**30
+    stepped = 2**36 - record(ahead.plan, "plan")["probes"][0]["headroom"]
+    assert need is not None and stepped <= need < 2**30, (stepped, need)
     assert not ahead.built.differences(BuildTarget.of(gpus("sm90", limit=2**30)))
     held = BuildTarget.of(gpus("sm90"))
     assert not ahead.built.differences(dataclasses.replace(held, memory=need))
     refused = ahead.built.differences(dataclasses.replace(held, memory=need - 1))
-    assert refused == [f"memory {need} bytes, not {need - 1}"], refused
+    assert len(refused) == 1 and str(need) in refused[0], refused
 
 
 def test_a_build_of_compile_only_gpus_holds_their_stated_memory_and_refuses_a_device_holding_less():
@@ -1652,7 +1657,10 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     canonical = compiled()
     assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
     assert pcie.target.memory == allocator_limit(int(capacity_gib(room) * 2**30))
-    assert 0 < pcie.built.memory <= pcie.target.memory
+    # Never under what a fitting compile's fit check left of the room (row 8712).
+    spared = max(probe["headroom"] for probe in listed(record(pcie.plan, "plan")["probes"], "probes",
+                                                       read=record, what="probes") if probe["fits"])
+    assert pcie.target.memory - spared <= pcie.built.memory <= pcie.target.memory
     # One target, its need the programs each carries: the inspected build's sampled step beside its step.
     assert pcie.sampled is not None
     assert again.built == dataclasses.replace(pcie.built, memory=again.built.memory)

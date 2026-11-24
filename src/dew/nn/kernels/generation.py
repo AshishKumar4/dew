@@ -2040,7 +2040,7 @@ def cutlass_built() -> dict[str, str | None]:
     """The generation of the installed dew_cutlass's kernels each CUDA GPU Dew names runs, as the wheel
     dispatches on its compute capability (`dew_cutlass.architecture`, the one statement of it), None for
     one it runs none on or where the wheel is not installed: what CUTLASS's eligibility reads
-    (`grouped_matmul.cutlass_built_for`). A call's route reads the wheel's presence and its build, so a
+    (`grouped_cutlass.cutlass_built_for`). A call's route reads the wheel's presence and its build, so a
     program lowered without it, or with another build, is another program, which no executable kept for the
     first is handed for (training.md §6)."""
     import importlib.util

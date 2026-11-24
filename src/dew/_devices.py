@@ -360,8 +360,14 @@ def device_memory(device, arguments: int = 0) -> Mapping[str, int]:
 def fresh_pool(memory: int, arguments: int = 0, share: float | None = None) -> dict[str, int]:
     """What XLA's BFC pool states on a GPU of `memory` bytes, fresh at its allocator's limit
     (`allocator_limit`, at `share` where the loading run's is stated) with `arguments` resident: the one
-    stated memory of a GPU not attached (`device_memory`, `dew.training.memory.needed`)."""
-    limit = allocator_limit(memory, share)
+    stated memory of a GPU not attached (`device_memory`)."""
+    return pool_at(allocator_limit(memory, share), arguments)
+
+
+def pool_at(limit: int, arguments: int = 0) -> dict[str, int]:
+    """What XLA's BFC pool states fresh at an allocator limit of `limit` bytes with `arguments` resident,
+    whatever GPU and share it is the limit of (`fresh_pool`): what a program's least limit is searched over
+    (`dew.training.memory.least_limit`)."""
     return {"bytes_limit": limit, "bytes_in_use": arguments, "pool_bytes": limit,
             "largest_free_block_bytes": limit - arguments}
 

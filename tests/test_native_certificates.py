@@ -98,7 +98,7 @@ EXACT = launches(("mosaic", "sm90"), ("triton", "sm80"), ("triton", "sm90"))
 """The launches of a kernel gradient's exact sums: Triton's, and Mosaic GPU's on Hopper alone (Ampere's
 bundle counts no running sum in its registers, `mosaic.Family.counts_sums`, so it refuses them)."""
 CUTLASS = launches(("cutlass", "sm90"))
-"""The vendored CUTLASS grouped GEMM's launch (`grouped_matmul.CutlassGmm`, the dew-cutlass wheel's): bf16
+"""The vendored CUTLASS grouped GEMM's launch (`grouped_cutlass.CutlassGmm`, the dew-cutlass wheel's): bf16
 operands on Hopper, its one tile, no exact sums or steps of its own, so its products' cell alone (row 2084
 (a)); a GPU whose installed wheel holds no sm90 kernels refuses it."""
 GRADIENTS = {"mosaic": grouped_matmul.MosaicTgmm, "triton": grouped_triton.Tgmm}
@@ -762,22 +762,20 @@ def cell(check, *args) -> Cell:
                 generation, mosaic="triton" not in args)
 
 
-def test_the_native_kernels_certify_on_this_gpu():
-    """Check 2's native certificates of the template kernels on this GPU, as one flow (`gpu_flow`, the
-    owner's rule: no unit tests on GPUs): every cell above on each generation this device runs, its
-    products admitted, its exact sums a depth step at a time, and each injected fault refused, each
-    cell's failure kept and all raised together."""
-    run_cells([
+FLOWS = {
+    "gemm products": lambda: [
         *(cell(the_grouped_gemm_templates_products_certify_natively, k, g, s)
           for k, g in (*PLAIN, *CUTLASS) for s in SIGNED),
         *(cell(fp32_operands_certify_natively_as_products_of_their_tf32_values, k, g, s)
-          for k, g in TRITON for s in SIGNED),
+          for k, g in TRITON for s in SIGNED)],
+    "gemm exact sums": lambda: [
         *(cell(a_depth_step_of_exact_zeros_leaves_the_native_accumulator_bit_identical, k, g)
           for k, g in EXACT),
         *(cell(the_kernel_gradients_exact_sums_certify_natively_a_step_at_a_time, k, g, s)
           for k, g in EXACT for s in SIGNED),
         *(cell(the_forwards_exact_sums_certify_natively_a_depth_step_at_a_time, k, g, s)
-          for k, g in TRITON for s in SIGNED),
+          for k, g in TRITON for s in SIGNED)],
+    "gemm faults": lambda: [
         *(cell(the_kernel_gradients_certificate_refuses_a_lost_block_and_a_misrouted_row, k, g)
           for k, g in PLAIN),
         *(cell(the_step_witness_refuses_a_truncating_add_a_lost_block_and_a_misrouted_row, k, g)
@@ -787,7 +785,8 @@ def test_the_native_kernels_certify_on_this_gpu():
         *(cell(the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narrow_partial, g)
           for g in GENERATIONS),
         *(cell(subnormal_operands_certify_natively_at_their_formats_least_normal, d, k, g)
-          for d, k, g in SUBNORMAL_CELLS),
+          for d, k, g in SUBNORMAL_CELLS)],
+    "recurrence": lambda: [
         *(cell(the_recurrence_templates_records_certify_natively_a_step_at_a_time, g, r)
           for g in GENERATIONS for r in rw.REGIMES),
         *(cell(the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16_natively, g)
@@ -801,9 +800,22 @@ def test_the_native_kernels_certify_on_this_gpu():
         *(cell(the_recurrence_witness_holds_the_inference_forward_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_the_delta_rules_fast_backward_natively, g) for g in GENERATIONS),
         *(cell(the_recurrence_witness_holds_a_decay_a_key_dimensions_fast_backward_natively, g, heads)
-          for g in GENERATIONS for heads in (1, 2)),
+          for g in GENERATIONS for heads in (1, 2))],
+    "attention": lambda: [
         *(cell(the_attention_templates_states_certify_natively_a_step_at_a_time, g, mask)
           for g in GENERATIONS for mask in ("causal", "full")),
         *(cell(the_attention_witness_refuses_its_faults_natively, g)
-          for g in GENERATIONS),
-    ])
+          for g in GENERATIONS)],
+}
+"""The flows the native cells run in (`gpu_flow.run_cells`), a family's links each: a GPU part runs each
+flow's cells in one batch, and a prepare's compile of one flow is a task of its own, the whole module's one
+outlasting a prepare's task timeout (Train 1247's P01b, 27 minutes on sm90)."""
+
+
+@pytest.mark.parametrize("flow", FLOWS)
+def test_the_native_kernels_certify_on_this_gpu(flow):
+    """Check 2's native certificates of the template kernels on this GPU, a flow a family (`gpu_flow`, the
+    owner's rule: no unit tests on GPUs): every cell of `flow` on each generation this device runs, its
+    products admitted, its exact sums a depth step at a time, and each injected fault refused, each
+    cell's failure kept and all raised together."""
+    run_cells(FLOWS[flow]())
