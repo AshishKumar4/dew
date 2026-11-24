@@ -285,13 +285,13 @@ class TakesBack(Protocol):
     taken_back: int
 
 
-def taken_back(encoder: object) -> int | None:
+def taken_back(encoder: Tokenizer) -> int | None:
     """The most tokens `encoder`'s encoding of a text loses as the text is cut longer, where it is proved:
     none for the byte vocabulary's own encoding (`ByteTokenizer`, its encode and offsets not overridden),
     each character's bytes its own tokens; what a vocabulary states of itself (`TakesBack`); None, no
     bound, for any other."""
-    kind = type(encoder)
-    if kind.encode is ByteTokenizer.encode and kind.offsets is ByteTokenizer.offsets:
+    if (isinstance(encoder, ByteTokenizer) and type(encoder).encode is ByteTokenizer.encode
+            and type(encoder).offsets is ByteTokenizer.offsets):
         return 0
     return encoder.taken_back if isinstance(encoder, TakesBack) else None
 
