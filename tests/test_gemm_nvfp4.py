@@ -668,18 +668,30 @@ def test_the_rescues_rounding_reads_a_leading_limb_past_one_digit():
     assert rounded([2 ** 30], -40) == 2.0 ** -10
 
 
+def _cancelling():
+    """Codes +1 and -1 at input 0 (the cancellation the rescue tests share), unit block scales, and one
+    token at input 0."""
+    return (jnp.zeros((512, 128), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0),
+            jnp.ones((32, 128), jnp.float8_e4m3fn), jnp.zeros((1, 512), jnp.float32).at[0, 0].set(1.0))
+
+
+def _cancelling_bank():
+    """Two experts: the first's codes cancelling (`_cancelling`) at a tensor scale of 2**110, the second's +1
+    code at column 2 at 2**-8."""
+    codes, scales, _ = _cancelling()
+    second = jnp.zeros((512, 128), jnp.float32).at[0, 2].set(1.0)
+    return formats.NvFp4.of(jnp.stack([codes, second]), jnp.stack([scales, scales]),
+                            jnp.asarray([2.0 ** 110, 2.0 ** -8], jnp.float32))
+
+
 @INTERPRETS
 def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
     """An NVFP4 product's input gradient where each cotangent times the matrix's factor (2**8 owed times a
     tensor scale of 2**110) passes fp32's largest, against codes +1 and -1 that cancel: 0, not inf - inf;
     a cotangent of 3 * 2**126 at a factor of 3 (a tensor scale of 3/256) against a +1 code of block scale
-    one, 2**-8 decoded: 9 * 2**118, its product with the factor's significand moved, not overflowed.
-    Gathered, one token routed to two experts, the first's cancelling (cotangents 2**100 at a tensor scale
-    of 2**110) beside the second's +1 code under a cotangent of 2**-30 at a tensor scale of 2**-8: the
-    token's gradient is that second route's 2**-38; two routes' cotangents sum before they round; a gather
-    routing none pulls back zeros (row 1464's transpose, `factored`)."""
-    codes = jnp.zeros((512, 128), jnp.float32).at[0, 0].set(1.0).at[0, 1].set(-1.0)
-    scales = jnp.ones((32, 128), jnp.float8_e4m3fn)
+    one, 2**-8 decoded: 9 * 2**118, its product with the factor's significand moved, not overflowed (row
+    1464's transpose, `factored`)."""
+    codes, scales, _ = _cancelling()
     x = jnp.zeros((4, 512), jnp.float32).at[:, 0].set(1.0)
     matrix = formats.NvFp4.of(codes, scales, jnp.float32(2.0 ** 110))
     _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32), x)
@@ -694,10 +706,16 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
     want[0, 0] = 9.0 * 2.0 ** 118
     np.testing.assert_array_equal(np.asarray(d_x), want)
 
+
+@INTERPRETS
+def test_an_nvfp4_products_gathered_gradient_sums_its_routes_before_it_rounds():
+    """Gathered, one token routed to two experts, the first's cancelling (cotangents 2**100 at a tensor
+    scale of 2**110) beside the second's +1 code under a cotangent of 2**-30 at a tensor scale of 2**-8: the
+    token's gradient is that second route's 2**-38; two routes' cotangents 256 and -255.5 through a 2**-8
+    value sum to 2**-9 before they round, alone or beside a cancelling route, packed or decoded (row 1464's
+    transpose, `factored`)."""
+    (codes, scales, token), bank = _cancelling(), _cancelling_bank()
     second = jnp.zeros((512, 128), jnp.float32).at[0, 2].set(1.0)
-    bank = formats.NvFp4.of(jnp.stack([codes, second]), jnp.stack([scales, scales]),
-                            jnp.asarray([2.0 ** 110, 2.0 ** -8], jnp.float32))
-    token = jnp.zeros((1, 512), jnp.float32).at[0, 0].set(1.0)
     _, pull = jax.vjp(lambda rows: gemm.nvfp4_product(rows, bank, jnp.asarray([1, 1], jnp.int32),
                                                       jnp.asarray([0, 0], jnp.int32), out_dtype=jnp.float32),
                       token)
@@ -736,6 +754,14 @@ def test_an_nvfp4_products_input_gradient_cancels_past_fp32s_largest():
         want[0, 0] = 2.0 ** -9
         np.testing.assert_array_equal(np.asarray(d_token), want, err_msg=kernel)
 
+
+
+@INTERPRETS
+def test_an_nvfp4_products_gathered_gradient_keeps_far_routes_apart_and_routes_none_to_zeros():
+    """Two routes of one token far apart (one cancelling at 2**240, the other's products peaking at 2**97)
+    each summed exactly; one route cancelling at 2**252 beside a third product 2**-126 times its factor keeps
+    the third's 2**-8; and a gather routing no token pulls back zeros (row 1464's transpose, `factored`)."""
+    (_, scales, token), bank = _cancelling(), _cancelling_bank()
     # Two routes of one token far apart: one cancelling at 2**240 on input 0, the other's products peaking
     # at 2**97 on input 1 and giving input 0 2**-28, each summed exactly (`aligned_segment_sum`).
     far = (jnp.zeros((2, 512, 128), jnp.float32).at[0, 0, 0].set(1.0).at[0, 0, 1].set(-1.0)

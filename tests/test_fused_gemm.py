@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import INTERPRETS
-from reference_error import assert_as_exact, seeds_for
+from reference_error import assert_as_exact
 from test_algebra import traces_cheaper
 from test_algebra_program import _scaled_twice
 
@@ -690,11 +690,14 @@ def test_a_normed_projection_takes_the_template_where_a_receipt_timed_it(hidden,
     assert (("grouped_matmul", "mosaic") in found) == (gpu in taken), found
 
 
+@pytest.mark.check1_shards(seeds=32, per_task=8)
 def test_fused_product_fuses_its_epilogue_with_gather_and_scatter():
     """`fused_gemm.product(..., gather=..., scatter=...)` over a token-order RMSNorm producer (top-k routes,
     `M_routed != M_tok`) runs the producer in XLA in its tokens' order, so its derivative sums each token's
     routes first, and fuses a post-scatter bias+residual consumer into the epilogue, holding check 1
-    forward and VJP against float64 truth (rows 5391, 12306)."""
+    forward and VJP against float64 truth (rows 5391, 12306). Its 32 seeds, the count `seeds_for` sized
+    for it (witness/seeds-probe-1), are declared and drawn in map tasks of 8: sized at each run they took
+    135 s, past the group target (row 12633)."""
     # 512 routed rows: the bias's gradient, a sum over them of bf16 cotangents, rounds in fp32 on most draws,
     # so its error from float64 resolves (at 64 rows it was exact on most, its ratio inconclusive).
     tokens_n, rows, depth, width, groups = 256, 512, 64, 64, 4
@@ -751,8 +754,7 @@ def test_fused_product_fuses_its_epilogue_with_gather_and_scatter():
 
     dew_fn, ref_fn = jax.jit(dew_vjp), jax.jit(plain_vjp)
     label = "fused_gemm gather+scatter+prologue+epilogue"
-    assert_as_exact(dew_fn, ref_fn, draw, label, truth_fn=truth,
-                    seeds=seeds_for(ref_fn, draw, label, truth_fn=truth, dew_fn=dew_fn))
+    assert_as_exact(dew_fn, ref_fn, draw, label, truth_fn=truth, seeds=32)
 
 
 def test_a_gathered_products_producer_pulls_back_each_tokens_routes_summed():
