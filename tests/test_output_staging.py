@@ -1,10 +1,18 @@
 """How a consumer stages an output tile through shared memory in chunks
 (`dew.nn.kernels.templates.stores.output_staging`)."""
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from generation_support import INTERPRETS, on_the_host
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import stores
+
+NVFP4 = (stores.Output((64, 256), jnp.uint8, 2), stores.Output((64, 256), jnp.float8_e4m3fn, 16))
+"""A 64-row share of a 256-column NVFP4 tile's codes (two to a byte) and scales (one a 16-column block)."""
 
 
 def test_a_stated_chunk_stores_whole_tma_rows_in_each_output_dtype():
@@ -41,3 +49,61 @@ def test_a_candidate_asks_whether_a_staging_holds_with_no_exception(columns, dty
     dtype, by its bits; a chunk within the piece its issuer emits; a buffer at least (the GEMM
     output-staging head's review: GEMM's candidates held a copy of the rule to ask it)."""
     assert (stores.staging_refusal(columns, dtypes, staging, piece=piece) is None) == holds
+
+
+def test_a_packed_outputs_chunk_stores_whole_rows_of_each_or_is_refused():
+    """Outputs stored packed (`stores.Output.divisor`) stage chunks whose stored rows are each whole 16-byte
+    TMA rows of at most 256 elements: a 128-column tile's NVFP4 scales, 8 bytes a row, refused, a 256-column
+    tile's derived chunk 256 (its codes 128 bytes, its scales 16); a transposed output (`Output.transposed`,
+    `[columns, rows]`) judged by its share's rows, 64 fp32 or 128 E8M0 whole at any width, 2 fp32 not."""
+    codes, scales = NVFP4
+    assert stores.staging_refusal(128, (jnp.float8_e4m3fn,), packed=(scales._replace(shape=(64, 128)),))
+    assert stores.output_staging(256, (jnp.uint8,), packed=(codes,)) == (128, 2)
+    assert stores.output_staging(256, (jnp.float8_e4m3fn,), packed=(scales,)) == (256, 1)
+    with pytest.raises(ValueError):
+        stores.output_staging(256, (jnp.float8_e4m3fn,), (128, 2), packed=(scales,))
+    with pytest.raises(ValueError):
+        stores.output_staging(512, (jnp.uint8,), (512, 1), packed=(codes._replace(divisor=1),))
+    fp32 = stores.Output((64, 128), jnp.float32, 128, transposed=True)
+    assert stores.output_staging(128, (jnp.float32,), packed=(fp32,)) == (128, 1)
+    e8m0 = stores.Output((128, 128), jnp.float8_e8m0fnu, 32, transposed=True)
+    assert stores.output_staging(128, (jnp.float8_e8m0fnu,), packed=(e8m0,)) == (128, 1)
+    assert stores.staging_refusal(128, (jnp.float32,), packed=(fp32._replace(shape=(2, 128)),))
+
+
+def _packed_store(rows: int, columns: int, divisor: int, chunk: int, *, transposed: bool):
+    """A kernel staging a share of `rows` by `columns` tile columns, each its column's index plus a thousand
+    times its row, through two buffers of `chunk` tile columns stored packed (`stores.staged_chunks`), its
+    write keeping each `divisor`th column (a stand-in for a block's scale), transposed where asked."""
+    stored = chunk // divisor
+    block = (stored, rows) if transposed else (rows, stored)
+
+    def write(buffer, piece):
+        kept = piece[:, ::divisor]
+        buffer[...] = kept.T if transposed else kept
+
+    def body(out_gmem):
+        def scoped(smem):
+            value = (jax.lax.broadcasted_iota(jnp.float32, (rows, columns), 1)
+                     + 1000.0 * jax.lax.broadcasted_iota(jnp.float32, (rows, columns), 0))
+            stores.staged_chunks(smem, value, out_gmem, (0, 0, jnp.int32(rows), 0, rows, rows), write=write,
+                                 divisor=divisor, transposed=transposed)
+            plgpu.wait_smem_to_gmem(0)
+
+        pl.run_scoped(scoped, plgpu.SMEM((2, *block), jnp.float32))
+
+    out = (columns // divisor, rows) if transposed else (rows, columns // divisor)
+    return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(out, jnp.float32), interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("transposed", [False, True], ids=["row-major", "transposed"])
+def test_a_packed_output_stores_each_chunks_columns_at_its_stored_place(transposed):
+    """Interpreted on the host's CPU: a share stored packed four tile columns a stored column through
+    16-column chunks (`stores.staged_chunks`' `divisor`) holds each kept column at its stored place, row-major
+    `[rows, columns // 4]` or transposed `[columns // 4, rows]`, every chunk's at its own."""
+    rows, columns = 8, 64
+    with on_the_host():
+        got = np.asarray(_packed_store(rows, columns, 4, 16, transposed=transposed)())
+    expected = np.arange(0, columns, 4)[None, :] + 1000.0 * np.arange(rows)[:, None]
+    np.testing.assert_array_equal(got, expected.T if transposed else expected)
