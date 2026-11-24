@@ -1394,8 +1394,9 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     if not transition:
         # A transition of its own binds no template call: no kernel but the portable math forms it. A turned
         # call's as its launch binds them (`_turned_launch`).
-        launched = (_turned_launch(query, key, value, g, beta, state, skip, turn, starts, firsts, forked)
-                    if turns else (query, key, forked))
+        launched = (query, key, forked)
+        if turns:
+            launched = _turned_launch(query, key, value, state, turn, starts, forked)
         call, shards = template_bind(
             launched[0], launched[1], value, g, beta, state, starts, firsts, skip, launched[2],
             max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound, rounded=rounded,
@@ -1416,30 +1417,25 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
-def _turned_launch(query, key, value, g, beta, state, skip, turn, starts, firsts,
-                   forked: Forked | None) -> tuple:
-    """A turned call's operands as its launch binds them, `(query, key, forked)` as shapes: traced through
-    the turned call itself (`_turned_or_plain`, under `jax.eval_shape`), its launch recording what it is
-    given, its queries and keys a value head's each and a forked call's entry keys and load rotation its
-    documents' (`Forked.entry`, `Forked.turning`), so the call a selector certifies (`template_bind`) is the
-    launch that runs. Restated by hand beside it, the two drifted: the selector certified a launch the step
-    never ran (rows 7976, 12402, 12478)."""
-    seen = []
+def _turned_launch(query, key, value, state, turn, starts, forked: Forked | None) -> tuple:
+    """A turned call's operands as its launch binds them, `(query, key, forked)` as shapes: its queries and
+    keys a value head's each and in its documents' frames, a forked call's entry keys with them and its load
+    rotation its documents' (`Forked.entry`, `Forked.turning`), formed by the functions its launch's
+    operands are (`_value_headed`, `turned.bound`) under `jax.eval_shape`, so the call a selector certifies
+    (`template_bind`) is the launch that runs. Restated by hand beside them, the two drifted: the selector
+    certified a launch the step never ran (rows 7976, 12402, 12478)."""
+    from .templates.recurrence import turned
 
-    def launch(context, query, key, value, g, beta, state, skip, entry, turning):
-        bound = context[2]
-        if bound is not None:
-            bound = dataclasses.replace(bound, entry=entry, turning=turning)
-        seen.append(jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (query, key, bound)))
-        memory = (value.shape[0], value.shape[2], key.shape[-1], value.shape[-1])
-        return jnp.zeros(value.shape, value.dtype), jnp.zeros(memory, jnp.float32)
+    def bound(query, key, value, state, turn, starts, forked):
+        entry = None if forked is None else forked.entry
+        query, key, entry = _value_headed(query, key, value, entry)
+        documents = None if forked is None else (forked.firsts, forked.loads, forked.stores)
+        query, key, _, entry, turning = turned.bound(query, key, value, state, entry, turn, starts, documents)
+        if forked is not None:
+            forked = dataclasses.replace(forked, entry=entry, turning=turning)
+        return query, key, forked
 
-    def traced(query, key, value, g, beta, state, skip, turn, starts, firsts, forked):
-        return _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, starts=starts,
-                                firsts=firsts, forked=forked, scale=1.0, group=1)
-
-    jax.eval_shape(traced, query, key, value, g, beta, state, skip, turn, starts, firsts, forked)
-    return seen[0]
+    return jax.eval_shape(bound, query, key, value, state, turn, starts, forked)
 
 
 def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, starts, firsts, *,
@@ -1812,10 +1808,7 @@ def _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, *, s
         raise ValueError("a turned call's documents add no second slot (`Chunk.adds`, row 8284): its turns' "
                          "gradient composes each document's frames from the one slot it loads "
                          "(`turned._forked_frames`)")
-    heads = value.shape[2]
-    query, key = (jnp.repeat(t, heads // t.shape[2], axis=2) for t in (query, key))
-    if entry is not None:
-        entry = (jnp.repeat(entry[0], heads // entry[0].shape[3], axis=3), *entry[1:])
+    query, key, entry = _value_headed(query, key, value, entry)
     documents = None if forked is None else (forked.firsts, forked.loads, forked.stores)
     held = 0 if forked is None else forked.held
     # The call's arrays its launch reads, the entry write and rotation its own operands (`turned.call`'s).
@@ -1823,6 +1816,15 @@ def _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, *, s
     context = (starts, firsts, unrotated)
     return turned.call(launch, query, key, value, g, beta, state, skip, turn, starts, scale=scale,
                        group=group, documents=documents, held=held, entry=entry, context=context)
+
+
+def _value_headed(query, key, value, entry) -> tuple:
+    """A turned call's queries, keys and entry keys a value head's each (its turns', `_turned_or_plain`)."""
+    heads = value.shape[2]
+    query, key = (jnp.repeat(t, heads // t.shape[2], axis=2) for t in (query, key))
+    if entry is not None:
+        entry = (jnp.repeat(entry[0], heads // entry[0].shape[3], axis=3), *entry[1:])
+    return query, key, entry
 
 
 def _template_launch(query, key, value, g, beta, state, starts, firsts, skip, forked: Forked | None,
