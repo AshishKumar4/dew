@@ -730,7 +730,7 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | formats.NvFp4
     layer too), scaled in the product's prologue (`_streamed`), but by a run's recipe, which takes them
     gathered; with `scatter`, each output row lands at its entry's row (`gemm.gemm`'s `scatter`, a
     permutation). `tensor_scale`, the rows' NVFP4 tensor scale under a delayed-scaling recipe that takes the
-    experts (`dense.history_scale`, `projections.recipe_projection`'s), which it requires (row 12721).
+    experts (`ExpertLinear.history`, `projections.recipe_projection`'s), which it requires (row 12721).
 
     Every implementation runs the GEMM template
     (`dew.nn.kernels.gemm.gemm`), which selects each of its
@@ -831,7 +831,7 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     projection runs on its own and the gated
     product between them (`gated_product`), as before. Every arm's output the compute dtype's. `scatter`,
     `expert_projection`'s. `scales`, the gate's, up's and down's delayed-scaling NVFP4 tensor scales
-    (`dense.history_scale`, row 12721) where a run's delayed recipe takes the experts, which runs them apart,
+    (`ExpertLinear.history`, row 12721) where a run's delayed recipe takes the experts, which runs them apart,
     and `noted`, what records the down projection's rows (their gated product) there (`dense.recorded`)."""
     compute, paired = _paired(x, gate, up, dtype)
     down_stack, down_layer = (down.stack, down.layer) if isinstance(down, Layered) else (down, None)
@@ -980,6 +980,7 @@ class ExpertLinear(nn.Module):
             # A scanned decode over a bank hands the run's stack and the iteration's layer.
             self.kernel = Layered(self.get_variable(BANKED_EXPERTS, 'kernel'),
                                   self.get_variable(BANKED_EXPERTS, 'layer'))
+            self.history = None
             return
         # With the expert dimension as a batch axis, fan_in is per expert and
         # every expert initialises like the matching Dense of a dense MLP. A served checkpoint's packed
@@ -990,6 +991,11 @@ class ExpertLinear(nn.Module):
                 1.0, 'fan_in', 'truncated_normal', in_axis=-2, out_axis=-1,
                 batch_axis=(0,)))['kernel_init'], self.kernel_axes),
             (self.num_experts, self.in_features, self.features), jnp.float32))
+        # Its amax history under a delayed-scaling NVFP4 recipe that takes the experts (`dense.amax_history`,
+        # row 12721), as a Dense holds its own; a packed bank the recipe never takes holds none.
+        with projection_role("experts"):
+            self.history = (None if isinstance(self.kernel, formats.NvFp4)
+                            else amax_history(self, 'amax_history', (self.in_features, self.features)))
 
 
 def capacity_positions(indices: jax.Array, num_experts: int,
@@ -1465,21 +1471,13 @@ class ExpertMLP(nn.Module):
                                 kernel_axes=EXPERT_AXES['down_proj'],
                                 init_std=(self.init_std if self.output_init_std is None
                                           else self.output_init_std))
-        # Each projection's amax history under a delayed-scaling NVFP4 recipe that takes the experts
-        # (`dense.amax_history`), declared here: the products run in a derivative's span, where none is.
-        shapes = {'gate_proj': (self.out_features, self.hidden_features),
-                  'up_proj': (self.out_features, self.hidden_features),
-                  'down_proj': (self.hidden_features, self.out_features)}
-        with projection_role("experts"):
-            self.histories = {name: amax_history(self, name, shape) for name, shape in shapes.items()
-                              if self.activation != 'relu2' or name != 'gate_proj'}
 
     def _project(self, tokens: jax.Array | Gathered, sizes: jax.Array, _expert_ids: jax.Array,
                  kernels: tuple[jax.Array, ...], *, dtype: Dtype) -> jax.Array:
         kernels = _one_layer(kernels)
-        names = (('up_proj', 'down_proj') if self.activation == 'relu2'
-                 else ('gate_proj', 'up_proj', 'down_proj'))
-        scales = self._delayed(names, kernels, tokens)
+        layers = ((self.up_proj, self.down_proj) if self.activation == 'relu2'
+                  else (self.gate_proj, self.up_proj, self.down_proj))
+        scales = self._delayed(layers, tokens)
 
         def linear(x: jax.Array | Gathered, kernel: jax.Array, scatter: jax.Array | None = None,
                    tensor_scale: jax.Array | None = None) -> jax.Array:
@@ -1497,7 +1495,7 @@ class ExpertMLP(nn.Module):
             up = checkpoint_name(linear(tokens, kernels[0], tensor_scale=up_scale), Residual.UP_PROJ)
             hidden = relu2(up)
             if scales is not None:
-                recorded(self, 'down_proj', hidden)
+                recorded(self.down_proj, 'amax_history', hidden)
             return checkpoint_name(linear(hidden, kernels[1], slots, down_scale), Residual.DOWN_PROJ)
         # The gate and up projections read the same rows: one paired product, their gated product its
         # epilogue and the down projection's prologue (`gated_experts`).
@@ -1505,29 +1503,23 @@ class ExpertMLP(nn.Module):
         return checkpoint_name(gated_experts(
             tokens, gate, up, down, sizes, dtype, self.implementation, self.precision, self.activation,
             self.swiglu_limit, slots, scales=scales,
-            noted=None if scales is None else functools.partial(recorded, self, 'down_proj')),
+            noted=None if scales is None else functools.partial(recorded, self.down_proj, 'amax_history')),
             Residual.DOWN_PROJ)
 
     @nn.nowrap
-    def _delayed(self, names: tuple[str, ...], kernels: tuple, tokens: jax.Array | Gathered
+    def _delayed(self, layers: tuple[ExpertLinear, ...], tokens: jax.Array | Gathered
                  ) -> tuple[jax.Array | None, ...] | None:
-        """Each of the layer's projections' (`names`, its `kernels`') delayed-scaling NVFP4 tensor scale in
-        the experts' role, its history's (`setup`'s, `dense.amax_history`; row 12721), the rows they read
-        first recorded
-        (`dense.recorded`; the down projection's its caller records), or None where the run's recipe is no
-        delayed one that takes them (a packed bank its recipe never takes)."""
-        if any(isinstance(kernel.stack if isinstance(kernel, Layered) else kernel, formats.NvFp4)
-               for kernel in kernels):
-            return None
-        histories = [self.histories[name] for name in names]
-        scales = tuple(None if history is None else projections.delayed_tensor_scale(history.value)
-                       for history in histories)
-        if all(scale is None for scale in scales):
+        """Each of the layer's projections' (`layers`') delayed-scaling NVFP4 tensor scale, its amax
+        history's (`ExpertLinear.history`; row 12721), the rows they read first recorded (`dense.recorded`;
+        the down projection's its caller records), or None where none holds a history (the run's recipe no
+        delayed one that takes them, or a packed bank)."""
+        if all(layer.history is None for layer in layers):
             return None
         rows = gathered(tokens)
-        for name in names[:-1]:
-            recorded(self, name, rows)
-        return scales
+        for layer in layers[:-1]:
+            recorded(layer, 'amax_history', rows)
+        return tuple(None if layer.history is None else projections.delayed_tensor_scale(layer.history.value)
+                     for layer in layers)
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
         wide = at_least_fp32(slots.dtype)
