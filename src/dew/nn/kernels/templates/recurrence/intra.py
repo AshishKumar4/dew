@@ -432,12 +432,11 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, call: Call, *, scale: float, prod
             held: list = []
             for j in range(later):
                 first = (j + 1) * algebra.SUB
-                if j and len(raised) == 1:
-                    # One buffer for every sub-chunk's keys (`_sub_chunk_staged`): the last sub-chunk's
-                    # products read it before this one's keys overwrite it.
-                    mosaic.synced(call.interpret)
                 # A sub-chunk's keys staged and published once (`Family.staged_together`), the row sets' gated
-                # rows with the first's, its products issued then.
+                # rows with the first's, its products issued then. With one buffer for every sub-chunk's keys
+                # (`_sub_chunk_staged`), the last sub-chunk's products' reads end before this one's keys
+                # overwrite it by the staging's own barrier (`Family.staged`): a barrier of its own here was a
+                # second one beside it (FS-INTRA-BAR1).
                 with family.staged_together():
                     keyed = operands.staged(family, gated_up(j + 1), raised[j % len(raised)]).T
                     held = held or [operands.staged(family, value, lefts[r]) for r, value in enumerate(gated)]
