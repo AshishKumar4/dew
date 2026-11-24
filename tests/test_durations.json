@@ -81479,15 +81479,75 @@ null,
 5.765,
 1244176384
 ],
-"tests/test_attention_mosaic_compile.py::test_a_backward_certification_refuses_every_config_of_takes_another_route": [
+"tests/test_attention_mosaic_certification.py::test_a_backward_certification_refuses_every_config_of_takes_another_route": [
 25.622,
 39.294,
 750886912
 ],
-"tests/test_attention_mosaic_compile.py::test_a_cuda_targets_verdict_key_names_the_ptxas_jax_gives_xla_and_none_stating_no_build": [
+"tests/test_attention_mosaic_certification.py::test_a_cuda_targets_verdict_key_names_the_ptxas_jax_gives_xla_and_none_stating_no_build": [
 13.436,
 null,
 750886912
+],
+"tests/test_attention_mosaic_certification.py::test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks": [
+0.645,
+1.005,
+1255198720
+],
+"tests/test_attention_mosaic_certification.py::test_a_ladder_holds_no_rung_its_assembler_caps_otherwise": [
+0.343,
+1.014,
+770162688
+],
+"tests/test_attention_mosaic_certification.py::test_a_ladder_that_spills_throughout_certifies_its_ends_alone": [
+48.504,
+63.206,
+2068115456
+],
+"tests/test_attention_mosaic_certification.py::test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_them": [
+73.51,
+null,
+2243141632
+],
+"tests/test_attention_mosaic_certification.py::test_a_launch_is_certified_once_a_machine": [
+31.454,
+null,
+2243141632
+],
+"tests/test_attention_mosaic_certification.py::test_a_launchs_kernels_are_named_alike_on_every_part_of_one_generation_and_size": [
+12.461,
+14.9,
+2243141632
+],
+"tests/test_attention_mosaic_certification.py::test_a_launchs_stored_verdict_is_read_where_its_ptxas_build_assembles_and_not_another": [
+46.16,
+null,
+1138864128
+],
+"tests/test_attention_mosaic_certification.py::test_a_programs_launches_compile_beside_its_trace": [
+47.021,
+17.452,
+1475170304
+],
+"tests/test_attention_mosaic_certification.py::test_a_refused_launch_states_its_model_beside_the_assemblers_registers": [
+7.328,
+7.481,
+1138864128
+],
+"tests/test_attention_mosaic_certification.py::test_a_start_runs_the_kernels_its_launches_certified[none]": [
+34.498,
+54.003,
+1138864128
+],
+"tests/test_attention_mosaic_certification.py::test_a_start_runs_the_kernels_its_launches_certified[temperature]": [
+15.114,
+21.079,
+1138864128
+],
+"tests/test_attention_mosaic_certification.py::test_a_tpu_targets_verdict_key_reads_no_gpu_assembler": [
+3.488,
+null,
+1138864128
 ],
 "tests/test_attention_mosaic_compile.py::test_a_decode_step_compiles_spill_free_at_its_plans_tiles[sm100-256-bfloat16-decode]": [
 261.212,
@@ -81669,11 +81729,6 @@ null,
 24.095,
 1255198720
 ],
-"tests/test_attention_mosaic_compile.py::test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks": [
-0.645,
-1.005,
-1255198720
-],
 "tests/test_attention_mosaic_compile.py::test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100[0]": [
 31.285,
 43.593,
@@ -81683,36 +81738,6 @@ null,
 33.241,
 47.998,
 770162688
-],
-"tests/test_attention_mosaic_compile.py::test_a_ladder_holds_no_rung_its_assembler_caps_otherwise": [
-0.343,
-1.014,
-770162688
-],
-"tests/test_attention_mosaic_compile.py::test_a_ladder_that_spills_throughout_certifies_its_ends_alone": [
-48.504,
-63.206,
-2068115456
-],
-"tests/test_attention_mosaic_compile.py::test_a_launch_is_certified_by_its_kernels_verdict_in_a_tree_edited_outside_them": [
-73.51,
-null,
-2243141632
-],
-"tests/test_attention_mosaic_compile.py::test_a_launch_is_certified_once_a_machine": [
-31.454,
-null,
-2243141632
-],
-"tests/test_attention_mosaic_compile.py::test_a_launchs_kernels_are_named_alike_on_every_part_of_one_generation_and_size": [
-12.461,
-14.9,
-2243141632
-],
-"tests/test_attention_mosaic_compile.py::test_a_launchs_stored_verdict_is_read_where_its_ptxas_build_assembles_and_not_another": [
-46.16,
-null,
-1138864128
 ],
 "tests/test_attention_mosaic_compile.py::test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles[p1-sm100]": [
 219.299,
@@ -81774,11 +81799,6 @@ null,
 219.535,
 1910116352
 ],
-"tests/test_attention_mosaic_compile.py::test_a_programs_launches_compile_beside_its_trace": [
-47.021,
-17.452,
-1475170304
-],
 "tests/test_attention_mosaic_compile.py::test_a_public_fp32_decode_fallback_reports_every_plain_forward_kernels_resources[sm100-256]": [
 55.958,
 72.33,
@@ -81788,11 +81808,6 @@ null,
 45.613,
 61.182,
 1139183616
-],
-"tests/test_attention_mosaic_compile.py::test_a_refused_launch_states_its_model_beside_the_assemblers_registers": [
-7.328,
-7.481,
-1138864128
 ],
 "tests/test_attention_mosaic_compile.py::test_a_short_training_calls_backward_compiles_spill_free_for_an_a100[16-deterministic]": [
 21.918,
@@ -81818,21 +81833,6 @@ null,
 41.876,
 45.248,
 1139183616
-],
-"tests/test_attention_mosaic_compile.py::test_a_start_runs_the_kernels_its_launches_certified[none]": [
-34.498,
-54.003,
-1138864128
-],
-"tests/test_attention_mosaic_compile.py::test_a_start_runs_the_kernels_its_launches_certified[temperature]": [
-15.114,
-21.079,
-1138864128
-],
-"tests/test_attention_mosaic_compile.py::test_a_tpu_targets_verdict_key_reads_no_gpu_assembler": [
-3.488,
-null,
-1138864128
 ],
 "tests/test_attention_mosaic_compile.py::test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block[accurate]": [
 36.266,
