@@ -777,15 +777,15 @@ def test_an_integer_multiply_counts_on_the_fma_pipe_at_its_own_rate_beside_the_f
     IMAD, the FMA pipe's, as a bit form's left shifts by a multiply are, `bits.BitForm.work`) and nothing of
     the ALU's or the fp32 lanes'; a launch of them is priced at the target's IMAD rate
     (`Architecture.integer_multiply_adds_per_clock`), its seconds the fp32 lanes' unit's, so an FFMA beside it
-    adds to them: on sm90, 64 a clock against 256 FLOPs of FFMA, where read as FFMA work they cost a quarter
-    (the review of 3580, F3)."""
+    adds to them: on sm90, 64 a clock against the lanes' 128 instructions, where read as fp32 instructions
+    they cost half (the review of 3580, F3)."""
     row = jax.ShapeDtypeStruct((1, 128), jnp.int32)
     role = _emitted(lambda x: x * 3, row).roles[0]
     assert (role.fixed.integer_multiply_adds, role.fixed.integer_operations, role.fixed.operations) == (
         128, 0, 0), role.fixed
     target = generation.gpu_target("sm90")
     rates = cost.rates(target, device=False)
-    assert rates.multiply_adds == 64 / 256 * rates.cuda
+    assert rates.multiply_adds == 64 / 128 * rates.cuda
     alone, _ = cost.units(Work(integer_multiply_adds=128), rates)
     beside, _ = cost.units(Work(integer_multiply_adds=128, operations=256), rates)
     assert beside[1] == alone[1] + 256 / rates.cuda

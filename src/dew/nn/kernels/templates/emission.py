@@ -10,6 +10,7 @@ operation of the CUDA cores its output's elements; a copy between memories its b
 shared memory. A primitive no rule here prices raises (`Unpriced`): the count states every instruction a
 kernel emits."""
 
+import collections
 import dataclasses
 import functools
 import math
@@ -30,7 +31,7 @@ from jax.experimental import pallas as pl
 from dew.nn import derivatives, precision, programs
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import inline_work, resources
-from dew.nn.kernels.templates.cost import ISSUED_UNITS, Chain, Stated, Work, followed
+from dew.nn.kernels.templates.cost import ISSUED_UNITS, Chain, Stated, Work, followed, multiplied
 from dew.nn.kernels.templates.product import product_mode
 
 
@@ -594,9 +595,12 @@ class _Counting:
                 return np.asarray(atom.val)[()] if np.ndim(atom.val) == 0 else atom.val
             return held.get(atom)
 
-        # The variables a later equation or the jaxpr's outputs read: a swap's old value is live where read.
-        live = {atom for atoms in (*(equation.invars for equation in jaxpr.eqns), jaxpr.outvars)
-                for atom in atoms if isinstance(atom, jax_core.Var)}
+        # How often a later equation or the jaxpr's outputs read each variable: a swap's old value is live
+        # where read, and a multiply an add alone reads fuses with it (`fused`).
+        live = collections.Counter(atom for atoms in (*(equation.invars for equation in jaxpr.eqns),
+                                                      jaxpr.outvars)
+                                   for atom in atoms if isinstance(atom, jax_core.Var))
+        products: set = set()
         for equation in jaxpr.eqns:
             values = [read(atom) for atom in equation.invars]
             given = [isinstance(atom, jax_core.Literal) or atom in self.static for atom in equation.invars]
@@ -609,10 +613,29 @@ class _Counting:
                      else [_static(equation, given)] * len(outputs))
             for variable, known in zip(equation.outvars, fixed, strict=True):
                 (self.static.add if known else self.static.discard)(variable)
+            self.fused(equation, outputs, live, products)
         self.returned = [isinstance(atom, jax_core.Literal) or atom in self.static for atom in jaxpr.outvars]
         return [read(atom) for atom in jaxpr.outvars]
 
-    def moved(self, equation, values: list, live: set) -> list | None:
+    def fused(self, equation, outputs: list, live: collections.Counter, products: set) -> None:
+        """A floating multiply the count issued (its value unknown, not of the program's constants) whose
+        output one equation alone reads (`live`) is kept in `products`; an add or a subtract the count issued
+        reading one fuses with it into one instruction an element (`Work.fused_multiply_adds`: the
+        assembler's FFMA, ptxas's --fmad, its default), however many of its operands are products."""
+        primitive = equation.primitive
+        if primitive not in (lax.mul_p, lax.add_p, lax.sub_p):
+            return
+        (output,) = equation.outvars
+        if (not jnp.issubdtype(output.aval.dtype, jnp.floating) or outputs[0] is not None
+                or output in self.static):
+            return
+        if primitive is lax.mul_p:
+            if live[output] == 1:
+                products.add(output)
+        elif any(isinstance(atom, jax_core.Var) and atom in products for atom in equation.invars):
+            self.add(Work(fused_multiply_adds=_elements(output.aval)))
+
+    def moved(self, equation, values: list, live: collections.Counter) -> list | None:
         """A read or write of a ref in device memory (`emitted`'s `device`) counted as the bytes it moves,
         its outputs unknown; None for any other equation. A read and a swap read the old value where it is
         `live` (a later equation or the jaxpr's outputs read it: a swap a load and a store, as Triton lowers
@@ -1002,7 +1025,7 @@ def operation_work(primitive, inputs: Sequence, outputs: Sequence, params: Mappi
         field, passes = product_mode(params.get("precision"), lhs.dtype, rhs.dtype,
                                      target or generation.gpu_target())
         flops = 2 * _elements(outputs[0]) * math.prod(lhs.shape[dimension] for dimension in contracted)
-        return dataclasses.replace(Work(), **{field: flops * passes})
+        return multiplied(field, flops * passes)
     if primitive in _FREE:
         return Work()
     return Work(unpriced_operations=sum(_elements(aval) for aval in outputs))

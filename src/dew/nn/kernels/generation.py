@@ -260,7 +260,10 @@ class Multiprocessor:
     `block_shared`, the static shared memory a block declares without opting in), the threads of a warp
     (`warp_threads`), the allocator's `register_step` a thread (256 a warp), the shared memory the driver
     reserves for each resident block (`reserved_shared`), the bytes its shared memory serves a clock
-    (`shared_bytes_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
+    (`shared_bytes_per_clock`), the threads' instructions its warp schedulers issue a clock
+    (`issue_per_clock`: four schedulers, each one warp's instruction a clock, CUDA C++ Programming Guide 12.6
+    §16.6.1 to §16.8.1 for compute capabilities 7.x to 9.0; 10.x and 12.x, which no edition of it describes,
+    taken alike), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
     (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
     to 12.x shares (CUDA C++ Programming Guide §5.1, Tables 33 and 34; 128 bytes a clock measured 126 to 128
     on an A100 and an H800, Luo et al. 2025, "Dissecting the NVIDIA Hopper Architecture through
@@ -278,6 +281,7 @@ class Multiprocessor:
     register_step: int = 8
     reserved_shared: int = 1024
     shared_bytes_per_clock: int = 128
+    issue_per_clock: int = 4 * 32
     register_raises: RegisterRaises | None = SETMAXNREG
 
     def raises(self) -> RegisterRaises:
