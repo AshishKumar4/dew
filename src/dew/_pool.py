@@ -67,11 +67,11 @@ def answered(argv: Sequence[str], timeout: float = 60) -> str | None:
     return found.stdout
 
 
-def listed_gpus(argv: Sequence[str]) -> int | None:
+def listed_gpus(argv: Sequence[str], timeout: float = 60) -> int | None:
     """GPUs in the `nvidia-smi -L` output of `argv`, whose MIG lines are
-    indented; None when they could not be counted (`answered`). None is not
+    indented; None when they could not be counted (`answered`, given `timeout` seconds). None is not
     zero GPUs, and every check that reads a count skips on it."""
-    listed = answered(argv)
+    listed = answered(argv, timeout)
     return None if listed is None else sum(line.startswith("GPU ") for line in listed.splitlines())
 
 
