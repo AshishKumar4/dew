@@ -1321,10 +1321,8 @@ met yet; else the scaled blocks summed in XLA (`xla_products.step_scaled`)."""
 
 
 def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
-                          column_scales: jax.Array, *, out_dtype, epilogue: Callable | None = None,
-                          out_dtypes: tuple | None = None, out_forms: tuple | None = None,
-                          dense: bool = False, interpret_on_cpu: bool = False
-                          ) -> jax.Array | tuple[jax.Array, ...]:
+                          column_scales: jax.Array, *, out_dtype, interpret_on_cpu: bool = False
+                          ) -> jax.Array:
     """Each group's rows of `lhs` (FP8 codes, `[rows, depth]`) times its matrix of `kernel` (FP8 codes,
     K-major `[groups, width, depth]`, as Hopper's FP8 tensor cores read it), each 128-deep block's partial,
     summed exactly in fp32, times its rows' scales (`row_scales`, `[depth / 128, rows]`) and its group's
@@ -1332,30 +1330,48 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     weight block's, 1 a column's) before it is added, rounded once to `out_dtype`: DeepSeek-V3's
     blockwise FP8 product (1 x 128 activation tiles, 128 x 128 weight blocks; row 4518). Its forward alone:
     a recipe's gradients are their own FP8 products of requantized operands (row 2513). Its selector
-    (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's. `epilogue`, where
-    given, takes each fp32 sum and returns the call's outputs, in `out_dtypes` where it returns several (the
+    (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's."""
+    (out,) = _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales,
+                            dtypes=(jnp.dtype(out_dtype),), interpret=interpret_on_cpu)
+    return out
+
+
+def blockwise_fp8_finished(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
+                           column_scales: jax.Array, *, epilogue: Callable, out_dtypes: tuple,
+                           out_forms: tuple | None = None, dense: bool = False,
+                           interpret_on_cpu: bool = False) -> tuple[jax.Array, ...]:
+    """`blockwise_fp8_product`'s fp32 sums through `epilogue`, its several outputs in `out_dtypes` (the
     template's epilogue, XLA's the same function of its sums: a next product's rows quantized from them,
     `quantized.blockwise_fp8_epilogue`, row 8547), each stored as `out_forms` states (`Hooks.out_forms`: an
     output broadcast across each block's columns stored one value a row a block, transposed, as a next
     blockwise product reads its rows' scales). `dense`: its one group covers every row (a padded chain's,
     `projections.blockwise_chain`), which a transposed form's stores need (`quantized.forms_refusal`)."""
+    return _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales,
+                          dtypes=tuple(jnp.dtype(dtype) for dtype in out_dtypes), epilogue=epilogue,
+                          out_forms=out_forms, dense=dense, interpret=interpret_on_cpu)
+
+
+def _blockwise_fp8(lhs, kernel, group_sizes, row_scales, column_scales, *, dtypes: tuple,
+                   epilogue: Callable | None = None, out_forms: tuple | None = None, dense: bool = False,
+                   interpret: bool) -> tuple[jax.Array, ...]:
+    """The blockwise FP8 product's outputs (`blockwise_fp8_product`'s, `blockwise_fp8_finished`'s), each a
+    tuple's: the template's step-scaled walk where its selector names it, else XLA's."""
     from .templates.gemm import quantized
 
     sizes_spec = jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32)
     launch = grouped_matmul.MosaicStepScaledGmm()
     per = kernel.shape[1] // column_scales.shape[-1]
-    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     # Its outputs' forms, refused as every route's where no several outputs state them (`forms_of`).
     out_forms = quantized.forms_of(out_forms, len(dtypes)) or None
-    hooks = NO_HOOKS if epilogue is None else Hooks(
-        epilogue=epilogue, out_dtypes=tuple(dtype.name for dtype in dtypes) if out_dtypes else None,
-        out_forms=out_forms)
-    stored = dtypes[0].name if epilogue is not None else 'float32'
+    several = epilogue is not None
+    hooks = NO_HOOKS if not several else Hooks(
+        epilogue=epilogue, out_dtypes=tuple(dtype.name for dtype in dtypes), out_forms=out_forms)
+    stored = dtypes[0].name if several else 'float32'
     if dense and group_sizes.shape != (1,):
         raise ValueError(f"a dense blockwise product is one group's, not {group_sizes.shape[0]}")
     # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
     tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel), sizes_spec, out_dtype=stored,
-                                         trans_rhs=True, interpret=interpret_on_cpu, exact_sums=True,
+                                         trans_rhs=True, interpret=interpret, exact_sums=True,
                                          scales=_abstract(row_scales, column_scales), hooks=hooks,
                                          dense=dense))
             if per == 1 or per % SCALE_DEPTH == 0 else None)
@@ -1372,22 +1388,21 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
         outputs = summed if epilogue is None else epilogue(summed)
         outputs = outputs if isinstance(outputs, tuple) else (outputs,)
         forms = out_forms or (None,) * len(dtypes)
-        cast = tuple(quantized.stored(value.astype(dtype), form)
+        return tuple(quantized.stored(value.astype(dtype), form)
                      for value, dtype, form in zip(outputs, dtypes, forms, strict=True))
-        return cast if out_dtypes else cast[0]
 
     def mosaic(lhs, kernel, sizes, row_scales, column_scales, *, interpret):
         out = launch(lhs, kernel, sizes.astype(jnp.int32), out_dtype=stored, trans_rhs=True,
                      interpret=interpret, exact_sums=True, scales=(row_scales, column_scales), hooks=hooks,
                      dense=dense)
-        return out if epilogue is not None else finished(out)
+        return tuple(out) if several else finished(out)
 
     def portable_finished(*operands):
         return finished(portable(*operands))
 
     if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
-        return xla_products.dispatched(mosaic, portable_finished, interpret_on_cpu, lhs, kernel, group_sizes,
+        return xla_products.dispatched(mosaic, portable_finished, interpret, lhs, kernel, group_sizes,
                                        row_scales, column_scales)
     return portable_finished(lhs, kernel, group_sizes, row_scales, column_scales)
 

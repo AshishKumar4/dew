@@ -70,12 +70,12 @@ from dew.nn.kernels.templates import (
     tail as tail_of,
 )
 from dew.nn.kernels.templates.gemm import (
+    no_depth,
     packed as packing,
     quantized,
     row_tiles,
     rows_extended,
     rows_padded,
-    scattered,
     sides_extended,
     sides_padded,
 )
@@ -373,17 +373,10 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         parts=(prologue, packed_flag, step_scales, mx_scales, gather), packed_rows=packed_rows)
     k = k if linked is None else linked.depth
     rows = rows if gather is None else gather.shape[0]
-    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
-    forms = quantized.forms_of(out_forms, len(dtypes))
-    if (refusal := quantized.forms_refusal(forms, tiles, dense=dense)) is not None:
-        raise ValueError(f"{tiles}: {refusal}")
+    dtypes, forms = quantized.typed_outputs(out_dtypes or (out_dtype,), out_forms, tiles, dense=dense)
     if 0 in (k, rows):
-        outs = _gmm_of_no_depth(side_by_side, (rows, n), group_sizes, paired, scatter, dtypes, out_dtypes,
-                                (epilogue, epilogue_operands, epilogue_axes))
-        if not forms:
-            return outs
-        stored = tuple(quantized.stored(out, form) for out, form in zip(outs, forms, strict=True))
-        return stored if out_dtypes else stored[0]
+        return no_depth.outputs(side_by_side, (rows, n), group_sizes, paired, scatter, dtypes, out_dtypes,
+                                (epilogue, epilogue_operands, epilogue_axes), forms)
     _gmm_forms_refused(tiles, family_of(tiles, dtype), k, n, mx_scales, step_scales,
                        parts=(prologue, epilogue, paired, scales), transpose_rhs=transpose_rhs,
                        transpose_lhs=transpose_lhs, exact_sums=exact_sums)
@@ -404,8 +397,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         paired=paired, joined=joined, exact_sums=exact_sums, transpose_lhs=transpose_lhs, scales=scales,
         step_scales=step_scales, scale_per=per, mx_scales=mx_scales, gather=gather, scatter=scatter,
         stored=None if scatter is None else rows, packed_rows=packed_rows, registers=registers, shared=shared,
-        beside=side_by_side, beside_matrices=beside, chained=linked, packed_format=packed_format,
-        forms=forms,
+        beside=side_by_side, beside_matrices=beside, chained=linked, packed_format=packed_format, forms=forms,
         chained_operands=_chained_walked(chained, tiles, dtype, transpose_lhs, dense, interpret))
     outs = walk(multiprocessors=launched(fam, multiprocessors, walked, tail),
                 hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
@@ -418,9 +410,8 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
 
 
 def _gmm_outputs(outs: tuple, dtypes: tuple, rows: int, splits: int, forms: tuple = ()) -> tuple:
-    """`gmm`'s outputs from its walk's, each its first `rows` along its own rows (`quantized.trimmed`: a
-    transposed reduced output's second axis): a split's runs' fp32 partials summed in their order (the same
-    sums every call) and rounded once to each of `dtypes`."""
+    """`gmm`'s outputs from its walk's, each its first `rows` along its own rows (`quantized.trimmed`): a
+    split's runs' fp32 partials summed in their order and rounded once to each of `dtypes`."""
     if splits > 1:
         total = functools.reduce(jnp.add, tuple(outs[0]))
         outs = tuple(total.astype(dtype) for dtype in dtypes)
@@ -472,22 +463,6 @@ def _dense_tail(tiles: Tiles, dtype, extents: tuple, itemsizes: tuple, multiproc
     if not balanced:
         return None
     return dense_tail(tiles, dtype, extents, itemsizes, generation.gpu_target(), multiprocessors, dense=True)
-
-
-def _of_no_depth(shape: tuple, group_sizes, accumulators: int, epilogue, epilogue_operands: tuple,
-                 epilogue_axes: tuple, dtypes: tuple) -> tuple:
-    """Dew: `gmm`'s outputs of a product of no depth, which sums nothing, or of no rows, which has no tile to
-    through the epilogue on whole arrays (its hooks are a tile's elementwise arithmetic), with no launch (a
-    walk of no steps has no block of the matrix to view: JAX 0.12 refuses a zero-extent slice; a block of no
-    rows none to tile: the interpreter's padding divided by it); its side operands by group read at each row
-    as XLA's program reads them (`axes.at_rows`, row 4489)."""
-    rows = shape[0]
-    zeros = (jnp.zeros(shape, jnp.float32),) * accumulators
-    by_row = tuple(axes.at_rows(side, side_axes, group_sizes, rows) if axes.GROUPS in side_axes else side
-                   for side, side_axes in zip(epilogue_operands, epilogue_axes, strict=True))
-    values = zeros if epilogue is None else epilogue(*zeros, *by_row)
-    values = values if isinstance(values, tuple) else (values,)
-    return tuple(value.astype(dtype) for value, dtype in zip(values, dtypes, strict=True))
 
 
 def split_runs(steps: int, splits: int) -> bool:
@@ -634,20 +609,6 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                   *_workspace(tail, (pair, pairs, 2, consumers, *part), interpret))
 
 
-def _gmm_of_no_depth(beside: "Beside | None", shape: tuple, group_sizes, paired, scatter, dtypes: tuple,
-                     out_dtypes, epilogue: tuple):
-    """Dew: `gmm`'s outputs of a call of no depth or no rows: each matrix side by side's zeros, or its
-    epilogue's value on zero accumulators (`_of_no_depth`), a scattered product's rows where its table says,
-    as its stores put them."""
-    rows, n = shape
-    if beside is not None:
-        return tuple(jnp.zeros((rows, width), dtypes[0]) for width in beside.widths)
-    hook, operands, axes_of = epilogue
-    outs = scattered(_of_no_depth((rows, n), group_sizes, 1 if paired is None else 2, hook, operands, axes_of,
-                                  dtypes), scatter)
-    return outs if out_dtypes else outs[0]
-
-
 def _gmm_forms_refused(tiles: Tiles, family: mosaic.Family, k: int, n: int, mx_scales, step_scales, *,
                        parts: tuple, transpose_rhs: bool, transpose_lhs: bool, exact_sums: bool) -> None:
     """Dew: `gmm`'s refusal of an MX product's or a depth split's form it cannot run (`_mx_refused`,
@@ -791,11 +752,8 @@ def _declared(lhs, rhs, gather, shape: tuple[int, int, int | None], splits: int,
     if width.size != n:
         raise ValueError(f"a gmm's outputs are its matrix's width, {n}, not {width.size}")
     if any(forms):
-        if splits != 1:
-            raise ValueError("an output a form reduces is a call's of no depth split")
-        return tuple(outputs.output(dtype, rows, width) if form is None
-                     else quantized.declared(dtype, form, m, n)
-                     for dtype, form in zip(dtypes, forms, strict=True))
+        return quantized.declared_all(dtypes, forms, splits, lambda dtype: outputs.output(dtype, rows, width),
+                                      m, n)
     dims = (rows, width) if splits == 1 else (splits, rows, width)
     return tuple(outputs.output(dtype, *dims) for dtype in dtypes)
 
@@ -808,9 +766,8 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
     the other programs' are added (`mosaic.Family.fixed_up`); with `flags` (`chained.flags_declared`'s, the
     pair and the consumers sharing a tile's rows, `Tiles.sharing`), its row share's written at its table
     entry (`chained.flag_row`): a ping-pong consumer's whole tile's the one slot, as it alone finishes the
-    tile (`persistent`'s ping-pong walk; 3b97e20f F5). With `whole` (a dense call storing a transposed
-    output, `stores.transposed_rows`), each share stores its whole rows, the tensor's bound clipping those
-    past its last."""
+    tile (`persistent`'s ping-pong walk; 3b97e20f F5); with `whole`, each share's whole rows (a transposed
+    output's, `stores.transposed_rows`, the tensor's bound clipping those past its last)."""
     group, row_start, ni, _, gathered, program, split, entry = tile
     flags_gmem, pair, sharing = flags
     nonfinite = None if flags_gmem is None else flags_gmem.at[

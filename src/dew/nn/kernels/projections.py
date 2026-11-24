@@ -27,6 +27,7 @@ from dew.nn.derivatives import (
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.formats import MxFp8, NvFp4Block
 from dew.nn.kernels.gemm import (
+    blockwise_fp8_finished,
     blockwise_fp8_kernel_gradient,
     blockwise_fp8_product,
     gemm,
@@ -236,8 +237,8 @@ def _chain_value(x, w_up, w_down, group_blocks, activation, out_dtype, interpret
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     rows, rows_scales = rows_quantized(x)
     up_blocks, up_scales = blocks_quantized(w_up)
-    up, codes, scales = blockwise_fp8_product(
-        rows, jnp.swapaxes(up_blocks, 1, 2), sizes, rows_scales.T, up_scales, out_dtype=out_dtype,
+    up, codes, scales = blockwise_fp8_finished(
+        rows, jnp.swapaxes(up_blocks, 1, 2), sizes, rows_scales.T, up_scales,
         epilogue=quantized.blockwise_fp8_epilogue(activation, out_dtype),
         out_dtypes=(out_dtype, jnp.float8_e4m3fn, jnp.float32), out_forms=(None, None, (SCALE_DEPTH, True)),
         dense=True, interpret_on_cpu=interpret)

@@ -266,7 +266,7 @@ def forms_refusal(out_forms: tuple | None, config, *, dense: bool) -> str | None
         return None
     if config.staging is None or config.staging[0] != divisor:
         return f"a reduced output's chunk is one {divisor}-column block, not {config.staging}"
-    if not dense and any(form is not None and form[1] for form in out_forms):
+    if not dense and any(form is not None and form[1] for form in out_forms or ()):
         return "a transposed output is a dense call's"
     return None
 
@@ -294,3 +294,30 @@ def trimmed(outs: tuple, forms: tuple, rows: int | None, columns: int | None = N
         return out[:blocks, :rows] if transposed else out[:rows, :blocks]
 
     return tuple(one(out, form) for out, form in zip(outs, forms or (None,) * len(outs), strict=True))
+
+
+def typed_outputs(dtypes: tuple, out_forms: tuple | None, config, *, dense: bool) -> tuple[tuple, tuple]:
+    """A `gmm` call's outputs' dtypes and forms (`forms_of`), refused where its tile stores none of them
+    (`forms_refusal`): a direct call's as a launch's planning refuses it."""
+    typed = tuple(jnp.dtype(dtype) for dtype in dtypes)
+    forms = forms_of(out_forms, len(typed))
+    if (refusal := forms_refusal(forms, config, dense=dense)) is not None:
+        raise ValueError(f"{config}: {refusal}")
+    return typed, forms
+
+
+def stored_all(outs, forms: tuple):
+    """A call's outputs each as its form stores it (`stored`), the outputs as they are where none states
+    one: a several-output call's alone (`forms_of`)."""
+    if not forms:
+        return outs
+    return tuple(stored(out, form) for out, form in zip(outs, forms, strict=True))
+
+
+def declared_all(dtypes: tuple, forms: tuple, splits: int, tile, rows: int, columns: int) -> tuple:
+    """A `gmm` call's outputs as it declares them where a form reduces one (`declared`), the others its
+    tiles (`tile(dtype)`); a call of no depth split's."""
+    if splits != 1:
+        raise ValueError("an output a form reduces is a call's of no depth split")
+    return tuple(tile(dtype) if form is None else declared(dtype, form, rows, columns)
+                 for dtype, form in zip(dtypes, forms, strict=True))

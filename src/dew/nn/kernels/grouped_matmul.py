@@ -1317,6 +1317,7 @@ class MosaicGmm(_Mosaic):
             from .templates.gemm import quantized
 
             # Each output's columns along its own axes (a transposed reduced one's its first).
+            assert isinstance(out, tuple), "forms are a several-output call's (`quantized.forms_of`)"
             return quantized.trimmed(out, hooks.out_forms, None, width), residuals
         return jax.tree.map(lambda each: each[:, :width], out), residuals
 
