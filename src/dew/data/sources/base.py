@@ -161,10 +161,6 @@ class ShardRows(Protocol):
         """How many records the shard holds, at most `limit`: read only as far as `limit` needs."""
         ...
 
-    def release(self) -> None:
-        """Let its file go, keeping its records' places: a later read opens it again."""
-        ...
-
     def __getitem__(self, index: int) -> Batch:
         """The `index`th record the shard's stream gives."""
         ...
@@ -207,9 +203,6 @@ class MappedRows:
 
     def index_of(self, state: Mapping[str, object]) -> int:
         return self.held.index_of(state)
-
-    def release(self) -> None:
-        self.held.release()
 
     def close(self) -> None:
         self.held.close()

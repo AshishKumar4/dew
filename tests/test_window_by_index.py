@@ -54,7 +54,8 @@ CHAINS = {
     # Two files read in the run's seeded order of them, one record a window.
     "two-files": (lambda files: _read(files).shuffle(3, window=1).batch(2), (1, 1)),
     "larger-than-its-window": (lambda files: _read(files).shuffle(3, window=4).batch(3), (9, 7)),
-    "one-pass": (lambda files: _read(files).repeat(1).shuffle(3, window=4).batch(3), (9, 7)),
+    # One pass of 15 records, a record a batch: its last window three of four.
+    "one-pass": (lambda files: _read(files).repeat(1).shuffle(3, window=4).batch(1), (9, 6)),
     "columns": (lambda files: _read(files, columns=("file", "id")).shuffle(3, window=8).batch(2), (6,)),
 }
 
@@ -141,15 +142,17 @@ def test_a_streams_saved_position_resumes_a_window_read_by_index_and_back(tmp_pa
 
 
 def test_a_finite_window_read_by_index_ends_where_its_stream_ends(tmp_path, streaming):
-    """A read of one pass ends, its last window smaller than the rest, where its stream's does, the same
-    batches given; resumed from the stream's position within that last window, it gives the rest."""
+    """A read of one pass of 15 records, windows of four, gives its stream's batches and ends where its
+    stream's does; its stream's position saved within the last window, three records of four, one of them
+    given, resumes the read by index there: the two records left, then its end."""
     served = _taken(_reader(tmp_path, "one-pass"), 100)
     streamed = _reader(tmp_path, "one-pass")
-    assert _taken(streamed, len(served) - 1, streaming) == served[:-1]
-    resumed = _reader(tmp_path, "one-pass")
+    assert len(served) == 15 and _taken(streamed, 13, streaming) == served[:13]
     with streaming():
-        resumed.set_state(streamed.get_state())
-    assert _taken(resumed, 100) == _taken(streamed, 100, streaming) == served[-1:]
+        saved = streamed.get_state()
+    resumed = _reader(tmp_path, "one-pass")
+    resumed.set_state(saved)
+    assert _taken(resumed, 100) == served[13:], served
 
 
 def test_two_workers_read_a_window_by_index_as_their_stream_does(tmp_path):
@@ -189,10 +192,14 @@ def test_an_elastic_window_saved_without_workers_resumes_with_two(tmp_path):
     assert _taken(resumed, 6) == _taken(saved, 6)
 
 
-def test_a_window_over_more_places_than_it_holds_open_reads_them_all(tmp_path, streaming):
-    """A window over more one-record files than a pass holds open for reads by index at once
-    (`dew.data.shards.MAPPED`) reads every record its stream reads, each file let go as others are asked."""
-    files = _files(tmp_path / "files", (1,) * (3 * shards.MAPPED))
+def test_a_window_over_more_files_than_the_process_may_open_reads_them_all(tmp_path, streaming):
+    """A window over 256 one-record files, read where the process may open 32 files more than it holds,
+    reads every record its stream reads: no file is held open between reads by index (review of row
+    12475: a window over more one-record files than the limit failed before its first record)."""
+    import os
+    import resource
+
+    files = _files(tmp_path / "files", (1,) * 256)
     chain = _read(files).shuffle(3, window=len(files)).batch(len(files))
 
     def read(within):
@@ -200,4 +207,10 @@ def test_a_window_over_more_places_than_it_holds_open_reads_them_all(tmp_path, s
             reader = compile(chain, read="streamed", loading=LOADING, seed=7).train(DataPartition())
             return sorted(_ids(next(reader)))
 
-    assert read(contextlib.nullcontext) == read(streaming)
+    expected = read(streaming)
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (len(os.listdir("/proc/self/fd")) + 32, hard))
+    try:
+        assert read(contextlib.nullcontext) == expected
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))

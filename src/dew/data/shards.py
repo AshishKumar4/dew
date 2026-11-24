@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import bisect
-import collections
 import dataclasses
 import functools
 import itertools
@@ -284,21 +283,16 @@ class _SequentialIterator(grain.DatasetIterator):
         super().__init__()
         self.places, self.reader, self.loading = places, reader, loading
         self.place, self.rows = 0, None
-        # Each place's records by index, read as a window asks for them (`window`), by its place, the
-        # latest asked last: at most `MAPPED` of them hold their file open at once (`ShardRows.release`).
-        self._indexed: collections.OrderedDict[Hashable, ShardRows | None] = collections.OrderedDict()
+        # Each place's records by index, read as a window asks for them (`window`), by its place: none holds
+        # its file open between reads (`ShardRows`).
+        self._indexed: dict[Hashable, ShardRows | None] = {}
 
     def _by_index(self, place: int) -> ShardRows | None:
         """Place `place`'s records by index (`_Reader.indexed`), opened once, None where its reader serves
-        none so; the places asked longest ago let their files go past `MAPPED`, their records' places
-        kept."""
+        none so."""
         held = self.places[place]
         if held not in self._indexed:
             self._indexed[held] = self.reader.indexed(held) if isinstance(self.reader, _Reader) else None
-        self._indexed.move_to_end(held)
-        for rows in itertools.islice(reversed(self._indexed.values()), MAPPED, None):
-            if rows is not None:
-                rows.release()
         return self._indexed[held]
 
     def window(self, limit: int) -> Window | None:
@@ -381,7 +375,7 @@ class _SequentialIterator(grain.DatasetIterator):
         for rows in self._indexed.values():
             if rows is not None:
                 rows.close()
-        self._indexed = collections.OrderedDict()
+        self._indexed = {}
 
 
 def made_one(step: Callable, record: Batch) -> Batch:
@@ -411,7 +405,9 @@ class _IndexedMapIterator(grain.DatasetIterator):
         self.parent, self.step, self.made = parent, step, made
 
     def __next__(self):
-        return self.step(next(self.parent))
+        # As Grain's map: an element none passes through (`_MapDatasetIterator`).
+        element = next(self.parent)
+        return None if element is None else self.step(element)
 
     def get_state(self):
         return self.parent.get_state()
@@ -447,11 +443,6 @@ def passed(rows: grain.DatasetIterator, window: Window) -> None:
     """Stand `rows`, the iterator that served `window` (`served`), past its records."""
     assert isinstance(rows, ServesWindows)
     rows.skip(window)
-
-
-MAPPED = 8
-"""The places a sequential pass holds open for reads by index at once (`_SequentialIterator._by_index`): a
-window over more one-record places than a process may open files reads each again where it is asked."""
 
 
 @dataclasses.dataclass(frozen=True)
