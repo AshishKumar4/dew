@@ -506,15 +506,16 @@ def test_a_runs_stacked_packed_banks_decode_as_each_layers_bank_does():
                                   np.stack([values for _, values in layers]))
 
 
-def test_a_layers_paired_and_scaled_expert_products_read_their_rows_and_layer_in_place(monkeypatch):
+def test_a_layers_paired_and_scaled_expert_products_read_their_rows_and_layer_in_place():
     """A stack's layer's gate and up projections pair at that layer (`paired_projections`: one product,
     `gemm.gemm`'s `paired` at its `layer`), and a scaled stream's rows (`Gathered.scales`, Llama 4's scaled
     input) are read where they lie and scaled in the product's prologue (its `gather` and `prologue`), no
-    copy of them gathered or scaled first, nor of the layer's matrices sliced out: each product the values
-    of its rows gathered and scaled, its layer's matrices sliced, multiplied apart, bit for bit (row
-    12306)."""
+    copy of them gathered or scaled first, nor of the layer's matrices sliced out: the one grouped call the
+    pair makes (`grouped_matmul.weighed`) takes the whole stacks, the layer's offset, the rows' indices and a
+    prologue, and each product is the values of its rows gathered and scaled, its layer's matrices sliced,
+    multiplied apart, bit for bit (row 12306)."""
     from dew.nn import moe
-    from dew.nn.kernels import gemm
+    from dew.nn.kernels import grouped_matmul
 
     keys = jax.random.split(jax.random.key(12306), 4)
     tokens = jax.random.normal(keys[0], (6, 8), jnp.float32)
@@ -522,22 +523,17 @@ def test_a_layers_paired_and_scaled_expert_products_read_their_rows_and_layer_in
     rows = jnp.asarray([0, 3, 1, 5, 2, 2, 4, 0], jnp.int32)
     scales = jax.random.uniform(keys[3], (8,), jnp.float32, 0.5, 1.5)
     sizes = jnp.asarray([3, 2, 3], jnp.int32)
-    layer = jnp.asarray(1, jnp.int32)
     stream = moe.Gathered(tokens, rows, jnp.arange(8, dtype=jnp.int32), scales)
 
-    calls = []
-    product = gemm.gemm
-
-    def recorded(*args, **kwargs):
-        calls.append(kwargs)
-        return product(*args, **kwargs)
-
-    monkeypatch.setattr(gemm, "gemm", recorded)
-    gate, up = moe.paired_projections(stream, *(moe.Layered(stack, layer) for stack in stacks), sizes,
-                                      jnp.float32, "auto", None)
-    (call,) = calls
-    assert call["layer"] is layer and call["gather"] is rows and call["prologue"] is not None
-    assert call["paired"] is stacks[1]
+    with grouped_matmul.weighed() as calls:
+        gate, up = moe.paired_projections(stream, *(moe.Layered(stack, jnp.asarray(1, jnp.int32))
+                                                    for stack in stacks), sizes, jnp.float32, "auto", None)
+    bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
+    assert len(bound) == 1, len(bound)
+    (arguments,) = bound
+    assert arguments["kernel"].shape == (6, 8, 4) and arguments["paired"].shape == (6, 8, 4)
+    assert arguments["first"] is not None and arguments["gather"].shape == rows.shape
+    assert arguments["tokens"].shape == tokens.shape and arguments["hooks"].prologue is not None
     apart = [moe.expert_projection(moe.gathered(stream), stack[1], sizes, jnp.float32, "auto", None)
              for stack in stacks]
     np.testing.assert_array_equal(np.asarray(gate), np.asarray(apart[0]))
