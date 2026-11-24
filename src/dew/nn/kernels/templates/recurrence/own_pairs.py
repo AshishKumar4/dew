@@ -350,7 +350,7 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                 # Each output's blocks a sub-chunk, compact (`[C, SUB]` at the head's columns).
                 for o, (name, ref) in enumerate(zip(products, outs, strict=True)):
                     form = forms[name]
-                    views = form.views(ref, row, chunk, h * algebra.SUB, algebra.SUB)
+                    views = tuple(form.views(ref, row, chunk, h * algebra.SUB, algebra.SUB))
                     if name == "system":
                         if threaded:
                             # Each thread a column of a sub-chunk's block's inverse, from the summed blocks.

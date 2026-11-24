@@ -371,7 +371,7 @@ def _sub_chunk_walk(q, k, prefix, beta, taken, own: tuple, call: Call, *, scale:
                                 else {}))
         (lefts, raised, separated), solve = staging[:3], staging[3:]
         # The own blocks' views, read into their tiles after the walk (`_read_out`).
-        owned = [form.views(ref, row, chunk, h * algebra.SUB, algebra.SUB)
+        owned = [tuple(form.views(ref, row, chunk, h * algebra.SUB, algebra.SUB))
                  for form, ref in zip((placed, inverted), own_refs, strict=False)]
 
         def step(index, slots, carry, accumulators):
