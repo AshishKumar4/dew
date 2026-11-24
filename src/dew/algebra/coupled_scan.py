@@ -192,7 +192,7 @@ def _finite(declared: float | tuple[float, float]) -> float | tuple[float, float
         return declared
     low, high = declared
     largest = float(np.finfo(np.float64).max)
-    return max(low, -largest), min(high, largest)
+    return min(max(low, -largest), largest), min(max(high, -largest), largest)
 
 
 def _decayed_sums(alpha, mu, lam):

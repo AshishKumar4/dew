@@ -149,5 +149,6 @@ def test_a_float32_pairs_walk_over_float64_tokens_carries_it_wide():
                  else value[:CHUNK] for name, value in zip(OPERANDS, tokens, strict=True)}
         entering = jnp.zeros((2, STATE, WIDTH), jnp.float32)
         outputs, leaving = forms.replay(chunk, entering)
-        d_entering, _ = forms.backward(chunk, (None, entering), jnp.ones_like(leaving), jnp.ones_like(outputs))
+        cotangents = jnp.ones_like(leaving), jnp.ones_like(outputs)
+        d_entering, _ = forms.backward(chunk, (None, entering), *cotangents)
     assert {outputs.dtype, leaving.dtype, d_entering.dtype} == {jnp.dtype(jnp.float64)}
