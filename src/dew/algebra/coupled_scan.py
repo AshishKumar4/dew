@@ -195,8 +195,11 @@ def _bounded(declaration, names: Sequence[str], chunk: Mapping, parts: linear_sc
         return power(first), power(second), lam
 
     closed = jax.make_jaxpr(bounded)(*tokens)
-    region = terms.region(closed, {index: declaration.ranges[name] for index, name in enumerate(names)
-                                   if name in declaration.ranges})
+    # An exponent's interval reaching -inf held at float64's least: the region bounds an exponential of an
+    # interval at most 0 by 2 where its input is proven finite, and an exponential of -inf is 0, finite too.
+    declared = {index: _finite(declaration.ranges[name]) for index, name in enumerate(names)
+                if name in declaration.ranges}
+    region = terms.region(closed, declared)
     magnitudes = []
     for output, literal in zip(region.outputs, region.literal_outputs, strict=True):
         if output is None:
@@ -214,6 +217,14 @@ def _bounded(declaration, names: Sequence[str], chunk: Mapping, parts: linear_sc
     if math.log2(length) + lam + length * max(decay, 0) >= 127:
         raise Refused(f"a pair's chunk of {length} tokens sums past float32's range under its declared "
                       "ranges")
+
+
+def _finite(declared):
+    """A declared range (`Scan.ranges`) with an interval's infinite ends held at float64's largest."""
+    if not isinstance(declared, tuple):
+        return declared
+    largest = float(np.finfo(np.float64).max)
+    return tuple(min(max(end, -largest), largest) for end in declared)
 
 
 def _decayed_sums(alpha, mu, lam):
