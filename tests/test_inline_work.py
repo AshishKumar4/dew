@@ -8,7 +8,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
-from jax.extend.mlir.dialects import arith, memref, scf
+from jax.extend.mlir.dialects import arith, math, memref, scf
 
 from dew.nn.kernels.templates import cost, emission
 from dew.nn.kernels.templates.cost import Work
@@ -64,9 +64,10 @@ def test_a_branch_a_lanes_place_decides_issues_for_its_warps_and_moves_its_lanes
     assert _counted(body) == Work(operations=32, shared_bytes=2 * 4 * 16)
 
 
-def _uniform_branch(*, multiplied: bool, xored: bool):
+def _uniform_branch(*, multiplied: bool, exponentiated: bool):
     """A body branching on a word every lane loads at one place, data its lanes hold alike: its then arm a
-    multiply a lane where `multiplied`, its else arm an integer xor over two warps' lanes where `xored`."""
+    multiply a lane where `multiplied` (the fp32 lanes'), its else arm an exponential a lane where
+    `exponentiated` (the special-function units')."""
     def body(ctx, ref):
         del ctx
         first = memref.load(ref, [arith.constant(ir.IndexType.get(), 0)])
@@ -77,9 +78,8 @@ def _uniform_branch(*, multiplied: bool, xored: bool):
                 arith.mulf(first, first)
             scf.YieldOp([])
         with ir.InsertionPoint(branch.else_block):
-            if xored:
-                with mgpu_utils.when(_thread(64)):
-                    arith.xori(mgpu_utils.thread_idx(), mgpu_utils.thread_idx())
+            if exponentiated:
+                math.exp2(first)
             scf.YieldOp([])
 
     return body
@@ -88,10 +88,10 @@ def _uniform_branch(*, multiplied: bool, xored: bool):
 def test_a_uniform_branch_issues_its_costliest_arms_slots():
     """A branch data every lane holds alike decides runs one arm, so its issue slots are the costlier arm's,
     a body with that arm alone: its arms' most taken unit by unit (one arm's fp32 multiplies beside the
-    other's integer xors) counted a mix neither issues (the review of lane/toolkit 4667ed46469)."""
-    both = cost.issued(_counted(_uniform_branch(multiplied=True, xored=True)))
-    alone = max(cost.issued(_counted(_uniform_branch(multiplied=True, xored=False))),
-                cost.issued(_counted(_uniform_branch(multiplied=False, xored=True))))
+    other's exponentials) counted a mix neither issues (the review of lane/toolkit 4667ed46469)."""
+    both = cost.issued(_counted(_uniform_branch(multiplied=True, exponentiated=True)))
+    alone = max(cost.issued(_counted(_uniform_branch(multiplied=True, exponentiated=False))),
+                cost.issued(_counted(_uniform_branch(multiplied=False, exponentiated=True))))
     assert both == alone, (both, alone)
 
 
