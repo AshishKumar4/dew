@@ -31,7 +31,7 @@ from typing_extensions import TypeVar
 
 from dew._coordination import read_by_holders
 from dew.averaging import ema_update
-from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables, dicts, leaves_by_path, merge
+from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables, dicts, leaves_by_path, merge, under_roots
 from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
@@ -602,14 +602,6 @@ def _period(run: Mapping) -> int:
     return len(keys) if keys and all(key.startswith("layers_") for key in keys) else 1
 
 
-def _under(key_path, prefixes: Sequence[tuple[str, ...]]) -> bool:
-    """Whether `key_path` (a pytree leaf's path) sits under any dict-key prefix in `prefixes`."""
-    return any(
-        tuple(entry.key if isinstance(entry, jax.tree_util.DictKey) else None
-              for entry in key_path[:len(prefix)]) == prefix
-        for prefix in prefixes)
-
-
 def _pooling_weights(previous: Accumulation, stats):
     """Shared-mean pooling weights for `stats` joining `previous`: prior mass and gradient, this
     microbatch's mass and total, the combined mass and its non-zero denominator."""
@@ -632,7 +624,7 @@ def _unscaled_beside(gradient: Variables, factor, pooled: Sequence[tuple[str, ..
     """`gradient` unscaled by `factor`, but its runs at `pooled`, which pooled into the window's accumulator
     in their backward unscaled there (`Transaction._planned_accumulation`)."""
     return jax.tree_util.tree_map_with_path(
-        lambda path, leaf: leaf if _under(path, pooled) else _unscale(leaf, factor), gradient)
+        lambda path, leaf: leaf if under_roots(path, tuple(pooled)) else _unscale(leaf, factor), gradient)
 
 
 def _pooled_leaf(fill, old_weight, new_weight, old, new):
@@ -1149,7 +1141,7 @@ class Transaction:
                 # (`pooled_paths`) pass through without reading `prior_gradient` again.
                 if pooled_paths:
                     gradient = jax.tree_util.tree_map_with_path(
-                        lambda path, old, new: new if _under(path, pooled_paths) else _pooled_leaf(
+                        lambda path, old, new: new if under_roots(path, pooled_paths) else _pooled_leaf(
                             fill, old_weight, new_weight, old, new), prior_gradient, gradient)
                 else:
                     gradient = jax.tree.map(
@@ -1638,6 +1630,27 @@ class Transaction:
             norms = merge(norms, _nested(path, {in_backward.PERIOD_NORMS: held} if periodic else held))
         return norms
 
+    @staticmethod
+    def _pooled_run(accumulated: Variables, norms: Variables, prior: Variables, direct: Variables,
+                    pooling: _Pooling) -> Variables:
+        """A run's window sum once this microbatch joined it: the sum its backward pooled in place
+        (`accumulated`), or, where its backward ran on no layer of it (a branch its loss took around the
+        run, its norms' cotangent then none: `dew.nn.in_backward.scanned_run`), the sum before it at its
+        share (`prior`, as `_pooled_leaf` keeps it); with the gradient of the loss's direct reads of the run's
+        parameters outside the scan (`direct`, a term on the weights themselves) pooled at this microbatch's
+        share, as an ordinary step pools the whole of its gradient."""
+        fill, old, new, factor = pooling.fill, pooling.old, pooling.new, pooling.factor
+        assert fill is not None and old is not None and new is not None and factor is not None
+        # Every layer's squares and count not finite are zero where its backward never ran.
+        ran = jnp.stack([jnp.any(leaf != 0) for leaf in jax.tree.leaves(norms)]).any()
+
+        def joined(pooled, before, outside):
+            kept = jnp.where(fill == 0, jnp.zeros_like(before), before * jnp.asarray(old, before.dtype))
+            return (jnp.where(ran, pooled, kept)
+                    + _unscale(outside, factor).astype(pooled.dtype) * jnp.asarray(new, pooled.dtype))
+
+        return jax.tree.map(joined, accumulated, prior, direct)
+
     def _planned_accumulation(self, state: TrainState) -> _Planned | None:
         """In-backward gradient pooling for a shared-mean accumulating window (`self.size > 1`): each
         scanned layer's unscaled gradient is pooled directly into `state.accumulation.gradient` during the
@@ -1656,16 +1669,22 @@ class Transaction:
 
         def accumulate(path, index, gradient, held, moments):
             del path, index, moments
+            fill, prior, given, factor = pooling.fill, pooling.old, pooling.new, pooling.factor
+            if fill is None or prior is None or given is None or factor is None:
+                # Its weights are set once the step's forward is (`_pulled`): a backward before it is one
+                # the loss itself takes of the run, a second differentiation no pooling may write.
+                raise ValueError(f"{type(self.objective).__name__} differentiates a stacked layer run inside "
+                                 "its loss, which no backward may pool in place: its _updates_in_backward "
+                                 "must say so")
+
             def pooled(old, new):
-                fill, prior, given, factor = pooling.fill, pooling.old, pooling.new, pooling.factor
-                assert fill is not None and prior is not None and given is not None and factor is not None, (
-                    "a window's weights are set before its backward pools by them (`_pulled`)")
                 return _pooled_leaf(fill, prior, given, old, _unscale(new, factor))
 
             return jax.tree.map(pooled, held, gradient), {}
 
         read = {in_backward.MASTERS: previous.gradient, in_backward.NORMS: self._run_norms(params, runs)}
-        return _Planned(in_backward.InBackward(update=accumulate, moments=()), read, pooling=pooling)
+        return _Planned(in_backward.InBackward(update=accumulate, moments=(), pooling=True), read,
+                        pooling=pooling)
 
     def planned(self, state: TrainState) -> _Planned | None:
         """The plan by which the runs a one-stage scanned state holds stacked update or accumulate in their
@@ -1684,7 +1703,9 @@ class Transaction:
         if not self.objective._updates_in_backward():
             return None
         if self.size > 1:
-            return self._planned_accumulation(state)
+            # A step that inspects what its layers made reads their scan's own collections, which a layer
+            # applied on its own opens none of: it pools no run in its backward.
+            return self._planned_accumulation(state) if self.inspection is None else None
         if self.split != 1 or self.inspection is not None:
             return None
         if self.aux_shape.effects is not None or FROZEN in state.variables:
@@ -1802,7 +1823,7 @@ class Transaction:
         if planned is not None:
             if planned.pooling is not None:
                 previous = state.accumulation
-                assert previous is not None
+                assert previous is not None and previous.gradient is not None
                 prior_mass, _, mass, _, _, denominator = _pooling_weights(previous, realized.stats)
                 planned.pooling.fill, planned.pooling.old = occupancy(previous), prior_mass / denominator
                 planned.pooling.new, planned.pooling.factor = mass / denominator, factor
@@ -1811,9 +1832,10 @@ class Transaction:
                 handled = tuple(_state_path(path) for path in planned.plan.handled)
                 if not handled:
                     return gradient, None, None, ()
-                accumulated = cotangents[in_backward.MASTERS]
-                pooled = functools.reduce(merge, [_nested(path, _at(accumulated, path)) for path in handled],
-                                          {})
+                pooled = functools.reduce(merge, [_nested(path, self._pooled_run(
+                    _at(cotangents[in_backward.MASTERS], path), _at(cotangents[in_backward.NORMS], path),
+                    _at(previous.gradient, path), _at(gradient, path), planned.pooling))
+                    for path in handled], {})
                 return merge(gradient, pooled), None, None, handled
             loss, active = self.objective.reduce_loss(realized.stats)
             # A run that updates in its backward holds no loss scale (`consumed_where_made`), so where it

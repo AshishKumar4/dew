@@ -64,6 +64,9 @@ class InBackward:
                      tuple[Tree, dict[str, Tree]]]
     moments: tuple[str, ...]
     handled: list[tuple[str, ...]] = dataclasses.field(default_factory=list)
+    pooling: bool = False
+    """Whether `update` pools each layer's gradient into a window's sum (`dew.training.transaction`): a run
+    whose layers draw dropout keys its masks as the ordinary scan does, and pools none."""
 
 
 _PLAN: contextvars.ContextVar[InBackward | None] = contextvars.ContextVar("dew_in_backward", default=None)

@@ -595,7 +595,16 @@ def _updates_in_backward(run: nn.Module, specs: Sequence[LayerSpec], *, train: b
     held = run.variables
     if LAYER_ROWS in held or any(name not in held for name in (*current.moments, in_backward.NORMS)):
         return False
+    if current.pooling and _drops_out(run):
+        return False
     return not any(run.is_mutable_collection(name) for name in (*WRITTEN, "intermediates"))
+
+
+def _drops_out(run: nn.Module) -> bool:
+    """Whether `run`'s layers drop anything out (a field naming a dropout rate above zero), whose masks a
+    layer applied on its own draws otherwise than Linen's scan does (`_updated_in_backward`)."""
+    return any(field.name.endswith("dropout_rate") and getattr(run, field.name) > 0
+               for field in dataclasses.fields(run))
 
 
 _KEPT_WITHOUT_A_RUNG = REMAT_POLICIES['minimal_with_scan_and_conv']
