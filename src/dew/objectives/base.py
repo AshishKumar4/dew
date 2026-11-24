@@ -467,11 +467,6 @@ class Step:
     """Whether the run's optimizer solves the objective's Gauss-Newton system (`dew.gauss_newton`): an
     objective that states one (`dew.objectives.residuals.Residuals`) returns it as its statistics, which
     the trainer pools and hands the update. Static, as stating it changes the program."""
-    amax: bool = struct.field(pytree_node=False, default=False)
-    """Whether the run's variables hold the amax histories of a delayed-scaling NVFP4 recipe's projections
-    (`dew.nn.dense.NVFP4_HISTORY`, row 12721): the objective opens the `NVFP4_AMAX` collection in the model
-    calls it trains through and returns what they recorded (`Aux.amax`), which the trainer rolls into the
-    histories once per committed update. Static, as `qk_stats` is."""
     watched: Watched | None = struct.field(pytree_node=False, default=None)
     """The activations a sampled step watches (`dew.nn.inspection.watching`): the objective opens the
     `inspected` collection in the model call it trains through and returns what it sowed
@@ -480,6 +475,11 @@ class Step:
     """Detached statistics over the step's logical minibatch (`Objective.batch_statistics`), computed
     once at a split step's first microbatch and held across its parts; None where the step is read whole
     or the objective states none."""
+    amax: bool = struct.field(pytree_node=False, default=False)
+    """Whether the run's variables hold the amax histories of a delayed-scaling NVFP4 recipe's projections
+    (`dew.nn.dense.NVFP4_HISTORY`, row 12721): the objective opens the `NVFP4_AMAX` collection in the model
+    calls it trains through and returns what they recorded (`Aux.amax`), which the trainer rolls into the
+    histories once per committed update. Static, as `qk_stats` is."""
 
     def sown(self, *collections: str) -> list[str]:
         """The collections a model call the objective trains through opens: `collections`, the ones its
@@ -644,12 +644,6 @@ class Aux(Generic[Effects]):
     clips by it refuses a step that returns None."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
-    amax: Variables | None = None
-    """The `nvfp4_amax` collection a delayed-scaling NVFP4 recipe's projections sowed (`Step.amax`,
-    `dew.nn.dense.NVFP4_AMAX`), named and nested as their histories (`dew.nn.dense.NVFP4_HISTORY`), each a
-    tuple of its calls' largest magnitudes, which the trainer takes the largest of across the calls and a
-    window's microbatches and rolls into the histories once per committed update (`dew.nn.dense.rolled`).
-    None where the step asked for none (`Step.amax`)."""
     inspected: Variables | None = None
     """What the watched modules of the model call the objective trains through sowed
     (`dew.nn.inspection.INSPECTED`), where the step watches (`Step.watched`); None otherwise."""
@@ -660,6 +654,12 @@ class Aux(Generic[Effects]):
     pooled: Mapping[str, Pooled] = struct.field(default_factory=dict)
     """The statistics behind the metrics stated as `Pooled`, by name, which the trainer pools across a
     step's microbatches (`dew.training.planning.whole_step`); set from `metrics` as an Aux is made."""
+    amax: Variables | None = None
+    """The `nvfp4_amax` collection a delayed-scaling NVFP4 recipe's projections sowed (`Step.amax`,
+    `dew.nn.dense.NVFP4_AMAX`), named and nested as their histories (`dew.nn.dense.NVFP4_HISTORY`), each a
+    tuple of its calls' largest magnitudes, which the trainer takes the largest of across the calls and a
+    window's microbatches and rolls into the histories once per committed update (`dew.nn.dense.rolled`).
+    None where the step asked for none (`Step.amax`)."""
 
     def __post_init__(self):
         # A metric stated as a statistic reads as its value; the statistic is kept for the trainer's pooling.
