@@ -41,6 +41,7 @@ from dew.mesh import mesh_axes
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted, with_gradients_formed_at
 from dew.nn.inputs import cu_seqlens
+from dew.nn.kernels import recurrence_coupled
 from dew.nn.nested import nested
 from dew.nn.precision import (
     accurate_exp,
@@ -284,9 +285,13 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     fp32's least normal, is kept as normal factors (`dew.algebra.scan._Split`, row 9660), while a
     product's own range is fla's: a term whose factors meet a decay past the least normal one at a time
     reads zero as fla's does. A call names a kernel through `generation.chosen`
-    alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call)."""
+    alone, the recurrence template's 'mosaic_gpu' among them (row 959: the selectors decide every call). A
+    coupled momentum (`recurrence.Hooks.coupled`) runs on the portable math alone (`recurrence_coupled`)."""
     given, query, key, value, g, beta, scale, dtype, work = _prologue_of(hooks, operands, dtype)
     state = operands.state
+    if hooks.coupled is not None:
+        return recurrence_coupled.chunked(hooks, given, query, key, value, g, beta, operands,
+                                          chunk_size=chunk_size, scale=scale, work=work, dtype=dtype)
     (query, key, value, g, beta, erase, starts, firsts, max_segments), stride = _laid(
         hooks, (query, key, value, g, beta), given, operands.starts, operands.firsts, max_segments)
     erase_left, correction = (None, None) if erase is None else erase
@@ -795,7 +800,7 @@ def _chunked(named: dict, starts, chunk_size: int, work) -> dict:
 def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, firsts=None, *,
                  scale: float, delta: bool, dtype=None, bound: float | None = None,
                  forked: Forked | None = None, reads: Reads = 'after', own=None, group: int = 1,
-                 correction=None, erase_left=None, across=None, values_read: bool = False):
+                 correction=None, erase_left=None, across=None, values_read: bool = False, coupled=None):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
     forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
@@ -821,8 +826,10 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     each token's erase along it of the memory it enters beside its write, `h = D h + a (c^T h)^T + beta k v^T`
     (an additive erase's); `across` `[B, S, Hv, Dv]`, where
     given, decays the memory along its values too, `h = D h E + beta k v^T`, `E = exp(across)` (two-sided
-    GLA's, `recurrence.Hooks.value_decay`); and `values_read` reads the memory along its values (`h scale
-    q`: Oja's rule's transposed memory, `_portable`)."""
+    GLA's, `recurrence.Hooks.value_decay`); `values_read` reads the memory along its values (`h scale
+    q`: Oja's rule's transposed memory, `_portable`); and `coupled` `(p [B, S, Hv, Dk], log_mu [B, S, Hv])`,
+    where given, is a coupled momentum's erase keys and log decay (`recurrence.Hooks.coupled`), the memory a
+    pair `[B, Hv, 2, Dk, Dv]` (`_delta_forms`' `coupled`)."""
     dtype, work, query, key = _grouped(query, key, value, dtype)
     rows, length, heads, columns = value.shape
     tokens = None
@@ -836,7 +843,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
              ("reads", reads), ("own", own is not None), ("group", group),
              ("corrected_by", None if correction is None else 'after' if erase_left is None else 'erased'),
              ("across", across is not None),
-             ("values_read", values_read))
+             ("values_read", values_read), ("coupled", coupled is not None))
     held = 0 if forked is None else forked.held
     # Each token's read's width: the memory's values', or its keys' read along its values (`values_read`).
     read = width if values_read else columns
@@ -848,6 +855,8 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         given["a"] = erase_left
     if across is not None:
         given["e"] = across
+    if coupled is not None:
+        given["p"], given["mu"] = coupled
     operands = _chunked(given, starts, config.chunk, work)
     if own is not None:
         # Each head's weight every chunk, as the walk maps a row's and head's chunks.
@@ -856,7 +865,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     # The memory entering, and each carry below, typed as every operand varies (a checked `shard_map`'s
     # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
     # do, keys, gates or resets replicated or not.
-    varying = (query, key, value, g, beta, starts, correction, erase_left, across,
+    varying = (query, key, value, g, beta, starts, correction, erase_left, across, *(coupled or ()),
                *(() if forked is None else jax.tree.leaves((tokens, forked.entry, forked.adds))))
     if tokens is not None and forked is not None and state is not None:
         # The table's given memories `[B, Hv, S', Dk, Dv]`, each token's load, store and document
@@ -878,8 +887,10 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         outputs, final = _rows_local(walk, value)(operands, walked)
         out = jnp.moveaxis(outputs.reshape(*outputs.shape[:2], -1, read), 1, 2)
         return out[:, :length].astype(dtype), final
-    entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), value) if state is None
-                            else state.astype(work), *varying)
+    # A coupled momentum's pair `[2, Dk, Dv]` a head's, the memory then the momentum.
+    paired = (2,) if coupled is not None else ()
+    entering = varying_like(rows_like(jnp.zeros((rows, heads, *paired, width, columns), work), value)
+                            if state is None else state.astype(work), *varying)
 
     outputs, final = _walk_once(facts, width=width, recomputed=recomputed_memory(), held=0,
                                 context=derive.context())(operands, entering)
@@ -890,7 +901,8 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
 @functools.lru_cache(maxsize=FORMS_HELD)
 def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, columns: int, work: jnp.dtype,
                  reset: bool, bound: float | None, reads: Reads = 'after', own: bool = False, group: int = 1,
-                 corrected_by: str | None = None, across: bool = False, values_read: bool = False):
+                 corrected_by: str | None = None, across: bool = False, values_read: bool = False,
+                 coupled: bool = False):
     """The delta rule's (or a plain linear recurrence's, without `delta`) chunk forms (`scan.derive_scan`) for
     these facts, every one its declaration reads: the update `h = D h - beta k (k^T D h) + beta k v^T` (`D h
     + beta k v^T` without the delta rule; `D h + beta k (v + c^T D h)^T` with a correction reader `c` of its
@@ -905,8 +917,13 @@ def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, column
     `own`), packed documents' resets where `reset`, and the range facts `bound` proves. Derived once for
     equal facts, the latest `FORMS_HELD` kept: built from a call's fresh
     closures, every layer's call derived its own forms, their decomposition and carry splits (`derive_scan`'s
-    caches a declaration's) again, 0.25 s a split (a 4B decoder's plan, row 5556)."""
+    caches a declaration's) again, 0.25 s a split (a 4B decoder's plan, row 5556). A `coupled` momentum's
+    are its pair's (`recurrence_coupled.declaration`)."""
     from dew.algebra import SATURATION, scan
+
+    if coupled:
+        return scan.derive_scan(recurrence_coupled.declaration(scale, width, columns, work, reset, bound),
+                                saturation=SATURATION)
 
     def update(h, q, k, v, g, beta, own=None, c=None, e=None, a=None):
         del q, own

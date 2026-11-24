@@ -165,6 +165,15 @@ class Hooks:
     and a decode token's on an axis of their own (`[rows, m, ...]`), its decay taken before the first and its
     query read after the last (the readout's row selector, kernel-templates.md §5); its queries and decays a
     token's."""
+    coupled: str | None = None
+    """A second state coupled to the memory, None for none: 'momentum', Momentum DeltaNet's (fla's
+    momentum_delta_rule), the delta rule's error gathered into a momentum `M` the memory steps along, `w =
+    p^T S - v`, `M' = mu M + k w^T`, `S' = alpha S - beta M'`, read `q^T S'`: its decay a head's `alpha =
+    exp(log_decay)`, the momentum's `mu = exp(Gated.momentum_decay)`, the write gate `beta` at most
+    `write_bound` (which its chunks' forms are bounded by, `dew.algebra.coupled_scan`), and its erase key `p`
+    the keys (`erase` 'tied') or its own (`erase` 'untied', `Gated.erase_key`, its caller's to normalize and
+    to scale, fla's by alpha); the state `[..., 2, Dk, Dv]`, the memory then the momentum. Its forms are the
+    portable math's alone, derived from the pair's token update (`recurrence_chunk._delta_forms`)."""
 
     @property
     def inverse_bound(self) -> float | None:
@@ -176,7 +185,7 @@ class Hooks:
         `-beta_i k_i^T (T_{i-1} ... T_{j+1}) k_j` (decays included), at most `b`, and a product of a chunk's
         partial inverse and its system, `w_i . k_j` with `|w_i| <= b`, too. Unnormalized keys with
         `beta |k|^2` past two grow it geometrically (an eigenvalue past -1)."""
-        if not self.delta or self.erase != 'tied':
+        if not self.delta or self.erase != 'tied' or self.coupled is not None:
             return None
         sigmoid = self.gates is not None and self.gates.write == 'sigmoid'
         bound = 1.0 if self.l2norm and sigmoid else self.write_bound
@@ -245,6 +254,15 @@ class Hooks:
                              f"without ranks, turns, an own write's weight or a rated decay: not {self}")
         if self.erase == 'values' and (self.skip or self.conv is not None or self.gates is not None):
             raise ValueError(f"an erase along the values takes no skip, conv or gates: not {self}")
+        uncoupled = (not self.delta or self.decay != 'scalar' or self.gates is not None or self.rated
+                     or self.reads != 'after' or self.ranks > 1 or self.own_weight or self.turns
+                     or self.value_decay or self.substeps > 1 or self.skip
+                     or self.erase not in ('tied', 'untied') or self.write_bound is None)
+        if self.coupled is not None and (self.coupled != 'momentum' or uncoupled):
+            raise ValueError(f"a coupled momentum ('momentum') is the delta rule's under a decay a head's, "
+                             f"read after its token, of one update, its erase key the keys' or its own, its "
+                             f"write gate bounded (`write_bound`), without gates, a rate, ranks, turns, an "
+                             f"own write's weight, a decay along the values or a skip: not {self}")
         if self.turns < 0 or (self.turns and (self.delta or self.own_weight or self.rated
                                               or self.decay != 'scalar' or self.reads == 'before')):
             raise ValueError(f"a state turns its key pairs under a decay a head's, unrated, without the "
@@ -398,6 +416,8 @@ class Gated:
     erase_key: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     erase_read: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     value_decay: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    momentum_decay: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
+    """A coupled momentum's log decay a value head's (`Hooks.coupled`), `[..., Hv]`."""
 
 
 @jax.tree_util.register_dataclass
@@ -452,6 +472,8 @@ def _names(hooks: Hooks) -> tuple[str, ...]:
         gates = ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.gated_write
     erasing = (('erase_key', 'erase_read') if hooks.erase in ('untied', 'additive')
                else ('erase_read',) if hooks.erase == 'read' else ())
+    if hooks.coupled is not None:
+        erasing = (*('erase_key',) * (hooks.erase == 'untied'), 'momentum_decay')
     return (*streams, *gates, *erasing, *('value_decay',) * hooks.value_decay, *('turn',) * bool(hooks.turns),
             *('own',) * hooks.own_weight,
             *('skip',) * hooks.skip,
@@ -632,6 +654,8 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     if hooks.substeps > 1:
         out, key, value, updated = _substeps(hooks, given, work)
         history = None
+    elif hooks.coupled is not None:
+        out, updated, key, value, history = _momentum_step(hooks, given, work)
     elif hooks.erase == 'values':
         query, key, value, history = _prologue(hooks, given, work)
         out, updated = _values_erased(hooks, given, state.astype(work), query, key, value, work)
@@ -646,10 +670,13 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
                               across=accurate_exp(given['value_decay'].astype(work)) if hooks.value_decay
                               else None, reader=_reader(hooks, given, work))
     out = normed(hooks, skipped(hooks, out, value, given, work), given, work)
-    held = _held(updated, key, value, state.dtype)
+    # A pair's keys and values salt both its states alike (`round_to_bf16`).
+    paired = hooks.coupled is not None
+    held = _held(updated, key[:, :, None] if paired else key, value[:, :, None] if paired else value,
+                 state.dtype)
     if operands.active is not None:
         active = jnp.asarray(operands.active, bool)
-        held = jnp.where(active[:, None, None, None], held, state)
+        held = jnp.where(active.reshape(-1, *([1] * (held.ndim - 1))), held, state)
         out = jnp.where(active[:, None, None], out, 0.0)
         if history is not None:
             history = jnp.where(active[:, None, None], history, given['held'])
@@ -680,6 +707,28 @@ def _substep(hooks: Hooks, given: dict, work, state, substep: int):
     decay, write = _gates(hooks, taken, work, state.shape[2])
     out, state = update(state, query, key, value, decay, write[..., None], delta=True, reads='after')
     return out, key, value, state
+
+
+def _momentum_step(hooks: Hooks, given: dict, work):
+    """A decode token of a coupled momentum (`Hooks.coupled` 'momentum') in `work` on its pair `[rows, Hv, 2,
+    Dk, Dv]`, the memory then the momentum: the erase key's read of the memory less the values, `w = p^T S -
+    v`, gathered into the momentum, `M' = mu M + k w^T`, the memory stepping along it, `S' = alpha S - beta
+    M'`, read `q^T S'` (fla's recurrent_momentum_delta_rule_ref). `(output, state', keys, values,
+    history)`."""
+    state = given['state'].astype(work)
+    memory, momentum = state[:, :, 0], state[:, :, 1]
+    query, key, value, history = _prologue(hooks, {**given, 'state': given['state'][:, :, 0]}, work)
+    erase = key
+    if hooks.erase == 'untied':
+        group = value.shape[1] // given['erase_key'].shape[1]
+        erase = jnp.repeat(given['erase_key'].astype(work), group, axis=1)
+    alpha, mu = (accurate_exp(given[name].astype(work))[..., None, None]
+                 for name in ('log_decay', 'momentum_decay'))
+    error = jnp.sum(erase[..., :, None] * memory, axis=-2) - value
+    momentum = mu * momentum + key[..., :, None] * error[..., None, :]
+    memory = alpha * memory - given['beta'].astype(work)[..., None, None] * momentum
+    out = jnp.sum(query[..., :, None] * memory, axis=-2)
+    return out, jnp.stack([memory, momentum], axis=2), key, value, history
 
 
 def _erasing(hooks: Hooks, given: dict, work):
@@ -778,7 +827,8 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     # The template's decode step turns no state (`Hooks.turns`), takes one update a token (`Hooks.substeps`)
     # and the delta rule's own erase beside a decay along the keys alone (`Hooks.erase`, `Hooks.value_decay`):
     # such a token's launch is the reference.
-    referenced = hooks.turns or hooks.substeps > 1 or hooks.erase != 'tied' or hooks.value_decay
+    referenced = (hooks.turns or hooks.substeps > 1 or hooks.erase != 'tied' or hooks.value_decay
+                  or hooks.coupled is not None)
     launched = functools.partial(step_reference if referenced else _launched, hooks, dtype=dtype)
     return contracted("test_the_decode_step_holds_every_order")(
         linear_tangent(lambda operands: (launched(operands), ()), pulled, portable,
