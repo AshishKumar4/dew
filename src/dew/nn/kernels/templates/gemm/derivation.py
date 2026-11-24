@@ -245,13 +245,15 @@ def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidat
     """`tile`, whose ring its consumers feed (`mosaic.Transport.feeds_itself`) at its least busy depth, with
     its outputs (`outputs`, their dtypes) staged narrower where that leaves the ring a stage more: of the
     stagings below the one a tile stages in unstated (`stores.output_staging`), the most bytes first and
-    two buffers before one on a tie, the first whose plan holds a deeper ring. Its loading consumer issues
-    a step's loads between its own products, no producer running ahead, so a ring at its least busy depth
+    one buffer before two on a tie, the first whose plan holds a deeper ring. Its loading consumer issues a
+    step's loads between its own products, no producer running ahead, so a ring at its least busy depth
     leaves a load's latency no slack: an RTX PRO 6000's input gradient at 128 x 256 x 32, two stages beside
     32 KB of output staging, slept on its full barriers in 14.4% of its samples (M-NG-1's ncu). The ring
     serves every step and the staging a tile's store once, CUTLASS's order (StageCountAutoCarveout: the
     epilogue's shared memory carved out first, the ring the rest); the tile as it was where no narrower
-    staging deepens it."""
+    staging deepens it. One buffer first: sm120's three-stage 128 x 256 forward compiled spill-free at (64,
+    1) and (32, 1), 227-229 registers, where CUDA 12.9's allocator took (32, 2) to 255 and spilled 148
+    bytes, its live values no more (row 12667); certification refuses a staging that spills all the same."""
     columns = pricing.tile_columns(tile, layout)
     piece = layout.chunk_columns(columns)
 
@@ -269,7 +271,7 @@ def _ring_staged(tile: Tiles, layout: mosaic.Family, outputs: tuple, *, candidat
                   if widest >> shift >= ACCUMULATOR_COLUMNS}
     sized = {staging: bits for staging in candidates
              if (bits := staged_bits(staging)) is not None and default is not None and bits < default}
-    stagings = sorted(sized, key=lambda staging: (-sized[staging], -staging[1]))
+    stagings = sorted(sized, key=lambda staging: (-sized[staging], staging[1]))
     for staging in stagings:
         staged = dataclasses.replace(tile, staging=staging)
         if not candidate(staged):
