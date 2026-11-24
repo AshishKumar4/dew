@@ -188,10 +188,10 @@ def _bounded(declaration, names: Sequence[str], chunk: Mapping, parts: linear_sc
               for name in names]
 
     def bounded(*xs):
-        from dew.algebra.scan import _exp
-
+        # The language's exponentials, whose bound an exponent's declared interval states (`terms.region`).
         first, second, lam = _token(parts, xs)[:3]
-        return _exp(parts.base2, first), _exp(parts.base2, second), lam
+        power = jnp.exp2 if parts.base2 else jnp.exp
+        return power(first), power(second), lam
 
     closed = jax.make_jaxpr(bounded)(*tokens)
     region = terms.region(closed, {index: declaration.ranges[name] for index, name in enumerate(names)
