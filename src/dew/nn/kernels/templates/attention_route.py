@@ -32,7 +32,6 @@ from dew.nn.kernels.templates.attention import (
     Hooks,
     Kept,
     KeySpans,
-    Kind,
     Param,
     Split,
     floating_params,
@@ -40,7 +39,6 @@ from dew.nn.kernels.templates.attention import (
     prologued,
     prologues_taken,
     reference,
-    shared_sum,
     takes_output_residuals,
 )
 from dew.nn.precision import configured_precision
@@ -295,8 +293,7 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     if mainloop == 'triton':
         from dew.nn.kernels.templates import attention_triton
 
-        return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=kept,
-                                        **form)
+        return attention_triton.forward(query, key, value, spans, hooks, residuals=kept, **form)
     portable, plain = _plain()
     return portable.xla_mainloop(plain, query, key, value, spans, hooks, residuals=residuals, **form)
 
@@ -423,29 +420,10 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     if mainloop == 'triton':
         from dew.nn.kernels.templates import attention_triton
 
-        grads = attention_triton.backward(query, key, value, spans, _spread(hooks, query), dout,
-                                          residuals=residuals, rounded=rounded, interpret=interpret, **form)
-        return dataclasses.replace(grads, score_params=tuple(
-            shared_sum(grad, param) if param.kind in SPREAD else grad
-            for grad, param in zip(grads.score_params, hooks.score_params, strict=True)))
+        return attention_triton.backward(*call, residuals=residuals, rounded=rounded, interpret=interpret,
+                                         **form)
     portable, plain = _plain()
     return portable.backward(plain, *call, residuals=residuals, rounded=rounded, **form)
-
-SPREAD = (Kind.QUERY, Kind.KEY, Kind.TILE)
-"""The parameter kinds `[B or 1, H or 1, ...]` the Pallas-Triton mainloop reads a batch row and head of
-apiece (`_spread`), whose gradients the route sums back over the rows and heads they share (`shared_sum`);
-a head's parameter `[H]` it reads as it is."""
-
-
-def _spread(hooks: Hooks, query: jax.Array) -> Hooks:
-    """`hooks` with each query, key or tile parameter spread over the batch rows and query heads it shares
-    (`template.shared_place`, `SPREAD`), as the Pallas-Triton mainloop indexes them; the other mainloops read
-    them shared."""
-    batch, heads = query.shape[0], query.shape[2]
-    return dataclasses.replace(hooks, score_params=tuple(
-        dataclasses.replace(param, value=jnp.broadcast_to(param.value,
-                                                          (batch, heads, *param.value.shape[2:])))
-        if param.kind in SPREAD else param for param in hooks.score_params))
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients, query_params: tuple = (), key_params: tuple = ()

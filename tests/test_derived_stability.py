@@ -37,6 +37,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_portable,
     attention_route,
+    attention_triton,
 )
 
 
@@ -222,41 +223,110 @@ def test_the_derived_chunk_holds_every_order_at_the_decays_edges(edge, name):
         assert np.isfinite(np.asarray(ours))[finite].all(), f"{name} {edge} {leaf}"
 
 
-def _two_rows(width: int, dtype):
-    """Two batch rows of one query over two keys `K = [0, 1]` (its first channel's), cotangent 2^127: row A's
-    values at fp32's largest, row B's `[0, 2^-120]` in their first channel."""
-    query = jnp.zeros((2, 1, 1, width), dtype)
-    key = jnp.zeros((2, 2, 1, width), dtype).at[:, 1, 0, 0].set(1.0)
-    value = jnp.zeros((2, 2, 1, width), dtype).at[0, :, 0, :].set(2.0 ** 127).at[1, 1, 0, 0].set(2.0 ** -120)
-    return query, key, value, jnp.full((2, 1, 1, width), 2.0 ** 127, dtype)
+WIDTH = 64
+"""The witnesses' head width, every mainloop's 16-bit one: each value and cotangent in its first channel."""
 
 
-def _biased(shape: tuple[int, ...]) -> template.Hooks:
-    """A tile bias of zeros `shape` (`Kind.TILE`), each row's own where its batch axis is 2, shared at 1."""
-    return template.Hooks(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype),
-                          (template.Param(jnp.zeros(shape, jnp.float32), template.Kind.TILE),))
+def _channel(rows: list[list[float]]) -> jax.Array:
+    """`[B, N, 1, WIDTH]` bf16 of each batch row's `N` entries in the first channel, zeros past it."""
+    first = jnp.asarray(rows, jnp.float32)[:, :, None, None]
+    return jnp.pad(first, ((0, 0), (0, 0), (0, 0), (0, WIDTH - 1))).astype(jnp.bfloat16)
 
 
-def test_a_rows_gradients_take_no_other_rows_shift():
-    """Row A's values at fp32's largest take its values beneath a shift (`attention.value_shift`), row B's
-    none (`_two_rows`), so row B's dQ is `2^5` (its weights 1/2, `dS = [-2^5, 2^5]`): unhooked, under a tile
-    bias each row's own, and under one the rows share, whose gradient the portable launch hands back a row
-    at a time (`attention.hook_restored` raises each) and the Mosaic dK/dV launch sums across them, each
-    row's part restored first (`attention.restore_factors`); where one shift for the call took row B's
-    2^-120 beneath 2^-248 and gave 0."""
-    spans = template.spans(1, 2, 2)
+def _witness(keys: list[float], values: list[list[float]], douts: list[list[float]], bias: list[list[float]],
+             gradients: dict[str, list], *, shared: bool) -> tuple:
+    """A call of queries of zeros over two keys (`keys` their first channel, every row's), its `values` and
+    output cotangents `douts` each row's, under a tile bias `[B or 1, 1, Q, 2]` (`bias` its queries' rows,
+    one table for every row where `shared`), and its exact gradients at a logit scale of 1, each leaf's first
+    channel (`gradients`, the bias's whole), every other channel's 0."""
+    batch, queries = len(values), len(douts[0])
+    query = jnp.zeros((batch, queries, 1, WIDTH), jnp.bfloat16)
+    key = jnp.broadcast_to(_channel([keys]), (batch, 2, 1, WIDTH))
+    table = jnp.asarray(bias, jnp.float32)[None, None]
+    hooks = template.Hooks(lambda s, q_pos, k_pos, bias: s + bias.astype(s.dtype), (template.Param(
+        table if shared else jnp.broadcast_to(table, (batch, 1, queries, 2)), template.Kind.TILE),))
+    expected = {name: np.asarray(_channel(rows), np.float32) for name, rows in gradients.items()
+                if name != "bias"}
+    expected["bias"] = np.asarray(gradients["bias"], np.float32).reshape(hooks.score_params[0].value.shape)
+    return (query, key, _channel(values), _channel(douts), hooks), expected
+
+
+def _witnesses(name: str) -> list[tuple]:
+    """`name`'s calls (`WITNESSES`), each with and without a bias the rows share where both are finite."""
+    sharing = (False, True)
+    match name:
+        case "a row beside one at fp32's largest":
+            # Row A's values at fp32's largest take its values beneath a shift (`attention.value_shift`),
+            # row B's `[0, 2^-120]` none: its weights 1/2, `dS = [-2^5, 2^5]`, its dQ `2^5` (keys `[0, 1]`),
+            # where one shift for the call took its 2^-120 beneath 2^-248 and gave 0.
+            return [_witness([0.0, 1.0], [[2.0 ** 127, 2.0 ** 127], [0.0, 2.0 ** -120]],
+                             [[2.0 ** 127], [2.0 ** 127]], [[0.0, 0.0]],
+                             {"query": [[0.0], [32.0]], "key": [[0.0, 0.0]] * 2,
+                              "value": [[2.0 ** 126, 2.0 ** 126]] * 2,
+                              "bias": [[-32.0, 32.0]] if shared else [[0.0, 0.0], [-32.0, 32.0]]},
+                             shared=shared) for shared in sharing]
+        case "rows at their own scales":
+            # Row A's `dO V` past fp32's largest by one binade (a shift of 1), row B's within it (none):
+            # each row's bias gradient `[-2^119, 2^119]` at its own scale, the shared one their sum.
+            return [_witness([0.0, 0.0], [[2.0 ** 126, 2.0 ** 126 + 2.0 ** 120], [0.0, 1.0]],
+                             [[2.0], [2.0 ** 121]], [[0.0, 0.0]],
+                             {"query": [[0.0]] * 2, "key": [[0.0, 0.0]] * 2,
+                              "value": [[1.0, 1.0], [2.0 ** 120, 2.0 ** 120]],
+                              "bias": [[-(2.0 ** 120), 2.0 ** 120]] if shared
+                                      else [[-(2.0 ** 119), 2.0 ** 119]] * 2},
+                             shared=shared) for shared in sharing]
+        case "rows past fp32 that cancel":
+            # Each row's bias gradient `±2^252` past fp32's largest, opposite: the shared one's sum 0,
+            # where each row's raised first was `±inf` and their sum NaN.
+            return [_witness([0.0, 0.0], [[0.0, 2.0 ** 127], [0.0, -(2.0 ** 127)]],
+                             [[2.0 ** 127], [2.0 ** 127]], [[0.0, 0.0]],
+                             {"query": [[0.0]] * 2, "key": [[0.0, 0.0]] * 2,
+                              "value": [[2.0 ** 126, 2.0 ** 126]] * 2, "bias": [[0.0, 0.0]]}, shared=True)]
+        case "an empty query of cotangent inf":
+            # A query the bias empties, its cotangent inf, beside a visited one of cotangent 0, values at
+            # fp32's largest: the launch's cotangent there 0 (`attention.launch_cotangent`) before its
+            # shift, so every gradient 0, where its inf took the row beneath a shift of 257 and its
+            # restoring factors inf.
+            return [_witness([0.0, 0.0], [[2.0 ** 127, 2.0 ** 127]] * 2, [[0.0, np.inf]] * 2,
+                             [[0.0, 0.0], [-np.inf, -np.inf]],
+                             {"query": [[0.0, 0.0]] * 2, "key": [[0.0, 0.0]] * 2,
+                              "value": [[0.0, 0.0]] * 2, "bias": [[0.0, 0.0]] * 2}, shared=True)]
+    raise KeyError(name)
+
+
+WITNESSES = ["a row beside one at fp32's largest", "rows at their own scales", "rows past fp32 that cancel",
+             "an empty query of cotangent inf"]
+"""Calls whose rows' values the backward takes beneath shifts of their own (`attention.value_shift`), their
+gradients exact (`_witnesses`): a shared bias's summed across its rows at each one's scale
+(`attention.hook_gradient`)."""
+
+
+def _mainloops(query, key, value, dout, hooks) -> dict[str, template.Gradients]:
+    """The call's gradients at a logit scale of 1 on each mainloop: the plain-JAX one's, and the
+    Pallas-Triton one's and the Mosaic one's as an H100's, interpreted."""
+    spans = template.spans(query.shape[1], key.shape[1], query.shape[0])
     natural, accurate = attention_route.run_forms()
-    tiles = attention_portable.Tiles(block_q=8, block_k=8, pad=8)
-    query, key, value, dout = _two_rows(1, jnp.float32)
-    for hooks in (None, _biased((2, 1, 1, 2)), _biased((1, 1, 1, 2))):
-        made = attention_portable.backward(tiles, query, key, value, spans, hooks, dout, natural=natural,
-                                           accurate=accurate)
-        np.testing.assert_array_equal(np.asarray(made.query[1]), 2.0 ** 5)
-    query, key, value, dout = _two_rows(64, jnp.bfloat16)
+    form = {"scale": 1.0, "natural": natural, "accurate": accurate}
+    made = {"plain-JAX": attention_portable.backward(attention_portable.Tiles(block_q=8, block_k=8, pad=8),
+                                                     query, key, value, spans, hooks, dout, **form)}
     with generation.assumed("sm90", interpreted=True):
-        for hooks in (_biased((2, 1, 1, 2)), _biased((1, 1, 1, 2))):
-            residuals = attention_mosaic.forward(query, key, value, spans, hooks,
-                                                 residuals=template.Kept.SPLIT, interpret=True)[1:]
-            made = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
-                                             interpret=True)
-            np.testing.assert_array_equal(np.asarray(made.query[1, 0, 0, 0], np.float32), 2.0 ** 5)
+        made["Pallas-Triton"] = attention_triton.backward(query, key, value, spans, hooks, dout,
+                                                          interpret=True, **form)
+        residuals = attention_mosaic.forward(query, key, value, spans, hooks, scale=1.0, natural=natural,
+                                             residuals=template.Kept.SPLIT, interpret=True)[1:]
+        made["Mosaic"] = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                                   interpret=True, **form)
+    return made
+
+
+@pytest.mark.parametrize("witness", WITNESSES)
+def test_a_rows_gradients_are_at_its_own_shift_and_a_shared_bias_sums_them(witness):
+    """Each witness's every gradient its exact one on every mainloop (`WITNESSES`): a row's own taken at its
+    own shift, whatever the rows share, and a bias the rows share summed across them at each one's, rounded
+    once (`attention.hook_gradient`)."""
+    for call, expected in _witnesses(witness):
+        for mainloop, made in _mainloops(*call).items():
+            for name, want in expected.items():
+                got = made.score_params[0] if name == "bias" else getattr(made, name)
+                np.testing.assert_array_equal(np.asarray(got, np.float32), want,
+                                              err_msg=f"{witness} {mainloop} {name}")

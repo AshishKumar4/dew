@@ -38,6 +38,7 @@ import numpy as np
 from jax.typing import DTypeLike
 
 from dew._hashing import fmix32
+from dew.nn.aligned import aligned_sum
 from dew.nn.derivatives import Protected, contracted, surrogate
 from dew.nn.float_bits import binade_of, lowered_rounded, raised_exactly
 from dew.nn.kernels import generation, tuning
@@ -1149,14 +1150,6 @@ def shared_place(shape: tuple[int, ...], row, head) -> tuple:
     return (row if shape[0] > 1 else 0), (head if shape[1] > 1 else 0)
 
 
-def shared_sum(grad: jax.Array, param: Param) -> jax.Array:
-    """A parameter's gradient `[B, H, ...]` (a mainloop's, a program a batch row and head) summed over the
-    batch rows and heads it shares (`shared_place`), its own shape; a mainloop that adds them in its
-    programs hands it back that shape already."""
-    shared = tuple(axis for axis in (0, 1) if param.value.shape[axis] == 1 and grad.shape[axis] > 1)
-    return grad.sum(axis=shared, keepdims=True) if shared else grad
-
-
 def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
     """`param` as the reference reads it for one batch row and query head, over every query and key."""
     value = param.value
@@ -1986,25 +1979,31 @@ class Gradients:
 
 
 
+def launch_cotangent(dout: jax.Array, dtype: DTypeLike, hooks: Hooks, totals: jax.Array) -> jax.Array:
+    """The one cotangent every part of the backward takes, its shift's (`value_shift`) and its launch's
+    (`launch_arguments`): the output's `dout` `[B, Q, H, Dv]` in the operands' `dtype`, as the reference
+    takes it, none at a query a score hook leaves seeing no key (its denominator `totals` `[B, H, Q]` 0, its
+    output the reference's zero), whose weights are 0 while its `dO Vᵀ` may overflow (`0 * inf`), and whose
+    `dO` of `inf` would take its row's values beneath a shift no visited query asks for."""
+    dout = dout.astype(dtype)
+    if hooks.score_mod is None:
+        return dout
+    return jnp.where(jnp.swapaxes(totals, 1, 2)[..., None] > 0, dout, jnp.zeros((), dout.dtype))
+
+
 def launch_arguments(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
                      dout: jax.Array, residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
                      scale: float | None) -> tuple[tuple, dict, tuple]:
     """The arrays and parameters `gradients` hands a mainloop's backward launch for this call (padded to
-    whole `block`s), and what it finishes the gradients from (the padded call, the initial state's terms
-    and the cotangent `[B, H, Q, Dv]` fp32): a launch's own fitting reads them before any launch runs
-    (`attention_triton.backward_unfitted`)."""
+    whole `block`s), `dout` the launch's cotangent (`launch_cotangent`), and what it finishes the gradients
+    from (the padded call, the initial state's terms and the cotangent `[B, H, Q, Dv]` fp32): a launch's own
+    fitting reads them before any launch runs (`attention_triton.backward_unfitted`)."""
     batch, queries, heads, width = query.shape
     group, value_width = heads // key.shape[2], value.shape[-1]
     # The logits taken as the forward took them (`prescale`): every launch recomputes them from the query
     # taken by the power, at the scale left, and takes the gradients' cotangents at the call's whole scale
     # against the call's own keys and queries, so no factor of the power is taken back from a product.
     power, scale = prescale(query.dtype, width, scale)
-    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it, none at
-    # a query a score hook leaves seeing no key (its denominator 0, its output the reference's zero), whose
-    # weights are 0 while its `dO Vᵀ` may overflow (`0 * inf`).
-    dout = dout.astype(query.dtype)
-    if hooks.score_mod is not None:
-        dout = jnp.where(jnp.swapaxes(residuals[1], 1, 2)[..., None] > 0, dout, jnp.zeros((), dout.dtype))
     cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
     state = hooks.initial
     if state is None:
@@ -2049,11 +2048,12 @@ def value_shift(dout: jax.Array, value: jax.Array, hooks: Hooks) -> jax.Array:
     wherever `sum_d max|dO_d| max|V_d|` over that row and head (the largest `|dP|` and `|D|` it can form, its
     channels' maxima paired, an initial state's mean among the values) stays under fp32's `2^127`, else the
     binades it passes by, so `dP = dO V^T`, `D = dO . O` and their difference form finite; a row's own, so
-    one past the format takes no other's small values beneath it, whatever hook parameters the rows share (a
-    launch summing a shared one's gradient across rows restores each row's part first, `restore_factors`).
-    Within a row and head the shift is its keys' and queries' together: a query of small values beside a
-    key at the format's edge is taken beneath it too (row 12452). Its sum taken at each factor's own largest
-    binade, finite whatever their product."""
+    one past the format takes no other's small values beneath it, whatever hook parameters the rows share
+    (`gradients` sums a shared one's parts across rows at their own scales, `raised_sum`). `dout` the
+    launch's own cotangent (`launch_cotangent`): a query no key reaches asks for no shift. Within a row and
+    head the shift is its keys' and queries' together: a query of small values beside a key at the format's
+    edge is taken beneath it too (row 12452), and a key head's for each of its query heads. Its sum taken at
+    each factor's own largest binade, finite whatever their product."""
     batch, queries, heads, width = dout.shape
     kv_heads = value.shape[2]
     group = heads // kv_heads
@@ -2080,30 +2080,35 @@ def shifted(x: jax.Array, shift: jax.Array) -> jax.Array:
     return jnp.where(shift == 0, x, power2(x, shift).astype(x.dtype))
 
 
-def restore_factors(dout: jax.Array, value: jax.Array, hooks: Hooks) -> jax.Array:
-    """Each batch row's and query head's shift (`value_shift`) as the factors a launch restores a part of a
-    hook's gradient by before it sums it across rows into a parameter they share, `[B, H, 3]` fp32: `2^a`,
-    `2^b` (`a + b` the shift, each within fp32) and 1 where the shift is 0, its part then kept as it is (a
-    product by 1 flushes a subnormal where a GPU flushes them)."""
-    shift = value_shift(dout, value, hooks)
-    shift = jnp.repeat(shift, dout.shape[2] // shift.shape[1], axis=1)
+def raised_sum(grad: jax.Array, shift: jax.Array, axes: tuple[int, ...]) -> jax.Array:
+    """`grad` fp32, each part `2^shift` beneath its truth (`shift` int32, at least 0, broadcast against it),
+    raised and summed over `axes` (kept): a part apiece exactly (`shifted`) where it sums none; else the
+    plain fp32 sum where every shift is 0, and otherwise the exact sum of the raised parts rounded once
+    (`aligned.aligned_sum`, `2^shift` its two factors within fp32), so parts past fp32's largest that cancel
+    give what they cancel to (two rows' `±2^252` under a shared bias 0, where each raised first was `±inf`
+    and their sum NaN) and a part at its own scale keeps its bits beside a larger one's."""
+    if not axes:
+        return shifted(grad, shift)
     half = shift // 2
-    return jnp.stack([power2(jnp.ones(shift.shape, jnp.float32), half),
-                      power2(jnp.ones(shift.shape, jnp.float32), shift - half),
-                      (shift == 0).astype(jnp.float32)], axis=-1)
+    one = jnp.ones((), jnp.float32)
+
+    def aligned() -> jax.Array:
+        return aligned_sum([(grad, power2(one, half), power2(one, shift - half))], axis=axes)
+
+    return jax.lax.cond(jnp.any(shift != 0), aligned, lambda: grad.sum(axis=axes, keepdims=True))
 
 
-def hook_restored(grad: jax.Array, shift: jax.Array, kind: Kind) -> jax.Array:
-    """A score hook's parameter gradient as a launch returns it, raised by its rows' and heads' shift `[B,
-    H]` (`beneath_shift`) before `gradients` sums it across them: a head's laid `[., B, H, 1]`, another's
-    `[B, H, ...]`. One a launch summed across its rows or heads already (an axis of extent one) the launch
-    restored a part at a time (`restore_factors`), as it is."""
-    rows, heads = (1, 2) if kind == Kind.HEAD else (0, 1)
-    if grad.shape[rows] != shift.shape[0] or grad.shape[heads] != shift.shape[1]:
-        return grad
-    laid = [1] * grad.ndim
-    laid[rows], laid[heads] = shift.shape
-    return shifted(grad, shift.reshape(laid))
+def hook_gradient(grad: jax.Array, shift: jax.Array, param: Param) -> jax.Array:
+    """A score hook parameter's gradient from a launch's fp32 parts, a batch row's and query head's each
+    (`[B, H, ...]`; a head's partial sums `[., B, H, 1]`) beneath their shift `[B, H]` (`beneath_shift`):
+    raised and summed over the rows and heads `param` shares (`shared_place`; a head's over every row and
+    partial sum) at once (`raised_sum`), in its own shape. Every launch writes a row's and head's apiece, so
+    no sum across rows precedes the one that takes each at its own scale."""
+    if param.kind == Kind.HEAD:
+        return raised_sum(grad, shift[None, :, :, None], (0, 1))[0, 0, :param.value.shape[0], 0]
+    laid = shift.reshape(*shift.shape, *(1,) * (grad.ndim - 2))
+    shared = tuple(axis for axis in (0, 1) if param.value.shape[axis] == 1 and grad.shape[axis] > 1)
+    return raised_sum(grad, laid, shared)
 
 
 def beneath_shift(dout: jax.Array, value: jax.Array, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
@@ -2207,8 +2212,9 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     if hooks.output_mod is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
     # Each gradient linear in the values (dQ, dK, the hooks' and the state's maximum and denominator)
-    # restored last by the power of two they were taken beneath (`beneath_shift`); dV and the state's sums'
-    # read none.
+    # restored last by the power of two they were taken beneath (`beneath_shift`), from the launch's own
+    # cotangent (`launch_cotangent`); dV and the state's sums' read none.
+    dout = launch_cotangent(dout, query.dtype, hooks, residuals[1])
     shift, value, residuals, hooks = beneath_shift(dout, value, residuals, hooks)
 
     def restored(grad: jax.Array) -> jax.Array:
@@ -2226,31 +2232,30 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     outputs = launch(*arrays, **params)
     dq, softmax = restored(outputs[0]), outputs[1:7]
     grads_out = list(outputs[8:])
-    dq_grads = [hook_restored(grads_out.pop(0), shift, kind) for kind in kinds if kind in DQ_GRADS]
+    dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
-    dk = restored(dk)
-    key_grads = [hook_restored(grad, shift, kind)
-                 for grad, kind in zip(key_grads, [kind for kind in kinds if kind in DKV_GRADS], strict=True)]
     delta, anchor, peak, total, mass, lost = (array[:, :, :queries] for array in softmax)
     # D and what its two roundings lost, its refinement's (`lost`, `gradient.dq_finish`) and its anchor's sum.
     delta, low = two_sum(anchor, delta)
     padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
     if dk.shape[2] != kv_heads:
-        # A launch's gradients a query head's each, a key head's summed here (in a fixed order); a launch
-        # that adds them into the key head's own returns them summed.
+        # A launch's gradients a query head's each, a key head's summed here (in a fixed order), beneath the
+        # shift its query heads share, then raised once; a launch that adds them into the key head's own
+        # returns them summed.
         dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
         dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
+    dk = restored(dk)
     grads = []
     for param in hooks.score_params:
         match param.kind:
             case Kind.HEAD:
-                grads.append(dq_grads.pop(0).sum(axis=(0, 1))[:param.value.shape[0], 0])
+                grads.append(hook_gradient(dq_grads.pop(0), shift, param))
             case Kind.QUERY:
-                grads.append(shared_sum(dq_grads.pop(0)[:, :, :queries], param))
+                grads.append(hook_gradient(dq_grads.pop(0)[:, :, :queries], shift, param))
             case Kind.TILE:
-                grads.append(shared_sum(key_grads.pop(0)[:, :, :queries, :keys], param))
+                grads.append(hook_gradient(key_grads.pop(0)[:, :, :queries, :keys], shift, param))
             case Kind.KEY:
-                grads.append(shared_sum(key_grads.pop(0)[:, :, :keys], param))
+                grads.append(hook_gradient(key_grads.pop(0)[:, :, :keys], shift, param))
             case Kind.OUTPUT:
                 raise ValueError("a score hook takes no output parameter")
     initial = None if state is None else _initial_gradients(

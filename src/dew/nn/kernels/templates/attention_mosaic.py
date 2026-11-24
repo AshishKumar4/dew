@@ -53,7 +53,6 @@ from dew.nn.kernels.templates.attention import (
     logit_scale,
     prologued,
     prologues_taken,
-    restore_factors,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
 from dew.nn.kernels.templates.attention_mosaic_coop import _coop_allocations
@@ -1741,14 +1740,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         padded_queries, padded_keys = _padded(queries, key.shape[1], config)
         spec = self._spec(queries, key.shape[1], ids=query_ids is not None,
                           initial=initial is not None, config=config)
-        # Each row's part of a shared hook parameter's gradient restored as the dK/dV launch sums it across
-        # rows (`restore_factors`), the shift `gradients` takes the values beneath.
-        restore = restore_factors(dout, value, hooks) if score_params else None
         launch = functools.partial(_launch_backward, spec=spec, accurate=self.accurate, tiles=config,
                                    family=family, interpret=interpret,
                                    drop=placed_draws(drop, padded_queries, padded_keys), rounded=self.rounded,
-                                   registered=self.registered(query, value, score_params, drop, config),
-                                   restore=restore)
+                                   registered=self.registered(query, value, score_params, drop, config))
         return gradients(launch, query, key, value, spans, hooks, dout, residuals,
                          block=_block(config), scale=self.scale, rounded=self.rounded), None
 
