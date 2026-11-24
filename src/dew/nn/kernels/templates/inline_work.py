@@ -12,6 +12,7 @@ from collections.abc import Callable, Sequence
 import numpy as np
 from jax._src.interpreters import mlir as jax_mlir
 from jax._src.pallas.mosaic_gpu import primitives as gpu_primitives
+from jax._src.state import types as state_types
 from jax.experimental.mosaic.gpu import fragmented_array, utils as mgpu_utils
 from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, func
@@ -123,8 +124,10 @@ def _stand_in_type(aval, kind) -> ir.Type:
     if isinstance(kind, gpu_primitives.RefType):
         # The memref its body takes: the ref's view with its type's own transforms (a tile's tiling and
         # swizzle) applied, the layout it lies in.
-        inner = functools.reduce(lambda viewed, transform: transform.transform_type(viewed),
-                                 kind.transforms, aval).inner_aval
+        viewed = functools.reduce(lambda viewed, transform: transform.transform_type(viewed),
+                                  kind.transforms, aval)
+        assert isinstance(viewed, state_types.AbstractRef), viewed
+        inner = viewed.inner_aval
         shared = "smem" in str(aval.memory_space).lower()
         return ir.MemRefType.get(inner.shape, mgpu_utils.dtype_to_ir_type(inner.dtype),
                                  memory_space=mgpu_utils.smem() if shared else None)
@@ -265,11 +268,12 @@ class _Lanes:
         """An address's arithmetic over values known up to a uniform term: sums and differences of them,
         a product by a constant every lane holds, a cast, and an element pointer of one index."""
         offsets = [self.offsets(operand) for operand in op.operands]
+        known = [each for each in offsets if each is not None]
         match name:
-            case "arith.addi" | "llvm.add" if all(each is not None for each in offsets):
-                return offsets[0] + offsets[1]
-            case "arith.subi" if all(each is not None for each in offsets):
-                return offsets[0] - offsets[1]
+            case "arith.addi" | "llvm.add" if len(known) == len(offsets) == 2:
+                return known[0] + known[1]
+            case "arith.subi" if len(known) == len(offsets) == 2:
+                return known[0] - known[1]
             case "arith.muli" | "llvm.mul":
                 for constant, other in ((0, 1), (1, 0)):
                     held = self.values.get(op.operands[constant])
