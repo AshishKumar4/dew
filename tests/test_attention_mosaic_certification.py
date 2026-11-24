@@ -363,6 +363,8 @@ def test_a_refused_launch_states_its_model_beside_the_assemblers_registers():
     from dew.nn.kernels.generation import compile_only_gpus
 
     op, ba, derived = _gated_backward("sm90", 64, accurate=True)
+
+    assert isinstance(derived, attention_mosaic.BackwardTiles), derived
     # Its tile at 128 query rows, which its dQ spills at (FS-DECISION-sm90).
     config = dataclasses.replace(derived, block_q=128)
     with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]), report.refusals():
@@ -388,6 +390,8 @@ def test_a_ladder_that_spills_throughout_certifies_its_ends_alone():
     from dew.nn.kernels.generation import compile_only_gpus
 
     op, ba, derived = _gated_backward("sm90", 64, accurate=True, hooks="alibi")
+
+    assert isinstance(derived, attention_mosaic.BackwardTiles), derived
     assert derived is not None
     with generation.assumed("sm90"), report.certifying(compile_only_gpus("sm90")[0]), report.refusals():
         before = len(report.certifications())
@@ -409,6 +413,7 @@ def test_a_ladder_holds_no_rung_its_assembler_caps_otherwise():
     255), and its ladder (`MosaicBackward.ladder`, whose rungs a refusal infers refused) holds no rung whose
     launches' stated caps or register movement differ from its own (row 8467)."""
     op, ba, derived = _gated_backward("sm90", 64, accurate=True, hooks="alibi")
+    assert isinstance(derived, attention_mosaic.BackwardTiles), derived
     with generation.assumed("sm90"):
         config = dataclasses.replace(derived, block_q=128)
         dtype = ba.arguments["query"].dtype
@@ -434,6 +439,8 @@ def test_a_fewer_rows_ladder_walks_the_query_blocks_its_derivation_walks():
     from dew.nn.kernels.templates.attention_mosaic_program import fewer_rows
 
     op, ba, derived = _gated_backward("sm80", 64, accurate=True)
+
+    assert isinstance(derived, attention_mosaic.BackwardTiles), derived
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         query = ba.arguments["query"]
