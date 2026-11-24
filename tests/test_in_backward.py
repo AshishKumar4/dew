@@ -573,17 +573,22 @@ def test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the
 
 
 @pytest.mark.usefixtures("scanned_stacks")
-@pytest.mark.parametrize(("generation", "dtype"), [("sm90", "float32"), ("sm80", "bfloat16")])
-def test_an_accumulating_scanned_step_holds_no_extra_gradient_buffer(generation, dtype):
+@pytest.mark.parametrize(("generation", "dtype", "dropout"),
+                         [("sm90", "float32", 0.0), ("sm80", "bfloat16", 0.0), ("sm90", "float32", 0.1)],
+                         ids=["sm90-f32", "sm80-bf16", "sm90-f32-dropout"])
+def test_an_accumulating_scanned_step_holds_no_extra_gradient_buffer(generation, dtype, dropout):
     """A scanned step that accumulates its update over microbatches, its batches or its batch's split,
     pools each layer's gradient into the window's accumulator as its backward walks the layer
     (`Transaction._planned_accumulation`): its temporaries hold no stacked `[L, ...]` gradient beside the
     accumulator, nor the scan's forward residuals unrematerialized, past what a one-microbatch step holds
-    (row 12080: an sm90 f32 step held 5.6 MB more, an sm80 bf16 one 2.4 MB)."""
+    (row 12080: an sm90 f32 step held 5.6 MB more, an sm80 bf16 one 2.4 MB). One whose layers drop out
+    draws its masks as Linen's scan does, which a layer applied alone in its backward would draw otherwise:
+    it pools none, and holds the stacked gradient as an unpooled step does (`_DRAWS`)."""
     from dew.training import UpdateBatch
 
     wide = {**TINY_DECODER, "emb_features": 64, "mlp_features": 2048}
-    model = models.build("causal_transformer", vocab_size=96, **wide, num_kv_heads=2, dtype=dtype)
+    model = models.build("causal_transformer", vocab_size=96, **wide, num_kv_heads=2, dtype=dtype,
+                         dropout_rate=dropout)
 
     def ahead(accumulation: int, split: int, rows: int):
         gpu = compile_only_gpus(generation, 1, 64 * 2**30)
@@ -605,8 +610,9 @@ def test_an_accumulating_scanned_step_holds_no_extra_gradient_buffer(generation,
         second stacked sum held as an unaliased output counts as one held among its temporaries does."""
         return ahead.output_bytes - ahead.alias_bytes + ahead.temp_bytes
 
-    assert beside(accumulated) - beside(one) < narrow, (beside(accumulated), beside(one), narrow)
-    assert beside(split) - beside(one) < narrow, (beside(split), beside(one), narrow)
+    pooled = not dropout
+    assert (beside(accumulated) - beside(one) < narrow) == pooled, (beside(accumulated), beside(one), narrow)
+    assert (beside(split) - beside(one) < narrow) == pooled, (beside(split), beside(one), narrow)
 
 
 ACCUMULATING_SEEDS = 64
@@ -659,7 +665,17 @@ class _Repeated(LMObjective):
         return (Ratio(jnp.sum(stats.total), jnp.sum(stats.mass)), jax.tree.map(lambda leaf: leaf[0], aux))
 
 
-OBJECTIVES = {"lm": LMObjective, "penalized": _Penalized, "branched": _Branched, "repeated": _Repeated}
+class _Nested(LMObjective):
+    """An LM whose loss runs within a jit of its own (`jax.jit`), which a later trace of the step reads
+    from its cache without calling the run again: a run read within a nested jit pools nothing in its
+    backward (`Transaction._pools_once`)."""
+
+    def loss(self, variables, batch, step):
+        return jax.jit(lambda held, rows: LMObjective.loss(self, held, rows, step))(variables, batch)
+
+
+OBJECTIVES = {"lm": LMObjective, "penalized": _Penalized, "branched": _Branched, "repeated": _Repeated,
+              "nested": _Nested}
 """Each accumulating witness's objective: the LM, whose runs pool in their backward, and those whose runs
 the step accumulates ordinarily, read beside a term on the weights, in a branch or in a loop."""
 
@@ -678,6 +694,8 @@ the step accumulates ordinarily, read beside a term on the weights, in a branch 
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param("float32", 0.0, False, "repeated", id="repeated",
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "nested", id="nested-jit",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
 ])
 def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, objective):
     """A scanned step accumulating a window of two batches each split in two, its parts of unequal token
@@ -685,7 +703,8 @@ def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, ob
     with the unrolled step's (check 1, against one device's float64 unrolled step), on two devices
     splitting its parameters: pooling its gradient in its backward (`Transaction._planned_accumulation`),
     clipped with narrow copies or over a periodic stack; or accumulating it as an unscanned step does where
-    its loss reads a run beside a term on its weights, in a branch or in a loop (`_pools_once`)."""
+    its loss reads a run beside a term on its weights, in a branch, in a loop or within a nested jit
+    (`_pools_once`)."""
     from arm_forms import as_given
     from test_stage_local import wide
 
