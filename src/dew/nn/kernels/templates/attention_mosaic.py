@@ -334,7 +334,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     """The queries each of the spans' intervals holds (`KeySpans.per_span`)."""
     runs: int = 1
     """The key runs each query of a spans call sees the union of (`KeySpans.start`'s last axis where it has
-    one: R of `[B, Q, R]`), each further run's bounds a walk holds across its loop (`ForwardRegisters.runs`)."""
+    one: R of `[B, Q, R]`), each further run's bounds a walk holds across its loop
+    (`ForwardRegisters.runs`)."""
 
     @property
     def score_types(self) -> tuple:
