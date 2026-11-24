@@ -38,6 +38,7 @@ from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
 from dew.nn import in_backward
+from dew.nn.derivatives import marked_call_p
 from dew.nn.finite import all_finite, leaf_finite, zeroed_unless
 from dew.nn.inspection import (
     PROBES,
@@ -1823,8 +1824,9 @@ class Transaction:
             return self.objective._loss({**read, **trainable}, batch, step_info)
 
         def total(trainable):
+            # Reduced as the step reduces it (`local_reduction`), whatever form its statistics take.
             stats, _ = loss(trainable)
-            return jnp.sum(stats.total)
+            return self.objective.reduce_loss(stats)[0]
 
         probe = dataclasses.replace(planned.plan, handled=[], shapes={})
         with unscaled(factor), fixed_routers(), in_backward.planned(probe):
@@ -2098,7 +2100,7 @@ def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, _Root],
             continue
         runs = {root.run for root in read}
         name = equation.primitive.name
-        if name.startswith("custom_vjp") and any(root.sum for root in read):
+        if name.startswith("custom_vjp") and any(root.sum for root in read) and _runs_rule(equation):
             reads.update(runs)
             # Its operands' shapes the run's own as its trace saw them, else a batching transform's lanes
             # beside them: one call standing for each lane's.
@@ -2124,6 +2126,13 @@ def _run_reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, _Root],
                      for value, inside in zip(equation.outvars, body.outvars, strict=True)
                      if computed(inside) and inside in through})
     return held
+
+
+def _runs_rule(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation`, a custom derivative's call, is a run's own rule (`dew.nn.in_backward.RUN_RULE`):
+    its function a marked call of that kind (`dew.nn.derivatives.declared_derivative`), no rule around it."""
+    return any(inner.primitive is marked_call_p and isinstance(inner.params["kind"], in_backward.RunRule)
+               for program in jcore.jaxprs_in_params(equation.params) for inner in program.eqns)
 
 
 def _draws(program: jcore.Jaxpr) -> bool:

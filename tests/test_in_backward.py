@@ -665,19 +665,36 @@ class _Repeated(LMObjective):
         return (Ratio(jnp.sum(stats.total), jnp.sum(stats.mass)), jax.tree.map(lambda leaf: leaf[0], aux))
 
 
+_NESTED_LOSS = jax.jit(lambda objective, held, rows, step: LMObjective.loss(objective, held, rows, step),
+                       static_argnums=0)
+"""An LM's loss within one jit of its own (`_Nested`), whose cache each trace of a step after the first
+reads without calling the run again."""
+
+
 class _Nested(LMObjective):
-    """An LM whose loss runs within a jit of its own (`jax.jit`), which a later trace of the step reads
-    from its cache without calling the run again: a run read within a nested jit pools nothing in its
-    backward (`Transaction._pools_once`)."""
+    """An LM whose loss runs within a jit of its own, defined once (`_NESTED_LOSS`), so the step's traces
+    after the first (its gate's, its gradient's) read its program from the jit's cache: a run read within
+    a nested jit pools nothing in its backward (`Transaction._pools_once`)."""
 
     def loss(self, variables, batch, step):
-        return jax.jit(lambda held, rows: LMObjective.loss(self, held, rows, step))(variables, batch)
+        return _NESTED_LOSS(self, variables, batch, step)
+
+
+class _Scalar(LMObjective):
+    """An LM whose loss is its microbatch's mean alone, a scalar the step pools with a mass of one
+    (`Objective.reduce_loss`): its gate reduces it as the step does."""
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        assert isinstance(stats, Ratio), type(stats)
+        return stats.mean()[0], aux
 
 
 OBJECTIVES = {"lm": LMObjective, "penalized": _Penalized, "branched": _Branched, "repeated": _Repeated,
-              "nested": _Nested}
-"""Each accumulating witness's objective: the LM, whose runs pool in their backward, and those whose runs
-the step accumulates ordinarily, read beside a term on the weights, in a branch or in a loop."""
+              "nested": _Nested, "scalar": _Scalar}
+"""Each accumulating witness's objective: the LM and its scalar mean, whose runs pool in their backward,
+and those whose runs the step accumulates ordinarily, read beside a term on the weights, in a branch, in a
+loop or within a nested jit."""
 
 
 @pytest.mark.mesh(devices=2)
@@ -696,13 +713,16 @@ the step accumulates ordinarily, read beside a term on the weights, in a branch 
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param("float32", 0.0, False, "nested", id="nested-jit",
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "scalar", id="scalar-loss",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
 ])
 def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, objective):
     """A scanned step accumulating a window of two batches each split in two, its parts of unequal token
     counts (padding scored as none), leaves its parameters and optimizer state after two updates on par
     with the unrolled step's (check 1, against one device's float64 unrolled step), on two devices
     splitting its parameters: pooling its gradient in its backward (`Transaction._planned_accumulation`),
-    clipped with narrow copies or over a periodic stack; or accumulating it as an unscanned step does where
+    clipped with narrow copies, over a periodic stack or under a scalar loss; or accumulating it as an
+    unscanned step does where
     its loss reads a run beside a term on its weights, in a branch, in a loop or within a nested jit
     (`_pools_once`)."""
     from arm_forms import as_given

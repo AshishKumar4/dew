@@ -50,6 +50,17 @@ from layers no step holds together."""
 
 
 @dataclasses.dataclass(frozen=True)
+class RunRule(Surrogate):
+    """The rule of a run updating or pooling in its backward (`scanned_run`): a surrogate (its cotangents
+    the step's new state), which a step's gate tells from every other custom rule by its kind
+    (`dew.training.transaction._run_reads`): an outer rule wrapping it, which may scale what it pools, is
+    no run's."""
+
+
+RUN_RULE = RunRule()
+
+
+@dataclasses.dataclass(frozen=True)
 class InBackward:
     """A step's plan for the runs that update in their backward.
 
@@ -327,7 +338,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     # (`Surrogate`): the step reads them as its update (`InBackward`), its gate (`gated`) a value of the
     # step's own trace the backward reads where it runs.
     updating = contracted("test_a_run_updating_in_its_backward_moves_as_its_step_would")(
-        declared_derivative(Surrogate(), run, run_forward, run_backward))
+        declared_derivative(RUN_RULE, run, run_forward, run_backward))
     called = (weights, masters, dict(moments), norms, x, per_layer, tuple(arrays))
     _registered(current, path, called)
     return updating(*called)
