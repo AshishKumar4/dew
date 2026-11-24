@@ -1020,6 +1020,8 @@ def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_step
     # holds none past its end): copies of its parameters alone, the packed collection's two leaves held
     # through the step as they were.
     _, batch = _decoder()
+    # Where the fit left the attribute-reached parameter, read before the step donates the state.
+    before = np.asarray(state.variables["params"]["attribute"].values)
     with chosen(narrow_copies="on"):
         stepped, *_ = trainer.compile(state, batch)(state, batch)
     copied = {path[0].key for path, _ in jax.tree_util.tree_flatten_with_path(stepped.compute or {})[0]}
@@ -1029,11 +1031,10 @@ def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_step
     held = stepped.variables["quantization"]["head"]
     np.testing.assert_array_equal(np.asarray(held.values), np.ones((4, 2), np.uint8))
     np.testing.assert_array_equal(np.asarray(held.scale), np.ones(4))
-    # Trained through its cast by its read, from where the fit left it.
+    # Trained through its cast by its read, by the fit and again by the step.
     reached = stepped.variables["params"]["attribute"]
-    before = state.variables["params"]["attribute"].values
-    assert not np.array_equal(np.asarray(before), np.full((4, 2), 2.0)), before
-    assert not np.array_equal(np.asarray(reached.values), np.asarray(before)), reached
+    assert not np.array_equal(before, np.full((4, 2), 2.0)), before
+    assert not np.array_equal(np.asarray(reached.values), before), reached
 
 
 @attending("template")
