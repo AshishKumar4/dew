@@ -1139,7 +1139,8 @@ def _logits_and_gradients(model):
 
 def _collectives_in_loops(text: str) -> collections.Counter:
     """The collectives (`all-gather`, `reduce-scatter`, `all-reduce`, their async starts) in a compiled
-    program's `while` loops, their bodies and every computation they call, from its HLO `text`."""
+    program's `while` loops, their bodies and every computation they call, from its HLO `text`, each by its
+    name and the rank of the arrays it moves (a matrix's 2)."""
     computations, current = {}, None
     for line in text.splitlines():
         header = re.match(r"^(?:ENTRY )?%?([\w.\-]+) .*\{$", line)
@@ -1158,7 +1159,12 @@ def _collectives_in_loops(text: str) -> collections.Counter:
             seen.add(name)
             pending.extend(called for line in computations[name]
                            for called in re.findall(r"%([\w.\-]+)", line) if called in computations)
-    return collections.Counter(op for name in seen for line in computations[name]
+    def rank(line: str, op: str) -> int:
+        # Its result's shapes' (`f32[64,32]{1,0}`, a tuple's widest), written between `=` and its name.
+        result = line.split("=", 1)[1].split(op, 1)[0]
+        return max((len(dims.split(",")) if dims else 0) for dims in re.findall(r"\w+\[([\d,]*)\]", result))
+
+    return collections.Counter((op, rank(line, op)) for name in seen for line in computations[name]
                                for op in re.findall(r"\b(all-gather|reduce-scatter|all-reduce)(?:-start)?\(",
                                                     line))
 
@@ -1181,12 +1187,12 @@ def _gathered_case(*, gathered: bool, remat: bool):
 @pytest.mark.parametrize("remat", [False, True], ids=["plain", "recomputed"])
 def test_a_gathered_loop_reads_its_block_gathered_once(remat, boxed):
     """A looped block whose parameters fully sharded data parallelism splits, with `Loop.gathered`, reads
-    them gathered once before its passes, and reduces their gradient once after them: its training step's
-    pass loop (the `while` of its three later passes), its body and all it calls, holds no all-gather and no
-    gradient reduction (all-reduce or reduce-scatter), where the same step without it gathers and reduces
-    there each pass, each pass and layer recomputed or not (row 12722: the gather is not sunk back into a
-    checkpointed body), its variables arrays or as its init boxes them (`flax.core.meta`'s logical axes).
-    Every leaf split eight ways (`Layout(min_shard=1)`)."""
+    them gathered once before its passes, and reduces its matrices' gradients once after them: its training
+    step's pass loop (the `while` of its three later passes), its body and all it calls, holds no all-gather
+    and no reduction (all-reduce or reduce-scatter) of a matrix, where the same step without it gathers and
+    reduces there each pass, each pass and layer recomputed or not (row 12722: the gather is not sunk back
+    into a checkpointed body), its variables arrays or as its init boxes them (`flax.core.meta`'s logical
+    axes). Every leaf split eight ways (`Layout(min_shard=1)`)."""
     from dew.distributed.placement import Layout
     from dew.mesh import DEFAULT_RULES
     from dew.nn.sharding import placing
@@ -1205,10 +1211,14 @@ def test_a_gathered_loop_reads_its_block_gathered_once(remat, boxed):
         with jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout):
             text = jax.jit(gradient).lower(variables, ids, cotangent).compile().as_text()
         found[gathered] = _collectives_in_loops(text)
-    assert found[False]["all-gather"] and not found[True]["all-gather"], found
-    # The passes' gradients summed unreduced, reduced once after the loop (`Loop.gathered`).
-    assert found[False]["all-reduce"] + found[False]["reduce-scatter"], found
-    assert not found[True]["all-reduce"] + found[True]["reduce-scatter"], found
+    gathers = {gathered: sum(count for (op, _), count in moved.items() if op == "all-gather")
+               for gathered, moved in found.items()}
+    assert gathers[False] and not gathers[True], found
+    # The passes' matrices' gradients summed unreduced, reduced once after the loop (`Loop.gathered`); a
+    # vector's (a norm's scale) still reduced each pass.
+    matrices = {gathered: sum(count for (op, rank), count in moved.items()
+                              if op != "all-gather" and rank > 1) for gathered, moved in found.items()}
+    assert matrices[False] and not matrices[True], found
 
 
 @pytest.mark.mesh(devices=8)

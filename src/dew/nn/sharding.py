@@ -645,12 +645,16 @@ def constrained[T](x: T, spec: jax.sharding.PartitionSpec | Callable[[], jax.sha
 
 def gathered_over(x: jax.Array, spec: jax.sharding.PartitionSpec, axis: str) -> jax.Array:
     """`x`, placed as `spec`, gathered whole over `axis`, an Explicit axis of the mesh in context
-    (`explicit_over`), and reduced over it (`PartitionSpec`'s `reduced`): every device holds the one copy,
-    and a gradient reaching it stays unreduced, each use's partial sum added as it lies, reduced over `axis`
-    once where its transpose places it back as `spec` places it over `axis` (a reduce-scatter).
-    `x` is first placed over the axis as `spec` places it there (from a type placing it on the mesh the step
-    traces, where `axis` is Auto): what `dew.nn.backbones.looping`'s gathered block reads."""
+    (`explicit_over`), and a matrix reduced over it (`PartitionSpec`'s `reduced`): every device holds the
+    one copy, and a gradient reaching it through a product stays unreduced, each use's partial sum added
+    as it lies, reduced over `axis` once where its transpose places it back as `spec` places it over `axis`
+    (a reduce-scatter). A vector (a norm's scale, a bias) is held replicated: JAX types no reduced operand
+    beside one the axis splits but a product's, so each of its uses reduces its gradient as an Auto axis
+    would. `x` is first placed over the axis as `spec` places it there (from a type placing it on the mesh
+    the step traces, where `axis` is Auto): what `dew.nn.backbones.looping`'s gathered block reads."""
     placed = jax.sharding.reshard(x, _only(spec, {axis}))
+    if x.ndim < 2:
+        return jax.sharding.reshard(placed, jax.sharding.PartitionSpec())
     return jax.sharding.reshard(placed, jax.sharding.PartitionSpec(reduced={axis}))
 
 

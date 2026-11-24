@@ -39,7 +39,7 @@ from flax.core.scope import DenyList
 from flax.linen.transforms import lift_direct_transform
 from jax.sharding import NamedSharding
 
-from dew.batch import sows_appended
+from dew.batch import sows_appended, unboxed
 from dew.mesh import FSDP_AXIS
 from dew.nn.dense import captures_any_method
 
@@ -405,18 +405,18 @@ def _gathered_params(variables: Mapping[str, Mapping], *, layout, mesh, scope: t
                      span: tuple[int, int]) -> dict:
     """`variables`' `params` (a decoder's, under its variables `scope`, `('params', ...)`) with each leaf a
     gathered loop's passes read gathered whole over the FSDP axis from where `layout` places it on the step's
-    `mesh` (`sharding.gathered_over`, `Layout.leaf_spec`, read of the leaf unboxed): a layer's within the
-    block (`span`, `[first, end)`), met by any module name running it, its own (`layers_3`) or a run's
-    (`layers_1_2`, `layer_names.group_layers`), and the decoder's own, no layer's (its step and reinjection
-    norms); every other (the prelude's and the coda's layers) as it is, which no pass reads. Each leaves its
-    box (`flax.core.meta`'s), whose logical axes a scan over the passes would place by a constraint, which
-    an Explicit axis takes none of, and a gathered one's would place back on the FSDP axis."""
+    `mesh` (`sharding.gathered_over`, `Layout.leaf_spec`): a layer's within the block (`span`, `[first,
+    end)`), met by any module name running it, its own (`layers_3`) or a run's (`layers_1_2`,
+    `layer_names.group_layers`), and the decoder's own, no layer's (its step and reinjection norms); every
+    other (the prelude's and the coda's layers) as it is, which no pass reads. Each leaves its box
+    (`flax.core.meta`'s) unconstrained (`dew.batch.unboxed`): its logical axes would place it by a
+    constraint, which an Explicit axis takes none of, and a gathered one's back on the FSDP axis."""
     first, end = span
 
     def leaf(where, value):
         keys = tuple(jax.tree_util.DictKey(key) for key in scope) + tuple(where)
         runs = group_layers(where[0].key) if isinstance(where[0], jax.tree_util.DictKey) else None
-        raw = meta.unbox(value)
+        raw = unboxed(value)
         held = runs is None or (first <= runs.start and runs.stop <= end)
         return gathered_over(raw, layout.leaf_spec(mesh, keys, raw), FSDP_AXIS) if held else raw
 
