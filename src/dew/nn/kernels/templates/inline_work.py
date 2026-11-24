@@ -338,7 +338,7 @@ class _Lanes:
 
     def relative_of(self, name: str, op) -> np.ndarray | None:
         """An address's arithmetic over values known up to a uniform term: sums and differences of them,
-        a product by a constant every lane holds, a cast, and an element pointer of one index."""
+        a product by a constant every lane holds, a cast, and an element pointer (`_element_offsets`)."""
         offsets = [self.offsets(operand) for operand in op.operands]
         known = [each for each in offsets if each is not None]
         match name:
@@ -353,8 +353,8 @@ class _Lanes:
                         return offsets[other] * held[0]
             case "arith.extsi" | "arith.extui" | "arith.index_cast" | "arith.index_castui" | "arith.trunci":
                 return offsets[0]
-            case "llvm.getelementptr" if len(offsets) <= 2 and all(each is not None for each in offsets):
-                return offsets[-1] if len(offsets) == 2 else offsets[0]
+            case "llvm.getelementptr" if all(each is not None for each in offsets):
+                return _element_offsets(op, offsets)
         return None
 
     def issued(self, op, active: np.ndarray) -> Work:
@@ -712,6 +712,23 @@ def _elements(value_type: ir.Type) -> int:
 def _is_float(value_type: ir.Type) -> bool:
     element = value_type.element_type if isinstance(value_type, ir.VectorType) else value_type
     return isinstance(element, ir.FloatType)
+
+
+def _element_offsets(op, offsets: list) -> np.ndarray | None:
+    """An `llvm.getelementptr`'s address in bytes up to a uniform term, its base's (`offsets[0]`) plus its
+    one index's times its element's bytes (a dynamic index `offsets[1]`, a constant one a uniform term), so
+    each index of a chain of them keeps its lanes; None for several indices (a struct's or array's walk)."""
+    indices = ir.DenseI32ArrayAttr(op.attributes["rawConstantIndices"])
+    if len(indices) != 1:
+        return None
+    base = offsets[0]
+    if len(offsets) == 1:
+        return base
+    element = ir.TypeAttr(op.attributes["elem_type"]).value
+    scalar = element.element_type if isinstance(element, ir.VectorType) else element
+    if not isinstance(scalar, ir.IntegerType | ir.FloatType | ir.IndexType):
+        return None
+    return base + offsets[1] * _bytes(element)
 
 
 def _bytes(value_type: ir.Type) -> int:
