@@ -586,7 +586,7 @@ class MosaicForward(_Mainloop[Tiles]):
             arguments["query"], arguments["value"], arguments["score_params"],
             arguments.get("residuals"), config, arguments.get("table"),
             arguments.get("sources"), arguments.get("scales"),
-            arguments.get("initial"), arguments.get("drop"),
+            arguments.get("initial"), arguments.get("drop"), arguments.get("start"),
             peaks=peaks, columns=columns, decides=decides, priced=priced, masked=masked, target=target)
 
     def deciding(self, ba: tokamax.BoundArguments, config: Tiles,
@@ -601,7 +601,7 @@ class MosaicForward(_Mainloop[Tiles]):
         return staged, regs
 
     def _decided_model(self, query, value, score_params, residuals: Kept | None, config: Tiles,
-                       table=None, sources=None, scales=None, initial=None, drop=None, *,
+                       table=None, sources=None, scales=None, initial=None, drop=None, start=None, *,
                        peaks: bool = False, columns: int | None = None, decides: bool | None = None,
                        priced: bool = True, masked: bool = False,
                        target: generation.GpuTarget | None = None,
@@ -611,7 +611,8 @@ class MosaicForward(_Mainloop[Tiles]):
         price so planning, residency and emission agree without double-pricing prologues."""
         resolved = self.launch_target() if target is None else target
         family = bundle_of(config, query.dtype, target=resolved)
-        base = self.registered(query, value, score_params, residuals, table, sources, scales, initial, drop)
+        base = self.registered(query, value, score_params, residuals, table, sources, scales, initial, drop,
+                               start)
         if decides is not None:
             model = dataclasses.replace(base, scaled=True) if decides else base
             count = model.at(family, config, peaks=peaks, columns=columns, masked=masked) if priced else None
@@ -635,7 +636,7 @@ class MosaicForward(_Mainloop[Tiles]):
         return False, base, count
 
     def decided(self, query, value, score_params, residuals: Kept | None, config: Tiles, table=None,
-                sources=None, scales=None, initial=None, drop=None, *,
+                sources=None, scales=None, initial=None, drop=None, start=None, *,
                 target: generation.GpuTarget | None = None) -> bool:
         """Whether its launch at `config` walks unscaled and decides a scaled second walk of a program whose
         rows pass fp32's largest (`after_walk.Decided`, `algebra.may_scale`, rows 5272, 5274): memory-bound
@@ -644,7 +645,7 @@ class MosaicForward(_Mainloop[Tiles]):
         scaled walk's registers (`register_budget`). Compute-bound prefill/training forwards take `_fwd`'s
         1-kernel `algebra.may_scale` guard so the inner loop pays no per-tile magnitude reduction."""
         return self._decided_model(query, value, score_params, residuals, config, table, sources, scales,
-                                   initial, drop, priced=False, target=target)[0]
+                                   initial, drop, start, priced=False, target=target)[0]
 
     def _hooks(self, score_params, output_params, initial, drop, query_params=()) -> Hooks:
         return Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
@@ -660,7 +661,7 @@ class MosaicForward(_Mainloop[Tiles]):
         spans = self.spans(start, end, query_ids, key_ids)
         target = self.launch_target()
         decides, registered, _ = self._decided_model(query, value, score_params, residuals, config, table,
-                                                     sources, scales, initial, drop, priced=False,
+                                                     sources, scales, initial, drop, start, priced=False,
                                                      target=target)
         family = bundle_of(config, query.dtype, target=target)
         products = None
@@ -1371,10 +1372,11 @@ class MosaicForward(_Mainloop[Tiles]):
                                            decides=decides, masked=masked)[2]
 
     def registered(self, query, value, score_params, residuals, table=None, sources=None,
-                   scales=None, initial=None, drop=None) -> ForwardRegisters:
+                   scales=None, initial=None, drop=None, start=None) -> ForwardRegisters:
         """The call's base register facts (`ForwardRegisters`): an `initial` state merges past an inference
         walk's keys (`attention_mosaic_forward._started`), a split training walk starting from it; a `drop`
-        over fp16 values takes its kept weights in two parts (`algebra.kept_parts`)."""
+        over fp16 values takes its kept weights in two parts (`algebra.kept_parts`); a spans call's `start`
+        `[B, Q, R]` names the R key runs a query sees the union of, each further run's bounds held."""
         params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype) for param in score_params),
                            strict=True))
         computed = query.dtype if scales is not None else value.dtype
@@ -1384,6 +1386,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                 self._scales(table, sources, scales, computed), codes=scales is not None,
                                 positions=math.ceil(query.shape[1] / self.per_span)
                                 if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span,
+                                runs=start.shape[-1] if start is not None and start.ndim == 3 else 1,
                                 merged=initial is not None and residuals is not Kept.SPLIT,
                                 started=initial is not None and residuals is Kept.SPLIT,
                                 dropped=drop is not None,
@@ -1617,7 +1620,7 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                          f"the call derives {family.name}, whose sums its issuer keeps in tensor memory")
     arguments = ba.arguments
     registered = op.registered(arguments["query"], arguments["value"], arguments["score_params"], Kept.NONE,
-                               drop=arguments.get("drop"))
+                               drop=arguments.get("drop"), start=arguments.get("start"))
     if hooks.query_mod is not None and op.query_mod is None:
         # A query prologue the launch does not take where it loads the query (`_forward_call`), taken here.
         query = prologued(query, hooks.query_mod, hooks.query_params)
