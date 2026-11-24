@@ -1550,19 +1550,20 @@ def test_a_paired_custom_jvp_epilogue_reading_its_accumulators_wide_is_recompute
     tangent reads them at fp32 (`jax.custom_jvp`): its derivative reads more than the roundings, so its
     backward recomputes the pair, its gradients raw-bit the unnamed call's (#4039's review)."""
     @jax.custom_jvp
-    def activation(gate_acc, up_acc):
-        return (jax.nn.silu(gate_acc.astype(jnp.bfloat16).astype(jnp.float32))
-                * up_acc.astype(jnp.bfloat16).astype(jnp.float32))
+    def epilogue(gate_acc, up_acc):
+        # Its primal reads each accumulator through its bf16 rounding alone, which it returns.
+        gate_rows, up_rows = gate_acc.astype(jnp.bfloat16), up_acc.astype(jnp.bfloat16)
+        hidden = jax.nn.silu(gate_rows.astype(jnp.float32)) * up_rows.astype(jnp.float32)
+        return hidden.astype(jnp.bfloat16), gate_rows, up_rows
 
-    @activation.defjvp
+    @epilogue.defjvp
     def _(primals, tangents):
         gate_acc, up_acc = primals
         d_gate, d_up = tangents
-        return activation(gate_acc, up_acc), gate_acc * d_up + up_acc * d_gate
-
-    def epilogue(gate_acc, up_acc):
-        return (activation(gate_acc, up_acc).astype(jnp.bfloat16), gate_acc.astype(jnp.bfloat16),
-                up_acc.astype(jnp.bfloat16))
+        # Its tangent reads the accumulators at their fp32 width.
+        d_hidden = (jax.nn.sigmoid(gate_acc) * up_acc * d_gate + jax.nn.silu(gate_acc) * d_up)
+        return epilogue(gate_acc, up_acc), (d_hidden.astype(jnp.bfloat16), d_gate.astype(jnp.bfloat16),
+                                            d_up.astype(jnp.bfloat16))
 
     _assert_named_pullback(epilogue, _operands_1376(jnp.bfloat16), (jnp.bfloat16,) * 3, kept=False)
 
