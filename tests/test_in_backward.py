@@ -9,7 +9,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, scanning, stacked_as, unrolled
+from model_support import TINY_DECODER, scanning, stacked_as, under_kernels, unrolled
 from reference_error import assert_as_exact, dew_path, widened
 from token_support import token_rows
 
@@ -568,3 +568,118 @@ def test_a_loss_differentiating_a_scanned_run_twice_is_refused_its_update_in_the
     run.device_mesh = MeshSpec().build(jax.devices()[:1])
     with pytest.raises(ValueError):
         scanning(run.fit)(data, steps=1, log_every=1)
+
+
+@pytest.mark.usefixtures("scanned_stacks")
+@pytest.mark.parametrize(("generation", "dtype"), [("sm90", "float32"), ("sm80", "bfloat16")])
+def test_an_accumulating_scanned_step_holds_no_extra_gradient_buffer(generation, dtype):
+    """A scanned step that accumulates its update over microbatches, its batches or its batch's split,
+    pools each layer's gradient into the window's accumulator as its backward walks the layer
+    (`Transaction._planned_accumulation`): its temporaries hold no stacked `[L, ...]` gradient beside the
+    accumulator, nor the scan's forward residuals unrematerialized, past what a one-microbatch step holds
+    (row 12080: an sm90 f32 step held 5.6 MB more, an sm80 bf16 one 2.4 MB)."""
+    from dew.training import UpdateBatch
+
+    wide = {**TINY_DECODER, "emb_features": 64, "mlp_features": 2048}
+    model = models.build("causal_transformer", vocab_size=96, **wide, num_kv_heads=2, dtype=dtype)
+
+    def ahead(accumulation: int, split: int, rows: int):
+        gpu = compile_only_gpus(generation, 1, 64 * 2**30)
+        run = Trainer(LMObjective(model, 16), OptimConfig(optimizer=AdamW(), learning_rate=1e-3),
+                      key=jax.random.key(0), mesh=MeshSpec().build(gpu),
+                      layout=Layout(min_shard=256), update=UpdateBatch(batches=accumulation),
+                      fit=FitPolicy(split=split))
+        run.validate(steps=8)
+        return compile_ahead(run, token_rows(96, rows, 17))
+
+    one = ahead(1, 1, 1)
+    accumulated = ahead(4, 1, 1)
+    split = ahead(1, 2, 2)
+    shapes = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 16), jnp.int32))["params"]
+    narrow = 2 * sum(leaf.size for leaf in jax.tree.leaves(shapes))
+    assert accumulated.temp_bytes - one.temp_bytes < narrow, (accumulated.temp_bytes, one.temp_bytes, narrow)
+    assert split.temp_bytes - one.temp_bytes < narrow, (split.temp_bytes, one.temp_bytes, narrow)
+
+
+ACCUMULATING_SEEDS = 64
+"""Check 1's seeds for a scanned step pooling in its backward against the unrolled step's window: the
+layer-at-a-time sites' (`RUN_SEEDS`), whose judgement the map judge widens where it needs more units."""
+
+
+@pytest.mark.parametrize(("dtype", "clip", "periodic"), [
+    pytest.param("float32", 0.0, False, id="fp32",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("bfloat16", 1.0, False, id="bf16-clipped",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, True, id="periodic",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+])
+def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic):
+    """A scanned step pooling its gradient in its backward (`Transaction._planned_accumulation`) over a
+    window of two accumulated batches each split in two, clipped with narrow copies or over a periodic
+    stack, leaves its parameters and optimizer state after two updates on par with the unrolled step's
+    (check 1, against one device's float64 unrolled step)."""
+    from arm_forms import as_given
+    from test_stage_local import wide
+
+    from dew.training import UpdateBatch
+
+    extra = ({"num_layers": 4, "layer_types": ("sliding_attention", "full_attention") * 2,
+              "kinds": {"sliding_attention": {"window": 4}}}
+             if periodic else {"num_layers": 2})
+    optimizer = OptimConfig(optimizer=AdamW(weight_decay=0.1), learning_rate=1e-2, clip_grads=clip)
+
+    def built(*, exact: bool = False) -> Trainer:
+        model = decoder(dtype="float64" if exact else dtype, **extra)
+        run = Trainer(LMObjective(model, SEQ), optimizer, key=jax.random.key(0), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30), update=UpdateBatch(batches=2), fit=FitPolicy(split=2),
+                      checkpoints=None, tracker=None)
+        run.device_mesh = MeshSpec().build(jax.devices()[:1])
+        run.validate(steps=4)
+        return run
+
+    with jax.enable_x64(new_val=False):
+        start = unrolled(built)().initial_state()
+    init, made = jax.jit(decoder(dtype=dtype, **extra).init), {}
+
+    def initial(drawn: int):
+        # Each seed's own variables, the optimizer state every draw starts from.
+        if drawn not in made:
+            with jax.enable_x64(new_val=False):
+                variables = nn.unbox(init(jax.random.key(drawn), jnp.zeros((1, SEQ), jnp.int32)))
+                variables = jax.tree.map(lambda held, new: jnp.asarray(new, held.dtype), start.variables,
+                                         variables)
+                made[drawn] = dataclasses.replace(start, variables=variables)
+        return made[drawn]
+
+    def stepped(*, scan: bool, exact: bool = False):
+        # Its stack scanned or a layer at a time, a bf16 step reading narrow copies, compiled and stepped
+        # under those choices (`under_kernels`).
+        compiled = []
+
+        @as_given
+        @under_kernels(layer_scan="scanned" if scan else "plain",
+                       narrow_copies="on" if dtype == "bfloat16" and not exact else "off")
+        def run(tokens, drawn):
+            if not compiled:
+                compiled.append(built(exact=exact))
+            steps = compiled[0]
+            first = initial(int(drawn))
+            state = steps.staged(wide(first) if exact else jax.tree.map(jnp.copy, first))
+            placed = [shard_batch(steps.device_mesh, {"text": rows}) for rows in tokens]
+            if len(compiled) == 1:
+                compiled.append(steps.compile(state, placed[0]))
+            for batch in placed:
+                state, *_ = compiled[1](state, batch)
+            stored = steps.stored(state)
+            assert int(stored.updates) == 2, int(stored.updates)
+            return jax.device_get({"params": stored.variables["params"], "opt_state": stored.opt_state})
+        return run
+
+    def draw(seed):
+        # Four batches of four rows, two updates of two batches each.
+        return np.stack([token_rows(VOCAB, 4, SEQ + 1, seed=4 * seed + at)["text"] for at in range(4)]), (
+            np.int64(seed))
+
+    assert_as_exact(stepped(scan=True), stepped(scan=False), draw, "an accumulating scanned step",
+                    seeds=ACCUMULATING_SEEDS, truth_fn=stepped(scan=False, exact=True))
