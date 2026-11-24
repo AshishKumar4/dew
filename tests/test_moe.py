@@ -15,6 +15,7 @@ Slot order inside a token's top-k carries no meaning: the reference calls
 the comparisons sort each token's slots by expert id first.
 """
 
+import collections
 import functools
 import json
 from pathlib import Path
@@ -612,3 +613,146 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
     _, apart = moe.paired_projections(moe.Gathered(x, rows, where, scales), moe.Layered(gate, jnp.asarray(0)),
                                       moe.Layered(up, jnp.asarray(1)), sizes, jnp.bfloat16, "xla", None)
     np.testing.assert_array_equal(np.asarray(apart), np.asarray(plain(x, gate, up, scales)[1]))
+
+
+def _gated_case():
+    """A gated expert layer's rows, routing and three kernel stacks (two layers of two experts each) for
+    `moe.gated_experts`, the layer index each projection reads: [slots, depth] rows of 68 tokens at top 2,
+    sorted by expert, [layers, experts, depth, width] gate and up stacks and a [layers, experts, width,
+    depth] down stack."""
+    from dew.nn import moe
+
+    layers, experts, depth, width, tokens, top_k = 2, 2, 128, 256, 68, 2
+    slots = tokens * top_k
+    order = np.random.default_rng(1376).permutation(slots).astype(np.int32)
+    rows, where = jnp.asarray(order // top_k), jnp.arange(slots, dtype=jnp.int32)
+    sizes = jnp.asarray([70, 66], jnp.int32)
+    layer = jnp.asarray(1, jnp.int32)
+
+    def draw(seed: int, dtype=jnp.bfloat16):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(tokens, depth)), dtype),
+                *(jnp.asarray(rng.normal(size=shape) / 8, dtype)
+                  for shape in ((layers, experts, depth, width),) * 2 + ((layers, experts, width, depth),)))
+
+    def gated(x, gate, up, down, limit=None):
+        kernels = (moe.Layered(kernel, layer) for kernel in (gate, up, down))
+        return moe.gated_experts(moe.Gathered(x, rows, where), *kernels, sizes, x.dtype, "auto", None,
+                                 "swiglu", limit)
+
+    def apart(x, gate, up, down, limit=None):
+        # Each projection on its own, the gated product between them, as before the fused form.
+        stream = moe.Gathered(x, rows, where)
+        gate_rows, up_rows = (moe.expert_projection(stream, moe.Layered(kernel, layer), sizes, x.dtype,
+                                                    "auto", None) for kernel in (gate, up))
+        hidden = moe.gated_product("swiglu")(*moe.swiglu_clamped(gate_rows, up_rows, limit))
+        return moe.expert_projection(hidden, moe.Layered(down, layer), sizes, x.dtype, "auto", None)
+
+    return draw, gated, apart, (slots, depth, width)
+
+
+@pytest.mark.parametrize("limit", [None, 7.0], ids=["swiglu", "clamped swiglu"])
+def test_a_gated_expert_layer_is_bitwise_its_projections_apart(limit):
+    """A gated expert layer as one chain (`moe.gated_experts`, row 1376: the gate and up projections one
+    paired product, their gated product its epilogue and the down projection's prologue) computes its output
+    and each kernel's gradient bitwise its three projections apart with the gated product between them,
+    clamped or not (GPT-OSS's limit), and the rows' gradient as exactly (check 1)."""
+    from reference_error import assert_as_exact, with_gradients
+
+    draw, gated, apart, _ = _gated_case()
+    x, gate, up, down = draw(0)
+    cotangent = jax.random.normal(jax.random.key(3), (x.shape[0] * 2, x.shape[1]), jnp.bfloat16)
+    ran = [jax.jit(with_gradients(functools.partial(form, limit=limit)))(x, gate, up, down, cotangent)
+           for form in (gated, apart)]
+    # The output and each kernel's gradient bitwise (the leaves: output, rows', gate's, up's, down's); the
+    # rows' gradient below.
+    fused, separate = (jax.tree.leaves(each) for each in ran)
+    for mine, theirs in zip([fused[0], *fused[2:]], [separate[0], *separate[2:]], strict=True):
+        held = np.asarray(mine), np.asarray(theirs)
+        np.testing.assert_array_equal(*(each.view(np.uint16) for each in held))
+
+    # The rows' gradient sums the gate's and up's in the paired product's one accumulation, rounded once,
+    # where apart rounds each and adds: as exact as apart's, from their float64 truth (check 1).
+    def rows_gradient(form, dtype=None):
+        def gradient(x, gate, up, down, cotangent):
+            def loss(x):
+                out = form(x, gate, up, down, limit=limit)
+                wide = jnp.promote_types(out.dtype, jnp.float32)
+                return jnp.sum(out.astype(wide) * cotangent.astype(wide))
+            return jax.grad(loss)(x if dtype is None else x.astype(dtype))
+        return gradient
+
+    def drawn(seed):
+        operands = draw(seed)
+        return (*operands, jax.random.normal(jax.random.key(seed), cotangent.shape, jnp.bfloat16))
+
+    with jax.enable_x64(new_val=True):
+        def truth(x, gate, up, down, cotangent):
+            wide = [jnp.asarray(each, jnp.float64) for each in (x, gate, up, down, cotangent)]
+            return rows_gradient(apart)(*wide)
+        assert_as_exact(jax.jit(rows_gradient(gated)), jax.jit(rows_gradient(apart)), drawn,
+                        "a gated expert layer's rows' gradient", seeds=8, truth_fn=truth)
+
+
+def test_a_gated_expert_layer_runs_its_chain_on_mosaic_gpu_under_a_declared_swiglu():
+    """On an H100 whose grouped matmul is Mosaic GPU's and whose SwiGLU is declared Pallas's (a dense layer's
+    `norm_swiglu` launch), a gated expert layer's chain selects Mosaic GPU's launches, forward and backward,
+    refusing none (`generation.routes`): its gated product the epilogue's and the prologue's arithmetic on the
+    tile (`activations.gated_hook`), no launch of its own inside them; one paired call with an epilogue and a
+    down call reading what it formed (`grouped_matmul.weighed`)."""
+    from dew.nn.kernels import generation, grouped_matmul
+
+    draw, gated, _, _ = _gated_case()
+    operands = draw(0)
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic", swiglu="pallas"),
+          generation.routes() as routes, grouped_matmul.weighed() as calls):
+        loss = jax.grad(lambda *operands: gated(*operands).astype(jnp.float32).sum(), argnums=(0, 1, 2, 3))
+        jax.eval_shape(loss, *operands)
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}, routes
+    bound = [next(iter(call.bound.values()))[1].arguments for call, _ in calls]
+    # The forward's paired call carries the epilogue; the backward's (the rows' gradient through both stacks)
+    # none.
+    assert sum(arguments["hooks"].epilogue is not None for arguments in bound
+               if arguments.get("paired") is not None) == 1, bound
+    # The down projection's forward reads the epilogue's formed product (`gemm.gemm`'s `applied`), its
+    # prologue the backward's: its call takes the [slots, width] rows through the down stack.
+    down = operands[3]
+    assert any(arguments.get("kernel") is not None and tuple(arguments["kernel"].shape) == (
+        down.shape[0] * down.shape[1], *down.shape[2:]) and arguments["tokens"].shape[-1] == down.shape[2]
+        for arguments in bound), bound
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32"])
+def test_a_gated_expert_layers_checkpointed_gradient_runs_its_pair_once(dtype):
+    """A gated expert layer checkpointed under the `minimal` remat policy (its blocks' `nn.remat`: the gate's,
+    up's and down's outputs saved by name), its gradient of the rows and all three kernels holds the paired
+    product's forward, each wrapper and its launch, as often as the unchecked gradient does
+    (`moe.gated_experts`, row 1376): the gate's and up's roundings named where the policy reads them, the
+    paired product's backward reading its kept roundings and the down projection's its prologue's operands,
+    neither replays the pair; at bf16 on Mosaic GPU's launch and at fp32 (where the accumulators' rounding is
+    the accumulators themselves) on the route it selects."""
+    from reference_error import equations
+
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.nn.kernels import generation
+
+    draw, gated, _, (slots, _, width) = _gated_case()
+    operands = draw(0, dtype)
+
+    def loss(*operands):
+        return gated(*operands).astype(jnp.float32).sum()
+
+    def paired(f) -> collections.Counter:
+        # The paired forward's equations, each wrapper and its launch: those whose three outputs are the
+        # gate's and up's roundings and their gated product.
+        chosen = {"grouped_matmul": "mosaic"} if dtype == jnp.bfloat16 else {}
+        with generation.assumed("sm90"), generation.chosen(**chosen):
+            graph = jax.make_jaxpr(jax.grad(f, argnums=(0, 1, 2, 3)))(*operands)
+        three = [(slots, width)] * 3
+        return collections.Counter(equation.primitive.name for equation in equations(graph)
+                                   if [tuple(var.aval.shape) for var in equation.outvars] == three)
+
+    plain = paired(loss)
+    assert plain, "the gated expert layer runs its pair"
+    # Replayed, the checkpointed gradient would hold each of them twice.
+    assert paired(jax.checkpoint(loss, policy=REMAT_POLICIES["minimal"].checkpoint_policy())) == plain
