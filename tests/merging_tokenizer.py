@@ -16,9 +16,6 @@ class Merging(ByteTokenizer):
     def __init__(self, merged: bytes = b"B. y"):
         super().__init__()
         self.merged = merged
-        # Its one merge, which nothing cascades from, takes back its string's characters but one
-        # (`TakesBack`).
-        self.taken_back = len(merged) - 1
 
     def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
         """Its ids, each covering its characters, the merged string one id covering all of its."""
@@ -44,8 +41,8 @@ class Merging(ByteTokenizer):
 class RankedPairs(ByteTokenizer):
     """A ranked BPE over characters: its `merges`, pairs of tokens by rank, the best-ranked pair present
     merged wherever it stands left to right, again until none is, each merged token an id of its own past
-    every byte's. Its merges cascade, so it states no bound on what a longer cut takes back
-    (`dew.data.text.TakesBack`), though it inherits the byte vocabulary."""
+    every byte's. Its merges cascade, so it declares no bound on what a longer cut takes back
+    (`dew.data.text.taken_back`), though it inherits the byte vocabulary."""
 
     def __init__(self, merges: list[tuple[str, str]]):
         super().__init__()

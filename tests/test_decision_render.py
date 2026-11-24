@@ -482,9 +482,12 @@ def test_a_long_state_cut_in_a_merging_row_encoded_whole_encodes_few_cuts_past_i
     _, _, _, *question = release().segments
 
     class Counting(Merging):
-        """The merging vocabulary, counting the texts it reads the offsets of."""
+        """The merging vocabulary of "xyz", counting the texts it reads the offsets of: its one merge, which
+        nothing cascades from, takes back its three characters but one, which it declares
+        (`dew.data.text.taken_back`)."""
 
         read = 0
+        taken_back = 2
 
         def offsets(self, text: str):
             self.read += 1
@@ -506,7 +509,7 @@ def test_a_long_state_cut_in_a_byte_row_encoded_whole_encodes_few_cuts_past_its_
 
     class Counting(ByteTokenizer):
         """The byte vocabulary, counting the texts it reads the offsets of: its encoding the byte
-        vocabulary's, which it states (`dew.data.text.TakesBack`), as its offsets are no longer the byte
+        vocabulary's, which it declares (`dew.data.text.taken_back`), as its offsets are no longer the byte
         vocabulary's own by name."""
 
         read = 0

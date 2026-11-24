@@ -274,26 +274,20 @@ def _token_row(ids: ArrayLike | Sequence[int]) -> list[int]:
     return [int(token) for token in values]
 
 
-@runtime_checkable
-class TakesBack(Protocol):
-    """A vocabulary that states, as a proof of its own encoding, the most tokens a text's encoding can lose
-    as it is extended past a cut (`taken_back`): a cut of a text that overflows by more overflows however
-    much longer it is cut (`dew.decision.layout.SegmentLayout._cut`). Stated by a vocabulary's own
-    choosing, none inherited: a ranked BPE's merges cascade, one character turning every later pair's
-    parity, so no bound of its tokens' lengths holds."""
-
-    taken_back: int
-
-
 def taken_back(encoder: Tokenizer) -> int | None:
-    """The most tokens `encoder`'s encoding of a text loses as the text is cut longer, where it is proved:
-    none for the byte vocabulary's own encoding (`ByteTokenizer`, its encode and offsets not overridden),
-    each character's bytes its own tokens; what a vocabulary states of itself (`TakesBack`); None, no
-    bound, for any other."""
-    if (isinstance(encoder, ByteTokenizer) and type(encoder).encode is ByteTokenizer.encode
-            and type(encoder).offsets is ByteTokenizer.offsets):
+    """The most tokens `encoder`'s encoding of a text loses as the text is cut longer, where it is proved,
+    a cut of a text that overflows by more overflowing however much longer it is cut
+    (`dew.decision.layout.SegmentLayout._cut`): none for the byte vocabulary's own encoding
+    (`ByteTokenizer`, its encode and offsets not overridden), each character's bytes its own tokens; what a
+    vocabulary's own class declares of itself (its `taken_back`, an int), none inherited and none an
+    instance holds; None, no bound, for any other: a ranked BPE's merges cascade, one character turning
+    every later pair's parity, so no bound of its tokens' lengths holds."""
+    kind = type(encoder)
+    if isinstance(encoder, ByteTokenizer) and kind.encode is ByteTokenizer.encode and (
+            kind.offsets is ByteTokenizer.offsets):
         return 0
-    return encoder.taken_back if isinstance(encoder, TakesBack) else None
+    declared = vars(kind).get("taken_back")
+    return declared if isinstance(declared, int) and not isinstance(declared, bool) else None
 
 
 class ByteTokenizer:

@@ -1002,9 +1002,9 @@ class StepCompiler[L, E]:
             # copies built, and the bytes it held beside the step that the allocators did not.
             held_out, built = judging.charged
             stats = compiled_memory(planned.judged)
-            beside = None if stats is None else placed_beside(stats, held_out)
             # Its admitted terms the placed judgement's too (`memory.admission`), beside them as it placed.
             admitted = None if stats is None else list(admission(stats, held_out, built))
+            beside = None if admitted is None else admitted[1]
             probes = [*probes[:own], {**probes[own], "headroom": headroom, "beside": beside,
                                       "admitted": admitted}, *probes[own + 1:]]
             memory = memory_record(planned.executable, local_devices(mesh), held_out, fits=True)
