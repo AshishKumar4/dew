@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, PartitionSpec as P
 from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid, softplus, unit
+from test_recurrence_chunk import assert_packed_on_par, hosted, marked, sigmoid, softplus, unit
 
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
@@ -295,27 +295,28 @@ def test_a_chunks_faint_reads_are_kept_for_the_factors_that_raise_them():
                                        pair(0.0, 2.0 ** -59))
 
 
-def test_a_chunk_solves_its_inputs_once():
-    """ReviewMomentum1454's double solve (row 12693): the chunked op's forward program holds one triangular
-    solve, its walk's step's, which its outputs read again (`forms.Derived`'s `kept`), where the outputs'
-    map solved the chunk's system a second time."""
+def test_a_chunk_solves_its_inputs_once(monkeypatch):
+    """ReviewMomentum1454's double solve (row 12693): the chunked op's forward program builds one solve a
+    chunk, its walk's step's scaled substitution (`coupled_scan._substituted`), which its outputs read again
+    (`forms.Derived`'s `kept`), and no triangular solve beside it, where the outputs' map solved the chunk's
+    system a second time and each solve ran a float and a scaled solver both."""
+    from jax.lax import linalg
+
+    from dew.algebra import coupled_scan
+    from dew.nn.programs import equations
+
+    built = []
+    solve = coupled_scan._substituted
+
+    def counted(*given):
+        built.append(given)
+        return solve(*given)
+
+    monkeypatch.setattr(coupled_scan, "_substituted", counted)
     *given, _ = operands(jnp.float32, untied=False)(0)
     program = jax.make_jaxpr(lambda *x: tied(chunked(TIED))(*x))(*given)
-
-    def solves(jaxpr) -> int:
-        """The triangular solves of `jaxpr` and of every program its equations hold."""
-        count = 0
-        for equation in jaxpr.eqns:
-            count += equation.primitive.name == 'triangular_solve'
-            for value in equation.params.values():
-                for held in value if isinstance(value, (tuple, list)) else (value,):
-                    inner = getattr(held, 'jaxpr', held)
-                    count += solves(inner) if hasattr(inner, 'eqns') else 0
-        return count
-
-    assert solves(program.jaxpr) == 1
-
-
+    assert len(built) == 1
+    assert not any(equation.primitive is linalg.triangular_solve_p for equation in equations(program.jaxpr))
 def faint(seed):
     """A chunk of 16 tokens whose last decays the memory by about exp(-86), every other's one, its keys
     along the first key and its erase keys along the second, no values and write gates of one, the memory
@@ -343,3 +344,18 @@ def test_a_decay_past_float32s_least_normal_keeps_the_memorys_normal_reads():
     16 brought the decayed query below float32's least normal and flushed it."""
     assert_as_exact(jax.jit(chunked(UNTIED)), jax.jit(tokenwise), faint, "a faint decay's chunked reads",
                     seeds=SEEDS)
+
+
+def test_an_exact_zero_decay_is_differentiated_finite():
+    """ReviewMomentum1454's -inf (row 12693): log decays of -inf (an exact zero, admitted by their range) at
+    a packed row's tokens, one a document's first: the chunked op's output and every operand's gradient
+    finite, the -inf decays' own gradients zero, where the replay's faint arm read -inf less its nearest
+    integer, NaN, through its derivative."""
+    *given, cotangent = operands(jnp.float32, untied=False)(1)
+    q, k, v, log_decay, beta, mu, state = given
+    log_decay = log_decay.at[:, 3].set(-jnp.inf).at[:, 11].set(-jnp.inf)
+    starts = marked(DOCUMENTS, LENGTH)
+    rule = with_gradients(lambda *x: tied(chunked(TIED))(*x, starts=starts))
+    out, *grads = jax.jit(rule)(q, k, v, log_decay, beta, mu, state, cotangent)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((out, grads)))
+    np.testing.assert_array_equal(np.asarray(grads[3][:, [3, 11]]), 0.0)

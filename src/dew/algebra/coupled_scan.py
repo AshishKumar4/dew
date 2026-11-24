@@ -22,10 +22,12 @@ past float32's least normal is kept, and no sum is divided by another's (`_expon
 weighs is brought into it once, the memory's and the outputs' terms summed in scaled arithmetic and landed
 once (`_sum`, `_summed`): a term past float32's range where the result is not cancels before it is rounded,
 as the token walk's running state does, and a read of the entering pair (`_read`) a key at a time, weighed
-after. The solve's products (`L W`) are float32's, their terms the token walk's own reads of
-the state it has summed. The chunk's adjoint is its token walk's
-(`replay`), differentiated, as the single state's is. A packed document's first token (`Scan.reset`)
-enters a zero pair: its decays and its correction zero, the walk's pair selected to zero.
+after; each result the float computation's where it is its own (`_landed`). The solve is one forward
+substitution in scaled arithmetic (`_substituted`), its system's weights and sides never landed, its step's
+(`Derived.step`'s `kept`), which the outputs read again. The chunk's adjoint is its token walk's (`replay`),
+differentiated, as the single state's is, its faint decays never landed alone (`_decayed`). A packed
+document's first token (`Scan.reset`) enters a zero pair: its decays and its correction zero, the walk's
+pair selected to zero.
 
 The declaration names ranges for the operands its decays and `lam` read (`Scan.ranges`), which bound the
 chunk's sums (`_bounded`); a pair whose decays or `lam` no declared range bounds, whose sums pass float32's
@@ -45,7 +47,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.scipy.linalg import solve_triangular
 
 from dew import _cache
 from dew.algebra import derive, linear_scan, program, scaled, terms
@@ -171,15 +172,18 @@ def _decayed(state, exponent, base2: bool, cut) -> tuple:
     (`_exponential`), never the decay landed alone, nor a cotangent scaled beneath the least normal before
     the state it meets (power2's pullback scales its cotangent first)."""
     decay = _exp(base2, exponent)
+    # A faint decay's exponent finite (an exact zero's, -inf, read as none): neither arm reads -inf less
+    # its own nearest integer, NaN, nor differentiates through it (ReviewMomentum1454).
+    faint = (jnp.abs(decay) < np.finfo(decay.dtype).tiny) & jnp.isfinite(exponent) & ~cut
+    exponent = jnp.where(faint, exponent, 0.0)
     if base2:
         high, low = exponent, jnp.zeros_like(exponent)
     else:
         high, low = scaled.base2(exponent)
     whole = lax.stop_gradient(jnp.round(high))
     fraction = (high - whole) + low
-    faint = jnp.abs(decay) < np.finfo(decay.dtype).tiny
     split = jnp.exp(fraction * np.asarray(math.log(2), fraction.dtype)) * power2(state, whole)
-    return jnp.where(cut | faint, 0.0, decay), jnp.where(faint & ~cut, split, 0.0)
+    return jnp.where(cut | faint, 0.0, decay), jnp.where(faint, split, 0.0)
 
 
 def _bounded(declaration, names: Sequence[str], chunk: Mapping, parts: linear_scan.Coupled) -> None:
@@ -383,15 +387,14 @@ LOCAL_REACH = SUMS_REACH + 2048
 class Chunked(NamedTuple):
     """A chunk's values that read no state (`_prepared`), its decayed sums scaled values (`_decayed_sums`)
     each brought into its term once, none divided by another's factor: the system's strictly lower part `L`
-    (`L_ts = g(s, t - 1) C_t . B_s`) and whether a product of it flushed (`_weighed`), the tokens' inputs `U`
+    (`L_ts = g(s, t - 1) C_t . B_s`) scaled, never landed (`_substituted`), the tokens' inputs `U`
     and corrections `C`, the entering memory's and momentum's factors a token back (`A_{t-1}`, `b_{t-1}`),
     the queries' dots with the keys and their sums `g(s, t)`, the entering memory's factors to each token
     (`A_t`), the queries and the momentum's factors to each token (`b_t`), the free readouts, the keys and
     their sums to the chunk's end by the memory (`g(s, C)`) and the momentum (`m(s, C)`), and the entering
     memory's, momentum's and momentum's own factors there (`A_C`, `b_C`, `m(0, C)`)."""
 
-    lower: jax.Array
-    flushed: jax.Array
+    lower: scaled.Scaled
     inputs: jax.Array
     corrections: jax.Array
     kept_before: scaled.Scaled
@@ -415,10 +418,10 @@ def _prepared(first, second, lam, b, u, c, q, r, cut, *, base2: bool) -> Chunked
     alpha, mu = _exponential(first, base2, cut), _exponential(second, base2, cut)
     g, last, kept = _decayed_sums(alpha, mu, lam)
     before = _shifted(g, 0.0)
-    lower, flushed = _weighed(c @ b.T, _sliced(before, (..., slice(1, None))))
+    lower = scaled.mul(scaled.scaled(c @ b.T), _sliced(before, (..., slice(1, None))))
     ends = _sliced(g, -1)
     return Chunked(
-        lower=lower, flushed=jnp.any(flushed > 0), inputs=u, corrections=c, kept_before=_shifted(kept, 1.0),
+        lower=lower, inputs=u, corrections=c, kept_before=_shifted(kept, 1.0),
         momentum_before=_sliced(before, (..., 0)), dots=q @ b.T, sums=_sliced(g, (..., slice(1, None))),
         kept_to=kept, queries=q, momentum=_sliced(g, (..., 0)), free=r, keys=b,
         memory_sums=_sliced(ends, slice(1, None)), momentum_sums=_sliced(last, slice(1, None)),
@@ -498,35 +501,32 @@ def _read(vectors, state) -> scaled.Scaled:
     return _summed(_outer, (vectors.T, state), (vectors.shape[0], state.shape[-1]))
 
 
-def _substituted(lower, sides: scaled.Scaled):
-    """`W` of `(I - L) W = sides`, a token at a time in scaled arithmetic: each row its side plus the earlier
-    rows' weights by `L`, summed in scaled arithmetic (`_total`) and landed once, so a side past the format's
-    range that the correction brings back (2^127 entering the memory and -2^127 the momentum under decays and
-    write gates of one: a side 2^128 where the input is 2^127, ReviewMomentum1454) is never rounded alone."""
+def _substituted(lower: scaled.Scaled, sides: scaled.Scaled):
+    """`W` of `(I - L) W = sides`, a token at a time in scaled arithmetic, the chunk's one solve: each row its
+    side plus the earlier rows' weights by `L`, both scaled, never landed alone, summed in scaled arithmetic
+    (`_total`) and landed once: a side past the format's range that the correction brings back (2^127
+    entering the memory and -2^127 the momentum under decays and write gates of one: a side 2^128 where the
+    input is 2^127) and a weight beneath its least normal that a large earlier row raises (`L_21 = -2^-155`
+    over `w_1 = 2^100`, -2^-55) each kept (ReviewMomentum1454)."""
     def row(w, t):
-        products = scaled.mul(scaled.scaled(lower[t][:, None]), scaled.scaled(w))
+        weights = scaled.Scaled(lower.significand[t][:, None], lower.exponent[t][:, None], lower.reach)
+        products = scaled.mul(weights, scaled.scaled(w))
         side = scaled.Scaled(sides.significand[t], sides.exponent[t], sides.reach)
         return w.at[t].set(scaled.landed(scaled.add(side, _total(products)))), None
 
-    start = varying_like(jnp.zeros(sides.shape, sides.significand.dtype), lower, sides.significand)
+    start = varying_like(jnp.zeros(sides.shape, sides.significand.dtype), lower.significand,
+                         sides.significand)
     w, _ = lax.scan(row, start, jnp.arange(lower.shape[0]))
     return w
 
 
 def _inputs(chunk: Chunked, pair):
-    """A chunk's inputs `W` from the pair entering it: the system solved (a unit lower-triangular solve)
-    against each token's input and its correction's reads of the entering memory and momentum, each weighed
-    by its factor, the float solve's where it is its own (`_taken`, no product of the system flushed), else
-    its scaled twin's (`_substituted`, its sides never landed)."""
-    twin = _sum(chunk.inputs, scaled.mul(_read(chunk.corrections, pair[0]), _column(chunk.kept_before)),
-                scaled.mul(_read(chunk.corrections, pair[1]), _column(chunk.momentum_before)))
-    sides = (chunk.inputs + scaled.applied(chunk.corrections @ pair[0], _column(chunk.kept_before))
-             + scaled.applied(chunk.corrections @ pair[1], _column(chunk.momentum_before)))
-    eye = jnp.eye(chunk.lower.shape[0], dtype=chunk.lower.dtype)
-    running = solve_triangular(eye - chunk.lower, sides, lower=True, unit_diagonal=True)
-    substituted = _substituted(chunk.lower, twin)
-    taken = jnp.isfinite(running) & ((jnp.abs(running) >= ORDINARY) | ((running == 0) & (substituted == 0)))
-    return jnp.where(taken & ~chunk.flushed, running, substituted)
+    """A chunk's inputs `W` from the pair entering it: the system solved once in scaled arithmetic
+    (`_substituted`) against each token's input and its correction's reads of the entering memory and
+    momentum, each weighed by its factor, the sides never landed."""
+    sides = _sum(chunk.inputs, scaled.mul(_read(chunk.corrections, pair[0]), _column(chunk.kept_before)),
+                 scaled.mul(_read(chunk.corrections, pair[1]), _column(chunk.momentum_before)))
+    return _substituted(chunk.lower, sides)
 
 
 def _leaving(entering_terms: tuple, keys, w, sums: scaled.Scaled):
