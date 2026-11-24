@@ -383,6 +383,22 @@ class _Swapped(LMObjective):
         return super().loss({**variables, "params": swapped(variables["params"])}, batch, step)
 
 
+class _Returned(LMObjective):
+    """An LM whose statistics hold its layers' query projections beside its own, which its reduction reads
+    as a term on the weights: a read of them outside the loss's program."""
+
+    def loss(self, variables, batch, step):
+        stats, aux = super().loss(variables, batch, step)
+        queries = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(variables["params"])
+                   if "q_proj" in jax.tree_util.keystr(path)]
+        return (stats, queries), aux
+
+    def reduce_loss(self, stats):
+        held, queries = stats
+        value, mass = super().reduce_loss(held)
+        return value + 1e-3 * sum(jnp.sum(jnp.square(leaf)) for leaf in queries), mass
+
+
 class _Transposed(LMObjective):
     """An LM whose model reads each of its layers' square weights transposed on its last two axes (its
     attention's projections, `TINY_DECODER`'s 32 by 32), a layer at a time or stacked alike: a layout its
@@ -775,7 +791,7 @@ class _Scalar(LMObjective):
 OBJECTIVES = {"lm": LMObjective, "penalized": _Penalized, "branched": _Branched, "repeated": _Repeated,
               "nested": _Nested, "scalar": _Scalar, "transposed": _Transposed, "detached": _Detached,
               "twice": _Twice, "permuted": _Permuted, "swapped": _Swapped,
-              "substituted": _Substituted, "cast": _Cast}
+              "substituted": _Substituted, "cast": _Cast, "returned": _Returned}
 """Each accumulating witness's objective: the LM and its scalar mean, whose runs pool in their backward,
 and those whose runs the step accumulates ordinarily, read beside a term on the weights, in a branch, in a
 loop or within a nested jit."""
@@ -825,14 +841,18 @@ def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, ob
 @pytest.mark.parametrize("objective", [
     pytest.param("detached", id="detached", marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param("twice", id="scored-twice", marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("returned", id="weights-in-statistics",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
 ])
 def test_a_scanned_step_planned_in_its_backward_but_no_once_read_run_updates_as_unrolled(objective):
     """A scanned step of one microbatch an update, which updates its runs in their backward where its
     loss reads each once and the step's pullback reaches it (`Transaction._read_once`), leaves its
     parameters and optimizer state after four updates on par with the unrolled step's (check 1, against one
     device's float64 unrolled step) where its loss detaches its decoder's output (no backward reaches its
-    runs, which then took the zeros left as their weights and moments) or scores it twice (each run read
-    twice, which the step refused by name): the step updates them as unscanned (review of row 12080)."""
+    runs, which then took the zeros left as their weights and moments), scores it twice (each run read
+    twice, which the step refused by name) or returns its weights among its statistics, which its
+    reduction penalizes (a read outside the loss's program, whose cotangent the rule's new weights took
+    as theirs): the step updates them as unscanned (review of row 12080)."""
     _on_par_unrolled("float32", 0.0, objective, periodic=False, batches=1, split=1)
 
 
