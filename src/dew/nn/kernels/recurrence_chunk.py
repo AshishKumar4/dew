@@ -1386,25 +1386,25 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     but for a form the rule's kernels do not run, which the portable math takes; `readout` whether the
     call's readout reads the state after its token's update alone (`PortCase.readout`) or after it less its
     own write (`apart`, which its call to the template carries), `turns` the key pairs its state turns
-    (`PortCase.turns`, `recurrence.Hooks.turns`) and `turn` its turns, which its forked rotation's dtype
-    reads (`_turned_shapes`)."""
+    (`PortCase.turns`, `recurrence.Hooks.turns`) and `turn` its turns, through which a turned call's launch
+    binds its operands (`_turned_launch`)."""
     dtype = jnp.dtype(jnp.result_type(query, key, value))
     rounded = chunk_rounding(delta, dtype) if rounded is None else rounded
     call, shards = None, (None, key, value)
     if not transition:
         # A transition of its own binds no template call: no kernel but the portable math forms it. A turned
-        # call's as its launch binds (`_turned_shapes`).
-        launched = _turned_shapes(query, key, value, forked, turn) if turns else (query, key, forked)
+        # call's as its launch binds them (`_turned_launch`).
+        launched = (_turned_launch(query, key, value, g, beta, state, skip, turn, starts, firsts, forked)
+                    if turns else (query, key, forked))
         call, shards = template_bind(
             launched[0], launched[1], value, g, beta, state, starts, firsts, skip, launched[2],
             max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound, rounded=rounded,
             apart=apart, values_gated=values_gated, unit_pairs=unit_pairs, decay_bound=decay_bound)
     _, shard_key, shard_value, *_ = shards
     if turns and call is not None:
-        # The port's case reads the call's own key heads a shard: a turned launch's are a value head's each.
-        grouped = shard_value.shape[-2] * key.shape[2] // value.shape[2]
-        shard_key = jax.ShapeDtypeStruct((*shard_key.shape[:-2], grouped, shard_key.shape[-1]),
-                                         shard_key.dtype)
+        # The port's case reads the call's own key heads a shard, as an unturned call's are laid (a turned
+        # launch's are a value head's each).
+        (shard_key,) = shard_shapes((key,), (_shard_specs(value.shape, key.shape[2], g.ndim)[0],))
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying), dtype=dtype,
                     key_width=key.shape[-1], heads=(shard_key.shape[-2], *shard_value.shape[-2:]),
@@ -1416,26 +1416,30 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
-def _turned_shapes(query, key, value, forked: Forked | None, turn) -> tuple:
-    """A turned call's operands as its launch binds them (`_turned_or_plain`, `turned.call`): its queries and
-    keys a value head's each, a forked call's entry keys with them and its documents' load rotation `(cos,
-    sin)` `[B, D, Hv, A]` of its `turn` `[B, T, H, A]` (`Forked.turning`, in its frames' dtype, the turns'
-    at least fp32, `turned.frames`), as shapes: the call a
-    selector certifies (`template_bind`) is then the launch that runs. Bound to the unturned call, its key
-    heads grouped and its forked call's rotation none, the selector certified a launch the step never ran
-    (row 7976)."""
-    heads = value.shape[2]
+def _turned_launch(query, key, value, g, beta, state, skip, turn, starts, firsts,
+                   forked: Forked | None) -> tuple:
+    """A turned call's operands as its launch binds them, `(query, key, forked)` as shapes: traced through
+    the turned call itself (`_turned_or_plain`, under `jax.eval_shape`), its launch recording what it is
+    given, its queries and keys a value head's each and a forked call's entry keys and load rotation its
+    documents' (`Forked.entry`, `Forked.turning`), so the call a selector certifies (`template_bind`) is the
+    launch that runs. Restated by hand beside it, the two drifted: the selector certified a launch the step
+    never ran (rows 7976, 12402, 12478)."""
+    seen = []
 
-    def repeated(x, axis: int) -> jax.ShapeDtypeStruct:
-        return jax.ShapeDtypeStruct((*x.shape[:axis], heads, *x.shape[axis + 1:]), x.dtype)
+    def launch(context, query, key, value, g, beta, state, skip, entry, turning):
+        bound = context[2]
+        if bound is not None:
+            bound = dataclasses.replace(bound, entry=entry, turning=turning)
+        seen.append(jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (query, key, bound)))
+        memory = (value.shape[0], value.shape[2], key.shape[-1], value.shape[-1])
+        return jnp.zeros(value.shape, value.dtype), jnp.zeros(memory, jnp.float32)
 
-    query, key = (repeated(x, 2) for x in (query, key))
-    if forked is not None:
-        entry = forked.entry if forked.entry is None else (repeated(forked.entry[0], 3), *forked.entry[1:])
-        rotation = jax.ShapeDtypeStruct((*forked.loads.shape, heads, turn.shape[-1]),
-                                        at_least_fp32(jnp.result_type(turn)))
-        forked = dataclasses.replace(forked, entry=entry, turning=(rotation, rotation))
-    return query, key, forked
+    def traced(query, key, value, g, beta, state, skip, turn, starts, firsts, forked):
+        return _turned_or_plain(launch, query, key, value, g, beta, state, skip, turn, starts=starts,
+                                firsts=firsts, forked=forked, scale=1.0, group=1)
+
+    jax.eval_shape(traced, query, key, value, g, beta, state, skip, turn, starts, firsts, forked)
+    return seen[0]
 
 
 def _portable(hooks: recurrence.Hooks, tiles: Tiles, query, key, value, g, beta, state, starts, firsts, *,

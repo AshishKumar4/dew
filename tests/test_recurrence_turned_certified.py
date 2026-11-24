@@ -1,5 +1,5 @@
 """A turned call on the recurrence template: the kernels its selector certifies the ones its step runs
-(`recurrence_chunk._turned_shapes`, rows 7976 and 12402), read from the lowered program's own calls
+(`recurrence_chunk._turned_launch`, rows 7976, 12402 and 12478), read from the lowered program's own calls
 (`lowered.kernel_calls`), and its forked operands refused unforked (row 12631)."""
 
 import dataclasses
