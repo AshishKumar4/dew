@@ -246,10 +246,14 @@ def _token_back(program: Program, t, k_t, v_t, dy_t, read, terms, decay, after):
     kept, added = jnp.exp(aged - top), jnp.exp(k_t - top)
     # Each share in the reverse mode's grouping (the recurrence's, `rwkv4.recurrent_wkv4`'s), weighted first
     # where that parts past float32's range; the maximum's cotangent net of them, never added and taken back.
+    # A share whose step's factor is zero (the past's at a document's first token) is none, selected: an
+    # infinite cotangent times it was NaN (ReviewRecurrenceBatch).
     past_share = _finite_or((g_alpha * alpha + g_beta * beta) * kept,
                             lambda: _contracted(kept, g_alpha, alpha, g_beta, beta))
     own_share = _finite_or((g_alpha * v_t + g_beta) * added,
                            lambda: _contracted(added, g_alpha, v_t, g_beta, 1.0))
+    past_share = jnp.where(kept == 0.0, zero, past_share)
+    own_share = jnp.where(added == 0.0, zero, own_share)
     dk = du + jnp.where(won, g_eps - past_share, own_share)
     dw = jnp.where(won, past_share, g_eps - own_share)
     dv = by_present + added * g_alpha
@@ -278,7 +282,7 @@ def _kept(shape: Walk):
 
 @tuning.lowered_once(("shape",))
 def walked_back(k, v, w, u, starts, alpha, beta, eps, dy, final_alpha, final_beta, final_eps, *, shape: Walk):
-    """The gradients of `k` and `v` (`[B, T, D]` in their dtype), each program's of `w` and `u` (`[B, 1, D]`
+    """The gradients of `k` and `v` (`[B, T, D]` in their dtype), each span's of `w` and `u` (`[B, spans, D]`
     fp32, XLA sums them) and the cotangent of the carry entering the call (`[B, 1, D]` fp32 each), from the
     outputs' cotangent `dy`, each span's entering carry (`alpha`, `beta`, `eps` `[B, spans, D]`) and the final
     carry's cotangent (`final_*` `[B, 1, D]`): a program a row and a block of channels walks the row's spans
@@ -295,7 +299,7 @@ def walked_back(k, v, w, u, starts, alpha, beta, eps, dy, final_alpha, final_bet
         first = Program(shape, starts_ref, block=0)
         zero = jnp.zeros((shape.lanes,), jnp.float32)
 
-        def span(i, carried):
+        def span(i, after):
             program = Program(shape, starts_ref, block=shape.spans - 1 - i)
 
             def emit(t, k_t, v_t, dy_t, read, terms, decay, carried):
@@ -307,17 +311,22 @@ def walked_back(k, v, w, u, starts, alpha, beta, eps, dy, final_alpha, final_bet
                 return before, (compensated_add(dw_sum, (dw, zero)), compensated_add(du_sum, (du, zero)))
 
             given_refs = (k_ref, v_ref, w_ref, u_ref, dy_ref, carries)
-            return _back(program, given_refs, shape, kept_ref, carried, emit)
+            before, sums = _back(program, given_refs, shape, kept_ref, (after, ((zero, zero), (zero, zero))),
+                                 emit)
+            # Each span's own partial sums, XLA's to sum: a row's summed through would pass float32's range
+            # where its spans' did not (2^127 + 2^127 before -2^127, ReviewRecurrenceBatch).
+            for ref, (high, low) in zip((dw_ref, du_ref), sums, strict=True):
+                program.summarised(ref, high + low)
+            return before
 
         final = tuple(first.summary(ref) for ref in given[9:])
-        leaving, sums = jax.lax.fori_loop(0, shape.spans, span, (final, ((zero, zero), (zero, zero))))
-        for ref, (high, low) in zip((dw_ref, du_ref), sums, strict=True):
-            first.summarised(ref, high + low)
+        leaving = jax.lax.fori_loop(0, shape.spans, span, final)
         for ref, value in zip(leaving_refs, leaving, strict=True):
             first.summarised(ref, value)
 
     once = outputs.output(jnp.float32, outputs.axis(k, 0), 1, outputs.axis(k, 2))
-    out_type = (per_token(k, k.dtype), per_token(v, v.dtype), *(once for _ in range(5)))
+    out_type = (per_token(k, k.dtype), per_token(v, v.dtype), per_span(k, shape), per_span(k, shape),
+                *(once for _ in range(3)))
     return launch(entry, shape, "wkv4_walk_backward", out_type, operands, scratch=(_kept(shape),), whole=True)
 
 

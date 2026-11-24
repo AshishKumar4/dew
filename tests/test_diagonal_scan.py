@@ -265,6 +265,42 @@ def test_an_infinite_state_stays_infinite_through_a_decay_below_any_float():
     np.testing.assert_array_equal(np.asarray(final), np.inf)
 
 
+def test_a_write_after_a_raised_and_decayed_sum_keeps_its_place():
+    """ReviewRecurrenceBatch's term alignment: writes of 2^64 and 2^-63, the second's gate about -87.25, then
+    no writes and unit gates over three spans: the first span's sum is raised, decayed to about 2^-62 at its
+    raised scale, and the write joins it at the decayed sum's own scale (`walks.summed_on` raises it again
+    first), on par with the token recurrence from float64 (check 1), where the write aligned to the raised
+    scale fell below float32's range and was lost."""
+    def draw(seed):
+        rng = np.random.default_rng([1453, 4, seed])
+        x = np.zeros((ROWS, 150, CHANNELS))
+        x[:, 0], x[:, 1] = 2.0 ** 64, 2.0 ** -63
+        g = np.zeros(x.shape)
+        g[:, 1] = -87.25 + 0.01 * rng.standard_normal((ROWS, CHANNELS))
+        cotangents = (rng.standard_normal(x.shape).astype(np.float32),
+                      rng.standard_normal((ROWS, CHANNELS)).astype(np.float32))
+        return (x.astype(np.float32), g.astype(np.float32), np.zeros((ROWS, CHANNELS), np.float32),
+                np.zeros((ROWS, 150), bool), cotangents)
+
+    assert_as_exact(jax.jit(differentiated(routed("kernels"))), jax.jit(differentiated(stepped)), draw,
+                    "a write after a raised and decayed sum", seeds=FEWEST_SEEDS,
+                    truth_fn=jax.jit(differentiated(token_by_token)))
+
+
+def test_a_zero_decay_no_document_starts_at_is_no_cut():
+    """ReviewRecurrenceBatch's cut flag: an infinite entering state, a gate of -inf at the first token that
+    starts no document, a write of one there and none after, over three spans: the token walk's state is
+    `0 inf + 1`, NaN, at every token, and the kernels' alike, where a span's decay read as a cut where zero
+    took the write alone and later spans none of the state."""
+    x = np.zeros((ROWS, 150, CHANNELS), np.float32)
+    x[:, 0] = 1.0
+    g = np.zeros(x.shape, np.float32)
+    g[:, 0] = -np.inf
+    state = np.full((ROWS, CHANNELS), np.inf, np.float32)
+    out, final = jax.jit(routed("kernels"))(x, g, state, np.zeros((ROWS, 150), bool))
+    assert np.isnan(np.asarray(out)).all() and np.isnan(np.asarray(final)).all()
+
+
 @pytest.mark.mesh(devices=2)
 def test_the_kernels_refuse_a_checked_shard_map_whose_gates_alone_vary():
     """ReviewRecurrenceBatch's selector variation: inside a `shard_map` that checks varying axes, writes

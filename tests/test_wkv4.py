@@ -299,6 +299,34 @@ def test_a_document_cuts_an_infinite_cotangent_from_every_token_before_it():
         np.testing.assert_array_equal(np.asarray(grad), 0.0)
 
 
+def test_a_reset_tokens_key_takes_an_infinite_numerators_cotangent_from_none_of_its_past():
+    """ReviewRecurrenceBatch's zero factor: one token, a document's first, its key, bonus 0 and value 1, no
+    output cotangent and a final carry's of `(inf, 0, 1)`: the past's share at a document's first token is
+    none, so the key's gradient is the maximum's cotangent, 1, where the infinite cotangent times the past's
+    zero factor made it NaN."""
+    key, value = np.zeros((ROWS, 1, WIDE), np.float32), np.ones((ROWS, 1, WIDE), np.float32)
+    starts = np.ones((ROWS, 1), bool)
+    _, _, dkey, _, _ = _kernel_gradients(0.0, key, value, _carry(0.0, 1.0, 0.0), starts, np.zeros(key.shape),
+                                         _carry(np.inf, 0.0, 1.0))
+    np.testing.assert_array_equal(np.asarray(dkey), 1.0)
+
+
+def test_a_rows_parameter_gradient_sums_its_spans_apart():
+    """ReviewRecurrenceBatch's parameter sums: two-token documents of values -2 and 2 (keys and bonus 0, so
+    a document's second token's bonus gradient is its output cotangent), output cotangents of -2^127 and
+    2^127 at two second tokens of the second span and 2^127 at one of the third, in the first row alone: the
+    bonus's gradient is 2^127, each span's partial summed apart (0 and 2^127), where summed through the row
+    from its end it passed 2^128 before the -2^127, NaN."""
+    key = np.zeros((ROWS, 150, WIDE), np.float32)
+    value = np.where(np.arange(150) % 2 == 0, -2.0, 2.0)[None, :, None] * np.ones(key.shape, np.float32)
+    starts = np.broadcast_to(np.arange(150) % 2 == 0, (ROWS, 150))
+    dy = np.zeros(key.shape)
+    dy[0, 65], dy[0, 67], dy[0, 129] = -(2.0 ** 127), 2.0 ** 127, 2.0 ** 127
+    _, dtime_first, _, _, _ = _kernel_gradients(0.0, key, value.astype(np.float32), _carry(0.0, 1.0, 0.0),
+                                                starts, dy, _carry(0.0, 0.0, 0.0))
+    np.testing.assert_array_equal(np.asarray(dtime_first), 2.0 ** 127)
+
+
 @pytest.mark.mesh(devices=2)
 def test_the_kernels_refuse_a_checked_shard_map_whose_values_alone_vary():
     """ReviewRecurrenceBatch's selector variation: inside a `shard_map` that checks varying axes, keys whole

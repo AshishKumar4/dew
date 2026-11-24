@@ -184,19 +184,27 @@ def summed_on(carried, factor, term, first):
     float32's range at its scale. Summed whole, two writes of 2^127 after a state of -2^127 were infinite;
     halved, a least normal write was lost; raised and never lowered, writes of 2^126 and -2^126 left 2^-126
     after them lowered to nothing; raised after the factor, writes of 2^64 and -(2^64 - 2^40) times a decay
-    of e^-87.25 underflowed (ReviewRecurrenceBatch)."""
-    value, scale = carried
-    for _ in range(2):
-        small = (scale >= 1.0) & (jnp.abs(value) < 1.0)
-        value = jnp.where(small, value * 2.0 ** 64, value)
-        scale = jnp.where(small, scale - 1.0, scale)
-    decayed = factor * value
+    of e^-87.25 underflowed; raised before it alone, a write of 2^-63 after 2^64 decayed by e^-87.25 was
+    lowered to the raised scale and flushed (ReviewRecurrenceBatch): the decayed sum is raised again before
+    the term joins it."""
+    value, scale = _raised(*carried)
+    decayed, scale = _raised(factor * value, scale)
     lowered = jnp.where(scale >= 1.0, term * 2.0 ** -64, term)
     lowered = jnp.where(scale >= 2.0, lowered * 2.0 ** -64, lowered)
     value = cut(first, decayed + lowered, term)
     scale = cut(first, scale, jnp.zeros_like(scale))
     large = jnp.abs(value) >= LARGE
     return jnp.where(large, value * 2.0 ** -64, value), jnp.where(large, scale + 1.0, scale)
+
+
+def _raised(value, scale):
+    """`(value, scale)` raised back toward its range where it fell below one at a raised scale, 2^64 a step
+    (exact), at most twice."""
+    for _ in range(2):
+        small = (scale >= 1.0) & (jnp.abs(value) < 1.0)
+        value = jnp.where(small, value * 2.0 ** 64, value)
+        scale = jnp.where(small, scale - 1.0, scale)
+    return value, scale
 
 
 REACH = 2048
@@ -211,7 +219,7 @@ LEAST = -1100
 
 def held(value: scaled.Scaled) -> scaled.Scaled:
     """`value` bound within `REACH`, a nonzero one's exponent no lower than `LEAST`: only a structural zero
-    (a cut, `cut_off`) is zero, where zeroed below `2^LEAST` a decay of e^-4096 cut an infinite state the
+    (a cut, its map's flag) is zero, where zeroed below `2^LEAST` a decay of e^-4096 cut an infinite state the
     walk carries (ReviewRecurrenceBatch)."""
     return scaled.Scaled(value.significand, jnp.maximum(value.exponent, LEAST), REACH)
 
@@ -238,8 +246,9 @@ def chosen(condition, first: scaled.Scaled, second: scaled.Scaled) -> scaled.Sca
     return held(scaled.where(condition, first, second))
 
 
-def cut_off(decay: scaled.Scaled):
-    """Whether a span's map keeps none of the value entering it: its decay zero (a document starts in it)."""
+def zero_decay(decay: scaled.Scaled):
+    """Whether a span's decay is numerically zero (a gate of -inf): not a cut, which a flag carries (an
+    infinite value entering it is NaN, as the walk's `0 inf`)."""
     return decay.significand == 0
 
 
