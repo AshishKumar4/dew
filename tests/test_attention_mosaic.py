@@ -1597,23 +1597,17 @@ def test_a_pin_the_mosaic_program_cannot_take_is_illegal():
                                          interpret=True)
 
 
-@pytest.mark.parametrize("honored", [True, False], ids=["raised", "unraised"])
-def test_an_h100s_fused_backward_takes_its_producers_layout_where_its_raises_hold(honored, monkeypatch,
-                                                                                    without_deterministic_ops):
+def test_an_h100s_fused_backward_takes_its_producers_layout(without_deterministic_ops):
     """An H100's fast backward of a plain bf16 causal call 64 wide (Llama 3.2 1B's heads, 32 over 8, 4,096
-    tokens) derives its one launch on the dQ launch's layout, whose producer gives its consumers its
-    registers (`attention_mosaic.producer_raised`, M-NA-8-gh200), before the fed one, where the compile
-    honors the raises (`resources.RAISES_HONORED`); where it does not, the consumers hold no more than an
-    even share beside the producer and the fed layout is taken."""
-    from dew.nn.kernels.templates import resources
-
-    monkeypatch.setattr(resources, "RAISES_HONORED", honored)
+    tokens) derives its one launch queries first on the dQ launch's layout, whose producer gives its two
+    consumers its registers (`attention_mosaic.producer_raised`: 24/240), before the fed layout whose
+    consumers load their own rings (M-NA-8-gh200: 1.06 against 1.24 ms)."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _backward_call((1, 4096, 32, 8), 64, accurate=False)
         derived = op.derived(ba, target)
     assert derived is not None and derived.fused and derived.queries_first, derived
-    assert derived.family == (WGMMA if honored else FED["dkv_family"]), derived
+    assert (derived.family, derived.consumers) == (WGMMA, 2), derived
 
 
 def test_a_backward_derived_again_under_deterministic_ops_takes_no_fused_launch(request):
