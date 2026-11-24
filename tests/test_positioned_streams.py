@@ -248,7 +248,7 @@ def test_a_positioned_read_cut_finer_than_its_store_fills_no_cache_another_topol
 @pytest.mark.parametrize(("records", "shares"), [(130, 80), (130, 1), (192, 96)],
                          ids=["cut-for-its-readers", "read-whole", "cut-alike"])
 def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_cut_dealt_resumes(
-        tmp_path, records, shares, resume):
+        tmp_path, records, shares, resume, monkeypatch):
     """A positioned store of 130 records in 65 ranges read by 80 shares is cut into 80 ranges
     (`EVEN_CUT`), which each share's position holds: a position saved under the store's first cut, which
     held none, is refused where it resumes (`PlanChanged`, "shards.cut"), never read at the rows its
@@ -256,7 +256,7 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
     64 ranges read by 96 shares are cut into ranges of two records, as the first cut cut them, so it holds
     none: a position saved so, before any cut was named, resumes at its next row (review of d22: the cut
     was named in the store's fact whatever its readers, refusing reads it never cut; Train 1248's review:
-    one cut alike refused)."""
+    one cut alike refused), as does one an earlier Dew saved naming the cut alike (`EVEN_CUT`)."""
     from dew._position import PlanChanged
     from dew.training._fit import restored_or_restarted
 
@@ -265,7 +265,7 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
     files = Files(str(path))
     files.provision()
     chain = Pipeline(files).map_with_index(lambda index, row: {**row, "at": np.int64(index)},
-                                           identity="at").batch(3)
+                                           identity="at").batch(shares)
     loading = Loading(workers=0, threads=1, read_buffer=1)
     partition = DataPartition(index=0, count=shares)
 
@@ -320,6 +320,26 @@ def test_a_position_saved_under_another_cut_of_its_store_is_refused_and_one_no_c
             assert int(next(iter(resumed))["at"][0]) == int(following["at"][0]) != int(first["at"][0])
     finally:
         resumed.close()
+    if shares > 1 and not named:
+        # Saved as an earlier Dew saved it, every cut named, this one alike.
+        from dew.data import shards
+
+        with monkeypatch.context() as patched:
+            patched.setattr(shards, "_changed_cut", lambda manifest, cut: (
+                None if cut == tuple(manifest.shards) else manifest.subdivided_by))
+            tagged = opened()
+            try:
+                next(iter(tagged))
+                legacy = tagged.get_state()
+            finally:
+                tagged.close()
+        assert '"cut": "even"' in json.dumps(json.loads(legacy)), legacy
+        again = opened()
+        try:
+            again.set_state(legacy)
+            assert int(next(iter(again))["at"][0]) == int(following["at"][0])
+        finally:
+            again.close()
 
 
 @pytest.mark.parametrize("positioned", [True, False], ids=["positioned-ranges", "plain-lines"])

@@ -37,6 +37,7 @@ import numpy as np
 
 from dew._records import integer, record, strings
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, Batch, Draws
+from dew.data import shards as passes
 from dew.data.analysis import (
     _LOCAL,
     _VIEWS,
@@ -56,6 +57,7 @@ from dew.data.analysis import (
     _volatile,
     _written,
     groups_held,
+    indexable,
 )
 from dew.data.cache import _Mapped
 from dew.data.completion import Completed, Numbered, cuts, reach, released
@@ -590,6 +592,9 @@ def _through(rows: Rows, run: tuple[RecordStage, ...], name: str, label: str, lo
         return Concurrently(_as_iter(rows, loading), lowered, pool)
     if any(isinstance(stage, FlatMap) for stage in run):
         return _expanded(_as_iter(rows, loading), run, name, label, unplaced=unplaced)
+    if seed is None and isinstance(rows, pygrain.IterDataset) and indexable(run):
+        # One record of each, so a window shuffle after it can read its window by index through it.
+        return passes.IndexedMap(rows, lowered, functools.partial(passes.made_one, lowered))
     return rows.map(lowered) if seed is None else rows.random_map(lowered, seed=seed)
 
 
@@ -669,18 +674,10 @@ class _ShardSteps:
         """The shard's records by index through these steps (`base.ShardRows`), where its reader serves them
         so and every step is a map, none drawing, reading a record's place or on a pool of its own: one
         record of each, the stream's count kept. None for a cached shard or any other step's, a stream."""
-        plain = not self.cached and all(type(stage) is Map and pool_of((stage,)) is None
-                                        for stage in self.stages)
+        plain = not self.cached and indexable(self.stages)
         rows = self.reader.indexed(shard) if plain and isinstance(self.reader, base.IndexedShards) else None
         return rows if rows is None or not self.stages else base.MappedRows(
-            rows, functools.partial(_one_made, _Rows(self.stages)))
-
-
-def _one_made(steps: _Rows, record: Batch) -> Batch:
-    """`record` through `steps`, maps alone, each making one record of one (`_ShardSteps.indexed`)."""
-    made = steps(record)
-    assert isinstance(made, Mapping), type(made)
-    return made
+            rows, functools.partial(passes.made_one, _Rows(self.stages)))
 
 
 def _transparent(pipeline: Pipeline, cache: int) -> bool:

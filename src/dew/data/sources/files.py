@@ -1592,37 +1592,55 @@ _BLANK = np.frombuffer(b" \t\r\n\x0b\x0c", np.uint8)
 class _ShardLines:
     """A line file's shard's records by index (`ShardRows`), as `_LineIterator` gives them: the lines that
     start in its byte range from the first whole one (`_line_start`), a JSON line of whitespace alone none,
-    each decoded as the stream decodes it (`_decoded`). The file is mapped into memory once, and its
-    records' starts and ends found a chunk at a time (`_SCANNED_BYTES`) only as far as a read asks (`rows`),
-    sixteen bytes a record; its iterator's position is the offset past the record it gave last, as the
-    stream's (`_LineIterator.get_state`). Closed with the reader that asked it."""
+    each decoded as the stream decodes it (`_decoded`). The file is mapped into memory as a read asks for it
+    and let go as its reader releases it (`release`), its records' starts and ends found a chunk at a time
+    (`_SCANNED_BYTES`) only as far as a read asks (`rows`), sixteen bytes a record, kept across releases;
+    its iterator's position is the offset past the record it gave last, as the stream's
+    (`_LineIterator.get_state`). Closed with the reader that asked it."""
 
     def __init__(self, kind: str, path: str, shard: Shard):
-        self.kind, self.shard = kind, shard
-        descriptor = os.open(path, os.O_RDONLY)
-        try:
-            size = os.fstat(descriptor).st_size
-            # The map holds the file open itself until it closes.
-            self.memory = mmap.mmap(descriptor, 0, access=mmap.ACCESS_READ) if size else None
-        finally:
-            os.close(descriptor)
-        self.stop = size if shard.stop is None else min(shard.stop, size)
+        self.kind, self.shard, self.path = kind, shard, path
+        self.size = os.stat(path).st_size
+        self.stop = self.size if shard.stop is None else min(shard.stop, self.size)
+        self._memory: mmap.mmap | None = None
         self.first = 0
-        if shard.start and self.memory is not None:
+        if shard.start and self.size:
             # The first line starting at the range's start or past it, as a stream finds it (`_line_start`).
-            found = self.memory.find(b"\n", shard.start - 1, self.stop - 1)
+            found = self._mapped().find(b"\n", shard.start - 1, self.stop - 1)
             self.first = self.stop if found < 0 else found + 1
         # Where the scan stands (no line starts in the bytes before it that it has not found), and the
-        # records it found: their starts and ends, each end the offset past the line's newline.
-        self.scanned = self.first
-        self.starts = np.empty(0, np.uint64)
-        self.ends = np.empty(0, np.uint64)
+        # records it found: their starts and ends, each end the offset past the line's newline, in buffers
+        # grown by doubling, their first `count` entries found.
+        self.scanned, self.count = self.first, 0
+        self.starts = np.empty(1024, np.uint64)
+        self.ends = np.empty(1024, np.uint64)
+
+    def _mapped(self) -> mmap.mmap:
+        """The file mapped into memory, mapped again where it was let go (`release`)."""
+        if self._memory is None:
+            descriptor = os.open(self.path, os.O_RDONLY)
+            try:
+                # The map holds the file open itself until it closes.
+                self._memory = mmap.mmap(descriptor, 0, access=mmap.ACCESS_READ)
+            finally:
+                os.close(descriptor)
+        return self._memory
+
+    def _held(self, starts: np.ndarray, ends: np.ndarray) -> None:
+        """Keep `starts` and `ends` after the records found, their buffers doubled where they are full."""
+        needed = self.count + len(starts)
+        if needed > len(self.starts):
+            size = max(needed, 2 * len(self.starts))
+            self.starts = np.resize(self.starts, size)
+            self.ends = np.resize(self.ends, size)
+        self.starts[self.count:needed], self.ends[self.count:needed] = starts, ends
+        self.count = needed
 
     def _scan(self, limit: int) -> None:
         """Find records until `limit` are found or the range holds no more."""
-        assert self.memory is not None
-        while len(self.starts) < limit and self.scanned < self.stop:
-            chunk = np.frombuffer(self.memory, np.uint8, min(_SCANNED_BYTES, self.stop - self.scanned),
+        memory = self._mapped()
+        while self.count < limit and self.scanned < self.stop:
+            chunk = np.frombuffer(memory, np.uint8, min(_SCANNED_BYTES, self.stop - self.scanned),
                                   self.scanned)
             # Each line starting in the chunk: where the scan stands, and past each newline but the last
             # byte of the range (which starts no line in it).
@@ -1633,41 +1651,43 @@ class _ShardLines:
             ends[:len(newlines)] = newlines[:len(starts)] + np.uint64(1)
             if len(newlines) < len(starts):
                 # The last line runs past the chunk: it ends at the next newline past it, or the file's end.
-                found = self.memory.find(b"\n", int(starts[-1]))
-                ends[-1] = len(self.memory) if found < 0 else found + 1
+                found = memory.find(b"\n", int(starts[-1]))
+                ends[-1] = len(memory) if found < 0 else found + 1
             self.scanned = int(ends[-1]) if len(ends) else self.stop
             if self.kind == "jsonl":
                 # A line that opens with whitespace is no record where it holds nothing else.
-                opening = np.isin(np.frombuffer(self.memory, np.uint8)[starts.astype(np.int64)], _BLANK)
+                opening = np.isin(np.frombuffer(memory, np.uint8)[starts.astype(np.int64)], _BLANK)
                 kept = np.ones(len(starts), bool)
                 for at in np.flatnonzero(opening):
-                    kept[at] = bool(self.memory[int(starts[at]):int(ends[at])].strip())
+                    kept[at] = bool(memory[int(starts[at]):int(ends[at])].strip())
                 starts, ends = starts[kept], ends[kept]
-            self.starts = np.concatenate([self.starts, starts])
-            self.ends = np.concatenate([self.ends, ends])
+            self._held(starts, ends)
 
     def rows(self, limit: int) -> int:
-        if self.memory is not None:
+        if self.size:
             self._scan(limit)
-        return min(limit, len(self.starts))
+        return min(limit, self.count)
 
     def __getitem__(self, index: int) -> Batch:
-        assert self.memory is not None and 0 <= index < len(self.starts), index
-        return _decoded(self.kind, self.memory[int(self.starts[index]):int(self.ends[index])])
+        assert 0 <= index < self.count, index
+        return _decoded(self.kind, self._mapped()[int(self.starts[index]):int(self.ends[index])])
 
     def state_at(self, index: int) -> Mapping[str, object]:
         return {"offset": self.first if index == 0 else int(self.ends[index - 1])}
 
     def index_of(self, state: Mapping[str, object]) -> int:
         offset = integer(state.get("offset"), f"file offset for {self.shard.id}")
-        while self.memory is not None and self.scanned < min(offset, self.stop):
-            self._scan(len(self.starts) + 1)
-        return int(np.searchsorted(self.ends, np.uint64(offset), side="right"))
+        while self.size and self.scanned < min(offset, self.stop):
+            self._scan(self.count + 1)
+        return int(np.searchsorted(self.ends[:self.count], np.uint64(offset), side="right"))
+
+    def release(self) -> None:
+        if self._memory is not None:
+            self._memory.close()
+            self._memory = None
 
     def close(self) -> None:
-        if self.memory is not None:
-            self.memory.close()
-            self.memory = None
+        self.release()
 
 
 class _Lines(grain.IterDataset):

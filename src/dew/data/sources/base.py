@@ -161,6 +161,10 @@ class ShardRows(Protocol):
         """How many records the shard holds, at most `limit`: read only as far as `limit` needs."""
         ...
 
+    def release(self) -> None:
+        """Let its file go, keeping its records' places: a later read opens it again."""
+        ...
+
     def __getitem__(self, index: int) -> Batch:
         """The `index`th record the shard's stream gives."""
         ...
@@ -203,6 +207,9 @@ class MappedRows:
 
     def index_of(self, state: Mapping[str, object]) -> int:
         return self.held.index_of(state)
+
+    def release(self) -> None:
+        self.held.release()
 
     def close(self) -> None:
         self.held.close()
@@ -248,6 +255,9 @@ class ShardManifest:
     `dew.data.shards.cut`): a read's position names its places in the shards it was dealt, so one saved
     under another cut is refused where it resumes (`dew.data.shards._Passing`), and one of a read its store
     cut by an unchanged rule, or not at all, resumes as it was."""
+    alike: str | None = None
+    """The rule its shards were cut finer by where it cut them as the first rule does (`cut` none): a
+    position an earlier Dew saved naming it reads the same rows (`dew.data.shards._Passing`)."""
 
     @property
     def digest(self) -> str:
