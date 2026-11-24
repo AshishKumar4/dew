@@ -541,6 +541,27 @@ def named_rows(x, w):
     return jnp.exp2(checkpoint_name(x, "rows")) @ w
 
 
+def test_a_parts_prepare_holds_a_prologues_custom_derivative_by_its_name(tmp_path, monkeypatch):
+    """In a GPU tier part's prepare (its node an H100), the norm-in-prologue cell's arms are held with the
+    launches they took, each launch's prologue the normalization's custom derivative: held by its module and
+    qualified name (`truths_ahead.HeldName`, which its run never calls), where pickling it refused the store
+    and left the file unprepared (row 12657). Every site's held record reads back."""
+    import pickle
+
+    import tier_wire
+    from generation_support import TOPOLOGY, node_target, node_topology
+    from truths_ahead import HELD, prepared
+
+    monkeypatch.setenv(TOPOLOGY, str(node_topology(tmp_path / "topology.bin", gpu="sm90")))
+    monkeypatch.setenv(tier_wire.PREPARE, "1")
+    with prepared(tmp_path / "store", stamp="a", target=node_target()):
+        test_a_norms_normalization_runs_in_its_projections_prologue(normed)
+    records = [path.read_bytes() for path in (tmp_path / "store").rglob(HELD)]
+    assert records and any(b"HeldName" in record for record in records)
+    for record in records:
+        pickle.loads(record)
+
+
 @pytest.mark.compiles_at_run(reason="a template's certification compiles its configs as the call traces, "
                                    "no check-1 site")
 def test_a_name_on_a_products_rows_stays_outside_its_prologue():
