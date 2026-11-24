@@ -1710,18 +1710,20 @@ def climbed(monkeypatch, target: str, fields: dict, batch: dict, room_of, reques
     # The remat rungs past the start's at the run's own head, in order: what a tight start asks next.
     preferred = [moves for moves, place in enumerate(places)
                  if moves and place[0] is None and place[2] != places[0][2]]
+    # The start's own search first, its first compile the judge of whether its own rung fits the room: a
+    # fit of its place compiled apart would record the rung it settles, which the start then reads.
+    trainer = planned(0, room)
+    probes = [(probe["head_tile"], probe["head_fused"], probe["remat"], probe["xla_defaults"])
+              for probe in trainer.plan["probes"]]
     settled = next((at for at, moves in enumerate(preferred) if fitted(moves)), None)
     recomputing = None if settled is None else places[preferred[settled]]
     # What a start asks, a probe a place at its fixed split: its own rung, which settles it where it fits
     # (a split step's scanned gradient pooled in its backward needs no more at no remat than at a remat rung,
     # row 12080's), else each remat rung at its own head and options up to the first that fits.
-    asks = ([places[0]] if fitted(0) else None if settled is None
+    asks = ([places[0]] if trainer.plan["probes"][0]["fits"] else None if settled is None
             else [places[0], *(places[moves] for moves in preferred[:settled + 1])])
     lightest = None if recomputing is not None else next(
         (place for moves, place in enumerate(places) if fitted(moves)), None)
-    trainer = planned(0, room)
-    probes = [(probe["head_tile"], probe["head_fused"], probe["remat"], probe["xla_defaults"])
-              for probe in trainer.plan["probes"]]
     return places, room, placed(trainer), lightest, asks, probes
 
 
