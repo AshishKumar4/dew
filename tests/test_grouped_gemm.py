@@ -436,8 +436,33 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}, routes
     names = {equation.primitive.name for equation in equations(graph, platform="cuda")}
     assert "dot_general" in names and "ragged_dot_general" not in names, names
-    assert "select_n" not in names, names
+    assert not _masked_dot_operands(graph), "a dense call's rows reach its dot through a select"
     assert graph.out_avals[0].shape == (1, 256, 384)
+
+
+def _masked_dot_operands(graph) -> list:
+    """Each `dot_general` operand of `graph` (its sub-jaxprs' too) that a `select_n` computes, through the
+    elementwise casts between them: a mask of the product's rows."""
+    found = []
+
+    def walk(jaxpr):
+        produced = {out: eqn for eqn in jaxpr.eqns for out in eqn.outvars}
+        for eqn in jaxpr.eqns:
+            if eqn.primitive.name == "dot_general":
+                for operand in eqn.invars:
+                    source = produced.get(operand)
+                    while source is not None and source.primitive.name in ("convert_element_type", "copy"):
+                        source = produced.get(source.invars[0])
+                    if source is not None and source.primitive.name == "select_n":
+                        found.append(eqn)
+            for param in eqn.params.values():
+                for sub in (param if isinstance(param, (tuple, list)) else (param,)):
+                    inner = getattr(sub, "jaxpr", sub)
+                    if hasattr(inner, "eqns"):
+                        walk(inner)
+
+    walk(graph.jaxpr)
+    return found
 
 @pytest.mark.parametrize("product", ["forward", "input gradient", "kernel gradient"])
 def test_an_amperes_gpt_oss_projection_routes_to_a_kernel_that_lowers(product):
@@ -2260,16 +2285,26 @@ def test_sm100_pair_tiles_refuse_depth_splits_in_legal_and_derivation():
             fam, dataclasses.replace(t64, programs=3), jnp.bfloat16, target=sm100, stream_blocks=scales)
 
 
-def test_the_planner_prices_mma_syncs_row_bound_where_its_grouped_kernel_issues_it():
-    """A one-consumer grouped mma.sync tile, whose products take a row bound, is priced its issuer's own
-    registers for it (`MmaIssuer.bound_registers`); a dense call, whose products take none, none (row 12304).
-    """
-    tile = tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
+def test_the_planner_prices_mma_syncs_row_bound_where_its_grouped_kernel_issues_it(monkeypatch):
+    """The planner's register estimate of a one-consumer grouped mma.sync launch, whose products take a row
+    bound, holds its issuer's own registers for it (`MmaIssuer.bound_registers`); a dense call's, whose
+    products take none, holds none (row 12304)."""
+    from dew.nn.kernels.templates import mosaic_sm80
+
+    gmm, tile = grouped_matmul.MosaicGmm(), tiling.Tiles(128, 128, 32, 3, 1, warpgroups=1, family="mma.sync")
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    calls = {grouped: gmm.bind(bf16((512, 256)), bf16((4 if grouped else 1, 256, 256)),
+                               jax.ShapeDtypeStruct((4 if grouped else 1,), jnp.int32), out_dtype="bfloat16",
+                               trans_rhs=False, interpret=False, dense=not grouped)
+             for grouped in (True, False)}
+    bound = mosaic_sm80.MmaIssuer.bound_registers
     with generation.assumed("sm80"):
-        family = pricing.family_of(tile, jnp.bfloat16)
-        priced = {dense: pricing.bounded_registers(family, tile, jnp.bfloat16, dense=dense, staged_rows=False)
-                  for dense in (False, True)}
-    assert family.bound_registers > 0 and priced == {False: family.bound_registers, True: 0}, priced
+        target = generation.gpu_target()
+        priced = {grouped: gmm.registers(ba, tile, target) for grouped, ba in calls.items()}
+        monkeypatch.setattr(mosaic_sm80.MmaIssuer, "bound_registers", 0)
+        unbound = {grouped: gmm.registers(ba, tile, target) for grouped, ba in calls.items()}
+    assert bound > 0 and priced[True] - unbound[True] == bound, (bound, priced, unbound)
+    assert priced[False] == unbound[False], (priced, unbound)
 
 
 @INTERPRETS
