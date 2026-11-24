@@ -1586,12 +1586,6 @@ class Transport[Allocated, Opened](abc.ABC):
     warpgroup's threads, 128 elements at least ('CP_ASYNC requires the number of elements to be a multiple
     of 128', R9-gpu-a100): a step reads a side vector it does not copy from global memory instead."""
 
-    adds_vectors: bool = True
-    """Whether `added` takes a vector of fewer entries than a warpgroup's threads (TMA's reduction from shared
-    memory), where Mosaic GPU refuses atomic stores from a layout that replicates its entries across
-    threads (mma.sync's row and column layouts): a program writes such a sum to a place of its own
-    instead."""
-
     adds_through_shared: bool = True
     """Whether `added` reads its value through its `smem` (TMA's reduction from a staged tile), which is then
     live wherever a walk adds; an atomic add from registers (cp.async's `red.global`) reads none, so a tile
