@@ -43,7 +43,7 @@ from dew.nn.ssm import diagonal_recurrence
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
-from dew.quantization import UNQUANTIZED, Quantization, quantize_for_serving, quantize_with
+from dew.quantization import UNQUANTIZED, Quantization, entry_methods, quantize_for_serving, quantize_with
 from dew.registry import models
 
 import_module("dew.nn.backbones")  # registers the fixture kind
@@ -625,6 +625,86 @@ def test_a_recorded_kernel_no_rule_matches_multiplies_by_its_own_recipe():
     with pytest.raises(ValueError):
         activations.apply(served_variables, ids)
 
+
+@pytest.mark.parametrize("overrides", [
+    {}, {"qk_norm": False}, {"emb_features": 16, "num_heads": 2, "num_kv_heads": 2, "qk_norm": False}],
+    ids=["qk-normed", "plain-heads", "two-heads"])
+def test_a_served_int8_decoder_computes_scanned_what_it_computes_unrolled(overrides):
+    """A served int8 decoder (`quantize_for_serving`) whose layers run under the layer scan computes, bit for
+    bit, what it computes unrolled and what its quantized training computes: its scales read as the unrolled
+    stack reads them (`held_scales`). Where the scan's sliced scale fused with the projection's RoPE, the
+    served forward rounded RoPE's rotation twice where the others round once, by up to 3e-3 with one
+    quantized projection (row 12078)."""
+    from dew.nn.kernels import generation
+
+    pytest.importorskip("qwix")
+    spec = Quantization(patterns=(".*_proj",))
+    logits = {}
+    for scan in ("plain", "scanned"):
+        with generation.chosen(layer_scan=scan):
+            model, qmodel, variables, ids = quantized_forward(spec, **overrides)
+            served, served_variables = quantize_for_serving(model, variables, spec, ids)
+            logits[scan] = (np.asarray(compiled_apply(served, served_variables, ids)),
+                            np.asarray(compiled_apply(qmodel, variables, ids)))
+    np.testing.assert_array_equal(logits["scanned"][0], logits["plain"][0])
+    np.testing.assert_array_equal(logits["scanned"][0], logits["scanned"][1])
+
+
+def test_a_float_decoder_scans_while_another_thread_is_still_importing_qwix(monkeypatch):
+    """A float decoder's layers run under the layer scan while Qwix is half imported (its module present, its
+    `QArray` not yet bound, as another thread's import leaves it): no stored quantized array can exist yet,
+    so its params hold none (`holds_quantized`), rather than an AttributeError reading `qwix.QArray` (the
+    API03 review of row 12078's fix)."""
+    from dew.nn.kernels import generation
+
+    monkeypatch.setitem(sys.modules, "qwix", types.ModuleType("qwix"))
+    model = tiny()
+    prompt = jnp.asarray(token_batch()["text"][:, :4])
+    variables = nn.unbox(model.init(jax.random.key(0), prompt))
+    with generation.chosen(layer_scan="scanned"):
+        assert np.isfinite(np.asarray(jax.jit(model.apply)(variables, prompt))).all()
+
+
+def test_a_served_scan_holds_its_scales_inside_its_layers_alone():
+    """A served int8 decoder's scanned program holds its scales behind barriers within its scan's body alone,
+    each layer's as it is sliced (`held_scales`): none outside, on the whole stacked parameters, which no
+    layer reads (the API03 review of row 12078's fix: the presence test built them and threw them away)."""
+    from dew.nn.kernels import generation
+
+    pytest.importorskip("qwix")
+    spec = Quantization(patterns=(".*_proj",))
+    with generation.chosen(layer_scan="scanned"):
+        model, _, variables, ids = quantized_forward(spec)
+        served, served_variables = quantize_for_serving(model, variables, spec, ids)
+        program = jax.make_jaxpr(served.apply)(served_variables, ids)
+    from dew.nn import programs
+
+    def barriers(equations) -> int:
+        return sum(equation.primitive.name == "optimization_barrier" for equation in equations)
+
+    outside, inside = barriers(program.jaxpr.eqns), barriers(programs.equations(program.jaxpr))
+    assert outside == 0
+    assert inside > 0
+
+def test_a_direct_qwix_ptq_decoder_computes_scanned_what_it_computes_unrolled():
+    """A decoder Qwix's own PTQ quantizes (`qwix.PtqProvider`, its params `qwix.quantize_params`) computes
+    under the layer scan, bit for bit, what it computes unrolled (row 12078: 7e-2 apart before)."""
+    from dew.nn.kernels import generation
+
+    qwix = pytest.importorskip("qwix")
+    logits = {}
+    for scan in ("plain", "scanned"):
+        with generation.chosen(layer_scan=scan):
+            model = tiny()
+            prompt = jnp.asarray(token_batch()["text"][:, :4])
+            variables = nn.unbox(model.init(jax.random.key(0), prompt))
+            rules = [qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8, act_qtype=jnp.int8)]
+            direct = quantize_with(model, qwix.PtqProvider(rules), methods=entry_methods(model))
+            shapes = nn.unbox(jax.eval_shape(
+                functools.partial(direct.init, jax.random.key(0), jnp.zeros((1, 1), jnp.int32))))
+            held = {**variables, "params": qwix.quantize_params(variables["params"], shapes["params"])}
+            logits[scan] = np.asarray(jax.jit(direct.apply)(held, prompt))
+    np.testing.assert_array_equal(logits["scanned"], logits["plain"])
 
 def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     """Served weights are int8 values with their scales, and the served

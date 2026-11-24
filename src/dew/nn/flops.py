@@ -19,6 +19,7 @@ from jax.core import ShapedArray
 from jax.extend import core as jaxpr_core
 
 from dew import _cache
+from dew._facts import Held
 
 from .programs import (
     branches,
@@ -69,7 +70,8 @@ COUNTED = 256
 """The counts a process keeps of the modules and length signatures it last counted (`_declared`): a run's
 batches repeat a few signatures, a packed window's rows filling it alike, so each is counted once."""
 
-_counts: collections.OrderedDict[tuple[str, int, bytes], tuple[object, float]] = collections.OrderedDict()
+_counts: collections.OrderedDict[tuple[str, int, bytes], Held[tuple[object, float]]] = (
+    collections.OrderedDict())
 """Each module's counted work by its lengths' signature, the module held beside it (`_declared`, through
 `_cache.holding`)."""
 

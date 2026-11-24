@@ -52,6 +52,8 @@ from jax._src import core as jax_core
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
+from dew import _cache
+from dew._facts import Held
 from dew.nn import derivatives
 from dew.nn.kernels import generation
 from dew.nn.nested import nested
@@ -495,7 +497,7 @@ class RegionDecision(NamedTuple):
     launched: bool
 
 
-_held: collections.OrderedDict[Hashable, tuple[RegionDecision, dict]] = collections.OrderedDict()
+_held: collections.OrderedDict[Hashable, Held[RegionDecision]] = collections.OrderedDict()
 
 
 def choice_context() -> Hashable:
@@ -521,12 +523,12 @@ def _identity(jaxpr: jcore.Jaxpr, region: Region) -> Hashable:
 
 def _decided(identity: Hashable, decide: Callable[[], RegionDecision]) -> RegionDecision:
     """A region's decision (`decide`), weighed once for its structure (`_identity`) in the context a kernel
-    is chosen in (`choice_context`), held with the facts its probes read (`generation.held_trace`)."""
+    is chosen in (`choice_context`), held with the facts its probes read (`_cache.holding`)."""
     def weighed() -> RegionDecision:
         # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
         with generation.routes(alone=True):
             return decide()
-    return generation.held_trace(_held, (identity, choice_context()), weighed, DECISIONS_HELD)
+    return _cache.holding(_held, (identity, choice_context()), weighed, DECISIONS_HELD)
 
 
 def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> RegionDecision:
@@ -580,7 +582,7 @@ class Recorded(NamedTuple):
     (each its op and keyed arguments, and the config it took, `tuning.Seen.held`). A program written from
     that trace again, never traced again, reports them again (`replay`), so a report around the program
     that writes it holds them as one around the trace did; the facts the trace read go with its held value
-    (`generation.held_trace`, their one owner: Train 1205's review F1)."""
+    (`_cache.holding`, their one owner: Train 1205's review F1)."""
 
     routes: tuple
     launches: tuning.Seen
@@ -596,7 +598,7 @@ class Recorded(NamedTuple):
 def recorded[Made](make: Callable[[], Made]) -> tuple[Made, Recorded]:
     """`make()`, a trace of Dew's, and what it reported (`Recorded`): the one record-and-replay of a held
     trace's reports, a region's (`_traced`), a nested body's (`dew.algebra.program._closed`) and a marked
-    span's (`dew.nn.derivatives._traced_span`), each held through `generation.held_trace`."""
+    span's (`dew.nn.derivatives._traced_span`), each held through `_cache.holding`."""
     # Imported where used: tuning imports the algebra's terms, which this module's package imports.
     from dew.nn.kernels.tuning import seen as launched
 
@@ -614,14 +616,14 @@ class _Trace(NamedTuple):
     record: Recorded
 
 
-_traces: collections.OrderedDict[Hashable, tuple[_Trace, dict]] = collections.OrderedDict()
+_traces: collections.OrderedDict[Hashable, Held[_Trace]] = collections.OrderedDict()
 
 
 def _traced(region: Written) -> _Trace | None:
     """`region`'s call traced as one nested program over its inputs' types (`nested`), once a process for
     its identity (`Written.key`) in the context a kernel is chosen in (`choice_context`), held with the
     facts its trace read while each answers alike, those read again wherever it is taken
-    (`generation.held_trace`); its routes and launches reported where it is written, as its trace reported
+    (`_cache.holding`); its routes and launches reported where it is written, as its trace reported
     them (`generation.reported`, `tuning.noted`), so a report around the program that writes it holds them
     as one around its trace did (row 6708)."""
     def traced_once() -> _Trace:
@@ -629,7 +631,7 @@ def _traced(region: Written) -> _Trace | None:
         (equation,) = traced.jaxpr.eqns
         return _Trace(equation, tuple(traced.jaxpr.invars), record)
 
-    held = generation.held_trace(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD)
+    held = _cache.holding(_traces, (region.key, choice_context()), traced_once, DECISIONS_HELD)
     # Its outputs the very types the region made (`jax_core.typematch`: shape, dtype, sharding, the manual
     # axes they vary over), else it is not written, a value of another type in its place a program JAX
     # refuses, and its routes reported refused (`_unwritten`).

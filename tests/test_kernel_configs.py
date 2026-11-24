@@ -24,6 +24,7 @@ from generation_support import COMPILES_FOR_TPU, COMPILES_ON_CPU, generations, l
 from jax.sharding import PartitionSpec
 from kernel_compile import Uncounted, compile_kernels, failures, gate_generations
 
+from dew import _facts
 from dew.nn.kernels import (
     chunked_launch,
     fla_gdn,
@@ -1731,13 +1732,13 @@ def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kern
 
 def test_a_trace_held_by_its_state_is_held_in_any_recordings_scope():
     """The state a held trace is keyed by (`options.trace_context`, the algebra's written regions') is the
-    same in two fresh recordings (`generation.recording`): a recording is what a trace records into, no
+    same in two fresh recordings (`_facts.recording`): a recording is what a trace records into, no
     trace reads it, so identical regions traced in two of them share one trace (row 6668)."""
     from dew.nn.kernels import options
 
-    with generation.recording():
+    with _facts.recording():
         first = options.trace_context()
-    with generation.recording():
+    with _facts.recording():
         second = options.trace_context()
     assert first == second
 
@@ -1764,8 +1765,8 @@ def test_a_derivation_for_a_target_reads_that_targets_refusals():
 
 def test_a_recording_holds_while_the_refusals_its_trace_read_answer_alike():
     """A trace's read of a launch's refusals (its legality's, `report.refused`) is recorded with its answer
-    (`generation.recording`): the record holds while that launch's refusals stay as they were, a refusal of
-    another launch among them, and not once its own launch is refused another config (`generation.still`)."""
+    (`_facts.recording`): the record holds while that launch's refusals stay as they were, a refusal of
+    another launch among them, and not once its own launch is refused another config (`_facts.still`)."""
     from dew.nn.kernels.templates import report
 
     launch = grouped_matmul.MosaicGmm()
@@ -1774,13 +1775,13 @@ def test_a_recording_holds_while_the_refusals_its_trace_read_answer_alike():
     target = generation.TARGETS["sm90"]
     with report.refusals(), generation.assumed(target):
         tile = launch.derived(arguments, target)
-        with generation.recording() as reads:
+        with _facts.recording() as reads:
             assert not report.refused(launch, arguments, tile, target)
-        assert reads and generation.still(reads)
+        assert reads and _facts.still(reads)
         report.refuse([(report._identity(launch, other, target), launch.derived(other, target), {"dew_gmm"})])
-        assert generation.still(reads)
+        assert _facts.still(reads)
         report.refuse([(report._identity(launch, arguments, target), tile, {"dew_gmm"})])
-        assert not generation.still(reads)
+        assert not _facts.still(reads)
 
 
 def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):

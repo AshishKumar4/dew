@@ -185,14 +185,12 @@ class PhasePasses[L, E]:
         return None if self.sampled is None else [self.objective_for(count)
                                                   for count in range(1, self.sampled.cap + 1)]
 
-    def begins(self, compiled: Collection[Hashable]) -> bool:
-        """Whether the step being compiled (`current`) begins a phase whose count no step of `compiled`
-        (keys of `key`) ran, past the run's first: a step planned afresh, at its own count's split, where
-        the run is at an update's end (`Trainer._planned_afresh`)."""
-        if self.current is None or not compiled:
-            return False
-        return all(not isinstance(held, tuple) or len(held) != 2 or held[1] != self.current
-                   for held in compiled)
+    def begins(self, passes: Collection[int | None]) -> bool:
+        """Whether the step being compiled (`current`) begins a phase whose count no step the run compiled
+        ran (`passes`, each such step's count, None for the objective's own), past the run's first: a step
+        planned afresh, at its own count's split, where the run is at an update's end
+        (`Trainer._planned_afresh`)."""
+        return self.current is not None and bool(passes) and self.current not in passes
 
     def at(self, batch: Batch) -> int | None:
         """The count of the phase `batch` was read in (`count`), taken as the step being compiled's

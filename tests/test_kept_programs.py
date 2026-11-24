@@ -21,7 +21,7 @@ import os
 
 import jax.numpy as jnp
 
-from dew.nn.kernels.generation import traced_fact
+from dew._facts import traced_fact
 
 OFFSET = 0
 
