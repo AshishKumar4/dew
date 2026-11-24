@@ -646,14 +646,38 @@ def constrained[T](x: T, spec: jax.sharding.PartitionSpec | Callable[[], jax.sha
 def gathered_over[T](x: T, spec: jax.sharding.PartitionSpec, axis: str) -> T:
     """`x`, placed as `spec`, gathered whole over the mesh's `axis` and placed as before on every other: under
     an Explicit `axis` resharded from its type's spec without it (`jax.sharding.reshard`), else constrained to
-    `spec` without it (`constrained`). Where `axis` holds one device, `x` as it is. Its transpose places a
-    gradient back as `spec`, reduce-scattered over `axis` (`dew.nn.backbones.looping`'s gathered block)."""
+    `spec` without it (`constrained`). Where `axis` holds one device or `spec` places nothing on it (a
+    forward's whole placement, a leaf split over other axes alone), `x` as it is. Its transpose places a
+    gradient back as `spec`, reduced over `axis` (`dew.nn.backbones.looping`'s gathered block)."""
     mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or mesh.shape.get(axis, 1) == 1:
+    if mesh.empty or mesh.shape.get(axis, 1) == 1 or axis not in _named(spec):
         return x
     if axis in mesh.explicit_axes:
         return jax.sharding.reshard(x, _without(jax.typeof(x).sharding.spec, axis))
     return constrained(x, _without(spec, axis))
+
+
+def _named(spec: jax.sharding.PartitionSpec) -> set[str]:
+    """The mesh axes `spec` places a dimension on."""
+    return {name for entry in spec if entry is not None
+            for name in ((entry,) if isinstance(entry, str) else tuple(entry))}
+
+
+@dataclasses.dataclass(frozen=True)
+class GatheredOver:
+    """A layout (`layout`) placing every leaf under one of `paths` (variables paths' leading keys, a looped
+    block's layers) whole over `axis` as `gathered_over` takes it, every other where `layout` does: what a
+    pass of a gathered loop traces under (`placing`), so a projection mapped per shard takes its gathered
+    weight as it lies (`dew.nn.kernels.projections.shard_placement`) and gathers it again in no pass."""
+
+    layout: ParameterLayout
+    paths: tuple[tuple[str, ...], ...]
+    axis: str
+
+    def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
+        spec = self.layout.leaf_spec(mesh, path, value)
+        names = tuple(key.key if isinstance(key, jax.tree_util.DictKey) else key for key in path)
+        return _without(spec, self.axis) if any(names[:len(at)] == at for at in self.paths) else spec
 
 
 def _without(spec: jax.sharding.PartitionSpec, axis: str) -> jax.sharding.PartitionSpec:

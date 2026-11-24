@@ -46,7 +46,7 @@ from dew.quantization import holds_quantized
 
 from ..precision import at_least_fp32, softplus
 from ..protocols import EXIT_PASSES, EXITS, fixed_remat
-from ..sharding import gathered_over, placed_layout
+from ..sharding import GatheredOver, gathered_over, placed_layout, placing
 from .decoder_stack import BY_CALL, WRITTEN, Loop, PassView, SharedPassView
 from .layer_names import group_layers
 
@@ -354,12 +354,20 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
         x, _ = run.counted(x, bank, passes) if passes is not None else run.fixed(x, bank)
         return x, run.exited
 
-    if loop.gathered and not model.is_initializing():
-        # Every pass reads the block's parameters gathered once before the first (`Loop.gathered`).
+    layout = placed_layout()
+    if loop.gathered and not model.is_initializing() and layout is not None:
+        # Every pass reads the block's parameters gathered once before the first (`Loop.gathered`), and
+        # traces under a layout placing them so (`GatheredOver`): a projection mapped per shard takes them
+        # as they lie, gathering none again.
+        names = tuple(f'layers_{index}' for index in range(first, end))
         every_pass = nn.map_variables(every_pass, mapped_collections='params', init=False, mutable=False,
-                                      trans_in_fn=functools.partial(_gathered_block, span=(first, end),
-                                                                    path=model.scope.path))
-    x, exited = every_pass(model, x)
+                                      trans_in_fn=functools.partial(_gathered_block, names=names,
+                                                                    path=model.scope.path, layout=layout))
+        with placing(GatheredOver(layout, tuple(('params', *model.scope.path, name) for name in names),
+                                  FSDP_AXIS)):
+            x, exited = every_pass(model, x)
+    else:
+        x, exited = every_pass(model, x)
     if loop.reinject:
         x = model.norm(x)
     if end < layers:
@@ -369,36 +377,28 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
     return _handed_on(model, exited, x, loop.exit_threshold)
 
 
-def _gathered_block(variables: Mapping[str, Mapping], *, span: tuple[int, int],
-                    path: tuple[str, ...]) -> dict:
-    """`variables`' `params` with the block's layers (`span`, `layers_{first}` to `layers_{end - 1}` under
-    the decoder's scope `path`) each gathered whole over the FSDP axis from where the traced program's layout
-    places it (`sharding.gathered_over`, `Layout.leaf_spec`), every other parameter as it is
-    (`Loop.gathered`):
-    the prelude's, the coda's, the embedding's and head's, and a layer holding a quantized stored kernel
-    (`holds_quantized`), which keeps its placement. Without a layout traced under (an initialization, a
-    forward a server traces), `variables` as they are."""
-    layout = placed_layout()
-    if layout is None:
-        return dict(variables)
+def _gathered_block(variables: Mapping[str, Mapping], *, names: tuple[str, ...], path: tuple[str, ...],
+                    layout) -> dict:
+    """`variables`' `params` with the block's layers (`names` under the decoder's scope `path`) each leaf
+    gathered whole over the FSDP axis from where `layout` places it (`sharding.gathered_over`,
+    `Layout.leaf_spec`, read of the leaf unboxed), every other parameter as it is (`Loop.gathered`): the
+    prelude's, the coda's, the embedding's and head's, and a layer holding a quantized stored kernel
+    (`holds_quantized`), which keeps its placement. A gathered leaf leaves its box (`flax.core.meta`'s), whose
+    logical axes would place it back on the FSDP axis where the layer reads it."""
     mesh = jax.sharding.get_abstract_mesh()
     params = dict(variables['params'])
-    first, end = span
 
-    def gathered(at: tuple[str, ...], tree):
+    def gathered(name: str, tree):
         def leaf(where, value):
-            keys = tuple(jax.tree_util.DictKey(name) for name in ('params', *path, *at)) + tuple(where)
-            if isinstance(value, meta.AxisMetadata):
-                return value.replace_boxed(gathered_over(value.unbox(), layout.leaf_spec(mesh, keys, value),
-                                                         FSDP_AXIS))
-            return gathered_over(value, layout.leaf_spec(mesh, keys, value), FSDP_AXIS)
+            keys = tuple(jax.tree_util.DictKey(key) for key in ('params', *path, name)) + tuple(where)
+            raw = meta.unbox(value)
+            return gathered_over(raw, layout.leaf_spec(mesh, keys, raw), FSDP_AXIS)
         return jax.tree_util.tree_map_with_path(leaf, tree,
                                                 is_leaf=lambda value: isinstance(value, meta.AxisMetadata))
 
-    for index in range(first, end):
-        name = f'layers_{index}'
+    for name in names:
         if name in params and not holds_quantized(params[name]):
-            params[name] = gathered((name,), params[name])
+            params[name] = gathered(name, params[name])
     return {**variables, 'params': params}
 
 
