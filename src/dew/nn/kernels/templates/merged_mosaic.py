@@ -17,7 +17,7 @@ from jax.extend.mlir import ir as mgpu_ir
 from jax.extend.mlir.dialects import arith as mgpu_arith, vector as mgpu_vector
 
 from dew.algebra import windows
-from dew.nn.kernels.templates import attention_algebra as algebra, cost, emission, mosaic
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
 from dew.nn.kernels.templates.attention import Kind
 
 THREADS = 4 * 32
@@ -109,8 +109,6 @@ def _mgpu_load_chunk(padded_ref, stacked_ref, b, q, h, start, c_start, col_ok, *
     out_ty = plgpu.ShapeDtypeStruct((chunk, tile_block), padded_ref.dtype, layout=tile_layout)
     stat_ty = plgpu.ShapeDtypeStruct((chunk, tile_block), stacked_ref.dtype, layout=tile_layout)
 
-    @emission.stating(lambda p, s, *_: cost.Work(
-        device_bytes=chunk * ((read_width / blocks) * p.dtype.itemsize + 2 * s.dtype.itemsize)))
     def body(ctx, p_ref, s_ref, b_v, q_v, h_v, start_v, c_start_v, col_ok_v):
         del ctx
         pos0 = mgpu_ir.DenseI64ArrayAttr.get([0])
@@ -176,8 +174,6 @@ def _mgpu_load_initial(init_m_ref, init_t_ref, init_acc_ref, b, h, q, c_start, *
     acc_ty = plgpu.ShapeDtypeStruct((tile_block,), init_acc_ref.dtype, layout=tile_1d)
     stat_ty = plgpu.ShapeDtypeStruct((tile_block,), init_m_ref.dtype, layout=tile_1d)
 
-    @emission.stating(lambda m, t, a, *_: cost.Work(
-        device_bytes=(width / blocks) * a.dtype.itemsize + m.dtype.itemsize + t.dtype.itemsize))
     def body(ctx, im_ref, it_ref, ia_ref, b_v, h_v, q_v, c_start_v):
         del ctx
         i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
@@ -232,7 +228,6 @@ def _mgpu_store_finished(merged_ref, acc, b, out_t, out_h, c_start, *, block: in
     row 0 of `[2, tile_block]`, row 9795)."""
     scalar = plgpu.Layout.WG_SPLAT(())
 
-    @emission.stating(lambda ref, *_: cost.Work(device_bytes=(width / blocks) * ref.dtype.itemsize))
     def body(ctx, dest_ref, acc_v, b_v, t_v, h_v, c_start_v):
         del ctx
         pos0 = mgpu_ir.DenseI64ArrayAttr.get([0])
@@ -262,8 +257,6 @@ def _mgpu_store_stats(max_ref, tot_ref, maximum, total, b, q, h, *, tile_1d):
     """Single-thread GMEM store of one row's scalar maximum and total (thread 0; caller gates `c_block`)."""
     scalar = plgpu.Layout.WG_SPLAT(())
 
-    @emission.stating(lambda m_ref, t_ref, *_: cost.Work(
-        device_bytes=m_ref.dtype.itemsize + t_ref.dtype.itemsize))
     def body(ctx, m_ref, t_ref, m_v, t_v, b_v, q_v, h_v):
         del ctx
         pos0 = mgpu_ir.DenseI64ArrayAttr.get([0])
@@ -308,9 +301,6 @@ def _mgpu_load_output_param(param_ref, b, out_t, out_h, c_start, *, kind: Kind, 
         out_ty = plgpu.ShapeDtypeStruct((2, 1), out_dtype, layout=plgpu.Layout.WG_SPLAT((2, 1)))
     else:
         out_ty = plgpu.ShapeDtypeStruct((2, tile_block), out_dtype, layout=tile_layout)
-    n_elems = 1.0 if is_scalar else width / blocks
-
-    @emission.stating(lambda p, *_: cost.Work(device_bytes=n_elems * p.dtype.itemsize))
     def body(ctx, p_ref, b_v, t_v, h_v, c_start_v):
         del ctx
         i1, i32 = (mgpu_ir.IntegerType.get_signless(bits) for bits in (1, 32))

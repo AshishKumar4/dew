@@ -38,22 +38,6 @@ class Unpriced(ValueError):
     """A primitive in a kernel's body no rule of `emitted` prices."""
 
 
-_STATED: "weakref.WeakKeyDictionary[Callable, Callable]" = weakref.WeakKeyDictionary()
-"""What each opaque Mosaic GPU body a kernel inlines does (`stating`), by the body."""
-
-
-def stating[F: Callable](work: Callable[..., Work]) -> Callable[[F], F]:
-    """A decorator for an `inline_mgpu` body (`plgpu.inline_mgpu`'s function), stating what it does as
-    `work(*avals)` of its arguments' avals (a ref's own, before any transform it is passed through), which
-    the count reads where the kernel inlines it: an inlined
-    body is opaque to it, so its emitter, which knows it, states it (a ticket's atomic and barrier, no
-    product; a gathered copy's bytes)."""
-    def stated(fn: F) -> F:
-        _STATED[fn] = work
-        return fn
-    return stated
-
-
 @dataclasses.dataclass(frozen=True)
 class Emitted:
     """A program's work as its kernel body emits it (`emitted`), each of its warpgroups' apart (`roles`, by
@@ -857,9 +841,6 @@ def _inlined(params: Mapping, invars: Sequence, values: Sequence) -> Work:
     where the count holds them."""
     leading = params["pytree_args"].num_leaves
     avals = [variable.aval for variable in invars[:leading]]
-    stated = _STATED.get(params["mgpu_fn"])
-    if stated is not None:
-        return stated(*avals)
     try:
         return inline_work.body_work(params["mgpu_fn"], avals, params["flat_arg_types"], values[:leading])
     except inline_work.Uncounted as error:

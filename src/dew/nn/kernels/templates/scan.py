@@ -8,7 +8,6 @@ state `h_t = a_t h_{t+1} + b_t`. A chunked recurrence's backward walks its chunk
 scan's, mamba_ssm's selective_scan_bwd_kernel.cuh, a BlockScan a state forward and a reverse one back).
 Interpreted, the scan is XLA's (`lax.associative_scan`)."""
 
-import math
 from collections.abc import Callable
 
 import jax
@@ -23,8 +22,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, memref, vector
 
 from dew.nn import precision
-from dew.nn.kernels.templates import emission, native
-from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates import native
 
 THREADS = 128
 """A warpgroup's threads, a block's positions spread over them."""
@@ -137,12 +135,8 @@ def compensated_columns(pairs, running) -> None:
     once when done. The terms staged, and the threads met, before: a Pallas store a row at a time met the
     warpgroup at each, 44% of a running prefix's warp time an emulated GH200's (M-JS-145e). Additions alone,
     so no multiply contracts into them."""
-    elements = math.prod(pairs.shape[1:])
-    # Each element's two words read and written, and its compensated add's fourteen additions (two TwoSums'
-    # six and the dropped part's two).
-    body = emission.stating(lambda *refs: Work(operations=14 * elements, shared_bytes=16 * elements))(
-        lambda ctx, *refs: _compensated_columns(*refs))
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),) * 2, return_type=())(body)(pairs, running)
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),) * 2, return_type=())(
+        lambda ctx, *refs: _compensated_columns(*refs))(pairs, running)
 
 
 def suffix_columns(terms) -> None:
@@ -152,14 +146,9 @@ def suffix_columns(terms) -> None:
     `precision.renormalized_sum`, its rounded sum stored), a column a thread of the first `columns` (at most
     `THREADS`), its loads and stores its own words, and the warpgroup met once when done. Additions alone, so
     no multiply contracts into them."""
-    rows, columns = (terms.shape[0] - 1), terms.shape[1]
-    assert columns <= THREADS, "a column a thread"
-    # Each term read and its sum written, the start's word read, and each compensated add's fourteen
-    # additions (`compensated_columns`').
-    body = emission.stating(lambda ref: Work(operations=14 * rows * columns,
-                                             shared_bytes=4 * (2 * rows + 1) * columns))(
-        lambda ctx, ref: _suffix_columns(ref))
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(body)(terms)
+    assert terms.shape[1] <= THREADS, "a column a thread"
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(lambda ctx, ref: _suffix_columns(ref))(
+        terms)
 
 
 def _suffix_columns(ref) -> None:
@@ -181,9 +170,8 @@ def _suffix_columns(ref) -> None:
 def zeroed_columns(running) -> None:
     """Each column's running pair in `running`, a plain fp32 shared tile `(2, THREADS)`, set to zero, a column
     a thread in its own words (`compensated_columns`' starting pairs), the warpgroup met once when done."""
-    body = emission.stating(lambda ref: Work(operations=0, shared_bytes=8 * THREADS))(
-        lambda ctx, ref: _zeroed_columns(ref))
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(body)(running)
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),), return_type=())(lambda ctx, ref: _zeroed_columns(ref))(
+        running)
 
 
 def _zeroed_columns(running) -> None:

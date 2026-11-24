@@ -19,8 +19,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, memref, scf
 
 from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import emission, mosaic, native, resources, scan, swizzling
-from dew.nn.kernels.templates.cost import Work
+from dew.nn.kernels.templates import mosaic, native, resources, scan, swizzling
 from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, pair_streams, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
@@ -122,22 +121,9 @@ def own_bands(queries, staged, betas, bands, *, products: tuple[str, ...], unit_
     the bands a tile in the accumulator's layout took every offset of every row, its shifted reads whole
     tiles and its sums over a key block's columns a warp's shuffles, 70% of an emulated GH200's intra_own
     issues (M-JS-145h)."""
-    outputs, (chunk, keys) = len(products), staged.shape[1:]
-    # Each row's pairs at or before it in its sub-chunk, each over the block's columns: its key and decay
-    # read, its decay's multiply and (`unit_pairs`) the decayed key's, and each output's row read (the
-    # system's its key and write strength, and their multiply), its multiplies (one where `unit_pairs`, two
-    # else) and an add; then each output's sum over the quad (two shuffles and two adds) and its band's
-    # entry read, added and written.
-    pairs = chunk * (algebra.SUB + 1) // 2
-    columns = pairs * keys
-    system = "system" in products
-    work = Work(operations=columns * ((2 if unit_pairs else 3) * outputs + 1 + unit_pairs + system)
-                + pairs * outputs * 5,
-                shared_bytes=4 * columns * (2 + outputs) + 4 * pairs * system + 8 * pairs * outputs)
     refs = tuple(ref for ref in (queries, staged, betas, bands) if ref is not None)
-    body = emission.stating(lambda *refs: work)(
-        lambda ctx, *refs: _own_bands(*refs, products=products, unit_pairs=unit_pairs))
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),) * len(refs), return_type=())(body)(*refs)
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(),) * len(refs), return_type=())(
+        lambda ctx, *refs: _own_bands(*refs, products=products, unit_pairs=unit_pairs))(*refs)
 
 
 def _own_bands(*refs, products: tuple[str, ...], unit_pairs: bool) -> None:
