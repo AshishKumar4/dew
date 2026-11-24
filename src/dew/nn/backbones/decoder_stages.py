@@ -104,7 +104,7 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
     if decoder.is_initializing() or (stages == 1 and not scanned()):
         return unrolled()
     staged = stored_by_stage(decoder.variables)
-    banked = () if staged else decoder.banked_collections()
+    banked = () if staged else decoder.banked_collections(span)
     held = decoder.variables.get('cache', {})
     if decode and 'params' in banked and not any(group_layers(name) for name in held):
         # A decode over a store banked by run that opens its cache opens it banked as `init_cache` does
@@ -119,10 +119,10 @@ def stack(decoder: CausalTransformer, x, *, train: bool, decode: bool, per_layer
         view, split = (dataclasses.replace(stage_view(decoder, 1), staged=staged),
                        StageSplit(0, decoder.num_layers, 0))
     elif stages == 1:
-        if span is not None and banked:
+        groups, periods = one_stage_runs(decoder, first, end, banked=bool(banked))
+        if span is not None and banked and not set(groups).issubset(decoder.groups):
             raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                 f"by run holds whole runs; {list(banked)} arrived banked")
-        groups, periods = one_stage_runs(decoder, first, end, banked=bool(banked))
         if not any(count > 1 for _, count in groups) or (
                 not banked and 'streaming' not in decoder.variables and captures_any_method(decoder)):
             # No run scans, or a capture of any method keeps what no scan stacks (a method's non-array

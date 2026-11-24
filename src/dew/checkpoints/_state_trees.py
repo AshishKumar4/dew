@@ -152,59 +152,60 @@ def _decode_delta(planes: jax.Array, live: jax.Array, dtype) -> jax.Array:
 logger = logging.getLogger(__name__)
 
 _DECODED: dict[tuple, options.Compiling | None] = {}
-"""The restore decodes a save began compiling (`decoded_ahead`), by their signature; None while one is
-lowered, or where its lowering failed."""
+"""The restore programs a save began compiling (`compile_ahead`), by their cache directory and signature;
+None while one is lowered, or where its lowering failed."""
 _DECODED_LOCK = threading.Lock()
 
 
-def decoded_ahead(planes: jax.Array, live: jax.Array, dtype) -> None:
-    """Compile the program a restore reads `planes` back by (`_decode_delta`, over the planes and the
-    weight they are the difference from as a restore holds them, typed `dtype`) where the save that wrote
-    them runs: lowered here and compiled in a thread of its own, as a start's compile ahead is
-    (`options.compiling`), once a process for its signature (the arrays' shapes, dtypes and shardings: equal
-    for a mesh rebuilt over the same devices and spec, `NamedSharding`'s equality), so the program is in the
-    persistent compilation cache when a run resumes from the checkpoint, which then compiles no program the
-    runs before it did not (testing.md, a resumed run reuses its compiled programs). The step never waits on
-    the compile; a checkpoint's wait for its writes waits for it too (`decodes_done`), and so does a
-    process's exit, which never ends while a compile runs inside jaxlib (`options.compiling`). A compile
-    ahead that fails is no failed save: it is logged, and the resume compiles the program as it would
-    have."""
-    abstract = [jax.ShapeDtypeStruct(array.shape, array.dtype, sharding=array.sharding)
-                for array in (planes, live)]
-    key = (*((each.shape, each.dtype, each.sharding) for each in abstract), np.dtype(dtype))
+def compile_ahead(key: tuple, compiled_program, *args, what: str, **kwargs) -> None:
+    """Lower `compiled_program` over `*args` and `**kwargs` here and compile it in a thread of its own
+    (`options.compiling`), once a process for its cache directory and `key`, so the program is in the
+    persistent compilation cache when a run resumes from the checkpoint (`decodes_done` waits for it, as
+    does a process's exit). A compile ahead that fails is no failed save: it is logged, and the resume
+    compiles the program as it would have."""
+    scoped = (jax.config.jax_compilation_cache_dir, key)
     with _DECODED_LOCK:
-        if key in _DECODED:
+        if scoped in _DECODED:
             return
         # The signature reserved, so another save's thread neither lowers it again nor waits on this lowering.
-        _DECODED[key] = None
+        _DECODED[scoped] = None
     began = time.perf_counter()
     try:
-        begun = options.compiling(_decode_delta, *abstract, np.dtype(dtype))
+        begun = options.compiling(compiled_program, *args, **kwargs)
     except (Unlowerable, jax.errors.JaxRuntimeError):
         # A lowering refused (a placement no launch lowers for, XLA's refusal) fails no save: the resume
-        # compiles the decode as it would have.
-        logger.warning("a checkpoint average's restore decode %s did not lower ahead; a resume compiles it",
-                       key, exc_info=True)
+        # compiles the program as it would have.
+        logger.warning("%s %s did not lower ahead; a resume compiles it", what, key, exc_info=True)
         return
     with _DECODED_LOCK:
-        _DECODED[key] = begun
+        _DECODED[scoped] = begun
 
     def compiled(attempt: concurrent.futures.Future) -> None:
         # XLA's refusal of the compile (its memory, its device), which the attempt holds as its error
         # (`report.Attempt`): the resume compiles it as it would.
         refused = attempt.exception() or attempt.result().error
         if refused is not None:
-            logger.warning("a checkpoint average's restore decode %s did not compile ahead; a resume "
-                           "compiles it", key, exc_info=refused)
+            logger.warning("%s %s did not compile ahead; a resume compiles it", what, key, exc_info=refused)
         else:
-            logger.info("compiled a checkpoint average's restore decode %s ahead, off the step, in %.3f s",
-                        abstract[0].shape, time.perf_counter() - began)
+            logger.info("compiled %s ahead, off the step, in %.3f s", what, time.perf_counter() - began)
 
     begun.attempt.add_done_callback(compiled)
 
 
+def decoded_ahead(planes: jax.Array, live: jax.Array, dtype) -> None:
+    """Compile the program a restore reads `planes` back by (`_decode_delta`, over the planes and the
+    weight they are the difference from as a restore holds them, typed `dtype`) where the save that wrote
+    them runs (`compile_ahead`), so a resume compiles no program the runs before it did not (testing.md, a
+    resumed run reuses its compiled programs)."""
+    abstract = [jax.ShapeDtypeStruct(array.shape, array.dtype, sharding=array.sharding)
+                for array in (planes, live)]
+    key = ("ema-decode", *((each.shape, each.dtype, each.sharding) for each in abstract), np.dtype(dtype))
+    compile_ahead(key, _decode_delta, *abstract, np.dtype(dtype),
+                  what="a checkpoint average's restore decode")
+
+
 def decodes_done() -> None:
-    """Wait for every restore decode a save began compiling (`decoded_ahead`)."""
+    """Wait for every restore program a save began compiling (`compile_ahead`)."""
     with _DECODED_LOCK:
         begun = [compiling.attempt for compiling in _DECODED.values() if compiling is not None]
     concurrent.futures.wait(begun)
