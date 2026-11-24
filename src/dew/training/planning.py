@@ -170,9 +170,10 @@ class Candidate:
     """The mesh axes a projection of its step spread over as it traced (`dew.nn.sharding.Link.spread`), which
     a step kept apart from its trace (`dew.training._candidates.candidate_for`) sets again on the links of
     the trace that reads it."""
-    joins: bool = False
-    """Whether its updates join two or more Newton-Schulz stacks of one shape where its run states no group
-    (`dew.newton_schulz.joining`): what its plan's release would part (`FitSearch.searched`)."""
+    joined: int = 0
+    """What the Newton-Schulz stacks of one shape its updates join two or more of where its run states no
+    group hold by count (`dew.newton_schulz.joined_held`), every Muon transform's together, 0 where they
+    join none: an estimate that orders its plan's release (`Parting`) and rules none out."""
     resident: Mapping[Hashable, int] = dataclasses.field(default_factory=dict)
     """The bytes the state it was lowered from held on each of this process's devices as it was lowered
     (`resident_on`), read off the placed arrays before their shapes stood for them (`prepared`): the
@@ -803,6 +804,36 @@ def spill_record(miss: report.Miss) -> dict[str, JSON]:
     return {**record, "config": None if miss.config is None else repr(miss.config)}
 
 
+@dataclasses.dataclass
+class Parting:
+    """Where a climb asks a rung with its joined Newton-Schulz stacks parted (`released(1)`), as each rung
+    asked joined misses: at once where no process fell short there by more than the stacks hold by count
+    (`estimate`, `dew.newton_schulz.joined_bytes`), else once every rung asked joined has missed
+    (`deferred`, `FitSearch.searched`), as a count orders the asks and rules none out (XLA's buffers can
+    hold more than it counts: a spectral preconditioning's SVD). Each rung's own: one parted leaves the next
+    rung asked joined first, which may fit as it is, and one whose parting freed nothing leaves the next
+    rung's to its own miss (owner, 2026-11-23, row 12463: a 4B cold start parted its stacks before the remat
+    rung its miss needed, three compiles where two were its contract)."""
+    estimate: int
+    """What the step's joined stacks hold by count, every process's the same; 0 where it joins none."""
+    gather: Callable[[object], list]
+    """How every process's verdict is read (`FitSearch.gather`), so each asks the same rungs."""
+    deferred: list[Rung] = dataclasses.field(default_factory=list)
+    """The parted variants a miss past the count left for the climb's end, in the order it reached them."""
+
+    def after(self, rung: Rung, shortfall: int | None) -> Rung | None:
+        """`rung`, asked joined and missed by `shortfall` (None where it measured no miss), parted, where it
+        is asked at once; None where its parted variant is deferred, or where the step joins no stacks or
+        its rung parts them already."""
+        if not self.estimate or rung.ns_group is not None:
+            return None
+        parted = dataclasses.replace(rung, ns_group=1)
+        if any(self.gather(shortfall is not None and shortfall > self.estimate)):
+            self.deferred.append(parted)
+            return None
+        return parted
+
+
 class Lower(Protocol):
     """A search's step at a split, whether it keeps its narrow copies and the Newton-Schulz stacks it joins at
     a time (`ns_group`), at the objective's rung, lowered (`FitSearch.lower`)."""
@@ -838,9 +869,10 @@ class FitSearch[LossT, EffectsT]:
     what it lowered, compiled and measured, and the plan each rung fitted at.
 
     The rung it starts at (the run's own, a plan recorded or a search's before it) is asked first, its
-    splits walked as each miss's figures leave possible (`walked`): most runs fit there. Past it the
-    Newton-Schulz stacks its updates join where its run states no group (`Candidate.joins`) are parted one
-    at a time, before any recomputation, and joined again where that frees nothing (row 5889); then the
+    splits walked as each miss's figures leave possible (`walked`): most runs fit there. Each rung asked
+    with the Newton-Schulz stacks its updates join where its run states no group (`Candidate.joined`) is
+    asked again with them parted one at a time (row 5889) as `Parting` orders it: at once where its miss
+    was within what they hold by count, else past every rung asked joined. Past the start, the
     remat rungs, least recomputation first, each at the run's own head and options with the narrow copies
     the start held (`recomputing`): a tight start settles in its second compile where the next remat rung
     holds what its miss was short of (owner, 2026-11-21, BIBLE §6: two compiles a tight cold start). Past
@@ -1319,21 +1351,23 @@ class FitSearch[LossT, EffectsT]:
 
     def searched(self, candidates: Sequence[int], first: int) -> int | None:
         """The split the step fits at, the objective and the search left at its rung (`FitSearch`), or None
-        where no rung fits: the rung it stands on first, from `candidates[first]` (`walked`, `after`); then,
-        where its updates join Newton-Schulz stacks its run states no group for (`Candidate.joins`), the same
-        rung joining one at a time, its copies released (up to 11.3 GB at a 4B step's peak for 82 ms a step,
-        row 5669, where a remat rung recomputes its forward; row 5889), kept only where that brought it nearer
-        (`freed`, `parted`); then each remat rung of the ladder at the run's own head and options, the narrow
-        copies as the start held them, least
-        recomputation first (`recomputing`), the rung every process's miss reads as dropping what it was short
-        of first (`by_shortfall`): a tight start's next compile is
-        the rung that recomputes the activations its miss was short of (owner, 2026-11-21: a GH200's 4B
-        step asked six head and options rungs and the copies' drop, none freeing its 0.47 GiB, before
-        'minimal' fitted, 8 compiles where two were the start's contract, BIBLE §6). Past them, where none
+        where no rung fits: the rung it stands on first, from `candidates[first]` (`walked`, `after`); then
+        each remat rung of the ladder at the
+        run's own head and options, the narrow copies as the start held them, least recomputation first
+        (`recomputing`), the rung every process's miss reads as dropping what it was short of first
+        (`by_shortfall`): a tight start's next compile is the rung that recomputes the activations its miss
+        was short of (owner, 2026-11-21: a GH200's 4B step asked six head and options rungs and the copies'
+        drop, none freeing its 0.47 GiB, before 'minimal' fitted, 8 compiles where two were the start's
+        contract, BIBLE §6). Past them, where none
         fits, the rest of the ladder in its order: where its step read narrow copies, the start's rung
         without them, whose miss and the one before it decide whether the rungs after read them (`freed`),
         then every rung of the ladder from the batch whole, its head's tiles and XLA's default options
-        among them, until one fits. No rung is asked twice; every process asks the same."""
+        among them, until one fits. Where its updates join Newton-Schulz stacks its run states no group for
+        (`Candidate.joined`), each of those rungs that misses is asked again joining them one at a time, its
+        copies released (up to 11.3 GB at a 4B step's peak for 82 ms a step, row 5669; row 5889): at once
+        where its miss was within what they hold by count, else, past every rung asked joined, in the
+        climb's order before the search gives up (`Parting`). No rung is asked twice; every process asks the
+        same."""
         start = self.rung_now()
         after = functools.partial(self.after, candidates)
         split = walked(candidates, first, self.fits_here, after)
@@ -1350,49 +1384,78 @@ class FitSearch[LossT, EffectsT]:
             _log.warning(said, json.dumps(self.current(), sort_keys=True))
             return walked(candidates, 0, self.fits_here, after)
 
-        narrow, ns_group = self.narrow, self.ns_group
+        narrow, group = self.narrow, self.ns_group
         # The least the start fell short by, and its live set: what each remat rung would free of it.
         missed = self.short(named[0])
-        if ns_group is None and any(candidate.joins for candidate in self.lowered.values()):
-            # Parting the joined stacks frees their copies and what their joined iteration holds beside
-            # them, which a miss's live set does not name (XLA's fusions carry other ops' names): asked first.
-            split, ns_group = self.parted(start, ask)
-            if split is not None:
-                self.said(named)
-                return split
-        ordered, read = self.by_shortfall(self.recomputing(start, narrow, ns_group), missed)
+        # What its joined Newton-Schulz stacks hold by count, every process's the same (0: it joins none, or
+        # its run states their group): what orders each rung's parted variant (`Parting`).
+        parting = Parting(self.stacks_count() if group is None else 0, self.gather)
+
+        def parted(rung: Rung) -> int | None:
+            # `rung`, just asked joined and missed, asked parted at once where its miss leaves it so.
+            variant = parting.after(rung, self.shortfall(named[-1]))
+            if variant is None or variant in self.asked:
+                return None
+            self.variants = True
+            return ask(variant, "the step does not fit the devices with its Newton-Schulz stacks joined; "
+                       "compiling it again joining one at a time (%s)")
+
+        if (split := parted(start)) is not None:
+            self.said(named)
+            return split
+        ordered, read = self.by_shortfall(self.recomputing(start, narrow, group), missed)
         for rung in ordered:
             if rung in self.asked:
                 continue
             split = ask(rung, "the step does not fit the devices; compiling it again recomputing more at %s")
+            if split is None and rung == read:
+                self.moved(rung, missed)
+            if split is None:
+                split = parted(rung)
             if split is not None:
                 self.said(named)
                 return split
-            if rung == read:
-                self.moved(rung, missed)
         if narrow and any(candidate.copies for candidate in self.lowered.values()):
             # The narrow copies, two bytes a parameter held all run for 1-2% of a step, dropped at the start's
             # rung where no recomputation fits with them.
-            self.at(dataclasses.replace(start, ns_group=ns_group))
+            self.at(start)
             kept = self.rung()
-            split = ask(dataclasses.replace(start, narrow=False, ns_group=ns_group), "the step does not fit "
-                        "the devices with its narrow copies; compiling it again without them (%s)")
+            dropped = dataclasses.replace(start, narrow=False)
+            split = ask(dropped, "the step does not fit the devices with its narrow copies; compiling it "
+                        "again without them (%s)")
+            if split is None:
+                narrow = not self.freed(kept, self.rung())
+                self.variants = True
+                if narrow:
+                    # Dropped, the step fell no less short at the split both missed at: on a GPU the step
+                    # casts its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB
+                    # with them), so the copies come back, their 1-2% of a step kept, and the ladder climbs
+                    # with them.
+                    _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs "
+                                 "on")
+                split = parted(dropped)
             if split is not None:
                 self.said(named)
                 return split
-            narrow = not self.freed(kept, self.rung())
-            self.variants = True
-            if narrow:
-                # Dropped, the step fell no less short at the split both missed at: on a GPU the step casts
-                # its weights whole either way (a GH200: 68.352 MB without its copies, 68.344 MB with them),
-                # so the copies come back, their 1-2% of a step kept, and the ladder climbs with them.
-                _log.warning("the step's narrow copies free nothing it needs: it keeps them and climbs on")
-        rungs = [rung for group in self.ladder(start, narrow, ns_group, remat_set=self.remat_set,
-                                               defaults=self.own_defaults()) for rung in group]
+        rungs = [rung for places in self.ladder(start, narrow, group, remat_set=self.remat_set,
+                                                defaults=self.own_defaults()) for rung in places]
         for rung in rungs:
             if rung in self.asked:
                 continue
             split = ask(rung, "the step does not fit the devices; compiling it again at %s")
+            if split is None:
+                split = parted(rung)
+            if split is not None:
+                self.said(named)
+                return split
+        # Every rung asked joined missed: each parted variant a miss past the stacks' count deferred, in the
+        # climb's order, before the search gives up (the count orders, and rules none out).
+        for variant in parting.deferred:
+            if variant in self.asked:
+                continue
+            self.variants = True
+            split = ask(variant, "no rung fits the devices with its Newton-Schulz stacks joined; compiling "
+                        "one again joining them one at a time (%s)")
             if split is not None:
                 self.said(named)
                 return split
@@ -1409,17 +1472,24 @@ class FitSearch[LossT, EffectsT]:
         whatever the frontier above it asked since (`above`). Every rung's twin under XLA's defaults is read,
         whichever split's options it differs from (`step_options` reads a microbatch's size): where it is the
         step's own program at its split, its entry states the same figures as the own one's. None where the
-        plan is no rung of that climb (the run's own, or one past a release the climb does not read). The
-        objective is left at the last rung read, the run's to restore."""
+        plan is no rung of that climb (the run's own, or one past a release the climb does not read). Where
+        the step joins Newton-Schulz stacks its run states no group for, each place is read joined and then
+        with them parted (`Parting`), the configured rung's own parted step among them, as the search may
+        settle joined above a parted step that fits (review of row 12463). The objective is left at the last
+        rung read, the run's to restore."""
         self.at(origin)
         # The climb as the configured run reads it: one that set its own remat climbs its head alone, whatever
         # remat a record then moved it to.
         explicit = remat_stated(self.objective)
-        start = dataclasses.replace(origin, ns_group=plan.ns_group)
+        # Every process reads the same places: the count gathered, as the search gathers it.
+        groups = (None, 1) if origin.ns_group is None and self.stacks_count() else (plan.ns_group,)
+        start = dataclasses.replace(origin, ns_group=groups[0])
         copies = start.narrow and any(candidate.copies for candidate in self.lowered.values())
-        order = [*([dataclasses.replace(start, narrow=False)] if copies else []),
-                 *(rung for group in self.ladder(start, start.narrow, start.ns_group, remat_set=explicit,
-                                                 defaults=(False, True)) for rung in group)]
+        places = [*([dataclasses.replace(start, narrow=False)] if copies else []),
+                  *(rung for places in self.ladder(start, start.narrow, start.ns_group, remat_set=explicit,
+                                                   defaults=(False, True)) for rung in places)]
+        order = [*(dataclasses.replace(start, ns_group=group) for group in groups[1:]),
+                 *(dataclasses.replace(place, ns_group=group) for place in places for group in groups)]
         if plan not in order:
             return ()
         # A rung read here that misses is no checkpoint's rung missing (`fits_here`).
@@ -1436,23 +1506,22 @@ class FitSearch[LossT, EffectsT]:
                 found.append(self.probes[-1])
         return tuple(found)
 
-    def parted(self, at: Rung, ask: Callable[[Rung, str], int | None]) -> tuple[int | None, int | None]:
-        """The joined stacks parted at `at`, the search's start (`searched`): the split it fits at, None
-        where it does not; and the group the rungs after it ask: one at a time where parting brought it
-        nearer (`freed`), else joined."""
-        self.at(at)
-        kept = self.rung()
-        split = ask(dataclasses.replace(at, ns_group=1), "the step does not fit the devices with its "
-                    "Newton-Schulz stacks joined; compiling it again joining one at a time (%s)")
-        if split is not None:
-            return split, 1
-        # The rungs past here chosen from what the misses read (`PlanRefused.variants`).
-        self.variants = True
-        parted = self.freed(kept, self.rung())
-        if not parted:
-            _log.warning("the step's joined Newton-Schulz stacks free nothing it needs: it keeps them joined "
-                         "and climbs on")
-        return None, 1 if parted else None
+    def stacks_held(self) -> int:
+        """What the Newton-Schulz stacks the step's updates join hold by count (`Candidate.joined`), the most
+        of any step this search lowered; 0 where they join none."""
+        return max((candidate.joined for candidate in self.lowered.values()), default=0)
+
+    def stacks_count(self) -> int:
+        """`stacks_held` as every process reads it, the largest any holds (`gather`): a trace JAX's cache
+        answered notes none on its process, so a process's own count is no verdict every process shares,
+        and whether a rung's parted step is asked is one (`Parting`, `below`)."""
+        return max(self.gather(self.stacks_held()))
+
+    def shortfall(self, rung: str) -> int | None:
+        """What the search fell short by at `rung` at the split it last missed at there, its walk's finest
+        (`MemoryMiss.shortfall`, in bytes), as `freed` reads it; None where it measured no miss there."""
+        latest = next((miss for (at, _), miss in reversed(self.misses.items()) if at == rung), None)
+        return None if latest is None else latest.shortfall // self.factor
 
     def short(self, rung: str) -> tuple[int, LiveSet] | None:
         """The least the search fell short by at `rung` (`MemoryMiss.shortfall`, in bytes) among its misses
