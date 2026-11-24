@@ -141,9 +141,27 @@ def program_key(lowered: jax.stages.Lowered) -> Hashable:
     prunes an argument neither reads do not, nor two that call other callbacks from one text (an Optax
     update's `jax.pure_callback` over another closure); any tree has one, a class made inside a function
     among its nodes. The key of every match within a process (the executables it holds across trainers, a
-    begun compile's lowering); `program_digest` is the one a file of programs holds."""
+    begun compile's lowering); `program_digest` is the one a file of programs holds. Rendered once a
+    lowering, which holds one program for as long as it lives (`known_program_key`)."""
+    with _KEYING:
+        if (known := _PROGRAM_KEYS.get(lowered)) is not None:
+            return known
     types = tuple((aval.shape, str(aval.dtype), aval.weak_type) for aval in jax.tree.leaves(lowered.in_avals))
-    return _text_digest(lowered), lowered.in_tree, lowered.out_tree, types, host_callbacks(lowered)
+    key = _text_digest(lowered), lowered.in_tree, lowered.out_tree, types, host_callbacks(lowered)
+    with _KEYING:
+        _PROGRAM_KEYS[lowered] = key
+    return key
+
+
+def known_program_key(lowered: jax.stages.Lowered) -> Hashable | None:
+    """`lowered`'s `program_key` where one was read of it, None where none was, its text never rendered
+    here: a lowering whose key no one read keys no executable held by it."""
+    with _KEYING:
+        return _PROGRAM_KEYS.get(lowered)
+
+
+_PROGRAM_KEYS: weakref.WeakKeyDictionary[jax.stages.Lowered, Hashable] = weakref.WeakKeyDictionary()
+_KEYING = threading.Lock()
 
 
 def host_callbacks(lowered: jax.stages.Lowered) -> tuple:

@@ -1806,6 +1806,24 @@ def test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_plac
     assert (trainer.plan["split"], trainer.plan["remat"]) == (1, None), trainer.plan["probes"]
 
 
+def test_a_plan_searched_again_placed_lowers_no_candidate_its_unplaced_search_lowered(monkeypatch):
+    """A fresh fit whose plan made before its state was placed is searched again over the placed state
+    (`test_a_plan_made_before_the_state_is_placed_is_searched_again_where_the_placed_devices_cover_a_miss`)
+    lowers each step it asks once in all: the placed search's batch whole is the step the unplaced one
+    lowered, the state then its shapes and the batch on the host, now placed (row 12465: a 4B search
+    traced and lowered each candidate again, 2 to 4.5 minutes each, its XLA compile a minute)."""
+    whole = needs(monkeypatch, lm())
+    state, _, _ = lm().place()
+    held = sum(leaf.nbytes for leaf in jax.tree.leaves(state) if isinstance(leaf, jax.Array))
+    free(monkeypatch, whole + held)
+    trainer = lm()
+    data = Pipeline(Memory({"text": np.asarray(BATCH["text"])})).repeat().batch(ROWS)
+    lowered, _ = lowered_and_compiled(lambda: trainer.fit(data, steps=1))
+    asked = {(probe["split"], json.dumps(probe["remat"])) for probe in trainer.plan["probes"]}
+    assert (trainer.plan["split"], trainer.plan["remat"]) == (1, None), trainer.plan["probes"]
+    assert lowered <= len(asked) + 1, (lowered, asked)
+
+
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
     """An A100's plan: no recomputation fits the batch at four microbatches and not in fewer, so the plan
     is four at no recomputation, which XLA's memory analysis of each compile decides, and no optional

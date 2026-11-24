@@ -43,7 +43,7 @@ from dew.batch import sows_appended
 from dew.nn.dense import captures_any_method
 
 from ..precision import at_least_fp32, softplus
-from ..protocols import EXIT_PASSES, EXITS
+from ..protocols import EXIT_PASSES, EXITS, fixed_remat
 from .decoder_stack import BY_CALL, WRITTEN, Loop, PassView, SharedPassView
 from .layer_names import group_layers
 
@@ -389,7 +389,9 @@ class _Passes:
         model, loop = self.model, self.loop
         self.span = loop.layers or (0, model.num_layers)
         self.shared = SharedPassView(self.span) if loop.shared_cache else None
-        self.run_block = nn.remat(self.pass_block) if loop.remat and not self.decode else self.pass_block
+        # A pass recomputed whole whatever the rung (`fixed_remat`).
+        self.run_block = (nn.remat(fixed_remat(self.pass_block)) if loop.remat and not self.decode
+                          else self.pass_block)
         self.exit_states = (loop.exiting and loop.exit_threshold is not None
                             and not model.is_mutable_collection(EXITS))
         self.exit_outputs = loop.exiting and (self.exit_states or model.is_mutable_collection(EXITS)
@@ -578,7 +580,7 @@ class _Passes:
             index = jnp.where(step >= passes, 0, jnp.where(step < passes - backprop, 1, 2))
             return _sown_switch(index, (skip, held_back, run), module, carry)
 
-        stepping = nn.remat(branched) if self.loop.remat else branched
+        stepping = nn.remat(fixed_remat(branched)) if self.loop.remat else branched
         return stepping(module, carry, step, passes)
 
 
