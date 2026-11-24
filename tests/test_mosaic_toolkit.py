@@ -165,7 +165,8 @@ FED_ROWS, FED_WIDTH = 64, 128
 
 
 def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled: bool = False,
-                  in_flight: int = 0, shared: bool = False, split: bool = False, agreed: bool = True):
+                  in_flight: int = 0, shared: bool = False, split: bool = False, agreed: bool = True,
+                  common: bool = False):
     """`p @ x` and `2 * p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on
     warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
     first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
@@ -178,7 +179,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
     step falls in (walked by none), the rest past a boundary each consumer's own (a causal call's masked
     segment, which one consumer's keys end a step sooner in) at twice the weight (`_split_weights`), and an
     empty one past the operands' blocks; its steps loaded as `walk_own` agrees them (`agreed`, else walked
-    directly)."""
+    directly); `common`, the boundary every consumer's alike, stated so (`walk_own`'s `common`)."""
     from dew.nn.kernels.templates import mosaic_sm90
     share = FED_ROWS // consumers
     family = bundles.named("mma.sync", jnp.bfloat16, None) if shared else mosaic_sm90.FED
@@ -207,7 +208,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
                                           rows.at[pl.ds(wg * share, share)])
                 return carry, (acc,)
 
-            middle = first + 3 + wg
+            middle = first + 3 + (0 if common else wg)
             twice = functools.partial(step, weight=2)
             whole = ((step, first, first + FED_STEPS),)
             # An empty segment past the operands' blocks last, whose tiles no trip may load.
@@ -221,7 +222,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
 
             if shared and agreed:
                 streamed = (first, first + FED_STEPS)
-                return family.walk_own(feed, views, streamed, streamed, wg, walk)
+                return family.walk_own(feed, views, streamed, streamed, wg, walk, common=common)
             return walk(feed, first, first + FED_STEPS, first)
 
         summed = family.scoped(walked, streams=allocated)
@@ -343,29 +344,32 @@ def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store
 
 
 @INTERPRETS
-def test_two_mma_sync_consumers_walk_segments_whose_boundaries_differ_through_one_pipeline():
+@pytest.mark.parametrize("common", [False, True], ids=["own", "common"])
+def test_two_mma_sync_consumers_walk_segments_whose_boundaries_differ_through_one_pipeline(common):
     """Interpreted: two mma.sync consumers sharing one pipeline walk segments from a step past 0 (empty ones,
     a gap, and a boundary each consumer's own), as one pipeline over the steps `walk_own` agrees, each
     consumer's step its own segment's or none: exactly each segment's weighted products (a pipeline of its
-    own a segment met unpaired where their boundaries differ, and hung). Walked directly, several segments
-    are refused: the consumers' loads would follow segments each its own."""
+    own a segment met unpaired where their boundaries differ, and hung); segments every consumer's alike,
+    stated so (`common`), a pipeline each. Walked directly, several segments are refused."""
     p, x = _fed_operands()
     with pytest.raises(NotImplementedError):
         _fed_products(p, x, interpret=INTERPRETED, consumers=2, lo=3, shared=True, split=True, agreed=False)
-    got = _fed_products(p, x, interpret=INTERPRETED, consumers=2, lo=3, shared=True, split=True)
+    got = _fed_products(p, x, interpret=INTERPRETED, consumers=2, lo=3, shared=True, split=True,
+                        common=common)
     summed = sum(weight * np.asarray(p, np.float32)[:, rows] @ np.asarray(x, np.float32)[rows]
-                 for rows, weight in _split_weights(consumers=2))
+                 for rows, weight in _split_weights(consumers=2, common=common))
     for value, expected in zip(got, (summed, 2 * summed), strict=True):
         np.testing.assert_array_equal(np.asarray(value), expected)
 
 
-def _split_weights(consumers: int):
+def _split_weights(consumers: int, *, common: bool = False):
     """`_fed_products`' split walk's weights: each consumer's share of each step's rows, and the times its
-    segment adds its product (none for the step its gap holds, two past its consumer's boundary)."""
+    segment adds its product (none for the step its gap holds, two past its consumer's boundary, every
+    consumer's alike where `common`)."""
     share = FED_ROWS // consumers
     for wg in range(consumers):
         for step in range(FED_STEPS):
-            weight = 0 if step == 1 else 1 if step < 3 + wg else 2
+            weight = 0 if step == 1 else 1 if step < 3 + (0 if common else wg) else 2
             yield slice(step * FED_ROWS + wg * share, step * FED_ROWS + (wg + 1) * share), weight
 
 
@@ -381,15 +385,18 @@ def test_two_mma_sync_consumers_finish_each_tile_when_one_alone_stores_it():
 
 
 @pytest.mark.parametrize("consumers", [1, 2])
-@pytest.mark.parametrize(("shared", "target"), [(False, "sm90"), (True, "sm80")])
-def test_the_fed_walk_lowers_for_its_gpu(shared, target, consumers):
+@pytest.mark.parametrize(("shared", "target", "common"), [(False, "sm90", False), (True, "sm80", False),
+                                                          (True, "sm80", True)])
+def test_the_fed_walk_lowers_for_its_gpu(shared, target, common, consumers):
     """The fed walk's kernel, two consumers' 32-row contraction staged at 64 bytes, lowers for an H100 on any
-    host; two mma.sync consumers' shared cp.async walk for an A100 (`shared`)."""
+    host; two mma.sync consumers' shared cp.async walk for an A100 (`shared`), and its segments every
+    consumer's alike, a collective pipeline each (`common`)."""
     p, x = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _fed_operands())
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), target)
+    walked = functools.partial(_fed_products, interpret=False, consumers=consumers, shared=shared,
+                               split=common, common=common)
     with generation.assumed(target), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, shared=shared)).trace(
-            p, x).lower(lowering_platforms=("cuda",))
+        jax.jit(walked).trace(p, x).lower(lowering_platforms=("cuda",))
 
 
 def consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
