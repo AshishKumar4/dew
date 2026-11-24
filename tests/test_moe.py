@@ -510,15 +510,19 @@ def test_a_runs_stacked_packed_banks_decode_as_each_layers_bank_does():
                                   np.stack([values for _, values in layers]))
 
 
-def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_apart():
+@pytest.mark.parametrize("part", ["values", pytest.param(
+    "gradients", marks=pytest.mark.check1_shards(seeds=8, per_task=4))])
+def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_apart(part, request):
     """A stack's layer's gate and up projections over a scaled stream (`Gathered.scales`, Llama 4's scaled
     input) are, on an H100's routes, one paired launch (`paired_projections`) taking both whole stacks, the
     layer's offset into them, the rows' table and the scale in its prologue: no copy of the rows gathered or
     scaled, nor of the layer's matrices sliced (`grouped_matmul.weighed`, its route the template's). Its
     outputs and its gradients of the tokens, both stacks and the scales are as exact as the products of the
     rows gathered and scaled and the layer's matrices sliced, each multiplied apart, both from float64
-    truth (check 1; row 12306). The kernels run interpreted on this CPU, as the H100's."""
+    truth (check 1; row 12306). The kernels run interpreted on this CPU, as the H100's: the binding and the
+    values one case, the gradients another, their draws in map tasks of four (214 s together)."""
     from generation_support import here
+    from map_judge import marked_seeds
     from reference_error import as_given, assert_as_exact, with_gradients
 
     from dew.nn import moe
@@ -584,13 +588,16 @@ def test_a_layers_paired_and_scaled_expert_products_are_one_launch_as_exact_as_a
             assert arguments["first"] is not None and arguments["gather"].shape == (slots,)
             assert arguments["tokens"].shape == (tokens, depth) and arguments["hooks"].prologue is not None
         label = "a layer's paired experts over scaled rows"
+        if part == "gradients":
+            # The gradients eagerly, as the Mosaic interpreters' ordered callbacks need (`as_given`).
+            assert_as_exact(as_given(with_gradients(launched)), jax.jit(with_gradients(plain)), draw,
+                            f"{label}, gradients", seeds=marked_seeds(request),
+                            truth_fn=with_gradients(truth))
+            return
         with generation.routes() as routes:
             assert_as_exact(jax.jit(valued(launched)), jax.jit(valued(plain)), draw, label, seeds=8,
                             truth_fn=valued(truth))
         assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
-        # The gradients eagerly, as the Mosaic interpreters' ordered callbacks need (`as_given`).
-        assert_as_exact(as_given(with_gradients(launched)), jax.jit(with_gradients(plain)), draw,
-                        f"{label}, gradients", seeds=8, truth_fn=with_gradients(truth))
 
     # Stacks read at two indices are each read at its own: no pair, the second stack at its layer.
     with grouped_matmul.weighed() as calls:
