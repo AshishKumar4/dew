@@ -227,3 +227,18 @@ def test_a_forms_inline_block_compiles_for_an_h100(form):
                           num_threads=1, thread_name="wg")
     case = KernelCase(form, lambda: (launch, (jax.ShapeDtypeStruct(shape, jnp.uint32),)))
     assert not (failed := mosaic_failures(compile_mosaic_kernels([case], "sm90"))), failed
+
+
+def test_a_store_a_branch_holds_under_a_guard_of_the_data_is_refused():
+    """A store some lanes reach (a branch's first 16) under a guard the block sets of the data is refused,
+    its lanes unknown among the active ones (a partial active mask once passed it as bounded)."""
+    def body(ctx, ref):
+        del ctx
+        i32 = ir.IntegerType.get_signless(32)
+        with mgpu_utils.when(_thread(16)):
+            word = arith.bitcast(i32, memref.load(ref, [arith.constant(ir.IndexType.get(), 0)]))
+            mgpu_utils.inline_ptx("{ .reg .pred p; setp.eq.u32 p, $1, 010; @p st.shared.u32 [$0], $1; }",
+                                  arith.constant(i32, 1), word, has_side_effects=True)
+
+    with pytest.raises(emission.Unpriced):
+        _counted(body)
