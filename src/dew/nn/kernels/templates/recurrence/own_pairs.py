@@ -19,7 +19,7 @@ from jax.extend.mlir import ir
 from jax.extend.mlir.dialects import arith, memref, scf
 
 from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import emission, mosaic, native, resources, scan, swizzling
+from dew.nn.kernels.templates import emission, mosaic, native, product, resources, scan, swizzling
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.recurrence.intra import _named, intra_rows, pair_streams, systems
 from dew.nn.kernels.templates.recurrence.mainloop import (
@@ -316,14 +316,10 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
             def _():
                 # Each sub-chunk's diagonal block of each output, in place in the walk's sums (`into`), the
                 # entries it leaves zero.
-                sub = algebra.SUB
                 for o, (name, ref) in enumerate(zip(products, sums, strict=True)):
-                    for s in range(chunk // sub):
-                        block = (family.tile_of(threaded[-1].at[o, pl.ds(s * sub, sub)]) if threaded
-                                 else bands[o][s * sub:(s + 1) * sub])
-                        _band_form(call, name).store(
-                            ref, algebra.block_masked(block, strict=name == "system", scale=scale),
-                            row + s * sub, sub, h * chunk + s * sub, sub, family=family, smem=landing[name])
+                    block = family.tile_of(threaded[-1].at[o]) if threaded else bands[o]
+                    masked = algebra.block_masked(block, strict=name == "system", scale=scale)
+                    _blocks_written(call, name, masked, ref, row, h * chunk, landing[name])
 
             return bands, accumulators
 
@@ -353,6 +349,58 @@ def intra_own(q, k, prefix, beta, taken, call: Call, *, scale: float, products: 
                             for name, (_, dtype) in blocks.items()})(*inputs, *into)
 
 
+def _blocks_written(call: Call, name: str, blocks, ref, row, column, landing) -> None:
+    """A chunk's own pairs `blocks` `[C, SUB]` of output `name` (a row's columns its sub-chunk's diagonal
+    block's, `algebra.key_diagonal_bands`') written in place on the sub-chunks' diagonal blocks of the walk's
+    sums `ref` at `row` and `column`, in the output's form (`_band_form`, each part through `landing`, a
+    `[C, SUB]` tile of its stored dtype): a block's rows a tile of 16 no layout of a 64-row product holds,
+    so each part is copied from `landing` by its threads' own words (`_diagonal_copied`)."""
+    form, chunk, sub = _band_form(call, name), call.chunk, algebra.SUB
+    pieces = product.formed(blocks.astype(jnp.float32), form.parts) if form.parts > 1 else (blocks,)
+    for piece, view in zip(pieces, form.views(ref, row, chunk, column, chunk), strict=True):
+        piece = piece.astype(form.stored)
+        if call.interpret:
+            for s in range(chunk // sub):
+                view.at[pl.ds(s * sub, sub), pl.ds(s * sub, sub)][...] = piece[s * sub:(s + 1) * sub]
+            continue
+        plgpu.store(landing, piece, optimized=False)
+        mosaic.synced(call.interpret)
+        _diagonal_copied(landing, view)
+        mosaic.synced(call.interpret)
+
+
+def _diagonal_copied(landing, view) -> None:
+    """`landing` `[C, SUB]` (a row's columns its sub-chunk's diagonal block's) copied onto the sub-chunks'
+    diagonal blocks of `view` `[C, C]`, each thread its run of entries."""
+    chunk, sub = landing.shape
+    entries = chunk * sub
+    work = Work(operations=entries, shared_bytes=entries * landing.dtype.itemsize,
+                device_bytes=entries * view.dtype.itemsize)
+    body = emission.stating(lambda *_: work)(lambda ctx, source, target: _copied(source, target))
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType()), return_type=())(body)(landing, view)
+
+
+def _copied(landing_ref, view_ref) -> None:
+    """`_diagonal_copied` in Mosaic GPU's terms: a thread's `C * SUB / THREADS` entries, each its row and
+    column in `landing` and its sub-chunk's block's column in `view`."""
+    index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
+    chunk, sub = ir.MemRefType(landing_ref.type).shape
+    run = chunk * sub // scan.THREADS
+
+    def const(value):
+        return arith.constant(i32, value)
+
+    def at(*values):
+        return [arith.index_cast(index, value) for value in values]
+
+    thread = arith.remui(utils.thread_idx(), const(scan.THREADS))
+    for step in range(run):
+        entry = arith.addi(arith.muli(thread, const(run)), const(step))
+        r, c = arith.divui(entry, const(sub)), arith.remui(entry, const(sub))
+        column = arith.addi(arith.muli(arith.divui(r, const(sub)), const(sub)), c)
+        memref.store(memref.load(landing_ref, at(r, c)), view_ref, at(r, column))
+
+
 def _band_form(call: Call, name: str):
     """The form an output's bands are stored in (`intra_own`'s): the scores' the held operand's, the system's
     `systems`', as the intra walk stores their sums."""
@@ -372,7 +420,7 @@ def _own_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
                     *((swizzling.plain((chunk,), jnp.float32),) if "system" in products else ()),
                     swizzling.plain((outputs, chunk, algebra.SUB), jnp.float32))
     staging = (*own_staging(call, keys, padded=not by_thread(call)), *threaded)
-    return staging, {name: _band_form(call, name).landing(algebra.SUB, algebra.SUB) for name in products}
+    return staging, {name: _band_form(call, name).landing(chunk, algebra.SUB) for name in products}
 
 
 def _threaded(threaded: list, products: tuple[str, ...]) -> tuple:
