@@ -239,11 +239,12 @@ def kept_sites(base: Path, redone: Collection[str],
     with np.load(base, allow_pickle=False) as part:
         recorded = json.loads(str(part["provenance"]))
         named, device = recorded.pop("devices", None), recorded.pop("device")
-        kept = {key: value for key, value in part.items()
-                if key != "provenance" and key.split(".", 1)[0] not in redone}
-    if kept and recorded != common:
-        raise ValueError(f"{base} was recorded under another provenance ({recorded}) than its sites "
-                         f"recorded again ({common}): record every site of it again")
+        names = [key for key in part.files if key != "provenance" and key.split(".", 1)[0] not in redone]
+        if names and recorded != common:
+            raise ValueError(f"{base} was recorded under another provenance ({recorded}) than its sites "
+                             f"recorded again ({common}): record every site of it again")
+        # Each kept key read alone, once its keeping is allowed: a site recorded again is never decompressed.
+        kept = {key: part[key] for key in names}
     owner = {site: name for name, sites in named.items() for site in sites} if named else {}
     sites = dict.fromkeys(key.split(".", 1)[0] for key in kept)
     return kept, {site: owner[site] if named else device for site in sites}
