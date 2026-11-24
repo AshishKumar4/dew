@@ -1509,7 +1509,7 @@ def _weighted_held(call: Call, block: int) -> Held:
     # inverse, a value tile, its write-gated fp32 copy beside the product's accumulator and fragments (an
     # H100's ptxas asked 58 registers of the 48 its residency left with the gated copy unstated,
     # jsf-kdaintra6).
-    vb = call.value_block
+    vb = _weighted_value_block(call, block)
     valued = ([held_tile(held, chunk, chunk) + held_tile(call.given, chunk, vb) + [f32(chunk, vb)] * 2
                + product_fragments(call, (held, chunk, chunk), (held, chunk, vb))]
               if call.per_key and call.delta else [])
@@ -1520,7 +1520,7 @@ def _weighted_held(call: Call, block: int) -> Held:
         + [f32(chunk, block)] * (3 + call.prefix_limbs) * call.per_key
         # The inverse against the scaled values and keys in turn, the delta rule's alone (`algebra.weighted`).
         + (largest_live_set(
-            product_fragments(call, (held, chunk, chunk), (held, chunk, call.value_block)),
+            product_fragments(call, (held, chunk, chunk), (held, chunk, vb)),
             product_fragments(call, (held, chunk, chunk),
                               (held, chunk, block if call.per_key else call.block)))
            if call.delta else []),))
@@ -1550,11 +1550,10 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
                        functools.partial(_weighted_staged, call),
                        functools.partial(_weighted_streamed, call)) if call.per_key else call.block)
     # Under a decay a key dimension with the delta rule, a value block beside each step's key block, as many
-    # value blocks as key blocks where they divide (`_walked_value_block`).
+    # value blocks as key blocks where they divide (`_weighted_value_block`).
     key_steps = width // keyed if call.per_key else 1
-    if call.per_key and call.delta:
-        call = dataclasses.replace(call, value_block=_walked_value_block(call, key_steps))
-    value_steps = value_width // call.value_block if call.per_key and call.delta else 0
+    vb = _weighted_value_block(call, keyed)
+    value_steps = value_width // vb if call.per_key and call.delta else 0
     steps = max(key_steps, value_steps)
     # The inverse and the write gates loaded once a chunk where the family holds once streams apart.
     once = _weighted_once(call)
@@ -1571,7 +1570,6 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
         def weighted_values(slots, betas, issue, c: int, columns=None) -> None:
             """Value block `c`'s weights, the inverse against its write-gated values (`algebra.weighted`'s
             'apply_u'), stored."""
-            vb = call.value_block
             tile = stream_tile(slots, "values", call.given, columns=columns).value()
             inverse = stream_tile(slots, "inverse", held)
             u = algebra.weighted("apply_u", inverse, tile.astype(held.dtype), betas, issue)
@@ -1596,12 +1594,12 @@ def _weighted(k, v, a, prefix: tuple, beta, taken, call: Call):
                 inverse = stream_tile(slots, "inverse", held)
                 applied = inverse, betas, issue
 
-                # The values' weights, a value tile at a time (`Call.value_block`): under a decay a head
+                # The values' weights, a value tile at a time (`_weighted_value_block`): under a decay a head
                 # every tile of the whole row, under a key dimension's the step's own.
                 if call.per_key and values:
                     weighted_values(slots, betas, issue, index)
-                for c in range(0 if call.per_key else value_width // call.value_block):
-                    weighted_values(slots, betas, issue, c, pl.ds(c * call.value_block, call.value_block))
+                for c in range(0 if call.per_key else value_width // vb):
+                    weighted_values(slots, betas, issue, c, pl.ds(c * vb, vb))
             if halves is not None:
                 decay = lax.broadcast_in_dim(algebra.raised(*halves), (chunk, keyed), (0,))
             # Under a decay a key dimension the step's own key block (its streams' slots whole), else each.
@@ -1693,15 +1691,17 @@ def _weighted_views(call: Call, refs: tuple, n, h, steps: tuple[int, int]) -> tu
     return views, read
 
 
-def _walked_value_block(call: Call, key_steps: int) -> int:
-    """The value block `_weighted`'s walk takes beside each of its `key_steps` key blocks: the values' width
-    a key step's share, where whole tiles of 16 columns divide it, so every step holds a block of each and no
-    segment walks one row alone; else the call's own (`Call.value_block`). Walked at the call's wider value
-    block, its key-only steps copied the value tile held at its last block again every step, 48 KB a
-    program of Kimi Linear's on a GH200 (8 key steps beside 2 value steps), about 25 us of the launch's 101
-    (FS-12368-STEPS, row 12368)."""
-    block, rest = divmod(call.value_width, key_steps)
-    return block if not rest and block % 16 == 0 else call.value_block
+def _weighted_value_block(call: Call, keyed: int) -> int:
+    """`_weighted`'s value tile at key block `keyed`: under a decay a key dimension with the delta rule the
+    values' width a key step's share, where a key block's least columns divide it (`_key_unit`), so every
+    step walks a block of each and no segment one row alone; else the call's (`Call.value_block`). At the
+    call's wider block beside narrower key blocks, the walk's key-only steps copied the value tile held at
+    its last block again every step: 48 KB a program of Kimi Linear's on a GH200 (8 key steps beside 2 value
+    steps), about 25 us of the launch's 101 (FS-12368-STEPS, row 12368)."""
+    if not (call.per_key and call.delta):
+        return call.value_block
+    block, rest = divmod(call.value_width, call.width // keyed)
+    return block if not rest and block % _key_unit(call, contracted=False) == 0 else call.value_block
 
 
 def _paired_segments(step: Callable, key_steps: int, value_steps: int) -> tuple:
@@ -1718,11 +1718,15 @@ def _paired_segments(step: Callable, key_steps: int, value_steps: int) -> tuple:
 
 
 def _weighted_swizzles(call: Call, keyed: int) -> dict:
-    """`_weighted`'s key-block streams staged at their row (a tile slices only whole swizzle rows): the keys
-    and a decay a key dimension's prefix, each part's widest swizzle at `keyed` columns."""
-    return {part: resources.widest_swizzle(operand.stored, keyed)
-            for name, (_, operand) in _weighted_blocks(call, keyed).items()
-            if name in ("keys", *PREFIX_STREAMS) for part in part_names(name, operand.parts)}
+    """`_weighted`'s streams a block of their row (a tile slices only whole swizzle rows): the keys and a
+    decay a key dimension's prefix, each part's widest swizzle at `keyed` columns, and the values at their
+    block (`_weighted_value_block`) where it walks them."""
+    walked = {name: keyed for name in ("keys", *PREFIX_STREAMS)}
+    if call.per_key:
+        walked.update(values=_weighted_value_block(call, keyed))
+    return {part: resources.widest_swizzle(operand.stored, walked[name])
+            for name, (_, operand) in _weighted_blocks(call, keyed).items() if name in walked
+            for part in part_names(name, operand.parts)}
 
 
 def _weighted_split(call: Call, keyed: int, once: tuple[str, ...]) -> tuple[dict, dict]:
@@ -1756,9 +1760,10 @@ def _weighted_blocks(call: Call, keyed: int) -> dict:
     if call.delta:
         given.update(inverse=((chunk, chunk), dataclasses.replace(call.held, rows=call.rows)))
     if call.delta:
-        # The values whole under a decay a head; a value block a step before the key blocks' under a key
-        # dimension's.
-        given.update(values=((chunk, call.value_block if call.per_key else call.value_width), call.given))
+        # The values whole under a decay a head; a value block a step beside the key blocks' under a key
+        # dimension's (`_weighted_value_block`).
+        values = _weighted_value_block(call, keyed) if call.per_key else call.value_width
+        given.update(values=((chunk, values), call.given))
     return given
 
 
@@ -1770,14 +1775,14 @@ def _weighted_streamed(call: Call, keyed: int) -> dict:
 
 def _weighted_staged(call: Call, keyed: int) -> tuple:
     """`_weighted`'s staging tiles and landings at key block `keyed`: its products' staged operands where
-    the delta rule takes them, a value tile's (`Call.value_block`) and a key block's, one set where they are
-    as wide, and their landings: a value tile's, a block's and a key block's own only where it is one."""
-    chunk = call.chunk
+    the delta rule takes them, a value tile's (`_weighted_value_block`) and a key block's, one set where they
+    are as wide, and their landings: a value tile's, a block's and a key block's own only where it is one."""
+    chunk, vb = call.chunk, _weighted_value_block(call, keyed)
     held = dataclasses.replace(call.held, rows=call.rows)
-    widths = ((chunk, call.value_block), (chunk, keyed if call.per_key else call.block))
+    widths = ((chunk, vb), (chunk, keyed if call.per_key else call.block))
     staging = staging_tiles(held, *dict.fromkeys(widths)) if call.delta else ()
     return staging, {"block": held.landing(chunk, call.block),
-                     **({"values": held.landing(chunk, call.value_block)} if call.delta else {}),
+                     **({"values": held.landing(chunk, vb)} if call.delta else {}),
                      **({"keyed": held.landing(chunk, keyed)} if call.per_key else {})}
 
 
