@@ -68,9 +68,10 @@ def test_a_runs_held_steps_stay_whole_under_threads_holding_and_reading_at_once(
 def _ramped():
     """The affine run's records, its batch ramped from 8 rows a step to 32 by 8 each step (`Ramp`): four
     batch shapes, each a step of its own, then 32 rows a step on."""
-    from dew.data import Loading, Memory, Pipeline
+    from dew.data import Loading, Memory
     from dew.data.compile import compile
     from dew.data.dataset import Ramp, ramped
+    from dew.data.pipeline import Pipeline
 
     x = np.random.default_rng(0).normal(size=(256, FEATURES)).astype(np.float32)
     records = [{"x": row, "y": 2 * row[:2]} for row in x]
