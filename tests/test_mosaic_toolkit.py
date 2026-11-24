@@ -174,8 +174,9 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
     (`Family.scoped` returns); the walk's steps counted from `lo`, its ring counters from 0 (`first`).
     `shared`: on mma.sync, its consumers running one cp.async pipeline together (`CpAsync.shared_consumers`,
     each copying its share of every block and meeting the other before a slot is read and refilled);
-    `split`, its walk in two segments whose boundary is each consumer's own (a causal call's masked segment,
-    which one consumer's keys end a step sooner in)."""
+    `split`, its walk in segments of their own weights: an empty one, a first step's alone, a gap its next
+    step falls in (walked by none), and the rest past a boundary each consumer's own (a causal call's masked
+    segment, which one consumer's keys end a step sooner in) at twice the weight (`_split_weights`)."""
     from dew.nn.kernels.templates import mosaic_sm90
     share = FED_ROWS // consumers
     family = bundles.named("mma.sync", jnp.bfloat16, None) if shared else mosaic_sm90.FED
@@ -195,17 +196,20 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
             feed = (family.opened(streams, views) if shared
                     else family.fed(family.opened(streams), views, first, first + FED_STEPS, wg))
 
-            def step(at, slots, carry, accumulators):
+            def step(at, slots, carry, accumulators, *, weight: int = 1):
                 del at
                 (acc,) = accumulators
                 block, rows = slots['p'], slots['x']
-                product = family.products(acc, block.at[:, pl.ds(wg * share, share)],
+                for _ in range(weight):
+                    acc = family.products(acc, block.at[:, pl.ds(wg * share, share)],
                                           rows.at[pl.ds(wg * share, share)])
-                return carry, (product,)
+                return carry, (acc,)
 
-            middle = first + 2 + wg if split else first + FED_STEPS
-            segments = ((step, first, middle), (step, middle, first + FED_STEPS)) if split else (
-                (step, first, first + FED_STEPS),)
+            middle = first + 3 + wg
+            twice = functools.partial(step, weight=2)
+            whole = ((step, first, first + FED_STEPS),)
+            segments = ((step, first, first), (step, first, first + 1), (step, first + 2, middle),
+                        (twice, middle, first + FED_STEPS)) if split else whole
             return family.walk(feed, segments, (), ((FED_ROWS, FED_WIDTH),), interpret, first=first,
                                unrolled=unrolled, in_flight=in_flight)[1][0]
 
@@ -329,13 +333,26 @@ def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store
 
 @INTERPRETS
 def test_two_mma_sync_consumers_walk_segments_whose_boundaries_differ_through_one_pipeline():
-    """Interpreted: two mma.sync consumers sharing one pipeline walk two segments whose boundary is each
-    consumer's own, as one pipeline over the walk's whole range: exactly the product and its double (a
-    pipeline of its own a segment met unpaired where their boundaries differ, and hung)."""
+    """Interpreted: two mma.sync consumers sharing one pipeline walk segments from a step past 0 (an empty
+    one, a gap, and a boundary each consumer's own), as one pipeline over the walk's whole range, each step
+    its own segment's (none in the gap): exactly each segment's weighted products (a pipeline of its own a
+    segment met unpaired where their boundaries differ, and hung)."""
     p, x = _fed_operands()
-    got = _fed_products(p, x, interpret=INTERPRETED, consumers=2, shared=True, split=True)
-    for value, expected in zip(got, _fed_expected(p, x), strict=True):
+    got = _fed_products(p, x, interpret=INTERPRETED, consumers=2, lo=3, shared=True, split=True)
+    summed = sum(weight * np.asarray(p, np.float32)[:, rows] @ np.asarray(x, np.float32)[rows]
+                 for rows, weight in _split_weights(consumers=2))
+    for value, expected in zip(got, (summed, 2 * summed), strict=True):
         np.testing.assert_array_equal(np.asarray(value), expected)
+
+
+def _split_weights(consumers: int):
+    """`_fed_products`' split walk's weights: each consumer's share of each step's rows, and the times its
+    segment adds its product (none for the step its gap holds, two past its consumer's boundary)."""
+    share = FED_ROWS // consumers
+    for wg in range(consumers):
+        for step in range(FED_STEPS):
+            weight = 0 if step == 1 else 1 if step < 3 + wg else 2
+            yield slice(step * FED_ROWS + wg * share, step * FED_ROWS + (wg + 1) * share), weight
 
 
 @INTERPRETS
