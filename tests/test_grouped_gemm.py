@@ -285,10 +285,12 @@ def test_cutlass_eligibility_reads_the_dew_cutlass_build_installed_now(tmp_path,
     assert ampere["sm80"] == "sm80" and grouped_cutlass.cutlass_built_for("sm80") == "sm80"
 
 
-def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
+def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes, stacked=False):
     """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
     gradients through CUTLASS's launches, chosen by name and the forward's kernel pinned, are as exact as
-    XLA's ragged dot from float64, unrouted rows and empty groups included."""
+    XLA's ragged dot from float64, unrouted rows and empty groups included. `stacked`, its matrices the
+    second layer of a stack the call reads from its layer's first (a scanned stack's, `gemm._grouped`),
+    which a pinned CUTLASS launch takes as a slice of the stack (row 4074's review)."""
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
     here = generation.gpu_target().generation
@@ -308,12 +310,25 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     built = grouped_cutlass.cutlass_built_for(here)
     pinned = {grouped_cutlass.CutlassGmm: grouped_cutlass.cutlass_tile(built, jnp.bfloat16)}
 
+    def layer_of_a_stack(x, stack):
+        return gemm.gemm(x, stack, jnp.asarray(group_sizes, jnp.int32), layer=jnp.int32(1),
+                         out_dtype=jnp.bfloat16)
+
     def through_cutlass(x, w, dy):
         with generation.chosen(grouped_matmul="cutlass"), tuning.pinned(pinned):
-            return with_gradients(projection("pallas"))(x, w, dy)
+            if not stacked:
+                return with_gradients(projection("pallas"))(x, w, dy)
+            # The whole stack differentiated: its other layer's gradient zero, its layer's the projection's.
+            out, d_x, d_stack = with_gradients(layer_of_a_stack)(x, jnp.stack([jnp.ones_like(w), w]), dy)
+            return out, d_x, d_stack[1], d_stack[0]
 
-    assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
-                    f"cutlass {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection("xla", jnp.float64)))
+    def plain(x, w, dy, dtype=jnp.bfloat16):
+        out, d_x, d_w = with_gradients(projection("xla", dtype))(x, w, dy)
+        return (out, d_x, d_w, *((jnp.zeros_like(d_w),) if stacked else ()))
+
+    assert_as_exact(jax.jit(through_cutlass), jax.jit(plain), draw,
+                    f"cutlass {sizes}{' stacked' if stacked else ''}", seeds=SEEDS,
+                    truth_fn=functools.partial(plain, dtype=jnp.float64))
 
 
 def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
@@ -2398,3 +2413,32 @@ def test_mma_sync_grouped_gemm_suppresses_ragged_rows_via_bounded():
             assert not rec.get("error"), rec
             assert rec["kernels"], rec
             assert all(k.get("spilled") == 0 for k in rec["kernels"]), rec
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_cutlass_launch_under_a_checked_shard_map_varies_as_its_operands_do(monkeypatch):
+    """A CUTLASS launch inside a checked `shard_map` (`check_vma=True`) whose layer each device reads its own
+    of, its rows and stack read whole: the layer's matrices it slices vary over the mesh's axis, so its result
+    is typed as varying there, its operands made to vary alike before the FFI call takes them (#3976's
+    review P0: the result was typed the same on every device). Traced on the CPU, the library's targets
+    named as a stand-in (no CPU runs its kernels)."""
+    import types
+
+    monkeypatch.setitem(sys.modules, "dew_cutlass", types.SimpleNamespace(
+        TARGETS=("dew_cutlass_gmm", "dew_cutlass_tgmm"), registered=lambda: None))
+    gmm = grouped_cutlass.CutlassGmm()
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()[:2]), ("data",))
+    data, whole = jax.sharding.PartitionSpec("data"), jax.sharding.PartitionSpec()
+    typed = []
+
+    def each_device(tokens, stack, sizes, layer):
+        out, _ = gmm._fwd(tokens, stack, sizes, first=layer[0] * sizes.shape[0], out_dtype="bfloat16",
+                          trans_rhs=False, interpret=False, config=None)
+        typed.append(jax.typeof(out).mat.varying)
+        return out
+
+    jax.make_jaxpr(jax.shard_map(each_device, mesh=mesh, in_specs=(whole, whole, whole, data),
+                                 out_specs=data, check_vma=True))(
+        jax.ShapeDtypeStruct((64, 32), jnp.bfloat16), jax.ShapeDtypeStruct((4, 32, 16), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2,), jnp.int32), jax.ShapeDtypeStruct((2,), jnp.int32))
+    assert typed == [frozenset({"data"})], typed
