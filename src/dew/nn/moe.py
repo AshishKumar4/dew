@@ -832,6 +832,9 @@ def gated_experts(x: jax.Array | Gathered, gate: jax.Array | Layered, up: jax.Ar
     gate_rows, up_rows, hidden = _paired_call(
         paired, group_sizes, compute, implementation, precision, epilogue=projected,
         named=(Residual.GATE_PROJ, Residual.UP_PROJ, None))
+    # Named where a remat policy reads them too, as the down projection's operands (`fused_products`).
+    gate_rows, up_rows = (checkpoint_name(gate_rows, Residual.GATE_PROJ),
+                          checkpoint_name(up_rows, Residual.UP_PROJ))
     with _named(implementation):
         out = gemm.gemm(gate_rows, down_stack, group_sizes, compute=compute, out_dtype=compute,
                         precision=precision, layer=down_layer, scatter=scatter, prologue=hook,
