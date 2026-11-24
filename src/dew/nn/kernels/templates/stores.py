@@ -234,22 +234,19 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
     its stores."""
     buffers, width = smem.shape[0], smem.shape[-2 if transposed else -1]
     row_start, first, stored, column, *ladder = place
-    if isinstance(ref, Scattered) and (divisor > 1 or transposed):
-        raise ValueError("a scattered output's rows land a row at a time as computed, none packed")
-    rows = smem.shape[-1] if transposed else smem.shape[-2]
-    if transposed and not (_static(first, 0) and _static(stored, rows)):
-        raise ValueError(f"a transposed output stores its share's {rows} rows whole, from its first: a "
-                         f"share of rows {first} to {first} + {stored} (a grouped tile's, or one ending "
-                         "mid-tensor) takes none; a dense call's last share states them all, the tensor's "
-                         "bound clipping")
-    if transposed and width == 1 and ref.shape[-1] % rows:
-        # A one-column box is one contiguous run, which Mosaic GPU copies by a linear bulk copy clamped
-        # at the whole tensor's end, not its row's: a last share past the rows' end writes into the next
-        # column's rows (`launch_context.async_copy`'s contiguous path).
-        raise ValueError(f"a transposed output's one-column chunk of {rows}-row shares over "
-                         f"{ref.shape[-1]} rows runs its last share into its next column")
-    if divisor > 1 and not transposed:
+    if isinstance(ref, Scattered):
+        if divisor > 1 or transposed:
+            raise ValueError("a scattered output's rows land a row at a time as computed, none packed")
+    elif transposed:
+        _whole_shares(smem.shape[-1], width, ref.shape[-1], first, stored)
+    elif divisor > 1:
         _aligned_ladder(width * jax.dtypes.itemsize_bits(smem.dtype) // 8, first, ladder)
+        if (ladder[1] if len(ladder) > 1 else 1) == 1 and ref.shape[-1] % width:
+            # A rung of one row is one contiguous run, which Mosaic GPU copies by a linear bulk copy clamped
+            # at the whole tensor's end, not its row's (`launch_context.async_copy`): a last chunk past the
+            # row's end would write into the next row.
+            raise ValueError(f"a packed chunk of {width} columns copied a row at a time over "
+                             f"{ref.shape[-1]} columns runs its last chunk into the next row")
     chunks = column_chunks(value, width * divisor)
     waits = buffer_waits(len(chunks), buffers) if waits is None else waits
     for chunk, (start, piece) in enumerate(chunks):
@@ -260,6 +257,23 @@ def staged(smem, value: jax.Array, ref, place: tuple, *, write: Callable = writt
             continue
         staged_rows(smem.at[chunk % buffers], piece, ref, row_start, first, stored,
                     (column + start) // divisor, *ladder, write=write)
+
+
+def _whole_shares(rows: int, columns: int, extent: int, first, stored) -> None:
+    """Refuse a transposed output's share of `rows` rows, `columns` packed columns a chunk, into an output
+    of `extent` rows, stored from `first` for `stored`, where its whole-share copy writes rows not its own:
+    its first row and rows not the static 0 and the share's (a grouped tile's, one ending mid-tensor; a dense
+    call states its last share whole, the tensor's bound clipping); or one column a chunk whose last share
+    passes the rows' end, one contiguous run, which Mosaic GPU copies by a linear bulk copy clamped at the
+    whole tensor's end, not its row's (`launch_context.async_copy`), into the next column."""
+    if not (_static(first, 0) and _static(stored, rows)):
+        raise ValueError(f"a transposed output stores its share's {rows} rows whole, from its first: a "
+                         f"share of rows {first} to {first} + {stored} (a grouped tile's, or one ending "
+                         "mid-tensor) takes none; a dense call's last share states them all, the tensor's "
+                         "bound clipping")
+    if columns == 1 and extent % rows:
+        raise ValueError(f"a transposed output's one-column chunk of {rows}-row shares over {extent} rows "
+                         "runs its last share into its next column")
 
 
 def _static(value, expected: int) -> bool:
