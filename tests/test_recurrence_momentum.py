@@ -66,24 +66,33 @@ def tied(fn):
     return run
 
 
+def momentum_draw(normal, rows: int, length: int, heads: int, keys: int, values: int) -> dict:
+    """A draw's operands as fla's layer forms them, in float64 (`hosted` rounds them), from `normal(shape)`'s
+    draws in turn: unit queries, keys and erase keys (`q`, `k`, `p`), values, the log decays `log sigmoid`
+    of normals (the memory's `g` near one, the momentum's `mu` held at -2 or above, fla's `min_log_mu`), the
+    write gate `beta` a sigmoid's, an entering pair `h0` `[B, H, 2, Dk, Dv]`, and the cotangents of the
+    output and the final pair (`dy`, `dfinal`)."""
+    gates = (rows, length, heads)
+    q, k, p = (unit(normal((rows, length, heads, keys))) for _ in range(3))
+    v = normal((rows, length, heads, values))
+    g = -softplus(-(normal(gates) + 3.0))
+    mu = np.maximum(-softplus(-(normal(gates) + 1.0)), -2.0)
+    beta = sigmoid(normal(gates))
+    h0 = normal((rows, heads, 2, keys, values))
+    return {"q": q, "k": k, "v": v, "p": p, "g": g, "mu": mu, "beta": beta, "h0": h0, "dy": normal(v.shape),
+            "dfinal": normal(h0.shape)}
+
+
 def operands(dtype, untied: bool):
-    """A seed's operands as fla's layer forms them, queries, keys, values and erase keys in `dtype`
-    (`hosted`): unit queries, keys and erase keys, the log decays `log sigmoid` of normals (the memory's
-    near one, the momentum's held at -2 or above, fla's `min_log_mu`), the write gate a sigmoid's; an
-    entering pair, and the cotangents of the output and the final pair."""
+    """A seed's operands (`momentum_draw`), queries, keys, values and erase keys in `dtype` (`hosted`)."""
     def at(seed):
-        normal = np.random.default_rng([1454, seed]).standard_normal
-        gates = (ROWS, LENGTH, HEADS)
-        q, k, p = (unit(normal((ROWS, LENGTH, HEADS, KEYS))) for _ in range(3))
-        v = normal((ROWS, LENGTH, HEADS, VALUES))
-        log_decay = -softplus(-(normal(gates) + 3.0))
-        momentum_decay = np.maximum(-softplus(-(normal(gates) + 1.0)), -2.0)
-        beta = sigmoid(normal(gates))
-        state = hosted(normal((ROWS, HEADS, 2, KEYS, VALUES)))
-        cotangent = (hosted(normal(v.shape), dtype), hosted(normal(state.shape)))
-        erase = (hosted(p, dtype),) if untied else ()
-        return (hosted(q, dtype), hosted(k, dtype), hosted(v, dtype), hosted(log_decay), hosted(beta),
-                hosted(momentum_decay), *erase, state, cotangent)
+        drawn = momentum_draw(np.random.default_rng([1454, seed]).standard_normal, ROWS, LENGTH, HEADS, KEYS,
+                              VALUES)
+        keyed = (hosted(drawn[name], dtype) for name in ("q", "k", "v"))
+        erase = (hosted(drawn["p"], dtype),) if untied else ()
+        cotangent = (hosted(drawn["dy"], dtype), hosted(drawn["dfinal"]))
+        return (*keyed, hosted(drawn["g"]), hosted(drawn["beta"]), hosted(drawn["mu"]), *erase,
+                hosted(drawn["h0"]), cotangent)
     return at
 
 

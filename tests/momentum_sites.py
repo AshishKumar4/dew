@@ -51,7 +51,8 @@ def _drawn(seed: int, dtype) -> dict:
     H, 2, Dk, Dv]`, and the cotangents of the output and the final pair: normals the same on every host, as
     a recorded site draws them (testing.md, `input_digest`)."""
     from recorded_inputs import normals
-    from test_recurrence_chunk import hosted, sigmoid, softplus, unit
+    from test_recurrence_chunk import hosted
+    from test_recurrence_momentum import momentum_draw
 
     draws = iter(range(12))
 
@@ -59,16 +60,9 @@ def _drawn(seed: int, dtype) -> dict:
         """The seed's next normals, the same bits on every host (`recorded_inputs.normals`)."""
         return normals([1454, 7, seed, next(draws)], shape, np.float64)
 
-    gates = (ROWS, LENGTH, HEADS)
-    q, k, p = (unit(normal((ROWS, LENGTH, HEADS, KEYS))) for _ in range(3))
-    v = normal((ROWS, LENGTH, HEADS, VALUES))
-    g = -softplus(-(normal(gates) + 3.0))
-    mu = np.maximum(-softplus(-(normal(gates) + 1.0)), -2.0)
-    beta = sigmoid(normal(gates))
-    h0 = normal((ROWS, HEADS, 2, KEYS, VALUES))
-    return {"q": hosted(q, dtype), "k": hosted(k, dtype), "v": hosted(v, dtype), "p": hosted(p, dtype),
-            "g": hosted(g), "mu": hosted(mu), "beta": hosted(beta), "h0": hosted(h0),
-            "dy": hosted(normal(v.shape), dtype), "dfinal": hosted(normal(h0.shape))}
+    drawn = momentum_draw(normal, ROWS, LENGTH, HEADS, KEYS, VALUES)
+    return {name: hosted(value, dtype if name in ("q", "k", "v", "p", "dy") else jnp.float32)
+            for name, value in drawn.items()}
 
 
 def chunk_of(arrays: dict) -> tuple[Chunk, tuple]:

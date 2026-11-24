@@ -309,7 +309,8 @@ def _decayed_sums(alpha: scaled.Scaled, mu: scaled.Scaled, lam) -> tuple:
 
     def token(carried, step):
         scaled_parts, float_parts = carried
-        g, m, kept = (scaled.Scaled(*parts, SUMS_REACH) for parts in scaled_parts)
+        g, m, kept = (scaled.Scaled(significand, exponent, SUMS_REACH)
+                      for significand, exponent in scaled_parts)
         g_f, m_f, kept_f = float_parts
         a, u, weight, mine, a_f, u_f, lam_f = step
         one = scaled.one_like(m.significand)
@@ -333,14 +334,16 @@ def _decayed_sums(alpha: scaled.Scaled, mu: scaled.Scaled, lam) -> tuple:
                seeded(zeros, first, jnp.ones((), lam.dtype)))
     ((_, last, _), (_, last_f, _)), (g, kept, g_f, kept_f) = lax.scan(
         token, carried, (alpha, mu, weights, own, *floats))
-    return tuple(_ordinary(running, scaled.Scaled(*twin, SUMS_REACH), faint)
-                 for running, twin in ((g_f, g), (last_f, last), (kept_f, kept)))
+    return tuple(_ordinary(running, scaled.Scaled(significand, exponent, SUMS_REACH), faint)
+                 for running, (significand, exponent) in ((g_f, g), (last_f, last), (kept_f, kept)))
 
 
 def _shifted(value: scaled.Scaled, first: float) -> scaled.Scaled:
     """`value` a token back along its first axis, the chunk's first token's `first` (zero or one)."""
-    return scaled.Scaled(*(jnp.concatenate([jnp.full_like(part[:1], fill), part[:-1]])
-                           for part, fill in ((value.significand, first), (value.exponent, 0))), value.reach)
+    def back(part, fill):
+        return jnp.concatenate([jnp.full_like(part[:1], fill), part[:-1]])
+
+    return scaled.Scaled(back(value.significand, first), back(value.exponent, 0), value.reach)
 
 
 def _sliced(value: scaled.Scaled, index) -> scaled.Scaled:
@@ -429,7 +432,7 @@ def _summed(product, operands: tuple, shape: tuple[int, ...], weights: scaled.Sc
         weighed = scaled.scaled(product(*each))
         if weights is not None:
             weighed = scaled.mul(weighed, scaled.Scaled(significand, exponent, weights.reach))
-        total = scaled.add(scaled.Scaled(*total, LOCAL_REACH), weighed)
+        total = scaled.add(scaled.Scaled(total[0], total[1], LOCAL_REACH), weighed)
         return (total.significand, total.exponent), None
 
     count = operands[0].shape[0]
