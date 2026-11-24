@@ -35,13 +35,13 @@ from dew.data.dataset import DataPartition
 from dew.inference.rollouts import Draw
 from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
 from dew.nn.progress import Progress
-from dew.sampling.text import Generation, Sampling
+from dew.registry import to_record
+from dew.sampling.text import Generation, Sampling, policy_identity
 
 from .sessions import Call, Session, Snapshot, Status, Task, Transcript, finite_reward, json_objects
 
 if TYPE_CHECKING:
-    from dew.inference.serving import Server
-    from dew.nn.kv_cache import KVCache
+    from dew.inference.serving import PagedKV, Server
 
     from .journal import EpisodeJournal, JournalRun
 
@@ -399,17 +399,18 @@ class EpisodeCollector:
     sampling: Sampling
     record: EpisodeRecorder | None = None
     journal: EpisodeJournal | None = None
-    kv_cache: KVCache | None = None
-    """A paged cache layout (`dew.nn.kv_cache.KVCache` with a `page_size`) the cohort's turns are served over:
-    its `TextGeneration` policy, bound to the snapshot, becomes a `dew.inference.serving.Server` in process,
+    cache: PagedKV | None = None
+    """The paged cache the cohort's turns are served over (`dew.inference.serving.PagedKV`, as
+    `Server.from_task` takes it: one name for a served cache, Train 1208's review F3): its
+    `TextGeneration` policy, bound to the snapshot, becomes a `dew.inference.serving.Server` in process,
     one a cohort, whose prefix cache keeps each row's history, so a turn whose context continues its row's
     last reads that history's full pages from the cache and prefills only the rest (the history's tokens
     past its last full page among them, and, over a recurrent mixer, those past the last page its state is
     held at), a group's shared prompt once, and a row whose context does not continue its last prefills it
     whole, saying so (a warning naming the row); its pages and states are the server's, released when the
-    cohort's collection returns. None draws each turn from the policy whole. A
-    served turn draws what the policy's draws: every row's tokens and likelihoods, the key folded by its
-    global row."""
+    cohort's collection returns. None draws each turn from the policy whole, as a cache of whole rows would:
+    a server's dense rows keep no history to read back. A served turn draws what the policy's draws: every
+    row's tokens and likelihoods, the key folded by its global row."""
 
     def __post_init__(self) -> None:
         for name in ("max_prompt_tokens", "max_new_tokens", "max_turns"):
@@ -418,6 +419,10 @@ class EpisodeCollector:
         if self.sampling.eos_token_ids is None and not self.sampling.stop:
             raise ValueError("tool episodes need an EOS id or a stop string to tell a turn that ended "
                              "from one cut at its token limit")
+        if self.journal is not None:
+            # A journal records each episode's policy (`records.record_json`): a component it cannot
+            # record is refused here, by name, not at its first turn's commit.
+            to_record(self.sampling, Sampling)
 
     @property
     def width(self) -> int:
@@ -468,8 +473,9 @@ class EpisodeCollector:
                 )
                 slot.status, slot.detail = episode.status, episode.detail
 
-    def _inputs(self, slots: list[EpisodeProgress], turn: int) -> ModelInputs:
-        """Pack this turn's contexts into one right-aligned cohort of rows.
+    def _inputs(self, slots: list[EpisodeProgress], turn: int, pad: int) -> ModelInputs:
+        """Pack this turn's contexts into one right-aligned cohort of rows, padded by `pad`, the id of the
+        policy the cohort draws under (`_effective`).
 
         A slot that is finished, or whose context does not fit, still
         occupies its row: the shapes have to match across ranks, and its
@@ -482,12 +488,12 @@ class EpisodeCollector:
                 context = slot.next_context(max_prompt_tokens=self.max_prompt_tokens)
             # A finished slot keeps its row, one padding id, so global row indices and collective
             # shapes stay stable. Its draw is discarded, never executed or trained.
-            contexts.append([self.sampling.pad] if context is None or not len(context) else context)
-        tokens, fields = pad_token_rows(contexts, pad_id=self.sampling.pad, width=self.max_prompt_tokens)
+            contexts.append([pad] if context is None or not len(context) else context)
+        tokens, fields = pad_token_rows(contexts, pad_id=pad, width=self.max_prompt_tokens)
         return ModelInputs(jnp.asarray(tokens), {name: jnp.asarray(value) for name, value in fields.items()})
 
     def _advance(self, slots: list[EpisodeProgress], generation: Generation, policy_step: int,
-                 binding_id: str, turn: int, run: JournalRun | None) -> None:
+                 binding_id: str, turn: int, run: JournalRun | None, sampling: Sampling) -> None:
         """Record this turn's draws, then step each slot's environment with them.
 
         A model turn that stopped on its token limit instead of EOS or a stop
@@ -508,7 +514,8 @@ class EpisodeCollector:
             ):
                 observation = slot.observation
                 assert observation is not None
-                slot.pending = slot.invoke(self._action, rows, row, observation.context, policy_step)
+                slot.pending = slot.invoke(self._action, rows, row, observation.context, policy_step,
+                                           sampling)
                 self._persist(slot, run, policy_step, binding_id)
         for slot in slots:
             action = slot.pending
@@ -571,8 +578,10 @@ class EpisodeCollector:
         row: int,
         context: tuple[int, ...],
         policy_step: int,
+        sampling: Sampling,
     ) -> Draw:
-        """Read one cohort row as a `Draw`, validating its provenance first.
+        """Read one cohort row as a `Draw`, validating its provenance first, against `sampling`, the policy
+        the cohort drew under (`_effective`).
 
         The environment acts on this record, so the row has to carry back
         the exact context that was requested.
@@ -584,7 +593,7 @@ class EpisodeCollector:
             np.asarray(generation.behavior_log_probs)[row],
         )
         width = self.max_prompt_tokens
-        expected = np.full(width, self.sampling.pad, np.int32)
+        expected = np.full(width, sampling.pad, np.int32)
         expected[-len(context):] = context
         if (tokens.shape != (width + self.max_new_tokens,)
                 or not np.issubdtype(tokens.dtype, np.integer)
@@ -597,11 +606,23 @@ class EpisodeCollector:
             raise ValueError("inference must record raw and behavior likelihoods for every output slot")
         if ended.shape != lengths.shape or ended.dtype != np.bool_:
             raise ValueError("inference must record a boolean EOS termination flag")
-        return Draw.generated(context, generation, row, policy_step).checked(self.sampling)
+        return Draw.generated(context, generation, row, policy_step).checked(sampling)
 
-    def _slots(self, tasks: np.ndarray, samples: int, snapshot: Snapshot,
-               rank: int) -> list[EpisodeProgress]:
-        """Build one session per task and sample, each with its own identity.
+    def _effective(self, policy: EpisodeInference) -> Sampling:
+        """The policy the cohort draws under and its draws are checked against: the collector's sampling over
+        a bound text task's own (`Sampling.with_defaults_of`: its ids, stopping and strategy the task's where
+        the collector's leaves them at their defaults), the collector's alone over any other policy; the one
+        its cohort's fingerprint states, so a resume under another (other stop strings, a task's inherited
+        criteria) is no cohort the journal holds (the API02 review)."""
+        from dew.inference.tasks import TextGeneration
+
+        return (self.sampling.with_defaults_of(policy.sampling) if isinstance(policy, TextGeneration)
+                else self.sampling)
+
+    def _slots(self, tasks: np.ndarray, samples: int, snapshot: Snapshot, rank: int,
+               sampling: Sampling) -> list[EpisodeProgress]:
+        """Build one session per task and sample, each with its own identity, under `sampling`, the policy
+        the cohort draws under (`_effective`), which its episodes record and its journal persists.
 
         The identity is drawn from the cohort key and the sample's global
         index, so a rank's slots are reproducible from checkpointed work.
@@ -613,7 +634,7 @@ class EpisodeCollector:
                 draw = jax.random.fold_in(snapshot.key, sample)
                 slots.append(EpisodeProgress(EpisodeId(int(task), snapshot.step, int(sample),
                     tuple(int(value) for value in np.asarray(jax.random.key_data(draw))), snapshot.branch),
-                    self.sampling))
+                    sampling))
         return slots
 
     def _bound_journal(self, journal_stack: ExitStack, snapshot: Snapshot, tasks: np.ndarray,
@@ -643,7 +664,7 @@ class EpisodeCollector:
         return run, bound
 
     def _turns(self, slots: list[EpisodeProgress], policy: EpisodeInference, key: jax.Array,
-               run: JournalRun | None, policy_step: int, binding_id: str) -> None:
+               run: JournalRun | None, policy_step: int, binding_id: str, sampling: Sampling) -> None:
         """Run the cohort turn by turn until every rank's slots are finished.
 
         A turn packs the contexts, agrees on whether any slot is still
@@ -654,15 +675,16 @@ class EpisodeCollector:
         with ExitStack() as stack:
             agreed("episode reset", lambda: self._open(slots, stack, run, policy_step, binding_id))
             for turn in range(self.max_turns):
-                inputs = agreed("episode context preparation", lambda turn=turn: self._inputs(slots, turn))
+                inputs = agreed("episode context preparation",
+                                lambda turn=turn: self._inputs(slots, turn, sampling.pad))
                 active = any(slot.status == EpisodeStatus.RUNNING for slot in slots)
                 if not agree_process_phase(None, phase="episode availability", available=active):
                     break
                 generation = agreed("episode generation", lambda inputs=inputs, turn=turn: policy(
                     inputs, self.max_new_tokens,
-                    key=jax.random.fold_in(key, turn), sampling=self.sampling))
+                    key=jax.random.fold_in(key, turn), sampling=sampling))
                 agreed("episode tool step", lambda generation=generation, turn=turn: self._advance(
-                    slots, generation, policy_step, binding_id, turn, run))
+                    slots, generation, policy_step, binding_id, turn, run, sampling))
             agreed("episode verification", lambda: self._verify(slots, policy_step, binding_id, run))
 
     def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
@@ -688,20 +710,33 @@ class EpisodeCollector:
             ids = np.asarray([int(task.id) for task in tasks], np.int64)
             # The policy the step's loss reads, at the updates the run committed (`Objective.progress`).
             policy = self.policy.bind(snapshot.variables, Progress(jnp.asarray(snapshot.updates, jnp.int32)))
-            if self.kv_cache is not None:
-                policy = _ServedTurns.over(policy, self, rows=ids.size * samples)
+            sampling = self._effective(policy)
+            if self.journal is not None:
+                # The journal records the policy the cohort draws under (`records.record_json`), the
+                # task's inherited controls among it: one it cannot record is refused before it opens.
+                to_record(sampling, Sampling)
+            if self.cache is not None:
+                policy = _ServedTurns.over(policy, self, sampling, rows=ids.size * samples)
             key_words = tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist())
+            # The policy the cohort draws under (`_effective`), by its components' identity, which every
+            # process states alike (`policy_identity`), never its text, which a function's address enters,
+            # with its pad id and its stop strings, which no component holds: stated where processes agree on
+            # it or a journal keeps it, whose statement asks each function's code of a file, where a cohort of
+            # one process keeps it in memory alone and a notebook's function, which has none, draws (the
+            # models review).
+            stated = jax.process_count() > 1 or self.journal is not None
             signature = (ids.size, samples, self.max_turns, self.max_prompt_tokens, self.max_new_tokens,
-                         self.sampling, snapshot.step, snapshot.updates, key_words, self.journal is not None)
-            return ids, policy, repr(signature)
-        ids, policy, described = agreed("episode preparation", prepare)
+                         policy_identity(sampling) if stated else None, sampling.pad, sampling.stop,
+                         snapshot.step, snapshot.updates, key_words, self.journal is not None)
+            return ids, policy, sampling, repr(signature)
+        ids, policy, sampling, described = agreed("episode preparation", prepare)
         described = agreed_same("episode cohort (task counts, budgets, sampling and clocks)",
                                 lambda: described)
         signature = np.frombuffer(hashlib.sha256(described.encode()).digest(), np.uint8)
         processes, rank = jax.process_count(), jax.process_index()
         binding_id = broadcast_from_process_zero(uuid4().hex if rank == 0 else None)
         policy_step = snapshot.updates
-        slots = self._slots(ids, samples, snapshot, rank)
+        slots = self._slots(ids, samples, snapshot, rank, sampling)
         error = None
         try:
             with ExitStack() as journal_stack:
@@ -709,7 +744,7 @@ class EpisodeCollector:
                 if self.journal is not None:
                     run, binding_id = self._bound_journal(
                         journal_stack, snapshot, ids, signature, processes, rank, binding_id)
-                self._turns(slots, policy, snapshot.key, run, policy_step, binding_id)
+                self._turns(slots, policy, snapshot.key, run, policy_step, binding_id, sampling)
         except BaseException as failure:
             error = failure
         try:
@@ -762,26 +797,27 @@ def session_of(episode: Episode, *, group: str) -> Session:
 
 
 class _ServedTurns:
-    """A cohort's turns served in process (`EpisodeCollector.kv_cache`): its bound `TextGeneration` as a
-    `dew.inference.serving.Server` over the paged layout, each turn a call of every row, row `i` folding the
+    """A cohort's turns served in process (`EpisodeCollector.cache`): its bound `TextGeneration` as a
+    `dew.inference.serving.Server` over the paged cache, each turn a call of every row, row `i` folding the
     turn's key by its global row as the policy's own call folds it: where its context continues the history
     its last turn left, the server reads that history's full pages and its state where it ends at a page's
     end, which it named as the turn finished (`PagedRows.finished`), and prefills the rest; a row whose
     context does not continue it is prefilled whole, the reset logged as a warning naming the row."""
 
-    def __init__(self, server: Server, collector: EpisodeCollector, first: int) -> None:
-        self.server, self.collector, self.first = server, collector, first
+    def __init__(self, server: Server, sampling: Sampling, first: int) -> None:
+        self.server, self.sampling, self.first = server, sampling, first
         self.histories: dict[int, np.ndarray] = {}
 
     @classmethod
-    def over(cls, policy: EpisodeInference, collector: EpisodeCollector, *, rows: int) -> _ServedTurns:
-        """`policy`, a bound `TextGeneration`, served for a cohort of `rows` rows of this process: a slot a
-        row, each holding the cohort's whole allowed context and draw, its pool's pages the layout's."""
+    def over(cls, policy: EpisodeInference, collector: EpisodeCollector, sampling: Sampling, *,
+             rows: int) -> _ServedTurns:
+        """`policy`, a bound `TextGeneration`, served for a cohort of `rows` rows of this process under
+        `sampling`, the policy the cohort draws under (`EpisodeCollector._effective`): a slot a row, each
+        holding the cohort's whole allowed context and draw, its pool's pages the cache's."""
         from dataclasses import replace
 
         from dew.inference.serving import Server, row_groups
         from dew.inference.tasks import TextGeneration
-        from dew.sampling.text import with_ids_of
 
         if not isinstance(policy, TextGeneration):
             raise TypeError(f"a served cohort serves a TextGeneration policy, not a {type(policy).__name__}")
@@ -790,9 +826,8 @@ class _ServedTurns:
             # slot.
             raise TypeError(f"tool episodes require one autoregressive Generation row per slot; this policy "
                             f"draws {policy.n} continuations a prompt (TextGeneration.n)")
-        # The task as a call under the collector's sampling runs it (`TextGeneration._controls`): its ids
-        # filled from the task's policy, and no logits chain of the task's, which an overriding call drops.
-        task = replace(policy, sampling=with_ids_of(collector.sampling, policy.sampling), logits=None)
+        # The task under the cohort's policy, the collector's over the task's (`_effective`).
+        task = replace(policy, sampling=sampling)
         # A slot a row of every process the weights' mesh spans (one pool's), as many as its row groups
         # divide.
         mesh = mesh_of(task.variables)
@@ -800,19 +835,19 @@ class _ServedTurns:
         groups = row_groups(mesh)
         slots = -(-rows * processes // groups) * groups
         server = Server.from_task(task, slots=slots, capacity=collector.max_prompt_tokens
-                                  + collector.max_new_tokens, kv_cache=collector.kv_cache)
+                                  + collector.max_new_tokens, cache=collector.cache)
         # A pool's rows fold by their global row, this process's from its rank's first on.
         first = jax.process_index() * rows if server.pooled else 0
-        return cls(server, collector, first)
+        return cls(server, sampling, first)
 
     def bind(self, variables: Variables, /, progress: Progress | None = None) -> EpisodeInference:
         raise TypeError("a served cohort is bound to its snapshot when it is made; bind the policy instead")
 
     def __call__(self, inputs: ModelInputs | Sequence[Sequence[int]], max_new_tokens: int, /,
                  *, key: jax.Array, sampling: Sampling) -> Generation:
-        if sampling != self.collector.sampling:
-            raise ValueError("a served cohort draws under the collector's sampling, which its server was "
-                             "made with")
+        if sampling != self.sampling:
+            raise ValueError("a served cohort draws under the policy its server was made with, the "
+                             "collector's over its task's")
         held = inputs if isinstance(inputs, ModelInputs) else ModelInputs.from_value(inputs)
         tokens = np.asarray(held.tokens)
         validity = token_validity(held.token_fields)

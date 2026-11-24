@@ -158,6 +158,31 @@ def test_a_requests_callback_reloads_from_inside_its_step():
         engine.close()
 
 
+def test_a_banked_server_made_scanned_serves_scanned_on_its_engines_thread():
+    """A server over a banked store made where its stack runs scanned (`stacked(scanned=True)`), served by
+    an engine (`Engine.start`, a worker thread of its own) outside that block: its steps trace under the
+    kernel choices it was made under (`Server._context`, `dew._cache.carried`), its stack's run held whole
+    (`layers_0_3`), where the worker's thread, which holds no choice, traced its stack a layer at a time and
+    looked for `layers_0` (the API02 review)."""
+    from model_support import stacked
+    from serving_support import assert_same_draws
+    from test_serving import banked_task
+
+    from dew.inference.serving import PagedKV, Server
+    from dew.sampling import Sampling
+
+    with stacked(scanned=True):
+        bound = banked_task(Sampling(temperature=1.0))
+        alone = bound("123456", 4, key=0)
+        server = Server.from_task(bound, slots=1, capacity=64, cache=PagedKV(page_size=4, pages=8))
+    engine = Engine(server)
+    engine.start()
+    try:
+        assert_same_draws(server.submit("123456", 4, key=0).result(), alone)
+    finally:
+        engine.close()
+
+
 class Looked:
     """A serving kind that answers every waiting request a step, and whose next look at its own work
     runs `hook` once after the look, so the look reports what waited before the hook."""

@@ -44,8 +44,7 @@ from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import Perplexity
 from dew.optim import AdamW, Cosine, OptimConfig
 from dew.registry import ModelConfig
-from dew.training import MeshSpec, prepare_process
-from dew.training.budget import Horizon
+from dew.training import Keep, MeshSpec, prepare_process
 
 EOS, PAD, IMAGE = 256, 257, 258
 """The ids past the 256 bytes: end of caption, padding and the image placeholder."""
@@ -254,12 +253,13 @@ def main(config: Config) -> Path:
         model=ModelConfig.from_model(model), data=train, validation=test,
         objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
                                                       "pad_token_id": PAD, "eos_token_ids": (EOS,)}),
-        optim=OptimConfig(optimizer=AdamW(weight_decay=0.05), clip_grads=1.0, learning_rate=Cosine(
+        optim=OptimConfig(optimizer=AdamW(weight_decay=0.05), clip=1.0, schedule=Cosine(
             peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
             end_value=config.learning_rate / 20)),
         # A smoke run keeps both of its checkpoints, so what training moved between them can be read.
-        trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=2 if config.smoke else 1,
-                              horizon=Horizon(steps=config.steps), log_every=1 if config.smoke else 100,
+        trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
+                              keep=Keep(latest=2 if config.smoke else 1),
+                              steps=config.steps, log_every=1 if config.smoke else 100,
                               eval_every=config.eval_every, checkpoint_every=config.eval_every,
                               mesh=MeshSpec(fsdp=1), multi_host=False, compilation_cache_dir=None))
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.diagnostics.xla_flags,

@@ -372,9 +372,9 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
         activation, portable,
         lambda gate_up: norm_swiglu.packed_swiglu_kernel(implementation, gate_up, axes=axes),
         lambda gate_up, portable: norm_swiglu.packed_swiglu(gate_up, portable, axes=axes))
-    # The pair whole on each device before either product reads it (`whole_along`, row 12224), so neither
-    # reads a pair a mesh axis splits.
-    return lambda gate_up: product(whole_along(gate_up, -2))
+    # The pair whole on each device before either product reads it (`whole_along`, row 12224), its mesh axis
+    # moved onto the hidden width where it divides it, so each device computes its share (row 12225).
+    return lambda gate_up: product(whole_along(gate_up, -2, onto=-1))
 
 
 def _portable(activate, halves):

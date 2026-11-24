@@ -52,7 +52,7 @@ def test_symmetric_gram_holds_check_1_and_vjp(shape, transpose):
         return x, cot
 
     def native(x, cot):
-        with generation.chosen(grouped_matmul="mosaic"):
+        with generation.chosen(syrk="mosaic"):
             y, pull = jax.vjp(lambda a: gemm.symmetric_gram(a, transpose=transpose, interpret_on_cpu=True), x)
             (dx,) = pull(cot)
         return y, dx
@@ -84,7 +84,7 @@ def test_symmetric_polynomial_and_newton_schulz_hold_check_1(side):
         return sym, coeffs, cot
 
     def native(a, coeffs, cot):
-        with generation.chosen(grouped_matmul="mosaic"):
+        with generation.chosen(syrk="mosaic"):
             y, pull = jax.vjp(lambda x, c: gemm.symmetric_polynomial(x, c, interpret_on_cpu=True), a, coeffs)
             da, dc = pull(cot)
         return y, da, dc
@@ -155,7 +155,7 @@ def test_syrk_polynomial_pinned_ragged_tile_and_skew_cotangent():
 @lowers("sm90")
 def test_unforced_syrk_skips_mosaic_certification_while_forced_certifies():
     """Default (unforced) ragged BF16 SYRK declines on `measured` before certifying `MosaicSyrk`, while forced
-    `grouped_matmul='mosaic'` certifies `MosaicSyrk` on the compile-only device (row 11941)."""
+    `syrk='mosaic'` certifies `MosaicSyrk` on the compile-only device (row 11941)."""
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.templates import report
@@ -169,7 +169,7 @@ def test_unforced_syrk_skips_mosaic_certification_while_forced_certifies():
 
     before_forced = {id(c) for c in report.certifications()}
     with (report.refusals(), report.certifying(generation.compile_only_gpus("sm90")[0]),
-          generation.chosen(grouped_matmul="mosaic")):
+          generation.chosen(syrk="mosaic")):
         lowered_for(lambda operand: gemm.symmetric_gram(operand), (x,), "sm90")
     assert any(id(c) not in before_forced and c.op == type(syrk.MOSAIC_SYRK).__name__
                for c in report.certifications())
@@ -486,7 +486,7 @@ def test_complex_symmetric_gram_value_and_vjp_match_dot_general(transpose, conju
 
 @lowers("sm90")
 def test_newton_schulz_reaches_mosaic_syrk_and_honors_dot_algorithm():
-    """Live `newton_schulz` reaches certified `MosaicSyrk` when `grouped_matmul='mosaic'` is chosen on bf16
+    """Live `newton_schulz` reaches certified `MosaicSyrk` when `syrk='mosaic'` is chosen on bf16
     operands, while an explicit non-matching dot algorithm keeps XLA's dot (rows 11941, 11981)."""
     from kernel_compile import lowered_for
 
@@ -498,14 +498,14 @@ def test_newton_schulz_reaches_mosaic_syrk_and_honors_dot_algorithm():
     x = jax.ShapeDtypeStruct((2, 256, 512), jnp.bfloat16)
     before = {id(c) for c in report.certifications()}
     with (report.refusals(), report.certifying(generation.compile_only_gpus("sm90")[0]),
-          generation.chosen(grouped_matmul="mosaic")):
+          generation.chosen(syrk="mosaic")):
         lowered_for(lambda a: ns.newton_schulz(a, ns.NEWTON_SCHULZ, 1, 1e-8), (x,), "sm90")
     assert any(id(c) not in before and c.op == type(syrk.MOSAIC_SYRK).__name__
                for c in report.certifications())
 
     # Non-matching DotAlgorithmPreset (TF32_TF32_F32 on bf16) refuses Mosaic SYRK; BF16_BF16_F32 and
     # HIGHEST (exact fp32 accumulation of bf16 products) permit it.
-    with generation.chosen(grouped_matmul="mosaic"):
+    with generation.chosen(syrk="mosaic"):
         with (configured_precision(jax.lax.DotAlgorithmPreset.TF32_TF32_F32),
               pytest.raises(selection.KernelRefused)):
             lowered_for(lambda a: gemm.symmetric_gram(a), (x,), "sm90")

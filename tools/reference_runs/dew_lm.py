@@ -21,6 +21,7 @@ choose them the way jax does, with CUDA_VISIBLE_DEVICES or JAX_PLATFORMS.
 """
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import time
@@ -51,8 +52,8 @@ from common import (
 )
 from reference_source import dew_revision
 
+from dew import kernels
 from dew.optim import AdamW
-from dew.training import FitPolicy
 
 if TYPE_CHECKING:
     from dew.telemetry.workload import WorkloadWork
@@ -131,8 +132,7 @@ def build(args: argparse.Namespace) -> Run:
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
 
     # On the host: the trainer places the weights over its mesh.
-    pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
-                                 attention_impl=args.attention, on_host=True)
+    pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32", on_host=True)
     model, variables = pretrained.model, pretrained.variables
     if isinstance(model, MultimodalTransformer):
         # A text run trains a multimodal checkpoint's decoder, its language model, alone: the towers
@@ -165,12 +165,12 @@ def build(args: argparse.Namespace) -> Run:
     # and biases too.
     solver = OptimConfig(optimizer=AdamW(eps=args.eps, b1=args.b1, b2=args.b2, weight_decay=args.weight_decay,
                                          state_dtype=args.state_dtype),
-                         learning_rate=schedule, clip_grads=args.clip,
+                         schedule=schedule, clip=args.clip,
                          param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
     trainer = Trainer(objective, solver, key=jax.random.key(0), mesh=mesh, checkpoints=None, tracker=None,
-                      fit=FitPolicy(split="auto" if args.split is None else args.split))
+                      split="auto" if args.split is None else args.split)
     state, _, _ = trainer.place()
     del pretrained
     placement = batch_shardings(trainer.device_mesh, rows(np.arange(args.batch)))
@@ -322,11 +322,15 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
 def main() -> None:
     args = arguments()
     built_from = versions()
-    run = build(args)
-    probe = RouterProbe(run, args.probe_rows) if args.probe_every else None
-    state, curves = train(args, run, probe)
-    if probe is not None:
-        probe(run.total, state.variables)
+    # The attention kernel the run names, every trace it builds, trains and probes under (`dew.kernels.use`);
+    # "auto" forces none, its selector's choice.
+    forced = contextlib.nullcontext() if args.attention == "auto" else kernels.use(attention=args.attention)
+    with forced:
+        run = build(args)
+        probe = RouterProbe(run, args.probe_rows) if args.probe_every else None
+        state, curves = train(args, run, probe)
+        if probe is not None:
+            probe(run.total, state.variables)
     result = record(args, run, curves, probe, built_from)
     if args.profile_steps:
         write_record(args.out, result)

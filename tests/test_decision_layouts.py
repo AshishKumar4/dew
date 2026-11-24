@@ -158,3 +158,57 @@ def test_a_position_main_saved_under_a_layout_class_resumes_exactly_under_its_se
     plan = compile(chain, read="streamed", loading=Loading(workers=0)).plan
     assert plan is not None
     assert plan.check(json.loads(PLANS.read_text())[form], resume="exact") == ()
+
+
+def test_a_saved_heads_description_drops_only_the_fields_its_class_retired():
+    """A position main saved describes its decision head with the attention kernel it held
+    (`attention_impl`, retired by row 11938), which the plan's reading of saved descriptions leaves out
+    (`dew._records.earlier_described_fields`), so it resumes exactly (above); a field its class never held
+    and never retired stays, so a description naming one is refused, never read as a different step."""
+    from dew._position import PlanChanged
+    from dew.data.compile import compile
+    from dew.data.dataset import Loading
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import Memory
+    from dew.decision.head import DecisionHead
+    from dew.decision.rows import Fit
+
+    specials = Specials(begin=254, separator=253, marker=0, marker_text="\x00", pad=255)
+    chain = Pipeline(Memory([{"id": index} for index in range(4)])).filter_map(
+        Fit(SegmentLayout.joint_row(max_state_tokens=7), TOKENIZER, specials, DecisionHead(64))).batch(2)
+    plan = compile(chain, read="streamed", loading=Loading(workers=0)).plan
+    assert plan is not None
+    saved = json.loads(PLANS.read_text())["joint"]
+    held = [step for step in saved["manifest"]["steps"] if '"attention_impl"' in step["config"]]
+    assert held
+    for step in held:
+        config = json.loads(step["config"])
+        config["head"]["queries"] = 3
+        step["config"] = json.dumps(config, sort_keys=True)
+    with pytest.raises(PlanChanged):
+        plan.check(saved, resume="exact")
+
+
+def test_a_saved_plans_strings_are_read_as_json_only_where_a_step_states_its_configuration():
+    """A saved plan's descriptions read without retired fields (`dew._records.earlier_described_fields`)
+    decode a plan's step's configuration (`StepIdentity.config`, an entry's of its `steps`) alone: a string
+    a description holds that mentions a retired field and is no JSON (a caption's template,
+    `{{"stream":"{label}"}}`), a step's own field named `config` among them, and a step's declared identity
+    (its configuration then too), are kept as written, where a string under any `config` was decoded and
+    those raised (the API02 review)."""
+    from dew._records import earlier_described_fields
+
+    template = '{{"stream":"{label}"}}'
+    head = {"class": "dew.decision.head.DecisionHead", "attention_impl": "xla", "width": 8}
+    config = json.dumps({"head": head, "caption": template, "config": template}, sort_keys=True)
+    # A step declaring its own identity (`Pipeline.map(identity=...)`), its configuration that identity.
+    declared = '{{"attention_impl":"{label}"}}'
+    saved = {"manifest": {"steps": [{"config": config, "name": "fit"},
+                                    {"config": declared, "declared": declared, "name": "named"}]},
+             "caption": template}
+    read = earlier_described_fields(saved)
+    assert read["manifest"]["steps"][1] == saved["manifest"]["steps"][1]
+    assert read["caption"] == template
+    head_now = {"class": "dew.decision.head.DecisionHead", "width": 8}
+    assert json.loads(read["manifest"]["steps"][0]["config"]) == {
+        "caption": template, "config": template, "head": head_now}

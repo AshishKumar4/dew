@@ -10,12 +10,13 @@ import optax
 import pytest
 from arm_arithmetic import summed_as_run
 from map_judge import drawing
+from model_support import attending
 from placement_parity import layouts_agree, x64
 
 from dew.checkpoints import _filled
 from dew.nn.kernels.generation import chosen
 from dew.optim import Optax, OptimConfig
-from dew.training import FitPolicy, UpdateBatch
+from dew.training import TrainerAdvanced
 from dew.training.narrow import narrowed, narrowed_paths, program_reads
 
 
@@ -162,13 +163,13 @@ def keeping_sgd(learning_rate) -> optax.GradientTransformation:
     return _keeping_gradients(optax.sgd(learning_rate))
 
 
-ADAM_2, ADAM_3 = (OptimConfig(optimizer=Optax('optax:adam'), learning_rate=rate) for rate in (1e-2, 1e-3))
+ADAM_2, ADAM_3 = (OptimConfig(optimizer=Optax('optax:adam'), lr=rate) for rate in (1e-2, 1e-3))
 """Optax's Adam at 1e-2 and 1e-3, as configs, which key the step."""
 
-SGD = OptimConfig(optimizer=Optax('optax:sgd'), learning_rate=0.5)
+SGD = OptimConfig(optimizer=Optax('optax:sgd'), lr=0.5)
 """Optax's SGD at 0.5, as a config, which keys the step."""
 
-KEEPING_SGD = OptimConfig(optimizer=Optax('test_narrow:keeping_sgd'), learning_rate=0.5)
+KEEPING_SGD = OptimConfig(optimizer=Optax('test_narrow:keeping_sgd'), lr=0.5)
 """SGD at 0.5 keeping its last gradient, stated as a config, which keys the step (`Trainer._step_key`): every
 draw's fits of one shape read the step the first traced and planned, where each built its own (row 5774:
 61 plans and compiles, 542 s of a profiled 605)."""
@@ -185,7 +186,7 @@ def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False, see
     from dew.objectives.routing import ExpertBalance
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
                               num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
-                              tie_embeddings=True, dtype=dtype, scan_layers=scanned, remat=remat,
+                              tie_embeddings=True, dtype=dtype, remat=remat,
                               mixture={"experts": 4, "top_k": 2} if mixture else None)
     if dex:
         from dew.nn.dex import DifferentialExtension
@@ -224,10 +225,13 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
                                 dtype=jnp.float64 if wide else jnp.bfloat16)
     long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
                                              jnp.int32)}
-    with chosen(narrow_copies='on' if copies else 'off'):
+    # A `scanned` decoder's stack scans, any other's runs a layer at a time (`generation.Choice.LAYER_SCAN`).
+    with chosen(narrow_copies='on' if copies else 'off', layer_scan='scanned' if scanned else 'plain'):
         trainer = Trainer(objective, optimizer, key=jax.random.key(seed), mesh=mesh or MeshSpec(),
-                          layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=accumulation),
-                          fit=FitPolicy(split=split), param_dtype="float64" if wide else None)
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0),
+                                                   param_dtype="float64" if wide else None),
+                          accumulation=accumulation,
+                          split=split)
         # A configured optimizer built over the run's updates, as a fit builds it.
         trainer.scheduled((steps + padded) // accumulation)
         state = trainer.initial_state()
@@ -270,7 +274,7 @@ def test_a_phase_planned_afresh_builds_its_window_over_the_outgoing_one():
     shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), fresh.window)
     assert gradient
     finer = Trainer(trainer.objective, optax.sgd(0.5), key=jax.random.key(0), mesh=device,
-                    layout=Layout(min_shard=1, tolerance=1.0), fit=FitPolicy(split=4))
+                    advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), split=4)
     batch = _decoder(rows=16)[1]
     stepped, *_ = finer.compile(fresh, batch)(fresh, batch)
     assert int(stepped.window_size) == 4
@@ -295,7 +299,7 @@ def test_a_phase_planned_afresh_is_planned_at_its_own_split_past_the_window_it_h
     fresh = freshly_held(state)
     donor = jax.tree.leaves(fresh.window)
     planner = Trainer(trainer.objective, optax.sgd(0.5), key=jax.random.key(0), mesh=device,
-                      layout=Layout(min_shard=1, tolerance=1.0))
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
     planner._compiler.afresh = True  # as the boundary sets it (`Trainer._compiled_for`)
     batch = _decoder(rows=16)[1]
     stepped, *_ = planner.compile(fresh, batch)(fresh, batch)
@@ -572,8 +576,8 @@ def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monk
     def built() -> tuple[Trainer, dict]:
         objective, batch = _decoder(remat="full")
         return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
-                       layout=Layout(min_shard=1, tolerance=1.0), update=UpdateBatch(batches=2),
-                       fit=FitPolicy(split=1)), batch
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), accumulation=2,
+                       split=1), batch
 
     def streamed() -> Loader:
         return Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
@@ -670,7 +674,7 @@ def test_a_fresh_plan_refused_with_its_copies_built_deletes_them_before_it_is_se
     def built() -> Trainer:
         objective, _ = _decoder(remat="full")
         return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
-                       layout=Layout(min_shard=1, tolerance=1.0))
+                       advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
 
     def streamed() -> Loader:
         return Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
@@ -729,7 +733,8 @@ def test_a_fresh_plan_its_placed_devices_refuse_records_no_rung(monkeypatch, tmp
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: held)
     objective, _ = _decoder(remat="full")
     run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(jax.devices()[:1]), layout=Layout(min_shard=1, tolerance=1.0))
+                  mesh=MeshSpec().build(jax.devices()[:1]),
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
     stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
     with chosen(narrow_copies='off'), pytest.raises(PlanRefused):
         run.fit(stream, steps=2)
@@ -758,7 +763,7 @@ def test_a_fresh_fit_whose_placed_pool_holds_its_step_in_two_microbatches_splits
     assert two < one, (one, two)
     objective, batch = _decoder(remat="full")
     run = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=device,
-                  layout=Layout(min_shard=1, tolerance=1.0))
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
     with chosen(narrow_copies='off'):
         state = max(run.validate(batch).device_bytes.values())
     # The pool's largest free block, and what it can still grow by, between the step's needs at two
@@ -903,7 +908,7 @@ def test_a_steps_buffers_built_before_it_runs_are_judged_where_they_land(monkeyp
 
     def compiled(**allocator):
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec().build(
-            jax.devices()[:1]), fit=FitPolicy(split=split))
+            jax.devices()[:1]), split=split)
         state, _, _ = trainer.place()
         placed = jax.device_put(batch, batch_shardings(trainer.device_mesh, batch))
         allocating(monkeypatch, **allocator)
@@ -996,7 +1001,7 @@ def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_step
     objective = LMObjective(plain.model, seq_len=8, pad_id=0, variables=variables)
     with chosen(narrow_copies="on"):
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
-                          layout=Layout(min_shard=1, tolerance=1.0))
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
         state = trainer.fit(Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None,
                                    records=None, batch=8), steps=1)
     assert int(state.step) == 1
@@ -1013,6 +1018,7 @@ def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_step
     np.testing.assert_array_equal(np.asarray(held.scale), np.ones(4))
 
 
+@attending("template")
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
 def test_a_forwards_parameter_reads_are_its_drawn_forwards(dtype):
     """A decoder's forward whose every launch taking a parameter runs a template where a GPU runs it (the
@@ -1033,7 +1039,7 @@ def test_a_forwards_parameter_reads_are_its_drawn_forwards(dtype):
 
     model = models.build("causal_transformer", vocab_size=64, emb_features=128, num_layers=2, num_heads=2,
                          num_kv_heads=1, head_dim=64, mlp_features=256, max_seq_len=128, dtype=dtype,
-                         attention_impl="template", mixture={"experts": 4, "top_k": 2, "layers": (1,)})
+                         mixture={"experts": 4, "top_k": 2, "layers": (1,)})
     tokens = jax.ShapeDtypeStruct((2, 128), jnp.int32)
     variables = jax.eval_shape(model.init, jax.random.key(0), tokens)
     objective, step = LMObjective(model, 127), Step(jnp.asarray(0), jax.random.key(1), None)

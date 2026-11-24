@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from interop_support import assert_reloads, fixture_ids, token_draw, transformers_arms
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -59,6 +60,7 @@ EXPORT_SEEDS = 16
 paired with Dew's logits on armada."""
 
 
+@attending("reference")
 def test_an_export_opens_in_transformers_as_the_model_it_was(tmp_path):
     """qwen4-exp-tiny written back (a qwen4_exp_text config, its experts fused, its n-gram table in its row
     shards beside the buffers the class holds) opens in transformers' Qwen4ExpForCausalLM with no tensor
@@ -67,7 +69,7 @@ def test_an_export_opens_in_transformers_as_the_model_it_was(tmp_path):
     import torch
     from transformers import AutoModelForCausalLM
 
-    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(TINY, dtype='float32')
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
     model, report = AutoModelForCausalLM.from_pretrained(
         tmp_path, dtype=torch.float32, attn_implementation='eager', experts_implementation='eager',
@@ -94,6 +96,7 @@ def with_mtp(directory: Path) -> None:
     save_file({**stored, **drawn}, directory / 'model.safetensors', metadata={'format': 'pt'})
 
 
+@attending("reference")
 def test_the_wrapper_loads_whole_and_text_only_and_writes_back_as_stored(tmp_path):
     """qwen4-exp-native-tiny, transformers' own Qwen4ExpForConditionalGeneration save, with the release's
     root prediction-layer names beside it, loads whole, its tower Qwen 3.5's, and as its language model
@@ -103,8 +106,8 @@ def test_the_wrapper_loads_whole_and_text_only_and_writes_back_as_stored(tmp_pat
 
     source = Path(shutil.copytree(NATIVE, tmp_path / 'source'))
     with_mtp(source)
-    whole = Pretrained.load(source, dtype='float32', attention_impl='reference')
-    alone = Pretrained.load(source, dtype='float32', attention_impl='reference', text_only=True)
+    whole = Pretrained.load(source, dtype='float32')
+    alone = Pretrained.load(source, dtype='float32', text_only=True)
     (ids,) = token_draw(0x4E, 200, (2, 12))(0)
     np.testing.assert_array_equal(alone.model.apply(alone.variables, ids),
                                   whole.model.apply(whole.variables, ids))
@@ -112,6 +115,7 @@ def test_the_wrapper_loads_whole_and_text_only_and_writes_back_as_stored(tmp_pat
     assert_reloads(whole, tmp_path / 'saved', ids)
 
 
+@attending("reference")
 def test_a_loaded_checkpoint_of_a_sharded_table_writes_back_and_reloads(tmp_path):
     """qwen4-exp-tiny, its n-gram table in four row shards and the release's root prediction-layer names
     beside it, loads as without them and writes back as stored (each shard from its slice of the
@@ -121,8 +125,8 @@ def test_a_loaded_checkpoint_of_a_sharded_table_writes_back_and_reloads(tmp_path
 
     source = Path(shutil.copytree(TINY, tmp_path / 'source'))
     with_mtp(source)
-    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
-    plain = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(source, dtype='float32')
+    plain = Pretrained.load(TINY, dtype='float32')
     ids = np.load(TINY / 'input_ids.npy')
     np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
                                   plain.model.apply(plain.variables, ids))
@@ -135,6 +139,7 @@ MEDIA_SEEDS = 32
 """The media's declared draws (check 1), sized by `seeds_for` paired with Dew's logits on armada."""
 
 
+@attending("reference")
 def test_images_and_a_video_read_through_the_processor_as_transformers_reads_them():
     """qwen4-exp-native-tiny (tools/qwen4_exp_reference.py --native) through its own Qwen3-VL processor:
     a prompt over a drawn image and one over a drawn video of two frames, their tower Qwen 3.5's, their
@@ -144,7 +149,7 @@ def test_images_and_a_video_read_through_the_processor_as_transformers_reads_the
     import torch
     import transformers
 
-    loaded = Pretrained.load(NATIVE, dtype='float32', attention_impl='reference')
+    loaded = Pretrained.load(NATIVE, dtype='float32')
     assert loaded.processor is not None
     prompts = json.loads((NATIVE / 'prompts.json').read_text())
     processor = transformers.AutoProcessor.from_pretrained(NATIVE, local_files_only=True)

@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture, packed, unpacked
+from model_support import attending
 from reference_error import as_given, assert_as_exact
 
 from _dew_torch.precision import float64
@@ -116,6 +117,7 @@ def assert_reads_as_diffusers(loaded, repo, dduf_file: str, label: str, *, revis
                     truth_fn=as_given(wide))
 
 
+@attending("xla")
 def test_a_dduf_file_loads_what_diffusers_reads_from_it_and_unpacks_once(packed_pipeline, tmp_path,
                                                                          monkeypatch):
     """Dew's load of the packed file is its load of the directory the file
@@ -128,8 +130,8 @@ def test_a_dduf_file_loads_what_diffusers_reads_from_it_and_unpacks_once(packed_
     from dew.interop import dduf
 
     directory, repo = packed_pipeline
-    loaded = Pretrained.load(repo, dduf_file="pipeline.dduf", dtype="float32", attention_impl="xla")
-    direct = Pretrained.load(directory, dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(repo, dduf_file="pipeline.dduf", dtype="float32")
+    direct = Pretrained.load(directory, dtype="float32")
     assert type(loaded.model) is type(direct.model)
     paths = jax.tree_util.tree_leaves_with_path(loaded.variables)
     expected_paths = [path for path, _ in jax.tree_util.tree_leaves_with_path(direct.variables)]
@@ -187,10 +189,11 @@ def test_an_entry_named_outside_the_archive_directory_is_refused(tmp_path, monke
     assert not (tmp_path / "cache" / "dew" / "dduf" / "escaped.json").exists()
 
 
+@attending("xla")
 @pytest.mark.network
 def test_a_published_dduf_file_loads_what_diffusers_reads_from_it():
     """The same comparison on a DDUF file published on the Hub, at a pinned
     commit: Dew's Flux prediction against Diffusers' own DDUF load."""
     repo, file, revision = PUBLISHED
-    loaded = Pretrained.load(repo, dduf_file=file, revision=revision, dtype="float32", attention_impl="xla")
+    loaded = Pretrained.load(repo, dduf_file=file, revision=revision, dtype="float32")
     assert_reads_as_diffusers(loaded, repo, file, "published DDUF Flux", revision=revision)

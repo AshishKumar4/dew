@@ -62,6 +62,7 @@ The recipe's data is a chain, which it records with the run, and its model a `Mo
 ```python
 # byte_demo.py
 from dew.config import TrainerConfig
+from dew.config.trainer import Diagnostics
 from dew.training import Horizon
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
@@ -74,8 +75,9 @@ run = LMRunConfig(
     data=TokenFiles("tokens/train").shuffle(seed=0).repeat().pipe(presets.token_windows, **windows)
     .loading(loading),
     validation=TokenFiles("tokens/val").pipe(presets.token_windows, **windows, records=16).loading(loading),
-    model=ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "reference", "emb_features": 16,
-                                             "num_layers": 1, "num_heads": 2, "mlp_features": 32}),
+    model=ModelConfig("causal_transformer", {"dtype": "float32", "emb_features": 16, "num_layers": 1,
+                                             "num_heads": 2, "mlp_features": 32}),
+    diagnostics=Diagnostics(kernels={"attention": "reference"}),
     trainer=TrainerConfig(horizon=Horizon(steps=2), log_every=1, eval_every=2, checkpoint_every=2,
                           checkpoint_dir="runs", name="byte-demo", multi_host=False),
     max_new_tokens=0,
@@ -113,20 +115,20 @@ Every recipe's configuration extends `RunConfig` with five parts:
 | `model` (`ModelConfig`) | The model's class and its constructor fields, compute dtype and attention kernel among them. | Python: `ModelConfig("causal_transformer", {"num_layers": 12})` |
 | `objective` (`ObjectiveConfig`) | The objective's class and the constructor arguments the run states. | Python: `ObjectiveConfig("lm", {"ema_decay": 0.999})` |
 | `data`, `validation` | Chains: a source, its steps and a preset, recorded with the run. | Python: `presets.token_windows(seq_len=16)` |
-| `optim` (`OptimConfig`) | Optimizer, constant or scheduled rate, weight decay, clipping, optimizer-state dtype. | `--optim.learning-rate 0.0001` |
-| `trainer` (`TrainerConfig`) | Run length, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.horizon.steps 1000` |
+| `optim` (`OptimConfig`) | Optimizer, constant or scheduled rate, weight decay, clipping, optimizer-state dtype. | `--optim.lr 0.0001` |
+| `trainer` (`TrainerConfig`) | Run length, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.steps 1000` |
 
-A dotted flag sets one of the run's own settings, `--optim.learning-rate 0.0001` or `--trainer.horizon.steps 1000`. What the run trains, its model, its objective and its data, is built in Python: the recipe's `default`, or a run file of your own, which states each class by alias or import path (`ModelConfig("hybrid_dit")`, `ModelConfig("mypackage.models:Net")`) and its fields, a field holding records (a UNet's `attention_configs`) as its record. `RunConfig.override` sets any field by its dotted path, `data.<preset>.<setting>` a setting of the run's data chain, as a sweep does.
+A dotted flag sets one of the run's own settings, `--optim.lr 0.0001` or `--trainer.steps 1000`. What the run trains, its model, its objective and its data, is built in Python: the recipe's `default`, or a run file of your own, which states each class by alias or import path (`ModelConfig("hybrid_dit")`, `ModelConfig("mypackage.models:Net")`) and its fields, a field holding records (a UNet's `attention_configs`) as its record. `RunConfig.override` sets any field by its dotted path, `data.<preset>.<setting>` a setting of the run's data chain, as a sweep does.
 
 Each setting's default is the recipe's own, which can differ from the configuration class's: the language-model recipe states its own optimizer settings (`LMRunConfig`). A recipe's `--help` prints every flag with the default that recipe runs with, for example `python recipes/lm/train.py --help`.
 
 | Setting | Notes |
 |---|---|
 | model `dtype` | The model's compute dtype, which each recipe's default model states (`ModelConfig` fields). Parameters are stored in float32. A run-wide matmul precision is `--trainer.precision`; a model's own is its `precision` field. |
-| model `attention_impl` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
+| `--diagnostics.kernels` | The kernel the run runs for each op it names, its attention's a name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example names `reference` so no device-specific kernel runs. |
 | `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon`, `muonclip` or `laprop` at its defaults, or its record with its settings as JSON (`'{"class": "adamw", "fields": {"b2": 0.95}}'`). |
 | `--optim.learning-rate` | The learning rate: a number, or a schedule's record as JSON (`'{"class": "cosine", "fields": {...}}'`). |
-| `--trainer.horizon.steps` / `--trainer.horizon.epochs` | Run length; set one, not both. |
+| `--trainer.steps` / `--trainer.epochs` | Run length; set one, not both. |
 | the preset's `batch` | Global batch across all JAX processes, the data chain's preset's (`presets.token_windows(batch=...)`, `presets.images(batch=...)`). |
 | `--trainer.eval-every`, `--trainer.checkpoint-every` | A step interval, `epoch`, `passes` (the default), a share such as `5%`, or `None`. |
 | `--trainer.checkpoint-dir`, `--trainer.name` | The run's directory is `<checkpoint-dir>/<name>`. |
@@ -135,13 +137,13 @@ Each setting's default is the recipe's own, which can differ from the configurat
 
 A chain's `workers(n)`, `threads(n)` or `loading(Loading(...))` control how the host reads data; they do not change the batch size on the device. With zero workers the loader starts no worker processes. [Training data](concepts/data.md) covers the loading settings.
 
-An `epoch` interval needs data whose passes the run counts: a record count, or `--trainer.horizon.epochs` over source examples; written where the run counts none, it is refused. The default, `passes`, is each pass's end where the run counts them and the run's end otherwise, which the start logs and records. A stream that cannot save and restore its read position still checkpoints its weights and training state, and `fit` refuses to resume from such a checkpoint unless the stream declares that it replays its batches ([Data position](guides/checkpoints.md#data-position)).
+An `epoch` interval needs data whose passes the run counts: a record count, or `--trainer.epochs` over source examples; written where the run counts none, it is refused. The default, `passes`, is each pass's end where the run counts them and the run's end otherwise, which the start logs and records. A stream that cannot save and restore its read position still checkpoints its weights and training state, and `fit` refuses to resume from such a checkpoint unless the stream declares that it replays its batches ([Data position](guides/checkpoints.md#data-position)).
 
-Muon treats matrix parameters separately from embedding, head and normalization parameters. MuonClip also needs the step's attention logit maxima for its clipping step. A run whose optimizer holds a QK-Clip asks its objective for them (`Step.qk_stats`): the LM, RL, preference, masked-diffusion and block-diffusion objectives return them (`Aux.qk_stats`), and a run whose objective returns none is refused rather than left unclipped, as a decision run is for now. MuonClip clips by rescaling the query and key kernels after the step, and the trainer's step applies the rescale as it stores the weights. A loop of your own applies a MuonClip update, or a bounded param group's, with `dew.optim.stepped(params, updates, before, after)`, the optimizer's state before and after the update, since `optax.apply_updates` leaves the rescale and the clamp out. A layer that normalizes its queries and keys divides that scale back out of the logits, so MuonClip refuses such a layer. The causal transformer normalizes them by default, so to train it with MuonClip, state the run's model with `qk_norm=False` and pass `--optim.optimizer muonclip`.
+Muon treats matrix parameters separately from embedding, head and normalization parameters. MuonClip also needs the step's attention logit maxima for its clipping step. A run whose optimizer holds a QK-Clip asks its objective for them (`Step.qk_stats`): the LM, RL, preference, masked-diffusion and block-diffusion objectives return them (`Aux.qk_stats`), and a run whose objective returns none is refused rather than left unclipped, as a decision run is for now. MuonClip clips by rescaling the query and key kernels after the step, and the trainer's step applies the rescale as it stores the weights. A loop of your own applies a MuonClip update, or a bounded param group's, with `dew.optim.stepped(params, updates, before, after)`, the optimizer's state before and after the update, since `optax.apply_updates` leaves the rescale and the clamp out. A layer that normalizes its queries and keys divides that scale back out of the logits, so MuonClip refuses such a layer. The causal transformer normalizes them by default, so to train it with MuonClip, state the run's model with `qk_norm=False` and pass `optim.optimizer:muonclip`.
 
-Two optimizers from Nested Learning (arXiv 2512.24695) are Optax transforms in `dew.optim`, composed in a Python run's own `optax.chain` rather than named by `--optim.optimizer`. `scale_by_m3` is M3, its Algorithm 1: Muon's orthogonalized momentum over Adam's second moment, plus a slow momentum that gathers each chunk of `frequency` updates and reaches the next chunk's updates, weighted by `alpha`; follow it with `optax.scale_by_learning_rate`, and partition a model's vectors to another optimizer as Muon's do. `delta_gradient_descent` steps each kernel to the minimizer of its eq. 56, forgetting what the kernel held along the step's input `x`: its update takes `inputs=`, the input of each kernel, and suits a memory or fast weight that sees one input a step.
+Two optimizers from Nested Learning (arXiv 2512.24695) are Optax transforms in `dew.optim`, composed in a Python run's own `optax.chain` rather than chosen by `optim.optimizer:<name>`. `scale_by_m3` is M3, its Algorithm 1: Muon's orthogonalized momentum over Adam's second moment, plus a slow momentum that gathers each chunk of `frequency` updates and reaches the next chunk's updates, weighted by `alpha`; follow it with `optax.scale_by_learning_rate`, and partition a model's vectors to another optimizer as Muon's do. `delta_gradient_descent` steps each kernel to the minimizer of its eq. 56, forgetting what the kernel held along the step's input `x`: its update takes `inputs=`, the input of each kernel, and suits a memory or fast weight that sees one input a step.
 
-`AdamW(state_dtype="bfloat16")` halves the memory the optimizer state takes, and `AdamW(state_dtype="int8")` quarters it, about 2 bytes a parameter for both moments (bitsandbytes' and torchao's 8-bit Adam); on the command line, `--optim.optimizer '{"class": "adamw", "fields": {"state_dtype": "int8"}}'`. Its effect on step time depends on the device ([Performance measurements](performance.md)).
+`AdamW(state_dtype="bfloat16")` halves the memory the optimizer state takes, and `AdamW(state_dtype="int8")` quarters it, about 2 bytes a parameter for both moments (bitsandbytes' and torchao's 8-bit Adam); on the command line, `optim.optimizer:adamw --optim.optimizer.state-dtype int8`. Its effect on step time depends on the device ([Performance measurements](performance.md)).
 
 With `trainer.wandb` unset, the recipe prints to the terminal and keeps a local tracking journal in `<checkpoint-dir>/<name>/tracking`. To use Weights & Biases, select it with `trainer.wandb:wandb` and set `--trainer.wandb.project NAME`; the run shows in W&B under its own name, or under `--trainer.wandb.name` where that is set, while its checkpoints stay under the run's name. `--trainer.wandb.offline` stops the tracker from opening an online session, but the recipe can still download datasets and models. `--trainer.wandb.shared` opens the run in W&B's shared mode as its primary writer, so other processes, such as a forecaster or an evaluator, can log into the same run: each opens `WandbTracker(project, id=RUN_ID, shared=True, primary=False, label="eval")` and logs its `eval/` metrics against its own `eval/step`. W&B keeps a second writer's rows only in a run opened this way; a shared run cannot be offline. Profiling is off unless `trainer.profile` is set. `run.json` records the configuration only, so to reproduce a run, archive the dataset contents, the package versions and the source checkout separately.
 
@@ -151,7 +153,7 @@ To train on your own text, export records with the tokenizer the run will use. T
 
 For whole documents, preserve their boundaries when exporting: the producer ends each with the tokenizer's EOS unless told `--no-eos`; and pack them in a run file, which packs in the store's order and orders the packed rows after: `TokenFiles(url).pipe(presets.lm, None, seq_len=256, batch=None, pack="first-fit").shuffle(0).repeat().batch(32)`. The byte tokenizer's EOS is ID 255, which never occurs in UTF-8 text. Packing resets attention boundaries and positions between documents.
 
-`--pretrained` takes a supported Hugging Face model directory, a Hub ID, `repo@revision` for a branch, tag or commit, or a saved Dew run's directory, whose checkpoint `--source.step` (a step, `latest`, `best` or `best:<metric>`) and `--source.ema` select and the run's record pins. A Hub ID can start a download, which may need authentication and a license agreement. `run.json` records a Hub source as `repo@commit`, with the commit it resolved to. To run offline, prepare a local checkpoint and its tokenizer, tokenize the data with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. The checkpoint decides the architecture, so of its model's fields `max_seq_len`, `dtype` and `attention_impl` alone may be set. With any other field, the recipe refuses to load the checkpoint. [Language models](concepts/language_models.md) covers loading and export.
+`--pretrained` takes a supported Hugging Face model directory, a Hub ID, `repo@revision` for a branch, tag or commit, or a saved Dew run's directory, whose checkpoint `--source.step` (a step, `latest`, `best` or `best:<metric>`) and `--source.ema` select and the run's record pins. A Hub ID can start a download, which may need authentication and a license agreement. `run.json` records a Hub source as `repo@commit`, with the commit it resolved to. To run offline, prepare a local checkpoint and its tokenizer, tokenize the data with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. The checkpoint decides the architecture, so of its model's fields `max_seq_len` and `dtype` alone may be set. With any other field, the recipe refuses to load the checkpoint. [Language models](concepts/language_models.md) covers loading and export.
 
 The LM recipe's objective is `lm`, `masked_diffusion` or `block_diffusion` (`ObjectiveConfig`), each with its own constructor's arguments as fields: `mtp_weight` 0.3 for `LMObjective`, say, and `prefix` 64 (or `"prompt"`, on chat rows) for a prefix run ([Prefix blocks](concepts/language_models.md#prefix-blocks)). `masked_diffusion` trains a bidirectional masked-denoising model, with an EMA (`ema_decay`, 0.999) unless set to `None`. With `--pretrained` it continues from a LLaDA or Dream checkpoint. Without it, the model starts from a fresh initialization, and needs the model's `mask_token_id` as well as `causal=False`. `block_diffusion` fine-tunes a DiffusionGemma checkpoint and needs both `--pretrained` and a token-store chain, and `prompt_length`, the clean prefix of each row. The recipe does not run SFT, distillation, DPO, GRPO or PPO; those run in Python, alone or chained with pretraining by `recipes/chain.py` ([Stage chains](concepts/post_training.md#stage-chains)).
 
@@ -168,7 +170,7 @@ By default the recipe trains on Oxford Flowers with a CLIP condition encoder. Pr
 
 For a committed store, the chain's source is its URL (`RunConfig.override({"data.source.url": ...})` points a recipe's chain at it). A URL catalog adds a fetch step before decoding, written in the chain. The CLIP condition and metric need their pretrained checkpoint; an offline tracker does not prepare it.
 
-`--pretrained` fine-tunes a published diffusion pipeline in the diffusers layout. It takes a Hub ID, `repo@revision` or a local directory holding SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image or Z-Image. The pipeline decides the model, its autoencoder and its text conditioning, which comes from all of its text encoders and reaches the model as `conditioning`. So the run's model then states only its `dtype` and `attention_impl`, the parameters load in float32, and `text` and `autoencoder` stay unset. The pipeline runs at the data's resolution, and its images use the autoencoder's own channels; Qwen-Image 2.1's, for example, are RGBA. `--pretrained` also takes a saved Dew diffusion run's directory, at the checkpoint `--source.step` and `--source.ema` select: the run starts from that run's own model, conditioning, autoencoder, weights and sampling policy, as its `TextToImage.from_run` holds them.
+`--pretrained` fine-tunes a published diffusion pipeline in the diffusers layout. It takes a Hub ID, `repo@revision` or a local directory holding SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image or Z-Image. The pipeline decides the model, its autoencoder and its text conditioning, which comes from all of its text encoders and reaches the model as `conditioning`. So the run's model then states only its `dtype`, the parameters load in float32, and `text` and `autoencoder` stay unset. The pipeline runs at the data's resolution, and its images use the autoencoder's own channels; Qwen-Image 2.1's, for example, are RGBA. `--pretrained` also takes a saved Dew diffusion run's directory, at the checkpoint `--source.step` and `--source.ema` select: the run starts from that run's own model, conditioning, autoencoder, weights and sampling policy, as its `TextToImage.from_run` holds them.
 
 `preset:none` trains with the convention the pipeline's scheduler reads, using the flow shift its sampler applies at that resolution. That shift is 3.0 for SD3, and for Flux it is exp(mu), with mu linear in the packed latent's token count. A scheduler file says how its checkpoint samples and says nothing about how it was trained, so this is a choice Dew makes for fine-tuning. A preset of the same kind replaces it, for example `preset:flow --preset.shift 1.0`. `run.json` records a Hub source as `repo@commit`.
 
@@ -187,7 +189,6 @@ A JEPA configuration adds predictor fields, target-mask settings and optional re
 from flax import linen as nn
 
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
-from dew.training import Horizon
 
 from dew.registry import ModelConfig
 from dew.data import Files
@@ -209,14 +210,14 @@ run = RunConfig(
     data=Files("rows.jsonl").map(Formatting()).shuffle(seed=0).repeat().batch(64),
     objective=ObjectiveConfig("supervised", {
         "loss": CrossEntropy(), "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
-    trainer=TrainerConfig(horizon=Horizon(steps=300)))
+    trainer=TrainerConfig(steps=300))
 ```
 
 ```bash
 dew train experiment.py
 ```
 
-A run file changes a field at its dotted path with `RunConfig.override` (`run.override({"trainer.horizon.steps": 2000, "model.hidden": 64})`), each value as the run's record holds it: a record (`objective.loss`, `{"function": "pkg.losses:hinge"}`) as its JSON. Under `model` and `objective`, a path names a constructor argument of the class the run names. A path the run does not declare is refused. Sweeps override the same paths.
+A run file changes a field at its dotted path with `RunConfig.override` (`run.override({"trainer.steps": 2000, "model.hidden": 64})`), each value as the run's record holds it: a record (`objective.loss`, `{"function": "pkg.losses:hinge"}`) as its JSON. Under `model` and `objective`, a path names a constructor argument of the class the run names. A path the run does not declare is refused. Sweeps override the same paths.
 
 `dew train` imports the file as the module its name names, so the model, loss and metrics it defines are recorded by import path (`experiment:MLP`), and a lambda is refused where the run states it. Reading a record constructs only what its field declares: a model is a Flax module, an objective an `Objective`, and a loss or metric a function, or a class whose instances are called from Dew, Flax, the experiment's own module or a package `--trust` names. `dew train <checkpoint-dir>/<name>/run.json --trust experiment` rebuilds the run from its record alone, with `experiment.py` importable (`PYTHONPATH`); it continues from the run's checkpoints, or trains it again elsewhere from a run file that loads it and sets its `trainer.checkpoint_dir` (`RunConfig.override`). [`examples/train_supervised.py`](../examples/train_supervised.py) is a complete experiment. `dew train` also trains a recipe's run from its `run.json`, which names the run's class.
 

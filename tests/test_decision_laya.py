@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 from one_draw import assert_as_exact_as_the_reference
 from recorded_runs import assert_as_exact_as_recorded
 from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact, indexed_recording, recording
@@ -72,7 +73,7 @@ OUTPUTS = ("sequential", "parallel")
 
 @functools.cache
 def tiny() -> Decide:
-    return Decide.from_pretrained(TINY, attention_impl="xla")
+    return Decide.from_pretrained(TINY)
 
 
 @functools.cache
@@ -137,12 +138,14 @@ def dew(dtype, inputs, *, typed: bool = True) -> dict:
             for layout in OUTPUTS}
 
 
+@attending("xla")
 def test_laya_logits_match_laya_under_the_float64_rule():
     """Every case's option logits, sequential and parallel, over drawn weights, as exact as Laya's
     float32 run against its float64 run (check 1)."""
     assert_as_exact_as_recorded(FIXTURE, "laya", LAYA_SEEDS, draw, dew, "Laya's option logits")
 
 
+@attending("xla")
 def test_the_rule_catches_a_head_that_ignores_the_question_type():
     """The type embedding is the only place a choice and a noul differ in
     the head; dropping it moves the logits past the rule: check 1 decides
@@ -156,6 +159,7 @@ def test_the_rule_catches_a_head_that_ignores_the_question_type():
     assert not isinstance(failed.value, Inconclusive)
 
 
+@attending("xla")
 def test_padded_rows_score_as_they_do_alone():
     """Every question of every case in one batch: padding reaches neither
     the encoder's nor the head's attention, so the batch is held to Laya's
@@ -175,6 +179,7 @@ def test_padded_rows_score_as_they_do_alone():
     assert_as_exact_as_recorded(FIXTURE, "laya", LAYA_SEEDS, draw, in_one_batch, "batched Laya logits")
 
 
+@attending("xla")
 @pytest.mark.network
 @pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"), reason="downloads the 1.7 GB English checkpoint")
 @pytest.mark.gpu(reason="XLA:CPU's fp32 dot rounds more than MKL's")
@@ -190,7 +195,7 @@ def test_the_released_english_checkpoint_matches_laya():
     reductions carry through 28 layers."""
     source = json.loads((FIXTURES / "real" / "source.json").read_text())
     with jax.default_matmul_precision("highest"):
-        checkpoint = Decide.from_pretrained(source["repo"], revision=source["revision"], attention_impl="xla")
+        checkpoint = Decide.from_pretrained(source["repo"], revision=source["revision"])
         compare_released(checkpoint)
 
 

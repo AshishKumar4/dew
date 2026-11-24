@@ -10,6 +10,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from model_support import attending, stacked
 from process_support import run_pool
 from run_kinds import SEQ, captioned, decision, diffusion, lm, pictures, trained
 from saved_run_kinds import over, windows
@@ -23,10 +24,10 @@ from dew.inference import TextToImage
 from dew.inference.tasks import SavedRun
 from dew.interop.pretrained import load_diffusion_source
 from dew.interop.saved_sources import export_run, released_run
+from dew.kernels import Kernels
 from dew.lora import LoRA
 from dew.registry import ModelConfig
 from dew.sampling.solvers import Euler
-from dew.training.budget import Horizon
 
 
 @pytest.mark.mesh(devices=8)
@@ -58,7 +59,7 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     # weights, on a host whose cache holds no release.
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "another_cache"))
     trained(recorded, tmp_path, "from_run",
-            trainer={"name": "from_run", "horizon": Horizon(steps=2), "checkpoint_final": True})
+            trainer={"name": "from_run", "steps": 2, "checkpoint_final": True})
     assert "2" in {path.name for path in (tmp_path / "runs" / "from_run").iterdir()}
     assert released_run(source, step="latest") == released_run(source)
     with pytest.raises(ValueError):
@@ -191,7 +192,7 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     # Another host, the training host's cache nowhere: the run resumes there and trains a second step.
     shutil.move(trained_on.parent.parent, tmp_path / "kept")
     resumed_on = cache("resuming_host")
-    trained(run, tmp_path, "second", trainer={"horizon": Horizon(steps=2), "checkpoint_final": True})
+    trained(run, tmp_path, "second", trainer={"steps": 2, "checkpoint_final": True})
     (later,) = SavedRun.at(second, 2).record[RELEASE_SOURCES]
     assert Path(later).parent == resumed_on
     stepped = answered(Decide.from_run(second, step=2))
@@ -212,6 +213,7 @@ def test_a_run_started_from_a_saved_run_resumes_and_serves_on_hosts_whose_caches
     assert str(source) in str(refused.value)
 
 
+@attending("xla")
 @pytest.mark.mesh(devices=8)
 def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(tmp_path, monkeypatch):
     """A language model run whose decoder no family's layout holds (GPT-J's parallel layout under a gated
@@ -240,8 +242,8 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
     assert not source_layout(saved_model(SavedRun.pinned(str(source)).record, None).build())
-    loaded = Pretrained.load(str(source), max_seq_len=2 * SEQ, attention_impl="xla")
-    assert (loaded.model.max_seq_len, loaded.model.attention_impl) == (2 * SEQ, "xla")
+    loaded = Pretrained.load(str(source), max_seq_len=2 * SEQ)
+    assert loaded.model.max_seq_len == 2 * SEQ
     # Asked no mesh, its weights lie on JAX's default device, as a family's load places them, not on
     # every device of a default mesh (ledger 4798).
     assert {frozenset(leaf.sharding.device_set) for leaf in jax.tree.leaves(loaded.variables)} == {
@@ -299,6 +301,7 @@ TEAM = {"billing": "payments", "technical": "outages", "sales": "pricing"}
 """The question the chat-format decision runs answer, `Choice("Which team?", TEAM)`."""
 
 
+@attending("xla")
 @pytest.mark.shared_setup("chat_decision_run")
 def test_a_saved_chat_format_decision_runs_release_answers_as_its_run(chat_decision_run, tmp_path,
                                                                       monkeypatch):
@@ -318,7 +321,7 @@ def test_a_saved_chat_format_decision_runs_release_answers_as_its_run(chat_decis
     served = Decide.of(PretrainedDecision.of(dataclasses.replace(task, variables=jax.tree.map(
         np.asarray, task.variables))))
     for written in ("exported", "saved"):
-        reloaded = Decide.from_pretrained(tmp_path / written, attention_impl="xla")
+        reloaded = Decide.from_pretrained(tmp_path / written)
         for state_text in ("charged twice", "is the site down?"):
             np.testing.assert_array_equal(reloaded(state_text, {"team": team})["team"].probabilities,
                                           served(state_text, {"team": team})["team"].probabilities)
@@ -451,7 +454,7 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
                                   model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)),
                                   objective=ObjectiveConfig("diffusion", {}))
     trained(command, tmp_path, "after", trainer={"name": "after", "checkpoint_final": True})
-    trained(first, tmp_path, "first", trainer={"name": "first", "horizon": Horizon(steps=2),
+    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2,
                                                "checkpoint_final": True})
     later = SavedRun.pinned(str(source)).step
     assert later != read
@@ -465,26 +468,26 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
     assert stated.resumed().pinned().source.step == later
     with pytest.raises(ValueError):
         dataclasses.replace(recorded, source=SourceOptions(step=later)).check_resume(saved)
-    trained(command, tmp_path, "after", trainer={"name": "after", "horizon": Horizon(steps=2),
+    trained(command, tmp_path, "after", trainer={"name": "after", "steps": 2,
                                                  "checkpoint_final": True})
     assert "2" in {path.name for path in (tmp_path / "runs" / "after").iterdir()}
 
 
 @pytest.mark.mesh(devices=8)
 def test_a_run_resumes_whether_its_decoder_scans_its_layers_or_not(tmp_path):
-    """How a decoder executes its layers (`scan_layers`, `RunConfig.EXECUTED`) is no part of what a run
-    computes or stores, its checkpoint holding every layer `layers_N` either way: a run saved running a
-    layer at a time resumes scanning them, and back, where its resume refused it as another model (row
-    4104)."""
+    """How a decoder executes its layers (scanned or a layer at a time, `generation.Choice.LAYER_SCAN`) is no
+    part of what a run computes or stores, its checkpoint holding every layer `layers_N` either way: a run
+    saved running a layer at a time resumes scanning them, and back, where its resume refused it as another
+    model (row 4104)."""
     first = lm(tmp_path, drawn=False)
     deeper = dataclasses.replace(first, model=ModelConfig("causal_transformer",
                                                           {**first.model.fields, "num_layers": 2}))
-    trained(deeper, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
+    with stacked(scanned=False):
+        trained(deeper, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
     for scanned, steps in ((True, 2), (False, 3)):
-        run = dataclasses.replace(deeper, model=ModelConfig("causal_transformer", {
-            **deeper.model.fields, "scan_layers": scanned}))
-        trained(run, tmp_path, "run", trainer={"name": "run", "horizon": Horizon(steps=steps),
-                                               "checkpoint_final": True})
+        with stacked(scanned):
+            trained(deeper, tmp_path, "run",
+                    trainer={"name": "run", "steps": steps, "checkpoint_final": True})
         assert str(steps) in {path.name for path in (tmp_path / "runs" / "run").iterdir()}
 
 
@@ -506,16 +509,16 @@ def test_a_run_resumes_under_another_kernel_choice_and_refuses_its_experts_packe
                                 vocab_size=96)
     first = dataclasses.replace(over(str(source), tmp_path, drawn=False), data=windows(corpus.train),
                                 validation=windows(corpus.val),
-                                diagnostics=Diagnostics(kernels={"attention": "reference"}))
+                                diagnostics=Diagnostics(kernels=Kernels(attention="reference")))
     trained(first, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
-    rerun = dataclasses.replace(first, diagnostics=Diagnostics(kernels={"attention": "xla"}))
+    rerun = dataclasses.replace(first, diagnostics=Diagnostics(kernels=Kernels(attention="xla")))
     again, _ = trained(rerun, tmp_path, "run",
-                       trainer={"name": "run", "horizon": Horizon(steps=2), "checkpoint_final": True})
+                       trainer={"name": "run", "steps": 2, "checkpoint_final": True})
     assert int(again.step) == 2
     record = (tmp_path / "runs" / "run" / "run.json").read_text()
     packed = dataclasses.replace(first, source=dataclasses.replace(first.source, packed_weights=True))
     with pytest.raises(ValueError):
-        trained(packed, tmp_path, "run", trainer={"name": "run", "horizon": Horizon(steps=3),
+        trained(packed, tmp_path, "run", trainer={"name": "run", "steps": 3,
                                                   "checkpoint_final": True})
     assert (tmp_path / "runs" / "run" / "run.json").read_text() == record
 
@@ -540,7 +543,7 @@ def test_a_saved_decision_runs_step_reads_the_calibration_fitted_on_it_after_a_l
     # The run as a Dew that kept no calibration by step left it: its latest alone, which the next fit
     # keeps by its own weights before it replaces it (row 3877).
     shutil.rmtree(source / "calibrations")
-    trained(first, tmp_path, "first", trainer={"name": "first", "horizon": Horizon(steps=2),
+    trained(first, tmp_path, "first", trainer={"name": "first", "steps": 2,
                                                "checkpoint_final": True})
     later = SavedRun.pinned(str(source)).step
     assert later != read
@@ -620,6 +623,7 @@ PUBLISHED = {"xl": ("tiny_diffusers", "xl"), "flux": ("flux_source", "pipeline")
 state its size, and Flux's, whose grid's tokens set its resolution shift."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("pipeline", sorted(PUBLISHED))
 def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_does(pipeline, tmp_path):
     """A run trained a step from a published pipeline and saved binds at another size as the pipeline binds
@@ -638,11 +642,11 @@ def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_d
     archive, folder = PUBLISHED[pipeline]
     directory = extract_fixture(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz", tmp_path / archive)
     directory = directory / folder
-    own = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    own = load_diffusion_source(str(directory), dtype="float32")
     height, width = own.inputs.sample.shape[-3:-1]
     config = DiffusionRunConfig(
         pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height), preset=None,
-        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32"}),
         val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
@@ -650,7 +654,7 @@ def test_a_run_from_a_published_pipeline_binds_at_another_size_as_the_pipeline_d
     # Wider and taller apart: a rectangle's two extents each read where they are.
     size = (2 * height, width + width // 2)
     saved = load_diffusion_source(str(tmp_path / "run"), dtype="float32", size=size)
-    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=size)
+    published = load_diffusion_source(str(directory), dtype="float32", size=size)
     assert isinstance(saved, RunPipeline) and saved.grid is not None
     assert isinstance(published, PretrainedPipeline) and isinstance(own, PretrainedPipeline)
     assert saved.inputs.sample == published.inputs.sample != own.inputs.sample
@@ -681,6 +685,7 @@ def flow_shift(source) -> float:
     return schedule.shift
 
 
+@attending("xla")
 def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size(tmp_path):
     """A run from a published Flux pipeline naming a resolution shift of its own keeps its process at another
     size, where its source's follows its grid there: the run's shift equals the grid's at its own size,
@@ -700,7 +705,7 @@ def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size
     archive, folder = PUBLISHED["flux"]
     directory = extract_fixture(Path(__file__).parent / "fixtures" / f"{archive}.tar.xz", tmp_path / archive)
     directory = directory / folder
-    own = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla")
+    own = load_diffusion_source(str(directory), dtype="float32")
     assert isinstance(own, PretrainedPipeline)
     # An objective over the pipeline trains its process over its grid; one given another grid, even an
     # equal one, trains the pipeline's process over a grid of its own.
@@ -713,7 +718,7 @@ def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size
     config = DiffusionRunConfig(
         pretrained=str(directory), data=images_of("tfds://oxford_flowers102", height),
         preset=Flow(resolution_shift=ResolutionShift(base_shift=mu, max_shift=mu)),
-        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32", "attention_impl": "xla"}),
+        model=ModelConfig("unet", {**DEFAULT_MODEL_CONFIG, "dtype": "float32"}),
         val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         objective=ObjectiveConfig("diffusion", {"steps": 2, "ema_decay": None}))
     task, _, _ = saved_after_one_step(config, lambda task: batch_for(task, 4), tmp_path / "run", 1e-2)
@@ -721,7 +726,7 @@ def test_a_run_naming_its_own_resolution_shift_keeps_its_process_at_another_size
     assert flow_shift(task) == flow_shift(own)
     size = (2 * height, width + width // 2)
     saved = load_diffusion_source(str(tmp_path / "run"), dtype="float32", size=size)
-    published = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=size)
+    published = load_diffusion_source(str(directory), dtype="float32", size=size)
     assert isinstance(saved, RunPipeline)
     assert flow_shift(saved) == flow_shift(own) != flow_shift(published)
     assert not task.grid_process and not saved.grid_process

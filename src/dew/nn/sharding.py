@@ -264,7 +264,7 @@ class Link:
 
     The trainer measures the interconnect when it places a step
     (`dew.training.distributed.link_bandwidth`), or takes it as stated
-    (`Trainer(links=...)`). `down_projection` and
+    (`TrainerAdvanced(links=...)`). `down_projection` and
     `split_positions` set `spread` when they decide to split a projection in
     the step over the axis.
     """
@@ -480,7 +480,7 @@ def split_positions(x: jax.Array, head_shape: tuple[int, int],
     this serves; its weight-gradient sum usually outweighs the saved
     projection, so a GPU's link rarely pays (an H100 would need 2.47 TB/s at
     SDXL's widths); a CPU's devices measure no link and keep the context whole
-    unless the run states one (`Trainer(links=...)`)."""
+    unless the run states one (`TrainerAdvanced(links=...)`)."""
     shards = sequence_shards()
     length = x.shape[1]
     if shards == 1 or length % shards == 0:
@@ -695,18 +695,83 @@ def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding
     return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*padded))
 
 
-def whole_along(x: jax.Array, axis: int) -> jax.Array:
+def whole_along(x: jax.Array, axis: int, onto: int | None = None) -> jax.Array:
     """`x` with its dimension `axis` whole on each device where an Explicit axis splits it, its other
     dimensions placed as they were: the one reshard that makes a dimension whole, a local attention's
     sequence (`dew.nn.local_attention`) and a packed projection's gate-and-up pair
-    (`dew.nn.activations.packed_gated_product`) alike (row 12224)."""
+    (`dew.nn.activations.packed_gated_product`) alike (row 12224). The mesh axes that split `axis` move onto
+    dimension `onto`, after those splitting it already, where together they divide it (one all-to-all, each
+    device keeping its share of the work, row 12225), else are gathered."""
     placed = explicit_spec(x)
     if placed is None or placed.spec[axis] is None:
         return x
     entries = list(placed.spec)
-    entries[axis] = None
+    moved, entries[axis] = mesh_axes(entries[axis]), None
+    if onto is not None:
+        joined = (*mesh_axes(entries[onto]), *moved)
+        if x.shape[onto] % math.prod(placed.mesh.shape[name] for name in joined) == 0:
+            entries[onto] = joined[0] if len(joined) == 1 else joined
     return jax.sharding.reshard(x, jax.sharding.NamedSharding(placed.mesh,
                                                              jax.sharding.PartitionSpec(*entries)))
+
+
+def holds_sum(x: jax.Array) -> bool:
+    """Whether `x`'s Explicit placement carries a sum still to take over a mesh axis (`PartitionSpec`'s
+    `reduced` or `unreduced` axes): a value whose spec is no tuple of entries to read (`explicit_spec`),
+    which JAX's own rules place."""
+    placed = explicit_placement(jax.typeof(x))
+    return placed is not None and bool(placed.spec.reduced or placed.spec.unreduced)
+
+
+def contracted_alike(lhs: jax.Array, rhs: jax.Array, dimension_numbers
+                     ) -> tuple[jax.Array, jax.Array, jax.sharding.NamedSharding | None]:
+    """`lhs` and `rhs`, and where a product of them over `dimension_numbers` lands, where Explicit axes split
+    a contracted dimension on both sides (row 12225: a down projection contracting a hidden width a tensor
+    axis splits): each such pair split by the axes both sides split it by alone (`('tensor', 'fsdp')`
+    against `'tensor'` gathers `fsdp`, as a weight's FSDP shards gather), so every device sums its share,
+    and the product placed as its operands' other dimensions are (batch, the left's free, the right's
+    free, a mesh axis placing one of them at most), the summed axes out of it, which JAX asks to be told;
+    the operands as they are and None where no contracted dimension is split on both sides (JAX places a
+    one-sided split itself), or where either is no Explicit placement's."""
+    if not (isinstance(lhs, jax.Array) and isinstance(rhs, jax.Array)):
+        # An operand of no JAX type (a quantized weight a quantizing provider hands its product).
+        return lhs, rhs, None
+    if holds_sum(lhs) or holds_sum(rhs):
+        # An operand whose placement carries a sum still to take (`reduced`, `unreduced`) keeps JAX's own
+        # route, which places its product; its spec is no tuple of entries to read (the confirm review).
+        return lhs, rhs, None
+    left, right = explicit_spec(lhs), explicit_spec(rhs)
+    if left is None or right is None:
+        return lhs, rhs, None
+    (left_contracted, right_contracted), (left_batch, right_batch) = dimension_numbers
+    lefts = [*left.spec, *(None,) * (lhs.ndim - len(left.spec))]
+    rights = [*right.spec, *(None,) * (rhs.ndim - len(right.spec))]
+    summed: list[str] = []
+    for a, b in zip(left_contracted, right_contracted, strict=True):
+        mine, theirs = mesh_axes(lefts[a]), mesh_axes(rights[b])
+        if not (mine and theirs):
+            continue
+        common = tuple(name for name in mine if name in theirs)
+        lefts[a] = rights[b] = (common[0] if len(common) == 1 else common) if common else None
+        summed.extend(common)
+    if lefts != [*left.spec, *(None,) * (lhs.ndim - len(left.spec))]:
+        lhs = jax.sharding.reshard(lhs, jax.sharding.NamedSharding(left.mesh,
+                                                                   jax.sharding.PartitionSpec(*lefts)))
+    if rights != [*right.spec, *(None,) * (rhs.ndim - len(right.spec))]:
+        rhs = jax.sharding.reshard(rhs, jax.sharding.NamedSharding(right.mesh,
+                                                                   jax.sharding.PartitionSpec(*rights)))
+    if not summed:
+        return lhs, rhs, None
+    entries = [lefts[d] for d in left_batch]
+    entries += [lefts[d] for d in range(lhs.ndim) if d not in left_contracted and d not in left_batch]
+    entries += [rights[d] for d in range(rhs.ndim) if d not in right_contracted and d not in right_batch]
+    used: set[str] = set(summed)
+    placed = []
+    for entry in entries:
+        names = mesh_axes(entry)
+        placed.append(None if not names or used & set(names) else entry)
+        used |= set(names)
+    return lhs, rhs, jax.sharding.NamedSharding(left.mesh, jax.sharding.PartitionSpec(*placed))
 
 
 def rows_taken(table: jax.Array, index: jax.Array) -> jax.Array:

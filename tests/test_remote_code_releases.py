@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 
 import pytest
-from model_support import remote_code_site
+from model_support import attending, remote_code_site
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 from release_support import under_release
 from remote_code_draws import SITES, draw
@@ -21,6 +21,7 @@ from dew.interop import Pretrained
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
 
 
+@attending("reference")
 @pytest.mark.parametrize(('name', 'site'), [(name, site) for name, sites in SITES.items() for site in sites])
 def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, site):
     """The decoder against its release over the recording's seeds, on par with the release against
@@ -34,7 +35,7 @@ def test_a_decoder_computes_its_releases_outputs_at_each_recorded_site(name, sit
     sliding layers attend in their own geometry (ledger 4290); MiMo-V2.6's whole over
     rows a drawn image, a drawn video's frames or drawn audio clips fill, and its prediction layer's logits
     (row 357)."""
-    source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
+    source = Pretrained.load(FIXTURES / name, dtype='float32')
     path, label = FIXTURES / name / 'released.npz', f'{name} {site}'
     seeds = declared_seeds(path)[label]
     config = json.loads((FIXTURES / name / 'config.json').read_text())

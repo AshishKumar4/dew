@@ -12,6 +12,8 @@ from dew.data import records
 from dew.nn.precision import Numerics, numerics_of
 from dew.registry import from_record, models, objectives
 
+type _Fields = dict[str, _records.JSON]
+
 
 def _chains() -> tuple[str, ...]:
     """The run's fields that hold chains today (`dew.config.CHAINS`), which an earlier record's chains are
@@ -43,20 +45,147 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     source's `packed_experts` as `packed_weights` (`earlier_packed_experts`, row 8550); and wherever it holds
     a run or trainer, a trainer's retired `export_model` taken off and a looped decoder's
     `loop_message_additive` true read as unset where it could not be unset (`earlier_retired`, rows 11636,
-    11742).
+    11742); its model's attention kernel as the run's (`earlier_attention_kernel`, row 11938); a pin of the
+    grouped products' kernel written before SYRK took a choice of its own as SYRK's too
+    (`earlier_grouped_pins`, row 12457); and every
+    field a class lost since, its model's, its source options' and any class record's, left out
+    (`earlier_removed`, `dew._records.REMOVED_FIELDS`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    unsettable, additive = (record.get(key) is True for key in (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE))
-    moved = _records.moved_record({key: value for key, value in record.items() if key not in MARKERS})
+    unsettable, additive, split = (record.get(key) is True
+                                   for key in (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE, KERNELS_SPLIT))
+    moved = earlier_removed(earlier_attention_kernel(earlier_layer_scan(_records.moved_record(
+        {key: value for key, value in record.items() if key not in MARKERS}))))
+    moved = moved if split else earlier_grouped_pins(moved)
     earlier = earlier_none_of_the_above(earlier_profile(earlier_trainer(
         moved if unsettable else earlier_trainer_layout(moved))))
     earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
     earlier = earlier_newton_schulz(earlier_retired(earlier_packed_experts(earlier), additive_unset=additive))
+    # Its optimizer's and trainer's settings by the names a run's surface gives them now (`earlier_surface`).
+    earlier = earlier_surface(earlier)
     # A decision layout recorded by one of the classes it was before (decision-inputs.md §1, row 6140).
     earlier = {name: _records.earlier_layout(_records.json_value(value, name))
                for name, value in earlier.items()}
     return records.earlier_chains(earlier_data_plan(earlier), _chains())
+
+
+def earlier_attention_kernel(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose model named its attention kernel (`attention_impl`, a model's field
+    until row 11938) with the kernel the run's own (`chosen_kernel`'s `attention`), where it named one but
+    'auto' and the run named none: the model's own, else a decoder's it wraps (`saved_decoders`,
+    `DiffusionGemma.text`, `MultimodalTransformer.language_model`, the API02 review: the root alone missed
+    a wrapped decoder's); the field itself is left out after (`earlier_removed`). Carried to 1.0 (ledger
+    1552)."""
+    from dew.inference.tasks import earlier_attention_pin
+
+    fields = record.get("fields")
+    model = fields.get("model") if isinstance(fields, Mapping) else None
+    kernel = earlier_attention_pin(model) if isinstance(model, Mapping) else None
+    return record if kernel is None else chosen_kernel(record, "attention", kernel)
+
+
+def earlier_layer_scan(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose model or source options scanned its stack (`scan_layers=True`, a field
+    of each until row 4074) with the scan the run's own kernel choice (`chosen_kernel`'s `layer_scan`), so
+    a resumed run, a host-streamed one among them, scans as it trained (the API02 review: a saved
+    streamed rung resumed a layer at a time and its host placement raised); the fields themselves are left
+    out after (`earlier_removed`). Carried to 1.0 (ledger 1552)."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping):
+        return record
+    from dew.inference.tasks import saved_decoders
+
+    scanned = any(decoder.get("scan_layers") is True for part in (fields.get("model"), fields.get("source"))
+                  if isinstance(part, Mapping) for decoder in saved_decoders(part))
+    return chosen_kernel(record, "layer_scan", "scanned") if scanned else record
+
+
+def earlier_grouped_pins(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record written before Muon's symmetric products took a kernel choice of their own
+    (`syrk`, rows 12457, 12485; no `KERNELS_SPLIT` beside its fields), whose `grouped_matmul` pin of
+    `mosaic` or `xla` chose SYRK's kernel too, refusals and all: that pin SYRK's as well, where the run named
+    none of its own, so a resumed run takes its Muon steps as it trained. Fused linear cross-entropy's is
+    not carried: its pin read the grouped products' only where its loss's dtype held the kernel, falling to
+    the chunked program elsewhere, a handoff no pin of `linear_ce` states (row 12457's defect, the coupling
+    itself), and both its arms compute the loss alike (check 1, tests/linear_ce_matrix.py), so the resumed
+    run's loss is its chunked program's. A pin of another of the grouped products' kernels named none of
+    SYRK's. Carried to 1.0 (ledger 1552)."""
+    found = _kernel_pins(record)
+    kernels = None if found is None else found[2].get("kernels")
+    pinned = kernels.get("grouped_matmul") if isinstance(kernels, Mapping) else None
+    if pinned not in ("mosaic", "xla"):
+        return record
+    return chosen_kernel(record, "syrk", pinned)
+
+
+type _Pins = tuple[Mapping[str, object], Mapping[str, object] | None, Mapping[str, object]]
+
+
+def _kernel_pins(record: Mapping[str, object]) -> _Pins | None:
+    """A saved run's record's fields, its diagnostics (a mapping, a class record, or absent) and the mapping
+    that holds its kernel pins (`kernels`): its diagnostics' fields, its diagnostics, or, a record of
+    before its diagnostics held them, its own fields; None where it holds no fields."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping):
+        return None
+    held = fields.get("diagnostics")
+    diagnostics = held if isinstance(held, Mapping) else None
+    named = _records.class_record(diagnostics) if diagnostics is not None else None
+    pins = named[1] if named is not None else diagnostics if diagnostics is not None else fields
+    return fields, diagnostics, pins
+
+
+def chosen_kernel(record: Mapping[str, object], choice: str, kernel: str) -> Mapping[str, object]:
+    """A saved run's record whose kernel choices name `kernel` for `choice` (`Diagnostics.kernels`, or the
+    run's `kernels` a record of before its diagnostics states, which `earlier_retired` moves there), where
+    the run named none of its own for it, which stands."""
+    found = _kernel_pins(record)
+    if found is None:
+        return record
+    fields, diagnostics, pins = found
+    named = _records.class_record(diagnostics) if isinstance(diagnostics, Mapping) else None
+    kernels = pins.get("kernels")
+    # A choice the run left unset (written None, as a record of its kernels writes each it names none for)
+    # takes `kernel`; one it named stands.
+    named_kernels = {name: value for name, value in (kernels.items() if isinstance(kernels, Mapping) else ())
+                     if value is not None}
+    chosen = {choice: kernel, **named_kernels}
+    if not isinstance(diagnostics, Mapping):
+        return {**record, "fields": {**fields, "kernels": chosen}}
+    stated = {**pins, "kernels": chosen}
+    return {**record, "fields": {**fields, "diagnostics": (stated if named is None
+                                                            else {"class": named[0], "fields": stated})}}
+
+
+def earlier_removed(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record without the fields their classes lost since it was saved
+    (`dew._records.REMOVED_FIELDS`: how a model executes, never what it computes): its source options'
+    (`SourceOptions`, which its run states by its type alone) and every class record's
+    (`dew._records.earlier_fields`); its model's are its model record's to drop
+    (`dew.inference.tasks.earlier_model`, which every reader of a saved model reads it through). Carried to
+    1.0 (ledger 1552)."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping):
+        return record
+    kept = dict(fields)
+    source = kept.get("source")
+    if isinstance(source, Mapping) and _records.class_record(source) is None:
+        kept["source"] = _without_removed(source, _SOURCE_OPTIONS)
+    walked = earlier_fields(_records.json_value({**record, "fields": kept}, "run"))
+    assert isinstance(walked, Mapping)
+    return walked
+
+
+_SOURCE_OPTIONS = "dew.interop.source_options:SourceOptions"
+"""The class a run's source options are (`RunConfig.source`), stated by the run's type, never by a record."""
+
+
+def _without_removed(fields: Mapping[str, object], name: str) -> Mapping[str, object]:
+    """`fields`, a record of the class `name`, without the fields it lost since (`REMOVED_FIELDS`)."""
+    removed = _records.REMOVED_FIELDS.get(name, frozenset())
+    return fields if removed.isdisjoint(fields) else {key: value for key, value in fields.items()
+                                                       if key not in removed}
 
 
 LAYOUT_UNSETTABLE = "layout_unsettable"
@@ -70,7 +199,13 @@ ADDITIVE_UNSETTABLE = "additive_unsettable"
 this Dew does, unset as null: a record written while it could not be unset (true its default) lacks it and
 reads its true as unset (`earlier_retired`), where one written since keeps a stated true (row 11742)."""
 
-MARKERS = (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE)
+KERNELS_SPLIT = "kernels_split"
+"""The key beside a run record's fields (`RunConfig.record`) that says its kernel pins name Muon's symmetric
+products' own choice (`syrk`): a record written before it had one lacks it, and its `grouped_matmul` pin
+reads as SYRK's too (`earlier_grouped_pins`), where one written since keeps them apart (rows 12457,
+12485)."""
+
+MARKERS = (LAYOUT_UNSETTABLE, ADDITIVE_UNSETTABLE, KERNELS_SPLIT)
 """Every key a run record holds beside its fields, each saying how it states a field (`RunConfig.record`)."""
 
 
@@ -166,6 +301,116 @@ def _retired(name: str, fields: Mapping[str, _records.JSON], root: bool,
     return {"class": name, "fields": migrated}
 
 
+def earlier_surface(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record with each optimizer and trainer config it holds, by its class record or flat in
+    its run's, under the names a run's surface gives its settings now (API03): an optimizer's
+    `learning_rate` as its `lr`, a number, or its `schedule`, a schedule's record; its `spared` as
+    `decay_norms_and_biases`, its inverse, a param group's too; its `clip_grads` as `clip`; a trainer's
+    `horizon`, `update` and `fit` records as its own fields (`steps`, `accumulation`, `update_tokens`,
+    `split`, ...); its `keep` of a count as its latest kept; its `best` of a metric's name as that metric's
+    policy, one policy listed as that one, several refused, as a run's config ranks by one; and its split
+    of None as the planner's, "auto". A preset's name for its numerics reads as the config reads it
+    (`TrainerConfig.precision`). Carried to 1.0 (ledger 1552)."""
+    surfaced = _records.class_records({key: _records.json_value(value, key) for key, value in record.items()},
+                                      _surfaced)
+    assert isinstance(surfaced, Mapping)
+    return surfaced
+
+
+def _surfaced(name: str, fields: Mapping[str, _records.JSON], root: bool) -> dict[str, _records.JSON] | None:
+    """The record of `name` and `fields` under today's names (`earlier_surface`), None where none changes."""
+    from dew.config import RunConfig
+    from dew.config.trainer import TrainerConfig
+    from dew.optim import OptimConfig
+
+    kind = _recorded_class(name) or (RunConfig if root else None)
+    if kind is None:
+        return None
+    if issubclass(kind, OptimConfig):
+        optim = _optim_surface(fields)
+        return None if optim is None else {"class": name, "fields": optim}
+    if issubclass(kind, TrainerConfig):
+        trainer = _trainer_surface(fields)
+        return None if trainer is None else {"class": name, "fields": trainer}
+    if not issubclass(kind, RunConfig):
+        return None
+    # An optimizer or trainer recorded flat, by its run's class, is read here; one by its own class as a
+    # record of its own.
+    flat = {key: surfaced for key, surface in (("optim", _optim_surface), ("trainer", _trainer_surface))
+            if isinstance(held := fields.get(key), Mapping) and _records.class_record(held) is None
+            and (surfaced := surface(held)) is not None}
+    return {"class": name, "fields": {**fields, **flat}} if flat else None
+
+
+EARLIER_RATE_FIELDS = ("learning_rate", "spared", "clip_grads")
+"""The fields an optimizer config held its rate, its decay's sparing and its clip in before a run's surface
+named them (`OptimConfig.lr`, `OptimConfig.schedule`, `OptimConfig.decay_norms_and_biases`,
+`OptimConfig.clip`)."""
+
+
+def _optim_surface(fields: Mapping[str, _records.JSON]) -> _Fields | None:
+    """An optimizer config's fields under today's names (`earlier_surface`), None where it states them so."""
+    groups = fields.get("param_groups")
+    grouped = isinstance(groups, list) and any(isinstance(group, Mapping) and "spared" in group
+                                               for group in groups)
+    if not grouped and not any(key in fields for key in EARLIER_RATE_FIELDS):
+        return None
+    kept = {key: value for key, value in fields.items() if key not in EARLIER_RATE_FIELDS}
+    rate = fields.get("learning_rate")
+    if isinstance(rate, Mapping):
+        kept["schedule"] = rate
+    elif rate is not None:
+        kept["lr"] = rate
+    if "spared" in fields:
+        kept["decay_norms_and_biases"] = not fields["spared"]
+    if "clip_grads" in fields:
+        kept["clip"] = fields["clip_grads"]
+    if grouped:
+        assert isinstance(groups, list)
+        kept["param_groups"] = [
+            {**{key: value for key, value in group.items() if key != "spared"},
+             "decay_norms_and_biases": not group["spared"]}
+            if isinstance(group, Mapping) and "spared" in group else group for group in groups]
+    return kept
+
+
+EARLIER_TRAINER_RECORDS = {"horizon": {}, "update": {"batches": "accumulation", "tokens": "update_tokens"},
+                           "fit": {}}
+"""The records a trainer config held its length, its update's size and its step's fit in before it held
+each setting as its own field (`TrainerConfig.steps`, ...), each record's fields by the name it has now
+where that differs."""
+
+
+def _trainer_surface(fields: Mapping[str, _records.JSON]) -> _Fields | None:
+    """A trainer config's fields under today's names (`earlier_surface`), None where it states them so."""
+    keep, best = fields.get("keep"), fields.get("best")
+    counted = isinstance(keep, int) and not isinstance(keep, bool)
+    # A split of None, the planner's: "auto" now (row 11934's flat trainer held None).
+    unsplit = "split" in fields and fields["split"] is None
+    if not (counted or unsplit or isinstance(best, (str, list))
+            or any(key in fields for key in EARLIER_TRAINER_RECORDS)):
+        return None
+    kept: _Fields = {key: value for key, value in fields.items()
+                     if key not in EARLIER_TRAINER_RECORDS and not (unsplit and key == "split")}
+    for key, renamed in EARLIER_TRAINER_RECORDS.items():
+        held = fields.get(key)
+        tagged = _records.class_record(held) if isinstance(held, Mapping) else None
+        inner = tagged[1] if tagged is not None else held
+        if isinstance(inner, Mapping):
+            kept.update({renamed.get(field, field): value for field, value in inner.items()})
+    if counted:
+        kept["keep"] = {"latest": keep}
+    if isinstance(best, str):
+        kept["best"] = {"metric": best}
+    elif isinstance(best, list):
+        if len(best) != 1:
+            raise ValueError(f"a saved run's trainer ranks its checkpoints by {len(best)} policies, where "
+                             "a run's config ranks by one (TrainerConfig.best); rank by several in "
+                             "Trainer.fit's best=")
+        kept["best"] = best[0]
+    return kept
+
+
 def _suites(fields: Mapping[str, _records.JSON]) -> dict[str, _records.JSON]:
     """A run record's fields with its split's metrics and cadences, each earlier stated beside the others'
     (a metric's `split`, `val_every`), as the split's suite (`dew.config.Suite`, `RunConfig.suites`, row
@@ -201,27 +446,19 @@ EARLIER_DIAGNOSTICS = ("links", "tune_kernels", "xla_flags")
 (`dew.config.Diagnostics`, row 11933), beside the run's own `kernels`."""
 
 
-EARLIER_LENGTHS = ("steps", "epochs", "tokens", "examples")
-"""The fields a trainer's config held its run's length in before its horizon held it (`Horizon`, row
-11935)."""
-
-EARLIER_TRAINER_FIELDS = ("update_tokens", "accumulation", "split", "microbatches", "dynamic_scale",
-                          "lower_for", "compile_ahead", "publish", *EARLIER_LENGTHS)
-"""The fields a trainer's config held its update's size and its step's split in before it held one update
-(`dew.training.UpdateBatch`) and one fit policy (`dew.training.FitPolicy`, row 11934), its loss scaling
-before its numerics held it (`Numerics.loss_scaling`, row 11935), and a target to lower its step for in
-place of training before a run was lowered by its own call (`RunConfig.lower`, row 11933), which a saved
-record, a run that trained, never acts on."""
+EARLIER_TRAINER_FIELDS = ("dynamic_scale", "lower_for", "compile_ahead", "publish")
+"""The fields a trainer's config held its loss scaling in before its numerics held it
+(`Numerics.loss_scaling`, row 11935), a target to lower its step for in place of training before a run was
+lowered by its own call (`RunConfig.lower`, row 11933), which a saved record, a run that trained, never acts
+on, and its publishing before its W&B sink held it. Its length, its update's size and its step's split it held
+as it holds them again (`TrainerConfig.steps`, `TrainerConfig.accumulation`, `TrainerConfig.split`, ...; row
+11934 held them in records of their own between, `earlier_surface`)."""
 
 
 def _update_and_fit(fields: Mapping[str, _records.JSON]) -> dict[str, _records.JSON]:
-    """A trainer config's fields with its earlier batching fields (`EARLIER_TRAINER_FIELDS`) as its update
-    and its fit policy: its token budget or its accumulation as the update, its split and its pipeline's
-    microbatches as the fit's (`FitPolicy.split`, `FitPolicy.microbatches`); its dynamic scale
-    stated as its numerics' loss scaling, unset as theirs, "auto"; its length as its horizon; its publishing
-    its W&B sink's; and no target to lower for. Carried to 1.0 (ledger 1552)."""
-    from dew.nn.precision import Numerics, numerics_of
-
+    """A trainer config's fields with its earlier fields (`EARLIER_TRAINER_FIELDS`) as today's: its dynamic
+    scale stated as its numerics' loss scaling, unset as theirs, "auto"; its publishing its W&B sink's; and
+    no target to lower for. Carried to 1.0 (ledger 1552)."""
     kept: dict[str, _records.JSON] = {key: value for key, value in fields.items()
                                        if key not in EARLIER_TRAINER_FIELDS}
     scaled = fields.get("dynamic_scale")
@@ -230,15 +467,6 @@ def _update_and_fit(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
         recorded = registry.to_record(numerics_of(given), Numerics) if isinstance(given, str) else given
         precision = dict(recorded) if isinstance(recorded, Mapping) else {}
         kept["precision"] = {**precision, "loss_scaling": "dynamic" if scaled else "none"}
-    tokens, batches = fields.get("update_tokens"), fields.get("accumulation", 1)
-    if tokens is not None:
-        kept["update"] = {"tokens": tokens}
-    elif batches != 1:
-        kept["update"] = {"batches": batches}
-    if fit := {key: fields[key] for key in ("split", "microbatches") if fields.get(key) is not None}:
-        kept["fit"] = fit
-    if lengths := {key: fields[key] for key in EARLIER_LENGTHS if fields.get(key) is not None}:
-        kept["horizon"] = lengths
     wandb = kept.get("wandb")
     if fields.get("publish") and isinstance(wandb, Mapping):
         # Publishing is the W&B sink's (`Wandb.publish`), the final checkpoint the run's save policy keeps.
@@ -305,8 +533,6 @@ def _optimizer_spec(fields: Mapping[str, _records.JSON]) -> dict[str, _records.J
     return {**kept, "optimizer": optimizer}
 
 
-type _Fields = dict[str, _records.JSON]
-
 MUON_GROUPS = ("muon", "muonclip")
 """The optimizers an earlier run named whose matrices' decay took its mask by `weight_decay_mask`
 (`dew.optim.Muon.masked_by`)."""
@@ -343,9 +569,10 @@ def earlier_typed(named: str) -> str | None:
 
 def mask_readers(config: Mapping[str, JSON]) -> tuple[list[JSON], Sequence[Mapping[str, JSON]]]:
     """An earlier optimizer config's param groups, and the parts of it that read a mask among its optimizer's
-    options: where it spared its decay (`OptimConfig.spared`, on by default) its own mask was written over
-    the options', as a group's that spared (`ParamGroup.spared`, off by default) was, every group reading it
-    alike; so the config where it neither groups nor spares, else each group that does not spare."""
+    options: where it spared its decay (its `spared`, on by default; `OptimConfig.decay_norms_and_biases` off
+    now) its own mask was written over the options', as a group's that spared (its `spared`, off by default;
+    `ParamGroup.decay_norms_and_biases` on now) was, every group reading it alike; so the config where it
+    neither groups nor spares, else each group that does not spare."""
     groups = config.get("param_groups") or []
     assert isinstance(groups, list), groups
     held: list[Mapping[str, JSON]] = [group for group in groups
@@ -367,7 +594,8 @@ which builds the masked decay step its checkpoints hold (`unmarked`)."""
 def unmarked(record: Mapping[str, object], mark: Mapping[str, object]) -> Mapping[str, object]:
     """A run record an intermediate Dew rewrote beside its `MASKED_DECAY_MARK` (`mark`), as its earlier run
     trained: each part the mark names (its optimizer config ungrouped, or each named param group) masked
-    off by its own mask (`OptimConfig.decay_mask`, `ParamGroup.decay_mask`) and unspared, its decay of 0,
+    off by its own mask (`OptimConfig.decay_mask`, `ParamGroup.decay_mask`), decaying norms and biases too
+    (`decay_norms_and_biases`), its decay of 0,
     which that Dew wrote in its place, given `INERT_DECAY`, so its optimizer holds the masked decay step its
     checkpoints hold. The decay it trained at is not recorded: one of 0 held no step, so a checkpoint of
     such a run is refused at its restore, its tree another, never read across (Main, review of d22)."""
@@ -380,7 +608,7 @@ def unmarked(record: Mapping[str, object], mark: Mapping[str, object]) -> Mappin
     config = dict(_records.record(tagged[1] if tagged is not None else optim, "optim"))
 
     def masked(part: Mapping[str, object], decay_of) -> Mapping[str, object]:
-        return {**decay_of(part), "decay_mask": False, "spared": False}
+        return {**decay_of(part), "decay_mask": False, "decay_norms_and_biases": True}
 
     def decayed(fields_: Mapping[str, object]) -> Mapping[str, object]:
         return {**fields_, "weight_decay": fields_.get("weight_decay") or INERT_DECAY}
@@ -407,9 +635,10 @@ def _masked(mask: _records.JSON, config: _Fields) -> _Fields:
     longer, as its config's decay mask (`OptimConfig.decay_mask`) or each param group's that read it
     (`ParamGroup.decay_mask`, `mask_readers`): a boolean or a tree of them, Optax's decay mask, which builds
     the decay step, and its state, the earlier Dew built, so its checkpoints restore as they were written.
-    Where the config spared its decay (`OptimConfig.spared`, on by default) its own mask was written over
-    it, as a group's that spared (`ParamGroup.spared`, off by default) was: it changed nothing, as a mask of
-    None did not. Any other mask, which no record of this Dew states, is refused."""
+    Where the config spared its decay (its `spared`, on by default; `OptimConfig.decay_norms_and_biases` off
+    now) its own mask was written over it, as a group's that spared (its `spared`, off by default;
+    `ParamGroup.decay_norms_and_biases` on now) was: it changed nothing, as a mask of None did not. Any other
+    mask, which no record of this Dew states, is refused."""
     if mask is None:
         return config
     groups, read = mask_readers(config)

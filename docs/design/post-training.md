@@ -9,7 +9,7 @@ LMObjective(model, seq_len)
 LMObjective(model, seq_len, loss_role=Role.ASSISTANT)
 DPOObjective(model, seq_len, beta=0.1)
 GRPOObjective(model, seq_len, beta=0.0)
-Trainer(objective, optimizer, ..., rollout=RolloutScheduler.sampled(...))
+Trainer(objective, optimizer, ..., advanced=TrainerAdvanced(rollout=RolloutScheduler.sampled(...)))
 ```
 
 They run on the same Trainer, state, sharding, EMA clock, checkpoints and tracker keys. The reference is the EMA tree at unit decay (§3), sampling is a host-side trainer capability (§4), and rewards are plain callables (§5). The online objectives assemble the shared estimators and surrogates in `dew.rl`; staged runs compose them in `recipes/chain.py` (§12). Control and world-model objectives run on the same trainer with an environment in place of a generation engine (§14).
@@ -97,7 +97,7 @@ class Rollout(Protocol):
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch: ...
 ```
 
-`objective` is the objective the step the rollout feeds trains. It is the run's own, or, where the data's phases set the loop's pass count (`Trainer(phase_passes=)`), the copy at the count of the phase the step's first read batch was read in, so a policy drawn for the step samples as the step trains. One update's further draws read the first read's phase. A rollout whose policy is fixed where it was made (an environment or a dreamer rollout's compiled programs, an episode collector's bound policy, an asynchronous source's server) refuses any other objective (`own_objective`), so its rows never train under a policy that did not draw them.
+`objective` is the objective the step the rollout feeds trains. It is the run's own, or, where the data's phases set the loop's pass count (`TrainerAdvanced(phase_passes=)`), the copy at the count of the phase the step's first read batch was read in, so a policy drawn for the step samples as the step trains. One update's further draws read the first read's phase. A rollout whose policy is fixed where it was made (an environment or a dreamer rollout's compiled programs, an episode collector's bound policy, an asynchronous source's server) refuses any other objective (`own_objective`), so its rows never train under a policy that did not draw them.
 
 `Trainer(..., rollout=None)` runs without a rollout. With one, it reads a batch, calls the rollout, places its output and invokes the compiled step. The compiled `step=` interface owns optimizer work; external generation belongs outside it. The objective's loss and evaluation stay pure functions of variables, batch and step.
 

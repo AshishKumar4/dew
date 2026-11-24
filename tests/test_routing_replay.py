@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import attending, unrolled
 from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.inference.banks import HeldBanks
@@ -40,11 +41,11 @@ SEEDS = {'gate': 128, 'banked': 32, 'pipeline': 8, 'conflicting prefix': 128, 'p
 the most any of a site's cases took."""
 
 
-def objective(scan: bool = False, dtype=None, layers: tuple[int, ...] | None = None,
+def objective(dtype=None, layers: tuple[int, ...] | None = None,
               parallel: bool = False, **fields) -> LMObjective:
     model = CausalTransformer(
         vocab_size=VOCAB, emb_features=32, num_layers=LAYERS, num_heads=2, num_kv_heads=1,
-        mlp_features=64, max_seq_len=SEQ_LEN, scan_layers=scan, dtype=dtype,
+        mlp_features=64, max_seq_len=SEQ_LEN, dtype=dtype,
         mixture=Mixture(experts=EXPERTS, top_k=TOP_K, layers=layers, parallel=parallel), **fields)
     return LMObjective(model, SEQ_LEN)
 
@@ -98,12 +99,12 @@ def natively(obj):
     return jax.jit(lambda params, tokens, routed: obj.per_token_log_probs(params, tokens))
 
 
-@pytest.mark.parametrize("scan", [False, True])
-def test_replay_reproduces_the_rollout_routing_where_the_trainer_would_flip(scan):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_replay_reproduces_the_rollout_routing_where_the_trainer_would_flip(stack_scan):
     """The rollout ran an older policy in bf16; the trainer runs the update in
     fp32. Its own top-k disagrees with the rollout's on some tokens, and the
     replayed forward uses the rollout's experts on every token of every layer."""
-    trainer, engine = objective(scan), objective(scan, dtype=jnp.bfloat16)
+    trainer, engine = objective(), objective(dtype=jnp.bfloat16)
     params = nn.unbox(trainer.init(jax.random.key(0)))
     stale = jax.tree.map(
         lambda leaf: leaf + 0.05 * jax.random.normal(jax.random.key(3), leaf.shape, leaf.dtype), params
@@ -265,7 +266,7 @@ def test_gpt_oss_experts_in_a_mixer_slot_replay_the_record():
 def test_replaying_a_forwards_own_routing_changes_nothing():
     """A record of the router's own choice, replayed, scores the tokens as the router's own run does: on
     par from that run's float64 truth over drawn models and tokens (check 1)."""
-    obj = objective(scan=True)
+    obj = objective()
     init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
 
     def draw(seed):
@@ -273,7 +274,7 @@ def test_replaying_a_forwards_own_routing_changes_nothing():
         return params, tokens, engine_layout(choices(obj, params, tokens), 2)
 
     assert_as_exact(replayed(obj), natively(obj), draw, "own routing", seeds=SEEDS['own routing'],
-                    truth_fn=natively(objective(scan=True, dtype=jnp.float64)))
+                    truth_fn=natively(objective(dtype=jnp.float64)))
 
 
 def test_the_gate_keeps_its_gradient_under_replay():
@@ -385,6 +386,7 @@ def test_tokens_without_a_record_keep_the_routers_own_choice():
     np.testing.assert_array_equal(replayed[0][:, 5:], native[0][:, 5:])
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("where", ["device", "host"])
 def test_replay_on_banked_weights_scores_as_on_the_plain_tree(where):
     """A store banked by run, resident or in pinned host memory, is read by
@@ -393,7 +395,7 @@ def test_replay_on_banked_weights_scores_as_on_the_plain_tree(where):
     layout = Layout(min_shard=1, tolerance=1.0,
                     host_parameters=("params/layers_*",) if where == "host" else ())
     plain = objective()
-    banked = objective(scan=True, bank_layers=2)
+    banked = objective(bank_layers=2)
     draw = replay_draw(plain, 2)
     scored = jax.jit(lambda store, tokens, routed: replayed_log_probs(banked, store, tokens, (routed, None)))
 
@@ -401,8 +403,9 @@ def test_replay_on_banked_weights_scores_as_on_the_plain_tree(where):
     def from_banks(params, tokens, routed):
         return np.asarray(scored(HeldBanks(params).place(banked.model, layout=layout), tokens, routed))
 
-    assert_as_exact(from_banks, replayed(plain), draw, f"{where} banked replay", seeds=SEEDS['banked'],
-                    truth_fn=replayed(objective(dtype=jnp.float64)))
+    # The plain tree's arms a layer at a time (`unrolled`).
+    assert_as_exact(from_banks, unrolled(replayed(plain)), draw, f"{where} banked replay",
+                    seeds=SEEDS['banked'], truth_fn=unrolled(replayed(objective(dtype=jnp.float64))))
     params, tokens, routed = draw(0)
     native = plain.per_token_log_probs(params, tokens)
     assert not np.array_equal(replayed(plain)(params, tokens, routed), native)
@@ -457,7 +460,7 @@ def test_pack_extends_recorded_routing_when_the_shared_prefix_agrees():
 def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
     from dew.objectives.rl.grpo import GRPOObjective
 
-    obj, wide = objective(scan=True), objective(scan=True, dtype=jnp.float64)
+    obj, wide = objective(), objective(dtype=jnp.float64)
     grpo = GRPOObjective(obj.model, SEQ_LEN)
     init = jax.jit(lambda *args: nn.unbox(obj.init(*args)))
     first_routes = np.broadcast_to(np.arange(TOP_K, dtype=np.uint8), (4, LAYERS, TOP_K)).copy()
@@ -500,7 +503,7 @@ def test_packed_grpo_replays_the_routing_its_batch_carries():
     packed scoring replays them, and scores the batch as a direct replay does."""
     from dew.objectives.rl.grpo import GRPOObjective
 
-    obj = objective(scan=True)
+    obj = objective()
     grpo = GRPOObjective(obj.model, SEQ_LEN)
     packed = jax.jit(grpo.packed_log_probs)
 
@@ -518,7 +521,7 @@ def test_packed_grpo_replays_the_routing_its_batch_carries():
 
     draw = replay_draw(obj, 1)
     assert_as_exact(through_pack, direct(obj), draw, "packed replay", seeds=SEEDS['packed'],
-                    truth_fn=direct(objective(scan=True, dtype=jnp.float64)))
+                    truth_fn=direct(objective(dtype=jnp.float64)))
     params, tokens, routed = draw(0)
     native = np.asarray(obj.per_token_log_probs(params, tokens))[0, 4:]
     assert not np.array_equal(through_pack(params, tokens, routed), native)
@@ -604,6 +607,7 @@ def test_a_record_keyed_by_site_travels_through_pack_the_journal_and_verl_and_gr
         from_verl([{**rows[0], "routed_experts": {}}])
 
 
+@attending("reference")
 def test_a_multimodal_mixture_replays_through_its_language_model():
     """A vision-conditioned MoE decoder (Gemma 3's wrapper here, Gemma 4
     26B-A4B's in the wild) takes the replay beside the media and hands it to
@@ -613,7 +617,7 @@ def test_a_multimodal_mixture_replays_through_its_language_model():
 
     text = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=2,
                              head_dim=8, mlp_features=32, max_seq_len=SEQ_LEN, dtype=jnp.float32,
-                             attention_impl="reference", mixture=Mixture(experts=4, top_k=2))
+                             mixture=Mixture(experts=4, top_k=2))
     vision = SiglipVision(
         hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8, patch_size=4
     )

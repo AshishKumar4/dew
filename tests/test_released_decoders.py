@@ -10,6 +10,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import pytest
 from interop_support import fixture_ids, token_draw, transformers_arms, transformers_model
+from model_support import attending
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
 
 from dew.interop import Pretrained
@@ -22,6 +23,7 @@ def shrunk(name: str, **dims) -> dict:
     return {**json.loads((FIXTURES / name / "config.json").read_text()), **dims}
 
 
+@attending("reference")
 def test_minicpm5_computes_transformers_logits_through_the_llama_reader(tmp_path):
     """MiniCPM5-2B's released config (a llama: grouped queries 16 over 2, a 128-wide head over a
     2048-wide stream, rope theta 5e6, an untied head, two end tokens and its whole 130560-token
@@ -34,7 +36,7 @@ def test_minicpm5_computes_transformers_logits_through_the_llama_reader(tmp_path
                     num_attention_heads=4, num_key_value_heads=2, head_dim=16)
     torch.manual_seed(0)
     LlamaForCausalLM(LlamaConfig(**config)).to(torch.float32).save_pretrained(tmp_path)
-    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path, dtype="float32")
     reference, truth = transformers_arms(transformers_model(tmp_path),
                                          lambda model, ids: model(ids, use_cache=False).logits)
     draw = token_draw(0x1D5, config["vocab_size"], (2, 9))
@@ -59,7 +61,7 @@ def at_tiny_dims(release: str, tiny: str, dims: tuple[str, ...], directory: Path
 def assert_recorded_logits(directory: Path, tiny: Path, label: str) -> None:
     """Check 1 of the checkpoint at `directory`'s logits against the source's recorded over `tiny`'s drawn
     ids (its recorded_logits.npz, `indexed_recording`), Dew's float64 run held to the recording's sketch."""
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     path = tiny / "recorded_logits.npz"
     seeds = declared_seeds(path)["logits"]
     draw = fixture_ids(tiny)
@@ -80,6 +82,7 @@ M2_DIMS = ("head_dim", "hidden_size", "intermediate_size", "max_position_embeddi
 """The fields that size a MiniMax-M2 checkpoint, which its tiny states at its own small values."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["minimax-m2.5", "minimax-m2.7"])
 def test_a_later_minimax_release_computes_m2s_source_logits(name, tmp_path):
     """MiniMax-M2.5's and M2.7's released configs (which leave out fields M2's states at the values the
@@ -99,6 +102,7 @@ DREAM_DIMS = ("hidden_size", "intermediate_size", "max_position_embeddings", "ma
 """The fields that size a Dream checkpoint, its token ids among them, which dream-tiny states small."""
 
 
+@attending("reference")
 def test_diffucoder_computes_dreams_source_logits(tmp_path):
     """DiffuCoder-7B's released config (Dream-v0-7B's but for its stored dtype; its configuration_dream.py
     and modeling_dream.py are Dream-v0's at 6572adb byte for byte, tools/hf_reference.py) at dream-tiny's
@@ -110,7 +114,7 @@ def test_diffucoder_computes_dreams_source_logits(tmp_path):
 
     directory = at_tiny_dims("diffucoder-7b", "dream-tiny", DREAM_DIMS, tmp_path / "diffucoder",
                              bos_token_id=None, eos_token_id=None)
-    source = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(directory, dtype="float32")
     path, label = FIXTURES / "dream-tiny" / "released.npz", "dream-tiny logits"
     seeds = declared_seeds(path)[label]
     config = json.loads((directory / "config.json").read_text())

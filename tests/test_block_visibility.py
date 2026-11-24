@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from block_support import VOCAB, block_causal, model, wrapped
-from model_support import called_outputs, model_draw
+from model_support import attending, called_outputs, model_draw
 from reference_error import assert_as_exact
 
 from dew.batch import coordinates, token_coordinates
@@ -65,6 +65,7 @@ tokens keeps, where one of two slots would drop it; the second row's three-token
 or an image its window cuts."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("layout", LAYOUTS.values(), ids=list(LAYOUTS))
 def test_a_block_layer_reads_the_keys_the_block_causal_rule_keeps(layout):
     """A layer reading block groups computes what it computes over an explicit mask of the rule's keys
@@ -73,7 +74,7 @@ def test_a_block_layer_reads_the_keys_the_block_causal_rule_keeps(layout):
     them. The rule keeps keys a causal mask does not, so the groups are read. (The fused kernels' own
     parity over these spans is the template's and the route's tests'.)"""
     kinds, fields, rule = layout
-    decoder = model(**kinds).clone(attention_impl="xla")
+    decoder = model(**kinds).clone()
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
     params = decoder.init(jax.random.key(1), ids)
     segment_ids, attention_mask, block_groups, image_groups = (
@@ -95,6 +96,7 @@ HF = Path(__file__).parent / "fixtures" / "hf"
 BLOCKED = {"attention": {"full_attention": "block_bidirectional"}}
 
 
+@attending("xla")
 def test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names(tmp_path):
     """`Pretrained.load(..., modeling_overrides=)` turns block reading on for the layer kinds it names,
     on a family whose release states none, through the reader a release's own overrides take: a
@@ -104,8 +106,8 @@ def test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names(tmp_path):
     and a recurrent kind refuses to read blocks."""
     from dew.interop import Pretrained
 
-    plain = Pretrained.load(HF / "llama-tiny", dtype="float32", attention_impl="xla")
-    blocked = Pretrained.load(HF / "llama-tiny", dtype="float32", attention_impl="xla",
+    plain = Pretrained.load(HF / "llama-tiny", dtype="float32")
+    blocked = Pretrained.load(HF / "llama-tiny", dtype="float32",
                               modeling_overrides=BLOCKED)
     assert blocked.model.kind_of("full_attention").mixer.bidirectional_blocks
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, blocked.model.vocab_size)
@@ -118,9 +120,9 @@ def test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names(tmp_path):
     np.testing.assert_array_equal(np.asarray(blocked.model.apply(blocked.variables, ids)),
                                   np.asarray(plain.model.apply(plain.variables, ids)))
 
-    hybrid = Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32", attention_impl="xla",
+    hybrid = Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32",
                              modeling_overrides=BLOCKED)
-    release = Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32", attention_impl="xla")
+    release = Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32")
     assert hybrid.model.language_model.kind_of("full_attention").mixer.bidirectional_blocks
     assert hybrid.model.language_model.kind_of("linear_attention") == release.model.language_model.kind_of(
         "linear_attention")
@@ -128,14 +130,15 @@ def test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names(tmp_path):
     blocked.save(tmp_path / "saved")
     stated = json.loads((tmp_path / "saved" / "config.json").read_text())["modeling_overrides"]
     assert stated == BLOCKED
-    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32")
     again = reloaded.model.apply(reloaded.variables, ids, block_groups=groups)
     np.testing.assert_array_equal(np.asarray(again), np.asarray(read))
     with pytest.raises(ValueError):
-        Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32", attention_impl="xla",
+        Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32",
                         modeling_overrides={"attention": {"linear_attention": "block_bidirectional"}})
 
 
+@attending("xla")
 def test_a_nemotron_hybrids_attention_layers_read_blocks_where_an_override_names_them(tmp_path):
     """Nemotron-H's attention kind reads its blocks under a block-bidirectional override, as a
     Nemotron 3.5 Lightning run asks of it, its Mamba kind the release's, and without groups the plain
@@ -143,8 +146,8 @@ def test_a_nemotron_hybrids_attention_layers_read_blocks_where_an_override_names
     (ledger 1883)."""
     from dew.interop import Pretrained
 
-    plain = Pretrained.load(HF / "nemotron-h-tiny", dtype="float32", attention_impl="xla")
-    blocked = Pretrained.load(HF / "nemotron-h-tiny", dtype="float32", attention_impl="xla",
+    plain = Pretrained.load(HF / "nemotron-h-tiny", dtype="float32")
+    blocked = Pretrained.load(HF / "nemotron-h-tiny", dtype="float32",
                               modeling_overrides=BLOCKED)
     assert blocked.model.kind_of("full_attention").mixer.bidirectional_blocks
     assert blocked.model.kind_of("linear_attention") == plain.model.kind_of("linear_attention")
@@ -154,7 +157,7 @@ def test_a_nemotron_hybrids_attention_layers_read_blocks_where_an_override_names
     read = blocked.model.apply(blocked.variables, ids, block_groups=jnp.asarray(BLOCKS))
     blocked.save(tmp_path / "saved")
     assert json.loads((tmp_path / "saved" / "config.json").read_text())["modeling_overrides"] == BLOCKED
-    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32")
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids,
                                                                   block_groups=jnp.asarray(BLOCKS))),
                                   np.asarray(read))
@@ -183,6 +186,7 @@ CACHED_SEEDS = 16
 """Check 1's declared seeds for the cached rollout, sized by `seeds_for`."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("shared", [False, True], ids=["own-keys", "shared-keys"])
 def test_a_cached_rollout_reads_its_blocks_as_the_full_pass_does(shared):
     """Gemma 4's layout, images on its sliding layers and blocks on its full ones: a prefill, a cached call of
@@ -201,7 +205,7 @@ def test_a_cached_rollout_reads_its_blocks_as_the_full_pass_does(shared):
                                                          image_groups=images)[:, 3:])
 
     rolled = rollout(decoder, CALLS, block_groups=blocks, image_groups=images)
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
+    wide = decoder.clone(dtype=jnp.float64)
     forward = jax.jit(lambda params, ids, held_blocks, held_images: decoder.apply(
         params, ids, block_groups=held_blocks, image_groups=held_images))
 
@@ -238,6 +242,7 @@ PAST_THE_WINDOW = {
 where the last call begins."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("shared", [False, True], ids=["own-keys", "shared-keys"])
 @pytest.mark.parametrize("case", PAST_THE_WINDOW.values(), ids=list(PAST_THE_WINDOW))
 def test_a_blocks_last_call_reads_its_earlier_keys_past_the_window_from_the_cache(case, shared):
@@ -255,7 +260,7 @@ def test_a_blocks_last_call_reads_its_earlier_keys_past_the_window_from_the_cach
         return jax.jit(lambda params, ids: decoder.apply(params, ids, block_groups=groups)[:, last:])
 
     rolled = rollout(decoder, calls, block_groups=groups)
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
+    wide = decoder.clone(dtype=jnp.float64)
     assert_as_exact(lambda params, ids: rolled(params, ids)[:, last:], full(decoder),
                     model_draw(decoder, blocks.shape, VOCAB), "blocks past the window", seeds=CACHED_SEEDS,
                     truth_fn=full(wide))
@@ -280,11 +285,11 @@ def test_padding_inside_a_row_reaches_the_fused_kernel_as_its_keys_validity(kind
     """A call with padding inside its rows hands the kernel its real keys and, under a window, the places
     the window counts, rather than a mask it builds: a layer naming the template traces on an A100, where
     the template refuses a mask by its inherent limit (so a mask built here would raise)."""
-    decoder = model(**kinds).clone(dtype=jnp.bfloat16, attention_impl="template")
+    decoder = model(**kinds).clone(dtype=jnp.bfloat16)
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
-    params = decoder.clone(attention_impl="xla").init(jax.random.key(1), ids)
+    params = attending("xla")(decoder.init)(jax.random.key(1), ids)
     blocks = jnp.asarray(WINDOWED) if kinds is WINDOWED_BLOCKS else None
-    with generation.assumed("sm80"):
+    with generation.assumed("sm80"), generation.chosen(attention="template"):
         jax.eval_shape(lambda params, ids: decoder.apply(params, ids, attention_mask=jnp.asarray(GAPS),
                                                          block_groups=blocks), params, ids)
 
@@ -310,6 +315,7 @@ def test_a_prediction_depth_reads_the_groups_of_the_tokens_it_reads():
     assert not np.array_equal(depth(1, 3), none)
 
 
+@attending("reference")
 def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_does():
     """A multimodal wrapper hands its language model the call's groups (`MultimodalTransformer`): text alone
     through its cache, a prefill, a cached call and single steps, with blocks inside each call, on par with
@@ -323,7 +329,7 @@ def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_
         return jax.jit(lambda params, ids: wrapper.apply(params, ids, block_groups=groups)[:, 3:])
 
     rolled = rollout(wrapper, CALLS, block_groups=groups)
-    wide = wrapped(decoder.clone(dtype=jnp.float64, attention_impl="reference"))
+    wide = wrapped(decoder.clone(dtype=jnp.float64))
     forward = jax.jit(lambda params, ids, held: wrapper.apply(params, ids, block_groups=held))
 
     def calls(params, ids):
@@ -367,6 +373,7 @@ right-padded, named by no segment ids, and a non-causal decoder's layer keeping 
 reads no blocks, whole or not."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("case", WHOLE_CASES.values(), ids=list(WHOLE_CASES))
 def test_whole_blocks_read_as_their_block_causal_reading(case):
     """Where its producer states each block is its document's whole (`AttentionMetadata.whole_blocks`, a
@@ -374,7 +381,7 @@ def test_whole_blocks_read_as_their_block_causal_reading(case):
     its states and its QK-Clip maxima are bitwise those of its block-causal reading of the same blocks,
     under a window the blocks pass and over padding the rows name by validity alike."""
     kinds, fields, causal = case
-    decoder = model(**kinds).clone(attention_impl="xla", causal=causal)
+    decoder = model(**kinds).clone(causal=causal)
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
     params = decoder.init(jax.random.key(1), ids)
     given = {name: jnp.asarray(value) if isinstance(value, np.ndarray) else value
@@ -392,6 +399,7 @@ def test_whole_blocks_read_as_their_block_causal_reading(case):
     np.testing.assert_equal(whole, blocked)
 
 
+@attending("xla")
 def test_rows_of_one_document_each_read_whole_blocks_by_their_documents():
     """Rows of one document each with their padding after it (`Coordinates.max_segments` 1, right-padded),
     each document one whole block (`AttentionMetadata.whole_blocks`), take the non-causal call by their
@@ -399,7 +407,7 @@ def test_rows_of_one_document_each_read_whole_blocks_by_their_documents():
     would leave to causality stay (`_one_document_a_row`). The real tokens' states are bitwise those of
     the same rows read as packed documents."""
     kinds = {"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}}
-    decoder = model(**kinds).clone(attention_impl="xla")
+    decoder = model(**kinds).clone()
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
     params = decoder.init(jax.random.key(1), ids)
     segments, blocks = jnp.asarray(PADDED, jnp.int32), jnp.asarray(np.where(PADDED, 0, -1), jnp.int32)
@@ -417,11 +425,12 @@ def test_whole_blocks_route_as_the_non_causal_call_by_documents():
     non-causal decoder computes over the documents, and its call routes as that decoder's does on an
     H100 (the kernels that run a non-causal call by documents, which block groups' spans refuse)."""
     kinds = {"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}}
-    decoder = model(**kinds).clone(attention_impl="xla")
+    decoder = model(**kinds)
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
-    params = decoder.init(jax.random.key(1), ids)
+    params = attending("xla")(decoder.init)(jax.random.key(1), ids)
     segments, blocks = jnp.asarray(SEGMENTS), jnp.asarray(WHOLE)
 
+    @attending("xla")
     def states(decoder, **fields):
         return np.asarray(decoder.apply(params, ids, coordinates=coordinates(ids.shape, segments=segments),
                                         method=CausalTransformer.hidden_states, **fields))
@@ -430,7 +439,7 @@ def test_whole_blocks_route_as_the_non_causal_call_by_documents():
                                   states(decoder.clone(causal=False)))
 
     def routes(decoder, **fields):
-        bf16 = decoder.clone(attention_impl="auto", dtype="bfloat16", head_dim=64)
+        bf16 = decoder.clone(dtype="bfloat16", head_dim=64)
         shapes = jax.eval_shape(lambda: bf16.init(jax.random.key(1), ids))
         with generation.assumed("sm90"), generation.routes() as found:
             laid = coordinates(ids.shape, segments=segments)

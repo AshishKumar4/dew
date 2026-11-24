@@ -57,6 +57,7 @@ from dew.interop import codecs, decoder_config, decoder_parts, hf_decoders as de
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.probe import BATCH, LENGTH, probe_ids
 from dew.nn.blocks import padded_row
+from dew.nn.kernels import generation
 from dew.nn.kernels.options import owned_program
 from dew.nn.sharding import abstract
 from dew.objectives.base import Variables
@@ -765,7 +766,7 @@ def _built(model_type: str, convention: str, family: decoder_parts.DecoderFamily
     """A candidate's model at the probe's sizes, its record, the fields it
     left unread and its parameter count."""
     record, inert = _translate({**fields, 'model_type': model_type}, convention, family)
-    model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
+    model = models.build("causal_transformer", {**record, "dtype": "float32"})
     # The model's own record (`to_record`), the one codec of a configuration, as its key.
     key = json.dumps(to_record(model, type(model)), sort_keys=True)
     if key not in _PARAMETER_COUNTS:
@@ -915,9 +916,19 @@ def _mapped(draw: Callable[[int], tuple[dict, dict, dict]]) -> list[str]:
 
 
 def _wide_dew(record: decoder_parts.DecoderFields, variables: Variables) -> tuple[nn.Module, Variables]:
-    """Dew's decoder of `record` in float64, and `variables` widened, built and read under x64."""
-    model = models.build('causal_transformer', {**record, 'dtype': 'float64', 'attention_impl': 'reference'})
+    """Dew's decoder of `record` in float64, and `variables` widened, built and read under x64, attending as
+    the reference path does (`verdict_kernels`)."""
+    model = models.build('causal_transformer', {**record, 'dtype': 'float64'})
     return model, jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), variables)
+
+
+@contextmanager
+def verdict_kernels() -> Iterator[None]:
+    """Within the block, Dew's decoder computes a tier 2 verdict's side: in float64 (x64), its attention
+    the reference path's, which alone reads its dtype and precision (`dew.nn.attention.AttentionImpl`),
+    whatever the run's context names."""
+    with jax.enable_x64(new_val=True), generation.chosen(attention="reference"):
+        yield
 
 
 def logits_mapped(source: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]],
@@ -926,7 +937,7 @@ def logits_mapped(source: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]],
     draws of ids (`probe_ids`) against the source's float64 twin, within the source's float32 rounding,
     `source` the two over a draw's ids (`_Source.logits`). The departures it finds, none where Dew
     computes the source's forward."""
-    with jax.enable_x64(new_val=True):
+    with verdict_kernels():
         model, held = _wide_dew(record, variables)
         # Held by this verdict alone, which a closure over its probe's arrays is (`owned_program`).
         forward = owned_program(lambda ids: model.apply(held, ids))
@@ -992,7 +1003,7 @@ def gradients_mapped(source: _Source, family: decoder_parts.DecoderFamily,
         return {'/'.join(path): np.asarray(leaf, np.float64)
                 for path, leaf in flax_traverse.flatten_dict(tree['params']).items()}
 
-    with jax.enable_x64(new_val=True):
+    with verdict_kernels():
         model, held = _wide_dew(record, variables)
 
         def gradient(params, ids, cotangent):
@@ -1239,8 +1250,7 @@ def _candidates(model_type: str, name: str, reasons: dict[str, str], sized: list
         else:
             record = assembly.fields
             try:
-                model = models.build("causal_transformer",
-                                     {**record, "dtype": "float32", "attention_impl": "reference"})
+                model = models.build("causal_transformer", {**record, "dtype": "float32"})
             except ValueError as refused:
                 # Parts each read alike may still combine into a decoder Dew refuses to build.
                 reasons[PARTS] = f"Dew builds no decoder of its assembled parts ({refused})"

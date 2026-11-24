@@ -35,6 +35,8 @@ from pathlib import Path
 import numpy as np
 from flax import linen as nn
 
+from dew.training import TrainerAdvanced
+
 TINY_SHARD = 256
 TASKS = 8
 PACKED = ("input_ids", "response_mask", "old_log_probs", "behavior_log_probs", "advantages")
@@ -86,7 +88,7 @@ def main() -> None:
     process = jax.process_index()
     mixture = Mixture(experts=4, top_k=2, expert_features=16) if args.records else None
     narrow = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                               mlp_features=32, max_seq_len=12, dtype="float32", attention_impl="xla",
+                               mlp_features=32, max_seq_len=12, dtype="float32",
                                mixture=mixture)
     model = float64_twin(narrow) if args.float64 else narrow
     # The run's initial parameters: the float32 model's, widened under `--float64`.
@@ -130,8 +132,7 @@ def main() -> None:
             optax.sgd(0.1),
             key=jax.random.key(5),
             mesh=MeshSpec(**json.loads(args.mesh)),
-            layout=Layout(min_shard=TINY_SHARD),
-            rollout=rollout,
+            advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD), rollout=rollout),
         )
         partition = DataPartition.of(trainer.device_mesh)
         draws, leaves = [], {}

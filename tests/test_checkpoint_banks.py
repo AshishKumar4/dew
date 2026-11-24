@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 from flax import linen as nn
 from steady_state import steady_state
 
@@ -16,7 +17,7 @@ from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_names import group_layers
 from dew.objectives.lm import LMObjective
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 DEVICE = Layout(min_shard=1, tolerance=1.)
 HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
@@ -25,14 +26,15 @@ ROWS = [{"text": (np.arange(9, dtype=np.int32) + index) % 16} for index in range
 
 def decoder(**overrides):
     fields = {"vocab_size": 16, "emb_features": 8, "num_layers": 4, "num_heads": 2, "mlp_features": 16,
-              "max_seq_len": 8, "scan_layers": True, "dtype": "float32"}
+              "max_seq_len": 8, "dtype": "float32"}
     return CausalTransformer(**{**fields, **overrides})
 
 
 def trained(directory, objective, layout):
     """One checkpointed step of `objective` under `layout`; returns the state it ends with."""
     checkpoints = Checkpoints(str(directory))
-    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=layout,
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5),
+                      advanced=TrainerAdvanced(layout=layout),
                       checkpoints=checkpoints)
     data = Memory(ROWS).shuffle().repeat().batch(jax.device_count()).read("memory").loading(
         Loading(workers=0))
@@ -41,6 +43,7 @@ def trained(directory, objective, layout):
     return state
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_trees_banks_spread_back_into_its_rows():
     """`banked` moves each scanned run's leaves its rows all hold into one bank under the run's name,
     a leaf only some rows hold kept per layer, and tells `release` each row leaf it replaced; `spread`
@@ -65,6 +68,7 @@ def test_a_trees_banks_spread_back_into_its_rows():
         np.testing.assert_array_equal(actual, expected)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_run_places_bank_by_bank_and_again_on_the_programs_it_compiled(tmp_path):
     """A stack of two runs of two layers each: each bank the source places is its layers of the
     trained state stacked, and a second load stacks them with the program the first compiled."""
@@ -84,6 +88,7 @@ def test_a_run_places_bank_by_bank_and_again_on_the_programs_it_compiled(tmp_pat
             np.testing.assert_array_equal(np.asarray(again), want)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_cpu_owned_run_reads_its_frozen_banks_into_rows_again_on_the_programs_it_compiled(tmp_path):
     """A LoRA run whose frozen base the CPU owns stores that base banked. Reading the run's
     variables cuts each bank into the rows of its layers, those of the trained state, and a second

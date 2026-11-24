@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import attending
 
 from dew import Mean
 from dew.artifacts import TokenScores
@@ -18,9 +19,10 @@ from dew.objectives.lm import LMObjective
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "token_accuracy"
 MODEL = {"vocab_size": 32, "emb_features": 16, "num_layers": 2, "num_heads": 2, "mlp_features": 32,
-         "max_seq_len": 16, "attention_impl": "reference"}
+         "max_seq_len": 16}
 
 
+@attending("reference")
 def test_assistant_token_accuracy_is_trls_count_over_uneven_batches():
     """A two-layer decoder's assistant-only accuracy over two batches of
     three and five rows, against TRL's count on the same logits with every

@@ -16,7 +16,7 @@ from token_support import token_rows
 
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 
 def test_a_convolution_compiled_ahead_without_its_gpu_is_compiled_on_it(tmp_path, monkeypatch):
@@ -112,7 +112,8 @@ def test_a_step_file_whose_start_alone_holds_a_convolution_is_compiled_on_the_ru
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
     trainer = Trainer(ConvolvedStart(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                      mesh=MeshSpec().build(gpus("sm90")), layout=Layout(min_shard=TINY_SHARD))
+                      mesh=MeshSpec().build(gpus("sm90")),
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)))
     compile_ahead(trainer, batch).save(tmp_path / "step.dew-aot")
     handed = AheadOfTime.load(tmp_path / "step.dew-aot")
     assert handed.at_run

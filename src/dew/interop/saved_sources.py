@@ -19,7 +19,7 @@ import json
 import os
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     from dew.interop.pretrained import Pretrained
     from dew.interop.releases import ReleasePlan
     from dew.lora import LoRA
-    from dew.nn.attention import AttentionImpl
     from dew.nn.autoencoders import AutoEncoder
     from dew.sampling.guidance import Guidance
     from dew.sampling.solvers.common import Solver
@@ -230,18 +229,17 @@ class RunPipeline:
 
 
 def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: str | None,
-                    revision: str | None, attention_impl: AttentionImpl, size: tuple[int, ...] | None,
+                    revision: str | None, size: tuple[int, ...] | None,
                     variables: Variables | None, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                     text: bool, ema: bool | None) -> RunPipeline:
     """The diffusion run `run` (`checkpoint`) as a diffusion run starts from it: its own task's parts and
     policy (`TextToImage.from_saved`), computing in `dtype`, over its tree as its checkpoint holds it
     (`restored_tree`: an adapter's split of it kept, so its base stays frozen), stored in `param_dtype` (as
     saved where None) where `mesh` and `layout` place it, or over supplied `variables`, the starting run's
-    own tree, held as given; its denoiser attending through `attention_impl` where its class takes a
-    kernel.
+    own tree, held as given.
 
     A run of another task, a revision of a directory, and `text=False`, which the restore of a run's
-    tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none. A
+    tree cannot skip, are refused. A
     `size` other than the run's own binds its inputs, conditioning, grid and process at it, as a published
     pipeline's are bound (`pipeline_assembly.bound_at_size`, ledger 2792). A run that tuned its autoencoder
     (`end_to_end`) is started from with its tuned autoencoder, which the started run records and holds
@@ -276,11 +274,6 @@ def pipeline_of_run(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: 
         task = TextToImage.from_saved(run, dtype=dtype, variables=variables, published=True)
         tree = variables
     model = task.model
-    if "attention_impl" in {field.name for field in fields(model)}:
-        model = model.clone(attention_impl=attention_impl)
-    elif attention_impl != "auto":
-        raise ValueError(f"{type(model).__name__} takes no attention_impl: the attention its record states "
-                         "is its run's")
     # The grid as its record states it, the one `from_saved` built the task's from.
     grid = None if settings.grid is None else from_record(SourceGrid, record(settings.grid, "grid"))
     inputs, process = task.inputs, task.process
@@ -472,7 +465,7 @@ def native_release(source: str | Path) -> bool:
 def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *, mesh: MeshSpec | Mesh | None,
                                       layout: Layout | None, dtype: DTypeLike | None,
                                       param_dtype: DTypeLike | Literal["auto"] | None, on_host: bool,
-                                      weights: bool, attention_impl: str, max_seq_len: int | None,
+                                      weights: bool, max_seq_len: int | None,
                                       building: Mapping[str, object]) -> Loaded:
     """The native release in `source` as the `kind` of source a run starts from: its run's step
     (`dew.inference.models.ReleasedRun`) as its task's bundle where its task declares one
@@ -480,8 +473,7 @@ def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *,
     token task's run, its model in its native layout where no family's writes it; row 4785), placed on
     `mesh` under `layout`, or on the host (`on_host`), every tree of it, computing in `dtype` and stored in
     `param_dtype` ("auto": as the release stores it), its weights read where `weights` asks, else their
-    shapes alone from the files' headers (`ReleasedRun.shapes`). The load's `attention_impl` (but "auto")
-    is the recorded model's own field (`ModelConfig.with_declared`), and its `max_seq_len` the cache the
+    shapes alone from the files' headers (`ReleasedRun.shapes`). The load's `max_seq_len` is the cache the
     model is reloaded at, as every task sizes it (`dew.inference.tasks.cache_sized`: a learned position
     table keeps its rows). A load option that builds a family's model another way (`building`, set where
     neither None nor False, a 0 among them) is refused, as the release builds the model its run recorded,
@@ -499,13 +491,9 @@ def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *,
         raise ValueError(f"{source} is a run's native release, which builds the model its run recorded; "
                          f"load it without {', '.join(built)}")
     run = replace(ReleasedRun.of(str(source)), shapes=not weights)
-    if attention_impl != "auto" or max_seq_len is not None:
+    if max_seq_len is not None:
         # The recorded model as the load asks it, which every builder of the run reads off its record.
-        model = saved_model(run.record, None)
-        if attention_impl != "auto":
-            model = model.with_declared("attention_impl", attention_impl)
-        if max_seq_len is not None:
-            model = ModelConfig.from_model(cache_sized(model.build(), max_seq_len))
+        model = ModelConfig.from_model(cache_sized(saved_model(run.record, None).build(), max_seq_len))
         run = replace(run, record={**run.record, "model": to_record(model, ModelConfig)})
     task = run.objective.saved_task
     # On the host, read into host arrays from storage, so no accelerator holds the weights on the way.

@@ -39,7 +39,7 @@ Usage:
     python tools/benchmark_step.py --preset small --json-out /tmp/bench.json
     python tools/benchmark_step.py --preset small --architectures simple_dit unet
     python tools/benchmark_step.py --architectures causal_transformer \\
-        --attention-impl cudnn
+        --attention cudnn
     python tools/benchmark_step.py --architectures unet \\
         --xla-flags=--xla_gpu_triton_gemm_any=true
     python tools/benchmark_step.py --architectures simple_dit \\
@@ -197,8 +197,9 @@ class BenchmarkConfig:
     dtype: Literal['bfloat16', 'float32'] = 'bfloat16'
     """Model compute dtype for every case that names none of its own; losses
     stay fp32 either way."""
-    attention_impl: AttentionImpl = 'auto'
-    """Attention kernel, through the same precision policy a recipe uses."""
+    attention: AttentionImpl = 'auto'
+    """The attention kernel every case's programs run (`generation.chosen(attention=...)`), the selector's
+    where 'auto', through the same precision policy a recipe uses."""
     fixed_batch: bool = False
     """Reuse one placed batch in every step, as tools/benchmark_torch.py does
     without --h2d. Unset, each step takes a fresh placement of the host batch
@@ -414,7 +415,7 @@ def measured_row(case: Case, config: BenchmarkConfig) -> Row:
         try:
             peaks = peak_memory.measured(
                 [os.path.abspath(__file__), "--cases", cases_to_json([case]),
-                 "--dtype", config.dtype, "--attention-impl", config.attention_impl, "--warmup",
+                 "--dtype", config.dtype, "--attention", config.attention, "--warmup",
                  str(config.warmup), "--steps", str(config.steps),
                  "--fixed-batch" if config.fixed_batch else "--no-fixed-batch", "--json-out", out,
                  *(["--xla-flags", config.xla_flags] if config.xla_flags else []),
@@ -614,7 +615,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
     ahead = AheadOfTime.load(found) if found is not None else None
     # A step compiled for as many devices as this run's is its program; one for another count is not handed.
     handed = ahead if ahead is not None and ahead.devices == jax.device_count() else None
-    trainer = build_trainer(case, config.attention_impl, ahead=handed)
+    trainer = build_trainer(case, ahead=handed)
 
     count_compilation_cache()
     hits = compilation_cache_counts().get("train/cache_hits", 0.0)
@@ -674,7 +675,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "image_pixels": None if case.media is None else list(media_pixels(case)),
             "canvases_per_row": 0 if case.canvas is None else canvas_split(case)[2],
             "dtype": case.dtype,
-            "attention_impl": config.attention_impl,
+            "attention": config.attention,
             "fixed_batch": config.fixed_batch,
             "xla_flags": config.xla_flags,
             "devices": trainer.device_mesh.devices.size,
@@ -825,57 +826,69 @@ def tracked(rows: list[Row], tracker: Tracker) -> None:
     tracker.close()
 
 
+def attended(config: BenchmarkConfig) -> contextlib.AbstractContextManager:
+    """The block every case's programs trace in: on the attention kernel `config` names, the selector's
+    where 'auto'."""
+    from dew.nn.kernels import generation
+
+    return (contextlib.nullcontext() if config.attention == 'auto'
+            else generation.chosen(attention=config.attention))
+
+
 def main(config: BenchmarkConfig) -> list[Row]:
-    if config.compile_ahead is not None:
-        if config.generation is None or config.capacity_gib is None:
-            raise SystemExit("--compile-ahead names the GPU it compiles for: --generation and --capacity-gib")
-        Path(config.compile_ahead).mkdir(parents=True, exist_ok=True)
-        refused = []
-        for case in build_cases(config):
-            try:
-                ahead = ahead_of(case, config.generation, config.capacity_gib << 30, config.attention_impl)
-            except Unlowerable as refusal:
-                refused.append(f"{ahead_name(case)} ({case.architecture}): {refusal}")
-                continue
-            ahead.save(Path(config.compile_ahead) / ahead_name(case))
-        # Each case this host compiled is kept, and a refused one fails the prepare: a run handed this
-        # directory takes each case's step from it, never its own compile in its place (row 10796).
-        if refused:
-            raise SystemExit(f"not compiled ahead, so this prepare fails: {'; '.join(refused)}")
-        return []
-    # Each case in processes of its own (`measured_row`), this one opening no backend, which would hold the
-    # device they need; a pool's processes and a case's own measure in process.
-    apart = not (joins_pool(None, detected_environment()) or config.peak_run)
-    if not apart and not config.peak_run and not jax.config.jax_compilation_cache_dir:
-        # A pool's step compile seconds are a cold compile's, which no cached executable stands in for. A
-        # caller that names its cache (JAX_COMPILATION_CACHE_DIR) keeps it, and its own switch
-        # (JAX_ENABLE_COMPILATION_CACHE).
-        jax.config.update("jax_enable_compilation_cache", val=False)
-    if not apart:
-        # Joins a `dew launch` pool when one launched this process, and applies
-        # the flags before the backend opens either way.
-        prepare_process(xla_flags=config.xla_flags)
-    speaker = apart or jax.process_index() == 0
-    if speaker:
-        print(f"dtype {config.dtype}, attention_impl {config.attention_impl}, "
-              f"XLA_FLAGS {os.environ.get('XLA_FLAGS', '')!r}")
-    with contextlib.nullcontext() if apart else entered(config.within):
-        rows = run(config, apart)
-    if not speaker:
-        return rows
-    if rows:
-        print(f"Devices: {rows[0]['devices']} x {rows[0]['device_kind']}, {rows[0]['processes']} process(es)")
-    print()
-    print(format_table(rows))
-    if config.json_out:
-        print(f"\nWrote {config.json_out}")
-    else:
+    with attended(config):
+        if config.compile_ahead is not None:
+            if config.generation is None or config.capacity_gib is None:
+                raise SystemExit("--compile-ahead names the GPU it compiles for: --generation and "
+                                 "--capacity-gib")
+            Path(config.compile_ahead).mkdir(parents=True, exist_ok=True)
+            refused = []
+            for case in build_cases(config):
+                try:
+                    ahead = ahead_of(case, config.generation, config.capacity_gib << 30)
+                except Unlowerable as refusal:
+                    refused.append(f"{ahead_name(case)} ({case.architecture}): {refusal}")
+                    continue
+                ahead.save(Path(config.compile_ahead) / ahead_name(case))
+            # Each case this host compiled is kept, and a refused one fails the prepare: a run handed this
+            # directory takes each case's step from it, never its own compile in its place (row 10796).
+            if refused:
+                raise SystemExit(f"not compiled ahead, so this prepare fails: {'; '.join(refused)}")
+            return []
+        # Each case in processes of its own (`measured_row`), this one opening no backend, which would hold
+        # the device they need; a pool's processes and a case's own measure in process.
+        apart = not (joins_pool(None, detected_environment()) or config.peak_run)
+        if not apart and not config.peak_run and not jax.config.jax_compilation_cache_dir:
+            # A pool's step compile seconds are a cold compile's, which no cached executable stands in for. A
+            # caller that names its cache (JAX_COMPILATION_CACHE_DIR) keeps it, and its own switch
+            # (JAX_ENABLE_COMPILATION_CACHE).
+            jax.config.update("jax_enable_compilation_cache", val=False)
+        if not apart:
+            # Joins a `dew launch` pool when one launched this process, and applies
+            # the flags before the backend opens either way.
+            prepare_process(xla_flags=config.xla_flags)
+        speaker = apart or jax.process_index() == 0
+        if speaker:
+            print(f"dtype {config.dtype}, attention {config.attention}, "
+                  f"XLA_FLAGS {os.environ.get('XLA_FLAGS', '')!r}")
+        with contextlib.nullcontext() if apart else entered(config.within):
+            rows = run(config, apart)
+        if not speaker:
+            return rows
+        if rows:
+            print(f"Devices: {rows[0]['devices']} x {rows[0]['device_kind']}, "
+                  f"{rows[0]['processes']} process(es)")
         print()
-        print(json.dumps(rows, indent=2))
-    # Last, the rows written first: a tracker that fails loses none of them (train 1150's review F4).
-    if config.tracked:
-        tracked(rows, WandbTracker(config.tracked, name=f"benchmark_step {config.preset}"))
-    return rows
+        print(format_table(rows))
+        if config.json_out:
+            print(f"\nWrote {config.json_out}")
+        else:
+            print()
+            print(json.dumps(rows, indent=2))
+        # Last, the rows written first: a tracker that fails loses none of them (train 1150's review F4).
+        if config.tracked:
+            tracked(rows, WandbTracker(config.tracked, name=f"benchmark_step {config.preset}"))
+        return rows
 
 
 if __name__ == "__main__":

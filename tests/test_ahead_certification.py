@@ -22,12 +22,16 @@ from dew.nn.kernels.templates import report
 from dew.training import MeshSpec
 from dew.training.ahead import _targeted
 
-target = MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30))
-trainer = fine_tune(target, xla=True, split=2, dtype="bfloat16")
-batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-with _targeted(trainer, batch, what="test", platforms=(frozenset({"gpu"}),)):
-    ops = [c.op for c in report.certifications()]
-print(json.dumps({"ops": ops}))
+from dew.nn.kernels.generation import chosen
+
+# The fine-tune's attention XLA's (`chosen`), as `fine_tune(xla=True)` named it before row 11938.
+with chosen(attention="xla"):
+    target = MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30))
+    trainer = fine_tune(target, split=2, dtype="bfloat16")
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    with _targeted(trainer, batch, what="test", platforms=(frozenset({"gpu"}),)):
+        ops = [c.op for c in report.certifications()]
+    print(json.dumps({"ops": ops}))
 """
     result = fresh(script, cache_dir=tmp_path / "cache", platforms="cpu",
                    variables={"CUDA_VISIBLE_DEVICES": ""})
@@ -96,7 +100,7 @@ from test_compile_ahead import BATCH, TINY_SHARD, VOCAB, gpus
 from token_support import token_rows
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 from dew.training.ahead import compile_ahead
 
 compiled_on = []
@@ -110,7 +114,8 @@ model = models.build("causal_transformer", vocab_size=VOCAB,
                      **{**TINY_DECODER, "emb_features": 256, "max_seq_len": tokens}, num_kv_heads=2,
                      dtype="bfloat16")
 trainer = Trainer(LMObjective(model, tokens), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(gpus("sm90")), layout=Layout(min_shard=TINY_SHARD))
+                  mesh=MeshSpec().build(gpus("sm90")),
+                  advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)))
 jax.monitoring.register_event_duration_secs_listener(heard)
 from dew.nn.kernels.generation import assumed
 from dew.nn.kernels.templates import report

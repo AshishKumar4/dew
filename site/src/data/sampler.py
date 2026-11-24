@@ -1,7 +1,7 @@
 import dew
 from dew.sampling import CFG, DPMSolverMultistep
 
-pipe = dew.pipeline("dewml/hybrid-dit-176m", revision="972a6dbbf501a75b8ed0622590ce9233a2ada40d")
+pipe = dew.pipeline("dewml/hybrid-dit-176m", revision="a8da69cf12f2dc26464b72d609548cbd2c514b0a")
 prompt = "the northern lights over a frozen lake at night, vivid colors, dramatic lighting, highly detailed"
 negative = ("letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, "
             "low quality, dull colors, washed out, low contrast, grainy")

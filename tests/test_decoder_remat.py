@@ -20,7 +20,7 @@ import optax
 import pytest
 import selection_margins
 from flax import linen as nn
-from model_support import largest_difference
+from model_support import largest_difference, stacked, unrolled
 from reference_error import as_given, assert_as_exact, dew_path, without_ynn
 
 from dew.checkpoints import Checkpoints
@@ -193,56 +193,58 @@ def assert_recomputed_blocks_train_the_same_model(shape, *, scan):
     are compared a step at a time: recomputation changes rounding in the
     backward pass, and a token within rounding of a routing tie moves to
     another expert at the next step."""
-    plain = model_for(shape, scan_layers=scan)
-    remat = plain.clone(remat='full')
-    ids = batch()["text"][:, :-1]
-    # Each initialized as one program (row 11760: traced op by op, each layer's span compiled its own).
-    variables = nn.unbox(jax.jit(plain.init)(jax.random.key(0), ids))
-    recomputed = nn.unbox(jax.jit(remat.init)(jax.random.key(0), ids))
-    assert jax.tree.structure(variables) == jax.tree.structure(recomputed)
-    assert largest_difference(variables, recomputed) == 0
-    stepped = training_step(plain)
-    run, _ = stepped
-    rerun, _ = training_step(remat)
-    draw = drawn_steps(plain, stepped, routed=shape == "sparse")
-    wide = plain.clone(dtype=jnp.float64)
-    assert_as_exact(lambda variables, *_: remat.apply(variables, ids),
-                    dew_path(lambda variables, *_: plain.apply(variables, ids)), draw,
-                    f"a recomputed {shape} block's forward, scan {scan}", seeds=STEP_SEEDS,
-                    truth_fn=jax.jit(lambda variables, *_: wide.apply(variables, ids)))
-    assert_as_exact(committed(rerun), dew_path(committed(run)), draw,
-                    f"a recomputed {shape} block's step, scan {scan}",
-                    seeds=SIZED_STEP_SEEDS.get((shape, scan), STEP_SEEDS),
-                    truth_fn=committed(wide_step(plain)))
-    moved, state, tokens, key = draw(0)
-    key = jax.random.wrap_key_data(key)
-    after, _, _, _, aux = run(moved, state, tokens, key)
-    _, _, _, _, other_aux = rerun(moved, state, tokens, key)
-    assert not np.array_equal(after["params"]["embed_tokens"]["embedding"],
-                              moved["params"]["embed_tokens"]["embedding"])
-    if shape == "sparse":
-        np.testing.assert_array_equal(jax.tree.leaves(aux.effects), jax.tree.leaves(other_aux.effects))
-        assert not all(np.array_equal(a, b) for a, b in zip(
-            jax.tree.leaves(after["moe"]), jax.tree.leaves(moved["moe"]), strict=True))
+    with stacked(scan):
+        plain = model_for(shape)
+        remat = plain.clone(remat='full')
+        ids = batch()["text"][:, :-1]
+        # Each initialized as one program (row 11760: traced op by op, each layer's span compiled its own).
+        variables = nn.unbox(jax.jit(plain.init)(jax.random.key(0), ids))
+        recomputed = nn.unbox(jax.jit(remat.init)(jax.random.key(0), ids))
+        assert jax.tree.structure(variables) == jax.tree.structure(recomputed)
+        assert largest_difference(variables, recomputed) == 0
+        stepped = training_step(plain)
+        run, _ = stepped
+        rerun, _ = training_step(remat)
+        draw = drawn_steps(plain, stepped, routed=shape == "sparse")
+        wide = plain.clone(dtype=jnp.float64)
+        assert_as_exact(lambda variables, *_: remat.apply(variables, ids),
+                        dew_path(lambda variables, *_: plain.apply(variables, ids)), draw,
+                        f"a recomputed {shape} block's forward, scan {scan}", seeds=STEP_SEEDS,
+                        truth_fn=jax.jit(lambda variables, *_: wide.apply(variables, ids)))
+        assert_as_exact(committed(rerun), dew_path(committed(run)), draw,
+                        f"a recomputed {shape} block's step, scan {scan}",
+                        seeds=SIZED_STEP_SEEDS.get((shape, scan), STEP_SEEDS),
+                        truth_fn=committed(wide_step(plain)))
+        moved, state, tokens, key = draw(0)
+        key = jax.random.wrap_key_data(key)
+        after, _, _, _, aux = run(moved, state, tokens, key)
+        _, _, _, _, other_aux = rerun(moved, state, tokens, key)
+        assert not np.array_equal(after["params"]["embed_tokens"]["embedding"],
+                                  moved["params"]["embed_tokens"]["embedding"])
+        if shape == "sparse":
+            np.testing.assert_array_equal(jax.tree.leaves(aux.effects), jax.tree.leaves(other_aux.effects))
+            assert not all(np.array_equal(a, b) for a, b in zip(
+                jax.tree.leaves(after["moe"]), jax.tree.leaves(moved["moe"]), strict=True))
 
 
 @pytest.mark.parametrize("shape", ["dense", "shared", "altup"])
 @pytest.mark.parametrize("scan", [False, True])
 def test_remat_prefills_and_appends_the_same_cache(shape, scan):
-    plain = model_for(shape, scan_layers=scan)
-    remat = plain.clone(remat='full')
-    ids = batch()["text"][:2]
-    plain_vars = nn.unbox(plain.init(jax.random.key(0), ids[:, :2], decode=True))
-    remat_vars = nn.unbox(remat.init(jax.random.key(0), ids[:, :2], decode=True))
-    for start, end in [(0, 5), (5, 6), (6, 8)]:
-        expected, cache = plain.apply(plain_vars, ids[:, start:end],
-                                       decode=True, mutable=["cache"])
-        actual, recomputed_cache = remat.apply(remat_vars, ids[:, start:end],
-                                               decode=True, mutable=["cache"])
-        assert largest_difference(actual, expected) == 0
+    with stacked(scan):
+        plain = model_for(shape)
+        remat = plain.clone(remat='full')
+        ids = batch()["text"][:2]
+        plain_vars = nn.unbox(plain.init(jax.random.key(0), ids[:, :2], decode=True))
+        remat_vars = nn.unbox(remat.init(jax.random.key(0), ids[:, :2], decode=True))
+        for start, end in [(0, 5), (5, 6), (6, 8)]:
+            expected, cache = plain.apply(plain_vars, ids[:, start:end],
+                                           decode=True, mutable=["cache"])
+            actual, recomputed_cache = remat.apply(remat_vars, ids[:, start:end],
+                                                   decode=True, mutable=["cache"])
+            assert largest_difference(actual, expected) == 0
 
-        plain_vars = {**plain_vars, **cache}
-        remat_vars = {**remat_vars, **recomputed_cache}
+            plain_vars = {**plain_vars, **cache}
+            remat_vars = {**remat_vars, **recomputed_cache}
 
 
 @pytest.mark.mesh
@@ -253,48 +255,50 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
     pipeline stages of two microbatches each, on par with the plain model's
     (check 1), both from the plain step's float64 run across the same
     stages."""
-    plain = model_for(shape, scan_layers=scan, num_nextn_predict_layers=0)
-    remat = plain.clone(remat='full')
-    # Eight rows split four ways over data x fsdp hold two a device, which
-    # two microbatches divide.
-    mesh = MeshSpec(fsdp=2, stage=2).build()
-    stepped = training_step(plain)
-    run, _ = stepped
-    rerun, _ = training_step(remat)
+    with stacked(scan):
+        plain = model_for(shape, num_nextn_predict_layers=0)
+        remat = plain.clone(remat='full')
+        # Eight rows split four ways over data x fsdp hold two a device, which
+        # two microbatches divide.
+        mesh = MeshSpec(fsdp=2, stage=2).build()
+        stepped = training_step(plain)
+        run, _ = stepped
+        rerun, _ = training_step(remat)
 
-    def place(variables, tokens):
-        laid = jax.device_put(variables, Layout(min_shard=16).shardings(mesh, variables))
-        return laid, shard_batch(mesh, tokens)
+        def place(variables, tokens):
+            laid = jax.device_put(variables, Layout(min_shard=16).shardings(mesh, variables))
+            return laid, shard_batch(mesh, tokens)
 
-    @contextlib.contextmanager
-    def staged():
-        with jax.set_mesh(mesh), pipeline_microbatches(2):
-            yield
+        @contextlib.contextmanager
+        def staged():
+            with jax.set_mesh(mesh), pipeline_microbatches(2):
+                yield
 
-    def placed(step):
-        # Both arms are Dew's programs, each compiled once as the gate compiles two Dew arms (row 1801).
-        compiled = without_ynn(committed(step))
+        def placed(step):
+            # Both arms are Dew's programs, each compiled once as the gate compiles two Dew arms (row 1801).
+            compiled = without_ynn(committed(step))
 
-        @as_given
-        def on_mesh(variables, state, tokens, key):
-            variables, tokens = place(variables, tokens)
-            with staged():
-                return jax.device_get(compiled(variables, state, tokens, key))
-        return on_mesh
+            @as_given
+            def on_mesh(variables, state, tokens, key):
+                variables, tokens = place(variables, tokens)
+                with staged():
+                    return jax.device_get(compiled(variables, state, tokens, key))
+            return on_mesh
 
-    draw = drawn_steps(plain, stepped, routed=shape == "sparse", within=staged, place=place)
-    assert_as_exact(as_given(placed(rerun)), as_given(placed(run)), draw,
-                    f"a recomputed {shape} pipeline's step, scan {scan}", seeds=STEP_SEEDS,
-                    truth_fn=placed(wide_step(plain)))
+        draw = drawn_steps(plain, stepped, routed=shape == "sparse", within=staged, place=place)
+        assert_as_exact(as_given(placed(rerun)), as_given(placed(run)), draw,
+                        f"a recomputed {shape} pipeline's step, scan {scan}", seeds=STEP_SEEDS,
+                        truth_fn=placed(wide_step(plain)))
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("saved_remat", [None, 'full'])
 def test_checkpoint_resumes_with_remat_switched(tmp_path, saved_remat):
     """A checkpoint saved under one remat policy restores, value for value, into a template of the other,
     and the other model steps from it as from the state saved: the restore is exact, and so is the same
     program on the same values (that the two policies train alike is
     `assert_recomputed_blocks_train_the_same_model`'s)."""
-    model = model_for("shared", scan_layers=True, remat=saved_remat)
+    model = model_for("shared", remat=saved_remat)
     variables = nn.unbox(model.init(jax.random.key(0), batch()["text"][:, :-1]))
     run, optimizer = training_step(model)
     moved, opt_state, _, _, _ = run(
@@ -353,13 +357,16 @@ def gradient_step(model):
 def against_full(scan):
     """`full`'s decoder, its draws, and its step compiled once for every policy: the reference arm and,
     in float64, the truth."""
-    full = model_for("dense", scan_layers=scan, remat='full')
+    full = model_for("dense", remat="full")
     initialized = jax.jit(lambda key: nn.unbox(full.init(key, batch()["text"][:, :-1])))
 
     def draw(seed):
         return initialized(jax.random.key(seed)), jax.random.key_data(jax.random.key(seed + (1 << 20)))
 
-    return full, draw, dew_path(gradient_step(full)), jax.jit(gradient_step(full.clone(dtype=jnp.float64)))
+    # Each arm run as the test's stack runs (`stacked`).
+    arm = (lambda function: function) if scan else unrolled
+    return (full, draw, arm(dew_path(gradient_step(full))),
+            arm(jax.jit(gradient_step(full.clone(dtype=jnp.float64)))))
 
 
 @pytest.mark.parametrize("policy", NAMED)
@@ -369,6 +376,7 @@ def test_named_policies_train_the_same_model_as_full(policy, scan):
     recomputation would have produced, dropout and MTP included: over drawn
     decoders and keys, a named policy's loss, gradients and metrics on par
     with `full`'s, both from `full`'s float64 run (check 1)."""
-    full, draw, reference, truth = against_full(scan)
-    assert_as_exact(gradient_step(full.clone(remat=policy)), reference, draw,
-                    f"{policy} against full, scan {scan}", seeds=POLICY_SEEDS, truth_fn=truth)
+    with stacked(scan):
+        full, draw, reference, truth = against_full(scan)
+        assert_as_exact(gradient_step(full.clone(remat=policy)), reference, draw,
+                        f"{policy} against full, scan {scan}", seeds=POLICY_SEEDS, truth_fn=truth)

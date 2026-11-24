@@ -57,6 +57,7 @@ from capability_modules import (
 )
 from decision_support import decision_rows
 from flax.nnx import bridge
+from model_support import attending
 from recording import RecordingTracker, finite
 from scenario_contract import assert_steps_finite
 from steady_state import steady_state
@@ -111,7 +112,7 @@ from dew.objectives.rl.sessions import (
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
 from dew.registry import models, objectives
 from dew.sampling import Euler, Sampling
-from dew.training import Trainer
+from dew.training import Trainer, TrainerAdvanced
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
@@ -206,7 +207,7 @@ def built(name: str, **config) -> Callable[[], Loaded]:
 def released(directory: str) -> Callable[[], Loaded]:
     """A committed tiny checkpoint in a released family's own format, loaded offline."""
     def load() -> Loaded:
-        source = Pretrained.load(FIXTURES / directory, dtype="float32", attention_impl="reference")
+        source = Pretrained.load(FIXTURES / directory, dtype="float32")
         return Loaded(source, source.model, source.variables, source.text_processor)
     return load
 
@@ -500,7 +501,7 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     tracker = RecordingTracker()
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints, tracker=tracker,
-                      rollout=rollout)
+                      advanced=TrainerAdvanced(rollout=rollout))
     if data is None:
         data = Loader(replayed(lambda partition: itertools.repeat(batch)), None, batch=ROWS, records=None)
     # A fresh fit, its own batch-aware startup the one a run that never stopped takes.
@@ -538,7 +539,7 @@ def assert_resumes(objective, data, directory: Path, rollout, whole: Trainer, un
     shutil.copytree(directory, copied)
     shutil.rmtree(Checkpoints(str(copied)).path(2))
     resumed = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(copied)),
-                      rollout=rollout)
+                      advanced=TrainerAdvanced(rollout=rollout))
     after = resumed.fit(data, steps=2, log_every=1, checkpoint_final=False)
     assert int(after.step) == int(uninterrupted.step) == 2
 
@@ -1130,11 +1131,13 @@ assert {method.name for method in METHODS if method.refuse is not None} <= {
 }, "every method with a refusal check must generate at least one refused cell"
 
 
+@attending("reference")
 @pytest.mark.parametrize("method, family", cells(supported=True))
 def test_a_supported_cell_trains_evaluates_and_reloads(method, family, tmp_path):
     method.run(family, tmp_path / "run")
 
 
+@attending("reference")
 @pytest.mark.parametrize("method, family", cells(supported=False))
 def test_a_refused_cell_names_what_the_family_lacks(method, family):
     """The method refuses the family for a fact its math needs and the family lacks
@@ -1147,6 +1150,7 @@ def test_a_refused_cell_names_what_the_family_lacks(method, family):
     assert (carried.capability, carried.args) == (refused.value.capability, refused.value.args)
 
 
+@attending("reference")
 @pytest.mark.parametrize("name", ["simple_dit", "user+denoiser"])
 def test_supervised_refuses_denoisers_requiring_time_beside_the_sample(name):
     """`Supervised` calls its model on the sample alone, so a denoiser that initializes and predicts

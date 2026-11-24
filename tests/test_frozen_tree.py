@@ -13,12 +13,13 @@ import numpy as np
 import optax
 import pytest
 from flax.core import freeze
+from model_support import attending
 
 from dew.batch import FROZEN, TEXT_KEY
 from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.objectives.lm import LMObjective
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
 
@@ -26,7 +27,7 @@ LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
 def adapted(placed: bool = False) -> LMObjective:
     """A language objective over the tiny Llama with a LoRA adapter, its base the frozen tree, loaded
     onto the mesh where `placed` (each leaf where the trainer's state keeps it), else on one device."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16,
+    source = Pretrained.load(LLAMA, dtype="float32", max_seq_len=16,
                              mesh=MeshSpec() if placed else None)
     return LMObjective(source.adapt(LoRA(rank=2, modules=("q_proj", "v_proj")), key=0), 8, ema_decay=None)
 
@@ -39,6 +40,7 @@ def frozen_ids(tree) -> set[int]:
     return {id(leaf) for leaf in jax.tree.leaves(tree)}
 
 
+@attending("reference")
 @pytest.mark.parametrize("placed", [False, True])
 def test_a_runs_frozen_tree_is_its_objectives_held_arrays_through_every_step(placed):
     """The frozen leaves of a state built from the objective's held tree, fresh (`initial_state`) or
@@ -68,6 +70,7 @@ def test_a_runs_frozen_tree_is_its_objectives_held_arrays_through_every_step(pla
     assert analysis is not None and analysis.output_size_in_bytes < frozen_bytes
 
 
+@attending("reference")
 def test_trial_runs_of_a_plan_leave_the_frozen_tree_whole():
     """Two trial runs of a plan's step, as AutoPGLE's profile takes them (`planning.Trials.run`), each
     step a copy of the moving state and delete it, then restore it: the frozen tree the run and its
@@ -102,13 +105,14 @@ class Rebuilt(LMObjective):
         return {**tree, FROZEN: jax.tree.unflatten(structure, [self.change(leaves[0]), *leaves[1:]])}
 
 
+@attending("reference")
 @pytest.mark.parametrize("change", ["values", "dtype"])
 def test_a_frozen_leaf_an_init_builds_is_the_states_own_placed_as_fresh(change):
     """An init that builds a frozen leaf, same-shaped values of its own or another dtype, and passes
     the rest through, from a source loaded onto the mesh: the placed start's frozen tree is the fresh
     start's, value for value, the built leaf its own array and every other the held array itself, the
     held arrays left whole."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16,
+    source = Pretrained.load(LLAMA, dtype="float32", max_seq_len=16,
                              mesh=MeshSpec())
     built = {"values": lambda leaf: leaf + 1, "dtype": lambda leaf: leaf.astype(jnp.float16)}[change]
     rebuilt = Rebuilt(built, source.adapt(LoRA(rank=2, modules=("q_proj", "v_proj")), key=0), 8,
@@ -126,6 +130,7 @@ def test_a_frozen_leaf_an_init_builds_is_the_states_own_placed_as_fresh(change):
     assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(held[FROZEN]))
 
 
+@attending("reference")
 def test_a_frozen_tree_an_init_moves_is_the_held_arrays_where_the_state_keeps_them():
     """An init that nests its held frozen tree under a key of its own, as an objective that holds a
     policy's tree does: the placed start's frozen leaves at their new paths are the held arrays
@@ -138,10 +143,11 @@ def test_a_frozen_tree_an_init_moves_is_the_held_arrays_where_the_state_keeps_th
             return {**tree, FROZEN: {"policy": tree[FROZEN]}}
 
     sharded = Layout(min_shard=1)
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16,
+    source = Pretrained.load(LLAMA, dtype="float32", max_seq_len=16,
                              mesh=MeshSpec(), layout=sharded)
     objective = Moved(source.adapt(LoRA(rank=2, modules=("q_proj", "v_proj")), key=0), 8, ema_decay=None)
-    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec(), layout=sharded)
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec(),
+                      advanced=TrainerAdvanced(layout=sharded))
     state, shardings = trainer.place()[:2]
     held = objective.held_variables()
     assert held is not None
@@ -151,6 +157,7 @@ def test_a_frozen_tree_an_init_moves_is_the_held_arrays_where_the_state_keeps_th
         assert leaf.sharding == sharding
 
 
+@attending("reference")
 def test_a_placed_start_shares_a_frozen_tree_held_in_flax_containers():
     """An objective that holds its tree in Flax's FrozenDict starts placed as one holding dicts: its
     frozen leaves are the held arrays."""
@@ -160,7 +167,7 @@ def test_a_placed_start_shares_a_frozen_tree_held_in_flax_containers():
             held = super().held_variables()
             return None if held is None else freeze(held)
 
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16,
+    source = Pretrained.load(LLAMA, dtype="float32", max_seq_len=16,
                              mesh=MeshSpec())
     objective = Frozen(source.adapt(LoRA(rank=2, modules=("q_proj", "v_proj")), key=0), 8, ema_decay=None)
     state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5), mesh=MeshSpec()).place()[0]
@@ -169,6 +176,7 @@ def test_a_placed_start_shares_a_frozen_tree_held_in_flax_containers():
     assert frozen_ids(state.variables[FROZEN]) == frozen_ids(held[FROZEN])
 
 
+@attending("reference")
 def test_a_source_on_one_device_starts_placed_on_the_mesh_as_it_starts_fresh():
     """A source loaded onto one device, trained on a mesh of every device: its frozen leaves move to
     where the state keeps them, value for value the fresh start's, and the held arrays stay whole."""
@@ -232,7 +240,7 @@ def test_an_eager_initial_state_of_a_held_tree_copies_it_by_transfer():
     weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
     objective = LMObjective(model, seq_len=4, variables=weights, ema_decay=0.999)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
-                      layout=Layout(min_shard=1, tolerance=1.0), mesh=MeshSpec())
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)), mesh=MeshSpec())
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     with Compiles(None) as compiles:
         state = trainer.initial_state()

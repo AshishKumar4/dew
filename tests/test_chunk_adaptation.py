@@ -18,6 +18,7 @@ import pytest
 from affine_run import Replaying, dataset
 from flax import linen as nn
 from map_judge import drawing, judged_in_its_body
+from model_support import attending
 from reference_error import as_given, assert_as_exact, over_windows, widened, windows, with_gradients
 
 from dew.batch import TEXT_KEY
@@ -61,7 +62,7 @@ OBJECTIVE_SEEDS = 8
 def decoder(continuum: ContinuumLevel | None = LEVEL, **options) -> CausalTransformer:
     """A test-size decoder in float32, its continuum level on its final states."""
     return CausalTransformer(vocab_size=VOCAB, emb_features=FEATURES, num_layers=1, num_heads=2, head_dim=4,
-                             mlp_features=16, max_seq_len=32, attention_impl="xla", continuum=continuum,
+                             mlp_features=16, max_seq_len=32, continuum=continuum,
                              **options)
 
 
@@ -312,6 +313,7 @@ def draw(seed: int, rows: int = ROWS, scale: float = 0.5):
             rng.integers(0, VOCAB, (rows, LENGTH)).astype(np.int32), weights)
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", LAYOUTS)
 @pytest.mark.parametrize(("window", "rate", "scale"), [
     (1, 0.5, 0.25), (3, 0.5, 0.25), (3, 0.1, 0.5), (3, 0.0, 0.5), (32, 0.5, 0.5)])
@@ -346,18 +348,21 @@ def forward_corner(kind: str) -> None:
                     truth_fn=reference(truth=True), conditioning=CORNER_SEEDS.get(("forward", kind)))
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=512, per_task=2048, conditioning=256, conditioning_per_task=256)
 def test_the_one_token_window_where_the_inner_step_diverges_is_on_par_weighed_over_documents():
     """`forward_corner` over one document a row."""
     forward_corner("documents")
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=512, per_task=2048)
 def test_the_one_token_window_where_the_inner_step_diverges_is_on_par_over_packed_rows():
     """`forward_corner` over rows packed with documents."""
     forward_corner("packed")
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=512, per_task=2048)
 def test_the_one_token_window_where_the_inner_step_diverges_is_on_par_over_padded_rows():
     """`forward_corner` over packed rows padded inside documents and after them."""
@@ -386,18 +391,21 @@ def gradient_corner(kind: str) -> None:
          conditioning=CORNER_SEEDS.get(("gradient", kind)))
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=512, per_task=768, conditioning=32, conditioning_per_task=20)
 def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_weighed_over_documents():
     """`gradient_corner` over one document a row."""
     gradient_corner("documents")
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=512, per_task=768)
 def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_over_packed_rows():
     """`gradient_corner` over rows packed with documents."""
     gradient_corner("packed")
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=512, per_task=768)
 def test_the_outer_gradient_where_the_inner_step_diverges_is_on_par_over_padded_rows():
     """`gradient_corner` over packed rows padded inside documents and after them."""
@@ -431,6 +439,7 @@ def corner_failure(dew, label: str) -> GateFailure | None:
     return raised.value
 
 
+@attending("xla")
 def test_the_weighed_corner_holds_no_rate_a_thousandth_off():
     """The weighed corner has teeth: Dew's one-token window stepped at a rate 2^-10 past the loop's fails the
     corner's public flow (`corner_failure`) decided."""
@@ -443,6 +452,7 @@ def test_the_weighed_corner_holds_no_rate_a_thousandth_off():
     corner_failure(jax.jit(dew), "a rate off at the corner")
 
 
+@attending("xla")
 @pytest.mark.check1_shards(seeds=512, per_task=2048, conditioning=256, conditioning_per_task=256)
 def test_the_weighed_corner_fails_an_error_past_parity():
     """An arm whose every error is 1.6 times the literal loop's, the loop's own result moved 0.6 of its error
@@ -463,6 +473,7 @@ def test_the_weighed_corner_fails_an_error_past_parity():
     corner_failure(as_given(dew), "an error 1.6 times the loop's at the corner")
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", LAYOUTS)
 @pytest.mark.check1_shards(seeds=128, per_task=128)
 def test_the_scan_steps_the_level_as_equation_71_where_the_inner_step_diverges(kind):
@@ -615,6 +626,7 @@ def chain_loop(model, variables, hidden, targets, weights, fields, adaptation: C
     return jax.vmap(row_losses)(hidden, targets, weights, real, documents)
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", LAYOUTS)
 @pytest.mark.parametrize("windows", sorted(CHAIN_SEEDS), ids=lambda windows: "-".join(map(str, windows)))
 def test_a_chain_steps_each_level_as_equation_71_at_its_own_window(kind, windows):
@@ -641,6 +653,7 @@ def test_a_chain_steps_each_level_as_equation_71_at_its_own_window(kind, windows
          f"a chain at windows {windows} over {kind}", CHAIN_SEEDS[windows])
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", LAYOUTS)
 def test_a_damped_chain_steps_each_level_as_the_literal_loop(kind):
     """A damped chain (`ChunkAdaptation.damped`) steps each level at the rate its window's bound takes,
@@ -666,6 +679,7 @@ def test_a_damped_chain_steps_each_level_as_the_literal_loop(kind):
          damped=True)
 
 
+@attending("xla")
 @pytest.mark.parametrize("index", [0, 1])
 def test_a_chain_levels_damped_rate_holds_below_one_over_its_curvature(index):
     """A damped chain level's rate times the largest curvature of its window's loss in its kernels,
@@ -708,6 +722,7 @@ def test_a_chain_levels_damped_rate_holds_below_one_over_its_curvature(index):
     assert rate * largest[0] > 2 and damped * largest[0] >= MOVES, (index, damped * largest[0])
 
 
+@attending("xla")
 def test_a_damped_chain_refuses_a_level_after_whose_curvature_no_number_bounds():
     """A damped chain bounds a level's loss's curvature through the levels after it, so a level after the
     first under ReLU, whose second derivative is a point mass, is refused (ValueError)."""
@@ -719,6 +734,7 @@ def test_a_damped_chain_refuses_a_level_after_whose_curvature_no_number_bounds()
         objective.token_scores(objective.init(jax.random.key(0)), tokens)
 
 
+@attending("xla")
 @pytest.mark.parametrize("adaptation", [ChunkAdaptation(window=3, rate=0.5, select=("up",)),
                                         ChunkAdaptation(window=3, rate=5.0, damped=True)],
                          ids=["selected", "damped"])
@@ -735,6 +751,7 @@ def test_a_chain_of_one_level_steps_as_the_level_alone(adaptation):
     np.testing.assert_array_equal(np.asarray(scored[0]), np.asarray(scored[1]))
 
 
+@attending("xla")
 def test_a_damped_step_carries_its_terms_in_its_states_precision():
     """A damped step carries its window's terms as its states hold them: a float64 model's in float64,
     and a float32 model's in float32 though x64 is on, its losses finite in each."""
@@ -749,6 +766,7 @@ def test_a_damped_step_carries_its_terms_in_its_states_precision():
             assert losses.dtype == dtype and np.all(np.isfinite(np.asarray(losses))), dtype
 
 
+@attending("xla")
 def test_a_damped_step_through_a_relu_head_transform_is_refused():
     """A damped step bounds the head's curvature through its transform's activation, and a ReLU's second
     derivative is a point mass, so a damped step under a ReLU head transform is refused (ValueError)."""
@@ -759,6 +777,7 @@ def test_a_damped_step_through_a_relu_head_transform_is_refused():
         objective.token_scores(objective.init(jax.random.key(0)), tokens)
 
 
+@attending("xla")
 def test_a_chains_levels_count_as_head_work():
     """A chain's levels (`continuum_0`, `continuum_1`) count as head work in a decoder's matrix usage, as
     one level's `continuum` does: read on every head read, its own and each prediction depth's."""
@@ -772,6 +791,7 @@ def test_a_chains_levels_count_as_head_work():
         assert prediction_matrix_usage(CHAINED, path, lengths, [(lengths, lengths)]).size, scope
 
 
+@attending("xla")
 def test_a_chain_starts_as_the_plain_head_and_steps_nothing_at_rate_zero():
     """A chain's levels start as the identity, so its logits are the model's without them, and a chain
     stepped at rate zero scores the targets as the level-free model does, bit for bit."""
@@ -789,6 +809,7 @@ def test_a_chain_starts_as_the_plain_head_and_steps_nothing_at_rate_zero():
                                   np.asarray(still.token_scores(variables, rows).losses))
 
 
+@attending("xla")
 def test_a_chain_names_one_window_and_rate_a_level_its_windows_nested():
     """A chain's windows, ordered, each divide the next (a slower level steps on a faster one's
     boundary), and one window or rate a level, or one for all: else refused (ValueError)."""
@@ -814,6 +835,7 @@ def carried_draw(seed: int):
     return {**variables, CARRIED: carried}, hidden, targets, weights
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", LAYOUTS)
 def test_a_carried_level_steps_through_a_rows_documents_as_equation_71_reads_them(kind):
     """A level the run carries (`carry="run"`) starts at the trained level plus what is carried, and
@@ -834,6 +856,7 @@ def test_a_carried_level_steps_through_a_rows_documents_as_equation_71_reads_the
     site(dew, reference, carried_draw, 0.1, 0.5, 3, f"a carried level over {kind}", CARRY_SEEDS)
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", LAYOUTS)
 def test_an_update_carries_its_rows_mean_step_of_the_level(kind):
     """What an update carries on (`_carried_update`) is what was carried plus the mean, over the rows
@@ -863,6 +886,7 @@ def test_an_update_carries_its_rows_mean_step_of_the_level(kind):
     site(dew, reference, carried_draw, 0.1, 0.5, 3, f"a carried level's update over {kind}", CARRY_SEEDS)
 
 
+@attending("xla")
 @pytest.mark.parametrize("frozen", ["level", "down"])
 def test_a_run_carries_a_level_whose_leaves_are_frozen(frozen):
     """A run that carries its level starts with nothing carried in the level's whole tree, its frozen
@@ -900,6 +924,7 @@ def _checkpointed(objective, directory):
                    checkpoints=Checkpoints(str(directory)))
 
 
+@attending("xla")
 def test_a_run_that_carries_its_level_resumes_what_it_carried_bit_for_bit(tmp_path):
     """A run that carries its level (`carry="run"`) starts with nothing carried, carries its rows' steps
     from its first update, and a run resumed from its checkpoint ends where the uninterrupted one does,
@@ -924,6 +949,7 @@ PADDING_SEEDS = 8
 sized paired by `seeds_for` on armada."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", ["segment_padded", "unmarked_mask"])
 def test_padding_steps_alike_however_it_is_marked(kind):
     """Padding marked by document 0 alone, or by document 0 beside a mask that marks every slot,
@@ -943,6 +969,7 @@ def test_padding_steps_alike_however_it_is_marked(kind):
     site(dew, reference, draw, 0.5, 0.5, 3, f"padding marked as {kind}", PADDING_SEEDS)
 
 
+@attending("xla")
 def test_only_the_selected_parts_step():
     """A selection steps those parts of the level and holds the rest at their trained values: with
     `up` alone stepping, each loss is equation 71's with `down` fixed (check 1)."""
@@ -964,6 +991,7 @@ DAMPED_SEEDS = {(1, 0.5): 8, (3, 0.5): 8, (3, 0.1): 8}
 `seeds_for` on armada, the most any layout took."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("parts", [("up",), ("down",), ("down", "up")], ids=["up", "down", "both"])
 @pytest.mark.parametrize("kind", LAYOUTS)
 @pytest.mark.parametrize(("window", "rate"), [(1, 0.5), (3, 0.5), (3, 0.1)])
@@ -1039,6 +1067,7 @@ own fixed point and the window's states take 5.5e-6 to 2.2e-2 (fix/t67a-review, 
 20261102182705-facdb322)."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("parts", [("up",), ("down",), ("down", "up")], ids=["up", "down", "both"])
 @pytest.mark.parametrize("head", sorted(DAMPED_HEADS))
 def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step(head, parts):
@@ -1086,6 +1115,7 @@ def test_a_damped_rate_holds_below_one_over_its_windows_curvature_along_its_step
     assert damped * largest[0] >= MOVES, (head, parts, damped * largest[0])
 
 
+@attending("xla")
 def test_a_zero_heads_damped_step_is_finite():
     """A zero head's curvature and slope are zero, and its damped step's losses are finite."""
     variables, hidden, targets, weights = draw(0, scale=0.5)
@@ -1150,6 +1180,7 @@ DAMPED_GRADIENT_SEEDS = {("documents", "up"): 32, ("packed", "up"): 128, ("padde
 parts, one draw a seed, sized paired by `seeds_for` on armada."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("kind", LAYOUTS)
 @pytest.mark.parametrize(("rate", "scale", "damped"),
                          [(0.1, 0.5, None), (0.5, 0.25, None), (0.5, 0.5, "up"), (0.5, 0.5, "both")],
@@ -1181,6 +1212,7 @@ def test_training_differentiates_through_every_step(kind, rate, scale, damped):
          damped=damped is not None)
 
 
+@attending("xla")
 def test_a_level_at_its_start_is_the_identity():
     """A decoder gains its continuum level as the identity: `up` starts at zero, so its logits are
     the same decoder's without the level, bit for bit, and its head reads no table (`output_table`),
@@ -1196,6 +1228,7 @@ def test_a_level_at_its_start_is_the_identity():
     assert plain.apply(without, method="output_table") is not None
 
 
+@attending("xla")
 def test_the_gradient_through_the_level_is_its_formula():
     """The level is `x + up(silu(down(x)))` on the final states before the head: the logits and
     their gradients for every variable, the level's among them, on par with that formula written
@@ -1222,6 +1255,7 @@ def test_the_gradient_through_the_level_is_its_formula():
                     "the gradient through the level", seeds=LEVEL_SEEDS)
 
 
+@attending("xla")
 def test_a_level_that_never_steps_scores_as_the_plain_objective():
     """At rate zero the level never moves, so the adapted objective's per-token losses are the
     plain objective's over the same decoder, its level read as trained, on par (check 1): the scan
@@ -1240,6 +1274,7 @@ def test_a_level_that_never_steps_scores_as_the_plain_objective():
                     "a level that never steps", seeds=OBJECTIVE_SEEDS)
 
 
+@attending("xla")
 @pytest.mark.parametrize("select", [(), ("up",)], ids=["every-part", "up"])
 @pytest.mark.parametrize("rate", [0.0, 0.5])
 def test_a_frozen_tree_steps_as_its_dict_does(select, rate):
@@ -1256,6 +1291,7 @@ def test_a_frozen_tree_steps_as_its_dict_does(select, rate):
     np.testing.assert_array_equal(np.asarray(frozen), np.asarray(held))
 
 
+@attending("xla")
 def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
     """A run of the adapted objective trains through the Trainer, the level's start among its
     parameters, and a run resumed from its checkpoint ends where the uninterrupted one does, bit for
@@ -1300,6 +1336,7 @@ def test_each_activations_slopes_bound_its_derivatives(act):
         assert p2 == bound(second, third)
 
 
+@attending("xla")
 def test_what_the_adaptation_cannot_serve_is_refused():
     """An adaptation needs a level to step, takes a window of a token or more and a rate of zero or
     more, and steps parts the level has. A damped one, whose bounds read the whole sequence, decodes
@@ -1371,6 +1408,7 @@ ROUNDED = {
 it is refused (`test_a_damped_step_bounds_what_rounds_where_it_steps`)."""
 
 
+@attending("xla")
 @pytest.mark.parametrize("case", sorted(ROUNDED))
 def test_a_damped_step_bounds_what_rounds_where_it_steps(case):
     """A damped step's bounds read each map's operands as its rounding leaves them. A head map that
@@ -1396,6 +1434,7 @@ def test_a_damped_step_bounds_what_rounds_where_it_steps(case):
         assert np.all(np.isfinite(np.asarray(objective.token_scores(variables, tokens).losses)))
 
 
+@attending("xla")
 def test_a_step_of_down_through_an_up_in_frozen_fp8_beside_its_quantizer_is_refused():
     """A step of `down` through an `up` that multiplies in frozen FP8 beside a checkpoint's quantizer of
     its input is refused (ValueError): the bound reads the quantizer's rounding, not the frozen product's,
@@ -1420,6 +1459,7 @@ def test_a_step_of_down_through_an_up_in_frozen_fp8_beside_its_quantizer_is_refu
         objective.token_scores(frozen, tokens)
 
 
+@attending("xla")
 @pytest.mark.parametrize(("dtype", "calibration", "grown"), [
     ("float16", "absmax", 2.0), ("float32", "absmax", 1 + math.sqrt(4) / 255),
     ("float32", "absmax,1e-20", 2.0)])
@@ -1444,6 +1484,7 @@ def test_qwixs_unit_scale_bounds_an_operands_growth_by_two(dtype, calibration, g
     assert np.all(after <= grown * before), (after / before, grown)
 
 
+@attending("xla")
 def test_a_damped_steps_bound_grows_each_operand_as_qwixs_rounding_can():
     """Under Qwix's int8 quantization of the level's `up`, a damped step's terms grow its input's norm and
     its kernel's by 1 + sqrt(g) c / 255, g the contraction (the level's 4 hidden units) and c the weight
@@ -1458,6 +1499,7 @@ def test_a_damped_steps_bound_grows_each_operand_as_qwixs_rounding_can():
         assert np.all(np.asarray(rounded.inputs) > np.asarray(plain.inputs))
 
 
+@attending("xla")
 def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():
     """A damped step's terms read x and f as the level's maps multiply them (`level_terms`): a
     checkpoint's quantizer of `down`'s input at a scale that rounds every state to zero zeroes each
@@ -1472,6 +1514,7 @@ def test_a_damped_steps_terms_read_the_inputs_its_maps_multiply():
         assert not np.any(np.asarray(rounded)), site
 
 
+@attending("xla")
 def test_a_run_config_states_a_damped_adaptation_and_reads_it_back():
     """A run's record states a damped adaptation of a decoder with a continuum level (`LMRunConfig`, its
     model's `continuum` and its objective's `adaptation`): `run.json` reads back as the record that wrote
@@ -1485,7 +1528,7 @@ def test_a_run_config_states_a_damped_adaptation_and_reads_it_back():
     config = LMRunConfig(
         model=ModelConfig("causal_transformer", {
             "vocab_size": VOCAB, "emb_features": FEATURES, "num_layers": 1, "num_heads": 2, "head_dim": 4,
-            "mlp_features": 16, "max_seq_len": 32, "attention_impl": "xla", "continuum": LEVEL}),
+            "mlp_features": 16, "max_seq_len": 32, "continuum": LEVEL}),
         objective=ObjectiveConfig("lm", {"adaptation": adaptation}))
     read = RunConfig.read(json.loads(json.dumps(config.record())))
     assert read.record() == config.record()
@@ -1496,13 +1539,14 @@ def test_a_run_config_states_a_damped_adaptation_and_reads_it_back():
                                                                 tokens).losses)))
 
 
+@attending("reference")
 def test_a_level_has_no_transformers_counterpart_so_export_refuses_it():
     """A continuum level is no field of any transformers config, so a decoder with one exports no
     config that reads back as it (ValueError), where the same decoder without it exports."""
     from dew.interop import Pretrained
     from dew.interop.hf_decoders import export_config
 
-    loaded = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32")
     export_config(loaded.model)
     with pytest.raises(ValueError):
         export_config(loaded.model.clone(continuum=LEVEL))

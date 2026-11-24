@@ -96,7 +96,7 @@ class ScheduleBase:
     def _horizon(self, steps: int | None, field: str) -> int:
         """Resolve a decay's step horizon, which a token budget cannot supply."""
         if steps is None:
-            raise ValueError(f"{type(self).__name__} needs {field} or trainer.horizon.steps as its step "
+            raise ValueError(f"{type(self).__name__} needs {field} or trainer.steps as its step "
                              "horizon")
         return steps
 
@@ -174,6 +174,27 @@ class ScheduleBase:
         return through, count >= written, marks.get("warmup", jnp.zeros([], progress.dtype))
 
 
+
+
+@dataclasses.dataclass(frozen=True)
+class Peaked(ScheduleBase):
+    """A schedule that climbs to one peak rate (`peak_value`), which a run's optimizer config names as its
+    learning rate where the schedule names none (`dew.optim.OptimConfig.lr`): cosine, linear, power and
+    one-cycle. Named, the schedule runs at it alone."""
+
+    peak_value: float | None = dataclasses.field(default=None, kw_only=True, metadata={'rate': True})
+    """The rate it climbs to; None takes the learning rate of the config that holds it (`OptimConfig.lr`),
+    and a schedule outside one (a param group's `b1`) names its own."""
+
+    def peak_rate(self) -> float:
+        """Its `peak_value`, which a schedule held by no config's rate names (`OptimConfig.lr`)."""
+        if self.peak_value is None:
+            raise ValueError(f"{type(self).__name__} names no peak_value, which only an optimizer config's "
+                             "schedule takes from its rate (OptimConfig.lr)")
+        return self.peak_value
+
+    def rates(self) -> dict[str, float]:
+        return {**super().rates(), 'peak_value': self.peak_rate()}
 
 
 class RateState(NamedTuple):

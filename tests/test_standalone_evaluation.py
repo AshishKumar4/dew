@@ -7,6 +7,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
+from model_support import attending
 from steady_state import steady_state
 
 from dew import Evaluation, Trainer
@@ -25,7 +26,7 @@ def tiny_decoder(**fields):
     """An eight-token decoder small enough to evaluate in a test, with `fields` changed."""
     return CausalTransformer(**{"vocab_size": 8, "emb_features": 16, "num_layers": 1, "num_heads": 2,
                                 "mlp_features": 32, "max_seq_len": 16, "dtype": "float32",
-                                "attention_impl": "xla", **fields})
+                                **fields})
 
 
 class Recording:
@@ -40,6 +41,7 @@ class Recording:
         self.artifacts.append(artifact)
 
 
+@attending("xla")
 def test_a_run_compiles_its_evaluations_before_its_first_step():
     """A run that evaluates between steps warms each suite beside its step's compile, before its
     first step, reporting nothing of it: two batches, the loss's reduction and the preview. The
@@ -74,6 +76,7 @@ def test_a_run_compiles_its_evaluations_before_its_first_step():
     assert sum(isinstance(artifact, TextSamples) for artifact in tracker.artifacts) == 2
 
 
+@attending("xla")
 def test_a_run_warms_a_validation_whose_first_batch_counts_no_target():
     """Warming a split scores no part of it, so a validation whose first batch is all padding,
     its targets counted by a later batch, trains and evaluates."""
@@ -88,6 +91,7 @@ def test_a_run_warms_a_validation_whose_first_batch_counts_no_target():
     assert sum("val/perplexity" in scalars for scalars in tracker.scalars) == 2
 
 
+@attending("xla")
 def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     model = tiny_decoder()
     objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)),
@@ -117,6 +121,7 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
     assert test.previews == ()
 
 
+@attending("xla")
 def test_a_second_pass_over_a_split_neither_compiles_nor_moves_data_unasked():
     """A validation pass repeated at a later step, over other batches of the
     same shapes, reuses the programs the first compiled, and moves only what
@@ -167,6 +172,7 @@ def counted_masked():
     return CountedMasked(model, MDLM(mask_id=7)(), seq_len=4, ema_decay=None), 4
 
 
+@attending("xla")
 @pytest.mark.parametrize("build", [counted_lm, counted_masked], ids=["lm", "masked"])
 def test_a_pass_asking_for_the_loss_and_a_metric_scores_each_batch_once(build):
     """The validation loss and the perplexity come from one scoring of each

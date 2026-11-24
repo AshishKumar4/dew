@@ -1,7 +1,7 @@
 """Measure this GPU's kernel picks (`dew.nn.kernels.tuning`) for a language
 model's training step at its real shapes.
 
-The step is lowered from abstract state (`Trainer(lower_for=...)` on this
+The step is lowered from abstract state (`TrainerAdvanced(lower_for=...)` on this
 GPU's generation), so a model this GPU cannot hold still lowers, and each
 Pallas launch the step holds is measured here and stored beside the
 compilation cache (`dew._cache.kernel_picks_path`), where every later tuning run
@@ -35,7 +35,7 @@ from dew.interop import sources
 from dew.nn.backbones import CausalTransformer
 from dew.nn.kernels import generation, tuning
 from dew.objectives.lm import LMObjective
-from dew.training import Trainer
+from dew.training import Trainer, TrainerAdvanced
 from dew.training._lowering import Lowered
 
 
@@ -61,7 +61,7 @@ def main() -> None:
                          "run it under gpu-run without -n")
     model = model_of(arguments)
     trainer = Trainer(LMObjective(model, arguments.seq), optax.adamw(1e-4), key=jax.random.key(0),
-                      lower_for=generation.device_generation())
+                      advanced=TrainerAdvanced(lower_for=generation.device_generation()))
     state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
     batch = {"text": jax.ShapeDtypeStruct((arguments.batch, arguments.seq + 1), jnp.int32)}
 

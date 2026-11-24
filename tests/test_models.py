@@ -16,7 +16,7 @@ import pytest
 from arm_arithmetic import ahead_on_the_host
 from flax import linen as nn
 from flax.core import freeze, unfreeze
-from model_support import moved
+from model_support import attending, moved
 from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
 
 from dew.interop.autoencoders.vae import translate_vae_weights
@@ -460,11 +460,12 @@ def test_dropout_is_active_in_train_mode(rng, stack):
     assert jnp.array_equal(e0, e1), "eval mode must be deterministic"
 
 
+@attending("reference")
 def test_the_second_attention_of_a_dual_block_takes_its_dropout():
     """With every gate closed but the second attention's, a dual-attention block's training outputs
     differ between dropout keys and its evaluation ones do not: the second attention's output is
     dropped as the block's other projected outputs are."""
-    block = DoubleStreamBlock(8, 2, 4, mlp_hidden=16, attention_impl="reference", dual_attention=True,
+    block = DoubleStreamBlock(8, 2, 4, mlp_hidden=16, dual_attention=True,
                               shared_modulation=True, dropout_rate=0.5)
     image, context = jnp.ones((1, 3, 8)), jnp.ones((1, 2, 8))
     ones, zeros = jnp.ones((1, 8)), jnp.zeros((1, 8))
@@ -481,10 +482,11 @@ def test_the_second_attention_of_a_dual_block_takes_its_dropout():
     assert jnp.array_equal(run(), run())
 
 
+@attending("reference")
 def test_a_joint_attention_over_an_empty_context_attends_as_the_image_alone():
     """A context of no tokens joins no keys, so the image attends as it does
     with no context at all, and the context's output is as empty as it is."""
-    attention = JointAttention(2, 4, attention_impl="reference")
+    attention = JointAttention(2, 4)
     image, context = jax.random.normal(jax.random.key(0), (1, 3, 8)), jnp.zeros((1, 0, 8))
     variables = attention.init(jax.random.key(1), image, jnp.ones((1, 2, 8)))
     joined, added = attention.apply(variables, image, context)
@@ -624,6 +626,7 @@ def test_a_stage_names_the_dials_the_block_supports(rng):
 @pytest.mark.parametrize("dtype, inputs", [(None, jnp.float32), (jnp.float32, jnp.float32),
                                            (jnp.bfloat16, jnp.bfloat16), (None, jnp.float64)],
                          ids=["unset", "float32", "bfloat16", "unset-float64"])
+@attending("reference")
 def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, inputs, rng):
     """An unchanged stage inherits the model dtype, or, when both leave it unset, at least fp32 of its
     input's: a float64 run attends in float64, as FlaxDiff's float64 twin does."""
@@ -632,9 +635,8 @@ def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, inputs, rng):
     expected_dtype = dtype or inputs
     stage = Stage(heads=2)
     with jax.enable_x64(new_val=inputs == jnp.float64):
-        block = stage_attention(stage, 8, "reference", dtype, None, "attention")
-        explicit = stage_attention(
-            Stage(heads=2, dtype=expected_dtype), 8, "reference", dtype, None, "attention")
+        block = stage_attention(stage, 8, dtype, None, "attention")
+        explicit = stage_attention(Stage(heads=2, dtype=expected_dtype), 8, dtype, None, "attention")
         x = jnp.ones((1, 4, 8), inputs)
         variables = block.init(rng, x)
         output = block.apply(variables, x)

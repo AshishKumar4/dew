@@ -14,6 +14,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Replaying
+from model_support import attending
 from objective_cases import IMAGES
 
 from dew.batch import VALID_ROWS
@@ -26,8 +27,7 @@ from dew.inputs import Field, InputSpec
 from dew.objectives.jepa.objective import JepaObjective
 from dew.objectives.supervised import Supervised
 from dew.registry import ModelConfig
-from dew.training import Trainer
-from dew.training.budget import Horizon
+from dew.training import Trainer, TrainerAdvanced
 from dew.training.observe import Observe
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,17 +40,18 @@ class Built(JepaRunConfig):
         return objective
 
 
+@attending("xla")
 def test_a_jepa_predictor_takes_the_width_its_encoder_was_built_at(tmp_path):
     """An encoder whose width its record pins as a default (a run recorded at another class default)
     is built at that width, and the predictor it feeds takes the same width: before, the predictor
     read the stated fields alone and took its class's 384 (AT-06)."""
     rows = TFDS("dew_images", path=str(IMAGES), split="all").pipe(presets.images, 16, batch=8)
     encoder = ModelConfig("jepa_encoder", {"patch_size": 2, "num_layers": 1, "num_heads": 2, "mlp_ratio": 2,
-                                           "dtype": "float32", "attention_impl": "xla"},
+                                           "dtype": "float32"},
                           defaults={"emb_features": 16})
     run = Built(model=encoder, predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
                 data=rows.read("memory").loading(Loading(workers=0)),
-                trainer=TrainerConfig(checkpoint_dir=str(tmp_path), horizon=Horizon(steps=1)))
+                trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1))
     objective = run.prepare().train("built")
     assert isinstance(objective, JepaObjective)
     assert (objective.encoder.emb_features, objective.predictor.emb_features) == (16, 16)
@@ -135,6 +136,7 @@ def test_a_validation_split_of_undeclared_inputs_is_refused_before_the_run_train
     assert stepped.values == []
 
 
+@attending("reference")
 @pytest.mark.parametrize("metric", ["mean", "own"])
 @pytest.mark.parametrize("eval_every", [None, 2], ids=["at-the-end", "midway"])
 def test_a_validation_split_holding_no_field_its_metric_reads_is_refused_before_the_run_trains(eval_every,
@@ -153,7 +155,7 @@ def test_a_validation_split_holding_no_field_its_metric_reads_is_refused_before_
     tokens = np.tile(np.asarray([[0, 1, 2, 3, 0]], np.int32), (8, 1))
     rows = Memory({"text": tokens}).read("memory").loading(Loading(workers=0, threads=1, read_buffer=1))
     model = CausalTransformer(vocab_size=4, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
-                              max_seq_len=4, attention_impl="reference")
+                              max_seq_len=4)
     class Captions:
         """A metric of a user's own, no `Mean`, that reads the captions beside its scores (`Metric`'s
         `fields`), as FID reads its reference images: the captions it was handed, counted."""
@@ -362,7 +364,8 @@ def test_a_step_built_with_its_evaluations_needs_their_room_beside_the_state_onc
             objective.ema = EMASpec(decay=optax.constant_schedule(0.9))
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                           mesh=MeshSpec().build(gpus("sm90")),
-                          layout=Layout(min_shard=TINY_SHARD, host=("ema",) if average == "host" else ()))
+                          advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD,
+                                                                 host=("ema",) if average == "host" else ())))
         if scale is None:
             return trainer, compile_ahead(trainer, batch)
         scored = scale * BATCH

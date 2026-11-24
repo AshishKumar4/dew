@@ -14,7 +14,7 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
-from model_support import flat_tree
+from model_support import attending, flat_tree
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 
@@ -32,8 +32,7 @@ from dew.inputs import CharTable
 from dew.interop import Pretrained
 from dew.nn.cross_attention import ContextEncoder, CrossAttention, crossing
 from dew.nn.multimodal import MultimodalTransformer
-from dew.training import Trainer
-from dew.training.budget import Horizon
+from dew.training import Trainer, TrainerAdvanced
 
 pytestmark = pytest.mark.mesh
 
@@ -66,7 +65,7 @@ def conditioned(length: int = 32, layers: tuple[int, ...] = (0, 1),
     """A decision over the tiny Llama with fresh cross-attention before `layers`, its context up to
     `length` tokens and encoded as `encoder` says, its rows laid out by bytes, at most `segments` rows
     a window where given."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     return DecisionObjective(source.with_cross_attention(CrossAttention(layers, length), key=0),
                              tokenizer=ByteTokenizer(), specials=SPECIALS, context_encoder=encoder,
                              segments=segments)
@@ -140,6 +139,7 @@ def windows_of(objective: DecisionObjective, rows, count: int = 6) -> list[dict]
     return list(itertools.islice(reader.val(DataPartition()), count))
 
 
+@attending("reference")
 @pytest.mark.parametrize("grouped", ["rows", "unit", "unit beside rows"])
 def test_rows_that_carry_a_context_pack_several_a_window_each_beside_its_own(grouped):
     """Rows that carry a context pack several a window as rows without one do, each row's context
@@ -184,6 +184,7 @@ def test_rows_that_carry_a_context_pack_several_a_window_each_beside_its_own(gro
     assert several, "no window held more than one row"
 
 
+@attending("reference")
 def test_a_unit_whose_contexts_outgrow_a_windows_trains_its_examples_apart():
     """Grouped examples train as one unit where a window holds their rows' contexts end to end
     (`DecisionObjective.context_window`), and apart where their contexts outgrow it, as where their
@@ -287,6 +288,7 @@ def packed_contexts_read_as_alone(encoder: str):
                            PACKED_CONTEXT_SEEDS[encoder])
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=128, per_task=32)
 def test_packed_rows_each_read_their_own_context_through_the_token_table_as_each_does_alone():
     """Packed rows read their own contexts through the token table as each row alone does
@@ -294,6 +296,7 @@ def test_packed_rows_each_read_their_own_context_through_the_token_table_as_each
     packed_contexts_read_as_alone("table")
 
 
+@attending("reference")
 @pytest.mark.check1_shards(seeds=256, per_task=32)
 def test_packed_rows_each_read_their_own_context_through_the_backbone_as_each_does_alone():
     """Packed rows read their own contexts through the backbone's own pass over each context as its own
@@ -302,12 +305,13 @@ def test_packed_rows_each_read_their_own_context_through_the_backbone_as_each_do
     packed_contexts_read_as_alone("backbone")
 
 
+@attending("reference")
 def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_does():
     """The cross-attention blocks start from zero gates, so a decision over the backbone with them
     answers a row, with its context or without, as the backbone alone does: on par from float64 (check
     1), the two being programs of their own. The blocks train and the source's weights are held
     frozen."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     plain = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
     crossed = conditioned(32, (0,))
     assert crossed.context_length == 32 and plain.context_length is None
@@ -338,6 +342,7 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
                         truth_fn=truth)
 
 
+@attending("reference")
 def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
     """Examples with a context trained through context layers: every logged step reports its
     training work, and beyond what its batch's rows cost without their contexts by the
@@ -369,6 +374,7 @@ def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
     assert not np.array_equal(read[0].probabilities, read[1].probabilities)
 
 
+@attending("reference")
 def test_a_decisions_context_is_its_inputs_condition_and_its_check_reads_it():
     """A decision whose backbone reads a context holds it as its inputs' condition (`InputSpec`,
     `DecisionModel.context_condition`): the backbone's token table as the run says, or its own pass where
@@ -384,7 +390,7 @@ def test_a_decisions_context_is_its_inputs_condition_and_its_check_reads_it():
     objective.inputs.check(batch)
     with pytest.raises(ValueError):
         objective.inputs.check({name: value for name, value in batch.items() if name != "context"})
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     plain = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
     assert dict(plain.inputs.conditions) == {}
 
@@ -418,12 +424,13 @@ def configured(tokens: int = 12, *, trained: bool = False) -> DecisionObjective:
     layer 0 at that width, its windows packing rows as a decision's do."""
 
     table = CharTable.from_pretrained(tokens=tokens, features=16)
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     blocks = CrossAttention((0,), tokens, context_features=16)
     return DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
                              specials=SPECIALS, context_encoder=table, context_trained=trained)
 
 
+@attending("reference")
 def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly(tmp_path):
     """A decision whose context a configured encoder reads (`CharTable`, any `ConditionEncoder`): its
     rows carry the encoder's tokens of the context, its model reads the encoder's states, a step counts
@@ -457,7 +464,7 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
         want = trained("one two three", QUESTION, context=context)["pick"].probabilities
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     again = Trainer(configured(), optax.adam(1e-3), key=0, checkpoints=Checkpoints(directory, keep=2),
-                    data_resume="exact")
+                    advanced=TrainerAdvanced(data_resume="exact"))
     resumed = again.fit(dataclasses.replace(data, resume="exact"), steps=3, log_every=1, checkpoint_every=1)
     # Every weight, the encoder's among them, and the optimizer's state as a run of three steps leaves them.
     whole = Trainer(configured(), optax.adam(1e-3), key=0).fit(data, steps=3, log_every=1)
@@ -472,6 +479,7 @@ def test_a_context_read_by_a_configured_encoder_trains_saves_and_resumes_exactly
     assert (row.context_given, row.cuts["context"]) == (1 + len(note), 1 + len(note) - 12)
 
 
+@attending("reference")
 def test_a_clip_context_encoder_trains_serves_and_counts_each_rows_context_alone():
     """A decision whose context a pretrained text tower reads (`CLIPText`, 77 tokens a text): a window of
     hundreds of context positions reaches it a row's context at a time, each at the tower's own width, so a
@@ -484,7 +492,7 @@ def test_a_clip_context_encoder_trains_serves_and_counts_each_rows_context_alone
 
     tower = CLIPText.from_pretrained(str(TINY))
     width = tower.conditioning_flops(tower.tokenize([""])).features
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     blocks = CrossAttention((0,), 16, context_features=width)
     objective = DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
                                   specials=SPECIALS, context_encoder=tower)
@@ -506,6 +514,7 @@ def test_a_clip_context_encoder_trains_serves_and_counts_each_rows_context_alone
     assert set(task("one two three", QUESTION, context="a first note")) == {"pick"}
 
 
+@attending("xla")
 def test_a_configured_context_encoders_bundle_carries_it_and_its_trained_weights():
     """A task whose context a configured encoder reads is a bundle a run starts from
     (`PretrainedDecision.of`) carrying the encoder bound to its trained weights, so the task it declares
@@ -515,7 +524,7 @@ def test_a_configured_context_encoders_bundle_carries_it_and_its_trained_weights
     from dew.decision.sources import PretrainedDecision
 
     directory = LLAMA.parent / "qwen38-dense-tiny"
-    source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
+    source = Pretrained.load(directory, dtype="float32")
     tokenizer = HFTokenizer(str(directory), local_files_only=True)
     layout = SegmentLayout.joint_row(max_len=1024)
     blocks = CrossAttention((0,), 12, context_features=16)
@@ -542,6 +551,7 @@ def test_a_configured_context_encoders_bundle_carries_it_and_its_trained_weights
             np.testing.assert_array_equal(np.asarray(got), np.asarray(want) / 2)
 
 
+@attending("reference")
 def test_a_configured_context_encoder_beside_a_schema_read_in_context_is_refused():
     """A layout that reads its schema as the row's context has the backbone's own pass encode it, the
     example's context after it in the backbone's tokens, so a configured encoder would read nothing: the
@@ -549,7 +559,7 @@ def test_a_configured_context_encoder_beside_a_schema_read_in_context_is_refused
     backbone to read (theme 22's head review)."""
     from test_decision_schema_stream import LAYOUT as IN_CONTEXT
 
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     blocks = CrossAttention((0,), 64, context_features=16)
     with pytest.raises(ValueError):
         DecisionObjective(source.with_cross_attention(blocks, key=0), tokenizer=ByteTokenizer(),
@@ -573,6 +583,7 @@ def test_a_configured_encoder_reads_each_packed_rows_context_alone():
     np.testing.assert_array_equal(states, [[3, 7, 5, 11, 18, 0], [8, 9, 10, 0, 0, 0]])
 
 
+@attending("reference")
 def test_the_context_layers_work_is_counted_in_a_conditioned_batch():
     """The objective's training work for a batch whose rows carry a context is the frozen backbone's,
     three passes of its cross-attention blocks over each row's real context tokens
@@ -597,6 +608,7 @@ def test_the_context_layers_work_is_counted_in_a_conditioned_batch():
     assert objective.training_flops(None, plain) == frozen + 3 * head
 
 
+@attending("reference")
 def test_a_batch_answers_each_request_from_its_own_context():
     """With the gates open, a request's answer reads its context: another context, or none, answers it
     otherwise. A call over requests lays each out with its own context (`Decide.rows`, which it
@@ -654,6 +666,7 @@ def test_a_batch_answers_each_request_from_its_own_context():
                     "batched answers with their contexts", seeds=CONTEXT_SEEDS, truth_fn=truth)
 
 
+@attending("xla")
 def test_a_request_with_images_reads_its_context_beside_them():
     """Over a backbone that reads images (a `MultimodalTransformer`), the blocks attach to its language
     model. With their gates shut a request with images and a context is answered as with its images
@@ -663,7 +676,7 @@ def test_a_request_with_images_reads_its_context_beside_them():
     from dew.data.text import HFTokenizer
 
     directory = LLAMA.parent / "qwen38-dense-tiny"
-    source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
+    source = Pretrained.load(directory, dtype="float32")
     tokenizer = HFTokenizer(str(directory), local_files_only=True)
     layout = SegmentLayout.joint_row(max_len=1024)
     objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 32), key=0),
@@ -696,6 +709,7 @@ def test_a_request_with_images_reads_its_context_beside_them():
         reading("one two three", QUESTION, images=images, context="a long note " * 20)
 
 
+@attending("xla")
 def test_a_context_reading_tasks_bundle_carries_its_cross_attention_and_refuses_to_export(tmp_path):
     """A task whose backbone reads its decision context through cross-attention is a bundle a run starts
     from (`PretrainedDecision.of`), its backbone its source family's carrying the cross-attention, so the
@@ -707,7 +721,7 @@ def test_a_context_reading_tasks_bundle_carries_its_cross_attention_and_refuses_
     from dew.decision.sources import PretrainedDecision
 
     directory = LLAMA.parent / "qwen38-dense-tiny"
-    source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
+    source = Pretrained.load(directory, dtype="float32")
     tokenizer = HFTokenizer(str(directory), local_files_only=True)
     layout = SegmentLayout.joint_row(max_len=1024)
     objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 32), key=0),
@@ -725,6 +739,7 @@ def test_a_context_reading_tasks_bundle_carries_its_cross_attention_and_refuses_
     assert not (tmp_path / "saved" / "config.json").exists()
 
 
+@attending("reference")
 def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
     """With `context_encoder="backbone"` the cross-attention reads the backbone's final states over the
     context, its own pass (`encode_context`): the decision states are the backbone's over the row with
@@ -763,6 +778,7 @@ def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
     assert DecisionObjective(tasks[1]).model.context_encoder == "backbone"
 
 
+@attending("reference")
 def test_a_context_past_its_cross_attentions_room_is_cut_and_its_caller_told():
     """A context of more tokens than the cross-attention reads keeps its first ones, as a context beside a
     schema does (one policy, `with_context`): a task answers from them, a served answer states the
@@ -797,11 +813,12 @@ def test_a_context_past_its_cross_attentions_room_is_cut_and_its_caller_told():
     assert isinstance(fitted, dict) and fitted["_dew_cut"] == {"context": (1, 2)}
 
 
+@attending("reference")
 def test_a_backbone_without_cross_attention_refuses_a_requests_context():
     """A task over a backbone with no cross-attention refuses a request that brings a context, by a call
     and over the wire (its own refusal, ValueError), rather than answering it without the context; the
     same request without one is answered (docs/design/training.md, context)."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    source = Pretrained.load(LLAMA, dtype="float32")
     objective = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
     task = Decide(objective.model, objective.init(jax.random.key(0)), objective.layout, objective.tokenizer,
                   objective.specials)
@@ -814,6 +831,7 @@ def test_a_backbone_without_cross_attention_refuses_a_requests_context():
     assert isinstance(refused, ValueError) and not isinstance(answered, Exception)
 
 
+@attending("reference")
 def test_the_batched_engine_reads_a_requests_context():
     """The batched engine (`WireScoring`) reads a request's context, as `Decide` does: each answer's
     probabilities those of the task's own call with that context, to the bit, the one program; under
@@ -834,6 +852,7 @@ def test_the_batched_engine_reads_a_requests_context():
     assert task._read_wire(bodies[0], strict=True)[3] is None
 
 
+@attending("reference")
 def test_a_configured_context_encoder_is_frozen_unless_trained_and_counted_as_it_runs():
     """A configured context encoder's weights are held frozen (`FROZEN`) and run forward alone, as a
     diffusion run's text towers do: a step leaves them as drawn; trained (`context_trained=True`) they are
@@ -912,16 +931,16 @@ def test_a_run_from_a_saved_run_holds_its_configured_encoders_weights_frozen_or_
     text = TextCondition(encoder="clip_text", checkpoint=str(TINY))
     first = dataclasses.replace(decision(tmp_path, drawn=False), context_layers=(0,), context_length=32,
                                 context_text=text, context_text_trained=True, calibrate=False,
-                                optim=OptimConfig(learning_rate=1e-2))
+                                optim=OptimConfig(lr=1e-2))
     # Two steps: the cross-attention's gate opens from zero on the first, so the second reaches the encoder.
-    state, _ = trained(first, tmp_path, "first", trainer={"horizon": Horizon(steps=2),
+    state, _ = trained(first, tmp_path, "first", trainer={"steps": 2,
                                                           "checkpoint_final": True})
     held = jax.tree.leaves(state.variables["params"]["context"])
     checkpoint = jax.tree.leaves(text.build(dtype="float32").encoder.params)
     assert any(np.any(np.asarray(one) != np.asarray(two)) for one, two in zip(held, checkpoint, strict=True))
     start = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(tmp_path / "runs" / "first"),
                                 source=SourceOptions(step="latest"), calibrate=False,
-                                optim=OptimConfig(learning_rate=0.0))
+                                optim=OptimConfig(lr=0.0))
     for trains in (False, True):
         second, _ = trained(dataclasses.replace(start, context_text_trained=trains), tmp_path,
                             f"second-{trains}")
@@ -973,7 +992,7 @@ def test_a_configured_encoder_is_placed_by_its_own_axes_frozen_or_trained(tmp_pa
                                   context_text=text, context_text_trained=trains, calibrate=False)
         objective = run.prepare().objective
         trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), mesh=LAYOUT,
-                          layout=Placement(min_shard=MIN_SHARD), tracker=None)
+                          advanced=TrainerAdvanced(layout=Placement(min_shard=MIN_SHARD)), tracker=None)
         trainer.device_mesh = LAYOUT.build(jax.devices()[:8])
         placed = trainer.shardings(jax.eval_shape(trainer.initial_state)).variables
         held = placed["params" if trains else FROZEN]["context"]

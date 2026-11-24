@@ -24,7 +24,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from interop_support import fetch
-from model_support import encoded_form
+from model_support import attending, encoded_form
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights, save_hf_layout, stored_dtypes
@@ -451,6 +451,7 @@ def v4_release_storage(
     return stored, names
 
 
+@attending("reference")
 @pytest.mark.parametrize("experts, scale_dtype", [("fp4", "float8_e8m0fnu"), ("fp8", "float32")],
                          ids=["v4-flash", "v4-flash-base"])
 def test_a_v4_checkpoint_in_the_release_storage_loads_and_saves_in_it(tmp_path, experts, scale_dtype):
@@ -462,8 +463,8 @@ def test_a_v4_checkpoint_in_the_release_storage_loads_and_saves_in_it(tmp_path, 
     weights that decode to the source's values."""
     stored, names = v4_release_storage(tmp_path, experts, scale_dtype)
 
-    loaded = Pretrained.load(tmp_path / "quantized", dtype="float32", attention_impl="reference")
-    dense = Pretrained.load(tmp_path / "dense", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path / "quantized", dtype="float32")
+    dense = Pretrained.load(tmp_path / "dense", dtype="float32")
     loaded.save(tmp_path / "export")
 
     assert set(loaded.quantized_tensors) == set(names)
@@ -643,6 +644,7 @@ def integer_checkpoint(directory: Path, method: str, integer) -> dict[str, np.nd
     return stored
 
 
+@attending("reference")
 @pytest.mark.parametrize("method", ["awq", "gptq"])
 def test_an_integer_checkpoint_saves_back_its_own_bytes_and_refuses_a_value_off_its_grid(
         tmp_path, method, integer):
@@ -651,7 +653,7 @@ def test_an_integer_checkpoint_saves_back_its_own_bytes_and_refuses_a_value_off_
     trained value its source grid cannot hold is refused: AutoAWQ's packing
     would spill it into the neighbouring codes and gptqmodel's would clamp it."""
     stored = integer_checkpoint(tmp_path / "source", method, integer)
-    loaded = Pretrained.load(tmp_path / "source", dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(tmp_path / "source", dtype="float32")
     loaded.save(tmp_path / "export")
     written = read_weights(tmp_path / "export")
     assert set(written) == set(stored)

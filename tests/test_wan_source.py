@@ -45,6 +45,7 @@ from interop_support import (
     source_transformer,
     torch_arms,
 )
+from model_support import attending
 from recorded_runs import assert_arms_as_recorded
 from reference_error import as_given, assert_as_exact
 
@@ -72,6 +73,7 @@ def load(source, name):
     return source_transformer(source, name, WanTransformer, wan_fields, wan_path)
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", CASES)
 def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     _, params, layouts = load(source, name)
@@ -117,7 +119,7 @@ def flowing(name: str, *, gradients: bool):
     tensors = sorted((layout.name.removeprefix("transformer/"), layout) for layout in layouts)
 
     def dew(dtype, inputs) -> dict:
-        model = WanTransformer(**wan_fields(config, dtype=jnp.dtype(dtype).name, attention_impl="xla"))
+        model = WanTransformer(**wan_fields(config, dtype=jnp.dtype(dtype).name))
         held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype if dtype == jnp.float64 else leaf.dtype),
                             params)
         times = jnp.asarray(inputs["times"], jnp.float64 if dtype == jnp.float64 else jnp.float32)
@@ -151,6 +153,7 @@ def pipeline_arms(arms: str):
             flowing(name, gradients=not half), ("output",) if half else ("output", "gradients"))
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", CASES)
 def test_the_flow_and_its_gradients_are_as_exact_as_the_source(name):
     """The flow, and the gradients of `sum(flow * probe)` with respect to the latents, the prompt states and
@@ -159,6 +162,7 @@ def test_the_flow_and_its_gradients_are_as_exact_as_the_source(name):
     assert_arms_as_recorded(pipeline_arms(name), f"wan-{name}", WAN_SEEDS[name], f"{name} flow and gradients")
 
 
+@attending("xla")
 @pytest.mark.parametrize("name", CASES)
 def test_a_bfloat16_flow_is_as_exact_as_the_bfloat16_source(name):
     """In bfloat16, Dew's flow on par with the source's own bfloat16 run, whose time embedder stays in
@@ -177,20 +181,22 @@ def walk(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def pipeline(walk):
     from dew.interop.pretrained import Pretrained
 
-    return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32")
 
 
 @pytest.fixture(scope="module")
+@attending("xla")
 def streamed(walk):
     """The pipeline loaded onto a mesh, its weights streamed as recipes and
     placed a leaf at a time (tests/test_pipeline_streaming.py)."""
     from dew.interop.pretrained import Pretrained
     from dew.training import MeshSpec
 
-    return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla", mesh=MeshSpec())
+    return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", mesh=MeshSpec())
 
 
 @pytest.fixture(scope="module")
@@ -303,6 +309,7 @@ def assert_walked_as_the_source(walked, sources, record, label: str) -> None:
     assert_as_exact(walked, reference, walk_draw(record), label, seeds=SEEDS, truth_fn=truth)
 
 
+@attending("xla")
 def test_prompt_encoding_matches_the_source_pipeline(pipeline, walk, sources):
     """The conditioner reads what `encode_prompt` reads: the prompt cleaned (its curly quotes, the entities
     ftfy leaves beside a `<` for the source's two unescapes, its runs of whitespace), the UMT5 states of its
@@ -330,6 +337,7 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, walk, sources):
     assert_as_exact(encoded, reference, draw, "Wan prompt encoding", seeds=SEEDS, truth_fn=truth)
 
 
+@attending("xla")
 @pytest.mark.parametrize("load", ["pipeline", "streamed"])
 def test_pipeline_walk_matches_the_source(load, walk, sources, request):
     """`Pretrained.load().text_to_image()` samples a clip with the source's own policy, 50 steps guided at
@@ -347,6 +355,7 @@ def test_pipeline_walk_matches_the_source(load, walk, sources, request):
     assert_walked_as_the_source(dew_walked(task, prepare), sources, record, f"{load} Wan walk")
 
 
+@attending("xla")
 def test_a_text_free_walk_from_the_sources_own_encodings_matches_the_source(walk, sources):
     """A pipeline loaded without its text encoder (`load_diffusion_source(text=False)`) samples from encoded
     conditions alone: handed the UMT5 states the source's own `encode_prompt` writes for each prompt and for
@@ -357,7 +366,7 @@ def test_a_text_free_walk_from_the_sources_own_encodings_matches_the_source(walk
     from dew.interop.pretrained import load_diffusion_source
 
     _, record, _ = walk
-    source = load_diffusion_source(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla",
+    source = load_diffusion_source(str(walk[0] / "pipeline"), dtype="float32",
                                    text=False)
     assert "conditioning" not in source.variables.get("encoders", {})
     task = source.text_to_image()
@@ -385,6 +394,7 @@ class Replay(nn.Module):
         return self.outputs[jnp.argmin(jnp.abs(jnp.asarray(self.timesteps) - time[0]))]
 
 
+@attending("xla")
 @pytest.mark.parametrize("steps", [10, 50])
 def test_the_scheduler_steps_as_the_source_on_the_same_model_outputs(pipeline, walk, sources, steps):
     """The grid and solver `text_to_image()` walks, stepped on drawn model outputs as the source's own UniPC
@@ -436,6 +446,7 @@ def clip_batch(objective, prompts):
             **objective.inputs.tokenize([prompts[row % len(prompts)] for row in range(rows)])}
 
 
+@attending("xla")
 def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
     """A denoising step over the whole source: the VAE encodes the clip, UMT5
     the prompt, and the transformer takes the gradient. The text encoder and
@@ -450,7 +461,7 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
 
     export = tmp_path / "export"
     pipeline.save(export, variables=state.variables)
-    reloaded = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
+    reloaded = Pretrained.load(str(export), dtype="float32")
     assert reloaded.inputs.sample.shape == pipeline.inputs.sample.shape
     jax.tree.map(np.testing.assert_array_equal, reloaded.variables, state.variables)
 
@@ -481,6 +492,7 @@ def test_a_trained_wan_step_exports_and_reloads(pipeline, walk, tmp_path):
                              "trained Wan")
 
 
+@attending("xla")
 def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, walk, sources):
     """An adapter binds the transformer's self- and cross-attention projections,
     never UMT5's; with B at zero it follows the source within its float64 rule, and

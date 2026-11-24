@@ -21,6 +21,7 @@ import numpy as np
 import optax
 import pytest
 from float64_terms import float32_values, float64_forward
+from model_support import attending
 from multimodal_families import (
     DRAWN,
     FAMILIES,
@@ -55,14 +56,15 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import ModelConfig
 from dew.sampling.text import Sampling
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, TrainerAdvanced
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3-native-tiny"
 
 
 @pytest.fixture(scope="module")
+@attending("reference")
 def source():
-    loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURE, dtype="float32")
     images = np.load(FIXTURE / "raw_images.npy")
     prompts = json.loads((FIXTURE / "prompts.json").read_text())
     assert loaded.processor is not None
@@ -70,6 +72,7 @@ def source():
     return loaded, inputs
 
 
+@attending("reference")
 def test_public_processor_and_native_forward_match_conditional_model(source):
     """The public processor encodes the reference's ids and the native forward picks the reference's argmax
     at every valid slot; its logits' numerics are the drawn site's (`multimodal-gemma3`,
@@ -109,6 +112,7 @@ def test_public_processor_and_native_forward_match_conditional_model(source):
                  truth_fn=lambda pixels: forward(exact, widened(loaded.variables), pixels))
 
 
+@attending("reference")
 def test_objective_pixel_gradient_matches_reference(source):
     """The objective's pixel gradient crosses the image encoder, projection, decoder and shifted loss, and a
     padded image slot takes none of it, to the bit. Its loss and gradient's numerics are the drawn site's,
@@ -129,6 +133,7 @@ def test_objective_pixel_gradient_matches_reference(source):
     np.testing.assert_array_equal(gradient[0, 1], jnp.zeros_like(gradient[0, 1]))
 
 
+@attending("reference")
 def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path):
     """One real Trainer update is the all-parameter SGD step the drawn site holds to the reference's
     (`multimodal-gemma3`): its logits after the step on par with the step's own (`_stepped`, `_trained`)
@@ -143,7 +148,7 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
         train=lambda partition: iter([{"text": training_inputs}]), val=None, records=rows, batch=rows
     )
     trainer = Trainer(objective, optax.sgd(LEARNING_RATE), key=jax.random.key(3),
-                      mesh=MeshSpec(), layout=Layout(min_shard=2**30))
+                      mesh=MeshSpec(), advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)))
     state = trainer.fit(data, steps=1, log_every=1)
     output = loaded.model.apply(state.variables, inputs.tokens, **inputs.kwargs())
     valid = np.asarray(inputs.token_fields["attention_mask"])
@@ -152,7 +157,7 @@ def test_trainer_update_exports_and_reloads_the_complete_model(source, tmp_path)
     untrained = loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
     assert not np.array_equal(np.asarray(output)[valid], np.asarray(untrained)[valid])
     loaded.save(tmp_path, variables=state.variables)
-    reloaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    reloaded = Pretrained.load(tmp_path, dtype="float32")
     for actual, wanted in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(state.variables),
                               strict=True):
         np.testing.assert_array_equal(actual, wanted)
@@ -214,6 +219,7 @@ def assert_trainer_takes_the_plain_step(loaded, inputs, trainer, fitted) -> None
                     seeds=TRAINER_STEP_SEEDS, truth_fn=plain(exact, widened(loaded.variables)))
 
 
+@attending("reference")
 def test_model_inputs_alignment_preserves_media_identity(source):
     _loaded, inputs = source
     padding = (~inputs.token_fields["attention_mask"]).sum(axis=1)
@@ -231,12 +237,13 @@ def test_model_inputs_alignment_preserves_media_identity(source):
 
 
 @pytest.fixture(scope='module')
+@attending("reference")
 def gemma4_video_batch():
     from transformers import AutoProcessor
     from transformers.video_utils import VideoMetadata
 
     loaded = Pretrained.load(
-        FIXTURE.parent / "gemma4-native-tiny", dtype="float32", attention_impl="reference"
+        FIXTURE.parent / "gemma4-native-tiny", dtype="float32"
     )
     native = loaded.processor
     if native is None:
@@ -272,6 +279,7 @@ def gemma4_video_batch():
     return loaded, values
 
 
+@attending("reference")
 def test_gemma4_processor_interleaves_independent_image_and_video_streams(gemma4_video_batch):
     import torch
     from transformers.models.gemma4.modeling_gemma4 import get_block_sequence_ids_for_mask
@@ -289,6 +297,7 @@ def test_gemma4_processor_interleaves_independent_image_and_video_streams(gemma4
     np.testing.assert_array_equal(inputs.token_fields['image_groups'], groups)
 
 
+@attending("reference")
 @pytest.mark.parametrize('grouped', [False, True], ids=['causal_without_mmtypes', 'vision_groups'])
 def test_gemma4_mixed_video_forward_matches_unmodified_reference(gemma4_video_batch, grouped):
     import torch
@@ -313,6 +322,7 @@ def test_gemma4_mixed_video_forward_matches_unmodified_reference(gemma4_video_ba
     np.testing.assert_allclose(np.asarray(actual)[valid], expected[valid], atol=1e-4, rtol=0)
 
 
+@attending("reference")
 def test_public_cached_generation_preserves_image_conditioning(source):
     """Greedy continuation matches HF; changing pixels changes raw likelihoods."""
     loaded, inputs = source
@@ -329,10 +339,11 @@ def test_public_cached_generation_preserves_image_conditioning(source):
 
 
 
+@attending("reference")
 def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_path):
     """The exported HF buffers stay bitwise unchanged while AdamW updates weights."""
     directory = FIXTURE.parent / "gemma4-tiny-mm"
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     patches = np.load(directory / "pixels.npy")
     batch, count, _ = patches.shape
     side = int(count ** 0.5)
@@ -349,7 +360,7 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
                             ema_decay=None, pad_id=0)
     data = Loader(train=lambda partition: iter([{"text": repeated}]), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-3, weight_decay=0.1), key=jax.random.key(12),
-                      mesh=MeshSpec(), layout=Layout(min_shard=2**30))
+                      mesh=MeshSpec(), advanced=TrainerAdvanced(layout=Layout(min_shard=2**30)))
     state = trainer.fit(data, steps=1, log_every=1)
     loaded.save(tmp_path, variables=state.variables)
     before = load_file(str(directory / "model.safetensors"))
@@ -439,7 +450,7 @@ def _family(family: str):
     references, checkpoint = FAMILIES[family]
     directory = FIXTURE.parent / references
     source = FIXTURE.parent / checkpoint
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(source, dtype="float32")
     images = np.load(directory / "raw_images.npy")
     waveforms = sorted(source.glob("waveform_*.npy"))
     assert loaded.processor is not None
@@ -450,16 +461,19 @@ def _family(family: str):
 
 
 @pytest.fixture(scope="module", params=sorted(FAMILIES))
+@attending("reference")
 def family_source(request):
     return request.param, *_family(request.param)
 
 
 @pytest.fixture(scope="module", params=sorted(set(FAMILIES) - DRAWN))
+@attending("reference")
 def source_draw(request):
     """A family whose numerics are held on its source draw (multimodal_families.DRAWN's others)."""
     return request.param, *_family(request.param)
 
 
+@attending("reference")
 def test_training_reaches_the_gemma3n_vision_drop_path():
     """`train` reaches Gemma 3n's MobileNet through the wrapper: with a
     drop-path rate the training forward depends on the dropout key, without
@@ -490,7 +504,7 @@ def _audio(name: str):
     fixture's prompts and waveforms, and its reference."""
     pytest.importorskip("torchvision", reason="the vision extra supplies the actual Gemma processors")
     directory = FIXTURE.parent / name
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(directory, dtype="float32")
     meta = json.loads((directory / "meta.json").read_text())
     assert loaded.processor is not None
     inputs = loaded.processor(
@@ -500,10 +514,12 @@ def _audio(name: str):
 
 
 @pytest.fixture(scope="module", params=["gemma-3n-audio-tiny", "gemma-4-audio-tiny"])
+@attending("reference")
 def audio_source(request):
     return _audio(request.param)
 
 
+@attending("reference")
 def test_audio_only_processor_forward_and_greedy_continuation_match_reference(audio_source):
     """Waveforms through the actual Gemma processors and native audio towers.
 
@@ -522,6 +538,7 @@ def test_audio_only_processor_forward_and_greedy_continuation_match_reference(au
     np.testing.assert_array_equal(generated.tokens[:, -3:], reference["generated"][:, -3:])
 
 
+@attending("reference")
 def test_a_gemma4_audio_models_prediction_depths_read_its_audio_frames():
     """A Gemma 4 audio model with a prediction depth initializes and trains with its audio, and the
     depth reads the embeddings the main forward read, its audio frames in place: its states are
@@ -547,10 +564,11 @@ def test_a_gemma4_audio_models_prediction_depths_read_its_audio_frames():
     assert np.isfinite(float(objective.reduce_loss(statistics)[0]))
 
 
+@attending("reference")
 def test_a_cached_continuation_reads_the_coordinates_its_prefill_was_placed_at():
     """A cached prefill whose tokens' places come as coordinates alone leaves the decode cursor
     where raw positions leave it: an implicit continuation step after it is the same, bitwise."""
-    loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(FIXTURE, dtype="float32")
     model, variables = loaded.model, loaded.variables
     tokens = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))[:1, -6:]
     positions = jnp.arange(6)[None] + 10
@@ -566,6 +584,7 @@ def test_a_cached_continuation_reads_the_coordinates_its_prefill_was_placed_at()
                                   np.asarray(continued(positions=positions[:, :4])))
 
 
+@attending("reference")
 def test_source_processor_and_cached_generation_match_reference(family_source):
     """Actual processors to native models: Gemma4's padded patches with active
     clipping and its video placeholder decode rule, Qwen3.5's packed
@@ -579,6 +598,7 @@ def test_source_processor_and_cached_generation_match_reference(family_source):
     np.testing.assert_array_equal(generated.tokens[:, -3:], np.load(directory / "continuation.npy"))
 
 
+@attending("reference")
 def test_source_forward_matches_reference(source_draw):
     """The valid logits are as exact as the reference's (`assert_as_exact_as_the_reference`), the truth
     its float64 twin's; each family's characteristic slip fails the same rule."""
@@ -623,6 +643,7 @@ def _trained(variables, gradient):
     return {**variables, "params": optax.apply_updates(params, updates)}
 
 
+@attending("reference")
 def test_source_backward_matches_reference(source_draw):
     """Loss, pixel gradient and all-parameter SGD against the reference backward.
 
@@ -666,6 +687,7 @@ def test_source_backward_matches_reference(source_draw):
                                          f"{family} post-SGD logits of a slip", terms=terms(slip))
 
 
+@attending("reference")
 def test_source_trained_export_and_frozen_buffers_match_reference(family_source, tmp_path):
     """The model trained one SGD step exports under the source's tensor names and reloads to the logits
     the trained model computes, and every non-parameter collection (Gemma4's standardization and clipping
@@ -677,7 +699,7 @@ def test_source_trained_export_and_frozen_buffers_match_reference(family_source,
     forward = jax.jit(lambda model, variables: model.apply(variables, inputs.tokens, **inputs.kwargs()),
                       static_argnums=0)
     loaded.save(tmp_path / "trained", variables=stepped)
-    restored = Pretrained.load(tmp_path / "trained", dtype="float32", attention_impl="reference")
+    restored = Pretrained.load(tmp_path / "trained", dtype="float32")
     np.testing.assert_array_equal(np.asarray(forward(restored.model, restored.variables)),
                                   np.asarray(forward(loaded.model, stepped)))
     for collection, tree in restored.variables.items():
@@ -786,6 +808,7 @@ def text_recording(family: str) -> Path:
     return FIXTURE.parent / FAMILIES[family][0] / "recording-text.npz"
 
 
+@attending("reference")
 @pytest.mark.parametrize("family", sorted(DRAWN))
 def test_a_drawn_site_is_on_par_with_its_reference(family):
     """A drawn site's leaves, on par with the reference's (check 1), the truth the reference's float64 twin
@@ -794,6 +817,7 @@ def test_a_drawn_site_is_on_par_with_its_reference(family):
     assert_arms_as_recorded(pipeline_arms(family), f"multimodal-{family}", SEEDS[family], family)
 
 
+@attending("reference")
 @pytest.mark.parametrize("slipped", ["inputs", "gradient"])
 @pytest.mark.parametrize("family", sorted(DRAWN))
 def test_a_drawn_sites_slip_fails_its_check(family, slipped):
@@ -824,6 +848,7 @@ def text_truths(family: str, *, slipped: str | None = None) -> None:
     assert_truths_as_recorded(read_recording(text_recording(family)), f"multimodal-{family}-text", truth)
 
 
+@attending("reference")
 @pytest.mark.parametrize("family", sorted(TEXT_DRAWN))
 def test_a_text_sites_float64_step_is_its_references(family):
     """A text site's leaves (`TEXT_OUTPUTS`: the valid logits, the summed next-token loss and the logits after
@@ -834,6 +859,7 @@ def test_a_text_sites_float64_step_is_its_references(family):
     text_truths(family)
 
 
+@attending("reference")
 @pytest.mark.parametrize("slipped", ["inputs", "gradient"])
 @pytest.mark.parametrize("family", sorted(TEXT_DRAWN))
 def test_a_text_sites_slip_is_another_function(family, slipped):
@@ -857,6 +883,7 @@ def _float32_values_in_float64(loaded, inputs) -> int:
         return float32_values(jax.make_jaxpr(jax.grad(summed))(variables["params"]).jaxpr)
 
 
+@attending("reference")
 def test_a_float64_wrapper_computes_in_float64_throughout(family_source):
     """A family's wrapper built in float64 differentiates its logits in every parameter, through its
     towers, with no float32 value (`float32_values`): their statistics, softmaxes, sinusoids and position
@@ -866,6 +893,7 @@ def test_a_float64_wrapper_computes_in_float64_throughout(family_source):
     assert _float32_values_in_float64(loaded, inputs) == 0
 
 
+@attending("reference")
 def test_a_float64_gemma4_audio_tower_computes_in_float64_throughout():
     """Gemma 4's audio tower built in float64 attends, forward and backward, with no float32 value: its
     projections and relative positions, float32 in a narrower model, read `at_least_fp32` (ledger 3332)."""

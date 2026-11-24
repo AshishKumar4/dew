@@ -250,7 +250,7 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     sampled = samples(task.sampling, label)
     decoder, variables, vocab = task.model, task.variables, task.model.vocab_size
     held_model, held_variables = (decoder, variables) if truth is None else truth
-    wide = held_model.clone(dtype=jnp.float64, attention_impl="reference")
+    wide = held_model.clone(dtype=jnp.float64)
     width = max(request.length for request in requests)
 
     # One server for every draw, as a deployment serves request after request: its programs compile
@@ -321,7 +321,7 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
 def assert_served_through_its_cache_as_exact(task: TextGeneration, requests: Sequence[Served], label: str, *,
                                              serving: dict, budget: int, seeds: int,
                                              hits: Sequence[int] | None = None) -> None:
-    """Check 1 of a server over a quantized cache (`serving`'s `kv_cache`, `KVCache.quantized`; ledger 5681):
+    """Check 1 of a server over a quantized cache (`serving`'s `cache`, its `quantized`; ledger 5681):
     `requests` of a drawn row (`served_row`), served one a round, score their own draws'
     raw log probabilities on par with the decoder's own cached decode of each prompt and its draws through
     a cache of the same format. Each arm gives the values its cache rounded and the codes and scales it
@@ -330,10 +330,10 @@ def assert_served_through_its_cache_as_exact(task: TextGeneration, requests: Seq
     code's boundary decides it either way, so no truth that rounds for itself holds every arm
     (docs/design/testing.md, a quantized computation's truth). Each request is served in a round of its
     own, so the roundings a round reports are its own row's (`Written.row`). Where `hits` is given (a prefix
-    cache's: `serving`'s `prefix_cache`), each round reads that many prompt tokens from the pages earlier
-    rounds left, and a request's slots before its own writes hold the codes those rounds wrote
+    cache's: `serving`'s `cache.prefix_cache`), each round reads that many prompt tokens from the pages
+    earlier rounds left, and a request's slots before its own writes hold the codes those rounds wrote
     (`cache_roundings.held`). `seeds` is the site's declared count, sized paired by `seeds_for` on armada."""
-    quantized = serving["kv_cache"].quantized
+    quantized = serving["cache"].layout.quantized
     decoder, variables, vocab = task.model, task.variables, task.model.vocab_size
     width = max(request.length for request in requests)
 
@@ -406,7 +406,7 @@ def assert_served_through_its_cache_as_exact(task: TextGeneration, requests: Seq
             decisions.update(named(str(index), decided))
         return Rounded({"scores": tuple(scores), **rounded}, decisions)
 
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference").with_kv_cache(
+    wide = decoder.clone(dtype=jnp.float64).with_kv_cache(
         KVCache(quantized=quantized))
 
     @jax.jit

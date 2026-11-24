@@ -27,6 +27,7 @@ import pytest
 from arm_forms import dew_path
 from flax import linen as nn
 from flax.traverse_util import unflatten_dict
+from model_support import attending
 from reference_error import as_given, assert_as_exact, widened
 from test_model_flops import forward_products
 
@@ -39,7 +40,7 @@ from dew.objectives.base import EMASpec, Step, head_tile_of
 from dew.objectives.distillation import PROJECTIONS, TEACHER
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance, RoutedStatistics
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainerAdvanced
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "distillation"
 META = json.loads((FIXTURES / "meta.json").read_text())
@@ -491,7 +492,7 @@ def fixed(batch):
 def make_trainer(arrays, tmp_path=None):
     objective, _ = fixture_objective(arrays)
     return Trainer(objective, optax.adam(3e-3), key=jax.random.key(0), mesh=MeshSpec(),
-                   layout=Layout(min_shard=TINY_SHARD),
+                   advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)),
                    checkpoints=None if tmp_path is None else Checkpoints(str(tmp_path / "distill")))
 
 
@@ -942,6 +943,7 @@ def test_a_full_kl_where_diloco_holds_its_axis_manual_scores_each_groups_own_tok
     assert not gathered & {(rows // 2, positions, width), (rows // 2 * positions, width)}, gathered
 
 
+@attending("xla")
 def test_a_full_kl_distillation_of_an_adapted_student_plans_on_no_head_tile(monkeypatch):
     """A full-KL distillation whose student adapts in context (`ChunkAdaptation`, which scores through more
     than its head, `predicts_by_head`), fit on devices with room for no step, walks its whole ladder without
@@ -956,7 +958,8 @@ def test_a_full_kl_distillation_of_an_adapted_student_plans_on_no_head_tile(monk
     student = LMObjective(decoder(), LENGTH, ema_decay=None, adaptation=ChunkAdaptation(window=1, rate=0.5))
     teacher = LMObjective(decoder(continuum=None), LENGTH, ema_decay=None)
     trainer = Trainer(DistillationObjective(student, teacher), optax.sgd(0.1), key=jax.random.key(0),
-                      mesh=MeshSpec().build(jax.devices()[:1]), layout=Layout(min_shard=1, tolerance=1.0))
+                      mesh=MeshSpec().build(jax.devices()[:1]),
+                      advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
     batch = {TEXT_KEY: jax.random.randint(jax.random.key(1), (2, LENGTH + 1), 1, VOCAB)}
     free(monkeypatch, 1)
     with pytest.raises(PlanRefused) as refused:

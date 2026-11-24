@@ -154,7 +154,7 @@ def run(out: Path, assets: Path, drones: int = ENVIRONMENTS, setting: Setting = 
         rollout=RolloutConfig("dreamer", {"batch": WINDOWS, "length": phase.length,
                                           "train_ratio": TRAIN_RATIO, "capacity": setting.replay // drones,
                                           "prefill": phase.length}),
-        optim=OptimConfig(optimizer=LaProp(), learning_rate=Linear(peak_value=phase.learning_rate,
+        optim=OptimConfig(optimizer=LaProp(), schedule=Linear(peak_value=phase.learning_rate,
                                                                    warmup_steps=1000,
                                                                    end_value=phase.learning_rate)),
         trainer=TrainerConfig(checkpoint_dir=str(out), log_every=500, eval_every=None, checkpoint_every=None,
@@ -282,7 +282,7 @@ def trained(out: Path, assets: Path, steps: int, every: int, setting: Setting = 
         if reached is None:
             break
         prepared = dataclasses.replace(prepared,
-                                       run=prepared.run.override({"trainer.horizon.steps": reached}))
+                                       run=prepared.run.override({"trainer.steps": reached}))
         state = prepared.train("base")
         done, taken = int(state.step), rollout.environment_steps
         if done in scored_at:

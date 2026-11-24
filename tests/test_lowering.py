@@ -38,6 +38,7 @@ from dew.nn.kernels.generation import (
 from dew.nn.kernels.lowered import custom_calls, triton_kernels
 from dew.nn.kernels.selection import Refusal
 from dew.telemetry import instrumentation
+from dew.training import TrainerAdvanced
 from dew.training._lowering import KernelReport, kernel_report
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,7 +108,7 @@ gradients of 256 rows by 128 by 128."""
 def _reported(generation: str, layers: int = 1, *, scanned: bool = False):
     """A grouped GEMM's forward and backward, `layers` times over one shape (as a model's same-shape layers
     each call it, its kernels lowered once, `tuning.lowered_once`), unrolled or under a scan (`scanned`, as
-    `scan_layers=True` runs a stack of like layers), beside a Triton kernel, lowered on this CPU for
+    a decoder runs a stack of like layers), beside a Triton kernel, lowered on this CPU for
     `generation`'s GPU, with the routes its dispatches reported (`routes`)."""
     from dew.nn.kernels import gemm
 
@@ -139,6 +140,7 @@ def templated_calls(record) -> dict[str, int]:
     return {entry["name"]: entry["calls"] for entry in record["launches"] if entry["kind"] == "mosaic_gpu"}
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("stacked", ["one", "unrolled", "scanned"])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_as_it_does(generation,
@@ -386,7 +388,7 @@ def _step_lowered(generation: str):
     """A bf16 Qwen 3.5 hybrid's language-model training step (tests/fixtures/hf/qwen35-tiny: three gated
     delta net layers and one attention layer, its delta nets' heads 32 wide, a power of two as a real
     model's and the short conv's kernels take), lowered for `generation` from abstract state as
-    tools/kernel_picks.py lowers one (`Trainer(lower_for=...)`): the `Lowered` its dry run raises."""
+    tools/kernel_picks.py lowers one (`TrainerAdvanced(lower_for=...)`): the `Lowered` its dry run raises."""
     import optax
 
     from dew.interop.hf_decoders import translate_config
@@ -400,7 +402,7 @@ def _step_lowered(generation: str):
                                "linear_value_head_dim": 32})
     model = CausalTransformer(**{**fields, "dtype": jnp.bfloat16})
     trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0),
-                      lower_for=generation)
+                      advanced=TrainerAdvanced(lower_for=generation))
     state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
     with pytest.raises(Lowered) as lowered:
         # A row for each of the host's devices, which the trainer's data axis splits.
@@ -415,13 +417,14 @@ def test_a_hybrid_language_model_step_lowers_for_every_gpu(generation):
     _step_lowered(generation)
 
 
+@pytest.mark.usefixtures("scanned_stacks")
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_scanned_stacks_kernel_report_counts_every_layers_launches_as_the_flop_count_does(generation):
-    """A bf16 language model of two like layers, its stack scanned (`scan_layers=True`, as host and bank
-    layouts require) or unrolled, its training step lowered for the GPU through `lower_for`
-    (`--trainer.lower-for`'s dry run): its kernel report counts each kernel's launches and FLOPs alike both
-    ways, every layer's, and as the FLOP count of the same program counts them (row 2933: a scan's body
-    once, its kernels at half)."""
+    """A bf16 language model of two like layers, its stack scanned (`generation.chosen(layer_scan="scanned")`,
+    as host and bank layouts require) or unrolled (`layer_scan="plain"`), its training step lowered for the
+    GPU through `lower_for` (`--trainer.lower-for`'s dry run): its kernel report counts each kernel's
+    launches and FLOPs alike both ways, every layer's, and as the FLOP count of the same program counts
+    them (row 2933: a scan's body once, its kernels at half)."""
     import optax
 
     from dew.nn.backbones import CausalTransformer
@@ -431,13 +434,16 @@ def test_a_scanned_stacks_kernel_report_counts_every_layers_launches_as_the_flop
     from dew.training._lowering import Lowered
 
     def reported(scanned: bool) -> tuple[dict, object]:
+        from model_support import stacked
+
         model = CausalTransformer(vocab_size=256, emb_features=128, num_layers=2, num_heads=2,
-                                  mlp_features=256, max_seq_len=128, dtype=jnp.bfloat16, scan_layers=scanned)
-        trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0),
-                          lower_for=generation)
-        state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
-        with pytest.raises(Lowered) as lowered:
-            trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
+                                  mlp_features=256, max_seq_len=128, dtype=jnp.bfloat16)
+        with stacked(scanned):
+            trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0),
+                              advanced=TrainerAdvanced(lower_for=generation))
+            state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+            with pytest.raises(Lowered) as lowered:
+                trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
         return lowered.value.kernels.record(), hlo_flops(lowered.value.lowered.as_text(dialect="hlo"))
 
     (scanned, counted), (unrolled, alike) = reported(scanned=True), reported(scanned=False)
@@ -470,7 +476,8 @@ def test_a_decoders_residual_norms_run_the_fused_kernel_on_a_data_parallel_step(
 
     model = CausalTransformer(vocab_size=256, emb_features=128, num_layers=2, num_heads=2, mlp_features=256,
                               max_seq_len=128, dtype=jnp.bfloat16, sandwich_norms=True)
-    trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0), lower_for="sm90")
+    trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(lower_for="sm90"))
     state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
     with dew.kernels.use(rms_norm="pallas"), pytest.raises(Lowered) as lowered:
         trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
@@ -486,13 +493,14 @@ def test_a_full_remat_runs_check_lowers_its_step_at_each_modules_whole_recomputa
     from dew.nn.backbones import CausalTransformer
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
     from dew.objectives.lm import LMObjective
-    from dew.training import FitPolicy, Trainer
+    from dew.training import Trainer
     from dew.training._lowering import Lowered
 
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2, mlp_features=64,
                               max_seq_len=16)
-    trainer = Trainer(LMObjective(model, 16), optax.sgd(1e-2), key=jax.random.key(0), lower_for="sm90",
-                      fit=FitPolicy(split=1, remat="full"))
+    trainer = Trainer(LMObjective(model, 16), optax.sgd(1e-2), key=jax.random.key(0),
+                      advanced=TrainerAdvanced(lower_for="sm90"),
+                      split=1, remat="full")
     state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
     with pytest.raises(Lowered):
         trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 17), jnp.int32)})
@@ -1536,7 +1544,7 @@ def test_a_tpu_build_is_refused_on_as_many_chips_of_its_kind_laid_out_otherwise(
     assert BuildTarget.of(jax.devices("cpu")).chips is None
 
 
-def _topology_trainer(topology: str, **options):
+def _topology_trainer(topology: str, checkpoints=None):
     """A tiny Llama's language-model trainer over the TPU `topology`'s compile-only devices
     (`compile_only_tpus`), its state sharded whole over them."""
     import optax
@@ -1550,8 +1558,8 @@ def _topology_trainer(topology: str, **options):
     model = CausalTransformer(vocab_size=256, num_layers=2, num_heads=4, emb_features=128, mlp_features=256,
                               dtype=jnp.bfloat16)
     return Trainer(LMObjective(model, 64), optax.adamw(1e-4), key=jax.random.key(0),
-                   **{"mesh": MeshSpec(fsdp=len(devices)).build(devices), "layout": Layout(min_shard=1),
-                      **options})
+                   mesh=MeshSpec(fsdp=len(devices)).build(devices), checkpoints=checkpoints,
+                   advanced=TrainerAdvanced(layout=Layout(min_shard=1)))
 
 
 def _topology_ahead(topology: str):
@@ -1625,7 +1633,8 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
     model = CausalTransformer(vocab_size=256, num_layers=2, num_heads=4, emb_features=128, mlp_features=256,
                               dtype=jnp.bfloat16)
     here = Trainer(LMObjective(model, 64), optax.adamw(1e-4), key=jax.random.key(0),
-                   mesh=Mesh(np.asarray(jax.devices()[:4]), ("fsdp",)), layout=Layout(min_shard=1),
+                   mesh=Mesh(np.asarray(jax.devices()[:4]), ("fsdp",)),
+                   advanced=TrainerAdvanced(layout=Layout(min_shard=1)),
                    checkpoints=Checkpoints(str(tmp_path / "run")))
     here.fit(data, steps=1, checkpoint_every=1)
     assert read[0] == 0

@@ -40,6 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from diffusion_support import images_of
+from model_support import attending
 
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
@@ -52,7 +53,6 @@ from dew.objectives.diffusion.objective import VALIDATION_SAMPLES
 from dew.registry import ModelConfig
 from dew.sampling import Euler
 from dew.training import Trainer
-from dew.training.budget import Horizon
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 T5_TINY = FIXTURES / "t5" / "tiny"
@@ -69,9 +69,9 @@ def run_config(directory):
     return DiffusionRunConfig(
         model=ModelConfig("simple_mmdit", {"patch_size": 2, "emb_features": 32, "num_layers": 1,
                                                "num_heads": 2, "mlp_ratio": 1,
-                                               "dtype": "float32", "attention_impl": "reference"}),
+                                               "dtype": "float32"}),
         data=images_of("tfds://oxford_flowers102", RES, batch=BATCH),
-        trainer=TrainerConfig(checkpoint_dir=str(directory), horizon=Horizon(steps=2)),
+        trainer=TrainerConfig(checkpoint_dir=str(directory), steps=2),
         preset=Flow(), text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
         val_metrics=(),
@@ -93,6 +93,7 @@ def batches(objective):
     return stream
 
 
+@attending("reference")
 def test_one_trainer_step_and_a_sample(tmp_path):
     """The whole path: the objective's tree holds the model and the frozen T5,
     the trainer takes two steps on it, and preview samples through the same

@@ -42,7 +42,7 @@ def _block(stack: _AttentionStackOptions, remat: RematChoice, features: int, hea
         features, heads, features // heads, context_first=True, qk_norm=stack.qk_norm,
         epsilon=stack.norm_epsilon, qk_epsilon=1e-6, mlp_hidden=int(features * stack.mlp_ratio),
         zero_modulation=True, rotary_pairs="half", dropout_rate=stack.dropout_rate, dtype=stack.dtype,
-        precision=stack.precision, attention_impl=stack.attention_impl,
+        precision=stack.precision,
         force_fp32_for_softmax=stack.force_fp32_for_softmax, name=name)
 
 

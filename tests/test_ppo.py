@@ -32,7 +32,7 @@ from dew.objectives.rl.sessions import (
 )
 from dew.optim import MuonClip
 from dew.rl import clipped_value_loss_terms, gae, token_log_ratio
-from dew.training import FitPolicy, Trainer
+from dew.training import Trainer, TrainerAdvanced
 
 FIXTURE = Path(__file__).parent / "fixtures/rl/ppo.npz"
 
@@ -47,7 +47,7 @@ class TokenFeatures(nn.Module):
 def build_ppo(verifier=verify, gamma=.97, *, lam=.9, split="auto", **policy_options):
     objective = PPOObjective(ToolPolicy(), PROMPT + RESPONSE - 1,
                              critic=ValueHead(TokenFeatures()), beta=.03, **policy_options)
-    trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), fit=FitPolicy(split=split))
+    trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), split=split)
     episodes = EpisodeCollector(objective.policy(objective.init(jax.random.key(19))), Harness(), verifier,
                                 PROMPT, RESPONSE, TURNS, sampling=SAMPLING)
     rollout = PPORollout(objective, episodes, groups=GROUPS, gamma=gamma, lam=lam)
@@ -406,7 +406,7 @@ def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1,
                               num_heads=2, mlp_features=16, max_seq_len=8, qk_norm=False)
     objective = PPOObjective(model, 5, critic=ValueHead(model))
-    optimizer = OptimConfig(optimizer=MuonClip(qk_clip_threshold=.01), learning_rate=0.).build(1)
+    optimizer = OptimConfig(optimizer=MuonClip(qk_clip_threshold=.01), lr=0.).build(1)
     trainer = Trainer(objective, optimizer, key=jax.random.key(0))
     initial = trainer.initial_state()
     ids = jnp.tile(jnp.arange(6, dtype=jnp.int32), (jax.device_count(), 1))
@@ -604,7 +604,8 @@ def test_a_run_watching_its_actor_and_critic_names_each_by_its_path_in_the_varia
                               max_seq_len=8, qk_norm=False)
     objective = PPOObjective(model, 5, critic=ValueHead(model))
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(0),
-                      inspection=Inspection(modules=("*Attention",), targets=("params",), cotangents=True))
+                      advanced=TrainerAdvanced(inspection=Inspection(modules=("*Attention",),
+                                                                     targets=("params",), cotangents=True)))
     ids = jnp.tile(jnp.arange(6, dtype=jnp.int32), (jax.device_count(), 1))
     mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
     batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
@@ -633,7 +634,8 @@ def test_a_run_watching_its_critic_alone_logs_the_critics_activations_and_cotang
                               max_seq_len=8, qk_norm=False)
     objective = PPOObjective(model, 5, critic=ValueHead(model))
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(0),
-                      inspection=Inspection(modules=modules, targets=("params",), cotangents=True))
+                      advanced=TrainerAdvanced(inspection=Inspection(modules=modules, targets=("params",),
+                                                                     cotangents=True)))
     ids = jnp.tile(jnp.arange(6, dtype=jnp.int32), (jax.device_count(), 1))
     mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
     batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),

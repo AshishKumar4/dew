@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from dew._cleanup import end_group, exit_code, signal_group
+from dew._cleanup import end_group, exit_code, signal_group, start
 from dew.inference.rollouts import INFRASTRUCTURE
 from dew.objectives.rl.sessions import Call, Session, Status, Task
 
@@ -365,9 +365,11 @@ class HarnessSource:
                 trial = None if queued_cancel else self._harness.trial(
                     task, self._gateway.session(session), f"dew-{group}-{sample}")
                 with self._lock:
-                    process = None if trial is None or record.cancelled else subprocess.Popen(
-                        trial.argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
-                        cwd=trial.cwd, env={**os.environ, **trial.environment} if trial.environment else None)
+                    # The trial's session and group outlive no owner (`start`'s lifeline), a trainer killed
+                    # mid-trial's too, where a detached session outlived it (row 12172).
+                    process = None if trial is None or record.cancelled else start(
+                        trial.argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=trial.cwd,
+                        env={**os.environ, **trial.environment} if trial.environment else None)
                     record.process = process
                 if trial is None or process is None:
                     # Resolved outside the lock: the future's done-callback takes it.

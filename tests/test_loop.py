@@ -16,7 +16,16 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from map_judge import marked_seeds
-from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
+from model_support import (
+    TINY_DECODER,
+    as_stepped,
+    attending,
+    compiled_apply,
+    decode_steps,
+    model_draw,
+    unrolled as layer_at_a_time,
+    with_logit_cotangent,
+)
 from reference_error import assert_as_exact, dew_path, with_gradients
 
 from dew.batch import leaves_by_path
@@ -34,7 +43,7 @@ VOCAB = 37
 
 
 def tiny(**overrides):
-    return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "attention_impl": "reference",
+    return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER,
                                 "tie_embeddings": False, "loop": Loop(3, exit_gate=True), **overrides})
 
 
@@ -93,6 +102,7 @@ def unrolled(params, steps):
     return {'params': tree}
 
 
+@attending("reference")
 def test_a_loop_without_its_norm_is_the_stack_repeated_cache_and_all(rng):
     """Two passes of two layers compute four layers whose last two repeat the
     first two, and their decode cache holds the same entries under the same names."""
@@ -100,7 +110,9 @@ def test_a_loop_without_its_norm_is_the_stack_repeated_cache_and_all(rng):
     deep = tiny(num_layers=4, loop=None)
     ids = tokens(rng)
     params = nn.unbox(looped.init(rng, ids))
-    np.testing.assert_array_equal(looped.apply(params, ids), deep.apply(unrolled(params, 2), ids))
+    # Each a layer at a time (`layer_at_a_time`), so the claim is the loop's alone, bit for bit.
+    np.testing.assert_array_equal(layer_at_a_time(looped.apply)(params, ids),
+                                  layer_at_a_time(deep.apply)(unrolled(params, 2), ids))
     ours, cache = decoded(looped, params, ids)
     theirs, deep_cache = decoded(deep, unrolled(params, 2), ids)
     np.testing.assert_array_equal(ours, theirs)
@@ -108,24 +120,28 @@ def test_a_loop_without_its_norm_is_the_stack_repeated_cache_and_all(rng):
     jax.tree.map(np.testing.assert_array_equal, cache, deep_cache)
 
 
-@pytest.mark.parametrize("scan_layers", [False, True])
-def test_decoding_a_loop_matches_its_prefill(rng, scan_layers):
+@attending("reference")
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_decoding_a_loop_matches_its_prefill(rng, stack_scan):
     """A loop decoded a token at a time is on par with its prefills, each step's at the width it reads
     (check 1), and its cache holds each pass's layers."""
-    model = tiny(scan_layers=scan_layers)
+    model = tiny()
     assert_as_exact(lambda params, ids: decoded(model, params, ids)[0], passes(model),
-                    drawn(model), f'{scan_layers} loop decode', seeds=SEEDS['decode'], truth_fn=wide(model))
+                    drawn(model), f'{stack_scan} loop decode', seeds=SEEDS['decode'], truth_fn=wide(model))
     ids = tokens(rng)
     _, cache = decoded(model, nn.unbox(model.init(rng, ids)), ids)
     assert sorted(cache) == [f'layers_{index}' for index in range(6)]
 
 
+@attending("reference")
+@pytest.mark.usefixtures("scanned_stacks")
 def test_scanned_runs_loop_as_the_plain_layers_do():
-    """A loop's layers scanned are on par with them run one by one (check 1)."""
-    assert_as_exact(jax.jit(tiny(scan_layers=True).apply), jax.jit(tiny().apply), drawn(tiny()),
-                    'scanned loop', seeds=SEEDS['scanned'], truth_fn=wide(tiny()))
+    """A loop's layers scanned are on par with them run one by one (`layer_at_a_time`, check 1)."""
+    assert_as_exact(jax.jit(tiny().apply), layer_at_a_time(jax.jit(tiny().apply)), drawn(tiny()),
+                    'scanned loop', seeds=SEEDS['scanned'], truth_fn=layer_at_a_time(wide(tiny())))
 
 
+@attending("reference")
 def test_backprop_steps_train_through_the_last_passes_alone(rng):
     ids = tokens(rng)
     params = nn.unbox(tiny().init(rng, ids))
@@ -146,16 +162,17 @@ def test_backprop_steps_train_through_the_last_passes_alone(rng):
     assert np.any(last['params']['layers_0']['mlp']['down_proj']['kernel'])
 
 
+@attending("reference")
 @pytest.mark.parametrize("backprop_steps", [None, 1])
-@pytest.mark.parametrize("scan_layers", [False, True])
-def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, scan_layers):
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, stack_scan):
     """Three passes over layers [1, 3) of four, checkpointed, keep the fp32
     logits and gradients of the plain passes on par (check 1), including the
     cut before the last pass: a pass recomputed instead of retained may fuse
     its backward another way.
     """
     loop = Loop(3, layers=(1, 3), backprop_steps=backprop_steps, remat=False)
-    plain = tiny(num_layers=4, loop=loop, scan_layers=scan_layers, dtype="float32")
+    plain = tiny(num_layers=4, loop=loop, dtype="float32")
     checkpointed = plain.clone(loop=dataclasses.replace(loop, remat=True))
 
     def result(model):
@@ -168,20 +185,21 @@ def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, scan_
     # Eight rows of sixteen tokens: a norm's scale sums its gradient over enough of them to resolve.
     draw = with_logit_cotangent(drawn(plain, 16, 8), VOCAB, 0x100)
     assert_as_exact(result(checkpointed), result(plain), draw,
-                    f'{scan_layers} {backprop_steps} checkpointed', seeds=SEEDS['checkpointed'],
+                    f'{stack_scan} {backprop_steps} checkpointed', seeds=SEEDS['checkpointed'],
                     truth_fn=result(plain.clone(dtype=jnp.float64)))
     gradients = result(checkpointed)(*draw(0))['gradients']['params']
     assert bool(jnp.any(gradients['embed_tokens']['embedding'])) == (backprop_steps is None)
     assert bool(jnp.any(gradients['layers_1']['mlp']['down_proj']['kernel']))
 
 
-@pytest.mark.parametrize("scan_layers", [False, True])
-def test_checkpointed_passes_leave_decode_and_its_collections_unchanged(rng, scan_layers):
+@attending("reference")
+@pytest.mark.parametrize("stack_scan", ["plain", "scanned"], indirect=True)
+def test_checkpointed_passes_leave_decode_and_its_collections_unchanged(rng, stack_scan):
     """Decode bypasses the pass checkpoints and retains each pass's cache
     names and values, under both the plain stack and its scanned runs.
     """
     loop = Loop(3, layers=(1, 3), remat=False)
-    plain = tiny(num_layers=4, loop=loop, scan_layers=scan_layers)
+    plain = tiny(num_layers=4, loop=loop)
     checkpointed = plain.clone(loop=dataclasses.replace(loop, remat=True))
     ids = tokens(rng)
     params = nn.unbox(plain.init(rng, ids))
@@ -196,6 +214,8 @@ def test_checkpointed_passes_leave_decode_and_its_collections_unchanged(rng, sca
     assert boundaries[0] == boundaries[1]
 
 
+@attending("reference")
+@pytest.mark.usefixtures("scanned_stacks")
 def test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all(rng):
     """Layers 1 and 2 of four, run twice with no norm between, compute six
     layers whose fourth and fifth repeat the second and third, to the bit,
@@ -210,19 +230,23 @@ def test_a_loop_over_a_block_is_the_stack_with_the_block_repeated_cache_and_all(
     repeated = {f'layers_{index}': tree[f'layers_{source}'] for index, source in enumerate(order)}
     deep_params = {'params': {**shared, **repeated}}
     deep = tiny(num_layers=6, loop=None)
-    np.testing.assert_array_equal(looped.apply(params, ids), deep.apply(deep_params, ids))
-    ours, cache = decoded(looped, params, ids)
-    theirs, deep_cache = decoded(deep, deep_params, ids)
+    # Each a layer at a time (`layer_at_a_time`), so the claim is the loop's alone, bit for bit.
+    np.testing.assert_array_equal(layer_at_a_time(looped.apply)(params, ids),
+                                  layer_at_a_time(deep.apply)(deep_params, ids))
+    ours, cache = layer_at_a_time(decoded)(looped, params, ids)
+    theirs, deep_cache = layer_at_a_time(decoded)(deep, deep_params, ids)
     np.testing.assert_array_equal(ours, theirs)
     # The second pass's block sits after the decoder's own layers: deep layers 3, 4 at stored 4, 5.
     for stored, deep_index in ((0, 0), (1, 1), (2, 2), (4, 3), (5, 4), (3, 5)):
         jax.tree.map(np.testing.assert_array_equal, cache[f'layers_{stored}'],
                      deep_cache[f'layers_{deep_index}'])
-    assert_as_exact(lambda params, ids: decoded(looped, params, ids)[0], passes(looped), drawn(looped),
-                    'block loop decode', seeds=SEEDS['block decode'], truth_fn=wide(looped))
-    scanned = tiny(num_layers=4, loop=Loop(2, step_norm=False, layers=(1, 3)), scan_layers=True)
-    assert_as_exact(jax.jit(scanned.apply), jax.jit(looped.apply), drawn(looped), 'scanned block loop',
-                    seeds=SEEDS['scanned'], truth_fn=wide(looped))
+    assert_as_exact(layer_at_a_time(lambda params, ids: decoded(looped, params, ids)[0]),
+                    layer_at_a_time(passes(looped)),
+                    drawn(looped), 'block loop decode', seeds=SEEDS['block decode'],
+                    truth_fn=layer_at_a_time(wide(looped)))
+    scanned = tiny(num_layers=4, loop=Loop(2, step_norm=False, layers=(1, 3)))
+    assert_as_exact(jax.jit(scanned.apply), layer_at_a_time(jax.jit(looped.apply)), drawn(looped),
+                    'scanned block loop', seeds=SEEDS['scanned'], truth_fn=layer_at_a_time(wide(looped)))
 
 
 UNROLLED = (0, 1, 2, 1, 2, 3)
@@ -250,6 +274,7 @@ def by_layer(tree) -> dict[int, dict[tuple[str, ...], np.ndarray]]:
     return found
 
 
+@attending("reference")
 @pytest.mark.parametrize("shared_cache", [False, True])
 def test_a_looped_router_moves_its_bias_by_the_load_of_every_pass(rng, shared_cache):
     """A mixture a loop runs twice routes tokens at both passes, and its one balancing bias balances them
@@ -286,6 +311,7 @@ def test_a_looped_router_moves_its_bias_by_the_load_of_every_pass(rng, shared_ca
     assert any(not np.array_equal(moved[1][path], by_layer(variables['moe'])[1][path]) for path in moved[1])
 
 
+@attending("reference")
 def test_qk_clip_bounds_a_looped_layer_by_the_largest_logit_of_every_pass(rng):
     """QK-Clip rescales a looped layer's queries and keys by the largest attention logit any of its passes
     reads: from a looped stack's sows its factors are, bit for bit, those of the unrolled stack's logit
@@ -295,8 +321,8 @@ def test_qk_clip_bounds_a_looped_layer_by_the_largest_logit_of_every_pass(rng):
     deep = tiny(num_layers=6, qk_norm=False, loop=None)
     ids = tokens(rng)
     variables = nn.unbox(looped.init(rng, ids))
-    ours = looped.apply(variables, ids, mutable=[QK])[1][QK]
-    theirs = deep.apply(repeated(variables), ids, mutable=[QK])[1][QK]
+    ours = compiled_apply(looped, variables, ids, mutable=[QK])[1][QK]
+    theirs = compiled_apply(deep, repeated(variables), ids, mutable=[QK])[1][QK]
 
     def called(layers: list[int]) -> dict:
         """The unrolled stack's sows at `layers`, calls of one looped layer, as one call: their maxima's
@@ -333,13 +359,14 @@ def test_qk_clip_bounds_a_looped_layer_by_the_largest_logit_of_every_pass(rng):
     assert any(not np.array_equal(alone[key], expected[key]) for key in clipped)
 
 
+@attending("reference")
 def test_a_decoder_gains_a_loop_over_its_own_block_that_one_pass_leaves_as_it_was(rng):
     plain = tiny(num_layers=4, loop=None)
     ids = tokens(rng)
     params = nn.unbox(plain.init(rng, ids))
     once, twice = plain.with_passes(1, (1, 3)), plain.with_passes(2, (1, 3))
     assert twice.loop == Loop(2, step_norm=False, layers=(1, 3))
-    np.testing.assert_array_equal(once.apply(params, ids), plain.apply(params, ids))
+    np.testing.assert_array_equal(compiled_apply(once, params, ids), compiled_apply(plain, params, ids))
     assert not np.array_equal(twice.apply(params, ids), plain.apply(params, ids))
     assert plain.with_passes(2) is None and plain.with_passes(None, (1, 3)) is None
     assert twice.with_passes(4).loop == Loop(4, step_norm=False, layers=(1, 3))
@@ -351,6 +378,7 @@ DELTA_NETS = {'linear_attention': {'mixer': {'class': 'gated_delta_net', 'fields
 """A stack of gated delta nets, whose decode state is a recurrent memory and a convolution tail."""
 
 
+@attending("reference")
 def test_each_pass_of_a_shared_cache_step_starts_from_the_cache_the_step_found(rng):
     """Every pass of a `Loop(shared_cache=True)` step starts from the cache as the step found it
     (`SharedPassView`), its recurrent memory and convolution tail with its cursors: allocating the
@@ -389,7 +417,7 @@ def _qwen35(steps: int | None = None, **loop):
     from dew.interop.hf_decoders import translate_config
 
     plain = CausalTransformer(**{**translate_config(json.loads((QWEN35 / "config.json").read_text())),
-                                 "dtype": "float32", "attention_impl": "reference"})
+                                 "dtype": "float32"})
     return plain if steps is None else plain.with_passes(steps, (1, 4), implicit=True, **loop)
 
 
@@ -402,6 +430,7 @@ def _results(forward):
     return jax.jit(run)
 
 
+@attending("reference")
 @pytest.mark.parametrize("steps", [2, 3, 4])
 def test_an_implicit_loop_at_zero_theta_computes_the_decoder_it_loops(steps):
     """Qwen 3.5 with a block of its own run `steps` times, each later pass at `a + θ⊙(h - a)` leaving
@@ -466,6 +495,7 @@ def _theta_method(module, ids):
     return module.logits_from_hidden(module.norm(module.stack(h, span=(end, module.num_layers), **inputs)))
 
 
+@attending("reference")
 @pytest.mark.parametrize("name, steps, loop", [("two passes", 2, {}), ("three passes", 3, {}),
                                                ("three passes, the last trained", 3, {"backprop_steps": 1})],
                          ids=["two passes", "three passes", "the last trained"])
@@ -495,6 +525,7 @@ PER_PASS_SEEDS = 8
 """Check 1's declared seeds for an implicit loop with a θ per pass against the θ-method unrolled here."""
 
 
+@attending("reference")
 @pytest.mark.parametrize("steps", [3, 2], ids=["three passes", "two of three"])
 def test_an_implicit_loop_with_a_theta_per_pass_reads_each_pass_its_own(steps):
     """Qwen 3.5 with an implicit loop whose θ holds a row for each later pass of three (`Loop.theta_passes`,
@@ -527,6 +558,7 @@ def test_an_implicit_loop_with_a_theta_per_pass_reads_each_pass_its_own(steps):
     assert np.any(np.asarray(gradient[1]) != 0) == (steps == 3)
 
 
+@attending("reference")
 def test_an_implicit_loop_whose_rows_are_one_theta_computes_the_shared_theta():
     """An implicit loop of three passes whose θ rows are each one vector computes what its loop of one θ of
     that vector computes, bit for bit, its logits and its θ's gradient summed over the rows (row 7661); a
@@ -546,6 +578,7 @@ def test_an_implicit_loop_whose_rows_are_one_theta_computes_the_shared_theta():
         per_pass.with_passes(4)
 
 
+@attending("reference")
 def test_a_loaded_decoder_gains_an_implicit_loop_at_zero_theta():
     """A loaded Qwen 3.5 given an implicit loop over its own block, as a run asks for one
     (`dew.config.looping`), draws the loop's θ at zero beside the parameters it loaded, among what it drew
@@ -553,7 +586,7 @@ def test_a_loaded_decoder_gains_an_implicit_loop_at_zero_theta():
     from dew.config import looping
     from dew.interop.pretrained import Pretrained
 
-    loaded = Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(str(QWEN35), dtype="float32")
     looped = looping(loaded, 3, (1, 4), implicit=True)
     theta = looped.variables["params"]["loop_theta"]
     assert looped.model.loop == Loop(3, step_norm=False, layers=(1, 4), implicit=True)
@@ -597,6 +630,7 @@ def _unrolled_passes(module, ids):
     return logits, gates
 
 
+@attending("reference")
 @pytest.mark.parametrize("name, layers, loop, z_loss, shift, spread, rows", [
     pytest.param("whole stack", (0, 4), {}, 0.0, 0.0, 4.0, 4, id="whole stack"),
     # Each block-before-a-coda case's 256 seeds (131 to 161 s whole in each of nine trains' CI, row 10754)
@@ -718,6 +752,7 @@ def _passes_exiting(module, ids):
     return module.logits_from_hidden(module.norm(out))
 
 
+@attending("reference")
 def test_a_loop_exits_each_token_at_its_threshold_through_each_passs_coda():
     """Qwen 3.5 looping a block before its coda, each pass weighed by its exit gate through its own coda:
     its logits, each token at the pass its threshold exits at, on par with the passes and codas unrolled
@@ -732,6 +767,7 @@ def test_a_loop_exits_each_token_at_its_threshold_through_each_passs_coda():
                     seeds=EXITING_SEEDS["forward"], truth_fn=unrolled(looped.clone(dtype=jnp.float64)))
 
 
+@attending("reference")
 def test_decoding_a_loop_that_exits_through_each_passs_coda_matches_its_prefill():
     """The loop exiting at its threshold through each pass's coda, decoded a token at a time, is on par
     with its prefills (check 1), its cache holding each pass's block and each earlier pass's coda beside
@@ -750,6 +786,7 @@ def test_decoding_a_loop_that_exits_through_each_passs_coda_matches_its_prefill(
     assert sorted(cache) == sorted(f"layers_{index}" for index in range(4 + 2 * 2 + 2 * 1))
 
 
+@attending("reference")
 def test_a_shared_cache_keeps_each_passs_coda_entries_as_the_coda_wrote_them():
     """The exiting loop with a cache its passes share (`Loop.shared_cache`), prefilled into an allocated
     cache, computes what the loop with a cache of its own per pass does there, its logits and each

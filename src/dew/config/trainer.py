@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import functools
 import hashlib
-import json
 import logging
+import operator
 import os
 import re
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import tyro
 
@@ -28,81 +29,30 @@ from dew.interop.source_options import (
     SourceOptionsKeywords as SourceOptionsKeywords,
     SourcePlacement as SourcePlacement,
 )
-from dew.nn.precision import Numerics, numerics_of
+from dew.kernels import Kernels
+from dew.nn.precision import DTYPE_PRESETS, NUMERICS_PRESETS, Numerics, numerics_of
 from dew.nn.sharding import Link
 from dew.quantization import Quantization
-from dew.registry import from_record, record_argument, to_record
+from dew.registry import record_argument
 from dew.training.budget import Horizon, Pause, Plateau, budget_tokens, run_steps
 from dew.training.cadence import Counted
 from dew.training.cooldown import Cooldowns
 from dew.training.diloco import DiLoCo
 from dew.training.inspection import Inspection
-from dew.training.policy import FitPolicy, UpdateBatch
+from dew.training.policy import FitPolicy, Remat, UpdateBatch
 from dew.training.profiling import ProfileWindow, RunProfile
 from dew.training.selection import Best
 from dew.training.tracker import Wandb
 
 if TYPE_CHECKING:
-
-    pass
-
-
-def _best_argument():
-    """A metric name or JSON policies through one CLI argument."""
-    def read(given):
-        text = given[0]
-        if text == 'None':
-            return None
-        if text.startswith(('{', '[')):
-            policies = json.loads(text)
-            kind = tuple[Best, ...] if isinstance(policies, list) else Best
-            return from_record(kind, policies, dtypes=False)
-        return Best(text)
-
-    def write(policy):
-        if policy is None:
-            return ['None']
-        if isinstance(policy, str):
-            return [policy]
-        return [
-            json.dumps(
-                [to_record(entry, Best) for entry in policy]
-                if isinstance(policy, tuple)
-                else to_record(policy, Best)
-            )
-        ]
-
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1, metavar='METRIC|JSON', instance_from_str=read,
-        is_instance=lambda policy: policy is None or isinstance(policy, (str, Best, tuple)),
-        str_from_instance=write)
-
-
-def _numerics_argument():
-    """A run's numerics on the command line: a preset's name ("accurate", "default"), the usual dtypes'
-    Lightning name ("bf16-true"), or a `Numerics` record's JSON (`dew.nn.precision.numerics_of`)."""
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="NAME|JSON",
-        instance_from_str=lambda given: (from_record(Numerics, json.loads(given[0]))
-                                         if given[0].startswith("{") else numerics_of(given[0])),
-        is_instance=lambda value: isinstance(value, Numerics),
-        str_from_instance=lambda value: [json.dumps(to_record(value, Numerics))],
-    )
-
-
-def _keep_argument():
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="LATEST|JSON",
-        instance_from_str=lambda given: from_record(Keep, json.loads(given[0]), dtypes=False)
-        if given[0].startswith("{")
-        else int(given[0]),
-        is_instance=lambda keep: isinstance(keep, (int, Keep)),
-        str_from_instance=lambda keep: [
-            json.dumps(to_record(keep, Keep)) if isinstance(keep, Keep) else str(keep)
-        ],
-    )
+    # tyro reads the runtime annotation, a subcommand per named numerics (`trainer.precision:bf16-true`), each
+    # a `Numerics` at that preset; a type checker reads the class.
+    type NumericsChoices = Numerics
+else:
+    NumericsChoices = functools.reduce(operator.or_, (
+        Annotated[Numerics, tyro.conf.subcommand(name, default=numerics)]
+        for name, numerics in {"default": Numerics(), **NUMERICS_PRESETS,
+                               **{name: numerics_of(name) for name in DTYPE_PRESETS}}.items()))
 
 
 _log = logging.getLogger(__name__)
@@ -144,10 +94,10 @@ class Diagnostics:
     links of its split axes, the measuring of its launches and extra XLA flags, set where a run diagnoses or
     measures, every one derived where it states none (`RunConfig.diagnostics`, `--diagnostics.*`)."""
 
-    kernels: dict[str, str] = dataclasses.field(default_factory=dict)
-    """The kernel the run runs for each op it names (`dew.kernels.use`, ops `dew.kernels.choices`), for
-    every program it traces, its steps', evaluations' and samples' (`RunConfig.traced`):
-    `--diagnostics.kernels attention xla`. None named, each op's pick for its call (row 4649)."""
+    kernels: Kernels = dataclasses.field(default_factory=Kernels)
+    """The kernel the run runs for each op it names (`dew.kernels.Kernels`, `dew.kernels.use`), for every
+    program it traces, its steps', evaluations' and samples' (`RunConfig.traced`):
+    `--diagnostics.kernels.attention xla`. None named, each op's pick for its call (row 4649)."""
     links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
         default_factory=dict)
     """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
@@ -161,7 +111,7 @@ class Diagnostics:
     Only a process with the GPU to itself measures, and the picks persist beside
     the compilation cache for every later run that sets it too, each pick read for
     its own launch alone. It measures each of Dew's own launches that declares
-    variants to time (the kernel templates, `attention_impl="template"`, the norms,
+    variants to time (the kernel templates, `kernels={"attention": "template"}`, the norms,
     SwiGLU and decode attention); tokamax's flash kernel (`"triton"`) runs at
     tokamax's heuristic config, unmeasured.
     Unset, nothing is measured or read: every launch takes the config it derives
@@ -184,8 +134,9 @@ class TrainerConfig:
 
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
-    keep: Annotated[int | Keep, _keep_argument()] = Keep.latest
-    """The number of latest checkpoints kept, besides the best one (`Keep`'s own default)."""
+    keep: Keep = dataclasses.field(default_factory=Keep)
+    """Which checkpoints the run keeps besides its best (`Keep`): its latest, `--trainer.keep.latest 2`, every
+    so many steps, `--trainer.keep.every 1000`, or at a wall-time spacing, `--trainer.keep.interval 1h`."""
     resume: Resume = "auto"
     """Whether the run continues its directory's latest checkpoint: where there is one, "require" for a
     job that must not start afresh, or "never" for one that must not continue another (`Trainer.fit`)."""
@@ -197,14 +148,25 @@ class TrainerConfig:
     """Whether a step with no loss scale whose loss or gradient norm is not finite is skipped, its optimizer
     taking one step of zero gradient, the run stopping after five in a row; off, the step is taken as it is
     formed and the run stops at its next log, naming it (training.md, a step that is not finite)."""
-    best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
-    """The metric name and ranking policy; None selects validation loss or training loss."""
+    best: Annotated[Best, tyro.conf.subcommand("best")] | None = None
+    """The metric the run ranks its checkpoints by and how (`Best`), by its recorded name:
+    `--trainer.best.metric val/accuracy --trainer.best.mode max`; None ranks by validation loss, or by
+    training loss where the run validates on nothing. Several policies are `Trainer.fit`'s (`best=`)."""
     key: int = 0
     """The seed of the run key, which sets parameter init and every per-step draw."""
-    horizon: Horizon = dataclasses.field(default_factory=Horizon)
-    """How long the run trains, named once (`dew.training.budget.Horizon`): `--trainer.horizon.steps 2000`,
-    `--trainer.horizon.epochs 3`, `--trainer.horizon.tokens 1e9` or `--trainer.horizon.examples 50000`;
-    unnamed, as long as its data."""
+    steps: int | None = None
+    """Train this many steps (`--trainer.steps 2000`). The run's length is named once, by `steps`, `epochs`,
+    `tokens` or `examples`; none named, it is as long as its data (`dew.training.budget.Horizon`)."""
+    epochs: int | None = None
+    """Train this many passes over the data."""
+    tokens: int | None = None
+    """Train on this many tokens, its loss's targets, counted without padding as committed updates train on
+    them, the final microbatch crossing it."""
+    examples: int | None = None
+    """Train on the data's first this many source examples, each read once with every row it makes."""
+    max_tokens: int | None = None
+    """End a run of steps, epochs or examples at this many tokens, counted as `tokens` counts them, the first
+    of the two it reaches."""
     stop: (Annotated[Pause, tyro.conf.subcommand("pause")]
            | Annotated[Plateau, tyro.conf.subcommand("plateau")] | None) = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
@@ -252,18 +214,23 @@ class TrainerConfig:
     """A directory that takes every validation batch's scoring artifacts at each evaluation, a decision
     run's decisions among them, as `<scored_to>/step-<step>/<split>-<batch>.npz`, for pooling a pass's
     metrics offline (`Trainer.fit`'s `scored_to`); None writes none."""
-    update: UpdateBatch = dataclasses.field(default_factory=UpdateBatch)
-    """One optimizer update's size (`dew.training.UpdateBatch`): the steps of the data's batch it pools,
-    `--trainer.update.batches 4`, or the tokens it trains on, `--trainer.update.tokens 524288`, a whole
-    number of the data's token batches (`Dataset.batch(tokens=)`); unset, one batch."""
-    fit: FitPolicy = dataclasses.field(default_factory=FitPolicy)
-    """How the step fits the devices (`dew.training.FitPolicy`): the microbatches each step's batch is read
-    in, `--trainer.fit.split 4`, and what it recomputes, `--trainer.fit.remat selective`; each "auto", the
-    planner's choice, by default: the fewest microbatches that fit the devices before it recomputes
-    anything, at the least recomputation that fits (`Trainer.compile`); and under a mesh of pipeline stages
-    the microbatches each of those feeds through them, `--trainer.fit.microbatches 8`, a multiple of the
-    stages, one a stage unset. A step's tokens and the update's stay as configured either way; only the
-    microbatch shrinks."""
+    accumulation: int | None = None
+    """The batches one optimizer update adds up (gradient accumulation), `--trainer.accumulation 4`; or,
+    with `update_tokens`, none stated: one update's size is named once (`dew.training.UpdateBatch`). Neither
+    named, one batch an update."""
+    update_tokens: int | None = None
+    """The tokens one optimizer update trains on, a whole number of the data's token batches
+    (`Dataset.batch(tokens=)`), from which the run reads the batches it adds up: `--trainer.update-tokens
+    524288`."""
+    split: int | Literal["auto"] = "auto"
+    """The microbatches each step's batch is read in, its rows split evenly; "auto", the fewest that fit the
+    devices before the step recomputes anything (`Trainer.compile`). A step's tokens and its update's stay
+    as stated either way; only the microbatch shrinks (`dew.training.FitPolicy`)."""
+    remat: Remat = "auto"
+    """What the step recomputes in its backward pass (`dew.training.Remat`): "auto", the least that fits."""
+    microbatches: int | None = None
+    """Under a mesh of pipeline stages, the microbatches each step feeds through them, a multiple of the
+    stages; None, one a stage (`dew.training.distributed.stage_microbatches`)."""
     batch_ramp: Ramp | None = None
     """A ramp that grows `batch_size` over the run's first records instead of starting there.
 
@@ -272,16 +239,17 @@ class TrainerConfig:
     way there is one optimizer update a step, and the compiled step is traced
     once per stage.
     """
-    precision: Annotated[Numerics, _numerics_argument()] = dataclasses.field(default_factory=Numerics)
+    precision: NumericsChoices = dataclasses.field(default_factory=Numerics)
     """The run's numerics, set once and recorded with it (`dew.nn.precision.Numerics`; `ACCURATE` for
-    scientific runs): its dtypes by Lightning's names, its products' precision by JAX's levels and its
-    ops' forms, over every program it traces, the step and its evaluations
-    (`dew.nn.kernels.generation.run_precision`). Its compute dtype is the model's where the model's
-    record states none (`RunConfig.numerics_fields`), its parameters' a loaded checkpoint's storage, and
-    a float16 compute scales the loss (`RunConfig.built`). The optimizer's moments are a storage format
-    of their own (`dew.optim.Adam.state_dtype`: float32 under any weights, bfloat16 stochastically rounded,
-    int8 blockwise). A dtype or precision the model states still wins, and a resumed run traces under
-    the numerics it records."""
+    scientific runs), on the command line a named preset each of whose fields its flags move:
+    `trainer.precision:bf16-true`, `trainer.precision:accurate --trainer.precision.forms fast`: its dtypes
+    by Lightning's names, its products' precision by JAX's levels and its ops' forms, over every program it
+    traces, the step and its evaluations (`dew.nn.kernels.generation.run_precision`). Its compute dtype is
+    the model's where the model's record states none (`RunConfig.numerics_fields`), its parameters' a
+    loaded checkpoint's storage, and a float16 compute scales the loss (`RunConfig.built`). The optimizer's
+    moments are a storage format of their own (`dew.optim.Adam.state_dtype`: float32 under any weights,
+    bfloat16 stochastically rounded, int8 blockwise). A dtype or precision the model states still wins, and
+    a resumed run traces under the numerics it records."""
     mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
     layout: Annotated[Layout, tyro.conf.subcommand("layout")] | None = None
     """The layout the run's trainer is given (`Trainer`'s `layout`): unset, the layout chooser decides
@@ -341,15 +309,15 @@ class TrainerConfig:
     """DiLoCo over the mesh's diloco groups (`--trainer.mesh.diloco`, `dew.training.diloco.DiLoCo`): every
     `--trainer.diloco.every` windows of updates the groups' copies are averaged into the outer model, by
     Nesterov SGD at `--trainer.diloco.rate` with `--trainer.diloco.momentum`; unset, one copy trains."""
-    def accumulation(self, dataset: Loader) -> int:
+    def update_batches(self, dataset: Loader) -> int:
         """The steps an update pools over `dataset`: its stated batches, or its tokens over the data's token
         batches, every phase's alike (`UpdateBatch.of_tokens`)."""
-        return self.update.of_tokens(dataset.each_token_batch)
+        return self.update_batch.of_tokens(dataset.each_token_batch)
 
     def __post_init__(self):
         # A record names its numerics as a preset's name or by their fields (`numerics_of`).
         object.__setattr__(self, "precision", numerics_of(self.precision))
-        if self.update.tokens is not None and self.batch_ramp is not None:
+        if self.update_tokens is not None and self.batch_ramp is not None:
             raise ValueError("--trainer.batch-ramp grows row batches and cannot use a token budget")
         if self.wandb is not None and self.wandb.publish and not self.checkpoint_final:
             raise ValueError("trainer.wandb.publish publishes the final checkpoint, which "
@@ -366,30 +334,33 @@ class TrainerConfig:
         if (isinstance(self.checkpoint_every, str) and self.checkpoint_every not in ('epoch', PASSES)
                 and not is_share(self.checkpoint_every)):
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
-        if isinstance(self.keep, Mapping):
-            object.__setattr__(self, 'keep', from_record(Keep, self.keep, dtypes=False))
-        if isinstance(self.keep, Keep) and self.keep.where is not None:
+        if self.keep.where is not None:
             raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
-        if self.best is not None:
-            choices = self.best if isinstance(self.best, (tuple, list)) else (self.best,)
-            rebuilt = []
-            for choice in choices:
-                if isinstance(choice, str):
-                    choice = Best(choice)
-                elif isinstance(choice, Mapping):
-                    choice = from_record(Best, choice, dtypes=False)
-                if not isinstance(choice, Best) or choice.score is not None:
-                    raise TypeError("a recorded best selector names metrics; callable scores are code-only")
-                rebuilt.append(choice)
-            object.__setattr__(
-                self, "best", tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0]
-            )
+        if self.best is not None and (not isinstance(self.best, Best) or self.best.score is not None):
+            raise TypeError("a recorded best selector names metrics; callable scores are code-only")
+        # Each refuses what it holds as it is made, a length named twice or an update sized twice.
+        _ = self.horizon, self.update_batch, self.fit_policy
 
-    def best_policies(self):
-        if self.best is None:
-            return None
-        return (Best(self.best),) if isinstance(self.best, str) else (
-            self.best if isinstance(self.best, tuple) else (self.best,))
+    @property
+    def horizon(self) -> Horizon:
+        """How long the run trains (`steps`, `epochs`, `tokens`, `examples`, `max_tokens`), as the fit reads
+        it."""
+        return Horizon(steps=self.steps, epochs=self.epochs, tokens=self.tokens, examples=self.examples,
+                       max_tokens=self.max_tokens)
+
+    @property
+    def update_batch(self) -> UpdateBatch:
+        """One optimizer update's size (`accumulation`, `update_tokens`), as the trainer reads it."""
+        return UpdateBatch(batches=self.accumulation, tokens=self.update_tokens)
+
+    @property
+    def fit_policy(self) -> FitPolicy:
+        """How the step fits the devices (`split`, `remat`, `microbatches`), as the trainer reads it."""
+        return FitPolicy(split=self.split, remat=self.remat, microbatches=self.microbatches)
+
+    def best_policies(self) -> tuple[Best, ...] | None:
+        """The policies the run ranks its checkpoints by (`best`), None for the run's default."""
+        return None if self.best is None else (self.best,)
 
     def resumes(self) -> bool:
         """Whether this run continues from a checkpoint of its own: a named run whose directory holds a
@@ -454,7 +425,7 @@ class TrainerConfig:
         """Return the step cap from `steps`, `epochs` or `examples`, None for a run its tokens bound
         alone, its own or where its data's schedule ends (`budget_tokens`; `run_steps`, the one policy
         a direct fit applies too, which refuses a schedule to an objective counting no tokens)."""
-        return run_steps(dataset, self.horizon, self.accumulation(dataset),
+        return run_steps(dataset, self.horizon, self.update_batches(dataset),
                          budget_tokens(dataset, self.horizon.token_cap))
 
     def total_updates(self, dataset: Loader) -> int | None:
@@ -463,7 +434,7 @@ class TrainerConfig:
         update ramps over. None for a token-only run."""
         _, steps = self.resolved(dataset)
         # A window the run ends inside is never committed, as the trainer counts its updates.
-        return None if steps is None else steps // self.accumulation(dataset)
+        return None if steps is None else steps // self.update_batches(dataset)
 
     def eval_interval(self, dataset: Loader) -> int | str | Counted | None:
         """Return the steps between validation passes over `data`, or None for never."""
@@ -501,7 +472,7 @@ class TrainerConfig:
             raise ValueError(
                 f"{option} epoch needs a dataset with a record count; this "
                 f"one streams without one, so give the interval in steps or None")
-        return dataset.epoch_steps(window=self.accumulation(dataset))
+        return dataset.epoch_steps(window=self.update_batches(dataset))
 
 
 def local_records(directory: str, name: str, kind: str) -> str:

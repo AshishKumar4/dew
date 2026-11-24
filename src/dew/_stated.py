@@ -11,7 +11,9 @@ file, its slots) and refuse what answers nothing."""
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
+import dis
 import functools
 import hashlib
 import inspect
@@ -129,7 +131,109 @@ _NONE_KNOWN: Mapping[int, JSON] = types.MappingProxyType({})
 """No value known by its `id` (`stated`'s default)."""
 
 
-def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
+_INSTALLED = contextvars.ContextVar("installed", default=False)
+"""Whether the statement in progress walks an installed distribution's code as a user's own (`stated`'s
+`installed`)."""
+
+def _walked(name: str | None) -> bool:
+    """Whether the module `name`'s code is stated with what it reads (`_own`, `_module_state`): a user's own
+    (`dew._sources.own_source`), and under a statement walking installed code (`stated`'s `installed`) an
+    installed distribution's (its top-level package a distribution's) unless every distribution whose
+    installed files hold its file (`_owners`) is one of Dew's own dependencies (`_dependencies`: their
+    versions, which Dew's environment pins, state them). One whose file no distribution's record lists is
+    walked (fail closed: no dependency vouches for it); one whose code no statement reads (an extension's,
+    one of no file) and no dependency vouches for is refused (`Unestablished`). Dew's own (its package
+    digest's) and the interpreter's stay their names."""
+    if _sources.own_source(name):
+        return True
+    if not _INSTALLED.get() or name is None or name not in sys.modules or name.partition(".")[0] == "dew":
+        return False
+    candidates = _sources.packages().get(name.partition(".")[0])
+    if not candidates:
+        return False
+    path = _sources.recorded(name)
+    owners = _owners(path, tuple(candidates)) if path is not None else ()
+    if owners and {_normalized(each) for each in owners} <= _dependencies():
+        return False
+    if path is None or path.suffix not in (".py", ".pyc"):
+        raise Unestablished(f"the installed module {name}, whose state no statement reads (an extension's or "
+                            "one of no file) and no dependency of Dew's installed")
+    return True
+
+
+@functools.cache
+def _owners(path: Path, candidates: tuple[str, ...]) -> tuple[str, ...]:
+    """The distributions among `candidates` (those sharing a module's top-level package) whose installed
+    files hold its file `path`: a namespace's submodule is the distribution's that installed it (the confirm
+    review: a plugin installed beside a dependency in its namespace was the dependency's); none where no
+    record lists it, which no dependency then vouches for."""
+    import importlib.metadata
+
+    owners = []
+    for candidate in candidates:
+        try:
+            distribution = importlib.metadata.distribution(candidate)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        files = distribution.files or ()
+        if any(Path(str(distribution.locate_file(held))).resolve() == path for held in files):
+            owners.append(candidate)
+    return tuple(owners)
+
+
+@functools.cache
+def _dependencies() -> frozenset[str]:
+    """The distributions Dew depends on, its requirements' and theirs, transitively (normalized names), each
+    requirement's marker evaluated (`packaging`) for the extras its requirer asked of it, none at the root:
+    Dew's metadata's where it is installed (its published distribution, `dewml`), its source tree's
+    `pyproject.toml` (its dependencies, no extra's) where it runs from source; a requirement an inactive
+    extra or another platform's marker holds is no dependency (the confirm review: every marker stripped
+    exempted a plugin an inactive extra named). Unknown, a statement walking installed code is refused
+    rather than walking every installed library's."""
+    import importlib.metadata
+    import tomllib
+
+    from packaging.requirements import Requirement
+
+    try:
+        declared = importlib.metadata.requires("dewml") or []
+    except importlib.metadata.PackageNotFoundError:
+        project = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        if not project.is_file():
+            raise Unestablished("Dew's dependencies, which neither its metadata nor a source tree's "
+                                "pyproject.toml declares") from None
+        declared = list(tomllib.loads(project.read_text())["project"].get("dependencies", []))
+
+    def applicable(texts: list[str], extras: frozenset[str]) -> list[Requirement]:
+        held = [Requirement(text) for text in texts]
+        return [requirement for requirement in held if requirement.marker is None
+                or any(requirement.marker.evaluate({"extra": extra}) for extra in extras or {""})]
+
+    pending = [(requirement, frozenset(requirement.extras))
+               for requirement in applicable(declared, frozenset())]
+    found: set[str] = set()
+    seen: set[tuple[str, frozenset[str]]] = set()
+    while pending:
+        requirement, extras = pending.pop()
+        name = _normalized(requirement.name)
+        if (name, extras) in seen:
+            continue
+        seen.add((name, extras))
+        found.add(name)
+        try:
+            texts = importlib.metadata.requires(name) or []
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        pending.extend((each, frozenset(each.extras)) for each in applicable(texts, extras))
+    return frozenset(found)
+
+
+def _normalized(name: str) -> str:
+    """A distribution's name as the packaging standard compares it (PEP 503)."""
+    return "-".join(part for part in name.lower().replace("_", "-").replace(".", "-").split("-") if part)
+
+
+def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN, *, installed: bool = False) -> JSON:
     """`value` as an identity states it: a JSON value equal in every process that holds an equal value.
 
     A class, a module's function or any object its module holds under its own name is that name (`_named`:
@@ -146,8 +250,17 @@ def stated(value, at: str, known: Mapping[int, JSON] = _NONE_KNOWN) -> JSON:
     An array of JAX's is its values and sharding (`_jax_array`); a function `jax.jit` wraps, what it wraps
     and its options (`_jitted`); a program Dew's compile point compiles (`dew.jit`'s), its function and its
     arguments (`_outer_program`). Refused, naming `at` and the value's type, for anything else: an object
-    with no such form could differ between two processes with nothing in the identity to show it."""
-    return _stated(value, at, known, ())
+    with no such form could differ between two processes with nothing in the identity to show it.
+
+    With `installed`, an installed distribution's code is walked as a user's own is (`_walked`): its
+    functions' closures and globals, its modules' state, its classes' members, and a dependency no statement
+    holds refused, where a statement names it alone as its version's (a policy plugin whose module data a
+    process set apart, the decoding boundary's, `dew.sampling.text.policy_identity`)."""
+    token = _INSTALLED.set(installed)
+    try:
+        return _stated(value, at, known, ())
+    finally:
+        _INSTALLED.reset(token)
 
 
 def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
@@ -167,11 +280,11 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return computed
     if isinstance(value, types.ModuleType):
         # A module of the user's is everything it holds: code that names it may read any of it.
-        held = _module_state(value, at, known, walking) if _sources.own_source(value.__name__) else None
+        held = _module_state(value, at, known, walking) if _walked(value.__name__) else None
         return ["module", _coded(value.__name__, at), held]
     if isinstance(value, logging.Logger):
         return ["logger", value.name]
-    if isinstance(value, (types.FunctionType, type)) and _sources.own_source(value.__module__):
+    if isinstance(value, (types.FunctionType, type)) and _walked(value.__module__):
         return _own(value, at, known, walking)
     if (wrapping := _wrapping(value, at, again)) is not None:
         return wrapping
@@ -214,7 +327,26 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...])
         return ["partial", again(type(value), at=at), again(value.func, at=at), again(value.args, at=at),
                 again(value.keywords, at=at)]
     if isinstance(value, types.MethodType):
-        return ["method", again(value.__self__, at=at), value.__name__]
+        # An installed plugin's object entered by this method (`_reached`, its own class's alone), and the
+        # function bound, which a method object may bind apart from its class's (the confirm review); a
+        # user's own whole as before, its class stating every member.
+        function = value.__func__
+        # The class a classmethod binds is its receiver itself, an object's its class (the confirm review).
+        receiver = value.__self__ if isinstance(value.__self__, type) else type(value.__self__)
+        # The bound body seeds an installed plugin's reachable members alone (`_reached`): a user's own
+        # class is stated whole, its methods' bytecode never read for dispatch (the confirm review).
+        walks = (_INSTALLED.get() and not _sources.own_source(receiver.__module__)
+                 and _walked(receiver.__module__) and isinstance(function, types.FunctionType))
+        body = _dispatched(function.__code__)[0] if walks else set()
+        token = _ENTRY.set((receiver, frozenset({value.__name__, *body})))
+        try:
+            held = ["method", again(value.__self__, at=at), value.__name__]
+        finally:
+            _ENTRY.reset(token)
+        if isinstance(function, types.FunctionType) and not _sources.own_source(function.__module__) and (
+                _walked(function.__module__)):
+            held.append(again(function, at=f"{at}.{value.__name__}"))
+        return held
     if isinstance(value, types.FunctionType):
         if id(value) in walking:
             return ["itself", value.__qualname__]
@@ -254,7 +386,7 @@ def _wrapping(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     if (flax_module is not None and isinstance(value, flax_module.Module)
             and inspect.getattr_static(value, "scope", None) is not None):
         raise Unestablished(f"{at}: a Flax module bound to its variables, which no statement holds")
-    if _sources.hand_written(inspect.getattr_static(value, "__wrapped__", None)):
+    if _sources.hand_written(inspect.getattr_static(value, "__wrapped__", None), _walked):
         return _wrapping_users(value, at, again)
     return None
 
@@ -290,7 +422,7 @@ def _computed(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     if isinstance(value, PjitFunction):
         # A library's jitted function its module names (`jax.nn.silu`) is that name, as the library's code
         # is its version's; one wrapping the user's code is what it wraps, with its options.
-        if not _sources.hand_written(value.__wrapped__) and (named := _named(value, at)) is not None:
+        if not _sources.hand_written(value.__wrapped__, _walked) and (named := _named(value, at)) is not None:
             return named
         return _jitted(value, at, again)
     return None
@@ -504,7 +636,7 @@ def library_function(function: types.FunctionType) -> bool:
     module it names, which `functools.wraps` copies from the function it wraps (row 10554: a user's function
     wrapping a library's was stated without the globals it reads), as `_sources.hand_written` decides."""
     module = function.__globals__.get("__name__")
-    return module not in (None, "__main__") and not _sources.own_source(module)
+    return module not in (None, "__main__") and not _walked(module)
 
 
 def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
@@ -533,10 +665,117 @@ def _own(value, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) ->
         raise Unestablished(f"{at}: the class {value.__module__}.{value.__qualname__}, made inside a "
                             "function")
     within = (*walking, id(value))
-    return [*stated_name, [_class(held, at, known, within) for held in _sources.own_classes(value)]]
+    # Every class of its MRO whose code is walked (`_walked`: a user's own, an installed plugin's under
+    # `installed`), what a call of its methods runs, an inherited method's class among them; an installed
+    # plugin's by the members a call reaches alone (`_reached`).
+    classes = [held for held in value.__mro__ if _walked(held.__module__)]
+    if _sources.own_source(value.__module__):
+        return [*stated_name, [_class(held, at, known, within) for held in classes]]
+    kept = _reached(value)
+    return [*stated_name, [_class(held, at, known, within, kept.get(held, frozenset())) for held in classes]]
 
 
-def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
+_ENTRY: contextvars.ContextVar[tuple[type | None, frozenset[str]]] = contextvars.ContextVar(
+    "entry", default=(None, frozenset()))
+"""The class a bound method's object is and the names its statement enters it by (`_reached`): the method's
+name and every name the bound function's own body reads (an installed function bound to an object of no
+such member reaching `self.helper`), beside the methods Python calls by name; that object's class's alone,
+never a class another object it holds is."""
+
+
+def _reached(kind: type) -> dict[type, frozenset[str]]:
+    """The members of each class of an installed plugin's `kind`'s MRO a call reaches, as Python dispatches
+    it: from the methods Python calls by name (`__call__`, `__post_init__`, any its author wrote) and the
+    names a bound method's own body reads on the object it binds (`_ENTRY`), each name a reached
+    definition's code reads (`_dispatched`: `self.helper`'s `helper` among them) at its first definition
+    in the MRO, a name read through `super()` at its first definition past the reading one's class;
+    a class no statement walks (a dependency's) holds its slot, its version stating it. A method no call
+    reaches (one reading an opaque sentinel), an override's shadowed base among them, is no part of what
+    the plugin computes (the confirm review)."""
+    order = kind.__mro__
+    defined: dict[str, list[tuple[int, object]]] = {}
+    for position, owner in enumerate(order):
+        walked = _walked(owner.__module__)
+        held = dict(_sources.members(owner, _walked)) if walked else dict.fromkeys(vars(owner))
+        for name, member in held.items():
+            defined.setdefault(name, []).append((position, member))
+
+    def resolved(name: str, start: int) -> tuple[int, object] | None:
+        return next(((position, member) for position, member in defined.get(name, ())
+                     if position >= start), None)
+
+    receiver, entered = _ENTRY.get()
+    seeds = [name for name in defined if name.startswith("__") and name.endswith("__")]
+    seeds += list(entered) if receiver is kind else []
+    pending = [(name, 0) for name in seeds]
+    reached: set[tuple[str, int]] = set()
+    kept: dict[type, set[str]] = {}
+    while pending:
+        name, start = pending.pop()
+        found = resolved(name, start)
+        if found is None or (name, found[0]) in reached:
+            continue
+        position, member = found
+        reached.add((name, position))
+        if member is None:
+            continue
+        kept.setdefault(order[position], set()).add(name)
+        if isinstance(member, types.FunctionType):
+            plain, above = _dispatched(member.__code__)
+            pending.extend((each, 0) for each in plain)
+            if above:
+                # A zero-argument super() dispatches past the class its function was written in (its
+                # `__class__` cell), whatever slot it was found in (the confirm review).
+                lexical = _lexical_class(member)
+                if lexical not in order:
+                    raise Unestablished(f"{member.__qualname__}'s super(), whose class no closure states "
+                                        "within the object's MRO")
+                pending.extend((each, order.index(lexical) + 1) for each in above)
+    return {owner: frozenset(names) for owner, names in kept.items()}
+
+
+def _lexical_class(function: types.FunctionType) -> type | None:
+    """The class `function` was written in, which a zero-argument `super()` reads (its `__class__` closure
+    cell); None where it holds none."""
+    names = function.__code__.co_freevars
+    if "__class__" not in names or function.__closure__ is None:
+        return None
+    held = function.__closure__[names.index("__class__")].cell_contents
+    return held if isinstance(held, type) else None
+
+
+def _dispatched(code: types.CodeType) -> tuple[set[str], set[str]]:
+    """The names `code` (and the code nested in it) reads by an object's own dispatch, and those it reads
+    through a zero-argument `super()` (`LOAD_SUPER_ATTR`), each access by its own receiver (the confirm
+    review: one `super()` sent a method's every name past its class). A `super` whose receiver no
+    instruction states (two arguments, or one held or passed on rather than read at once) is refused."""
+    plain: set[str] = set()
+    above: set[str] = set()
+    supers = attributes = 0
+    for instruction in dis.get_instructions(code):
+        if instruction.opname == "LOAD_SUPER_ATTR":
+            if instruction.arg is not None and instruction.arg & 2:
+                raise Unestablished(f"a two-argument super() reading {instruction.argval} in "
+                                    f"{code.co_qualname}, whose dispatch no statement reads")
+            above.add(str(instruction.argval))
+            attributes += 1
+        elif instruction.opname in ("LOAD_GLOBAL", "LOAD_NAME") and instruction.argval == "super":
+            supers += 1
+        elif instruction.opcode in dis.hasname and isinstance(instruction.argval, str):
+            plain.add(instruction.argval)
+    if supers != attributes:
+        raise Unestablished(f"a super() in {code.co_qualname} held or passed on rather than read at once, "
+                            "whose dispatch no statement reads")
+    for constant in code.co_consts:
+        if isinstance(constant, types.CodeType):
+            nested_plain, nested_above = _dispatched(constant)
+            plain |= nested_plain
+            above |= nested_above
+    return plain, above
+
+
+def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, ...],
+           kept: frozenset[str] | None = None) -> JSON:
     """One class of a user's own class's MRO, completely: its module and name, its members (`_members`), its
     generated fields (`_field`: a dataclass's or an attrs class's), and its
     metaclass where that is the user's own code too (which runs as the class is made and may set what it
@@ -545,9 +784,9 @@ def _class(held: type, at: str, known: Mapping[int, JSON], walking: tuple[int, .
                           for field in _sources.generated_fields(held)]
     maker = type(held)
     made = (_stated(maker, f"{at} ({held.__name__}'s metaclass)", known, walking)
-            if _sources.own_source(maker.__module__) else None)
-    entry: list[JSON] = [_coded(held.__module__, at), held.__qualname__, _members(held, at, known, walking),
-                         fields, made]
+            if _walked(maker.__module__) else None)
+    entry: list[JSON] = [_coded(held.__module__, at), held.__qualname__,
+                         _members(held, at, known, walking, kept), fields, made]
     # How its generator made it, as it records its options (`generation_options`).
     options = _sources.generation_options(held)
     return [*entry, dict(options)] if options else entry
@@ -592,12 +831,13 @@ def met_again(value, walking: tuple[int, ...]) -> JSON:
             len(walking) - walking.index(id(value))]
 
 
-def _members(held, at: str, known: Mapping[int, JSON], walking: tuple[int, ...]) -> JSON:
+def _members(held, at: str, known: Mapping[int, JSON], walking: tuple[int, ...],
+             kept: frozenset[str] | None = None) -> JSON:
     """What a class or a module of the user's holds, each under its name (`dew._sources.members`), as an
     identity states it (`stated`): a method by the function its descriptor wraps, anything else by its
-    value, a partial or a bound method whole."""
+    value, a partial or a bound method whole; those `kept` names alone where given (`_reached`)."""
     return {name: _stated(member, f"{at} ({held.__name__}.{name})", known, walking)
-            for name, member in _sources.members(held)}
+            for name, member in _sources.members(held, _walked) if kept is None or name in kept}
 
 
 def _module_state(module: types.ModuleType, at: str, known: Mapping[int, JSON],

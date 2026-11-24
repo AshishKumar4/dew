@@ -308,7 +308,7 @@ class BlockSparseSelfAttention(CausalSelfAttention):
         selected = moba_selection(gate, keep, self.top_k)
         return checkpoint_name(selected_attention(
             query, key, value, selected, window_runs(chunks.windows), own=chunks.own, slots=slots,
-            key_valid=valid, implementation=self.ctx.attention_impl, dtype=self.ctx.dtype,
+            key_valid=valid, dtype=self.ctx.dtype,
             precision=self.ctx.precision, force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
             wide_logits=self.ctx.wide_logits, softcap=self.ctx.attn_logit_softcap), Residual.CONTEXT)
 
