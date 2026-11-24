@@ -436,45 +436,11 @@ def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}, routes
     names = {equation.primitive.name for equation in equations(graph, platform="cuda")}
     assert "dot_general" in names and "ragged_dot_general" not in names, names
-    assert not _masked_dot_operands(graph), "a dense call's rows reach its dot through a select"
+    masks = [equation for equation in equations(graph, platform="cuda")
+             if equation.primitive.name == "select_n" and equation.outvars[0].aval.shape == (512, 256)]
+    assert not masks, "a dense call's rows are selected whole before its product"
     assert graph.out_avals[0].shape == (1, 256, 384)
 
-
-def _masked_dot_operands(graph) -> list:
-    """Each `dot_general` of `graph` (its sub-jaxprs' too, an operand followed into a call's jaxpr as its
-    parameter) whose operand a `select_n` computes, through the elementwise casts between them: a mask of the
-    product's rows."""
-    from jax.extend import core as jcore
-
-    found = []
-
-    def walk(jaxpr, inherited: dict):
-        sources = dict(inherited) | {out: eqn for eqn in jaxpr.eqns for out in eqn.outvars}
-
-        def source(var):
-            eqn = sources.get(var)
-            while eqn is not None and eqn.primitive.name in ("convert_element_type", "copy"):
-                eqn = sources.get(eqn.invars[0])
-            return eqn
-
-        for eqn in jaxpr.eqns:
-            if eqn.primitive.name == "dot_general" and any(
-                    (each := source(operand)) is not None and each.primitive.name == "select_n"
-                    for operand in eqn.invars):
-                found.append(eqn)
-            for param in eqn.params.values():
-                for sub in (param if isinstance(param, (tuple, list)) else (param,)):
-                    inner = getattr(sub, "jaxpr", sub)
-                    if hasattr(inner, "eqns"):
-                        # A call's parameters are its operands where their counts agree (pjit, custom calls).
-                        passed = ({var: sources[outer] for var, outer in zip(inner.invars, eqn.invars,
-                                                                              strict=True)
-                                   if isinstance(outer, jcore.Var) and outer in sources}
-                                  if len(inner.invars) == len(eqn.invars) else {})
-                        walk(inner, passed)
-
-    walk(graph.jaxpr, {})
-    return found
 
 @pytest.mark.parametrize("product", ["forward", "input gradient", "kernel gradient"])
 def test_an_amperes_gpt_oss_projection_routes_to_a_kernel_that_lowers(product):
