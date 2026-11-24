@@ -1496,13 +1496,14 @@ def held_mean(acc: jax.Array, total: jax.Array, dtype, law) -> jax.Array:
 def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax.Array,
                  acc0: jax.Array) -> jax.Array:
     """The mean of the values `[B, K, Hk, Dv]` at the logits `[B, H, Q, K]` beside a state (its maximum `m0`
-    and mass `total0`, `[B, H, Q]`, and its sums `acc0`, `[B, H, Q, Dv]`, a valueless state's zero),
-    `[B, H, Q, Dv]`, as the reference forms it (`valued`): each key's mass at the row's maximum, held out of
-    the graph (`m`'s, any shift's derivative cancels), weighing the values narrowed to their dtype, the
-    narrowing a stop-gradient operand of its own; their total unnarrowed beside the state's mass. One quotient
-    formed apart from its binades (`scaled_contraction`, its divisor its own sum of its operands): every
-    order is that quotient again, so a cotangent's part through the values and through the total (each 2^130
-    at values near the format's largest) cancel within one sum; zero over a total of none."""
+    and mass `total0`, `[B, H, Q]`, and its sums `acc0`, `[B, H, Q, Dv]`, a valueless state's zero), `[B, H,
+    Q, Dv]`, as the reference forms it (`valued`): each key's mass at the row's maximum, held out of the graph
+    (`m`'s, any shift's derivative cancels), weighing the values narrowed to their dtype, the narrowing a
+    stop-gradient operand of its own and the weights' cotangent from them rounded there (`Form. narrowed`, as
+    JAX's transpose of the narrowing rounds it); their total unnarrowed beside the state's mass. One quotient
+    formed apart from its binades (`scaled_contraction`, its divisor its own sum of its operands): every order
+    is that quotient again, so a cotangent's part through the values and through the total (each 2^130 at
+    values near the format's largest) cancel within one sum; zero over a total of none."""
     batch, heads, queries, keys = logits.shape
     kv_heads, width = value.shape[2], value.shape[3]
     wide = at_least_fp32(value.dtype)
@@ -1516,7 +1517,8 @@ def _scaled_mean(logits: jax.Array, value: jax.Array, m0: jax.Array, total0: jax
     form = scaled_contraction.Form(
         ("bhgqk", "bhgqk", "bkhd", "bhgqd", "bhgq", "bhgq"),
         ((1, (((0, 1),), ((2, 1),))), (1, (((1, 1),), ((2, 1),))), (1, (((3, 1), (4, 1)),))), "bhgqd",
-        divisor=((1, (((0, 1),),)), (1, (((4, 1), (5, 1)),))), divided="bhgq")
+        divisor=((1, (((0, 1),),)), (1, (((4, 1), (5, 1)),))), divided="bhgq",
+        narrowed=((0, 0, jnp.dtype(value.dtype).name),))
     mean = scaled_contraction.contract(
         form, masses.reshape(*grouped, keys), narrowing.reshape(*grouped, keys), value.astype(wide),
         acc0.reshape(*grouped, width), carried.reshape(grouped), total0.reshape(grouped))

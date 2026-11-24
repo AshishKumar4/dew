@@ -59,14 +59,18 @@ class Form:
     """A sum's shape: each operand's subscript, each term (`Term`, its factors naming operands) and the
     result's subscript `out`; with `divisor` terms, the sum over them (over the letters `divided`, a subset
     of `out`'s) divides it, both formed apart from their binades and divided before they land, so a quotient
-    whose numerator and divisor pass the format lands within it (a zero divisor read as one). Every letter
-    has one extent wherever it appears, and none twice in one subscript."""
+    whose numerator and divisor pass the format lands within it (a zero divisor read as one). Each of
+    `narrowed`'s `(term, operand, dtype)` lands that term's pull onto that operand apart, rounded to `dtype`
+    before it joins the rest (a product of weights narrowed to their values' dtype, whose cotangent JAX's own
+    transpose rounds there). Every letter has one extent wherever it appears, and none twice in one
+    subscript."""
 
     subscripts: tuple[str, ...]
     terms: tuple[Term, ...]
     out: str
     divisor: tuple[Term, ...] = ()
     divided: str = ""
+    narrowed: tuple[tuple[int, int, str], ...] = ()
 
     def letters(self, group: tuple[Factor, ...]) -> str:
         """`group`'s letters, each once, in the order its factors' subscripts name them."""
@@ -199,18 +203,20 @@ def contract(form: Form, *arrays: jax.Array) -> jax.Array:
     return scaled_contraction_p.bind(*arrays, form=form)
 
 
-def _moved(terms: tuple[Term, ...], moving: dict, at: dict[int, int]) -> list[Term]:
-    """`terms`' product rule along the moving operands: along one to `+1` its tangent in its place; along
-    one to `-1`, `-dx / x^2`, its tangent to `+1` and the operand to `-1` twice."""
+def _moved(terms: tuple[Term, ...], moving: dict, at: dict[int, int]) -> list[tuple[Term, int, int]]:
+    """`terms`' product rule along the moving operands, each moved term with the term and operand it moved:
+    along one to `+1` its tangent in its place; along one to `-1`, `-dx / x^2`, its tangent to `+1` and the
+    operand to `-1` twice."""
     moved = []
-    for sign, groups in terms:
+    for t, (sign, groups) in enumerate(terms):
         for g, group in enumerate(groups):
             for f, (index, power) in enumerate(group):
                 if index not in moving:
                     continue
                 factors = (((at[index], 1),) if power > 0 else ((at[index], 1), (index, -1), (index, -1)))
                 changed = (*group[:f], *factors, *group[f + 1:])
-                moved.append((sign if power > 0 else -sign, (*groups[:g], changed, *groups[g + 1:])))
+                term = (sign if power > 0 else -sign, (*groups[:g], changed, *groups[g + 1:]))
+                moved.append((term, t, index))
     return moved
 
 
@@ -224,7 +230,11 @@ def _jvp(primals, tangents, *, form: Form):
     if not moving:
         return out, ad.Zero(jax.typeof(out).to_tangent_aval())
     at = {index: len(primals) + place for place, index in enumerate(moving)}
-    terms = _moved(form.terms, moving, at)
+    numerator = _moved(form.terms, moving, at)
+    terms = [term for term, _, _ in numerator]
+    marks = {(t, index): dtype for t, index, dtype in form.narrowed}
+    narrowed = tuple((j, at[index], marks[t, index]) for j, (_, t, index) in enumerate(numerator)
+                     if (t, index) in marks)
     operands = [*primals, *moving.values()]
     subscripts = [*form.subscripts, *(form.subscripts[index] for index in moving)]
     if form.divisor:
@@ -235,10 +245,10 @@ def _jvp(primals, tangents, *, form: Form):
             none = _laid(total == 0, form.divided, form.out)
             operands.append(jnp.where(none, jnp.zeros((), out.dtype), out))
             subscripts.append(form.out)
-            terms += [(-sign, (*groups, ((len(operands) - 1, 1),))) for sign, groups in below]
+            terms += [(-sign, (*groups, ((len(operands) - 1, 1),))) for (sign, groups), _, _ in below]
     if not terms:
         return out, ad.Zero(jax.typeof(out).to_tangent_aval())
-    tangent = Form(tuple(subscripts), tuple(terms), form.out, form.divisor, form.divided)
+    tangent = Form(tuple(subscripts), tuple(terms), form.out, form.divisor, form.divided, narrowed)
     return out, contract(tangent, *operands)
 
 
@@ -282,7 +292,9 @@ def _transpose(cotangent, *arrays, form: Form):
         subscripts.append(form.out)
         pulled = len(operands) - 1
         terms = []
-        for sign, groups in form.terms:
+        marks = {t: dtype for t, index, dtype in form.narrowed if index == linear}
+        rounded: dict[str, list[Term]] = {}
+        for t, (sign, groups) in enumerate(form.terms):
             found = [(g, f) for g, group in enumerate(groups) for f, (index, _) in enumerate(group)
                      if index == linear]
             if not found:
@@ -302,11 +314,16 @@ def _transpose(cotangent, *arrays, form: Form):
                                          array.aval.dtype))
                 subscripts.append(unread)
                 extra = ((len(operands) - 1, 1),)
-            terms.append((sign, (*(group for group in rest if group), ((pulled, 1), *below, *extra))))
-        if not terms:
+            pulled_term = (sign, (*(group for group in rest if group), ((pulled, 1), *below, *extra)))
+            (rounded.setdefault(marks[t], []) if t in marks else terms).append(pulled_term)
+        if not terms and not rounded:
             # An operand no term reads (a sum's operand its own transpose carried along): no cotangent.
             continue
-        landed = contract(Form(tuple(subscripts), tuple(terms), subscript), *operands)
+        landed = (contract(Form(tuple(subscripts), tuple(terms), subscript), *operands) if terms
+                  else jnp.zeros(array.aval.shape, _dtype(operands)))
+        for dtype, apart in rounded.items():
+            alone = contract(Form(tuple(subscripts), tuple(apart), subscript), *operands)
+            landed = landed + alone.astype(dtype).astype(alone.dtype)
         out[linear] = landed.astype(array.aval.dtype)
     return out
 
@@ -344,7 +361,8 @@ def _batched(arrays, dims, *, form: Form):
     terms = spanned(form.terms)
     divisor = spanned(form.divisor) if form.divisor else ()
     divided = letter + form.divided if form.divisor else ""
-    return contract(Form(tuple(subscripts), terms, letter + form.out, divisor, divided), *operands), 0
+    return contract(Form(tuple(subscripts), terms, letter + form.out, divisor, divided, form.narrowed),
+                    *operands), 0
 
 
 batching.primitive_batchers[scaled_contraction_p] = _batched
