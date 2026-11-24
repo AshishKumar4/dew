@@ -175,8 +175,9 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
     `shared`: on mma.sync, its consumers running one cp.async pipeline together (`CpAsync.shared_consumers`,
     each copying its share of every block and meeting the other before a slot is read and refilled);
     `split`, its walk in segments of their own weights: an empty one, a first step's alone, a gap its next
-    step falls in (walked by none), and the rest past a boundary each consumer's own (a causal call's masked
-    segment, which one consumer's keys end a step sooner in) at twice the weight (`_split_weights`)."""
+    step falls in (walked by none), the rest past a boundary each consumer's own (a causal call's masked
+    segment, which one consumer's keys end a step sooner in) at twice the weight (`_split_weights`), and an
+    empty one past the operands' blocks, which the interpreter's memory refuses a load of."""
     from dew.nn.kernels.templates import mosaic_sm90
     share = FED_ROWS // consumers
     family = bundles.named("mma.sync", jnp.bfloat16, None) if shared else mosaic_sm90.FED
@@ -208,8 +209,10 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
             middle = first + 3 + wg
             twice = functools.partial(step, weight=2)
             whole = ((step, first, first + FED_STEPS),)
+            # An empty segment past the operands' blocks last, whose tiles no trip may load.
+            past = first + FED_STEPS + 3
             segments = ((step, first, first), (step, first, first + 1), (step, first + 2, middle),
-                        (twice, middle, first + FED_STEPS)) if split else whole
+                        (twice, middle, first + FED_STEPS), (step, past, past)) if split else whole
             return family.walk(feed, segments, (), ((FED_ROWS, FED_WIDTH),), interpret, first=first,
                                unrolled=unrolled, in_flight=in_flight)[1][0]
 
@@ -333,10 +336,11 @@ def test_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store
 
 @INTERPRETS
 def test_two_mma_sync_consumers_walk_segments_whose_boundaries_differ_through_one_pipeline():
-    """Interpreted: two mma.sync consumers sharing one pipeline walk segments from a step past 0 (an empty
-    one, a gap, and a boundary each consumer's own), as one pipeline over the walk's whole range, each step
-    its own segment's (none in the gap): exactly each segment's weighted products (a pipeline of its own a
-    segment met unpaired where their boundaries differ, and hung)."""
+    """Interpreted: two mma.sync consumers sharing one pipeline walk segments from a step past 0 (empty ones,
+    one past the operands' blocks, a gap, and a boundary each consumer's own), as one pipeline over the
+    segments' steps alone, each its own segment's: exactly each segment's weighted products, no gap's or
+    empty segment's tile loaded (a pipeline of its own a segment met unpaired where their boundaries differ,
+    and hung; one over the walk's whole range loaded the gap's tiles and past the operands)."""
     p, x = _fed_operands()
     got = _fed_products(p, x, interpret=INTERPRETED, consumers=2, lo=3, shared=True, split=True)
     summed = sum(weight * np.asarray(p, np.float32)[:, rows] @ np.asarray(x, np.float32)[rows]
