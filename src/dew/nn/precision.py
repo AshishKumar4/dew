@@ -1198,8 +1198,10 @@ class LowPrecision:
             raise ValueError(f"tensor_scaling is 'current' or 'delayed', not {self.tensor_scaling!r}")
         if self.tensor_scaling == "delayed" and self.recipe != "nvfp4":
             raise ValueError(f"delayed tensor scaling is NVFP4's alone, not {self.recipe!r}'s")
-        if self.amax_history < 1:
-            raise ValueError(f"an amax history holds at least one step, not {self.amax_history}")
+        if (not isinstance(self.amax_history, int) or isinstance(self.amax_history, bool)
+                or self.amax_history < 1):
+            raise ValueError(f"an amax history holds a whole number of steps, at least one, not "
+                             f"{self.amax_history!r}")
 
 
 @contextlib.contextmanager

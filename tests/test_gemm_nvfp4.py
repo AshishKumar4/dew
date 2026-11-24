@@ -947,8 +947,9 @@ def test_an_nvfp4_products_gathered_rescue_sums_across_its_bands_seam_exactly():
 def test_an_nvfp4_operand_at_a_given_tensor_scale_is_the_rule_at_that_scale():
     """`NvFp4Block.quantized(x, tensor_scale)`, a delayed-scaling recipe's operand (row 12721): at `x`'s own
     tensor scale it is the current rule's operand bit for bit; at four times it, the operand of `x / 4` at
-    `x`'s scale (an exact power of two through every quotient), its tensor scale the given one; and at a
-    scale below `x`'s own, its block scales saturate at 448 and its codes at 6, as delayed scaling clips."""
+    `x`'s scale (an exact power of two through every quotient), its tensor scale the given one; at a scale
+    below `x`'s own, its block scales saturate at 448 and its codes at 6, as delayed scaling clips; and a
+    scale an array of more than one is refused."""
     from dew.nn.kernels.projections import delayed_tensor_scale
 
     x = jnp.asarray(np.random.default_rng(12721).normal(size=(64, 128)), jnp.float32)
@@ -967,6 +968,8 @@ def test_an_nvfp4_operand_at_a_given_tensor_scale_is_the_rule_at_that_scale():
     assert float(np.max(np.abs(np.asarray(clipped.codes, np.float32)))) == 6.0
     history = jnp.asarray([0.5, float(jnp.max(jnp.abs(x))), 2.0], jnp.float32)
     assert float(delayed_tensor_scale(history)) == float(bits.nvfp4_tensor_scale(jnp.max(history)))
+    with pytest.raises(ValueError):  # one scale for the tensor, never one a row
+        formats.NvFp4Block.quantized(x, jnp.full((64,), own.scale))
 
 
 def test_an_nvfp4_projection_at_its_rows_own_tensor_scale_is_the_current_recipes_bitwise():
@@ -994,8 +997,8 @@ def test_an_nvfp4_projection_at_its_rows_own_tensor_scale_is_the_current_recipes
 def test_a_delayed_nvfp4_recipe_takes_its_rows_tensor_scale_and_only_it_does():
     """A run's NVFP4 recipe under delayed tensor scaling (`LowPrecision.tensor_scaling`, opt-in, row 12721):
     its recipe projection requires the rows' tensor scale and is `nvfp4_projection` at it; the current
-    recipe refuses one; a layer's product through its `dot_general` takes the scale its block states
-    (`projections.delayed_scale`); and delayed scaling is NVFP4's alone."""
+    recipe refuses one; a layer's product (`recipe_general`, a `Dense`'s) and its `dot_general` take the
+    scale they are given; and delayed scaling is NVFP4's alone."""
     from dew.nn.kernels import projections
     from dew.nn.precision import DTYPE_PRESETS, NVFP4, LowPrecision, Numerics, projection_role
 
@@ -1018,9 +1021,103 @@ def test_a_delayed_nvfp4_recipe_takes_its_rows_tensor_scale_and_only_it_does():
     np.testing.assert_array_equal(np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16))
     with generation.run_precision(current), projection_role("mlp"), pytest.raises(ValueError):
         projections.recipe_projection(x, w, out_dtype=jnp.bfloat16, tensor_scale=scale)
-    # A layer's product through its `dot_general` (`recipe_general`, a Dense's) takes the scale its block
-    # states (`delayed_scale`).
     numbers = (((1,), (0,)), ((), ()))
-    with generation.run_precision(delayed), projection_role("mlp"), projections.delayed_scale(scale):
-        general = projections.recipe_general(x, w, numbers, jnp.bfloat16)
-    np.testing.assert_array_equal(np.asarray(general).view(np.uint16), np.asarray(want).view(np.uint16))
+    with generation.run_precision(delayed), projection_role("mlp"):
+        general = projections.recipe_general(x, w, numbers, jnp.bfloat16, tensor_scale=scale)
+        layered = projections.dot_general(jax.lax.dot_general)(x, w, numbers,
+                                                                 preferred_element_type=jnp.bfloat16,
+                                                                 tensor_scale=scale)
+    for got in (general, layered):
+        np.testing.assert_array_equal(np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16))
+
+
+def test_a_delayed_layers_product_takes_each_call_its_own_tensor_scale():
+    """A layer's product under delayed NVFP4 scaling (`recipe_general`, a `Dense`'s, and its `dot_general`)
+    takes its rows' tensor scale as an operand (row 12721): one compiled program called at two scales is the
+    projection at each, and under `jax.checkpoint` in a `jax.lax.scan` over the scales each step's value is
+    the projection's at its scale and the gradients the sum of theirs."""
+    from dew.nn.kernels import projections
+    from dew.nn.precision import DTYPE_PRESETS, LowPrecision, Numerics, projection_role
+
+    rng = np.random.default_rng(12725)
+    x = jnp.asarray(rng.normal(size=(128, 128)), jnp.bfloat16)
+    w = jnp.asarray(rng.normal(size=(128, 64)) / 8, jnp.bfloat16)
+    numbers = (((1,), (0,)), ((), ()))
+    scales = jnp.asarray([0.25, 2.0 ** -12], jnp.float32)
+    blocks = jnp.asarray([1], jnp.int32)
+
+    def summed(product):
+        def total(x, w):
+            out = product(x, w)
+            return jnp.sum(out.astype(jnp.float32)), out
+        return total
+
+    def apart(scale):
+        projected = summed(lambda x, w: projections.nvfp4_projection(
+            x, w[None], blocks, out_dtype=jnp.bfloat16, tensor_scale=scale))
+        (_, out), grads = jax.value_and_grad(projected, argnums=(0, 1), has_aux=True)(x, w)
+        return out, grads
+
+    def same(got, want):
+        np.testing.assert_array_equal(np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16))
+
+    wants = [apart(scale) for scale in scales]
+    # The two scales quantize the rows apart: a program reusing the first scale's would differ.
+    assert not np.array_equal(np.asarray(wants[0][0]), np.asarray(wants[1][0]))
+    delayed = Numerics(DTYPE_PRESETS["bf16-mixed"],
+                       low_precision=LowPrecision(recipe="nvfp4", tensor_scaling="delayed"))
+    with generation.run_precision(delayed), projection_role("mlp"):
+        general = jax.jit(lambda x, w, s: projections.recipe_general(x, w, numbers, jnp.bfloat16,
+                                                                     tensor_scale=s))
+        layered = jax.jit(lambda x, w, s: projections.dot_general(jax.lax.dot_general)(
+            x, w, numbers, preferred_element_type=jnp.bfloat16, tensor_scale=s))
+        for scale, (want, _) in zip(scales, wants, strict=True):
+            same(general(x, w, scale), want)
+            same(layered(x, w, scale), want)
+
+        def stepped(x, w):
+            def step(total, scale):
+                product = summed(lambda x, w: projections.recipe_general(x, w, numbers, jnp.bfloat16,
+                                                                         tensor_scale=scale))
+                each, out = jax.checkpoint(product)(x, w)
+                return total + each, out
+            return jax.lax.scan(step, jnp.float32(0), scales)
+
+        (_, outs), grads = jax.jit(jax.value_and_grad(stepped, argnums=(0, 1), has_aux=True))(x, w)
+    for step, (want, _) in enumerate(wants):
+        same(outs[step], want)
+    for got, first, second in zip(grads, wants[0][1], wants[1][1], strict=True):
+        same(got, first + second)
+
+
+def test_a_delayed_scale_is_its_records_largest_finite_magnitude():
+    """`nvfp4_amax` and `delayed_tensor_scale` (row 12721), compiled, reduce finite values alone from zero:
+    an empty or all-zero history's scale is 1, a NaN or infinite record leaves the finite ones' scale, an
+    empty or all-nonfinite tensor records 0, and a subnormal largest is the rule's own as NaN beside it
+    leaves it."""
+    from dew.nn.kernels import projections
+
+    amax, scale = jax.jit(projections.nvfp4_amax), jax.jit(projections.delayed_tensor_scale)
+    rule = jax.jit(bits.nvfp4_tensor_scale)
+    for history, want in (((), 1.0), ((0.0, 0.0), 1.0), ((np.nan, 3.0), rule(jnp.float32(3.0))),
+                          ((np.inf, 3.0, 0.5), rule(jnp.float32(3.0))), ((np.nan, -np.inf), 1.0)):
+        assert float(scale(jnp.asarray(history, jnp.float32))) == float(want)
+    assert float(amax(jnp.asarray([[np.nan, -5.0], [np.inf, 2.0]], jnp.float32))) == 5.0
+    for empty in (jnp.zeros((0, 4), jnp.bfloat16), jnp.full((2, 2), np.nan, jnp.float32),
+                  jnp.full((3,), -np.inf, jnp.float32)):
+        assert float(amax(empty)) == 0.0
+    subnormal = np.float32(2.0 ** -140)
+    alone, besides = (scale(jnp.asarray(history, jnp.float32))
+                      for history in ((subnormal,), (subnormal, np.nan)))
+    assert float(alone) == float(besides) and np.isfinite(float(alone)) and float(alone) > 0
+    assert float(amax(jnp.asarray([subnormal, np.nan, np.inf]))) == float(amax(jnp.asarray([subnormal])))
+
+
+@pytest.mark.parametrize("history", [0, 1.5, float("nan"), float("inf"), True])
+def test_an_amax_history_is_a_whole_number_of_steps(history):
+    """`LowPrecision.amax_history` (row 12721) refuses a history of no steps, a fraction, NaN, infinity and
+    a bool."""
+    from dew.nn.precision import LowPrecision
+
+    with pytest.raises(ValueError):
+        LowPrecision(recipe="nvfp4", tensor_scaling="delayed", amax_history=history)

@@ -1012,6 +1012,8 @@ def nvfp4_coded(x: jax.Array, tensor: jax.Array | None = None) -> tuple[jax.Arra
             return correctly_rounded_divide(numerator, denominator)
         return (jnp.asarray(numerator, x.dtype) / jnp.asarray(denominator, x.dtype)).astype(jnp.float32)
 
+    if tensor is not None and jnp.ndim(tensor) != 0:
+        raise ValueError(f"an NVFP4 tensor scale is one scalar, not a {jnp.shape(tensor)} array")
     magnitude = jnp.abs(x)
     tensor = (nvfp4_tensor_scale(jnp.max(magnitude), quotient) if tensor is None
               else jnp.asarray(tensor, jnp.float32))

@@ -5,8 +5,6 @@ of the quantized product's derivative), else through the template's dense produc
 launch takes any of its products, else XLA's own program."""
 
 import collections
-import contextlib
-import contextvars
 import functools
 import math
 from collections.abc import Callable, Hashable
@@ -398,24 +396,13 @@ def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out
     return _mx_projection(x, w, group_blocks, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
-def _recipe_value(form, product, x, w, group_blocks, out_dtype, interpret):
-    """A block-scaled recipe's value (`mxfp8_projection`'s, `nvfp4_projection`'s): `x` and `w` quantized
-    along the depth to `form`, their `product`."""
-    return product(form.quantized(x), form.quantized(jnp.swapaxes(w, 1, 2)), group_blocks,
-                   out_dtype=out_dtype, interpret_on_cpu=interpret)
-
-
-def _recipe_forward(value, x, w, group_blocks, out_dtype, interpret):
-    """A block-scaled recipe's forward: its `value`, the operands its backward reads."""
-    return value(x, w, group_blocks, out_dtype, interpret), (x, w, group_blocks)
-
-
 def _mx_value(x, w, group_blocks, out_dtype, interpret):
-    return _recipe_value(MxFp8, mxfp8_product, x, w, group_blocks, out_dtype, interpret)
+    return mxfp8_product(MxFp8.quantized(x), MxFp8.quantized(jnp.swapaxes(w, 1, 2)), group_blocks,
+                         out_dtype=out_dtype, interpret_on_cpu=interpret)
 
 
 def _mx_forward(x, w, group_blocks, out_dtype, interpret):
-    return _recipe_forward(_mx_value, x, w, group_blocks, out_dtype, interpret)
+    return _mx_value(x, w, group_blocks, out_dtype, interpret), (x, w, group_blocks)
 
 
 def _mx_backward(out_dtype, interpret, residuals, cotangent):
@@ -458,18 +445,25 @@ def _nvfp4_value(x, w, group_blocks, tensor_scale, out_dtype, interpret):
 
 
 def nvfp4_amax(x: jax.Array) -> jax.Array:
-    """`x`'s largest magnitude in fp32, no gradient through it: the value a delayed-scaling NVFP4 run records
-    in its amax history for the projection `x` is the rows of (row 12721), the max over devices its state's
-    to take."""
-    return jax.lax.stop_gradient(jnp.max(jnp.abs(x.astype(jnp.float32))))
+    """`x`'s largest finite magnitude in fp32 (0 for none: an empty `x`, or one all NaN or infinite), no
+    gradient through it: the value a delayed-scaling NVFP4 run records in its amax history for the
+    projection `x` is the rows of (row 12721), the max over devices its state's to take."""
+    return jax.lax.stop_gradient(_finite_largest(jnp.abs(x.astype(jnp.float32))))
 
 
 def delayed_tensor_scale(history: jax.Array) -> jax.Array:
     """The NVFP4 tensor scale of an amax `history` (its last steps' largest magnitudes): the scale of their
-    largest (`bits.nvfp4_tensor_scale`), as Transformer Engine's delayed scaling takes it (row 12721)."""
+    largest finite one (`bits.nvfp4_tensor_scale`, 1 for none), as Transformer Engine's delayed scaling
+    takes it (row 12721): an empty history, or a step's NaN or infinite record, leaves the scale the other
+    steps' rather than infinite or reset to 1."""
     from dew.algebra import bits
 
-    return bits.nvfp4_tensor_scale(jnp.max(jnp.asarray(history, jnp.float32)))
+    return bits.nvfp4_tensor_scale(_finite_largest(jnp.asarray(history, jnp.float32)))
+
+
+def _finite_largest(values: jax.Array) -> jax.Array:
+    """The largest of `values`' finite entries and 0: an amax's reduction, defined on none."""
+    return jnp.max(jnp.where(jnp.isfinite(values), values, jnp.float32(0)), initial=jnp.float32(0))
 
 
 class Recipe(NamedTuple):
@@ -533,9 +527,10 @@ def dot_general(xla, path: tuple | None = None):
     A `bias`, shaped to broadcast over the product's trailing axes, is added as `precision.biased` adds
     it; XLA's own product takes it inside its rule, the input's cotangent returned only with the kernel's
     and the bias's gradients formed, one barrier for both where the bias's own rule would add two (row
-    6740)."""
+    6740). A `tensor_scale`, the rows' tensor scale under the run's delayed NVFP4 scaling, goes to the
+    recipe's product (`recipe_general`); a product the recipe leaves reads none."""
     def product(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, bias=None,
-                **kwargs):
+                tensor_scale=None, **kwargs):
         def added(out):
             # A product another rule takes, the bias added past it by its own (`precision.biased`).
             return out if bias is None else biased(out, bias)
@@ -543,7 +538,8 @@ def dot_general(xla, path: tuple | None = None):
         (contracted, against), batch = dimension_numbers
         out_dtype = jnp.dtype(preferred_element_type or lhs.dtype)
         # The run's low-precision recipe takes the product where the projection's role takes it.
-        if not kwargs and (recipe := recipe_general(lhs, rhs, dimension_numbers, out_dtype)) is not None:
+        if not kwargs and (recipe := recipe_general(lhs, rhs, dimension_numbers, out_dtype,
+                                                    tensor_scale=tensor_scale)) is not None:
             return added(recipe)
         plain = (not kwargs and jnp.ndim(rhs) == 2 and lhs.dtype == rhs.dtype
                  and tuple(contracted) == (lhs.ndim - 1,) and tuple(against) == (0,)
@@ -665,30 +661,17 @@ def extents(lhs_shape: tuple[int, ...], rhs_shape: tuple[int, ...], dimension_nu
             math.prod(rhs_shape[axis] for axis in range(len(rhs_shape)) if axis not in against + batched_rhs))
 
 
-_DELAYED_SCALE: contextvars.ContextVar = contextvars.ContextVar("delayed_scale", default=None)
-
-
-@contextlib.contextmanager
-def delayed_scale(tensor_scale: jax.Array):
-    """Within the block, a layer's product in the run's recipe (`recipe_general`: a `Dense`'s, through its
-    `dot_general`) quantizes its rows at `tensor_scale` (`recipe_projection`'s): a delayed-scaling NVFP4
-    run's layer, its scale its amax history's (`delayed_tensor_scale`), enters it around its own product
-    (row 12721). Read at trace time: one layer's block, one scale."""
-    token = _DELAYED_SCALE.set(tensor_scale)
-    try:
-        yield
-    finally:
-        _DELAYED_SCALE.reset(token)
-
-
-def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype) -> jax.Array | None:
+def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype, *,
+                   tensor_scale: jax.Array | None = None) -> jax.Array | None:
     """A layer's product (`jax.lax.dot_general`'s `dimension_numbers`) in the run's low-precision recipe
     (`recipe_projection`), as matrices (`grouped_rows`): a dense projection's free rows against its kernel's
     contracted axes, a batched one's (a grouped output projection's, DeepSeek V4's `o_a_proj`) each batch
     member a group of rows against its own matrix, the result in `dot_general`'s order; None where
     `recipe_projection` takes none of it, and where the run trains in no recipe before any operand is laid
     out as matrices: an operand an explicit mesh axis splits takes no reshape that does not state where its
-    rows lie."""
+    rows lie. `tensor_scale`, the rows' tensor scale under the run's delayed scaling, an operand of the
+    product as `recipe_projection` takes it (a traced value: a scale held in no trace's key would serve a
+    later scale's call the first one's program)."""
     from dew.nn.precision import recipe_role
 
     if recipe_role() is None:
@@ -696,11 +679,9 @@ def recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype)
     rows, matrices, count, shape = grouped_rows(lhs, rhs, dimension_numbers)
     groups = matrices.shape[0]
     batched = bool(dimension_numbers[1][0])
-    # A delayed-scaling layer's rows' tensor scale, where its block states one (`delayed_scale`).
-    scale = _DELAYED_SCALE.get()
-    out = (recipe_projection(rows, matrices, jnp.full((groups,), count, jnp.int32), out_dtype=out_dtype,
-                             tensor_scale=scale)
-           if batched else recipe_projection(rows, matrices[0], out_dtype=out_dtype, tensor_scale=scale))
+    sizes = jnp.full((groups,), count, jnp.int32) if batched else None
+    out = recipe_projection(rows, matrices if batched else matrices[0], sizes, out_dtype=out_dtype,
+                            tensor_scale=tensor_scale)
     return None if out is None else out.reshape(shape)
 
 
