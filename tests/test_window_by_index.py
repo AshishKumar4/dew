@@ -12,7 +12,7 @@ import pytest
 
 from dew.data import Files
 from dew.data.compile import compile
-from dew.data.dataset import Closeable, DataPartition, Loading
+from dew.data.dataset import Checkpointable, Closeable, DataPartition, Loading
 
 LOADING = Loading(workers=0, threads=1, read_buffer=1)
 
@@ -62,7 +62,10 @@ def _reader(tmp_path, chain: str, how: str, loading: Loading = LOADING, **compil
     """`chain`'s training read over its files under `how` (`served` by index, or `streamed`)."""
     build, sizes = CHAINS[chain]
     files = _files(tmp_path / how, sizes)
-    return compile(build(files), read="streamed", loading=loading, seed=7, **compiled).train(DataPartition())
+    compiled_chain = compile(build(files), read="streamed", loading=loading, seed=7, **compiled)
+    reader = compiled_chain.train(DataPartition())
+    assert isinstance(reader, Checkpointable), type(reader)
+    return reader
 
 
 @pytest.mark.parametrize("chain", sorted(CHAINS))
@@ -145,7 +148,9 @@ def test_an_elastic_window_saved_without_workers_resumes_with_two(tmp_path):
         files = _files(tmp_path / "served", (9, 7))
         chain = _read(files).repeat().shuffle(3, window=8).batch(2).elastic()
         loading = Loading(workers=workers, threads=1, read_buffer=1)
-        return compile(chain, read="streamed", loading=loading, seed=7).train(DataPartition())
+        reader = compile(chain, read="streamed", loading=loading, seed=7).train(DataPartition())
+        assert isinstance(reader, Checkpointable), type(reader)
+        return reader
 
     saved = elastic(0)
     for _ in range(3):

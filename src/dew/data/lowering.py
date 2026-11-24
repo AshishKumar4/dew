@@ -672,7 +672,15 @@ class _ShardSteps:
         plain = not self.cached and all(type(stage) is Map and pool_of((stage,)) is None
                                         for stage in self.stages)
         rows = self.reader.indexed(shard) if plain and isinstance(self.reader, base.IndexedShards) else None
-        return rows if rows is None or not self.stages else base.MappedRows(rows, _Rows(self.stages))
+        return rows if rows is None or not self.stages else base.MappedRows(
+            rows, functools.partial(_made, _Rows(self.stages)))
+
+
+def _made(steps: _Rows, record: Batch) -> Batch:
+    """`record` through `steps`, maps alone, each making one record of one (`_ShardSteps.indexed`)."""
+    made = steps(record)
+    assert isinstance(made, Mapping), type(made)
+    return made
 
 
 def _transparent(pipeline: Pipeline, cache: int) -> bool:
