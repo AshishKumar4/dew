@@ -242,3 +242,28 @@ def test_a_store_a_branch_holds_under_a_guard_of_the_data_is_refused():
 
     with pytest.raises(emission.Unpriced):
         _counted(body)
+
+
+def test_a_comparison_reads_its_sides_at_their_width_and_signedness():
+    """A thread's index less one compared unsigned with 32 bits' largest (PTX's octal `037777777777`, and
+    arith's `ult` against -1) holds on the first lane alone, its -1 being that largest: a store it guards
+    moves one word, and a branch on it runs one lane's."""
+    def octal(ctx, ref):
+        del ctx, ref
+        i32 = ir.IntegerType.get_signless(32)
+        below = arith.subi(arith.remui(mgpu_utils.thread_idx(), arith.constant(i32, 128)),
+                           arith.constant(i32, 1))
+        mgpu_utils.inline_ptx("{ .reg .pred p; setp.eq.u32 p, $1, 037777777777; @p st.shared.u32 [$0], $1; }",
+                              arith.constant(i32, 1), below, has_side_effects=True)
+
+    assert _counted(octal) == Work(shared_bytes=4)
+
+    def unsigned(ctx, ref):
+        del ctx
+        i32 = ir.IntegerType.get_signless(32)
+        below = arith.subi(arith.remui(mgpu_utils.thread_idx(), arith.constant(i32, 128)),
+                           arith.constant(i32, 1))
+        with mgpu_utils.when(arith.cmpi(arith.CmpIPredicate.uge, below, arith.constant(i32, 127))):
+            _scaled(ref)
+
+    assert _counted(unsigned) == Work(operations=32, shared_bytes=2 * 4)
