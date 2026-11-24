@@ -665,19 +665,29 @@ def _named(spec: jax.sharding.PartitionSpec) -> set[str]:
 
 @dataclasses.dataclass(frozen=True)
 class GatheredOver:
-    """A layout (`layout`) placing every leaf under one of `paths` (variables paths' leading keys, a looped
-    block's layers) whole over `axis` as `gathered_over` takes it, every other where `layout` does: what a
-    pass of a gathered loop traces under (`placing`), so a projection mapped per shard takes its gathered
-    weight as it lies (`dew.nn.kernels.projections.shard_placement`) and gathers it again in no pass."""
+    """A layout (`layout`) placing every leaf of a looped block's layers (`span`, `[first, end)`, under the
+    decoder's variables `scope`, `('params', ...)`) whole over `axis` as `gathered_over` takes it, every
+    other where `layout` does: what a pass of a gathered loop traces under (`placing`), so a projection
+    mapped per shard takes its gathered weight as it lies (`dew.nn.kernels.projections.shard_placement`) and
+    gathers it again in no pass. A layer is met by any module name running it, its own (`layers_3`) or a
+    scanned run's within the block (`layers_1_2`, `dew.nn.backbones.layer_names.group_layers`)."""
 
     layout: ParameterLayout
-    paths: tuple[tuple[str, ...], ...]
+    scope: tuple[str, ...]
+    span: tuple[int, int]
     axis: str
 
     def leaf_spec(self, mesh, path, value) -> jax.sharding.PartitionSpec:
+        from dew.nn.backbones.layer_names import group_layers
+
         spec = self.layout.leaf_spec(mesh, path, value)
         names = tuple(key.key if isinstance(key, jax.tree_util.DictKey) else key for key in path)
-        return _without(spec, self.axis) if any(names[:len(at)] == at for at in self.paths) else spec
+        at = len(self.scope)
+        runs = (group_layers(names[at]) if len(names) > at and isinstance(names[at], str)
+                and names[:at] == self.scope else None)
+        first, end = self.span
+        held = runs is not None and first <= runs.start and runs.stop <= end
+        return _without(spec, self.axis) if held else spec
 
 
 def _without(spec: jax.sharding.PartitionSpec, axis: str) -> jax.sharding.PartitionSpec:

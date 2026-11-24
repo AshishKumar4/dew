@@ -364,8 +364,7 @@ def run_loop(model, x, *, train: bool, decode: bool, passes=None, **inputs):
         every_pass = nn.map_variables(every_pass, mapped_collections='params', init=False, mutable=False,
                                       trans_in_fn=functools.partial(_gathered_block, names=names,
                                                                     path=model.scope.path, layout=layout))
-        with placing(GatheredOver(layout, tuple(('params', *model.scope.path, name) for name in names),
-                                  FSDP_AXIS)):
+        with placing(GatheredOver(layout, ('params', *model.scope.path), (first, end), FSDP_AXIS)):
             x, exited = every_pass(model, x)
     else:
         x, exited = every_pass(model, x)
