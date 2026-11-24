@@ -336,7 +336,7 @@ class TrainerConfig:
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if self.keep.where is not None:
             raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
-        if self.best is not None and self.best.score is not None:
+        if self.best is not None and (not isinstance(self.best, Best) or self.best.score is not None):
             raise TypeError("a recorded best selector names metrics; callable scores are code-only")
         # Each refuses what it holds as it is made, a length named twice or an update sized twice.
         _ = self.horizon, self.update_batch, self.fit_policy
