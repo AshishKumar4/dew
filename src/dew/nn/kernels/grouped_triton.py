@@ -70,7 +70,10 @@ class _Triton(_GroupedLaunch[Tile]):
         held = accumulators * rows * columns // (32 * config.warps) < target.multiprocessor.thread_registers
         short = not ba.arguments.get('exact_sums') or self.contraction(config) <= EXACT_STEP
         shared = not (target.wgmma and rows // max(config.warps // 4, 1) % 64)
-        return held and short and shared and super().legal(ba, config, target)
+        # No output stored in a form of its own (`Hooks.out_forms`: the Mosaic template's staged stores
+        # alone), a pin's or a direct call's as the selection's.
+        formless = not ba.arguments['hooks'].out_forms
+        return formless and held and short and shared and super().legal(ba, config, target)
 
     @staticmethod
     @abc.abstractmethod

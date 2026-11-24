@@ -88,7 +88,7 @@ class _Cutlass(_GroupedLaunch[tiling.Tiles]):
         return (all(operand.dtype == jnp.bfloat16 for operand in operands)
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
                 and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
-                and hooks.epilogue is None and hooks.out_dtypes is None
+                and hooks.epilogue is None and hooks.out_dtypes is None and not hooks.out_forms
                 and not any(GROUPS in axes for axes in hooks.prologue_axes)
                 and not ba.arguments.get('exact_sums')
                 and not ba.arguments['interpret'])
@@ -103,9 +103,10 @@ class _Cutlass(_GroupedLaunch[tiling.Tiles]):
 
     def legal(self, ba, config: tiling.Tiles, target) -> bool:
         """Whether `config` runs the call: its build's one kernel (`space`), which CUTLASS sized to every part
-        of its architecture, its shared memory and registers its own; a pin or a tuned pick names it."""
+        of its architecture, its shared memory and registers its own; a pin or a tuned pick names it, of a
+        call its kernels take (`in_contract`)."""
         del target
-        return config in self.space(ba)
+        return config in self.space(ba) and self.in_contract(ba)
 
 
 def _formed(tokens: jax.Array, prologue_operands: tuple, hooks: Hooks) -> jax.Array:

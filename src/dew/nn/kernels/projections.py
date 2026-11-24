@@ -29,6 +29,7 @@ from dew.nn.derivatives import (
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.formats import MxFp8, NvFp4Block
 from dew.nn.kernels.gemm import (
+    blockwise_fp8_finished,
     blockwise_fp8_kernel_gradient,
     blockwise_fp8_product,
     gemm,
@@ -227,6 +228,68 @@ def _projection_backward(out_dtype, interpret, residuals, cotangent):
 _blockwise_projection = contracted("test_a_blockwise_fp8_projection_holds_every_reverse_order")(
     declared_derivative(Surrogate(), _projection_value, _projection_forward, _projection_backward,
                         nondiff_argnums=(3, 4)))
+
+
+def _chain_value(x, w_up, w_down, group_blocks, activation, out_dtype, interpret):
+    """`blockwise_chain`'s value and its up projection's rounded product: the up projection's epilogue
+    quantizing its activation as the down projection's rows (`quantized.blockwise_fp8_epilogue`: codes and
+    1 x 128 scales, `[width / 128, rows]`, as `blockwise_fp8_product` reads its rows' scales)."""
+    from dew.nn.kernels.templates.gemm import quantized
+
+    sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
+    rows, rows_scales = rows_quantized(x)
+    up_blocks, up_scales = blocks_quantized(w_up)
+    up, codes, scales = blockwise_fp8_finished(
+        rows, jnp.swapaxes(up_blocks, 1, 2), sizes, rows_scales.T, up_scales,
+        epilogue=quantized.blockwise_fp8_epilogue(activation, out_dtype),
+        out_dtypes=(out_dtype, jnp.float8_e4m3fn, jnp.float32), out_forms=(None, None, (SCALE_DEPTH, True)),
+        dense=True, interpret_on_cpu=interpret)
+    down_blocks, down_scales = blocks_quantized(w_down)
+    out = blockwise_fp8_product(codes, jnp.swapaxes(down_blocks, 1, 2), sizes, scales, down_scales,
+                                out_dtype=out_dtype, interpret_on_cpu=interpret)
+    return out, up
+
+
+def _chain(x, w_up, w_down, group_blocks, activation, out_dtype, interpret):
+    return _chain_value(x, w_up, w_down, group_blocks, activation, out_dtype, interpret)[0]
+
+
+def _chain_forward(x, w_up, w_down, group_blocks, activation, out_dtype, interpret):
+    out, up = _chain_value(x, w_up, w_down, group_blocks, activation, out_dtype, interpret)
+    return out, (x, w_up, w_down, group_blocks, up)
+
+
+def _chain_backward(activation, out_dtype, interpret, residuals, cotangent):
+    """The two blockwise projections' own reverse modes (`_projection_backward`) through the activation's
+    derivative at the up projection's rounded product: the recipe's surrogate of each, as the two apart."""
+    x, w_up, w_down, group_blocks, up = residuals
+    activated, pulled = jax.vjp(lambda value: activation(value).astype(out_dtype), up)
+    d_activated, d_w_down, _ = _projection_backward(out_dtype, interpret, (activated, w_down, group_blocks),
+                                                    cotangent)
+    (d_up,) = pulled(d_activated.astype(activated.dtype))
+    d_x, d_w_up, _ = _projection_backward(out_dtype, interpret, (x, w_up, group_blocks), d_up)
+    return d_x, d_w_up, d_w_down, None
+
+# The chain's gradient (`blockwise_chain`): the recipe's surrogate of each projection (`Surrogate`).
+_blockwise_chain = contracted("test_a_blockwise_fp8_chain_holds_every_reverse_order")(
+    declared_derivative(Surrogate(), _chain, _chain_forward, _chain_backward, nondiff_argnums=(4, 5, 6)))
+
+
+def blockwise_chain(x: jax.Array, w_up: jax.Array, w_down: jax.Array, activation, *, out_dtype,
+                    interpret_on_cpu: bool = False) -> jax.Array:
+    """`blockwise_fp8_projection(activation(blockwise_fp8_projection(x, w_up)), w_down)` of `x`'s rows
+    (`[rows, depth]`, whole 128-row blocks, one group of them; `w_up` `[1, depth, hidden]`, `w_down` `[1,
+    hidden, width]`), each product rounded to `out_dtype`, the activation of the rounded up projection rounded
+    again, as an ungated MLP's two projections run apart in DeepSeek-V3's blockwise FP8 recipe: the down
+    projection's rows quantized in the up projection's epilogue, its codes and scales stored there
+    (`quantized.blockwise_fp8_epilogue`, the scales `[hidden / 128, rows]`), no pass of their own between the
+    two (row 8547). Bitwise the two apart, forward and reverse (`_chain_backward`: each projection's own
+    surrogate); `activation` is an elementwise function of an `out_dtype` array, the MLP's."""
+    if w_up.shape[0] != 1 or w_down.shape[0] != 1 or x.shape[0] % SCALE_DEPTH:
+        raise ValueError("a blockwise chain is one group's of whole 128-row blocks: its rows' quantized "
+                         "scales are stored transposed, each share's rows whole")
+    group_blocks = jnp.full((1,), x.shape[0] // SCALE_DEPTH, jnp.int32)
+    return _blockwise_chain(x, w_up, w_down, group_blocks, activation, jnp.dtype(out_dtype), interpret_on_cpu)
 
 
 def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,

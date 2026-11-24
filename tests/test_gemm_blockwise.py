@@ -248,3 +248,66 @@ def test_restored_blockwise_cublaslt_references_prepare_on_sm90(tmp_path, monkey
     with_ref = [h for h in arm_sites
                 if any(k.startswith("dew ") for k in h) and any(k.startswith("reference ") for k in h)]
     assert len(with_ref) == 2, [list(h.keys()) for h in arm_sites]
+
+
+@pytest.mark.parametrize("rows", [256, 384])
+def test_a_blockwise_chain_through_the_template_is_its_two_projections_apart(rows):
+    """An ungated MLP's two blockwise FP8 projections chained (`projections.blockwise_chain`), on an H100,
+    interpreted, through the template named: the down projection's rows quantized in the up projection's
+    epilogue and stored there (E4M3 codes and 1 x 128 scales `[hidden / 128, rows]`, transposed,
+    `quantized.reduced`), its value and every gradient bitwise the two projections apart with the
+    activation between them in XLA, as a recipe's run takes them today (row 8547); and the up projection's
+    launch the template's, its scales output in its form (`Hooks.out_forms`). 384 rows end in a share past
+    the last row tile's pair of 128 (its stores whole shares, the tensor's bound clipping them)."""
+    group_blocks = jnp.asarray([rows // 128], jnp.int32)
+    rng = np.random.default_rng(8547)
+    x = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+    up = jnp.asarray(rng.normal(size=(1, 256, 384)) / 16, jnp.bfloat16)
+    down = jnp.asarray(rng.normal(size=(1, 384, 256)) / 16, jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16)
+
+    def chained(x, up, down):
+        return projections.blockwise_chain(x, up, down, jax.nn.gelu, out_dtype=jnp.bfloat16,
+                                           interpret_on_cpu=True)
+
+    def apart(x, up, down):
+        hidden = projections.blockwise_fp8_projection(x, up, group_blocks, out_dtype=jnp.bfloat16,
+                                                      interpret_on_cpu=True)
+        return projections.blockwise_fp8_projection(jax.nn.gelu(hidden).astype(jnp.bfloat16), down,
+                                                    group_blocks, out_dtype=jnp.bfloat16,
+                                                    interpret_on_cpu=True)
+
+    with generation.assumed("sm90"), generation.chosen(blockwise_fp8="mosaic"), generation.routes() as routes:
+        fused = jax.jit(with_gradients(chained))(x, up, down, cotangent)
+        separate = jax.jit(with_gradients(apart))(x, up, down, cotangent)
+    for name, got, want in zip(("value", "d_x", "d_up", "d_down"), fused, separate, strict=True):
+        assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
+        bits = np.dtype(f"uint{8 * got.dtype.itemsize}")
+        np.testing.assert_array_equal(np.asarray(got).view(bits), np.asarray(want).view(bits), err_msg=name)
+    assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
+
+
+def test_a_blockwise_fp8_epilogues_codes_and_scales_are_the_recipes():
+    """The blockwise quantizing epilogue (`quantized.blockwise_fp8_epilogue`) on XLA's route of a product:
+    its stored product rounded once, and its codes and transposed 1 x 128 scales of the activated product,
+    bitwise `projections.rows_quantized` of the activation of that rounded product (row 8547), including
+    rows of zeros (amax floored at 1e-4), a block past E4M3's range, and blocks holding an infinity and a
+    NaN beside finite and zero values."""
+    from dew.nn.kernels.templates.gemm import quantized
+
+    rng = np.random.default_rng(8550)
+    values = rng.normal(size=(128, 256)).astype(np.float32)
+    values[3] = 0.0
+    values[5, :128] *= 1e4
+    values[7, 0], values[7, 1:4] = np.inf, (1.0, 0.0, -2.0)  # an infinite block's codes: the recipe's
+    values[9, 130], values[9, 131:134] = np.nan, (1.0, 0.0, -2.0)  # a NaN block's
+    acc = jnp.asarray(values)
+    rounded, codes, scales = quantized.blockwise_fp8_epilogue(jax.nn.relu)(acc)
+    stored_scales = quantized.stored(scales, (128, True))
+    want_codes, want_scales = projections.rows_quantized(jax.nn.relu(acc.astype(jnp.bfloat16)).astype(
+        jnp.bfloat16))
+    np.testing.assert_array_equal(np.asarray(rounded).view(np.uint16),
+                                  np.asarray(acc.astype(jnp.bfloat16)).view(np.uint16))
+    np.testing.assert_array_equal(np.asarray(codes).view(np.uint8), np.asarray(want_codes).view(np.uint8))
+    np.testing.assert_array_equal(np.asarray(stored_scales).view(np.uint32),
+                                  np.asarray(want_scales.T).view(np.uint32))
