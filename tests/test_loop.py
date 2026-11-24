@@ -1243,7 +1243,7 @@ def test_a_gathered_loop_on_one_fsdp_device_is_the_loop():
     from dew.nn.sharding import placing
     from dew.training import MeshSpec
 
-    mesh = MeshSpec(data=8).build(jax.devices()[:8])
+    mesh = MeshSpec().build(jax.devices()[:8])
     layout = Layout(min_shard=1)
     programs = []
     for gathered in (False, True):
@@ -1272,12 +1272,15 @@ def test_a_gathered_loops_mapped_projections_take_their_weights_as_they_lie():
     layout = Layout(min_shard=1)
     found = {}
     for gathered in (False, True):
-        model, gradient = _gathered_case(gathered=gathered, remat=False)
+        # Computing in bf16, its products ones a launch takes (`projections.launched`).
+        model = tiny(num_layers=4, loop=Loop(4, layers=(1, 3), gathered=gathered, step_norm=False),
+                     dtype="bfloat16")
+        gradient = with_gradients(lambda variables, ids, model=model: model.apply(variables, ids))
         variables, ids = model_draw(model, (8, 16), VOCAB)(0)
-        variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), variables)
+        logits = jax.eval_shape(model.apply, variables, ids)
         with (jax.set_mesh(mesh), nn.logical_axis_rules(DEFAULT_RULES), placing(layout),
               generation.assumed("sm90")):
-            graph = jax.make_jaxpr(gradient)(variables, ids, jnp.ones((8, 16, VOCAB), jnp.bfloat16))
+            graph = jax.make_jaxpr(gradient)(variables, ids, jnp.ones(logits.shape, logits.dtype))
         found[gathered] = _gathers_in_loops(graph.jaxpr)
     assert found[False] and not found[True], found
 
