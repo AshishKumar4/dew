@@ -261,11 +261,6 @@ class Offsets(Protocol):
     """A vocabulary that says which characters each token of a text covers (`offsets`): a layout that
     encodes its prompt whole locates its spans by them (`dew.decision.renderer`)."""
 
-    taken_back: int
-    """The most tokens one merge across a cut boundary takes back from a text's encoding: its longest
-    token's characters but one, none for a vocabulary of single bytes. A cut that overflows by more keeps
-    overflowing, however much longer (`dew.decision.layout.SegmentLayout._cut`)."""
-
     def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
         """`text`'s ids without special tokens, and each token's first character and the character
         after its last."""
@@ -277,6 +272,17 @@ def _token_row(ids: ArrayLike | Sequence[int]) -> list[int]:
     if not isinstance(values, Sequence):
         raise TypeError("decode takes a row of token ids, not one id")
     return [int(token) for token in values]
+
+
+@runtime_checkable
+class TakesBack(Protocol):
+    """A vocabulary that states, as a proof of its own encoding, the most tokens a text's encoding can lose
+    as it is extended past a cut (`taken_back`): a cut of a text that overflows by more overflows however
+    much longer it is cut (`dew.decision.layout.SegmentLayout._cut`). None proves nothing: a ranked BPE's
+    merges cascade, one character turning every later pair's parity, so no bound of its tokens' lengths
+    holds."""
+
+    taken_back: int | None
 
 
 class ByteTokenizer:
@@ -292,8 +298,9 @@ class ByteTokenizer:
     name = "byte"
     """The name a run records for this vocabulary, which `tokenizer_for` resolves back to it."""
 
-    taken_back = 0
-    """None: each token one byte, no merge across a cut (`Offsets.taken_back`)."""
+    taken_back: int | None = 0
+    """None taken back: each token one byte, a text's encoding growing with every character
+    (`TakesBack`)."""
 
     def __init__(self):
         self.vocab_size = 256
@@ -416,12 +423,6 @@ class HFTokenizer:
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
-
-    @functools.cached_property
-    def taken_back(self) -> int:
-        """Its longest token's characters but one (`Offsets.taken_back`), as its vocabulary spells them: a
-        byte-level token's markers one character a byte, at least as many as the characters it covers."""
-        return max((len(token) for token in self.tokenizer.get_vocab()), default=1) - 1
 
     def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
         """`text`'s ids and each token's character span, by the fast tokenizer's offsets; a slow

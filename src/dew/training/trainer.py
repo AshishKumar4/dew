@@ -60,7 +60,6 @@ from dew.distributed.batches import (
     placed_abstract,
     shard_batch,
     split_fields,
-    with_host,
 )
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, Validation, device_mesh, placed_shapes
@@ -712,7 +711,8 @@ class Trainer(Generic[Loss, Effects]):
         placing anything, so a run is checked on a CPU host before a costly launch.
 
         The state is a fresh run's: its parameters, optimizer state and EMA, and, given one global `batch` as
-        the run reads it (its arrays as the run places them, as a fit's check and plan read its first), the
+        the run reads it (its arrays as the run places them, `placed_abstract`, as a fit's check and plan
+        read its first), the
         accumulation its steps pool where `accumulation` is above 1, read in the first of the splits its plan
         may take whose devices hold it, the trainer's own where it fixes one (`splits`). It leaves out the
         narrow copies a step may read (`TrainState.compute`), which the plan drops first where the step does
@@ -728,9 +728,8 @@ class Trainer(Generic[Loss, Effects]):
         state = jax.eval_shape(self._staged_start)
         if batch is None:
             return self._validated(state)[1]
-        device, host = split_fields(marked(DataPartition(), self._counted_batch)(batch))
-        placed = placed_shapes(device, batch_shardings(self.device_mesh, device))
-        return self._fitting(state, with_host(placed, host))
+        return self._fitting(state, placed_abstract(
+            self.device_mesh, marked(DataPartition(), self._counted_batch)(batch), whole=True))
 
     def _validated(self, state: TrainState) -> tuple[Placement[TrainState], Validation]:
         """`state`'s placement and what `Layout.validate` reads of the state it places, as the

@@ -38,14 +38,15 @@ def _ahead(model, optimizer, seq: int, rows: int, limit: int, variables=None
 
 def _needed(ahead: AheadOfTime) -> int:
     """The least memory an H100 whose pool holds all of it (a share of 1, as `_ahead`'s) states for
-    `ahead`'s step to be admitted, by the terms its search admitted it by (its fitting probe's arguments,
-    what it placed beside them and its temporaries, `least_limit`): its pool's limit, there its memory, as
-    `compile_only_gpus` takes it."""
+    `ahead`'s step to be admitted, by the terms its search admitted it by (its fitting probe's, `admitted`:
+    its resident arguments, less the copies its first call builds, which it places beside them, and its
+    temporaries; `least_limit`): its pool's limit, there its memory, as `compile_only_gpus` takes it."""
     gpu = compile_only_gpus("sm90", 1, 2 ** 34, share=1.0)[0]
     probe = next(probe for probe in reversed(ahead.plan["probes"]) if probe["fits"])
-    argument, beside, temp = probe["argument"], probe["beside"], probe["temp"]
-    assert isinstance(argument, int) and isinstance(beside, int) and isinstance(temp, int), probe
-    return least_limit(gpu, [(argument, beside, temp)])
+    admitted = probe["admitted"]
+    assert isinstance(admitted, list) and all(isinstance(term, int) for term in admitted), probe
+    resident, beside, temp = admitted
+    return least_limit(gpu, [(resident, beside, temp)])
 
 
 @pytest.mark.parametrize("stack", ["plain", "scanned", "rows"])

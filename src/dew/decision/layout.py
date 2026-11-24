@@ -30,7 +30,7 @@ from typing_extensions import get_protocol_members
 from dew import _records
 from dew._cache import Same
 from dew._records import EARLIER_LAYOUTS, JSON
-from dew.data.text import HFTokenizer, Offsets, Tokenizer
+from dew.data.text import HFTokenizer, Offsets, TakesBack, Tokenizer
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
 from dew.decision.renderer import Chunk, Point, Rendered, Unit, render as rendered_chunks, stream_point
@@ -1326,28 +1326,26 @@ class SegmentLayout(Layout):
             laid = built([piece(at) for at in range(len(copies))])
         # A merge across a cut may let a longer cut fit than the share counted: each copy takes the
         # longest that still fits, its own cap and the row's length both held. A subword row's encoding,
-        # and its slice's, need not grow with its cut: a merge across a later boundary can take back
-        # tokens one across an earlier did not, at most as many as its vocabulary states one merge takes
-        # back (`Offsets.taken_back`: its longest token's characters but one, none for bytes). So the
-        # walk asks each longer cut until one overflows the room, or its cap, by more than that, past
-        # which no longer cut's merges take enough back (rows 9060, 11739: it stopped 4 tokens past the
-        # room; row 11839: a subword walk asked every longer cut, a long state's rows encoded quadratically
-        # often).
-        taken_back = encoder.taken_back
+        # and its slice's, need not grow with its cut: a ranked BPE's merges cascade, one more character
+        # turning the parity of every later pair, so a longer cut can take back any number of tokens
+        # (rows 9060, 11739: the walk stopped 4 tokens past the room). Its walk asks every longer cut;
+        # one whose vocabulary proves a bound (`TakesBack`: none for bytes) stops once a cut overflows the
+        # room, or its cap, by more (row 11839: a byte walk past a long state's room, each row encoded).
+        taken_back = encoder.taken_back if isinstance(encoder, TakesBack) else None
         for at, copy in enumerate(copies):
             if len(laid.tokens) > self.max_len or copy.keep == "all":
                 continue
             for count in range(kept[at] + 1, lengths[at] + 1):
                 over = own_over(at, count)
                 if over > 0:
-                    if over > taken_back:
+                    if taken_back is not None and over > taken_back:
                         break
                     continue
                 longer = built([piece(other, count if other == at else kept[other])
                                 for other in range(len(copies))])
                 if len(longer.tokens) <= self.max_len:
                     kept[at], laid = count, longer
-                elif len(longer.tokens) - self.max_len > taken_back:
+                elif taken_back is not None and len(longer.tokens) - self.max_len > taken_back:
                     break
         alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
                  for at in range(len(copies))]

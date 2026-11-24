@@ -974,15 +974,17 @@ def test_a_steps_reads_of_its_parameters_pass_over_another_collections_attribute
 def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_steps_with_its_copies():
     """A fit whose state holds, beside its parameters, a collection of structured leaves its step reads no
     copy of (a packed checkpoint's `quantization`, an NvFp4 weight's attributes), and among its parameters
-    one reached through attributes, its narrow copies on, plans and steps, and the step it runs builds copies
-    of its mapped parameters alone (`held_copies`), the collection's leaves and the attribute-reached
-    parameter held through it as they were (row 11730: its first step raised on those attribute paths
-    before it ran; rows 11779, 11773: its proof read the analysis alone)."""
+    one reached through attributes that its loss reads cast to bfloat16, as it reads a weight it copies,
+    its narrow copies on, plans and steps: the step it runs builds copies of its mapped parameters alone
+    (`held_copies`), none of the attribute-reached one, which it trains through its cast; the collection's
+    leaves held through it as they were (row 11730: its first step raised on those attribute paths before
+    it ran; rows 11779, 11773: its proof read the analysis alone)."""
     from typing import NamedTuple
 
     from token_support import repeated_token_batch
 
     from dew.data.dataset import Loader
+    from dew.objectives.base import Ratio
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, MeshSpec, Trainer
     from dew.training.narrow import held_copies
@@ -992,12 +994,22 @@ def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_step
         values: jax.Array
         scale: jax.Array
 
+    class Reading(LMObjective):
+        """An LM whose loss reads the attribute-reached parameter's values cast to bfloat16, as a weight
+        a copy is planned for is read: a read no copy's overlay reaches."""
+
+        def loss(self, variables, batch, step):
+            stats, aux = super().loss(variables, batch, step)
+            assert isinstance(stats, Ratio), type(stats)
+            read = jnp.sum(variables["params"]["attribute"].values.astype(jnp.bfloat16)).astype(jnp.float32)
+            return Ratio(stats.total + read * stats.mass, stats.mass), aux
+
     plain, _ = _decoder()
     variables = dict(plain.init(jax.random.key(0)))
     variables["quantization"] = {"head": Packed(jnp.ones((4, 2), jnp.uint8), jnp.ones((4,), jnp.float32))}
     attribute = Packed(jnp.full((4, 2), 2.0, jnp.float32), jnp.ones((4,), jnp.float32))
     variables["params"] = {**variables["params"], "attribute": attribute}
-    objective = LMObjective(plain.model, seq_len=8, pad_id=0, variables=variables)
+    objective = Reading(plain.model, seq_len=8, pad_id=0, variables=variables)
     with chosen(narrow_copies="on"):
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
                           advanced=TrainerAdvanced(layout=Layout(min_shard=1, tolerance=1.0)))
@@ -1017,8 +1029,11 @@ def test_a_fit_over_a_state_holding_a_packed_collection_of_attribute_leaves_step
     held = stepped.variables["quantization"]["head"]
     np.testing.assert_array_equal(np.asarray(held.values), np.ones((4, 2), np.uint8))
     np.testing.assert_array_equal(np.asarray(held.scale), np.ones(4))
+    # Trained through its cast by its read, from where the fit left it.
     reached = stepped.variables["params"]["attribute"]
-    np.testing.assert_array_equal(np.asarray(reached.values), np.full((4, 2), 2.0))
+    before = state.variables["params"]["attribute"].values
+    assert not np.array_equal(np.asarray(before), np.full((4, 2), 2.0)), before
+    assert not np.array_equal(np.asarray(reached.values), np.asarray(before)), reached
 
 
 @attending("template")
