@@ -328,6 +328,29 @@ def _layer_weights(variables, laid) -> dict:
     return {**variables, "params": jax.tree_util.tree_map_with_path(each, variables["params"])}
 
 
+class _Substituted(LMObjective):
+    """An LM whose model reads each layer's query projection as a constant of its shape in place of the
+    weight: the weight's gradient none, the constant's no weight's."""
+
+    def loss(self, variables, batch, step):
+        def substituted(node):
+            if not isinstance(node, Mapping):
+                return node
+            held = {key: substituted(value) for key, value in node.items()}
+            if "q_proj" in held:
+                held["q_proj"] = jax.tree.map(lambda leaf: jnp.full_like(leaf, 0.01), held["q_proj"])
+            return held
+        return super().loss({**variables, "params": substituted(variables["params"])}, batch, step)
+
+
+class _Cast(LMObjective):
+    """An LM whose model reads its layers' weights rounded to bfloat16: its gradient reaches the float32
+    weights through the cast, which a rule updating them in place would round as it wrote them."""
+
+    def loss(self, variables, batch, step):
+        return super().loss(_layer_weights(variables, lambda leaf: leaf.astype(jnp.bfloat16)), batch, step)
+
+
 class _Permuted(LMObjective):
     """An LM whose model reads each of its layers' square weights through a reshape that permutes its last
     two axes first (`jax.lax.reshape`'s `dimensions`): a transpose by another name."""
@@ -747,7 +770,8 @@ class _Scalar(LMObjective):
 
 OBJECTIVES = {"lm": LMObjective, "penalized": _Penalized, "branched": _Branched, "repeated": _Repeated,
               "nested": _Nested, "scalar": _Scalar, "transposed": _Transposed, "detached": _Detached,
-              "twice": _Twice, "permuted": _Permuted, "swapped": _Swapped}
+              "twice": _Twice, "permuted": _Permuted, "swapped": _Swapped,
+              "substituted": _Substituted, "cast": _Cast}
 """Each accumulating witness's objective: the LM and its scalar mean, whose runs pool in their backward,
 and those whose runs the step accumulates ordinarily, read beside a term on the weights, in a branch, in a
 loop or within a nested jit."""
@@ -777,6 +801,8 @@ loop or within a nested jit."""
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
     pytest.param("float32", 0.0, False, "swapped", id="swapped-weights",
                  marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
+    pytest.param("float32", 0.0, False, "substituted", id="constant-substitute",
+                 marks=pytest.mark.check1_shards(seeds=64, per_task=32)),
 ])
 def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, objective):
     """A scanned step accumulating a window of two batches each split in two, its parts of unequal token
@@ -786,8 +812,8 @@ def test_an_accumulating_scanned_step_matches_unrolled(dtype, clip, periodic, ob
     clipped with narrow copies, over a periodic stack or under a scalar loss; or accumulating it as an
     unscanned step does where
     its loss reads a run beside a term on its weights, in a branch, in a loop, within a nested jit or
-    through a transpose of its weights, a permuting reshape or with two of its weights swapped
-    (`_read_once`)."""
+    through a transpose of its weights, a permuting reshape, with two of its weights swapped or one
+    replaced by a constant (`_read_once`)."""
     _on_par_unrolled(dtype, clip, objective, periodic=periodic, batches=2, split=2)
 
 
@@ -804,6 +830,33 @@ def test_a_scanned_step_planned_in_its_backward_but_no_once_read_run_updates_as_
     runs, which then took the zeros left as their weights and moments) or scores it twice (each run read
     twice, which the step refused by name): the step updates them as unscanned (review of row 12080)."""
     _on_par_unrolled("float32", 0.0, objective, periodic=False, batches=1, split=1)
+
+
+@pytest.mark.usefixtures("scanned_stacks")
+def test_a_scanned_step_whose_loss_casts_its_weights_keeps_them_unrounded():
+    """A scanned one-microbatch AdamW step over a staged state, reading no narrow copies, whose model reads
+    its layers' float32 weights cast to bfloat16 (`_Cast`) updates them as unscanned, through the cast's
+    gradient into the float32 weights: their entries stay off bfloat16's grid after the update as before
+    it. A rule updating them in place read the rounded weights and wrote them back, every entry on that
+    grid (review of row 12080)."""
+    @under_kernels(layer_scan="scanned", narrow_copies="off")
+    def trained():
+        steps = Trainer(_Cast(decoder(num_layers=LAYERS), SEQ), ADAMW, key=jax.random.key(0), mesh=MeshSpec(),
+                        split=1, checkpoints=None, tracker=None,
+                        advanced=TrainerAdvanced(layout=Layout(min_shard=TINY_SHARD)))
+        steps.device_mesh = MeshSpec().build(jax.devices()[:1])
+        steps.validate(steps=1)
+        state = steps.staged(steps.initial_state())
+        batch = shard_batch(steps.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
+        state, *_ = steps.compile(state, batch)(state, batch)
+        return jax.device_get(steps.stored(state).variables["params"])
+
+    leaves = [np.asarray(leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(trained())
+              if any(isinstance(key, jax.tree_util.DictKey) and isinstance(key.key, str)
+                     and group_layers(key.key) is not None for key in path) and np.size(leaf) > 1]
+    # The share of the layers' float32 weight entries bfloat16 holds exactly.
+    gridded = sum(int(np.sum(leaf == leaf.astype(jnp.bfloat16).astype(np.float32))) for leaf in leaves)
+    assert gridded < sum(leaf.size for leaf in leaves) / 2, gridded
 
 
 def _on_par_unrolled(dtype: str, clip: float, objective: str, *, periodic: bool, batches: int, split: int):

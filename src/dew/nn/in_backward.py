@@ -166,17 +166,12 @@ def _reads(program: jcore.Jaxpr, roots: Mapping[jcore.Var, tuple[RunRead, tuple]
 def _sourced(operands: Sequence[jcore.Var | jcore.Literal], held: Mapping[jcore.Var, tuple[RunRead, tuple]],
              sources: Sequence[tuple[str, tuple[str, ...]] | None]) -> bool:
     """Whether each of a run's rule's `operands` reads the source its call states (`InBackward.sources`): a
-    run variable (`held`) of that collection and leaf where it states one, the weights' alone free to be
-    the step's narrow copies, which are inputs of their own; none where it states none."""
+    run variable (`held`) of that collection and leaf where it states one (the step's narrow copies among
+    the variables its gate roots), never a value the loss made in its place; none where it states none."""
     for operand, source in zip(operands, sources, strict=True):
         root = held[operand][0] if computed(operand) and operand in held else None
-        if source is None:
-            if root is not None:
-                return False
-        elif root is None:
-            if source[0] != "params":
-                return False
-        elif (root.collection, root.leaf) != source:
+        read = None if root is None else (root.collection, root.leaf)
+        if read != source:
             return False
     return True
 
