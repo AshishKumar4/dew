@@ -204,3 +204,60 @@ def test_a_coupled_momentum_runs_in_a_shard_map_that_checks_varying_axes():
     found = jax.jit(mapped)(*given)
     pulled = jax.jit(lambda *operands: jax.vjp(mapped, *operands)[1](cotangent))(*given)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((found, pulled)))
+
+
+def test_a_chunks_writes_past_float32s_range_cancel_as_the_token_walks():
+    """ReviewMomentum1454's local write (row 12693): two tokens of queries and keys along the first key,
+    erase keys along the second, every decay and write gate one, the memory entering 2^127 along the first
+    key and the momentum none, values -2^127 then 0: the chunked op's outputs and final pair are the decode
+    step's, finite, where its first write weighed by its sum to the chunk's end, -2 2^127, overflowed before
+    the memory entering joined it."""
+    hooks = recurrence.Hooks(decay='scalar', coupled='momentum', erase='untied', write_bound=1.0, scale=1.0)
+    along = jnp.zeros((1, 2, 1, 2), jnp.float32).at[..., 0].set(1.0)
+    erase = jnp.zeros((1, 2, 1, 2), jnp.float32).at[..., 1].set(1.0)
+    value = jnp.asarray([-(2.0 ** 127), 0.0], jnp.float32).reshape(1, 2, 1, 1)
+    zero, one = jnp.zeros((1, 2, 1), jnp.float32), jnp.ones((1, 2, 1), jnp.float32)
+    state = jnp.zeros((1, 1, 2, 2, 1), jnp.float32).at[:, :, 0, 0, 0].set(2.0 ** 127)
+    out, final = chunk(hooks, Chunk(along, along, value, log_decay=zero, beta=one, momentum_decay=zero,
+                                    erase_key=erase, state=state), chunk_size=CHUNK)
+
+    def one_token(state, token):
+        q, p, v, a, b, mu = token
+        read, _, state = recurrence.step(hooks, recurrence.Step(state, query=q, key=q, value=v, log_decay=a,
+                                                                beta=b, momentum_decay=mu, erase_key=p))
+        return state, read
+
+    tokens = tuple(jnp.moveaxis(x, 1, 0) for x in (along, erase, value, zero, one, zero))
+    stepped_final, stepped = jax.lax.scan(one_token, state, tokens)
+    for got, want in ((out, jnp.moveaxis(stepped, 0, 1)), (final, stepped_final)):
+        assert np.isfinite(np.asarray(want)).all()
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def faint(seed):
+    """A chunk of 16 tokens whose last decays the memory by about exp(-86), every other's one, its keys
+    along the first key and its erase keys along the second, no values and write gates of one, the memory
+    entering 2^20 normals off the second key's row and the momentum none: the memory is the entering one
+    decayed, its reads normal, its momentum's factors reaching -15 before the last token."""
+    normal = np.random.default_rng([12693, seed]).standard_normal
+    shape = (ROWS, CHUNK, HEADS)
+    query = unit(normal((*shape, KEYS)))
+    key, erase = np.zeros((*shape, KEYS)), np.zeros((*shape, KEYS))
+    key[..., 0], erase[..., 1] = 1.0, 1.0
+    log_decay = np.zeros(shape)
+    log_decay[:, -1] = -86.0 - 0.25 * np.abs(normal((ROWS, HEADS)))
+    state = np.zeros((ROWS, HEADS, 2, KEYS, VALUES))
+    state[:, :, 0] = 2.0 ** 20 * normal((ROWS, HEADS, KEYS, VALUES))
+    state[:, :, 0, 1] = 0.0
+    keyed = (hosted(x, jnp.float32) for x in (query, key, np.zeros((*shape, VALUES))))
+    gates = (hosted(x) for x in (log_decay, np.ones(shape), np.zeros(shape)))
+    return (*keyed, *gates, hosted(erase, jnp.float32), hosted(state))
+
+
+def test_a_decay_past_float32s_least_normal_keeps_the_memorys_normal_reads():
+    """ReviewMomentum1454's flush (row 12693): a chunk's last token decaying the memory by about exp(-86)
+    beside momentum factors reaching -15: the chunked op's outputs and final pair on par with the recurrence a
+    token at a time from float64 (check 1), the last token's read about 2^-106, where a chunk-wide divisor of
+    16 brought the decayed query below float32's least normal and flushed it."""
+    assert_as_exact(jax.jit(chunked(UNTIED)), jax.jit(tokenwise), faint, "a faint decay's chunked reads",
+                    seeds=SEEDS)
