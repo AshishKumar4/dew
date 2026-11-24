@@ -477,7 +477,9 @@ def test_a_fast_fp32_kimi_forward_lowers_for_an_ampere_gpu():
         return chunk_gated_delta_rule(query, key, value, g, beta)
 
     mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), 'sm80')
+    # The default product precision the fast forms round at (the suite's lanes configure 'highest', which
+    # refuses an fp32 call on the template before its launch).
     with (generation.assumed('sm80'), jax.sharding.use_abstract_mesh(mesh),
           generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')),
-          generation.chosen(gated_delta_rule='mosaic_gpu')):
+          jax.default_matmul_precision('default'), generation.chosen(gated_delta_rule='mosaic_gpu')):
         jax.jit(forward).trace(*operands).lower(lowering_platforms=("cuda",))
